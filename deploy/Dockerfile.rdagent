@@ -1,0 +1,55 @@
+FROM python:3.11-slim
+
+ARG RDAGENT_COMMIT=4f9ecb005881cddc08df0124a2e894c018007679
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG DEBIAN_MIRROR=deb.debian.org/debian
+ARG APT_RETRIES=5
+ARG APT_TIMEOUT_SECONDS=30
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=60 \
+    PIP_RETRIES=5 \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    RDAGENT_REPO=/opt/rdagent \
+    RDAGENT_PYTHON=/usr/local/bin/python \
+    RDAGENT_COMMAND=/usr/local/bin/rdagent \
+    QLIB_PYTHON=/usr/local/bin/python \
+    WORKER_JOB_KINDS=rdagent_factor
+
+RUN sed -i "s|deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=${APT_RETRIES} \
+        -o Acquire::http::Timeout=${APT_TIMEOUT_SECONDS} \
+        -o Acquire::https::Timeout=${APT_TIMEOUT_SECONDS} update \
+    && apt-get -o Acquire::Retries=${APT_RETRIES} \
+        -o Acquire::http::Timeout=${APT_TIMEOUT_SECONDS} \
+        -o Acquire::https::Timeout=${APT_TIMEOUT_SECONDS} \
+        install -y --no-install-recommends build-essential ca-certificates curl docker-cli libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/rdagent \
+    && curl --fail --location --retry 5 --retry-all-errors \
+        --connect-timeout 20 --max-time 300 \
+        "https://codeload.github.com/microsoft/RD-Agent/tar.gz/${RDAGENT_COMMIT}" \
+      | tar -xz --strip-components=1 -C /opt/rdagent \
+    && SETUPTOOLS_SCM_PRETEND_VERSION="0.0.dev0+g${RDAGENT_COMMIT}" \
+       python -m pip install /opt/rdagent psycopg[binary]
+
+# The pinned upstream commit declares only the namespace package in setuptools,
+# so its wheel contains the CLI metadata but not the namespace source tree.
+# It was also released against Pydantic AI v1; an unconstrained install now picks
+# v2, where the MCP connector imported by this commit no longer exists.
+# Keep the immutable extracted source on Python's path, restore the exact
+# compatible dependency generation, and fail the build on the real imports.
+ENV PYTHONPATH=/opt/rdagent
+ARG PYDANTIC_AI_VERSION=1.90.0
+RUN python -m pip install "pydantic-ai-slim[mcp,openai,prefect]==${PYDANTIC_AI_VERSION}" \
+    && python -c "from pydantic_ai.mcp import MCPServerStreamableHTTP; from pydantic_ai.providers.litellm import LiteLLMProvider; from rdagent.app.cli import app; assert MCPServerStreamableHTTP and LiteLLMProvider and app"
+
+WORKDIR /app
+COPY pyproject.toml README.md alembic.ini ./
+COPY migrations ./migrations
+COPY src ./src
+COPY scripts ./scripts
+RUN python -m pip install .
+
+CMD ["quant-worker"]

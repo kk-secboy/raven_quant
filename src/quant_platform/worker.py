@@ -1,0 +1,887 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+from datetime import date
+from pathlib import Path
+
+from quant_data.config import Settings
+from quant_data.path_utils import to_wsl_path as _to_wsl_path
+
+from .allocation_store import AllocationStore
+from .job_store import JobStore
+from .pair_portfolio_store import PairPortfolioStore
+from .portfolio_store import PortfolioStore
+from .rdagent_runtime import rdagent_command
+from .research_store import ResearchStore
+from .runtime_secret_store import RuntimeSecretStore
+from .strategy_store import StrategyStore
+
+
+class LocalJobWorker:
+    """Runs one durable local job at a time in a child Python process."""
+
+    def __init__(self, store: JobStore, project_root: Path, settings: Settings) -> None:
+        self.store = store
+        self.project_root = project_root
+        self.settings = settings
+        self.research = ResearchStore(settings.database_url)
+        self.strategies = StrategyStore(settings.database_url)
+        self.portfolios = PortfolioStore(settings.database_url)
+        self.pair_portfolios = PairPortfolioStore(settings.database_url)
+        self.allocations = AllocationStore(settings.database_url)
+        self.runtime_secrets = RuntimeSecretStore(
+            settings.database_url, settings.platform_secret_key
+        )
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self.store.recover_interrupted(self.settings.worker_job_kinds)
+        self._thread = threading.Thread(target=self._loop, name="quant-job-worker", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def notify(self) -> None:
+        self._wake.set()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            job = self.store.claim_next(self.settings.worker_job_kinds)
+            if job is None:
+                self._wake.wait(timeout=2)
+                self._wake.clear()
+                continue
+            self._run(job)
+
+    def _run(self, job: dict) -> None:
+        research_run_id = job["payload"].get("research_run_id")
+        backtest_id = job["payload"].get("backtest_id")
+        portfolio_batch_id = job["payload"].get("portfolio_batch_id")
+        pair_portfolio_batch_id = job["payload"].get("pair_portfolio_batch_id")
+        if research_run_id:
+            self.research.mark_run(research_run_id, "running")
+        if backtest_id:
+            self.strategies.mark_backtest(backtest_id, "running")
+        if portfolio_batch_id:
+            self.portfolios.mark_batch(portfolio_batch_id, "running")
+        if pair_portfolio_batch_id:
+            self.pair_portfolios.mark_batch(pair_portfolio_batch_id, "running")
+        try:
+            command, result_path, extra_env = self._command(job)
+        except ValueError as exc:
+            self.store.finish(job["id"], exit_code=2, error=str(exc))
+            if research_run_id:
+                self.research.mark_run(research_run_id, "failed", error=str(exc))
+            if backtest_id:
+                self.strategies.mark_backtest(backtest_id, "failed", error=str(exc))
+            if portfolio_batch_id:
+                self.portfolios.mark_batch(portfolio_batch_id, "failed", error=str(exc))
+            if pair_portfolio_batch_id:
+                self.pair_portfolios.mark_batch(pair_portfolio_batch_id, "failed", error=str(exc))
+            return
+        log_path = Path(job["log_path"])
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        try:
+            with log_path.open("a", encoding="utf-8") as log:
+                process = subprocess.Popen(
+                    command,
+                    cwd=self.project_root,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    creationflags=creationflags,
+                    env={**os.environ, **extra_env},
+                )
+                exit_code = process.wait()
+            process_error = (
+                None
+                if exit_code == 0
+                else _failure_message(log_path, f"process exited with code {exit_code}")
+            )
+            result = None
+            if exit_code == 0 and result_path and result_path.exists():
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+            logical_error = None
+            if job["kind"] == "factor_evaluate" and result:
+                failures = [
+                    item for item in result.get("evaluations", []) if item.get("status") != "ok"
+                ]
+                if failures:
+                    logical_error = "; ".join(
+                        f"{item.get('candidate_id')}: {item.get('error', 'evaluation failed')}"
+                        for item in failures
+                    )
+                    exit_code = 3
+            if exit_code == 0 and job["kind"] == "strategy_backtest":
+                try:
+                    if not isinstance(result, dict) or not isinstance(result.get("metrics"), dict):
+                        raise ValueError("strategy backtest result is missing metrics")
+                    self.strategies.validate_backtest_artifacts(
+                        str(backtest_id), result["metrics"]
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    logical_error = str(exc)
+                    exit_code = 3
+            pipeline_stage = job["kind"] in {"data_verify", "data_snapshot", "data_qlib"}
+            bootstrap_finalize = job["kind"] == "bootstrap" and bool(
+                job["payload"].get("finalize_after_download")
+            )
+            if exit_code == 0 and (pipeline_stage or bootstrap_finalize):
+                try:
+                    self._queue_data_pipeline_successor(job)
+                except Exception as exc:
+                    logical_error = f"could not enqueue next data pipeline stage: {exc}"
+                    exit_code = 4
+            self.store.finish(
+                job["id"],
+                exit_code=exit_code,
+                error=(None if exit_code == 0 else logical_error or process_error),
+                result=result,
+            )
+            if research_run_id:
+                if exit_code == 0:
+                    if job["kind"] == "rdagent_factor":
+                        candidates = self._import_rdagent_candidates(research_run_id, result or {})
+                        self._queue_factor_evaluation(job, candidates)
+                        self.research.mark_run(
+                            research_run_id,
+                            "evaluating",
+                            runtime={
+                                "trace_path": (result or {}).get("trace_path"),
+                                "rounds": (result or {}).get("rounds", 0),
+                                "candidates": len(candidates),
+                            },
+                        )
+                    elif job["kind"] == "factor_evaluate":
+                        self._import_factor_evaluations(job, result or {})
+                        self.research.mark_run(research_run_id, "succeeded")
+                else:
+                    self.research.mark_run(
+                        research_run_id,
+                        "failed",
+                        error=logical_error or process_error,
+                    )
+            if backtest_id:
+                if exit_code == 0 and result:
+                    self.strategies.mark_backtest(
+                        backtest_id,
+                        "succeeded",
+                        metrics=result["metrics"],
+                    )
+                else:
+                    self.strategies.mark_backtest(
+                        backtest_id,
+                        "failed",
+                        error=logical_error or process_error,
+                    )
+            if portfolio_batch_id:
+                if exit_code == 0 and result:
+                    applied = self.portfolios.apply_batch(portfolio_batch_id, result)
+                    self.allocations.refresh_for_portfolio(applied["portfolio_id"])
+                else:
+                    self.portfolios.mark_batch(
+                        portfolio_batch_id,
+                        "failed",
+                        error=logical_error or process_error,
+                    )
+            if pair_portfolio_batch_id:
+                if exit_code == 0 and result:
+                    self.pair_portfolios.apply_batch(pair_portfolio_batch_id, result)
+                else:
+                    self.pair_portfolios.mark_batch(
+                        pair_portfolio_batch_id,
+                        "failed",
+                        error=logical_error or process_error,
+                    )
+        except Exception as exc:
+            self.store.finish(job["id"], exit_code=1, error=str(exc))
+            if research_run_id:
+                self.research.mark_run(research_run_id, "failed", error=str(exc))
+            if backtest_id:
+                self.strategies.mark_backtest(backtest_id, "failed", error=str(exc))
+            if portfolio_batch_id:
+                self.portfolios.mark_batch(portfolio_batch_id, "failed", error=str(exc))
+            if pair_portfolio_batch_id:
+                self.pair_portfolios.mark_batch(pair_portfolio_batch_id, "failed", error=str(exc))
+
+    def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
+        payload = job["payload"]
+        if job["kind"] in {"margin_eligibility_download", "core_intraday_download"} or job[
+            "kind"
+        ].startswith("supplemental_"):
+            stored = self.runtime_secrets.get("tushare")
+            api_url = (stored or {}).get("api_url") or self.settings.api_url
+            token = (stored or {}).get("token") or self.settings.token
+            if not api_url or not token:
+                raise ValueError("Tushare credentials are not configured")
+            output = self.settings.data_root / "artifacts" / "execution-data" / job["id"]
+            result_path = output / "result.json"
+            command = [sys.executable, "-m", "quant_data.cli"]
+            if job["kind"] == "margin_eligibility_download":
+                command.extend(
+                    [
+                        "margin-eligibility",
+                        "--start",
+                        payload["start"],
+                        "--end",
+                        payload["end"],
+                        "--result",
+                        str(result_path),
+                    ]
+                )
+            elif job["kind"] == "core_intraday_download":
+                command.extend(
+                    [
+                        "core-intraday",
+                        "--start",
+                        payload["start"],
+                        "--end",
+                        payload["end"],
+                        "--snapshot-name",
+                        payload["snapshot_name"],
+                        "--result",
+                        str(result_path),
+                    ]
+                )
+                for option, key in (
+                    ("--etfs", "etfs"),
+                    ("--stocks", "stocks"),
+                    ("--indices", "indices"),
+                    ("--futures", "futures"),
+                    ("--options", "options"),
+                ):
+                    values = payload.get(key) or []
+                    if values:
+                        command.extend([option, ",".join(values)])
+                if payload.get("auto_select", False):
+                    command.extend(
+                        [
+                            "--auto-universe",
+                            "--max-stocks",
+                            str(payload.get("max_stocks", 100)),
+                            "--max-options",
+                            str(payload.get("max_options", 100)),
+                            "--etf-categories",
+                            ",".join(
+                                payload.get("etf_categories")
+                                or ["broad", "industry", "gold", "bond"]
+                            ),
+                        ]
+                    )
+            else:
+                command.extend(
+                    [
+                        "supplemental-download",
+                        "--bundle",
+                        payload["bundle"],
+                        "--start",
+                        payload["start"],
+                        "--end",
+                        payload["end"],
+                        "--result",
+                        str(result_path),
+                    ]
+                )
+                if payload.get("symbols"):
+                    command.extend(["--symbols", ",".join(payload["symbols"])])
+            return command, result_path, {"TUSHARE_API_URL": api_url, "TUSHARE_TOKEN": token}
+        if job["kind"] == "data_verify":
+            return [sys.executable, "-m", "quant_data.cli", "verify"], None, {}
+        if job["kind"] == "data_snapshot":
+            return (
+                [
+                    sys.executable,
+                    "-m",
+                    "quant_data.cli",
+                    "snapshot",
+                    "--name",
+                    payload["snapshot_name"],
+                    "--start",
+                    payload["start"],
+                    "--end",
+                    payload["end"],
+                    "--profile",
+                    payload["profile"],
+                ],
+                None,
+                {},
+            )
+        if job["kind"] == "data_qlib":
+            return (
+                [
+                    sys.executable,
+                    "-m",
+                    "quant_data.cli",
+                    "build-qlib",
+                    "--snapshot",
+                    payload["snapshot_name"],
+                ],
+                None,
+                {},
+            )
+        if job["kind"] == "bootstrap":
+            stored = self.runtime_secrets.get("tushare")
+            api_url = (stored or {}).get("api_url") or self.settings.api_url
+            token = (stored or {}).get("token") or self.settings.token
+            if not api_url or not token:
+                raise ValueError("Tushare credentials are not configured")
+            command = [
+                sys.executable,
+                "-m",
+                "quant_data.cli",
+                "bootstrap",
+                "--profile",
+                payload["profile"],
+                "--start",
+                payload["start"],
+                "--end",
+                payload["end"],
+            ]
+            command.append("--download-only")
+            return (
+                command,
+                None,
+                {
+                    "TUSHARE_API_URL": api_url,
+                    "TUSHARE_TOKEN": token,
+                },
+            )
+        if job["kind"] == "qlib_baseline":
+            output = self.settings.data_root / "artifacts" / "qlib" / job["id"]
+            script = self.project_root / "scripts" / "run_qlib_baseline.py"
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    _to_wsl_path(Path(payload["dataset_path"]))
+                    if is_wsl
+                    else str(Path(payload["dataset_path"])),
+                    "--output",
+                    _to_wsl_path(output) if is_wsl else str(output),
+                    "--tracking-uri",
+                    self.settings.mlflow_tracking_uri,
+                    "--market",
+                    payload["market"],
+                    "--benchmark",
+                    payload["benchmark"],
+                    "--account",
+                    str(payload["account"]),
+                    "--topk",
+                    str(payload["topk"]),
+                    "--n-drop",
+                    str(payload["n_drop"]),
+                    "--open-cost",
+                    str(payload["open_cost"]),
+                    "--close-cost",
+                    str(payload["close_cost"]),
+                    "--min-cost",
+                    str(payload["min_cost"]),
+                ]
+            )
+            return command, output / "result.json", {}
+        if job["kind"] == "rdagent_factor":
+            output = self.settings.data_root / "artifacts" / "rdagent" / payload["research_run_id"]
+            trace = output / "trace"
+            result_path = output / "result.json"
+            output.mkdir(parents=True, exist_ok=True)
+            command, env = rdagent_command(
+                self.settings,
+                project_root=self.project_root,
+                trace_path=trace,
+                result_path=result_path,
+                dataset_path=Path(payload["dataset_path"]),
+                loop_n=int(payload["loop_n"]),
+                duration=str(payload["duration"]),
+                periods=payload["periods"],
+                objective=str(payload["objective"]),
+            )
+            llm = self.runtime_secrets.get("llm")
+            if llm:
+                env[self.settings.rdagent_llm_key_env] = llm["api_key"]
+                env["OPENAI_API_BASE"] = llm.get("api_base", "")
+                env["CHAT_MODEL"] = llm.get("chat_model", "gpt-4.1-mini")
+            return command, result_path, env
+        if job["kind"] == "factor_evaluate":
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "factor-evaluations"
+                / payload["research_run_id"]
+            )
+            output.mkdir(parents=True, exist_ok=True)
+            manifest_path = output / "manifest.json"
+            result_path = output / "result.json"
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+
+            def runtime_path(value: str) -> str:
+                return _to_wsl_path(Path(value)) if is_wsl else str(value)
+
+            promoted = self.research.list_candidates(status="promoted", limit=500)
+            manifest = {
+                "candidates": [
+                    {**item, "values_path": runtime_path(item["values_path"])}
+                    for item in payload["candidates"]
+                ],
+                "periods": payload["periods"],
+                "comparison_values": [
+                    runtime_path(item["values_path"])
+                    for item in promoted
+                    if item.get("values_path") and Path(item["values_path"]).exists()
+                ],
+                "cost_rate": payload.get("cost_rate", 0.002),
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            script = self.project_root / "scripts" / "evaluate_factor_batch.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    _to_wsl_path(Path(payload["dataset_path"]))
+                    if is_wsl
+                    else str(Path(payload["dataset_path"])),
+                    "--manifest",
+                    _to_wsl_path(manifest_path) if is_wsl else str(manifest_path),
+                    "--output",
+                    _to_wsl_path(result_path) if is_wsl else str(result_path),
+                ]
+            )
+            return command, result_path, {}
+        if job["kind"] == "strategy_backtest":
+            output = self.settings.data_root / "artifacts" / "backtests" / payload["backtest_id"]
+            output.mkdir(parents=True, exist_ok=True)
+            manifest_path = output / "manifest.json"
+            result_path = output / "result.json"
+            version = self.strategies.get_version(payload["strategy_version_id"])
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+
+            def runtime_path(value: str) -> str:
+                return _to_wsl_path(Path(value)) if is_wsl else str(value)
+
+            manifest = {
+                "strategy_version_id": version["id"],
+                "dataset": payload["dataset"],
+                "benchmark": version["benchmark"],
+                "periods": payload["periods"],
+                "config": version["config"],
+                "factors": [
+                    {
+                        "candidate_id": item["factor_candidate_id"],
+                        "values_path": runtime_path(item["values_path"]),
+                        "code_sha256": item["code_sha256"],
+                        "weight": item["weight"],
+                        "direction": item["direction"],
+                    }
+                    for item in version["factors"]
+                ],
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            script = self.project_root / "scripts" / "run_multifactor_backtest.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    _to_wsl_path(Path(payload["dataset_path"]))
+                    if is_wsl
+                    else str(Path(payload["dataset_path"])),
+                    "--manifest",
+                    _to_wsl_path(manifest_path) if is_wsl else str(manifest_path),
+                    "--output",
+                    _to_wsl_path(output) if is_wsl else str(output),
+                ]
+            )
+            return command, result_path, {}
+        if job["kind"] == "pair_backtest":
+            output = self.settings.data_root / "artifacts" / "backtests" / payload["backtest_id"]
+            output.mkdir(parents=True, exist_ok=True)
+            manifest_path = output / "manifest.json"
+            result_path = output / "result.json"
+            version = self.strategies.get_version(payload["strategy_version_id"])
+            if version.get("strategy_type") != "pair" or not version.get("pair"):
+                raise ValueError("pair backtest job requires a pair strategy version")
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+
+            def runtime_path(value: str) -> str:
+                return _to_wsl_path(Path(value)) if is_wsl else str(Path(value))
+
+            manifest = {
+                "strategy_version_id": version["id"],
+                "dataset": payload["dataset"],
+                "execution_snapshot": payload["execution_snapshot"],
+                "periods": payload["periods"],
+                "config": version["config"],
+                "pair": version["pair"],
+                "daily_provenance": payload["daily_provenance"],
+                "minute_dataset": payload["minute_dataset"],
+                "shortability_dataset": payload["shortability_dataset"],
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            script = self.project_root / "scripts" / "run_pair_backtest.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    runtime_path(payload["dataset_path"]),
+                    "--minute-path",
+                    runtime_path(payload["minute_dataset"]["dataset_path"]),
+                    "--shortability-path",
+                    runtime_path(payload["shortability_dataset"]["dataset_path"]),
+                    "--manifest",
+                    runtime_path(str(manifest_path)),
+                    "--output",
+                    runtime_path(str(output)),
+                ]
+            )
+            return command, result_path, {}
+        if job["kind"] == "pair_paper_rebalance":
+            portfolio = self.pair_portfolios.get(payload["pair_portfolio_id"])
+            batch = self.pair_portfolios.get_batch(payload["pair_portfolio_batch_id"])
+            output = Path(str(batch["artifact_path"]))
+            output.mkdir(parents=True, exist_ok=True)
+            manifest_path = output / "manifest.json"
+            result_path = output / "result.json"
+            version = self.strategies.get_version(portfolio["strategy_version_id"])
+            if version["status"] != "approved" or version.get("strategy_type") != "pair":
+                raise ValueError("pair paper rebalance requires an approved pair version")
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+
+            def runtime_path(value: str | Path) -> str:
+                path = Path(value)
+                return _to_wsl_path(path) if is_wsl else str(path)
+
+            manifest = {
+                "portfolio_id": portfolio["id"],
+                "strategy_version_id": version["id"],
+                "as_of_date": payload["as_of_date"],
+                "dataset_start": payload["dataset_start"],
+                "config": version["config"],
+                "pair": version["pair"],
+                "daily_provenance": payload["daily_provenance"],
+                "minute_dataset": payload["minute_dataset"],
+                "shortability_dataset": payload["shortability_dataset"],
+                "state": {
+                    "status": portfolio["status"],
+                    "cash": portfolio["cash"],
+                    "nav": portfolio["nav"],
+                    "high_water_mark": portfolio["high_water_mark"],
+                    "position_direction": portfolio["position_direction"],
+                    "quantity_y": portfolio["quantity_y"],
+                    "quantity_x": portfolio["quantity_x"],
+                    "entry_nav": portfolio["entry_nav"],
+                    "holding_days": portfolio["holding_days"],
+                },
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            script = self.project_root / "scripts" / "run_pair_paper_step.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    runtime_path(payload["dataset_path"]),
+                    "--minute-path",
+                    runtime_path(payload["minute_dataset"]["dataset_path"]),
+                    "--shortability-path",
+                    runtime_path(payload["shortability_dataset"]["dataset_path"]),
+                    "--manifest",
+                    runtime_path(manifest_path),
+                    "--output",
+                    runtime_path(output),
+                ]
+            )
+            return command, result_path, {}
+        if job["kind"] == "paper_rebalance":
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "paper-portfolios"
+                / payload["portfolio_id"]
+                / payload["portfolio_batch_id"]
+            )
+            output.mkdir(parents=True, exist_ok=True)
+            manifest_path = output / "manifest.json"
+            result_path = output / "result.json"
+            portfolio = self.portfolios.get(payload["portfolio_id"])
+            version = self.strategies.get_version(portfolio["strategy_version_id"])
+            if version["status"] != "approved":
+                raise ValueError("paper rebalance requires an approved strategy version")
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+
+            def runtime_path(value: str) -> str:
+                return _to_wsl_path(Path(value)) if is_wsl else str(value)
+
+            manifest = {
+                "portfolio_id": portfolio["id"],
+                "strategy_version_id": version["id"],
+                "as_of_date": payload["as_of_date"],
+                "benchmark": version["benchmark"],
+                "config": version["config"],
+                "cash": portfolio["cash"],
+                "nav": portfolio["nav"],
+                "high_water_mark": portfolio["high_water_mark"],
+                "portfolio_status": portfolio["status"],
+                "daily_provenance": payload.get("daily_provenance") or {},
+                "positions": portfolio["positions"],
+                "slippage": payload.get("slippage", 0.0005),
+                "factors": [
+                    {
+                        "candidate_id": item["factor_candidate_id"],
+                        "values_path": runtime_path(item["values_path"]),
+                        "weight": item["weight"],
+                        "direction": item["direction"],
+                    }
+                    for item in version["factors"]
+                ],
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            script = self.project_root / "scripts" / "run_paper_rebalance.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    _to_wsl_path(Path(payload["dataset_path"]))
+                    if is_wsl
+                    else str(Path(payload["dataset_path"])),
+                    "--manifest",
+                    _to_wsl_path(manifest_path) if is_wsl else str(manifest_path),
+                    "--output",
+                    _to_wsl_path(result_path) if is_wsl else str(result_path),
+                ]
+            )
+            return command, result_path, {}
+        raise ValueError(f"unsupported job kind: {job['kind']}")
+
+    def _queue_data_pipeline_successor(self, job: dict) -> dict:
+        payload = dict(job["payload"])
+        snapshot_name = str(payload["snapshot_name"])
+        if job["kind"] == "bootstrap":
+            if not payload.get("finalize_after_download"):
+                raise ValueError("bootstrap job did not request a finalize pipeline")
+            kind = "data_verify"
+            successor_payload = {
+                "pipeline_id": payload["pipeline_id"],
+                "profile": payload["profile"],
+                "start": payload.get("snapshot_start", payload["start"]),
+                "end": payload.get("snapshot_end", payload["end"]),
+                "snapshot_name": payload["snapshot_name"],
+            }
+        elif job["kind"] == "data_verify":
+            kind = "data_snapshot"
+            successor_payload = payload
+        elif job["kind"] == "data_snapshot":
+            kind = "data_qlib"
+            successor_payload = payload
+        elif job["kind"] == "data_qlib":
+            kind = "qlib_baseline"
+            successor_payload = {
+                **payload,
+                "dataset": snapshot_name,
+                "dataset_path": str(self.settings.data_root / "qlib" / snapshot_name),
+                "market": "cn_all",
+                "benchmark": "SH000300",
+                "account": 5_000_000,
+                "topk": 50,
+                "n_drop": 5,
+                "open_cost": 0.0005,
+                "close_cost": 0.0015,
+                "min_cost": 5.0,
+            }
+        else:
+            raise ValueError(f"job {job['kind']} is not a data pipeline stage")
+        log_path = self.settings.data_root / "platform" / "logs" / f"{kind}-{snapshot_name}.log"
+        successor = self.store.create(
+            kind,
+            successor_payload,
+            log_path,
+            idempotency_key=f"data-finalize:{snapshot_name}:{kind}",
+        )
+        self.notify()
+        return successor
+
+    def _import_rdagent_candidates(self, run_id: str, result: dict) -> list[dict]:
+        imported = []
+        for item in result.get("candidates", []):
+            imported.append(
+                self.research.add_candidate(
+                    run_id,
+                    name=str(item["name"]),
+                    description=str(item.get("description") or ""),
+                    formulation=item.get("formulation"),
+                    variables=item.get("variables") or {},
+                    source_iteration=item.get("source_iteration"),
+                    code_path=_local_artifact_path(item.get("code_path")),
+                    values_path=_local_artifact_path(item.get("values_path")),
+                    code_sha256=item.get("code_sha256"),
+                    rdagent_decision=item.get("rdagent_decision"),
+                    rdagent_feedback=item.get("rdagent_feedback"),
+                )
+            )
+        return imported
+
+    def _queue_factor_evaluation(self, job: dict, candidates: list[dict]) -> None:
+        payload = job["payload"]
+        eligible = [
+            {"id": item["id"], "values_path": item["values_path"]}
+            for item in candidates
+            if item.get("rdagent_decision") is not False
+            and item.get("values_path")
+            and Path(item["values_path"]).exists()
+        ]
+        if not eligible:
+            raise ValueError("RD-Agent produced no executable factor value artifacts")
+        log_path = (
+            self.settings.data_root
+            / "platform"
+            / "logs"
+            / f"factor-evaluate-{payload['research_run_id']}.log"
+        )
+        self.store.create(
+            "factor_evaluate",
+            {
+                "research_run_id": payload["research_run_id"],
+                "dataset": payload["dataset"],
+                "dataset_path": payload["dataset_path"],
+                "periods": payload["periods"],
+                "candidates": eligible,
+                "cost_rate": 0.002,
+            },
+            log_path,
+        )
+
+    def _import_factor_evaluations(self, job: dict, result: dict) -> None:
+        payload = job["payload"]
+        periods = {key: date.fromisoformat(value) for key, value in payload["periods"].items()}
+        artifact_path = (
+            self.settings.data_root
+            / "artifacts"
+            / "factor-evaluations"
+            / payload["research_run_id"]
+            / "result.json"
+        )
+        for item in result.get("evaluations", []):
+            if item.get("status") != "ok":
+                continue
+            self.research.record_evaluation(
+                item["candidate_id"],
+                dataset=payload["dataset"],
+                **periods,
+                metrics=item["metrics"],
+                artifact_path=str(artifact_path),
+            )
+
+
+def _failure_message(log_path: Path, fallback: str) -> str:
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - 65_536))
+            text = stream.read().decode("utf-8", errors="replace")
+    except OSError:
+        return fallback
+    ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+    lines = [ansi.sub("", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    markers = ("ValueError:", "RuntimeError:", "Error:", "Exception:", "required")
+    for line in reversed(lines):
+        if any(marker.lower() in line.lower() for marker in markers):
+            return line[-1000:]
+    return (lines[-1] if lines else fallback)[-1000:]
+
+
+def _local_artifact_path(value: str | None) -> str | None:
+    if not value or os.name != "nt" or not value.startswith("/mnt/"):
+        return value
+    parts = value.split("/", 3)
+    if len(parts) < 4 or len(parts[2]) != 1:
+        return value
+    return str(Path(f"{parts[2].upper()}:/{parts[3]}"))

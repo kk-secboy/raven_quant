@@ -1,0 +1,24 @@
+[Unit]
+Description=QuantLab coordinated PostgreSQL and data backup
+Documentation=file:/opt/quantlab/docs/DEPLOYMENT.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/quantlab/deploy/.env
+ConditionPathExists=/opt/quantlab/.venv/bin/python
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/quantlab
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/opt/quantlab/.venv/bin/python /opt/quantlab/scripts/release_preflight.py --minimum-free-gb 20 --report /opt/quantlab/artifacts/scheduled-backup-preflight.json
+ExecStart=/opt/quantlab/.venv/bin/python /opt/quantlab/scripts/backup.py --backup-root /opt/quantlab-backups --retention-count 14
+TimeoutStartSec=6h
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

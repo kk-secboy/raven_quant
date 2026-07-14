@@ -1,0 +1,14 @@
+.git
+.venv
+.test-tmp
+.pytest_cache
+.ruff_cache
+data
+mlruns
+mnt
+web/.git
+web/.wrangler
+web/dist
+web/node_modules
+**/__pycache__
+**/*.pyc

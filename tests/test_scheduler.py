@@ -1,0 +1,192 @@
+from datetime import UTC, datetime, time, timedelta
+from pathlib import Path
+
+from quant_data.config import Settings
+from quant_platform.alert_store import AlertStore
+from quant_platform.job_store import JobStore
+from quant_platform.schedule_store import ScheduleStore
+from quant_platform.scheduler import SchedulerEngine
+
+
+def _settings(database_url: str, tmp_path: Path) -> Settings:
+    return Settings(
+        api_url="https://relay.example/api/v1/query",
+        token="test-token",
+        data_root=tmp_path / "data",
+        database_url=database_url,
+        embedded_worker=False,
+    )
+
+
+def test_scheduler_materializes_once_and_enqueues_incremental_job(
+    database_url: str, tmp_path: Path
+) -> None:
+    current = datetime(2025, 1, 2, 7, 29, tzinfo=UTC)
+    store = ScheduleStore(database_url)
+    schedule = store.create(
+        name="daily incremental sync",
+        kind="incremental_sync",
+        timezone="Asia/Shanghai",
+        run_time=time(15, 30),
+        trading_days_only=True,
+        payload={"profile": "core", "lookback_days": 7, "build_qlib": False},
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+    assert schedule["next_run_at"] == "2025-01-02T07:30:00+00:00"
+    engine = SchedulerEngine(_settings(database_url, tmp_path))
+    first = engine.tick(current + timedelta(minutes=1))
+    second = engine.tick(current + timedelta(minutes=1))
+    assert first["materialized"] == 1
+    assert first["processed"] == 1
+    assert second["materialized"] == 0
+    assert second["processed"] == 0
+    runs = store.list_runs()
+    assert len(runs) == 1
+    assert runs[0]["status"] == "enqueued"
+    job = JobStore(database_url).get(runs[0]["job_id"])
+    assert job["payload"]["start"] == "2024-12-26"
+    assert job["payload"]["end"] == "latest"
+    assert job["payload"]["build_qlib"] is False
+    assert job["payload"]["finalize_after_download"] is False
+    assert job["payload"]["snapshot_start"] == "2024-01-01"
+
+
+def test_expired_schedule_run_lease_is_reclaimed(database_url: str) -> None:
+    current = datetime(2025, 1, 2, 7, 29, tzinfo=UTC)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="lease recovery",
+        kind="incremental_sync",
+        timezone="Asia/Shanghai",
+        run_time=time(15, 30),
+        trading_days_only=True,
+        payload={"profile": "core"},
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+    store.materialize_due(current + timedelta(minutes=1))
+    claimed = store.claim_run(now=current + timedelta(minutes=1), lease_seconds=60)
+    assert claimed and claimed["attempts"] == 1
+    assert store.claim_run(now=current + timedelta(minutes=1, seconds=30)) is None
+    reclaimed = store.claim_run(now=current + timedelta(minutes=2, seconds=1))
+    assert reclaimed and reclaimed["id"] == claimed["id"]
+    assert reclaimed["attempts"] == 2
+
+
+def test_scheduler_runs_broker_reconciliation_without_creating_order_job(
+    database_url: str, tmp_path: Path
+) -> None:
+    current = datetime(2025, 1, 2, 7, 29, tzinfo=UTC)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="daily broker reconciliation",
+        kind="broker_reconcile",
+        timezone="Asia/Shanghai",
+        run_time=time(15, 30),
+        trading_days_only=False,
+        payload={"destination_id": "sandbox-destination"},
+        misfire_grace_seconds=900,
+        actor="admin",
+        now=current,
+    )
+    engine = SchedulerEngine(_settings(database_url, tmp_path))
+    calls = []
+
+    def reconcile(destination_id: str, *, actor: str) -> dict:
+        calls.append((destination_id, actor))
+        return {"id": "reconciliation-id", "status": "matched"}
+
+    engine.brokers.reconcile = reconcile  # type: ignore[method-assign]
+    result = engine.tick(current + timedelta(minutes=1))
+    assert result["processed"] == 1
+    assert calls == [("sandbox-destination", "scheduler")]
+    run = store.list_runs()[0]
+    assert run["status"] == "succeeded"
+    assert run["job_id"] is None
+    assert "reconciliation-id" in run["message"]
+
+
+def test_job_idempotency_allows_multiple_scheduled_portfolio_jobs(
+    database_url: str, tmp_path: Path
+) -> None:
+    jobs = JobStore(database_url)
+    first = jobs.create(
+        "paper_rebalance",
+        {"portfolio": "one"},
+        tmp_path / "one.log",
+        dedupe_active_kind=False,
+        idempotency_key="slot-one",
+    )
+    second = jobs.create(
+        "paper_rebalance",
+        {"portfolio": "two"},
+        tmp_path / "two.log",
+        dedupe_active_kind=False,
+        idempotency_key="slot-two",
+    )
+    duplicate = jobs.create(
+        "paper_rebalance",
+        {"portfolio": "different-payload"},
+        tmp_path / "duplicate.log",
+        dedupe_active_kind=False,
+        idempotency_key="slot-one",
+    )
+    assert first["id"] != second["id"]
+    assert duplicate["id"] == first["id"]
+
+
+def test_alerts_are_idempotent_deliverable_and_acknowledgeable(
+    database_url: str, monkeypatch
+) -> None:
+    alerts = AlertStore(database_url)
+    first = alerts.create(
+        source_type="job",
+        source_id="job-1",
+        severity="critical",
+        category="job_failure",
+        title="job failed",
+        message="provider timeout",
+        dedupe_key="job:job-1:failed",
+    )
+    duplicate = alerts.create(
+        source_type="job",
+        source_id="job-1",
+        severity="critical",
+        category="job_failure",
+        title="job failed again",
+        message="same occurrence",
+        dedupe_key="job:job-1:failed",
+    )
+    assert duplicate["id"] == first["id"]
+    assert alerts.deliver_pending("") == 0
+    assert alerts.get(first["id"])["delivery_status"] == "not_configured"
+    acknowledged = alerts.acknowledge(first["id"], actor="risk-owner")
+    assert acknowledged["status"] == "acknowledged"
+    assert acknowledged["acknowledged_by"] == "risk-owner"
+
+    delivery = alerts.create(
+        source_type="risk_event",
+        source_id="risk-2",
+        severity="critical",
+        category="portfolio_risk",
+        title="risk threshold exceeded",
+        message="portfolio paused",
+        dedupe_key="risk:risk-2",
+    )
+
+    class Response:
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+    monkeypatch.setattr(
+        "quant_platform.alert_store.requests.post",
+        lambda *_args, **_kwargs: Response(),
+    )
+    assert alerts.deliver_pending("https://alerts.internal/hook") == 1
+    delivered = alerts.get(delivery["id"])
+    assert delivered["delivery_status"] == "delivered"
+    assert delivered["delivery_attempts"] == 1

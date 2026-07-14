@@ -1,0 +1,17 @@
+:8080 {
+    encode zstd gzip
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy strict-origin-when-cross-origin
+        X-Frame-Options DENY
+        -Server
+    }
+
+    handle /api/* {
+        reverse_proxy api:8765
+    }
+
+    handle {
+        reverse_proxy web:3000
+    }
+}

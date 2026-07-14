@@ -1,0 +1,41 @@
+FROM python:3.11-slim
+
+ARG QLIB_COMMIT=d5379c520f66a39953bad76234a7019a72796fd0
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG DEBIAN_MIRROR=deb.debian.org/debian
+ARG APT_RETRIES=5
+ARG APT_TIMEOUT_SECONDS=30
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=60 \
+    PIP_RETRIES=5 \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    QLIB_REPO=/opt/qlib \
+    QLIB_PYTHON=/usr/local/bin/python
+
+RUN sed -i "s|deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=${APT_RETRIES} \
+        -o Acquire::http::Timeout=${APT_TIMEOUT_SECONDS} \
+        -o Acquire::https::Timeout=${APT_TIMEOUT_SECONDS} update \
+    && apt-get -o Acquire::Retries=${APT_RETRIES} \
+        -o Acquire::http::Timeout=${APT_TIMEOUT_SECONDS} \
+        -o Acquire::https::Timeout=${APT_TIMEOUT_SECONDS} \
+        install -y --no-install-recommends build-essential ca-certificates curl libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/qlib \
+    && curl --fail --location --retry 5 --retry-all-errors \
+        --connect-timeout 20 --max-time 300 \
+        "https://codeload.github.com/microsoft/qlib/tar.gz/${QLIB_COMMIT}" \
+      | tar -xz --strip-components=1 -C /opt/qlib \
+    && SETUPTOOLS_SCM_PRETEND_VERSION="0.0.dev0+g${QLIB_COMMIT}" \
+       python -m pip install /opt/qlib lightgbm psycopg[binary]
+
+WORKDIR /app
+COPY pyproject.toml README.md alembic.ini ./
+COPY migrations ./migrations
+COPY src ./src
+COPY scripts ./scripts
+RUN python -m pip install .
+
+CMD ["quant-worker"]

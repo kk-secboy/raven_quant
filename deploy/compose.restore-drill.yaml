@@ -1,0 +1,11 @@
+services:
+  api:
+    image: quantlab-platform-api:latest
+  scheduler:
+    image: quantlab-platform-scheduler:latest
+  worker:
+    image: quantlab-platform-worker:latest
+  rdagent-worker:
+    image: quantlab-platform-rdagent-worker:latest
+  web:
+    image: quantlab-platform-web:latest
