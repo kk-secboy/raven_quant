@@ -57,9 +57,26 @@ def decode_response(api_name: str, body: bytes, status_code: int = 200) -> Provi
     code = root.get("code", 0)
     message = str(root.get("msg") or root.get("message") or "").strip()
     message_lower = message.lower()
-    rate_limited = status_code == 429 or any(
-        token in message_lower for token in ("rate", "频率", "限速", "冷却", "too many request")
+    # ``rate_limited`` means that every caller should observe the shared
+    # provider cooldown.  Tushare maintenance responses are provider-wide in
+    # exactly the same way as a rate-limit response: immediately retrying the
+    # next work unit only turns a short outage into a failed job.
+    provider_cooldown = any(
+        token in message_lower
+        for token in (
+            "rate",
+            "频率",
+            "限速",
+            "冷却",
+            "too many request",
+            "服务升级",
+            "稍后再试",
+            "maintenance",
+            "temporarily unavailable",
+            "service unavailable",
+        )
     )
+    rate_limited = status_code in {429, 502, 503, 504} or provider_cooldown
     if status_code < 200 or status_code >= 300 or str(code) not in {"0", "", "None"}:
         permission_error = any(
             token in message_lower for token in ("permission", "权限", "积分", "forbidden")

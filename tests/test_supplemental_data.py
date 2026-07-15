@@ -2,6 +2,7 @@ from datetime import date
 
 import pytest
 
+from quant_data.catalog import ALL_DEFINITIONS
 from quant_data.models import ProviderResult
 from quant_data.provider import ProviderError
 from quant_data.supplemental_data import (
@@ -11,6 +12,7 @@ from quant_data.supplemental_data import (
     market_financial_specs,
     next_pagination_specs,
     require_pagination_terminated,
+    share_float_overflow_repartition_specs,
     supplemental_specs,
     validate_supplemental,
 )
@@ -41,6 +43,77 @@ def test_macro_bundle_is_small_and_contains_verified_interfaces() -> None:
     assert schedules[0].params == {"m": "202401"}
     assert schedules[-1].params == {"m": "202607"}
     assert bundle_datasets("cn_macro") == {spec.dataset for spec in specs}
+
+
+def test_institutional_bundle_matches_its_declared_interface_contract() -> None:
+    specs = supplemental_specs(
+        "cn_institutional",
+        start=date(2024, 1, 2),
+        end=date(2024, 1, 2),
+        trading_dates=["20240102"],
+        max_attempts=3,
+    )
+    assert {spec.dataset for spec in specs} == {
+        "report_rc",
+        "etf_sh_cons",
+        "etf_sz_cons",
+        "ci_daily",
+        "shibor_quote",
+        "major_news",
+    }
+    assert len([spec for spec in specs if spec.dataset == "major_news"]) == 9
+    assert all("ts_code" not in spec.params for spec in specs)
+    assert next(spec for spec in specs if spec.dataset == "report_rc").scope[
+        "page_size"
+    ] == 3_000
+    assert next(spec for spec in specs if spec.dataset == "ci_daily").params[
+        "trade_date"
+    ] == "20240102"
+    assert next(spec for spec in specs if spec.dataset == "major_news").scope[
+        "page_size"
+    ] == 400
+    assert next(spec for spec in specs if spec.dataset == "major_news").fields == (
+        "title",
+        "content",
+        "pub_time",
+        "src",
+    )
+    assert bundle_datasets("cn_institutional") == {spec.dataset for spec in specs}
+
+
+def test_institutional_pages_advance_instead_of_accepting_provider_caps() -> None:
+    specs = supplemental_specs(
+        "cn_institutional",
+        start=date(2024, 1, 2),
+        end=date(2024, 1, 2),
+        trading_dates=["20240102"],
+        max_attempts=3,
+    )
+    target = next(spec for spec in specs if spec.dataset == "major_news")
+    next_specs = next_pagination_specs(
+        [target],
+        [{"unit_key": target.unit_key, "row_count": 400}],
+    )
+    assert len(next_specs) == 1
+    assert next_specs[0].params["offset"] == 400
+    assert next_specs[0].fields == target.fields
+
+
+def test_major_news_uses_monthly_source_windows_instead_of_daily_churn() -> None:
+    specs = supplemental_specs(
+        "cn_institutional",
+        start=date(2024, 1, 15),
+        end=date(2024, 3, 2),
+        trading_dates=["20240115", "20240301"],
+        max_attempts=3,
+    )
+    news = [spec for spec in specs if spec.dataset == "major_news"]
+
+    assert len(news) == 27
+    assert news[0].params["start_date"] == "2024-01-15 00:00:00"
+    assert news[0].params["end_date"] == "2024-01-31 23:59:59"
+    assert news[-1].params["start_date"] == "2024-03-01 00:00:00"
+    assert news[-1].params["end_date"] == "2024-03-02 23:59:59"
 
 
 def test_extended_bundle_adds_point_in_time_st_and_sw_industry_bars() -> None:
@@ -111,6 +184,20 @@ def test_full_a_share_history_uses_market_cross_sections_instead_of_symbols() ->
     }
     assert event_datasets <= {spec.dataset for spec in specs}
     assert all(spec.scope["page_size"] == 1_000 for spec in specs)
+
+
+def test_a_share_financial_history_includes_four_quarters_before_start() -> None:
+    specs = a_share_bulk_history_specs(
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 2),
+        max_attempts=3,
+    )
+    periods = {
+        spec.params["period"]
+        for spec in specs
+        if spec.dataset == "fina_indicator"
+    }
+    assert periods == {"20230331", "20230630", "20230930", "20231231"}
 
 
 def test_options_bundle_starts_one_page_per_partition_and_advances_full_pages() -> None:
@@ -485,3 +572,99 @@ def test_pagination_rejects_a_full_last_allowed_page(monkeypatch) -> None:
     assert len(specs) == 2
     with pytest.raises(RuntimeError, match="pagination did not reach"):
         require_pagination_terminated(specs, rows)
+
+
+def test_share_float_continues_after_the_old_64_page_ceiling() -> None:
+    specs = [
+        spec
+        for spec in a_share_bulk_history_specs(
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 31),
+            max_attempts=3,
+        )
+        if spec.dataset == "share_float"
+    ]
+    rows: list[dict[str, object]] = []
+    for _ in range(64):
+        current = specs[-1]
+        rows.append(
+            {
+                "unit_key": current.unit_key,
+                "row_count": int(current.scope["page_size"]),
+            }
+        )
+        specs.extend(next_pagination_specs(specs, rows))
+
+    assert int(specs[-1].scope["offset"]) == 64_000
+
+
+def test_share_float_offset_cap_repartitions_the_whole_month_by_day() -> None:
+    parent = next(
+        spec
+        for spec in a_share_bulk_history_specs(
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 31),
+            max_attempts=3,
+        )
+        if spec.dataset == "share_float"
+    )
+    failed = parent
+    for _ in range(101):
+        failed = next_pagination_specs(
+            [failed],
+            [{"unit_key": failed.unit_key, "row_count": 1_000}],
+        )[0]
+    assert failed.params["offset"] == 101_000
+
+    daily = share_float_overflow_repartition_specs(failed)
+    assert len(daily) == 31
+    assert daily[0].params == {
+        "start_date": "20240101",
+        "end_date": "20240101",
+        "limit": 6_000,
+        "offset": 0,
+    }
+    assert daily[-1].params["start_date"] == "20240131"
+    assert all(
+        item.scope["supersedes_page_group"] == parent.scope["page_group"]
+        for item in daily
+    )
+    assert all(item.scope["expected_date"] == item.params["start_date"] for item in daily)
+
+    following = next_pagination_specs(
+        [parent, *daily],
+        [
+            {"unit_key": parent.unit_key, "row_count": 1_000},
+            {"unit_key": daily[0].unit_key, "row_count": 6_000},
+            *[
+                {"unit_key": item.unit_key, "row_count": 0}
+                for item in daily[1:]
+            ],
+        ],
+    )
+    assert len(following) == 1
+    assert following[0].params["start_date"] == "20240101"
+    assert following[0].params["offset"] == 6_000
+
+    require_pagination_terminated(
+        [parent, *daily],
+        [
+            {"unit_key": parent.unit_key, "row_count": 1_000},
+            *[
+                {"unit_key": item.unit_key, "row_count": 0}
+                for item in daily
+            ],
+        ],
+    )
+
+
+def test_share_float_has_a_natural_date_and_duplicate_gate() -> None:
+    definition = ALL_DEFINITIONS["share_float"]
+    assert definition.date_field == "float_date"
+    assert definition.primary_key == (
+        "ts_code",
+        "ann_date",
+        "float_date",
+        "holder_name",
+        "share_type",
+    )

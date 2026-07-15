@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated
 
+import pandas as pd
 import typer
 from rich.console import Console
 from rich.progress import Progress
@@ -20,6 +21,7 @@ from .catalog import (
 )
 from .checkpoint import CheckpointStore
 from .config import Settings
+from .coverage_data import coverage_secondary_specs
 from .execution_data import MARGIN_DATASET, MINUTE_DATASETS, margin_specs
 from .minute_qlib_builder import MinuteQlibBuilder
 from .models import FetchSpec
@@ -27,6 +29,7 @@ from .planner import BootstrapPlanner, ExecutionDataPlanner, compact_date, parse
 from .provider import TushareHttpProvider
 from .qlib_builder import QlibBuilder
 from .rate_limit import GlobalRateGate
+from .reference_data import select_current_reference_units
 from .runner import DownloadRunner
 from .snapshot_lineage import file_contract_sha256, make_lineage_id, prepare_lineage_metadata
 from .storage import ParquetStore
@@ -37,6 +40,7 @@ from .supplemental_data import (
     market_financial_specs,
     next_pagination_specs,
     require_pagination_terminated,
+    share_float_overflow_repartition_specs,
     supplemental_specs,
 )
 from .universe import select_intraday_universe_from_store
@@ -104,16 +108,83 @@ def _run_paginated_specs(
     inserted = context.checkpoint.add(specs)
     context.checkpoint.retry_failed_units(spec.unit_key for spec in specs)
     datasets = {spec.dataset for spec in specs}
+    ignored_keys: set[str] = set()
     _run_phase(context, label, datasets)
-    rows = _require_specs_complete(context, specs)
-    while next_specs := next_pagination_specs(specs, rows):
+
+    while True:
+        recovery_specs, recovered_keys = _share_float_overflow_recovery(
+            context, specs, ignored_keys
+        )
+        if recovered_keys:
+            ignored_keys.update(recovered_keys)
+            known = {spec.unit_key for spec in specs}
+            recovery_specs = [spec for spec in recovery_specs if spec.unit_key not in known]
+            specs.extend(recovery_specs)
+            inserted += context.checkpoint.add(recovery_specs)
+            context.checkpoint.retry_failed_units(spec.unit_key for spec in recovery_specs)
+            _run_phase(context, f"{label} overflow continuation", datasets)
+            continue
+
+        active_specs = [spec for spec in specs if spec.unit_key not in ignored_keys]
+        rows = _require_specs_complete(context, active_specs)
+        next_specs = next_pagination_specs(active_specs, rows)
+        if not next_specs:
+            require_pagination_terminated(active_specs, rows)
+            return specs, rows, inserted
+
+        specs.extend(next_specs)
+        recovery_specs, recovered_keys = _share_float_overflow_recovery(
+            context, specs, ignored_keys
+        )
+        if recovered_keys:
+            ignored_keys.update(recovered_keys)
+            known = {spec.unit_key for spec in specs}
+            recovery_specs = [spec for spec in recovery_specs if spec.unit_key not in known]
+            specs.extend(recovery_specs)
+            inserted += context.checkpoint.add(recovery_specs)
+            context.checkpoint.retry_failed_units(spec.unit_key for spec in recovery_specs)
+            _run_phase(context, f"{label} overflow continuation", datasets)
+            continue
+
         inserted += context.checkpoint.add(next_specs)
         context.checkpoint.retry_failed_units(spec.unit_key for spec in next_specs)
-        specs.extend(next_specs)
         _run_phase(context, f"{label} pagination", datasets)
-        rows = _require_specs_complete(context, specs)
-    require_pagination_terminated(specs, rows)
-    return specs, rows, inserted
+
+
+def _share_float_overflow_recovery(
+    context: Context,
+    specs: list[FetchSpec],
+    ignored_keys: set[str],
+) -> tuple[list[FetchSpec], set[str]]:
+    """Replace provider-capped monthly pages with disjoint tail continuations."""
+
+    rows_by_key = {
+        str(row["unit_key"]): row
+        for row in context.checkpoint.unit_rows(spec.unit_key for spec in specs)
+    }
+    recovery_specs: list[FetchSpec] = []
+    recovered_keys: set[str] = set()
+    for failed_spec in specs:
+        if failed_spec.unit_key in ignored_keys or failed_spec.dataset != "share_float":
+            continue
+        row = rows_by_key.get(failed_spec.unit_key)
+        if not row or str(row.get("status")) not in {"failed", "superseded"}:
+            continue
+        error = str(row.get("last_error") or "")
+        normalized_error = error.replace("-", " ")
+        offset = int(failed_spec.params.get("offset") or 0)
+        if offset < 100_000 or (
+            "code=50101" not in error and "offset cap" not in normalized_error
+        ):
+            continue
+
+        recovery_specs.extend(share_float_overflow_repartition_specs(failed_spec))
+        recovered_keys.add(failed_spec.unit_key)
+        context.checkpoint.supersede_units(
+            [failed_spec.unit_key],
+            f"{error}; pagination offset cap superseded by disjoint date continuations",
+        )
+    return recovery_specs, recovered_keys
 
 
 @app.command()
@@ -157,11 +228,21 @@ def bootstrap(
 
     planned_reference = context.planner.plan_reference(start_date, end_date, max_attempts)
     console.print(f"planned reference units: +{planned_reference}")
-    _run_phase(context, "reference", {"stock_basic", "trade_cal"})
+    _run_phase(context, "stock and calendar reference", {"stock_basic", "trade_cal"})
+    index_specs = context.planner.index_catalog_specs(max_attempts, as_of=end_date)
+    _, _, index_inserted = _run_paginated_specs(
+        context,
+        "complete index catalog",
+        index_specs,
+    )
+    console.print(
+        f"planned complete index catalog: {len(index_specs)} initial, "
+        f"+{index_inserted} inserted with pagination"
+    )
     reference_failures = [
         row
         for row in context.checkpoint.failures(1000)
-        if row["dataset"] in {"stock_basic", "trade_cal"}
+        if row["dataset"] in {"stock_basic", "trade_cal", "index_basic"}
     ]
     if reference_failures:
         console.print("[red]reference phase failed; daily planning was not attempted[/red]")
@@ -170,7 +251,7 @@ def bootstrap(
     planned = context.planner.plan_profile(profile, start_date, end_date, max_attempts)
     console.print(f"planned data units: {json.dumps(planned, ensure_ascii=False)}")
     daily_datasets = {definition.name for definition in CORE_DAILY}
-    daily_datasets.update({"index_daily", "index_weight"})
+    daily_datasets.update({"index_daily", "index_dailybasic", "index_weight"})
     _run_phase(context, "core market data", daily_datasets)
     if profile in {"research", "full"}:
         _run_phase(context, "research daily data", {item.name for item in RESEARCH_DAILY})
@@ -185,7 +266,9 @@ def bootstrap(
                 "disclosure_date",
             },
         )
-        planned_members = context.planner.plan_industry_members(max_attempts)
+        planned_members = context.planner.plan_industry_members(
+            max_attempts, as_of=end_date
+        )
         console.print(f"planned historical industry membership units: +{planned_members}")
         _run_phase(context, "historical industry members", {"index_member_all"})
     if profile == "full":
@@ -203,13 +286,35 @@ def bootstrap(
             f"planned full-market financial/event units: "
             f"{len(bulk_specs)} initial, +{bulk_inserted} inserted with pagination"
         )
+        institutional_specs = supplemental_specs(
+            "cn_institutional",
+            start=start_date,
+            end=end_date,
+            trading_dates=context.planner.trading_dates(start_date, end_date),
+            max_attempts=max_attempts,
+        )
+        _, _, institutional_inserted = _run_paginated_specs(
+            context,
+            "institutional research and enhanced data",
+            institutional_specs,
+        )
+        console.print(
+            "planned institutional research units: "
+            f"{len(institutional_specs)} initial, "
+            f"+{institutional_inserted} inserted with pagination"
+        )
         _run_phase(context, "market news", {"news"})
 
     if download_only:
         console.print("[bold green]download phase complete[/bold green]")
         return
 
-    report = verify_downloads(context.checkpoint, context.settings.data_root)
+    report = verify_downloads(
+        context.checkpoint,
+        context.settings.data_root,
+        snapshot_end=end_date,
+        require_all_planned=False,
+    )
     report_path = context.settings.data_root / "verification" / "latest.json"
     write_report(report, report_path)
     if not report["ok"]:
@@ -254,10 +359,26 @@ def retry_failed() -> None:
 
 
 @app.command()
-def verify() -> None:
+def verify(
+    snapshot_end: Annotated[
+        str, typer.Option("--snapshot-end", help="Successor snapshot end date")
+    ] = "latest",
+    allow_incomplete_plans: Annotated[
+        bool,
+        typer.Option(
+            "--allow-incomplete-plans",
+            help="Warn about unrelated dormant plans instead of failing the pipeline",
+        ),
+    ] = False,
+) -> None:
     """Validate checkpoints, files, checksums, empties, and duplicate core keys."""
     context = load_context(require_credentials=False)
-    report = verify_downloads(context.checkpoint, context.settings.data_root)
+    report = verify_downloads(
+        context.checkpoint,
+        context.settings.data_root,
+        snapshot_end=parse_date(snapshot_end, latest=date.today()),
+        require_all_planned=not allow_incomplete_plans,
+    )
     path = context.settings.data_root / "verification" / "latest.json"
     write_report(report, path)
     console.print_json(json.dumps(report, ensure_ascii=False))
@@ -454,6 +575,116 @@ def core_intraday(
     console.print_json(json.dumps(result, ensure_ascii=False))
 
 
+@app.command("ashare-5m")
+def ashare_5m(
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2024-01-01",
+    end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
+    snapshot_name: Annotated[str | None, typer.Option("--snapshot-name")] = None,
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Download resumable 5-minute bars for every A-share active in the range."""
+
+    start_date = parse_date(start)
+    end_date = parse_date(end, latest=date.today())
+    if end_date < start_date:
+        raise typer.BadParameter("end must not be before start")
+    context = load_context()
+    master = context.storage.read_units(context.checkpoint.successful("stock_basic"))
+    active_ranges = _historical_a_share_active_ranges(
+        master, start=start_date, end=end_date
+    )
+    symbols = sorted(active_ranges)
+
+    if not symbols:
+        raise RuntimeError("stock_basic produced an empty historical A-share universe")
+    specs = context.execution_planner.plan_minutes(
+        {"ashare_5m": symbols},
+        start_date,
+        end_date,
+        context.settings.max_request_attempts,
+        freq="5min",
+        active_ranges_by_dataset={"ashare_5m": active_ranges},
+    )
+    _run_phase(context, "full A-share 5-minute bars", {"ashare_5m"})
+    rows = _require_specs_complete(context, specs)
+    _require_symbol_coverage(specs, rows)
+    name = snapshot_name or (
+        f"ashare-5m-{start_date:%Y%m%d}-{end_date:%Y%m%d}-"
+        f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+    )
+    snapshot_path = _build_execution_snapshot(
+        context,
+        name=name,
+        selected={"ashare_5m": rows},
+        start_date=start_date,
+        end_date=end_date,
+        symbols_by_dataset={"ashare_5m": symbols},
+        universe_evidence={
+            "mode": "historically_active_a_share_master",
+            "source": "stock_basic",
+            "count": len(symbols),
+        },
+        frequency="5min",
+        profile="ashare_intraday",
+    )
+    result = {
+        "status": "succeeded",
+        "dataset": "ashare_5m",
+        "snapshot_name": name,
+        "snapshot_path": str(snapshot_path),
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "symbols": len(symbols),
+        "units": len(rows),
+        "rows": sum(int(row.get("row_count") or 0) for row in rows),
+        "frequency": "5min",
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+def _historical_a_share_symbols(
+    master: pd.DataFrame, *, start: date, end: date
+) -> list[str]:
+    return sorted(_historical_a_share_active_ranges(master, start=start, end=end))
+
+
+def _historical_a_share_active_ranges(
+    master: pd.DataFrame, *, start: date, end: date
+) -> dict[str, tuple[date, date]]:
+    required = {"ts_code", "list_date", "delist_date"}
+    if master.empty or not required <= set(master.columns):
+        raise RuntimeError(
+            "stock_basic lifecycle master is unavailable; run bootstrap reference first"
+        )
+    list_dates = pd.to_datetime(master["list_date"], format="%Y%m%d", errors="coerce")
+    delist_dates = pd.to_datetime(master["delist_date"], format="%Y%m%d", errors="coerce")
+    active = master.loc[
+        list_dates.le(pd.Timestamp(end))
+        & (delist_dates.isna() | delist_dates.ge(pd.Timestamp(start)))
+        & master["ts_code"]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        .str.endswith((".SH", ".SZ", ".BJ"))
+    ]
+    ranges: dict[str, tuple[date, date]] = {}
+    for index, row in active.iterrows():
+        symbol = str(row["ts_code"]).strip().upper()
+        listed_at = list_dates.loc[index].date()
+        delisted_value = delist_dates.loc[index]
+        delisted_at = end if pd.isna(delisted_value) else delisted_value.date()
+        clipped = (max(start, listed_at), min(end, delisted_at))
+        if clipped[1] < clipped[0]:
+            continue
+        previous = ranges.get(symbol)
+        ranges[symbol] = (
+            min(previous[0], clipped[0]),
+            max(previous[1], clipped[1]),
+        ) if previous else clipped
+    return ranges
+
+
 @app.command("supplemental-download")
 def supplemental_download(
     bundle: Annotated[str, typer.Option(help="Independent supplemental data bundle")],
@@ -491,15 +722,71 @@ def supplemental_download(
     console.print(
         f"planned supplemental bundle={bundle} units={len(specs)} newly_inserted={inserted}"
     )
-    _run_phase(context, bundle, datasets)
-    rows = _require_specs_complete(context, specs)
-    while next_specs := next_pagination_specs(specs, rows):
-        inserted += context.checkpoint.add(next_specs)
-        context.checkpoint.retry_failed_units(spec.unit_key for spec in next_specs)
-        specs.extend(next_specs)
-        _run_phase(context, f"{bundle} pagination", datasets)
+    rows: list[dict] = []
+    if specs:
+        _run_phase(context, bundle, datasets)
         rows = _require_specs_complete(context, specs)
-    require_pagination_terminated(specs, rows)
+        while next_specs := next_pagination_specs(specs, rows):
+            inserted += context.checkpoint.add(next_specs)
+            context.checkpoint.retry_failed_units(spec.unit_key for spec in next_specs)
+            specs.extend(next_specs)
+            _run_phase(context, f"{bundle} pagination", datasets)
+            rows = _require_specs_complete(context, specs)
+        require_pagination_terminated(specs, rows)
+    if bundle == "cn_governance_risk":
+        master = context.storage.read_units(context.checkpoint.successful("stock_basic"))
+        if "ts_code" not in master.columns:
+            raise RuntimeError(
+                "stock_basic did not provide ts_code for management-reward planning"
+            )
+        secondary_specs = coverage_secondary_specs(
+            bundle,
+            {
+                "stk_rewards": sorted(
+                    {
+                        str(value).strip()
+                        for value in master["ts_code"].dropna().tolist()
+                        if str(value).strip()
+                    }
+                )
+            },
+            start=start_date,
+            end=end_date,
+            max_attempts=context.settings.max_request_attempts,
+        )
+        inserted += context.checkpoint.add(secondary_specs)
+        context.checkpoint.retry_failed_units(spec.unit_key for spec in secondary_specs)
+        secondary_datasets = {spec.dataset for spec in secondary_specs}
+        _run_phase(context, f"{bundle} symbol batches", secondary_datasets)
+        secondary_rows = _require_specs_complete(context, secondary_specs)
+        specs.extend(secondary_specs)
+        rows.extend(secondary_rows)
+        datasets.update(secondary_datasets)
+    if bundle == "strategy_specialty_minutes":
+        requested = _split_codes(symbols)
+        if not requested:
+            raise typer.BadParameter(
+                "strategy_specialty_minutes requires --symbols; HK codes are routed "
+                "to hk_mins and all other codes to sw_mins"
+            )
+        secondary_specs = coverage_secondary_specs(
+            bundle,
+            {
+                "hk_mins": [value for value in requested if value.upper().endswith(".HK")],
+                "sw_mins": [value for value in requested if not value.upper().endswith(".HK")],
+            },
+            start=start_date,
+            end=end_date,
+            max_attempts=context.settings.max_request_attempts,
+        )
+        inserted += context.checkpoint.add(secondary_specs)
+        context.checkpoint.retry_failed_units(spec.unit_key for spec in secondary_specs)
+        secondary_datasets = {spec.dataset for spec in secondary_specs}
+        _run_phase(context, f"{bundle} symbol windows", secondary_datasets)
+        secondary_rows = _require_specs_complete(context, secondary_specs)
+        specs.extend(secondary_specs)
+        rows.extend(secondary_rows)
+        datasets.update(secondary_datasets)
     if bundle == "cn_options_bonds":
         master = context.storage.read_units(context.checkpoint.successful("cb_basic"))
         if "ts_code" not in master.columns:
@@ -612,13 +899,13 @@ def build_minute_qlib_command(
     output_name: Annotated[str | None, typer.Option("--output-name")] = None,
     staging_only: Annotated[bool, typer.Option("--staging-only")] = False,
 ) -> None:
-    """Build an independent Qlib 1-minute dataset from an execution snapshot."""
+    """Build an independent Qlib dataset at a minute snapshot's native frequency."""
     context = load_context(require_credentials=False)
     snapshot_path = context.storage.snapshots_root / snapshot_name
     result = _build_minute_qlib(
         context,
         snapshot_path,
-        output_name=output_name or f"{snapshot_name}-1min",
+        output_name=output_name,
         staging_only=staging_only,
     )
     console.print(result)
@@ -667,7 +954,9 @@ def _build_snapshot(
         # a separate execution snapshot with a different frequency contract.
         selected_datasets.update(available - set(MINUTE_DATASETS) - {MARGIN_DATASET})
     units = {
-        dataset: context.checkpoint.successful(dataset)
+        dataset: select_current_reference_units(
+            context.checkpoint.successful(dataset), snapshot_end=end_date
+        )
         for dataset in sorted(selected_datasets & available)
     }
     if not units:
@@ -726,21 +1015,22 @@ def _build_minute_qlib(
     context: Context,
     snapshot_path: Path,
     *,
-    output_name: str,
+    output_name: str | None,
     staging_only: bool,
 ) -> Path:
     builder = MinuteQlibBuilder(snapshot_path)
+    output_name = output_name or f"{snapshot_path.name}-{builder.frequency}"
     staging = context.settings.data_root / "qlib_staging" / output_name
     output = context.settings.data_root / "qlib" / output_name
     if not staging_only and output.exists():
         required = (
-            output / "calendars" / "1min.txt",
+            output / "calendars" / f"{builder.frequency}.txt",
             output / "instruments" / "all.txt",
             output / "features",
             output / "metadata" / "provenance.json",
         )
         if all(path.exists() for path in required) and any(
-            (output / "features").rglob("*.1min.bin")
+            (output / "features").rglob(f"*.{builder.frequency}.bin")
         ):
             return output
         raise ValueError(
@@ -808,13 +1098,15 @@ def _build_execution_snapshot(
     end_date: date,
     symbols_by_dataset: dict[str, list[str]],
     universe_evidence: dict | None = None,
+    frequency: str = "1min",
+    profile: str = "pair_execution",
 ) -> Path:
     module_root = Path(__file__).resolve().parent
     lineage_id = make_lineage_id(
-        "pair_execution",
+        profile,
         {
             "start_date": start_date.isoformat(),
-            "frequency": "1min",
+            "frequency": frequency,
             "provider": "tushare-compatible",
             "symbols": symbols_by_dataset,
             "ingestion_contract_sha256": file_contract_sha256(
@@ -827,10 +1119,10 @@ def _build_execution_snapshot(
         },
     )
     expected = {
-        "profile": "pair_execution",
+        "profile": profile,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
-        "frequency": "1min",
+        "frequency": frequency,
         "symbols": symbols_by_dataset,
         "universe": universe_evidence or {"mode": "manual"},
         "lineage_id": lineage_id,
@@ -863,7 +1155,9 @@ def _profile_datasets(profile: str) -> set[str]:
     datasets = {
         "stock_basic",
         "trade_cal",
+        "index_basic",
         "index_daily",
+        "index_dailybasic",
         "index_weight",
         *(item.name for item in CORE_DAILY),
     }

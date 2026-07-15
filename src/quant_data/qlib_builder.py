@@ -73,6 +73,7 @@ class QlibBuilder:
             raise FileNotFoundError("snapshot does not contain adj_factor Parquet data")
         if not list((self.snapshot_path / "parquet" / "stk_limit").rglob("*.parquet")):
             raise FileNotFoundError("snapshot does not contain A-share price-limit Parquet data")
+        self._validate_research_sources()
 
         staging_path = staging_path.resolve()
         temporary = staging_path.with_name(f".{staging_path.name}.tmp")
@@ -667,6 +668,101 @@ class QlibBuilder:
             },
         }
 
+    def _validate_research_sources(self) -> None:
+        """Reject a price-only snapshot before it can become a research dataset."""
+
+        issues: list[str] = []
+        required_columns = {
+            "daily_basic": {"ts_code", "trade_date", "total_mv"},
+            "fina_indicator": {"ts_code", "ann_date", "end_date"},
+            "index_weight": {"index_code", "con_code", "trade_date", "weight"},
+        }
+        columns_by_dataset = {
+            dataset: self._parquet_columns(dataset)
+            for dataset in (*required_columns, "index_member_all")
+        }
+        for dataset, required in required_columns.items():
+            columns = columns_by_dataset[dataset]
+            if not columns:
+                issues.append(f"missing {dataset}")
+                continue
+            missing = sorted(required - columns)
+            if missing:
+                issues.append(f"{dataset} missing columns: {', '.join(missing)}")
+
+        financial_columns = columns_by_dataset["fina_indicator"]
+        if financial_columns and not set(_FUNDAMENTAL_RESEARCH_FIELDS).intersection(
+            financial_columns
+        ):
+            issues.append("fina_indicator has no supported financial factor columns")
+
+        industry_columns = columns_by_dataset["index_member_all"]
+        if not industry_columns:
+            issues.append("missing index_member_all")
+        else:
+            if not {"ts_code", "con_code"}.intersection(industry_columns):
+                issues.append("index_member_all has no stock-code column")
+            if not {"l1_code", "index_code", "l2_code"}.intersection(industry_columns):
+                issues.append("index_member_all has no industry-code column")
+            if "in_date" not in industry_columns:
+                issues.append("index_member_all missing columns: in_date")
+
+        if not issues:
+            usable_predicates = {
+                "daily_basic": (
+                    f"ts_code IS NOT NULL AND {_as_date_sql('trade_date')} IS NOT NULL "
+                    "AND try_cast(total_mv AS DOUBLE) > 0"
+                ),
+                "fina_indicator": (
+                    f"ts_code IS NOT NULL AND {_as_date_sql('ann_date')} IS NOT NULL "
+                    f"AND {_as_date_sql('end_date')} IS NOT NULL AND ("
+                    + " OR ".join(
+                        f"try_cast({field} AS DOUBLE) IS NOT NULL"
+                        for field in _FUNDAMENTAL_RESEARCH_FIELDS
+                        if field in financial_columns
+                    )
+                    + ")"
+                ),
+                "index_member_all": self._industry_usable_predicate(industry_columns),
+                "index_weight": (
+                    "index_code IS NOT NULL AND con_code IS NOT NULL "
+                    f"AND {_as_date_sql('trade_date')} IS NOT NULL "
+                    "AND try_cast(weight AS DOUBLE) > 0"
+                ),
+            }
+            for dataset, predicate in usable_predicates.items():
+                if not self._has_usable_row(dataset, predicate):
+                    issues.append(f"{dataset} has no usable rows")
+
+        if issues:
+            raise RuntimeError("Qlib research inputs are incomplete: " + "; ".join(issues))
+
+    @staticmethod
+    def _industry_usable_predicate(columns: set[str]) -> str:
+        instrument = next(
+            name for name in ("ts_code", "con_code") if name in columns
+        )
+        industry = next(
+            name for name in ("l1_code", "index_code", "l2_code") if name in columns
+        )
+        return (
+            f"{instrument} IS NOT NULL AND {industry} IS NOT NULL "
+            f"AND {_as_date_sql('in_date')} IS NOT NULL"
+        )
+
+    def _has_usable_row(self, dataset: str, predicate: str) -> bool:
+        root = self.snapshot_path / "parquet" / dataset
+        glob = _sql_string(str((root / "**" / "*.parquet").resolve()))
+        connection = duckdb.connect()
+        try:
+            row = connection.execute(
+                f"SELECT 1 FROM read_parquet({glob}, hive_partitioning=true, "
+                f"union_by_name=true) WHERE {predicate} LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+        return row is not None
+
     def _parquet_columns(self, dataset: str) -> set[str]:
         root = self.snapshot_path / "parquet" / dataset
         if not root.exists() or not any(root.rglob("*.parquet")):
@@ -675,7 +771,8 @@ class QlibBuilder:
         connection = duckdb.connect()
         try:
             rows = connection.execute(
-                f"DESCRIBE SELECT * FROM read_parquet({glob}, hive_partitioning=true)"
+                f"DESCRIBE SELECT * FROM read_parquet({glob}, hive_partitioning=true, "
+                "union_by_name=true)"
             ).fetchall()
         finally:
             connection.close()
@@ -707,6 +804,14 @@ class QlibBuilder:
 
 def _sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _as_date_sql(column: str) -> str:
+    identifier = '"' + column.replace('"', '""') + '"'
+    return (
+        f"coalesce(try_cast({identifier} AS DATE), "
+        f"try_strptime(CAST({identifier} AS VARCHAR), '%Y%m%d')::DATE)"
+    )
 
 
 def _sha256_file(path: Path) -> str:

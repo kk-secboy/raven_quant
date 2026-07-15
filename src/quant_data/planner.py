@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 
@@ -9,7 +9,10 @@ from .catalog import (
     CORE_DAILY,
     DISCLOSURE_FIELDS,
     ETF_DAILY,
+    INDEX_CATALOG_MARKETS,
+    INDEX_CATALOG_PAGE_SIZE,
     INDEX_CODES,
+    INDEX_DAILY_BASIC,
     REFERENCE_FIELDS,
     RESEARCH_DAILY,
     DatasetDefinition,
@@ -17,6 +20,7 @@ from .catalog import (
 from .checkpoint import CheckpointStore
 from .execution_data import margin_specs, minute_specs, news_specs
 from .models import FetchSpec
+from .reference_data import apply_reference_refresh
 from .storage import ParquetStore
 
 
@@ -57,7 +61,31 @@ class BootstrapPlanner:
                 max_attempts=max_attempts,
             )
         )
+        specs.extend(self.index_catalog_specs(max_attempts, as_of=end))
+        specs = apply_reference_refresh(specs, as_of=end)
         return self.checkpoint.add(specs)
+
+    def index_catalog_specs(
+        self, max_attempts: int, *, as_of: date | None = None
+    ) -> list[FetchSpec]:
+        specs = [
+            FetchSpec(
+                dataset="index_basic",
+                api_name="index_basic",
+                scope={
+                    "market": market,
+                    "page_group": f"index_basic:{market}",
+                    "page_size": INDEX_CATALOG_PAGE_SIZE,
+                    "offset": 0,
+                },
+                params={"market": market, "limit": INDEX_CATALOG_PAGE_SIZE, "offset": 0},
+                fields=REFERENCE_FIELDS["index_basic"],
+                allow_empty=True,
+                max_attempts=max_attempts,
+            )
+            for market in INDEX_CATALOG_MARKETS
+        ]
+        return apply_reference_refresh(specs, as_of=as_of) if as_of else specs
 
     def trading_dates(self, start: date, end: date) -> list[str]:
         frame = self.storage.read_units(self.checkpoint.successful("trade_cal"))
@@ -74,19 +102,29 @@ class BootstrapPlanner:
         definitions: Iterable[DatasetDefinition],
         max_attempts: int,
     ) -> int:
-        specs = (
-            FetchSpec(
-                dataset=definition.name,
-                api_name=definition.api_name,
-                scope={"trade_date": trade_date},
-                params={"trade_date": trade_date},
-                fields=definition.fields,
-                allow_empty=definition.allow_empty,
-                max_attempts=max_attempts,
-            )
-            for trade_date in dates
-            for definition in definitions
-        )
+        specs = []
+        for trade_date in dates:
+            for definition in definitions:
+                scope: dict[str, object] = {"trade_date": trade_date}
+                if definition.row_limit is not None:
+                    scope.update(
+                        {
+                            "row_limit": definition.row_limit,
+                            "expected_date_field": "trade_date",
+                            "expected_date": trade_date,
+                        }
+                    )
+                specs.append(
+                    FetchSpec(
+                        dataset=definition.name,
+                        api_name=definition.api_name,
+                        scope=scope,
+                        params={"trade_date": trade_date},
+                        fields=definition.fields,
+                        allow_empty=definition.allow_empty,
+                        max_attempts=max_attempts,
+                    )
+                )
         return self.checkpoint.add(specs)
 
     def plan_index_context(self, start: date, end: date, max_attempts: int) -> int:
@@ -110,7 +148,7 @@ class BootstrapPlanner:
                     max_attempts=max_attempts,
                 )
             )
-            for chunk_start, chunk_end in _quarter_ranges(start, end):
+            for chunk_start, chunk_end in _month_ranges(start, end):
                 specs.append(
                     FetchSpec(
                         dataset="index_weight",
@@ -129,7 +167,23 @@ class BootstrapPlanner:
                         max_attempts=max_attempts,
                     )
                 )
-        return self.checkpoint.add(specs)
+        for trade_date in self.trading_dates(start, end):
+            specs.append(
+                FetchSpec(
+                    dataset=INDEX_DAILY_BASIC.name,
+                    api_name=INDEX_DAILY_BASIC.api_name,
+                    scope={
+                        "trade_date": trade_date,
+                    },
+                    params={
+                        "trade_date": trade_date,
+                    },
+                    fields=INDEX_DAILY_BASIC.fields,
+                    allow_empty=INDEX_DAILY_BASIC.allow_empty,
+                    max_attempts=max_attempts,
+                )
+            )
+        return self.checkpoint.add(apply_reference_refresh(specs, as_of=end))
 
     def plan_research_reference(self, start: date, end: date, max_attempts: int) -> int:
         specs: list[FetchSpec] = [
@@ -165,7 +219,7 @@ class BootstrapPlanner:
                     max_attempts=max_attempts,
                 )
             )
-        return self.checkpoint.add(specs)
+        return self.checkpoint.add(apply_reference_refresh(specs, as_of=end))
 
     def industry_codes(self) -> list[str]:
         frame = self.storage.read_units(self.checkpoint.successful("index_classify"))
@@ -174,7 +228,7 @@ class BootstrapPlanner:
         column = "index_code" if "index_code" in frame.columns else "ts_code"
         return sorted(frame[column].dropna().astype(str).unique().tolist())
 
-    def plan_industry_members(self, max_attempts: int) -> int:
+    def plan_industry_members(self, max_attempts: int, *, as_of: date | None = None) -> int:
         specs = [
             FetchSpec(
                 dataset="index_member_all",
@@ -186,15 +240,15 @@ class BootstrapPlanner:
             )
             for index_code in self.industry_codes()
         ]
-        return self.checkpoint.add(specs)
+        return self.checkpoint.add(
+            apply_reference_refresh(specs, as_of=as_of) if as_of else specs
+        )
 
     def plan_etf_daily(self, dates: Iterable[str], max_attempts: int) -> int:
         return self.plan_daily(dates, ETF_DAILY, max_attempts)
 
     def plan_news(self, start: date, end: date, max_attempts: int) -> int:
-        return self.checkpoint.add(
-            news_specs(start, end, max_attempts=max_attempts)
-        )
+        return self.checkpoint.add(news_specs(start, end, max_attempts=max_attempts))
 
     def plan_profile(
         self, profile: str, start: date, end: date, max_attempts: int
@@ -231,12 +285,19 @@ class ExecutionDataPlanner:
         start: date,
         end: date,
         max_attempts: int,
+        *,
+        freq: str = "1min",
+        active_ranges_by_dataset: dict[
+            str, dict[str, tuple[date, date]]
+        ] | None = None,
     ) -> list[FetchSpec]:
         specs = minute_specs(
             symbols_by_dataset,
             start=start,
             end=end,
             max_attempts=max_attempts,
+            freq=freq,
+            active_ranges_by_dataset=active_ranges_by_dataset,
         )
         self.checkpoint.add(specs)
         self.checkpoint.retry_failed_units(spec.unit_key for spec in specs)
@@ -263,6 +324,19 @@ def _quarter_ranges(start: date, end: date) -> list[tuple[date, date]]:
         chunk_end = min(end, date.fromordinal(next_quarter.toordinal() - 1))
         ranges.append((chunk_start, chunk_end))
         cursor = next_quarter
+    return ranges
+
+
+def _month_ranges(start: date, end: date) -> list[tuple[date, date]]:
+    ranges: list[tuple[date, date]] = []
+    cursor = date(start.year, start.month, 1)
+    while cursor <= end:
+        if cursor.month == 12:
+            next_month = date(cursor.year + 1, 1, 1)
+        else:
+            next_month = date(cursor.year, cursor.month + 1, 1)
+        ranges.append((max(start, cursor), min(end, next_month - timedelta(days=1))))
+        cursor = next_month
     return ranges
 
 

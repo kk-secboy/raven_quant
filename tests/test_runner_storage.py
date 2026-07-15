@@ -73,3 +73,116 @@ def test_runner_writes_atomic_parquet_and_snapshot(tmp_path: Path, database_url:
         path = snapshot / item["path"]
         assert item["bytes"] == path.stat().st_size
         assert item["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_verifier_uses_successor_generation_and_can_ignore_dormant_plans(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    parent_group = "share_float:20240101:20240131"
+    parent = FetchSpec(
+        dataset="share_float",
+        api_name="share_float",
+        params={"start_date": "20240101", "end_date": "20240131", "offset": 0},
+        scope={"page_group": parent_group, "offset": 0},
+    )
+    replacement = FetchSpec(
+        dataset="share_float",
+        api_name="share_float",
+        params={"start_date": "20240101", "end_date": "20240101", "offset": 0},
+        scope={
+            "page_group": f"{parent_group}:daily:20240101",
+            "offset": 0,
+            "supersedes_page_group": parent_group,
+        },
+    )
+    dormant = FetchSpec(
+        dataset="daily",
+        api_name="daily",
+        params={"trade_date": "20240103"},
+        scope={"trade_date": "20240103"},
+    )
+    checkpoint.add([parent, replacement, dormant])
+    row = {
+        "ts_code": "000001.SZ",
+        "ann_date": "20240101",
+        "float_date": "20240101",
+        "holder_name": "holder",
+        "share_type": "A",
+    }
+    for spec in (parent, replacement):
+        written = storage.write_unit(
+            "share_float",
+            spec.unit_key,
+            ProviderResult(
+                api_name="share_float",
+                columns=list(row),
+                rows=[row],
+                raw_body=b"{}",
+            ),
+        )
+        checkpoint.succeed(spec.unit_key, written)
+
+    strict = verify_downloads(checkpoint, tmp_path)
+    relaxed = verify_downloads(checkpoint, tmp_path, require_all_planned=False)
+
+    assert strict["ok"] is False
+    assert any("daily: 0/1 units succeeded" in item for item in strict["errors"])
+    assert relaxed["ok"] is True
+    assert relaxed["duplicate_checks"]["share_float"] == 0
+    assert any("daily: 0/1 units succeeded" in item for item in relaxed["warnings"])
+
+
+def test_verifier_rejects_missing_trading_day_and_stock_quote(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    fixtures = {
+        "trade_cal": [
+            {"exchange": "SSE", "cal_date": "20240102", "is_open": "1"},
+            {"exchange": "SSE", "cal_date": "20240103", "is_open": "1"},
+        ],
+        "daily": [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": "20240102",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.0,
+                "vol": 100.0,
+            }
+        ],
+        "daily_basic": [
+            {"ts_code": "000001.SZ", "trade_date": "20240102", "total_mv": 100.0},
+            {"ts_code": "000002.SZ", "trade_date": "20240102", "total_mv": 200.0},
+        ],
+    }
+    specs = [
+        FetchSpec(
+            dataset=dataset,
+            api_name=dataset,
+            scope={"fixture": dataset},
+            params={"fixture": dataset},
+        )
+        for dataset in fixtures
+    ]
+    checkpoint.add(specs)
+    for spec in specs:
+        rows = fixtures[spec.dataset]
+        written = storage.write_unit(
+            spec.dataset,
+            spec.unit_key,
+            ProviderResult(spec.api_name, list(rows[0]), rows, b"{}"),
+        )
+        checkpoint.succeed(spec.unit_key, written)
+
+    report = verify_downloads(checkpoint, tmp_path)
+
+    assert report["ok"] is False
+    assert report["completeness_checks"]["missing_trading_days"] == 1
+    assert report["completeness_checks"]["stocks_missing_daily_quotes"] == 1
+    assert any("open trading days have no quotes" in item for item in report["errors"])
+    assert any("stock/date quotes are missing" in item for item in report["errors"])

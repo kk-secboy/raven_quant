@@ -183,6 +183,27 @@ class CheckpointStore:
         with self.engine.begin() as connection:
             return int(connection.execute(statement).rowcount or 0)
 
+    def supersede_units(self, unit_keys: Iterable[str], reason: str) -> int:
+        """Retain unusable plan rows while removing them from runnable work."""
+
+        keys = sorted(set(unit_keys))
+        if not keys:
+            return 0
+        statement = (
+            update(work_units)
+            .where(work_units.c.unit_key.in_(keys), work_units.c.status != "succeeded")
+            .values(
+                status="superseded",
+                attempts=work_units.c.max_attempts,
+                next_retry_at=None,
+                lease_until=None,
+                last_error=reason[:2000],
+                updated_at=_utc_now(),
+            )
+        )
+        with self.engine.begin() as connection:
+            return int(connection.execute(statement).rowcount or 0)
+
     def counts(self) -> list[dict[str, Any]]:
         statement = (
             select(
@@ -222,6 +243,20 @@ class CheckpointStore:
                 rows.extend(row_dict(row) for row in connection.execute(statement))
         return sorted(rows, key=lambda row: (str(row["dataset"]), str(row["unit_key"])))
 
+    def unit_rows(self, unit_keys: Iterable[str]) -> list[dict[str, Any]]:
+        """Return checkpoint rows for an explicit plan, regardless of status."""
+
+        keys = sorted(set(unit_keys))
+        if not keys:
+            return []
+        rows: list[dict[str, Any]] = []
+        with self.engine.connect() as connection:
+            for offset in range(0, len(keys), _SELECT_BATCH_SIZE):
+                batch = keys[offset : offset + _SELECT_BATCH_SIZE]
+                statement = select(work_units).where(work_units.c.unit_key.in_(batch))
+                rows.extend(row_dict(row) for row in connection.execute(statement))
+        return sorted(rows, key=lambda row: (str(row["dataset"]), str(row["unit_key"])))
+
     def datasets(self) -> list[str]:
         statement = select(work_units.c.dataset).distinct().order_by(work_units.c.dataset)
         with self.engine.connect() as connection:
@@ -258,10 +293,15 @@ class CheckpointStore:
         statement = (
             select(
                 work_units.c.dataset,
-                func.count().label("planned"),
+                func.sum(
+                    case((work_units.c.status != "superseded", 1), else_=0)
+                ).label("planned"),
                 func.sum(case((work_units.c.status == "succeeded", 1), else_=0)).label("succeeded"),
                 func.sum(case((work_units.c.status == "failed", 1), else_=0)).label("failed"),
                 func.sum(case((work_units.c.status == "running", 1), else_=0)).label("running"),
+                func.sum(
+                    case((work_units.c.status == "superseded", 1), else_=0)
+                ).label("superseded"),
                 func.sum(
                     case(
                         (

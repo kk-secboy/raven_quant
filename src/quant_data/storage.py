@@ -13,6 +13,7 @@ import duckdb
 import pandas as pd
 
 from .models import ProviderResult, UnitResult
+from .reference_data import reference_manifest_metadata
 
 DATE_COLUMNS = {
     "trade_date",
@@ -29,8 +30,17 @@ DATE_COLUMNS = {
     "start_date",
     "in_date",
     "out_date",
+    "pub_date",
+    "imp_date",
+    "publish_date",
+    "change_date",
+    "ipo_date",
+    "issue_date",
+    "surv_date",
+    "nav_date",
+    "date",
 }
-DATETIME_COLUMNS = {"pub_time", "datetime", "trade_time"}
+DATETIME_COLUMNS = {"pub_time", "publish_time", "datetime", "trade_time"}
 
 
 def _normalize_frame(rows: list[dict[str, Any]], columns: list[str]) -> pd.DataFrame:
@@ -135,6 +145,7 @@ class ParquetStore:
         connection = duckdb.connect()
         try:
             for dataset, rows in sorted(successful_units.items()):
+                refresh_metadata = reference_manifest_metadata(rows)
                 source_identity = [
                     {
                         "unit_key": str(row["unit_key"]),
@@ -162,6 +173,9 @@ class ParquetStore:
                         "unit_files": 0,
                         "empty_units": len(rows),
                         "date_field": None,
+                        "date_min": None,
+                        "date_max": None,
+                        "reference_refresh": refresh_metadata,
                         "source_sha256": source_sha256,
                         "source_units": source_identity,
                         "files": [],
@@ -182,12 +196,19 @@ class ParquetStore:
                     None,
                 )
                 source_sql = _snapshot_source_query(dataset, quoted_paths, set(columns))
+                date_min = None
+                date_max = None
                 if date_field:
+                    date_expression = _date_sql_expression(date_field)
+                    date_min, date_max = connection.execute(
+                        f"SELECT min({date_expression})::VARCHAR, max({date_expression})::VARCHAR "
+                        f"FROM ({source_sql}) WHERE {date_expression} IS NOT NULL"
+                    ).fetchone()
                     export_sql = (
-                        f"SELECT *, year({_identifier(date_field)})::INTEGER AS partition_year, "
-                        f"month({_identifier(date_field)})::INTEGER AS partition_month "
+                        f"SELECT *, year({date_expression})::INTEGER AS partition_year, "
+                        f"month({date_expression})::INTEGER AS partition_month "
                         f"FROM ({source_sql}) "
-                        f"WHERE {_identifier(date_field)} IS NOT NULL"
+                        f"WHERE {date_expression} IS NOT NULL"
                     )
                     connection.execute(
                         f"COPY ({export_sql}) TO {_sql_string(str(dataset_dir))} "
@@ -217,10 +238,32 @@ class ParquetStore:
                     "unit_files": len(paths),
                     "empty_units": len(rows) - len(paths),
                     "date_field": date_field,
+                    "date_min": date_min,
+                    "date_max": date_max,
+                    "reference_refresh": refresh_metadata,
                     "source_sha256": source_sha256,
                     "source_units": source_identity,
                     "files": files,
                 }
+            historical = {
+                dataset: {
+                    "date_field": details["date_field"],
+                    "date_min": details["date_min"],
+                    "date_max": details["date_max"],
+                    "source_sha256": details["source_sha256"],
+                }
+                for dataset, details in manifest["datasets"].items()
+                if details.get("date_min") and str(details["date_min"]) < "2024-01-01"
+            }
+            manifest["coverage_audit"] = {
+                "historical_before_2024_count": len(historical),
+                "historical_before_2024": historical,
+                "versioned_reference_count": sum(
+                    1
+                    for details in manifest["datasets"].values()
+                    if details.get("reference_refresh")
+                ),
+            }
         finally:
             connection.close()
         (temporary / "manifest.json").write_text(
@@ -240,14 +283,46 @@ def _date_field_candidates(dataset: str) -> tuple[str, ...]:
         return ("ann_date", "f_ann_date", "end_date")
     return (
         "trade_date",
+        "cal_date",
         "ann_date",
         "pub_time",
+        "publish_time",
+        "pub_date",
+        "imp_date",
+        "date",
         "datetime",
         "trade_time",
+        "month",
+        "MONTH",
+        "quarter",
+        "publish_date",
+        "change_date",
+        "ipo_date",
+        "issue_date",
+        "surv_date",
+        "nav_date",
         "start_date",
         "in_date",
         "end_date",
         "out_date",
+    )
+
+
+def _date_sql_expression(field: str) -> str:
+    value = f"CAST({_identifier(field)} AS VARCHAR)"
+    if field in {"month", "MONTH"}:
+        return f"try_strptime(regexp_replace({value}, '[^0-9]', '', 'g'), '%Y%m')::DATE"
+    if field == "quarter":
+        return (
+            f"CASE WHEN regexp_matches({value}, '^[0-9]{{4}}Q[1-4]$') THEN "
+            f"make_date(CAST(substr({value}, 1, 4) AS INTEGER), "
+            f"(CAST(substr({value}, 6, 1) AS INTEGER) - 1) * 3 + 1, 1) "
+            f"ELSE try_cast({_identifier(field)} AS DATE) END"
+        )
+    return (
+        f"coalesce(try_cast({_identifier(field)} AS DATE), "
+        f"try_strptime({value}, '%Y%m%d')::DATE, "
+        f"try_strptime({value}, '%Y-%m-%d %H:%M:%S')::DATE)"
     )
 
 

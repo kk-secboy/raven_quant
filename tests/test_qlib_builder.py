@@ -17,6 +17,7 @@ def _write_market_control_snapshot(
     ts_code: str,
     up_limit: float,
     down_limit: float,
+    include_research_inputs: bool = True,
 ) -> Path:
     snapshot = tmp_path / "snapshot"
     values = {
@@ -47,7 +48,44 @@ def _write_market_control_snapshot(
         target = snapshot / "parquet" / dataset / "partition_year=2024"
         target.mkdir(parents=True)
         pd.DataFrame([row]).to_parquet(target / "data.parquet")
+    if include_research_inputs:
+        _write_required_research_inputs(snapshot)
     return snapshot
+
+
+def _write_required_research_inputs(snapshot: Path) -> None:
+    fixtures = {
+        "daily_basic": {
+            "ts_code": "000001.SZ",
+            "trade_date": "2024-01-02",
+            "total_mv": 100_000.0,
+        },
+        "fina_indicator": {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-12-31",
+            "roe": 10.0,
+        },
+        "index_member_all": {
+            "ts_code": "000001.SZ",
+            "l1_code": "801780.SI",
+            "in_date": "2021-01-01",
+            "out_date": None,
+        },
+        "index_weight": {
+            "index_code": "000300.SH",
+            "con_code": "000001.SZ",
+            "trade_date": "2024-01-02",
+            "weight": 4.5,
+        },
+    }
+    for dataset, row in fixtures.items():
+        root = snapshot / "parquet" / dataset
+        if root.exists() and any(root.rglob("*.parquet")):
+            continue
+        target = root / "partition_year=2024"
+        target.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([row]).to_parquet(target / "research.parquet")
 
 
 def test_builds_per_symbol_normalized_qlib_staging(tmp_path: Path) -> None:
@@ -112,6 +150,8 @@ def test_builds_per_symbol_normalized_qlib_staging(tmp_path: Path) -> None:
             )
         ]
     ).to_parquet(limit_dir / "data.parquet")
+
+    _write_required_research_inputs(snapshot)
 
     by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
     frame = pd.read_parquet(by_symbol / "SZ000001.parquet")
@@ -184,6 +224,8 @@ def test_adds_point_in_time_research_features_without_announcement_leakage(
         target.mkdir(parents=True)
         pd.DataFrame(data).to_parquet(target / "data.parquet")
 
+    _write_required_research_inputs(snapshot)
+
     builder = QlibBuilder(snapshot)
     by_symbol = builder.build_staging(tmp_path / "staging")
     frame = pd.read_parquet(by_symbol / "SZ000001.parquet")
@@ -226,6 +268,27 @@ def test_rejects_non_sentinel_zero_price_limit(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="price limits"):
         QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+
+def test_rejects_qlib_build_without_financial_industry_and_weights(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+        include_research_inputs=False,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+    message = str(raised.value)
+    assert "missing daily_basic" in message
+    assert "missing fina_indicator" in message
+    assert "missing index_member_all" in message
+    assert "missing index_weight" in message
 
 
 def test_adds_normalized_index_staging(tmp_path: Path) -> None:
@@ -281,6 +344,8 @@ def test_adds_normalized_index_staging(tmp_path: Path) -> None:
             }
         ]
     ).to_parquet(index_dir / "data.parquet")
+
+    _write_required_research_inputs(snapshot)
 
     by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
     index = pd.read_parquet(by_symbol / "SH000300.parquet")

@@ -1,10 +1,10 @@
 from datetime import date
 from pathlib import Path
 
-from quant_data.catalog import CORE_DAILY
+from quant_data.catalog import CORE_DAILY, INDEX_CATALOG_MARKETS
 from quant_data.checkpoint import CheckpointStore
 from quant_data.models import FetchSpec, ProviderResult
-from quant_data.planner import BootstrapPlanner, _quarter_ranges, _report_periods
+from quant_data.planner import BootstrapPlanner, _month_ranges, _quarter_ranges, _report_periods
 from quant_data.storage import ParquetStore
 
 
@@ -58,12 +58,58 @@ def test_plans_full_market_calls_by_trade_date(tmp_path: Path, database_url: str
     assert planned == [{"trade_date": "20240102"}, {"trade_date": "20240103"}]
     assert all("ts_code" not in row for row in planned)
 
+    for dataset, row_limit in (
+        ("stk_premarket", 8_000),
+        ("stk_auction_o", 10_000),
+        ("stk_auction_c", 10_000),
+    ):
+        units = []
+        while unit := checkpoint.claim({dataset}):
+            units.append(unit.spec)
+            checkpoint.fail(unit.unit_key, "test inspection", terminal=True)
+        assert sorted((unit.params for unit in units), key=lambda item: item["trade_date"]) == [
+            {"trade_date": "20240102"},
+            {"trade_date": "20240103"},
+        ]
+        assert {unit.scope["row_limit"] for unit in units} == {row_limit}
+        assert {unit.scope["expected_date_field"] for unit in units} == {"trade_date"}
+
     planner.plan_index_context(date(2024, 1, 1), date(2024, 1, 4), 5)
     index_codes = []
     while unit := checkpoint.claim({"index_daily"}):
         index_codes.append(unit.spec.params["ts_code"])
         checkpoint.fail(unit.unit_key, "test inspection", terminal=True)
-    assert sorted(index_codes) == ["000016.SH", "000300.SH", "000852.SH", "000905.SH"]
+    assert sorted(index_codes) == [
+        "000001.SH",
+        "000016.SH",
+        "000300.SH",
+        "000688.SH",
+        "000852.SH",
+        "000905.SH",
+        "399001.SZ",
+        "399006.SZ",
+        "899050.BJ",
+    ]
+
+    daily_basic = []
+    while unit := checkpoint.claim({"index_dailybasic"}):
+        daily_basic.append(unit.spec.params)
+        checkpoint.fail(unit.unit_key, "test inspection", terminal=True)
+    assert sorted(daily_basic, key=lambda item: item["trade_date"]) == [
+        {"trade_date": "20240102"},
+        {"trade_date": "20240103"},
+    ]
+
+
+def test_complete_index_catalog_starts_one_paginated_partition_per_market(
+    tmp_path: Path, database_url: str
+) -> None:
+    planner = BootstrapPlanner(CheckpointStore(database_url), ParquetStore(tmp_path))
+    specs = planner.index_catalog_specs(5)
+    assert [spec.params["market"] for spec in specs] == list(INDEX_CATALOG_MARKETS)
+    assert all(spec.params["limit"] == 1_000 and spec.params["offset"] == 0 for spec in specs)
+    assert all(spec.scope["page_group"].startswith("index_basic:") for spec in specs)
+    assert all(spec.allow_empty for spec in specs)
 
 
 def test_quarter_ranges_clip_to_requested_window() -> None:
@@ -71,6 +117,14 @@ def test_quarter_ranges_clip_to_requested_window() -> None:
         (date(2024, 2, 10), date(2024, 3, 31)),
         (date(2024, 4, 1), date(2024, 6, 30)),
         (date(2024, 7, 1), date(2024, 8, 5)),
+    ]
+
+
+def test_month_ranges_clip_to_requested_window() -> None:
+    assert _month_ranges(date(2024, 2, 10), date(2024, 4, 5)) == [
+        (date(2024, 2, 10), date(2024, 2, 29)),
+        (date(2024, 3, 1), date(2024, 3, 31)),
+        (date(2024, 4, 1), date(2024, 4, 5)),
     ]
 
 

@@ -83,3 +83,23 @@ def test_successful_units_reads_only_the_requested_plan(database_url: str) -> No
 
     rows = store.successful_units([first.unit_key, second.unit_key])
     assert [row["unit_key"] for row in rows] == [first.unit_key]
+
+
+def test_superseded_units_are_retained_but_not_runnable_or_planned(
+    database_url: str,
+) -> None:
+    store = CheckpointStore(database_url)
+    item = spec()
+    store.add([item])
+    unit = store.claim()
+    assert unit is not None
+    store.fail(unit.unit_key, "provider offset cap")
+
+    assert store.supersede_units([unit.unit_key], "continued by a smaller partition") == 1
+    assert store.claim() is None
+    rows = store.unit_rows([unit.unit_key])
+    assert rows[0]["status"] == "superseded"
+    assert rows[0]["last_error"] == "continued by a smaller partition"
+    verification = store.verification_rows()[0]
+    assert verification["planned"] == 0
+    assert verification["superseded"] == 1

@@ -24,12 +24,14 @@ NEWS_SOURCES = (
 NEWS_FIELDS = ("datetime", "content", "title", "channels")
 NEWS_WINDOW_HOURS = 12
 MINUTE_DATASETS: dict[str, str] = {
+    "ashare_5m": "stk_mins",
     "indices_1m": "idx_mins",
     "etf_1m": "etf_mins",
     "futures_1m": "ft_mins",
     "options_1m": "opt_mins",
     "liquid_stocks_1m": "stk_mins",
 }
+MINUTE_FREQUENCIES = frozenset({"1min", "5min", "15min", "30min", "60min"})
 
 MARGIN_FIELDS = ("trade_date", "ts_code", "name", "exchange")
 MINUTE_FIELDS = ("ts_code", "trade_time", "open", "close", "high", "low", "vol", "amount")
@@ -123,10 +125,13 @@ def minute_specs(
     end: date,
     max_attempts: int,
     freq: str = "1min",
+    active_ranges_by_dataset: Mapping[
+        str, Mapping[str, tuple[date, date]]
+    ] | None = None,
 ) -> list[FetchSpec]:
     if end < start:
         raise ValueError("end must not be before start")
-    if freq not in {"1min", "5min", "15min", "30min", "60min"}:
+    if freq not in MINUTE_FREQUENCIES:
         raise ValueError("unsupported minute frequency")
     unknown = set(symbols_by_dataset) - set(MINUTE_DATASETS)
     if unknown:
@@ -135,12 +140,21 @@ def minute_specs(
     specs: list[FetchSpec] = []
     for dataset, raw_symbols in sorted(symbols_by_dataset.items()):
         symbols = sorted({_normalize_symbol(value) for value in raw_symbols if str(value).strip()})
-        windows = (
-            _fortnight_ranges(start, end)
-            if dataset == "futures_1m"
-            else _month_ranges(start, end)
-        )
+        raw_active_ranges = (active_ranges_by_dataset or {}).get(dataset, {})
+        active_ranges = {
+            _normalize_symbol(symbol): bounds for symbol, bounds in raw_active_ranges.items()
+        }
         for symbol in symbols:
+            symbol_start, symbol_end = active_ranges.get(symbol, (start, end))
+            symbol_start = max(start, symbol_start)
+            symbol_end = min(end, symbol_end)
+            if symbol_end < symbol_start:
+                continue
+            windows = (
+                _fortnight_ranges(symbol_start, symbol_end)
+                if dataset == "futures_1m"
+                else _month_ranges(symbol_start, symbol_end)
+            )
             for window_start, window_end in windows:
                 start_time = datetime.combine(window_start, time.min).strftime("%Y-%m-%d %H:%M:%S")
                 end_time = datetime.combine(window_end, time.max.replace(microsecond=0)).strftime(

@@ -49,10 +49,15 @@ def test_selects_major_assets_and_dynamic_liquidity() -> None:
     selection = select_intraday_universe(frames, max_stocks=2, max_options=1)
 
     assert selection.symbols_by_dataset["indices_1m"] == [
+        "000001.SH",
         "000016.SH",
         "000300.SH",
+        "000688.SH",
         "000852.SH",
         "000905.SH",
+        "399001.SZ",
+        "399006.SZ",
+        "899050.BJ",
     ]
     assert selection.symbols_by_dataset["liquid_stocks_1m"] == [
         "600001.SH",

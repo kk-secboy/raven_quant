@@ -11,7 +11,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from .execution_data import MINUTE_DATASETS
+from .execution_data import MINUTE_DATASETS, MINUTE_FREQUENCIES
 from .path_utils import to_wsl_path
 from .qlib_builder import QlibBuilder, _sql_string
 
@@ -31,7 +31,7 @@ MINUTE_QLIB_FIELDS = (
 
 
 class MinuteQlibBuilder:
-    """Build a separate Qlib 1-minute dataset from an immutable execution snapshot."""
+    """Build a Qlib minute dataset at the immutable snapshot's native frequency."""
 
     def __init__(self, snapshot_path: Path) -> None:
         self.snapshot_path = snapshot_path.resolve()
@@ -40,8 +40,11 @@ class MinuteQlibBuilder:
             self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError) as exc:
             raise ValueError("minute snapshot manifest is missing or invalid") from exc
-        if self.manifest.get("frequency") != "1min":
-            raise ValueError("minute Qlib builder requires a 1min execution snapshot")
+        self.frequency = str(self.manifest.get("frequency") or "")
+        if self.frequency not in MINUTE_FREQUENCIES:
+            raise ValueError(
+                "minute Qlib builder requires a supported minute execution snapshot"
+            )
         if not set(self.manifest.get("datasets", {})).intersection(MINUTE_DATASETS):
             raise ValueError("minute snapshot contains no supported bar datasets")
 
@@ -62,7 +65,8 @@ class MinuteQlibBuilder:
             glob = _sql_string(str((root / "**" / "*.parquet").resolve()))
             oi = "try_cast(oi AS DOUBLE)" if dataset == "futures_1m" else "NULL::DOUBLE"
             sources.append(
-                f"SELECT *, {oi} AS normalized_oi, {_sql_string(dataset)} AS source_dataset "
+                "SELECT ts_code, trade_time, open, high, low, close, vol, amount, "
+                f"{oi} AS normalized_oi, {_sql_string(dataset)} AS source_dataset "
                 f"FROM read_parquet({glob}, hive_partitioning=true, union_by_name=true)"
             )
         if not sources:
@@ -135,7 +139,7 @@ class MinuteQlibBuilder:
         command.extend(
             [
                 "--freq",
-                "1min",
+                self.frequency,
                 "--file_suffix",
                 ".parquet",
                 "--date_field_name",
@@ -150,7 +154,7 @@ class MinuteQlibBuilder:
         )
         try:
             subprocess.run(command, check=True)
-            if not any((qlib_dir / "features").rglob("*.1min.bin")):
+            if not any((qlib_dir / "features").rglob(f"*.{self.frequency}.bin")):
                 raise RuntimeError("Qlib dump produced no minute feature binaries")
             self._write_provenance(qlib_dir)
         except Exception:
@@ -166,7 +170,7 @@ class MinuteQlibBuilder:
             "snapshot_name": self.snapshot_path.name,
             "snapshot_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
             "qlib_builder_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-            "frequency": "1min",
+            "frequency": self.frequency,
             "fields": list(MINUTE_QLIB_FIELDS),
         }
         canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))

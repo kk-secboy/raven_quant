@@ -6,23 +6,27 @@ from collections.abc import Iterable
 from datetime import date, timedelta
 from typing import Any
 
+from .coverage_data import COVERAGE_BUNDLES, coverage_bundle_datasets, coverage_specs
 from .models import FetchSpec, ProviderResult
 from .planner import compact_date
 from .provider import ProviderError
+from .reference_data import apply_reference_refresh
 
 SUPPORTED_BUNDLES = {
     "cn_extended_daily",
     "cn_funds",
     "cn_macro",
+    "cn_institutional",
     "cn_futures",
     "cn_options_bonds",
     "hk_market",
     "us_market",
     "global_markets",
-}
+} | COVERAGE_BUNDLES
 
 _CN_EXCHANGES = ("CFFEX", "DCE", "CZCE", "SHFE", "INE", "GFEX")
 _PAGINATION_MAX_PAGES = {
+    "index_basic": 16,
     # These are safety ceilings, not pre-planned page counts.  The CLI starts
     # with one page and stops as soon as Tushare returns a short page.  Dense
     # month/day partitions observed in production legitimately exceed the old
@@ -42,7 +46,11 @@ _PAGINATION_MAX_PAGES = {
     "namechange": 64,
     "dividend": 16,
     "repurchase": 64,
-    "share_float": 64,
+    # A single monthly unlock-date partition exceeded 64,000 holder-level
+    # rows in production.  Keep the existing 1,000-row page keys so completed
+    # pages remain reusable, but permit pagination to continue until a short
+    # terminal page proves completeness.
+    "share_float": 512,
     "pledge_stat": 16,
     "pledge_detail": 16,
     "stk_holdertrade": 64,
@@ -101,9 +109,17 @@ _PAGINATION_MAX_PAGES = {
     "fx_obasic": 8,
     "index_global": 8,
     "fx_daily": 8,
+    "report_rc": 64,
+    "etf_sh_cons": 256,
+    "etf_sz_cons": 256,
+    "ci_daily": 4,
+    "major_news": 512,
 }
 
 _PAGINATION_PREFETCH_PAGES = {
+    # CSI currently spans nine 1,000-row pages. Fetch a bounded window while
+    # retaining the mandatory short-page termination proof.
+    "index_basic": 8,
     # Contract-master offsets are independent. Fetch a small bounded window in
     # parallel so one full page does not force another complete CLI phase.
     "opt_basic": 8,
@@ -126,22 +142,35 @@ def supplemental_specs(
 ) -> list[FetchSpec]:
     if bundle not in SUPPORTED_BUNDLES:
         raise ValueError(f"unsupported supplemental bundle: {bundle}")
-    dates = sorted(set(trading_dates))
-    if bundle == "cn_extended_daily":
-        return _cn_extended_specs(start, end, dates, max_attempts)
-    if bundle == "cn_funds":
-        return _cn_fund_specs(start, end, dates, max_attempts)
-    if bundle == "cn_macro":
-        return _cn_macro_specs(start, end, max_attempts)
-    if bundle == "cn_futures":
-        return _cn_futures_specs(start, end, dates, max_attempts)
-    if bundle == "cn_options_bonds":
-        return _cn_options_bonds_specs(dates, max_attempts)
-    if bundle == "hk_market":
-        return _hk_market_specs(start, end, max_attempts)
-    if bundle == "us_market":
-        return _us_market_specs(start, end, max_attempts)
-    return _global_market_specs(start, end, max_attempts)
+    if bundle in COVERAGE_BUNDLES:
+        specs = coverage_specs(
+            bundle,
+            start=start,
+            end=end,
+            trading_dates=trading_dates,
+            max_attempts=max_attempts,
+        )
+    else:
+        dates = sorted(set(trading_dates))
+        if bundle == "cn_extended_daily":
+            specs = _cn_extended_specs(start, end, dates, max_attempts)
+        elif bundle == "cn_funds":
+            specs = _cn_fund_specs(start, end, dates, max_attempts)
+        elif bundle == "cn_macro":
+            specs = _cn_macro_specs(start, end, max_attempts)
+        elif bundle == "cn_institutional":
+            specs = _cn_institutional_specs(start, end, dates, max_attempts)
+        elif bundle == "cn_futures":
+            specs = _cn_futures_specs(start, end, dates, max_attempts)
+        elif bundle == "cn_options_bonds":
+            specs = _cn_options_bonds_specs(dates, max_attempts)
+        elif bundle == "hk_market":
+            specs = _hk_market_specs(start, end, max_attempts)
+        elif bundle == "us_market":
+            specs = _us_market_specs(start, end, max_attempts)
+        else:
+            specs = _global_market_specs(start, end, max_attempts)
+    return apply_reference_refresh(specs, as_of=end)
 
 
 def validate_supplemental(spec: FetchSpec, result: ProviderResult) -> ProviderResult:
@@ -182,8 +211,18 @@ def require_pagination_terminated(
         group = spec.scope.get("page_group")
         if group:
             groups[str(group)].append(spec)
+    continued_groups = {
+        str(parent)
+        for spec in specs
+        if (
+            parent := spec.scope.get("continues_page_group")
+            or spec.scope.get("supersedes_page_group")
+        )
+    }
     unterminated: list[str] = []
     for group, pages in groups.items():
+        if group in continued_groups:
+            continue
         ordered = sorted(pages, key=lambda item: int(item.scope["offset"]))
         counts = [row_counts.get(page.unit_key, -1) for page in ordered]
         terminated = bool(counts) and 0 <= counts[-1] < int(ordered[-1].scope["page_size"])
@@ -206,14 +245,30 @@ def next_pagination_specs(
         group = spec.scope.get("page_group")
         if group:
             groups[str(group)].append(spec)
+    continued_groups = {
+        str(parent)
+        for spec in specs
+        if (
+            parent := spec.scope.get("continues_page_group")
+            or spec.scope.get("supersedes_page_group")
+        )
+    }
     result: list[FetchSpec] = []
-    for pages in groups.values():
+    for group, pages in groups.items():
+        if group in continued_groups:
+            continue
         current = max(pages, key=lambda item: int(item.scope["offset"]))
         page_size = int(current.scope["page_size"])
         if row_counts.get(current.unit_key, -1) < page_size:
             continue
-        next_page = int(current.scope["offset"]) // page_size + 1
-        max_pages = _PAGINATION_MAX_PAGES[current.dataset]
+        current_page = int(
+            current.scope.get("page_index", int(current.scope["offset"]) // page_size)
+        )
+        next_page = current_page + 1
+        max_pages = int(
+            current.scope.get("max_pages")
+            or _PAGINATION_MAX_PAGES[current.dataset]
+        )
         if next_page >= max_pages:
             continue
         prefetch = _PAGINATION_PREFETCH_PAGES.get(current.dataset, 1)
@@ -222,7 +277,71 @@ def next_pagination_specs(
     return result
 
 
+def share_float_overflow_repartition_specs(failed_spec: FetchSpec) -> list[FetchSpec]:
+    """Replace an offset-capped share-float window with daily partitions.
+
+    Provider probes proved that an exact-day query does not preserve the row
+    order of the enclosing monthly query, so a cursor cannot safely resume at
+    the monthly boundary.  Successful monthly units remain immutable, while
+    the daily generation explicitly supersedes that page group in successor
+    snapshots.
+    """
+
+    if failed_spec.dataset != "share_float":
+        raise ValueError("overflow continuation is only supported for share_float")
+    start_text = str(failed_spec.params.get("start_date") or "")
+    end_text = str(failed_spec.params.get("end_date") or "")
+    if len(start_text) != 8 or len(end_text) != 8:
+        raise ValueError("share_float overflow requires compact date bounds")
+    window_start = date.fromisoformat(
+        f"{start_text[:4]}-{start_text[4:6]}-{start_text[6:8]}"
+    )
+    window_end = date.fromisoformat(
+        f"{end_text[:4]}-{end_text[4:6]}-{end_text[6:8]}"
+    )
+    if window_start == window_end:
+        raise RuntimeError(
+            f"single-day share_float partition {start_text} exceeded the provider offset cap"
+        )
+
+    parent_group = str(failed_spec.scope["page_group"])
+    page_size = 6_000
+    result: list[FetchSpec] = []
+    current = window_start
+    while current <= window_end:
+        value = compact_date(current)
+        result.append(
+            _spec(
+                "share_float",
+                "share_float",
+                {
+                    "start_date": value,
+                    "end_date": value,
+                    "limit": page_size,
+                    "offset": 0,
+                },
+                scope={
+                    "start_date": value,
+                    "end_date": value,
+                    "page_group": f"{parent_group}:daily:{value}",
+                    "offset": 0,
+                    "page_size": page_size,
+                    "max_pages": _PAGINATION_MAX_PAGES["share_float"],
+                    "expected_date_field": "float_date",
+                    "expected_date": value,
+                    "supersedes_page_group": parent_group,
+                },
+                allow_empty=True,
+                max_attempts=failed_spec.max_attempts,
+            )
+        )
+        current += timedelta(days=1)
+    return result
+
+
 def bundle_datasets(bundle: str) -> set[str]:
+    if bundle in COVERAGE_BUNDLES:
+        return coverage_bundle_datasets(bundle)
     marker = date(2024, 1, 2)
     datasets = {
         spec.dataset
@@ -276,7 +395,7 @@ def a_share_bulk_history_specs(*, start: date, end: date, max_attempts: int) -> 
                     {"period": period},
                     group=f"{dataset}:{period}",
                     page_size=1_000,
-                    max_pages=64,
+                    max_pages=_PAGINATION_MAX_PAGES[dataset],
                     max_attempts=max_attempts,
                     expected_date_field="end_date",
                     expected_date=period,
@@ -295,7 +414,7 @@ def a_share_bulk_history_specs(*, start: date, end: date, max_attempts: int) -> 
                     params,
                     group=f"{dataset}:{compact_start}:{compact_end}",
                     page_size=1_000,
-                    max_pages=64,
+                    max_pages=_PAGINATION_MAX_PAGES[dataset],
                     max_attempts=max_attempts,
                 )
             )
@@ -328,6 +447,7 @@ def _spec(
     params: dict[str, Any],
     *,
     scope: dict[str, Any] | None = None,
+    fields: tuple[str, ...] = (),
     allow_empty: bool = True,
     max_attempts: int,
 ) -> FetchSpec:
@@ -336,6 +456,7 @@ def _spec(
         api_name=api_name,
         scope=dict(scope or params),
         params=params,
+        fields=fields,
         allow_empty=allow_empty,
         max_attempts=max_attempts,
     )
@@ -350,6 +471,7 @@ def _paged_specs(
     page_size: int,
     max_pages: int,
     max_attempts: int,
+    fields: tuple[str, ...] = (),
     expected_date_field: str | None = None,
     expected_date: str | None = None,
 ) -> list[FetchSpec]:
@@ -372,6 +494,7 @@ def _paged_specs(
             api_name,
             {**base_params, "limit": page_size, "offset": 0},
             scope=scope,
+            fields=fields,
             allow_empty=True,
             max_attempts=max_attempts,
         )
@@ -380,14 +503,18 @@ def _paged_specs(
 
 def _next_page_spec(current: FetchSpec, page: int) -> FetchSpec:
     page_size = int(current.scope["page_size"])
-    offset = page * page_size
+    offset_origin = int(current.scope.get("offset_origin", 0))
+    offset = offset_origin + page * page_size
     params = {**current.params, "limit": page_size, "offset": offset}
     scope = {**current.scope, "offset": offset}
+    if "page_index" in current.scope:
+        scope["page_index"] = page
     return _spec(
         current.dataset,
         current.api_name,
         params,
         scope=scope,
+        fields=current.fields,
         allow_empty=True,
         max_attempts=current.max_attempts,
     )
@@ -661,6 +788,101 @@ def _cn_macro_specs(start: date, end: date, max_attempts: int) -> list[FetchSpec
     return specs
 
 
+_MAJOR_NEWS_SOURCES = (
+    "新华网",
+    "凤凰财经",
+    "同花顺",
+    "新浪财经",
+    "华尔街见闻",
+    "中证网",
+    "财新网",
+    "第一财经",
+    "财联社",
+)
+
+
+def _cn_institutional_specs(
+    start: date, end: date, dates: list[str], max_attempts: int
+) -> list[FetchSpec]:
+    """Plan the remaining Tushare-provided institutional research surface.
+
+    Every capped endpoint uses an explicit limit/offset termination proof.  The
+    request grain follows the provider's largest safe cross-section: monthly
+    for research reports and Shibor quotes, and full-market trading-day pages
+    for ETF baskets and industry indices.  Long-form news is source/day paged
+    because its documented 400-row ceiling is too small for multi-day windows.
+    """
+
+    specs: list[FetchSpec] = []
+    for window_start, window_end in _month_ranges(start, end):
+        compact_start = compact_date(window_start)
+        compact_end = compact_date(window_end)
+        specs.extend(
+            _paged_specs(
+                "report_rc",
+                "report_rc",
+                {"start_date": compact_start, "end_date": compact_end},
+                group=f"report_rc:{compact_start}:{compact_end}",
+                page_size=3_000,
+                max_pages=64,
+                max_attempts=max_attempts,
+            )
+        )
+        specs.append(
+            _spec(
+                "shibor_quote",
+                "shibor_quote",
+                {"start_date": compact_start, "end_date": compact_end},
+                scope={
+                    "start_date": compact_start,
+                    "end_date": compact_end,
+                    "row_limit": 4_000,
+                },
+                max_attempts=max_attempts,
+            )
+        )
+        start_text = f"{window_start.isoformat()} 00:00:00"
+        end_text = f"{window_end.isoformat()} 23:59:59"
+        for source in _MAJOR_NEWS_SOURCES:
+            specs.extend(
+                _paged_specs(
+                    "major_news",
+                    "major_news",
+                    {"src": source, "start_date": start_text, "end_date": end_text},
+                    group=f"major_news:{source}:{compact_start}:{compact_end}",
+                    page_size=400,
+                    max_pages=512,
+                    max_attempts=max_attempts,
+                    fields=("title", "content", "pub_time", "src"),
+                )
+            )
+
+    market_dates = dates or _weekdays(start, end)
+    for dataset in ("etf_sh_cons", "etf_sz_cons"):
+        specs.extend(
+            _daily_paged_specs(
+                dataset,
+                dataset,
+                market_dates,
+                page_size=3_000,
+                max_pages=256,
+                max_attempts=max_attempts,
+            )
+        )
+    specs.extend(
+        _daily_paged_specs(
+            "ci_daily",
+            "ci_daily",
+            market_dates,
+            page_size=4_000,
+            max_pages=4,
+            max_attempts=max_attempts,
+        )
+    )
+
+    return specs
+
+
 def _cn_futures_specs(
     start: date, end: date, dates: list[str], max_attempts: int
 ) -> list[FetchSpec]:
@@ -826,7 +1048,7 @@ def bond_reference_specs(
                     max_attempts=max_attempts,
                 )
             )
-    return specs
+    return apply_reference_refresh(specs, as_of=end)
 
 
 def _hk_market_specs(start: date, end: date, max_attempts: int) -> list[FetchSpec]:
@@ -1057,13 +1279,14 @@ def _calendar_dates(start: date, end: date) -> list[str]:
 
 
 def _financial_periods(start: date, end: date) -> list[str]:
-    periods = {f"{start.year - 1}1231"}
-    for year in range(start.year, end.year + 1):
-        for month, day in ((3, 31), (6, 30), (9, 30), (12, 31)):
-            period = date(year, month, day)
-            if start <= period <= end:
-                periods.add(compact_date(period))
-    return sorted(periods)
+    quarter_ends = [
+        date(year, month, day)
+        for year in range(start.year - 2, end.year + 1)
+        for month, day in ((3, 31), (6, 30), (9, 30), (12, 31))
+    ]
+    previous_four = sorted(period for period in quarter_ends if period < start)[-4:]
+    requested = [period for period in quarter_ends if start <= period <= end]
+    return [compact_date(period) for period in sorted({*previous_four, *requested})]
 
 
 def _batched(values: list[str], size: int) -> Iterable[list[str]]:

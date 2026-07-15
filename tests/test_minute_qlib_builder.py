@@ -44,7 +44,7 @@ def _snapshot(tmp_path: Path, *, frequency: str = "1min") -> Path:
                 "lineage_id": "a" * 64,
                 "start_date": "2024-01-02",
                 "end_date": "2024-01-02",
-                "datasets": {"etf_1m": {}},
+                "datasets": {"etf_1m": {"source_sha256": "b" * 64}},
             }
         ),
         encoding="utf-8",
@@ -66,6 +66,78 @@ def test_builds_minute_qlib_staging_from_execution_snapshot(tmp_path: Path) -> N
     assert set(MINUTE_QLIB_FIELDS).issubset(frame.columns)
 
 
+def test_builds_staging_from_minute_datasets_with_different_source_columns(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path)
+    target = snapshot / "parquet" / "futures_1m" / "partition_year=2024"
+    target.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "IF2401.CFX",
+                "trade_time": "2024-01-02 09:31:00",
+                "open": 3300.0,
+                "high": 3301.0,
+                "low": 3299.0,
+                "close": 3300.5,
+                "vol": 120,
+                "amount": 396060.0,
+                "oi": 80000,
+                "exchange_specific": "ignored",
+            }
+        ]
+    ).to_parquet(target / "bars.parquet")
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["datasets"]["futures_1m"] = {}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    by_symbol = MinuteQlibBuilder(snapshot).build_staging(tmp_path / "mixed-staging")
+
+    future = pd.read_parquet(by_symbol / "CFXIF2401.parquet")
+    assert future["oi"].tolist() == [80000.0]
+    assert (by_symbol / "SH510300.parquet").is_file()
+
+
 def test_rejects_non_minute_snapshot(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="1min"):
+    with pytest.raises(ValueError, match="supported minute"):
         MinuteQlibBuilder(_snapshot(tmp_path, frequency="day"))
+
+
+def test_five_minute_snapshot_uses_native_qlib_frequency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = MinuteQlibBuilder(_snapshot(tmp_path, frequency="5min"))
+    qlib_repo = tmp_path / "qlib"
+    script = qlib_repo / "scripts" / "dump_bin.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("# fixture", encoding="utf-8")
+    qlib_dir = tmp_path / "qlib-output"
+    captured: list[str] = []
+
+    def fake_run(command: list[str], *, check: bool) -> None:
+        assert check is True
+        captured.extend(command)
+        feature = qlib_dir / "features" / "sh510300"
+        feature.mkdir(parents=True)
+        (feature / "close.5min.bin").write_bytes(b"fixture")
+
+    monkeypatch.setattr("quant_data.minute_qlib_builder.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "quant_data.minute_qlib_builder.QlibBuilder._snapshot_manifest_digest",
+        lambda _self: "c" * 64,
+    )
+    builder.dump_bin(
+        staging_by_symbol=tmp_path / "staging",
+        qlib_dir=qlib_dir,
+        qlib_repo=qlib_repo,
+        qlib_python="python",
+        wsl_distro="Ubuntu",
+    )
+
+    assert captured[captured.index("--freq") + 1] == "5min"
+    provenance = json.loads(
+        (qlib_dir / "metadata" / "provenance.json").read_text(encoding="utf-8")
+    )
+    assert provenance["frequency"] == "5min"

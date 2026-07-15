@@ -39,3 +39,20 @@ def test_rate_limit_error_is_retryable() -> None:
         decode_response("daily", body, 429)
     assert raised.value.retryable is True
     assert raised.value.rate_limited is True
+
+
+@pytest.mark.parametrize(
+    "message,status_code",
+    [
+        ("服务升级中,请稍后再试", 200),
+        ("Service temporarily unavailable", 503),
+    ],
+)
+def test_provider_maintenance_uses_shared_cooldown(
+    message: str, status_code: int
+) -> None:
+    body = json.dumps({"code": 503, "msg": message}).encode()
+    with pytest.raises(ProviderError) as raised:
+        decode_response("stock_basic", body, status_code)
+    assert raised.value.retryable is True
+    assert raised.value.rate_limited is True

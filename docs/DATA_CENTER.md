@@ -1,5 +1,10 @@
 # Tushare data center
 
+Interface coverage claims are governed by
+[`TUSHARE_COVERAGE.md`](TUSHARE_COVERAGE.md). Downloader implementation,
+production materialization, and Qlib readiness must always be reported
+separately.
+
 The data center stores immutable market files in Parquet and mutable task state in
 PostgreSQL. A download job never writes research tables into PostgreSQL. Each provider
 request is a resumable work unit with an atomic output file, row count and SHA-256.
@@ -11,11 +16,20 @@ request is a resumable work unit with an atomic output file, row count and SHA-2
 | `cn_extended_daily` | historical ST state, SW industry bars, holders, surveys, block trades, northbound holdings, professional factors, audit opinions, business composition and IPOs |
 | `cn_funds` | ETF-specific masters/tracking indices plus exchange-traded and OTC fund masters, companies, managers, NAV, shares/scale, dividends and portfolios |
 | `cn_macro` | GDP, CPI, PPI, PMI, money supply, social financing, Shibor, LPR and official publication schedules |
+| `cn_institutional` | broker research forecasts, Shanghai/Shenzhen ETF creation-redemption baskets, CITIC industry daily indices, Shibor contributor quotes and long-form financial news |
 | `cn_futures` | contract masters, exchange calendars, daily bars, continuous mappings, holdings, warehouse receipts, settlement parameters, price limits and minimum margin ratios |
 | `cn_options_bonds` | option masters/bars, convertible-bond issue, redemption, coupon, conversion-price/share lifecycle, ratings, top holders, daily bars, repos and yield curves |
 | `hk_market` | masters, calendars, daily/adjusted prices and four financial-statement/indicator interfaces |
 | `us_market` | masters, calendars, daily/adjusted prices and four financial-statement/indicator interfaces |
 | `global_markets` | international indices, overseas FX masters/daily prices and the US Treasury yield curve |
+| `cn_governance_risk` | corporate/governance masters, manager rewards, abnormal volatility, chip distribution, CCASS, broker recommendations, margin and securities lending |
+| `cn_capital_flow` | northbound/southbound, THS and Eastmoney security, concept, industry and market-wide capital flow |
+| `cn_fund_index_enhanced` | ETF scale, index announcements/members/factors, exchange statistics, benchmark libraries and fund factors |
+| `cn_derivatives_enhanced` | futures indices/weekly statistics, Shanghai gold, convertible-bond factors, OTC bond quotes, block trades and economic calendar |
+| `global_rates_enhanced` | Hong Kong/US adjustment factors plus LIBOR, HIBOR and US rate curves |
+| `research_corpus` | policy, research-report, financial-news, exchange Q&A and public-account text corpora |
+| `strategy_specialty` | optional limit-board, theme, hot-list, active-capital and vendor index/member feeds |
+| `strategy_specialty_minutes` | explicitly selected SW-index and Hong Kong 5-minute histories |
 
 ### Goal interface contract
 
@@ -25,24 +39,26 @@ set. The exact Tushare-facing APIs required by this delivery are:
 | Domain | Tushare APIs |
 | --- | --- |
 | A-share core | `stock_basic`, `trade_cal`, `daily`, `adj_factor`, `daily_basic`, `suspend_d`, `stk_limit`, `limit_list_d`, `stock_st`, financial statements, corporate events and research flows |
-| Domestic indices | `index_daily`, `index_weight` for SSE 50, CSI 300, CSI 500 and CSI 1000 |
+| Domestic indices | complete paged `index_basic`, `index_daily`, `index_dailybasic` and `index_weight` for SSE Composite, SSE 50, CSI 300, STAR 50, CSI 500, CSI 1000, Shenzhen Component, ChiNext and Beijing 50 |
 | Industry risk | `index_classify`, `index_member_all`, `sw_daily` for point-in-time SW2021 membership and industry returns/valuation |
 | Funds | `fund_basic` (`E`/`O`, split by status), `fund_company`, `fund_manager`, `fund_nav`, `fund_share`, `fund_div`, `fund_portfolio`, `etf_basic`, `etf_index`, plus ETF `fund_daily` and `fund_adj` |
 | Futures | `fut_basic`, `fut_trade_cal`, `fut_mapping`, `fut_daily`, `fut_holding`, `fut_wsr`, `fut_settle`, `ft_limit` |
-| Options and bonds | `opt_basic`, `opt_daily`, `cb_basic`, `cb_issue`, `cb_call`, `cb_rate`, `cb_price_chg`, `cb_share`, `cb_rating`, `top10_cb_holders`, `cb_daily`, `repo_daily`, `yc_cb` |
+| Options and bonds | `opt_basic`, `opt_daily`, `cb_basic`, `cb_issue`, `cb_redeem`, `cb_rate`, `cb_price_chg`, `cb_share`, `cb_rating`, `top10_cb_holders`, `cb_daily`, `repo_daily`, `yc_cb` |
 | Hong Kong | `hk_basic`, `hk_tradecal`, `hk_daily`, `hk_daily_adj`, `hk_income`, `hk_balancesheet`, `hk_cashflow`, `hk_fina_indicator` |
 | United States | `us_basic`, `us_tradecal`, `us_daily`, `us_daily_adj`, `us_income`, `us_balancesheet`, `us_cashflow`, `us_fina_indicator` |
 | Macro timing | `cn_schedule` alongside the domestic macro value interfaces, so point-in-time research can use publication dates |
+| Institutional research | `report_rc`, `etf_sh_cons`, `etf_sz_cons`, `ci_daily`, `shibor_quote`, `major_news` |
 | Global signals | `index_global`, `fx_obasic`, `fx_daily`, `us_tycr` |
-| Execution data | `margin_secs`, `idx_mins`, `etf_mins`, `ft_mins`, `opt_mins`, `stk_mins` |
+| Execution data | `margin_secs`, `idx_mins`, `etf_mins`, `ft_mins`, `opt_mins`, selected-stock `stk_mins` at 1 minute and all-listed-A-share `stk_mins` at 5 minutes |
 
-This is the required beginner-to-research platform scope, not a claim that every
-Tushare product is downloaded. Newly added premium specialty feeds, real-time feeds,
-all-market tick data and Level-2 remain separate opt-in products with their own storage,
+The reviewed offline historical target now has formal downloaders for all 211 selected
+Tushare interfaces. This is not a promise that future provider additions are implicitly
+enabled: the official catalog is reconciled as a dated release gate. Exchange Tick,
+transaction-level and Level-2 feeds remain external products with their own storage,
 permissions and cost controls.
 
-The domestic index bootstrap includes SSE 50, CSI 300, CSI 500 and CSI 1000. Weekly
-and monthly bars are derived locally from daily data instead of being downloaded again.
+Weekly and monthly bars are derived locally from daily data instead of being downloaded
+again.
 
 Hong Kong and US downloads always fetch the market master, calendar and requested
 daily price window. US income, balance-sheet and cash-flow history uses reporting-
@@ -69,6 +85,13 @@ The durable pipeline is deliberately split into separate jobs:
 
 Each stage has its own job, log, error and retry operation. Retrying a failed job keeps
 the original parameters and does not repeat already successful provider work units.
+As-of reference requests use reviewed daily, weekly or monthly refresh buckets. A new
+bucket creates a successor work unit without deleting the earlier file. Immutable old
+snapshots retain their original source manifest; a new snapshot selects the newest
+successful version per reference partition and records its bucket, cadence and source
+hash. Dated datasets also record `date_min` and `date_max`, and the snapshot-level
+coverage audit enumerates every dataset with observations before 2024.
+
 Paged Tushare interfaces are expanded lazily: the planner creates only page zero and
 adds another page only when the previous response is exactly full. A short non-empty
 page is accepted as the terminal page; a full final allowed page fails closed as a

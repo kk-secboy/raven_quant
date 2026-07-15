@@ -11,6 +11,7 @@ class DatasetDefinition:
     allow_empty: bool = False
     date_field: str | None = "trade_date"
     primary_key: tuple[str, ...] = ()
+    row_limit: int | None = None
 
 
 REFERENCE_FIELDS = {
@@ -28,6 +29,21 @@ REFERENCE_FIELDS = {
         "is_hs",
     ),
     "trade_cal": ("exchange", "cal_date", "is_open", "pretrade_date"),
+    "index_basic": (
+        "ts_code",
+        "name",
+        "fullname",
+        "market",
+        "publisher",
+        "index_type",
+        "category",
+        "base_date",
+        "base_point",
+        "list_date",
+        "weight_rule",
+        "desc",
+        "exp_date",
+    ),
 }
 
 CORE_DAILY: tuple[DatasetDefinition, ...] = (
@@ -83,6 +99,38 @@ CORE_DAILY: tuple[DatasetDefinition, ...] = (
     DatasetDefinition("suspend_d", "suspend_d", allow_empty=True),
     DatasetDefinition("stk_limit", "stk_limit", allow_empty=False),
     DatasetDefinition("limit_list_d", "limit_list_d", allow_empty=True),
+    DatasetDefinition(
+        "stk_premarket",
+        "stk_premarket",
+        (
+            "trade_date",
+            "ts_code",
+            "total_share",
+            "float_share",
+            "pre_close",
+            "up_limit",
+            "down_limit",
+        ),
+        allow_empty=True,
+        primary_key=("ts_code", "trade_date"),
+        row_limit=8_000,
+    ),
+    DatasetDefinition(
+        "stk_auction_o",
+        "stk_auction_o",
+        ("ts_code", "trade_date", "close", "open", "high", "low", "vol", "amount", "vwap"),
+        allow_empty=True,
+        primary_key=("ts_code", "trade_date"),
+        row_limit=10_000,
+    ),
+    DatasetDefinition(
+        "stk_auction_c",
+        "stk_auction_c",
+        ("ts_code", "trade_date", "close", "open", "high", "low", "vol", "amount", "vwap"),
+        allow_empty=True,
+        primary_key=("ts_code", "trade_date"),
+        row_limit=10_000,
+    ),
 )
 
 RESEARCH_DAILY: tuple[DatasetDefinition, ...] = (
@@ -119,7 +167,13 @@ CORPORATE_EVENTS: tuple[DatasetDefinition, ...] = (
     DatasetDefinition("namechange", "namechange", allow_empty=True, date_field="ann_date"),
     DatasetDefinition("dividend", "dividend", allow_empty=True, date_field="ann_date"),
     DatasetDefinition("repurchase", "repurchase", allow_empty=True, date_field="ann_date"),
-    DatasetDefinition("share_float", "share_float", allow_empty=True, date_field="ann_date"),
+    DatasetDefinition(
+        "share_float",
+        "share_float",
+        allow_empty=True,
+        date_field="float_date",
+        primary_key=("ts_code", "ann_date", "float_date", "holder_name", "share_type"),
+    ),
     DatasetDefinition("pledge_stat", "pledge_stat", allow_empty=True, date_field="end_date"),
     DatasetDefinition("pledge_detail", "pledge_detail", allow_empty=True, date_field="ann_date"),
     DatasetDefinition(
@@ -144,7 +198,49 @@ DISCLOSURE_FIELDS = (
     "modify_date",
 )
 
-INDEX_CODES = ("000016.SH", "000300.SH", "000905.SH", "000852.SH")
+# All markets documented by Tushare plus BSE, which the live endpoint exposes
+# even though it is not listed in the current market-code table.  Every market
+# is paginated because CSI currently contains more than the provider's legacy
+# 8,000-row default response ceiling.
+INDEX_CATALOG_MARKETS = ("MSCI", "CSI", "SSE", "SZSE", "CICC", "SW", "OTH", "BSE")
+INDEX_CATALOG_PAGE_SIZE = 1_000
+
+# Broad-market benchmarks required by the Web market view, Qlib benchmark
+# metadata and risk/regime analysis. Keep this as a concrete, reviewed
+# universe instead of silently treating the three CSI benchmarks as the whole
+# domestic index market.
+INDEX_CODES = (
+    "000001.SH",  # SSE Composite
+    "000016.SH",  # SSE 50
+    "000300.SH",  # CSI 300
+    "000688.SH",  # STAR 50
+    "000905.SH",  # CSI 500
+    "000852.SH",  # CSI 1000
+    "399001.SZ",  # Shenzhen Component
+    "399006.SZ",  # ChiNext
+    "899050.BJ",  # Beijing 50
+)
+
+INDEX_DAILY_BASIC = DatasetDefinition(
+    "index_dailybasic",
+    "index_dailybasic",
+    (
+        "trade_date",
+        "ts_code",
+        "total_mv",
+        "float_mv",
+        "total_share",
+        "float_share",
+        "free_share",
+        "turnover_rate",
+        "turnover_rate_f",
+        "pe",
+        "pe_ttm",
+        "pb",
+    ),
+    allow_empty=True,
+    primary_key=("ts_code", "trade_date"),
+)
 
 ALL_DEFINITIONS = {
     definition.name: definition
@@ -155,5 +251,6 @@ ALL_DEFINITIONS = {
         *FUNDAMENTALS,
         *CORPORATE_EVENTS,
         *INDUSTRY_CATALOG,
+        INDEX_DAILY_BASIC,
     )
 }

@@ -90,7 +90,12 @@ def test_data_finalize_stages_are_durable_idempotent_and_retryable(
     }
     verify = jobs.create("data_verify", payload, tmp_path / "verify.log")
     command, result, env = worker._command(verify)
-    assert command[-1] == "verify"
+    assert "verify" in command
+    assert command[-3:] == [
+        "--snapshot-end",
+        payload["end"],
+        "--allow-incomplete-plans",
+    ]
     assert result is None and env == {}
     jobs.finish(verify["id"], exit_code=0)
 
@@ -185,5 +190,6 @@ def test_chained_data_pipeline_keeps_each_download_and_build_as_separate_job(
 
 def test_full_snapshot_contract_keeps_execution_frequency_separate() -> None:
     assert "daily" in _profile_datasets("full")
+    assert {"stk_premarket", "stk_auction_o", "stk_auction_c"} <= _profile_datasets("full")
     assert MARGIN_DATASET not in _profile_datasets("full")
     assert not set(MINUTE_DATASETS).intersection(_profile_datasets("full"))
