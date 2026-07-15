@@ -11,7 +11,9 @@ from quant_data.config import Settings
 from quant_data.database import jobs, risk_events
 
 from .alert_store import AlertStore
+from .autonomous_research import AutonomousResearchOrchestrator
 from .broker_gateway import BrokerStore
+from .continuous_research import ContinuousResearchController
 from .data_rollover import (
     next_qlib_trading_date,
     select_execution_snapshot,
@@ -21,6 +23,8 @@ from .health_store import OperationalHealthStore
 from .job_store import JobStore
 from .pair_portfolio_store import PairPortfolioStore
 from .portfolio_store import PortfolioStore
+from .research_automation import normalize_research_schedule_payload
+from .research_store import ResearchStore
 from .runtime_secret_store import RuntimeSecretStore
 from .schedule_store import (
     RUNNABLE_PAIR_PORTFOLIO_STATUSES,
@@ -28,6 +32,17 @@ from .schedule_store import (
     ScheduleStore,
 )
 from .services import list_qlib_datasets
+
+AUTOMATED_DATA_BUNDLES = (
+    "cn_extended_daily",
+    "cn_funds",
+    "cn_macro",
+    "cn_futures",
+    "cn_options_bonds",
+    "hk_market",
+    "us_market",
+    "global_markets",
+)
 
 
 class SchedulerEngine:
@@ -37,6 +52,7 @@ class SchedulerEngine:
         self.settings = settings
         self.jobs = JobStore(settings.database_url)
         self.portfolios = PortfolioStore(settings.database_url)
+        self.research = ResearchStore(settings.database_url)
         self.pair_portfolios = PairPortfolioStore(settings.database_url)
         self.schedules = ScheduleStore(settings.database_url)
         self.alerts = AlertStore(settings.database_url)
@@ -45,6 +61,8 @@ class SchedulerEngine:
         self.runtime_secrets = RuntimeSecretStore(
             settings.database_url, settings.platform_secret_key
         )
+        self.autonomous_research = AutonomousResearchOrchestrator(settings)
+        self.continuous_research = ContinuousResearchController(settings)
 
     def tick(self, now: datetime | None = None) -> dict[str, int]:
         current = now or datetime.now(UTC)
@@ -56,6 +74,8 @@ class SchedulerEngine:
                 break
             self._process_run(run, current)
             processed += 1
+        program_result = self.continuous_research.tick(limit=5, now=current)
+        campaign_result = self.autonomous_research.tick(limit=10)
         projected = self.project_alerts()
         health_recorded = 0
         if self.health.due(current):
@@ -66,6 +86,13 @@ class SchedulerEngine:
         return {
             "materialized": materialized,
             "processed": processed,
+            "research_campaigns_processed": campaign_result["processed"],
+            "research_campaigns_deferred": campaign_result["deferred"],
+            "research_campaigns_failed": campaign_result["failed"],
+            "research_programs_checked": program_result["checked"],
+            "research_programs_created": program_result["created"],
+            "research_programs_deferred": program_result["deferred"],
+            "research_programs_failed": program_result["failed"],
             "alerts_projected": projected,
             "alerts_delivered": delivered,
             "health_recorded": health_recorded,
@@ -100,6 +127,12 @@ class SchedulerEngine:
         try:
             if run["kind"] == "incremental_sync":
                 job = self._enqueue_incremental(run, scheduled_for)
+            elif run["kind"] == "data_pipeline":
+                job = self._enqueue_data_pipeline(run, scheduled_for)
+            elif run["kind"] == "rdagent_research":
+                job = self._enqueue_research(run, scheduled_for)
+                if job is None:
+                    return
             elif run["kind"] == "paper_rebalance":
                 job = self._enqueue_portfolio(run, scheduled_for)
                 if job is None:
@@ -167,6 +200,144 @@ class SchedulerEngine:
             log_path,
             idempotency_key=f"schedule-run:{run['id']}",
         )
+
+    def _enqueue_data_pipeline(
+        self,
+        run: dict[str, Any],
+        scheduled_for: datetime,
+    ) -> dict[str, Any]:
+        stored = self.runtime_secrets.get("tushare")
+        if not stored and (not self.settings.api_url or not self.settings.token):
+            raise ValueError("Tushare credentials are not configured")
+        payload = run["payload"]
+        local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
+        lookback_days = max(1, min(90, int(payload.get("lookback_days", 7))))
+        snapshot_start = str(payload.get("snapshot_start", "2024-01-01"))
+        bundles = payload.get("bundles") or list(AUTOMATED_DATA_BUNDLES)
+        unknown = sorted(set(bundles) - set(AUTOMATED_DATA_BUNDLES))
+        if unknown:
+            raise ValueError(f"unsupported automated data bundles: {unknown}")
+        incremental_start = (local_date - timedelta(days=lookback_days)).isoformat()
+        snapshot_name = f"cn-{snapshot_start.replace('-', '')}-{local_date:%Y%m%d}"
+        pipeline_steps = [
+            {
+                "kind": f"supplemental_{bundle}",
+                "payload": {
+                    "bundle": bundle,
+                    "start": incremental_start,
+                    "end": "latest",
+                    "symbols": [],
+                },
+            }
+            for bundle in bundles
+        ]
+        pipeline_steps.extend(
+            {"kind": kind, "payload": {}}
+            for kind in ("data_verify", "data_snapshot", "data_qlib", "qlib_baseline")
+        )
+        pipeline_id = f"schedule-run:{run['id']}"
+        log_path = (
+            self.settings.data_root
+            / "platform"
+            / "logs"
+            / f"scheduled-pipeline-{run['id']}.log"
+        )
+        return self.jobs.create(
+            "bootstrap",
+            {
+                "profile": payload.get("profile", "full"),
+                "start": incremental_start,
+                "end": "latest",
+                "build_qlib": False,
+                "finalize_after_download": False,
+                "pipeline_id": pipeline_id,
+                "pipeline_steps": pipeline_steps,
+                "pipeline_next_index": 0,
+                "snapshot_start": snapshot_start,
+                "snapshot_end": local_date.isoformat(),
+                "snapshot_name": snapshot_name,
+            },
+            log_path,
+            idempotency_key=pipeline_id,
+        )
+
+    def _enqueue_research(
+        self,
+        run: dict[str, Any],
+        scheduled_for: datetime,
+    ) -> dict[str, Any] | None:
+        payload = normalize_research_schedule_payload(
+            run["payload"], max_loops=self.settings.rdagent_max_loops
+        )
+        datasets = {item["name"]: item for item in list_qlib_datasets(self.settings.data_root)}
+        dataset = datasets.get(payload["dataset"])
+        if not dataset or not dataset["ready"] or not dataset.get("reproducible"):
+            raise ValueError("scheduled RD-Agent research Qlib dataset is not reproducible")
+        periods = payload["periods"]
+        if dataset.get("start_date") and periods["train_start"] < dataset["start_date"]:
+            raise ValueError("scheduled RD-Agent training window starts before the dataset")
+        if dataset.get("end_date") and periods["test_end"] > dataset["end_date"]:
+            raise ValueError("scheduled RD-Agent test window ends after the dataset")
+        if run["trading_days_only"]:
+            local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date().isoformat()
+            calendar = set(
+                (Path(dataset["path"]) / "calendars" / "day.txt")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            )
+            if local_date not in calendar:
+                self.schedules.finish_run(
+                    run["id"], "skipped", message="not a Qlib trading day"
+                )
+                return None
+        artifact_root = self.settings.data_root / "artifacts" / "rdagent"
+        try:
+            research_run = self.research.create_run(
+                kind="factor",
+                objective=payload["objective"],
+                dataset=payload["dataset"],
+                requested_by=payload["requested_by"],
+                budget={"loop_n": payload["loop_n"], "duration": payload["duration"]},
+                config={"periods": periods, "dataset_path": dataset["path"]},
+                artifact_path=artifact_root,
+            )
+        except ValueError as exc:
+            if "active factor research run" not in str(exc):
+                raise
+            self.schedules.finish_run(
+                run["id"],
+                "skipped",
+                message="a bounded factor research run is already active",
+            )
+            return None
+        log_path = (
+            self.settings.data_root
+            / "platform"
+            / "logs"
+            / f"rdagent-factor-{research_run['id']}.log"
+        )
+        try:
+            job = self.jobs.create(
+                "rdagent_factor",
+                {
+                    "research_run_id": research_run["id"],
+                    "dataset": payload["dataset"],
+                    "dataset_path": dataset["path"],
+                    "objective": payload["objective"],
+                    "loop_n": payload["loop_n"],
+                    "duration": payload["duration"],
+                    "periods": periods,
+                },
+                log_path,
+                idempotency_key=f"schedule-run:{run['id']}",
+            )
+        except Exception as exc:
+            self.research.mark_run(
+                research_run["id"], "failed", actor="scheduler", error=str(exc)
+            )
+            raise
+        self.research.attach_job(research_run["id"], job["id"])
+        return job
 
     def _enqueue_portfolio(
         self,

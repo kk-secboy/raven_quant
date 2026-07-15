@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from .factor_evaluator import normalize_series
+from .portfolio_optimizer import optimize_benchmark_relative_weights
 
 
 def compose_factor_scores(
@@ -122,6 +123,10 @@ def simulate_long_only_topk(
     style_exposures: pd.DataFrame | None = None,
     max_industry_deviation: float = 1.0,
     max_size_deviation: float = 10.0,
+    portfolio_construction: str = "topk_equal_weight",
+    optimizer_alpha_weight: float = 0.05,
+    optimizer_tracking_penalty: float = 1.0,
+    optimizer_turnover_penalty: float = 0.10,
     min_average_daily_amount: float = 0.0,
     liquidity_lookback_days: int = 20,
     min_commission: float = 0.0,
@@ -145,6 +150,10 @@ def simulate_long_only_topk(
         raise ValueError("max industry weight must be between zero and one")
     if not 0 <= max_industry_deviation <= 1 or max_size_deviation < 0:
         raise ValueError("benchmark exposure limits are invalid")
+    if portfolio_construction not in {"topk_equal_weight", "benchmark_relative_qp"}:
+        raise ValueError("portfolio construction method is invalid")
+    if min(optimizer_alpha_weight, optimizer_tracking_penalty, optimizer_turnover_penalty) < 0:
+        raise ValueError("optimizer objective weights must be non-negative")
     if portfolio_notional <= 0 or not 0 < max_volume_participation <= 1:
         raise ValueError("capacity notional and volume participation must be positive")
     if min_average_daily_amount < 0 or liquidity_lookback_days < 2 or min_commission < 0:
@@ -173,6 +182,12 @@ def simulate_long_only_topk(
     memberships = _normalize_industry_memberships(industry_memberships)
     benchmark_weight_frame = _normalize_benchmark_weights(benchmark_weights)
     style_frame = _normalize_style_exposures(style_exposures)
+    if portfolio_construction == "benchmark_relative_qp" and any(
+        item is None for item in (memberships, benchmark_weight_frame, style_frame)
+    ):
+        raise ValueError(
+            "benchmark-relative optimization requires industry, benchmark, and style metadata"
+        )
     observations = pd.concat([score, label], axis=1, join="inner").dropna()
     benchmark = benchmark_returns.copy()
     benchmark.index = pd.to_datetime(benchmark.index).tz_localize(None)
@@ -196,6 +211,13 @@ def simulate_long_only_topk(
     drawdown_reduction_count = 0
     drawdown_liquidation_count = 0
     daily_loss_pause_count = 0
+    optimizer_objectives: list[float] = []
+    optimizer_tracking_proxies: list[float] = []
+    optimizer_active_shares: list[float] = []
+    optimizer_expected_turnovers: list[float] = []
+    optimizer_industry_deviations: list[float] = []
+    optimizer_size_deviations: list[float] = []
+    optimizer_iterations: list[int] = []
     for timestamp, group in observations.groupby(level="datetime", sort=True):
         if timestamp not in benchmark.index or len(group) < topk:
             continue
@@ -229,6 +251,12 @@ def simulate_long_only_topk(
             if not daily_benchmark.empty
             else pd.Series(dtype=float)
         )
+        benchmark_styles = _styles_at(style_frame, timestamp, daily_benchmark.index)
+        benchmark_size = (
+            float(daily_benchmark.dot(benchmark_styles.reindex(daily_benchmark.index)))
+            if not daily_benchmark.empty and style_frame is not None
+            else None
+        )
         selected = _select_with_industry_cap(
             candidate_order,
             industries,
@@ -238,8 +266,41 @@ def simulate_long_only_topk(
             max_industry_deviation=max_industry_deviation,
             require_industry=memberships is not None,
         )
-        target_weight = min(1.0 / topk, max_position_weight)
-        target = pd.Series(target_weight, index=selected, dtype=float)
+        optimizer_result = None
+        if portfolio_construction == "benchmark_relative_qp":
+            if benchmark_size is None:
+                raise ValueError("benchmark-relative optimization has no benchmark style exposure")
+            optimizer_result = optimize_benchmark_relative_weights(
+                ranking.reindex(selected),
+                daily_benchmark,
+                current,
+                industries=all_industries.reindex(selected),
+                benchmark_industry_weights=benchmark_industries,
+                style_exposures=daily_styles.reindex(selected),
+                benchmark_style_exposure=benchmark_size,
+                max_position_weight=max_position_weight,
+                max_industry_weight=max_industry_weight,
+                max_industry_deviation=max_industry_deviation,
+                max_size_deviation=max_size_deviation,
+                alpha_weight=optimizer_alpha_weight,
+                tracking_penalty=optimizer_tracking_penalty,
+                turnover_penalty=optimizer_turnover_penalty,
+            )
+            target = optimizer_result.weights
+            optimizer_objectives.append(optimizer_result.objective)
+            optimizer_tracking_proxies.append(optimizer_result.tracking_risk_proxy)
+            optimizer_active_shares.append(optimizer_result.active_share)
+            optimizer_expected_turnovers.append(optimizer_result.expected_turnover)
+            if optimizer_result.max_industry_deviation is not None:
+                optimizer_industry_deviations.append(
+                    optimizer_result.max_industry_deviation
+                )
+            if optimizer_result.size_deviation is not None:
+                optimizer_size_deviations.append(optimizer_result.size_deviation)
+            optimizer_iterations.append(optimizer_result.iterations)
+        else:
+            target_weight = min(1.0 / topk, max_position_weight)
+            target = pd.Series(target_weight, index=selected, dtype=float)
         daily_stop_loss_exits = 0
         daily_partial_take_profit_exits = 0
         daily_full_take_profit_exits = 0
@@ -442,12 +503,6 @@ def simulate_long_only_topk(
         portfolio_size = float(
             next_weights.dot(daily_styles.reindex(next_weights.index).fillna(0.0))
         )
-        benchmark_styles = _styles_at(style_frame, timestamp, daily_benchmark.index)
-        benchmark_size = (
-            float(daily_benchmark.dot(benchmark_styles.reindex(daily_benchmark.index).fillna(0.0)))
-            if not daily_benchmark.empty and style_frame is not None
-            else None
-        )
         size_deviation = (
             abs(portfolio_size - benchmark_size) if benchmark_size is not None else None
         )
@@ -475,6 +530,35 @@ def simulate_long_only_topk(
                 "daily_loss_breached": daily_loss_breached,
                 "portfolio_risk_action": portfolio_risk_action,
                 "portfolio_risk_state": portfolio_risk_state,
+                "optimizer_objective": (
+                    optimizer_result.objective if optimizer_result is not None else None
+                ),
+                "optimizer_tracking_risk_proxy": (
+                    optimizer_result.tracking_risk_proxy
+                    if optimizer_result is not None
+                    else None
+                ),
+                "optimizer_active_share": (
+                    optimizer_result.active_share if optimizer_result is not None else None
+                ),
+                "optimizer_expected_turnover": (
+                    optimizer_result.expected_turnover
+                    if optimizer_result is not None
+                    else None
+                ),
+                "optimizer_industry_deviation": (
+                    optimizer_result.max_industry_deviation
+                    if optimizer_result is not None
+                    else None
+                ),
+                "optimizer_size_deviation": (
+                    optimizer_result.size_deviation
+                    if optimizer_result is not None
+                    else None
+                ),
+                "optimizer_iterations": (
+                    optimizer_result.iterations if optimizer_result is not None else None
+                ),
             }
         )
         for instrument, weight in next_weights.items():
@@ -608,6 +692,35 @@ def simulate_long_only_topk(
             if execution_risk_enabled
             else None
         ),
+        "portfolio_construction": portfolio_construction,
+        "optimizer_days": len(optimizer_objectives),
+        "optimizer_execution_replay_enforced": (
+            portfolio_construction == "benchmark_relative_qp"
+            and len(optimizer_objectives) == len(daily_rows)
+        ),
+        "optimizer_mean_objective": (
+            float(np.mean(optimizer_objectives)) if optimizer_objectives else None
+        ),
+        "optimizer_max_tracking_risk_proxy": (
+            max(optimizer_tracking_proxies) if optimizer_tracking_proxies else None
+        ),
+        "optimizer_mean_active_share": (
+            float(np.mean(optimizer_active_shares)) if optimizer_active_shares else None
+        ),
+        "optimizer_mean_expected_turnover": (
+            float(np.mean(optimizer_expected_turnovers))
+            if optimizer_expected_turnovers
+            else None
+        ),
+        "optimizer_max_industry_deviation": (
+            max(optimizer_industry_deviations)
+            if optimizer_industry_deviations
+            else None
+        ),
+        "optimizer_max_size_deviation": (
+            max(optimizer_size_deviations) if optimizer_size_deviations else None
+        ),
+        "optimizer_max_iterations": max(optimizer_iterations) if optimizer_iterations else None,
     }
     daily = daily.assign(nav=nav, benchmark_nav=benchmark_nav, drawdown=drawdown)
     return metrics, daily, positions
@@ -659,6 +772,16 @@ def run_robustness_suite(
             "max_industry_weight": float(config.get("max_industry_weight", 1.0)),
             "max_industry_deviation": float(config.get("max_industry_deviation", 1.0)),
             "max_size_deviation": float(config.get("max_size_deviation", 10.0)),
+            "portfolio_construction": str(
+                config.get("portfolio_construction", "topk_equal_weight")
+            ),
+            "optimizer_alpha_weight": float(config.get("optimizer_alpha_weight", 0.05)),
+            "optimizer_tracking_penalty": float(
+                config.get("optimizer_tracking_penalty", 1.0)
+            ),
+            "optimizer_turnover_penalty": float(
+                config.get("optimizer_turnover_penalty", 0.10)
+            ),
             "min_average_daily_amount": float(config.get("min_average_daily_amount", 0.0)),
             "liquidity_lookback_days": int(config.get("liquidity_lookback_days", 20)),
             "min_commission": float(config.get("min_commission", 0.0)),
@@ -1158,6 +1281,16 @@ def _simulation_config(config: dict[str, Any]) -> dict[str, Any]:
         "max_industry_weight": float(config.get("max_industry_weight", 1.0)),
         "max_industry_deviation": float(config.get("max_industry_deviation", 1.0)),
         "max_size_deviation": float(config.get("max_size_deviation", 10.0)),
+        "portfolio_construction": str(
+            config.get("portfolio_construction", "topk_equal_weight")
+        ),
+        "optimizer_alpha_weight": float(config.get("optimizer_alpha_weight", 0.05)),
+        "optimizer_tracking_penalty": float(
+            config.get("optimizer_tracking_penalty", 1.0)
+        ),
+        "optimizer_turnover_penalty": float(
+            config.get("optimizer_turnover_penalty", 0.10)
+        ),
         "min_average_daily_amount": float(config.get("min_average_daily_amount", 0.0)),
         "liquidity_lookback_days": int(config.get("liquidity_lookback_days", 20)),
         "min_commission": float(config.get("min_commission", 0.0)),

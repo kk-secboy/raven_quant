@@ -14,10 +14,54 @@ import pandas as pd
 
 from .path_utils import to_wsl_path as _to_wsl_path
 
+_BASE_QLIB_FIELDS = (
+    "open",
+    "high",
+    "low",
+    "close",
+    "vwap",
+    "volume",
+    "factor",
+    "change",
+    "amount",
+    "paused",
+    "up_limit",
+    "down_limit",
+)
+
+_DAILY_RESEARCH_FIELDS = (
+    "turnover_rate",
+    "turnover_rate_f",
+    "volume_ratio",
+    "pe_ttm",
+    "pb",
+    "ps_ttm",
+    "dv_ttm",
+    "total_mv",
+    "circ_mv",
+)
+
+_FUNDAMENTAL_RESEARCH_FIELDS = {
+    "roe": "fund_roe",
+    "roa": "fund_roa",
+    "grossprofit_margin": "fund_grossprofit_margin",
+    "debt_to_assets": "fund_debt_to_assets",
+    "current_ratio": "fund_current_ratio",
+    "or_yoy": "fund_revenue_yoy",
+    "netprofit_yoy": "fund_netprofit_yoy",
+    "q_sales_yoy": "fund_quarter_revenue_yoy",
+    "q_profit_yoy": "fund_quarter_profit_yoy",
+}
+
 
 class QlibBuilder:
     def __init__(self, snapshot_path: Path) -> None:
         self.snapshot_path = snapshot_path.resolve()
+        self.research_feature_contract = self._research_feature_contract()
+
+    @property
+    def qlib_fields(self) -> tuple[str, ...]:
+        return (*_BASE_QLIB_FIELDS, *self.research_feature_contract["fields"])
 
     def build_staging(self, staging_path: Path) -> Path:
         daily_glob = self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet"
@@ -135,7 +179,7 @@ class QlibBuilder:
                 "--symbol_field_name",
                 "symbol",
                 "--include_fields",
-                "open,high,low,close,vwap,volume,factor,change,amount,paused,up_limit,down_limit",
+                ",".join(self.qlib_fields),
                 "--max_workers",
                 str(max_workers),
             ]
@@ -167,21 +211,12 @@ class QlibBuilder:
             (self.snapshot_path / "manifest.json").read_text(encoding="utf-8")
         )
         builder_digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-        fields = [
-            "open",
-            "high",
-            "low",
-            "close",
-            "vwap",
-            "volume",
-            "factor",
-            "change",
-            "amount",
-            "paused",
-            "up_limit",
-            "down_limit",
-        ]
-        contract = {"frequency": "day", "fields": fields}
+        fields = list(self.qlib_fields)
+        contract = {
+            "frequency": "day",
+            "fields": fields,
+            "research_features": self.research_feature_contract,
+        }
         contract_sha256 = hashlib.sha256(
             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -210,6 +245,7 @@ class QlibBuilder:
             "qlib_builder_sha256": builder_digest,
             "frequency": "day",
             "fields": fields,
+            "research_features": self.research_feature_contract,
         }
         canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         provenance = {
@@ -228,6 +264,10 @@ class QlibBuilder:
         target = qlib_dir / "metadata" / "provenance.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8")
+        (target.parent / "research_feature_contract.json").write_text(
+            json.dumps(self.research_feature_contract, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def _snapshot_manifest_digest(self) -> str:
         snapshot_manifest = self.snapshot_path / "manifest.json"
@@ -413,14 +453,146 @@ class QlibBuilder:
                     styles.to_parquet(target / "style_exposures.parquet", index=False)
                     wrote_metadata = True
 
+        if self._write_market_context_metadata(target):
+            wrote_metadata = True
+
         if not wrote_metadata and target.exists() and not any(target.iterdir()):
             target.rmdir()
 
-    @staticmethod
-    def _normalized_query(daily_glob: Path, adj_glob: Path, limit_glob: Path) -> str:
+    def _write_market_context_metadata(self, target: Path) -> bool:
+        """Store non-equity daily context once, without copying it into every stock."""
+
+        definitions = {
+            "index_global": (
+                ("trade_date", "date"),
+                ("close", "pct_chg", "vol", "amount"),
+            ),
+            "fx_daily": (
+                ("trade_date", "date"),
+                ("bid_open", "bid_close", "ask_open", "ask_close", "tick_qty"),
+            ),
+            "fut_daily": (
+                ("trade_date", "date"),
+                ("close", "settle", "vol", "amount", "oi"),
+            ),
+            "shibor": (
+                ("date",),
+                ("on", "1w", "2w", "1m", "3m", "6m", "9m", "1y"),
+            ),
+            "shibor_lpr": (("date",), ("1y", "5y")),
+            "us_tycr": (
+                ("date",),
+                ("m1", "m2", "m3", "m6", "y1", "y2", "y3", "y5", "y7", "y10", "y20", "y30"),
+            ),
+        }
+        chunks: list[pd.DataFrame] = []
+        sources: dict[str, dict[str, object]] = {}
+        for dataset, (date_candidates, value_candidates) in definitions.items():
+            root = self.snapshot_path / "parquet" / dataset
+            files = sorted(root.rglob("*.parquet")) if root.exists() else []
+            if not files:
+                continue
+            frame = pd.concat([pd.read_parquet(path) for path in files], ignore_index=True)
+            date_field = next((name for name in date_candidates if name in frame.columns), None)
+            value_fields = [name for name in value_candidates if name in frame.columns]
+            if date_field is None or not value_fields:
+                continue
+            instrument = (
+                frame["ts_code"].astype("string")
+                if "ts_code" in frame.columns
+                else pd.Series(dataset, index=frame.index, dtype="string")
+            )
+            normalized = frame[value_fields].apply(pd.to_numeric, errors="coerce")
+            normalized.insert(0, "instrument", instrument)
+            normalized.insert(0, "datetime", pd.to_datetime(frame[date_field], errors="coerce"))
+            long = normalized.melt(
+                id_vars=["datetime", "instrument"],
+                var_name="feature",
+                value_name="value",
+            ).dropna(subset=["datetime", "instrument", "value"])
+            if long.empty:
+                continue
+            long.insert(1, "source", dataset)
+            chunks.append(long)
+            sources[dataset] = {
+                "date_field": date_field,
+                "features": value_fields,
+                "availability": "same_timestamp_after_close",
+            }
+        if not chunks:
+            return False
+        context = pd.concat(chunks, ignore_index=True)
+        context.drop_duplicates(
+            ["datetime", "source", "instrument", "feature"], keep="last", inplace=True
+        )
+        context.sort_values(["datetime", "source", "instrument", "feature"], inplace=True)
+        target.mkdir(parents=True, exist_ok=True)
+        context.to_parquet(target / "market_context.parquet", index=False, compression="zstd")
+        (target / "market_context_contract.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "join_policy": "asof_backward_or_exact_for_next_period_signals",
+                    "sources": sources,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return True
+
+    def _normalized_query(self, daily_glob: Path, adj_glob: Path, limit_glob: Path) -> str:
         daily = _sql_string(str(daily_glob.resolve()))
         adj = _sql_string(str(adj_glob.resolve()))
         limits = _sql_string(str(limit_glob.resolve()))
+        daily_features = self.research_feature_contract["daily_fields"]
+        fundamental_features = self.research_feature_contract["fundamental_fields"]
+        daily_basic_root = self.snapshot_path / "parquet" / "daily_basic"
+        fina_indicator_root = self.snapshot_path / "parquet" / "fina_indicator"
+
+        joined_daily_select = ""
+        daily_join = ""
+        if daily_features:
+            daily_basic = _sql_string(
+                str((daily_basic_root / "**" / "*.parquet").resolve())
+            )
+            joined_daily_select = "".join(
+                f"\n                    , try_cast(db.{field} AS DOUBLE) AS {field}"
+                for field in daily_features
+            )
+            daily_join = f"""
+                LEFT JOIN read_parquet({daily_basic}, hive_partitioning=true) db
+                  ON d.ts_code = db.ts_code
+                 AND try_cast(d.trade_date AS DATE) = try_cast(db.trade_date AS DATE)
+            """
+
+        joined_fundamental_select = ""
+        fundamental_join = ""
+        if fundamental_features:
+            fina_indicator = _sql_string(
+                str((fina_indicator_root / "**" / "*.parquet").resolve())
+            )
+            joined_fundamental_select = "".join(
+                f"\n                    , try_cast(fi.{source} AS DOUBLE) AS {target}"
+                for source, target in fundamental_features.items()
+            )
+            projected = ", ".join(
+                ["ts_code", "ann_date", "end_date", *fundamental_features]
+            )
+            fundamental_join = f"""
+                ASOF LEFT JOIN (
+                    SELECT {projected}
+                    FROM read_parquet({fina_indicator}, hive_partitioning=true)
+                    WHERE ts_code IS NOT NULL AND try_cast(ann_date AS DATE) IS NOT NULL
+                    QUALIFY row_number() OVER (
+                        PARTITION BY ts_code, try_cast(ann_date AS DATE)
+                        ORDER BY try_cast(end_date AS DATE) DESC NULLS LAST
+                    ) = 1
+                ) fi
+                  ON d.ts_code = fi.ts_code
+                 AND try_cast(d.trade_date AS DATE) > try_cast(fi.ann_date AS DATE)
+            """
         return f"""
             WITH joined AS (
                 SELECT
@@ -435,8 +607,10 @@ class QlibBuilder:
                     d.pct_chg,
                     a.adj_factor,
                     l.up_limit,
-                    l.down_limit,
-                    first_value(d.close * a.adj_factor) OVER (
+                    l.down_limit
+                    {joined_daily_select}
+                    {joined_fundamental_select}
+                    , first_value(d.close * a.adj_factor) OVER (
                         PARTITION BY d.ts_code ORDER BY d.trade_date
                     ) AS base_price
                 FROM read_parquet({daily}, hive_partitioning=true) d
@@ -444,6 +618,8 @@ class QlibBuilder:
                   ON d.ts_code = a.ts_code AND d.trade_date = a.trade_date
                 LEFT JOIN read_parquet({limits}, hive_partitioning=true) l
                   ON d.ts_code = l.ts_code AND d.trade_date = l.trade_date
+                {daily_join}
+                {fundamental_join}
                 WHERE d.ts_code IS NOT NULL AND d.close IS NOT NULL
             )
             SELECT
@@ -465,9 +641,45 @@ class QlibBuilder:
                 CASE WHEN vol IS NULL OR vol <= 0 THEN 1.0 ELSE 0.0 END AS paused
                 , up_limit * adj_factor / base_price AS up_limit
                 , down_limit * adj_factor / base_price AS down_limit
+                {''.join(f', {field}' for field in daily_features)}
+                {''.join(f', {field}' for field in fundamental_features.values())}
             FROM joined
             WHERE adj_factor IS NOT NULL AND adj_factor > 0 AND base_price > 0
         """
+
+    def _research_feature_contract(self) -> dict[str, object]:
+        daily_columns = self._parquet_columns("daily_basic")
+        fundamental_columns = self._parquet_columns("fina_indicator")
+        daily_fields = [field for field in _DAILY_RESEARCH_FIELDS if field in daily_columns]
+        fundamental_fields = {
+            source: target
+            for source, target in _FUNDAMENTAL_RESEARCH_FIELDS.items()
+            if source in fundamental_columns
+        }
+        return {
+            "version": 1,
+            "daily_fields": daily_fields,
+            "fundamental_fields": fundamental_fields,
+            "fields": [*daily_fields, *fundamental_fields.values()],
+            "availability_policy": {
+                "daily_basic": "same_trade_date_after_close",
+                "fina_indicator": "strictly_after_announcement_date",
+            },
+        }
+
+    def _parquet_columns(self, dataset: str) -> set[str]:
+        root = self.snapshot_path / "parquet" / dataset
+        if not root.exists() or not any(root.rglob("*.parquet")):
+            return set()
+        glob = _sql_string(str((root / "**" / "*.parquet").resolve()))
+        connection = duckdb.connect()
+        try:
+            rows = connection.execute(
+                f"DESCRIBE SELECT * FROM read_parquet({glob}, hive_partitioning=true)"
+            ).fetchall()
+        finally:
+            connection.close()
+        return {str(row[0]) for row in rows}
 
     @staticmethod
     def _missing_market_controls_query(daily_glob: Path, adj_glob: Path, limit_glob: Path) -> str:

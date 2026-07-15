@@ -199,6 +199,16 @@ def main() -> None:
         style_exposures=style_exposures,
         max_industry_deviation=float(config.get("max_industry_deviation", 1.0)),
         max_size_deviation=float(config.get("max_size_deviation", 10.0)),
+        portfolio_construction=str(
+            config.get("portfolio_construction", "topk_equal_weight")
+        ),
+        optimizer_alpha_weight=float(config.get("optimizer_alpha_weight", 0.05)),
+        optimizer_tracking_penalty=float(
+            config.get("optimizer_tracking_penalty", 1.0)
+        ),
+        optimizer_turnover_penalty=float(
+            config.get("optimizer_turnover_penalty", 0.10)
+        ),
         portfolio_notional=float(config["capacity_notional"]),
         max_volume_participation=float(config["max_volume_participation"]),
         execution_risk_enabled=True,

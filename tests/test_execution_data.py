@@ -147,6 +147,39 @@ def test_execution_data_api_and_worker_commands(
     monkeypatch.setenv("PLATFORM_SECRET_KEY", key)
     monkeypatch.setenv("TUSHARE_API_URL", "https://api.tushare.pro")
     monkeypatch.setenv("TUSHARE_TOKEN", "fixture-token")
+    snapshot = tmp_path / "data" / "snapshots" / "execution-fixture"
+    snapshot.mkdir(parents=True)
+    (snapshot / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": "execution-fixture",
+                "frequency": "1min",
+                "datasets": {"etf_1m": {"rows": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    minute_dataset = tmp_path / "data" / "qlib" / "execution-fixture-1min"
+    (minute_dataset / "calendars").mkdir(parents=True)
+    (minute_dataset / "instruments").mkdir()
+    (minute_dataset / "features").mkdir()
+    (minute_dataset / "metadata").mkdir()
+    (minute_dataset / "calendars" / "1min.txt").write_text(
+        "2024-01-02 09:31:00\n2024-01-31 15:00:00\n", encoding="utf-8"
+    )
+    (minute_dataset / "instruments" / "all.txt").write_text(
+        "SH510300\t2024-01-02 09:31:00\t2024-01-31 15:00:00\n", encoding="utf-8"
+    )
+    (minute_dataset / "metadata" / "provenance.json").write_text(
+        json.dumps(
+            {
+                "frequency": "1min",
+                "dataset_identity_sha256": "a" * 64,
+                "snapshot_manifest_sha256": "b" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
     app = create_app(tmp_path)
     with TestClient(app) as client:
         margin = client.post(
@@ -178,10 +211,25 @@ def test_execution_data_api_and_worker_commands(
                 "symbols": ["00700.HK", "00941.HK"],
             },
         )
+        minute_qlib = client.post(
+            "/api/jobs/minute-qlib",
+            json={"snapshot_name": "execution-fixture"},
+        )
+        minute_research = client.post(
+            "/api/jobs/minute-research",
+            json={
+                "dataset": "execution-fixture-1min",
+                "start": "2024-01-02",
+                "end": "2024-01-31",
+                "horizons": [5, 15],
+            },
+        )
     assert margin.status_code == 202
     assert intraday.status_code == 202
     assert supplemental.status_code == 202
     assert market.status_code == 202
+    assert minute_qlib.status_code == 202
+    assert minute_research.status_code == 202
 
     settings = Settings(
         api_url="",
@@ -203,6 +251,12 @@ def test_execution_data_api_and_worker_commands(
         supplemental.json()
     )
     market_command, market_result, market_env = worker._command(market.json())
+    minute_qlib_command, minute_qlib_result, minute_qlib_env = worker._command(
+        minute_qlib.json()
+    )
+    minute_research_command, minute_research_result, minute_research_env = worker._command(
+        minute_research.json()
+    )
     assert "margin-eligibility" in margin_command
     assert "core-intraday" in intraday_command
     assert margin_result.name == "result.json"
@@ -222,6 +276,37 @@ def test_execution_data_api_and_worker_commands(
     assert "00700.HK,00941.HK" in market_command
     assert market_result.name == "result.json"
     assert market_env == margin_env
+    assert "build-minute-qlib" in minute_qlib_command
+    assert "execution-fixture" in minute_qlib_command
+    assert "execution-fixture-1min" in minute_qlib_command
+    assert minute_qlib_result is None
+    assert minute_qlib_env == {}
+    assert any("run_minute_factor_research.py" in item for item in minute_research_command)
+    assert "5,15" in minute_research_command
+    assert minute_research_result.name == "result.json"
+    assert minute_research_env == {}
+
+
+def test_minute_qlib_api_rejects_daily_snapshot(
+    tmp_path: Path, monkeypatch, database_url: str
+) -> None:
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
+    snapshot = tmp_path / "data" / "snapshots" / "daily-fixture"
+    snapshot.mkdir(parents=True)
+    (snapshot / "manifest.json").write_text(
+        json.dumps({"name": "daily-fixture", "frequency": "day", "datasets": {}}),
+        encoding="utf-8",
+    )
+
+    with TestClient(create_app(tmp_path)) as client:
+        response = client.post(
+            "/api/jobs/minute-qlib",
+            json={"snapshot_name": "daily-fixture"},
+        )
+
+    assert response.status_code == 409
+    assert "1min" in response.json()["detail"]
 
 
 def test_completed_supplemental_job_can_be_created_again_for_missing_units(

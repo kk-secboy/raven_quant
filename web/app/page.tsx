@@ -6,11 +6,14 @@ import { BacktestPanel } from "./backtest-panel";
 import { DataTask, DataTaskCenter } from "./data-task-center";
 import { AuthPanel, AuthState } from "./auth-panel";
 import { FactorLibraryPanel } from "./factor-library-panel";
+import { JobRunCenter } from "./job-run-center";
+import { MarketOverviewPanel } from "./market-overview-panel";
 import { PortfolioPanel } from "./portfolio-panel";
 import { OperationsPanel } from "./operations-panel";
 import { PairTradingPanel } from "./pair-trading-panel";
 import { QlibPanel } from "./qlib-panel";
 import { RDAgentPanel } from "./rdagent-panel";
+import { ResearchCampaignPanel } from "./research-campaign-panel";
 import { SettingsPanel } from "./settings-panel";
 
 type Overview = {
@@ -67,22 +70,24 @@ type RetentionPlan = {
 
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8765";
 const navGroups = [
-  { label: "主页", items: [{ index: 0, label: "总览" }] },
-  { label: "数据与研究", items: [{ index: 1, label: "数据中心" }, { index: 2, label: "Qlib 研究" }, { index: 3, label: "RD-Agent" }, { index: 4, label: "因子库" }] },
-  { label: "策略与交易", items: [{ index: 5, label: "回测" }, { index: 6, label: "配对交易" }, { index: 7, label: "模拟组合" }] },
-  { label: "系统", items: [{ index: 8, label: "任务与告警" }, { index: 9, label: "系统设置" }] },
+  { label: "主页", items: [{ index: 0, label: "总览" }, { index: 11, label: "行情总览" }] },
+  { label: "数据与研究", items: [{ index: 1, label: "数据中心" }, { index: 2, label: "Qlib 研究" }, { index: 3, label: "RD-Agent" }, { index: 4, label: "自动研究" }, { index: 5, label: "因子库" }] },
+  { label: "策略与交易", items: [{ index: 6, label: "回测" }, { index: 7, label: "配对交易" }, { index: 8, label: "模拟组合" }] },
+  { label: "系统", items: [{ index: 9, label: "任务与告警" }, { index: 10, label: "系统设置" }] },
 ];
 const headings: Record<number, [string, string]> = {
   0: ["QUANTLAB / WORKSPACE", "总览"],
   1: ["DATA OPERATIONS / A-SHARE", "数据中心"],
   2: ["MODEL RESEARCH / QLIB", "Qlib 研究"],
   3: ["AUTONOMOUS RESEARCH / GOVERNED", "RD-Agent 研究"],
-  4: ["FACTOR GOVERNANCE / REGISTRY", "因子库"],
-  5: ["STRATEGY RESEARCH / RISK GATES", "策略回测"],
-  6: ["STATISTICAL ARBITRAGE / MINUTE EXECUTION", "配对交易"],
-  7: ["PAPER EXECUTION / ATOMIC LEDGER", "模拟组合"],
-  8: ["AUTOMATION / ALERTS / RECOVERY", "任务与告警"],
-  9: ["SERVER CONFIGURATION / ENCRYPTED", "系统设置"],
+  4: ["RESEARCH AUTOPILOT / GOVERNED PIPELINE", "自动研究"],
+  5: ["FACTOR GOVERNANCE / REGISTRY", "因子库"],
+  6: ["STRATEGY RESEARCH / RISK GATES", "策略回测"],
+  7: ["STATISTICAL ARBITRAGE / MINUTE EXECUTION", "配对交易"],
+  8: ["PAPER EXECUTION / ATOMIC LEDGER", "模拟组合"],
+  9: ["AUTOMATION / ALERTS / RECOVERY", "任务与告警"],
+  10: ["SERVER CONFIGURATION / ENCRYPTED", "系统设置"],
+  11: ["MARKET INTELLIGENCE / RESEARCH SNAPSHOT", "行情总览"],
 };
 
 function formatNumber(value: number) {
@@ -201,14 +206,6 @@ export default function Home() {
     await refresh();
   }
 
-  async function retryJob(job: Job) {
-    const response = await apiFetch(`${API}/api/jobs/${job.id}/retry`, { method: "POST" });
-    const body = await response.json();
-    if (!response.ok) { setMessage(body.detail ?? "任务重试失败"); return; }
-    setMessage(`任务 ${job.id.slice(0, 8)} 已重新进入队列。`);
-    await refresh();
-  }
-
   async function applyRetention() {
     const names = Object.entries(retentionSelection).filter(([, selected]) => selected).map(([name]) => name);
     const response = await apiFetch(`${API}/api/data-retention/apply`, {
@@ -243,7 +240,7 @@ export default function Home() {
             <div className="nav-group" key={group.label}>
               <span className="nav-group-label">{group.label}</span>
               {group.items.map((item) => (
-                <button className={item.index === activeNav ? "nav-item active" : "nav-item"} key={item.label} disabled={item.index === 9 && auth.user?.role !== "admin"} onClick={() => setActiveNav(item.index)}>
+                <button className={item.index === activeNav ? "nav-item active" : "nav-item"} key={item.label} disabled={item.index === 10 && auth.user?.role !== "admin"} onClick={() => setActiveNav(item.index)}>
                   <span className="nav-dot" />{item.label}
                 </button>
               ))}
@@ -281,9 +278,11 @@ export default function Home() {
               <article className="workspace-card quick-entry">
                 <div className="section-heading"><div><h2>工作入口</h2><p>按工作目标进入，不必记系统模块。</p></div></div>
                 <button onClick={() => { setActiveNav(1); setDataView("create"); }}><b>补充市场数据</b><span>新建日线、分钟线或海外数据任务</span></button>
+                <button onClick={() => setActiveNav(11)}><b>查看研究行情</b><span>指数、市场宽度、行业强弱与自选观察池</span></button>
                 <button onClick={() => setActiveNav(2)}><b>训练 Qlib 模型</b><span>管理数据集和基线实验</span></button>
-                <button onClick={() => setActiveNav(5)}><b>运行策略回测</b><span>验证收益、风险和交易约束</span></button>
-                <button onClick={() => setActiveNav(7)}><b>查看模拟组合</b><span>持仓、订单和风险状态</span></button>
+                <button onClick={() => setActiveNav(4)}><b>启动自动研究</b><span>因子、参数实验、回测和模拟盘候选</span></button>
+                <button onClick={() => setActiveNav(6)}><b>运行策略回测</b><span>验证收益、风险和交易约束</span></button>
+                <button onClick={() => setActiveNav(8)}><b>查看模拟组合</b><span>持仓、订单和风险状态</span></button>
               </article>
             </section>
           </div>
@@ -332,14 +331,14 @@ export default function Home() {
               <DataTaskCenter tasks={dataTasks} api={API} mode="create" onCreated={refresh} onMessage={setMessage} />
             </div> : null}
 
-            {dataView === "runs" ? <section className="jobs-panel runs-view"><div className="panel-heading"><div><h2>运行记录</h2><p>失败任务可以按原参数重试。</p></div><span>{jobs.length} 条</span></div><div className="job-list">{jobs.slice(0, 30).map((job) => <article key={job.id}><span className={`job-state ${job.status}`} /><div><strong>{job.payload.snapshot_name ?? job.payload.profile ?? job.kind}</strong><small>{job.payload.start && job.payload.end ? `${job.payload.start} → ${job.payload.end}` : job.error ?? new Date(job.created_at).toLocaleString("zh-CN")}</small></div><code>{job.id.slice(0, 10)}</code><span>{statusLabel(job.status)}</span>{job.status === "failed" && auth.user?.role === "admin" ? <button onClick={() => retryJob(job)}>重试</button> : null}</article>)}{!jobs.length ? <div className="empty compact">尚无任务记录。</div> : null}</div></section> : null}
+            {dataView === "runs" ? <JobRunCenter api={API} canControl={auth.user?.role === "admin" || auth.user?.role === "operator"} onChanged={refresh} onMessage={setMessage} /> : null}
 
             {dataView === "storage" ? <div className="storage-stack">
               <section className="data-panel storage-panel"><div className="panel-heading"><div><h2>不可变快照与 Qlib 数据</h2><p>被研究、回测和模拟组合引用的数据不会被清理。</p></div><span>{formatBytes(retention?.eligible_bytes ?? 0)} 可清理</span></div><div className="table-wrap"><table><thead><tr><th>选择</th><th>数据集</th><th>创建时间</th><th>占用</th><th>状态 / 原因</th></tr></thead><tbody>{retention?.entries.map((item) => <tr key={item.name}><td><input aria-label={`选择清理 ${item.name}`} type="checkbox" disabled={item.state !== "eligible" || auth.user?.role !== "admin"} checked={!!retentionSelection[item.name]} onChange={(event) => setRetentionSelection({ ...retentionSelection, [item.name]: event.target.checked })} /></td><td><code>{item.name}</code></td><td>{new Date(item.created_at).toLocaleString("zh-CN")}</td><td>{formatBytes(item.bytes)}</td><td><span className={`state ${item.state === "eligible" ? "failed" : "ready"}`}>{item.state === "eligible" ? "可清理" : "受保护"}</span><small>{item.reasons.join("；") || "未被引用且已过保留期"}</small></td></tr>)}</tbody></table>{!retention?.entries.length ? <div className="empty compact">尚无快照或 Qlib 数据集。</div> : null}</div>{auth.user?.role === "admin" ? <div className="retention-action"><label>输入 DELETE_UNREFERENCED_DATASETS 确认<input value={retentionConfirmation} onChange={(event) => setRetentionConfirmation(event.target.value)} /></label><button className="primary" onClick={applyRetention} disabled={retentionConfirmation !== "DELETE_UNREFERENCED_DATASETS" || !Object.values(retentionSelection).some(Boolean)}>清理所选数据</button></div> : null}</section>
               <section className="data-panel"><div className="panel-heading"><div><h2>基础数据集</h2><p>用于核对旧初始化流水线的工作单元。</p></div><div className="segmented">{["core", "research", "full"].map((value) => <button className={profile === value ? "selected" : ""} onClick={() => setProfile(value)} key={value}>{value}</button>)}</div></div><div className="table-wrap"><table><thead><tr><th>数据集</th><th>层级</th><th>状态</th><th>进度</th><th>数据行</th><th>失败</th></tr></thead><tbody>{visibleDatasets.map((item) => <tr key={item.name}><td><code>{item.name}</code></td><td><span className={`tier ${item.profile}`}>{item.profile}</span></td><td><span className={`state ${item.state}`}>{item.state === "ready" ? "已就绪" : item.state === "partial" ? "部分完成" : "未下载"}</span></td><td><div className="mini-progress"><i style={{ width: `${item.coverage}%` }} /></div><small>{item.coverage}%</small></td><td>{formatNumber(item.rows)}</td><td className={item.failed ? "danger" : "muted"}>{item.failed}</td></tr>)}</tbody></table></div></section>
             </div> : null}
           </div>
-        ) : activeNav === 2 ? <QlibPanel api={API} /> : activeNav === 3 ? <RDAgentPanel api={API} /> : activeNav === 4 ? <FactorLibraryPanel api={API} /> : activeNav === 5 ? <BacktestPanel api={API} /> : activeNav === 6 ? <PairTradingPanel api={API} /> : activeNav === 7 ? <PortfolioPanel api={API} /> : activeNav === 8 ? <OperationsPanel api={API} currentUser={auth.user!} /> : <SettingsPanel api={API} />}
+        ) : activeNav === 11 ? <MarketOverviewPanel api={API} onOpenData={() => { setActiveNav(1); setDataView("overview"); }} /> : activeNav === 2 ? <QlibPanel api={API} /> : activeNav === 3 ? <RDAgentPanel api={API} /> : activeNav === 4 ? <ResearchCampaignPanel api={API} /> : activeNav === 5 ? <FactorLibraryPanel api={API} /> : activeNav === 6 ? <BacktestPanel api={API} /> : activeNav === 7 ? <PairTradingPanel api={API} /> : activeNav === 8 ? <PortfolioPanel api={API} /> : activeNav === 9 ? <OperationsPanel api={API} currentUser={auth.user!} /> : <SettingsPanel api={API} />}
       </section>
     </main>
   );

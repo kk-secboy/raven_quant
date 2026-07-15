@@ -135,7 +135,7 @@ services:
       PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
       REQUESTS_PER_MINUTE: ${REQUESTS_PER_MINUTE:-90}
       DOWNLOAD_WORKERS: ${DOWNLOAD_WORKERS:-4}
-      WORKER_JOB_KINDS: bootstrap,data_verify,data_snapshot,data_qlib,qlib_baseline,margin_eligibility_download,core_intraday_download,supplemental_download,supplemental_cn_extended_daily,supplemental_cn_funds,supplemental_cn_macro,supplemental_cn_futures,supplemental_cn_options_bonds,supplemental_hk_market,supplemental_us_market,supplemental_global_markets,factor_evaluate,strategy_backtest,pair_backtest,pair_paper_rebalance,paper_rebalance
+      WORKER_JOB_KINDS: bootstrap,data_verify,data_snapshot,data_qlib,minute_qlib,minute_research,qlib_baseline,margin_eligibility_download,core_intraday_download,supplemental_download,supplemental_cn_extended_daily,supplemental_cn_funds,supplemental_cn_macro,supplemental_cn_futures,supplemental_cn_options_bonds,supplemental_hk_market,supplemental_us_market,supplemental_global_markets,factor_evaluate,strategy_backtest,parameter_experiment,pair_backtest,pair_paper_rebalance,paper_rebalance
       RDAGENT_ENABLED: "false"
     volumes:
       - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data

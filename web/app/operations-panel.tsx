@@ -74,6 +74,14 @@ type AuditEvent = {
 
 const timeText = (value?: string | null) => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—";
 const stateClass = (status: string) => ["succeeded", "enqueued", "active", "ok", "acknowledged", "resolved"].includes(status) ? "ready" : ["failed", "missed", "open", "unavailable", "degraded"].includes(status) ? "failed" : "partial";
+const scheduleKindText: Record<string, string> = {
+  incremental_sync: "数据增量同步",
+  data_pipeline: "全数据恢复流水线",
+  rdagent_research: "RD-Agent 因子研究",
+  paper_rebalance: "模拟组合再平衡",
+  pair_paper_rebalance: "配对模拟再平衡",
+  broker_reconcile: "券商账户对账",
+};
 
 export function OperationsPanel({ api, currentUser }: { api: string; currentUser: AuthUser }) {
   const [view, setView] = useState("status");
@@ -93,6 +101,7 @@ export function OperationsPanel({ api, currentUser }: { api: string; currentUser
   });
   const [syncName, setSyncName] = useState("每日数据增量同步");
   const [syncTime, setSyncTime] = useState("18:00");
+  const [syncKind, setSyncKind] = useState<"incremental_sync" | "data_pipeline">("incremental_sync");
   const [profile, setProfile] = useState("full");
   const [syncLookbackDays, setSyncLookbackDays] = useState(7);
   const [syncBuildQlib, setSyncBuildQlib] = useState(true);
@@ -190,10 +199,11 @@ export function OperationsPanel({ api, currentUser }: { api: string; currentUser
   async function createSync(event: FormEvent) {
     event.preventDefault();
     await createSchedule({
-      name: syncName, kind: "incremental_sync", timezone: "Asia/Shanghai", run_time: syncTime,
+      name: syncName, kind: syncKind, timezone: "Asia/Shanghai", run_time: syncTime,
       trading_days_only: true, payload: {
         profile, lookback_days: syncLookbackDays, build_qlib: syncBuildQlib,
         snapshot_start: syncSnapshotStart,
+        ...(syncKind === "data_pipeline" ? { bundles: ["cn_extended_daily", "cn_funds", "cn_macro", "cn_futures", "cn_options_bonds", "hk_market", "us_market", "global_markets"] } : {}),
       },
       misfire_grace_seconds: syncMisfireGrace, actor: "local-operator",
     });
@@ -351,10 +361,11 @@ export function OperationsPanel({ api, currentUser }: { api: string; currentUser
       <form className="automation-card" onSubmit={createSync}>
         <div className="card-heading"><div><span>数据自动化</span><strong>每日增量同步</strong></div><span className="status-chip">可恢复</span></div>
         <label>计划名称<input value={syncName} onChange={(event) => setSyncName(event.target.value)} /></label>
-        <div className="form-row"><label>运行时间<input type="time" value={syncTime} onChange={(event) => setSyncTime(event.target.value)} /></label><label>数据范围<select value={profile} onChange={(event) => setProfile(event.target.value)}><option value="core">Core</option><option value="research">Research</option><option value="full">Full</option></select></label></div>
+        <div className="form-row"><label>运行时间<input type="time" value={syncTime} onChange={(event) => setSyncTime(event.target.value)} /></label><label>任务模式<select value={syncKind} onChange={(event) => setSyncKind(event.target.value as "incremental_sync" | "data_pipeline")}><option value="incremental_sync">A 股核心增量</option><option value="data_pipeline">全部数据依赖链</option></select></label></div>
+        <label>数据范围<select value={profile} onChange={(event) => setProfile(event.target.value)}><option value="core">Core</option><option value="research">Research</option><option value="full">Full</option></select></label>
         <div className="form-row"><label>修订回看天数<input type="number" min="1" max="90" step="1" value={syncLookbackDays} onChange={(event) => setSyncLookbackDays(Number(event.target.value))} /></label><label>快照起始日<input type="date" value={syncSnapshotStart} onChange={(event) => setSyncSnapshotStart(event.target.value)} /></label></div>
         <div className="form-row"><label>错过宽限（秒）<input type="number" min="60" max="86400" step="60" value={syncMisfireGrace} onChange={(event) => setSyncMisfireGrace(Number(event.target.value))} /></label><label className="policy-toggle"><input type="checkbox" checked={syncBuildQlib} onChange={(event) => setSyncBuildQlib(event.target.checked)} /><span>同步后构建 Qlib 快照</span></label></div>
-        <div className="execution-note"><b>自动流程</b><span>按配置的回看窗口吸收修订数据</span><span>可选重建不可变快照与 Qlib 数据集</span><span>错过执行窗口时失败关闭并产生告警</span></div>
+        <div className="execution-note"><b>自动流程</b><span>{syncKind === "data_pipeline" ? "核心日线与八类扩展数据逐项执行，前项成功才启动后项" : "按配置的回看窗口吸收 A 股核心修订数据"}</span><span>下载、校验、快照、Qlib 与基线保持独立任务，可分别重试</span><span>错过执行窗口或任一依赖失败时停止后续任务并产生告警</span></div>
         <button className="primary" disabled={syncName.length < 3}>启用数据计划</button>
       </form>
       <form className="automation-card" onSubmit={createPortfolioSchedule}>
@@ -368,7 +379,7 @@ export function OperationsPanel({ api, currentUser }: { api: string; currentUser
       </form>
     </section>}
 
-    <section className="data-panel"><div className="panel-heading"><div><p className="eyebrow">DURABLE SCHEDULES</p><h2>自动计划</h2></div><span>{schedules.length} 条</span></div><div className="table-wrap"><table className="operations-table"><thead><tr><th>计划</th><th>类型</th><th>时间</th><th>下一次运行</th><th>期望状态</th><th>实际状态 / 原因</th><th>操作</th></tr></thead><tbody>{schedules.map((item) => <tr key={item.id}><td><strong>{item.name}</strong><small>{item.timezone}{item.payload.managed_by === "allocation_schedule_group" ? " · 组合统一托管" : ""}</small></td><td><code>{item.kind}</code></td><td>{item.run_time}</td><td>{timeText(item.next_run_at)}</td><td><span className={`state ${stateClass(item.desired_status)}`}>{item.desired_status}</span></td><td><span className={`state ${stateClass(item.status)}`}>{item.status}</span><small>{item.suspension_reason ?? "无安全暂停"}</small></td><td>{can("automation:manage") ? item.payload.managed_by === "allocation_schedule_group" ? <span className="muted">在多策略组合中操作</span> : item.status === "retired" ? <span className="muted">已退役</span> : <button className="inline-action" onClick={() => setScheduleStatus(item)}>{item.desired_status === "active" ? "暂停" : "恢复"}</button> : "—"}</td></tr>)}</tbody></table>{!schedules.length && <div className="empty">尚无自动计划。创建后，调度时点与每次运行都会持久化。</div>}</div></section>
+    <section className="data-panel"><div className="panel-heading"><div><p className="eyebrow">DURABLE SCHEDULES</p><h2>自动计划</h2></div><span>{schedules.length} 条</span></div><div className="table-wrap"><table className="operations-table"><thead><tr><th>计划</th><th>类型</th><th>时间</th><th>下一次运行</th><th>期望状态</th><th>实际状态 / 原因</th><th>操作</th></tr></thead><tbody>{schedules.map((item) => <tr key={item.id}><td><strong>{item.name}</strong><small>{item.timezone}{item.payload.managed_by === "allocation_schedule_group" ? " · 组合统一托管" : ""}</small></td><td>{scheduleKindText[item.kind] ?? item.kind}</td><td>{item.run_time}</td><td>{timeText(item.next_run_at)}</td><td><span className={`state ${stateClass(item.desired_status)}`}>{item.desired_status}</span></td><td><span className={`state ${stateClass(item.status)}`}>{item.status}</span><small>{item.suspension_reason ?? "无安全暂停"}</small></td><td>{can("automation:manage") ? item.payload.managed_by === "allocation_schedule_group" ? <span className="muted">在多策略组合中操作</span> : item.status === "retired" ? <span className="muted">已退役</span> : <button className="inline-action" onClick={() => setScheduleStatus(item)}>{item.desired_status === "active" ? "暂停" : "恢复"}</button> : "—"}</td></tr>)}</tbody></table>{!schedules.length && <div className="empty">尚无自动计划。创建后，调度时点与每次运行都会持久化。</div>}</div></section>
 
     <section className="operations-lower">
       <section className="data-panel"><div className="panel-heading"><div><p className="eyebrow">ALERT INBOX</p><h2>告警收件箱</h2></div><span>{openAlerts.length} 条待确认</span></div><div className="alert-list">{alerts.slice(0, 30).map((item) => <article key={item.id}><span className={`alert-severity ${item.severity}`} /><div><strong>{item.title}</strong><p>{item.message}</p><small>{timeText(item.created_at)} · 投递 {item.delivery_status}</small></div><span className={`state ${stateClass(item.status)}`}>{item.status}</span><div>{can("alerts:manage") && item.status === "open" && <button className="inline-action" onClick={() => actOnAlert(item, "acknowledge")}>确认</button>}{can("alerts:manage") && item.status !== "resolved" && <button className="inline-action" onClick={() => actOnAlert(item, "resolve")}>关闭</button>}</div></article>)}{!alerts.length && <div className="empty compact">没有告警。任务失败、调度错过和组合风险事件会自动进入这里。</div>}</div></section>

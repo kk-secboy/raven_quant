@@ -53,6 +53,14 @@ const groups: FieldGroup[] = [
     ],
   },
   {
+    title: "基准相对组合优化",
+    fields: [
+      { key: "optimizer_alpha_weight", label: "因子收益权重", min: 0, max: 10, step: 0.01 },
+      { key: "optimizer_tracking_penalty", label: "基准跟踪惩罚", min: 0, max: 100, step: 0.1 },
+      { key: "optimizer_turnover_penalty", label: "换手惩罚", min: 0, max: 100, step: 0.01 },
+    ],
+  },
+  {
     title: "回测、稳健性与压力门槛",
     fields: [
       { key: "max_tracking_error", label: "最大跟踪误差（%）", min: 0.1, max: 100, step: 0.5, scale: 100 },
@@ -140,6 +148,11 @@ export function StrategyDefaultsPanel({ api }: { api: string }) {
     <p>这里只决定新建策略的初始值。每个策略版本会保存完整参数，已审批和运行中的版本不会随模板变化。</p>
     {message && <div className="notice">{message}</div>}
     <form onSubmit={save}>
+      <section className="settings-card">
+        <div className="card-heading"><div><span>PORTFOLIO CONSTRUCTION</span><strong>组合构建方式</strong></div></div>
+        <label>默认方式<select value={String(draft.portfolio_construction ?? "topk_equal_weight")} onChange={(event) => setDraft({ ...draft, portfolio_construction: event.target.value })}><option value="topk_equal_weight">Top-K 等权</option><option value="benchmark_relative_qp">基准相对优化</option></select></label>
+        <p>指数增强建议使用基准相对优化；波段策略可继续使用 Top-K 等权。</p>
+      </section>
       {groups.map((group) => <section key={group.title} className="settings-card">
         <div className="card-heading"><div><span>CONFIGURATION GROUP</span><strong>{group.title}</strong></div></div>
         <div className="risk-grid">

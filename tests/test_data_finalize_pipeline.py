@@ -3,7 +3,9 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from quant_data.checkpoint import CheckpointStore
+from quant_data.cli import _profile_datasets
 from quant_data.config import Settings
+from quant_data.execution_data import MARGIN_DATASET, MINUTE_DATASETS
 from quant_data.models import FetchSpec, UnitResult
 from quant_platform.api import create_app
 from quant_platform.job_store import JobStore
@@ -127,3 +129,61 @@ def test_data_finalize_stages_are_durable_idempotent_and_retryable(
     retried = jobs.retry(snapshot["id"])
     assert retried["status"] == "queued"
     assert retried["error"] is None
+
+
+def test_chained_data_pipeline_keeps_each_download_and_build_as_separate_job(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
+    settings = Settings.from_env(tmp_path / ".env")
+    jobs = JobStore(database_url)
+    worker = LocalJobWorker(jobs, tmp_path, settings)
+    steps = [
+        {
+            "kind": "supplemental_cn_macro",
+            "payload": {
+                "bundle": "cn_macro",
+                "start": "2025-01-01",
+                "end": "latest",
+                "symbols": [],
+            },
+        },
+        {"kind": "data_verify", "payload": {}},
+        {"kind": "data_snapshot", "payload": {}},
+        {"kind": "data_qlib", "payload": {}},
+        {"kind": "qlib_baseline", "payload": {}},
+    ]
+    current = {
+        "kind": "bootstrap",
+        "payload": {
+            "pipeline_id": "scheduled-chain",
+            "profile": "full",
+            "start": "2025-01-01",
+            "end": "latest",
+            "snapshot_start": "2024-01-01",
+            "snapshot_end": "2025-01-02",
+            "snapshot_name": "cn-chain-fixture",
+            "pipeline_steps": steps,
+            "pipeline_next_index": 0,
+        },
+    }
+
+    expected = [step["kind"] for step in steps]
+    created = []
+    for _kind in expected:
+        successor = worker._queue_data_pipeline_successor(current)
+        created.append(successor["kind"])
+        current = successor
+
+    assert created == expected
+    assert current["payload"]["dataset"] == "cn-chain-fixture"
+    assert current["payload"]["pipeline_next_index"] == len(steps)
+    assert worker._has_data_pipeline_successor(current) is False
+
+
+def test_full_snapshot_contract_keeps_execution_frequency_separate() -> None:
+    assert "daily" in _profile_datasets("full")
+    assert MARGIN_DATASET not in _profile_datasets("full")
+    assert not set(MINUTE_DATASETS).intersection(_profile_datasets("full"))

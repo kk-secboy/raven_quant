@@ -116,8 +116,9 @@ masters before planning minute requests:
 
 - SSE 50, CSI 300, CSI 500 and CSI 1000;
 - broad, industry, gold and bond ETF groups;
-- every IF/IC/IM/IH continuous code and mapped deliverable contract active in the
-  requested historical range;
+- every IF/IC/IM/IH mapped deliverable contract active in the requested historical
+  range; synthetic continuous codes are reconstructed locally from `fut_mapping`
+  because the Tushare minute endpoint only accepts real contracts;
 - the configurable top liquid A-share pool by mean amount over the latest 20 available
   trading days, excluding ST names;
 - configurable top active SSE/SZSE option contracts by amount and volume.

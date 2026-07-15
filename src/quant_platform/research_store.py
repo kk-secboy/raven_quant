@@ -263,6 +263,36 @@ class ResearchStore:
                 payload={"error": error} if error else {},
             )
 
+    def requeue_run(self, run_id: str, *, actor: str = "operator") -> None:
+        with self.engine.begin() as connection:
+            row = connection.execute(
+                select(research_runs.c.status)
+                .where(research_runs.c.id == run_id)
+                .with_for_update()
+            ).first()
+            if row is None:
+                raise KeyError(run_id)
+            if row.status not in {"failed", "cancelled"}:
+                raise ValueError("only failed or cancelled research runs may be requeued")
+            connection.execute(
+                update(research_runs)
+                .where(research_runs.c.id == run_id)
+                .values(
+                    status="queued",
+                    error=None,
+                    started_at=None,
+                    finished_at=None,
+                    updated_at=_now(),
+                )
+            )
+            self._event(
+                connection,
+                run_id=run_id,
+                event_type="run.requeued",
+                actor=actor,
+                payload={},
+            )
+
     def get_run(self, run_id: str) -> dict[str, Any]:
         with self.engine.connect() as connection:
             row = connection.execute(

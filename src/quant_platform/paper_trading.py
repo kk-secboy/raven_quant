@@ -6,6 +6,8 @@ from typing import Any
 
 import pandas as pd
 
+from quant_platform.portfolio_optimizer import optimize_benchmark_relative_weights
+
 
 def _risk_event(
     rule: str,
@@ -49,6 +51,16 @@ def build_rebalance_plan(
     max_drawdown_liquidate: float = 0.15,
     drawdown_reduction_exposure: float = 0.50,
     max_industry_weight: float = 0.30,
+    max_industry_deviation: float = 0.05,
+    max_size_deviation: float = 0.30,
+    portfolio_construction: str = "topk_equal_weight",
+    benchmark_weights: pd.Series | None = None,
+    benchmark_industry_weights: pd.Series | None = None,
+    style_exposures: pd.Series | None = None,
+    benchmark_style_exposure: float | None = None,
+    optimizer_alpha_weight: float = 0.05,
+    optimizer_tracking_penalty: float = 1.0,
+    optimizer_turnover_penalty: float = 0.10,
     min_average_daily_amount: float = 500_000_000,
     max_volume_participation: float = 0.01,
     open_cost: float,
@@ -90,6 +102,8 @@ def build_rebalance_plan(
         raise ValueError("drawdown reduction threshold must be below liquidation threshold")
     if take_profit_partial_fraction >= 1 or drawdown_reduction_exposure >= 1:
         raise ValueError("reduction fractions must be below one")
+    if portfolio_construction not in {"topk_equal_weight", "benchmark_relative_qp"}:
+        raise ValueError("portfolio construction method is invalid")
     score = pd.to_numeric(scores, errors="coerce").dropna().sort_values(ascending=False)
     if score.empty:
         raise ValueError("no factor scores are available for the signal date")
@@ -178,8 +192,6 @@ def build_rebalance_plan(
         )
 
     target_weight = min(1.0 / topk, max_position_weight)
-    if reduction_required:
-        target_weight *= drawdown_reduction_exposure
     buffer = set(score.head(topk + n_drop).index.astype(str))
     ranked = [item for item in current if item in buffer]
     ranked.extend(item for item in score.index.astype(str) if item not in ranked)
@@ -217,7 +229,53 @@ def build_rebalance_plan(
                 },
             )
         )
-    targets = {} if liquidation_required else {instrument: target_weight for instrument in selected}
+    optimizer_result = None
+    target_weights = pd.Series(target_weight, index=selected, dtype=float)
+    if portfolio_construction == "benchmark_relative_qp" and not liquidation_required:
+        if any(
+            item is None
+            for item in (
+                benchmark_weights,
+                benchmark_industry_weights,
+                style_exposures,
+                benchmark_style_exposure,
+            )
+        ):
+            raise ValueError(
+                "benchmark-relative paper trading requires benchmark and exposure metadata"
+            )
+        previous_weights = pd.Series(
+            {
+                instrument: float(current.get(instrument, 0.0))
+                * float(market.loc[instrument, "open"])
+                / nav
+                for instrument in selected
+                if instrument in market.index
+                and pd.notna(market.loc[instrument, "open"])
+                and float(market.loc[instrument, "open"]) > 0
+            },
+            dtype=float,
+        )
+        optimizer_result = optimize_benchmark_relative_weights(
+            score.reindex(selected),
+            benchmark_weights,  # type: ignore[arg-type]
+            previous_weights,
+            industries=market["industry"].reindex(selected),
+            benchmark_industry_weights=benchmark_industry_weights,  # type: ignore[arg-type]
+            style_exposures=style_exposures,  # type: ignore[arg-type]
+            benchmark_style_exposure=float(benchmark_style_exposure),
+            max_position_weight=max_position_weight,
+            max_industry_weight=max_industry_weight,
+            max_industry_deviation=max_industry_deviation,
+            max_size_deviation=max_size_deviation,
+            alpha_weight=optimizer_alpha_weight,
+            tracking_penalty=optimizer_tracking_penalty,
+            turnover_penalty=optimizer_turnover_penalty,
+        )
+        target_weights = optimizer_result.weights
+    if reduction_required:
+        target_weights = target_weights.mul(drawdown_reduction_exposure)
+    targets = {} if liquidation_required else target_weights.to_dict()
 
     orders: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
@@ -536,4 +594,18 @@ def build_rebalance_plan(
         "opening_return": opening_return,
         "opening_drawdown": opening_drawdown,
         "estimated_turnover": used / nav,
+        "portfolio_construction": portfolio_construction,
+        "optimizer": (
+            {
+                "objective": optimizer_result.objective,
+                "tracking_risk_proxy": optimizer_result.tracking_risk_proxy,
+                "active_share": optimizer_result.active_share,
+                "expected_turnover": optimizer_result.expected_turnover,
+                "max_industry_deviation": optimizer_result.max_industry_deviation,
+                "size_deviation": optimizer_result.size_deviation,
+                "iterations": optimizer_result.iterations,
+            }
+            if optimizer_result is not None
+            else None
+        ),
     }

@@ -2,6 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { apiFetch } from "./api-client";
+import { ParameterExperimentPanel } from "./parameter-experiment-panel";
 
 type Factor = { id: string; name: string; description: string; status: string };
 type Dataset = { name: string; ready: boolean; reproducible: boolean; start_date: string; end_date: string; trading_days: number };
@@ -14,7 +15,7 @@ type Strategy = { id: string; name: string; description: string; status: string;
 type StrategyRecipe = {
   id: string; version: string; name: string; category: string; description: string;
   benchmark: string; universe: string; rdagent_objective: string;
-  factor_guidance: string[]; config_overrides: Record<string, number>;
+  factor_guidance: string[]; config_overrides: Record<string, number | string>;
 };
 type Backtest = {
   id: string; strategy_version_id: string; dataset: string; status: string;
@@ -72,6 +73,12 @@ export function BacktestPanel({ api }: { api: string }) {
   const [maxDrawdownLiquidate, setMaxDrawdownLiquidate] = useState(0.15);
   const [drawdownReductionExposure, setDrawdownReductionExposure] = useState(0.50);
   const [maxIndustryWeight, setMaxIndustryWeight] = useState(0.30);
+  const [maxIndustryDeviation, setMaxIndustryDeviation] = useState(0.05);
+  const [maxSizeDeviation, setMaxSizeDeviation] = useState(0.30);
+  const [portfolioConstruction, setPortfolioConstruction] = useState("topk_equal_weight");
+  const [optimizerAlphaWeight, setOptimizerAlphaWeight] = useState(0.05);
+  const [optimizerTrackingPenalty, setOptimizerTrackingPenalty] = useState(1.0);
+  const [optimizerTurnoverPenalty, setOptimizerTurnoverPenalty] = useState(0.10);
   const [maxParticipation, setMaxParticipation] = useState(0.01);
   const [minCapacityFill, setMinCapacityFill] = useState(0.95);
   const [selectedVersion, setSelectedVersion] = useState("");
@@ -83,29 +90,35 @@ export function BacktestPanel({ api }: { api: string }) {
   const [serverDefaults, setServerDefaults] = useState<Record<string, number | string>>({});
   const defaultsApplied = useRef(false);
 
-  function applyVisibleConfig(config: Record<string, number>) {
-    setTopk(config.topk);
-    setNDrop(config.n_drop);
-    setMaxPositionWeight(config.max_position_weight);
-    setMaxDailyTurnover(config.max_daily_turnover);
-    setMaxDailyLoss(config.max_daily_loss);
-    setMaxTrackingError(config.max_tracking_error);
-    setMaxDrawdown(config.max_drawdown);
-    setMaxTurnover(config.max_turnover);
-    setMinSharpe(config.min_sharpe_ratio);
-    setMinSortino(config.min_sortino_ratio);
-    setMinRobustness(config.min_robustness_pass_rate);
-    setCapacityNotional(config.capacity_notional);
-    setStopLoss(config.stop_loss);
-    setTakeProfitPartial(config.take_profit_partial);
-    setTakeProfitPartialFraction(config.take_profit_partial_fraction);
-    setTakeProfit(config.take_profit);
-    setMaxDrawdownReduce(config.max_drawdown_reduce);
-    setMaxDrawdownLiquidate(config.max_drawdown_liquidate);
-    setDrawdownReductionExposure(config.drawdown_reduction_exposure);
-    setMaxIndustryWeight(config.max_industry_weight);
-    setMaxParticipation(config.max_volume_participation);
-    setMinCapacityFill(config.min_capacity_fill_ratio);
+  function applyVisibleConfig(config: Record<string, number | string>) {
+    setTopk(Number(config.topk));
+    setNDrop(Number(config.n_drop));
+    setMaxPositionWeight(Number(config.max_position_weight));
+    setMaxDailyTurnover(Number(config.max_daily_turnover));
+    setMaxDailyLoss(Number(config.max_daily_loss));
+    setMaxTrackingError(Number(config.max_tracking_error));
+    setMaxDrawdown(Number(config.max_drawdown));
+    setMaxTurnover(Number(config.max_turnover));
+    setMinSharpe(Number(config.min_sharpe_ratio));
+    setMinSortino(Number(config.min_sortino_ratio));
+    setMinRobustness(Number(config.min_robustness_pass_rate));
+    setCapacityNotional(Number(config.capacity_notional));
+    setStopLoss(Number(config.stop_loss));
+    setTakeProfitPartial(Number(config.take_profit_partial));
+    setTakeProfitPartialFraction(Number(config.take_profit_partial_fraction));
+    setTakeProfit(Number(config.take_profit));
+    setMaxDrawdownReduce(Number(config.max_drawdown_reduce));
+    setMaxDrawdownLiquidate(Number(config.max_drawdown_liquidate));
+    setDrawdownReductionExposure(Number(config.drawdown_reduction_exposure));
+    setMaxIndustryWeight(Number(config.max_industry_weight));
+    setMaxIndustryDeviation(Number(config.max_industry_deviation ?? 0.05));
+    setMaxSizeDeviation(Number(config.max_size_deviation ?? 0.30));
+    setPortfolioConstruction(String(config.portfolio_construction ?? "topk_equal_weight"));
+    setOptimizerAlphaWeight(Number(config.optimizer_alpha_weight ?? 0.05));
+    setOptimizerTrackingPenalty(Number(config.optimizer_tracking_penalty ?? 1.0));
+    setOptimizerTurnoverPenalty(Number(config.optimizer_turnover_penalty ?? 0.10));
+    setMaxParticipation(Number(config.max_volume_participation));
+    setMinCapacityFill(Number(config.min_capacity_fill_ratio));
   }
 
   async function load() {
@@ -131,7 +144,7 @@ export function BacktestPanel({ api }: { api: string }) {
       const recipeBody: { recipes: StrategyRecipe[] } = await responses[5].json();
       setRecipes(recipeBody.recipes.filter((item) => item.category === "multifactor"));
       if (!defaultsApplied.current) {
-        applyVisibleConfig(defaults.config as Record<string, number>);
+        applyVisibleConfig(defaults.config as Record<string, number | string>);
         defaultsApplied.current = true;
       }
       if (!Object.keys(selectedFactors).length && nextFactors.length) {
@@ -166,7 +179,11 @@ export function BacktestPanel({ api }: { api: string }) {
   const active = useMemo(() => backtests.some((item) => ["queued", "running"].includes(item.status)), [backtests]);
   const riskConfigurationValid = takeProfitPartial < takeProfit
     && maxDrawdownReduce < maxDrawdownLiquidate
-    && maxIndustryWeight >= maxPositionWeight;
+    && maxIndustryWeight >= maxPositionWeight
+    && maxIndustryDeviation >= 0
+    && maxSizeDeviation >= 0
+    && (portfolioConstruction !== "benchmark_relative_qp" || topk * maxPositionWeight >= 1)
+    && optimizerAlphaWeight + optimizerTrackingPenalty + optimizerTurnoverPenalty > 0;
 
   function toggleFactor(factorId: string) {
     const next = { ...selectedFactors };
@@ -177,12 +194,12 @@ export function BacktestPanel({ api }: { api: string }) {
   function selectRecipe(value: string) {
     setRecipeId(value);
     if (value === "custom") {
-      applyVisibleConfig(serverDefaults as Record<string, number>);
+      applyVisibleConfig(serverDefaults as Record<string, number | string>);
       return;
     }
     const recipe = recipes.find((item) => item.id === value);
     if (!recipe) return;
-    const merged = { ...serverDefaults, ...recipe.config_overrides } as Record<string, number>;
+    const merged = { ...serverDefaults, ...recipe.config_overrides } as Record<string, number | string>;
     applyVisibleConfig(merged);
     setName(recipe.name);
     setDescription(recipe.description);
@@ -205,6 +222,12 @@ export function BacktestPanel({ api }: { api: string }) {
         max_drawdown_reduce: maxDrawdownReduce, max_drawdown_liquidate: maxDrawdownLiquidate,
         drawdown_reduction_exposure: drawdownReductionExposure,
         max_industry_weight: maxIndustryWeight,
+        max_industry_deviation: maxIndustryDeviation,
+        max_size_deviation: maxSizeDeviation,
+        portfolio_construction: portfolioConstruction,
+        optimizer_alpha_weight: optimizerAlphaWeight,
+        optimizer_tracking_penalty: optimizerTrackingPenalty,
+        optimizer_turnover_penalty: optimizerTurnoverPenalty,
         max_tracking_error: maxTrackingError, max_drawdown: maxDrawdown,
         max_turnover: maxTurnover,
         min_sharpe_ratio: minSharpe, min_sortino_ratio: minSortino,
@@ -285,8 +308,9 @@ export function BacktestPanel({ api }: { api: string }) {
   return <>
     {message && <div className="notice">{message}</div>}
     <div className="page-tabs" role="tablist" aria-label="回测工作区">
-      {[["create", "新建回测"], ["results", "结果与压力测试"], ["history", "运行记录"]].map(([value, label]) => <button type="button" role="tab" aria-selected={view === value} className={view === value ? "active" : ""} onClick={() => setView(value)} key={value}>{label}</button>)}
+      {[["create", "新建回测"], ["results", "结果与压力测试"], ["experiments", "参数实验"], ["history", "运行记录"]].map(([value, label]) => <button type="button" role="tab" aria-selected={view === value} className={view === value ? "active" : ""} onClick={() => setView(value)} key={value}>{label}</button>)}
     </div>
+    {view === "experiments" && <ParameterExperimentPanel api={api} />}
     {view === "create" && <section className="backtest-hero">
       <form className="strategy-builder" onSubmit={createStrategy}>
         <div className="card-heading"><div><span>不可变策略版本</span><strong>用已晋级因子建模</strong></div><span className="status-chip">研究草稿</span></div>
@@ -299,6 +323,7 @@ export function BacktestPanel({ api }: { api: string }) {
           <summary>风控与容量参数（使用系统默认值，可展开修改）</summary>
           <div className="execution-note"><b>默认风控模板</b><span>比例直接按百分数填写，例如 7 = 7%</span><span>已审批版本不会被修改；调整参数会创建新的不可变策略版本</span></div>
           <div className="risk-grid">
+          <label>组合构建方式<select value={portfolioConstruction} onChange={(event) => setPortfolioConstruction(event.target.value)}><option value="topk_equal_weight">Top-K 等权</option><option value="benchmark_relative_qp">基准相对优化</option></select></label>
           <label>持仓数量<input type="number" min="5" max="500" value={topk} onChange={(event) => setTopk(Number(event.target.value))} /></label>
           <label>缓冲替换<input type="number" min="0" max={topk} value={nDrop} onChange={(event) => setNDrop(Number(event.target.value))} /></label>
           <label>单票权重上限（%）<input type="number" step="0.1" min="0.1" max="20" value={maxPositionWeight * 100} onChange={(event) => setMaxPositionWeight(Number(event.target.value) / 100)} /></label>
@@ -312,6 +337,13 @@ export function BacktestPanel({ api }: { api: string }) {
           <label>降仓后目标仓位（%）<input type="number" step="5" min="5" max="95" value={drawdownReductionExposure * 100} onChange={(event) => setDrawdownReductionExposure(Number(event.target.value) / 100)} /></label>
           <label>组合回撤清仓（%）<input type="number" step="1" min="1" max="80" value={maxDrawdownLiquidate * 100} onChange={(event) => setMaxDrawdownLiquidate(Number(event.target.value) / 100)} /></label>
           <label>行业权重上限（%）<input type="number" step="5" min="5" max="100" value={maxIndustryWeight * 100} onChange={(event) => setMaxIndustryWeight(Number(event.target.value) / 100)} /></label>
+          <label>相对基准行业偏离（%）<input type="number" step="0.5" min="0" max="30" value={maxIndustryDeviation * 100} onChange={(event) => setMaxIndustryDeviation(Number(event.target.value) / 100)} /></label>
+          <label>市值风格偏离（标准差）<input type="number" step="0.05" min="0" max="2" value={maxSizeDeviation} onChange={(event) => setMaxSizeDeviation(Number(event.target.value))} /></label>
+          {portfolioConstruction === "benchmark_relative_qp" && <>
+          <label>因子收益权重<input type="number" step="0.01" min="0" max="10" value={optimizerAlphaWeight} onChange={(event) => setOptimizerAlphaWeight(Number(event.target.value))} /></label>
+          <label>基准跟踪惩罚<input type="number" step="0.1" min="0" max="100" value={optimizerTrackingPenalty} onChange={(event) => setOptimizerTrackingPenalty(Number(event.target.value))} /></label>
+          <label>换手惩罚<input type="number" step="0.01" min="0" max="100" value={optimizerTurnoverPenalty} onChange={(event) => setOptimizerTurnoverPenalty(Number(event.target.value))} /></label>
+          </>}
           <label>最大跟踪误差<input type="number" step="0.01" value={maxTrackingError} onChange={(event) => setMaxTrackingError(Number(event.target.value))} /></label>
           <label>回测最大回撤<input type="number" step="0.01" value={maxDrawdown} onChange={(event) => setMaxDrawdown(Number(event.target.value))} /></label>
           <label>最大平均换手<input type="number" step="0.05" value={maxTurnover} onChange={(event) => setMaxTurnover(Number(event.target.value))} /></label>
@@ -323,7 +355,7 @@ export function BacktestPanel({ api }: { api: string }) {
           <label>容量最小成交率<input type="number" step="0.01" min="0" max="1" value={minCapacityFill} onChange={(event) => setMinCapacityFill(Number(event.target.value))} /></label>
           </div>
         </details>
-        {!riskConfigurationValid && <div className="notice">风控参数无效：首次止盈必须低于最终止盈，降仓回撤必须低于清仓回撤，行业上限不能低于单票权重。</div>}
+        {!riskConfigurationValid && <div className="notice">参数无效：请检查止盈/回撤阈值、行业与单票上限；基准相对优化还要求持仓数 × 单票上限不低于 100%，且目标函数至少有一个正权重。</div>}
         <button className="primary" disabled={!riskConfigurationValid || !Object.keys(selectedFactors).length || name.length < 3 || description.length < 10}>创建策略 v1</button>
         <button type="button" onClick={createNextVersion} disabled={!riskConfigurationValid || !current || !Object.keys(selectedFactors).length}>基于当前参数创建 vNext</button>
       </form>
@@ -341,6 +373,7 @@ export function BacktestPanel({ api }: { api: string }) {
     {view === "results" && <>
     {currentBacktest?.status === "succeeded" && <div className="notice">正式回测引擎：{isQlibNative ? "Qlib 原生回测" : "非 Qlib 验证结果（不可审批）"}</div>}
     {currentBacktest?.status === "succeeded" && <div className="notice">执行风控重放：{metrics.execution_risk_overlay_enforced === true && executionReplay ? `已按该版本的止损、分批止盈和组合回撤规则验证 · 重放最大回撤 ${pct(executionReplay.max_drawdown)}` : "缺失（不可审批）"}</div>}
+    {currentBacktest?.status === "succeeded" && metrics.portfolio_construction === "benchmark_relative_qp" && <div className="notice">组合优化：基准相对权重已执行 · 平均主动权重 {pct(metrics.optimizer_mean_active_share)} · 优化器预计单边换手 {pct(metrics.optimizer_mean_expected_turnover)} · 最大跟踪代理 {decimal(metrics.optimizer_max_tracking_risk_proxy)} · 最大行业偏离 {pct(metrics.max_industry_deviation)} · 最大市值风格偏离 {decimal(metrics.max_size_deviation)} · 最大迭代 {String(metrics.optimizer_max_iterations ?? "—")}</div>}
     <section className="metric-strip backtest-metrics"><div><span>年化收益</span><strong>{pct(metrics.annualized_return)}</strong></div><div><span>年化超额</span><strong>{pct(metrics.annualized_excess_return)}</strong></div><div><span>跟踪误差</span><strong>{pct(metrics.tracking_error)}</strong></div><div><span>信息比率</span><strong>{decimal(metrics.information_ratio)}</strong></div><div><span>最大回撤</span><strong>{pct(metrics.max_drawdown)}</strong></div><div><span>平均换手</span><strong>{pct(metrics.average_turnover)}</strong></div></section>
     <section className="metric-strip backtest-metrics"><div><span>Sharpe</span><strong>{decimal(metrics.sharpe_ratio)}</strong></div><div><span>Sortino</span><strong>{decimal(metrics.sortino_ratio)}</strong></div><div><span>容量成交率</span><strong>{pct(metrics.capacity_fill_ratio)}</strong></div><div><span>稳健通过率</span><strong>{pct(metrics.robustness_pass_rate)}</strong></div><div><span>最差场景超额</span><strong>{pct(metrics.worst_scenario_excess_return)}</strong></div><div><span>单日最大亏损</span><strong>{pct(metrics.max_daily_loss)}</strong></div></section>
 

@@ -11,6 +11,8 @@ from quant_platform.strategy_backtest import (
     simulate_long_only_topk,
 )
 
+pytestmark = pytest.mark.no_database
+
 
 def test_governed_signal_is_the_point_in_time_input_for_qlib() -> None:
     dates = pd.bdate_range("2025-01-02", periods=8)
@@ -236,7 +238,7 @@ def test_backtest_enforces_point_in_time_industry_cap() -> None:
         benchmark,
         topk=10,
         n_drop=0,
-        max_position_weight=0.10,
+        max_position_weight=0.15,
         max_daily_turnover=1.0,
         open_cost=0.0,
         close_cost=0.0,
@@ -246,6 +248,10 @@ def test_backtest_enforces_point_in_time_industry_cap() -> None:
         style_exposures=style_exposures,
         max_industry_deviation=0.05,
         max_size_deviation=2.0,
+        portfolio_construction="benchmark_relative_qp",
+        optimizer_alpha_weight=0.10,
+        optimizer_tracking_penalty=1.0,
+        optimizer_turnover_penalty=0.20,
     )
 
     exposure = positions.groupby(["datetime", "industry"])["weight"].sum()
@@ -256,6 +262,13 @@ def test_backtest_enforces_point_in_time_industry_cap() -> None:
     assert metrics["size_neutralization_enforced"] is True
     assert metrics["max_industry_deviation"] <= 0.05 + 1e-12
     assert metrics["max_size_deviation"] <= 2.0
+    assert metrics["portfolio_construction"] == "benchmark_relative_qp"
+    assert metrics["optimizer_days"] == len(dates)
+    assert metrics["optimizer_mean_expected_turnover"] is not None
+    assert metrics["optimizer_max_industry_deviation"] <= 0.05 + 1e-6
+    assert metrics["optimizer_max_size_deviation"] <= 2.0 + 1e-6
+    assert metrics["optimizer_max_iterations"] >= 1
+    assert positions.groupby("datetime")["weight"].nunique().max() > 1
 
 
 def test_backtest_filters_illiquid_names_and_charges_minimum_commission() -> None:

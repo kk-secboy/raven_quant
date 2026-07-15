@@ -67,3 +67,28 @@ def test_strategy_config_pins_a_supported_recipe_version() -> None:
         StrategyConfigRequest.model_validate(
             {"recipe_id": "swing_trend", "recipe_version": "stale"}
         )
+
+
+def test_index_enhancement_recipe_uses_benchmark_relative_optimizer() -> None:
+    recipe = get_strategy_recipe("index_enhancement")
+    config = StrategyConfigRequest.model_validate(
+        {
+            **recipe["config_overrides"],
+            "recipe_id": recipe["id"],
+            "recipe_version": recipe["version"],
+        }
+    )
+
+    assert config.portfolio_construction == "benchmark_relative_qp"
+    assert config.optimizer_tracking_penalty > 0
+
+    with pytest.raises(ValidationError, match=r"topk \* max_position_weight"):
+        StrategyConfigRequest.model_validate(
+            {
+                **recipe["config_overrides"],
+                "recipe_id": recipe["id"],
+                "recipe_version": recipe["version"],
+                "topk": 20,
+                "max_position_weight": 0.02,
+            }
+        )

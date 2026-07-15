@@ -363,6 +363,12 @@ factor promotion to immutable code/value/Qlib evidence, and 0027 adds two tables
 current and append-only Web configuration revisions. A separate isolated migration
 round trip also exercised every downgrade and upgrade step from 0027 to
 `0024_pair_paper_ledger` and back to 0027, ending with all 54 control-plane tables.
+The local schema has since advanced to `0030_research_programs`: 0028 adds durable
+parameter experiments and per-trial evidence, 0029 adds leased autonomous research
+campaigns, and 0030 adds continuous research programs with a unique dataset trigger.
+These three revisions must be
+included in the next idle-queue release and restore drills; the historical reports
+above do not claim to validate them.
 
 ## Schema upgrades
 
@@ -478,6 +484,10 @@ The current accepted restore report is
 strategy-allocation, risk-lifecycle, schedule, pair-paper and Fernet runtime-secret
 sentinels, a healthy restored eight-service stack, HTTP 200 through the gateway, and
 complete cleanup of both isolated projects.
+
+This accepted restore report predates local revisions 0028 through 0030. Do not treat
+it as release evidence for parameter experiments, autonomous campaigns or continuous
+research programs until a new restore drill reaches `0030_research_programs`.
 
 Repeat the same self-cleaning drill after later migrations or storage-layout changes:
 

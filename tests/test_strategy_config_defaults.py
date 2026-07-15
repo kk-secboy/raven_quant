@@ -13,6 +13,8 @@ from quant_platform.strategy_store import (
     _sha256_file,
 )
 
+pytestmark = pytest.mark.no_database
+
 
 def test_docx_risk_template_is_the_strategy_default() -> None:
     config = StrategyConfigRequest()
@@ -89,6 +91,41 @@ def test_strategy_approval_accepts_matching_execution_replay_evidence() -> None:
     config = StrategyConfigRequest()
 
     assert _execution_replay_failures(config.model_dump(), _replay_metrics(config)) == []
+
+
+def test_strategy_approval_requires_optimizer_execution_replay_evidence() -> None:
+    config = StrategyConfigRequest(portfolio_construction="benchmark_relative_qp")
+    metrics = _replay_metrics(config)
+    metrics["execution_replay"].update(
+        {
+            "portfolio_construction": "benchmark_relative_qp",
+            "optimizer_execution_replay_enforced": True,
+            "optimizer_days": 504,
+        }
+    )
+    assert _execution_replay_failures(config.model_dump(), metrics) == []
+
+    metrics["execution_replay"]["optimizer_execution_replay_enforced"] = False
+    failures = _execution_replay_failures(config.model_dump(), metrics)
+    assert "benchmark-relative optimizer execution replay is required" in failures
+
+
+def test_benchmark_relative_optimizer_rejects_an_impossible_position_cap() -> None:
+    with pytest.raises(ValidationError, match="topk \\* max_position_weight"):
+        StrategyConfigRequest(
+            portfolio_construction="benchmark_relative_qp",
+            topk=20,
+            max_position_weight=0.02,
+        )
+
+
+def test_benchmark_relative_optimizer_requires_a_nonzero_objective() -> None:
+    with pytest.raises(ValidationError, match="positive weight"):
+        StrategyConfigRequest(
+            optimizer_alpha_weight=0,
+            optimizer_tracking_penalty=0,
+            optimizer_turnover_penalty=0,
+        )
 
 
 @pytest.mark.parametrize(

@@ -45,7 +45,7 @@ Web console (vinext / React)
       -> leased schedule and alert service
       -> capability-partitioned durable workers
           -> Tushare downloader and Parquet snapshots
-          -> Qlib dataset, training, prediction, backtest, and paper-execution runner
+          -> day/minute Qlib datasets, training, factor scans, backtest, and paper runner
           -> governed pair runner (cointegration, Kalman, minute two-leg execution)
           -> RD-Agent factor research runner
               -> private Docker-in-Docker sandbox (no host Docker socket)
@@ -95,13 +95,36 @@ plane migrations; application startup no longer creates tables implicitly.
 1. Data operations: credentials, bootstrap, incremental sync, coverage, quality,
    snapshots, Qlib conversion, durable jobs, logs, and Web status.
 2. Qlib research: experiment templates, immutable configurations, Alpha158 baseline,
-   LightGBM baseline, prediction artifacts, transaction-cost backtests, and comparisons.
+   LightGBM baseline, separate minute microstructure scans, prediction artifacts,
+   transaction-cost backtests, and comparisons. Frequency mixing fails closed.
 3. RD-Agent: constrained objectives, budgets, run timelines, generated code isolation,
    evaluation, and candidate registration.
 4. Research governance: factor registry, IC/RankIC, decay, correlation, walk-forward
    gates, promotion states, and audit history.
 5. Portfolio operations: daily scoring, explainable candidates, constraints, paper
    orders, holdings, NAV, attribution, alerts, and scheduled after-close workflows.
+
+Continuous research is a control-plane policy above those slices, rather than a
+second research engine. A program pins one verified Qlib lineage, fixed rolling
+train/validation/test windows, bounded RD-Agent and experiment budgets, and a
+maximum number of active campaigns. The scheduler creates at most one campaign for
+each immutable dataset identity after the configured number of new trading days.
+That campaign then follows the same governed path:
+
+```text
+verified same-lineage Qlib snapshot
+  -> bounded RD-Agent factor proposals
+  -> independent factor evaluation and gate
+  -> Qlib baseline and parameter experiments
+  -> challenger strategy and backtest evidence
+  -> human strategy approval
+  -> paper schedule
+```
+
+Program leases and the database uniqueness constraint make scheduler retries safe.
+Waiting conditions remain visible without shortening safety windows; controller
+failures release their lease and append an immutable failure event. No program can
+approve a strategy or cross the sandbox-only broker boundary automatically.
 
 Implemented vertical slices:
 
@@ -124,6 +147,15 @@ Implemented vertical slices:
    resolution of every critical event, and an explicit operator resume action.
 8. Web -> durable daily schedule -> leased run slot -> idempotent worker job ->
    failure/risk projection -> in-app acknowledgement and optional webhook delivery.
+- Minute research: Web -> minute execution snapshot -> independent minute-Qlib conversion -> bounded
+   multi-horizon factor scan. Download, conversion, and research are separate retryable
+   jobs; none can silently enter the day-frequency strategy engine.
+
+Every durable job remains append-only history. The API exposes filtered/paged queries,
+bounded log tails and parameter/error detail. Cancellation is cooperative: queued work
+is cancelled atomically, while a running worker observes `cancel_requested_at`, terminates
+its owned child process, and records a terminal cancelled state without deleting output
+or successful prerequisite work.
 
 ## Document six-layer mapping
 

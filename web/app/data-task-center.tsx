@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
 
 export type DataTask = {
@@ -26,6 +26,8 @@ export type DataTask = {
     range_end: string;
   };
 };
+
+type Snapshot = { name: string; frequency?: string; end_date?: string };
 
 const statusText: Record<string, string> = {
   planned: "待开始",
@@ -59,7 +61,7 @@ const groupDefinitions = [
 
 function groupFor(task: DataTask) {
   if (["cn_funds", "cn_macro"].includes(task.task_key)) return "fund";
-  if (["cn_futures", "cn_options_bonds", "cn_margin_eligibility", "liquid_intraday_1m"].includes(task.task_key)) return "execution";
+  if (["cn_futures", "cn_options_bonds", "cn_margin_eligibility", "liquid_intraday_1m", "liquid_intraday_qlib"].includes(task.task_key)) return "execution";
   if (["hk_market", "us_market", "global_markets"].includes(task.task_key)) return "overseas";
   if (["permission_probe", "external_source_required"].includes(task.implementation_status)) return "advanced";
   return "cn";
@@ -91,11 +93,25 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
   const [catalogFilter, setCatalogFilter] = useState("attention");
   const [query, setQuery] = useState("");
   const [createMode, setCreateMode] = useState("supplemental");
+  const [minuteSnapshots, setMinuteSnapshots] = useState<Snapshot[]>([]);
+  const [minuteSnapshot, setMinuteSnapshot] = useState("");
   const active = tasks.filter((task) => ["queued", "running"].includes(task.status)).length;
   const marginTask = tasks.find((task) => task.task_key === "cn_margin_eligibility");
   const minuteTask = tasks.find((task) => task.task_key === "liquid_intraday_1m");
+  const minuteQlibTask = tasks.find((task) => task.task_key === "liquid_intraday_qlib");
   const supplementalTasks = tasks.filter((task) => supplementalBundles.has(task.task_key));
   const selectedTask = supplementalTasks.find((task) => task.task_key === selectedBundle);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`${api}/api/snapshots`, { cache: "no-store" }).then(async (response) => {
+      if (!response.ok || cancelled) return;
+      const values = (await response.json() as Snapshot[]).filter((item) => item.frequency === "1min");
+      setMinuteSnapshots(values);
+      setMinuteSnapshot((current) => current || values[0]?.name || "");
+    });
+    return () => { cancelled = true; };
+  }, [api]);
 
   const visibleTasks = useMemo(() => tasks.filter((task) => {
     if (catalogFilter === "attention" && task.status === "succeeded") return false;
@@ -144,6 +160,11 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
       end: end || "latest",
       symbols: symbols.split(",").map((item) => item.trim()).filter(Boolean),
     }, task.title);
+  }
+
+  function startMinuteQlib() {
+    if (!minuteSnapshot) { onMessage("尚无已完成的 1 分钟不可变快照。"); return; }
+    void submit("/api/jobs/minute-qlib", { snapshot_name: minuteSnapshot }, "分钟 Qlib 数据集");
   }
 
   function retryTask(task: DataTask) {
@@ -196,6 +217,7 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
                         {supplementalBundles.has(task.task_key) && !["queued", "running"].includes(task.status) ? (
                           <button type="button" disabled={submitting !== null || !task.dependencies_satisfied} onClick={() => startSupplemental(task)}>{task.status === "partial" ? "补齐" : task.status === "succeeded" ? "更新" : "下载"}</button>
                         ) : null}
+                        {task.task_key === "liquid_intraday_qlib" && !["queued", "running"].includes(task.status) ? <button type="button" disabled={submitting !== null || !task.dependencies_satisfied || !minuteSnapshot} onClick={startMinuteQlib}>构建 Qlib</button> : null}
                         {task.status === "failed" && task.job_id ? <button className="danger-button" type="button" disabled={submitting !== null} onClick={() => retryTask(task)}>重试</button> : null}
                         <details>
                           <summary>详情</summary>
@@ -276,6 +298,9 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
           </details>
           <button className="primary" disabled={submitting !== null || !minuteTask?.dependencies_satisfied || ["queued", "running"].includes(minuteTask?.status ?? "")}>{minuteTask?.status === "succeeded" ? "创建增量更新" : "创建下载任务"}</button>
           {!minuteTask?.dependencies_satisfied ? <p className="form-warning">需先完成期货、期权和同区间融券资格数据。</p> : null}
+          <div className="form-intro"><strong>下载完成后构建分钟 Qlib</strong><span>转换是独立任务；失败只重试构建，不会重新下载分钟行情。</span></div>
+          <label>1 分钟不可变快照<select value={minuteSnapshot} onChange={(event) => setMinuteSnapshot(event.target.value)}><option value="">尚无可用快照</option>{minuteSnapshots.map((item) => <option value={item.name} key={item.name}>{item.name}{item.end_date ? ` · 至 ${item.end_date}` : ""}</option>)}</select></label>
+          <button type="button" onClick={startMinuteQlib} disabled={submitting !== null || !minuteSnapshot || !minuteQlibTask?.dependencies_satisfied || ["queued", "running"].includes(minuteQlibTask?.status ?? "")}>构建分钟 Qlib 数据集</button>
         </form>
       )}
     </section>

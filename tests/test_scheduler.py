@@ -1,9 +1,11 @@
+import json
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 from quant_data.config import Settings
 from quant_platform.alert_store import AlertStore
 from quant_platform.job_store import JobStore
+from quant_platform.research_store import ResearchStore
 from quant_platform.schedule_store import ScheduleStore
 from quant_platform.scheduler import SchedulerEngine
 
@@ -51,6 +53,120 @@ def test_scheduler_materializes_once_and_enqueues_incremental_job(
     assert job["payload"]["build_qlib"] is False
     assert job["payload"]["finalize_after_download"] is False
     assert job["payload"]["snapshot_start"] == "2024-01-01"
+
+
+def test_scheduler_creates_recoverable_full_data_pipeline(
+    database_url: str, tmp_path: Path
+) -> None:
+    current = datetime(2025, 1, 2, 7, 29, tzinfo=UTC)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="weekly complete data pipeline",
+        kind="data_pipeline",
+        timezone="Asia/Shanghai",
+        run_time=time(15, 30),
+        trading_days_only=True,
+        payload={
+            "profile": "full",
+            "lookback_days": 14,
+            "snapshot_start": "2024-01-01",
+            "bundles": ["cn_extended_daily", "cn_macro", "global_markets"],
+        },
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+
+    result = SchedulerEngine(_settings(database_url, tmp_path)).tick(
+        current + timedelta(minutes=1)
+    )
+
+    assert result["processed"] == 1
+    run = store.list_runs()[0]
+    job = JobStore(database_url).get(run["job_id"])
+    assert job["kind"] == "bootstrap"
+    assert job["payload"]["finalize_after_download"] is False
+    assert job["payload"]["start"] == "2024-12-19"
+    assert [step["kind"] for step in job["payload"]["pipeline_steps"]] == [
+        "supplemental_cn_extended_daily",
+        "supplemental_cn_macro",
+        "supplemental_global_markets",
+        "data_verify",
+        "data_snapshot",
+        "data_qlib",
+        "qlib_baseline",
+    ]
+
+
+def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
+    database_url: str, tmp_path: Path
+) -> None:
+    current = datetime(2025, 1, 2, 12, 29, tzinfo=UTC)
+    settings = _settings(database_url, tmp_path)
+    dataset = settings.data_root / "qlib" / "cn-research"
+    (dataset / "calendars").mkdir(parents=True)
+    (dataset / "instruments").mkdir()
+    (dataset / "features").mkdir()
+    (dataset / "metadata").mkdir()
+    (dataset / "calendars" / "day.txt").write_text(
+        "2018-01-01\n2025-01-02\n", encoding="utf-8"
+    )
+    (dataset / "instruments" / "cn_all.txt").write_text(
+        "SH600000\t2018-01-01\t2025-01-02\n", encoding="utf-8"
+    )
+    (dataset / "metadata" / "provenance.json").write_text(
+        json.dumps(
+            {
+                "dataset_identity_sha256": "a" * 64,
+                "snapshot_manifest_sha256": "b" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = ScheduleStore(database_url)
+    research_payload = {
+        "objective": "Research a low-turnover quality factor for CSI 300 enhancement.",
+        "dataset": "cn-research",
+        "loop_n": 2,
+        "duration": "1h",
+        "requested_by": "research-scheduler",
+        "periods": {
+            "train_start": "2018-01-01",
+            "train_end": "2021-12-31",
+            "valid_start": "2022-01-01",
+            "valid_end": "2023-12-31",
+            "test_start": "2024-01-01",
+            "test_end": "2025-01-02",
+        },
+    }
+    for name in ("daily bounded factor research", "overlapping research guard"):
+        store.create(
+            name=name,
+            kind="rdagent_research",
+            timezone="Asia/Shanghai",
+            run_time=time(20, 30),
+            trading_days_only=True,
+            payload=research_payload,
+            misfire_grace_seconds=1800,
+            actor="operator",
+            now=current,
+        )
+
+    result = SchedulerEngine(settings).tick(current + timedelta(minutes=1))
+    assert result["materialized"] == 2
+    assert result["processed"] == 2
+    schedule_runs = store.list_runs()
+    assert sorted(item["status"] for item in schedule_runs) == ["enqueued", "skipped"]
+    skipped = next(item for item in schedule_runs if item["status"] == "skipped")
+    assert "already active" in skipped["message"]
+    schedule_run = next(item for item in schedule_runs if item["status"] == "enqueued")
+    assert schedule_run["status"] == "enqueued"
+    job = JobStore(database_url).get(schedule_run["job_id"])
+    assert job["kind"] == "rdagent_factor"
+    assert job["payload"]["loop_n"] == 2
+    research_run = ResearchStore(database_url).list_runs()[0]
+    assert research_run["status"] == "queued"
+    assert research_run["job_id"] == job["id"]
 
 
 def test_expired_schedule_run_lease_is_reclaimed(database_url: str) -> None:

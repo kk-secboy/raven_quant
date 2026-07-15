@@ -235,6 +235,13 @@ class PortfolioStore:
             ]
         return [self.get(portfolio_id) for portfolio_id in ids]
 
+    def get_by_name(self, name: str) -> dict[str, Any] | None:
+        with self.engine.connect() as connection:
+            portfolio_id = connection.scalar(
+                select(paper_portfolios.c.id).where(paper_portfolios.c.name == name)
+            )
+        return self.get(str(portfolio_id)) if portfolio_id else None
+
     def set_status(self, portfolio_id: str, status: str) -> dict[str, Any]:
         if status not in {"active", "paused", "closed"}:
             raise ValueError("portfolio status must be active, paused, or closed")

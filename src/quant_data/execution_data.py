@@ -9,6 +9,20 @@ from .models import FetchSpec, ProviderResult
 from .provider import ProviderError
 
 MARGIN_DATASET = "margin_eligibility"
+NEWS_DATASET = "news"
+NEWS_SOURCES = (
+    "sina",
+    "wallstreetcn",
+    "10jqka",
+    "eastmoney",
+    "yuncaijing",
+    "fenghuang",
+    "jinrongjie",
+    "cls",
+    "yicai",
+)
+NEWS_FIELDS = ("datetime", "content", "title", "channels")
+NEWS_WINDOW_HOURS = 12
 MINUTE_DATASETS: dict[str, str] = {
     "indices_1m": "idx_mins",
     "etf_1m": "etf_mins",
@@ -22,6 +36,7 @@ MINUTE_FIELDS = ("ts_code", "trade_time", "open", "close", "high", "low", "vol",
 FUTURE_MINUTE_FIELDS = (*MINUTE_FIELDS, "oi")
 _TUSHARE_ROW_LIMIT = 8_000
 _MARGIN_ROW_LIMIT = 6_000
+_NEWS_ROW_LIMIT = 1_500
 
 
 def margin_specs(trading_dates: Iterable[str], *, max_attempts: int) -> list[FetchSpec]:
@@ -38,6 +53,67 @@ def margin_specs(trading_dates: Iterable[str], *, max_attempts: int) -> list[Fet
         )
         for trading_date in dates
     ]
+
+
+def news_specs(
+    start: date,
+    end: date,
+    *,
+    max_attempts: int,
+    sources: Iterable[str] = NEWS_SOURCES,
+    window_hours: int = NEWS_WINDOW_HOURS,
+) -> list[FetchSpec]:
+    """Plan bounded, source-aware news requests without accepting capped days."""
+
+    if end < start:
+        raise ValueError("end must not be before start")
+    if not 1 <= window_hours <= 24 or 24 % window_hours != 0:
+        raise ValueError("news window hours must divide one day")
+    normalized_sources = sorted({str(value).strip() for value in sources if str(value).strip()})
+    unknown = set(normalized_sources) - set(NEWS_SOURCES)
+    if unknown:
+        raise ValueError(f"unsupported news sources: {', '.join(sorted(unknown))}")
+    if not normalized_sources:
+        raise ValueError("at least one news source is required")
+
+    specs: list[FetchSpec] = []
+    cursor = start
+    while cursor <= end:
+        day_start = datetime.combine(cursor, time.min)
+        day_end = datetime.combine(cursor, time.max.replace(microsecond=0))
+        for source in normalized_sources:
+            window_start = day_start
+            while window_start <= day_end:
+                window_end = min(
+                    window_start + timedelta(hours=window_hours) - timedelta(seconds=1),
+                    day_end,
+                )
+                start_text = window_start.strftime("%Y-%m-%d %H:%M:%S")
+                end_text = window_end.strftime("%Y-%m-%d %H:%M:%S")
+                specs.append(
+                    FetchSpec(
+                        dataset=NEWS_DATASET,
+                        api_name="news",
+                        scope={
+                            "date": cursor.isoformat(),
+                            "source": source,
+                            "start": start_text,
+                            "end": end_text,
+                            "row_limit": _NEWS_ROW_LIMIT,
+                        },
+                        params={
+                            "src": source,
+                            "start_date": start_text,
+                            "end_date": end_text,
+                        },
+                        fields=NEWS_FIELDS,
+                        allow_empty=True,
+                        max_attempts=max_attempts,
+                    )
+                )
+                window_start = window_end + timedelta(seconds=1)
+        cursor += timedelta(days=1)
+    return specs
 
 
 def minute_specs(
@@ -99,6 +175,8 @@ def minute_specs(
 def validate_and_normalize(spec: FetchSpec, result: ProviderResult) -> ProviderResult:
     if spec.dataset == MARGIN_DATASET:
         return _validate_margin(spec, result)
+    if spec.dataset == NEWS_DATASET:
+        return _validate_news(spec, result)
     if spec.dataset in MINUTE_DATASETS:
         return _validate_minute(spec, result)
     if (
@@ -110,6 +188,42 @@ def validate_and_normalize(spec: FetchSpec, result: ProviderResult) -> ProviderR
 
         return validate_supplemental(spec, result)
     return result
+
+
+def _validate_news(spec: FetchSpec, result: ProviderResult) -> ProviderResult:
+    _require_columns(spec.dataset, result.columns, set(NEWS_FIELDS))
+    if len(result.rows) >= _NEWS_ROW_LIMIT:
+        raise ProviderError(
+            f"{spec.dataset} returned {len(result.rows)} rows and may be truncated at the "
+            f"Tushare {_NEWS_ROW_LIMIT}-row limit; use a smaller source time window",
+            retryable=False,
+        )
+    start = _parse_timestamp(spec.params["start_date"])
+    end = _parse_timestamp(spec.params["end_date"])
+    source = str(spec.params["src"])
+    seen: set[tuple[datetime, str, str]] = set()
+    rows: list[dict[str, Any]] = []
+    for raw in result.rows:
+        row = dict(raw)
+        stamp = _parse_timestamp(row.get("datetime"))
+        if not start <= stamp <= end:
+            raise ProviderError(
+                f"{spec.dataset} returned timestamp {stamp.isoformat()} outside requested window",
+                retryable=False,
+            )
+        title = str(row.get("title") or "")
+        content = str(row.get("content") or "")
+        key = (stamp, title, content)
+        if key in seen:
+            continue
+        seen.add(key)
+        row["source"] = source
+        rows.append(row)
+    columns = [*result.columns]
+    if "source" not in columns:
+        columns.append("source")
+    metadata = {**result.metadata, "source": source}
+    return ProviderResult(result.api_name, columns, rows, result.raw_body, metadata)
 
 
 def _validate_margin(spec: FetchSpec, result: ProviderResult) -> ProviderResult:

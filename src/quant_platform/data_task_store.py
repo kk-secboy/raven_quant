@@ -330,6 +330,20 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         estimated_storage_gb=180,
     ),
     DataTaskDefinition(
+        "liquid_intraday_qlib",
+        6,
+        95,
+        "分钟 Qlib 研究数据集",
+        "将已完成的核心资产1分钟快照独立转换为 Qlib 二进制数据，下载与构建可分别重试。",
+        "研究基础设施",
+        "Qlib",
+        "ready",
+        ("liquid_intraday_1m",),
+        ("qlib_minute_dataset",),
+        "on-demand",
+        estimated_storage_gb=120,
+    ),
+    DataTaskDefinition(
         "cn_ashare_5m",
         6,
         100,
@@ -426,6 +440,7 @@ class DataTaskStore:
             "qlib_baseline": "cn_qlib_baseline",
             "margin_eligibility_download": "cn_margin_eligibility",
             "core_intraday_download": "pair_execution_1m",
+            "minute_qlib": "liquid_intraday_qlib",
         }
         rows = connection.execute(
             select(jobs.c.id, jobs.c.kind, jobs.c.status, jobs.c.created_at)
@@ -572,19 +587,37 @@ class DataTaskStore:
                 unit_counts[name] for name in row["config"]["datasets"] if name in unit_counts
             ]
             if str(row["task_key"]) in SUPPLEMENTAL_TASK_KEYS:
-                per_dataset = [
-                    (
-                        unit_counts[name]["succeeded"] / unit_counts[name]["planned"]
-                        if name in unit_counts and unit_counts[name]["planned"]
+                progress = row.get("progress") or {}
+                completed_datasets = set((progress.get("datasets") or {}).keys())
+                expected_datasets = set(row["config"]["datasets"])
+                authoritative_success = (
+                    row["status"] == "succeeded"
+                    and progress.get("status") == "succeeded"
+                    and progress.get("pagination_verified") is True
+                    and expected_datasets <= completed_datasets
+                )
+                if authoritative_success:
+                    # The successful job result describes the exact current
+                    # plan and proves pagination termination. Historical work
+                    # units from superseded request shapes remain available
+                    # for audit, but must not lower current readiness.
+                    row["coverage"] = 100.0
+                else:
+                    per_dataset = [
+                        (
+                            unit_counts[name]["succeeded"] / unit_counts[name]["planned"]
+                            if name in unit_counts and unit_counts[name]["planned"]
+                            else 0.0
+                        )
+                        for name in row["config"]["datasets"]
+                    ]
+                    row["coverage"] = (
+                        round(sum(per_dataset) / len(per_dataset) * 100, 1)
+                        if per_dataset
                         else 0.0
                     )
-                    for name in row["config"]["datasets"]
-                ]
-                row["coverage"] = (
-                    round(sum(per_dataset) / len(per_dataset) * 100, 1) if per_dataset else 0.0
-                )
-                if row["status"] == "succeeded" and row["coverage"] < 100:
-                    row["status"] = "partial"
+                    if row["status"] == "succeeded" and row["coverage"] < 100:
+                        row["status"] = "partial"
             else:
                 planned = sum(item["planned"] for item in counts)
                 succeeded = sum(item["succeeded"] for item in counts)

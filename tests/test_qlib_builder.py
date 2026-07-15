@@ -124,6 +124,83 @@ def test_builds_per_symbol_normalized_qlib_staging(tmp_path: Path) -> None:
     assert frame["down_limit"].tolist() == pytest.approx([0.9, 0.9])
 
 
+def test_adds_point_in_time_research_features_without_announcement_leakage(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    rows = [
+        {
+            "ts_code": "000001.SZ",
+            "trade_date": day,
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.0,
+            "vol": 100.0,
+            "amount": 1000.0,
+            "pct_chg": 0.0,
+        }
+        for day in ("2024-01-02", "2024-01-03", "2024-01-04")
+    ]
+    fixtures = {
+        "daily": rows,
+        "adj_factor": [
+            {"ts_code": "000001.SZ", "trade_date": row["trade_date"], "adj_factor": 1.0}
+            for row in rows
+        ],
+        "stk_limit": [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": row["trade_date"],
+                "up_limit": 11.0,
+                "down_limit": 9.0,
+            }
+            for row in rows
+        ],
+        "daily_basic": [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": row["trade_date"],
+                "turnover_rate": value,
+                "pe_ttm": 8.0 + value,
+                "pb": 1.0 + value / 10.0,
+                "total_mv": 100_000.0,
+            }
+            for row, value in zip(rows, (1.0, 2.0, 3.0), strict=True)
+        ],
+        "fina_indicator": [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-03",
+                "end_date": "2023-12-31",
+                "roe": 12.5,
+                "debt_to_assets": 45.0,
+                "netprofit_yoy": 18.0,
+            }
+        ],
+    }
+    for dataset, data in fixtures.items():
+        target = snapshot / "parquet" / dataset / "partition_year=2024"
+        target.mkdir(parents=True)
+        pd.DataFrame(data).to_parquet(target / "data.parquet")
+
+    builder = QlibBuilder(snapshot)
+    by_symbol = builder.build_staging(tmp_path / "staging")
+    frame = pd.read_parquet(by_symbol / "SZ000001.parquet")
+
+    assert frame["turnover_rate"].tolist() == pytest.approx([1.0, 2.0, 3.0])
+    assert frame["pe_ttm"].tolist() == pytest.approx([9.0, 10.0, 11.0])
+    assert frame["fund_roe"].iloc[:2].isna().all()
+    assert frame["fund_roe"].iloc[2] == pytest.approx(12.5)
+    assert frame["fund_debt_to_assets"].iloc[2] == pytest.approx(45.0)
+    assert frame["fund_netprofit_yoy"].iloc[2] == pytest.approx(18.0)
+    assert builder.research_feature_contract["availability_policy"] == {
+        "daily_basic": "same_trade_date_after_close",
+        "fina_indicator": "strictly_after_announcement_date",
+    }
+    assert "fund_roe" in builder.qlib_fields
+
+
 def test_accepts_tushare_unrestricted_price_limit_sentinel(tmp_path: Path) -> None:
     snapshot = _write_market_control_snapshot(
         tmp_path,
@@ -273,6 +350,41 @@ def test_writes_point_in_time_industry_metadata(tmp_path: Path) -> None:
     styles = pd.read_parquet(qlib_dir / "metadata" / "style_exposures.parquet")
     assert styles.loc[0, "instrument"] == "SZ000001"
     assert styles.loc[0, "log_market_cap"] == pytest.approx(11.736069, rel=1e-6)
+
+
+def test_writes_normalized_market_context_without_stock_level_duplication(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    global_root = snapshot / "parquet" / "index_global"
+    shibor_root = snapshot / "parquet" / "shibor"
+    global_root.mkdir(parents=True)
+    shibor_root.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "SPX",
+                "trade_date": "2024-01-02",
+                "close": 4750.0,
+                "pct_chg": 0.5,
+            }
+        ]
+    ).to_parquet(global_root / "global.parquet")
+    pd.DataFrame(
+        [{"date": "2024-01-02", "on": 1.75, "1w": 1.82, "1y": 2.10}]
+    ).to_parquet(shibor_root / "shibor.parquet")
+
+    target = tmp_path / "qlib" / "metadata"
+    assert QlibBuilder(snapshot)._write_market_context_metadata(target) is True
+
+    context = pd.read_parquet(target / "market_context.parquet")
+    assert set(context["source"]) == {"index_global", "shibor"}
+    assert set(context.loc[context["source"] == "index_global", "instrument"]) == {"SPX"}
+    assert set(context.loc[context["source"] == "shibor", "instrument"]) == {"shibor"}
+    contract = json.loads(
+        (target / "market_context_contract.json").read_text(encoding="utf-8")
+    )
+    assert contract["sources"]["shibor"]["features"] == ["on", "1w", "1y"]
 
 
 def test_writes_reproducible_qlib_dataset_provenance(tmp_path: Path) -> None:

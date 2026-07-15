@@ -147,7 +147,16 @@ def test_role_permission_matrix_is_closed_by_default() -> None:
     assert has_permission("admin", permission_for("POST", "/api/auth/users"))
     assert has_permission("researcher", permission_for("POST", "/api/rdagent/runs"))
     assert has_permission(
+        "researcher", permission_for("POST", "/api/research-programs")
+    )
+    assert has_permission(
         "researcher", permission_for("POST", "/api/strategies/strategy-id/versions")
+    )
+    assert has_permission(
+        "researcher",
+        permission_for(
+            "POST", "/api/strategy-versions/version-id/parameter-experiments"
+        ),
     )
     assert not has_permission(
         "researcher", permission_for("POST", "/api/strategy-versions/version-id/approve")

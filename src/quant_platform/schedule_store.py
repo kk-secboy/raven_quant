@@ -154,6 +154,8 @@ class ScheduleStore:
     ) -> dict[str, Any]:
         if kind not in {
             "incremental_sync",
+            "data_pipeline",
+            "rdagent_research",
             "paper_rebalance",
             "pair_paper_rebalance",
             "broker_reconcile",
@@ -227,6 +229,13 @@ class ScheduleStore:
         if row is None:
             raise KeyError(schedule_id)
         return self._schedule_row(row)
+
+    def get_by_name(self, name: str) -> dict[str, Any] | None:
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(schedules).where(schedules.c.name == name)
+            ).first()
+        return self._schedule_row(row) if row else None
 
     def list(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.engine.connect() as connection:

@@ -25,6 +25,12 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "pair_portfolio_risk_events",
         "pair_portfolio_reviews",
         "backtest_runs",
+        "parameter_experiments",
+        "parameter_experiment_trials",
+        "research_campaigns",
+        "research_campaign_events",
+        "research_programs",
+        "research_program_events",
         "broker_destinations",
         "broker_order_outbox",
         "broker_events",
@@ -65,7 +71,11 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0027_web_config_templates"
+    assert revision == "0032_job_cancellation"
+    assert {"research_program_id", "dataset_identity_sha256"} <= {
+        column["name"]
+        for column in inspector.get_columns("research_campaigns", schema="quantlab")
+    }
     assert {
         "values_sha256",
         "promoted_evaluation_id",

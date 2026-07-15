@@ -14,6 +14,9 @@ from quant_data.database import (
     jobs,
     open_database,
     paper_portfolios,
+    parameter_experiments,
+    research_campaigns,
+    research_programs,
     research_runs,
 )
 
@@ -126,6 +129,12 @@ class DataRetentionManager:
                 add(value, "factor evaluation")
             for value in connection.scalars(select(backtest_runs.c.dataset)):
                 add(value, "strategy backtest")
+            for value in connection.scalars(select(parameter_experiments.c.dataset)):
+                add(value, "parameter experiment")
+            for value in connection.scalars(select(research_campaigns.c.dataset)):
+                add(value, "research campaign")
+            for value in connection.scalars(select(research_programs.c.last_dataset_name)):
+                add(value, "continuous research program")
             for value in connection.scalars(select(paper_portfolios.c.dataset)):
                 add(value, "paper portfolio")
             active_jobs = connection.execute(

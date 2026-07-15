@@ -11,6 +11,7 @@ from .database import open_database, row_dict, work_units
 from .models import FetchSpec, UnitResult, WorkUnit
 
 _INSERT_BATCH_SIZE = 500
+_SELECT_BATCH_SIZE = 5_000
 
 
 def _utc_now() -> datetime:
@@ -203,6 +204,23 @@ class CheckpointStore:
         statement = statement.order_by(work_units.c.dataset, work_units.c.unit_key)
         with self.engine.connect() as connection:
             return [row_dict(row) for row in connection.execute(statement)]
+
+    def successful_units(self, unit_keys: Iterable[str]) -> list[dict[str, Any]]:
+        """Return successful rows for an explicit plan without scanning all history."""
+
+        keys = sorted(set(unit_keys))
+        if not keys:
+            return []
+        rows: list[dict[str, Any]] = []
+        with self.engine.connect() as connection:
+            for offset in range(0, len(keys), _SELECT_BATCH_SIZE):
+                batch = keys[offset : offset + _SELECT_BATCH_SIZE]
+                statement = select(work_units).where(
+                    work_units.c.status == "succeeded",
+                    work_units.c.unit_key.in_(batch),
+                )
+                rows.extend(row_dict(row) for row in connection.execute(statement))
+        return sorted(rows, key=lambda row: (str(row["dataset"]), str(row["unit_key"])))
 
     def datasets(self) -> list[str]:
         statement = select(work_units.c.dataset).distinct().order_by(work_units.c.dataset)

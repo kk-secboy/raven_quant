@@ -82,6 +82,31 @@ def resolve_snapshot_dataset(
     }
 
 
+def resolve_snapshot_manifest(data_root: Path, snapshot_name: str) -> dict[str, Any]:
+    """Resolve and validate an immutable snapshot without trusting its name as a path."""
+
+    snapshots_root = (data_root / "snapshots").resolve()
+    snapshot = (snapshots_root / snapshot_name).resolve()
+    try:
+        snapshot.relative_to(snapshots_root)
+    except ValueError as exc:
+        raise ValueError("snapshot name resolves outside the snapshot root") from exc
+    manifest_path = snapshot / "manifest.json"
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise ValueError("immutable snapshot manifest is missing or invalid") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("immutable snapshot manifest is missing or invalid")
+    return {
+        "name": snapshot.name,
+        "path": str(snapshot),
+        "manifest": manifest,
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }
+
+
 def dataset_catalog(checkpoint: CheckpointStore) -> list[dict[str, Any]]:
     profiles: dict[str, str] = {
         "stock_basic": "core",
@@ -154,14 +179,23 @@ def list_qlib_datasets(data_root: Path) -> list[dict[str, Any]]:
     if not root.exists():
         return datasets
     for path in sorted((item for item in root.iterdir() if item.is_dir()), reverse=True):
-        calendar = path / "calendars" / "day.txt"
-        instruments = path / "instruments" / "cn_all.txt"
-        features = path / "features"
         provenance_path = path / "metadata" / "provenance.json"
         try:
             provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
             provenance = None
+        frequency = str((provenance or {}).get("frequency") or "day")
+        calendar = path / "calendars" / f"{frequency}.txt"
+        instrument_candidates = (
+            path / "instruments" / "cn_all.txt",
+            path / "instruments" / "liquid_all.txt",
+            path / "instruments" / "all.txt",
+        )
+        instruments = next(
+            (candidate for candidate in instrument_candidates if candidate.exists()),
+            instrument_candidates[-1],
+        )
+        features = path / "features"
         days = calendar.read_text(encoding="utf-8").splitlines() if calendar.exists() else []
         stocks = (
             instruments.read_text(encoding="utf-8").splitlines() if instruments.exists() else []
@@ -177,6 +211,7 @@ def list_qlib_datasets(data_root: Path) -> list[dict[str, Any]]:
                     and provenance.get("snapshot_manifest_sha256")
                 ),
                 "provenance": provenance,
+                "frequency": frequency,
                 "lineage_id": (provenance or {}).get("dataset_lineage_id"),
                 "lineage_verified": bool((provenance or {}).get("lineage_verified")),
                 "start_date": days[0] if days else None,

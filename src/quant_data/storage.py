@@ -181,9 +181,7 @@ class ParquetStore:
                     (field for field in _date_field_candidates(dataset) if field in columns),
                     None,
                 )
-                source_sql = (
-                    f"SELECT DISTINCT * FROM read_parquet({quoted_paths}, union_by_name=true)"
-                )
+                source_sql = _snapshot_source_query(dataset, quoted_paths, set(columns))
                 if date_field:
                     export_sql = (
                         f"SELECT *, year({_identifier(date_field)})::INTEGER AS partition_year, "
@@ -251,6 +249,31 @@ def _date_field_candidates(dataset: str) -> tuple[str, ...]:
         "end_date",
         "out_date",
     )
+
+
+def _snapshot_source_query(dataset: str, quoted_paths: str, columns: set[str]) -> str:
+    base = f"SELECT DISTINCT * FROM read_parquet({quoted_paths}, union_by_name=true)"
+    news_identity = {"datetime", "content", "title", "source"}
+    if dataset != "news" or not news_identity.issubset(columns):
+        return base
+    # Keep every explicitly sourced record. Legacy all-day news units did not
+    # persist the source; retain those only when no new source-aware window has
+    # supplied the same timestamp/title/content. This lets immutable old units
+    # remain on disk without duplicating repaired snapshots.
+    return f"""
+        WITH source_rows AS ({base})
+        SELECT candidate.*
+        FROM source_rows AS candidate
+        WHERE candidate.source IS NOT NULL
+           OR NOT EXISTS (
+                SELECT 1
+                FROM source_rows AS tagged
+                WHERE tagged.source IS NOT NULL
+                  AND candidate.datetime IS NOT DISTINCT FROM tagged.datetime
+                  AND candidate.title IS NOT DISTINCT FROM tagged.title
+                  AND candidate.content IS NOT DISTINCT FROM tagged.content
+           )
+    """
 
 
 def _sha256_file(path: Path) -> str:

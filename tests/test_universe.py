@@ -59,11 +59,10 @@ def test_selects_major_assets_and_dynamic_liquidity() -> None:
         "600000.SH",
     ]
     assert selection.symbols_by_dataset["futures_1m"] == [
-        "IF.CFX",
         "IF2401.CFX",
-        "IM.CFX",
         "IM2401.CFX",
     ]
+    assert "reconstructed locally" in selection.evidence["rules"]["futures"]
     assert selection.symbols_by_dataset["options_1m"] == ["10000002.SH"]
     assert selection.evidence["source_dates"]["stocks"] == "2024-01-02"
 

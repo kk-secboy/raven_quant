@@ -64,6 +64,28 @@ def _industry_map(memberships: pd.DataFrame, trade_date: pd.Timestamp) -> dict[s
     )
 
 
+def _latest_cross_section(
+    frame: pd.DataFrame,
+    as_of: pd.Timestamp,
+    value_column: str,
+) -> pd.Series:
+    required = {"datetime", "instrument", value_column}
+    if not required.issubset(frame.columns):
+        raise ValueError(f"metadata is missing fields: {sorted(required - set(frame.columns))}")
+    normalized = frame.copy()
+    normalized["datetime"] = pd.to_datetime(normalized["datetime"], errors="coerce")
+    eligible = normalized[normalized["datetime"] <= as_of]
+    if eligible.empty:
+        raise ValueError(f"metadata has no {value_column} snapshot at or before {as_of.date()}")
+    latest = eligible["datetime"].max()
+    snapshot = eligible[eligible["datetime"] == latest]
+    values = pd.to_numeric(snapshot[value_column], errors="coerce")
+    values.index = snapshot["instrument"].astype(str)
+    if values.index.has_duplicates or values.isna().any():
+        raise ValueError(f"metadata {value_column} snapshot is incomplete or duplicated")
+    return values.astype(float)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-uri", required=True)
@@ -183,8 +205,27 @@ def main() -> None:
     average_amount = amount_frame.iloc[:, 0].groupby(level="instrument").mean() * 1000.0
     market["amount"] = pd.to_numeric(market["amount"], errors="coerce").fillna(0.0) * 1000.0
     market["average_amount"] = market.index.map(average_amount).astype(float)
-    industries = _industry_map(industry_memberships, trade_date)
+    industries = _industry_map(industry_memberships, as_of)
     market["industry"] = market.index.map(industries)
+    latest_benchmark_weights = _latest_cross_section(benchmark_weights, as_of, "weight")
+    latest_style_exposures = _latest_cross_section(
+        style_exposures, as_of, "log_market_cap"
+    )
+    benchmark_industries = pd.Series(
+        {
+            instrument: industries.get(str(instrument))
+            for instrument in latest_benchmark_weights.index
+        }
+    )
+    if benchmark_industries.isna().any():
+        raise ValueError("benchmark constituents are missing point-in-time industries")
+    benchmark_industry_weights = latest_benchmark_weights.groupby(
+        benchmark_industries
+    ).sum()
+    benchmark_styles = latest_style_exposures.reindex(latest_benchmark_weights.index)
+    if benchmark_styles.isna().any():
+        raise ValueError("benchmark constituents are missing point-in-time style exposures")
+    benchmark_style_exposure = float(latest_benchmark_weights.dot(benchmark_styles))
     benchmark_frame = D.features(
         [manifest["benchmark"]],
         ["$close/$factor"],
@@ -225,6 +266,22 @@ def main() -> None:
         max_drawdown_liquidate=float(config.get("max_drawdown_liquidate", 0.15)),
         drawdown_reduction_exposure=float(config.get("drawdown_reduction_exposure", 0.50)),
         max_industry_weight=float(config.get("max_industry_weight", 0.30)),
+        max_industry_deviation=float(config.get("max_industry_deviation", 0.05)),
+        max_size_deviation=float(config.get("max_size_deviation", 0.30)),
+        portfolio_construction=str(
+            config.get("portfolio_construction", "topk_equal_weight")
+        ),
+        benchmark_weights=latest_benchmark_weights,
+        benchmark_industry_weights=benchmark_industry_weights,
+        style_exposures=latest_style_exposures.reindex(signal.index),
+        benchmark_style_exposure=benchmark_style_exposure,
+        optimizer_alpha_weight=float(config.get("optimizer_alpha_weight", 0.05)),
+        optimizer_tracking_penalty=float(
+            config.get("optimizer_tracking_penalty", 1.0)
+        ),
+        optimizer_turnover_penalty=float(
+            config.get("optimizer_turnover_penalty", 0.10)
+        ),
         min_average_daily_amount=float(config.get("min_average_daily_amount", 500_000_000)),
         max_volume_participation=float(config.get("max_volume_participation", 0.01)),
         open_cost=float(config["open_cost"]),

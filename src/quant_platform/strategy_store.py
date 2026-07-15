@@ -90,6 +90,16 @@ def _execution_replay_failures(
         )
     if replay.get("execution_model") != "next_open":
         failures.append("execution risk replay must use next_open execution")
+    if config.get("portfolio_construction") == "benchmark_relative_qp":
+        if replay.get("portfolio_construction") != "benchmark_relative_qp":
+            failures.append("execution replay did not use benchmark-relative optimization")
+        if replay.get("optimizer_execution_replay_enforced") is not True:
+            failures.append("benchmark-relative optimizer execution replay is required")
+        try:
+            if int(replay.get("optimizer_days", 0)) <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            failures.append("benchmark-relative optimizer has no completed replay days")
     thresholds = replay.get("execution_risk_thresholds")
     if not isinstance(thresholds, dict):
         failures.append("execution risk replay thresholds are required for approval")
@@ -681,6 +691,13 @@ class StrategyStore:
         result["versions"] = [self.get_version(str(item.id)) for item in versions]
         return result
 
+    def get_by_name(self, name: str) -> dict[str, Any] | None:
+        with self.engine.connect() as connection:
+            strategy_id = connection.scalar(
+                select(strategies.c.id).where(strategies.c.name == name)
+            )
+        return self.get(str(strategy_id)) if strategy_id else None
+
     def list(self, limit: int = 100) -> list[dict[str, Any]]:
         statement = select(strategies).order_by(strategies.c.updated_at.desc()).limit(limit)
         with self.engine.connect() as connection:
@@ -773,6 +790,29 @@ class StrategyStore:
             )
             if not result.rowcount:
                 raise KeyError(backtest_id)
+
+    def requeue_backtest(self, backtest_id: str) -> None:
+        with self.engine.begin() as connection:
+            row = connection.execute(
+                select(backtest_runs.c.status)
+                .where(backtest_runs.c.id == backtest_id)
+                .with_for_update()
+            ).first()
+            if row is None:
+                raise KeyError(backtest_id)
+            if row.status not in {"failed", "cancelled"}:
+                raise ValueError("only failed or cancelled backtests may be requeued")
+            connection.execute(
+                update(backtest_runs)
+                .where(backtest_runs.c.id == backtest_id)
+                .values(
+                    status="queued",
+                    metrics_json=None,
+                    error=None,
+                    started_at=None,
+                    finished_at=None,
+                )
+            )
 
     def validate_backtest_artifacts(
         self, backtest_id: str, metrics: dict[str, Any]

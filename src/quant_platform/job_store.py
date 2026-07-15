@@ -124,6 +124,7 @@ class JobStore:
                     exit_code=exit_code,
                     error=error,
                     progress_json=result,
+                    cancel_requested_at=None,
                     finished_at=_now(),
                 )
             )
@@ -147,14 +148,89 @@ class JobStore:
                     error=None,
                     started_at=None,
                     finished_at=None,
+                    cancel_requested_at=None,
                 )
             )
         return self.get(job_id)
 
-    def list(self, limit: int = 50) -> list[dict[str, Any]]:
-        statement = select(jobs).order_by(jobs.c.created_at.desc()).limit(limit)
+    def request_cancel(self, job_id: str) -> dict[str, Any]:
+        with self.engine.begin() as connection:
+            row = connection.execute(
+                select(jobs.c.status).where(jobs.c.id == job_id).with_for_update()
+            ).first()
+            if row is None:
+                raise KeyError(job_id)
+            if row.status == "queued":
+                connection.execute(
+                    update(jobs)
+                    .where(jobs.c.id == job_id)
+                    .values(
+                        status="cancelled",
+                        error="Cancelled before execution",
+                        cancel_requested_at=_now(),
+                        finished_at=_now(),
+                    )
+                )
+            elif row.status == "running":
+                connection.execute(
+                    update(jobs)
+                    .where(jobs.c.id == job_id)
+                    .values(cancel_requested_at=_now())
+                )
+            else:
+                raise ValueError("only queued or running jobs may be cancelled")
+        return self.get(job_id)
+
+    def cancellation_requested(self, job_id: str) -> bool:
+        with self.engine.connect() as connection:
+            value = connection.execute(
+                select(jobs.c.cancel_requested_at).where(jobs.c.id == job_id)
+            ).scalar_one_or_none()
+        return value is not None
+
+    def mark_cancelled(self, job_id: str, error: str = "Cancelled by operator") -> None:
+        with self.engine.begin() as connection:
+            connection.execute(
+                update(jobs)
+                .where(jobs.c.id == job_id)
+                .values(
+                    status="cancelled",
+                    exit_code=None,
+                    error=error,
+                    finished_at=_now(),
+                )
+            )
+
+    def list(
+        self,
+        limit: int = 50,
+        *,
+        offset: int = 0,
+        statuses: tuple[str, ...] = (),
+        kinds: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        statement = select(jobs)
+        if statuses:
+            statement = statement.where(jobs.c.status.in_(statuses))
+        if kinds:
+            statement = statement.where(jobs.c.kind.in_(kinds))
+        statement = statement.order_by(jobs.c.created_at.desc()).offset(offset).limit(limit)
         with self.engine.connect() as connection:
             return [self._decode(row_dict(row)) for row in connection.execute(statement)]
+
+    def count(
+        self,
+        *,
+        statuses: tuple[str, ...] = (),
+        kinds: tuple[str, ...] = (),
+    ) -> int:
+        statement = select(text("count(*)")).select_from(jobs)
+        if statuses:
+            statement = statement.where(jobs.c.status.in_(statuses))
+        if kinds:
+            statement = statement.where(jobs.c.kind.in_(kinds))
+        with self.engine.connect() as connection:
+            return int(connection.execute(statement).scalar_one())
 
     def get(self, job_id: str) -> dict[str, Any]:
         with self.engine.connect() as connection:

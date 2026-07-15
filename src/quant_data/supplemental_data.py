@@ -53,12 +53,13 @@ _PAGINATION_MAX_PAGES = {
     "fina_audit": 16,
     "new_share": 4,
     "fina_mainbz": 64,
+    "fund_basic": 16,
     "fund_company": 4,
     "fund_manager": 64,
     "fund_nav": 64,
     "fund_share": 64,
     "fund_div": 32,
-    "fund_portfolio": 64,
+    "fund_portfolio": 1_024,
     "etf_basic": 4,
     "etf_index": 4,
     "fut_mapping": 8,
@@ -67,7 +68,10 @@ _PAGINATION_MAX_PAGES = {
     "fut_wsr": 4,
     "fut_settle": 4,
     "ft_limit": 4,
-    "opt_basic": 64,
+    # opt_basic is an all-history contract master. Production exceeded the
+    # former 64-page ceiling (128k rows), so allow the short-page proof to
+    # continue without accepting a truncated catalog.
+    "opt_basic": 1_024,
     "cb_basic": 6,
     "cb_issue": 8,
     "cb_redeem": 8,
@@ -84,13 +88,31 @@ _PAGINATION_MAX_PAGES = {
     "us_basic": 30,
     "us_daily": 16,
     "us_daily_adj": 16,
-    "us_income": 64,
-    "us_balancesheet": 64,
-    "us_cashflow": 64,
+    # US VIP statement cross-sections are much denser than their A-share
+    # equivalents. Production probes for a single report period still
+    # returned full 1,000-row pages beyond offset 128k, while all three
+    # endpoints terminated before offset 256k. Keep a generous safety ceiling
+    # so completeness is proved by a short page instead of silently accepting
+    # the former 64-page truncation.
+    "us_income": 512,
+    "us_balancesheet": 512,
+    "us_cashflow": 512,
     "us_fina_indicator": 64,
     "fx_obasic": 8,
     "index_global": 8,
     "fx_daily": 8,
+}
+
+_PAGINATION_PREFETCH_PAGES = {
+    # Contract-master offsets are independent. Fetch a small bounded window in
+    # parallel so one full page does not force another complete CLI phase.
+    "opt_basic": 8,
+    # Report-period pages are independent. A bounded window avoids hundreds
+    # of planner phases while the shared provider rate gate remains the hard
+    # request ceiling.
+    "us_income": 8,
+    "us_balancesheet": 8,
+    "us_cashflow": 8,
 }
 
 
@@ -194,7 +216,9 @@ def next_pagination_specs(
         max_pages = _PAGINATION_MAX_PAGES[current.dataset]
         if next_page >= max_pages:
             continue
-        result.append(_next_page_spec(current, next_page))
+        prefetch = _PAGINATION_PREFETCH_PAGES.get(current.dataset, 1)
+        for page in range(next_page, min(max_pages, next_page + prefetch)):
+            result.append(_next_page_spec(current, page))
     return result
 
 
@@ -521,18 +545,32 @@ def _cn_fund_specs(start: date, end: date, dates: list[str], max_attempts: int) 
     # fund_basic defaults to exchange-traded funds only.  Plan both markets so
     # this independently runnable bundle also has the master rows required to
     # interpret NAV, share, dividend and portfolio records.
-    specs: list[FetchSpec] = [
-        _spec(
-            "fund_basic",
-            "fund_basic",
-            {"market": market, "status": status},
-            scope={"market": market, "status": status, "row_limit": 15_000},
-            allow_empty=True,
-            max_attempts=max_attempts,
-        )
-        for market in ("E", "O")
-        for status in ("L", "I", "D")
-    ]
+    specs: list[FetchSpec] = []
+    for market in ("E", "O"):
+        for status in ("L", "I", "D"):
+            if market == "O" and status == "L":
+                specs.extend(
+                    _paged_specs(
+                        "fund_basic",
+                        "fund_basic",
+                        {"market": market, "status": status},
+                        group=f"fund_basic:{market}:{status}",
+                        page_size=5_000,
+                        max_pages=16,
+                        max_attempts=max_attempts,
+                    )
+                )
+            else:
+                specs.append(
+                    _spec(
+                        "fund_basic",
+                        "fund_basic",
+                        {"market": market, "status": status},
+                        scope={"market": market, "status": status, "row_limit": 15_000},
+                        allow_empty=True,
+                        max_attempts=max_attempts,
+                    )
+                )
     for status in ("L", "D", "P"):
         specs.extend(
             _paged_specs(
@@ -576,7 +614,7 @@ def _cn_fund_specs(start: date, end: date, dates: list[str], max_attempts: int) 
         ("fund_nav", "nav_date", "nav_date", 2_000, 64),
         ("fund_share", "trade_date", "trade_date", 2_000, 64),
         ("fund_div", "ann_date", "ann_date", 1_000, 32),
-        ("fund_portfolio", "ann_date", "ann_date", 2_000, 64),
+        ("fund_portfolio", "ann_date", "ann_date", 2_000, 1_024),
     ):
         specs.extend(
             _daily_paged_specs(
@@ -687,7 +725,7 @@ def _cn_options_bonds_specs(dates: list[str], max_attempts: int) -> list[FetchSp
         {},
         group="opt_basic:all",
         page_size=2_000,
-        max_pages=64,
+        max_pages=1_024,
         max_attempts=max_attempts,
     )
     specs.extend(
@@ -885,7 +923,7 @@ def market_financial_specs(
                         {"period": period},
                         group=f"{dataset}:{period}",
                         page_size=1_000,
-                        max_pages=64,
+                        max_pages=512,
                         max_attempts=max_attempts,
                         expected_date_field="end_date",
                         expected_date=period,

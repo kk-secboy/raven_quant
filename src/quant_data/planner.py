@@ -15,7 +15,7 @@ from .catalog import (
     DatasetDefinition,
 )
 from .checkpoint import CheckpointStore
-from .execution_data import margin_specs, minute_specs
+from .execution_data import margin_specs, minute_specs, news_specs
 from .models import FetchSpec
 from .storage import ParquetStore
 
@@ -192,25 +192,9 @@ class BootstrapPlanner:
         return self.plan_daily(dates, ETF_DAILY, max_attempts)
 
     def plan_news(self, start: date, end: date, max_attempts: int) -> int:
-        specs: list[FetchSpec] = []
-        cursor = start
-        while cursor <= end:
-            day = cursor.isoformat()
-            specs.append(
-                FetchSpec(
-                    dataset="news",
-                    api_name="news",
-                    scope={"date": day},
-                    params={
-                        "start_date": f"{day} 00:00:00",
-                        "end_date": f"{day} 23:59:59",
-                    },
-                    allow_empty=True,
-                    max_attempts=max_attempts,
-                )
-            )
-            cursor = date.fromordinal(cursor.toordinal() + 1)
-        return self.checkpoint.add(specs)
+        return self.checkpoint.add(
+            news_specs(start, end, max_attempts=max_attempts)
+        )
 
     def plan_profile(
         self, profile: str, start: date, end: date, max_attempts: int

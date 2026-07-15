@@ -36,9 +36,20 @@ type ResearchRun = {
   error?: string | null;
 };
 
+type ResearchSchedule = {
+  id: string;
+  name: string;
+  kind: string;
+  status: string;
+  desired_status: string;
+  run_time: string;
+  next_run_at: string;
+  payload: Record<string, unknown>;
+};
+
 type StrategyRecipe = {
   id: string; version: string; name: string; category: string; description: string;
-  rdagent_objective: string; factor_guidance: string[]; config_overrides: Record<string, number>;
+  rdagent_objective: string; factor_guidance: string[]; config_overrides: Record<string, number | string>;
 };
 
 const statusText: Record<string, string> = {
@@ -53,12 +64,16 @@ export function RDAgentPanel({ api }: { api: string }) {
   const [runtime, setRuntime] = useState<Runtime | null>(null);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [runs, setRuns] = useState<ResearchRun[]>([]);
+  const [schedules, setSchedules] = useState<ResearchSchedule[]>([]);
   const [recipes, setRecipes] = useState<StrategyRecipe[]>([]);
   const [recipeId, setRecipeId] = useState("index_enhancement");
   const [dataset, setDataset] = useState("");
   const [objective, setObjective] = useState("研究低换手、低拥挤度的质量因子，用于沪深300指数增强。");
   const [loopN, setLoopN] = useState(1);
   const [duration, setDuration] = useState("30m");
+  const [scheduleName, setScheduleName] = useState("每日受控因子研究");
+  const [scheduleTime, setScheduleTime] = useState("20:30");
+  const [scheduleMisfireGrace, setScheduleMisfireGrace] = useState(1800);
   const [periods, setPeriods] = useState({
     train_start: "2018-01-01", train_end: "2021-12-31",
     valid_start: "2022-01-01", valid_end: "2023-12-31",
@@ -74,6 +89,7 @@ export function RDAgentPanel({ api }: { api: string }) {
         apiFetch(`${api}/api/qlib/datasets`, { cache: "no-store" }),
         apiFetch(`${api}/api/rdagent/runs`, { cache: "no-store" }),
         apiFetch(`${api}/api/strategy-recipes`, { cache: "no-store" }),
+        apiFetch(`${api}/api/schedules`, { cache: "no-store" }),
       ]);
       const nextRuntime = await responses[0].json();
       const nextDatasets = await responses[1].json();
@@ -82,6 +98,7 @@ export function RDAgentPanel({ api }: { api: string }) {
       setRuns(await responses[2].json());
       const recipeBody: { recipes: StrategyRecipe[] } = await responses[3].json();
       setRecipes(recipeBody.recipes);
+      setSchedules((await responses[4].json()).filter((item: ResearchSchedule) => item.kind === "rdagent_research"));
       if (!recipeApplied.current) {
         const recipe = recipeBody.recipes.find((item) => item.id === recipeId)
           ?? recipeBody.recipes[0];
@@ -151,6 +168,50 @@ export function RDAgentPanel({ api }: { api: string }) {
     await load();
   }
 
+  async function createResearchSchedule(event: FormEvent) {
+    event.preventDefault();
+    setMessage("正在保存可恢复的自动研究计划…");
+    const response = await apiFetch(`${api}/api/schedules`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: scheduleName,
+        kind: "rdagent_research",
+        timezone: "Asia/Shanghai",
+        run_time: scheduleTime,
+        trading_days_only: true,
+        payload: { objective, dataset, loop_n: loopN, duration, periods, requested_by: "research-scheduler" },
+        misfire_grace_seconds: scheduleMisfireGrace,
+        actor: "local-operator",
+      }),
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      const detail = body.detail;
+      setMessage(typeof detail === "string" ? detail : detail?.message ?? "自动研究计划保存失败");
+      return;
+    }
+    setMessage(`自动研究计划 ${body.name} 已启用；同一时间只允许一个因子研究运行。`);
+    await load();
+  }
+
+  async function toggleResearchSchedule(item: ResearchSchedule) {
+    const status = item.desired_status === "active" ? "paused" : "active";
+    const response = await apiFetch(`${api}/api/schedules/${item.id}/status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      const detail = body.detail;
+      setMessage(typeof detail === "string" ? detail : detail?.message ?? "自动研究计划状态更新失败");
+      return;
+    }
+    setMessage(status === "paused" ? "自动研究计划已暂停。" : "自动研究计划已恢复。" );
+    await load();
+  }
+
   const checks = [
     { label: "RD-Agent 运行时", pass: runtime?.status === "ok", value: runtime?.version ?? runtime?.status ?? "检查中" },
     { label: "Docker 沙箱", pass: runtime?.docker_available, value: runtime?.docker_available ? "可用" : "未就绪" },
@@ -186,6 +247,19 @@ export function RDAgentPanel({ api }: { api: string }) {
       ] as const).map(([label, startKey, endKey]) => <div key={label}><strong>{label}</strong><label>开始<input type="date" value={periods[startKey]} onChange={(event) => setPeriods({ ...periods, [startKey]: event.target.value })} /></label><label>结束<input type="date" value={periods[endKey]} onChange={(event) => setPeriods({ ...periods, [endKey]: event.target.value })} /></label></div>)}</div>
       {!coverageReady && selectedDataset ? <p className="period-warning">所选快照覆盖 {selectedDataset.start_date} 至 {selectedDataset.end_date}，无法支撑上面的完整研究区间。仅下载 2024–2026 年数据可以做近期回测，但不足以完成默认训练与验证。</p> : null}
     </section>
+
+    <details className="research-automation">
+      <summary><span>自动研究计划</span><strong>{schedules.filter((item) => item.status === "active").length} 个运行中</strong></summary>
+      <div className="research-automation-body">
+        <form onSubmit={createResearchSchedule}>
+          <p>按交易日定时执行当前研究目标；RD-Agent 产出后自动进入独立 Qlib 评估，重叠任务会安全跳过。</p>
+          <label>计划名称<input value={scheduleName} minLength={3} maxLength={150} onChange={(event) => setScheduleName(event.target.value)} /></label>
+          <div className="form-row"><label>运行时间<input type="time" value={scheduleTime} onChange={(event) => setScheduleTime(event.target.value)} /></label><label>错过宽限（秒）<input type="number" min="60" max="86400" step="60" value={scheduleMisfireGrace} onChange={(event) => setScheduleMisfireGrace(Number(event.target.value))} /></label></div>
+          <button className="secondary-action" disabled={!runtime?.ready || !coverageReady || objective.length < 10}>保存并启用</button>
+        </form>
+        <div className="research-schedule-list">{schedules.map((item) => <article key={item.id}><div><strong>{item.name}</strong><small>{item.run_time} · 下次 {new Date(item.next_run_at).toLocaleString("zh-CN", { hour12: false })}</small></div><span className={`state ${item.status === "active" ? "ready" : "partial"}`}>{item.status}</span><button className="inline-action" onClick={() => toggleResearchSchedule(item)}>{item.desired_status === "active" ? "暂停" : "恢复"}</button></article>)}{!schedules.length && <div className="empty compact">尚未启用自动研究；手工研究入口不受影响。</div>}</div>
+      </div>
+    </details>
 
     <section className="jobs-panel">
       <div className="panel-heading"><div><p className="eyebrow">RESEARCH RUNS</p><h2>研究运行</h2></div><span>{runs.length} 条记录</span></div>

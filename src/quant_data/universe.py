@@ -80,7 +80,10 @@ def select_intraday_universe(
                 "indices": "fixed major A-share indices",
                 "etfs": list(etf_categories),
                 "stocks": "highest mean amount over latest 20 available trading days",
-                "futures": "latest IF/IC/IM/IH continuous-to-deliverable mappings",
+                "futures": (
+                    "IF/IC/IM/IH mapped deliverable contracts; continuous series "
+                    "are reconstructed locally"
+                ),
                 "options": "highest amount/volume active SSE/SZSE option contracts",
             },
             "source_dates": {
@@ -171,7 +174,11 @@ def _active_futures(
         ]
         if rows.empty:
             continue
-        selected.update(rows["ts_code"].dropna().astype(str).str.strip().str.upper())
+        # Tushare's minute endpoint accepts real deliverable contracts, not
+        # synthetic continuous identifiers such as IF.CFX/IFL1.CFX. Preserve
+        # the mapping table as lineage evidence and download only the mapped
+        # contracts; continuous series can then be reconstructed locally
+        # without treating a provider-empty synthetic code as complete data.
         selected.update(
             rows["mapping_ts_code"].dropna().astype(str).str.strip().str.upper()
         )

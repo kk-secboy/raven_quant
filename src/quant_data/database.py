@@ -75,6 +75,7 @@ jobs = Table(
         Column("log_path", Text),
         Column("exit_code", Integer),
         Column("error", Text),
+        Column("cancel_requested_at", DateTime(timezone=True)),
         Column("created_at", DateTime(timezone=True), nullable=False),
         Column("started_at", DateTime(timezone=True)),
         Column("finished_at", DateTime(timezone=True)),
@@ -367,6 +368,208 @@ Index(
     "idx_backtest_runs_status_created",
     backtest_runs.c.status,
     backtest_runs.c.created_at.desc(),
+)
+
+parameter_experiments = Table(
+    "parameter_experiments",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("job_id", String, ForeignKey("quantlab.jobs.id", ondelete="SET NULL")),
+    Column(
+        "strategy_version_id",
+        String,
+        ForeignKey("quantlab.strategy_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("dataset", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("periods_json", json_type, nullable=False),
+    Column("parameter_grid_json", json_type, nullable=False),
+    Column("baseline_config_json", json_type, nullable=False),
+    Column("summary_json", json_type),
+    Column("artifact_path", Text, nullable=False),
+    Column("error", Text),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("started_at", DateTime(timezone=True)),
+    Column("finished_at", DateTime(timezone=True)),
+)
+Index(
+    "idx_parameter_experiments_status_created",
+    parameter_experiments.c.status,
+    parameter_experiments.c.created_at.desc(),
+)
+
+parameter_experiment_trials = Table(
+    "parameter_experiment_trials",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "experiment_id",
+        String,
+        ForeignKey("quantlab.parameter_experiments.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("trial_index", Integer, nullable=False),
+    Column("parameters_json", json_type, nullable=False),
+    Column("config_json", json_type, nullable=False),
+    Column("status", String, nullable=False),
+    Column("score", Float),
+    Column("metrics_json", json_type),
+    Column("warnings_json", json_type),
+    Column("error", Text),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("started_at", DateTime(timezone=True)),
+    Column("finished_at", DateTime(timezone=True)),
+    UniqueConstraint("experiment_id", "trial_index", name="uq_parameter_experiment_trial"),
+)
+Index(
+    "idx_parameter_experiment_trials_status",
+    parameter_experiment_trials.c.experiment_id,
+    parameter_experiment_trials.c.status,
+    parameter_experiment_trials.c.trial_index,
+)
+
+research_programs = Table(
+    "research_programs",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("name", String, nullable=False, unique=True),
+    Column("status", String, nullable=False),
+    Column("recipe_id", String, nullable=False),
+    Column("objective", Text, nullable=False),
+    Column("benchmark", String, nullable=False),
+    Column("universe", String, nullable=False),
+    Column("dataset_lineage_id", String, nullable=False),
+    Column("config_json", json_type, nullable=False),
+    Column("min_new_trading_days", Integer, nullable=False),
+    Column("max_active_campaigns", Integer, nullable=False),
+    Column("last_dataset_name", String),
+    Column("last_dataset_identity_sha256", String),
+    Column("last_dataset_end_date", String),
+    Column("last_message", Text),
+    Column("last_checked_at", DateTime(timezone=True)),
+    Column("last_triggered_at", DateTime(timezone=True)),
+    Column("last_evaluated_campaign_id", String),
+    Column("champion_campaign_id", String),
+    Column("champion_strategy_version_id", String),
+    Column("champion_score", Float),
+    Column("champion_selected_at", DateTime(timezone=True)),
+    Column("decay_status", String, nullable=False, server_default="unavailable"),
+    Column("decay_message", Text),
+    Column("next_check_at", DateTime(timezone=True), nullable=False),
+    Column("lease_until", DateTime(timezone=True)),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_research_programs_claim",
+    research_programs.c.status,
+    research_programs.c.next_check_at,
+    research_programs.c.lease_until,
+)
+
+research_campaigns = Table(
+    "research_campaigns",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("name", String, nullable=False, unique=True),
+    Column("status", String, nullable=False),
+    Column("stage", String, nullable=False),
+    Column("objective", Text, nullable=False),
+    Column("dataset", String, nullable=False),
+    Column("benchmark", String, nullable=False),
+    Column("universe", String, nullable=False),
+    Column("recipe_id", String, nullable=False),
+    Column(
+        "research_program_id",
+        String,
+        ForeignKey("quantlab.research_programs.id", ondelete="SET NULL"),
+    ),
+    Column("dataset_identity_sha256", String),
+    Column("config_json", json_type, nullable=False),
+    Column("state_json", json_type, nullable=False),
+    Column("research_run_id", String, ForeignKey("quantlab.research_runs.id", ondelete="SET NULL")),
+    Column("strategy_id", String, ForeignKey("quantlab.strategies.id", ondelete="SET NULL")),
+    Column(
+        "strategy_version_id",
+        String,
+        ForeignKey("quantlab.strategy_versions.id", ondelete="SET NULL"),
+    ),
+    Column(
+        "parameter_experiment_id",
+        String,
+        ForeignKey("quantlab.parameter_experiments.id", ondelete="SET NULL"),
+    ),
+    Column("backtest_id", String, ForeignKey("quantlab.backtest_runs.id", ondelete="SET NULL")),
+    Column(
+        "paper_portfolio_id",
+        String,
+        ForeignKey("quantlab.paper_portfolios.id", ondelete="SET NULL"),
+    ),
+    Column("paper_schedule_id", String, ForeignKey("quantlab.schedules.id", ondelete="SET NULL")),
+    Column("error", Text),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("next_action_at", DateTime(timezone=True), nullable=False),
+    Column("lease_until", DateTime(timezone=True)),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("finished_at", DateTime(timezone=True)),
+    UniqueConstraint(
+        "research_program_id",
+        "dataset_identity_sha256",
+        name="uq_research_campaign_program_dataset",
+    ),
+)
+Index(
+    "idx_research_campaigns_claim",
+    research_campaigns.c.status,
+    research_campaigns.c.next_action_at,
+    research_campaigns.c.lease_until,
+)
+
+research_campaign_events = Table(
+    "research_campaign_events",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column(
+        "campaign_id",
+        String,
+        ForeignKey("quantlab.research_campaigns.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("event_type", String, nullable=False),
+    Column("actor", String, nullable=False),
+    Column("payload_json", json_type, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_research_campaign_events_created",
+    research_campaign_events.c.campaign_id,
+    research_campaign_events.c.created_at,
+)
+
+research_program_events = Table(
+    "research_program_events",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column(
+        "program_id",
+        String,
+        ForeignKey("quantlab.research_programs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("event_type", String, nullable=False),
+    Column("actor", String, nullable=False),
+    Column("payload_json", json_type, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_research_program_events_created",
+    research_program_events.c.program_id,
+    research_program_events.c.created_at,
 )
 
 strategy_events = Table(

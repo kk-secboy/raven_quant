@@ -56,6 +56,12 @@ Open the local URL printed by the Web process. The data center reads real checkp
 snapshot, Qlib, and job state from the Python API. Bootstrap actions are durable jobs:
 closing the browser does not cancel or lose them.
 
+The **Market Overview** page reads the latest immutable daily snapshot and aggregates
+core indices, A-share breadth, 20-day market pulse, industry strength, active ETFs,
+index futures, and an editable watchlist. It is deliberately labeled as reproducible
+research data rather than live quotes; a future broker or streaming provider can be
+added without changing the snapshot-backed research contract.
+
 ## Reproducible deployment
 
 The production-shaped Compose stack separates PostgreSQL, FastAPI, the Qlib worker,
@@ -160,19 +166,46 @@ into train, validation, and test segments, records IC/RankIC, and runs a Top-K b
 with explicit transaction costs. Experiment artifacts are stored under
 `data/artifacts/qlib/<job-id>/`.
 
+Day and minute research are separate contracts. Execution snapshots can be converted
+with the durable `minute_qlib` job after the minute download finishes; conversion can be
+retried without downloading bars again. The Qlib page then offers a bounded minute-factor
+scan over momentum, VWAP deviation, volume surprise, range pressure, and realized
+volatility for configurable 5/15/30-minute horizons and transaction costs. Minute results
+are exploratory records only: they do not enter the daily Alpha158/RD-Agent strategy,
+promotion, approval, or paper-trading path automatically.
+
 The RD-Agent page runs bounded factor loops only after the runtime, Docker sandbox,
 LLM credential, Qlib snapshot, and date coverage checks pass. Generated code and H5
 factor values enter the factor registry as candidates. An independent Qlib evaluator
 selects direction on the validation window, recomputes out-of-sample IC/RankIC,
 turnover, correlation, and cost-adjusted return, and fails closed on missing evidence.
-Only a gate-passed candidate can be manually promoted with an audited reason.
+Only a gate-passed candidate can be promoted. Standalone research keeps the manual
+promotion action; an autonomous campaign may perform a policy-recorded promotion after
+deterministic Qlib ranking, but it still cannot approve a strategy or enter paper trading.
+
+The **Automatic Research** page creates one durable campaign that pins a reproducible
+Qlib dataset and advances through RD-Agent generation, Qlib factor gates, deterministic
+ranking, immutable baseline backtest, bounded parameter experiment, challenger backtest,
+and champion selection. PostgreSQL leases and idempotent child-job keys make every stage
+restart-safe; the Web can pause future stages, resume, cancel, or retry only the failed
+child stage. The champion remains `draft` until a human completes the existing strategy
+approval. Only after that approval does the campaign create its paper portfolio and
+after-close schedule. No campaign can enable broker live mode.
+
+The same page can also persist a **Continuous Research Program**. A program follows
+one verified Qlib dataset lineage, checks for its newest immutable descendant, waits
+for a configurable number of new trading days, derives fixed train/validation/test
+windows from the real trading calendar, and creates at most one campaign per dataset
+identity. PostgreSQL leases, a unique program/dataset key and per-program concurrency
+limits prevent duplicate or overlapping research after restarts. Insufficient history
+is a waiting state rather than permission to shorten the 504-day out-of-sample gate.
 
 The RD-Agent and Strategy Backtest pages share server-owned, versioned recipes derived
 from the design document. Selecting index enhancement or A-share swing/trend loads the
 documented research objective and factor guidance, then pins the recipe version and its
 portfolio/risk/liquidity limits into the immutable strategy version. Unknown or stale
 recipe versions are rejected; selecting a recipe never bypasses independent Qlib
-evaluation, manual factor promotion, backtest gates, or strategy approval.
+evaluation, factor admission policy, backtest gates, or strategy approval.
 
 The Strategy Backtest page builds immutable versions from promoted factors only.
 Each factor is pinned to the exact independent evaluation that selected its direction.
@@ -399,6 +432,10 @@ PostgreSQL
   factor_candidates              # code/value artifacts and lifecycle state
   factor_evaluations             # versioned Qlib metrics and gate decisions
   research_events                # append-only research audit trail
+  research_programs              # continuous same-lineage research policies
+  research_program_events        # append-only lifecycle, trigger, and failure audit
+  research_campaigns             # restart-safe autonomous research state machines
+  research_campaign_events       # append-only campaign stage evidence
   strategies                     # stable strategy identity
   strategy_versions              # immutable configuration and approval state
   strategy_factors               # promoted factor weights and directions
@@ -469,3 +506,17 @@ per-symbol normalized staging view and calls Qlib's official
 uses the Qlib environment in WSL. RD-Agent consumes the resulting Qlib binary
 snapshot and never calls Tushare during an experiment. Use `--no-build-qlib`
 only when downloading on a machine where Qlib is not installed.
+
+Minute snapshots use `python -m quant_data.cli build-minute-qlib` and produce a separate
+`1min` calendar and feature store. API validation rejects a minute dataset anywhere the
+daily Alpha158, RD-Agent, allocation, backtest, or paper engine expects `day`; the minute
+factor lab likewise rejects daily datasets. This prevents silent frequency mixing.
+
+## Durable task operations
+
+`GET /api/jobs` supports status/type filters plus limit/offset pagination and exposes the
+matching total through `X-Total-Count`. The Web task center uses the job detail and bounded
+log-tail endpoints instead of rendering an unbounded page. Failed or cancelled jobs retain
+their parameters and can be retried. Queued jobs cancel immediately; running jobs record a
+cancellation request and the owning worker terminates its child process cooperatively,
+then preserves the cancelled record and log for audit.

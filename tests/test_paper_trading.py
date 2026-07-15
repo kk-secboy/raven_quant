@@ -2,13 +2,74 @@ import inspect
 from datetime import UTC, datetime
 
 import pandas as pd
+import pytest
 
 from quant_platform.paper_trading import build_rebalance_plan
+
+pytestmark = pytest.mark.no_database
 
 
 def test_docx_default_single_position_stop_loss_is_seven_percent() -> None:
     parameter = inspect.signature(build_rebalance_plan).parameters["stop_loss"]
     assert parameter.default == 0.07
+
+
+def test_paper_rebalance_uses_benchmark_relative_target_weights() -> None:
+    instruments = [f"SH{600000 + index:06d}" for index in range(10)]
+    scores = pd.Series(range(10), index=instruments, dtype=float)
+    market = pd.DataFrame(
+        {
+            "open": 10.0,
+            "close": 10.0,
+            "paused": 0.0,
+            "volume": 10_000_000.0,
+            "amount": 1_000_000_000.0,
+            "average_amount": 1_000_000_000.0,
+            "industry": ["bank"] * 5 + ["technology"] * 5,
+            "up_limit": 11.0,
+            "down_limit": 9.0,
+        },
+        index=instruments,
+    )
+
+    result = build_rebalance_plan(
+        scores,
+        market,
+        [],
+        nav=1_000_000,
+        cash=1_000_000,
+        topk=10,
+        n_drop=0,
+        max_position_weight=0.15,
+        max_daily_turnover=1.0,
+        max_industry_weight=0.60,
+        max_industry_deviation=0.10,
+        max_size_deviation=0.20,
+        portfolio_construction="benchmark_relative_qp",
+        benchmark_weights=pd.Series(0.10, index=instruments),
+        benchmark_industry_weights=pd.Series({"bank": 0.50, "technology": 0.50}),
+        style_exposures=pd.Series(
+            [-1.0, -0.8, -0.6, -0.4, -0.2, 0.2, 0.4, 0.6, 0.8, 1.0],
+            index=instruments,
+        ),
+        benchmark_style_exposure=0.0,
+        optimizer_alpha_weight=0.10,
+        optimizer_tracking_penalty=1.0,
+        optimizer_turnover_penalty=0.10,
+        min_average_daily_amount=1.0,
+        max_volume_participation=1.0,
+        open_cost=0.0,
+        close_cost=0.0,
+        slippage=0.0,
+        fill_time=datetime(2025, 1, 2, tzinfo=UTC),
+    )
+
+    assert result["portfolio_construction"] == "benchmark_relative_qp"
+    assert result["optimizer"]["iterations"] > 0
+    assert result["optimizer"]["max_industry_deviation"] <= 0.10 + 1e-6
+    assert result["optimizer"]["size_deviation"] <= 0.20 + 1e-6
+    target_weights = [order["target_weight"] for order in result["orders"]]
+    assert max(target_weights) - min(target_weights) > 1e-4
 
 
 def test_rebalance_plan_respects_turnover_cash_and_suspension() -> None:

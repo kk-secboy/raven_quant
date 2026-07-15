@@ -20,7 +20,8 @@ from .catalog import (
 )
 from .checkpoint import CheckpointStore
 from .config import Settings
-from .execution_data import MARGIN_DATASET, margin_specs
+from .execution_data import MARGIN_DATASET, MINUTE_DATASETS, margin_specs
+from .minute_qlib_builder import MinuteQlibBuilder
 from .models import FetchSpec
 from .planner import BootstrapPlanner, ExecutionDataPlanner, compact_date, parse_date
 from .provider import TushareHttpProvider
@@ -605,6 +606,24 @@ def build_qlib_command(
     console.print(result)
 
 
+@app.command("build-minute-qlib")
+def build_minute_qlib_command(
+    snapshot_name: Annotated[str, typer.Option("--snapshot")],
+    output_name: Annotated[str | None, typer.Option("--output-name")] = None,
+    staging_only: Annotated[bool, typer.Option("--staging-only")] = False,
+) -> None:
+    """Build an independent Qlib 1-minute dataset from an execution snapshot."""
+    context = load_context(require_credentials=False)
+    snapshot_path = context.storage.snapshots_root / snapshot_name
+    result = _build_minute_qlib(
+        context,
+        snapshot_path,
+        output_name=output_name or f"{snapshot_name}-1min",
+        staging_only=staging_only,
+    )
+    console.print(result)
+
+
 def _build_snapshot(
     context: Context, name: str, start_date: date, end_date: date, profile: str
 ) -> Path:
@@ -641,9 +660,15 @@ def _build_snapshot(
             raise ValueError(f"existing snapshot {name!r} does not match the requested range")
         return existing
     available = set(context.checkpoint.datasets())
+    selected_datasets = _profile_datasets(profile)
+    if profile == "full":
+        # A full immutable research lake must retain every downloaded daily,
+        # reference and alternative dataset. Minute bars and shortability form
+        # a separate execution snapshot with a different frequency contract.
+        selected_datasets.update(available - set(MINUTE_DATASETS) - {MARGIN_DATASET})
     units = {
         dataset: context.checkpoint.successful(dataset)
-        for dataset in sorted(_profile_datasets(profile) & available)
+        for dataset in sorted(selected_datasets & available)
     }
     if not units:
         raise ValueError(f"no successful {profile} datasets are available for snapshotting")
@@ -697,6 +722,43 @@ def _build_qlib(context: Context, snapshot_path: Path, *, staging_only: bool) ->
     )
 
 
+def _build_minute_qlib(
+    context: Context,
+    snapshot_path: Path,
+    *,
+    output_name: str,
+    staging_only: bool,
+) -> Path:
+    builder = MinuteQlibBuilder(snapshot_path)
+    staging = context.settings.data_root / "qlib_staging" / output_name
+    output = context.settings.data_root / "qlib" / output_name
+    if not staging_only and output.exists():
+        required = (
+            output / "calendars" / "1min.txt",
+            output / "instruments" / "all.txt",
+            output / "features",
+            output / "metadata" / "provenance.json",
+        )
+        if all(path.exists() for path in required) and any(
+            (output / "features").rglob("*.1min.bin")
+        ):
+            return output
+        raise ValueError(
+            f"existing minute Qlib output is incomplete and requires operator review: {output}"
+        )
+    by_symbol = builder.build_staging(staging)
+    if staging_only:
+        return by_symbol
+    return builder.dump_bin(
+        staging_by_symbol=by_symbol,
+        qlib_dir=output,
+        qlib_repo=context.settings.qlib_repo,
+        qlib_python=context.settings.qlib_python,
+        wsl_distro=context.settings.qlib_wsl_distro,
+        max_workers=min(16, max(1, context.settings.workers * 2)),
+    )
+
+
 def _require_specs_complete(
     context: Context,
     specs: list[FetchSpec],
@@ -704,7 +766,7 @@ def _require_specs_complete(
     hint: str | None = None,
 ) -> list[dict]:
     keys = {spec.unit_key for spec in specs}
-    rows = [row for row in context.checkpoint.successful() if row["unit_key"] in keys]
+    rows = context.checkpoint.successful_units(keys)
     missing = keys - {str(row["unit_key"]) for row in rows}
     if missing:
         suffix = f"; {hint}" if hint else ""

@@ -135,7 +135,29 @@ def test_options_bundle_starts_one_page_per_partition_and_advances_full_pages() 
     ]
     next_specs = next_pagination_specs(specs, rows)
     assert {spec.dataset for spec in next_specs} == {"opt_basic", "opt_daily"}
-    assert all(spec.params["offset"] == spec.scope["page_size"] for spec in next_specs)
+    basic_offsets = [spec.params["offset"] for spec in next_specs if spec.dataset == "opt_basic"]
+    daily_offsets = [spec.params["offset"] for spec in next_specs if spec.dataset == "opt_daily"]
+    assert basic_offsets == list(range(2_000, 18_000, 2_000))
+    assert daily_offsets == [2_000]
+
+
+def test_option_contract_master_can_continue_beyond_old_64_page_ceiling() -> None:
+    specs = supplemental_specs(
+        "cn_options_bonds",
+        start=date(2024, 1, 2),
+        end=date(2024, 1, 2),
+        trading_dates=["20240102"],
+        max_attempts=3,
+    )
+    specs = [spec for spec in specs if spec.dataset == "opt_basic"]
+    while len(specs) < 65:
+        rows = [
+            {"unit_key": spec.unit_key, "row_count": int(spec.scope["page_size"])}
+            for spec in specs
+        ]
+        specs.extend(next_pagination_specs(specs, rows))
+    assert len(specs) == 65
+    assert specs[-1].params["offset"] == 128_000
 
 
 def test_fund_bundle_covers_research_master_and_time_series() -> None:
@@ -163,10 +185,42 @@ def test_fund_bundle_covers_research_master_and_time_series() -> None:
     assert {spec.params["market"] for spec in masters} == {"E", "O"}
     assert {spec.params["status"] for spec in masters} == {"L", "I", "D"}
     assert len(masters) == 6
-    assert all(spec.scope["row_limit"] == 15_000 for spec in masters)
+    paged_master = next(
+        spec
+        for spec in masters
+        if spec.params["market"] == "O" and spec.params["status"] == "L"
+    )
+    assert paged_master.params["limit"] == 5_000
+    assert paged_master.params["offset"] == 0
+    assert paged_master.scope["page_size"] == 5_000
+    assert all(
+        spec.scope["row_limit"] == 15_000
+        for spec in masters
+        if spec is not paged_master
+    )
     etf_masters = [spec for spec in specs if spec.dataset == "etf_basic"]
     assert {spec.params["list_status"] for spec in etf_masters} == {"L", "D", "P"}
     assert next(spec for spec in specs if spec.dataset == "etf_index").scope["page_size"] == 5_000
+
+
+def test_dense_fund_portfolio_can_continue_beyond_the_old_256_page_ceiling() -> None:
+    specs = supplemental_specs(
+        "cn_funds",
+        start=date(2024, 3, 29),
+        end=date(2024, 3, 29),
+        trading_dates=["20240329"],
+        max_attempts=3,
+    )
+    specs = [spec for spec in specs if spec.dataset == "fund_portfolio"]
+    rows = []
+    for _ in range(256):
+        current = specs[-1]
+        rows.append(
+            {"unit_key": current.unit_key, "row_count": int(current.scope["page_size"])}
+        )
+        specs.extend(next_pagination_specs(specs, rows))
+    assert len(specs) == 257
+    assert specs[-1].params["offset"] == 512_000
 
 
 def test_futures_bundle_includes_calendar_and_continuous_mapping() -> None:
@@ -322,6 +376,26 @@ def test_us_financial_specs_use_period_cross_sections() -> None:
     assert all(spec.scope["row_limit"] == 200 for spec in indicators)
 
 
+def test_us_financial_pagination_continues_beyond_old_64_page_ceiling() -> None:
+    specs = market_financial_specs(
+        "us",
+        [],
+        start=date(2024, 1, 1),
+        end=date(2024, 3, 31),
+        max_attempts=3,
+    )
+    pages = [spec for spec in specs if spec.dataset == "us_income"]
+    rows: list[dict] = []
+    for _ in range(9):
+        current_window = sorted(pages, key=lambda item: int(item.scope["offset"]))[-8:]
+        rows.extend(
+            {"unit_key": page.unit_key, "row_count": int(page.scope["page_size"])}
+            for page in current_window
+        )
+        pages.extend(next_pagination_specs(pages, rows))
+    assert max(int(page.scope["offset"]) for page in pages) >= 71_000
+
+
 def test_market_financial_row_limit_is_enforced_by_shared_validator() -> None:
     from quant_data.execution_data import validate_and_normalize
 
@@ -391,7 +465,9 @@ def test_pagination_accepts_a_short_nonempty_terminal_page() -> None:
     assert next_pagination_specs(specs, rows) == []
 
 
-def test_pagination_rejects_a_full_last_allowed_page() -> None:
+def test_pagination_rejects_a_full_last_allowed_page(monkeypatch) -> None:
+    from quant_data import supplemental_data
+
     specs = supplemental_specs(
         "cn_options_bonds",
         start=date(2024, 1, 2),
@@ -400,11 +476,12 @@ def test_pagination_rejects_a_full_last_allowed_page() -> None:
         max_attempts=3,
     )
     specs = [spec for spec in specs if spec.dataset == "opt_basic"]
+    monkeypatch.setitem(supplemental_data._PAGINATION_MAX_PAGES, "opt_basic", 2)
     rows = []
-    for _ in range(64):
+    for _ in range(2):
         current = specs[-1]
         rows.append({"unit_key": current.unit_key, "row_count": int(current.scope["page_size"])})
         specs.extend(next_pagination_specs(specs, rows))
-    assert len(specs) == 64
+    assert len(specs) == 2
     with pytest.raises(RuntimeError, match="pagination did not reach"):
         require_pagination_terminated(specs, rows)

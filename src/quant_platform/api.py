@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from threading import Lock
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -25,11 +25,13 @@ from .alert_store import AlertStore
 from .allocation_store import AllocationStore
 from .auth_policy import ROLE_PERMISSIONS, has_permission, permission_for
 from .auth_store import AuthenticationError, AuthStore
+from .autonomous_research import AutonomousResearchOrchestrator
 from .broker_gateway import (
     BrokerGatewayError,
     BrokerStore,
     validate_broker_gateway_credentials,
 )
+from .continuous_research import ContinuousResearchController
 from .data_rollover import (
     next_qlib_trading_date,
     select_execution_snapshot,
@@ -39,10 +41,14 @@ from .data_task_store import DataTaskStore
 from .deployment_readiness import DeploymentReadinessStore
 from .health_store import OperationalHealthStore
 from .job_store import JobStore
+from .market_overview import MarketOverviewService
 from .pair_portfolio_store import PairPortfolioStore
+from .parameter_experiment_store import ParameterExperimentStore
+from .parameter_experiments import normalize_parameter_grid, split_research_period
 from .platform_config_store import PlatformConfigStore
 from .portfolio_store import PortfolioStore
 from .rdagent_runtime import probe_rdagent, validate_duration
+from .research_automation import normalize_research_schedule_payload
 from .research_store import ResearchStore
 from .retention import DataRetentionManager
 from .runtime_secret_store import RuntimeSecretStore
@@ -54,6 +60,7 @@ from .services import (
     list_snapshots,
     probe_qlib,
     resolve_snapshot_dataset,
+    resolve_snapshot_manifest,
     system_summary,
 )
 from .strategy_recipes import RECIPE_VERSION, get_strategy_recipe, list_strategy_recipes
@@ -172,6 +179,38 @@ class QlibBaselineRequest(BaseModel):
         return self
 
 
+class MinuteQlibRequest(BaseModel):
+    snapshot_name: str = Field(
+        min_length=3,
+        max_length=120,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
+    output_name: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=120,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
+
+
+class MinuteResearchRequest(BaseModel):
+    dataset: str = Field(min_length=3, max_length=120)
+    start: date
+    end: date
+    horizons: list[int] = Field(default_factory=lambda: [5, 15, 30], min_length=1, max_length=6)
+    cost_rate: float = Field(default=0.0002, ge=0, le=0.02)
+
+    @model_validator(mode="after")
+    def validate_minute_research(self) -> MinuteResearchRequest:
+        if self.end < self.start:
+            raise ValueError("end must not be before start")
+        if min(self.horizons) < 1 or max(self.horizons) > 240:
+            raise ValueError("horizons must be between 1 and 240 minutes")
+        if len(set(self.horizons)) != len(self.horizons):
+            raise ValueError("horizons must be unique")
+        return self
+
+
 class ResearchPeriods(BaseModel):
     train_start: date = date(2018, 1, 1)
     train_end: date = date(2021, 12, 31)
@@ -251,6 +290,12 @@ class StrategyConfigRequest(BaseModel):
     max_industry_weight: float = Field(default=0.30, gt=0, le=1.0)
     max_industry_deviation: float = Field(default=0.05, ge=0, le=0.30)
     max_size_deviation: float = Field(default=0.30, ge=0, le=2.0)
+    portfolio_construction: Literal["topk_equal_weight", "benchmark_relative_qp"] = (
+        "topk_equal_weight"
+    )
+    optimizer_alpha_weight: float = Field(default=0.05, ge=0, le=10.0)
+    optimizer_tracking_penalty: float = Field(default=1.0, ge=0, le=100.0)
+    optimizer_turnover_penalty: float = Field(default=0.10, ge=0, le=100.0)
     min_average_daily_amount: float = Field(default=500_000_000, ge=1_000_000, le=100_000_000_000)
     liquidity_lookback_days: int = Field(default=20, ge=5, le=252)
     max_tracking_error: float = Field(default=0.12, gt=0, le=1.0)
@@ -287,6 +332,19 @@ class StrategyConfigRequest(BaseModel):
             raise ValueError("n_drop must not exceed topk")
         if self.max_industry_weight < self.max_position_weight:
             raise ValueError("max_industry_weight must not be below max_position_weight")
+        if (
+            self.portfolio_construction == "benchmark_relative_qp"
+            and self.topk * self.max_position_weight < 1.0
+        ):
+            raise ValueError(
+                "benchmark-relative optimization requires topk * max_position_weight >= 1"
+            )
+        if (
+            self.optimizer_alpha_weight == 0
+            and self.optimizer_tracking_penalty == 0
+            and self.optimizer_turnover_penalty == 0
+        ):
+            raise ValueError("optimizer objective must contain a positive weight")
         if self.take_profit_partial >= self.take_profit:
             raise ValueError("take_profit_partial must be below take_profit")
         if self.max_drawdown_reduce >= self.max_drawdown_liquidate:
@@ -407,6 +465,115 @@ class StrategyBacktestRequest(BaseModel):
         return self
 
 
+class ParameterExperimentRequest(BaseModel):
+    dataset: str
+    start: date
+    end: date
+    parameter_grid: dict[str, list[int | float]]
+    max_trials: int = Field(default=27, ge=1, le=81)
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+    @model_validator(mode="after")
+    def valid_period(self) -> ParameterExperimentRequest:
+        split_research_period(self.start, self.end)
+        return self
+
+
+class ResearchCampaignCreateRequest(BaseModel):
+    name: str = Field(min_length=3, max_length=150)
+    objective: str = Field(min_length=10, max_length=2000)
+    dataset: str
+    recipe_id: Literal["index_enhancement", "swing_trend"] = "index_enhancement"
+    benchmark: str | None = None
+    universe: str | None = None
+    loop_n: int = Field(default=2, ge=1, le=20)
+    duration: str = "1h"
+    periods: ResearchPeriods = Field(default_factory=ResearchPeriods)
+    max_factors: int = Field(default=5, ge=1, le=20)
+    parameter_grid: dict[str, list[int | float]] = Field(
+        default_factory=lambda: {
+            "n_drop": [5, 10],
+            "max_daily_turnover": [0.15, 0.20, 0.25],
+            "max_volume_participation": [0.005, 0.01],
+        }
+    )
+    max_trials: int = Field(default=27, ge=1, le=81)
+    strategy_config: StrategyConfigRequest | None = None
+    initial_cash: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
+    timezone: str = "Asia/Shanghai"
+    paper_run_time: time = time(15, 30)
+    paper_slippage: float = Field(default=0.0005, ge=0, le=0.02)
+    misfire_grace_seconds: int = Field(default=1800, ge=60, le=86400)
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_campaign(self) -> ResearchCampaignCreateRequest:
+        validate_duration(self.duration)
+        split_research_period(self.periods.test_start, self.periods.test_end)
+        if self.paper_run_time < time(15, 10):
+            raise ValueError("paper simulation must run after the A-share close")
+        try:
+            ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone is not available") from exc
+        return self
+
+
+class ResearchCampaignStatusRequest(BaseModel):
+    status: Literal["paused", "running", "cancelled"]
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+
+class ResearchProgramCreateRequest(BaseModel):
+    name: str = Field(min_length=3, max_length=100)
+    dataset: str
+    recipe_id: Literal["index_enhancement", "swing_trend"] = "index_enhancement"
+    objective: str | None = Field(default=None, min_length=10, max_length=2000)
+    benchmark: str | None = None
+    universe: str | None = None
+    train_trading_days: int = Field(default=756, ge=252, le=2520)
+    validation_trading_days: int = Field(default=252, ge=63, le=756)
+    test_trading_days: int = Field(default=504, ge=252, le=1260)
+    min_new_trading_days: int = Field(default=20, ge=1, le=252)
+    max_active_campaigns: int = Field(default=1, ge=1, le=3)
+    champion_min_score_improvement: float = Field(default=0.05, ge=0, le=5)
+    champion_decay_fraction: float = Field(default=0.25, gt=0, le=1)
+    loop_n: int = Field(default=2, ge=1, le=20)
+    duration: str = "1h"
+    max_factors: int = Field(default=5, ge=1, le=20)
+    parameter_grid: dict[str, list[int | float]] = Field(
+        default_factory=lambda: {
+            "n_drop": [5, 10],
+            "max_daily_turnover": [0.15, 0.20, 0.25],
+            "max_volume_participation": [0.005, 0.01],
+        }
+    )
+    max_trials: int = Field(default=27, ge=1, le=81)
+    strategy_config: StrategyConfigRequest | None = None
+    initial_cash: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
+    timezone: str = "Asia/Shanghai"
+    paper_run_time: time = time(15, 30)
+    paper_slippage: float = Field(default=0.0005, ge=0, le=0.02)
+    misfire_grace_seconds: int = Field(default=1800, ge=60, le=86400)
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_program(self) -> ResearchProgramCreateRequest:
+        validate_duration(self.duration)
+        if self.paper_run_time < time(15, 10):
+            raise ValueError("paper simulation must run after the A-share close")
+        try:
+            ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone is not available") from exc
+        return self
+
+
+class ResearchProgramStatusRequest(BaseModel):
+    status: Literal["active", "paused", "cancelled"]
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+
 class StrategyApprovalRequest(BaseModel):
     actor: str = Field(min_length=2, max_length=100)
     reason: str = Field(min_length=10, max_length=2000)
@@ -504,6 +671,8 @@ class ScheduleCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=150)
     kind: Literal[
         "incremental_sync",
+        "data_pipeline",
+        "rdagent_research",
         "paper_rebalance",
         "pair_paper_rebalance",
         "broker_reconcile",
@@ -521,7 +690,9 @@ class ScheduleCreateRequest(BaseModel):
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as exc:
             raise ValueError("timezone is not available") from exc
-        if self.kind == "paper_rebalance":
+        if self.kind == "rdagent_research":
+            normalize_research_schedule_payload(self.payload, max_loops=20)
+        elif self.kind == "paper_rebalance":
             if not self.payload.get("portfolio_id"):
                 raise ValueError("paper_rebalance requires portfolio_id")
             if self.run_time < time(15, 10):
@@ -536,10 +707,30 @@ class ScheduleCreateRequest(BaseModel):
                 raise ValueError("broker_reconcile requires destination_id")
             if self.run_time < time(15, 10):
                 raise ValueError("broker_reconcile must run after the A-share close")
-        else:
+        elif self.kind == "incremental_sync":
             profile = self.payload.get("profile", "full")
             if profile not in {"core", "research", "full"}:
                 raise ValueError("incremental_sync profile is invalid")
+        else:
+            profile = self.payload.get("profile", "full")
+            if profile not in {"core", "research", "full"}:
+                raise ValueError("data_pipeline profile is invalid")
+            allowed = {
+                "cn_extended_daily",
+                "cn_funds",
+                "cn_macro",
+                "cn_futures",
+                "cn_options_bonds",
+                "hk_market",
+                "us_market",
+                "global_markets",
+            }
+            bundles = self.payload.get("bundles") or sorted(allowed)
+            if not isinstance(bundles, list) or not bundles:
+                raise ValueError("data_pipeline requires at least one bundle")
+            unknown = sorted({str(item) for item in bundles} - allowed)
+            if unknown:
+                raise ValueError(f"data_pipeline contains unsupported bundles: {unknown}")
         return self
 
 
@@ -697,6 +888,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     strategies = StrategyStore(settings.database_url)
     portfolios = PortfolioStore(settings.database_url)
     pair_portfolios = PairPortfolioStore(settings.database_url)
+    parameter_experiments = ParameterExperimentStore(settings.database_url)
+    autonomous_research = AutonomousResearchOrchestrator(settings)
+    continuous_research = ContinuousResearchController(settings)
     allocations = AllocationStore(settings.database_url)
     schedules = ScheduleStore(settings.database_url)
     alerts = AlertStore(settings.database_url)
@@ -706,6 +900,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     runtime_secrets = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
     platform_configs = PlatformConfigStore(settings.database_url)
     retention = DataRetentionManager(settings.data_root, settings.database_url)
+    market_dashboard = MarketOverviewService(settings.data_root)
     deployment_readiness = DeploymentReadinessStore(settings, project_root)
     worker = LocalJobWorker(jobs, project_root, settings)
     qlib_runtime: dict | None = None
@@ -786,7 +981,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "updated_at": record.get("updated_at") if record else None,
         }
 
-    def require_qlib_dataset(name: str, *, purpose: str) -> dict:
+    def require_qlib_dataset(
+        name: str, *, purpose: str, frequency: str | None = None
+    ) -> dict:
         available = {item["name"]: item for item in list_qlib_datasets(settings.data_root)}
         dataset = available.get(name)
         if not dataset or not dataset["ready"]:
@@ -795,6 +992,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(
                 409,
                 f"{purpose} requires a Qlib dataset with immutable provenance metadata",
+            )
+        if frequency and dataset.get("frequency") != frequency:
+            raise HTTPException(
+                409,
+                f"{purpose} requires a {frequency} Qlib dataset; selected dataset is "
+                f"{dataset.get('frequency') or 'unknown'}",
             )
         return dataset
 
@@ -1274,6 +1477,17 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def datasets() -> list[dict]:
         return dataset_catalog(checkpoint)
 
+    @app.get("/api/market/overview")
+    def market_overview(
+        snapshot: str | None = Query(default=None, min_length=3, max_length=120),
+        symbols: str | None = Query(default=None, max_length=1000),
+    ) -> dict:
+        requested_symbols = symbols.split(",") if symbols else None
+        try:
+            return market_dashboard.get(snapshot_name=snapshot, symbols=requested_symbols)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @app.get("/api/snapshots")
     def snapshots() -> list[dict]:
         return list_snapshots(settings.data_root)
@@ -1366,7 +1580,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(
                 422, f"loop_n exceeds configured limit {settings.rdagent_max_loops}"
             )
-        dataset = require_qlib_dataset(payload.dataset, purpose="RD-Agent research")
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="RD-Agent research", frequency="day"
+        )
         periods = payload.periods.model_dump(mode="json")
         if (
             dataset.get("start_date")
@@ -1409,6 +1625,273 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         research.attach_job(run["id"], job["id"])
         worker.notify()
         return research.get_run(run["id"])
+
+    @app.get("/api/research-programs")
+    def list_research_programs(
+        limit: int = Query(100, ge=1, le=500),
+    ) -> list[dict[str, Any]]:
+        return continuous_research.programs.list(limit=limit)
+
+    @app.get("/api/research-programs/{program_id}")
+    def get_research_program(program_id: str) -> dict[str, Any]:
+        try:
+            return continuous_research.programs.get(program_id)
+        except KeyError as exc:
+            raise HTTPException(404, "research program not found") from exc
+
+    @app.post("/api/research-programs", status_code=201)
+    def create_research_program(
+        payload: ResearchProgramCreateRequest, request: Request
+    ) -> dict[str, Any]:
+        if payload.loop_n > settings.rdagent_max_loops:
+            raise HTTPException(
+                422, f"loop_n exceeds configured limit {settings.rdagent_max_loops}"
+            )
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="continuous research", frequency="day"
+        )
+        if not dataset.get("lineage_verified") or not dataset.get("lineage_id"):
+            raise HTTPException(
+                409, "continuous research requires a verified Qlib dataset lineage"
+            )
+        try:
+            recipe = get_strategy_recipe(payload.recipe_id)
+            actor = authenticated_actor(request, payload.actor)
+            objective = payload.objective or recipe["rdagent_objective"]
+            if payload.strategy_config is None:
+                strategy_config = StrategyConfigRequest.model_validate(
+                    {
+                        **strategy_defaults_state()["config"],
+                        **recipe["config_overrides"],
+                        "recipe_id": recipe["id"],
+                        "recipe_version": recipe["version"],
+                    }
+                ).model_dump()
+            else:
+                strategy_config = payload.strategy_config.model_dump()
+            parameter_grid, trial_parameters = normalize_parameter_grid(
+                payload.parameter_grid, max_trials=payload.max_trials
+            )
+            experiment_trials = [
+                {
+                    "parameters": parameters,
+                    "config": StrategyConfigRequest.model_validate(
+                        {**strategy_config, **parameters}
+                    ).model_dump(),
+                }
+                for parameters in trial_parameters
+            ]
+            program = continuous_research.programs.create(
+                name=payload.name,
+                recipe_id=payload.recipe_id,
+                objective=objective,
+                benchmark=payload.benchmark or recipe["benchmark"],
+                universe=payload.universe or recipe["universe"],
+                dataset_lineage_id=str(dataset["lineage_id"]),
+                config={
+                    "window_days": {
+                        "train": payload.train_trading_days,
+                        "validation": payload.validation_trading_days,
+                        "test": payload.test_trading_days,
+                    },
+                    "loop_n": payload.loop_n,
+                    "duration": payload.duration,
+                    "max_factors": payload.max_factors,
+                    "strategy_config": strategy_config,
+                    "parameter_grid": parameter_grid,
+                    "experiment_trials": experiment_trials,
+                    "paper": {
+                        "initial_cash": payload.initial_cash,
+                        "timezone": payload.timezone,
+                        "run_time": payload.paper_run_time.isoformat(timespec="minutes"),
+                        "slippage": payload.paper_slippage,
+                        "misfire_grace_seconds": payload.misfire_grace_seconds,
+                    },
+                    "manual_strategy_approval": True,
+                    "champion_min_score_improvement": payload.champion_min_score_improvement,
+                    "champion_decay_fraction": payload.champion_decay_fraction,
+                },
+                min_new_trading_days=payload.min_new_trading_days,
+                max_active_campaigns=payload.max_active_campaigns,
+                actor=actor,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return program
+
+    @app.post("/api/research-programs/{program_id}/status")
+    def set_research_program_status(
+        program_id: str,
+        payload: ResearchProgramStatusRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        try:
+            return continuous_research.programs.set_status(
+                program_id,
+                payload.status,
+                actor=authenticated_actor(request, payload.actor),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "research program not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/research-programs/{program_id}/check-now")
+    def check_research_program_now(program_id: str, request: Request) -> dict[str, Any]:
+        try:
+            return continuous_research.programs.check_now(
+                program_id, actor=authenticated_actor(request)
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "research program not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/research-campaigns")
+    def list_research_campaigns(
+        limit: int = Query(100, ge=1, le=500),
+    ) -> list[dict[str, Any]]:
+        return autonomous_research.campaigns.list(limit=limit)
+
+    @app.get("/api/research-campaigns/{campaign_id}")
+    def get_research_campaign(campaign_id: str) -> dict[str, Any]:
+        try:
+            return autonomous_research.campaigns.get(campaign_id)
+        except KeyError as exc:
+            raise HTTPException(404, "research campaign not found") from exc
+
+    @app.post("/api/research-campaigns", status_code=202)
+    def create_research_campaign(
+        payload: ResearchCampaignCreateRequest, request: Request
+    ) -> dict[str, Any]:
+        runtime = probe_rdagent(settings, project_root)
+        if not runtime.get("ready"):
+            blockers = runtime.get("blockers") or [runtime.get("error") or "runtime unavailable"]
+            raise HTTPException(409, {"message": "RD-Agent is not ready", "blockers": blockers})
+        if payload.loop_n > settings.rdagent_max_loops:
+            raise HTTPException(
+                422, f"loop_n exceeds configured limit {settings.rdagent_max_loops}"
+            )
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="autonomous research", frequency="day"
+        )
+        if (
+            dataset.get("start_date")
+            and payload.periods.train_start.isoformat() < dataset["start_date"]
+        ):
+            raise HTTPException(409, "training window starts before the selected dataset")
+        if dataset.get("end_date") and payload.periods.test_end.isoformat() > dataset["end_date"]:
+            raise HTTPException(409, "test window ends after the selected dataset")
+        try:
+            recipe = get_strategy_recipe(payload.recipe_id)
+            actor = authenticated_actor(request, payload.actor)
+            periods = payload.periods.model_dump(mode="json")
+            research_payload = normalize_research_schedule_payload(
+                {
+                    "objective": payload.objective,
+                    "dataset": payload.dataset,
+                    "loop_n": payload.loop_n,
+                    "duration": payload.duration,
+                    "requested_by": actor,
+                    "periods": periods,
+                },
+                max_loops=settings.rdagent_max_loops,
+            )
+            if payload.strategy_config is None:
+                strategy_config = StrategyConfigRequest.model_validate(
+                    {
+                        **strategy_defaults_state()["config"],
+                        **recipe["config_overrides"],
+                        "recipe_id": recipe["id"],
+                        "recipe_version": recipe["version"],
+                    }
+                ).model_dump()
+            else:
+                strategy_config = payload.strategy_config.model_dump()
+            parameter_grid, trial_parameters = normalize_parameter_grid(
+                payload.parameter_grid, max_trials=payload.max_trials
+            )
+            experiment_trials = [
+                {
+                    "parameters": parameters,
+                    "config": StrategyConfigRequest.model_validate(
+                        {**strategy_config, **parameters}
+                    ).model_dump(),
+                }
+                for parameters in trial_parameters
+            ]
+            campaign = autonomous_research.create(
+                name=payload.name,
+                objective=payload.objective,
+                dataset=payload.dataset,
+                benchmark=payload.benchmark or recipe["benchmark"],
+                universe=payload.universe or recipe["universe"],
+                recipe_id=payload.recipe_id,
+                config={
+                    "research": research_payload,
+                    "strategy_config": strategy_config,
+                    "backtest_periods": {
+                        "start": payload.periods.test_start.isoformat(),
+                        "end": payload.periods.test_end.isoformat(),
+                    },
+                    "experiment_periods": split_research_period(
+                        payload.periods.test_start, payload.periods.test_end
+                    ),
+                    "parameter_grid": parameter_grid,
+                    "experiment_trials": experiment_trials,
+                    "max_factors": payload.max_factors,
+                    "paper": {
+                        "initial_cash": payload.initial_cash,
+                        "timezone": payload.timezone,
+                        "run_time": payload.paper_run_time.isoformat(timespec="minutes"),
+                        "slippage": payload.paper_slippage,
+                        "misfire_grace_seconds": payload.misfire_grace_seconds,
+                    },
+                    "manual_strategy_approval": True,
+                },
+                actor=actor,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+        autonomous_research.tick(limit=1)
+        worker.notify()
+        return autonomous_research.campaigns.get(campaign["id"])
+
+    @app.post("/api/research-campaigns/{campaign_id}/status")
+    def set_research_campaign_status(
+        campaign_id: str,
+        payload: ResearchCampaignStatusRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        try:
+            result = autonomous_research.campaigns.set_status(
+                campaign_id,
+                payload.status,
+                actor=authenticated_actor(request, payload.actor),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "research campaign not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if payload.status == "running":
+            autonomous_research.tick(limit=1)
+            worker.notify()
+            return autonomous_research.campaigns.get(campaign_id)
+        return result
+
+    @app.post("/api/research-campaigns/{campaign_id}/retry")
+    def retry_research_campaign(campaign_id: str, request: Request) -> dict[str, Any]:
+        try:
+            autonomous_research.retry(
+                campaign_id, actor=authenticated_actor(request)
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "research campaign not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        autonomous_research.tick(limit=1)
+        worker.notify()
+        return autonomous_research.campaigns.get(campaign_id)
 
     @app.get("/api/factors")
     def list_factors(
@@ -1548,9 +2031,83 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     ) -> list[dict]:
         return strategies.list_backtests(version_id=version_id, limit=limit)
 
+    @app.get("/api/parameter-experiments")
+    def list_parameter_experiments(
+        limit: int = Query(100, ge=1, le=500),
+    ) -> list[dict]:
+        return parameter_experiments.list(limit=limit)
+
+    @app.get("/api/parameter-experiments/{experiment_id}")
+    def get_parameter_experiment(experiment_id: str) -> dict:
+        try:
+            return parameter_experiments.get(experiment_id)
+        except KeyError as exc:
+            raise HTTPException(404, "parameter experiment not found") from exc
+
+    @app.post(
+        "/api/strategy-versions/{version_id}/parameter-experiments", status_code=202
+    )
+    def create_parameter_experiment(
+        version_id: str, payload: ParameterExperimentRequest, request: Request
+    ) -> dict:
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="parameter experiment", frequency="day"
+        )
+        if dataset.get("start_date") and payload.start.isoformat() < dataset["start_date"]:
+            raise HTTPException(409, "experiment starts before the selected dataset")
+        if dataset.get("end_date") and payload.end.isoformat() > dataset["end_date"]:
+            raise HTTPException(409, "experiment ends after the selected dataset")
+        try:
+            version = strategies.get_version(version_id)
+            if version.get("strategy_type") != "multifactor":
+                raise ValueError("parameter experiments require a multifactor strategy")
+            parameter_grid, trial_parameters = normalize_parameter_grid(
+                payload.parameter_grid, max_trials=payload.max_trials
+            )
+            trial_configs = []
+            for parameters in trial_parameters:
+                config = StrategyConfigRequest.model_validate(
+                    {**version["config"], **parameters}
+                ).model_dump()
+                trial_configs.append({"parameters": parameters, "config": config})
+            experiment = parameter_experiments.create(
+                strategy_version_id=version_id,
+                dataset=payload.dataset,
+                periods=split_research_period(payload.start, payload.end),
+                parameter_grid=parameter_grid,
+                baseline_config=version["config"],
+                trials=trial_configs,
+                artifact_root=settings.data_root / "artifacts" / "parameter-experiments",
+                created_by=authenticated_actor(request, payload.actor),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "strategy version not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        log_path = platform_root / "logs" / f"parameter-experiment-{experiment['id']}.log"
+        try:
+            job = jobs.create(
+                "parameter_experiment",
+                {
+                    "parameter_experiment_id": experiment["id"],
+                    "strategy_version_id": version_id,
+                    "dataset": payload.dataset,
+                    "dataset_path": dataset["path"],
+                },
+                log_path,
+            )
+        except ValueError as exc:
+            parameter_experiments.mark(experiment["id"], "failed", error=str(exc))
+            raise HTTPException(409, str(exc)) from exc
+        parameter_experiments.attach_job(experiment["id"], job["id"])
+        worker.notify()
+        return parameter_experiments.get(experiment["id"])
+
     @app.post("/api/strategy-versions/{version_id}/backtests", status_code=202)
     def create_strategy_backtest(version_id: str, payload: StrategyBacktestRequest) -> dict:
-        dataset = require_qlib_dataset(payload.dataset, purpose="strategy backtest")
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="strategy backtest", frequency="day"
+        )
         if dataset.get("start_date") and payload.start.isoformat() < dataset["start_date"]:
             raise HTTPException(409, "backtest starts before the selected dataset")
         if dataset.get("end_date") and payload.end.isoformat() > dataset["end_date"]:
@@ -1592,7 +2149,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def create_pair_strategy_backtest(
         version_id: str, payload: PairStrategyBacktestRequest
     ) -> dict:
-        dataset = require_qlib_dataset(payload.dataset, purpose="pair strategy backtest")
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="pair strategy backtest", frequency="day"
+        )
         if dataset.get("start_date") and payload.start.isoformat() < dataset["start_date"]:
             raise HTTPException(409, "backtest starts before the selected daily dataset")
         if dataset.get("end_date") and payload.end.isoformat() > dataset["end_date"]:
@@ -1678,7 +2237,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         payload: StrategyAllocationCreateRequest,
         request: Request,
     ) -> dict:
-        require_qlib_dataset(payload.dataset, purpose="strategy allocation")
+        require_qlib_dataset(
+            payload.dataset, purpose="strategy allocation", frequency="day"
+        )
         fixed_weights = (
             {
                 item.strategy_version_id: float(item.weight)
@@ -1854,7 +2415,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.post("/api/pair-portfolios", status_code=201)
     def create_pair_portfolio(payload: PairPortfolioCreateRequest, request: Request) -> dict:
-        dataset = require_qlib_dataset(payload.dataset, purpose="pair paper portfolio")
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="pair paper portfolio", frequency="day"
+        )
         try:
             minute = resolve_snapshot_dataset(
                 settings.data_root,
@@ -2009,7 +2572,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.post("/api/portfolios", status_code=201)
     def create_portfolio(payload: PortfolioCreateRequest, request: Request) -> dict:
-        dataset = require_qlib_dataset(payload.dataset, purpose="paper portfolio")
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="paper portfolio", frequency="day"
+        )
         try:
             return portfolios.create(
                 name=payload.name,
@@ -2131,23 +2696,53 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.post("/api/schedules", status_code=201)
     def create_schedule(payload: ScheduleCreateRequest, request: Request) -> dict:
-        if payload.kind == "paper_rebalance":
+        schedule_actor = authenticated_actor(request, payload.actor)
+        schedule_payload = dict(payload.payload)
+        if payload.kind == "rdagent_research":
+            runtime = probe_rdagent(settings, project_root)
+            if not runtime.get("ready"):
+                blockers = runtime.get("blockers") or [
+                    runtime.get("error") or "runtime unavailable"
+                ]
+                raise HTTPException(
+                    409,
+                    {"message": "RD-Agent is not ready", "blockers": blockers},
+                )
             try:
-                portfolio = portfolios.get(str(payload.payload["portfolio_id"]))
+                research_payload = normalize_research_schedule_payload(
+                    schedule_payload, max_loops=settings.rdagent_max_loops
+                )
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            research_payload["requested_by"] = schedule_actor
+            schedule_payload = research_payload
+            dataset = require_qlib_dataset(
+                research_payload["dataset"],
+                purpose="scheduled RD-Agent research",
+                frequency="day",
+            )
+            periods = research_payload["periods"]
+            if dataset.get("start_date") and periods["train_start"] < dataset["start_date"]:
+                raise HTTPException(409, "training window starts before the selected dataset")
+            if dataset.get("end_date") and periods["test_end"] > dataset["end_date"]:
+                raise HTTPException(409, "test window ends after the selected dataset")
+        elif payload.kind == "paper_rebalance":
+            try:
+                portfolio = portfolios.get(str(schedule_payload["portfolio_id"]))
             except KeyError as exc:
                 raise HTTPException(404, "portfolio not found") from exc
             if portfolio["status"] == "closed":
                 raise HTTPException(409, "closed portfolios cannot be scheduled")
         elif payload.kind == "pair_paper_rebalance":
             try:
-                portfolio = pair_portfolios.get(str(payload.payload["pair_portfolio_id"]))
+                portfolio = pair_portfolios.get(str(schedule_payload["pair_portfolio_id"]))
             except KeyError as exc:
                 raise HTTPException(404, "pair portfolio not found") from exc
             if portfolio["status"] == "closed":
                 raise HTTPException(409, "closed pair portfolios cannot be scheduled")
         elif payload.kind == "broker_reconcile":
             try:
-                destination = brokers.get_destination(str(payload.payload["destination_id"]))
+                destination = brokers.get_destination(str(schedule_payload["destination_id"]))
             except KeyError as exc:
                 raise HTTPException(404, "broker destination not found") from exc
             if destination["status"] != "armed":
@@ -2159,9 +2754,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 timezone=payload.timezone,
                 run_time=payload.run_time,
                 trading_days_only=payload.trading_days_only,
-                payload=payload.payload,
+                payload=schedule_payload,
                 misfire_grace_seconds=payload.misfire_grace_seconds,
-                actor=authenticated_actor(request, payload.actor),
+                actor=schedule_actor,
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -2346,8 +2941,24 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/jobs")
-    def list_jobs(limit: int = Query(50, ge=1, le=200)) -> list[dict]:
-        return jobs.list(limit)
+    def list_jobs(
+        response: Response,
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0, le=100_000),
+        status: Annotated[list[str] | None, Query()] = None,
+        kind: Annotated[list[str] | None, Query()] = None,
+    ) -> list[dict]:
+        allowed_statuses = {"queued", "running", "succeeded", "failed", "cancelled"}
+        unknown = set(status or []) - allowed_statuses
+        if unknown:
+            raise HTTPException(422, f"unsupported job status: {sorted(unknown)}")
+        statuses = tuple(status or [])
+        kinds = tuple(item for item in (kind or []) if item.strip())
+        response.headers["X-Total-Count"] = str(
+            jobs.count(statuses=statuses, kinds=kinds)
+        )
+        response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
+        return jobs.list(limit, offset=offset, statuses=statuses, kinds=kinds)
 
     @app.get("/api/data-tasks")
     def list_data_tasks() -> list[dict]:
@@ -2550,9 +3161,22 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         worker.notify()
         return job
 
+    @app.post("/api/jobs/{job_id}/cancel", status_code=202)
+    def cancel_job(job_id: str) -> dict:
+        try:
+            job = jobs.request_cancel(job_id)
+        except KeyError as exc:
+            raise HTTPException(404, "job not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return job
+
     @app.post("/api/jobs/qlib-baseline", status_code=202)
     def create_qlib_baseline(payload: QlibBaselineRequest) -> dict:
-        dataset = require_qlib_dataset(payload.dataset, purpose="Qlib baseline")
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="Qlib baseline", frequency="day"
+        )
         serialized = {
             "dataset": payload.dataset,
             "dataset_path": dataset["path"],
@@ -2569,6 +3193,68 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         log_path = platform_root / "logs" / f"qlib-baseline-{stamp}.log"
         try:
             job = jobs.create("qlib_baseline", serialized, log_path)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return job
+
+    @app.post("/api/jobs/minute-qlib", status_code=202)
+    def create_minute_qlib(payload: MinuteQlibRequest) -> dict:
+        try:
+            snapshot = resolve_snapshot_manifest(settings.data_root, payload.snapshot_name)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        manifest = snapshot["manifest"]
+        if manifest.get("frequency") != "1min":
+            raise HTTPException(409, "minute Qlib requires a 1min execution snapshot")
+        supported = {
+            "indices_1m",
+            "etf_1m",
+            "futures_1m",
+            "options_1m",
+            "liquid_stocks_1m",
+        }
+        if not supported.intersection(manifest.get("datasets", {})):
+            raise HTTPException(409, "execution snapshot has no supported minute datasets")
+        output_name = payload.output_name or f"{payload.snapshot_name}-1min"
+        serialized = {
+            "snapshot_name": payload.snapshot_name,
+            "snapshot_manifest_sha256": snapshot["manifest_sha256"],
+            "output_name": output_name,
+        }
+        log_path = platform_root / "logs" / f"minute-qlib-{output_name}.log"
+        try:
+            job = jobs.create(
+                "minute_qlib",
+                serialized,
+                log_path,
+                idempotency_key=f"minute-qlib:{payload.snapshot_name}:{output_name}",
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return job
+
+    @app.post("/api/jobs/minute-research", status_code=202)
+    def create_minute_research(payload: MinuteResearchRequest) -> dict:
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="minute factor research", frequency="1min"
+        )
+        serialized = {
+            "dataset": payload.dataset,
+            "dataset_path": dataset["path"],
+            "dataset_identity_sha256": dataset["provenance"][
+                "dataset_identity_sha256"
+            ],
+            "start": payload.start.isoformat(),
+            "end": payload.end.isoformat(),
+            "horizons": sorted(payload.horizons),
+            "cost_rate": payload.cost_rate,
+        }
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        log_path = platform_root / "logs" / f"minute-research-{stamp}.log"
+        try:
+            job = jobs.create("minute_research", serialized, log_path)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         worker.notify()

@@ -201,7 +201,7 @@ def test_known_older_database_revision_has_upgrade_path() -> None:
         "0017_qmt_execution_state",
     )
 
-    assert code_revision == "0027_web_config_templates"
+    assert code_revision == "0032_job_cancellation"
     assert state == "upgrade_required"
     assert compatible is True
 
@@ -214,6 +214,6 @@ def test_unknown_database_revision_fails_closed() -> None:
         "9999_unknown_revision",
     )
 
-    assert code_revision == "0027_web_config_templates"
+    assert code_revision == "0032_job_cancellation"
     assert state == "unknown_database_revision"
     assert compatible is False

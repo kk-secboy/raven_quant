@@ -119,7 +119,7 @@ def test_api_exposes_persistent_data_tasks(database_url: str, tmp_path: Path, mo
 
     assert response.status_code == 200
     tasks = response.json()
-    assert len(tasks) == 18
+    assert len(tasks) == 19
     assert next(item for item in tasks if item["task_key"] == "hk_market")
     assert next(item for item in tasks if item["task_key"] == "cn_funds")
     assert next(item for item in tasks if item["task_key"] == "global_markets")
@@ -149,12 +149,37 @@ def test_api_exposes_persistent_data_tasks(database_url: str, tmp_path: Path, mo
     assert margin["implementation_status"] == "ready"
     minute = next(item for item in tasks if item["task_key"] == "liquid_intraday_1m")
     assert minute["depends_on"] == ["cn_options_bonds", "cn_margin_eligibility"]
+    minute_qlib = next(
+        item for item in tasks if item["task_key"] == "liquid_intraday_qlib"
+    )
+    assert minute_qlib["depends_on"] == ["liquid_intraday_1m"]
     assert (
         next(item for item in tasks if item["task_key"] == "cn_extended_daily")[
             "implementation_status"
         ]
         == "ready"
     )
+
+
+def test_minute_qlib_job_updates_its_own_task_card(
+    database_url: str, tmp_path: Path
+) -> None:
+    jobs = JobStore(database_url)
+    job = jobs.create(
+        "minute_qlib",
+        {
+            "snapshot_name": "execution-fixture",
+            "output_name": "execution-fixture-1min",
+        },
+        tmp_path / "minute-qlib.log",
+    )
+    store = DataTaskStore(database_url)
+    store.sync_catalog()
+
+    tasks = {item["task_key"]: item for item in store.list()}
+    assert tasks["liquid_intraday_qlib"]["job_id"] == job["id"]
+    assert tasks["liquid_intraday_qlib"]["status"] == "queued"
+    assert tasks["liquid_intraday_1m"]["job_id"] is None
 
 
 def test_task_card_exposes_failure_reason_and_retry_identity(
@@ -209,3 +234,47 @@ def test_legacy_success_is_partial_when_new_interfaces_are_missing(
 
     assert task["status"] == "partial"
     assert task["coverage"] == 11.1
+
+
+def test_verified_current_plan_ignores_superseded_failed_units(
+    database_url: str, tmp_path: Path
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    obsolete = FetchSpec(
+        dataset="fund_basic",
+        api_name="fund_basic",
+        scope={"market": "O", "status": "L", "row_limit": 15_000},
+        params={"market": "O", "status": "L"},
+        max_attempts=1,
+    )
+    checkpoint.add([obsolete])
+    unit = checkpoint.claim({"fund_basic"})
+    assert unit is not None
+    checkpoint.fail(unit.unit_key, "provider row limit reached", terminal=True)
+
+    jobs = JobStore(database_url)
+    job = jobs.create(
+        "supplemental_cn_funds",
+        {"bundle": "cn_funds", "start": "2024-01-01", "end": "2024-01-31"},
+        tmp_path / "funds.log",
+    )
+    datasets = {
+        name: {"units": 1, "rows": 1} for name in bundle_datasets("cn_funds")
+    }
+    jobs.finish(
+        job["id"],
+        exit_code=0,
+        result={
+            "status": "succeeded",
+            "bundle": "cn_funds",
+            "datasets": datasets,
+            "pagination_verified": True,
+        },
+    )
+
+    store = DataTaskStore(database_url)
+    store.sync_catalog()
+    task = next(item for item in store.list() if item["task_key"] == "cn_funds")
+
+    assert task["status"] == "succeeded"
+    assert task["coverage"] == 100.0

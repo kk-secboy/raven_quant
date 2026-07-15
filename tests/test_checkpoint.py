@@ -57,3 +57,29 @@ def test_checkpoint_batches_large_plans(database_url: str) -> None:
 
     assert store.add(specs) == 6_000
     assert store.add(specs) == 0
+
+
+def test_successful_units_reads_only_the_requested_plan(database_url: str) -> None:
+    store = CheckpointStore(database_url)
+    first = spec()
+    second = FetchSpec(
+        dataset="daily",
+        api_name="daily",
+        scope={"trade_date": "20240103"},
+        params={"trade_date": "20240103"},
+    )
+    unrelated = FetchSpec(
+        dataset="daily",
+        api_name="daily",
+        scope={"trade_date": "20240104"},
+        params={"trade_date": "20240104"},
+    )
+    store.add([first, second, unrelated])
+    for item in (first, unrelated):
+        store.succeed(
+            item.unit_key,
+            UnitResult(output_path=f"units/{item.unit_key}.parquet", row_count=1, sha256="abc"),
+        )
+
+    rows = store.successful_units([first.unit_key, second.unit_key])
+    assert [row["unit_key"] for row in rows] == [first.unit_key]

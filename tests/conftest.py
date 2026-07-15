@@ -37,12 +37,18 @@ from quant_data.database import (
     paper_orders,
     paper_portfolios,
     paper_positions,
+    parameter_experiment_trials,
+    parameter_experiments,
     platform_config_revisions,
     platform_configs,
     portfolio_batches,
     portfolio_nav,
     portfolio_reviews,
+    research_campaign_events,
+    research_campaigns,
     research_events,
+    research_program_events,
+    research_programs,
     research_runs,
     risk_events,
     runtime_secrets,
@@ -90,6 +96,10 @@ def database_state(monkeypatch, request: pytest.FixtureRequest) -> str:
         connection.execute(delete(users))
         connection.execute(delete(alerts))
         connection.execute(delete(system_health_snapshots))
+        connection.execute(delete(research_campaign_events))
+        connection.execute(delete(research_campaigns))
+        connection.execute(delete(research_program_events))
+        connection.execute(delete(research_programs))
         connection.execute(delete(broker_gateway_events))
         connection.execute(delete(broker_gateway_attempts))
         connection.execute(delete(broker_gateway_children))
@@ -123,6 +133,8 @@ def database_state(monkeypatch, request: pytest.FixtureRequest) -> str:
         connection.execute(delete(portfolio_batches))
         connection.execute(delete(paper_portfolios))
         connection.execute(delete(strategy_events))
+        connection.execute(delete(parameter_experiment_trials))
+        connection.execute(delete(parameter_experiments))
         connection.execute(delete(backtest_runs))
         connection.execute(delete(strategy_factors))
         connection.execute(delete(strategy_pairs))
