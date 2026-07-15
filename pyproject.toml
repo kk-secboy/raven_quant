@@ -22,6 +22,7 @@ dependencies = [
   "scipy>=1.13,<2",
   "sqlalchemy>=2.0,<3",
   "statsmodels>=0.14,<1",
+  "tables>=3.10,<4",
   "psycopg[binary]>=3.2,<4",
   "typer>=0.15,<1",
   "uvicorn[standard]>=0.35,<1",

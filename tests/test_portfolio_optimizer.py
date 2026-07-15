@@ -66,6 +66,35 @@ def test_benchmark_relative_optimizer_fails_closed_on_infeasible_book() -> None:
         )
 
 
+def test_benchmark_relative_optimizer_enforces_multiple_style_dimensions() -> None:
+    instruments = pd.Index([f"stock-{index:02d}" for index in range(10)])
+    styles = pd.DataFrame(
+        {
+            "size": [-1.0, -0.8, -0.6, -0.4, -0.2, 0.2, 0.4, 0.6, 0.8, 1.0],
+            "value": [1.0, 0.8, 0.6, 0.4, 0.2, -0.2, -0.4, -0.6, -0.8, -1.0],
+            "growth": [-0.5, 0.5] * 5,
+            "volatility": [0.5, -0.5] * 5,
+        },
+        index=instruments,
+    )
+    result = optimize_benchmark_relative_weights(
+        pd.Series(range(10), index=instruments, dtype=float),
+        pd.Series(0.10, index=instruments),
+        pd.Series(0.10, index=instruments),
+        industries=pd.Series(["all"] * 10, index=instruments),
+        benchmark_industry_weights=pd.Series({"all": 1.0}),
+        style_exposures=styles,
+        benchmark_style_exposure=pd.Series(0.0, index=styles.columns),
+        max_position_weight=0.15,
+        max_industry_weight=1.0,
+        max_industry_deviation=0.0,
+        max_size_deviation=0.10,
+        max_style_deviations={column: 0.10 for column in styles.columns},
+    )
+    assert set(result.style_deviations) == set(styles.columns)
+    assert max(result.style_deviations.values()) <= 0.10 + 1e-6
+
+
 def test_benchmark_relative_optimizer_requires_point_in_time_membership() -> None:
     instruments = pd.Index([f"stock-{index}" for index in range(5)])
     with pytest.raises(ValueError, match="point-in-time"):

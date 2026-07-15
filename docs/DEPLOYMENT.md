@@ -2,6 +2,11 @@
 
 ## Deployment boundary
 
+The deployed product is research and recommendation only. QMT is disabled unless the
+optional plugin flag is explicitly enabled, and even then it is not connected to
+recommendation snapshots. Legacy paper and pair-paper records are retained only for
+historical inspection; their APIs and schedules are not part of the active workflow.
+
 The deployment stack contains eight isolated services:
 
 - `gateway`: the only HTTP entry point; proxies `/api/*` to FastAPI and all other

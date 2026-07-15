@@ -76,8 +76,6 @@ export function JobRunCenter({ api, canControl, onChanged, onMessage }: Props) {
     return () => { window.clearTimeout(initial); window.clearInterval(timer); };
   }, [load]);
 
-  useEffect(() => setPage(0), [kind, status]);
-
   async function openJob(job: Job) {
     const [detailResponse, logResponse] = await Promise.all([
       apiFetch(`${api}/api/jobs/${job.id}`, { cache: "no-store" }),
@@ -110,8 +108,8 @@ export function JobRunCenter({ api, canControl, onChanged, onMessage }: Props) {
     <div className="job-run-toolbar">
       <div><h2>运行记录</h2><p>筛选、分页、查看错误与日志；下载和 Qlib 构建可单独重试。</p></div>
       <div className="job-run-filters">
-        <select aria-label="任务状态" value={status} onChange={(event) => setStatus(event.target.value)}>{statusOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select>
-        <input aria-label="任务类型" list="job-kinds" value={kind} onChange={(event) => setKind(event.target.value)} placeholder="全部任务类型" />
+        <select aria-label="任务状态" value={status} onChange={(event) => { setStatus(event.target.value); setPage(0); }}>{statusOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select>
+        <input aria-label="任务类型" list="job-kinds" value={kind} onChange={(event) => { setKind(event.target.value); setPage(0); }} placeholder="全部任务类型" />
         <datalist id="job-kinds">{kindsOnPage.map((value) => <option value={value} key={value} />)}</datalist>
         <button type="button" onClick={load}>刷新</button>
       </div>

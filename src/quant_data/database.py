@@ -75,13 +75,16 @@ jobs = Table(
         Column("log_path", Text),
         Column("exit_code", Integer),
         Column("error", Text),
+        Column("attempts", Integer, nullable=False, default=0),
+        Column("max_attempts", Integer, nullable=False, default=1),
+        Column("next_attempt_at", DateTime(timezone=True)),
         Column("cancel_requested_at", DateTime(timezone=True)),
         Column("created_at", DateTime(timezone=True), nullable=False),
         Column("started_at", DateTime(timezone=True)),
         Column("finished_at", DateTime(timezone=True)),
     ],
 )
-Index("idx_jobs_status_created", jobs.c.status, jobs.c.created_at.desc())
+Index("idx_jobs_status_created", jobs.c.status, jobs.c.next_attempt_at, jobs.c.created_at.desc())
 
 data_tasks = Table(
     "data_tasks",
@@ -214,6 +217,9 @@ factor_evaluations = Table(
         Column("artifact_sha256", String),
         Column("candidate_code_sha256", String),
         Column("candidate_values_sha256", String),
+        Column("submitted_values_sha256", String),
+        Column("recomputed_values_sha256", String),
+        Column("recompute_evidence_json", json_type),
         Column("metrics_sha256", String),
         Column("policy_json", json_type),
         Column("policy_sha256", String),
@@ -617,6 +623,7 @@ recommendation_portfolios = Table(
     Column("status", String, nullable=False),
     Column("base_currency", String, nullable=False),
     Column("hypothetical_initial_value", Numeric(20, 6), nullable=False),
+    Column("risk_exposure_override", Float, nullable=False, server_default="1"),
     Column("created_by", String, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
@@ -677,6 +684,8 @@ recommendation_holdings = Table(
     Column("weight_change", Float, nullable=False),
     Column("action", String, nullable=False),
     Column("reason", Text, nullable=False),
+    Column("average_cost", Float),
+    Column("take_profit_stage", Integer, nullable=False, server_default="0"),
 )
 
 recommendation_nav = Table(
@@ -1153,6 +1162,7 @@ strategy_allocations = Table(
     Column("name", String, nullable=False, unique=True),
     Column("dataset", String, nullable=False),
     Column("status", String, nullable=False),
+    Column("is_legacy", Boolean, nullable=False, server_default="false"),
     Column("allocation_method", String, nullable=False),
     Column("lookback_days", Integer, nullable=False),
     Column("target_volatility", Float, nullable=False),
@@ -1206,6 +1216,12 @@ strategy_allocation_members = Table(
         ForeignKey("quantlab.paper_portfolios.id", ondelete="RESTRICT"),
         unique=True,
     ),
+    Column(
+        "recommendation_portfolio_id",
+        String,
+        ForeignKey("quantlab.recommendation_portfolios.id", ondelete="RESTRICT"),
+        unique=True,
+    ),
     Column("target_weight", Float, nullable=False),
     Column("annualized_volatility", Float, nullable=False),
     Column("risk_contribution", Float, nullable=False),
@@ -1250,6 +1266,11 @@ strategy_allocation_events = Table(
         "portfolio_id",
         String,
         ForeignKey("quantlab.paper_portfolios.id", ondelete="SET NULL"),
+    ),
+    Column(
+        "recommendation_portfolio_id",
+        String,
+        ForeignKey("quantlab.recommendation_portfolios.id", ondelete="SET NULL"),
     ),
     Column("severity", String, nullable=False),
     Column("event_type", String, nullable=False),

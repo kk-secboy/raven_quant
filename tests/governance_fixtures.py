@@ -90,6 +90,9 @@ def create_promoted_factor(
         ),
         encoding="utf-8",
     )
+    recomputed_path = tmp_path / f"recomputed-{suffix}.h5"
+    recomputed_path.write_bytes(b"independently-recomputed-factor-values")
+    recomputed_sha256 = hashlib.sha256(recomputed_path.read_bytes()).hexdigest()
     store.record_evaluation(
         candidate["id"],
         dataset=dataset,
@@ -97,6 +100,21 @@ def create_promoted_factor(
         **PERIODS,
         metrics=metrics,
         artifact_path=str(artifact),
+        recomputed_values_path=str(recomputed_path),
+        recomputed_values_sha256=recomputed_sha256,
+        recompute_evidence={
+            "executor_version": "factor-recompute-v1",
+            "code_sha256": hashlib.sha256(code_path.read_bytes()).hexdigest(),
+            "dataset_identity_sha256": DATASET_IDENTITY,
+            "provider_input_sha256": "1" * 64,
+            "periods": {key: value.isoformat() for key, value in PERIODS.items()},
+            "submitted_comparison": {
+                "available": True,
+                "exact_match": True,
+                "submitted_sha256": hashlib.sha256(values_path.read_bytes()).hexdigest(),
+            },
+            "authoritative_values_sha256": recomputed_sha256,
+        },
     )
     return store.promote(
         candidate["id"], actor="factor-owner", reason="Approved governed test evidence."
@@ -160,6 +178,22 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
         "event_stress_count": 5,
         "event_stress_pass_rate": 1.0,
         "event_stress_passed": True,
+        "closed_trade_count": 40,
+        "win_rate": 0.55,
+        "average_win": 100.0,
+        "average_loss": -80.0,
+        "profit_loss_ratio": 1.25,
+        "gross_realized_pnl": 600.0,
+        "capacity_curve_points": 3,
+        "capacity_curve_passed": True,
+        "capacity": {
+            "points": [
+                {"notional": 5_000_000, "annualized_excess_return": 0.05},
+                {"notional": 20_000_000, "annualized_excess_return": 0.04},
+                {"notional": 100_000_000, "annualized_excess_return": 0.02},
+            ],
+            "passed": True,
+        },
         "trading_days": 600,
         "provenance": {
             "dataset_identity_sha256": DATASET_IDENTITY,

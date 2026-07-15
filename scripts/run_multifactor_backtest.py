@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -62,6 +63,26 @@ def _latest_cross_section(frame: pd.DataFrame, when: pd.Timestamp, column: str) 
     return result.astype(float)
 
 
+def _latest_style_cross_section(frame: pd.DataFrame, when: pd.Timestamp) -> pd.DataFrame:
+    values = frame.copy()
+    values["datetime"] = pd.to_datetime(values["datetime"], errors="coerce")
+    values = values[values["datetime"] <= when]
+    if values.empty:
+        raise ValueError(f"point-in-time styles have no values at {when.date()}")
+    values = values[values["datetime"] == values["datetime"].max()]
+    result = values.set_index(values["instrument"].astype(str)).drop(
+        columns=["datetime", "instrument"]
+    )
+    result = result.apply(pd.to_numeric, errors="coerce")
+    if (
+        result.index.has_duplicates
+        or result.isna().any().any()
+        or not np.isfinite(result.to_numpy(dtype=float)).all()
+    ):
+        raise ValueError("point-in-time style exposures are duplicated or incomplete")
+    return result.astype(float)
+
+
 def _qlib_cross_section(frame: pd.DataFrame, when: pd.Timestamp, column: str) -> pd.Series:
     values = frame.copy()
     dates = pd.to_datetime(values.index.get_level_values("datetime")).tz_localize(None)
@@ -100,7 +121,7 @@ def _metadata_provider(
         )
         industries = active.set_index(active["instrument"].astype(str))["industry"].astype(str)
         benchmark = _latest_cross_section(benchmark_weights, timestamp, "weight")
-        style = _latest_cross_section(styles, timestamp, "log_market_cap")
+        style = _latest_style_cross_section(styles, timestamp)
         benchmark_industries = industries.reindex(benchmark.index)
         if benchmark_industries.isna().any():
             raise ValueError("benchmark constituents are missing point-in-time industries")
@@ -109,10 +130,15 @@ def _metadata_provider(
             "benchmark_weights": benchmark,
             "benchmark_industry_weights": benchmark.groupby(benchmark_industries).sum(),
             "style_exposures": style,
-            "benchmark_style_exposure": float(benchmark.dot(style.reindex(benchmark.index))),
+            "benchmark_style_exposure": style.reindex(benchmark.index).mul(
+                benchmark, axis=0
+            ).sum(),
             "prices": _qlib_cross_section(execution_metadata, timestamp, "$open").reindex(
                 instruments.astype(str)
             ),
+            "current_prices": _qlib_cross_section(
+                execution_metadata, timestamp, "$close"
+            ).reindex(instruments.astype(str)),
             "average_daily_values": (
                 _qlib_cross_section(
                     execution_metadata, timestamp, "Ref(Mean($amount, 20), 1)"
@@ -163,7 +189,7 @@ def main() -> None:
     ).mul(1000.0)
     execution_metadata = D.features(
         instruments,
-        ["$open", "Ref(Mean($amount, 20), 1)"],
+        ["$open", "$close", "Ref(Mean($amount, 20), 1)"],
         start_time=periods["start"],
         end_time=periods["end"],
         freq="day",
@@ -181,12 +207,23 @@ def main() -> None:
         benchmark_weights = benchmark_weights[
             benchmark_weights["benchmark"] == manifest["benchmark"]
         ].drop(columns=["benchmark"])
-    style_path = Path(args.provider_uri) / "metadata" / "style_exposures.parquet"
-    style_exposures = pd.read_parquet(style_path) if style_path.exists() else None
+    style_fields = {
+        "Log($total_mv)": "size",
+        "1/$pb": "value",
+        "($fund_quarter_revenue_yoy+$fund_quarter_profit_yoy)/2": "growth",
+        "Std($close/Ref($close, 1)-1, 60)": "volatility",
+    }
+    style_exposures = D.features(
+        instruments,
+        list(style_fields),
+        start_time=periods["start"],
+        end_time=periods["end"],
+        freq="day",
+    ).rename(columns=style_fields).reset_index()
     if benchmark_weights is None or benchmark_weights.empty:
         raise ValueError("index-enhancement backtest requires historical benchmark weights")
-    if style_exposures is None:
-        raise ValueError("index-enhancement backtest requires point-in-time size exposures")
+    if style_exposures.empty:
+        raise ValueError("index-enhancement backtest requires point-in-time style exposures")
     config = manifest["config"]
     governed_signal = build_governed_signal(
         scores,
@@ -206,7 +243,9 @@ def main() -> None:
         industry_memberships, benchmark_weights, style_exposures, execution_metadata
     )
 
-    def run(start: str, end: str, costs: CostModelConfig):
+    def run(
+        start: str, end: str, costs: CostModelConfig, account: float | None = None
+    ):
         scenario_policy = PortfolioPolicy(PortfolioPolicyConfig.from_mapping(config), costs)
         strategy = create_qlib_policy_strategy(
             signal=governed_signal,
@@ -217,9 +256,10 @@ def main() -> None:
             strategy=strategy,
             start_time=start,
             end_time=end,
-            account=float(config["capacity_notional"]),
+            account=float(account if account is not None else config["capacity_notional"]),
             benchmark=manifest["benchmark"],
             cost_model=costs,
+            execution_method=str(config.get("execution_method", "open")),
         )
 
     formal = run(periods["start"], periods["end"], cost_model)
@@ -230,6 +270,11 @@ def main() -> None:
         end_time=periods["end"],
         cost_model=cost_model,
         config=config,
+        capacity_runner=lambda notional: (
+            formal
+            if abs(notional - float(config["capacity_notional"])) < 1e-6
+            else run(periods["start"], periods["end"], cost_model, notional)
+        ),
     )
     qlib_report = formal.report
     qlib_positions = formal.positions
@@ -237,6 +282,17 @@ def main() -> None:
         **formal.metrics,
         "policy_version": policy.version,
         "cost_model": cost_model.to_dict(),
+        "execution_model": {
+            "method": str(config.get("execution_method", "open")),
+            "days": int(config.get("execution_days", 1)),
+            "price_assumption": (
+                "daily OHLC mean proxy"
+                if config.get("execution_method") == "twap"
+                else "daily vwap"
+                if config.get("execution_method") == "vwap"
+                else "next-day open"
+            ),
+        },
         "robustness": {"double_cost": validation["double_cost"]},
         "robustness_passed": validation["double_cost"]["passed"],
         "robustness_pass_rate": 1.0 if validation["double_cost"]["passed"] else 0.0,
@@ -248,6 +304,9 @@ def main() -> None:
         "event_stress_count": validation["event_stress"]["event_count"],
         "event_stress_pass_rate": validation["event_stress"]["pass_rate"],
         "event_stress_passed": validation["event_stress"]["passed"],
+        "capacity": validation["capacity"],
+        "capacity_curve_points": len(validation["capacity"]["points"]),
+        "capacity_curve_passed": validation["capacity"]["passed"],
         "provenance": {
             "dataset_identity_sha256": provider_provenance.get("dataset_identity_sha256"),
             "snapshot_manifest_sha256": provider_provenance.get("snapshot_manifest_sha256"),
@@ -276,6 +335,9 @@ def main() -> None:
     (output / "event_stress.json").write_text(
         json.dumps(metrics["event_stress"], ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    (output / "capacity_curve.json").write_text(
+        json.dumps(metrics["capacity"], ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     result = {
         "status": "ok",
         "backtest_engine": "qlib",
@@ -290,6 +352,7 @@ def main() -> None:
             "robustness": str(output / "robustness.json"),
             "rolling": str(output / "rolling.json"),
             "event_stress": str(output / "event_stress.json"),
+            "capacity_curve": str(output / "capacity_curve.json"),
         },
     }
     (output / "result.json").write_text(

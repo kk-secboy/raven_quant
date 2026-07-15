@@ -82,6 +82,31 @@ def _write_evaluation_artifact(path: Path, candidate_id: str, metrics: dict) -> 
     return path
 
 
+def _recompute_args(store: ResearchStore, candidate_id: str, tmp_path: Path) -> dict:
+    candidate = store.get_candidate(candidate_id)
+    sequence = len(list(tmp_path.glob("recomputed-*")))
+    recomputed_path = tmp_path / f"recomputed-{candidate_id}-{sequence}.h5"
+    recomputed_path.write_bytes(b"independently-recomputed-factor-values")
+    recomputed_sha256 = hashlib.sha256(recomputed_path.read_bytes()).hexdigest()
+    return {
+        "recomputed_values_path": str(recomputed_path),
+        "recomputed_values_sha256": recomputed_sha256,
+        "recompute_evidence": {
+            "executor_version": "factor-recompute-v1",
+            "code_sha256": candidate["code_sha256"],
+            "dataset_identity_sha256": DATASET_IDENTITY,
+            "provider_input_sha256": "1" * 64,
+            "periods": {key: value.isoformat() for key, value in PERIODS.items()},
+            "submitted_comparison": {
+                "available": True,
+                "exact_match": True,
+                "submitted_sha256": candidate["values_sha256"],
+            },
+            "authoritative_values_sha256": recomputed_sha256,
+        },
+    }
+
+
 def test_factor_must_pass_qlib_gate_before_manual_promotion(
     tmp_path: Path, database_url: str
 ) -> None:
@@ -105,6 +130,7 @@ def test_factor_must_pass_qlib_gate_before_manual_promotion(
             "test_days": 500,
         },
         artifact_path=None,
+        **_recompute_args(store, candidate["id"], tmp_path),
     )
     assert failed["gate_status"] == "failed"
     assert store.get_candidate(candidate["id"])["status"] == "gate_failed"
@@ -122,6 +148,7 @@ def test_factor_must_pass_qlib_gate_before_manual_promotion(
         **PERIODS,
         metrics=passed_metrics,
         artifact_path=str(evaluation_artifact),
+        **_recompute_args(store, candidate["id"], tmp_path),
     )
     assert passed["gate_status"] == "passed"
     assert len(passed["evidence_sha256"]) == 64
@@ -141,7 +168,7 @@ def test_factor_must_pass_qlib_gate_before_manual_promotion(
     }
 
 
-@pytest.mark.parametrize("artifact_name", ["factor.py", "factor.h5", "evaluation.json"])
+@pytest.mark.parametrize("artifact_name", ["factor.py", "recomputed", "evaluation.json"])
 def test_factor_promotion_rejects_evidence_changed_after_evaluation(
     tmp_path: Path, database_url: str, artifact_name: str
 ) -> None:
@@ -149,6 +176,7 @@ def test_factor_promotion_rejects_evidence_changed_after_evaluation(
     candidate = _candidate(store, tmp_path)
     metrics = _passing_metrics()
     artifact = _write_evaluation_artifact(tmp_path / "evaluation.json", candidate["id"], metrics)
+    recompute_args = _recompute_args(store, candidate["id"], tmp_path)
     store.record_evaluation(
         candidate["id"],
         dataset="snapshot-20260710",
@@ -156,8 +184,14 @@ def test_factor_promotion_rejects_evidence_changed_after_evaluation(
         **PERIODS,
         metrics=metrics,
         artifact_path=str(artifact),
+        **recompute_args,
     )
-    (tmp_path / artifact_name).write_bytes(b"tampered")
+    target = (
+        Path(recompute_args["recomputed_values_path"])
+        if artifact_name == "recomputed"
+        else tmp_path / artifact_name
+    )
+    target.write_bytes(b"tampered")
 
     with pytest.raises(ValueError, match="changed"):
         store.promote(
@@ -179,9 +213,36 @@ def test_factor_gate_fails_closed_when_metrics_are_missing(
         **PERIODS,
         metrics={"ic": 0.04},
         artifact_path=None,
+        **_recompute_args(store, candidate["id"], tmp_path),
     )
     assert evaluation["gate_status"] == "failed"
     assert any("is missing" in reason for reason in evaluation["gate_reasons"])
+
+
+def test_factor_evaluation_rejects_submitted_values_that_do_not_match_recompute(
+    tmp_path: Path, database_url: str
+) -> None:
+    store = ResearchStore(database_url)
+    candidate = _candidate(store, tmp_path)
+    recompute = _recompute_args(store, candidate["id"], tmp_path)
+    recompute["recompute_evidence"]["submitted_comparison"]["exact_match"] = False
+
+    with pytest.raises(ValueError, match="do not match independent recomputation"):
+        store.record_evaluation(
+            candidate["id"],
+            dataset="snapshot-20260710",
+            dataset_identity_sha256=DATASET_IDENTITY,
+            **PERIODS,
+            metrics=_passing_metrics(),
+            artifact_path=str(
+                _write_evaluation_artifact(
+                    tmp_path / "mismatched-evaluation.json",
+                    candidate["id"],
+                    _passing_metrics(),
+                )
+            ),
+            **recompute,
+        )
 
 
 def test_only_one_active_factor_research_pipeline_is_allowed(

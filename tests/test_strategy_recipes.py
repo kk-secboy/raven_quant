@@ -38,6 +38,8 @@ def test_document_strategy_recipes_are_versioned_and_defensive() -> None:
         "liquidity_lookback_days": 20,
         "capacity_notional": 5_000_000,
         "max_volume_participation": 0.01,
+        "execution_days": 2,
+        "execution_method": "twap",
     }
     assert "MA5/MA10" in swing["rdagent_objective"]
     assert "Wilder ADX(14)" in swing["rdagent_objective"]
@@ -81,6 +83,9 @@ def test_index_enhancement_recipe_uses_benchmark_relative_optimizer() -> None:
 
     assert config.portfolio_construction == "benchmark_relative_qp"
     assert config.optimizer_tracking_penalty > 0
+    assert config.execution_days == 3
+    assert config.execution_method == "vwap"
+    assert config.max_value_deviation == pytest.approx(0.10)
 
     with pytest.raises(ValidationError, match=r"topk \* max_position_weight"):
         StrategyConfigRequest.model_validate(

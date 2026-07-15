@@ -93,23 +93,20 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
     const recipePayload = await recipeResponse.json();
     setCampaigns(nextCampaigns);
     setDatasets(nextDatasets.filter((item) => item.ready && item.reproducible));
-    setRecipes(recipePayload.recipes ?? []);
+    const nextRecipes = (recipePayload.recipes ?? []) as Recipe[];
+    setRecipes(nextRecipes);
+    setObjective((current) => current || nextRecipes.find((item) => item.id === recipeId)?.rdagent_objective || "");
     if (!dataset && nextDatasets.length) {
       const usable = nextDatasets.find((item) => item.ready && item.reproducible);
       if (usable) setDataset(usable.name);
     }
-  }, [api, dataset]);
+  }, [api, dataset, recipeId]);
 
   useEffect(() => {
     const initial = window.setTimeout(refresh, 0);
     const timer = window.setInterval(refresh, 5000);
     return () => { window.clearTimeout(initial); window.clearInterval(timer); };
   }, [refresh]);
-
-  useEffect(() => {
-    const recipe = recipes.find((item) => item.id === recipeId);
-    if (recipe) setObjective(recipe.rdagent_objective);
-  }, [recipeId, recipes]);
 
   const activeCount = useMemo(
     () => campaigns.filter((item) => ["queued", "running", "awaiting_approval"].includes(item.status)).length,
@@ -218,7 +215,7 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
       <form className="data-panel campaign-create" onSubmit={createProgram}>
         <div className="panel-heading"><div><p className="eyebrow">CONTINUOUS PROGRAM</p><h2>启用持续自动研究</h2><p>同一数据血缘新增足够交易日后，系统自动创建完整研究流水线。</p></div></div>
         <label>计划名称<input value={programName} onChange={(event) => setProgramName(event.target.value)} minLength={3} maxLength={100} /></label>
-        <div className="form-row"><label>策略模板<select value={recipeId} onChange={(event) => setRecipeId(event.target.value)}>{recipes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>数据血缘起点<select value={dataset} onChange={(event) => setDataset(event.target.value)}>{datasets.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label></div>
+        <div className="form-row"><label>策略模板<select value={recipeId} onChange={(event) => { const next = event.target.value; setRecipeId(next); setObjective(recipes.find((item) => item.id === next)?.rdagent_objective ?? ""); }}>{recipes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>数据血缘起点<select value={dataset} onChange={(event) => setDataset(event.target.value)}>{datasets.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label></div>
         <label>RD-Agent 研究目标<textarea value={objective} onChange={(event) => setObjective(event.target.value)} minLength={10} maxLength={2000} rows={5} /></label>
         <label>累计新增交易日再研究<input type="number" min={1} max={252} value={minNewTradingDays} onChange={(event) => setMinNewTradingDays(Number(event.target.value))} /></label>
         <details className="campaign-advanced"><summary>严格隔离的时间窗口</summary><p>默认使用最近 756 个训练日、252 个验证日和 504 个独立测试日。数据不足时只等待，不缩短窗口；最终测试不参与跨轮次选择。</p></details>
@@ -244,7 +241,7 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
       <form className="data-panel campaign-create" onSubmit={createCampaign}>
         <div className="panel-heading"><div><p className="eyebrow">NEW CAMPAIGN</p><h2>启动一次完整研究</h2><p>日常只需选择模板和数据集，高级参数已有安全默认值。</p></div></div>
         <label>研究名称<input value={name} onChange={(event) => setName(event.target.value)} minLength={3} maxLength={150} /></label>
-        <div className="form-row"><label>策略模板<select value={recipeId} onChange={(event) => setRecipeId(event.target.value)}>{recipes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Qlib 数据集<select value={dataset} onChange={(event) => setDataset(event.target.value)}>{datasets.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label></div>
+        <div className="form-row"><label>策略模板<select value={recipeId} onChange={(event) => { const next = event.target.value; setRecipeId(next); setObjective(recipes.find((item) => item.id === next)?.rdagent_objective ?? ""); }}>{recipes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Qlib 数据集<select value={dataset} onChange={(event) => setDataset(event.target.value)}>{datasets.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label></div>
         <label>RD-Agent 研究目标<textarea value={objective} onChange={(event) => setObjective(event.target.value)} minLength={10} maxLength={2000} rows={5} /></label>
         <details className="campaign-advanced"><summary>研究时间窗口</summary>
           <div className="form-row"><label>训练开始<input type="date" value={periods.train_start} onChange={(event) => setPeriods({ ...periods, train_start: event.target.value })} /></label><label>训练结束<input type="date" value={periods.train_end} onChange={(event) => setPeriods({ ...periods, train_end: event.target.value })} /></label></div>

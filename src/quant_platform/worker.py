@@ -13,6 +13,7 @@ from pathlib import Path
 from quant_data.config import Settings
 from quant_data.path_utils import to_wsl_path as _to_wsl_path
 
+from .allocation_store import AllocationStore
 from .cost_model import CostModelConfig
 from .job_store import JobStore
 from .parameter_experiment_store import ParameterExperimentStore
@@ -33,6 +34,7 @@ class LocalJobWorker:
         self.research = ResearchStore(settings.database_url)
         self.strategies = StrategyStore(settings.database_url)
         self.recommendations = RecommendationStore(settings.database_url)
+        self.allocations = AllocationStore(settings.database_url)
         self.parameter_experiments = ParameterExperimentStore(settings.database_url)
         self.runtime_secrets = RuntimeSecretStore(
             settings.database_url, settings.platform_secret_key
@@ -175,12 +177,19 @@ class LocalJobWorker:
                 except Exception as exc:
                     logical_error = f"could not enqueue next data pipeline stage: {exc}"
                     exit_code = 4
-            self.store.finish(
-                job["id"],
-                exit_code=exit_code,
-                error=(None if exit_code == 0 else logical_error or process_error),
-                result=result,
-            )
+            if exit_code == 0:
+                self.store.finish(job["id"], exit_code=0, result=result)
+            else:
+                failure_error = logical_error or process_error or "job failed"
+                requeued = self.store.finish_or_retry(
+                    job["id"],
+                    exit_code=exit_code,
+                    error=failure_error,
+                    result=result,
+                    retryable=logical_error is None,
+                )
+                if requeued:
+                    return
             if research_run_id:
                 if exit_code == 0:
                     if job["kind"] == "rdagent_factor":
@@ -225,19 +234,29 @@ class LocalJobWorker:
                 )
             if recommendation_snapshot_id:
                 if exit_code == 0 and result:
-                    self.recommendations.apply_result(recommendation_snapshot_id, result)
+                    snapshot = self.recommendations.apply_result(recommendation_snapshot_id, result)
+                    self.allocations.refresh_for_portfolio(str(snapshot["portfolio_id"]))
                 else:
                     self.recommendations.mark_failed(
                         recommendation_snapshot_id, logical_error or process_error
                     )
         except Exception as exc:
-            self.store.finish(job["id"], exit_code=1, error=str(exc))
+            requeued = self.store.finish_or_retry(
+                job["id"],
+                exit_code=1,
+                error=str(exc),
+                retryable=True,
+            )
+            if requeued:
+                return
             if research_run_id:
                 self.research.mark_run(research_run_id, "failed", error=str(exc))
             if backtest_id:
                 self.strategies.mark_backtest(backtest_id, "failed", error=str(exc))
             if parameter_experiment_id:
                 self.parameter_experiments.mark(parameter_experiment_id, "failed", error=str(exc))
+            if recommendation_snapshot_id:
+                self.recommendations.mark_failed(recommendation_snapshot_id, str(exc))
 
     def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
         payload = job["payload"]
@@ -545,9 +564,14 @@ class LocalJobWorker:
             promoted = self.research.list_candidates(status="promoted", limit=500)
             manifest = {
                 "candidates": [
-                    {**item, "values_path": runtime_path(item["values_path"])}
+                    {
+                        **item,
+                        "code_path": runtime_path(item["code_path"]),
+                        "submitted_values_path": runtime_path(item["values_path"]),
+                    }
                     for item in payload["candidates"]
                 ],
+                "dataset_identity_sha256": payload["dataset_identity_sha256"],
                 "periods": payload["periods"],
                 "universe": payload.get("universe", "cn_all"),
                 "min_daily_instruments": int(payload.get("min_daily_instruments", 50)),
@@ -792,7 +816,8 @@ class LocalJobWorker:
                 return _to_wsl_path(Path(value)) if is_wsl else str(value)
 
             latest_snapshot = portfolio.get("latest_snapshot") or {}
-            latest_performance = (portfolio.get("hypothetical_performance") or [None])[-1]
+            performance_history = portfolio.get("hypothetical_performance") or []
+            latest_performance = performance_history[-1] if performance_history else None
             manifest = {
                 "portfolio_id": portfolio["id"],
                 "strategy_version_id": version["id"],
@@ -802,17 +827,28 @@ class LocalJobWorker:
                 "benchmark": version["benchmark"],
                 "config": version["config"],
                 "portfolio_value": float(portfolio["hypothetical_initial_value"]),
+                "risk_exposure": float(portfolio.get("risk_exposure_override", 1.0)),
                 "previous_holdings": latest_snapshot.get("holdings") or [],
                 "previous_snapshot": (
                     {
                         "as_of_date": str(latest_snapshot["as_of_date"]),
+                        "effective_date": str(latest_snapshot.get("effective_date") or ""),
                         "holdings": latest_snapshot.get("holdings") or [],
+                        "position_state": (
+                            (latest_snapshot.get("snapshot") or {}).get("position_state") or {}
+                        ),
                     }
                     if latest_snapshot
                     else None
                 ),
                 "previous_performance": (
-                    {"hypothetical_value": float(latest_performance["hypothetical_value"])}
+                    {
+                        "hypothetical_value": float(latest_performance["hypothetical_value"]),
+                        "high_water_mark": max(
+                            float(item["hypothetical_value"]) for item in performance_history
+                        ),
+                        "drawdown": float(latest_performance["drawdown"]),
+                    }
                     if latest_performance
                     else None
                 ),
@@ -987,9 +1023,15 @@ class LocalJobWorker:
     def _queue_factor_evaluation(self, job: dict, candidates: list[dict]) -> None:
         payload = job["payload"]
         eligible = [
-            {"id": item["id"], "values_path": item["values_path"]}
+            {
+                "id": item["id"],
+                "code_path": item["code_path"],
+                "values_path": item["values_path"],
+            }
             for item in candidates
             if item.get("rdagent_decision") is not False
+            and item.get("code_path")
+            and Path(item["code_path"]).exists()
             and item.get("values_path")
             and Path(item["values_path"]).exists()
         ]
@@ -1042,6 +1084,9 @@ class LocalJobWorker:
                 **periods,
                 metrics=item["metrics"],
                 artifact_path=str(artifact_path),
+                recomputed_values_path=_local_artifact_path(item["recomputed_values_path"]),
+                recomputed_values_sha256=item["recomputed_values_sha256"],
+                recompute_evidence=item["recompute_evidence"],
             )
 
 

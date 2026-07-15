@@ -289,8 +289,11 @@ class RDAgentRunRequest(BaseModel):
 class FactorEvaluationRequest(BaseModel):
     dataset: str
     periods: ResearchPeriods
-    metrics: dict[str, float | None]
+    metrics: dict[str, Any]
     artifact_path: str | None = None
+    recomputed_values_path: str
+    recomputed_values_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    recompute_evidence: dict[str, Any]
 
 
 class PromotionRequest(BaseModel):
@@ -315,7 +318,7 @@ class StrategyConfigRequest(BaseModel):
     topk: int = Field(default=50, ge=5, le=500)
     n_drop: int = Field(default=5, ge=0, le=100)
     max_position_weight: float = Field(default=0.02, gt=0, le=0.20)
-    max_daily_turnover: float = Field(default=0.20, gt=0, le=1.0)
+    max_daily_turnover: float = Field(default=0.15, gt=0, le=1.0)
     max_daily_loss: float = Field(default=0.03, gt=0, le=0.20)
     stop_loss: float = Field(default=0.07, gt=0, le=0.50)
     take_profit_partial: float = Field(default=0.12, gt=0, le=2.0)
@@ -325,8 +328,11 @@ class StrategyConfigRequest(BaseModel):
     max_drawdown_liquidate: float = Field(default=0.15, gt=0, le=0.80)
     drawdown_reduction_exposure: float = Field(default=0.50, gt=0, lt=1.0)
     max_industry_weight: float = Field(default=0.30, gt=0, le=1.0)
-    max_industry_deviation: float = Field(default=0.05, ge=0, le=0.30)
+    max_industry_deviation: float = Field(default=0.03, ge=0, le=0.30)
     max_size_deviation: float = Field(default=0.30, ge=0, le=2.0)
+    max_value_deviation: float = Field(default=0.30, ge=0, le=2.0)
+    max_growth_deviation: float = Field(default=0.30, ge=0, le=2.0)
+    max_volatility_deviation: float = Field(default=0.30, ge=0, le=2.0)
     portfolio_construction: Literal["topk_equal_weight", "benchmark_relative_qp"] = (
         "topk_equal_weight"
     )
@@ -352,6 +358,17 @@ class StrategyConfigRequest(BaseModel):
     min_event_stress_pass_rate: float = Field(default=0.60, ge=0, le=1)
     min_backtest_days: int = Field(default=504, ge=252, le=2520)
     capacity_notional: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
+    capacity_curve_notionals: list[float] = Field(
+        default_factory=lambda: [5_000_000, 20_000_000, 100_000_000],
+        min_length=3,
+        max_length=10,
+    )
+    min_capacity_excess_return: float = Field(default=0.0, ge=-1.0, le=5.0)
+    min_closed_trades: int = Field(default=20, ge=0, le=100_000)
+    min_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    min_profit_loss_ratio: float = Field(default=0.0, ge=0.0, le=100.0)
+    execution_days: int = Field(default=1, ge=1, le=5)
+    execution_method: Literal["open", "twap", "vwap"] = "open"
     max_volume_participation: float = Field(default=0.01, gt=0, le=0.20)
     min_capacity_fill_ratio: float = Field(default=0.95, ge=0, le=1)
     open_cost: float = Field(default=0.0005, ge=0, le=0.02)
@@ -386,6 +403,10 @@ class StrategyConfigRequest(BaseModel):
             raise ValueError("take_profit_partial must be below take_profit")
         if self.max_drawdown_reduce >= self.max_drawdown_liquidate:
             raise ValueError("max_drawdown_reduce must be below max_drawdown_liquidate")
+        if len(set(self.capacity_curve_notionals)) < 3 or any(
+            value <= 0 for value in self.capacity_curve_notionals
+        ):
+            raise ValueError("capacity curve requires at least three distinct positive notionals")
         if self.rolling_step_days > self.rolling_window_days:
             raise ValueError("rolling_step_days must not exceed rolling_window_days")
         return self
@@ -1983,6 +2004,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 **payload.periods.model_dump(),
                 metrics=payload.metrics,
                 artifact_path=payload.artifact_path,
+                recomputed_values_path=payload.recomputed_values_path,
+                recomputed_values_sha256=payload.recomputed_values_sha256,
+                recompute_evidence=payload.recompute_evidence,
             )
         except KeyError as exc:
             raise HTTPException(404, "factor candidate not found") from exc
@@ -2296,7 +2320,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def list_strategy_allocations(limit: int = Query(100, ge=1, le=500)) -> list[dict]:
         items = allocations.list(limit)
         for item in items:
-            item["automation"] = schedules.get_allocation_group_optional(str(item["id"]))
+            item["automation"] = schedules.get_recommendation_allocation_group_optional(
+                str(item["id"])
+            )
         return items
 
     @app.post("/api/strategy-allocations", status_code=201)
@@ -2340,7 +2366,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def get_strategy_allocation(allocation_id: str) -> dict:
         try:
             result = allocations.get(allocation_id)
-            result["automation"] = schedules.get_allocation_group_optional(allocation_id)
+            result["automation"] = schedules.get_recommendation_allocation_group_optional(
+                allocation_id
+            )
             return result
         except KeyError as exc:
             raise HTTPException(404, "strategy allocation not found") from exc
@@ -2352,12 +2380,11 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         request: Request,
     ) -> dict:
         try:
-            return schedules.create_allocation_group(
+            return schedules.create_recommendation_allocation_group(
                 allocation_id,
                 timezone=payload.timezone,
                 run_time=payload.run_time,
                 trading_days_only=payload.trading_days_only,
-                slippage=payload.slippage,
                 misfire_grace_seconds=payload.misfire_grace_seconds,
                 actor=authenticated_actor(request, payload.actor),
             )
@@ -2374,7 +2401,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     ) -> dict:
         authenticated_actor(request, payload.actor)
         try:
-            return schedules.set_allocation_group_status(allocation_id, payload.status)
+            return schedules.set_recommendation_allocation_group_status(
+                allocation_id, payload.status
+            )
         except KeyError as exc:
             raise HTTPException(404, "strategy allocation schedule not found") from exc
         except ValueError as exc:
@@ -2388,7 +2417,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     ) -> dict:
         authenticated_actor(request, payload.actor)
         try:
-            return schedules.set_allocation_group_status(allocation_id, "retired")
+            return schedules.set_recommendation_allocation_group_status(
+                allocation_id, "retired"
+            )
         except KeyError as exc:
             raise HTTPException(404, "strategy allocation schedule not found") from exc
         except ValueError as exc:
@@ -2427,11 +2458,17 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         request: Request,
     ) -> dict:
         try:
-            return allocations.set_status(
+            result = allocations.set_status(
                 allocation_id,
                 payload.status,
                 actor=authenticated_actor(request, payload.actor),
             )
+            automation = schedules.get_recommendation_allocation_group_optional(allocation_id)
+            if automation and automation["status"] != "retired":
+                schedules.set_recommendation_allocation_group_status(
+                    allocation_id, payload.status
+                )
+            return result
         except KeyError as exc:
             raise HTTPException(404, "strategy allocation not found") from exc
         except ValueError as exc:
@@ -3273,9 +3310,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     app.router.routes = [
         route
         for route in app.router.routes
-        if not str(getattr(route, "path", "")).startswith(
-            ("/api/pair-portfolios", "/api/strategy-allocations")
-        )
+        if not str(getattr(route, "path", "")).startswith("/api/pair-portfolios")
     ]
 
     return app

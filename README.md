@@ -9,6 +9,17 @@ The repository now contains three connected surfaces:
 - `quant_platform`: FastAPI control plane and durable local job worker;
 - `web`: React/vinext operations console.
 
+The only active research product path is:
+
+`Tushare -> immutable Qlib dataset -> RD-Agent candidate code -> independent factor
+recomputation -> Qlib validation/backtest -> recommendation portfolio and hypothetical
+performance tracking`.
+
+Legacy paper-order/fill tables remain read-only historical archives and `/api/portfolios`
+returns `410 Gone`. QMT is disabled by default and is not allowed to turn a recommendation
+snapshot into an order. Pair trading remains a separate research-only area and is hidden
+from the active recommendation workflow.
+
 The first milestone is deliberately narrow and production-oriented:
 
 - pull 2024-to-present China equity data through the Tushare-compatible relay;

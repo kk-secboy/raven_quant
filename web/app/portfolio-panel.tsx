@@ -55,7 +55,12 @@ export function PortfolioPanel({ api }: { api: string }) {
     }
   }, [api, dataset, selectedId, versionId]);
 
-  useEffect(() => { load().catch(() => setMessage("无法读取推荐组合。")); }, [load]);
+  useEffect(() => {
+    const initial = window.setTimeout(() => {
+      load().catch(() => setMessage("无法读取推荐组合。"));
+    }, 0);
+    return () => window.clearTimeout(initial);
+  }, [load]);
   const selected = portfolios.find((item) => item.id === selectedId) ?? portfolios[0];
   const snapshot = selected?.latest_snapshot;
 

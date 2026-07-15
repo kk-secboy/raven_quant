@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +10,11 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import jobs, open_database, row_dict
+
+AUTO_RETRY_ATTEMPTS = {
+    "rdagent_factor": 3,
+    "recommendation_refresh": 3,
+}
 
 
 def _now() -> datetime:
@@ -27,7 +32,10 @@ class JobStore:
         if allowed_kinds:
             statement = statement.where(jobs.c.kind.in_(allowed_kinds))
         statement = statement.values(
-            status="queued", started_at=None, error="Worker restarted; job safely requeued"
+            status="queued",
+            started_at=None,
+            next_attempt_at=None,
+            error="Worker restarted; job safely requeued",
         )
         with self.engine.begin() as connection:
             return int(connection.execute(statement).rowcount or 0)
@@ -40,6 +48,7 @@ class JobStore:
         *,
         dedupe_active_kind: bool = True,
         idempotency_key: str | None = None,
+        max_attempts: int | None = None,
     ) -> dict[str, Any]:
         job_id = uuid.uuid4().hex
         existing_id: str | None = None
@@ -75,6 +84,12 @@ class JobStore:
                             status="queued",
                             payload_json=payload,
                             log_path=str(log_path),
+                            attempts=0,
+                            max_attempts=(
+                                max_attempts
+                                if max_attempts is not None
+                                else AUTO_RETRY_ATTEMPTS.get(kind, 1)
+                            ),
                             created_at=_now(),
                         )
                     )
@@ -90,7 +105,10 @@ class JobStore:
         return self.get(existing_id or job_id)
 
     def claim_next(self, allowed_kinds: tuple[str, ...] = ()) -> dict[str, Any] | None:
-        statement = select(jobs).where(jobs.c.status == "queued")
+        statement = select(jobs).where(
+            jobs.c.status == "queued",
+            (jobs.c.next_attempt_at.is_(None)) | (jobs.c.next_attempt_at <= _now()),
+        )
         if allowed_kinds:
             statement = statement.where(jobs.c.kind.in_(allowed_kinds))
         statement = statement.order_by(jobs.c.created_at).limit(1).with_for_update(skip_locked=True)
@@ -101,7 +119,13 @@ class JobStore:
             connection.execute(
                 update(jobs)
                 .where(jobs.c.id == row.id)
-                .values(status="running", started_at=_now(), error=None)
+                .values(
+                    status="running",
+                    started_at=_now(),
+                    attempts=jobs.c.attempts + 1,
+                    next_attempt_at=None,
+                    error=None,
+                )
             )
             job_id = str(row.id)
         return self.get(job_id)
@@ -125,9 +149,69 @@ class JobStore:
                     error=error,
                     progress_json=result,
                     cancel_requested_at=None,
+                    next_attempt_at=None,
                     finished_at=_now(),
                 )
             )
+
+    def finish_or_retry(
+        self,
+        job_id: str,
+        *,
+        exit_code: int,
+        error: str,
+        result: dict[str, Any] | None = None,
+        retryable: bool,
+    ) -> bool:
+        """Finish a job or queue a bounded transient retry.
+
+        Returns True only when the same durable job was requeued. Attempts are
+        incremented on claim, so a max_attempts value of three means at most
+        three actual process executions.
+        """
+        with self.engine.begin() as connection:
+            row = connection.execute(
+                select(jobs.c.status, jobs.c.attempts, jobs.c.max_attempts)
+                .where(jobs.c.id == job_id)
+                .with_for_update()
+            ).first()
+            if row is None:
+                raise KeyError(job_id)
+            if (
+                retryable
+                and row.status == "running"
+                and int(row.attempts) < int(row.max_attempts)
+            ):
+                delay_seconds = min(900, 30 * (2 ** max(0, int(row.attempts) - 1)))
+                connection.execute(
+                    update(jobs)
+                    .where(jobs.c.id == job_id)
+                    .values(
+                        status="queued",
+                        exit_code=exit_code,
+                        error=error,
+                        progress_json=result,
+                        started_at=None,
+                        finished_at=None,
+                        cancel_requested_at=None,
+                        next_attempt_at=_now() + timedelta(seconds=delay_seconds),
+                    )
+                )
+                return True
+            connection.execute(
+                update(jobs)
+                .where(jobs.c.id == job_id)
+                .values(
+                    status="failed",
+                    exit_code=exit_code,
+                    error=error,
+                    progress_json=result,
+                    cancel_requested_at=None,
+                    next_attempt_at=None,
+                    finished_at=_now(),
+                )
+            )
+        return False
 
     def retry(self, job_id: str) -> dict[str, Any]:
         with self.engine.begin() as connection:
@@ -143,12 +227,14 @@ class JobStore:
                 .where(jobs.c.id == job_id)
                 .values(
                     status="queued",
+                    attempts=0,
                     progress_json=None,
                     exit_code=None,
                     error=None,
                     started_at=None,
                     finished_at=None,
                     cancel_requested_at=None,
+                    next_attempt_at=None,
                 )
             )
         return self.get(job_id)

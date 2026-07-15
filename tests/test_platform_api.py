@@ -62,7 +62,9 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
     )
     assert client.get("/api/qlib/datasets").json() == []
     assert client.get("/api/qlib/experiments").json() == []
-    assert client.get("/api/strategy-allocations").status_code == 404
+    allocations = client.get("/api/strategy-allocations")
+    assert allocations.status_code == 200
+    assert allocations.json() == []
     allocation = client.post(
         "/api/strategy-allocations",
         json={
@@ -74,7 +76,7 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
             ],
         },
     )
-    assert allocation.status_code == 404
+    assert allocation.status_code == 409
     allocation_schedule = client.post(
         "/api/strategy-allocations/missing/schedule",
         json={"run_time": "15:30", "actor": "operator"},
@@ -84,7 +86,7 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
         "/api/strategy-allocations/missing/schedule",
         json={"run_time": "14:30", "actor": "operator"},
     )
-    assert invalid_schedule.status_code == 404
+    assert invalid_schedule.status_code == 422
     qlib_job = client.post(
         "/api/jobs/qlib-baseline",
         json={"dataset": "missing", "topk": 50, "n_drop": 5},

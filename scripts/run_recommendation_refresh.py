@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -39,6 +40,26 @@ def _latest(frame: pd.DataFrame, when: pd.Timestamp, column: str) -> pd.Series:
     result.index = values["instrument"].astype(str)
     if result.index.has_duplicates or result.isna().any():
         raise ValueError(f"metadata {column} snapshot is incomplete")
+    return result.astype(float)
+
+
+def _latest_styles(frame: pd.DataFrame, when: pd.Timestamp) -> pd.DataFrame:
+    values = frame.copy()
+    values["datetime"] = pd.to_datetime(values["datetime"], errors="coerce")
+    values = values[values["datetime"] <= when]
+    if values.empty:
+        raise ValueError(f"style metadata has no snapshot at {when.date()}")
+    values = values[values["datetime"] == values["datetime"].max()]
+    result = values.set_index(values["instrument"].astype(str)).drop(
+        columns=["datetime", "instrument"]
+    )
+    result = result.apply(pd.to_numeric, errors="coerce")
+    if (
+        result.index.has_duplicates
+        or result.isna().any().any()
+        or not np.isfinite(result.to_numpy(dtype=float)).all()
+    ):
+        raise ValueError("style metadata snapshot is incomplete")
     return result.astype(float)
 
 
@@ -75,7 +96,7 @@ def main() -> None:
     ).mul(1000.0)
     execution_metadata = D.features(
         instruments,
-        ["$open", "Ref(Mean($amount, 20), 1)"],
+        ["$open", "$close", "Ref(Mean($amount, 20), 1)"],
         start_time=as_of.date().isoformat(),
         end_time=as_of.date().isoformat(),
         freq="day",
@@ -94,7 +115,19 @@ def main() -> None:
     benchmark_frame = benchmark_frame[benchmark_frame["benchmark"] == manifest["benchmark"]].drop(
         columns=["benchmark"]
     )
-    styles_frame = pd.read_parquet(metadata_root / "style_exposures.parquet")
+    style_fields = {
+        "Log($total_mv)": "size",
+        "1/$pb": "value",
+        "($fund_quarter_revenue_yoy+$fund_quarter_profit_yoy)/2": "growth",
+        "Std($close/Ref($close, 1)-1, 60)": "volatility",
+    }
+    styles_frame = D.features(
+        instruments,
+        list(style_fields),
+        start_time=lookback,
+        end_time=as_of.date().isoformat(),
+        freq="day",
+    ).rename(columns=style_fields).reset_index()
     governed = build_governed_signal(
         scores.loc[(slice(lookback, as_of), slice(None))],
         topk=int(config["topk"]),
@@ -120,29 +153,15 @@ def main() -> None:
     )
     industries = active.set_index(active["instrument"].astype(str))["industry"].astype(str)
     benchmark = _latest(benchmark_frame, as_of, "weight")
-    styles = _latest(styles_frame, as_of, "log_market_cap")
+    styles = _latest_styles(styles_frame, as_of)
     benchmark_industries = industries.reindex(benchmark.index)
-    if benchmark_industries.isna().any() or styles.reindex(benchmark.index).isna().any():
+    if benchmark_industries.isna().any() or styles.reindex(benchmark.index).isna().any().any():
         raise ValueError("benchmark metadata is incomplete")
     cost_model = CostModelConfig.from_mapping(config)
     policy = PortfolioPolicy(PortfolioPolicyConfig.from_mapping(config), cost_model)
     previous = {
         item["instrument"]: item["weight"] for item in manifest.get("previous_holdings", [])
     }
-    decision = policy.decide(
-        signal,
-        previous,
-        industries=industries,
-        benchmark_weights=benchmark,
-        benchmark_industry_weights=benchmark.groupby(benchmark_industries).sum(),
-        style_exposures=styles,
-        benchmark_style_exposure=float(benchmark.dot(styles.reindex(benchmark.index))),
-        prices=pd.to_numeric(point_metadata["$open"], errors="coerce"),
-        average_daily_values=(
-            pd.to_numeric(point_metadata["Ref(Mean($amount, 20), 1)"], errors="coerce") * 1000.0
-        ),
-        portfolio_value=float(manifest["portfolio_value"]),
-    )
     previous_snapshot = manifest.get("previous_snapshot") or {}
     previous_performance = manifest.get("previous_performance") or {}
     prior_value = float(
@@ -150,7 +169,7 @@ def main() -> None:
     )
     hypothetical_return = 0.0
     benchmark_return = 0.0
-    previous_as_of = previous_snapshot.get("as_of_date")
+    previous_as_of = previous_snapshot.get("effective_date") or previous_snapshot.get("as_of_date")
     previous_holdings = previous_snapshot.get("holdings") or []
     if previous_as_of and previous_holdings:
         held = [str(item["instrument"]) for item in previous_holdings]
@@ -178,6 +197,42 @@ def main() -> None:
         )["$close"]
         if len(benchmark_close) >= 2:
             benchmark_return = float(benchmark_close.iloc[-1] / benchmark_close.iloc[0] - 1.0)
+    gross_value = max(0.0, prior_value * (1.0 + hypothetical_return))
+    previous_peak = float(previous_performance.get("high_water_mark") or prior_value)
+    current_peak = max(previous_peak, gross_value)
+    current_drawdown = gross_value / current_peak - 1.0 if current_peak > 0 else 0.0
+    cost_basis = {
+        str(item["instrument"]): float(item.get("average_cost") or 0.0)
+        for item in previous_holdings
+        if float(item.get("average_cost") or 0.0) > 0
+    }
+    take_profit_stages = {
+        str(item["instrument"]): int(item.get("take_profit_stage") or 0)
+        for item in previous_holdings
+    }
+    decision = policy.decide(
+        signal,
+        previous,
+        industries=industries,
+        benchmark_weights=benchmark,
+        benchmark_industry_weights=benchmark.groupby(benchmark_industries).sum(),
+        style_exposures=styles,
+        benchmark_style_exposure=styles.reindex(benchmark.index).mul(
+            benchmark, axis=0
+        ).sum(),
+        prices=pd.to_numeric(point_metadata["$open"], errors="coerce"),
+        current_prices=pd.to_numeric(point_metadata["$close"], errors="coerce"),
+        cost_basis=cost_basis,
+        take_profit_stages=take_profit_stages,
+        execution_state=(previous_snapshot.get("position_state") or {}).get("execution"),
+        portfolio_drawdown=current_drawdown,
+        daily_return=hypothetical_return,
+        average_daily_values=(
+            pd.to_numeric(point_metadata["Ref(Mean($amount, 20), 1)"], errors="coerce") * 1000.0
+        ),
+        portfolio_value=max(gross_value, 1.0),
+        risk_exposure=float(manifest.get("risk_exposure", 1.0)),
+    )
     average_values = (
         pd.to_numeric(point_metadata["Ref(Mean($amount, 20), 1)"], errors="coerce") * 1000.0
     )
@@ -197,7 +252,9 @@ def main() -> None:
             gross_value=gross,
             participation=participation,
         )
-    hypothetical_value = max(0.0, prior_value * (1.0 + hypothetical_return) - estimated_cost)
+    hypothetical_value = max(0.0, gross_value - estimated_cost)
+    high_water_mark = max(previous_peak, hypothetical_value)
+    drawdown = hypothetical_value / high_water_mark - 1.0 if high_water_mark > 0 else 0.0
     calendar = pd.DatetimeIndex(
         D.calendar(
             start_time=as_of.date().isoformat(),
@@ -209,6 +266,18 @@ def main() -> None:
     if not len(future):
         raise ValueError("Qlib calendar has no effective trading date")
     changes = {item["instrument"]: item for item in decision.changes}
+
+    def next_average_cost(instrument: str, target_weight: float) -> float:
+        mark = float(point_metadata.loc[instrument, "$close"])
+        old_weight = float(previous.get(instrument, 0.0))
+        old_cost = float(cost_basis.get(instrument, mark))
+        increase = max(0.0, target_weight - old_weight)
+        if old_weight <= 0 or increase <= 0:
+            return mark if old_weight <= 0 else old_cost
+        old_shares = old_weight * max(gross_value, 1.0) / old_cost
+        new_shares = increase * max(gross_value, 1.0) / mark
+        return (old_shares * old_cost + new_shares * mark) / (old_shares + new_shares)
+
     result = {
         "status": "ok",
         "portfolio_id": manifest["portfolio_id"],
@@ -220,13 +289,22 @@ def main() -> None:
         "dataset": manifest["dataset"],
         "dataset_identity_sha256": manifest["dataset_identity_sha256"],
         "cost_model": decision.cost_model,
-        "risk_summary": {"expected_turnover": decision.expected_turnover},
+        "position_state": decision.position_state,
+        "risk_summary": {
+            "expected_turnover": decision.expected_turnover,
+            "drawdown": drawdown,
+            "high_water_mark": high_water_mark,
+            "events": decision.risk_events,
+            "execution_method": config.get("execution_method", "open"),
+            "execution_days": int(config.get("execution_days", 1)),
+        },
         "hypothetical_observation": {
             "trade_date": as_of.date().isoformat(),
             "hypothetical_value": hypothetical_value,
             "daily_return": hypothetical_return,
             "benchmark_return": benchmark_return,
-            "drawdown": 0.0,
+            "drawdown": drawdown,
+            "high_water_mark": high_water_mark,
             "turnover": decision.expected_turnover,
             "estimated_cost": estimated_cost,
         },
@@ -240,6 +318,10 @@ def main() -> None:
                 "weight_change": changes.get(instrument, {}).get("weight_change", 0.0),
                 "action": changes.get(instrument, {}).get("action", "hold"),
                 "reason": changes.get(instrument, {}).get("reason", "unchanged target"),
+                "average_cost": next_average_cost(instrument, weight),
+                "take_profit_stage": int(
+                    decision.position_state.get("take_profit_stages", {}).get(instrument, 0)
+                ),
             }
             for instrument, weight in decision.target_weights.items()
         ],

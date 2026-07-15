@@ -14,6 +14,7 @@ from quant_data.database import (
     open_database,
     pair_paper_portfolios,
     paper_portfolios,
+    recommendation_portfolios,
     row_dict,
     schedule_runs,
     schedules,
@@ -321,8 +322,10 @@ class ScheduleStore:
             ).first()
             if allocation is None:
                 raise KeyError(allocation_id)
-            if allocation.status == "draft":
-                raise ValueError("approve the strategy allocation before scheduling it")
+            if allocation.is_legacy:
+                raise ValueError("legacy paper-backed allocations cannot be scheduled")
+            if allocation.status != "active":
+                raise ValueError("only an active strategy allocation may be scheduled")
             members = connection.execute(
                 select(
                     strategy_allocation_members.c.portfolio_id,
@@ -576,6 +579,158 @@ class ScheduleStore:
             return self.get_allocation_group(allocation_id)
         except KeyError:
             return None
+
+    def create_recommendation_allocation_group(
+        self,
+        allocation_id: str,
+        *,
+        timezone: str,
+        run_time: time,
+        trading_days_only: bool,
+        misfire_grace_seconds: int,
+        actor: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current = now or _now()
+        with self.engine.begin() as connection:
+            allocation = connection.execute(
+                select(strategy_allocations).where(strategy_allocations.c.id == allocation_id)
+            ).first()
+            if allocation is None:
+                raise KeyError(allocation_id)
+            if allocation.status == "draft":
+                raise ValueError("approve the strategy allocation before scheduling it")
+            members = connection.execute(
+                select(
+                    strategy_allocation_members.c.recommendation_portfolio_id,
+                    recommendation_portfolios.c.name,
+                )
+                .join(
+                    recommendation_portfolios,
+                    recommendation_portfolios.c.id
+                    == strategy_allocation_members.c.recommendation_portfolio_id,
+                )
+                .where(strategy_allocation_members.c.allocation_id == allocation_id)
+            ).all()
+            if len(members) < 2:
+                raise ValueError("allocation requires at least two recommendation portfolios")
+            group = connection.execute(
+                select(allocation_schedule_groups).where(
+                    allocation_schedule_groups.c.allocation_id == allocation_id
+                )
+            ).first()
+            values = {
+                "status": "active",
+                "timezone": timezone,
+                "run_time": run_time,
+                "trading_days_only": trading_days_only,
+                "slippage": 0.0,
+                "misfire_grace_seconds": misfire_grace_seconds,
+                "updated_at": current,
+            }
+            if group is None:
+                connection.execute(
+                    insert(allocation_schedule_groups).values(
+                        allocation_id=allocation_id,
+                        created_by=actor.strip(),
+                        created_at=current,
+                        **values,
+                    )
+                )
+            else:
+                connection.execute(
+                    update(allocation_schedule_groups)
+                    .where(allocation_schedule_groups.c.allocation_id == allocation_id)
+                    .values(**values)
+                )
+        existing = {
+            str(item["payload"].get("recommendation_portfolio_id")): item
+            for item in self.list(1000)
+            if item["kind"] == "recommendation_refresh"
+            and item["payload"].get("allocation_id") == allocation_id
+        }
+        for member in members:
+            portfolio_id = str(member.recommendation_portfolio_id)
+            item = existing.get(portfolio_id)
+            if item is None:
+                self.create(
+                    name=f"{allocation.name} / {member.name}"[:150],
+                    kind="recommendation_refresh",
+                    timezone=timezone,
+                    run_time=run_time,
+                    trading_days_only=trading_days_only,
+                    payload={
+                        "recommendation_portfolio_id": portfolio_id,
+                        "allocation_id": allocation_id,
+                    },
+                    misfire_grace_seconds=misfire_grace_seconds,
+                    actor=actor,
+                    now=current,
+                )
+            else:
+                self.set_status(str(item["id"]), "active", now=current)
+        return self.get_recommendation_allocation_group(allocation_id)
+
+    def get_recommendation_allocation_group(self, allocation_id: str) -> dict[str, Any]:
+        with self.engine.connect() as connection:
+            group = connection.execute(
+                select(allocation_schedule_groups).where(
+                    allocation_schedule_groups.c.allocation_id == allocation_id
+                )
+            ).first()
+        if group is None:
+            raise KeyError(allocation_id)
+        result = row_dict(group)
+        result["run_time"] = result["run_time"].isoformat(timespec="minutes")
+        result["members"] = [
+            item
+            for item in self.list(1000)
+            if item["kind"] == "recommendation_refresh"
+            and item["payload"].get("allocation_id") == allocation_id
+        ]
+        return result
+
+    def get_recommendation_allocation_group_optional(
+        self, allocation_id: str
+    ) -> dict[str, Any] | None:
+        try:
+            return self.get_recommendation_allocation_group(allocation_id)
+        except KeyError:
+            return None
+
+    def set_recommendation_allocation_group_status(
+        self, allocation_id: str, status: str
+    ) -> dict[str, Any]:
+        if status not in {"active", "paused", "retired"}:
+            raise ValueError("allocation schedule status must be active, paused or retired")
+        group = self.get_recommendation_allocation_group(allocation_id)
+        with self.engine.begin() as connection:
+            allocation = connection.execute(
+                select(strategy_allocations.c.status, strategy_allocations.c.is_legacy).where(
+                    strategy_allocations.c.id == allocation_id
+                )
+            ).first()
+            if allocation is None:
+                raise KeyError(allocation_id)
+            if allocation.is_legacy:
+                raise ValueError("legacy paper-backed allocations are read-only")
+            if status == "active" and allocation.status != "active":
+                raise ValueError("a paused or risk-blocked allocation cannot activate schedules")
+            for member in group["members"]:
+                values = {
+                    "status": status,
+                    "desired_status": status,
+                    "updated_at": _now(),
+                }
+                connection.execute(
+                    update(schedules).where(schedules.c.id == member["id"]).values(**values)
+                )
+            connection.execute(
+                update(allocation_schedule_groups)
+                .where(allocation_schedule_groups.c.allocation_id == allocation_id)
+                .values(status=status, updated_at=_now())
+            )
+        return self.get_recommendation_allocation_group(allocation_id)
 
     @staticmethod
     def _assert_group_idle(connection: Any, allocation_id: str) -> None:

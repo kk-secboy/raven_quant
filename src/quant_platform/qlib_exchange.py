@@ -19,6 +19,7 @@ class SquareRootImpactExchange(Exchange):
 
     def __init__(self, *, cost_model: CostModelConfig, **kwargs: Any) -> None:
         self.cost_model = cost_model
+        self.fill_log: list[dict[str, Any]] = []
         conservative_buy = (
             cost_model.buy_commission_rate
             + cost_model.fixed_slippage_rate
@@ -63,5 +64,16 @@ class SquareRootImpactExchange(Exchange):
             side=side,
             gross_value=trade_value,
             participation=participation,
+        )
+        self.fill_log.append(
+            {
+                "instrument": str(order.stock_id),
+                "date": str(order.start_time),
+                "side": side,
+                "amount": float(trade_value / trade_price) if trade_price else 0.0,
+                "trade_price": float(trade_price),
+                "trade_value": float(trade_value),
+                "cost": float(actual_cost),
+            }
         )
         return trade_price, trade_value, actual_cost

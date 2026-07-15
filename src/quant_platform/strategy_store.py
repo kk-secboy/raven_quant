@@ -1021,6 +1021,26 @@ class StrategyStore:
                 config.get("min_backtest_days", 504),
                 "min",
             ),
+            "closed_trade_count": (
+                metrics.get("closed_trade_count"),
+                config.get("min_closed_trades", 20),
+                "min",
+            ),
+            "win_rate": (
+                metrics.get("win_rate"),
+                config.get("min_win_rate", 0.0),
+                "min",
+            ),
+            "profit_loss_ratio": (
+                metrics.get("profit_loss_ratio"),
+                config.get("min_profit_loss_ratio", 0.0),
+                "min",
+            ),
+            "capacity_curve_points": (
+                metrics.get("capacity_curve_points"),
+                3,
+                "min",
+            ),
         }
         failures = []
         if (
@@ -1063,6 +1083,8 @@ class StrategyStore:
             failures.append("PortfolioPolicy version is missing or inconsistent")
         if metrics.get("event_stress_passed") is not True:
             failures.append("event stress scenarios did not satisfy the configured result gate")
+        if metrics.get("capacity_curve_passed") is not True:
+            failures.append("capacity curve did not satisfy the configured result gate")
         cost_model = metrics.get("cost_model")
         if not isinstance(cost_model, dict):
             failures.append("the unified cost model is required for approval")

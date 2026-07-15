@@ -99,6 +99,61 @@ def test_policy_enforces_industry_weight_cap() -> None:
     assert bank_weight <= 0.60 + 1e-12
 
 
+def test_policy_applies_position_and_portfolio_risk_rules() -> None:
+    scores = pd.Series({"winner": 2.0, "loser": 1.0})
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_daily_turnover=1.0,
+        )
+    )
+    decision = policy.decide(
+        scores,
+        {"winner": 0.50, "loser": 0.50},
+        current_prices=pd.Series({"winner": 12.5, "loser": 9.0}),
+        cost_basis={"winner": 10.0, "loser": 10.0},
+        portfolio_drawdown=-0.11,
+    )
+    assert "winner" not in decision.target_weights
+    assert "loser" not in decision.target_weights
+    assert {item["rule"] for item in decision.risk_events} == {
+        "max_drawdown_reduce",
+        "take_profit",
+        "stop_loss",
+    }
+
+
+def test_policy_execution_plan_reaches_target_on_configured_day() -> None:
+    scores = pd.Series({"one": 2.0, "two": 1.0})
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_daily_turnover=1.0,
+            execution_days=3,
+            execution_method="twap",
+        )
+    )
+    first = policy.decide(scores, {})
+    second = policy.decide(
+        scores,
+        first.target_weights,
+        execution_state=first.position_state["execution"],
+    )
+    third = policy.decide(
+        scores,
+        second.target_weights,
+        execution_state=second.position_state["execution"],
+    )
+    assert first.target_weights == {"one": pytest.approx(1 / 6), "two": pytest.approx(1 / 6)}
+    assert second.target_weights == {"one": pytest.approx(1 / 3), "two": pytest.approx(1 / 3)}
+    assert third.target_weights == {"one": pytest.approx(0.5), "two": pytest.approx(0.5)}
+    assert third.position_state["execution"] == {}
+
+
 def test_qlib_adapter_and_recommendation_call_return_identical_targets(monkeypatch) -> None:
     class WeightStrategyBase:
         def __init__(self, signal):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -9,7 +9,7 @@ import pandas as pd
 
 from .cost_model import CostModelConfig
 
-QLIB_ENGINE_VERSION = "qlib-policy-engine-v1"
+QLIB_ENGINE_VERSION = "qlib-policy-engine-v2"
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,49 @@ class QlibBacktestResult:
     metrics: dict[str, Any]
     report: pd.DataFrame
     positions: Any
+    fills: list[dict[str, Any]] = field(default_factory=list)
+
+
+def calculate_trade_metrics(fills: list[dict[str, Any]]) -> dict[str, Any]:
+    positions: dict[str, dict[str, float]] = {}
+    closed_pnl: list[float] = []
+    for fill in fills:
+        instrument = str(fill["instrument"])
+        amount = max(0.0, float(fill["amount"]))
+        value = max(0.0, float(fill["trade_value"]))
+        cost = max(0.0, float(fill["cost"]))
+        state = positions.setdefault(instrument, {"amount": 0.0, "basis": 0.0})
+        if fill["side"] == "buy":
+            new_amount = state["amount"] + amount
+            if new_amount > 0:
+                state["basis"] = (
+                    state["amount"] * state["basis"] + value + cost
+                ) / new_amount
+                state["amount"] = new_amount
+            continue
+        sold = min(amount, state["amount"])
+        if sold <= 0:
+            continue
+        net_proceeds = sold * float(fill["trade_price"]) - cost * (sold / amount if amount else 0.0)
+        closed_pnl.append(net_proceeds - sold * state["basis"])
+        state["amount"] -= sold
+        if state["amount"] <= 1e-10:
+            state["amount"] = 0.0
+            state["basis"] = 0.0
+    wins = [value for value in closed_pnl if value > 0]
+    losses = [value for value in closed_pnl if value < 0]
+    average_win = float(np.mean(wins)) if wins else 0.0
+    average_loss = float(np.mean(losses)) if losses else 0.0
+    return {
+        "closed_trade_count": len(closed_pnl),
+        "win_rate": float(len(wins) / len(closed_pnl)) if closed_pnl else None,
+        "average_win": average_win,
+        "average_loss": average_loss,
+        "profit_loss_ratio": (
+            float(average_win / abs(average_loss)) if wins and losses and average_loss else None
+        ),
+        "gross_realized_pnl": float(sum(closed_pnl)),
+    }
 
 
 def calculate_qlib_metrics(report: pd.DataFrame) -> dict[str, Any]:
@@ -64,6 +107,7 @@ def run_formal_qlib_backtest(
     account: float,
     benchmark: str,
     cost_model: CostModelConfig,
+    execution_method: str = "open",
 ) -> QlibBacktestResult:
     try:
         from qlib.contrib.evaluate import backtest_daily
@@ -71,12 +115,22 @@ def run_formal_qlib_backtest(
         raise RuntimeError("the formal backtest runtime does not contain Qlib") from exc
     from .qlib_exchange import SquareRootImpactExchange
 
+    deal_prices = {
+        "open": "$open",
+        "vwap": "$vwap",
+        "twap": (
+            "($open+$high+$low+$close)/4",
+            "($open+$high+$low+$close)/4",
+        ),
+    }
+    if execution_method not in deal_prices:
+        raise ValueError("unsupported formal execution method")
     exchange = SquareRootImpactExchange(
         cost_model=cost_model,
         freq="day",
         start_time=start_time,
         end_time=end_time,
-        deal_price="open",
+        deal_price=deal_prices[execution_method],
         limit_threshold=(
             "Or($paused, Ge($open, $up_limit))",
             "Or($paused, Le($open, $down_limit))",
@@ -90,7 +144,8 @@ def run_formal_qlib_backtest(
         benchmark=benchmark,
         exchange_kwargs={"exchange": exchange},
     )
-    return QlibBacktestResult(calculate_qlib_metrics(report), report, positions)
+    metrics = {**calculate_qlib_metrics(report), **calculate_trade_metrics(exchange.fill_log)}
+    return QlibBacktestResult(metrics, report, positions, exchange.fill_log)
 
 
 def run_qlib_validation_suites(
@@ -101,6 +156,7 @@ def run_qlib_validation_suites(
     end_time: str,
     cost_model: CostModelConfig,
     config: dict[str, Any],
+    capacity_runner: Callable[[float], QlibBacktestResult] | None = None,
 ) -> dict[str, Any]:
     """Repeat the same Qlib runner for cost, rolling and event validation."""
 
@@ -170,6 +226,34 @@ def run_qlib_validation_suites(
     event_pass_rate = (
         sum(item["status"] == "passed" for item in events) / len(events) if events else 0.0
     )
+    capacity_curve: list[dict[str, Any]] = []
+    if capacity_runner is not None:
+        notionals = sorted(
+            {
+                float(value)
+                for value in config.get(
+                    "capacity_curve_notionals", [5_000_000, 20_000_000, 100_000_000]
+                )
+            }
+        )
+        for notional in notionals:
+            result = capacity_runner(notional)
+            capacity_curve.append(
+                {
+                    "notional": notional,
+                    "annualized_return": result.metrics.get("annualized_return"),
+                    "annualized_excess_return": result.metrics.get("annualized_excess_return"),
+                    "sharpe_ratio": result.metrics.get("sharpe_ratio"),
+                    "total_cost": result.metrics.get("total_cost"),
+                }
+            )
+    minimum_capacity_return = float(config.get("min_capacity_excess_return", 0.0))
+    capacity_passed = len(capacity_curve) >= 3 and all(
+        item.get("annualized_excess_return") is not None
+        and np.isfinite(float(item["annualized_excess_return"]))
+        and float(item["annualized_excess_return"]) >= minimum_capacity_return
+        for item in capacity_curve
+    )
     return {
         "double_cost": {"passed": cost_passed, "metrics": double_cost.metrics},
         "rolling": {
@@ -186,5 +270,10 @@ def run_qlib_validation_suites(
             "max_event_underperformance": max_event_underperformance,
             "min_pass_rate": min_event_stress_pass_rate,
             "events": events,
+        },
+        "capacity": {
+            "passed": capacity_passed,
+            "minimum_excess_return": minimum_capacity_return,
+            "points": capacity_curve,
         },
     }

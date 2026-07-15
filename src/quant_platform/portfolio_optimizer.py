@@ -17,6 +17,7 @@ class PortfolioOptimizationResult:
     expected_turnover: float
     max_industry_deviation: float | None
     size_deviation: float | None
+    style_deviations: dict[str, float]
     iterations: int
 
 
@@ -27,12 +28,13 @@ def optimize_benchmark_relative_weights(
     *,
     industries: pd.Series,
     benchmark_industry_weights: pd.Series,
-    style_exposures: pd.Series,
-    benchmark_style_exposure: float,
+    style_exposures: pd.Series | pd.DataFrame,
+    benchmark_style_exposure: float | pd.Series | dict[str, float],
     max_position_weight: float,
     max_industry_weight: float,
     max_industry_deviation: float,
     max_size_deviation: float,
+    max_style_deviations: dict[str, float] | None = None,
     alpha_weight: float = 0.05,
     tracking_penalty: float = 1.0,
     turnover_penalty: float = 0.10,
@@ -71,9 +73,22 @@ def optimize_benchmark_relative_weights(
         pd.Index(benchmark_industry_weights.index.astype(str)),
         "benchmark industry weights",
     )
-    styles = _finite_series(style_exposures, instruments, "style exposures")
-    if not np.isfinite(float(benchmark_style_exposure)):
-        raise ValueError("benchmark style exposure must be finite")
+    styles = _finite_frame(style_exposures, instruments, "style exposures")
+    if isinstance(benchmark_style_exposure, pd.Series):
+        benchmark_styles = benchmark_style_exposure.astype(float)
+    elif isinstance(benchmark_style_exposure, dict):
+        benchmark_styles = pd.Series(benchmark_style_exposure, dtype=float)
+    else:
+        benchmark_styles = pd.Series(
+            {str(styles.columns[0]): float(benchmark_style_exposure)}, dtype=float
+        )
+    benchmark_styles = benchmark_styles.reindex(styles.columns)
+    if benchmark_styles.isna().any() or not np.isfinite(benchmark_styles).all():
+        raise ValueError("benchmark style exposures must be complete and finite")
+    style_limits = {
+        column: float((max_style_deviations or {}).get(str(column), max_size_deviation))
+        for column in styles.columns
+    }
 
     omitted_benchmark_weight = max(0.0, 1.0 - float(benchmark.sum()))
     previous_cash = max(0.0, 1.0 - float(previous.sum()))
@@ -84,7 +99,6 @@ def optimize_benchmark_relative_weights(
     alpha_values = normalized_alpha.to_numpy(dtype=float)
     benchmark_values = benchmark.to_numpy(dtype=float)
     previous_values = previous.to_numpy(dtype=float)
-    style_values = styles.to_numpy(dtype=float)
 
     def objective(weights: np.ndarray) -> float:
         active = weights - benchmark_values
@@ -135,25 +149,30 @@ def optimize_benchmark_relative_weights(
                 },
             )
         )
-    benchmark_style = float(benchmark_style_exposure)
-    constraints.extend(
-        (
-            {
-                "type": "ineq",
-                "fun": lambda weights: float(
-                    max_size_deviation - (np.dot(weights, style_values) - benchmark_style)
-                ),
-                "jac": lambda weights: -style_values,
-            },
-            {
-                "type": "ineq",
-                "fun": lambda weights: float(
-                    max_size_deviation + (np.dot(weights, style_values) - benchmark_style)
-                ),
-                "jac": lambda weights: style_values,
-            },
+    for column in styles.columns:
+        style_values = styles[column].to_numpy(dtype=float)
+        benchmark_style = float(benchmark_styles[column])
+        limit = style_limits[str(column)]
+        constraints.extend(
+            (
+                {
+                    "type": "ineq",
+                    "fun": lambda weights,
+                    values=style_values,
+                    benchmark=benchmark_style,
+                    limit=limit: float(limit - (np.dot(weights, values) - benchmark)),
+                    "jac": lambda weights, values=style_values: -values,
+                },
+                {
+                    "type": "ineq",
+                    "fun": lambda weights,
+                    values=style_values,
+                    benchmark=benchmark_style,
+                    limit=limit: float(limit + (np.dot(weights, values) - benchmark)),
+                    "jac": lambda weights, values=style_values: values,
+                },
+            )
         )
-    )
 
     result = minimize(
         objective,
@@ -180,7 +199,10 @@ def optimize_benchmark_relative_weights(
         .abs()
         .max()
     )
-    measured_size_deviation = abs(float(weights.dot(styles)) - float(benchmark_style_exposure))
+    measured_style_deviations = {
+        str(column): abs(float(weights.dot(styles[column])) - float(benchmark_styles[column]))
+        for column in styles.columns
+    }
     active = weights - benchmark
     return PortfolioOptimizationResult(
         weights=weights[weights > 0].sort_values(ascending=False),
@@ -189,7 +211,9 @@ def optimize_benchmark_relative_weights(
         active_share=0.5 * (float(active.abs().sum()) + omitted_benchmark_weight),
         expected_turnover=0.5 * (float((weights - previous).abs().sum()) + previous_cash),
         max_industry_deviation=measured_industry_deviation,
-        size_deviation=measured_size_deviation,
+        size_deviation=measured_style_deviations.get("size")
+        or measured_style_deviations.get("log_market_cap"),
+        style_deviations=measured_style_deviations,
         iterations=int(result.nit),
     )
 
@@ -203,6 +227,24 @@ def _finite_series(values: pd.Series, index: pd.Index, label: str) -> pd.Series:
     if normalized.isna().any() or not np.isfinite(normalized.to_numpy(dtype=float)).all():
         raise ValueError(f"{label} must contain complete finite values")
     return normalized.astype(float)
+
+
+def _finite_frame(
+    values: pd.Series | pd.DataFrame, index: pd.Index, label: str
+) -> pd.DataFrame:
+    frame = (
+        values.to_frame(name=values.name or "size")
+        if isinstance(values, pd.Series)
+        else values.copy()
+    )
+    if not isinstance(frame, pd.DataFrame) or frame.empty or not frame.index.is_unique:
+        raise ValueError(f"{label} must have a unique index and at least one column")
+    frame.index = frame.index.astype(str)
+    frame.columns = frame.columns.astype(str)
+    frame = frame.apply(pd.to_numeric, errors="coerce").reindex(index)
+    if frame.isna().any().any() or not np.isfinite(frame.to_numpy(dtype=float)).all():
+        raise ValueError(f"{label} must contain complete finite values")
+    return frame.astype(float)
 
 
 def _non_negative_series(values: pd.Series, index: pd.Index, label: str) -> pd.Series:

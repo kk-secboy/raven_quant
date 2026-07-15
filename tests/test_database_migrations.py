@@ -75,7 +75,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0034_legacy_readonly"
+    assert revision == "0035_research_policy_v2"
     assert {"research_program_id", "dataset_identity_sha256"} <= {
         column["name"]
         for column in inspector.get_columns("research_campaigns", schema="quantlab")
@@ -100,6 +100,9 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "evidence_sha256",
         "dataset_identity_sha256",
         "is_legacy",
+        "submitted_values_sha256",
+        "recomputed_values_sha256",
+        "recompute_evidence_json",
     } <= {
         column["name"]
         for column in inspector.get_columns("factor_evaluations", schema="quantlab")
@@ -175,3 +178,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "resolved_at",
         "resolution_reason",
     } <= allocation_event_columns
+    assert "is_legacy" in {
+        column["name"]
+        for column in inspector.get_columns("strategy_allocations", schema="quantlab")
+    }

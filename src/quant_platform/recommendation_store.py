@@ -85,6 +85,7 @@ class RecommendationStore:
                         status="active",
                         base_currency="CNY",
                         hypothetical_initial_value=Decimal(str(hypothetical_initial_value)),
+                        risk_exposure_override=1.0,
                         created_by=actor.strip(),
                         created_at=now,
                         updated_at=now,
@@ -200,7 +201,10 @@ class RecommendationStore:
         with self.engine.begin() as connection:
             result = connection.execute(
                 update(recommendation_snapshots)
-                .where(recommendation_snapshots.c.id == snapshot_id)
+                .where(
+                    recommendation_snapshots.c.id == snapshot_id,
+                    recommendation_snapshots.c.status.in_(("queued", "running")),
+                )
                 .values(job_id=job_id, status="running", started_at=_now())
             )
             if not result.rowcount:
@@ -291,6 +295,8 @@ class RecommendationStore:
                             "reason": item.get(
                                 "reason", "signal ranking and portfolio constraints"
                             ),
+                            "average_cost": item.get("average_cost"),
+                            "take_profit_stage": int(item.get("take_profit_stage", 0)),
                         }
                         for item in holdings
                     ],
@@ -330,7 +336,10 @@ class RecommendationStore:
         with self.engine.begin() as connection:
             connection.execute(
                 update(recommendation_snapshots)
-                .where(recommendation_snapshots.c.id == snapshot_id)
+                .where(
+                    recommendation_snapshots.c.id == snapshot_id,
+                    recommendation_snapshots.c.status.in_(("queued", "running")),
+                )
                 .values(status="failed", error=error, finished_at=_now())
             )
 

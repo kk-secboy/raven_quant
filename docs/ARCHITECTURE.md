@@ -6,33 +6,29 @@ backend, orchestration, and research adapters.
 
 ## Product boundary
 
-The system owns historical and incremental data ingestion, point-in-time snapshots,
-Qlib experiments and backtests, bounded RD-Agent research, factor/model lifecycle,
-job scheduling, research reports, and paper portfolios. Broker execution is a separate
-provider adapter boundary and is not treated as part of Qlib or RD-Agent.
+The system owns historical and incremental Tushare ingestion, immutable point-in-time
+snapshots, bounded RD-Agent research, independent factor-code recomputation, Qlib-only
+validation/backtests, factor and strategy governance, and recommendation portfolios
+with hypothetical performance tracking.
 
-The implemented broker boundary is an integration sandbox, not a live adapter. It
-replays successful paper orders to a separately deployed provider gateway so QMT,
-CTP, or another broker SDK can be validated without coupling provider credentials or
-Windows-only SDK processes to the research control plane. Live mode is rejected by
-configuration until a provider-specific adapter, account reconciliation, compliance
-approval, and small-capital rollout are separately completed.
+There is one active path:
 
-The first provider adapter is a Windows-side QMT/MiniQMT process. XtQuant trading is
-not placed in the Linux Compose stack. The gateway persists parent orders, scheduled
-TWAP/VWAP children, provider order identifiers, failures, and replay nonces in
-PostgreSQL; broker login state and trading credentials remain inside MiniQMT. A short
-deterministic `order_remark` makes a recovered slice idempotent without exposing the
-control-plane client order id to the provider.
+`Tushare -> Qlib snapshot -> RD-Agent -> factor recomputation -> Qlib formal backtest
+-> recommendation snapshot`.
 
-Before each slice, the gateway requires the latest completed positive-volume QMT
-minute bar and a fresh full-tick best bid/ask. The participation cap is applied to raw
-A-share volume; excess quantity moves forward to a later signed slot, while excess in
-the final slot fails closed. Every provider submission is an immutable attempt. A
-stale active or partially filled attempt is canceled first; only after QMT reports the
-cancel does the gateway submit the remaining quantity at the opposite quote bounded
-by the configured reprice limit. Order/trade/error callbacks are retained separately
-from query snapshots so recovery has both event and state evidence.
+`PortfolioPolicy` is shared by the Qlib strategy and the recommendation refresh service.
+It owns position, industry, style, liquidity, turnover, lot-size, stop-loss, take-profit,
+drawdown and staged-execution decisions. Qlib Exchange alone owns next-day execution,
+price limits, fills and the unified cost model.
+
+Paper orders, fills and ledgers are legacy read-only archives. They are not accepted as
+input to new research, approval, scheduling or recommendation calculations. The old
+`/api/portfolios` surface returns `410 Gone`.
+
+QMT/MiniQMT source is retained only as an optional isolated plugin. It is disabled by
+default, is absent from research health checks and cannot convert recommendation
+snapshots into orders. Pair trading remains a separate research/backtest capability;
+its paper execution, scheduling and recommendation entry points are disabled.
 
 ## Runtime structure
 

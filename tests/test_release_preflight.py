@@ -223,7 +223,7 @@ def test_known_older_database_revision_has_upgrade_path() -> None:
         "0017_qmt_execution_state",
     )
 
-    assert code_revision == "0034_legacy_readonly"
+    assert code_revision == "0035_research_policy_v2"
     assert state == "upgrade_required"
     assert compatible is True
 
@@ -236,6 +236,6 @@ def test_unknown_database_revision_fails_closed() -> None:
         "9999_unknown_revision",
     )
 
-    assert code_revision == "0034_legacy_readonly"
+    assert code_revision == "0035_research_policy_v2"
     assert state == "unknown_database_revision"
     assert compatible is False

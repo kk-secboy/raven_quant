@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import numpy as np
 import pandas as pd
 
 from .factor_evaluator import normalize_series
@@ -68,20 +69,21 @@ def build_governed_signal(
         else None
     )
     memberships = _normalize_memberships(industry_memberships)
-    styles = _normalize_snapshots(style_exposures, "log_market_cap")
+    styles = _normalize_style_snapshots(style_exposures)
     benchmark = _normalize_snapshots(benchmark_weights, "weight")
     rows: list[pd.Series] = []
     for timestamp, daily in score.groupby(level="datetime", sort=True):
         ranking = daily.droplevel("datetime").dropna()
-        daily_styles = _snapshot(styles, timestamp, "log_market_cap")
-        aligned_styles = daily_styles.reindex(ranking.index)
-        if aligned_styles.notna().sum() >= max(5, min(topk, len(ranking))):
-            design = pd.DataFrame({"score": ranking, "style": aligned_styles}).dropna()
-            slope = design["score"].cov(design["style"]) / design["style"].var()
-            if pd.notna(slope):
-                ranking.loc[design.index] = design["score"] - slope * (
-                    design["style"] - design["style"].mean()
-                )
+        daily_styles = _style_snapshot(styles, timestamp).reindex(ranking.index)
+        design = pd.concat([ranking.rename("score"), daily_styles], axis=1).dropna()
+        style_columns = [column for column in design.columns if column != "score"]
+        if style_columns and len(design) >= max(5, min(topk, len(ranking))):
+            matrix = design[style_columns].to_numpy(dtype=float)
+            matrix = np.column_stack([np.ones(len(matrix)), matrix])
+            coefficients, *_ = np.linalg.lstsq(
+                matrix, design["score"].to_numpy(dtype=float), rcond=None
+            )
+            ranking.loc[design.index] = design["score"] - matrix @ coefficients
         if min_average_daily_amount > 0:
             daily_amount = (
                 rolling_liquidity.loc[timestamp]
@@ -155,6 +157,24 @@ def _normalize_snapshots(values: pd.DataFrame | None, column: str) -> pd.DataFra
     return result.dropna()
 
 
+def _normalize_style_snapshots(values: pd.DataFrame | None) -> pd.DataFrame | None:
+    if values is None:
+        return None
+    required = {"datetime", "instrument"}
+    if not required.issubset(values.columns):
+        raise ValueError("point-in-time style metadata is incomplete")
+    style_columns = [column for column in values.columns if column not in required]
+    if not style_columns:
+        raise ValueError("point-in-time style metadata has no exposure columns")
+    result = values.loc[:, ["datetime", "instrument", *style_columns]].copy()
+    result["datetime"] = pd.to_datetime(result["datetime"], errors="coerce")
+    result["instrument"] = result["instrument"].astype(str)
+    result[style_columns] = result[style_columns].apply(pd.to_numeric, errors="coerce").replace(
+        [np.inf, -np.inf], np.nan
+    )
+    return result.dropna()
+
+
 def _snapshot(values: pd.DataFrame | None, timestamp: pd.Timestamp, column: str) -> pd.Series:
     if values is None:
         return pd.Series(dtype=float)
@@ -163,6 +183,18 @@ def _snapshot(values: pd.DataFrame | None, timestamp: pd.Timestamp, column: str)
         return pd.Series(dtype=float)
     current = eligible[eligible["datetime"] == eligible["datetime"].max()]
     return current.drop_duplicates("instrument", keep="last").set_index("instrument")[column]
+
+
+def _style_snapshot(values: pd.DataFrame | None, timestamp: pd.Timestamp) -> pd.DataFrame:
+    if values is None:
+        return pd.DataFrame()
+    eligible = values[values["datetime"] <= timestamp]
+    if eligible.empty:
+        return pd.DataFrame()
+    current = eligible[eligible["datetime"] == eligible["datetime"].max()]
+    return current.drop_duplicates("instrument", keep="last").set_index("instrument").drop(
+        columns=["datetime"], errors="ignore"
+    )
 
 
 def _industries_at(values: pd.DataFrame | None, timestamp: pd.Timestamp) -> pd.Series:

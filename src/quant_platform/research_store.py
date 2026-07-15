@@ -92,6 +92,8 @@ def _evaluation_evidence(
     evaluator_version: str,
     candidate_code_sha256: str,
     candidate_values_sha256: str,
+    submitted_values_sha256: str,
+    recompute_evidence_sha256: str,
     artifact_sha256: str,
     metrics_sha256: str,
     policy_sha256: str,
@@ -106,6 +108,8 @@ def _evaluation_evidence(
         "evaluator_version": evaluator_version,
         "candidate_code_sha256": candidate_code_sha256,
         "candidate_values_sha256": candidate_values_sha256,
+        "submitted_values_sha256": submitted_values_sha256,
+        "recompute_evidence_sha256": recompute_evidence_sha256,
         "artifact_sha256": artifact_sha256,
         "metrics_sha256": metrics_sha256,
         "policy_sha256": policy_sha256,
@@ -437,6 +441,9 @@ class ResearchStore:
         test_end: date,
         metrics: dict[str, float | None],
         artifact_path: str | None,
+        recomputed_values_path: str,
+        recomputed_values_sha256: str,
+        recompute_evidence: dict[str, Any],
         actor: str = "qlib-evaluator",
     ) -> dict[str, Any]:
         if not (train_start <= train_end < valid_start <= valid_end < test_start <= test_end):
@@ -452,13 +459,46 @@ class ResearchStore:
         current_code_sha256 = _artifact_hash(
             candidate.get("code_path"), "factor code", required=True
         )
-        current_values_sha256 = _artifact_hash(
+        submitted_values_sha256 = _artifact_hash(
             candidate.get("values_path"), "factor values", required=True
         )
         if current_code_sha256 != candidate.get("code_sha256"):
             raise ValueError("factor code artifact changed after RD-Agent import")
-        if current_values_sha256 != candidate.get("values_sha256"):
+        if submitted_values_sha256 != candidate.get("values_sha256"):
             raise ValueError("factor values artifact changed after RD-Agent import")
+        actual_recomputed_sha256 = _artifact_hash(
+            recomputed_values_path, "independently recomputed factor values", required=True
+        )
+        if actual_recomputed_sha256 != recomputed_values_sha256:
+            raise ValueError("recomputed factor values do not match evaluator SHA-256")
+        if recompute_evidence.get("code_sha256") != current_code_sha256:
+            raise ValueError("factor recomputation evidence is not bound to candidate code")
+        if recompute_evidence.get("dataset_identity_sha256") != dataset_identity_sha256:
+            raise ValueError("factor recomputation evidence is not bound to the Qlib dataset")
+        if recompute_evidence.get("authoritative_values_sha256") != actual_recomputed_sha256:
+            raise ValueError("factor recomputation evidence is not bound to authoritative values")
+        if recompute_evidence.get("executor_version") != "factor-recompute-v1":
+            raise ValueError("factor recomputation evidence has an unsupported executor version")
+        if not recompute_evidence.get("provider_input_sha256"):
+            raise ValueError("factor recomputation evidence is not bound to provider input")
+        expected_periods = {
+            "train_start": train_start.isoformat(),
+            "train_end": train_end.isoformat(),
+            "valid_start": valid_start.isoformat(),
+            "valid_end": valid_end.isoformat(),
+            "test_start": test_start.isoformat(),
+            "test_end": test_end.isoformat(),
+        }
+        if recompute_evidence.get("periods") != expected_periods:
+            raise ValueError("factor recomputation evidence is not bound to evaluation periods")
+        submitted_comparison = recompute_evidence.get("submitted_comparison")
+        if not isinstance(submitted_comparison, dict) or not (
+            submitted_comparison.get("available") is True
+            and submitted_comparison.get("exact_match") is True
+            and submitted_comparison.get("submitted_sha256") == submitted_values_sha256
+        ):
+            raise ValueError("submitted factor values do not match independent recomputation")
+        recompute_evidence_sha256 = _canonical_sha256(recompute_evidence)
         if gate_status == "passed" and not artifact_path:
             raise ValueError("passed Qlib evaluation requires a durable result artifact")
         artifact_sha256 = _artifact_hash(
@@ -488,7 +528,9 @@ class ResearchStore:
             gate_reasons=reasons,
             evaluator_version=self.policy.version,
             candidate_code_sha256=current_code_sha256,
-            candidate_values_sha256=current_values_sha256,
+            candidate_values_sha256=actual_recomputed_sha256,
+            submitted_values_sha256=submitted_values_sha256,
+            recompute_evidence_sha256=recompute_evidence_sha256,
             artifact_sha256=artifact_sha256 or "",
             metrics_sha256=metrics_sha256,
             policy_sha256=policy_sha256,
@@ -530,7 +572,10 @@ class ResearchStore:
                     artifact_path=artifact_path,
                     artifact_sha256=artifact_sha256,
                     candidate_code_sha256=current_code_sha256,
-                    candidate_values_sha256=current_values_sha256,
+                    candidate_values_sha256=actual_recomputed_sha256,
+                    submitted_values_sha256=submitted_values_sha256,
+                    recomputed_values_sha256=actual_recomputed_sha256,
+                    recompute_evidence_json=recompute_evidence,
                     metrics_sha256=metrics_sha256,
                     policy_json=policy,
                     policy_sha256=policy_sha256,
@@ -541,7 +586,12 @@ class ResearchStore:
             connection.execute(
                 update(factor_candidates)
                 .where(factor_candidates.c.id == candidate_id)
-                .values(status=candidate_status, updated_at=now)
+                .values(
+                    status=candidate_status,
+                    values_path=recomputed_values_path,
+                    values_sha256=actual_recomputed_sha256,
+                    updated_at=now,
+                )
             )
             self._event(
                 connection,
@@ -627,6 +677,8 @@ class ResearchStore:
             evaluator_version=evaluation["evaluator_version"],
             candidate_code_sha256=current_code_sha256,
             candidate_values_sha256=current_values_sha256,
+            submitted_values_sha256=evaluation["submitted_values_sha256"],
+            recompute_evidence_sha256=_canonical_sha256(evaluation["recompute_evidence"]),
             artifact_sha256=artifact_sha256,
             metrics_sha256=evaluation["metrics_sha256"],
             policy_sha256=evaluation["policy_sha256"],
@@ -742,4 +794,5 @@ class ResearchStore:
     def _decode_evaluation(row: dict[str, Any]) -> dict[str, Any]:
         row["metrics"] = row.pop("metrics_json")
         row["gate_reasons"] = row.pop("gate_reasons_json")
+        row["recompute_evidence"] = row.pop("recompute_evidence_json")
         return row
