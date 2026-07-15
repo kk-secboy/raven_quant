@@ -25,6 +25,7 @@ SUPPORTED_BUNDLES = {
 } | COVERAGE_BUNDLES
 
 _CN_EXCHANGES = ("CFFEX", "DCE", "CZCE", "SHFE", "INE", "GFEX")
+ETF_CONSTITUENT_DATASETS = {"etf_sh_cons", "etf_sz_cons"}
 _PAGINATION_MAX_PAGES = {
     "index_basic": 16,
     # These are safety ceilings, not pre-planned page counts.  The CLI starts
@@ -336,6 +337,73 @@ def share_float_overflow_repartition_specs(failed_spec: FetchSpec) -> list[Fetch
             )
         )
         current += timedelta(days=1)
+    return result
+
+
+def etf_constituent_overflow_repartition_specs(
+    failed_spec: FetchSpec, symbols: Iterable[str]
+) -> list[FetchSpec]:
+    """Replace an offset-capped ETF date partition with symbol partitions.
+
+    The ETF constituent endpoints accept both ``trade_date`` and ``ts_code``
+    but reject offsets beyond 100,000 for dense full-market dates.  A
+    per-symbol partition is the provider-documented escape hatch.  Existing
+    successful date pages remain immutable; the replacement groups explicitly
+    supersede the parent date group and snapshot ``DISTINCT`` removes overlap.
+    """
+
+    if failed_spec.dataset not in ETF_CONSTITUENT_DATASETS:
+        raise ValueError("ETF overflow continuation requires an ETF constituent dataset")
+    trade_date = str(failed_spec.params.get("trade_date") or "")
+    if len(trade_date) != 8:
+        raise ValueError("ETF overflow continuation requires a compact trade_date")
+    offset = int(failed_spec.params.get("offset") or 0)
+    if offset < 100_000:
+        raise ValueError("ETF overflow continuation requires an offset-capped page")
+
+    suffix = ".SH" if failed_spec.dataset == "etf_sh_cons" else ".SZ"
+    eligible = sorted(
+        {
+            str(symbol).strip().upper()
+            for symbol in symbols
+            if str(symbol).strip().upper().endswith(suffix)
+        }
+    )
+    if not eligible:
+        raise RuntimeError(
+            f"no {suffix} ETF symbols are available for {failed_spec.dataset} recovery"
+        )
+
+    parent_group = str(failed_spec.scope["page_group"])
+    page_size = 3_000
+    result: list[FetchSpec] = []
+    for symbol in eligible:
+        group = f"{parent_group}:symbol:{symbol}"
+        result.append(
+            _spec(
+                failed_spec.dataset,
+                failed_spec.api_name,
+                {
+                    "ts_code": symbol,
+                    "trade_date": trade_date,
+                    "limit": page_size,
+                    "offset": 0,
+                },
+                scope={
+                    "ts_code": symbol,
+                    "trade_date": trade_date,
+                    "page_group": group,
+                    "offset": 0,
+                    "page_size": page_size,
+                    "max_pages": _PAGINATION_MAX_PAGES[failed_spec.dataset],
+                    "expected_date_field": "trade_date",
+                    "expected_date": trade_date,
+                    "supersedes_page_group": parent_group,
+                },
+                allow_empty=True,
+                max_attempts=failed_spec.max_attempts,
+            )
+        )
     return result
 
 

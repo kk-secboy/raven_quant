@@ -9,6 +9,7 @@ from quant_data.supplemental_data import (
     a_share_bulk_history_specs,
     bond_reference_specs,
     bundle_datasets,
+    etf_constituent_overflow_repartition_specs,
     market_financial_specs,
     next_pagination_specs,
     require_pagination_terminated,
@@ -654,6 +655,47 @@ def test_share_float_offset_cap_repartitions_the_whole_month_by_day() -> None:
                 {"unit_key": item.unit_key, "row_count": 0}
                 for item in daily
             ],
+        ],
+    )
+
+
+def test_etf_constituent_offset_cap_repartitions_the_date_by_symbol() -> None:
+    parent = next(
+        spec
+        for spec in supplemental_specs(
+            "cn_institutional",
+            start=date(2026, 3, 16),
+            end=date(2026, 3, 16),
+            trading_dates=["20260316"],
+            max_attempts=5,
+        )
+        if spec.dataset == "etf_sh_cons"
+    )
+    failed = parent
+    for _ in range(34):
+        failed = next_pagination_specs(
+            [failed],
+            [{"unit_key": failed.unit_key, "row_count": 3_000}],
+        )[0]
+    assert failed.params["offset"] == 102_000
+
+    symbols = etf_constituent_overflow_repartition_specs(
+        failed,
+        ["510050.SH", "159001.SZ", "512000.SH", "510050.SH"],
+    )
+    assert [item.params["ts_code"] for item in symbols] == ["510050.SH", "512000.SH"]
+    assert all(item.params["trade_date"] == "20260316" for item in symbols)
+    assert all(item.params["offset"] == 0 for item in symbols)
+    assert all(
+        item.scope["supersedes_page_group"] == parent.scope["page_group"]
+        for item in symbols
+    )
+
+    require_pagination_terminated(
+        [parent, *symbols],
+        [
+            {"unit_key": parent.unit_key, "row_count": 3_000},
+            *[{"unit_key": item.unit_key, "row_count": 0} for item in symbols],
         ],
     )
 

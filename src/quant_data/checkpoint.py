@@ -169,19 +169,27 @@ class CheckpointStore:
         keys = sorted(set(unit_keys))
         if not keys:
             return 0
-        statement = (
-            update(work_units)
-            .where(work_units.c.status == "failed", work_units.c.unit_key.in_(keys))
-            .values(
-                status="pending",
-                attempts=0,
-                next_retry_at=None,
-                lease_until=None,
-                updated_at=_utc_now(),
-            )
-        )
+        updated = 0
+        now = _utc_now()
         with self.engine.begin() as connection:
-            return int(connection.execute(statement).rowcount or 0)
+            for offset in range(0, len(keys), _SELECT_BATCH_SIZE):
+                batch = keys[offset : offset + _SELECT_BATCH_SIZE]
+                statement = (
+                    update(work_units)
+                    .where(
+                        work_units.c.status == "failed",
+                        work_units.c.unit_key.in_(batch),
+                    )
+                    .values(
+                        status="pending",
+                        attempts=0,
+                        next_retry_at=None,
+                        lease_until=None,
+                        updated_at=now,
+                    )
+                )
+                updated += int(connection.execute(statement).rowcount or 0)
+        return updated
 
     def supersede_units(self, unit_keys: Iterable[str], reason: str) -> int:
         """Retain unusable plan rows while removing them from runnable work."""
@@ -189,20 +197,28 @@ class CheckpointStore:
         keys = sorted(set(unit_keys))
         if not keys:
             return 0
-        statement = (
-            update(work_units)
-            .where(work_units.c.unit_key.in_(keys), work_units.c.status != "succeeded")
-            .values(
-                status="superseded",
-                attempts=work_units.c.max_attempts,
-                next_retry_at=None,
-                lease_until=None,
-                last_error=reason[:2000],
-                updated_at=_utc_now(),
-            )
-        )
+        updated = 0
+        now = _utc_now()
         with self.engine.begin() as connection:
-            return int(connection.execute(statement).rowcount or 0)
+            for offset in range(0, len(keys), _SELECT_BATCH_SIZE):
+                batch = keys[offset : offset + _SELECT_BATCH_SIZE]
+                statement = (
+                    update(work_units)
+                    .where(
+                        work_units.c.unit_key.in_(batch),
+                        work_units.c.status != "succeeded",
+                    )
+                    .values(
+                        status="superseded",
+                        attempts=work_units.c.max_attempts,
+                        next_retry_at=None,
+                        lease_until=None,
+                        last_error=reason[:2000],
+                        updated_at=now,
+                    )
+                )
+                updated += int(connection.execute(statement).rowcount or 0)
+        return updated
 
     def counts(self) -> list[dict[str, Any]]:
         statement = (

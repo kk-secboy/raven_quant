@@ -37,6 +37,7 @@ from .supplemental_data import (
     SUPPORTED_BUNDLES,
     a_share_bulk_history_specs,
     bond_reference_specs,
+    etf_constituent_overflow_repartition_specs,
     market_financial_specs,
     next_pagination_specs,
     require_pagination_terminated,
@@ -112,7 +113,7 @@ def _run_paginated_specs(
     _run_phase(context, label, datasets)
 
     while True:
-        recovery_specs, recovered_keys = _share_float_overflow_recovery(
+        recovery_specs, recovered_keys = _pagination_overflow_recovery(
             context, specs, ignored_keys
         )
         if recovered_keys:
@@ -133,7 +134,7 @@ def _run_paginated_specs(
             return specs, rows, inserted
 
         specs.extend(next_specs)
-        recovery_specs, recovered_keys = _share_float_overflow_recovery(
+        recovery_specs, recovered_keys = _pagination_overflow_recovery(
             context, specs, ignored_keys
         )
         if recovered_keys:
@@ -185,6 +186,79 @@ def _share_float_overflow_recovery(
             f"{error}; pagination offset cap superseded by disjoint date continuations",
         )
     return recovery_specs, recovered_keys
+
+
+def _pagination_overflow_recovery(
+    context: Context,
+    specs: list[FetchSpec],
+    ignored_keys: set[str],
+) -> tuple[list[FetchSpec], set[str]]:
+    """Recover every provider offset cap using a smaller documented partition."""
+
+    recovery_specs, recovered_keys = _share_float_overflow_recovery(
+        context, specs, ignored_keys
+    )
+    rows_by_key = {
+        str(row["unit_key"]): row
+        for row in context.checkpoint.unit_rows(spec.unit_key for spec in specs)
+    }
+    etf_master: pd.DataFrame | None = None
+    for failed_spec in specs:
+        if (
+            failed_spec.unit_key in ignored_keys
+            or failed_spec.unit_key in recovered_keys
+            or failed_spec.dataset not in {"etf_sh_cons", "etf_sz_cons"}
+        ):
+            continue
+        row = rows_by_key.get(failed_spec.unit_key)
+        if not row or str(row.get("status")) not in {"failed", "superseded"}:
+            continue
+        error = str(row.get("last_error") or "")
+        offset = int(failed_spec.params.get("offset") or 0)
+        if offset < 100_000 or "code=50101" not in error:
+            continue
+
+        if etf_master is None:
+            etf_master = context.storage.read_units(
+                context.checkpoint.successful("etf_basic")
+            )
+            if "ts_code" not in etf_master.columns:
+                raise RuntimeError(
+                    "etf_basic did not provide ts_code for constituent overflow recovery"
+                )
+        symbols = _eligible_etf_symbols(
+            etf_master,
+            dataset=failed_spec.dataset,
+            trade_date=str(failed_spec.params["trade_date"]),
+        )
+        recovery_specs.extend(
+            etf_constituent_overflow_repartition_specs(failed_spec, symbols)
+        )
+        recovered_keys.add(failed_spec.unit_key)
+        context.checkpoint.supersede_units(
+            [failed_spec.unit_key],
+            f"{error}; pagination offset cap superseded by ETF symbol partitions",
+        )
+    return recovery_specs, recovered_keys
+
+
+def _eligible_etf_symbols(
+    master: pd.DataFrame, *, dataset: str, trade_date: str
+) -> list[str]:
+    suffix = ".SH" if dataset == "etf_sh_cons" else ".SZ"
+    frame = master.copy()
+    if "list_status" in frame.columns:
+        frame = frame[frame["list_status"].astype("string").isin(["L", "D"])]
+    if "list_date" in frame.columns:
+        listed = pd.to_datetime(frame["list_date"], errors="coerce")
+        frame = frame[listed.isna() | (listed <= pd.Timestamp(trade_date))]
+    return sorted(
+        {
+            str(value).strip().upper()
+            for value in frame["ts_code"].dropna().tolist()
+            if str(value).strip().upper().endswith(suffix)
+        }
+    )
 
 
 @app.command()
@@ -716,23 +790,14 @@ def supplemental_download(
         trading_dates=trading_dates,
         max_attempts=context.settings.max_request_attempts,
     )
-    inserted = context.checkpoint.add(specs)
-    context.checkpoint.retry_failed_units(spec.unit_key for spec in specs)
     datasets = {spec.dataset for spec in specs}
+    rows: list[dict] = []
+    inserted = 0
+    if specs:
+        specs, rows, inserted = _run_paginated_specs(context, bundle, specs)
     console.print(
         f"planned supplemental bundle={bundle} units={len(specs)} newly_inserted={inserted}"
     )
-    rows: list[dict] = []
-    if specs:
-        _run_phase(context, bundle, datasets)
-        rows = _require_specs_complete(context, specs)
-        while next_specs := next_pagination_specs(specs, rows):
-            inserted += context.checkpoint.add(next_specs)
-            context.checkpoint.retry_failed_units(spec.unit_key for spec in next_specs)
-            specs.extend(next_specs)
-            _run_phase(context, f"{bundle} pagination", datasets)
-            rows = _require_specs_complete(context, specs)
-        require_pagination_terminated(specs, rows)
     if bundle == "cn_governance_risk":
         master = context.storage.read_units(context.checkpoint.successful("stock_basic"))
         if "ts_code" not in master.columns:

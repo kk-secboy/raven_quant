@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import quant_data.checkpoint as checkpoint_module
 from quant_data.checkpoint import CheckpointStore
 from quant_data.models import FetchSpec, UnitResult
 
@@ -103,3 +104,35 @@ def test_superseded_units_are_retained_but_not_runnable_or_planned(
     verification = store.verification_rows()[0]
     assert verification["planned"] == 0
     assert verification["superseded"] == 1
+
+
+def test_bulk_status_updates_are_chunked(
+    database_url: str,
+    monkeypatch,
+) -> None:
+    store = CheckpointStore(database_url)
+    items = [
+        FetchSpec(
+            dataset="daily",
+            api_name="daily",
+            scope={"trade_date": f"2024010{index}"},
+            params={"trade_date": f"2024010{index}"},
+        )
+        for index in range(1, 5)
+    ]
+    store.add(items)
+    for _item in items:
+        unit = store.claim()
+        assert unit is not None
+        store.fail(unit.unit_key, "provider failure", terminal=True)
+
+    monkeypatch.setattr(checkpoint_module, "_SELECT_BATCH_SIZE", 2)
+    assert store.retry_failed_units(item.unit_key for item in items) == 4
+
+    rows = store.unit_rows(item.unit_key for item in items)
+    assert {row["status"] for row in rows} == {"pending"}
+    assert store.supersede_units(
+        (item.unit_key for item in items), "repartitioned"
+    ) == 4
+    rows = store.unit_rows(item.unit_key for item in items)
+    assert {row["status"] for row in rows} == {"superseded"}
