@@ -180,19 +180,14 @@ def optimize_benchmark_relative_weights(
         .abs()
         .max()
     )
-    measured_size_deviation = abs(
-        float(weights.dot(styles)) - float(benchmark_style_exposure)
-    )
+    measured_size_deviation = abs(float(weights.dot(styles)) - float(benchmark_style_exposure))
     active = weights - benchmark
     return PortfolioOptimizationResult(
         weights=weights[weights > 0].sort_values(ascending=False),
         objective=float(result.fun),
-        tracking_risk_proxy=float(
-            np.sqrt(np.dot(active, active) + omitted_benchmark_weight**2)
-        ),
+        tracking_risk_proxy=float(np.sqrt(np.dot(active, active) + omitted_benchmark_weight**2)),
         active_share=0.5 * (float(active.abs().sum()) + omitted_benchmark_weight),
-        expected_turnover=0.5
-        * (float((weights - previous).abs().sum()) + previous_cash),
+        expected_turnover=0.5 * (float((weights - previous).abs().sum()) + previous_cash),
         max_industry_deviation=measured_industry_deviation,
         size_deviation=measured_size_deviation,
         iterations=int(result.nit),

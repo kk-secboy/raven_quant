@@ -184,6 +184,7 @@ factor_evaluations = Table(
     metadata,
     *[
         Column("id", String, primary_key=True),
+        Column("is_legacy", Boolean, nullable=False, server_default="false"),
         Column(
             "factor_candidate_id",
             String,
@@ -191,6 +192,7 @@ factor_evaluations = Table(
             nullable=False,
         ),
         Column("dataset", String, nullable=False),
+        Column("dataset_identity_sha256", String),
         Column("train_start", Date, nullable=False),
         Column("train_end", Date, nullable=False),
         Column("valid_start", Date, nullable=False),
@@ -269,6 +271,7 @@ strategy_versions = Table(
     "strategy_versions",
     metadata,
     Column("id", String, primary_key=True),
+    Column("is_legacy", Boolean, nullable=False, server_default="false"),
     Column(
         "strategy_id",
         String,
@@ -346,6 +349,7 @@ backtest_runs = Table(
     "backtest_runs",
     metadata,
     Column("id", String, primary_key=True),
+    Column("is_legacy", Boolean, nullable=False, server_default="false"),
     Column("job_id", String, ForeignKey("quantlab.jobs.id", ondelete="SET NULL")),
     Column(
         "strategy_version_id",
@@ -598,10 +602,108 @@ Index(
     strategy_events.c.created_at,
 )
 
+recommendation_portfolios = Table(
+    "recommendation_portfolios",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("name", String, nullable=False, unique=True),
+    Column(
+        "strategy_version_id",
+        String,
+        ForeignKey("quantlab.strategy_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("dataset", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("base_currency", String, nullable=False),
+    Column("hypothetical_initial_value", Numeric(20, 6), nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_recommendation_portfolios_status_updated",
+    recommendation_portfolios.c.status,
+    recommendation_portfolios.c.updated_at.desc(),
+)
+
+recommendation_snapshots = Table(
+    "recommendation_snapshots",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.recommendation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("job_id", String, ForeignKey("quantlab.jobs.id", ondelete="SET NULL")),
+    Column("as_of_date", Date, nullable=False),
+    Column("effective_date", Date),
+    Column("status", String, nullable=False),
+    Column("snapshot_json", json_type),
+    Column("cost_model_json", json_type, nullable=False),
+    Column("policy_version", String, nullable=False),
+    Column("backtest_engine_version", String, nullable=False),
+    Column("dataset", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("strategy_version_id", String, nullable=False),
+    Column("error", Text),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("started_at", DateTime(timezone=True)),
+    Column("finished_at", DateTime(timezone=True)),
+    UniqueConstraint(
+        "portfolio_id", "as_of_date", name="uq_recommendation_snapshots_as_of"
+    ),
+)
+Index(
+    "idx_recommendation_snapshots_portfolio_created",
+    recommendation_snapshots.c.portfolio_id,
+    recommendation_snapshots.c.created_at.desc(),
+)
+
+recommendation_holdings = Table(
+    "recommendation_holdings",
+    metadata,
+    Column(
+        "snapshot_id",
+        String,
+        ForeignKey("quantlab.recommendation_snapshots.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("instrument", String, primary_key=True),
+    Column("weight", Float, nullable=False),
+    Column("previous_weight", Float, nullable=False),
+    Column("weight_change", Float, nullable=False),
+    Column("action", String, nullable=False),
+    Column("reason", Text, nullable=False),
+)
+
+recommendation_nav = Table(
+    "recommendation_nav",
+    metadata,
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.recommendation_portfolios.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("trade_date", Date, primary_key=True),
+    Column("hypothetical_value", Numeric(20, 6), nullable=False),
+    Column("daily_return", Float, nullable=False),
+    Column("benchmark_return", Float),
+    Column("drawdown", Float, nullable=False),
+    Column("turnover", Float, nullable=False),
+    Column("estimated_cost", Numeric(20, 6), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index("idx_recommendation_nav_trade_date", recommendation_nav.c.trade_date.desc())
+
 paper_portfolios = Table(
     "paper_portfolios",
     metadata,
     Column("id", String, primary_key=True),
+    Column("is_legacy", Boolean, nullable=False, server_default="true"),
     Column("name", String, nullable=False, unique=True),
     Column(
         "strategy_version_id",
@@ -663,6 +765,7 @@ paper_orders = Table(
     "paper_orders",
     metadata,
     Column("id", String, primary_key=True),
+    Column("is_legacy", Boolean, nullable=False, server_default="true"),
     Column(
         "batch_id",
         String,
@@ -692,6 +795,7 @@ paper_fills = Table(
     "paper_fills",
     metadata,
     Column("id", String, primary_key=True),
+    Column("is_legacy", Boolean, nullable=False, server_default="true"),
     Column(
         "order_id",
         String,
@@ -818,6 +922,7 @@ pair_paper_portfolios = Table(
     "pair_paper_portfolios",
     metadata,
     Column("id", String, primary_key=True),
+    Column("is_legacy", Boolean, nullable=False, server_default="true"),
     Column("name", String, nullable=False, unique=True),
     Column(
         "strategy_version_id",
@@ -895,6 +1000,7 @@ pair_paper_orders = Table(
     "pair_paper_orders",
     metadata,
     Column("id", String, primary_key=True),
+    Column("is_legacy", Boolean, nullable=False, server_default="true"),
     Column(
         "batch_id",
         String,
@@ -927,6 +1033,7 @@ pair_paper_fills = Table(
     "pair_paper_fills",
     metadata,
     Column("id", String, primary_key=True),
+    Column("is_legacy", Boolean, nullable=False, server_default="true"),
     Column(
         "order_id",
         String,

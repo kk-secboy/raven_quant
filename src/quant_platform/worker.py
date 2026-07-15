@@ -13,12 +13,11 @@ from pathlib import Path
 from quant_data.config import Settings
 from quant_data.path_utils import to_wsl_path as _to_wsl_path
 
-from .allocation_store import AllocationStore
+from .cost_model import CostModelConfig
 from .job_store import JobStore
-from .pair_portfolio_store import PairPortfolioStore
 from .parameter_experiment_store import ParameterExperimentStore
-from .portfolio_store import PortfolioStore
 from .rdagent_runtime import rdagent_command
+from .recommendation_store import RecommendationStore
 from .research_store import ResearchStore
 from .runtime_secret_store import RuntimeSecretStore
 from .strategy_store import StrategyStore
@@ -33,10 +32,8 @@ class LocalJobWorker:
         self.settings = settings
         self.research = ResearchStore(settings.database_url)
         self.strategies = StrategyStore(settings.database_url)
-        self.portfolios = PortfolioStore(settings.database_url)
-        self.pair_portfolios = PairPortfolioStore(settings.database_url)
+        self.recommendations = RecommendationStore(settings.database_url)
         self.parameter_experiments = ParameterExperimentStore(settings.database_url)
-        self.allocations = AllocationStore(settings.database_url)
         self.runtime_secrets = RuntimeSecretStore(
             settings.database_url, settings.platform_secret_key
         )
@@ -73,18 +70,13 @@ class LocalJobWorker:
         research_run_id = job["payload"].get("research_run_id")
         backtest_id = job["payload"].get("backtest_id")
         parameter_experiment_id = job["payload"].get("parameter_experiment_id")
-        portfolio_batch_id = job["payload"].get("portfolio_batch_id")
-        pair_portfolio_batch_id = job["payload"].get("pair_portfolio_batch_id")
+        recommendation_snapshot_id = job["payload"].get("recommendation_snapshot_id")
         if research_run_id:
             self.research.mark_run(research_run_id, "running")
         if backtest_id:
             self.strategies.mark_backtest(backtest_id, "running")
         if parameter_experiment_id:
             self.parameter_experiments.mark(parameter_experiment_id, "running")
-        if portfolio_batch_id:
-            self.portfolios.mark_batch(portfolio_batch_id, "running")
-        if pair_portfolio_batch_id:
-            self.pair_portfolios.mark_batch(pair_portfolio_batch_id, "running")
         try:
             command, result_path, extra_env = self._command(job)
         except ValueError as exc:
@@ -94,13 +86,9 @@ class LocalJobWorker:
             if backtest_id:
                 self.strategies.mark_backtest(backtest_id, "failed", error=str(exc))
             if parameter_experiment_id:
-                self.parameter_experiments.mark(
-                    parameter_experiment_id, "failed", error=str(exc)
-                )
-            if portfolio_batch_id:
-                self.portfolios.mark_batch(portfolio_batch_id, "failed", error=str(exc))
-            if pair_portfolio_batch_id:
-                self.pair_portfolios.mark_batch(pair_portfolio_batch_id, "failed", error=str(exc))
+                self.parameter_experiments.mark(parameter_experiment_id, "failed", error=str(exc))
+            if recommendation_snapshot_id:
+                self.recommendations.mark_failed(recommendation_snapshot_id, str(exc))
             return
         log_path = Path(job["log_path"])
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,24 +121,12 @@ class LocalJobWorker:
                 self.store.mark_cancelled(job["id"])
                 cancellation_error = "Cancelled by operator"
                 if research_run_id:
-                    self.research.mark_run(
-                        research_run_id, "failed", error=cancellation_error
-                    )
+                    self.research.mark_run(research_run_id, "failed", error=cancellation_error)
                 if backtest_id:
-                    self.strategies.mark_backtest(
-                        backtest_id, "failed", error=cancellation_error
-                    )
+                    self.strategies.mark_backtest(backtest_id, "failed", error=cancellation_error)
                 if parameter_experiment_id:
                     self.parameter_experiments.mark(
                         parameter_experiment_id, "failed", error=cancellation_error
-                    )
-                if portfolio_batch_id:
-                    self.portfolios.mark_batch(
-                        portfolio_batch_id, "failed", error=cancellation_error
-                    )
-                if pair_portfolio_batch_id:
-                    self.pair_portfolios.mark_batch(
-                        pair_portfolio_batch_id, "failed", error=cancellation_error
                     )
                 return
             process_error = (
@@ -176,9 +152,7 @@ class LocalJobWorker:
                 try:
                     if not isinstance(result, dict) or not isinstance(result.get("metrics"), dict):
                         raise ValueError("strategy backtest result is missing metrics")
-                    self.strategies.validate_backtest_artifacts(
-                        str(backtest_id), result["metrics"]
-                    )
+                    self.strategies.validate_backtest_artifacts(str(backtest_id), result["metrics"])
                 except (KeyError, TypeError, ValueError) as exc:
                     logical_error = str(exc)
                     exit_code = 3
@@ -186,9 +160,7 @@ class LocalJobWorker:
                 try:
                     if not isinstance(result, dict):
                         raise ValueError("parameter experiment result is missing")
-                    self.parameter_experiments.apply_result(
-                        str(parameter_experiment_id), result
-                    )
+                    self.parameter_experiments.apply_result(str(parameter_experiment_id), result)
                 except (KeyError, TypeError, ValueError) as exc:
                     logical_error = str(exc)
                     exit_code = 3
@@ -251,24 +223,12 @@ class LocalJobWorker:
                     "failed",
                     error=logical_error or process_error,
                 )
-            if portfolio_batch_id:
+            if recommendation_snapshot_id:
                 if exit_code == 0 and result:
-                    applied = self.portfolios.apply_batch(portfolio_batch_id, result)
-                    self.allocations.refresh_for_portfolio(applied["portfolio_id"])
+                    self.recommendations.apply_result(recommendation_snapshot_id, result)
                 else:
-                    self.portfolios.mark_batch(
-                        portfolio_batch_id,
-                        "failed",
-                        error=logical_error or process_error,
-                    )
-            if pair_portfolio_batch_id:
-                if exit_code == 0 and result:
-                    self.pair_portfolios.apply_batch(pair_portfolio_batch_id, result)
-                else:
-                    self.pair_portfolios.mark_batch(
-                        pair_portfolio_batch_id,
-                        "failed",
-                        error=logical_error or process_error,
+                    self.recommendations.mark_failed(
+                        recommendation_snapshot_id, logical_error or process_error
                     )
         except Exception as exc:
             self.store.finish(job["id"], exit_code=1, error=str(exc))
@@ -277,13 +237,7 @@ class LocalJobWorker:
             if backtest_id:
                 self.strategies.mark_backtest(backtest_id, "failed", error=str(exc))
             if parameter_experiment_id:
-                self.parameter_experiments.mark(
-                    parameter_experiment_id, "failed", error=str(exc)
-                )
-            if portfolio_batch_id:
-                self.portfolios.mark_batch(portfolio_batch_id, "failed", error=str(exc))
-            if pair_portfolio_batch_id:
-                self.pair_portfolios.mark_batch(pair_portfolio_batch_id, "failed", error=str(exc))
+                self.parameter_experiments.mark(parameter_experiment_id, "failed", error=str(exc))
 
     def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
         payload = job["payload"]
@@ -595,12 +549,17 @@ class LocalJobWorker:
                     for item in payload["candidates"]
                 ],
                 "periods": payload["periods"],
+                "universe": payload.get("universe", "cn_all"),
+                "min_daily_instruments": int(payload.get("min_daily_instruments", 50)),
                 "comparison_values": [
                     runtime_path(item["values_path"])
                     for item in promoted
                     if item.get("values_path") and Path(item["values_path"]).exists()
                 ],
-                "cost_rate": payload.get("cost_rate", 0.002),
+                "cost_model": CostModelConfig.from_mapping(payload.get("cost_model")).to_dict(),
+                "cost_reference_order_value": float(
+                    payload.get("cost_reference_order_value", 100_000.0)
+                ),
             }
             manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -632,9 +591,7 @@ class LocalJobWorker:
             )
             return command, result_path, {}
         if job["kind"] == "parameter_experiment":
-            experiment = self.parameter_experiments.get(
-                payload["parameter_experiment_id"]
-            )
+            experiment = self.parameter_experiments.get(payload["parameter_experiment_id"])
             output = Path(experiment["artifact_path"])
             output.mkdir(parents=True, exist_ok=True)
             manifest_path = output / "manifest.json"
@@ -814,108 +771,51 @@ class LocalJobWorker:
                 ]
             )
             return command, result_path, {}
-        if job["kind"] == "pair_paper_rebalance":
-            portfolio = self.pair_portfolios.get(payload["pair_portfolio_id"])
-            batch = self.pair_portfolios.get_batch(payload["pair_portfolio_batch_id"])
-            output = Path(str(batch["artifact_path"]))
-            output.mkdir(parents=True, exist_ok=True)
-            manifest_path = output / "manifest.json"
-            result_path = output / "result.json"
-            version = self.strategies.get_version(portfolio["strategy_version_id"])
-            if version["status"] != "approved" or version.get("strategy_type") != "pair":
-                raise ValueError("pair paper rebalance requires an approved pair version")
-            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
-
-            def runtime_path(value: str | Path) -> str:
-                path = Path(value)
-                return _to_wsl_path(path) if is_wsl else str(path)
-
-            manifest = {
-                "portfolio_id": portfolio["id"],
-                "strategy_version_id": version["id"],
-                "as_of_date": payload["as_of_date"],
-                "dataset_start": payload["dataset_start"],
-                "config": version["config"],
-                "pair": version["pair"],
-                "daily_provenance": payload["daily_provenance"],
-                "minute_dataset": payload["minute_dataset"],
-                "shortability_dataset": payload["shortability_dataset"],
-                "state": {
-                    "status": portfolio["status"],
-                    "cash": portfolio["cash"],
-                    "nav": portfolio["nav"],
-                    "high_water_mark": portfolio["high_water_mark"],
-                    "position_direction": portfolio["position_direction"],
-                    "quantity_y": portfolio["quantity_y"],
-                    "quantity_x": portfolio["quantity_x"],
-                    "entry_nav": portfolio["entry_nav"],
-                    "holding_days": portfolio["holding_days"],
-                },
-            }
-            manifest_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            script = self.project_root / "scripts" / "run_pair_paper_step.py"
-            command = (
-                [
-                    "wsl",
-                    "-d",
-                    self.settings.qlib_wsl_distro,
-                    "--exec",
-                    self.settings.qlib_python,
-                    _to_wsl_path(script),
-                ]
-                if is_wsl
-                else [self.settings.qlib_python, str(script)]
-            )
-            command.extend(
-                [
-                    "--provider-uri",
-                    runtime_path(payload["dataset_path"]),
-                    "--minute-path",
-                    runtime_path(payload["minute_dataset"]["dataset_path"]),
-                    "--shortability-path",
-                    runtime_path(payload["shortability_dataset"]["dataset_path"]),
-                    "--manifest",
-                    runtime_path(manifest_path),
-                    "--output",
-                    runtime_path(output),
-                ]
-            )
-            return command, result_path, {}
-        if job["kind"] == "paper_rebalance":
+        if job["kind"] == "recommendation_refresh":
             output = (
                 self.settings.data_root
                 / "artifacts"
-                / "paper-portfolios"
-                / payload["portfolio_id"]
-                / payload["portfolio_batch_id"]
+                / "recommendations"
+                / payload["recommendation_portfolio_id"]
+                / payload["recommendation_snapshot_id"]
             )
             output.mkdir(parents=True, exist_ok=True)
             manifest_path = output / "manifest.json"
             result_path = output / "result.json"
-            portfolio = self.portfolios.get(payload["portfolio_id"])
+            portfolio = self.recommendations.get(payload["recommendation_portfolio_id"])
             version = self.strategies.get_version(portfolio["strategy_version_id"])
             if version["status"] != "approved":
-                raise ValueError("paper rebalance requires an approved strategy version")
+                raise ValueError("recommendation refresh requires an approved strategy version")
             is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
 
             def runtime_path(value: str) -> str:
                 return _to_wsl_path(Path(value)) if is_wsl else str(value)
 
+            latest_snapshot = portfolio.get("latest_snapshot") or {}
+            latest_performance = (portfolio.get("hypothetical_performance") or [None])[-1]
             manifest = {
                 "portfolio_id": portfolio["id"],
                 "strategy_version_id": version["id"],
+                "dataset": payload["dataset"],
+                "dataset_identity_sha256": payload["dataset_identity_sha256"],
                 "as_of_date": payload["as_of_date"],
                 "benchmark": version["benchmark"],
                 "config": version["config"],
-                "cash": portfolio["cash"],
-                "nav": portfolio["nav"],
-                "high_water_mark": portfolio["high_water_mark"],
-                "portfolio_status": portfolio["status"],
-                "daily_provenance": payload.get("daily_provenance") or {},
-                "positions": portfolio["positions"],
-                "slippage": payload.get("slippage", 0.0005),
+                "portfolio_value": float(portfolio["hypothetical_initial_value"]),
+                "previous_holdings": latest_snapshot.get("holdings") or [],
+                "previous_snapshot": (
+                    {
+                        "as_of_date": str(latest_snapshot["as_of_date"]),
+                        "holdings": latest_snapshot.get("holdings") or [],
+                    }
+                    if latest_snapshot
+                    else None
+                ),
+                "previous_performance": (
+                    {"hypothetical_value": float(latest_performance["hypothetical_value"])}
+                    if latest_performance
+                    else None
+                ),
                 "factors": [
                     {
                         "candidate_id": item["factor_candidate_id"],
@@ -929,7 +829,7 @@ class LocalJobWorker:
             manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            script = self.project_root / "scripts" / "run_paper_rebalance.py"
+            script = self.project_root / "scripts" / "run_recommendation_refresh.py"
             command = (
                 [
                     "wsl",
@@ -972,17 +872,20 @@ class LocalJobWorker:
                 "data_snapshot",
                 "data_qlib",
                 "qlib_baseline",
-                *(f"supplemental_{bundle}" for bundle in (
-                    "cn_extended_daily",
-                    "cn_funds",
-                    "cn_macro",
-                    "cn_institutional",
-                    "cn_futures",
-                    "cn_options_bonds",
-                    "hk_market",
-                    "us_market",
-                    "global_markets",
-                )),
+                *(
+                    f"supplemental_{bundle}"
+                    for bundle in (
+                        "cn_extended_daily",
+                        "cn_funds",
+                        "cn_macro",
+                        "cn_institutional",
+                        "cn_futures",
+                        "cn_options_bonds",
+                        "hk_market",
+                        "us_market",
+                        "global_markets",
+                    )
+                ),
             }
             if kind not in allowed:
                 raise ValueError(f"unsupported data pipeline step: {kind}")
@@ -1000,9 +903,7 @@ class LocalJobWorker:
                 successor_payload.update(
                     {
                         "dataset": snapshot_name,
-                        "dataset_path": str(
-                            self.settings.data_root / "qlib" / snapshot_name
-                        ),
+                        "dataset_path": str(self.settings.data_root / "qlib" / snapshot_name),
                         "market": "cn_all",
                         "benchmark": "SH000300",
                         "account": 5_000_000,
@@ -1106,9 +1007,15 @@ class LocalJobWorker:
                 "research_run_id": payload["research_run_id"],
                 "dataset": payload["dataset"],
                 "dataset_path": payload["dataset_path"],
+                "dataset_identity_sha256": payload["dataset_identity_sha256"],
                 "periods": payload["periods"],
                 "candidates": eligible,
-                "cost_rate": 0.002,
+                "cost_model": CostModelConfig.from_mapping(payload.get("cost_model")).to_dict(),
+                "cost_reference_order_value": float(
+                    payload.get("cost_reference_order_value", 100_000.0)
+                ),
+                "universe": payload.get("universe", "cn_all"),
+                "min_daily_instruments": int(payload.get("min_daily_instruments", 50)),
             },
             log_path,
             idempotency_key=f"factor-evaluate:{payload['research_run_id']}",
@@ -1131,6 +1038,7 @@ class LocalJobWorker:
             self.research.record_evaluation(
                 item["candidate_id"],
                 dataset=payload["dataset"],
+                dataset_identity_sha256=payload["dataset_identity_sha256"],
                 **periods,
                 metrics=item["metrics"],
                 artifact_path=str(artifact_path),

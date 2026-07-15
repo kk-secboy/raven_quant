@@ -382,3 +382,6 @@ td:nth-child(4) { display:flex; align-items:center; gap:8px; }.mini-progress { w
 .research-schedule-list article div { display: grid; gap: 4px; }
 .research-schedule-list small { color: var(--muted); }
 @media (max-width: 900px) { .research-automation-body { grid-template-columns: 1fr; } }
+.broker-disabled > :last-child {
+  display: none;
+}

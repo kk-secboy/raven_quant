@@ -25,9 +25,7 @@ class ContinuousResearchController:
         self.programs = ResearchProgramStore(settings.database_url)
         self.orchestrator = AutonomousResearchOrchestrator(settings)
 
-    def tick(
-        self, *, limit: int = 5, now: datetime | None = None
-    ) -> dict[str, int]:
+    def tick(self, *, limit: int = 5, now: datetime | None = None) -> dict[str, int]:
         checked = 0
         created = 0
         deferred = 0
@@ -63,12 +61,8 @@ class ContinuousResearchController:
             exclude_campaign_id=program.get("last_evaluated_campaign_id"),
         )
         if completed is not None:
-            program = self.programs.record_campaign_outcome(
-                program["id"], campaign=completed
-            )
-        active = self.orchestrator.campaigns.active_count(
-            research_program_id=program["id"]
-        )
+            program = self.programs.record_campaign_outcome(program["id"], campaign=completed)
+        active = self.orchestrator.campaigns.active_count(research_program_id=program["id"])
         if active >= int(program["max_active_campaigns"]):
             self.programs.checked(
                 program["id"],
@@ -96,9 +90,7 @@ class ContinuousResearchController:
         )
         if existing is not None:
             if program.get("last_dataset_identity_sha256") != identity:
-                self.programs.triggered(
-                    program["id"], campaign_id=existing["id"], dataset=dataset
-                )
+                self.programs.triggered(program["id"], campaign_id=existing["id"], dataset=dataset)
             else:
                 self.programs.checked(
                     program["id"],
@@ -124,9 +116,7 @@ class ContinuousResearchController:
 
         template = program["config"]
         windows = template["window_days"]
-        required_days = int(windows["train"]) + int(windows["validation"]) + int(
-            windows["test"]
-        )
+        required_days = int(windows["train"]) + int(windows["validation"]) + int(windows["test"])
         if len(calendar) < required_days:
             self.programs.checked(
                 program["id"],
@@ -154,8 +144,8 @@ class ContinuousResearchController:
             },
             max_loops=self.settings.rdagent_max_loops,
         )
-        test_start = date.fromisoformat(periods["test_start"])
-        test_end = date.fromisoformat(periods["test_end"])
+        valid_start = date.fromisoformat(periods["valid_start"])
+        valid_end = date.fromisoformat(periods["valid_end"])
         config = {
             "research": research,
             "strategy_config": template["strategy_config"],
@@ -163,17 +153,15 @@ class ContinuousResearchController:
                 "start": periods["test_start"],
                 "end": periods["test_end"],
             },
-            "experiment_periods": split_research_period(test_start, test_end),
+            "experiment_periods": split_research_period(valid_start, valid_end),
             "parameter_grid": template["parameter_grid"],
             "experiment_trials": template["experiment_trials"],
             "max_factors": template["max_factors"],
-            "paper": template["paper"],
+            "recommendation": template["recommendation"],
             "manual_strategy_approval": True,
             "research_program_id": program["id"],
         }
-        name = (
-            f"{program['name']} · {dataset['end_date']} · {identity[:8]}"
-        )[:150]
+        name = (f"{program['name']} · {dataset['end_date']} · {identity[:8]}")[:150]
         campaign = self.orchestrator.create(
             name=name,
             objective=program["objective"],
@@ -186,9 +174,7 @@ class ContinuousResearchController:
             research_program_id=program["id"],
             dataset_identity_sha256=identity,
         )
-        self.programs.triggered(
-            program["id"], campaign_id=campaign["id"], dataset=dataset
-        )
+        self.programs.triggered(program["id"], campaign_id=campaign["id"], dataset=dataset)
         return "created"
 
     @staticmethod

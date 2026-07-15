@@ -301,15 +301,12 @@ def system_summary(
     actionable_tasks = [
         task
         for task in (data_tasks or [])
-        if task.get("implementation_status")
-        not in {"permission_probe", "external_source_required"}
+        if task.get("implementation_status") not in {"permission_probe", "external_source_required"}
     ]
     ready_tasks = sum(task.get("status") == "succeeded" for task in actionable_tasks)
     partial_tasks = sum(task.get("status") == "partial" for task in actionable_tasks)
     failed_tasks = sum(task.get("status") == "failed" for task in actionable_tasks)
-    running_tasks = sum(
-        task.get("status") in {"queued", "running"} for task in actionable_tasks
-    )
+    running_tasks = sum(task.get("status") in {"queued", "running"} for task in actionable_tasks)
     waiting_tasks = max(
         len(actionable_tasks) - ready_tasks - partial_tasks - failed_tasks - running_tasks,
         0,
@@ -317,9 +314,7 @@ def system_summary(
     readiness_percent = (
         round(
             sum(
-                100.0
-                if task.get("status") == "succeeded"
-                else float(task.get("coverage") or 0.0)
+                100.0 if task.get("status") == "succeeded" else float(task.get("coverage") or 0.0)
                 for task in actionable_tasks
             )
             / len(actionable_tasks),

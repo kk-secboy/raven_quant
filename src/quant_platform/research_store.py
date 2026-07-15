@@ -30,6 +30,14 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value.lower())
+    )
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -77,6 +85,7 @@ def _evaluation_evidence(
     *,
     candidate_id: str,
     dataset: str,
+    dataset_identity_sha256: str,
     periods: dict[str, str],
     gate_status: str,
     gate_reasons: list[str],
@@ -90,6 +99,7 @@ def _evaluation_evidence(
     return {
         "candidate_id": candidate_id,
         "dataset": dataset,
+        "dataset_identity_sha256": dataset_identity_sha256,
         "periods": periods,
         "gate_status": gate_status,
         "gate_reasons": gate_reasons,
@@ -106,7 +116,7 @@ def _evaluation_evidence(
 class FactorGatePolicy:
     """Versioned, deterministic admission policy for production factor candidates."""
 
-    version: str = "factor-gate-v1"
+    version: str = "factor-gate-v2"
     min_abs_ic: float = 0.02
     min_abs_icir: float = 0.50
     min_abs_rank_ic: float = 0.025
@@ -114,25 +124,25 @@ class FactorGatePolicy:
     max_turnover: float = 0.60
     max_correlation: float = 0.75
     min_cost_adjusted_return: float = 0.0
-    min_test_days: int = 252
+    min_selection_days: int = 100
 
     def evaluate(self, metrics: dict[str, float | None]) -> tuple[str, list[str]]:
         checks = (
-            ("ic", lambda value: abs(value) >= self.min_abs_ic, f"|IC| >= {self.min_abs_ic}"),
+            ("ic", lambda value: value >= self.min_abs_ic, f"directed IC >= {self.min_abs_ic}"),
             (
                 "icir",
-                lambda value: abs(value) >= self.min_abs_icir,
-                f"|ICIR| >= {self.min_abs_icir}",
+                lambda value: value >= self.min_abs_icir,
+                f"directed ICIR >= {self.min_abs_icir}",
             ),
             (
                 "rank_ic",
-                lambda value: abs(value) >= self.min_abs_rank_ic,
-                f"|RankIC| >= {self.min_abs_rank_ic}",
+                lambda value: value >= self.min_abs_rank_ic,
+                f"directed RankIC >= {self.min_abs_rank_ic}",
             ),
             (
                 "rank_icir",
-                lambda value: abs(value) >= self.min_abs_rank_icir,
-                f"|RankICIR| >= {self.min_abs_rank_icir}",
+                lambda value: value >= self.min_abs_rank_icir,
+                f"directed RankICIR >= {self.min_abs_rank_icir}",
             ),
             (
                 "turnover",
@@ -150,9 +160,24 @@ class FactorGatePolicy:
                 f"cost-adjusted return > {self.min_cost_adjusted_return}",
             ),
             (
-                "test_days",
-                lambda value: value >= self.min_test_days,
-                f"test days >= {self.min_test_days}",
+                "selection_days",
+                lambda value: value >= self.min_selection_days,
+                f"validation selection days >= {self.min_selection_days}",
+            ),
+            (
+                "coverage_pass_rate",
+                lambda value: value >= 0.95,
+                "coverage pass rate >= 0.95",
+            ),
+            (
+                "mean_coverage_ratio",
+                lambda value: value >= 0.80,
+                "mean universe coverage >= 0.80",
+            ),
+            (
+                "constant_day_rate",
+                lambda value: value <= 0.05,
+                "constant factor days <= 0.05",
             ),
         )
         reasons: list[str] = []
@@ -162,13 +187,14 @@ class FactorGatePolicy:
                 reasons.append(f"{name} is missing; expected {expectation}")
             elif not predicate(float(value)):
                 reasons.append(f"{name}={value:g} failed; expected {expectation}")
-        valid_ic = metrics.get("valid_ic")
+        raw_valid_ic = metrics.get("raw_valid_ic")
+        raw_selection_ic = metrics.get("raw_selection_ic")
         ic = metrics.get("ic")
         rank_ic = metrics.get("rank_ic")
-        if valid_ic is None:
-            reasons.append("valid_ic is missing; validation direction cannot be verified")
-        elif ic is not None and float(valid_ic) * float(ic) <= 0:
-            reasons.append("validation IC and out-of-sample IC must have the same direction")
+        if raw_valid_ic is None or raw_selection_ic is None:
+            reasons.append("raw direction and selection IC are required")
+        elif float(raw_valid_ic) * float(raw_selection_ic) <= 0:
+            reasons.append("raw direction and selection IC must have the same sign")
         if ic is not None and rank_ic is not None and float(ic) * float(rank_ic) <= 0:
             reasons.append("IC and RankIC must have the same direction")
         return ("passed" if not reasons else "failed", reasons)
@@ -266,9 +292,7 @@ class ResearchStore:
     def requeue_run(self, run_id: str, *, actor: str = "operator") -> None:
         with self.engine.begin() as connection:
             row = connection.execute(
-                select(research_runs.c.status)
-                .where(research_runs.c.id == run_id)
-                .with_for_update()
+                select(research_runs.c.status).where(research_runs.c.id == run_id).with_for_update()
             ).first()
             if row is None:
                 raise KeyError(run_id)
@@ -327,12 +351,8 @@ class ResearchStore:
         now = _now()
         status = "awaiting_evaluation" if rdagent_decision is not False else "rejected_by_rdagent"
         requires_artifacts = rdagent_decision is not False
-        actual_code_sha256 = _artifact_hash(
-            code_path, "factor code", required=requires_artifacts
-        )
-        values_sha256 = _artifact_hash(
-            values_path, "factor values", required=requires_artifacts
-        )
+        actual_code_sha256 = _artifact_hash(code_path, "factor code", required=requires_artifacts)
+        values_sha256 = _artifact_hash(values_path, "factor values", required=requires_artifacts)
         if code_sha256 and actual_code_sha256 and code_sha256 != actual_code_sha256:
             raise ValueError("factor code artifact does not match RD-Agent SHA-256")
         try:
@@ -408,6 +428,7 @@ class ResearchStore:
         candidate_id: str,
         *,
         dataset: str,
+        dataset_identity_sha256: str,
         train_start: date,
         train_end: date,
         valid_start: date,
@@ -422,6 +443,8 @@ class ResearchStore:
             raise ValueError(
                 "train, validation, and test windows must be ordered and non-overlapping"
             )
+        if not _is_sha256(dataset_identity_sha256):
+            raise ValueError("factor evaluation requires immutable dataset identity")
         candidate = self.get_candidate(candidate_id)
         if candidate["status"] in {"promoted", "retired"}:
             raise ValueError(f"cannot evaluate candidate in {candidate['status']} state")
@@ -459,6 +482,7 @@ class ResearchStore:
         evidence = _evaluation_evidence(
             candidate_id=candidate_id,
             dataset=dataset,
+            dataset_identity_sha256=dataset_identity_sha256,
             periods=periods,
             gate_status=gate_status,
             gate_reasons=reasons,
@@ -491,6 +515,7 @@ class ResearchStore:
                     id=evaluation_id,
                     factor_candidate_id=candidate_id,
                     dataset=dataset,
+                    dataset_identity_sha256=dataset_identity_sha256,
                     train_start=train_start,
                     train_end=train_end,
                     valid_start=valid_start,
@@ -576,9 +601,7 @@ class ResearchStore:
         if repeated_status != "passed" or repeated_reasons != evaluation.get("gate_reasons"):
             raise ValueError("Qlib evaluation no longer passes the recorded factor gate")
         artifact_path = evaluation.get("artifact_path")
-        artifact_sha256 = _artifact_hash(
-            artifact_path, "Qlib evaluation", required=True
-        )
+        artifact_sha256 = _artifact_hash(artifact_path, "Qlib evaluation", required=True)
         if artifact_sha256 != evaluation.get("artifact_sha256"):
             raise ValueError("Qlib evaluation artifact changed after evaluation")
         artifact_metrics = _evaluation_artifact_metrics(str(artifact_path), candidate_id)
@@ -587,6 +610,7 @@ class ResearchStore:
         evidence = _evaluation_evidence(
             candidate_id=candidate_id,
             dataset=evaluation["dataset"],
+            dataset_identity_sha256=evaluation["dataset_identity_sha256"],
             periods={
                 key: evaluation[key].isoformat()
                 for key in (

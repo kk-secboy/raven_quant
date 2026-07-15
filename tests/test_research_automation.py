@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from quant_platform.research_automation import (
-    choose_champion,
     derive_rolling_research_periods,
     normalize_research_schedule_payload,
     rank_factor_candidates,
@@ -88,30 +87,6 @@ def test_campaign_factor_ranking_uses_only_passed_qlib_evidence() -> None:
     ranked = rank_factor_candidates(candidates, limit=5)
     assert [item["id"] for item in ranked] == ["stable", "high-turnover"]
     assert all(item["id"] != "rejected" for item in ranked)
-
-
-@pytest.mark.no_database
-def test_champion_comparison_is_deterministic_and_keeps_baseline_on_tie() -> None:
-    baseline = {
-        "strategy_version_id": "baseline",
-        "metrics": {
-            "information_ratio": 0.8,
-            "annualized_excess_return": 0.1,
-            "max_drawdown": -0.08,
-            "average_turnover": 0.2,
-        },
-    }
-    challenger = {
-        "strategy_version_id": "challenger",
-        "metrics": {
-            "information_ratio": 0.9,
-            "annualized_excess_return": 0.12,
-            "max_drawdown": -0.06,
-            "average_turnover": 0.15,
-        },
-    }
-    assert choose_champion(baseline, challenger)["winner_version_id"] == "challenger"
-    assert choose_champion(baseline, baseline)["decision"] == "baseline"
 
 
 @pytest.mark.no_database

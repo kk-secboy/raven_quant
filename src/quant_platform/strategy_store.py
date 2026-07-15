@@ -53,94 +53,6 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-_EXECUTION_RISK_DEFAULTS = {
-    "max_daily_loss": 0.03,
-    "stop_loss": 0.07,
-    "take_profit_partial": 0.12,
-    "take_profit_partial_fraction": 0.50,
-    "take_profit": 0.20,
-    "max_drawdown_reduce": 0.10,
-    "max_drawdown_liquidate": 0.15,
-    "drawdown_reduction_exposure": 0.50,
-}
-
-
-def _execution_replay_failures(
-    config: dict[str, Any], metrics: dict[str, Any]
-) -> list[str]:
-    replay = metrics.get("execution_replay")
-    if metrics.get("execution_risk_overlay_enforced") is not True or not isinstance(
-        replay, dict
-    ):
-        return ["execution risk replay is required for approval"]
-    failures: list[str] = []
-    if replay.get("execution_risk_overlay_enforced") is not True:
-        failures.append("execution risk replay did not enforce the overlay")
-    replay_drawdown = replay.get("max_drawdown")
-    try:
-        drawdown_failed = replay_drawdown is None or abs(float(replay_drawdown)) > float(
-            config["max_drawdown"]
-        )
-    except (KeyError, TypeError, ValueError):
-        drawdown_failed = True
-    if drawdown_failed:
-        failures.append(
-            "execution risk replay max_drawdown="
-            f"{replay_drawdown} violates max {config.get('max_drawdown')}"
-        )
-    if replay.get("execution_model") != "next_open":
-        failures.append("execution risk replay must use next_open execution")
-    if config.get("portfolio_construction") == "benchmark_relative_qp":
-        if replay.get("portfolio_construction") != "benchmark_relative_qp":
-            failures.append("execution replay did not use benchmark-relative optimization")
-        if replay.get("optimizer_execution_replay_enforced") is not True:
-            failures.append("benchmark-relative optimizer execution replay is required")
-        try:
-            if int(replay.get("optimizer_days", 0)) <= 0:
-                raise ValueError
-        except (TypeError, ValueError):
-            failures.append("benchmark-relative optimizer has no completed replay days")
-    thresholds = replay.get("execution_risk_thresholds")
-    if not isinstance(thresholds, dict):
-        failures.append("execution risk replay thresholds are required for approval")
-        return failures
-    for field, default in _EXECUTION_RISK_DEFAULTS.items():
-        try:
-            expected = float(config.get(field, default))
-            observed = float(thresholds[field])
-        except (KeyError, TypeError, ValueError):
-            failures.append(f"execution risk replay {field} does not match strategy config")
-            continue
-        if abs(observed - expected) > 1e-12:
-            failures.append(f"execution risk replay {field} does not match strategy config")
-    return failures
-
-
-def _execution_replay_artifact_failures(
-    metrics: dict[str, Any], artifact_path: str | Path
-) -> list[str]:
-    replay = metrics.get("execution_replay")
-    provenance = metrics.get("provenance")
-    expected = provenance.get("execution_replay_sha256") if isinstance(provenance, dict) else None
-    if not isinstance(replay, dict) or not _is_sha256(expected):
-        return ["execution replay artifact SHA-256 provenance is required"]
-    failures: list[str] = []
-    if _canonical_sha256(replay) != expected:
-        failures.append("embedded execution replay does not match its SHA-256 provenance")
-    replay_path = Path(artifact_path) / "execution_replay.json"
-    if not replay_path.is_file():
-        failures.append("execution replay artifact is missing")
-        return failures
-    try:
-        artifact = json.loads(replay_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        failures.append("execution replay artifact is unreadable")
-        return failures
-    if not isinstance(artifact, dict) or _canonical_sha256(artifact) != expected:
-        failures.append("execution replay artifact does not match its SHA-256 provenance")
-    return failures
-
-
 def _multifactor_manifest_failures(
     version: dict[str, Any], backtest: dict[str, Any], metrics: dict[str, Any]
 ) -> list[str]:
@@ -277,24 +189,20 @@ class StrategyStore:
                 )
             ).first()
             if not evaluation:
-                raise ValueError(
-                    f"promoted factor {candidate_id} is not bound to its evaluation"
-                )
+                raise ValueError(f"promoted factor {candidate_id} is not bound to its evaluation")
             if (
                 evaluation.gate_status != "passed"
+                or evaluation.is_legacy
+                or not str(evaluation.evaluator_version).startswith("factor-gate-v2")
                 or evaluation.evidence_sha256 != candidate.promotion_evidence_sha256
                 or not _is_sha256(evaluation.evidence_sha256)
             ):
-                raise ValueError(
-                    f"promoted factor {candidate_id} has invalid promotion evidence"
-                )
+                raise ValueError(f"promoted factor {candidate_id} has invalid promotion evidence")
             if (
                 _canonical_sha256(evaluation.metrics_json) != evaluation.metrics_sha256
                 or _canonical_sha256(evaluation.policy_json) != evaluation.policy_sha256
             ):
-                raise ValueError(
-                    f"promoted factor {candidate_id} evaluation provenance is invalid"
-                )
+                raise ValueError(f"promoted factor {candidate_id} evaluation provenance is invalid")
             for artifact_kind, path_value, expected in (
                 ("code", candidate.code_path, candidate.code_sha256),
                 ("values", candidate.values_path, candidate.values_sha256),
@@ -421,9 +329,7 @@ class StrategyStore:
         try:
             with self.engine.begin() as connection:
                 strategy = connection.execute(
-                    select(strategies)
-                    .where(strategies.c.id == strategy_id)
-                    .with_for_update()
+                    select(strategies).where(strategies.c.id == strategy_id).with_for_update()
                 ).first()
                 if strategy is None:
                     raise KeyError(strategy_id)
@@ -612,9 +518,7 @@ class StrategyStore:
         try:
             with self.engine.begin() as connection:
                 strategy = connection.execute(
-                    select(strategies)
-                    .where(strategies.c.id == strategy_id)
-                    .with_for_update()
+                    select(strategies).where(strategies.c.id == strategy_id).with_for_update()
                 ).first()
                 if strategy is None:
                     raise KeyError(strategy_id)
@@ -743,9 +647,42 @@ class StrategyStore:
         artifact_path: Path,
         execution_dataset: str | None = None,
     ) -> dict[str, Any]:
-        self.get_version(version_id)
+        version = self.get_version(version_id)
         backtest_id = uuid.uuid4().hex
         with self.engine.begin() as connection:
+            if version.get("strategy_type") == "multifactor":
+                prior = connection.execute(
+                    select(backtest_runs.c.id).where(
+                        backtest_runs.c.strategy_version_id == version_id
+                    )
+                ).first()
+                if prior is not None:
+                    raise ValueError("a frozen strategy version may run the final test only once")
+                factor_windows = connection.execute(
+                    select(
+                        factor_evaluations.c.dataset,
+                        factor_evaluations.c.test_start,
+                        factor_evaluations.c.test_end,
+                        factor_evaluations.c.evaluator_version,
+                    )
+                    .join(
+                        strategy_factors,
+                        strategy_factors.c.factor_evaluation_id == factor_evaluations.c.id,
+                    )
+                    .where(strategy_factors.c.strategy_version_id == version_id)
+                ).all()
+                requested_start = date.fromisoformat(periods["start"])
+                requested_end = date.fromisoformat(periods["end"])
+                if not factor_windows or any(
+                    item.dataset != dataset
+                    or not str(item.evaluator_version).startswith("factor-gate-v2")
+                    or requested_start != item.test_start
+                    or requested_end != item.test_end
+                    for item in factor_windows
+                ):
+                    raise ValueError(
+                        "formal backtest must exactly match the reserved final-test window"
+                    )
             connection.execute(
                 insert(backtest_runs).values(
                     id=backtest_id,
@@ -794,7 +731,11 @@ class StrategyStore:
     def requeue_backtest(self, backtest_id: str) -> None:
         with self.engine.begin() as connection:
             row = connection.execute(
-                select(backtest_runs.c.status)
+                select(backtest_runs.c.status, strategy_versions.c.strategy_type)
+                .join(
+                    strategy_versions,
+                    strategy_versions.c.id == backtest_runs.c.strategy_version_id,
+                )
                 .where(backtest_runs.c.id == backtest_id)
                 .with_for_update()
             ).first()
@@ -802,6 +743,8 @@ class StrategyStore:
                 raise KeyError(backtest_id)
             if row.status not in {"failed", "cancelled"}:
                 raise ValueError("only failed or cancelled backtests may be requeued")
+            if row.strategy_type == "multifactor":
+                raise ValueError("a formal final test cannot be rerun")
             connection.execute(
                 update(backtest_runs)
                 .where(backtest_runs.c.id == backtest_id)
@@ -814,9 +757,7 @@ class StrategyStore:
                 )
             )
 
-    def validate_backtest_artifacts(
-        self, backtest_id: str, metrics: dict[str, Any]
-    ) -> None:
+    def validate_backtest_artifacts(self, backtest_id: str, metrics: dict[str, Any]) -> None:
         """Validate immutable multifactor artifacts before a worker reports success."""
 
         backtest = self.get_backtest(backtest_id)
@@ -824,9 +765,6 @@ class StrategyStore:
         if version.get("strategy_type") != "multifactor":
             return
         failures = _multifactor_manifest_failures(version, backtest, metrics)
-        failures.extend(
-            _execution_replay_artifact_failures(metrics, backtest["artifact_path"])
-        )
         if failures:
             raise ValueError("strategy backtest artifact validation failed: " + "; ".join(failures))
 
@@ -871,9 +809,10 @@ class StrategyStore:
             failures.append("pair strategy approval requires a second operator")
         if not backtest.get("execution_dataset"):
             failures.append("pair backtest requires an immutable minute execution dataset")
-        if metrics.get("backtest_engine") != "quantlab_pair" or metrics.get(
-            "pair_native_backtest"
-        ) is not True:
+        if (
+            metrics.get("backtest_engine") != "quantlab_pair"
+            or metrics.get("pair_native_backtest") is not True
+        ):
             failures.append("a native QuantLab pair backtest is required")
         pair = version.get("pair") or {}
         if metrics.get("leg_y") != pair.get("leg_y") or metrics.get("leg_x") != pair.get("leg_x"):
@@ -1008,10 +947,14 @@ class StrategyStore:
         if not actor.strip() or len(reason.strip()) < 10:
             raise ValueError("actor and a meaningful approval reason are required")
         version = self.get_version(version_id)
+        if version.get("is_legacy"):
+            raise ValueError("legacy strategy versions must be recreated through evaluation v2")
         backtests = self.list_backtests(version_id=version_id, limit=1)
         if not backtests or backtests[0]["status"] != "succeeded" or not backtests[0]["metrics"]:
             raise ValueError("strategy version requires a successful backtest before approval")
         metrics = backtests[0]["metrics"]
+        if backtests[0].get("is_legacy"):
+            raise ValueError("legacy backtests cannot approve a new strategy")
         config = version["config"]
         if version.get("strategy_type") == "pair":
             return self._approve_pair(
@@ -1052,11 +995,7 @@ class StrategyStore:
                 config.get("min_sortino_ratio", 0.0),
                 "min",
             ),
-            "robustness_pass_rate": (
-                metrics.get("robustness_pass_rate"),
-                config.get("min_robustness_pass_rate", 0.75),
-                "min",
-            ),
+            "robustness_pass_rate": (metrics.get("robustness_pass_rate"), 1.0, "min"),
             "rolling_pass_rate": (
                 metrics.get("rolling_pass_rate"),
                 config.get("min_rolling_pass_rate", 0.60),
@@ -1067,19 +1006,14 @@ class StrategyStore:
                 config.get("min_rolling_windows", 3),
                 "min",
             ),
-            "event_stress_pass_rate": (
-                metrics.get("event_stress_pass_rate"),
-                config.get("min_event_stress_pass_rate", 0.60),
-                "min",
-            ),
             "event_stress_count": (
                 metrics.get("event_stress_count"),
                 config.get("event_count", 5),
                 "min",
             ),
-            "capacity_fill_ratio": (
-                metrics.get("capacity_fill_ratio"),
-                config.get("min_capacity_fill_ratio", 0.95),
+            "event_stress_pass_rate": (
+                metrics.get("event_stress_pass_rate"),
+                config.get("min_event_stress_pass_rate", 0.60),
                 "min",
             ),
             "trading_days": (
@@ -1088,22 +1022,11 @@ class StrategyStore:
                 "min",
             ),
         }
-        if "max_industry_deviation" in config:
-            checks["max_industry_deviation"] = (
-                metrics.get("max_industry_deviation"),
-                config["max_industry_deviation"],
-                "max",
-            )
-        if "max_size_deviation" in config:
-            checks["max_size_deviation"] = (
-                metrics.get("max_size_deviation"),
-                config["max_size_deviation"],
-                "max",
-            )
         failures = []
-        if metrics.get("backtest_engine") != "qlib" or metrics.get(
-            "qlib_native_backtest"
-        ) is not True:
+        if (
+            metrics.get("backtest_engine") != "qlib"
+            or metrics.get("qlib_native_backtest") is not True
+        ):
             failures.append("a Qlib-native backtest is required for approval")
         provenance = metrics.get("provenance")
         expected_factors = {str(item["factor_candidate_id"]) for item in version["factors"]}
@@ -1116,7 +1039,6 @@ class StrategyStore:
                 "qlib_builder_sha256",
                 "strategy_config_sha256",
                 "execution_manifest_sha256",
-                "execution_replay_sha256",
             ):
                 if not _is_sha256(provenance.get(field)):
                     failures.append(f"provenance {field} must be a SHA-256 digest")
@@ -1126,32 +1048,29 @@ class StrategyStore:
                     failures.append(f"provenance {field} does not match strategy factors")
                 elif not all(_is_sha256(value) for value in hashes.values()):
                     failures.append(f"provenance {field} contains an invalid SHA-256 digest")
-            if not str(provenance.get("qlib_version") or "").strip() or provenance.get(
-                "qlib_version"
-            ) == "unknown":
-                failures.append("provenance qlib_version is required")
-        if "max_industry_deviation" in config:
-            for evidence in (
-                "industry_controls_enforced",
-                "benchmark_weights_enforced",
-                "size_neutralization_enforced",
+            if (
+                not str(provenance.get("qlib_version") or "").strip()
+                or provenance.get("qlib_version") == "unknown"
             ):
-                if metrics.get(evidence) is not True:
-                    failures.append(f"{evidence} is required for index-enhancement approval")
-        if float(config.get("min_average_daily_amount", 0.0)) > 0 and metrics.get(
-            "liquidity_filter_enforced"
-        ) is not True:
-            failures.append("liquidity_filter_enforced is required for approval")
-        failures.extend(_execution_replay_failures(config, metrics))
-        failures.extend(
-            _execution_replay_artifact_failures(metrics, backtests[0]["artifact_path"])
-        )
+                failures.append("provenance qlib_version is required")
+            if not str(provenance.get("backtest_engine_version") or "").strip():
+                failures.append("backtest engine version is required")
+            if not str(provenance.get("policy_version") or "").strip():
+                failures.append("PortfolioPolicy provenance is required")
+        if not isinstance(provenance, dict) or metrics.get("policy_version") != provenance.get(
+            "policy_version"
+        ):
+            failures.append("PortfolioPolicy version is missing or inconsistent")
+        if metrics.get("event_stress_passed") is not True:
+            failures.append("event stress scenarios did not satisfy the configured result gate")
+        cost_model = metrics.get("cost_model")
+        if not isinstance(cost_model, dict):
+            failures.append("the unified cost model is required for approval")
         failures.extend(_multifactor_manifest_failures(version, backtests[0], metrics))
-        if "min_commission" in config:
-            if metrics.get("market_controls_enforced") is not True:
-                failures.append("market_controls_enforced is required for approval")
-            if float(metrics.get("min_commission", -1.0)) < float(config["min_commission"]):
-                failures.append("minimum commission evidence is below the configured value")
+        if isinstance(cost_model, dict) and float(cost_model.get("min_commission", -1.0)) < float(
+            config.get("min_commission", 5.0)
+        ):
+            failures.append("minimum commission evidence is below the configured value")
         for name, (value, threshold, mode) in checks.items():
             if (
                 value is None
@@ -1167,6 +1086,9 @@ class StrategyStore:
                     select(
                         factor_evaluations.c.test_start,
                         factor_evaluations.c.test_end,
+                        factor_evaluations.c.evaluator_version,
+                        factor_evaluations.c.is_legacy,
+                        factor_evaluations.c.dataset_identity_sha256,
                     ).where(
                         factor_evaluations.c.id == factor["factor_evaluation_id"],
                         factor_evaluations.c.factor_candidate_id == factor["factor_candidate_id"],
@@ -1175,6 +1097,18 @@ class StrategyStore:
                 if evaluation is None:
                     failures.append(
                         f"factor {factor['factor_candidate_id']} has no out-of-sample evidence"
+                    )
+                elif evaluation.is_legacy or not str(evaluation.evaluator_version).startswith(
+                    "factor-gate-v2"
+                ):
+                    failures.append(
+                        f"factor {factor['factor_candidate_id']} uses a legacy evaluation"
+                    )
+                elif evaluation.dataset_identity_sha256 != provenance.get(
+                    "dataset_identity_sha256"
+                ):
+                    failures.append(
+                        f"factor {factor['factor_candidate_id']} dataset identity does not match"
                     )
                 elif backtest_start < evaluation.test_start or backtest_end > evaluation.test_end:
                     failures.append(

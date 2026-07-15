@@ -64,9 +64,7 @@ class PlatformConfigStore:
         now = _now()
         with self.engine.begin() as connection:
             current = connection.execute(
-                select(platform_configs)
-                .where(platform_configs.c.key == key)
-                .with_for_update()
+                select(platform_configs).where(platform_configs.c.key == key).with_for_update()
             ).first()
             revision = int(current.revision) + 1 if current else 1
             connection.execute(

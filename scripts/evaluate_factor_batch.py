@@ -13,6 +13,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from quant_platform.cost_model import CostModelConfig
 from quant_platform.factor_evaluator import evaluate_factor_values
 
 
@@ -38,20 +39,13 @@ def main() -> None:
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     candidates = manifest["candidates"]
     factor_frames = {item["id"]: _load_values(item["values_path"]) for item in candidates}
-    instruments = sorted(
-        {
-            str(instrument).upper()
-            for frame in factor_frames.values()
-            for instrument in frame.index.get_level_values("instrument")
-        }
-    )
     periods = manifest["periods"]
     qlib.init(provider_uri=args.provider_uri, region="cn")
     labels = D.features(
-        instruments,
+        D.instruments(str(manifest.get("universe") or "cn_all")),
         ["Ref($close, -2)/Ref($close, -1)-1"],
         start_time=periods["valid_start"],
-        end_time=periods["test_end"],
+        end_time=periods["valid_end"],
         freq="day",
     )
     comparisons = [_load_values(path) for path in manifest.get("comparison_values", [])]
@@ -66,7 +60,9 @@ def main() -> None:
                 test_start=pd.Timestamp(periods["test_start"]).date(),
                 test_end=pd.Timestamp(periods["test_end"]).date(),
                 comparison_values=comparisons,
-                cost_rate=float(manifest.get("cost_rate", 0.002)),
+                cost_model=CostModelConfig.from_mapping(manifest.get("cost_model")),
+                reference_order_value=float(manifest["cost_reference_order_value"]),
+                min_daily_instruments=int(manifest.get("min_daily_instruments", 50)),
             )
             evaluations.append({"candidate_id": item["id"], "status": "ok", "metrics": metrics})
         except Exception as exc:

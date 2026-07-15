@@ -49,9 +49,7 @@ def main() -> None:
     paths = {
         "health": "/v1/health",
         "snapshot": f"/v1/snapshot?account_ref={quote(args.account_ref, safe='')}",
-        "market_evidence": (
-            f"/v1/market-evidence?instrument={quote(args.instrument, safe='')}"
-        ),
+        "market_evidence": (f"/v1/market-evidence?instrument={quote(args.instrument, safe='')}"),
     }
     results = {
         name: signed_get(args.url, path, secret, args.timeout) for name, path in paths.items()

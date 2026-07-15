@@ -219,9 +219,7 @@ class BrokerStore:
             "status": "disabled" if settings.broker_mode == "disabled" else "configured",
             "mode": settings.broker_mode,
             "live_supported": False,
-            "gateway_configured": bool(
-                settings.broker_gateway_url and settings.broker_hmac_secret
-            ),
+            "gateway_configured": bool(settings.broker_gateway_url and settings.broker_hmac_secret),
             "destination_counts": destination_counts,
             "outbox_counts": outbox_counts,
             "max_order_notional": settings.broker_max_order_notional,

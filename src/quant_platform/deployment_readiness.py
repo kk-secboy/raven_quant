@@ -25,6 +25,8 @@ from quant_data.database import (
     paper_portfolios,
     portfolio_batches,
     portfolio_reviews,
+    recommendation_portfolios,
+    recommendation_snapshots,
     risk_events,
     runtime_secrets,
     schedules,
@@ -36,7 +38,6 @@ from quant_data.database import (
     users,
 )
 
-from .broker_gateway import BrokerStore
 from .data_task_store import DataTaskStore
 from .health_store import OperationalHealthStore
 from .runtime_secret_store import RuntimeSecretStore
@@ -95,7 +96,6 @@ class DeploymentReadinessStore:
         self.engine = open_database(settings.database_url)
         self.data_tasks = DataTaskStore(settings.database_url)
         self.health = OperationalHealthStore(settings)
-        self.brokers = BrokerStore(settings)
         self.runtime_secrets = RuntimeSecretStore(
             settings.database_url, settings.platform_secret_key
         )
@@ -104,10 +104,10 @@ class DeploymentReadinessStore:
         current = now or _now()
         research_checks = self._research_checks()
         pair_checks = [*research_checks, *self._pair_research_checks()]
-        pair_paper_checks = [*pair_checks, *self._pair_paper_checks(current)]
-        paper_checks = [*research_checks, *self._paper_checks(current)]
-        diversified_checks = [*paper_checks, *self._allocation_checks(current)]
-        broker_checks = [*paper_checks, *self._broker_checks(current)]
+        pair_paper_checks: list[dict[str, Any]] = []
+        paper_checks: list[dict[str, Any]] = []
+        diversified_checks: list[dict[str, Any]] = []
+        broker_checks: list[dict[str, Any]] = []
         profiles = [
             _profile("research", "研究与回测", research_checks),
             _profile("pair_research", "配对交易研究", pair_checks),
@@ -115,6 +115,15 @@ class DeploymentReadinessStore:
             _profile("paper", "模拟盘", paper_checks),
             _profile("broker_sandbox", "券商沙箱", broker_checks),
             _profile("diversified_paper", "多策略模拟盘", diversified_checks),
+        ]
+        profiles = [
+            profiles[0],
+            _profile(
+                "recommendation_tracking",
+                "推荐组合与假设跟踪",
+                [*research_checks, *self._recommendation_checks()],
+            ),
+            profiles[1],
         ]
         highest_ready = next(
             (item["id"] for item in reversed(profiles) if item["status"] == "ready"),
@@ -127,6 +136,44 @@ class DeploymentReadinessStore:
             "live_trading_supported": False,
             "profiles": profiles,
         }
+
+    def _recommendation_checks(self) -> list[dict[str, Any]]:
+        with self.engine.connect() as connection:
+            portfolio_count = int(
+                connection.scalar(select(func.count()).select_from(recommendation_portfolios)) or 0
+            )
+            snapshot_count = int(
+                connection.scalar(select(func.count()).select_from(recommendation_snapshots)) or 0
+            )
+            legacy_active = int(
+                connection.scalar(
+                    select(func.count())
+                    .select_from(schedules)
+                    .where(
+                        schedules.c.kind.in_(
+                            ["paper_rebalance", "pair_paper_rebalance", "broker_reconcile"]
+                        ),
+                        schedules.c.status == "active",
+                    )
+                )
+                or 0
+            )
+        return [
+            _check(
+                "recommendation_schema",
+                "推荐领域模型已启用",
+                True,
+                f"推荐组合 {portfolio_count} 个，快照 {snapshot_count} 个",
+                "运行数据库迁移后再启用推荐跟踪",
+            ),
+            _check(
+                "legacy_execution_retired",
+                "旧执行调度已退休",
+                legacy_active == 0,
+                f"仍活动的旧执行调度 {legacy_active} 个",
+                "将旧 Paper、配对执行和券商调度设为 retired",
+            ),
+        ]
 
     def _pair_research_checks(self) -> list[dict[str, Any]]:
         tasks = {item["task_key"]: item for item in self.data_tasks.list()}
@@ -153,14 +200,14 @@ class DeploymentReadinessStore:
                     str(row.id)
                     for row in pair_rows
                     if _valid_digest(
-                        (row.metrics_json or {}).get("provenance", {}).get(
-                            "daily_dataset_lineage_id"
-                        )
+                        (row.metrics_json or {})
+                        .get("provenance", {})
+                        .get("daily_dataset_lineage_id")
                     )
                     and _valid_digest(
-                        (row.metrics_json or {}).get("provenance", {}).get(
-                            "execution_snapshot_lineage_id"
-                        )
+                        (row.metrics_json or {})
+                        .get("provenance", {})
+                        .get("execution_snapshot_lineage_id")
                     )
                 }
             )
@@ -288,14 +335,11 @@ class DeploymentReadinessStore:
                     or 0
                 )
                 lineage_configured = (
-                    (
-                        portfolio.dataset_roll_policy == "pinned"
-                        or _valid_digest(portfolio.dataset_lineage_id)
-                    )
-                    and (
-                        portfolio.execution_roll_policy == "pinned"
-                        or _valid_digest(portfolio.execution_lineage_id)
-                    )
+                    portfolio.dataset_roll_policy == "pinned"
+                    or _valid_digest(portfolio.dataset_lineage_id)
+                ) and (
+                    portfolio.execution_roll_policy == "pinned"
+                    or _valid_digest(portfolio.execution_lineage_id)
                 )
                 review_age = (current.date() - latest_review).days if latest_review else None
                 continuity = review_days >= 5 and review_age is not None and 0 <= review_age <= 7

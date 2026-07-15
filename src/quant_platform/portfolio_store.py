@@ -60,9 +60,8 @@ def _validate_dataset_evidence(
     if portfolio.get("dataset_roll_policy") == "pinned":
         if resolved["name"] != portfolio["dataset"]:
             raise ValueError("pinned portfolio cannot change its Qlib dataset")
-    elif (
-        not _is_sha256(resolved["lineage_id"])
-        or resolved["lineage_id"] != portfolio.get("dataset_lineage_id")
+    elif not _is_sha256(resolved["lineage_id"]) or resolved["lineage_id"] != portfolio.get(
+        "dataset_lineage_id"
     ):
         raise ValueError("resolved Qlib dataset is outside the portfolio lineage")
     return resolved
@@ -121,9 +120,7 @@ class PortfolioStore:
         if version["status"] != "approved":
             raise ValueError("paper portfolios require an approved strategy version")
         if version.get("strategy_type") != "multifactor":
-            raise ValueError(
-                "pair strategy paper portfolios require the dedicated spread ledger"
-            )
+            raise ValueError("pair strategy paper portfolios require the dedicated spread ledger")
         if initial_cash < 100_000:
             raise ValueError("initial cash must be at least 100000")
         if not name.strip() or not dataset.strip() or not actor.strip():
@@ -571,14 +568,10 @@ class PortfolioStore:
                 raise ValueError("paper rebalance requires the governed Qlib signal engine")
             if batch.dataset_identity_sha256:
                 provenance = dict(result.get("provenance") or {})
-                if (
-                    provenance.get("daily_dataset_identity_sha256")
-                    != batch.dataset_identity_sha256
-                ):
+                if provenance.get("daily_dataset_identity_sha256") != batch.dataset_identity_sha256:
                     raise ValueError("paper result changed the batch-pinned Qlib dataset")
                 if batch.dataset_lineage_id and (
-                    provenance.get("daily_dataset_lineage_id")
-                    != batch.dataset_lineage_id
+                    provenance.get("daily_dataset_lineage_id") != batch.dataset_lineage_id
                 ):
                     raise ValueError("paper result left the batch-pinned Qlib lineage")
             config = dict(version.config_json)

@@ -66,11 +66,10 @@ def test_controller_creates_one_campaign_per_dataset_identity(
             "strategy_config": {"topk": 50, "n_drop": 5},
             "parameter_grid": {"topk": [30, 50]},
             "experiment_trials": [],
-            "paper": {
-                "initial_cash": 5_000_000,
+            "recommendation": {
+                "hypothetical_initial_value": 5_000_000,
                 "timezone": "Asia/Shanghai",
                 "run_time": "15:30",
-                "slippage": 0.0005,
                 "misfire_grace_seconds": 1800,
             },
         },
@@ -80,14 +79,14 @@ def test_controller_creates_one_campaign_per_dataset_identity(
     )
 
     first = controller.tick(limit=1)
-    assert first == {"checked": 1, "created": 1, "deferred": 0, "failed": 0}
+    assert first == {"checked": 1, "created": 1, "deferred": 0, "failed": 0}, (
+        controller.programs.get(program["id"])["last_message"]
+    )
     campaigns = controller.orchestrator.campaigns.list()
     assert len(campaigns) == 1
     assert campaigns[0]["research_program_id"] == program["id"]
     assert campaigns[0]["dataset_identity_sha256"] == "a" * 64
-    assert campaigns[0]["config"]["research"]["periods"]["test_end"] == dataset[
-        "end_date"
-    ]
+    assert campaigns[0]["config"]["research"]["periods"]["test_end"] == dataset["end_date"]
 
     controller.programs.check_now(program["id"], actor="research-admin")
     second = controller.tick(limit=1)

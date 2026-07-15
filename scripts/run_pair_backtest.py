@@ -78,10 +78,7 @@ def _read_parquet_dataset(
     glob = str((path / "**" / "*.parquet").resolve())
     connection = duckdb.connect()
     try:
-        source = (
-            f"read_parquet({_sql_string(glob)}, "
-            "hive_partitioning=true, union_by_name=true)"
-        )
+        source = f"read_parquet({_sql_string(glob)}, hive_partitioning=true, union_by_name=true)"
         columns = {
             str(row[0]) for row in connection.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
         }
@@ -296,15 +293,9 @@ def main() -> None:
             "pair_robustness_passed": robustness["passed"],
             "pair_robustness": robustness,
             "provenance": {
-                "daily_dataset_identity_sha256": daily_provenance[
-                    "dataset_identity_sha256"
-                ],
-                "daily_snapshot_manifest_sha256": daily_provenance[
-                    "snapshot_manifest_sha256"
-                ],
-                "minute_snapshot_manifest_sha256": manifest["minute_dataset"][
-                    "manifest_sha256"
-                ],
+                "daily_dataset_identity_sha256": daily_provenance["dataset_identity_sha256"],
+                "daily_snapshot_manifest_sha256": daily_provenance["snapshot_manifest_sha256"],
+                "minute_snapshot_manifest_sha256": manifest["minute_dataset"]["manifest_sha256"],
                 "strategy_config_sha256": _canonical_sha256(manifest["config"]),
                 "execution_manifest_sha256": _sha256_file(manifest_path),
                 "pair_engine_sha256": _sha256_file(
@@ -313,9 +304,7 @@ def main() -> None:
                     / "quant_platform"
                     / "pair_trading.py"
                 ),
-                "shortability_evidence_sha256": manifest["shortability_dataset"][
-                    "source_sha256"
-                ],
+                "shortability_evidence_sha256": manifest["shortability_dataset"]["source_sha256"],
                 "daily_dataset_lineage_id": daily_provenance.get("dataset_lineage_id"),
                 "execution_snapshot_lineage_id": manifest["minute_dataset"].get(
                     "snapshot_lineage_id"

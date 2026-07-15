@@ -50,9 +50,10 @@ def test_runtime_secret_store_encrypts_and_never_describes_plaintext(database_ur
         "record_count": 1,
     }
     assert RuntimeSecretStore(database_url, "").health()["status"] == "unavailable"
-    assert RuntimeSecretStore(
-        database_url, Fernet.generate_key().decode("ascii")
-    ).health()["status"] == "unavailable"
+    assert (
+        RuntimeSecretStore(database_url, Fernet.generate_key().decode("ascii")).health()["status"]
+        == "unavailable"
+    )
 
 
 def test_settings_api_validates_saves_and_enables_bootstrap(
@@ -65,6 +66,7 @@ def test_settings_api_validates_saves_and_enables_bootstrap(
     monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("BROKER_MODE", "disabled")
+    monkeypatch.setenv("BROKER_FEATURE_ENABLED", "true")
     monkeypatch.setenv("BROKER_GATEWAY_URL", "https://environment-broker.example/hook")
     monkeypatch.setenv("BROKER_HMAC_SECRET", "e" * 40)
     monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
@@ -100,15 +102,16 @@ def test_settings_api_validates_saves_and_enables_bootstrap(
     }
     with open_database(database_url).connect() as connection:
         alert_ciphertext = connection.scalar(
-            select(runtime_secrets.c.ciphertext).where(
-                runtime_secrets.c.name == "alert_webhook"
-            )
+            select(runtime_secrets.c.ciphertext).where(runtime_secrets.c.name == "alert_webhook")
         )
     assert alert_ciphertext and alert_url not in alert_ciphertext
-    assert client.post(
-        "/api/settings/alerts",
-        json={"webhook_url": "http://remote.example/hook"},
-    ).status_code == 422
+    assert (
+        client.post(
+            "/api/settings/alerts",
+            json={"webhook_url": "http://remote.example/hook"},
+        ).status_code
+        == 422
+    )
 
     broker_url = "https://broker.example.internal/quantlab"
     broker_secret = "b" * 40
@@ -121,6 +124,7 @@ def test_settings_api_validates_saves_and_enables_bootstrap(
     assert broker_secret not in broker_response.text
     broker_status = client.get("/api/settings").json()["broker"]
     assert broker_status == {
+        "feature_enabled": True,
         "mode": "disabled",
         "configured": True,
         "source": "database",
@@ -129,25 +133,32 @@ def test_settings_api_validates_saves_and_enables_bootstrap(
     }
     with open_database(database_url).connect() as connection:
         broker_ciphertext = connection.scalar(
-            select(runtime_secrets.c.ciphertext).where(
-                runtime_secrets.c.name == "broker_gateway"
-            )
+            select(runtime_secrets.c.ciphertext).where(runtime_secrets.c.name == "broker_gateway")
         )
     assert broker_ciphertext
     assert broker_url not in broker_ciphertext
     assert broker_secret not in broker_ciphertext
-    assert client.post(
-        "/api/settings/broker",
-        json={"gateway_url": "http://remote.example", "hmac_secret": broker_secret},
-    ).status_code == 422
-    assert client.post(
-        "/api/settings/broker",
-        json={"gateway_url": broker_url, "hmac_secret": "short"},
-    ).status_code == 422
-    assert client.post(
-        "/api/settings/broker",
-        json={"gateway_url": "", "hmac_secret": ""},
-    ).status_code == 200
+    assert (
+        client.post(
+            "/api/settings/broker",
+            json={"gateway_url": "http://remote.example", "hmac_secret": broker_secret},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            "/api/settings/broker",
+            json={"gateway_url": broker_url, "hmac_secret": "short"},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            "/api/settings/broker",
+            json={"gateway_url": "", "hmac_secret": ""},
+        ).status_code
+        == 200
+    )
     disabled_broker = client.get("/api/settings").json()["broker"]
     assert disabled_broker["configured"] is False
     assert disabled_broker["source"] == "database"

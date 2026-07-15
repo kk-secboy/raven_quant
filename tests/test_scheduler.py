@@ -2,6 +2,8 @@ import json
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
+import pytest
+
 from quant_data.config import Settings
 from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES, OPTIONAL_COVERAGE_BUNDLES
 from quant_platform.alert_store import AlertStore
@@ -83,9 +85,7 @@ def test_scheduler_creates_recoverable_full_data_pipeline(
         now=current,
     )
 
-    result = SchedulerEngine(_settings(database_url, tmp_path)).tick(
-        current + timedelta(minutes=1)
-    )
+    result = SchedulerEngine(_settings(database_url, tmp_path)).tick(current + timedelta(minutes=1))
 
     assert result["processed"] == 1
     run = store.list_runs()[0]
@@ -144,9 +144,7 @@ def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
     (dataset / "instruments").mkdir()
     (dataset / "features").mkdir()
     (dataset / "metadata").mkdir()
-    (dataset / "calendars" / "day.txt").write_text(
-        "2018-01-01\n2025-01-02\n", encoding="utf-8"
-    )
+    (dataset / "calendars" / "day.txt").write_text("2018-01-01\n2025-01-02\n", encoding="utf-8")
     (dataset / "instruments" / "cn_all.txt").write_text(
         "SH600000\t2018-01-01\t2025-01-02\n", encoding="utf-8"
     )
@@ -228,60 +226,45 @@ def test_expired_schedule_run_lease_is_reclaimed(database_url: str) -> None:
     assert reclaimed["attempts"] == 2
 
 
-def test_scheduler_runs_broker_reconciliation_without_creating_order_job(
+def test_scheduler_rejects_broker_reconciliation_schedule(
     database_url: str, tmp_path: Path
 ) -> None:
-    current = datetime(2025, 1, 2, 7, 29, tzinfo=UTC)
+    del tmp_path
     store = ScheduleStore(database_url)
-    store.create(
-        name="daily broker reconciliation",
-        kind="broker_reconcile",
-        timezone="Asia/Shanghai",
-        run_time=time(15, 30),
-        trading_days_only=False,
-        payload={"destination_id": "sandbox-destination"},
-        misfire_grace_seconds=900,
-        actor="admin",
-        now=current,
-    )
-    engine = SchedulerEngine(_settings(database_url, tmp_path))
-    calls = []
-
-    def reconcile(destination_id: str, *, actor: str) -> dict:
-        calls.append((destination_id, actor))
-        return {"id": "reconciliation-id", "status": "matched"}
-
-    engine.brokers.reconcile = reconcile  # type: ignore[method-assign]
-    result = engine.tick(current + timedelta(minutes=1))
-    assert result["processed"] == 1
-    assert calls == [("sandbox-destination", "scheduler")]
-    run = store.list_runs()[0]
-    assert run["status"] == "succeeded"
-    assert run["job_id"] is None
-    assert "reconciliation-id" in run["message"]
+    with pytest.raises(ValueError, match="unsupported schedule kind"):
+        store.create(
+            name="retired broker reconciliation",
+            kind="broker_reconcile",
+            timezone="Asia/Shanghai",
+            run_time=time(15, 30),
+            trading_days_only=False,
+            payload={"destination_id": "sandbox-destination"},
+            misfire_grace_seconds=900,
+            actor="admin",
+        )
 
 
-def test_job_idempotency_allows_multiple_scheduled_portfolio_jobs(
+def test_job_idempotency_allows_multiple_scheduled_recommendation_jobs(
     database_url: str, tmp_path: Path
 ) -> None:
     jobs = JobStore(database_url)
     first = jobs.create(
-        "paper_rebalance",
-        {"portfolio": "one"},
+        "recommendation_refresh",
+        {"recommendation_portfolio": "one"},
         tmp_path / "one.log",
         dedupe_active_kind=False,
         idempotency_key="slot-one",
     )
     second = jobs.create(
-        "paper_rebalance",
-        {"portfolio": "two"},
+        "recommendation_refresh",
+        {"recommendation_portfolio": "two"},
         tmp_path / "two.log",
         dedupe_active_kind=False,
         idempotency_key="slot-two",
     )
     duplicate = jobs.create(
-        "paper_rebalance",
-        {"portfolio": "different-payload"},
+        "recommendation_refresh",
+        {"recommendation_portfolio": "different-payload"},
         tmp_path / "duplicate.log",
         dedupe_active_kind=False,
         idempotency_key="slot-one",

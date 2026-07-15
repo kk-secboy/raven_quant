@@ -9,8 +9,6 @@ import { FactorLibraryPanel } from "./factor-library-panel";
 import { JobRunCenter } from "./job-run-center";
 import { MarketOverviewPanel } from "./market-overview-panel";
 import { PortfolioPanel } from "./portfolio-panel";
-import { OperationsPanel } from "./operations-panel";
-import { PairTradingPanel } from "./pair-trading-panel";
 import { QlibPanel } from "./qlib-panel";
 import { RDAgentPanel } from "./rdagent-panel";
 import { ResearchCampaignPanel } from "./research-campaign-panel";
@@ -75,6 +73,10 @@ const navGroups = [
   { label: "策略与交易", items: [{ index: 6, label: "回测" }, { index: 7, label: "配对交易" }, { index: 8, label: "模拟组合" }] },
   { label: "系统", items: [{ index: 9, label: "任务与告警" }, { index: 10, label: "系统设置" }] },
 ];
+const visibleNavGroups = navGroups.map((group) => ({
+  ...group,
+  items: group.items.filter((item) => item.index !== 7),
+}));
 const headings: Record<number, [string, string]> = {
   0: ["QUANTLAB / WORKSPACE", "总览"],
   1: ["DATA OPERATIONS / A-SHARE", "数据中心"],
@@ -236,7 +238,7 @@ export default function Home() {
       <aside className="sidebar">
         <div className="brand"><span className="brand-mark">Q</span><span>Quant<span>Lab</span></span></div>
         <nav aria-label="主导航">
-          {navGroups.map((group) => (
+          {visibleNavGroups.map((group) => (
             <div className="nav-group" key={group.label}>
               <span className="nav-group-label">{group.label}</span>
               {group.items.map((item) => (
@@ -338,7 +340,7 @@ export default function Home() {
               <section className="data-panel"><div className="panel-heading"><div><h2>基础数据集</h2><p>用于核对旧初始化流水线的工作单元。</p></div><div className="segmented">{["core", "research", "full"].map((value) => <button className={profile === value ? "selected" : ""} onClick={() => setProfile(value)} key={value}>{value}</button>)}</div></div><div className="table-wrap"><table><thead><tr><th>数据集</th><th>层级</th><th>状态</th><th>进度</th><th>数据行</th><th>失败</th></tr></thead><tbody>{visibleDatasets.map((item) => <tr key={item.name}><td><code>{item.name}</code></td><td><span className={`tier ${item.profile}`}>{item.profile}</span></td><td><span className={`state ${item.state}`}>{item.state === "ready" ? "已就绪" : item.state === "partial" ? "部分完成" : "未下载"}</span></td><td><div className="mini-progress"><i style={{ width: `${item.coverage}%` }} /></div><small>{item.coverage}%</small></td><td>{formatNumber(item.rows)}</td><td className={item.failed ? "danger" : "muted"}>{item.failed}</td></tr>)}</tbody></table></div></section>
             </div> : null}
           </div>
-        ) : activeNav === 11 ? <MarketOverviewPanel api={API} onOpenData={() => { setActiveNav(1); setDataView("overview"); }} /> : activeNav === 2 ? <QlibPanel api={API} /> : activeNav === 3 ? <RDAgentPanel api={API} /> : activeNav === 4 ? <ResearchCampaignPanel api={API} /> : activeNav === 5 ? <FactorLibraryPanel api={API} /> : activeNav === 6 ? <BacktestPanel api={API} /> : activeNav === 7 ? <PairTradingPanel api={API} /> : activeNav === 8 ? <PortfolioPanel api={API} /> : activeNav === 9 ? <OperationsPanel api={API} currentUser={auth.user!} /> : <SettingsPanel api={API} />}
+        ) : activeNav === 11 ? <MarketOverviewPanel api={API} onOpenData={() => { setActiveNav(1); setDataView("overview"); }} /> : activeNav === 2 ? <QlibPanel api={API} /> : activeNav === 3 ? <RDAgentPanel api={API} /> : activeNav === 4 ? <ResearchCampaignPanel api={API} /> : activeNav === 5 ? <FactorLibraryPanel api={API} /> : activeNav === 6 ? <BacktestPanel api={API} /> : activeNav === 8 ? <PortfolioPanel api={API} /> : activeNav === 9 ? <JobRunCenter api={API} canControl={auth.user?.role === "admin" || auth.user?.role === "operator"} onChanged={refresh} onMessage={setMessage} /> : <SettingsPanel api={API} />}
       </section>
     </main>
   );

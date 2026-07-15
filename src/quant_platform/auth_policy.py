@@ -39,17 +39,13 @@ def permission_for(method: str, path: str) -> str:
         "/api/jobs/supplemental-download",
     }:
         return "data:write"
-    if path.startswith("/api/jobs/") and (
-        path.endswith("/retry") or path.endswith("/cancel")
-    ):
+    if path.startswith("/api/jobs/") and (path.endswith("/retry") or path.endswith("/cancel")):
         return "data:write"
     if path in {"/api/jobs/qlib-baseline", "/api/jobs/minute-research"} or path.startswith(
         "/api/rdagent/"
     ):
         return "research:write"
-    if path.startswith("/api/research-campaigns") or path.startswith(
-        "/api/research-programs"
-    ):
+    if path.startswith("/api/research-campaigns") or path.startswith("/api/research-programs"):
         return "research:write"
     if path.startswith("/api/factors/") and path.endswith("/promote"):
         return "factor:approve"

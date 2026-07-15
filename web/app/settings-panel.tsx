@@ -20,12 +20,15 @@ type SettingsState = {
   broker: SecretState & { endpoint_host: string; mode: "disabled" | "sandbox" };
 };
 
+type Capabilities = { broker_qmt: boolean };
+
 function sourceLabel(value: SecretState["source"]) {
   return { database: "服务端动态配置", environment: "部署环境变量", missing: "未配置" }[value];
 }
 
 export function SettingsPanel({ api }: { api: string }) {
   const [state, setState] = useState<SettingsState | null>(null);
+  const [brokerEnabled, setBrokerEnabled] = useState(false);
   const [tushareUrl, setTushareUrl] = useState("https://api.tushare.pro");
   const [tushareToken, setTushareToken] = useState("");
   const [apiBase, setApiBase] = useState("");
@@ -38,10 +41,16 @@ export function SettingsPanel({ api }: { api: string }) {
   const [saving, setSaving] = useState<"tushare" | "llm" | "alerts" | "broker" | null>(null);
 
   const refresh = useCallback(async () => {
-    const response = await apiFetch(`${api}/api/settings`, { cache: "no-store" });
+    const [response, capabilitiesResponse] = await Promise.all([
+      apiFetch(`${api}/api/settings`, { cache: "no-store" }),
+      apiFetch(`${api}/api/capabilities`, { cache: "no-store" }),
+    ]);
     if (!response.ok) throw new Error("无法读取系统设置");
+    if (!capabilitiesResponse.ok) throw new Error("could not read capabilities");
     const value: SettingsState = await response.json();
+    const capabilities: Capabilities = await capabilitiesResponse.json();
     setState(value);
+    setBrokerEnabled(capabilities.broker_qmt);
     setTushareUrl(value.tushare.api_url || "https://api.tushare.pro");
     setApiBase(value.llm.api_base || "");
     setChatModel(value.llm.chat_model || "gpt-4.1-mini");
@@ -135,7 +144,7 @@ export function SettingsPanel({ api }: { api: string }) {
 
   return <>
     {message && <div className="notice">{message}</div>}
-    <section className="settings-status">
+    <section className={brokerEnabled ? "settings-status" : "settings-status broker-disabled"}>
       <article><span className={state?.storage_ready ? "pulse ok" : "pulse"} /><div><small>加密存储</small><strong>{state?.storage_ready ? "可用" : state?.storage_status === "unavailable" ? "无法解密" : "未启用"}</strong><p>{state?.storage_ready ? `${state.storage_record_count} 条密文记录已验证。` : "检查 PLATFORM_SECRET_KEY；不会回退到旧动态配置。"}</p></div></article>
       <article><span className={state?.tushare.configured ? "pulse ok" : "pulse"} /><div><small>Tushare</small><strong>{state?.tushare.configured ? "已配置" : "待配置"}</strong><p>{state ? sourceLabel(state.tushare.source) : "读取中"}</p></div></article>
       <article><span className={state?.llm.configured ? "pulse ok" : "pulse"} /><div><small>RD-Agent LLM</small><strong>{state?.llm.configured ? "已配置" : "待配置"}</strong><p>{state ? sourceLabel(state.llm.source) : "读取中"}</p></div></article>
@@ -143,7 +152,7 @@ export function SettingsPanel({ api }: { api: string }) {
       <article><span className={state?.broker.configured ? "pulse ok" : "pulse"} /><div><small>券商沙箱网关</small><strong>{state?.broker.configured ? "凭据已配置" : "未配置"}</strong><p>{state ? `${sourceLabel(state.broker.source)} · 安全锁 ${state.broker.mode}${state.broker.endpoint_host ? ` · ${state.broker.endpoint_host}` : ""}` : "读取中"}</p></div></article>
     </section>
 
-    <section className="settings-grid">
+    <section className={brokerEnabled ? "settings-grid" : "settings-grid broker-disabled"}>
       <form className="settings-card" onSubmit={saveTushare}>
         <div className="card-heading"><div><span>MARKET DATA CREDENTIAL</span><strong>Tushare 数据源</strong></div><span className={state?.tushare.configured ? "status-chip verified" : "status-chip"}>{state?.tushare.configured ? "已就绪" : "未配置"}</span></div>
         <p>保存前会调用交易日历接口验证。Token 只提交一次，保存后不会回显。</p>

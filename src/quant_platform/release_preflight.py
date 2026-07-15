@@ -192,8 +192,7 @@ def assess_release(
     else:
         postgres_running = bool(fallback_ids.get("postgres"))
         postgres_error = (
-            fallback_error
-            or "PostgreSQL container was not found through Docker project labels"
+            fallback_error or "PostgreSQL container was not found through Docker project labels"
         )
     checks.append(
         _check(
@@ -232,9 +231,7 @@ def assess_release(
                 "(SELECT version_num FROM quantlab.alembic_version);"
             )
             database_args = (
-                ("exec", "-T", "postgres")
-                if compose_valid
-                else ("exec", fallback_ids["postgres"])
+                ("exec", "-T", "postgres") if compose_valid else ("exec", fallback_ids["postgres"])
             )
             runner = context.run if compose_valid else context.docker
             raw = runner(
@@ -275,11 +272,7 @@ def assess_release(
     # job or a currently running/leased unit can race a container replacement.
     # Treating dormant checkpoints as active work creates an unrecoverable
     # release deadlock after a downloader fails.
-    queue_complete = (
-        database_query_ok
-        and queue["active_jobs"] == 0
-        and queue["running_units"] == 0
-    )
+    queue_complete = database_query_ok and queue["active_jobs"] == 0 and queue["running_units"] == 0
     checks.append(
         _check(
             "durable_work_idle",

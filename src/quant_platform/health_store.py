@@ -74,19 +74,26 @@ class OperationalHealthStore:
                 "message": f"Tushare credential storage failed: {exc}",
             }
         components["job_queue"] = self._job_queue_health(current)
-        broker = BrokerStore(self.settings, self.runtime_secrets).readiness(
-            probe=self.settings.broker_mode == "sandbox"
-        )
-        broker_status = str(broker["status"])
-        components["broker_boundary"] = {
-            "status": "ok" if broker_status == "disabled" else broker_status,
-            "message": (
-                "broker boundary locked; live trading unsupported"
-                if broker_status == "disabled"
-                else "sandbox broker boundary inspected"
-            ),
-            "details": broker,
-        }
+        if self.settings.broker_feature_enabled:
+            broker = BrokerStore(self.settings, self.runtime_secrets).readiness(
+                probe=self.settings.broker_mode == "sandbox"
+            )
+            broker_status = str(broker["status"])
+            components["broker_boundary"] = {
+                "status": "ok" if broker_status == "disabled" else broker_status,
+                "message": (
+                    "optional broker boundary locked; live trading unsupported"
+                    if broker_status == "disabled"
+                    else "optional sandbox broker boundary inspected"
+                ),
+                "details": broker,
+            }
+        else:
+            components["broker_boundary"] = {
+                "status": "not_applicable",
+                "message": "optional QMT broker integration is disabled",
+                "details": {"enabled": False, "mode": "disabled"},
+            }
 
         statuses = {item["status"] for item in components.values()}
         if statuses & {"degraded", "unavailable"}:

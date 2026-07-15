@@ -173,9 +173,7 @@ class JobStore:
                 )
             elif row.status == "running":
                 connection.execute(
-                    update(jobs)
-                    .where(jobs.c.id == job_id)
-                    .values(cancel_requested_at=_now())
+                    update(jobs).where(jobs.c.id == job_id).values(cancel_requested_at=_now())
                 )
             else:
                 raise ValueError("only queued or running jobs may be cancelled")

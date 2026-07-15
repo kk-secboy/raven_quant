@@ -34,9 +34,10 @@ def _read_completed_result(
             return None
         if provenance.get("strategy_config_sha256") != _canonical_sha256(config):
             return None
-        if metrics.get("backtest_engine") != "qlib" or metrics.get(
-            "qlib_native_backtest"
-        ) is not True:
+        if (
+            metrics.get("backtest_engine") != "qlib"
+            or metrics.get("qlib_native_backtest") is not True
+        ):
             return None
         return result
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -66,9 +67,7 @@ def _run_segment(
         "factors": base_manifest["factors"],
     }
     manifest_path = output / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     log_path = output / "backtest.log"
     with log_path.open("a", encoding="utf-8") as log:
         process = subprocess.run(
@@ -158,9 +157,7 @@ def main() -> None:
                 {
                     "completed_count": len(completed),
                     "trial_count": len(manifest["trials"]),
-                    "succeeded_count": sum(
-                        item["status"] == "succeeded" for item in completed
-                    ),
+                    "succeeded_count": sum(item["status"] == "succeeded" for item in completed),
                     "failed_count": sum(item["status"] == "failed" for item in completed),
                     "trials": completed,
                 },

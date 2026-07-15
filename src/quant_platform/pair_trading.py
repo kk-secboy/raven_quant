@@ -101,11 +101,15 @@ def evaluate_pair(
     *,
     min_observations: int = 20,
 ) -> PairEvidence:
-    frame = pd.concat(
-        [pd.to_numeric(y_prices, errors="coerce"), pd.to_numeric(x_prices, errors="coerce")],
-        axis=1,
-        keys=["y", "x"],
-    ).replace([np.inf, -np.inf], np.nan).dropna()
+    frame = (
+        pd.concat(
+            [pd.to_numeric(y_prices, errors="coerce"), pd.to_numeric(x_prices, errors="coerce")],
+            axis=1,
+            keys=["y", "x"],
+        )
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
     frame = frame[(frame["y"] > 0) & (frame["x"] > 0)]
     if len(frame) < min_observations:
         raise ValueError(f"pair evidence requires at least {min_observations} aligned observations")
@@ -179,9 +183,7 @@ def _kalman_spread(
         gain = covariance @ design / innovation_variance
         state = state + gain * innovation
         covariance = covariance - np.outer(gain, design) @ covariance
-        hedge_ratio = float(
-            np.clip(state[1], config.min_hedge_ratio, config.max_hedge_ratio)
-        )
+        hedge_ratio = float(np.clip(state[1], config.min_hedge_ratio, config.max_hedge_ratio))
         spread = observed_y - float(state[0]) - hedge_ratio * observed_x
         rows.append((float(state[0]), hedge_ratio, float(spread)))
     return pd.DataFrame(
@@ -206,15 +208,16 @@ def _execution_price(
     if day.empty:
         return None
     local_time = day.index.time
-    allowed = ((local_time >= pd.Timestamp("10:00").time()) & (
-        local_time <= pd.Timestamp("11:20").time()
-    )) | ((local_time >= pd.Timestamp("13:30").time()) & (
-        local_time <= pd.Timestamp("14:50").time()
-    ))
+    allowed = (
+        (local_time >= pd.Timestamp("10:00").time()) & (local_time <= pd.Timestamp("11:20").time())
+    ) | (
+        (local_time >= pd.Timestamp("13:30").time()) & (local_time <= pd.Timestamp("14:50").time())
+    )
     day = day.loc[allowed]
-    day = day[(pd.to_numeric(day["close"], errors="coerce") > 0) & (
-        pd.to_numeric(day["volume"], errors="coerce") > 0
-    )]
+    day = day[
+        (pd.to_numeric(day["close"], errors="coerce") > 0)
+        & (pd.to_numeric(day["volume"], errors="coerce") > 0)
+    ]
     if day.empty:
         return None
     volume = pd.to_numeric(day["volume"], errors="coerce").fillna(0.0)
@@ -252,11 +255,8 @@ def _trade_allowed(
         return "sell_at_down_limit"
     if opening_short:
         shortable = daily_row["shortable"]
-        authorized = (
-            isinstance(shortable, (bool, np.bool_)) and bool(shortable)
-        ) or (
-            isinstance(shortable, (int, float, np.integer, np.floating))
-            and float(shortable) == 1.0
+        authorized = (isinstance(shortable, (bool, np.bool_)) and bool(shortable)) or (
+            isinstance(shortable, (int, float, np.integer, np.floating)) and float(shortable) == 1.0
         )
         if pd.isna(shortable) or not authorized:
             return "short_borrow_not_authorized"
@@ -285,9 +285,7 @@ def _performance(daily: pd.DataFrame) -> dict[str, float | int | None]:
         "sharpe_ratio": float(returns.mean() / volatility * sqrt(252.0))
         if volatility > 0
         else None,
-        "sortino_ratio": float(returns.mean() / downside * sqrt(252.0))
-        if downside > 0
-        else None,
+        "sortino_ratio": float(returns.mean() / downside * sqrt(252.0)) if downside > 0 else None,
         "max_drawdown": float(drawdown.min()),
         "trading_days": len(daily),
     }
@@ -366,12 +364,16 @@ def run_pair_backtest(
                     leg_y: float(prices.loc[trade_date, leg_y]),
                     leg_x: float(prices.loc[trade_date, leg_x]),
                 }
-                target_quantities[leg_y] = direction * floor(
-                    gross * y_weight / reference[leg_y] / config.lot_size
-                ) * config.lot_size
-                target_quantities[leg_x] = -direction * floor(
-                    gross * x_weight / reference[leg_x] / config.lot_size
-                ) * config.lot_size
+                target_quantities[leg_y] = (
+                    direction
+                    * floor(gross * y_weight / reference[leg_y] / config.lot_size)
+                    * config.lot_size
+                )
+                target_quantities[leg_x] = (
+                    -direction
+                    * floor(gross * x_weight / reference[leg_x] / config.lot_size)
+                    * config.lot_size
+                )
                 planned_entry_notional += sum(
                     abs(target_quantities[item]) * reference[item] for item in target_quantities
                 )
@@ -404,9 +406,10 @@ def run_pair_backtest(
                 if rejection_reason:
                     rejection_reason = f"{instrument}:{rejection_reason}"
                     break
-                capacity = floor(
-                    minute_volume * config.max_volume_participation / config.lot_size
-                ) * config.lot_size
+                capacity = (
+                    floor(minute_volume * config.max_volume_participation / config.lot_size)
+                    * config.lot_size
+                )
                 fill_ratio = min(1.0, capacity / abs(delta)) if delta else 1.0
                 if fill_ratio < config.min_capacity_fill_ratio:
                     rejection_reason = f"{instrument}:insufficient_minute_capacity"
@@ -551,16 +554,12 @@ def run_pair_backtest(
         "win_rate": float(sum(value > 0 for value in closed_returns) / len(closed_returns))
         if closed_returns
         else None,
-        "average_closed_trade_return": float(np.mean(closed_returns))
-        if closed_returns
-        else None,
+        "average_closed_trade_return": float(np.mean(closed_returns)) if closed_returns else None,
         "stop_count": stop_count,
         "cointegration_breakdown_count": breakdown_count,
         "rolling_cointegration_checks": evidence_check_count,
         "rolling_cointegration_pass_rate": (
-            float(eligible_evidence_count / evidence_check_count)
-            if evidence_check_count
-            else 0.0
+            float(eligible_evidence_count / evidence_check_count) if evidence_check_count else 0.0
         ),
         "rejected_signal_count": len(rejections),
         "capacity_fill_ratio": min(1.0, float(filled_entry_notional / planned_entry_notional))
@@ -711,9 +710,9 @@ def run_pair_paper_step(
                 rejection = f"{instrument}:missing_valid_minute_execution_window"
                 break
             execution_price, minute_volume = execution
-            opening_short = targets[instrument] < 0 and (
-                quantity_y if instrument == leg_y else quantity_x
-            ) >= 0
+            opening_short = (
+                targets[instrument] < 0 and (quantity_y if instrument == leg_y else quantity_x) >= 0
+            )
             denied = _trade_allowed(
                 daily.loc[(trade_date, instrument)],
                 side=side,
@@ -723,9 +722,10 @@ def run_pair_paper_step(
             if denied:
                 rejection = f"{instrument}:{denied}"
                 break
-            capacity = floor(
-                minute_volume * config.max_volume_participation / config.lot_size
-            ) * config.lot_size
+            capacity = (
+                floor(minute_volume * config.max_volume_participation / config.lot_size)
+                * config.lot_size
+            )
             if min(1.0, capacity / abs(delta)) < config.min_capacity_fill_ratio:
                 rejection = f"{instrument}:insufficient_minute_capacity"
                 break
@@ -796,9 +796,7 @@ def run_pair_paper_step(
     )
     borrow_cost = short_value * config.annual_borrow_rate / 252.0
     cash -= borrow_cost
-    signed_market_value = (
-        quantity_y * closing_prices[leg_y] + quantity_x * closing_prices[leg_x]
-    )
+    signed_market_value = quantity_y * closing_prices[leg_y] + quantity_x * closing_prices[leg_x]
     nav = cash + signed_market_value
     if nav <= 0:
         raise ValueError("pair paper NAV must remain positive")
@@ -937,9 +935,7 @@ def run_pair_robustness_suite(
                 "max_drawdown": metrics["max_drawdown"],
                 "sharpe_ratio": metrics["sharpe_ratio"],
                 "closed_trade_count": metrics["closed_trade_count"],
-                "rolling_cointegration_pass_rate": metrics[
-                    "rolling_cointegration_pass_rate"
-                ],
+                "rolling_cointegration_pass_rate": metrics["rolling_cointegration_pass_rate"],
                 "capacity_fill_ratio": metrics["capacity_fill_ratio"],
             }
         )

@@ -21,6 +21,14 @@ from quant_data.database import (
     strategy_allocations,
 )
 
+ACTIVE_SCHEDULE_KINDS = (
+    "incremental_sync",
+    "data_pipeline",
+    "ashare_5m_sync",
+    "rdagent_research",
+    "recommendation_refresh",
+)
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -152,55 +160,23 @@ class ScheduleStore:
         actor: str,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        if kind not in {
-            "incremental_sync",
-            "data_pipeline",
-            "ashare_5m_sync",
-            "rdagent_research",
-            "paper_rebalance",
-            "pair_paper_rebalance",
-            "broker_reconcile",
-        }:
+        if kind not in ACTIVE_SCHEDULE_KINDS:
             raise ValueError("unsupported schedule kind")
         if not name.strip() or not actor.strip():
             raise ValueError("schedule name and actor are required")
         if misfire_grace_seconds < 60:
             raise ValueError("misfire grace must be at least 60 seconds")
-        portfolio_id = str(payload.get("portfolio_id") or "") if kind == "paper_rebalance" else None
-        pair_portfolio_id = (
-            str(payload.get("pair_portfolio_id") or "") if kind == "pair_paper_rebalance" else None
+        recommendation_portfolio_id = (
+            str(payload.get("recommendation_portfolio_id") or "")
+            if kind == "recommendation_refresh"
+            else None
         )
-        if kind == "paper_rebalance" and not portfolio_id:
-            raise ValueError("paper_rebalance requires portfolio_id")
-        if kind == "pair_paper_rebalance" and not pair_portfolio_id:
-            raise ValueError("pair_paper_rebalance requires pair_portfolio_id")
+        if kind == "recommendation_refresh" and not recommendation_portfolio_id:
+            raise ValueError("recommendation_refresh requires recommendation_portfolio_id")
         current = now or _now()
         schedule_id = uuid.uuid4().hex
         try:
             with self.engine.begin() as connection:
-                if portfolio_id:
-                    _lock_portfolio_schedule(connection, portfolio_id)
-                    _assert_no_conflicting_portfolio_schedule(connection, portfolio_id)
-                if pair_portfolio_id:
-                    connection.execute(
-                        select(
-                            func.pg_advisory_xact_lock(
-                                func.hashtext(f"quantlab:pair-paper-schedule:{pair_portfolio_id}")
-                            )
-                        )
-                    )
-                    conflict = connection.execute(
-                        select(schedules.c.id)
-                        .where(
-                            schedules.c.kind == "pair_paper_rebalance",
-                            schedules.c.payload_json["pair_portfolio_id"].as_string()
-                            == pair_portfolio_id,
-                            schedules.c.status != "retired",
-                        )
-                        .limit(1)
-                    ).first()
-                    if conflict is not None:
-                        raise ValueError("pair portfolio already has a non-retired paper schedule")
                 connection.execute(
                     insert(schedules).values(
                         id=schedule_id,
@@ -233,9 +209,7 @@ class ScheduleStore:
 
     def get_by_name(self, name: str) -> dict[str, Any] | None:
         with self.engine.connect() as connection:
-            row = connection.execute(
-                select(schedules).where(schedules.c.name == name)
-            ).first()
+            row = connection.execute(select(schedules).where(schedules.c.name == name)).first()
         return self._schedule_row(row) if row else None
 
     def list(self, limit: int = 200) -> list[dict[str, Any]]:
@@ -261,6 +235,8 @@ class ScheduleStore:
             ).first()
             if row is None:
                 raise KeyError(schedule_id)
+            if row.kind not in ACTIVE_SCHEDULE_KINDS:
+                raise ValueError("legacy schedules are read-only and cannot be reactivated")
             allocation_id = connection.execute(
                 select(allocation_schedule_members.c.allocation_id).where(
                     allocation_schedule_members.c.schedule_id == schedule_id
@@ -624,7 +600,11 @@ class ScheduleStore:
         with self.engine.begin() as connection:
             rows = connection.execute(
                 select(schedules)
-                .where(schedules.c.status == "active", schedules.c.next_run_at <= current)
+                .where(
+                    schedules.c.status == "active",
+                    schedules.c.kind.in_(ACTIVE_SCHEDULE_KINDS),
+                    schedules.c.next_run_at <= current,
+                )
                 .order_by(schedules.c.next_run_at)
                 .limit(limit)
                 .with_for_update(skip_locked=True)
@@ -668,14 +648,16 @@ class ScheduleStore:
         with self.engine.begin() as connection:
             row = connection.execute(
                 select(schedule_runs)
+                .join(schedules, schedules.c.id == schedule_runs.c.schedule_id)
                 .where(
+                    schedules.c.kind.in_(ACTIVE_SCHEDULE_KINDS),
                     or_(
                         schedule_runs.c.status == "pending",
                         (
                             (schedule_runs.c.status == "running")
                             & (schedule_runs.c.lease_until < current)
                         ),
-                    )
+                    ),
                 )
                 .order_by(schedule_runs.c.scheduled_for)
                 .limit(1)

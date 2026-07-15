@@ -4,6 +4,9 @@ import math
 from datetime import date
 from typing import Any
 
+import pandas as pd
+
+from .factor_evaluator import normalize_series
 from .rdagent_runtime import validate_duration
 
 RESEARCH_PERIOD_KEYS = (
@@ -88,8 +91,7 @@ def derive_rolling_research_periods(
     total = train_days + validation_days + test_days
     if len(ordered) < total:
         raise ValueError(
-            f"Qlib calendar has {len(ordered)} trading days; continuous research "
-            f"requires {total}"
+            f"Qlib calendar has {len(ordered)} trading days; continuous research requires {total}"
         )
     selected = ordered[-total:]
     train_end = train_days - 1
@@ -152,7 +154,11 @@ def factor_rank_score(candidate: dict[str, Any]) -> float:
 
 
 def rank_factor_candidates(
-    candidates: list[dict[str, Any]], *, limit: int
+    candidates: list[dict[str, Any]],
+    *,
+    limit: int,
+    reference_candidates: list[dict[str, Any]] | None = None,
+    max_abs_spearman: float = 0.75,
 ) -> list[dict[str, Any]]:
     if limit < 1:
         raise ValueError("factor selection limit must be positive")
@@ -161,44 +167,45 @@ def rank_factor_candidates(
         score = factor_rank_score(candidate)
         if math.isfinite(score):
             eligible.append({**candidate, "automation_score": score})
-    return sorted(
+    ranked = sorted(
         eligible,
         key=lambda item: (-float(item["automation_score"]), str(item.get("id") or "")),
-    )[:limit]
-
-
-def strategy_comparison_score(metrics: dict[str, Any] | None) -> float:
-    """Compare already validated strategy backtests without bypassing approval gates."""
-
-    if not isinstance(metrics, dict):
-        return -math.inf
-
-    def number(name: str, default: float = 0.0) -> float:
-        value = metrics.get(name)
-        if isinstance(value, (int, float)) and math.isfinite(float(value)):
-            return float(value)
-        return default
-
-    information_ratio = number("information_ratio", number("sharpe_ratio"))
-    return round(
-        information_ratio
-        + 0.50 * number("annualized_excess_return")
-        - 0.50 * abs(number("max_drawdown"))
-        - 0.10 * max(0.0, number("average_turnover")),
-        10,
     )
+    selected: list[dict[str, Any]] = []
+    references = list(reference_candidates or [])
+    for candidate in ranked:
+        if any(
+            _factor_spearman(candidate, other) > max_abs_spearman
+            for other in [*references, *selected]
+        ):
+            continue
+        selected.append(candidate)
+        if len(selected) == limit:
+            break
+    return selected
 
 
-def choose_champion(
-    baseline: dict[str, Any], challenger: dict[str, Any]
-) -> dict[str, Any]:
-    baseline_score = strategy_comparison_score(baseline.get("metrics"))
-    challenger_score = strategy_comparison_score(challenger.get("metrics"))
-    challenger_wins = challenger_score > baseline_score
-    winner = challenger if challenger_wins else baseline
-    return {
-        "winner_version_id": winner["strategy_version_id"],
-        "baseline_score": baseline_score,
-        "challenger_score": challenger_score,
-        "decision": "challenger" if challenger_wins else "baseline",
-    }
+def _factor_spearman(left: dict[str, Any], right: dict[str, Any]) -> float:
+    left_path = left.get("values_path")
+    right_path = right.get("values_path")
+    if not left_path or not right_path:
+        return 0.0
+
+    def load(path: str, name: str) -> pd.Series:
+        frame = (
+            pd.read_parquet(path) if str(path).lower().endswith(".parquet") else pd.read_hdf(path)
+        )
+        return normalize_series(frame, name)
+
+    try:
+        left_values = load(str(left_path), "left")
+        right_values = load(str(right_path), "right")
+    except (OSError, ValueError):
+        return 1.0
+    pair = pd.concat([left_values, right_values], axis=1, join="inner").dropna()
+    if pair.empty:
+        return 1.0
+    daily = pair.groupby(level="datetime").apply(
+        lambda group: group.iloc[:, 0].rank().corr(group.iloc[:, 1].rank())
+    )
+    return float(daily.abs().mean()) if daily.notna().any() else 1.0

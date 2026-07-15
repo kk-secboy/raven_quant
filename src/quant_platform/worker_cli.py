@@ -86,6 +86,7 @@ def run() -> None:
     worker = LocalJobWorker(store, root, settings)
     runtime_secrets = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
     stopped = threading.Event()
+
     def rdagent_status() -> dict:
         llm = runtime_secrets.get("llm")
         runtime_env = None
@@ -101,9 +102,7 @@ def run() -> None:
         "qlib": probe_qlib(settings, root),
         "rdagent": rdagent_status,
     }
-    required_runtime = (
-        "rdagent" if settings.worker_job_kinds == ("rdagent_factor",) else "qlib"
-    )
+    required_runtime = "rdagent" if settings.worker_job_kinds == ("rdagent_factor",) else "qlib"
     server = status_server(runtimes, required_runtime=required_runtime)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
 

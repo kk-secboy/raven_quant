@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import delete, insert, select, update
 
 from quant_data.database import (
+    factor_evaluations,
     open_database,
     parameter_experiment_trials,
     parameter_experiments,
     row_dict,
+    strategy_factors,
 )
 
 
@@ -40,6 +42,42 @@ class ParameterExperimentStore:
         artifact_path = artifact_root / experiment_id
         now = _now()
         with self.engine.begin() as connection:
+            evidence = connection.execute(
+                select(
+                    factor_evaluations.c.dataset,
+                    factor_evaluations.c.valid_end,
+                    factor_evaluations.c.metrics_json,
+                    factor_evaluations.c.evaluator_version,
+                    factor_evaluations.c.is_legacy,
+                )
+                .join(
+                    strategy_factors,
+                    strategy_factors.c.factor_evaluation_id == factor_evaluations.c.id,
+                )
+                .where(strategy_factors.c.strategy_version_id == strategy_version_id)
+            ).all()
+            if not evidence or any(
+                item.dataset != dataset
+                or item.is_legacy
+                or not str(item.evaluator_version).startswith("factor-gate-v2")
+                for item in evidence
+            ):
+                raise ValueError(
+                    "parameter experiments require matching factor evaluation v2 evidence"
+                )
+            experiment_start = min(
+                date.fromisoformat(section["start"]) for section in periods.values()
+            )
+            experiment_end = max(date.fromisoformat(section["end"]) for section in periods.values())
+            valid_start = max(
+                date.fromisoformat(str(dict(item.metrics_json)["selection_start"]))
+                for item in evidence
+            )
+            valid_end = min(item.valid_end for item in evidence)
+            if experiment_start < valid_start or experiment_end > valid_end:
+                raise ValueError(
+                    "parameter experiments must stay inside the validation selection window"
+                )
             connection.execute(
                 insert(parameter_experiments).values(
                     id=experiment_id,
@@ -153,8 +191,7 @@ class ParameterExperimentStore:
                     update(parameter_experiment_trials)
                     .where(
                         parameter_experiment_trials.c.experiment_id == experiment_id,
-                        parameter_experiment_trials.c.trial_index
-                        == int(item["trial_index"]),
+                        parameter_experiment_trials.c.trial_index == int(item["trial_index"]),
                     )
                     .values(
                         status=status,

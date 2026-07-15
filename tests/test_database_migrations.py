@@ -12,6 +12,10 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "research_runs",
         "factor_candidates",
         "factor_evaluations",
+        "recommendation_portfolios",
+        "recommendation_snapshots",
+        "recommendation_holdings",
+        "recommendation_nav",
         "research_events",
         "strategies",
         "strategy_versions",
@@ -71,7 +75,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0032_job_cancellation"
+    assert revision == "0034_legacy_readonly"
     assert {"research_program_id", "dataset_identity_sha256"} <= {
         column["name"]
         for column in inspector.get_columns("research_campaigns", schema="quantlab")
@@ -94,6 +98,8 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "policy_json",
         "policy_sha256",
         "evidence_sha256",
+        "dataset_identity_sha256",
+        "is_legacy",
     } <= {
         column["name"]
         for column in inspector.get_columns("factor_evaluations", schema="quantlab")
@@ -129,9 +135,21 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         for column in inspector.get_columns("strategy_versions", schema="quantlab")
     }
     assert "strategy_type" in strategy_version_columns
-    assert "execution_dataset" in {
+    assert "is_legacy" in strategy_version_columns
+    assert {"execution_dataset", "is_legacy"} <= {
         column["name"] for column in inspector.get_columns("backtest_runs", schema="quantlab")
     }
+    for table_name in (
+        "paper_portfolios",
+        "paper_orders",
+        "paper_fills",
+        "pair_paper_portfolios",
+        "pair_paper_orders",
+        "pair_paper_fills",
+    ):
+        assert "is_legacy" in {
+            column["name"] for column in inspector.get_columns(table_name, schema="quantlab")
+        }
     schedule_columns = {
         column["name"] for column in inspector.get_columns("schedules", schema="quantlab")
     }

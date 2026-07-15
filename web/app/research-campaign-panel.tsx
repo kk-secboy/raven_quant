@@ -17,11 +17,6 @@ type ResearchProgram = {
   last_dataset_end_date?: string | null;
   last_message?: string | null;
   last_checked_at?: string | null;
-  champion_campaign_id?: string | null;
-  champion_strategy_version_id?: string | null;
-  champion_score?: number | null;
-  decay_status?: "unavailable" | "healthy" | "warning";
-  decay_message?: string | null;
 };
 type Campaign = {
   id: string;
@@ -34,31 +29,29 @@ type Campaign = {
   strategy_version_id?: string | null;
   parameter_experiment_id?: string | null;
   backtest_id?: string | null;
-  paper_portfolio_id?: string | null;
+  recommendation_portfolio_id?: string | null;
   research_program_id?: string | null;
   updated_at: string;
-  state?: { champion?: { decision?: string; baseline_score?: number; challenger_score?: number } };
+  state?: { preferred_version_id?: string; recommendation_portfolio_id?: string };
 };
 
 const STAGES = [
   "research",
   "factor_selection",
-  "baseline_backtest",
   "parameter_experiment",
-  "challenger_backtest",
+  "final_backtest",
   "strategy_approval",
-  "paper_schedule",
+  "recommendation_schedule",
   "complete",
 ];
 
 const STAGE_LABELS: Record<string, string> = {
   research: "RD-Agent 研究",
   factor_selection: "因子排名与晋级",
-  baseline_backtest: "基线回测",
   parameter_experiment: "参数实验",
-  challenger_backtest: "挑战者回测",
+  final_backtest: "冻结策略最终测试",
   strategy_approval: "等待人工审批",
-  paper_schedule: "创建模拟盘",
+  recommendation_schedule: "创建推荐跟踪",
   complete: "自动流水线完成",
 };
 
@@ -75,8 +68,6 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
   const [name, setName] = useState("沪深300 自动研究");
   const [programName, setProgramName] = useState("沪深300 持续研究");
   const [minNewTradingDays, setMinNewTradingDays] = useState(20);
-  const [championMinImprovement, setChampionMinImprovement] = useState(0.05);
-  const [championDecayFraction, setChampionDecayFraction] = useState(0.25);
   const [dataset, setDataset] = useState("");
   const [recipeId, setRecipeId] = useState("index_enhancement");
   const [objective, setObjective] = useState("");
@@ -143,8 +134,6 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
         recipe_id: recipeId,
         objective,
         min_new_trading_days: minNewTradingDays,
-        champion_min_score_improvement: championMinImprovement,
-        champion_decay_fraction: championDecayFraction,
       }),
     });
     const body = await response.json();
@@ -214,7 +203,7 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
 
   return <div className="campaign-page">
     <section className="readiness-hero campaign-hero">
-      <div className="readiness-copy"><span className="status-chip">AUTONOMOUS RESEARCH</span><h2>自动研究流水线</h2><p>RD-Agent 提出因子，Qlib 独立评价，系统完成参数实验和冠军/挑战者回测；只有进入模拟盘前保留人工审批。</p></div>
+      <div className="readiness-copy"><span className="status-chip">AUTONOMOUS RESEARCH</span><h2>自动研究流水线</h2><p>RD-Agent 在训练集提出因子，验证集负责选择和调参；方案冻结后，Qlib 只运行一次最终测试。</p></div>
       <div className="campaign-hero-count"><strong>{activeProgramCount}</strong><span>个持续计划 · {activeCount} 条流水线</span></div>
     </section>
 
@@ -232,9 +221,9 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
         <div className="form-row"><label>策略模板<select value={recipeId} onChange={(event) => setRecipeId(event.target.value)}>{recipes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>数据血缘起点<select value={dataset} onChange={(event) => setDataset(event.target.value)}>{datasets.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label></div>
         <label>RD-Agent 研究目标<textarea value={objective} onChange={(event) => setObjective(event.target.value)} minLength={10} maxLength={2000} rows={5} /></label>
         <label>累计新增交易日再研究<input type="number" min={1} max={252} value={minNewTradingDays} onChange={(event) => setMinNewTradingDays(Number(event.target.value))} /></label>
-        <details className="campaign-advanced"><summary>安全时间窗口与冠军治理</summary><p>默认使用最近 756 个训练日、252 个验证日和 504 个独立测试日。数据不足时只等待，不会缩短样本窗口。</p><div className="form-row"><label>新冠军最低增分<input type="number" min="0" max="5" step="0.01" value={championMinImprovement} onChange={(event) => setChampionMinImprovement(Number(event.target.value))} /></label><label>衰减告警比例<input type="number" min="0.01" max="1" step="0.05" value={championDecayFraction} onChange={(event) => setChampionDecayFraction(Number(event.target.value))} /></label></div></details>
+        <details className="campaign-advanced"><summary>严格隔离的时间窗口</summary><p>默认使用最近 756 个训练日、252 个验证日和 504 个独立测试日。数据不足时只等待，不缩短窗口；最终测试不参与跨轮次选择。</p></details>
         <button className="primary" disabled={busy || !dataset || objective.length < 10}>{busy ? "正在保存…" : "启用持续研究"}</button>
-        <small>计划只跟随已验证的同一 Qlib 血缘；每个新快照最多创建一次活动，模拟盘前仍需人工审批。</small>
+        <small>计划只跟随已验证的同一 Qlib 血缘；每个新快照最多创建一次活动，生成推荐组合前仍需人工审批。</small>
       </form>
 
       <section className="data-panel campaign-list">
@@ -243,8 +232,6 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
           <div className="campaign-card-head"><div><strong>{item.name}</strong><small>{item.recipe_id} · {item.id.slice(0, 8)}</small></div><span className={`state ${item.status === "active" ? "ready" : "partial"}`}>{item.status === "active" ? "自动运行" : item.status === "paused" ? "已暂停" : "已取消"}</span></div>
           <div className="campaign-stage"><span>新增 {item.min_new_trading_days} 个交易日触发</span><b>并发 ≤ {item.max_active_campaigns}</b></div>
           {item.last_dataset_name ? <small>最近触发：{item.last_dataset_name} · {item.last_dataset_end_date}</small> : <small>尚未触发研究活动</small>}
-          {item.champion_campaign_id ? <div className="campaign-stage"><span>跨轮次冠军 · {item.champion_campaign_id.slice(0, 8)}</span><b>{item.champion_score?.toFixed(4) ?? "—"}</b></div> : null}
-          {item.decay_status && item.decay_status !== "unavailable" ? <p className={item.decay_status === "warning" ? "campaign-error" : "campaign-attention"}>{item.decay_status === "warning" ? "性能衰减告警" : "冠军表现稳定"}{item.decay_message ? ` · ${item.decay_message}` : ""}</p> : null}
           {item.last_message ? <p className="campaign-attention">{item.last_message}</p> : null}
           <div className="campaign-actions">
             {item.status === "active" ? <><button onClick={() => checkProgram(item)}>立即检查</button><button onClick={() => setProgramStatus(item, "paused")}>暂停</button></> : null}
@@ -265,7 +252,7 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
           <div className="form-row"><label>样本外开始<input type="date" value={periods.test_start} onChange={(event) => setPeriods({ ...periods, test_start: event.target.value })} /></label><label>样本外结束<input type="date" value={periods.test_end} onChange={(event) => setPeriods({ ...periods, test_end: event.target.value })} /></label></div>
         </details>
         <button className="primary" disabled={busy || !dataset || objective.length < 10}>{busy ? "正在创建…" : "启动自动研究"}</button>
-        <small>自动晋级只适用于通过独立 Qlib 门禁的因子；策略进入模拟盘前仍需人工审批。</small>
+        <small>只有评价 v2、统一 Qlib 回测和完整证据均通过，策略才能生成人工审批后的推荐组合。</small>
       </form>
 
       <section className="data-panel campaign-list">
@@ -277,8 +264,8 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
             <div className="campaign-card-head"><div><strong>{item.name}</strong><small>{item.dataset} · {item.id.slice(0, 8)}</small></div><span className={`state ${item.status === "failed" ? "failed" : item.status === "succeeded" ? "ready" : "partial"}`}>{item.status === "awaiting_approval" ? "待审批" : item.status}</span></div>
             <div className="campaign-stage"><span>{STAGE_LABELS[item.stage] ?? item.stage}</span><b>{progress}%</b></div>
             <div className="mini-progress"><i style={{ width: `${progress}%` }} /></div>
-            {item.state?.champion ? <small>冠军选择：{item.state.champion.decision === "challenger" ? "挑战者" : "基线"}</small> : null}
-            {item.status === "awaiting_approval" ? <p className="campaign-attention">回测已完成，请到“策略回测”审批冠军版本；审批后系统会自动创建模拟盘和每日任务。</p> : null}
+            {item.state?.preferred_version_id ? <small>冻结策略：{item.state.preferred_version_id.slice(0, 12)}</small> : null}
+            {item.status === "awaiting_approval" ? <p className="campaign-attention">最终测试已完成，请到“策略回测”审批冻结版本；审批后系统会创建推荐组合和每日刷新任务。</p> : null}
             {item.error ? <p className="campaign-error">{item.error}</p> : null}
             <div className="campaign-actions">
               {["queued", "running", "awaiting_approval"].includes(item.status) ? <button onClick={() => setStatus(item, "paused")}>暂停后续步骤</button> : null}

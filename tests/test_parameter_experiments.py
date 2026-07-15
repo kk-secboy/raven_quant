@@ -35,8 +35,8 @@ def test_period_split_is_non_overlapping_and_requires_history() -> None:
     periods = split_research_period(date(2024, 1, 1), date(2026, 1, 1))
     assert periods["in_sample"] == {"start": "2024-01-01", "end": "2025-03-15"}
     assert periods["out_of_sample"] == {"start": "2025-03-16", "end": "2026-01-01"}
-    with pytest.raises(ValueError, match="365"):
-        split_research_period(date(2025, 1, 1), date(2025, 6, 1))
+    with pytest.raises(ValueError, match="126"):
+        split_research_period(date(2025, 1, 1), date(2025, 4, 1))
 
 
 def test_trial_evaluation_flags_sample_decay_and_summary_risk() -> None:

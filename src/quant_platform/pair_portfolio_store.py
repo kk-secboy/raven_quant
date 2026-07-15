@@ -171,9 +171,7 @@ class PairPortfolioStore:
             raise ValueError("unsupported pair data roll policy")
         if dataset_roll_policy == "latest_compatible" and not _is_sha256(dataset_lineage_id):
             raise ValueError("latest-compatible pair portfolios require a Qlib lineage")
-        if execution_roll_policy == "latest_compatible" and not _is_sha256(
-            execution_lineage_id
-        ):
+        if execution_roll_policy == "latest_compatible" and not _is_sha256(execution_lineage_id):
             raise ValueError("latest-compatible pair portfolios require an execution lineage")
         version = self.strategies.get_version(strategy_version_id)
         if version.get("strategy_type") != "pair" or not version.get("pair"):
@@ -198,8 +196,7 @@ class PairPortfolioStore:
         ):
             raise ValueError("approved pair backtest does not pin the requested Qlib lineage")
         if execution_roll_policy == "latest_compatible" and (
-            approved_provenance.get("execution_snapshot_lineage_id")
-            != execution_lineage_id
+            approved_provenance.get("execution_snapshot_lineage_id") != execution_lineage_id
         ):
             raise ValueError("approved pair backtest does not pin the execution lineage")
         portfolio_id = uuid.uuid4().hex
@@ -398,9 +395,7 @@ class PairPortfolioStore:
                         dataset_identity_sha256=evidence["dataset"].get("identity"),
                         dataset_lineage_id=evidence["dataset"].get("lineage_id"),
                         execution_snapshot=evidence["execution"]["name"],
-                        execution_manifest_sha256=evidence["execution"].get(
-                            "manifest_sha256"
-                        ),
+                        execution_manifest_sha256=evidence["execution"].get("manifest_sha256"),
                         execution_lineage_id=evidence["execution"].get("lineage_id"),
                         artifact_path=str(artifact_path / batch_id),
                         created_at=_now(),
@@ -533,18 +528,15 @@ class PairPortfolioStore:
                 if (
                     not _is_sha256(execution_lineage)
                     or execution_lineage != portfolio.execution_lineage_id
-                    or execution_lineage
-                    != approved_provenance.get("execution_snapshot_lineage_id")
+                    or execution_lineage != approved_provenance.get("execution_snapshot_lineage_id")
                 ):
                     raise ValueError("pair paper execution evidence left the approved lineage")
             if batch.dataset_identity_sha256 and (
-                provenance["daily_dataset_identity_sha256"]
-                != batch.dataset_identity_sha256
+                provenance["daily_dataset_identity_sha256"] != batch.dataset_identity_sha256
             ):
                 raise ValueError("pair paper result changed the batch-pinned Qlib dataset")
             if batch.execution_manifest_sha256 and (
-                provenance["minute_snapshot_manifest_sha256"]
-                != batch.execution_manifest_sha256
+                provenance["minute_snapshot_manifest_sha256"] != batch.execution_manifest_sha256
             ):
                 raise ValueError("pair paper result changed the batch-pinned execution snapshot")
             trade_date = date.fromisoformat(str(result["trade_date"]))

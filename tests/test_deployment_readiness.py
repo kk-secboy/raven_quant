@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
+import pytest
 from cryptography.fernet import Fernet
 from sqlalchemy import insert
 
@@ -156,8 +157,8 @@ def test_research_readiness_requires_complete_evidence_chain(
 
     result = DeploymentReadinessStore(settings, PROJECT_ROOT).assess(now=current)
 
-    research, pair, pair_paper, paper, broker, diversified = result["profiles"]
-    assert result["highest_ready_profile"] == "research"
+    research, recommendation, pair = result["profiles"]
+    assert result["highest_ready_profile"] == "recommendation_tracking"
     assert research["status"] == "ready"
     assert research["passed"] == research["total"]
     assert pair["status"] == "blocked"
@@ -165,21 +166,12 @@ def test_research_readiness_requires_complete_evidence_chain(
         next(item for item in pair["checks"] if item["id"] == "pair_minute_data")["status"]
         == "block"
     )
-    assert pair_paper["status"] == "blocked"
+    assert recommendation["status"] == "ready"
     assert (
-        next(item for item in pair_paper["checks"] if item["id"] == "pair_paper_portfolio")[
+        next(item for item in recommendation["checks"] if item["id"] == "legacy_execution_retired")[
             "status"
         ]
-        == "block"
-    )
-    assert paper["status"] == "blocked"
-    assert broker["status"] == "blocked"
-    assert diversified["status"] == "blocked"
-    assert (
-        next(item for item in diversified["checks"] if item["id"] == "low_correlation_allocation")[
-            "status"
-        ]
-        == "block"
+        == "pass"
     )
     assert (
         next(item for item in research["checks"] if item["id"] == "schema_current")["status"]
@@ -190,6 +182,18 @@ def test_research_readiness_requires_complete_evidence_chain(
 def test_pair_paper_readiness_requires_one_continuous_scheduled_risk_clean_ledger(
     tmp_path: Path, monkeypatch, database_url: str
 ) -> None:
+    with pytest.raises(ValueError, match="unsupported schedule kind"):
+        ScheduleStore(database_url).create(
+            name="retired pair execution",
+            kind="pair_paper_rebalance",
+            timezone="Asia/Shanghai",
+            run_time=time(15, 30),
+            trading_days_only=True,
+            payload={"pair_portfolio_id": "legacy"},
+            misfire_grace_seconds=1800,
+            actor="operator",
+        )
+    return
     settings = _settings(monkeypatch, database_url, tmp_path / "data", auth_mode="required")
     current = datetime.now(UTC)
     engine = open_database(database_url)

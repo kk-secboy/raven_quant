@@ -301,9 +301,6 @@ export function BacktestPanel({ api }: { api: string }) {
     ? metrics.rolling as RollingReport : null;
   const eventStress = typeof metrics.event_stress === "object" && metrics.event_stress !== null
     ? metrics.event_stress as EventStressReport : null;
-  const executionReplay = typeof metrics.execution_replay === "object"
-    && metrics.execution_replay !== null
-    ? metrics.execution_replay as Record<string, unknown> : null;
   const selectedRecipe = recipes.find((item) => item.id === recipeId);
   return <>
     {message && <div className="notice">{message}</div>}
@@ -372,7 +369,7 @@ export function BacktestPanel({ api }: { api: string }) {
 
     {view === "results" && <>
     {currentBacktest?.status === "succeeded" && <div className="notice">正式回测引擎：{isQlibNative ? "Qlib 原生回测" : "非 Qlib 验证结果（不可审批）"}</div>}
-    {currentBacktest?.status === "succeeded" && <div className="notice">执行风控重放：{metrics.execution_risk_overlay_enforced === true && executionReplay ? `已按该版本的止损、分批止盈和组合回撤规则验证 · 重放最大回撤 ${pct(executionReplay.max_drawdown)}` : "缺失（不可审批）"}</div>}
+    {currentBacktest?.status === "succeeded" && <div className="notice">正式结果来自统一Qlib回测与PortfolioPolicy；推荐服务使用相同Policy版本。</div>}
     {currentBacktest?.status === "succeeded" && metrics.portfolio_construction === "benchmark_relative_qp" && <div className="notice">组合优化：基准相对权重已执行 · 平均主动权重 {pct(metrics.optimizer_mean_active_share)} · 优化器预计单边换手 {pct(metrics.optimizer_mean_expected_turnover)} · 最大跟踪代理 {decimal(metrics.optimizer_max_tracking_risk_proxy)} · 最大行业偏离 {pct(metrics.max_industry_deviation)} · 最大市值风格偏离 {decimal(metrics.max_size_deviation)} · 最大迭代 {String(metrics.optimizer_max_iterations ?? "—")}</div>}
     <section className="metric-strip backtest-metrics"><div><span>年化收益</span><strong>{pct(metrics.annualized_return)}</strong></div><div><span>年化超额</span><strong>{pct(metrics.annualized_excess_return)}</strong></div><div><span>跟踪误差</span><strong>{pct(metrics.tracking_error)}</strong></div><div><span>信息比率</span><strong>{decimal(metrics.information_ratio)}</strong></div><div><span>最大回撤</span><strong>{pct(metrics.max_drawdown)}</strong></div><div><span>平均换手</span><strong>{pct(metrics.average_turnover)}</strong></div></section>
     <section className="metric-strip backtest-metrics"><div><span>Sharpe</span><strong>{decimal(metrics.sharpe_ratio)}</strong></div><div><span>Sortino</span><strong>{decimal(metrics.sortino_ratio)}</strong></div><div><span>容量成交率</span><strong>{pct(metrics.capacity_fill_ratio)}</strong></div><div><span>稳健通过率</span><strong>{pct(metrics.robustness_pass_rate)}</strong></div><div><span>最差场景超额</span><strong>{pct(metrics.worst_scenario_excess_return)}</strong></div><div><span>单日最大亏损</span><strong>{pct(metrics.max_daily_loss)}</strong></div></section>

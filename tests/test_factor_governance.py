@@ -15,6 +15,27 @@ PERIODS = {
     "test_start": date(2024, 1, 1),
     "test_end": date(2026, 7, 10),
 }
+DATASET_IDENTITY = "a" * 64
+
+
+def _passing_metrics() -> dict:
+    return {
+        "ic": 0.035,
+        "icir": 0.80,
+        "rank_ic": 0.041,
+        "rank_icir": 0.76,
+        "turnover": 0.32,
+        "max_correlation": 0.44,
+        "cost_adjusted_return": 0.052,
+        "raw_valid_ic": -0.031,
+        "raw_selection_ic": -0.035,
+        "selection_days": 400,
+        "selection_start": "2022-05-27",
+        "coverage_pass_rate": 0.99,
+        "mean_coverage_ratio": 0.95,
+        "constant_day_rate": 0.0,
+        "direction": "inverted",
+    }
 
 
 def _candidate(store: ResearchStore, tmp_path: Path) -> dict:
@@ -51,9 +72,7 @@ def _write_evaluation_artifact(path: Path, candidate_id: str, metrics: dict) -> 
         json.dumps(
             {
                 "status": "ok",
-                "evaluations": [
-                    {"candidate_id": candidate_id, "status": "ok", "metrics": metrics}
-                ],
+                "evaluations": [{"candidate_id": candidate_id, "status": "ok", "metrics": metrics}],
             },
             ensure_ascii=False,
             indent=2,
@@ -72,6 +91,7 @@ def test_factor_must_pass_qlib_gate_before_manual_promotion(
     failed = store.record_evaluation(
         candidate["id"],
         dataset="snapshot-20260710",
+        dataset_identity_sha256=DATASET_IDENTITY,
         **PERIODS,
         metrics={
             "ic": 0.01,
@@ -91,23 +111,14 @@ def test_factor_must_pass_qlib_gate_before_manual_promotion(
     with pytest.raises(ValueError, match="must pass"):
         store.promote(candidate["id"], actor="portfolio-owner", reason="not ready yet")
 
-    passed_metrics = {
-        "ic": 0.035,
-        "icir": 0.80,
-        "rank_ic": 0.041,
-        "rank_icir": 0.76,
-        "turnover": 0.32,
-        "max_correlation": 0.44,
-        "cost_adjusted_return": 0.052,
-        "valid_ic": 0.031,
-        "test_days": 520,
-    }
+    passed_metrics = _passing_metrics()
     evaluation_artifact = _write_evaluation_artifact(
         tmp_path / "evaluation.json", candidate["id"], passed_metrics
     )
     passed = store.record_evaluation(
         candidate["id"],
         dataset="snapshot-20260710",
+        dataset_identity_sha256=DATASET_IDENTITY,
         **PERIODS,
         metrics=passed_metrics,
         artifact_path=str(evaluation_artifact),
@@ -136,23 +147,12 @@ def test_factor_promotion_rejects_evidence_changed_after_evaluation(
 ) -> None:
     store = ResearchStore(database_url)
     candidate = _candidate(store, tmp_path)
-    metrics = {
-        "ic": 0.035,
-        "icir": 0.80,
-        "rank_ic": 0.041,
-        "rank_icir": 0.76,
-        "turnover": 0.32,
-        "max_correlation": 0.44,
-        "cost_adjusted_return": 0.052,
-        "valid_ic": 0.031,
-        "test_days": 520,
-    }
-    artifact = _write_evaluation_artifact(
-        tmp_path / "evaluation.json", candidate["id"], metrics
-    )
+    metrics = _passing_metrics()
+    artifact = _write_evaluation_artifact(tmp_path / "evaluation.json", candidate["id"], metrics)
     store.record_evaluation(
         candidate["id"],
         dataset="snapshot-20260710",
+        dataset_identity_sha256=DATASET_IDENTITY,
         **PERIODS,
         metrics=metrics,
         artifact_path=str(artifact),
@@ -175,6 +175,7 @@ def test_factor_gate_fails_closed_when_metrics_are_missing(
     evaluation = store.record_evaluation(
         candidate["id"],
         dataset="snapshot-20260710",
+        dataset_identity_sha256=DATASET_IDENTITY,
         **PERIODS,
         metrics={"ic": 0.04},
         artifact_path=None,

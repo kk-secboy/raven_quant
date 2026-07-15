@@ -12,11 +12,10 @@ def _config() -> dict:
         "parameter_grid": {"topk": [30, 50]},
         "experiment_trials": [],
         "max_factors": 5,
-        "paper": {
-            "initial_cash": 5_000_000,
+        "recommendation": {
+            "hypothetical_initial_value": 5_000_000,
             "timezone": "Asia/Shanghai",
             "run_time": "15:30",
-            "slippage": 0.0005,
             "misfire_grace_seconds": 1800,
         },
     }

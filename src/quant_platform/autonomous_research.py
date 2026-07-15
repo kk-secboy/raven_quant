@@ -5,10 +5,11 @@ from typing import Any
 
 from quant_data.config import Settings
 
+from .cost_model import CostModelConfig
 from .job_store import JobStore
 from .parameter_experiment_store import ParameterExperimentStore
-from .portfolio_store import PortfolioStore
-from .research_automation import choose_champion, rank_factor_candidates
+from .recommendation_store import RecommendationStore
+from .research_automation import rank_factor_candidates
 from .research_campaign_store import ResearchCampaignStore
 from .research_store import ResearchStore
 from .schedule_store import ScheduleStore
@@ -34,7 +35,7 @@ class AutonomousResearchOrchestrator:
         self.research = ResearchStore(settings.database_url)
         self.strategies = StrategyStore(settings.database_url)
         self.experiments = ParameterExperimentStore(settings.database_url)
-        self.portfolios = PortfolioStore(settings.database_url)
+        self.recommendations = RecommendationStore(settings.database_url)
         self.schedules = ScheduleStore(settings.database_url)
 
     def create(
@@ -96,14 +97,20 @@ class AutonomousResearchOrchestrator:
         campaign = self.campaigns.get(campaign_id, include_events=False)
         if campaign["status"] != "failed":
             raise ValueError("only failed research campaigns may be retried")
+        if campaign["stage"] in {
+            "final_backtest",
+            "strategy_approval",
+            "recommendation_portfolio",
+            "recommendation_schedule",
+            "complete",
+        }:
+            raise ValueError(
+                "a failed frozen strategy or final test cannot be retried or reselected"
+            )
         if campaign["stage"] == "research" and campaign.get("research_run_id"):
             run = self.research.get_run(str(campaign["research_run_id"]))
             self._retry_job(run.get("job_id"))
             self.research.requeue_run(run["id"], actor=actor)
-        elif campaign["stage"] in {"baseline_backtest", "challenger_backtest"}:
-            backtest = self.strategies.get_backtest(str(campaign["backtest_id"]))
-            self._retry_job(backtest.get("job_id"))
-            self.strategies.requeue_backtest(backtest["id"])
         elif campaign["stage"] == "parameter_experiment":
             experiment = self.experiments.get(str(campaign["parameter_experiment_id"]))
             self._retry_job(experiment.get("job_id"))
@@ -114,11 +121,10 @@ class AutonomousResearchOrchestrator:
         handlers = {
             "research": self._research,
             "factor_selection": self._factor_selection,
-            "baseline_backtest": self._baseline_backtest,
             "parameter_experiment": self._parameter_experiment,
-            "challenger_backtest": self._challenger_backtest,
+            "final_backtest": self._final_backtest,
             "strategy_approval": self._strategy_approval,
-            "paper_schedule": self._paper_schedule,
+            "recommendation_schedule": self._recommendation_schedule,
         }
         handler = handlers.get(campaign["stage"])
         if handler is None:
@@ -147,6 +153,11 @@ class AutonomousResearchOrchestrator:
         config = campaign["config"]
         research = config["research"]
         evidence = config["dataset_evidence"]
+        strategy_config = config["strategy_config"]
+        cost_model = CostModelConfig.from_mapping(strategy_config)
+        reference_order_value = float(strategy_config.get("capacity_notional", 5_000_000)) / int(
+            strategy_config.get("topk", 50)
+        )
         try:
             run = self.research.create_run(
                 kind="factor",
@@ -157,7 +168,14 @@ class AutonomousResearchOrchestrator:
                 config={
                     "periods": research["periods"],
                     "dataset_path": evidence["path"],
+                    "dataset_identity_sha256": evidence["provenance"]["dataset_identity_sha256"],
                     "campaign_id": campaign["id"],
+                    "universe": campaign["universe"],
+                    "min_daily_instruments": max(
+                        50, int(config["strategy_config"].get("topk", 50))
+                    ),
+                    "cost_model": cost_model.to_dict(),
+                    "cost_reference_order_value": reference_order_value,
                 },
                 artifact_path=self.settings.data_root / "artifacts" / "rdagent",
             )
@@ -166,10 +184,7 @@ class AutonomousResearchOrchestrator:
                 raise CampaignDeferred("another bounded RD-Agent research run is active") from exc
             raise
         log_path = (
-            self.settings.data_root
-            / "platform"
-            / "logs"
-            / f"campaign-rdagent-{campaign['id']}.log"
+            self.settings.data_root / "platform" / "logs" / f"campaign-rdagent-{campaign['id']}.log"
         )
         try:
             job = self.jobs.create(
@@ -179,10 +194,17 @@ class AutonomousResearchOrchestrator:
                     "research_campaign_id": campaign["id"],
                     "dataset": campaign["dataset"],
                     "dataset_path": evidence["path"],
+                    "dataset_identity_sha256": evidence["provenance"]["dataset_identity_sha256"],
                     "objective": campaign["objective"],
                     "loop_n": research["loop_n"],
                     "duration": research["duration"],
                     "periods": research["periods"],
+                    "universe": campaign["universe"],
+                    "min_daily_instruments": max(
+                        50, int(config["strategy_config"].get("topk", 50))
+                    ),
+                    "cost_model": cost_model.to_dict(),
+                    "cost_reference_order_value": reference_order_value,
                 },
                 log_path,
                 idempotency_key=f"research-campaign:{campaign['id']}:rdagent",
@@ -205,7 +227,9 @@ class AutonomousResearchOrchestrator:
             run_id=str(campaign["research_run_id"]), limit=500
         )
         selected = rank_factor_candidates(
-            candidates, limit=int(campaign["config"]["max_factors"])
+            candidates,
+            limit=int(campaign["config"]["max_factors"]),
+            reference_candidates=self.research.list_candidates(status="promoted", limit=500),
         )
         if not selected:
             raise ValueError("RD-Agent produced no candidates that passed the Qlib factor gate")
@@ -221,9 +245,7 @@ class AutonomousResearchOrchestrator:
                     ),
                 )
         factor_weight = 1.0 / len(selected)
-        factors = [
-            {"candidate_id": item["id"], "weight": factor_weight} for item in selected
-        ]
+        factors = [{"candidate_id": item["id"], "weight": factor_weight} for item in selected]
         strategy = self.strategies.get_by_name(campaign["name"])
         if strategy is not None and strategy["created_by"] != actor:
             raise ValueError("strategy name is already owned by another workflow")
@@ -231,8 +253,8 @@ class AutonomousResearchOrchestrator:
             strategy = self.strategies.create(
                 name=campaign["name"],
                 description=(
-                    "Autonomous governed research campaign. Final strategy and paper "
-                    "admission remain subject to an explicit human approval."
+                    "Autonomous governed research campaign. Final recommendation "
+                    "admission remains subject to explicit human approval."
                 ),
                 benchmark=campaign["benchmark"],
                 universe=campaign["universe"],
@@ -241,71 +263,23 @@ class AutonomousResearchOrchestrator:
                 actor=actor,
             )
         baseline_version = strategy["versions"][0]
-        backtest, job = self._enqueue_backtest(
-            campaign, baseline_version["id"], label="baseline"
-        )
-        self.campaigns.transition(
-            campaign["id"],
-            stage="baseline_backtest",
-            event_type="baseline.enqueued",
-            payload={
-                "strategy_id": strategy["id"],
-                "version_id": baseline_version["id"],
-                "backtest_id": backtest["id"],
-                "job_id": job["id"],
-                "selected_factor_ids": [item["id"] for item in selected],
-            },
-            state_patch={
-                "selected_factors": [
-                    {
-                        "candidate_id": item["id"],
-                        "name": item["name"],
-                        "score": item["automation_score"],
-                    }
-                    for item in selected
-                ],
-                "baseline_version_id": baseline_version["id"],
-                "baseline_backtest_id": backtest["id"],
-            },
-            links={
-                "strategy_id": strategy["id"],
-                "strategy_version_id": baseline_version["id"],
-                "backtest_id": backtest["id"],
-            },
-            delay_seconds=30,
-        )
-
-    def _baseline_backtest(self, campaign: dict[str, Any]) -> None:
-        backtest = self.strategies.get_backtest(str(campaign["backtest_id"]))
-        if backtest["status"] in {"queued", "running"}:
-            raise CampaignDeferred(f"baseline backtest is {backtest['status']}")
-        if backtest["status"] != "succeeded":
-            raise ValueError(f"baseline backtest failed: {backtest.get('error')}")
         config = campaign["config"]
-        version = self.strategies.get_version(str(campaign["strategy_version_id"]))
-        actor = f"research-campaign:{campaign['id']}"
-        experiment = self.experiments.latest_for_version(
-            version["id"], created_by=actor
+        experiment = self.experiments.create(
+            strategy_version_id=baseline_version["id"],
+            dataset=campaign["dataset"],
+            periods=config["experiment_periods"],
+            parameter_grid=config["parameter_grid"],
+            baseline_config=baseline_version["config"],
+            trials=config["experiment_trials"],
+            artifact_root=self.settings.data_root / "artifacts" / "parameter-experiments",
+            created_by=actor,
         )
-        if experiment is None:
-            experiment = self.experiments.create(
-                strategy_version_id=version["id"],
-                dataset=campaign["dataset"],
-                periods=config["experiment_periods"],
-                parameter_grid=config["parameter_grid"],
-                baseline_config=version["config"],
-                trials=config["experiment_trials"],
-                artifact_root=self.settings.data_root
-                / "artifacts"
-                / "parameter-experiments",
-                created_by=actor,
-            )
         job = self.jobs.create(
             "parameter_experiment",
             {
                 "parameter_experiment_id": experiment["id"],
                 "research_campaign_id": campaign["id"],
-                "strategy_version_id": version["id"],
+                "strategy_version_id": baseline_version["id"],
                 "dataset": campaign["dataset"],
                 "dataset_path": campaign["config"]["dataset_evidence"]["path"],
             },
@@ -320,9 +294,30 @@ class AutonomousResearchOrchestrator:
         self.campaigns.transition(
             campaign["id"],
             stage="parameter_experiment",
-            event_type="experiment.enqueued",
-            payload={"experiment_id": experiment["id"], "job_id": job["id"]},
-            links={"parameter_experiment_id": experiment["id"]},
+            event_type="validation_experiment.enqueued",
+            payload={
+                "strategy_id": strategy["id"],
+                "version_id": baseline_version["id"],
+                "experiment_id": experiment["id"],
+                "job_id": job["id"],
+                "selected_factor_ids": [item["id"] for item in selected],
+            },
+            state_patch={
+                "selected_factors": [
+                    {
+                        "candidate_id": item["id"],
+                        "name": item["name"],
+                        "score": item["automation_score"],
+                    }
+                    for item in selected
+                ],
+                "baseline_version_id": baseline_version["id"],
+            },
+            links={
+                "strategy_id": strategy["id"],
+                "strategy_version_id": baseline_version["id"],
+                "parameter_experiment_id": experiment["id"],
+            },
             delay_seconds=30,
         )
 
@@ -347,7 +342,7 @@ class AutonomousResearchOrchestrator:
         ]
         actor = f"research-campaign:{campaign['id']}"
         strategy = self.strategies.get(str(campaign["strategy_id"]))
-        challenger = next(
+        frozen = next(
             (
                 item
                 for item in strategy["versions"]
@@ -355,8 +350,8 @@ class AutonomousResearchOrchestrator:
             ),
             None,
         )
-        if challenger is None:
-            challenger = self.strategies.create_version(
+        if frozen is None:
+            frozen = self.strategies.create_version(
                 str(campaign["strategy_id"]),
                 benchmark=campaign["benchmark"],
                 universe=campaign["universe"],
@@ -364,50 +359,44 @@ class AutonomousResearchOrchestrator:
                 config={**baseline["config"], **best_parameters},
                 actor=actor,
             )
-        backtest, job = self._enqueue_backtest(
-            campaign, challenger["id"], label="challenger"
-        )
+        backtest, job = self._enqueue_backtest(campaign, frozen["id"], label="final")
         self.campaigns.transition(
             campaign["id"],
-            stage="challenger_backtest",
-            event_type="challenger.enqueued",
+            stage="final_backtest",
+            event_type="strategy.frozen_final_test.enqueued",
             payload={
-                "version_id": challenger["id"],
+                "version_id": frozen["id"],
                 "backtest_id": backtest["id"],
                 "job_id": job["id"],
                 "parameters": best_parameters,
             },
             state_patch={
-                "challenger_version_id": challenger["id"],
-                "challenger_backtest_id": backtest["id"],
-                "challenger_parameters": best_parameters,
+                "frozen_version_id": frozen["id"],
+                "final_backtest_id": backtest["id"],
+                "frozen_parameters": best_parameters,
             },
             links={
-                "strategy_version_id": challenger["id"],
+                "strategy_version_id": frozen["id"],
                 "backtest_id": backtest["id"],
             },
             delay_seconds=30,
         )
 
-    def _challenger_backtest(self, campaign: dict[str, Any]) -> None:
-        challenger = self.strategies.get_backtest(str(campaign["backtest_id"]))
-        if challenger["status"] in {"queued", "running"}:
-            raise CampaignDeferred(f"challenger backtest is {challenger['status']}")
-        if challenger["status"] != "succeeded":
-            raise ValueError(f"challenger backtest failed: {challenger.get('error')}")
-        baseline = self.strategies.get_backtest(
-            str(campaign["state"]["baseline_backtest_id"])
-        )
-        decision = choose_champion(baseline, challenger)
-        winner = str(decision["winner_version_id"])
+    def _final_backtest(self, campaign: dict[str, Any]) -> None:
+        final = self.strategies.get_backtest(str(campaign["backtest_id"]))
+        if final["status"] in {"queued", "running"}:
+            raise CampaignDeferred(f"final test is {final['status']}")
+        if final["status"] != "succeeded":
+            raise ValueError(f"frozen strategy failed final test: {final.get('error')}")
+        frozen_version_id = str(campaign["state"]["frozen_version_id"])
         self.campaigns.transition(
             campaign["id"],
             stage="strategy_approval",
             status="awaiting_approval",
-            event_type="champion.selected",
-            payload=decision,
-            state_patch={"champion": decision, "preferred_version_id": winner},
-            links={"strategy_version_id": winner},
+            event_type="final_test.succeeded",
+            payload={"backtest_id": final["id"], "strategy_version_id": frozen_version_id},
+            state_patch={"preferred_version_id": frozen_version_id},
+            links={"strategy_version_id": frozen_version_id},
             delay_seconds=30,
         )
 
@@ -415,51 +404,54 @@ class AutonomousResearchOrchestrator:
         version = self.strategies.get_version(str(campaign["strategy_version_id"]))
         if version["status"] != "approved":
             raise CampaignDeferred(
-                "champion is awaiting explicit human approval before paper admission"
+                "frozen strategy is awaiting explicit approval before recommendations"
             )
         actor = f"research-campaign:{campaign['id']}"
-        portfolio_name = f"{campaign['name']} 模拟盘"[:150]
-        portfolio = self.portfolios.get_by_name(portfolio_name)
+        portfolio_name = f"{campaign['name']} 推荐组合"[:150]
+        portfolio = next(
+            (item for item in self.recommendations.list(500) if item["name"] == portfolio_name),
+            None,
+        )
         if portfolio is not None and portfolio["created_by"] != actor:
-            raise ValueError("paper portfolio name is already owned by another workflow")
+            raise ValueError("recommendation portfolio name is already owned by another workflow")
         if portfolio is None:
-            portfolio = self.portfolios.create(
+            portfolio = self.recommendations.create(
                 name=portfolio_name,
                 strategy_version_id=version["id"],
                 dataset=campaign["dataset"],
-                initial_cash=float(campaign["config"]["paper"]["initial_cash"]),
+                hypothetical_initial_value=float(
+                    campaign["config"]["recommendation"]["hypothetical_initial_value"]
+                ),
                 actor=actor,
-                dataset_roll_policy="pinned",
             )
         self.campaigns.transition(
             campaign["id"],
-            stage="paper_schedule",
+            stage="recommendation_schedule",
             status="running",
-            event_type="paper.created",
-            payload={"paper_portfolio_id": portfolio["id"]},
-            links={"paper_portfolio_id": portfolio["id"]},
+            event_type="recommendation_portfolio.created",
+            payload={"recommendation_portfolio_id": portfolio["id"]},
+            state_patch={"recommendation_portfolio_id": portfolio["id"]},
         )
 
-    def _paper_schedule(self, campaign: dict[str, Any]) -> None:
-        paper = campaign["config"]["paper"]
+    def _recommendation_schedule(self, campaign: dict[str, Any]) -> None:
+        recommendation = campaign["config"]["recommendation"]
         actor = f"research-campaign:{campaign['id']}"
-        schedule_name = f"{campaign['name']} 自动模拟盘"[:150]
+        schedule_name = f"{campaign['name']} 推荐刷新"[:150]
         schedule = self.schedules.get_by_name(schedule_name)
         if schedule is not None and schedule["created_by"] != actor:
-            raise ValueError("paper schedule name is already owned by another workflow")
+            raise ValueError("recommendation schedule name is already owned by another workflow")
         if schedule is None:
             schedule = self.schedules.create(
                 name=schedule_name,
-                kind="paper_rebalance",
-                timezone=str(paper["timezone"]),
-                run_time=time.fromisoformat(str(paper["run_time"])),
+                kind="recommendation_refresh",
+                timezone=str(recommendation["timezone"]),
+                run_time=time.fromisoformat(str(recommendation["run_time"])),
                 trading_days_only=True,
                 payload={
-                    "portfolio_id": campaign["paper_portfolio_id"],
-                    "slippage": float(paper["slippage"]),
+                    "recommendation_portfolio_id": campaign["state"]["recommendation_portfolio_id"],
                     "research_campaign_id": campaign["id"],
                 },
-                misfire_grace_seconds=int(paper["misfire_grace_seconds"]),
+                misfire_grace_seconds=int(recommendation["misfire_grace_seconds"]),
                 actor=actor,
             )
         self.campaigns.transition(
@@ -468,10 +460,9 @@ class AutonomousResearchOrchestrator:
             status="succeeded",
             event_type="campaign.succeeded",
             payload={
-                "paper_portfolio_id": campaign["paper_portfolio_id"],
-                "paper_schedule_id": schedule["id"],
+                "recommendation_portfolio_id": campaign["state"]["recommendation_portfolio_id"],
+                "recommendation_schedule_id": schedule["id"],
             },
-            links={"paper_schedule_id": schedule["id"]},
         )
 
     def _enqueue_backtest(

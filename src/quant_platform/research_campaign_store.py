@@ -103,8 +103,7 @@ class ResearchCampaignStore:
             row = connection.execute(
                 select(research_campaigns).where(
                     research_campaigns.c.research_program_id == research_program_id,
-                    research_campaigns.c.dataset_identity_sha256
-                    == dataset_identity_sha256,
+                    research_campaigns.c.dataset_identity_sha256 == dataset_identity_sha256,
                 )
             ).first()
         return self._decode(row_dict(row)) if row is not None else None
@@ -158,14 +157,10 @@ class ResearchCampaignStore:
 
     def list(self, *, limit: int = 100) -> list[dict[str, Any]]:
         statement = (
-            select(research_campaigns)
-            .order_by(research_campaigns.c.created_at.desc())
-            .limit(limit)
+            select(research_campaigns).order_by(research_campaigns.c.created_at.desc()).limit(limit)
         )
         with self.engine.connect() as connection:
-            return [
-                self._decode(row_dict(row)) for row in connection.execute(statement)
-            ]
+            return [self._decode(row_dict(row)) for row in connection.execute(statement)]
 
     def claim_due(
         self,
@@ -199,9 +194,7 @@ class ResearchCampaignStore:
             if row.status == "queued":
                 values["status"] = "running"
             connection.execute(
-                update(research_campaigns)
-                .where(research_campaigns.c.id == row.id)
-                .values(**values)
+                update(research_campaigns).where(research_campaigns.c.id == row.id).values(**values)
             )
             campaign_id = str(row.id)
         return self.get(campaign_id, include_events=False)
@@ -342,9 +335,7 @@ class ResearchCampaignStore:
             )
         return self.get(campaign_id)
 
-    def set_status(
-        self, campaign_id: str, status: str, *, actor: str
-    ) -> dict[str, Any]:
+    def set_status(self, campaign_id: str, status: str, *, actor: str) -> dict[str, Any]:
         if status not in {"paused", "running", "cancelled"}:
             raise ValueError("campaign status must be paused, running, or cancelled")
         current = _now()

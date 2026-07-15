@@ -4,7 +4,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any, Literal
@@ -34,11 +34,7 @@ from .broker_gateway import (
     validate_broker_gateway_credentials,
 )
 from .continuous_research import ContinuousResearchController
-from .data_rollover import (
-    next_qlib_trading_date,
-    select_execution_snapshot,
-    select_qlib_dataset,
-)
+from .data_rollover import select_qlib_dataset
 from .data_task_store import DataTaskStore
 from .deployment_readiness import DeploymentReadinessStore
 from .health_store import OperationalHealthStore
@@ -48,8 +44,8 @@ from .pair_portfolio_store import PairPortfolioStore
 from .parameter_experiment_store import ParameterExperimentStore
 from .parameter_experiments import normalize_parameter_grid, split_research_period
 from .platform_config_store import PlatformConfigStore
-from .portfolio_store import PortfolioStore
 from .rdagent_runtime import probe_rdagent, validate_duration
+from .recommendation_store import RecommendationStore
 from .research_automation import normalize_research_schedule_payload
 from .research_store import ResearchStore
 from .retention import DataRetentionManager
@@ -257,6 +253,22 @@ class ResearchPeriods(BaseModel):
             raise ValueError(
                 "train, validation, and test windows must be ordered and non-overlapping"
             )
+        valid_days = sum(
+            day.weekday() < 5
+            for day in (
+                self.valid_start + timedelta(days=offset)
+                for offset in range((self.valid_end - self.valid_start).days + 1)
+            )
+        )
+        test_days = sum(
+            day.weekday() < 5
+            for day in (
+                self.test_start + timedelta(days=offset)
+                for offset in range((self.test_end - self.test_start).days + 1)
+            )
+        )
+        if valid_days < 126 or test_days < 252:
+            raise ValueError("validation requires 126 and final test requires 252 trading days")
         return self
 
 
@@ -524,19 +536,20 @@ class ResearchCampaignCreateRequest(BaseModel):
     )
     max_trials: int = Field(default=27, ge=1, le=81)
     strategy_config: StrategyConfigRequest | None = None
-    initial_cash: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
+    hypothetical_initial_value: float = Field(
+        default=5_000_000, ge=100_000, le=10_000_000_000
+    )
     timezone: str = "Asia/Shanghai"
-    paper_run_time: time = time(15, 30)
-    paper_slippage: float = Field(default=0.0005, ge=0, le=0.02)
+    recommendation_run_time: time = time(15, 30)
     misfire_grace_seconds: int = Field(default=1800, ge=60, le=86400)
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
 
     @model_validator(mode="after")
     def validate_campaign(self) -> ResearchCampaignCreateRequest:
         validate_duration(self.duration)
-        split_research_period(self.periods.test_start, self.periods.test_end)
-        if self.paper_run_time < time(15, 10):
-            raise ValueError("paper simulation must run after the A-share close")
+        split_research_period(self.periods.valid_start, self.periods.valid_end)
+        if self.recommendation_run_time < time(15, 10):
+            raise ValueError("recommendation refresh must run after the A-share close")
         try:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as exc:
@@ -561,8 +574,6 @@ class ResearchProgramCreateRequest(BaseModel):
     test_trading_days: int = Field(default=504, ge=252, le=1260)
     min_new_trading_days: int = Field(default=20, ge=1, le=252)
     max_active_campaigns: int = Field(default=1, ge=1, le=3)
-    champion_min_score_improvement: float = Field(default=0.05, ge=0, le=5)
-    champion_decay_fraction: float = Field(default=0.25, gt=0, le=1)
     loop_n: int = Field(default=2, ge=1, le=20)
     duration: str = "1h"
     max_factors: int = Field(default=5, ge=1, le=20)
@@ -575,18 +586,19 @@ class ResearchProgramCreateRequest(BaseModel):
     )
     max_trials: int = Field(default=27, ge=1, le=81)
     strategy_config: StrategyConfigRequest | None = None
-    initial_cash: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
+    hypothetical_initial_value: float = Field(
+        default=5_000_000, ge=100_000, le=10_000_000_000
+    )
     timezone: str = "Asia/Shanghai"
-    paper_run_time: time = time(15, 30)
-    paper_slippage: float = Field(default=0.0005, ge=0, le=0.02)
+    recommendation_run_time: time = time(15, 30)
     misfire_grace_seconds: int = Field(default=1800, ge=60, le=86400)
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
 
     @model_validator(mode="after")
     def validate_program(self) -> ResearchProgramCreateRequest:
         validate_duration(self.duration)
-        if self.paper_run_time < time(15, 10):
-            raise ValueError("paper simulation must run after the A-share close")
+        if self.recommendation_run_time < time(15, 10):
+            raise ValueError("recommendation refresh must run after the A-share close")
         try:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as exc:
@@ -692,6 +704,18 @@ class PortfolioRebalanceRequest(BaseModel):
     slippage: float = Field(default=0.0005, ge=0, le=0.02)
 
 
+class RecommendationPortfolioCreateRequest(BaseModel):
+    name: str = Field(min_length=3, max_length=150)
+    strategy_version_id: str
+    dataset: str
+    hypothetical_initial_value: float = Field(default=5_000_000, ge=100_000)
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+
+class RecommendationRefreshRequest(BaseModel):
+    as_of_date: date
+
+
 class ScheduleCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=150)
     kind: Literal[
@@ -699,9 +723,7 @@ class ScheduleCreateRequest(BaseModel):
         "data_pipeline",
         "ashare_5m_sync",
         "rdagent_research",
-        "paper_rebalance",
-        "pair_paper_rebalance",
-        "broker_reconcile",
+        "recommendation_refresh",
     ]
     timezone: str = "Asia/Shanghai"
     run_time: time = time(15, 30)
@@ -718,21 +740,11 @@ class ScheduleCreateRequest(BaseModel):
             raise ValueError("timezone is not available") from exc
         if self.kind == "rdagent_research":
             normalize_research_schedule_payload(self.payload, max_loops=20)
-        elif self.kind == "paper_rebalance":
-            if not self.payload.get("portfolio_id"):
-                raise ValueError("paper_rebalance requires portfolio_id")
+        elif self.kind == "recommendation_refresh":
+            if not self.payload.get("recommendation_portfolio_id"):
+                raise ValueError("recommendation_refresh requires recommendation_portfolio_id")
             if self.run_time < time(15, 10):
-                raise ValueError("paper_rebalance must run after the A-share close")
-        elif self.kind == "pair_paper_rebalance":
-            if not self.payload.get("pair_portfolio_id"):
-                raise ValueError("pair_paper_rebalance requires pair_portfolio_id")
-            if self.run_time < time(15, 10):
-                raise ValueError("pair_paper_rebalance must run after the A-share close")
-        elif self.kind == "broker_reconcile":
-            if not self.payload.get("destination_id"):
-                raise ValueError("broker_reconcile requires destination_id")
-            if self.run_time < time(15, 10):
-                raise ValueError("broker_reconcile must run after the A-share close")
+                raise ValueError("recommendation_refresh must run after the A-share close")
         elif self.kind == "incremental_sync":
             profile = self.payload.get("profile", "full")
             if profile not in {"core", "research", "full"}:
@@ -920,7 +932,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     data_tasks = DataTaskStore(settings.database_url)
     research = ResearchStore(settings.database_url)
     strategies = StrategyStore(settings.database_url)
-    portfolios = PortfolioStore(settings.database_url)
+    recommendations = RecommendationStore(settings.database_url)
     pair_portfolios = PairPortfolioStore(settings.database_url)
     parameter_experiments = ParameterExperimentStore(settings.database_url)
     autonomous_research = AutonomousResearchOrchestrator(settings)
@@ -929,7 +941,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     schedules = ScheduleStore(settings.database_url)
     alerts = AlertStore(settings.database_url)
     health_history = OperationalHealthStore(settings)
-    brokers = BrokerStore(settings)
+    brokers = BrokerStore(settings) if settings.broker_feature_enabled else None
     auth = AuthStore(settings.database_url)
     runtime_secrets = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
     platform_configs = PlatformConfigStore(settings.database_url)
@@ -1015,9 +1027,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "updated_at": record.get("updated_at") if record else None,
         }
 
-    def require_qlib_dataset(
-        name: str, *, purpose: str, frequency: str | None = None
-    ) -> dict:
+    def require_qlib_dataset(name: str, *, purpose: str, frequency: str | None = None) -> dict:
         available = {item["name"]: item for item in list_qlib_datasets(settings.data_root)}
         dataset = available.get(name)
         if not dataset or not dataset["ready"]:
@@ -1034,6 +1044,29 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 f"{dataset.get('frequency') or 'unknown'}",
             )
         return dataset
+
+    def require_research_calendar(dataset: dict, periods: dict[str, str]) -> None:
+        calendar_path = Path(dataset["path"]) / "calendars" / "day.txt"
+        try:
+            calendar = [
+                date.fromisoformat(line.strip())
+                for line in calendar_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except (OSError, ValueError) as exc:
+            raise HTTPException(409, "Qlib trading calendar is missing or invalid") from exc
+        valid_start = date.fromisoformat(periods["valid_start"])
+        valid_end = date.fromisoformat(periods["valid_end"])
+        test_start = date.fromisoformat(periods["test_start"])
+        test_end = date.fromisoformat(periods["test_end"])
+        valid_days = sum(valid_start <= day <= valid_end for day in calendar)
+        test_days = sum(test_start <= day <= test_end for day in calendar)
+        if valid_days < 126 or test_days < 252:
+            raise HTTPException(
+                409,
+                f"Qlib calendar provides {valid_days} validation and {test_days} final-test "
+                "trading days; at least 126 and 252 are required",
+            )
 
     def client_ip_hash(request: Request) -> str | None:
         forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
@@ -1344,6 +1377,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 "updated_at": (alert_record or {}).get("updated_at"),
             },
             "broker": {
+                "feature_enabled": settings.broker_feature_enabled,
                 "mode": settings.broker_mode,
                 "configured": bool(
                     (broker_record or {}).get("metadata_json", {}).get("enabled")
@@ -1503,9 +1537,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.get("/api/overview")
     def overview() -> dict:
-        return system_summary(
-            effective_settings(), checkpoint, jobs.list(), data_tasks.list()
-        )
+        return system_summary(effective_settings(), checkpoint, jobs.list(), data_tasks.list())
 
     @app.get("/api/datasets")
     def datasets() -> list[dict]:
@@ -1618,6 +1650,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             payload.dataset, purpose="RD-Agent research", frequency="day"
         )
         periods = payload.periods.model_dump(mode="json")
+        require_research_calendar(dataset, periods)
         if (
             dataset.get("start_date")
             and payload.periods.train_start.isoformat() < dataset["start_date"]
@@ -1646,6 +1679,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "research_run_id": run["id"],
                     "dataset": payload.dataset,
                     "dataset_path": dataset["path"],
+                    "dataset_identity_sha256": dataset["provenance"]["dataset_identity_sha256"],
                     "objective": payload.objective,
                     "loop_n": payload.loop_n,
                     "duration": payload.duration,
@@ -1685,9 +1719,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             payload.dataset, purpose="continuous research", frequency="day"
         )
         if not dataset.get("lineage_verified") or not dataset.get("lineage_id"):
-            raise HTTPException(
-                409, "continuous research requires a verified Qlib dataset lineage"
-            )
+            raise HTTPException(409, "continuous research requires a verified Qlib dataset lineage")
         try:
             recipe = get_strategy_recipe(payload.recipe_id)
             actor = authenticated_actor(request, payload.actor)
@@ -1734,16 +1766,15 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "strategy_config": strategy_config,
                     "parameter_grid": parameter_grid,
                     "experiment_trials": experiment_trials,
-                    "paper": {
-                        "initial_cash": payload.initial_cash,
+                    "recommendation": {
+                        "hypothetical_initial_value": payload.hypothetical_initial_value,
                         "timezone": payload.timezone,
-                        "run_time": payload.paper_run_time.isoformat(timespec="minutes"),
-                        "slippage": payload.paper_slippage,
+                        "run_time": payload.recommendation_run_time.isoformat(
+                            timespec="minutes"
+                        ),
                         "misfire_grace_seconds": payload.misfire_grace_seconds,
                     },
                     "manual_strategy_approval": True,
-                    "champion_min_score_improvement": payload.champion_min_score_improvement,
-                    "champion_decay_fraction": payload.champion_decay_fraction,
                 },
                 min_new_trading_days=payload.min_new_trading_days,
                 max_active_campaigns=payload.max_active_campaigns,
@@ -1809,6 +1840,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         dataset = require_qlib_dataset(
             payload.dataset, purpose="autonomous research", frequency="day"
         )
+        require_research_calendar(dataset, payload.periods.model_dump(mode="json"))
         if (
             dataset.get("start_date")
             and payload.periods.train_start.isoformat() < dataset["start_date"]
@@ -1869,16 +1901,17 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                         "end": payload.periods.test_end.isoformat(),
                     },
                     "experiment_periods": split_research_period(
-                        payload.periods.test_start, payload.periods.test_end
+                        payload.periods.valid_start, payload.periods.valid_end
                     ),
                     "parameter_grid": parameter_grid,
                     "experiment_trials": experiment_trials,
                     "max_factors": payload.max_factors,
-                    "paper": {
-                        "initial_cash": payload.initial_cash,
+                    "recommendation": {
+                        "hypothetical_initial_value": payload.hypothetical_initial_value,
                         "timezone": payload.timezone,
-                        "run_time": payload.paper_run_time.isoformat(timespec="minutes"),
-                        "slippage": payload.paper_slippage,
+                        "run_time": payload.recommendation_run_time.isoformat(
+                            timespec="minutes"
+                        ),
                         "misfire_grace_seconds": payload.misfire_grace_seconds,
                     },
                     "manual_strategy_approval": True,
@@ -1916,9 +1949,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.post("/api/research-campaigns/{campaign_id}/retry")
     def retry_research_campaign(campaign_id: str, request: Request) -> dict[str, Any]:
         try:
-            autonomous_research.retry(
-                campaign_id, actor=authenticated_actor(request)
-            )
+            autonomous_research.retry(campaign_id, actor=authenticated_actor(request))
         except KeyError as exc:
             raise HTTPException(404, "research campaign not found") from exc
         except ValueError as exc:
@@ -1941,10 +1972,14 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.post("/api/factors/{candidate_id}/evaluations", status_code=201)
     def record_factor_evaluation(candidate_id: str, payload: FactorEvaluationRequest) -> dict:
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="factor evaluation", frequency="day"
+        )
         try:
             return research.record_evaluation(
                 candidate_id,
                 dataset=payload.dataset,
+                dataset_identity_sha256=dataset["provenance"]["dataset_identity_sha256"],
                 **payload.periods.model_dump(),
                 metrics=payload.metrics,
                 artifact_path=payload.artifact_path,
@@ -2078,9 +2113,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(404, "parameter experiment not found") from exc
 
-    @app.post(
-        "/api/strategy-versions/{version_id}/parameter-experiments", status_code=202
-    )
+    @app.post("/api/strategy-versions/{version_id}/parameter-experiments", status_code=202)
     def create_parameter_experiment(
         version_id: str, payload: ParameterExperimentRequest, request: Request
     ) -> dict:
@@ -2271,9 +2304,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         payload: StrategyAllocationCreateRequest,
         request: Request,
     ) -> dict:
-        require_qlib_dataset(
-            payload.dataset, purpose="strategy allocation", frequency="day"
-        )
+        require_qlib_dataset(payload.dataset, purpose="strategy allocation", frequency="day")
         fixed_weights = (
             {
                 item.strategy_version_id: float(item.weight)
@@ -2539,190 +2570,113 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.post("/api/pair-portfolios/{portfolio_id}/rebalance", status_code=202)
     def rebalance_pair_portfolio(portfolio_id: str, payload: PortfolioRebalanceRequest) -> dict:
-        try:
-            portfolio = pair_portfolios.get(portfolio_id)
-        except KeyError as exc:
-            raise HTTPException(404, "pair portfolio not found") from exc
-        try:
-            dataset = select_qlib_dataset(
-                settings.data_root,
-                anchor_name=portfolio["dataset"],
-                roll_policy=portfolio["dataset_roll_policy"],
-                lineage_id=portfolio.get("dataset_lineage_id"),
-                required_date=payload.as_of_date,
-                require_later_date=True,
-            )
-            trade_date = next_qlib_trading_date(dataset, payload.as_of_date)
-            execution = select_execution_snapshot(
-                settings.data_root,
-                anchor_name=portfolio["execution_snapshot"],
-                roll_policy=portfolio["execution_roll_policy"],
-                lineage_id=portfolio.get("execution_lineage_id"),
-                required_date=trade_date,
-                minute_dataset=portfolio["minute_dataset"],
-                shortability_dataset=portfolio["shortability_dataset"],
-            )
-            artifact_root = (
-                settings.data_root / "artifacts" / "pair-paper-portfolios" / portfolio_id
-            )
-            batch, created = pair_portfolios.create_batch(
-                portfolio_id=portfolio_id,
-                as_of_date=payload.as_of_date,
-                artifact_path=artifact_root,
-                dataset_evidence=dataset,
-                execution_evidence=execution,
-            )
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-        if not created:
-            return batch
-        log_path = platform_root / "logs" / f"pair-paper-rebalance-{batch['id']}.log"
-        try:
-            job = jobs.create(
-                "pair_paper_rebalance",
-                {
-                    "pair_portfolio_id": portfolio_id,
-                    "pair_portfolio_batch_id": batch["id"],
-                    "dataset": dataset["name"],
-                    "dataset_path": dataset["path"],
-                    "dataset_start": dataset["start_date"],
-                    "daily_provenance": dataset["provenance"],
-                    "as_of_date": payload.as_of_date.isoformat(),
-                    "minute_dataset": execution["minute"],
-                    "shortability_dataset": execution["shortability"],
-                },
-                log_path,
-            )
-        except ValueError as exc:
-            pair_portfolios.mark_batch(batch["id"], "failed", error=str(exc))
-            raise HTTPException(409, str(exc)) from exc
-        pair_portfolios.attach_job(batch["id"], job["id"])
-        worker.notify()
-        return pair_portfolios.get_batch(batch["id"])
+        del portfolio_id, payload
+        raise HTTPException(410, "pair execution is retired; research backtests remain available")
 
-    @app.get("/api/portfolios")
-    def list_portfolios(limit: int = Query(100, ge=1, le=500)) -> list[dict]:
-        return portfolios.list(limit)
+    @app.api_route("/api/portfolios", methods=["GET", "POST"], status_code=410)
+    @app.api_route("/api/portfolios/{legacy_path:path}", methods=["GET", "POST"], status_code=410)
+    def legacy_portfolios_retired(legacy_path: str = "") -> dict[str, str]:
+        return {"status": "retired", "replacement": "/api/recommendation-portfolios"}
 
-    @app.post("/api/portfolios", status_code=201)
-    def create_portfolio(payload: PortfolioCreateRequest, request: Request) -> dict:
-        dataset = require_qlib_dataset(
-            payload.dataset, purpose="paper portfolio", frequency="day"
-        )
+    @app.get("/api/recommendation-portfolios")
+    def list_recommendation_portfolios(
+        limit: int = Query(100, ge=1, le=500),
+    ) -> list[dict]:
+        return recommendations.list(limit)
+
+    @app.post("/api/recommendation-portfolios", status_code=201)
+    def create_recommendation_portfolio(
+        payload: RecommendationPortfolioCreateRequest, request: Request
+    ) -> dict:
+        require_qlib_dataset(payload.dataset, purpose="recommendation portfolio", frequency="day")
         try:
-            return portfolios.create(
+            return recommendations.create(
                 name=payload.name,
                 strategy_version_id=payload.strategy_version_id,
                 dataset=payload.dataset,
-                initial_cash=payload.initial_cash,
+                hypothetical_initial_value=payload.hypothetical_initial_value,
                 actor=authenticated_actor(request, payload.actor),
-                dataset_roll_policy=payload.dataset_roll_policy,
-                dataset_lineage_id=dataset.get("lineage_id"),
             )
         except KeyError as exc:
             raise HTTPException(404, "strategy version not found") from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 
-    @app.get("/api/portfolios/{portfolio_id}")
-    def get_portfolio(portfolio_id: str) -> dict:
+    @app.get("/api/recommendation-portfolios/{portfolio_id}")
+    def get_recommendation_portfolio(portfolio_id: str) -> dict:
         try:
-            return portfolios.get(portfolio_id)
+            return recommendations.get(portfolio_id)
         except KeyError as exc:
-            raise HTTPException(404, "portfolio not found") from exc
+            raise HTTPException(404, "recommendation portfolio not found") from exc
 
-    @app.post("/api/portfolios/{portfolio_id}/status")
-    def set_portfolio_status(portfolio_id: str, payload: PortfolioStatusRequest) -> dict:
+    @app.get("/api/recommendation-portfolios/{portfolio_id}/snapshots/{snapshot_id}")
+    def get_recommendation_snapshot(portfolio_id: str, snapshot_id: str) -> dict:
         try:
-            return portfolios.set_status(portfolio_id, payload.status)
+            snapshot = recommendations.get_snapshot(snapshot_id)
         except KeyError as exc:
-            raise HTTPException(404, "portfolio not found") from exc
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(404, "recommendation snapshot not found") from exc
+        if snapshot["portfolio_id"] != portfolio_id:
+            raise HTTPException(404, "recommendation snapshot not found")
+        return snapshot
 
-    @app.post("/api/portfolios/{portfolio_id}/risk-events/{event_id}/acknowledge")
-    def acknowledge_portfolio_risk_event(
-        portfolio_id: str,
-        event_id: int,
-        payload: RiskEventAcknowledgementRequest,
-        request: Request,
+    @app.get("/api/recommendation-portfolios/{portfolio_id}/holdings")
+    def get_recommendation_holdings(portfolio_id: str) -> list[dict]:
+        try:
+            portfolio = recommendations.get(portfolio_id)
+        except KeyError as exc:
+            raise HTTPException(404, "recommendation portfolio not found") from exc
+        latest = portfolio.get("latest_snapshot") or {}
+        return list(latest.get("holdings") or [])
+
+    @app.get("/api/recommendation-portfolios/{portfolio_id}/hypothetical-performance")
+    def get_recommendation_hypothetical_performance(portfolio_id: str) -> list[dict]:
+        try:
+            portfolio = recommendations.get(portfolio_id)
+        except KeyError as exc:
+            raise HTTPException(404, "recommendation portfolio not found") from exc
+        return list(portfolio.get("hypothetical_performance") or [])
+
+    @app.post("/api/recommendation-portfolios/{portfolio_id}/refresh", status_code=202)
+    def refresh_recommendation_portfolio(
+        portfolio_id: str, payload: RecommendationRefreshRequest
     ) -> dict:
         try:
-            return portfolios.acknowledge_risk_event(
-                portfolio_id,
-                event_id,
-                actor=authenticated_actor(request, payload.actor),
-            )
-        except KeyError as exc:
-            raise HTTPException(404, "portfolio risk event not found") from exc
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/portfolios/{portfolio_id}/risk-events/{event_id}/resolve")
-    def resolve_portfolio_risk_event(
-        portfolio_id: str,
-        event_id: int,
-        payload: RiskEventResolutionRequest,
-        request: Request,
-    ) -> dict:
-        try:
-            return portfolios.resolve_risk_event(
-                portfolio_id,
-                event_id,
-                actor=authenticated_actor(request, payload.actor),
-                reason=payload.reason,
-            )
-        except KeyError as exc:
-            raise HTTPException(404, "portfolio risk event not found") from exc
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/portfolios/{portfolio_id}/rebalance", status_code=202)
-    def rebalance_portfolio(portfolio_id: str, payload: PortfolioRebalanceRequest) -> dict:
-        try:
-            portfolio = portfolios.get(portfolio_id)
-        except KeyError as exc:
-            raise HTTPException(404, "portfolio not found") from exc
-        artifact_root = settings.data_root / "artifacts" / "paper-portfolios" / portfolio_id
-        try:
+            portfolio = recommendations.get(portfolio_id)
             dataset = select_qlib_dataset(
                 settings.data_root,
                 anchor_name=portfolio["dataset"],
-                roll_policy=portfolio["dataset_roll_policy"],
-                lineage_id=portfolio.get("dataset_lineage_id"),
+                roll_policy="pinned",
+                lineage_id=None,
                 required_date=payload.as_of_date,
             )
-            batch, created = portfolios.create_batch(
+            snapshot, created = recommendations.create_snapshot(
                 portfolio_id=portfolio_id,
                 as_of_date=payload.as_of_date,
-                artifact_path=artifact_root,
-                dataset_evidence=dataset,
+                dataset=dataset["name"],
+                dataset_identity_sha256=dataset["provenance"]["dataset_identity_sha256"],
             )
+        except KeyError as exc:
+            raise HTTPException(404, "recommendation portfolio not found") from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         if not created:
-            return batch
-        log_path = platform_root / "logs" / f"paper-rebalance-{batch['id']}.log"
-        try:
-            job = jobs.create(
-                "paper_rebalance",
-                {
-                    "portfolio_id": portfolio_id,
-                    "portfolio_batch_id": batch["id"],
-                    "dataset": dataset["name"],
-                    "dataset_path": dataset["path"],
-                    "daily_provenance": dataset["provenance"],
-                    "as_of_date": payload.as_of_date.isoformat(),
-                    "slippage": payload.slippage,
-                },
-                log_path,
-            )
-        except ValueError as exc:
-            portfolios.mark_batch(batch["id"], "failed", error=str(exc))
-            raise HTTPException(409, str(exc)) from exc
-        portfolios.attach_job(batch["id"], job["id"])
+            return snapshot
+        job = jobs.create(
+            "recommendation_refresh",
+            {
+                "recommendation_portfolio_id": portfolio_id,
+                "recommendation_snapshot_id": snapshot["id"],
+                "dataset": dataset["name"],
+                "dataset_path": dataset["path"],
+                "dataset_identity_sha256": dataset["provenance"]["dataset_identity_sha256"],
+                "as_of_date": payload.as_of_date.isoformat(),
+            },
+            platform_root / "logs" / f"recommendation-refresh-{snapshot['id']}.log",
+            dedupe_active_kind=False,
+        )
+        recommendations.attach_job(snapshot["id"], job["id"])
         worker.notify()
-        return portfolios.get_batch(batch["id"])
+        return recommendations.get_snapshot(snapshot["id"])
 
     @app.get("/api/schedules")
     def list_schedules(limit: int = Query(200, ge=1, le=500)) -> list[dict]:
@@ -2756,31 +2710,20 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 frequency="day",
             )
             periods = research_payload["periods"]
+            require_research_calendar(dataset, periods)
             if dataset.get("start_date") and periods["train_start"] < dataset["start_date"]:
                 raise HTTPException(409, "training window starts before the selected dataset")
             if dataset.get("end_date") and periods["test_end"] > dataset["end_date"]:
                 raise HTTPException(409, "test window ends after the selected dataset")
-        elif payload.kind == "paper_rebalance":
+        elif payload.kind == "recommendation_refresh":
             try:
-                portfolio = portfolios.get(str(schedule_payload["portfolio_id"]))
+                portfolio = recommendations.get(
+                    str(schedule_payload["recommendation_portfolio_id"])
+                )
             except KeyError as exc:
-                raise HTTPException(404, "portfolio not found") from exc
-            if portfolio["status"] == "closed":
-                raise HTTPException(409, "closed portfolios cannot be scheduled")
-        elif payload.kind == "pair_paper_rebalance":
-            try:
-                portfolio = pair_portfolios.get(str(schedule_payload["pair_portfolio_id"]))
-            except KeyError as exc:
-                raise HTTPException(404, "pair portfolio not found") from exc
-            if portfolio["status"] == "closed":
-                raise HTTPException(409, "closed pair portfolios cannot be scheduled")
-        elif payload.kind == "broker_reconcile":
-            try:
-                destination = brokers.get_destination(str(schedule_payload["destination_id"]))
-            except KeyError as exc:
-                raise HTTPException(404, "broker destination not found") from exc
-            if destination["status"] != "armed":
-                raise HTTPException(409, "broker destination must be armed before scheduling")
+                raise HTTPException(404, "recommendation portfolio not found") from exc
+            if portfolio["status"] != "active":
+                raise HTTPException(409, "only active recommendation portfolios can be scheduled")
         try:
             return schedules.create(
                 name=payload.name,
@@ -2988,9 +2931,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(422, f"unsupported job status: {sorted(unknown)}")
         statuses = tuple(status or [])
         kinds = tuple(item for item in (kind or []) if item.strip())
-        response.headers["X-Total-Count"] = str(
-            jobs.count(statuses=statuses, kinds=kinds)
-        )
+        response.headers["X-Total-Count"] = str(jobs.count(statuses=statuses, kinds=kinds))
         response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
         return jobs.list(limit, offset=offset, statuses=statuses, kinds=kinds)
 
@@ -3214,6 +3155,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.post("/api/jobs/{job_id}/retry", status_code=202)
     def retry_job(job_id: str) -> dict:
         try:
+            existing = jobs.get(job_id)
+            if existing["kind"] == "strategy_backtest":
+                raise ValueError("formal final-test jobs cannot be retried")
             job = jobs.retry(job_id)
         except KeyError as exc:
             raise HTTPException(404, "job not found") from exc
@@ -3235,9 +3179,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.post("/api/jobs/qlib-baseline", status_code=202)
     def create_qlib_baseline(payload: QlibBaselineRequest) -> dict:
-        dataset = require_qlib_dataset(
-            payload.dataset, purpose="Qlib baseline", frequency="day"
-        )
+        dataset = require_qlib_dataset(payload.dataset, purpose="Qlib baseline", frequency="day")
         serialized = {
             "dataset": payload.dataset,
             "dataset_path": dataset["path"],
@@ -3300,9 +3242,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         serialized = {
             "dataset": payload.dataset,
             "dataset_path": dataset["path"],
-            "dataset_identity_sha256": dataset["provenance"][
-                "dataset_identity_sha256"
-            ],
+            "dataset_identity_sha256": dataset["provenance"]["dataset_identity_sha256"],
             "start": payload.start.isoformat(),
             "end": payload.end.isoformat(),
             "horizons": sorted(payload.horizons),
@@ -3316,6 +3256,27 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(409, str(exc)) from exc
         worker.notify()
         return job
+
+    @app.get("/api/capabilities")
+    def platform_capabilities() -> dict[str, Any]:
+        return {
+            "broker_qmt": settings.broker_feature_enabled,
+            "recommendation_tracking": True,
+            "research_pipeline_version": "research-pipeline-v2",
+        }
+
+    if not settings.broker_feature_enabled:
+        app.router.routes = [
+            route for route in app.router.routes if "/broker" not in str(getattr(route, "path", ""))
+        ]
+
+    app.router.routes = [
+        route
+        for route in app.router.routes
+        if not str(getattr(route, "path", "")).startswith(
+            ("/api/pair-portfolios", "/api/strategy-allocations")
+        )
+    ]
 
     return app
 

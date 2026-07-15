@@ -14,14 +14,15 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from quant_platform.strategy_backtest import (
-    build_governed_signal,
-    compose_factor_scores,
-    run_event_stress_suite,
-    run_robustness_suite,
-    run_rolling_suite,
-    simulate_long_only_topk,
+from quant_platform.cost_model import CostModelConfig
+from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
+from quant_platform.qlib_backtest import (
+    QLIB_ENGINE_VERSION,
+    run_formal_qlib_backtest,
+    run_qlib_validation_suites,
 )
+from quant_platform.qlib_policy_strategy import create_qlib_policy_strategy
+from quant_platform.strategy_backtest import build_governed_signal, compose_factor_scores
 
 
 def _load(path: str) -> pd.DataFrame:
@@ -46,6 +47,83 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _latest_cross_section(frame: pd.DataFrame, when: pd.Timestamp, column: str) -> pd.Series:
+    values = frame.copy()
+    values["datetime"] = pd.to_datetime(values["datetime"], errors="coerce").dt.tz_localize(None)
+    values = values[values["datetime"] <= when]
+    if values.empty:
+        raise ValueError(f"point-in-time metadata has no {column} values at {when.date()}")
+    latest = values["datetime"].max()
+    snapshot = values[values["datetime"] == latest]
+    result = pd.to_numeric(snapshot[column], errors="coerce")
+    result.index = snapshot["instrument"].astype(str)
+    if result.index.has_duplicates or result.isna().any():
+        raise ValueError(f"point-in-time metadata {column} is duplicated or incomplete")
+    return result.astype(float)
+
+
+def _qlib_cross_section(frame: pd.DataFrame, when: pd.Timestamp, column: str) -> pd.Series:
+    values = frame.copy()
+    dates = pd.to_datetime(values.index.get_level_values("datetime")).tz_localize(None)
+    values.index = pd.MultiIndex.from_arrays(
+        [dates, values.index.get_level_values("instrument").astype(str)],
+        names=["datetime", "instrument"],
+    )
+    values = values.sort_index()
+    available = values.loc[(slice(None, when), slice(None)), column]
+    if available.empty:
+        raise ValueError(f"Qlib has no {column} data at {when.date()}")
+    return pd.to_numeric(
+        available.xs(available.index.get_level_values("datetime").max()), errors="coerce"
+    ).astype(float)
+
+
+def _metadata_provider(
+    memberships: pd.DataFrame,
+    benchmark_weights: pd.DataFrame,
+    styles: pd.DataFrame,
+    execution_metadata: pd.DataFrame,
+):
+    membership = memberships.copy()
+    membership["in_date"] = pd.to_datetime(membership["in_date"], errors="coerce")
+    membership["out_date"] = pd.to_datetime(membership["out_date"], errors="coerce")
+
+    def provide(when: Any, instruments: pd.Index) -> dict[str, Any]:
+        timestamp = pd.Timestamp(when).tz_localize(None)
+        active = (
+            membership[
+                (membership["in_date"] <= timestamp)
+                & (membership["out_date"].isna() | (membership["out_date"] >= timestamp))
+            ]
+            .sort_values("in_date")
+            .drop_duplicates("instrument", keep="last")
+        )
+        industries = active.set_index(active["instrument"].astype(str))["industry"].astype(str)
+        benchmark = _latest_cross_section(benchmark_weights, timestamp, "weight")
+        style = _latest_cross_section(styles, timestamp, "log_market_cap")
+        benchmark_industries = industries.reindex(benchmark.index)
+        if benchmark_industries.isna().any():
+            raise ValueError("benchmark constituents are missing point-in-time industries")
+        return {
+            "industries": industries.reindex(instruments.astype(str)),
+            "benchmark_weights": benchmark,
+            "benchmark_industry_weights": benchmark.groupby(benchmark_industries).sum(),
+            "style_exposures": style,
+            "benchmark_style_exposure": float(benchmark.dot(style.reindex(benchmark.index))),
+            "prices": _qlib_cross_section(execution_metadata, timestamp, "$open").reindex(
+                instruments.astype(str)
+            ),
+            "average_daily_values": (
+                _qlib_cross_section(
+                    execution_metadata, timestamp, "Ref(Mean($amount, 20), 1)"
+                ).reindex(instruments.astype(str))
+                * 1000.0
+            ),
+        }
+
+    return provide
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-uri", required=True)
@@ -58,8 +136,7 @@ def main() -> None:
         raise ValueError("formal Qlib backtest requires dataset provenance metadata")
     provider_provenance = json.loads(provider_provenance_path.read_text(encoding="utf-8"))
     factor_value_hashes = {
-        str(item["candidate_id"]): _sha256_file(item["values_path"])
-        for item in manifest["factors"]
+        str(item["candidate_id"]): _sha256_file(item["values_path"]) for item in manifest["factors"]
     }
     factor_code_hashes = {
         str(item["candidate_id"]): item.get("code_sha256") for item in manifest["factors"]
@@ -73,28 +150,10 @@ def main() -> None:
     instruments = sorted(set(scores.index.get_level_values("instrument")))
 
     import qlib
-    from qlib.contrib.evaluate import backtest_daily
-    from qlib.contrib.strategy import TopkDropoutStrategy
     from qlib.data import D
 
     qlib.init(provider_uri=args.provider_uri, region="cn")
     periods = manifest["periods"]
-    returns = D.features(
-        instruments,
-        ["Ref($open, -2)/Ref($open, -1)-1"],
-        start_time=periods["start"],
-        end_time=periods["end"],
-        freq="day",
-    )
-    # Qlib stores the Tushare daily amount field in thousands of CNY. Ref(..., -1)
-    # aligns the execution-day amount with a signal produced after the prior close.
-    amount = D.features(
-        instruments,
-        ["Ref($amount, -1)"],
-        start_time=periods["start"],
-        end_time=periods["end"],
-        freq="day",
-    ).mul(1000.0)
     liquidity_amount = D.features(
         instruments,
         ["$amount"],
@@ -102,14 +161,13 @@ def main() -> None:
         end_time=periods["end"],
         freq="day",
     ).mul(1000.0)
-    controls = D.features(
+    execution_metadata = D.features(
         instruments,
-        ["Ref($open, -1)", "Ref($paused, -1)", "Ref($up_limit, -1)", "Ref($down_limit, -1)"],
+        ["$open", "Ref(Mean($amount, 20), 1)"],
         start_time=periods["start"],
         end_time=periods["end"],
         freq="day",
     )
-    controls.columns = ["open", "paused", "up_limit", "down_limit"]
     industry_path = Path(args.provider_uri) / "metadata" / "industry_memberships.parquet"
     industry_memberships = pd.read_parquet(industry_path) if industry_path.exists() else None
     industry_cap_enabled = float(manifest["config"].get("max_industry_weight", 1.0)) < 1.0
@@ -129,14 +187,6 @@ def main() -> None:
         raise ValueError("index-enhancement backtest requires historical benchmark weights")
     if style_exposures is None:
         raise ValueError("index-enhancement backtest requires point-in-time size exposures")
-    benchmark_frame = D.features(
-        [manifest["benchmark"]],
-        ["Ref($open, -2)/Ref($open, -1)-1"],
-        start_time=periods["start"],
-        end_time=periods["end"],
-        freq="day",
-    )
-    benchmark = benchmark_frame.iloc[:, 0].droplevel("instrument")
     config = manifest["config"]
     governed_signal = build_governed_signal(
         scores,
@@ -150,189 +200,81 @@ def main() -> None:
         min_average_daily_amount=float(config.get("min_average_daily_amount", 0.0)),
         liquidity_lookback_days=int(config.get("liquidity_lookback_days", 20)),
     )
-    qlib_strategy = TopkDropoutStrategy(
-        signal=governed_signal,
-        topk=int(config["topk"]),
-        n_drop=int(config["n_drop"]),
-        only_tradable=True,
-        forbid_all_trade_at_limit=False,
+    cost_model = CostModelConfig.from_mapping(config)
+    policy = PortfolioPolicy(PortfolioPolicyConfig.from_mapping(config), cost_model)
+    metadata = _metadata_provider(
+        industry_memberships, benchmark_weights, style_exposures, execution_metadata
     )
-    qlib_report, qlib_positions = backtest_daily(
+
+    def run(start: str, end: str, costs: CostModelConfig):
+        scenario_policy = PortfolioPolicy(PortfolioPolicyConfig.from_mapping(config), costs)
+        strategy = create_qlib_policy_strategy(
+            signal=governed_signal,
+            policy=scenario_policy,
+            metadata_provider=metadata,
+        )
+        return run_formal_qlib_backtest(
+            strategy=strategy,
+            start_time=start,
+            end_time=end,
+            account=float(config["capacity_notional"]),
+            benchmark=manifest["benchmark"],
+            cost_model=costs,
+        )
+
+    formal = run(periods["start"], periods["end"], cost_model)
+    validation = run_qlib_validation_suites(
+        runner=run,
+        full_result=formal,
         start_time=periods["start"],
         end_time=periods["end"],
-        strategy=qlib_strategy,
-        account=float(config["capacity_notional"]),
-        benchmark=manifest["benchmark"],
-        exchange_kwargs={
-            "freq": "day",
-            "deal_price": "open",
-            "limit_threshold": (
-                "Or($paused, Ge($open, $up_limit))",
-                "Or($paused, Le($open, $down_limit))",
-            ),
-            "volume_threshold": (
-                "current",
-                f"{float(config['max_volume_participation'])} * $volume",
-            ),
-            "open_cost": float(config["open_cost"]),
-            "close_cost": float(config["close_cost"]),
-            "min_cost": float(config.get("min_commission", 5.0)),
-            "trade_unit": 100,
+        cost_model=cost_model,
+        config=config,
+    )
+    qlib_report = formal.report
+    qlib_positions = formal.positions
+    metrics = {
+        **formal.metrics,
+        "policy_version": policy.version,
+        "cost_model": cost_model.to_dict(),
+        "robustness": {"double_cost": validation["double_cost"]},
+        "robustness_passed": validation["double_cost"]["passed"],
+        "robustness_pass_rate": 1.0 if validation["double_cost"]["passed"] else 0.0,
+        "rolling": validation["rolling"],
+        "rolling_pass_rate": validation["rolling"]["pass_rate"],
+        "rolling_passed": validation["rolling"]["passed"],
+        "rolling_window_count": validation["rolling"]["window_count"],
+        "event_stress": validation["event_stress"],
+        "event_stress_count": validation["event_stress"]["event_count"],
+        "event_stress_pass_rate": validation["event_stress"]["pass_rate"],
+        "event_stress_passed": validation["event_stress"]["passed"],
+        "provenance": {
+            "dataset_identity_sha256": provider_provenance.get("dataset_identity_sha256"),
+            "snapshot_manifest_sha256": provider_provenance.get("snapshot_manifest_sha256"),
+            "qlib_builder_sha256": provider_provenance.get("qlib_builder_sha256"),
+            "strategy_config_sha256": _canonical_sha256(config),
+            "execution_manifest_sha256": _sha256_file(args.manifest),
+            "factor_values_sha256": factor_value_hashes,
+            "factor_code_sha256": factor_code_hashes,
+            "qlib_version": getattr(qlib, "__version__", "unknown"),
+            "backtest_engine_version": QLIB_ENGINE_VERSION,
+            "policy_version": policy.version,
         },
-    )
-    metrics, daily, positions = simulate_long_only_topk(
-        scores,
-        returns,
-        benchmark,
-        topk=int(config["topk"]),
-        n_drop=int(config["n_drop"]),
-        max_position_weight=float(config["max_position_weight"]),
-        max_daily_turnover=float(config["max_daily_turnover"]),
-        open_cost=float(config["open_cost"]),
-        close_cost=float(config["close_cost"]),
-        market_amount=amount,
-        liquidity_amount=liquidity_amount,
-        market_controls=controls,
-        industry_memberships=industry_memberships,
-        max_industry_weight=float(config.get("max_industry_weight", 1.0)),
-        benchmark_weights=benchmark_weights,
-        style_exposures=style_exposures,
-        max_industry_deviation=float(config.get("max_industry_deviation", 1.0)),
-        max_size_deviation=float(config.get("max_size_deviation", 10.0)),
-        portfolio_construction=str(
-            config.get("portfolio_construction", "topk_equal_weight")
-        ),
-        optimizer_alpha_weight=float(config.get("optimizer_alpha_weight", 0.05)),
-        optimizer_tracking_penalty=float(
-            config.get("optimizer_tracking_penalty", 1.0)
-        ),
-        optimizer_turnover_penalty=float(
-            config.get("optimizer_turnover_penalty", 0.10)
-        ),
-        portfolio_notional=float(config["capacity_notional"]),
-        max_volume_participation=float(config["max_volume_participation"]),
-        execution_risk_enabled=True,
-        max_daily_loss=float(config.get("max_daily_loss", 0.03)),
-        stop_loss=float(config.get("stop_loss", 0.07)),
-        take_profit_partial=float(config.get("take_profit_partial", 0.12)),
-        take_profit_partial_fraction=float(config.get("take_profit_partial_fraction", 0.50)),
-        take_profit=float(config.get("take_profit", 0.20)),
-        max_drawdown_reduce=float(config.get("max_drawdown_reduce", 0.10)),
-        max_drawdown_liquidate=float(config.get("max_drawdown_liquidate", 0.15)),
-        drawdown_reduction_exposure=float(config.get("drawdown_reduction_exposure", 0.50)),
-    )
-    robustness = run_robustness_suite(
-        scores,
-        returns,
-        benchmark,
-        config=config,
-        market_amount=amount,
-        liquidity_amount=liquidity_amount,
-        market_controls=controls,
-        industry_memberships=industry_memberships,
-        benchmark_weights=benchmark_weights,
-        style_exposures=style_exposures,
-    )
-    rolling = run_rolling_suite(
-        scores,
-        returns,
-        benchmark,
-        config=config,
-        market_amount=amount,
-        liquidity_amount=liquidity_amount,
-        market_controls=controls,
-        industry_memberships=industry_memberships,
-        benchmark_weights=benchmark_weights,
-        style_exposures=style_exposures,
-    )
-    event_stress = run_event_stress_suite(
-        scores,
-        returns,
-        benchmark,
-        config=config,
-        market_amount=amount,
-        liquidity_amount=liquidity_amount,
-        market_controls=controls,
-        industry_memberships=industry_memberships,
-        benchmark_weights=benchmark_weights,
-        style_exposures=style_exposures,
-    )
-    execution_replay_metrics = dict(metrics)
-    execution_replay_sha256 = _canonical_sha256(execution_replay_metrics)
-    metrics.update(
-        {
-            "robustness_pass_rate": robustness["pass_rate"],
-            "robustness_passed": robustness["passed"],
-            "worst_scenario_excess_return": robustness["worst_annualized_excess_return"],
-            "worst_scenario_drawdown": robustness["worst_max_drawdown"],
-            "robustness": robustness,
-            "rolling_pass_rate": rolling["pass_rate"],
-            "rolling_passed": rolling["passed"],
-            "rolling_window_count": rolling["window_count"],
-            "rolling": rolling,
-            "event_stress_pass_rate": event_stress["pass_rate"],
-            "event_stress_passed": event_stress["passed"],
-            "event_stress_count": event_stress["event_count"],
-            "event_stress": event_stress,
-            "execution_replay": execution_replay_metrics,
-        }
-    )
-    qlib_net = qlib_report["return"] - qlib_report["cost"]
-    qlib_excess = qlib_net - qlib_report["bench"]
-    qlib_nav = (1.0 + qlib_net).cumprod()
-    qlib_drawdown = qlib_nav / qlib_nav.cummax() - 1.0
-    downside = qlib_net[qlib_net < 0].std(ddof=1)
-    metrics.update(
-        {
-            "backtest_engine": "qlib",
-            "qlib_native_backtest": True,
-            "annualized_return": float(qlib_nav.iloc[-1] ** (252 / len(qlib_net)) - 1.0),
-            "annualized_excess_return": float(qlib_excess.mean() * 252),
-            "tracking_error": float(qlib_excess.std(ddof=1) * 252**0.5),
-            "information_ratio": float(
-                qlib_excess.mean() / qlib_excess.std(ddof=1) * 252**0.5
-            ),
-            "sharpe_ratio": float(qlib_net.mean() / qlib_net.std(ddof=1) * 252**0.5),
-            "sortino_ratio": float(qlib_net.mean() / downside * 252**0.5),
-            "max_drawdown": float(qlib_drawdown.min()),
-            "average_turnover": float(qlib_report["turnover"].mean()),
-            "total_cost": float(qlib_report["cost"].sum()),
-            "trading_days": int(len(qlib_report)),
-            "provenance": {
-                "dataset_identity_sha256": provider_provenance.get(
-                    "dataset_identity_sha256"
-                ),
-                "snapshot_manifest_sha256": provider_provenance.get(
-                    "snapshot_manifest_sha256"
-                ),
-                "qlib_builder_sha256": provider_provenance.get("qlib_builder_sha256"),
-                "strategy_config_sha256": _canonical_sha256(config),
-                "execution_manifest_sha256": _sha256_file(args.manifest),
-                "execution_replay_sha256": execution_replay_sha256,
-                "factor_values_sha256": factor_value_hashes,
-                "factor_code_sha256": factor_code_hashes,
-                "qlib_version": getattr(qlib, "__version__", "unknown"),
-            },
-        }
-    )
+    }
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    daily.reset_index().to_parquet(output / "daily_returns.parquet", index=False)
-    positions.to_parquet(output / "positions.parquet", index=False)
+    qlib_report.reset_index().to_parquet(output / "daily_returns.parquet", index=False)
     governed_signal.to_frame().to_parquet(output / "governed_signal.parquet")
     qlib_report.to_parquet(output / "qlib_portfolio_report.parquet")
     pd.to_pickle(qlib_positions, output / "qlib_positions.pkl")
     (output / "robustness.json").write_text(
-        json.dumps(robustness, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(metrics["robustness"], ensure_ascii=False, indent=2), encoding="utf-8"
     )
     (output / "rolling.json").write_text(
-        json.dumps(rolling, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(metrics["rolling"], ensure_ascii=False, indent=2), encoding="utf-8"
     )
     (output / "event_stress.json").write_text(
-        json.dumps(event_stress, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    (output / "execution_replay.json").write_text(
-        json.dumps(execution_replay_metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(metrics["event_stress"], ensure_ascii=False, indent=2), encoding="utf-8"
     )
     result = {
         "status": "ok",
@@ -342,14 +284,12 @@ def main() -> None:
         "benchmark": manifest["benchmark"],
         "artifacts": {
             "daily_returns": str(output / "daily_returns.parquet"),
-            "positions": str(output / "positions.parquet"),
             "governed_signal": str(output / "governed_signal.parquet"),
             "qlib_portfolio_report": str(output / "qlib_portfolio_report.parquet"),
             "qlib_positions": str(output / "qlib_positions.pkl"),
             "robustness": str(output / "robustness.json"),
             "rolling": str(output / "rolling.json"),
             "event_stress": str(output / "event_stress.json"),
-            "execution_replay": str(output / "execution_replay.json"),
         },
     }
     (output / "result.json").write_text(

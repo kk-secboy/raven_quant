@@ -51,9 +51,7 @@ def normalize_parameter_grid(
         normalized[name] = clean
         trial_count *= len(clean)
     if trial_count > max_trials:
-        raise ValueError(
-            f"parameter grid expands to {trial_count} trials; maximum is {max_trials}"
-        )
+        raise ValueError(f"parameter grid expands to {trial_count} trials; maximum is {max_trials}")
     names = list(normalized)
     trials = [
         dict(zip(names, values, strict=True))
@@ -64,8 +62,8 @@ def normalize_parameter_grid(
 
 def split_research_period(start: date, end: date) -> dict[str, dict[str, str]]:
     days = (end - start).days
-    if days < 365:
-        raise ValueError("parameter experiments require at least 365 calendar days")
+    if days < 126:
+        raise ValueError("parameter experiments require at least 126 calendar days")
     split = start + timedelta(days=round(days * 0.60))
     return {
         "in_sample": {"start": start.isoformat(), "end": split.isoformat()},
@@ -140,12 +138,8 @@ def summarize_trials(
                 "parameters": item["parameters"],
                 "score": item["score"],
                 "warnings": item.get("warnings", []),
-                "in_sample": _compact_metrics(
-                    item.get("metrics", {}).get("in_sample", {})
-                ),
-                "out_of_sample": _compact_metrics(
-                    item.get("metrics", {}).get("out_of_sample", {})
-                ),
+                "in_sample": _compact_metrics(item.get("metrics", {}).get("in_sample", {})),
+                "out_of_sample": _compact_metrics(item.get("metrics", {}).get("out_of_sample", {})),
             }
             for item in ranked
         ],

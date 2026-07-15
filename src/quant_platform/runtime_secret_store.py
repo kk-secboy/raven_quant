@@ -53,9 +53,7 @@ class RuntimeSecretStore:
             )
             if existing:
                 connection.execute(
-                    update(runtime_secrets)
-                    .where(runtime_secrets.c.name == name)
-                    .values(**values)
+                    update(runtime_secrets).where(runtime_secrets.c.name == name).values(**values)
                 )
             else:
                 connection.execute(runtime_secrets.insert().values(name=name, **values))
@@ -83,14 +81,18 @@ class RuntimeSecretStore:
 
     def describe(self, name: str) -> dict[str, Any] | None:
         with self.engine.connect() as connection:
-            row = connection.execute(
-                select(
-                    runtime_secrets.c.name,
-                    runtime_secrets.c.metadata_json,
-                    runtime_secrets.c.updated_at,
-                    runtime_secrets.c.updated_by,
-                ).where(runtime_secrets.c.name == name)
-            ).mappings().first()
+            row = (
+                connection.execute(
+                    select(
+                        runtime_secrets.c.name,
+                        runtime_secrets.c.metadata_json,
+                        runtime_secrets.c.updated_at,
+                        runtime_secrets.c.updated_by,
+                    ).where(runtime_secrets.c.name == name)
+                )
+                .mappings()
+                .first()
+            )
         return row_dict(row) if row else None
 
     def health(self) -> dict[str, Any]:

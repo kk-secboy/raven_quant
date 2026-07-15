@@ -69,9 +69,7 @@ def main() -> None:
                     horizon_minutes=horizon,
                     cost_rate=args.cost_rate,
                 )
-                score = float(metrics["rank_ic"] or 0) + float(
-                    metrics["mean_net_return"] or 0
-                )
+                score = float(metrics["rank_ic"] or 0) + float(metrics["mean_net_return"] or 0)
                 results.append(
                     {
                         "factor": name,

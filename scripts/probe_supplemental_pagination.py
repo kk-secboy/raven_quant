@@ -16,9 +16,7 @@ def fingerprint(rows: list[dict]) -> str:
 
 def main() -> None:
     settings = Settings.from_env()
-    stored = RuntimeSecretStore(
-        settings.database_url, settings.platform_secret_key
-    ).get("tushare")
+    stored = RuntimeSecretStore(settings.database_url, settings.platform_secret_key).get("tushare")
     if not stored:
         raise RuntimeError("Tushare runtime secret is unavailable")
     provider = TushareHttpProvider(

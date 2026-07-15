@@ -14,9 +14,7 @@ MINUTE_FACTOR_EXPRESSIONS: dict[str, str] = {
 }
 
 
-def normalize_minute_series(
-    values: pd.Series | pd.DataFrame, name: str
-) -> pd.Series:
+def normalize_minute_series(values: pd.Series | pd.DataFrame, name: str) -> pd.Series:
     if isinstance(values, pd.DataFrame):
         if values.shape[1] != 1:
             raise ValueError(f"{name} must contain exactly one value column")
@@ -86,10 +84,7 @@ def evaluate_minute_factor(
             union = previous.index.union(weights.index)
             turnover = float(
                 0.5
-                * (
-                    weights.reindex(union, fill_value=0.0)
-                    - previous.reindex(union, fill_value=0.0)
-                )
+                * (weights.reindex(union, fill_value=0.0) - previous.reindex(union, fill_value=0.0))
                 .abs()
                 .sum()
             )

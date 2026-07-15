@@ -23,8 +23,7 @@ def main() -> None:
     job = JobStore(settings.database_url).create(
         f"supplemental_{args.bundle}",
         {"bundle": args.bundle, "start": start.isoformat(), "end": end.isoformat()},
-        Path("/data/platform/logs")
-        / f"supplemental-{args.bundle}-{start:%Y%m%d}-{end:%Y%m%d}.log",
+        Path("/data/platform/logs") / f"supplemental-{args.bundle}-{start:%Y%m%d}-{end:%Y%m%d}.log",
         idempotency_key=f"supplemental:{args.bundle}:{start.isoformat()}:{end.isoformat()}",
     )
     print(job["id"])

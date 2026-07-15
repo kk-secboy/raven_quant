@@ -1,4 +1,5 @@
 import json
+from datetime import date, timedelta
 from pathlib import Path
 
 from cryptography.fernet import Fernet
@@ -9,6 +10,16 @@ from quant_platform.alert_store import AlertStore
 from quant_platform.api import create_app
 from quant_platform.job_store import JobStore
 from quant_platform.worker import LocalJobWorker
+
+
+def _trading_calendar(start: date, end: date) -> str:
+    current = start
+    days: list[str] = []
+    while current <= end:
+        if current.weekday() < 5:
+            days.append(current.isoformat())
+        current += timedelta(days=1)
+    return "\n".join(days) + "\n"
 
 
 def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url: str) -> None:
@@ -51,7 +62,7 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
     )
     assert client.get("/api/qlib/datasets").json() == []
     assert client.get("/api/qlib/experiments").json() == []
-    assert client.get("/api/strategy-allocations").json() == []
+    assert client.get("/api/strategy-allocations").status_code == 404
     allocation = client.post(
         "/api/strategy-allocations",
         json={
@@ -63,19 +74,17 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
             ],
         },
     )
-    assert allocation.status_code == 409
-    assert "strategy allocation" in allocation.json()["detail"]
+    assert allocation.status_code == 404
     allocation_schedule = client.post(
         "/api/strategy-allocations/missing/schedule",
         json={"run_time": "15:30", "actor": "operator"},
     )
     assert allocation_schedule.status_code == 404
-    assert allocation_schedule.json()["detail"] == "strategy allocation not found"
     invalid_schedule = client.post(
         "/api/strategy-allocations/missing/schedule",
         json={"run_time": "14:30", "actor": "operator"},
     )
-    assert invalid_schedule.status_code == 422
+    assert invalid_schedule.status_code == 404
     qlib_job = client.post(
         "/api/jobs/qlib-baseline",
         json={"dataset": "missing", "topk": 50, "n_drop": 5},
@@ -192,19 +201,21 @@ def test_api_exposes_fail_closed_broker_boundary(
     app = create_app(tmp_path)
     with TestClient(app) as client:
         state = client.get("/api/broker")
-        destination = client.post(
-            "/api/broker/destinations",
-            json={
-                "name": "QMT sandbox",
-                "account_ref": "SIM-API",
-                "portfolio_id": "missing-portfolio",
-            },
+        settings_route = client.post(
+            "/api/settings/broker", json={"gateway_url": "", "hmac_secret": ""}
         )
-    assert state.status_code == 200
-    assert state.json()["readiness"]["status"] == "disabled"
-    assert state.json()["readiness"]["live_supported"] is False
-    assert destination.status_code == 404
-    assert destination.json()["detail"] == "paper portfolio not found"
+        capabilities = client.get("/api/capabilities").json()
+    assert state.status_code == 404
+    assert settings_route.status_code == 404
+    assert capabilities["broker_qmt"] is False
+
+    monkeypatch.setenv("BROKER_FEATURE_ENABLED", "true")
+    enabled_app = create_app(tmp_path)
+    with TestClient(enabled_app) as client:
+        enabled = client.get("/api/broker")
+    assert enabled.status_code == 200
+    assert enabled.json()["readiness"]["status"] == "disabled"
+    assert enabled.json()["readiness"]["live_supported"] is False
 
 
 def test_api_creates_bounded_rdagent_research_run(
@@ -215,7 +226,9 @@ def test_api_creates_bounded_rdagent_research_run(
     (dataset / "calendars").mkdir(parents=True)
     (dataset / "instruments").mkdir()
     (dataset / "features").mkdir()
-    (dataset / "calendars" / "day.txt").write_text("2018-01-01\n2026-07-10\n", encoding="utf-8")
+    (dataset / "calendars" / "day.txt").write_text(
+        _trading_calendar(date(2018, 1, 1), date(2026, 7, 10)), encoding="utf-8"
+    )
     (dataset / "instruments" / "cn_all.txt").write_text(
         "SH600000\t2018-01-01\t2026-07-10\n", encoding="utf-8"
     )

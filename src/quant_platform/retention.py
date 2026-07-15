@@ -105,9 +105,7 @@ class DataRetentionManager:
                 if target.exists():
                     shutil.rmtree(target)
                     removed.append(root_name)
-            deleted.append(
-                {"name": name, "bytes": item["bytes"], "removed_locations": removed}
-            )
+            deleted.append({"name": name, "bytes": item["bytes"], "removed_locations": removed})
         return {
             "status": "deleted",
             "deleted": deleted,
@@ -158,8 +156,7 @@ class DataRetentionManager:
 
     def _entry(self, name: str, now: datetime) -> dict[str, Any]:
         paths = [
-            self.data_root / root_name / name
-            for root_name in ("snapshots", "qlib", "qlib_staging")
+            self.data_root / root_name / name for root_name in ("snapshots", "qlib", "qlib_staging")
         ]
         existing = [path for path in paths if path.exists()]
         created_at = self._created_at(name, existing, now)

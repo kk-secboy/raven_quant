@@ -60,6 +60,7 @@ class Settings:
     health_snapshot_seconds: int = 300
     data_freshness_max_days: int = 7
     stale_job_hours: int = 6
+    broker_feature_enabled: bool = False
     broker_mode: str = "disabled"
     broker_gateway_url: str = ""
     broker_hmac_secret: str = ""
@@ -134,6 +135,7 @@ class Settings:
             health_snapshot_seconds=max(60, int(os.getenv("HEALTH_SNAPSHOT_SECONDS", "300"))),
             data_freshness_max_days=max(1, int(os.getenv("DATA_FRESHNESS_MAX_DAYS", "7"))),
             stale_job_hours=max(1, int(os.getenv("STALE_JOB_HOURS", "6"))),
+            broker_feature_enabled=_bool("BROKER_FEATURE_ENABLED", False),
             broker_mode=broker_mode,
             broker_gateway_url=os.getenv("BROKER_GATEWAY_URL", "").strip().rstrip("/"),
             broker_hmac_secret=os.getenv("BROKER_HMAC_SECRET", "").strip(),

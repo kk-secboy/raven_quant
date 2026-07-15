@@ -63,68 +63,23 @@ def test_program_controller_failure_releases_lease_and_is_audited(
     assert failed["events"][0]["payload"]["error"] == "Qlib calendar is missing"
 
 
-def test_program_tracks_cross_campaign_champion_and_decay(database_url: str) -> None:
+def test_program_records_final_test_without_using_it_for_selection(database_url: str) -> None:
     store = ResearchProgramStore(database_url)
     program = _create(store)
 
-    first = store.record_campaign_outcome(
+    recorded = store.record_campaign_outcome(
         program["id"],
         campaign={
             "id": "campaign-a",
             "status": "succeeded",
-            "state": {
-                "preferred_version_id": "version-a",
-                "champion": {"decision": "baseline", "baseline_score": 1.0},
-            },
+            "state": {"preferred_version_id": "version-a"},
         },
     )
-    assert first["champion_campaign_id"] == "campaign-a"
-    assert first["champion_strategy_version_id"] == "version-a"
-    assert first["champion_score"] == 1.0
-    assert first["decay_status"] == "healthy"
-
-    retained = store.record_campaign_outcome(
-        program["id"],
-        campaign={
-            "id": "campaign-b",
-            "status": "succeeded",
-            "state": {
-                "preferred_version_id": "version-b",
-                "champion": {"decision": "challenger", "challenger_score": 1.02},
-            },
-        },
-    )
-    assert retained["champion_campaign_id"] == "campaign-a"
-    assert retained["decay_status"] == "healthy"
-    assert retained["events"][0]["event_type"] == "program.champion_retained"
-
-    decayed = store.record_campaign_outcome(
-        program["id"],
-        campaign={
-            "id": "campaign-c",
-            "status": "succeeded",
-            "state": {
-                "preferred_version_id": "version-c",
-                "champion": {"decision": "baseline", "baseline_score": 0.70},
-            },
-        },
-    )
-    assert decayed["champion_campaign_id"] == "campaign-a"
-    assert decayed["decay_status"] == "warning"
-    assert decayed["events"][0]["event_type"] == "program.decay_detected"
-
-    promoted = store.record_campaign_outcome(
-        program["id"],
-        campaign={
-            "id": "campaign-d",
-            "status": "succeeded",
-            "state": {
-                "preferred_version_id": "version-d",
-                "champion": {"decision": "challenger", "challenger_score": 1.20},
-            },
-        },
-    )
-    assert promoted["champion_campaign_id"] == "campaign-d"
-    assert promoted["champion_strategy_version_id"] == "version-d"
-    assert promoted["champion_score"] == 1.20
-    assert promoted["events"][0]["event_type"] == "program.champion_selected"
+    assert recorded["last_evaluated_campaign_id"] == "campaign-a"
+    assert recorded["champion_campaign_id"] is None
+    assert recorded["champion_strategy_version_id"] is None
+    assert recorded["champion_score"] is None
+    assert recorded["decay_status"] == "legacy"
+    event = recorded["events"][0]
+    assert event["event_type"] == "program.final_test_recorded"
+    assert event["payload"]["used_for_selection"] is False

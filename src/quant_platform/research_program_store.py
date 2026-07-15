@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -106,9 +105,7 @@ class ResearchProgramStore:
 
     def list(self, *, limit: int = 100) -> list[dict[str, Any]]:
         statement = (
-            select(research_programs)
-            .order_by(research_programs.c.created_at.desc())
-            .limit(limit)
+            select(research_programs).order_by(research_programs.c.created_at.desc()).limit(limit)
         )
         with self.engine.connect() as connection:
             return [self._decode(row_dict(row)) for row in connection.execute(statement)]
@@ -254,19 +251,10 @@ class ResearchProgramStore:
         campaign: dict[str, Any],
     ) -> dict[str, Any]:
         if campaign.get("status") != "succeeded":
-            raise ValueError("only succeeded campaigns can enter program governance")
-        champion = (campaign.get("state") or {}).get("champion") or {}
-        decision = str(champion.get("decision") or "")
-        score_key = "challenger_score" if decision == "challenger" else "baseline_score"
-        try:
-            score = float(champion[score_key])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("campaign has no comparable champion score") from exc
-        if not math.isfinite(score):
-            raise ValueError("campaign champion score must be finite")
+            raise ValueError("only succeeded campaigns can be recorded")
         version_id = str((campaign.get("state") or {}).get("preferred_version_id") or "")
         if not version_id:
-            raise ValueError("campaign has no preferred strategy version")
+            raise ValueError("campaign has no frozen strategy version")
 
         current = _now()
         with self.engine.begin() as connection:
@@ -279,64 +267,25 @@ class ResearchProgramStore:
                 raise KeyError(program_id)
             if str(row.last_evaluated_campaign_id or "") == str(campaign["id"]):
                 return self.get(program_id)
-            config = dict(row.config_json or {})
-            min_improvement = float(config.get("champion_min_score_improvement", 0.05))
-            decay_fraction = float(config.get("champion_decay_fraction", 0.25))
-            if min_improvement < 0 or not 0 < decay_fraction <= 1:
-                raise ValueError("program champion governance thresholds are invalid")
-            previous_score = (
-                float(row.champion_score) if row.champion_score is not None else None
-            )
-            promote = previous_score is None or score >= previous_score + min_improvement
-            decay_floor = (
-                previous_score - max(abs(previous_score) * decay_fraction, min_improvement)
-                if previous_score is not None
-                else None
-            )
-            decayed = decay_floor is not None and score < decay_floor
-            values: dict[str, Any] = {
-                "last_evaluated_campaign_id": str(campaign["id"]),
-                "decay_status": "warning" if decayed else "healthy",
-                "decay_message": (
-                    f"challenger score {score:.6f} fell below decay floor {decay_floor:.6f}"
-                    if decayed and decay_floor is not None
-                    else f"latest governed score {score:.6f}"
-                ),
-                "updated_at": current,
-            }
-            if promote:
-                values.update(
-                    {
-                        "champion_campaign_id": str(campaign["id"]),
-                        "champion_strategy_version_id": version_id,
-                        "champion_score": score,
-                        "champion_selected_at": current,
-                    }
-                )
             connection.execute(
                 update(research_programs)
                 .where(research_programs.c.id == program_id)
-                .values(**values)
-            )
-            event_type = (
-                "program.champion_selected"
-                if promote
-                else "program.decay_detected"
-                if decayed
-                else "program.champion_retained"
+                .values(
+                    last_evaluated_campaign_id=str(campaign["id"]),
+                    decay_status="legacy",
+                    decay_message="final test recorded; never used for cross-campaign selection",
+                    updated_at=current,
+                )
             )
             self._event(
                 connection,
                 program_id=program_id,
-                event_type=event_type,
+                event_type="program.final_test_recorded",
                 actor="research-program-controller",
                 payload={
                     "campaign_id": campaign["id"],
-                    "strategy_version_id": version_id,
-                    "score": score,
-                    "previous_champion_score": previous_score,
-                    "promoted": promote,
-                    "decayed": decayed,
+                    "frozen_strategy_version_id": version_id,
+                    "used_for_selection": False,
                 },
             )
         return self.get(program_id)

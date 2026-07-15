@@ -521,19 +521,22 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
     ),
 )
 
-SUPPLEMENTAL_TASK_KEYS = frozenset(
-    {
-        "cn_extended_daily",
-        "cn_funds",
-        "cn_macro",
-        "cn_institutional",
-        "cn_futures",
-        "cn_options_bonds",
-        "hk_market",
-        "us_market",
-        "global_markets",
-    }
-) | COVERAGE_BUNDLES
+SUPPLEMENTAL_TASK_KEYS = (
+    frozenset(
+        {
+            "cn_extended_daily",
+            "cn_funds",
+            "cn_macro",
+            "cn_institutional",
+            "cn_futures",
+            "cn_options_bonds",
+            "hk_market",
+            "us_market",
+            "global_markets",
+        }
+    )
+    | COVERAGE_BUNDLES
+)
 
 
 class DataTaskStore:
@@ -791,9 +794,7 @@ class DataTaskStore:
                         for name in row["config"]["datasets"]
                     ]
                     row["coverage"] = (
-                        round(sum(per_dataset) / len(per_dataset) * 100, 1)
-                        if per_dataset
-                        else 0.0
+                        round(sum(per_dataset) / len(per_dataset) * 100, 1) if per_dataset else 0.0
                     )
                     if row["status"] == "succeeded" and row["coverage"] < 100:
                         row["status"] = "partial"
