@@ -2,8 +2,6 @@ import json
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
-import pytest
-
 from quant_data.config import Settings
 from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES, OPTIONAL_COVERAGE_BUNDLES
 from quant_platform.alert_store import AlertStore
@@ -224,24 +222,6 @@ def test_expired_schedule_run_lease_is_reclaimed(database_url: str) -> None:
     reclaimed = store.claim_run(now=current + timedelta(minutes=2, seconds=1))
     assert reclaimed and reclaimed["id"] == claimed["id"]
     assert reclaimed["attempts"] == 2
-
-
-def test_scheduler_rejects_broker_reconciliation_schedule(
-    database_url: str, tmp_path: Path
-) -> None:
-    del tmp_path
-    store = ScheduleStore(database_url)
-    with pytest.raises(ValueError, match="unsupported schedule kind"):
-        store.create(
-            name="retired broker reconciliation",
-            kind="broker_reconcile",
-            timezone="Asia/Shanghai",
-            run_time=time(15, 30),
-            trading_days_only=False,
-            payload={"destination_id": "sandbox-destination"},
-            misfire_grace_seconds=900,
-            actor="admin",
-        )
 
 
 def test_job_idempotency_allows_multiple_scheduled_recommendation_jobs(

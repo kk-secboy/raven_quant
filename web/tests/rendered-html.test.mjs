@@ -62,6 +62,7 @@ test("ships the recommendation-only research interface", async () => {
   assert.match(sourceByName["market-overview-panel.tsx"], /\/api\/market\/overview/);
   assert.match(sourceByName["job-run-center.tsx"], /\/api\/jobs\/\$\{job\.id\}\/log/);
   assert.doesNotMatch(allSource, /SQLite/i);
+  assert.doesNotMatch(allSource, /\/api\/broker|\/api\/pair-portfolios|settings\/broker/i);
 
   const rawFetchFiles = sources
     .filter(([, source]) => /\bfetch\(/.test(source))

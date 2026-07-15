@@ -65,10 +65,6 @@ def test_settings_api_validates_saves_and_enables_bootstrap(
     monkeypatch.setenv("PLATFORM_SECRET_KEY", key)
     monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
-    monkeypatch.setenv("BROKER_MODE", "disabled")
-    monkeypatch.setenv("BROKER_FEATURE_ENABLED", "true")
-    monkeypatch.setenv("BROKER_GATEWAY_URL", "https://environment-broker.example/hook")
-    monkeypatch.setenv("BROKER_HMAC_SECRET", "e" * 40)
     monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
     monkeypatch.setattr(
         "quant_platform.api.requests.post",
@@ -112,57 +108,6 @@ def test_settings_api_validates_saves_and_enables_bootstrap(
         ).status_code
         == 422
     )
-
-    broker_url = "https://broker.example.internal/quantlab"
-    broker_secret = "b" * 40
-    broker_response = client.post(
-        "/api/settings/broker",
-        json={"gateway_url": broker_url, "hmac_secret": broker_secret},
-    )
-    assert broker_response.status_code == 200
-    assert broker_url not in broker_response.text
-    assert broker_secret not in broker_response.text
-    broker_status = client.get("/api/settings").json()["broker"]
-    assert broker_status == {
-        "feature_enabled": True,
-        "mode": "disabled",
-        "configured": True,
-        "source": "database",
-        "endpoint_host": "broker.example.internal",
-        "updated_at": broker_status["updated_at"],
-    }
-    with open_database(database_url).connect() as connection:
-        broker_ciphertext = connection.scalar(
-            select(runtime_secrets.c.ciphertext).where(runtime_secrets.c.name == "broker_gateway")
-        )
-    assert broker_ciphertext
-    assert broker_url not in broker_ciphertext
-    assert broker_secret not in broker_ciphertext
-    assert (
-        client.post(
-            "/api/settings/broker",
-            json={"gateway_url": "http://remote.example", "hmac_secret": broker_secret},
-        ).status_code
-        == 422
-    )
-    assert (
-        client.post(
-            "/api/settings/broker",
-            json={"gateway_url": broker_url, "hmac_secret": "short"},
-        ).status_code
-        == 422
-    )
-    assert (
-        client.post(
-            "/api/settings/broker",
-            json={"gateway_url": "", "hmac_secret": ""},
-        ).status_code
-        == 200
-    )
-    disabled_broker = client.get("/api/settings").json()["broker"]
-    assert disabled_broker["configured"] is False
-    assert disabled_broker["source"] == "database"
-    assert disabled_broker["endpoint_host"] == ""
 
     bootstrap = client.post(
         "/api/jobs/bootstrap",

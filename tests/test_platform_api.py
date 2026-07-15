@@ -193,7 +193,7 @@ def test_worker_cooperatively_terminates_cancelled_child(
     assert store.get(created["id"])["status"] == "cancelled"
 
 
-def test_api_exposes_fail_closed_broker_boundary(
+def test_api_keeps_optional_broker_plugin_outside_research_routes(
     tmp_path: Path, monkeypatch, database_url: str
 ) -> None:
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
@@ -215,9 +215,13 @@ def test_api_exposes_fail_closed_broker_boundary(
     enabled_app = create_app(tmp_path)
     with TestClient(enabled_app) as client:
         enabled = client.get("/api/broker")
-    assert enabled.status_code == 200
-    assert enabled.json()["readiness"]["status"] == "disabled"
-    assert enabled.json()["readiness"]["live_supported"] is False
+        enabled_settings = client.post(
+            "/api/settings/broker", json={"gateway_url": "", "hmac_secret": ""}
+        )
+        enabled_capabilities = client.get("/api/capabilities").json()
+    assert enabled.status_code == 404
+    assert enabled_settings.status_code == 404
+    assert enabled_capabilities["broker_qmt"] is True
 
 
 def test_api_creates_bounded_rdagent_research_run(

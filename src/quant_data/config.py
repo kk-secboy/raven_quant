@@ -61,12 +61,6 @@ class Settings:
     data_freshness_max_days: int = 7
     stale_job_hours: int = 6
     broker_feature_enabled: bool = False
-    broker_mode: str = "disabled"
-    broker_gateway_url: str = ""
-    broker_hmac_secret: str = ""
-    broker_timeout_seconds: float = 10.0
-    broker_max_order_notional: float = 1_000_000.0
-    broker_max_attempts: int = 3
     alert_webhook_url: str = ""
     scheduler_url: str = ""
     auth_mode: str = "disabled"
@@ -88,9 +82,6 @@ class Settings:
         auth_mode = os.getenv("AUTH_MODE", "disabled").strip().lower()
         if auth_mode not in {"disabled", "required"}:
             raise ValueError("AUTH_MODE must be disabled or required")
-        broker_mode = os.getenv("BROKER_MODE", "disabled").strip().lower()
-        if broker_mode not in {"disabled", "sandbox"}:
-            raise ValueError("BROKER_MODE must be disabled or sandbox; live trading is unsupported")
         return cls(
             api_url=normalize_api_url(api_url),
             token=token.strip(),
@@ -136,16 +127,6 @@ class Settings:
             data_freshness_max_days=max(1, int(os.getenv("DATA_FRESHNESS_MAX_DAYS", "7"))),
             stale_job_hours=max(1, int(os.getenv("STALE_JOB_HOURS", "6"))),
             broker_feature_enabled=_bool("BROKER_FEATURE_ENABLED", False),
-            broker_mode=broker_mode,
-            broker_gateway_url=os.getenv("BROKER_GATEWAY_URL", "").strip().rstrip("/"),
-            broker_hmac_secret=os.getenv("BROKER_HMAC_SECRET", "").strip(),
-            broker_timeout_seconds=max(
-                1.0, min(60.0, float(os.getenv("BROKER_TIMEOUT_SECONDS", "10")))
-            ),
-            broker_max_order_notional=max(
-                10_000.0, float(os.getenv("BROKER_MAX_ORDER_NOTIONAL", "1000000"))
-            ),
-            broker_max_attempts=max(1, min(10, int(os.getenv("BROKER_MAX_ATTEMPTS", "3")))),
             alert_webhook_url=os.getenv("ALERT_WEBHOOK_URL", "").strip(),
             scheduler_url=os.getenv("SCHEDULER_URL", "").strip().rstrip("/"),
             auth_mode=auth_mode,

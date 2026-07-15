@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from quant_data.config import Settings
 from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES
-from quant_data.database import jobs, risk_events
+from quant_data.database import jobs, strategy_allocation_events
 
 from .alert_store import AlertStore
 from .autonomous_research import AutonomousResearchOrchestrator
@@ -417,7 +417,9 @@ class SchedulerEngine:
                 select(jobs).where(jobs.c.status == "failed").order_by(jobs.c.finished_at.desc())
             ).all()
             open_risks = connection.execute(
-                select(risk_events).where(risk_events.c.status == "open")
+                select(strategy_allocation_events).where(
+                    strategy_allocation_events.c.status == "open"
+                )
             ).all()
         for row in failed_jobs:
             self.alerts.create(
@@ -436,11 +438,14 @@ class SchedulerEngine:
                 source_type="risk_event",
                 source_id=str(row.id),
                 severity=str(row.severity),
-                category="portfolio_risk",
-                title=f"模拟组合触发风险阈值：{row.rule}",
+                category="recommendation_allocation_risk",
+                title=f"推荐策略组合触发风险阈值：{row.rule}",
                 message=f"observed={row.observed}, limit={row.limit_value}",
-                dedupe_key=f"risk-event:{row.id}",
-                details={"portfolio_id": row.portfolio_id, "batch_id": row.batch_id},
+                dedupe_key=f"allocation-risk-event:{row.id}",
+                details={
+                    "allocation_id": row.allocation_id,
+                    "recommendation_portfolio_id": row.recommendation_portfolio_id,
+                },
             )
             created += 1
         return created

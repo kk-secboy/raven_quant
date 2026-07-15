@@ -2,7 +2,6 @@ import hashlib
 import json
 from datetime import date
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -11,8 +10,6 @@ from quant_platform.data_rollover import (
     select_execution_snapshot,
     select_qlib_dataset,
 )
-from quant_platform.pair_portfolio_store import _pair_batch_evidence
-from quant_platform.portfolio_store import _validate_dataset_evidence
 
 
 def _units(*keys: str, changed: bool = False) -> list[dict[str, object]]:
@@ -215,48 +212,3 @@ def test_selects_execution_descendant_and_resolves_exact_files(tmp_path: Path) -
     assert selected["minute"]["snapshot_name"] == "execution-v2"
     assert selected["shortability"]["snapshot_name"] == "execution-v2"
     assert all(Path(path).is_file() for path in selected["minute"]["files"])
-
-
-def test_batch_evidence_must_stay_inside_configured_lineages() -> None:
-    dataset_lineage = "d" * 64
-    execution_lineage = "e" * 64
-    dataset = {
-        "name": "qlib-v2",
-        "lineage_id": dataset_lineage,
-        "provenance": {"dataset_identity_sha256": "f" * 64},
-    }
-    portfolio = {
-        "dataset": "qlib-v1",
-        "dataset_roll_policy": "latest_compatible",
-        "dataset_lineage_id": dataset_lineage,
-    }
-    assert _validate_dataset_evidence(portfolio, dataset)["name"] == "qlib-v2"
-    with pytest.raises(ValueError, match="outside the portfolio lineage"):
-        _validate_dataset_evidence(portfolio, {**dataset, "lineage_id": "a" * 64})
-
-    pair_portfolio = SimpleNamespace(
-        dataset="qlib-v1",
-        dataset_roll_policy="latest_compatible",
-        dataset_lineage_id=dataset_lineage,
-        execution_snapshot="execution-v1",
-        execution_roll_policy="latest_compatible",
-        execution_lineage_id=execution_lineage,
-    )
-    execution = {
-        "snapshot": {"name": "execution-v2", "lineage_id": execution_lineage},
-        "minute": {
-            "snapshot_name": "execution-v2",
-            "manifest_sha256": "1" * 64,
-            "snapshot_lineage_id": execution_lineage,
-        },
-        "shortability": {
-            "snapshot_name": "execution-v2",
-            "manifest_sha256": "1" * 64,
-        },
-    }
-    evidence = _pair_batch_evidence(pair_portfolio, dataset, execution)
-    assert evidence["dataset"]["name"] == "qlib-v2"
-    assert evidence["execution"]["name"] == "execution-v2"
-    execution["shortability"]["manifest_sha256"] = "2" * 64
-    with pytest.raises(ValueError, match="share one snapshot"):
-        _pair_batch_evidence(pair_portfolio, dataset, execution)

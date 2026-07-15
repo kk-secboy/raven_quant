@@ -20,8 +20,6 @@ def permission_for(method: str, path: str) -> str:
     if path.startswith("/api/settings"):
         return "settings:manage"
     if method == "GET":
-        if path.startswith("/api/broker"):
-            return "broker:manage"
         if path.startswith("/api/auth/users") or path.startswith("/api/audit"):
             return "users:manage"
         return "read"
@@ -77,14 +75,12 @@ def permission_for(method: str, path: str) -> str:
         return "portfolio:write"
     if path.startswith("/api/strategy-allocations"):
         return "strategy:write"
-    if path.startswith("/api/portfolios") or path.startswith("/api/pair-portfolios"):
+    if path.startswith("/api/recommendation-portfolios"):
         return "portfolio:write"
     if path.startswith("/api/schedules"):
         return "automation:manage"
     if path.startswith("/api/alerts"):
         return "alerts:manage"
-    if path.startswith("/api/broker"):
-        return "broker:manage"
     return "admin:write"
 
 

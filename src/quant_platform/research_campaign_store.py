@@ -243,8 +243,6 @@ class ResearchCampaignStore:
                 "strategy_version_id",
                 "parameter_experiment_id",
                 "backtest_id",
-                "paper_portfolio_id",
-                "paper_schedule_id",
             }
             for key, value in (links or {}).items():
                 if key not in allowed_links:

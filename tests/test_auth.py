@@ -163,7 +163,9 @@ def test_role_permission_matrix_is_closed_by_default() -> None:
     )
     assert not has_permission("researcher", permission_for("POST", "/api/factors/id/promote"))
     assert has_permission("operator", permission_for("POST", "/api/schedules"))
-    assert has_permission("operator", permission_for("POST", "/api/portfolios"))
+    assert has_permission(
+        "operator", permission_for("POST", "/api/recommendation-portfolios")
+    )
     assert has_permission("researcher", permission_for("POST", "/api/strategy-allocations"))
     assert not has_permission(
         "researcher",
@@ -196,12 +198,6 @@ def test_role_permission_matrix_is_closed_by_default() -> None:
             "/api/strategy-allocations/allocation-id/events/1/resolve",
         ),
     )
-    assert has_permission(
-        "operator",
-        permission_for("POST", "/api/portfolios/portfolio-id/risk-events/1/resolve"),
-    )
-    assert not has_permission("operator", permission_for("POST", "/api/broker/destinations"))
-    assert has_permission("admin", permission_for("POST", "/api/broker/destinations"))
     assert not has_permission("viewer", permission_for("POST", "/api/schedules"))
     assert has_permission("viewer", permission_for("GET", "/api/overview"))
     assert has_permission(

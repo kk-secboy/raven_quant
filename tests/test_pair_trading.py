@@ -8,7 +8,6 @@ from quant_platform.pair_trading import (
     PairTradingConfig,
     evaluate_pair,
     run_pair_backtest,
-    run_pair_paper_step,
     run_pair_robustness_suite,
 )
 
@@ -184,78 +183,3 @@ def test_pair_robustness_suite_runs_cost_and_parameter_stress() -> None:
         "lower_entry",
         "higher_entry",
     }
-
-
-def _first_pair_paper_entry(
-    daily: pd.DataFrame,
-    minute: pd.DataFrame,
-    config: PairTradingConfig,
-) -> dict:
-    dates = daily.index.get_level_values("datetime").unique().sort_values()
-    state = {
-        "status": "active",
-        "cash": config.initial_capital,
-        "nav": config.initial_capital,
-        "high_water_mark": config.initial_capital,
-        "position_direction": 0,
-        "quantity_y": 0,
-        "quantity_x": 0,
-        "holding_days": 0,
-    }
-    for signal_date in dates[config.formation_window - 1 : -1]:
-        result = run_pair_paper_step(
-            daily,
-            minute,
-            leg_y="SH510300",
-            leg_x="SZ159919",
-            as_of_date=signal_date.date().isoformat(),
-            state=state,
-            config=config,
-        )
-        if result["action"] == "entry":
-            return result
-    raise AssertionError("fixture did not produce a pair entry")
-
-
-def test_pair_paper_step_executes_two_legs_and_accrues_borrow_cost() -> None:
-    daily, minute = _markets()
-    result = _first_pair_paper_entry(daily, minute, _config())
-    assert result["status"] == "ok"
-    assert result["action"] == "entry"
-    assert result["rejection"] is None
-    assert len(result["orders"]) == len(result["fills"]) == 2
-    assert {item["status"] for item in result["orders"]} == {"filled"}
-    assert result["state"]["position_direction"] in {-1, 1}
-    assert result["state"]["quantity_y"] * result["state"]["quantity_x"] < 0
-    assert result["metrics"]["borrow_cost"] > 0
-    assert result["metrics"]["atomic_pair_execution_enforced"] is True
-
-
-def test_pair_paper_step_rejects_both_legs_when_shortability_is_missing() -> None:
-    daily, minute = _markets()
-    eligible = _first_pair_paper_entry(daily, minute, _config())
-    daily["shortable"] = np.nan
-    state = {
-        "status": "active",
-        "cash": 5_000_000,
-        "nav": 5_000_000,
-        "high_water_mark": 5_000_000,
-        "position_direction": 0,
-        "quantity_y": 0,
-        "quantity_x": 0,
-        "holding_days": 0,
-    }
-    result = run_pair_paper_step(
-        daily,
-        minute,
-        leg_y="SH510300",
-        leg_x="SZ159919",
-        as_of_date=eligible["as_of_date"],
-        state=state,
-        config=_config(),
-    )
-    assert "short_borrow_not_authorized" in result["rejection"]
-    assert len(result["orders"]) == 2
-    assert not result["fills"]
-    assert result["state"]["position_direction"] == 0
-    assert result["state"]["cash"] == 5_000_000

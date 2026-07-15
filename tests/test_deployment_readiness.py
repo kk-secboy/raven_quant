@@ -5,20 +5,9 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
-import pytest
 from cryptography.fernet import Fernet
-from sqlalchemy import insert
 
 from quant_data.config import Settings
-from quant_data.database import (
-    open_database,
-    pair_paper_portfolios,
-    pair_portfolio_batches,
-    pair_portfolio_reviews,
-    pair_portfolio_risk_events,
-    strategies,
-    strategy_versions,
-)
 from quant_platform.auth_store import AuthStore
 from quant_platform.data_task_store import DataTaskStore
 from quant_platform.deployment_readiness import DeploymentReadinessStore
@@ -143,11 +132,10 @@ def test_research_readiness_requires_complete_evidence_chain(
             "components": {
                 "postgresql": {"status": "ok", "message": "ready"},
                 "rdagent_runtime": {"status": "ok", "message": "ready"},
-                "broker_boundary": {"status": "ok", "message": "locked"},
             },
             "summary": {
-                "component_count": 3,
-                "ok_count": 3,
+                "component_count": 2,
+                "ok_count": 2,
                 "problem_count": 0,
                 "bootstrap_count": 0,
             },
@@ -157,7 +145,7 @@ def test_research_readiness_requires_complete_evidence_chain(
 
     result = DeploymentReadinessStore(settings, PROJECT_ROOT).assess(now=current)
 
-    research, recommendation, pair = result["profiles"]
+    research, recommendation, allocation, pair = result["profiles"]
     assert result["highest_ready_profile"] == "recommendation_tracking"
     assert research["status"] == "ready"
     assert research["passed"] == research["total"]
@@ -168,153 +156,14 @@ def test_research_readiness_requires_complete_evidence_chain(
     )
     assert recommendation["status"] == "ready"
     assert (
-        next(item for item in recommendation["checks"] if item["id"] == "legacy_execution_retired")[
-            "status"
-        ]
+        next(
+            item
+            for item in recommendation["checks"]
+            if item["id"] == "unsupported_schedules_retired"
+        )["status"]
         == "pass"
     )
     assert (
         next(item for item in research["checks"] if item["id"] == "schema_current")["status"]
         == "pass"
     )
-
-
-def test_pair_paper_readiness_requires_one_continuous_scheduled_risk_clean_ledger(
-    tmp_path: Path, monkeypatch, database_url: str
-) -> None:
-    with pytest.raises(ValueError, match="unsupported schedule kind"):
-        ScheduleStore(database_url).create(
-            name="retired pair execution",
-            kind="pair_paper_rebalance",
-            timezone="Asia/Shanghai",
-            run_time=time(15, 30),
-            trading_days_only=True,
-            payload={"pair_portfolio_id": "legacy"},
-            misfire_grace_seconds=1800,
-            actor="operator",
-        )
-    return
-    settings = _settings(monkeypatch, database_url, tmp_path / "data", auth_mode="required")
-    current = datetime.now(UTC)
-    engine = open_database(database_url)
-    with engine.begin() as connection:
-        connection.execute(
-            insert(strategies).values(
-                id="pair-readiness-strategy",
-                name="pair readiness strategy",
-                description="readiness fixture",
-                status="active",
-                created_by="researcher",
-                created_at=current,
-                updated_at=current,
-            )
-        )
-        connection.execute(
-            insert(strategy_versions).values(
-                id="pair-readiness-version",
-                strategy_id="pair-readiness-strategy",
-                version=1,
-                status="approved",
-                strategy_type="pair",
-                benchmark="SH000300",
-                universe="cn_all",
-                config_json={},
-                created_by="researcher",
-                approved_by="reviewer",
-                approval_reason="independent readiness approval",
-                created_at=current,
-                approved_at=current,
-            )
-        )
-        connection.execute(
-            insert(pair_paper_portfolios).values(
-                id="pair-readiness-ledger",
-                name="pair readiness ledger",
-                strategy_version_id="pair-readiness-version",
-                dataset="daily-snapshot",
-                execution_snapshot="execution-snapshot",
-                minute_dataset="liquid_stocks_1m",
-                shortability_dataset="margin_eligibility",
-                status="active",
-                base_currency="CNY",
-                initial_cash=5_000_000,
-                cash=5_000_000,
-                nav=5_000_000,
-                high_water_mark=5_000_000,
-                position_direction=0,
-                quantity_y=0,
-                quantity_x=0,
-                entry_nav=None,
-                holding_days=0,
-                created_by="operator",
-                created_at=current,
-                updated_at=current,
-            )
-        )
-        for index in range(5):
-            trade_date = current.date() - timedelta(days=4 - index)
-            batch_id = f"pair-readiness-batch-{index}"
-            batch_time = current - timedelta(days=4 - index)
-            connection.execute(
-                insert(pair_portfolio_batches).values(
-                    id=batch_id,
-                    portfolio_id="pair-readiness-ledger",
-                    as_of_date=trade_date - timedelta(days=1),
-                    trade_date=trade_date,
-                    status="succeeded",
-                    idempotency_key=f"pair-readiness:{index}",
-                    starting_state_sha256="a" * 64,
-                    dataset="daily-snapshot",
-                    dataset_identity_sha256="b" * 64,
-                    execution_snapshot="execution-snapshot",
-                    execution_manifest_sha256="c" * 64,
-                    artifact_path=str(tmp_path / batch_id),
-                    created_at=batch_time,
-                    started_at=batch_time,
-                    finished_at=batch_time,
-                )
-            )
-            connection.execute(
-                insert(pair_portfolio_reviews).values(
-                    id=f"pair-readiness-review-{index}",
-                    portfolio_id="pair-readiness-ledger",
-                    batch_id=batch_id,
-                    trade_date=trade_date,
-                    status="completed",
-                    summary_json={"action": "hold"},
-                    created_at=batch_time,
-                )
-            )
-    ScheduleStore(database_url).create(
-        name="pair readiness schedule",
-        kind="pair_paper_rebalance",
-        timezone="Asia/Shanghai",
-        run_time=time(15, 30),
-        trading_days_only=True,
-        payload={"pair_portfolio_id": "pair-readiness-ledger"},
-        misfire_grace_seconds=1800,
-        actor="operator",
-    )
-
-    store = DeploymentReadinessStore(settings, PROJECT_ROOT)
-    checks = {item["id"]: item for item in store._pair_paper_checks(current)}
-    assert all(item["status"] == "pass" for item in checks.values())
-
-    with engine.begin() as connection:
-        connection.execute(
-            insert(pair_portfolio_risk_events).values(
-                portfolio_id="pair-readiness-ledger",
-                batch_id=None,
-                severity="critical",
-                event_type="drawdown",
-                rule="max_drawdown",
-                observed=-0.20,
-                limit_value=-0.15,
-                status="open",
-                details_json={},
-                created_at=current,
-            )
-        )
-    blocked = {item["id"]: item for item in store._pair_paper_checks(current)}
-    assert blocked["pair_paper_risk_clean"]["status"] == "block"
-    assert blocked["pair_paper_governed_run"]["status"] == "block"

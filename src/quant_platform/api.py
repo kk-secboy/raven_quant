@@ -28,11 +28,6 @@ from .allocation_store import AllocationStore
 from .auth_policy import ROLE_PERMISSIONS, has_permission, permission_for
 from .auth_store import AuthenticationError, AuthStore
 from .autonomous_research import AutonomousResearchOrchestrator
-from .broker_gateway import (
-    BrokerGatewayError,
-    BrokerStore,
-    validate_broker_gateway_credentials,
-)
 from .continuous_research import ContinuousResearchController
 from .data_rollover import select_qlib_dataset
 from .data_task_store import DataTaskStore
@@ -40,7 +35,6 @@ from .deployment_readiness import DeploymentReadinessStore
 from .health_store import OperationalHealthStore
 from .job_store import JobStore
 from .market_overview import MarketOverviewService
-from .pair_portfolio_store import PairPortfolioStore
 from .parameter_experiment_store import ParameterExperimentStore
 from .parameter_experiments import normalize_parameter_grid, split_research_period
 from .platform_config_store import PlatformConfigStore
@@ -637,34 +631,6 @@ class StrategyApprovalRequest(BaseModel):
     reason: str = Field(min_length=10, max_length=2000)
 
 
-class PortfolioCreateRequest(BaseModel):
-    name: str = Field(min_length=3, max_length=150)
-    strategy_version_id: str
-    dataset: str
-    dataset_roll_policy: Literal["pinned", "latest_compatible"] = "pinned"
-    initial_cash: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
-    actor: str = Field(default="local-operator", min_length=2, max_length=100)
-
-
-class PairPortfolioCreateRequest(BaseModel):
-    name: str = Field(min_length=3, max_length=150)
-    strategy_version_id: str
-    dataset: str
-    execution_snapshot: str
-    minute_dataset: str
-    shortability_dataset: str
-    dataset_roll_policy: Literal["pinned", "latest_compatible"] = "pinned"
-    execution_roll_policy: Literal["pinned", "latest_compatible"] = "pinned"
-    initial_cash: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
-    actor: str = Field(default="local-operator", min_length=2, max_length=100)
-
-    @model_validator(mode="after")
-    def distinct_execution_evidence(self) -> PairPortfolioCreateRequest:
-        if self.minute_dataset == self.shortability_dataset:
-            raise ValueError("minute and shortability evidence must be separate datasets")
-        return self
-
-
 class StrategyAllocationMemberRequest(BaseModel):
     strategy_version_id: str
     weight: float | None = Field(default=None, gt=0, le=1)
@@ -714,15 +680,6 @@ class RiskEventAcknowledgementRequest(BaseModel):
 class RiskEventResolutionRequest(BaseModel):
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
     reason: str = Field(min_length=10, max_length=2000)
-
-
-class PortfolioStatusRequest(BaseModel):
-    status: Literal["active", "paused", "closed"]
-
-
-class PortfolioRebalanceRequest(BaseModel):
-    as_of_date: date
-    slippage: float = Field(default=0.0005, ge=0, le=0.02)
 
 
 class RecommendationPortfolioCreateRequest(BaseModel):
@@ -837,22 +794,6 @@ class AlertActionRequest(BaseModel):
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
 
 
-class BrokerDestinationCreateRequest(BaseModel):
-    name: str = Field(min_length=3, max_length=150)
-    account_ref: str = Field(min_length=2, max_length=150)
-    portfolio_id: str = Field(min_length=16, max_length=100)
-    config: dict[str, Any] = Field(default_factory=dict)
-    actor: str = Field(default="local-admin", min_length=2, max_length=100)
-
-
-class BrokerActorRequest(BaseModel):
-    actor: str = Field(default="local-admin", min_length=2, max_length=100)
-
-
-class BrokerBatchRequest(BrokerActorRequest):
-    batch_id: str = Field(min_length=16, max_length=100)
-
-
 class AuthBootstrapRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64)
     display_name: str = Field(min_length=1, max_length=100)
@@ -929,20 +870,6 @@ class AlertWebhookSettingsRequest(BaseModel):
         return self
 
 
-class BrokerGatewaySettingsRequest(BaseModel):
-    gateway_url: str = Field(default="", max_length=1000)
-    hmac_secret: str = Field(default="", max_length=1000)
-
-    @model_validator(mode="after")
-    def validate_values(self) -> BrokerGatewaySettingsRequest:
-        validate_broker_gateway_credentials(
-            self.gateway_url,
-            self.hmac_secret,
-            allow_empty=True,
-        )
-        return self
-
-
 def create_app(project_root: Path | None = None) -> FastAPI:
     project_root = (project_root or Path.cwd()).resolve()
     settings = Settings.from_env(project_root / ".env")
@@ -954,7 +881,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     research = ResearchStore(settings.database_url)
     strategies = StrategyStore(settings.database_url)
     recommendations = RecommendationStore(settings.database_url)
-    pair_portfolios = PairPortfolioStore(settings.database_url)
     parameter_experiments = ParameterExperimentStore(settings.database_url)
     autonomous_research = AutonomousResearchOrchestrator(settings)
     continuous_research = ContinuousResearchController(settings)
@@ -962,7 +888,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     schedules = ScheduleStore(settings.database_url)
     alerts = AlertStore(settings.database_url)
     health_history = OperationalHealthStore(settings)
-    brokers = BrokerStore(settings) if settings.broker_feature_enabled else None
     auth = AuthStore(settings.database_url)
     runtime_secrets = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
     platform_configs = PlatformConfigStore(settings.database_url)
@@ -1344,7 +1269,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         tushare_record = runtime_secrets.describe("tushare")
         llm_record = runtime_secrets.describe("llm")
         alert_record = runtime_secrets.describe("alert_webhook")
-        broker_record = runtime_secrets.describe("broker_gateway")
         return {
             "storage_ready": secret_storage["status"] == "ok",
             "storage_status": secret_storage["status"],
@@ -1396,32 +1320,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     )
                 ),
                 "updated_at": (alert_record or {}).get("updated_at"),
-            },
-            "broker": {
-                "feature_enabled": settings.broker_feature_enabled,
-                "mode": settings.broker_mode,
-                "configured": bool(
-                    (broker_record or {}).get("metadata_json", {}).get("enabled")
-                    if broker_record
-                    else settings.broker_gateway_url and settings.broker_hmac_secret
-                ),
-                "source": "database"
-                if broker_record
-                else (
-                    "environment"
-                    if settings.broker_gateway_url and settings.broker_hmac_secret
-                    else "missing"
-                ),
-                "endpoint_host": (
-                    (broker_record or {}).get("metadata_json", {}).get("endpoint_host", "")
-                    if broker_record
-                    else (
-                        urlsplit(settings.broker_gateway_url).hostname
-                        if settings.broker_gateway_url
-                        else ""
-                    )
-                ),
-                "updated_at": (broker_record or {}).get("updated_at"),
             },
         }
 
@@ -1527,34 +1425,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(503, str(exc)) from exc
         return {"status": "saved", "configured": bool(webhook_url)}
-
-    @app.post("/api/settings/broker")
-    def update_broker_gateway_settings(
-        payload: BrokerGatewaySettingsRequest,
-        request: Request,
-    ) -> dict:
-        gateway_url, hmac_secret = validate_broker_gateway_credentials(
-            payload.gateway_url,
-            payload.hmac_secret,
-            allow_empty=True,
-        )
-        try:
-            runtime_secrets.put(
-                "broker_gateway",
-                {"gateway_url": gateway_url, "hmac_secret": hmac_secret},
-                metadata={
-                    "enabled": bool(gateway_url and hmac_secret),
-                    "endpoint_host": urlsplit(gateway_url).hostname or "" if gateway_url else "",
-                },
-                updated_by=request.state.user.get("id"),
-            )
-        except ValueError as exc:
-            raise HTTPException(503, str(exc)) from exc
-        return {
-            "status": "saved",
-            "configured": bool(gateway_url and hmac_secret),
-            "mode": settings.broker_mode,
-        }
 
     @app.get("/api/overview")
     def overview() -> dict:
@@ -2511,105 +2381,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 
-    @app.get("/api/pair-portfolios")
-    def list_pair_portfolios(limit: int = Query(100, ge=1, le=500)) -> list[dict]:
-        return pair_portfolios.list(limit)
-
-    @app.post("/api/pair-portfolios", status_code=201)
-    def create_pair_portfolio(payload: PairPortfolioCreateRequest, request: Request) -> dict:
-        dataset = require_qlib_dataset(
-            payload.dataset, purpose="pair paper portfolio", frequency="day"
-        )
-        try:
-            minute = resolve_snapshot_dataset(
-                settings.data_root,
-                snapshot_name=payload.execution_snapshot,
-                dataset_name=payload.minute_dataset,
-            )
-            shortability = resolve_snapshot_dataset(
-                settings.data_root,
-                snapshot_name=payload.execution_snapshot,
-                dataset_name=payload.shortability_dataset,
-            )
-            if minute.get("snapshot_lineage_id") != shortability.get("snapshot_lineage_id"):
-                raise ValueError("minute and shortability datasets have different lineages")
-            return pair_portfolios.create(
-                name=payload.name,
-                strategy_version_id=payload.strategy_version_id,
-                dataset=payload.dataset,
-                execution_snapshot=payload.execution_snapshot,
-                minute_dataset=payload.minute_dataset,
-                shortability_dataset=payload.shortability_dataset,
-                initial_cash=payload.initial_cash,
-                actor=authenticated_actor(request, payload.actor),
-                dataset_roll_policy=payload.dataset_roll_policy,
-                dataset_lineage_id=dataset.get("lineage_id"),
-                execution_roll_policy=payload.execution_roll_policy,
-                execution_lineage_id=minute.get("snapshot_lineage_id"),
-            )
-        except KeyError as exc:
-            raise HTTPException(404, "pair strategy version not found") from exc
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.get("/api/pair-portfolios/{portfolio_id}")
-    def get_pair_portfolio(portfolio_id: str) -> dict:
-        try:
-            return pair_portfolios.get(portfolio_id)
-        except KeyError as exc:
-            raise HTTPException(404, "pair portfolio not found") from exc
-
-    @app.post("/api/pair-portfolios/{portfolio_id}/status")
-    def set_pair_portfolio_status(portfolio_id: str, payload: PortfolioStatusRequest) -> dict:
-        try:
-            return pair_portfolios.set_status(portfolio_id, payload.status)
-        except KeyError as exc:
-            raise HTTPException(404, "pair portfolio not found") from exc
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/pair-portfolios/{portfolio_id}/risk-events/{event_id}/acknowledge")
-    def acknowledge_pair_portfolio_risk_event(
-        portfolio_id: str,
-        event_id: int,
-        payload: RiskEventAcknowledgementRequest,
-        request: Request,
-    ) -> dict:
-        try:
-            return pair_portfolios.acknowledge_risk_event(
-                portfolio_id,
-                event_id,
-                actor=authenticated_actor(request, payload.actor),
-            )
-        except KeyError as exc:
-            raise HTTPException(404, "pair portfolio risk event not found") from exc
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/pair-portfolios/{portfolio_id}/risk-events/{event_id}/resolve")
-    def resolve_pair_portfolio_risk_event(
-        portfolio_id: str,
-        event_id: int,
-        payload: RiskEventResolutionRequest,
-        request: Request,
-    ) -> dict:
-        try:
-            return pair_portfolios.resolve_risk_event(
-                portfolio_id,
-                event_id,
-                actor=authenticated_actor(request, payload.actor),
-                reason=payload.reason,
-            )
-        except KeyError as exc:
-            raise HTTPException(404, "pair portfolio risk event not found") from exc
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/pair-portfolios/{portfolio_id}/rebalance", status_code=202)
-    def rebalance_pair_portfolio(portfolio_id: str, payload: PortfolioRebalanceRequest) -> dict:
-        del portfolio_id, payload
-        raise HTTPException(410, "pair execution is retired; research backtests remain available")
-
     @app.api_route("/api/portfolios", methods=["GET", "POST"], status_code=410)
     @app.api_route("/api/portfolios/{legacy_path:path}", methods=["GET", "POST"], status_code=410)
     def legacy_portfolios_retired(legacy_path: str = "") -> dict[str, str]:
@@ -2830,129 +2601,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.get("/api/operations/readiness")
     def operational_readiness() -> dict:
         return deployment_readiness.assess()
-
-    @app.get("/api/broker")
-    def broker_status(probe: bool = False) -> dict:
-        return {
-            "readiness": brokers.readiness(probe=probe),
-            "destinations": brokers.list_destinations(),
-            "outbox": brokers.list_outbox(limit=200),
-            "reconciliations": brokers.list_reconciliations(limit=200),
-        }
-
-    @app.get("/api/broker/destinations/{destination_id}/events")
-    def list_broker_events(
-        destination_id: str, limit: int = Query(200, ge=1, le=500)
-    ) -> list[dict]:
-        return brokers.list_events(destination_id, limit)
-
-    @app.post("/api/broker/destinations", status_code=201)
-    def create_broker_destination(
-        payload: BrokerDestinationCreateRequest, request: Request
-    ) -> dict:
-        try:
-            return brokers.create_destination(
-                name=payload.name,
-                account_ref=payload.account_ref,
-                portfolio_id=payload.portfolio_id,
-                config=payload.config,
-                actor=authenticated_actor(request, payload.actor),
-            )
-        except KeyError as exc:
-            raise HTTPException(404, "paper portfolio not found") from exc
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/broker/destinations/{destination_id}/request-activation")
-    def request_broker_activation(
-        destination_id: str, payload: BrokerActorRequest, request: Request
-    ) -> dict:
-        try:
-            return brokers.request_activation(
-                destination_id, actor=authenticated_actor(request, payload.actor)
-            )
-        except KeyError as exc:
-            raise HTTPException(404, "broker destination not found") from exc
-        except (ValueError, BrokerGatewayError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/broker/destinations/{destination_id}/approve-activation")
-    def approve_broker_activation(
-        destination_id: str, payload: BrokerActorRequest, request: Request
-    ) -> dict:
-        try:
-            return brokers.approve_activation(
-                destination_id, actor=authenticated_actor(request, payload.actor)
-            )
-        except KeyError as exc:
-            raise HTTPException(404, "broker destination not found") from exc
-        except (ValueError, BrokerGatewayError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/broker/destinations/{destination_id}/disarm")
-    def disarm_broker_destination(
-        destination_id: str, payload: BrokerActorRequest, request: Request
-    ) -> dict:
-        try:
-            return brokers.disarm(destination_id, actor=authenticated_actor(request, payload.actor))
-        except KeyError as exc:
-            raise HTTPException(404, "broker destination not found") from exc
-
-    @app.post("/api/broker/destinations/{destination_id}/stage")
-    def stage_broker_batch(
-        destination_id: str, payload: BrokerBatchRequest, request: Request
-    ) -> list[dict]:
-        try:
-            return brokers.stage_batch(
-                destination_id,
-                payload.batch_id,
-                actor=authenticated_actor(request, payload.actor),
-            )
-        except KeyError as exc:
-            raise HTTPException(404, "broker destination or batch not found") from exc
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/broker/destinations/{destination_id}/approve")
-    def approve_broker_batch(
-        destination_id: str, payload: BrokerBatchRequest, request: Request
-    ) -> list[dict]:
-        try:
-            return brokers.approve_batch(
-                destination_id,
-                payload.batch_id,
-                actor=authenticated_actor(request, payload.actor),
-            )
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/broker/destinations/{destination_id}/dispatch")
-    def dispatch_broker_batch(
-        destination_id: str, payload: BrokerBatchRequest, request: Request
-    ) -> dict:
-        try:
-            return brokers.dispatch_batch(
-                destination_id,
-                payload.batch_id,
-                actor=authenticated_actor(request, payload.actor),
-            )
-        except KeyError as exc:
-            raise HTTPException(404, "broker destination not found") from exc
-        except (ValueError, BrokerGatewayError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post("/api/broker/destinations/{destination_id}/reconcile")
-    def reconcile_broker_destination(
-        destination_id: str, payload: BrokerActorRequest, request: Request
-    ) -> dict:
-        try:
-            return brokers.reconcile(
-                destination_id, actor=authenticated_actor(request, payload.actor)
-            )
-        except KeyError as exc:
-            raise HTTPException(404, "broker destination or portfolio not found") from exc
-        except (ValueError, BrokerGatewayError) as exc:
-            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/jobs")
     def list_jobs(
@@ -3301,17 +2949,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "recommendation_tracking": True,
             "research_pipeline_version": "research-pipeline-v2",
         }
-
-    if not settings.broker_feature_enabled:
-        app.router.routes = [
-            route for route in app.router.routes if "/broker" not in str(getattr(route, "path", ""))
-        ]
-
-    app.router.routes = [
-        route
-        for route in app.router.routes
-        if not str(getattr(route, "path", "")).startswith("/api/pair-portfolios")
-    ]
 
     return app
 

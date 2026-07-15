@@ -9,7 +9,6 @@ from sqlalchemy import func, insert, select
 from quant_data.config import Settings
 from quant_data.database import jobs, open_database, row_dict, system_health_snapshots
 
-from .broker_gateway import BrokerStore
 from .runtime_secret_store import RuntimeSecretStore
 from .services import list_qlib_datasets
 
@@ -74,26 +73,11 @@ class OperationalHealthStore:
                 "message": f"Tushare credential storage failed: {exc}",
             }
         components["job_queue"] = self._job_queue_health(current)
-        if self.settings.broker_feature_enabled:
-            broker = BrokerStore(self.settings, self.runtime_secrets).readiness(
-                probe=self.settings.broker_mode == "sandbox"
-            )
-            broker_status = str(broker["status"])
-            components["broker_boundary"] = {
-                "status": "ok" if broker_status == "disabled" else broker_status,
-                "message": (
-                    "optional broker boundary locked; live trading unsupported"
-                    if broker_status == "disabled"
-                    else "optional sandbox broker boundary inspected"
-                ),
-                "details": broker,
-            }
-        else:
-            components["broker_boundary"] = {
-                "status": "not_applicable",
-                "message": "optional QMT broker integration is disabled",
-                "details": {"enabled": False, "mode": "disabled"},
-            }
+        components["broker_boundary"] = {
+            "status": "not_applicable",
+            "message": "broker execution is outside the research and recommendation system",
+            "details": {"enabled": False, "mode": "not_applicable"},
+        }
 
         statuses = {item["status"] for item in components.values()}
         if statuses & {"degraded", "unavailable"}:

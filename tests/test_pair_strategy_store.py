@@ -5,7 +5,7 @@ from dataclasses import asdict
 import pytest
 
 from quant_platform.pair_trading import PairTradingConfig
-from quant_platform.portfolio_store import PortfolioStore
+from quant_platform.recommendation_store import RecommendationStore
 from quant_platform.strategy_store import StrategyStore
 
 
@@ -112,7 +112,7 @@ def test_pair_strategy_requires_second_person_and_minute_dataset(
         )
 
 
-def test_long_only_portfolio_rejects_pair_version_without_spread_ledger(
+def test_recommendation_portfolio_rejects_pair_research_version(
     database_url: str, tmp_path
 ) -> None:
     strategies = StrategyStore(database_url)
@@ -130,11 +130,11 @@ def test_long_only_portfolio_rejects_pair_version_without_spread_ledger(
         actor="risk-approver-b",
         reason="批准研究版本，但尚未接入专用价差模拟账本。",
     )
-    with pytest.raises(ValueError, match="dedicated spread ledger"):
-        PortfolioStore(database_url).create(
-            name="invalid-pair-long-only-ledger",
+    with pytest.raises(ValueError, match="approved multifactor strategy"):
+        RecommendationStore(database_url).create(
+            name="invalid-pair-recommendation",
             strategy_version_id=version["id"],
             dataset="daily-2024-2026",
-            initial_cash=5_000_000,
+            hypothetical_initial_value=5_000_000,
             actor="operator-c",
         )
