@@ -6,6 +6,8 @@ import pytest
 
 from quant_platform import release_upgrade
 
+pytestmark = pytest.mark.no_database
+
 
 class FakeContext:
     project_name = "quantlab-test"

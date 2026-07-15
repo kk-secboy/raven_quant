@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 
 from quant_data.config import Settings
+from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES
 from quant_data.database import jobs, risk_events
 
 from .alert_store import AlertStore
@@ -42,6 +43,8 @@ AUTOMATED_DATA_BUNDLES = (
     "hk_market",
     "us_market",
     "global_markets",
+    "cn_institutional",
+    *sorted(DEFAULT_COVERAGE_BUNDLES),
 )
 
 
@@ -129,6 +132,8 @@ class SchedulerEngine:
                 job = self._enqueue_incremental(run, scheduled_for)
             elif run["kind"] == "data_pipeline":
                 job = self._enqueue_data_pipeline(run, scheduled_for)
+            elif run["kind"] == "ashare_5m_sync":
+                job = self._enqueue_ashare_5m(run, scheduled_for)
             elif run["kind"] == "rdagent_research":
                 job = self._enqueue_research(run, scheduled_for)
                 if job is None:
@@ -259,6 +264,36 @@ class SchedulerEngine:
             },
             log_path,
             idempotency_key=pipeline_id,
+        )
+
+    def _enqueue_ashare_5m(
+        self,
+        run: dict[str, Any],
+        scheduled_for: datetime,
+    ) -> dict[str, Any]:
+        stored = self.runtime_secrets.get("tushare")
+        if not stored and (not self.settings.api_url or not self.settings.token):
+            raise ValueError("Tushare credentials are not configured")
+        payload = run["payload"]
+        local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
+        lookback_days = max(1, min(30, int(payload.get("lookback_days", 3))))
+        start = local_date - timedelta(days=lookback_days - 1)
+        snapshot_name = f"ashare-5m-incremental-{local_date:%Y%m%d}"
+        log_path = (
+            self.settings.data_root
+            / "platform"
+            / "logs"
+            / f"scheduled-ashare-5m-{run['id']}.log"
+        )
+        return self.jobs.create(
+            "ashare_5m_download",
+            {
+                "start": start.isoformat(),
+                "end": local_date.isoformat(),
+                "snapshot_name": snapshot_name,
+            },
+            log_path,
+            idempotency_key=f"schedule-run:{run['id']}",
         )
 
     def _enqueue_research(

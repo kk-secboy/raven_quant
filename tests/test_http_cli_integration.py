@@ -58,13 +58,19 @@ class FakeTushareHandler(BaseHTTPRequestHandler):
             rows = [[value_for(field) for field in fields]]
         elif api_name == "stock_basic":
             rows = []
+        elif api_name == "index_basic":
+            rows = [[value_for(field) for field in fields]]
         elif api_name in {
             "daily",
             "adj_factor",
             "daily_basic",
             "stk_limit",
             "index_daily",
+            "index_dailybasic",
             "index_weight",
+            "stk_premarket",
+            "stk_auction_o",
+            "stk_auction_c",
             "fund_daily",
             "fund_adj",
         }:
@@ -149,6 +155,7 @@ def test_bootstrap_cli_over_real_http(tmp_path: Path, monkeypatch) -> None:
         assert {
             "stock_basic",
             "trade_cal",
+            "index_basic",
             "daily",
             "adj_factor",
             "daily_basic",
@@ -156,7 +163,11 @@ def test_bootstrap_cli_over_real_http(tmp_path: Path, monkeypatch) -> None:
             "stk_limit",
             "limit_list_d",
             "index_daily",
+            "index_dailybasic",
             "index_weight",
+            "stk_premarket",
+            "stk_auction_o",
+            "stk_auction_c",
             "moneyflow",
             "margin_detail",
             "hsgt_top10",

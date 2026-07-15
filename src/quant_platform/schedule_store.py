@@ -155,6 +155,7 @@ class ScheduleStore:
         if kind not in {
             "incremental_sync",
             "data_pipeline",
+            "ashare_5m_sync",
             "rdagent_research",
             "paper_rebalance",
             "pair_paper_rebalance",

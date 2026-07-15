@@ -48,7 +48,10 @@ const implementationText: Record<string, string> = {
 
 const supplementalBundles = new Set([
   "cn_extended_daily", "cn_funds", "cn_macro", "cn_futures",
-  "cn_options_bonds", "hk_market", "us_market", "global_markets",
+  "cn_institutional", "cn_options_bonds", "hk_market", "us_market", "global_markets",
+  "cn_governance_risk", "cn_capital_flow", "cn_fund_index_enhanced",
+  "cn_derivatives_enhanced", "global_rates_enhanced", "research_corpus",
+  "strategy_specialty", "strategy_specialty_minutes",
 ]);
 
 const groupDefinitions = [
@@ -60,9 +63,10 @@ const groupDefinitions = [
 ];
 
 function groupFor(task: DataTask) {
-  if (["cn_funds", "cn_macro"].includes(task.task_key)) return "fund";
-  if (["cn_futures", "cn_options_bonds", "cn_margin_eligibility", "liquid_intraday_1m", "liquid_intraday_qlib"].includes(task.task_key)) return "execution";
+  if (["cn_funds", "cn_macro", "cn_institutional", "cn_fund_index_enhanced", "global_rates_enhanced"].includes(task.task_key)) return "fund";
+  if (["cn_futures", "cn_options_bonds", "cn_derivatives_enhanced", "strategy_specialty_minutes", "cn_margin_eligibility", "liquid_intraday_1m", "liquid_intraday_qlib", "cn_ashare_5m", "cn_ashare_5m_qlib"].includes(task.task_key)) return "execution";
   if (["hk_market", "us_market", "global_markets"].includes(task.task_key)) return "overseas";
+  if (task.task_key === "strategy_specialty") return "advanced";
   if (["permission_probe", "external_source_required"].includes(task.implementation_status)) return "advanced";
   return "cn";
 }
@@ -99,6 +103,7 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
   const marginTask = tasks.find((task) => task.task_key === "cn_margin_eligibility");
   const minuteTask = tasks.find((task) => task.task_key === "liquid_intraday_1m");
   const minuteQlibTask = tasks.find((task) => task.task_key === "liquid_intraday_qlib");
+  const ashare5mTask = tasks.find((task) => task.task_key === "cn_ashare_5m");
   const supplementalTasks = tasks.filter((task) => supplementalBundles.has(task.task_key));
   const selectedTask = supplementalTasks.find((task) => task.task_key === selectedBundle);
 
@@ -106,7 +111,7 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
     let cancelled = false;
     apiFetch(`${api}/api/snapshots`, { cache: "no-store" }).then(async (response) => {
       if (!response.ok || cancelled) return;
-      const values = (await response.json() as Snapshot[]).filter((item) => item.frequency === "1min");
+      const values = (await response.json() as Snapshot[]).filter((item) => ["1min", "5min"].includes(item.frequency ?? ""));
       setMinuteSnapshots(values);
       setMinuteSnapshot((current) => current || values[0]?.name || "");
     });
@@ -162,9 +167,17 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
     }, task.title);
   }
 
-  function startMinuteQlib() {
-    if (!minuteSnapshot) { onMessage("尚无已完成的 1 分钟不可变快照。"); return; }
-    void submit("/api/jobs/minute-qlib", { snapshot_name: minuteSnapshot }, "分钟 Qlib 数据集");
+  function startMinuteQlib(snapshotName = minuteSnapshot) {
+    if (!snapshotName) { onMessage("尚无已完成的分钟不可变快照。"); return; }
+    void submit("/api/jobs/minute-qlib", { snapshot_name: snapshotName }, "分钟 Qlib 数据集");
+  }
+
+  function startAshare5m() {
+    void submit(
+      "/api/jobs/ashare-5m",
+      { start, end: end || "latest" },
+      "全 A 股 5 分钟线",
+    );
   }
 
   function retryTask(task: DataTask) {
@@ -214,10 +227,12 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
                         <span>{task.coverage}%</span>
                       </div>
                       <div className="catalog-task-actions">
-                        {supplementalBundles.has(task.task_key) && !["queued", "running"].includes(task.status) ? (
+                        {supplementalBundles.has(task.task_key) && task.task_key !== "strategy_specialty_minutes" && !["queued", "running"].includes(task.status) ? (
                           <button type="button" disabled={submitting !== null || !task.dependencies_satisfied} onClick={() => startSupplemental(task)}>{task.status === "partial" ? "补齐" : task.status === "succeeded" ? "更新" : "下载"}</button>
                         ) : null}
-                        {task.task_key === "liquid_intraday_qlib" && !["queued", "running"].includes(task.status) ? <button type="button" disabled={submitting !== null || !task.dependencies_satisfied || !minuteSnapshot} onClick={startMinuteQlib}>构建 Qlib</button> : null}
+                        {task.task_key === "strategy_specialty_minutes" && !["queued", "running"].includes(task.status) ? <button type="button" onClick={() => onMessage("请到“新建任务”填写证券代码后启动策略分钟专项数据。")}>配置后下载</button> : null}
+                        {["liquid_intraday_qlib", "cn_ashare_5m_qlib"].includes(task.task_key) && !["queued", "running"].includes(task.status) ? (() => { const snapshot = minuteSnapshots.find((item) => item.frequency === task.config.frequency)?.name ?? ""; return <button type="button" disabled={submitting !== null || !task.dependencies_satisfied || !snapshot} onClick={() => startMinuteQlib(snapshot)}>构建 Qlib</button>; })() : null}
+                        {task.task_key === "cn_ashare_5m" && !["queued", "running"].includes(task.status) ? <button type="button" disabled={submitting !== null || !task.dependencies_satisfied} onClick={startAshare5m}>下载/更新</button> : null}
                         {task.status === "failed" && task.job_id ? <button className="danger-button" type="button" disabled={submitting !== null} onClick={() => retryTask(task)}>重试</button> : null}
                         <details>
                           <summary>详情</summary>
@@ -263,8 +278,8 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
             <label>开始日期<input type="date" value={start} onChange={(event) => setStart(event.target.value)} /></label>
             <label>结束日期<input type="date" value={end} onChange={(event) => setEnd(event.target.value)} /><small>留空表示最新交易日</small></label>
           </div>
-          {["hk_market", "us_market"].includes(selectedBundle) ? <label>证券代码（可选）<input value={symbols} onChange={(event) => setSymbols(event.target.value)} placeholder={selectedBundle === "hk_market" ? "00700.HK,00941.HK" : "AAPL,MSFT,NVDA"} /><small>留空下载当前配置允许的全市场范围</small></label> : null}
-          <button className="primary" disabled={!selectedTask || submitting !== null || !selectedTask.dependencies_satisfied || ["queued", "running"].includes(selectedTask.status)}>创建下载任务</button>
+          {["hk_market", "us_market", "strategy_specialty_minutes"].includes(selectedBundle) ? <label>证券代码（{selectedBundle === "strategy_specialty_minutes" ? "必填" : "可选"}）<input required={selectedBundle === "strategy_specialty_minutes"} value={symbols} onChange={(event) => setSymbols(event.target.value)} placeholder={selectedBundle === "hk_market" ? "00700.HK,00941.HK" : selectedBundle === "us_market" ? "AAPL,MSFT,NVDA" : "000001.SZ,600519.SH"} /><small>{selectedBundle === "strategy_specialty_minutes" ? "分钟专项接口必须明确证券范围，避免误拉全市场。" : "留空下载当前配置允许的全市场范围"}</small></label> : null}
+          <button className="primary" disabled={!selectedTask || submitting !== null || !selectedTask.dependencies_satisfied || ["queued", "running"].includes(selectedTask.status) || (selectedBundle === "strategy_specialty_minutes" && !symbols.trim())}>创建下载任务</button>
           {selectedTask && !selectedTask.dependencies_satisfied ? <p className="form-warning">前置数据尚未完成，暂不能启动。</p> : null}
         </form>
       )}
@@ -299,8 +314,10 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
           <button className="primary" disabled={submitting !== null || !minuteTask?.dependencies_satisfied || ["queued", "running"].includes(minuteTask?.status ?? "")}>{minuteTask?.status === "succeeded" ? "创建增量更新" : "创建下载任务"}</button>
           {!minuteTask?.dependencies_satisfied ? <p className="form-warning">需先完成期货、期权和同区间融券资格数据。</p> : null}
           <div className="form-intro"><strong>下载完成后构建分钟 Qlib</strong><span>转换是独立任务；失败只重试构建，不会重新下载分钟行情。</span></div>
-          <label>1 分钟不可变快照<select value={minuteSnapshot} onChange={(event) => setMinuteSnapshot(event.target.value)}><option value="">尚无可用快照</option>{minuteSnapshots.map((item) => <option value={item.name} key={item.name}>{item.name}{item.end_date ? ` · 至 ${item.end_date}` : ""}</option>)}</select></label>
+          <label>分钟不可变快照<select value={minuteSnapshot} onChange={(event) => setMinuteSnapshot(event.target.value)}><option value="">尚无可用快照</option>{minuteSnapshots.map((item) => <option value={item.name} key={item.name}>{item.name} · {item.frequency}{item.end_date ? ` · 至 ${item.end_date}` : ""}</option>)}</select></label>
           <button type="button" onClick={startMinuteQlib} disabled={submitting !== null || !minuteSnapshot || !minuteQlibTask?.dependencies_satisfied || ["queued", "running"].includes(minuteQlibTask?.status ?? "")}>构建分钟 Qlib 数据集</button>
+          <div className="form-intro"><strong>全 A 股 5 分钟线</strong><span>从 stock_basic 自动读取区间内曾上市的沪、深、北股票（含退市股），按股票和月份断点续传。</span></div>
+          <button type="button" onClick={startAshare5m} disabled={submitting !== null || !ashare5mTask?.dependencies_satisfied || ["queued", "running"].includes(ashare5mTask?.status ?? "")}>{ashare5mTask?.status === "succeeded" ? "创建增量更新" : "创建全市场 5 分钟下载"}</button>
         </form>
       )}
     </section>

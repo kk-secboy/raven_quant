@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import case, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from quant_data.coverage_data import COVERAGE_BUNDLES, coverage_bundle_datasets
 from quant_data.database import data_tasks, jobs, open_database, row_dict, work_units
 
 
@@ -205,6 +206,139 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         estimated_storage_gb=2,
     ),
     DataTaskDefinition(
+        "cn_institutional",
+        3,
+        35,
+        "机构研究与增强数据",
+        "券商盈利预测、沪深ETF申赎清单、中信行业指数、Shibor报价明细和长篇财经新闻。所有限额接口均分页并验证终止页。",
+        "研究增强",
+        "Tushare",
+        "ready",
+        ("cn_macro",),
+        (
+            "report_rc",
+            "etf_sh_cons",
+            "etf_sz_cons",
+            "ci_daily",
+            "shibor_quote",
+            "major_news",
+        ),
+        "daily/monthly",
+        estimated_storage_gb=25,
+    ),
+    DataTaskDefinition(
+        "cn_governance_risk",
+        3,
+        36,
+        "公司治理、风险与参考资料",
+        "ST变更、沪深港通标的、公司与管理层、异常波动、筹码、CCASS、券商推荐、两融与转融通。",
+        "A股增强",
+        "Tushare",
+        "ready",
+        ("cn_qlib_baseline",),
+        tuple(sorted(coverage_bundle_datasets("cn_governance_risk"))),
+        "daily/monthly",
+        estimated_storage_gb=35,
+    ),
+    DataTaskDefinition(
+        "cn_capital_flow",
+        3,
+        37,
+        "全市场资金流增强",
+        "沪深港通、同花顺与东方财富的个股、行业、概念和全市场资金流。",
+        "资金流",
+        "Tushare",
+        "ready",
+        ("cn_qlib_baseline",),
+        tuple(sorted(coverage_bundle_datasets("cn_capital_flow"))),
+        "daily",
+        estimated_storage_gb=20,
+    ),
+    DataTaskDefinition(
+        "cn_fund_index_enhanced",
+        3,
+        38,
+        "ETF、指数与基金增强",
+        "ETF份额、指数公告与成分、指数技术因子、交易所统计和基金技术因子。",
+        "基金与指数",
+        "Tushare",
+        "ready",
+        ("cn_funds",),
+        tuple(sorted(coverage_bundle_datasets("cn_fund_index_enhanced"))),
+        "daily",
+        estimated_storage_gb=30,
+    ),
+    DataTaskDefinition(
+        "cn_derivatives_enhanced",
+        4,
+        55,
+        "衍生品、黄金与债券增强",
+        "期货指数、周度统计、黄金、转债因子、银行间报价、债券大宗和财经日历。",
+        "跨资产",
+        "Tushare",
+        "ready",
+        ("cn_options_bonds",),
+        tuple(sorted(coverage_bundle_datasets("cn_derivatives_enhanced"))),
+        "daily/weekly",
+        estimated_storage_gb=25,
+    ),
+    DataTaskDefinition(
+        "global_rates_enhanced",
+        5,
+        85,
+        "海外复权与利率增强",
+        "港美股复权因子、LIBOR、HIBOR及美国短中长期利率曲线。",
+        "外围市场",
+        "Tushare",
+        "ready",
+        ("global_markets",),
+        tuple(sorted(coverage_bundle_datasets("global_rates_enhanced"))),
+        "daily",
+        estimated_storage_gb=12,
+    ),
+    DataTaskDefinition(
+        "research_corpus",
+        5,
+        86,
+        "研究报告与财经语料",
+        "新闻联播、研报、货币政策、交易所互动问答和财经公众号语料。",
+        "研究语料",
+        "Tushare",
+        "ready",
+        ("cn_qlib_baseline",),
+        tuple(sorted(coverage_bundle_datasets("research_corpus"))),
+        "daily/monthly",
+        estimated_storage_gb=80,
+    ),
+    DataTaskDefinition(
+        "strategy_specialty",
+        7,
+        108,
+        "策略专项与题材数据",
+        "九转、AH比较、涨停板、热点榜、同花顺/东财/通达信/开盘啦概念和指数。",
+        "策略可选",
+        "Tushare",
+        "ready",
+        ("cn_qlib_baseline",),
+        tuple(sorted(coverage_bundle_datasets("strategy_specialty"))),
+        "daily",
+        estimated_storage_gb=45,
+    ),
+    DataTaskDefinition(
+        "strategy_specialty_minutes",
+        7,
+        109,
+        "申万指数与港股专项分钟线",
+        "按显式策略标的下载申万指数和港股5分钟线，避免无边界全市场请求。",
+        "策略可选",
+        "Tushare",
+        "ready",
+        ("liquid_intraday_1m",),
+        tuple(sorted(coverage_bundle_datasets("strategy_specialty_minutes"))),
+        "5min",
+        estimated_storage_gb=80,
+    ),
+    DataTaskDefinition(
         "cn_futures",
         4,
         40,
@@ -351,11 +485,25 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         "2024年至今全市场5分钟行情；15/30/60分钟由5分钟数据本地聚合。",
         "分钟行情",
         "Tushare",
-        "permission_probe",
+        "ready",
         ("liquid_intraday_1m",),
         ("ashare_5m",),
         "5min",
         estimated_storage_gb=250,
+    ),
+    DataTaskDefinition(
+        "cn_ashare_5m_qlib",
+        6,
+        105,
+        "全A股5分钟Qlib数据集",
+        "将全A股5分钟不可变快照独立转换为Qlib二进制数据；构建失败不会重新下载行情。",
+        "研究基础设施",
+        "Qlib",
+        "ready",
+        ("cn_ashare_5m",),
+        ("qlib_ashare_5m_dataset",),
+        "5min",
+        estimated_storage_gb=180,
     ),
     DataTaskDefinition(
         "tick_level2",
@@ -378,13 +526,14 @@ SUPPLEMENTAL_TASK_KEYS = frozenset(
         "cn_extended_daily",
         "cn_funds",
         "cn_macro",
+        "cn_institutional",
         "cn_futures",
         "cn_options_bonds",
         "hk_market",
         "us_market",
         "global_markets",
     }
-)
+) | COVERAGE_BUNDLES
 
 
 class DataTaskStore:
@@ -440,11 +589,17 @@ class DataTaskStore:
             "qlib_baseline": "cn_qlib_baseline",
             "margin_eligibility_download": "cn_margin_eligibility",
             "core_intraday_download": "pair_execution_1m",
-            "minute_qlib": "liquid_intraday_qlib",
+            "ashare_5m_download": "cn_ashare_5m",
         }
         rows = connection.execute(
-            select(jobs.c.id, jobs.c.kind, jobs.c.status, jobs.c.created_at)
-            .where(jobs.c.kind.in_(tuple(task_by_kind)))
+            select(
+                jobs.c.id,
+                jobs.c.kind,
+                jobs.c.status,
+                jobs.c.payload_json,
+                jobs.c.created_at,
+            )
+            .where(jobs.c.kind.in_((*tuple(task_by_kind), "minute_qlib")))
             .order_by(jobs.c.created_at.desc())
         ).all()
         latest: dict[str, Any] = {}
@@ -458,6 +613,30 @@ class DataTaskStore:
                 update(data_tasks)
                 .where(data_tasks.c.task_key == task_key)
                 .values(job_id=current.id, status=current.status, updated_at=now)
+            )
+        minute_task_by_frequency = {
+            "1min": "liquid_intraday_qlib",
+            "5min": "cn_ashare_5m_qlib",
+        }
+        bound_frequencies: set[str] = set()
+        for row in rows:
+            if str(row.kind) != "minute_qlib":
+                continue
+            payload = row.payload_json or {}
+            frequency = str(payload.get("frequency") or "")
+            if not frequency:
+                output_name = str(payload.get("output_name") or "")
+                frequency = next(
+                    (item for item in minute_task_by_frequency if output_name.endswith(f"-{item}")),
+                    "1min",
+                )
+            if frequency in bound_frequencies or frequency not in minute_task_by_frequency:
+                continue
+            bound_frequencies.add(frequency)
+            connection.execute(
+                update(data_tasks)
+                .where(data_tasks.c.task_key == minute_task_by_frequency[frequency])
+                .values(job_id=row.id, status=row.status, updated_at=now)
             )
         current_intraday = latest.get("core_intraday_download")
         if current_intraday is not None:

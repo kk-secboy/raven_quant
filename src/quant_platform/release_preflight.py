@@ -270,17 +270,27 @@ def assess_release(
                 )
             )
 
-    queue_complete = database_query_ok and all(value == 0 for value in queue.values())
+    # Pending and failed units are durable, dormant checkpoints. They are often
+    # exactly what a bug-fix release needs to preserve and resume. Only a live
+    # job or a currently running/leased unit can race a container replacement.
+    # Treating dormant checkpoints as active work creates an unrecoverable
+    # release deadlock after a downloader fails.
+    queue_complete = (
+        database_query_ok
+        and queue["active_jobs"] == 0
+        and queue["running_units"] == 0
+    )
     checks.append(
         _check(
             "durable_work_idle",
-            "Durable jobs and work units are idle",
+            "No durable work is executing",
             queue_complete,
             (
                 f"active jobs {queue['active_jobs']}; pending {queue['pending_units']}; "
                 f"running {queue['running_units']}; failed {queue['failed_units']}"
             ),
-            "Wait for active work and resolve failed units; never bypass this by restart.",
+            "Wait for active jobs and running work units; dormant checkpoints "
+            "are preserved across release.",
         )
     )
 

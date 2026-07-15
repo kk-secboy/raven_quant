@@ -10,6 +10,10 @@ from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
 from quant_data.checkpoint import CheckpointStore
+from quant_data.cli import (
+    _historical_a_share_active_ranges,
+    _historical_a_share_symbols,
+)
 from quant_data.config import Settings
 from quant_data.execution_data import margin_specs, minute_specs
 from quant_data.models import ProviderResult
@@ -71,6 +75,73 @@ def test_plans_daily_market_margin_and_monthly_symbol_windows() -> None:
     assert len(futures) == 2
     assert {spec.params["ts_code"] for spec in etf} == {"510300.SH", "159919.SZ"}
     assert all(spec.params["freq"] == "1min" for spec in minutes)
+
+
+@pytest.mark.no_database
+def test_full_a_share_five_minute_plans_monthly_resumable_windows() -> None:
+    specs = minute_specs(
+        {"ashare_5m": ["600000.SH", "000001.SZ", "899050.BJ"]},
+        start=date(2024, 1, 20),
+        end=date(2024, 2, 5),
+        max_attempts=5,
+        freq="5min",
+    )
+    assert len(specs) == 6
+    assert {spec.api_name for spec in specs} == {"stk_mins"}
+    assert {spec.params["freq"] for spec in specs} == {"5min"}
+    assert {spec.dataset for spec in specs} == {"ashare_5m"}
+
+
+@pytest.mark.no_database
+def test_full_a_share_history_includes_delisted_names_without_survivorship_bias() -> None:
+    master = pd.DataFrame(
+        [
+            {"ts_code": "600000.SH", "list_date": "19991110", "delist_date": None},
+            {"ts_code": "000001.SZ", "list_date": "19910403", "delist_date": "20240510"},
+            {"ts_code": "600001.SH", "list_date": "19920101", "delist_date": "20231231"},
+            {"ts_code": "920001.BJ", "list_date": "20250102", "delist_date": None},
+            {"ts_code": "00700.HK", "list_date": "20040616", "delist_date": None},
+        ]
+    )
+
+    assert _historical_a_share_symbols(
+        master,
+        start=date(2024, 1, 1),
+        end=date(2024, 12, 31),
+    ) == ["000001.SZ", "600000.SH"]
+
+
+@pytest.mark.no_database
+def test_full_a_share_windows_are_clipped_to_each_stock_lifecycle() -> None:
+    master = pd.DataFrame(
+        [
+            {"ts_code": "600000.SH", "list_date": "19991110", "delist_date": "20240120"},
+            {"ts_code": "920001.BJ", "list_date": "20260215", "delist_date": None},
+        ]
+    )
+    active_ranges = _historical_a_share_active_ranges(
+        master,
+        start=date(2024, 1, 1),
+        end=date(2026, 3, 31),
+    )
+    specs = minute_specs(
+        {"ashare_5m": active_ranges},
+        start=date(2024, 1, 1),
+        end=date(2026, 3, 31),
+        max_attempts=3,
+        freq="5min",
+        active_ranges_by_dataset={"ashare_5m": active_ranges},
+    )
+
+    windows = {
+        (spec.params["ts_code"], spec.params["start_date"], spec.params["end_date"])
+        for spec in specs
+    }
+    assert windows == {
+        ("600000.SH", "2024-01-01 00:00:00", "2024-01-20 23:59:59"),
+        ("920001.BJ", "2026-02-15 00:00:00", "2026-02-28 23:59:59"),
+        ("920001.BJ", "2026-03-01 00:00:00", "2026-03-31 23:59:59"),
+    }
 
 
 def test_runner_normalizes_shortability_and_minute_timestamp(
@@ -202,6 +273,35 @@ def test_execution_data_api_and_worker_commands(
                 "end": "2024-01-31",
             },
         )
+        capital_flow = client.post(
+            "/api/jobs/supplemental-download",
+            json={
+                "bundle": "cn_capital_flow",
+                "start": "2024-01-01",
+                "end": "2024-01-31",
+            },
+        )
+        specialty_minutes_without_symbols = client.post(
+            "/api/jobs/supplemental-download",
+            json={
+                "bundle": "strategy_specialty_minutes",
+                "start": "2024-01-01",
+                "end": "2024-01-31",
+            },
+        )
+        specialty_minutes = client.post(
+            "/api/jobs/supplemental-download",
+            json={
+                "bundle": "strategy_specialty_minutes",
+                "start": "2024-01-01",
+                "end": "2024-01-31",
+                "symbols": ["000001.SZ", "600519.SH"],
+            },
+        )
+        ashare_5m = client.post(
+            "/api/jobs/ashare-5m",
+            json={"start": "2024-01-01", "end": "2024-01-31"},
+        )
         market = client.post(
             "/api/jobs/supplemental-download",
             json={
@@ -227,6 +327,10 @@ def test_execution_data_api_and_worker_commands(
     assert margin.status_code == 202
     assert intraday.status_code == 202
     assert supplemental.status_code == 202
+    assert capital_flow.status_code == 202
+    assert specialty_minutes_without_symbols.status_code == 422
+    assert specialty_minutes.status_code == 202
+    assert ashare_5m.status_code == 202
     assert market.status_code == 202
     assert minute_qlib.status_code == 202
     assert minute_research.status_code == 202
@@ -250,6 +354,11 @@ def test_execution_data_api_and_worker_commands(
     supplemental_command, supplemental_result, supplemental_env = worker._command(
         supplemental.json()
     )
+    capital_flow_command, _, _ = worker._command(capital_flow.json())
+    specialty_minutes_command, _, _ = worker._command(specialty_minutes.json())
+    ashare_5m_command, ashare_5m_result, ashare_5m_env = worker._command(
+        ashare_5m.json()
+    )
     market_command, market_result, market_env = worker._command(market.json())
     minute_qlib_command, minute_qlib_result, minute_qlib_env = worker._command(
         minute_qlib.json()
@@ -272,6 +381,13 @@ def test_execution_data_api_and_worker_commands(
     assert "cn_macro" in supplemental_command
     assert supplemental_result.name == "result.json"
     assert supplemental_env == margin_env
+    assert "cn_capital_flow" in capital_flow_command
+    assert "strategy_specialty_minutes" in specialty_minutes_command
+    assert "000001.SZ,600519.SH" in specialty_minutes_command
+    assert "ashare-5m" in ashare_5m_command
+    assert "--snapshot-name" in ashare_5m_command
+    assert ashare_5m_result.name == "result.json"
+    assert ashare_5m_env == margin_env
     assert "--symbols" in market_command
     assert "00700.HK,00941.HK" in market_command
     assert market_result.name == "result.json"
@@ -306,7 +422,36 @@ def test_minute_qlib_api_rejects_daily_snapshot(
         )
 
     assert response.status_code == 409
-    assert "1min" in response.json()["detail"]
+    assert "supported minute" in response.json()["detail"]
+
+
+def test_minute_qlib_api_accepts_five_minute_snapshot(
+    tmp_path: Path, monkeypatch, database_url: str
+) -> None:
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
+    snapshot = tmp_path / "data" / "snapshots" / "ashare-five-minute"
+    snapshot.mkdir(parents=True)
+    (snapshot / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": "ashare-five-minute",
+                "frequency": "5min",
+                "datasets": {"ashare_5m": {"rows": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with TestClient(create_app(tmp_path)) as client:
+        response = client.post(
+            "/api/jobs/minute-qlib",
+            json={"snapshot_name": "ashare-five-minute"},
+        )
+
+    assert response.status_code == 202
+    assert response.json()["payload"]["frequency"] == "5min"
+    assert response.json()["payload"]["output_name"] == "ashare-five-minute-5min"
 
 
 def test_completed_supplemental_job_can_be_created_again_for_missing_units(

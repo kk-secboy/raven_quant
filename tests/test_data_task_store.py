@@ -119,10 +119,23 @@ def test_api_exposes_persistent_data_tasks(database_url: str, tmp_path: Path, mo
 
     assert response.status_code == 200
     tasks = response.json()
-    assert len(tasks) == 19
+    assert len(tasks) == len(DATA_TASK_CATALOG)
     assert next(item for item in tasks if item["task_key"] == "hk_market")
     assert next(item for item in tasks if item["task_key"] == "cn_funds")
     assert next(item for item in tasks if item["task_key"] == "global_markets")
+    assert next(item for item in tasks if item["task_key"] == "cn_capital_flow")
+    assert next(item for item in tasks if item["task_key"] == "research_corpus")
+    institutional = next(
+        item for item in tasks if item["task_key"] == "cn_institutional"
+    )
+    assert {
+        "report_rc",
+        "etf_sh_cons",
+        "etf_sz_cons",
+        "ci_daily",
+        "shibor_quote",
+        "major_news",
+    } <= set(institutional["config"]["datasets"])
     assert {"stock_st", "sw_daily"} <= set(
         next(item for item in tasks if item["task_key"] == "cn_extended_daily")["config"][
             "datasets"
@@ -153,6 +166,15 @@ def test_api_exposes_persistent_data_tasks(database_url: str, tmp_path: Path, mo
         item for item in tasks if item["task_key"] == "liquid_intraday_qlib"
     )
     assert minute_qlib["depends_on"] == ["liquid_intraday_1m"]
+    ashare_5m = next(item for item in tasks if item["task_key"] == "cn_ashare_5m")
+    assert ashare_5m["implementation_status"] == "ready"
+    ashare_5m_qlib = next(
+        item for item in tasks if item["task_key"] == "cn_ashare_5m_qlib"
+    )
+    assert ashare_5m_qlib["depends_on"] == ["cn_ashare_5m"]
+    assert next(item for item in tasks if item["task_key"] == "cn_futures")[
+        "depends_on"
+    ] == ["cn_macro"]
     assert (
         next(item for item in tasks if item["task_key"] == "cn_extended_daily")[
             "implementation_status"
@@ -180,6 +202,28 @@ def test_minute_qlib_job_updates_its_own_task_card(
     assert tasks["liquid_intraday_qlib"]["job_id"] == job["id"]
     assert tasks["liquid_intraday_qlib"]["status"] == "queued"
     assert tasks["liquid_intraday_1m"]["job_id"] is None
+
+
+def test_five_minute_qlib_job_updates_five_minute_task_card(
+    database_url: str, tmp_path: Path
+) -> None:
+    jobs = JobStore(database_url)
+    job = jobs.create(
+        "minute_qlib",
+        {
+            "snapshot_name": "ashare-fixture",
+            "output_name": "ashare-fixture-5min",
+            "frequency": "5min",
+        },
+        tmp_path / "minute-qlib-5min.log",
+    )
+    store = DataTaskStore(database_url)
+    store.sync_catalog()
+
+    tasks = {item["task_key"]: item for item in store.list()}
+    assert tasks["cn_ashare_5m_qlib"]["job_id"] == job["id"]
+    assert tasks["cn_ashare_5m_qlib"]["status"] == "queued"
+    assert tasks["liquid_intraday_qlib"]["job_id"] is None
 
 
 def test_task_card_exposes_failure_reason_and_retry_identity(

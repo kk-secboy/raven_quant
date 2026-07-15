@@ -77,6 +77,7 @@ const stateClass = (status: string) => ["succeeded", "enqueued", "active", "ok",
 const scheduleKindText: Record<string, string> = {
   incremental_sync: "数据增量同步",
   data_pipeline: "全数据恢复流水线",
+  ashare_5m_sync: "全 A 股 5 分钟增量",
   rdagent_research: "RD-Agent 因子研究",
   paper_rebalance: "模拟组合再平衡",
   pair_paper_rebalance: "配对模拟再平衡",
@@ -101,7 +102,7 @@ export function OperationsPanel({ api, currentUser }: { api: string; currentUser
   });
   const [syncName, setSyncName] = useState("每日数据增量同步");
   const [syncTime, setSyncTime] = useState("18:00");
-  const [syncKind, setSyncKind] = useState<"incremental_sync" | "data_pipeline">("incremental_sync");
+  const [syncKind, setSyncKind] = useState<"incremental_sync" | "data_pipeline" | "ashare_5m_sync">("incremental_sync");
   const [profile, setProfile] = useState("full");
   const [syncLookbackDays, setSyncLookbackDays] = useState(7);
   const [syncBuildQlib, setSyncBuildQlib] = useState(true);
@@ -203,7 +204,7 @@ export function OperationsPanel({ api, currentUser }: { api: string; currentUser
       trading_days_only: true, payload: {
         profile, lookback_days: syncLookbackDays, build_qlib: syncBuildQlib,
         snapshot_start: syncSnapshotStart,
-        ...(syncKind === "data_pipeline" ? { bundles: ["cn_extended_daily", "cn_funds", "cn_macro", "cn_futures", "cn_options_bonds", "hk_market", "us_market", "global_markets"] } : {}),
+        ...(syncKind === "data_pipeline" ? { bundles: ["cn_extended_daily", "cn_funds", "cn_macro", "cn_futures", "cn_options_bonds", "hk_market", "us_market", "global_markets", "cn_institutional", "cn_governance_risk", "cn_capital_flow", "cn_fund_index_enhanced", "cn_derivatives_enhanced", "global_rates_enhanced", "research_corpus"] } : {}),
       },
       misfire_grace_seconds: syncMisfireGrace, actor: "local-operator",
     });
@@ -361,11 +362,11 @@ export function OperationsPanel({ api, currentUser }: { api: string; currentUser
       <form className="automation-card" onSubmit={createSync}>
         <div className="card-heading"><div><span>数据自动化</span><strong>每日增量同步</strong></div><span className="status-chip">可恢复</span></div>
         <label>计划名称<input value={syncName} onChange={(event) => setSyncName(event.target.value)} /></label>
-        <div className="form-row"><label>运行时间<input type="time" value={syncTime} onChange={(event) => setSyncTime(event.target.value)} /></label><label>任务模式<select value={syncKind} onChange={(event) => setSyncKind(event.target.value as "incremental_sync" | "data_pipeline")}><option value="incremental_sync">A 股核心增量</option><option value="data_pipeline">全部数据依赖链</option></select></label></div>
+        <div className="form-row"><label>运行时间<input type="time" value={syncTime} onChange={(event) => setSyncTime(event.target.value)} /></label><label>任务模式<select value={syncKind} onChange={(event) => { const kind = event.target.value as "incremental_sync" | "data_pipeline" | "ashare_5m_sync"; setSyncKind(kind); if (kind === "ashare_5m_sync") setSyncLookbackDays((current) => Math.min(current, 30)); }}><option value="incremental_sync">A 股核心增量</option><option value="data_pipeline">全部数据依赖链</option><option value="ashare_5m_sync">全 A 股 5 分钟增量</option></select></label></div>
         <label>数据范围<select value={profile} onChange={(event) => setProfile(event.target.value)}><option value="core">Core</option><option value="research">Research</option><option value="full">Full</option></select></label>
-        <div className="form-row"><label>修订回看天数<input type="number" min="1" max="90" step="1" value={syncLookbackDays} onChange={(event) => setSyncLookbackDays(Number(event.target.value))} /></label><label>快照起始日<input type="date" value={syncSnapshotStart} onChange={(event) => setSyncSnapshotStart(event.target.value)} /></label></div>
+        <div className="form-row"><label>修订回看天数<input type="number" min="1" max={syncKind === "ashare_5m_sync" ? 30 : 90} step="1" value={syncLookbackDays} onChange={(event) => setSyncLookbackDays(Number(event.target.value))} /></label><label>快照起始日<input type="date" value={syncSnapshotStart} onChange={(event) => setSyncSnapshotStart(event.target.value)} /></label></div>
         <div className="form-row"><label>错过宽限（秒）<input type="number" min="60" max="86400" step="60" value={syncMisfireGrace} onChange={(event) => setSyncMisfireGrace(Number(event.target.value))} /></label><label className="policy-toggle"><input type="checkbox" checked={syncBuildQlib} onChange={(event) => setSyncBuildQlib(event.target.checked)} /><span>同步后构建 Qlib 快照</span></label></div>
-        <div className="execution-note"><b>自动流程</b><span>{syncKind === "data_pipeline" ? "核心日线与八类扩展数据逐项执行，前项成功才启动后项" : "按配置的回看窗口吸收 A 股核心修订数据"}</span><span>下载、校验、快照、Qlib 与基线保持独立任务，可分别重试</span><span>错过执行窗口或任一依赖失败时停止后续任务并产生告警</span></div>
+        <div className="execution-note"><b>自动流程</b><span>{syncKind === "data_pipeline" ? "核心日线与九类扩展数据逐项执行，前项成功才启动后项" : syncKind === "ashare_5m_sync" ? "盘后按股票生命周期补齐最近窗口的全 A 股 5 分钟线" : "按配置的回看窗口吸收 A 股核心修订数据"}</span><span>下载、校验、快照、Qlib 与基线保持独立任务，可分别重试</span><span>错过执行窗口或任一依赖失败时停止后续任务并产生告警</span></div>
         <button className="primary" disabled={syncName.length < 3}>启用数据计划</button>
       </form>
       <form className="automation-card" onSubmit={createPortfolioSchedule}>

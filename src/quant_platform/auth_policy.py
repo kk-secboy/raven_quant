@@ -34,6 +34,7 @@ def permission_for(method: str, path: str) -> str:
         "/api/jobs/finalize-data",
         "/api/jobs/margin-eligibility",
         "/api/jobs/core-intraday",
+        "/api/jobs/ashare-5m",
         "/api/jobs/minute-qlib",
         "/api/jobs/supplemental-download",
     }:

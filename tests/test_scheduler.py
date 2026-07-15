@@ -3,11 +3,17 @@ from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 from quant_data.config import Settings
+from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES, OPTIONAL_COVERAGE_BUNDLES
 from quant_platform.alert_store import AlertStore
 from quant_platform.job_store import JobStore
 from quant_platform.research_store import ResearchStore
 from quant_platform.schedule_store import ScheduleStore
-from quant_platform.scheduler import SchedulerEngine
+from quant_platform.scheduler import AUTOMATED_DATA_BUNDLES, SchedulerEngine
+
+
+def test_automatic_pipeline_includes_default_coverage_but_not_optional_specialties() -> None:
+    assert DEFAULT_COVERAGE_BUNDLES <= set(AUTOMATED_DATA_BUNDLES)
+    assert OPTIONAL_COVERAGE_BUNDLES.isdisjoint(AUTOMATED_DATA_BUNDLES)
 
 
 def _settings(database_url: str, tmp_path: Path) -> Settings:
@@ -96,6 +102,36 @@ def test_scheduler_creates_recoverable_full_data_pipeline(
         "data_qlib",
         "qlib_baseline",
     ]
+
+
+def test_scheduler_creates_daily_full_a_share_five_minute_increment(
+    database_url: str, tmp_path: Path
+) -> None:
+    current = datetime(2025, 1, 2, 12, 59, tzinfo=UTC)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="daily A-share five-minute sync",
+        kind="ashare_5m_sync",
+        timezone="Asia/Shanghai",
+        run_time=time(21, 0),
+        trading_days_only=True,
+        payload={"lookback_days": 3},
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+
+    result = SchedulerEngine(_settings(database_url, tmp_path)).tick(
+        datetime(2025, 1, 2, 13, 1, tzinfo=UTC)
+    )
+
+    assert result["processed"] == 1
+    run = store.list_runs()[0]
+    job = JobStore(database_url).get(run["job_id"])
+    assert job["kind"] == "ashare_5m_download"
+    assert job["payload"]["start"] == "2024-12-31"
+    assert job["payload"]["end"] == "2025-01-02"
+    assert job["payload"]["snapshot_name"] == "ashare-5m-incremental-20250102"
 
 
 def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(

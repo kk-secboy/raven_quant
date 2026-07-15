@@ -287,9 +287,11 @@ class LocalJobWorker:
 
     def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
         payload = job["payload"]
-        if job["kind"] in {"margin_eligibility_download", "core_intraday_download"} or job[
-            "kind"
-        ].startswith("supplemental_"):
+        if job["kind"] in {
+            "margin_eligibility_download",
+            "core_intraday_download",
+            "ashare_5m_download",
+        } or job["kind"].startswith("supplemental_"):
             stored = self.runtime_secrets.get("tushare")
             api_url = (stored or {}).get("api_url") or self.settings.api_url
             token = (stored or {}).get("token") or self.settings.token
@@ -349,6 +351,20 @@ class LocalJobWorker:
                             ),
                         ]
                     )
+            elif job["kind"] == "ashare_5m_download":
+                command.extend(
+                    [
+                        "ashare-5m",
+                        "--start",
+                        payload["start"],
+                        "--end",
+                        payload["end"],
+                        "--snapshot-name",
+                        payload["snapshot_name"],
+                        "--result",
+                        str(result_path),
+                    ]
+                )
             else:
                 command.extend(
                     [
@@ -367,7 +383,19 @@ class LocalJobWorker:
                     command.extend(["--symbols", ",".join(payload["symbols"])])
             return command, result_path, {"TUSHARE_API_URL": api_url, "TUSHARE_TOKEN": token}
         if job["kind"] == "data_verify":
-            return [sys.executable, "-m", "quant_data.cli", "verify"], None, {}
+            return (
+                [
+                    sys.executable,
+                    "-m",
+                    "quant_data.cli",
+                    "verify",
+                    "--snapshot-end",
+                    str(payload.get("end") or "latest"),
+                    "--allow-incomplete-plans",
+                ],
+                None,
+                {},
+            )
         if job["kind"] == "data_snapshot":
             return (
                 [
@@ -948,6 +976,7 @@ class LocalJobWorker:
                     "cn_extended_daily",
                     "cn_funds",
                     "cn_macro",
+                    "cn_institutional",
                     "cn_futures",
                     "cn_options_bonds",
                     "hk_market",

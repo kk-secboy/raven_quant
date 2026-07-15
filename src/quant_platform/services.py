@@ -111,7 +111,9 @@ def dataset_catalog(checkpoint: CheckpointStore) -> list[dict[str, Any]]:
     profiles: dict[str, str] = {
         "stock_basic": "core",
         "trade_cal": "core",
+        "index_basic": "core",
         "index_daily": "core",
+        "index_dailybasic": "core",
         "index_weight": "core",
         "fund_basic": "research",
         "index_classify": "research",

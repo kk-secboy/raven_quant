@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 from cryptography.fernet import Fernet
 
-from quant_platform.backup_restore import create_backup, load_and_verify_manifest, restore_backup
+from quant_platform.backup_restore import (
+    _data_mount_source,
+    create_backup,
+    load_and_verify_manifest,
+    restore_backup,
+)
+
+pytestmark = pytest.mark.no_database
 
 
 def _digest(path: Path) -> str:
@@ -41,6 +48,55 @@ def _backup(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return root
+
+
+def test_data_mount_source_accepts_named_volume() -> None:
+    assert (
+        _data_mount_source(
+            {
+                "Mounts": [
+                    {
+                        "Type": "volume",
+                        "Name": "quantlab_data",
+                        "Destination": "/data",
+                    }
+                ]
+            }
+        )
+        == "quantlab_data"
+    )
+
+
+def test_data_mount_source_accepts_absolute_bind_mount() -> None:
+    assert (
+        _data_mount_source(
+            {
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": "/data/quantlab",
+                        "Destination": "/data",
+                    }
+                ]
+            }
+        )
+        == "/data/quantlab"
+    )
+
+
+def test_data_mount_source_rejects_relative_bind_mount() -> None:
+    with pytest.raises(RuntimeError, match="must be an absolute path"):
+        _data_mount_source(
+            {
+                "Mounts": [
+                    {
+                        "Type": "bind",
+                        "Source": "data/quantlab",
+                        "Destination": "/data",
+                    }
+                ]
+            }
+        )
 
 
 def test_backup_manifest_verifies_both_archives(tmp_path: Path) -> None:

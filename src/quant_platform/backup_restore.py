@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from cryptography.fernet import Fernet
@@ -44,6 +44,21 @@ def _inside(path: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _data_mount_source(inspection: dict[str, Any]) -> str:
+    for mount in inspection.get("Mounts", []):
+        if mount.get("Destination") != "/data":
+            continue
+        name = str(mount.get("Name") or "").strip()
+        if name:
+            return name
+        if mount.get("Type") == "bind":
+            source = str(mount.get("Source") or "").strip()
+            if source and PurePosixPath(source).is_absolute():
+                return source
+            raise RuntimeError("the /data bind mount source must be an absolute path")
+    raise RuntimeError("unable to resolve the /data Docker volume or bind mount")
 
 
 def _platform_secret_key_fingerprint(context: ComposeContext) -> str:
@@ -146,10 +161,7 @@ class ComposeContext:
         if not api_id:
             raise RuntimeError("unable to create the API service for /data volume discovery")
         inspection = json.loads(self.docker("inspect", api_id, capture=True))[0]
-        for mount in inspection.get("Mounts", []):
-            if mount.get("Destination") == "/data" and mount.get("Name"):
-                return str(mount["Name"])
-        raise RuntimeError("unable to resolve the /data Docker volume")
+        return _data_mount_source(inspection)
 
 
 def load_and_verify_manifest(backup_directory: Path) -> dict[str, Any]:

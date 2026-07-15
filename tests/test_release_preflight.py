@@ -123,6 +123,28 @@ def test_assess_release_blocks_active_durable_work(
     assert "pending 14472" in durable["evidence"]
 
 
+def test_assess_release_allows_dormant_resumable_checkpoints(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        release_preflight,
+        "_schema_compatibility",
+        lambda _root, _revision: ("0020_strategy_allocations", "current", True),
+    )
+    result = release_preflight.assess_release(
+        FakeComposeContext("0|16668|0|24|0020_strategy_allocations"),  # type: ignore[arg-type]
+        tmp_path,
+        minimum_free_gb=0,
+    )
+
+    assert result["status"] == "ready"
+    durable = next(check for check in result["checks"] if check["id"] == "durable_work_idle")
+    assert durable["status"] == "pass"
+    assert "pending 16668" in durable["evidence"]
+    assert "failed 24" in durable["evidence"]
+
+
 def test_assess_release_reports_invalid_compose_without_crashing(
     monkeypatch,
     tmp_path: Path,

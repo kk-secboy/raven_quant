@@ -6,6 +6,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest_tmp*/
+.codex_tmp/
 .test-tmp/
 .test-tmp*/
 .ruff_cache/
@@ -15,6 +16,8 @@ dist/
 build/
 artifacts/
 web/build/
+!web/build/
+!web/build/sites-vite-plugin.ts
 *.egg-info/
 data/
 mlruns/

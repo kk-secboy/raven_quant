@@ -20,6 +20,8 @@ from sqlalchemy import text
 
 from quant_data.checkpoint import CheckpointStore
 from quant_data.config import Settings, normalize_api_url
+from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES
+from quant_data.execution_data import MINUTE_DATASETS, MINUTE_FREQUENCIES
 
 from .alert_store import AlertStore
 from .allocation_store import AllocationStore
@@ -137,11 +139,20 @@ class SupplementalDownloadRequest(BaseModel):
         "cn_extended_daily",
         "cn_funds",
         "cn_macro",
+        "cn_institutional",
         "cn_futures",
         "cn_options_bonds",
         "hk_market",
         "us_market",
         "global_markets",
+        "cn_governance_risk",
+        "cn_capital_flow",
+        "cn_fund_index_enhanced",
+        "cn_derivatives_enhanced",
+        "global_rates_enhanced",
+        "research_corpus",
+        "strategy_specialty",
+        "strategy_specialty_minutes",
     ]
     start: date = Field(default=date(2024, 1, 1))
     end: date | Literal["latest"] = "latest"
@@ -149,6 +160,20 @@ class SupplementalDownloadRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_range(self) -> SupplementalDownloadRequest:
+        if isinstance(self.end, date) and self.end < self.start:
+            raise ValueError("end must not be before start")
+        if self.bundle == "strategy_specialty_minutes" and not self.symbols:
+            raise ValueError("strategy_specialty_minutes requires explicit symbols")
+        return self
+
+
+class Ashare5mRequest(BaseModel):
+    start: date = Field(default=date(2024, 1, 1))
+    end: date | Literal["latest"] = "latest"
+    snapshot_name: str | None = Field(default=None, min_length=3, max_length=120)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> Ashare5mRequest:
         if isinstance(self.end, date) and self.end < self.start:
             raise ValueError("end must not be before start")
         return self
@@ -672,6 +697,7 @@ class ScheduleCreateRequest(BaseModel):
     kind: Literal[
         "incremental_sync",
         "data_pipeline",
+        "ashare_5m_sync",
         "rdagent_research",
         "paper_rebalance",
         "pair_paper_rebalance",
@@ -711,6 +737,12 @@ class ScheduleCreateRequest(BaseModel):
             profile = self.payload.get("profile", "full")
             if profile not in {"core", "research", "full"}:
                 raise ValueError("incremental_sync profile is invalid")
+        elif self.kind == "ashare_5m_sync":
+            if self.run_time < time(15, 10):
+                raise ValueError("ashare_5m_sync must run after the A-share close")
+            lookback_days = int(self.payload.get("lookback_days", 3))
+            if not 1 <= lookback_days <= 30:
+                raise ValueError("ashare_5m_sync lookback_days must be between 1 and 30")
         else:
             profile = self.payload.get("profile", "full")
             if profile not in {"core", "research", "full"}:
@@ -719,11 +751,13 @@ class ScheduleCreateRequest(BaseModel):
                 "cn_extended_daily",
                 "cn_funds",
                 "cn_macro",
+                "cn_institutional",
                 "cn_futures",
                 "cn_options_bonds",
                 "hk_market",
                 "us_market",
                 "global_markets",
+                *DEFAULT_COVERAGE_BUNDLES,
             }
             bundles = self.payload.get("bundles") or sorted(allowed)
             if not isinstance(bundles, list) or not bundles:
@@ -3122,6 +3156,33 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         worker.notify()
         return job
 
+    @app.post("/api/jobs/ashare-5m", status_code=202)
+    def download_ashare_5m(payload: Ashare5mRequest) -> dict:
+        api_url, token = tushare_settings()
+        if not api_url or not token:
+            raise HTTPException(409, "Tushare credentials are not configured")
+        end_date = payload.end if isinstance(payload.end, date) else date.today()
+        snapshot_name = payload.snapshot_name or (
+            f"ashare-5m-{payload.start:%Y%m%d}-{end_date:%Y%m%d}"
+        )
+        serialized = {
+            "start": payload.start.isoformat(),
+            "end": end_date.isoformat(),
+            "snapshot_name": snapshot_name,
+        }
+        log_path = platform_root / "logs" / f"ashare-5m-{snapshot_name}.log"
+        try:
+            job = jobs.create(
+                "ashare_5m_download",
+                serialized,
+                log_path,
+                idempotency_key=f"ashare-5m:{snapshot_name}",
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return job
+
     @app.post("/api/jobs/supplemental-download", status_code=202)
     def download_supplemental(payload: SupplementalDownloadRequest) -> dict:
         api_url, token = tushare_settings()
@@ -3205,22 +3266,18 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         manifest = snapshot["manifest"]
-        if manifest.get("frequency") != "1min":
-            raise HTTPException(409, "minute Qlib requires a 1min execution snapshot")
-        supported = {
-            "indices_1m",
-            "etf_1m",
-            "futures_1m",
-            "options_1m",
-            "liquid_stocks_1m",
-        }
+        frequency = str(manifest.get("frequency") or "")
+        if frequency not in MINUTE_FREQUENCIES:
+            raise HTTPException(409, "minute Qlib requires a supported minute snapshot")
+        supported = set(MINUTE_DATASETS)
         if not supported.intersection(manifest.get("datasets", {})):
             raise HTTPException(409, "execution snapshot has no supported minute datasets")
-        output_name = payload.output_name or f"{payload.snapshot_name}-1min"
+        output_name = payload.output_name or f"{payload.snapshot_name}-{frequency}"
         serialized = {
             "snapshot_name": payload.snapshot_name,
             "snapshot_manifest_sha256": snapshot["manifest_sha256"],
             "output_name": output_name,
+            "frequency": frequency,
         }
         log_path = platform_root / "logs" / f"minute-qlib-{output_name}.log"
         try:
