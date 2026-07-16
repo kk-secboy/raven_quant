@@ -10,6 +10,8 @@ import time
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
+
 from quant_data.config import Settings
 from quant_data.path_utils import to_wsl_path as _to_wsl_path
 
@@ -21,6 +23,8 @@ from .rdagent_runtime import rdagent_command
 from .recommendation_store import RecommendationStore
 from .research_store import ResearchStore
 from .runtime_secret_store import RuntimeSecretStore
+from .services import list_qlib_datasets
+from .simulation_store import SimulationStore
 from .strategy_store import StrategyStore
 
 
@@ -34,6 +38,7 @@ class LocalJobWorker:
         self.research = ResearchStore(settings.database_url)
         self.strategies = StrategyStore(settings.database_url)
         self.recommendations = RecommendationStore(settings.database_url)
+        self.simulations = SimulationStore(settings.database_url)
         self.allocations = AllocationStore(settings.database_url)
         self.parameter_experiments = ParameterExperimentStore(settings.database_url)
         self.runtime_secrets = RuntimeSecretStore(
@@ -73,6 +78,7 @@ class LocalJobWorker:
         backtest_id = job["payload"].get("backtest_id")
         parameter_experiment_id = job["payload"].get("parameter_experiment_id")
         recommendation_snapshot_id = job["payload"].get("recommendation_snapshot_id")
+        simulation_batch_id = job["payload"].get("simulation_batch_id")
         if research_run_id:
             self.research.mark_run(research_run_id, "running")
         if backtest_id:
@@ -91,6 +97,8 @@ class LocalJobWorker:
                 self.parameter_experiments.mark(parameter_experiment_id, "failed", error=str(exc))
             if recommendation_snapshot_id:
                 self.recommendations.mark_failed(recommendation_snapshot_id, str(exc))
+            if simulation_batch_id:
+                self.simulations.mark_batch_failed(simulation_batch_id, str(exc))
             return
         log_path = Path(job["log_path"])
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,11 +243,43 @@ class LocalJobWorker:
             if recommendation_snapshot_id:
                 if exit_code == 0 and result:
                     snapshot = self.recommendations.apply_result(recommendation_snapshot_id, result)
+                    batch, created = self.simulations.create_batch_for_snapshot(
+                        recommendation_snapshot_id
+                    )
+                    if created and batch:
+                        self.store.create(
+                            "simulation_replay",
+                            {"simulation_batch_id": batch["id"]},
+                            self.settings.data_root
+                            / "platform"
+                            / "logs"
+                            / f"simulation-replay-{batch['id']}.log",
+                            dedupe_active_kind=False,
+                            idempotency_key=f"simulation-replay:{batch['id']}",
+                        )
                     self.allocations.refresh_for_portfolio(str(snapshot["portfolio_id"]))
                 else:
                     self.recommendations.mark_failed(
                         recommendation_snapshot_id, logical_error or process_error
                     )
+            if simulation_batch_id and exit_code == 0 and result:
+                if result_path is None:
+                    raise ValueError("simulation replay result path is missing")
+                bars = pd.read_parquet(result_path.parent / result["minute_bars_file"])
+                batch = self.simulations.process_batch(
+                    simulation_batch_id,
+                    minute_bars=bars,
+                    closing_prices=result["closing_prices"],
+                    execution_evidence=result,
+                )
+                manifest = self.simulations.execution_manifest(simulation_batch_id)
+                self.allocations.refresh_for_portfolio(
+                    str(manifest["recommendation_portfolio_id"])
+                )
+            elif simulation_batch_id:
+                self.simulations.mark_batch_failed(
+                    simulation_batch_id, logical_error or process_error
+                )
         except Exception as exc:
             requeued = self.store.finish_or_retry(
                 job["id"],
@@ -257,6 +297,8 @@ class LocalJobWorker:
                 self.parameter_experiments.mark(parameter_experiment_id, "failed", error=str(exc))
             if recommendation_snapshot_id:
                 self.recommendations.mark_failed(recommendation_snapshot_id, str(exc))
+            if simulation_batch_id:
+                self.simulations.mark_batch_failed(simulation_batch_id, str(exc))
 
     def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
         payload = job["payload"]
@@ -694,10 +736,33 @@ class LocalJobWorker:
             def runtime_path(value: str) -> str:
                 return _to_wsl_path(Path(value)) if is_wsl else str(value)
 
+            execution_dataset = payload.get("execution_dataset")
+            family_trials: dict[str, int] = {}
+            for factor in version["factors"]:
+                family = str(factor.get("experiment_family_id") or factor["factor_candidate_id"])
+                family_trials[family] = max(
+                    family_trials.get(family, 0), int(factor.get("experiment_count") or 1)
+                )
             manifest = {
                 "strategy_version_id": version["id"],
                 "dataset": payload["dataset"],
+                "execution_dataset": (
+                    execution_dataset.get("name") if isinstance(execution_dataset, dict) else None
+                ),
+                "execution_frequency": (
+                    execution_dataset.get("frequency")
+                    if isinstance(execution_dataset, dict)
+                    else None
+                ),
+                "execution_contract_version": (
+                    (execution_dataset.get("provenance") or {}).get(
+                        "execution_contract_version"
+                    )
+                    if isinstance(execution_dataset, dict)
+                    else None
+                ),
                 "benchmark": version["benchmark"],
+                "strategy_trial_count": max(1, sum(family_trials.values())),
                 "periods": payload["periods"],
                 "config": version["config"],
                 "factors": [
@@ -739,6 +804,15 @@ class LocalJobWorker:
                     _to_wsl_path(output) if is_wsl else str(output),
                 ]
             )
+            if isinstance(execution_dataset, dict):
+                command.extend(
+                    [
+                        "--execution-provider-uri",
+                        runtime_path(execution_dataset["path"]),
+                        "--execution-frequency",
+                        str(execution_dataset["frequency"]),
+                    ]
+                )
             return command, result_path, {}
         if job["kind"] == "pair_backtest":
             output = self.settings.data_root / "artifacts" / "backtests" / payload["backtest_id"]
@@ -816,8 +890,6 @@ class LocalJobWorker:
                 return _to_wsl_path(Path(value)) if is_wsl else str(value)
 
             latest_snapshot = portfolio.get("latest_snapshot") or {}
-            performance_history = portfolio.get("hypothetical_performance") or []
-            latest_performance = performance_history[-1] if performance_history else None
             manifest = {
                 "portfolio_id": portfolio["id"],
                 "strategy_version_id": version["id"],
@@ -826,7 +898,7 @@ class LocalJobWorker:
                 "as_of_date": payload["as_of_date"],
                 "benchmark": version["benchmark"],
                 "config": version["config"],
-                "portfolio_value": float(portfolio["hypothetical_initial_value"]),
+                "construction_notional": float(portfolio["construction_notional"]),
                 "risk_exposure": float(portfolio.get("risk_exposure_override", 1.0)),
                 "previous_holdings": latest_snapshot.get("holdings") or [],
                 "previous_snapshot": (
@@ -834,22 +906,8 @@ class LocalJobWorker:
                         "as_of_date": str(latest_snapshot["as_of_date"]),
                         "effective_date": str(latest_snapshot.get("effective_date") or ""),
                         "holdings": latest_snapshot.get("holdings") or [],
-                        "position_state": (
-                            (latest_snapshot.get("snapshot") or {}).get("position_state") or {}
-                        ),
                     }
                     if latest_snapshot
-                    else None
-                ),
-                "previous_performance": (
-                    {
-                        "hypothetical_value": float(latest_performance["hypothetical_value"]),
-                        "high_water_mark": max(
-                            float(item["hypothetical_value"]) for item in performance_history
-                        ),
-                        "drawdown": float(latest_performance["drawdown"]),
-                    }
-                    if latest_performance
                     else None
                 ),
                 "factors": [
@@ -884,6 +942,56 @@ class LocalJobWorker:
                     _to_wsl_path(Path(payload["dataset_path"]))
                     if is_wsl
                     else str(Path(payload["dataset_path"])),
+                    "--manifest",
+                    _to_wsl_path(manifest_path) if is_wsl else str(manifest_path),
+                    "--output",
+                    _to_wsl_path(result_path) if is_wsl else str(result_path),
+                ]
+            )
+            return command, result_path, {}
+        if job["kind"] == "simulation_replay":
+            manifest = self.simulations.execution_manifest(payload["simulation_batch_id"])
+            datasets = {
+                item["name"]: item
+                for item in list_qlib_datasets(self.settings.data_root)
+                if item.get("ready")
+            }
+            minute_dataset = datasets.get(manifest["execution_dataset"])
+            if minute_dataset is None:
+                raise ValueError("simulation execution Qlib dataset is unavailable")
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "simulations"
+                / manifest["portfolio_id"]
+                / manifest["batch_id"]
+            )
+            output.mkdir(parents=True, exist_ok=True)
+            manifest_path = output / "manifest.json"
+            result_path = output / "result.json"
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+            script = self.project_root / "scripts" / "run_simulation_replay.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    _to_wsl_path(Path(minute_dataset["path"]))
+                    if is_wsl
+                    else str(minute_dataset["path"]),
                     "--manifest",
                     _to_wsl_path(manifest_path) if is_wsl else str(manifest_path),
                     "--output",
@@ -1002,7 +1110,8 @@ class LocalJobWorker:
 
     def _import_rdagent_candidates(self, run_id: str, result: dict) -> list[dict]:
         imported = []
-        for item in result.get("candidates", []):
+        source_candidates = result.get("candidates", [])
+        for item in source_candidates:
             imported.append(
                 self.research.add_candidate(
                     run_id,
@@ -1016,6 +1125,9 @@ class LocalJobWorker:
                     code_sha256=item.get("code_sha256"),
                     rdagent_decision=item.get("rdagent_decision"),
                     rdagent_feedback=item.get("rdagent_feedback"),
+                    experiment_family_id=str(item.get("experiment_family_id") or run_id),
+                    label_horizon_days=int(item.get("label_horizon_days") or 1),
+                    experiment_count=len(source_candidates),
                 )
             )
         return imported
@@ -1027,6 +1139,9 @@ class LocalJobWorker:
                 "id": item["id"],
                 "code_path": item["code_path"],
                 "values_path": item["values_path"],
+                "experiment_family_id": item["experiment_family_id"],
+                "label_horizon_days": item["label_horizon_days"],
+                "experiment_count": item["experiment_count"],
             }
             for item in candidates
             if item.get("rdagent_decision") is not False

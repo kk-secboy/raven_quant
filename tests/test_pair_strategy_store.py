@@ -4,6 +4,7 @@ from dataclasses import asdict
 
 import pytest
 
+from quant_platform.cost_model import COST_SCHEDULE_VERSION
 from quant_platform.pair_trading import PairTradingConfig
 from quant_platform.recommendation_store import RecommendationStore
 from quant_platform.strategy_store import StrategyStore
@@ -47,6 +48,7 @@ def _passing_metrics() -> dict:
         "atomic_pair_execution_enforced": True,
         "transaction_costs_enforced": True,
         "borrow_cost_enforced": True,
+        "cost_schedule_version": COST_SCHEDULE_VERSION,
         "open_position_at_end": False,
         "provenance": {
             "daily_dataset_identity_sha256": digest,

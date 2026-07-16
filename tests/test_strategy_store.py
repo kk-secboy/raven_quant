@@ -7,6 +7,10 @@ from pathlib import Path
 import pytest
 from governance_fixtures import PERIODS, create_strategy_version, formal_backtest_metrics
 
+from quant_data.execution_contract import (
+    MINUTE_EXECUTION_CONTRACT_VERSION,
+    MINUTE_SOURCE_UNIT_CONTRACTS,
+)
 from quant_platform.strategy_store import StrategyStore
 
 
@@ -94,3 +98,103 @@ def test_final_test_can_only_be_created_once(tmp_path: Path, database_url: str) 
     store.mark_backtest(created["id"], "failed", error="final test gate failed")
     with pytest.raises(ValueError, match="cannot be rerun"):
         store.requeue_backtest(created["id"])
+
+
+def test_twap_approval_requires_minute_native_execution_evidence(
+    tmp_path: Path, database_url: str
+) -> None:
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        config_overrides={
+            "execution_method": "twap",
+            "execution_slice_minutes": 20,
+            "min_capacity_fill_ratio": 0.95,
+        },
+    )
+    store = StrategyStore(database_url)
+    version = store.get_version(version_id)
+    artifact = tmp_path / "minute-backtest"
+    artifact.mkdir()
+    periods = {
+        "start": PERIODS["test_start"].isoformat(),
+        "end": PERIODS["test_end"].isoformat(),
+    }
+    backtest = store.create_backtest(
+        version_id=version_id,
+        dataset="snapshot",
+        execution_dataset="ashare-5m",
+        periods=periods,
+        artifact_path=artifact,
+    )
+    factor = version["factors"][0]
+    manifest = artifact / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "strategy_version_id": version_id,
+                "dataset": "snapshot",
+                "execution_dataset": "ashare-5m",
+                "benchmark": version["benchmark"],
+                "periods": periods,
+                "config": version["config"],
+                "factors": [
+                    {
+                        "candidate_id": factor["factor_candidate_id"],
+                        "values_path": factor["values_path"],
+                        "code_sha256": factor["code_sha256"],
+                        "weight": factor["weight"],
+                        "direction": factor["direction"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    metrics = formal_backtest_metrics(version, manifest)
+    metrics.update(
+        {
+            "minute_execution_enforced": True,
+            "capacity_fill_ratio": 0.99,
+            "execution_model": {
+                "method": "twap",
+                "frequency": "5min",
+                "price_assumption": "minute bar vwap fills",
+            },
+        }
+    )
+    metrics["provenance"].update(
+        {
+            "execution_dataset_identity_sha256": "d" * 64,
+            "execution_snapshot_manifest_sha256": "e" * 64,
+            "execution_qlib_builder_sha256": "f" * 64,
+            "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
+            "execution_fields": ["vwap", "volume", "paused", "up_limit", "down_limit"],
+            "execution_source_datasets": ["ashare_5m"],
+            "execution_source_unit_contracts": {
+                "ashare_5m": MINUTE_SOURCE_UNIT_CONTRACTS["ashare_5m"]
+            },
+            "execution_lineage_verified": True,
+            "execution_source_lineage_id": "9" * 64,
+        }
+    )
+    store.validate_backtest_artifacts(backtest["id"], metrics)
+
+    proxy_metrics = deepcopy(metrics)
+    proxy_metrics["minute_execution_enforced"] = False
+    store.mark_backtest(backtest["id"], "succeeded", metrics=proxy_metrics)
+    with pytest.raises(ValueError, match="minute-native"):
+        store.approve(
+            version_id,
+            actor="risk-owner",
+            reason="Daily proxy evidence must not approve a TWAP strategy.",
+        )
+
+    store.mark_backtest(backtest["id"], "succeeded", metrics=metrics)
+    approved = store.approve(
+        version_id,
+        actor="risk-owner",
+        reason="Minute-native execution evidence passed independent review.",
+    )
+    assert approved["status"] == "approved"

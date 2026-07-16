@@ -15,6 +15,10 @@ from quant_data.cli import (
     _historical_a_share_symbols,
 )
 from quant_data.config import Settings
+from quant_data.execution_contract import (
+    MINUTE_EXECUTION_CONTRACT_VERSION,
+    MINUTE_SOURCE_UNIT_CONTRACTS,
+)
 from quant_data.execution_data import margin_specs, minute_specs
 from quant_data.models import ProviderResult
 from quant_data.provider import ProviderError
@@ -243,11 +247,18 @@ def test_execution_data_api_and_worker_commands(
     )
     (minute_dataset / "metadata" / "provenance.json").write_text(
         json.dumps(
-            {
-                "frequency": "1min",
-                "dataset_identity_sha256": "a" * 64,
-                "snapshot_manifest_sha256": "b" * 64,
-            }
+                {
+                    "frequency": "1min",
+                    "dataset_identity_sha256": "a" * 64,
+                    "snapshot_manifest_sha256": "b" * 64,
+                    "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
+                    "fields": ["vwap", "volume", "paused", "up_limit", "down_limit"],
+                    "lineage_verified": True,
+                    "source_datasets": ["etf_1m"],
+                    "source_unit_contracts": {
+                        "etf_1m": MINUTE_SOURCE_UNIT_CONTRACTS["etf_1m"]
+                    },
+                }
         ),
         encoding="utf-8",
     )

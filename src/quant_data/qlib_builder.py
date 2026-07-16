@@ -7,11 +7,25 @@ import shutil
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import numpy as np
 import pandas as pd
 
+from quant_platform.eligibility import (
+    ELIGIBILITY_CONTRACT_VERSION,
+    EligibilityPolicy,
+    build_point_in_time_eligibility,
+)
+
+from .execution_contract import (
+    DAILY_QLIB_FIELD_CONTRACT_VERSION,
+    INDEX_VOLUME_POLICY,
+    QLIB_DAILY_VOLUME_UNIT,
+    TUSHARE_DAILY_VOLUME_UNIT,
+    TUSHARE_HAND_SIZE,
+)
 from .path_utils import to_wsl_path as _to_wsl_path
 
 _BASE_QLIB_FIELDS = (
@@ -93,6 +107,13 @@ class QlibBuilder:
             if missing:
                 raise RuntimeError(
                     f"{missing} daily rows have no valid adjustment factor or price limits"
+                )
+            invalid_units = connection.execute(
+                self._invalid_daily_units_query(daily_glob)
+            ).fetchone()[0]
+            if invalid_units:
+                raise RuntimeError(
+                    f"{invalid_units} daily rows violate the Tushare hand/amount price contract"
                 )
             connection.execute(
                 f"COPY ({query}) TO {_sql_string(str(partitions))} "
@@ -214,9 +235,15 @@ class QlibBuilder:
         builder_digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         fields = list(self.qlib_fields)
         contract = {
+            "version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
             "frequency": "day",
             "fields": fields,
+            "source_volume_unit": TUSHARE_DAILY_VOLUME_UNIT,
+            "qlib_volume_unit": QLIB_DAILY_VOLUME_UNIT,
+            "source_hand_size": int(TUSHARE_HAND_SIZE),
+            "index_volume_policy": INDEX_VOLUME_POLICY,
             "research_features": self.research_feature_contract,
+            "eligibility_contract_version": ELIGIBILITY_CONTRACT_VERSION,
         }
         contract_sha256 = hashlib.sha256(
             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -244,9 +271,15 @@ class QlibBuilder:
             "snapshot_name": self.snapshot_path.name,
             "snapshot_manifest_sha256": snapshot_digest,
             "qlib_builder_sha256": builder_digest,
+            "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
             "frequency": "day",
             "fields": fields,
+            "source_volume_unit": TUSHARE_DAILY_VOLUME_UNIT,
+            "qlib_volume_unit": QLIB_DAILY_VOLUME_UNIT,
+            "source_hand_size": int(TUSHARE_HAND_SIZE),
+            "index_volume_policy": INDEX_VOLUME_POLICY,
             "research_features": self.research_feature_contract,
+            "eligibility_contract_version": ELIGIBILITY_CONTRACT_VERSION,
         }
         canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         provenance = {
@@ -317,10 +350,8 @@ class QlibBuilder:
                 continue
             exchange, code = str(ts_code).split(".", 1)[1], str(ts_code).split(".", 1)[0]
             symbol = f"{exchange.upper()}{code}"
-            volume = pd.to_numeric(group.get("vol", 0.0), errors="coerce").fillna(0.0)
             amount = pd.to_numeric(group.get("amount", 0.0), errors="coerce").fillna(0.0)
             close = pd.to_numeric(group["close"], errors="coerce")
-            raw_vwap = (amount * 10.0 / volume.where(volume > 0)).fillna(close)
             normalized = pd.DataFrame(
                 {
                     "date": group["trade_date"],
@@ -329,14 +360,16 @@ class QlibBuilder:
                     "high": pd.to_numeric(group["high"], errors="coerce") / base_price,
                     "low": pd.to_numeric(group["low"], errors="coerce") / base_price,
                     "close": close / base_price,
-                    "vwap": raw_vwap / base_price,
-                    "volume": volume * base_price,
+                    # The index amount/volume ratio is not an index-point VWAP and
+                    # its volume is not executable stock capacity.
+                    "vwap": close / base_price,
+                    "volume": 0.0,
                     "factor": 1.0 / base_price,
                     "change": pd.to_numeric(group.get("pct_chg", 0.0), errors="coerce")
                     .fillna(0.0)
                     .div(100.0),
                     "amount": amount,
-                    "paused": (volume <= 0).astype(float),
+                    "paused": 0.0,
                 }
             )
             normalized.to_parquet(by_symbol / f"{symbol}.parquet", index=False, compression="zstd")
@@ -457,6 +490,10 @@ class QlibBuilder:
         if self._write_market_context_metadata(target):
             wrote_metadata = True
 
+        if not self._write_eligibility_metadata(target):
+            raise RuntimeError("Qlib point-in-time eligibility metadata is incomplete")
+        wrote_metadata = True
+
         if not wrote_metadata and target.exists() and not any(target.iterdir()):
             target.rmdir()
 
@@ -535,6 +572,145 @@ class QlibBuilder:
                     "version": 1,
                     "join_policy": "asof_backward_or_exact_for_next_period_signals",
                     "sources": sources,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return True
+
+    def _write_eligibility_metadata(self, target: Path) -> bool:
+        def read(dataset: str) -> pd.DataFrame:
+            root = self.snapshot_path / "parquet" / dataset
+            files = sorted(root.rglob("*.parquet")) if root.exists() else []
+            return (
+                pd.concat([pd.read_parquet(path) for path in files], ignore_index=True)
+                if files
+                else pd.DataFrame()
+            )
+
+        daily = read("daily")
+        stock_basic = read("stock_basic")
+        balancesheet = read("balancesheet")
+        audit = read("fina_audit")
+        if any(frame.empty for frame in (daily, stock_basic, balancesheet, audit)):
+            return False
+        market = pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(daily["trade_date"], errors="coerce"),
+                "instrument": daily["ts_code"].map(_qlib_symbol),
+                "amount": pd.to_numeric(daily["amount"], errors="coerce") * 1000.0,
+                "paused": pd.to_numeric(daily["vol"], errors="coerce").fillna(0).le(0),
+            }
+        )
+        listings = pd.DataFrame(
+            {
+                "instrument": stock_basic["ts_code"].map(_qlib_symbol),
+                "list_date": pd.to_datetime(stock_basic["list_date"], errors="coerce"),
+                "delist_date": pd.to_datetime(
+                    stock_basic.get("delist_date"), errors="coerce"
+                ),
+            }
+        )
+        namechange = read("namechange")
+        if not namechange.empty and {"ts_code", "name", "start_date"}.issubset(
+            namechange.columns
+        ):
+            st_source = namechange[
+                namechange["name"].astype(str).str.contains(r"(?:\*?ST|退)", regex=True)
+            ]
+            st_intervals = pd.DataFrame(
+                {
+                    "instrument": st_source["ts_code"].map(_qlib_symbol),
+                    "start_date": st_source["start_date"],
+                    "end_date": st_source.get("end_date"),
+                    "is_st": True,
+                }
+            )
+        else:
+            st_intervals = pd.DataFrame(
+                columns=["instrument", "start_date", "end_date", "is_st"]
+            )
+        suspend = read("suspend_d")
+        suspension_rows: list[dict[str, Any]] = []
+        if not suspend.empty and "ts_code" in suspend:
+            date_column = next(
+                (name for name in ("suspend_date", "trade_date") if name in suspend), None
+            )
+            if date_column:
+                suspension_rows = [
+                    {
+                        "instrument": _qlib_symbol(row.ts_code),
+                        "datetime": getattr(row, date_column),
+                        "suspended": True,
+                    }
+                    for row in suspend.itertuples(index=False)
+                ]
+        suspensions = pd.DataFrame(
+            suspension_rows,
+            columns=["instrument", "datetime", "suspended"],
+        )
+        equity_column = next(
+            (
+                name
+                for name in (
+                    "total_hldr_eqy_exc_min_int",
+                    "total_hldr_eqy_inc_min_int",
+                    "total_hldr_eqy",
+                )
+                if name in balancesheet
+            ),
+            None,
+        )
+        if equity_column is None or "ann_date" not in balancesheet:
+            raise ValueError("balancesheet has no announced shareholder equity")
+        financials = pd.DataFrame(
+            {
+                "instrument": balancesheet["ts_code"].map(_qlib_symbol),
+                "announcement_date": balancesheet["ann_date"],
+                "equity": pd.to_numeric(balancesheet[equity_column], errors="coerce"),
+            }
+        )
+        opinion_column = next(
+            (name for name in ("audit_result", "audit_opinion") if name in audit), None
+        )
+        if opinion_column is None or "ann_date" not in audit:
+            raise ValueError("fina_audit has no announced audit opinion")
+        audits = pd.DataFrame(
+            {
+                "instrument": audit["ts_code"].map(_qlib_symbol),
+                "announcement_date": audit["ann_date"],
+                "audit_opinion": audit[opinion_column].astype(str),
+            }
+        )
+        regulatory_source = read("regulatory_events")
+        regulatory = None
+        if not regulatory_source.empty:
+            required = {"ts_code", "event_date", "known_date", "major"}
+            if not required.issubset(regulatory_source.columns):
+                raise ValueError("regulatory event source violates its data contract")
+            regulatory = regulatory_source.rename(columns={"ts_code": "instrument"}).copy()
+            regulatory["instrument"] = regulatory["instrument"].map(_qlib_symbol)
+        matrix = build_point_in_time_eligibility(
+            market=market,
+            listings=listings,
+            st_intervals=st_intervals,
+            suspensions=suspensions,
+            financials=financials,
+            audits=audits,
+            regulatory_events=regulatory,
+            policy=EligibilityPolicy(),
+        )
+        target.mkdir(parents=True, exist_ok=True)
+        matrix.to_parquet(target / "eligibility_matrix.parquet", index=False, compression="zstd")
+        (target / "eligibility_contract.json").write_text(
+            json.dumps(
+                {
+                    "version": ELIGIBILITY_CONTRACT_VERSION,
+                    "regulatory_data_available": regulatory is not None,
+                    "financial_availability": "strictly_after_announcement_date",
+                    "delisting_availability": "effective_date_only_no_backfill",
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -635,7 +811,7 @@ class QlibBuilder:
                     THEN amount * 10.0 / vol * adj_factor / base_price
                     ELSE close * adj_factor / base_price
                 END AS vwap,
-                vol * base_price / adj_factor AS volume,
+                vol * {float(TUSHARE_HAND_SIZE)} * base_price / adj_factor AS volume,
                 adj_factor / base_price AS factor,
                 pct_chg / 100.0 AS change,
                 amount,
@@ -646,6 +822,27 @@ class QlibBuilder:
                 {''.join(f', {field}' for field in fundamental_features.values())}
             FROM joined
             WHERE adj_factor IS NOT NULL AND adj_factor > 0 AND base_price > 0
+        """
+
+    @staticmethod
+    def _invalid_daily_units_query(daily_glob: Path) -> str:
+        """Reject daily rows whose Tushare amount/hand units imply an impossible VWAP."""
+
+        daily = _sql_string(str(daily_glob.resolve()))
+        return f"""
+            SELECT count(*)
+            FROM read_parquet({daily}, hive_partitioning=true)
+            WHERE try_cast(vol AS DOUBLE) > 0
+              AND (
+                try_cast(amount AS DOUBLE) IS NULL
+                OR try_cast(amount AS DOUBLE) <= 0
+                OR try_cast(low AS DOUBLE) <= 0
+                OR try_cast(high AS DOUBLE) < try_cast(low AS DOUBLE)
+                OR try_cast(amount AS DOUBLE) * 10.0 / try_cast(vol AS DOUBLE)
+                    < try_cast(low AS DOUBLE) * 0.95
+                OR try_cast(amount AS DOUBLE) * 10.0 / try_cast(vol AS DOUBLE)
+                    > try_cast(high AS DOUBLE) * 1.05
+              )
         """
 
     def _research_feature_contract(self) -> dict[str, object]:
@@ -676,6 +873,10 @@ class QlibBuilder:
             "daily_basic": {"ts_code", "trade_date", "total_mv"},
             "fina_indicator": {"ts_code", "ann_date", "end_date"},
             "index_weight": {"index_code", "con_code", "trade_date", "weight"},
+            "stock_basic": {"ts_code", "list_date"},
+            "balancesheet": {"ts_code", "ann_date"},
+            "fina_audit": {"ts_code", "ann_date", "audit_result"},
+            "namechange": {"ts_code", "name", "start_date"},
         }
         columns_by_dataset = {
             dataset: self._parquet_columns(dataset)
@@ -728,6 +929,20 @@ class QlibBuilder:
                     "index_code IS NOT NULL AND con_code IS NOT NULL "
                     f"AND {_as_date_sql('trade_date')} IS NOT NULL "
                     "AND try_cast(weight AS DOUBLE) > 0"
+                ),
+                "stock_basic": (
+                    f"ts_code IS NOT NULL AND {_as_date_sql('list_date')} IS NOT NULL"
+                ),
+                "balancesheet": (
+                    f"ts_code IS NOT NULL AND {_as_date_sql('ann_date')} IS NOT NULL"
+                ),
+                "fina_audit": (
+                    f"ts_code IS NOT NULL AND {_as_date_sql('ann_date')} IS NOT NULL "
+                    "AND audit_result IS NOT NULL"
+                ),
+                "namechange": (
+                    f"ts_code IS NOT NULL AND {_as_date_sql('start_date')} IS NOT NULL "
+                    "AND name IS NOT NULL"
                 ),
             }
             for dataset, predicate in usable_predicates.items():

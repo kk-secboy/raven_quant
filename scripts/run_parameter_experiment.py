@@ -11,9 +11,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from quant_platform.parameter_experiments import evaluate_trial, summarize_trials
+from quant_platform.statistical_validation import deflated_sharpe_probability
 
 
 def _canonical_sha256(value: Any) -> str:
@@ -130,6 +133,18 @@ def main() -> None:
                     output=trial_output / segment,
                 )
                 segment_metrics[segment] = result["metrics"]
+                if segment == "out_of_sample":
+                    daily = pd.read_parquet(trial_output / segment / "daily_returns.parquet")
+                    returns = pd.to_numeric(daily["return"], errors="coerce") - pd.to_numeric(
+                        daily.get("cost", 0.0), errors="coerce"
+                    )
+                    dsr = deflated_sharpe_probability(
+                        returns, trials=len(manifest["trials"])
+                    )
+                    segment_metrics[segment]["deflated_sharpe"] = dsr
+                    segment_metrics[segment]["deflated_sharpe_probability"] = dsr[
+                        "probability"
+                    ]
             score, warnings = evaluate_trial(
                 segment_metrics["in_sample"], segment_metrics["out_of_sample"]
             )

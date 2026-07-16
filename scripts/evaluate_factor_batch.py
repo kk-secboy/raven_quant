@@ -21,6 +21,7 @@ from quant_platform.factor_recompute import (
     execute_factor_code,
     sha256_file,
 )
+from quant_platform.statistical_validation import benjamini_hochberg
 
 
 def _load_values(path: str) -> pd.DataFrame:
@@ -65,13 +66,7 @@ def main() -> None:
     input_path = recompute_root / "daily_pv.h5"
     factor_input.to_hdf(input_path, key="data", mode="w")
     input_sha256 = sha256_file(input_path)
-    labels = D.features(
-        D.instruments(str(manifest.get("universe") or "cn_all")),
-        ["Ref($close, -2)/Ref($close, -1)-1"],
-        start_time=periods["valid_start"],
-        end_time=periods["valid_end"],
-        freq="day",
-    )
+    labels_by_horizon: dict[int, pd.DataFrame] = {}
     comparisons = [_load_values(path) for path in manifest.get("comparison_values", [])]
     evaluations = []
     for item in candidates:
@@ -100,9 +95,22 @@ def main() -> None:
                     "authoritative_values_sha256": sha256_file(recomputed_path),
                 }
             )
+            label_horizon_days = int(item["label_horizon_days"])
+            recompute_evidence["label_horizon_days"] = label_horizon_days
+            if label_horizon_days not in labels_by_horizon:
+                labels_by_horizon[label_horizon_days] = D.features(
+                    D.instruments(str(manifest.get("universe") or "cn_all")),
+                    [
+                        f"Ref($close, -{label_horizon_days + 1})/"
+                        "Ref($close, -1)-1"
+                    ],
+                    start_time=periods["valid_start"],
+                    end_time=periods["valid_end"],
+                    freq="day",
+                )
             metrics = evaluate_factor_values(
                 recomputed,
-                labels,
+                labels_by_horizon[label_horizon_days],
                 valid_start=pd.Timestamp(periods["valid_start"]).date(),
                 valid_end=pd.Timestamp(periods["valid_end"]).date(),
                 test_start=pd.Timestamp(periods["test_start"]).date(),
@@ -111,6 +119,7 @@ def main() -> None:
                 cost_model=CostModelConfig.from_mapping(manifest.get("cost_model")),
                 reference_order_value=float(manifest["cost_reference_order_value"]),
                 min_daily_instruments=int(manifest.get("min_daily_instruments", 50)),
+                label_horizon_days=label_horizon_days,
             )
             evaluations.append(
                 {
@@ -120,10 +129,28 @@ def main() -> None:
                     "recomputed_values_path": str(recomputed_path),
                     "recomputed_values_sha256": sha256_file(recomputed_path),
                     "recompute_evidence": recompute_evidence,
+                    "experiment_family_id": item["experiment_family_id"],
+                    "experiment_count": int(item["experiment_count"]),
                 }
             )
         except Exception as exc:
             evaluations.append({"candidate_id": item["id"], "status": "failed", "error": str(exc)})
+    families: dict[str, list[dict[str, Any]]] = {}
+    for evaluation in evaluations:
+        family = str(evaluation.get("experiment_family_id") or "")
+        if family:
+            families.setdefault(family, []).append(evaluation)
+    for family in families.values():
+        declared = max(int(item.get("experiment_count") or len(family)) for item in family)
+        p_values = [
+            float((item.get("metrics") or {}).get("hac_p_value", 1.0)) for item in family
+        ]
+        p_values.extend([1.0] * max(0, declared - len(p_values)))
+        q_values = benjamini_hochberg(p_values)
+        for item, q_value in zip(family, q_values, strict=False):
+            if item.get("status") == "ok":
+                item["metrics"]["bh_q_value"] = q_value
+                item["metrics"]["experiment_count"] = declared
     result = {"status": "ok", "evaluations": evaluations}
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

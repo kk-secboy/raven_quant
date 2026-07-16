@@ -14,7 +14,9 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from quant_data.execution_contract import require_daily_qlib_contract
 from quant_platform.cost_model import CostModelConfig
+from quant_platform.eligibility import eligibility_statistics
 from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.strategy_backtest import build_governed_signal, compose_factor_scores
@@ -70,6 +72,10 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    provenance_path = Path(args.provider_uri) / "metadata" / "provenance.json"
+    if not provenance_path.exists():
+        raise ValueError("recommendation refresh requires dataset provenance metadata")
+    require_daily_qlib_contract(json.loads(provenance_path.read_text(encoding="utf-8")))
     as_of = pd.Timestamp(manifest["as_of_date"]).tz_localize(None)
     factors = [
         (_load(item["values_path"]), float(item["weight"]), int(item["direction"]))
@@ -101,6 +107,13 @@ def main() -> None:
         end_time=as_of.date().isoformat(),
         freq="day",
     )
+    close_history = D.features(
+        instruments,
+        ["$close"],
+        start_time=lookback,
+        end_time=as_of.date().isoformat(),
+        freq="day",
+    )["$close"].unstack("instrument").sort_index()
     execution_metadata.index = pd.MultiIndex.from_arrays(
         [
             pd.to_datetime(execution_metadata.index.get_level_values("datetime")).tz_localize(None),
@@ -128,6 +141,12 @@ def main() -> None:
         end_time=as_of.date().isoformat(),
         freq="day",
     ).rename(columns=style_fields).reset_index()
+    eligibility_frame = pd.read_parquet(metadata_root / "eligibility_matrix.parquet")
+    eligibility_evidence = eligibility_statistics(eligibility_frame)
+    if config.get("require_regulatory_events") and not eligibility_evidence[
+        "regulatory_data_available"
+    ]:
+        raise ValueError("strategy requires regulatory events but no reliable source is available")
     governed = build_governed_signal(
         scores.loc[(slice(lookback, as_of), slice(None))],
         topk=int(config["topk"]),
@@ -135,6 +154,7 @@ def main() -> None:
         industry_memberships=memberships,
         benchmark_weights=benchmark_frame,
         style_exposures=styles_frame,
+        eligibility_matrix=eligibility_frame,
         max_industry_weight=float(config.get("max_industry_weight", 1.0)),
         max_industry_deviation=float(config.get("max_industry_deviation", 1.0)),
         min_average_daily_amount=float(config.get("min_average_daily_amount", 0.0)),
@@ -157,59 +177,21 @@ def main() -> None:
     benchmark_industries = industries.reindex(benchmark.index)
     if benchmark_industries.isna().any() or styles.reindex(benchmark.index).isna().any().any():
         raise ValueError("benchmark metadata is incomplete")
+    risk_instruments = signal.index.astype(str).union(benchmark.index.astype(str))
+    risk_returns = (
+        close_history.reindex(columns=risk_instruments)
+        .tail(61)
+        .pct_change(fill_method=None)
+        .dropna(how="any")
+    )
+    if len(risk_returns) < 60:
+        raise ValueError("recommendation optimizer requires 60 complete return observations")
     cost_model = CostModelConfig.from_mapping(config)
     policy = PortfolioPolicy(PortfolioPolicyConfig.from_mapping(config), cost_model)
     previous = {
         item["instrument"]: item["weight"] for item in manifest.get("previous_holdings", [])
     }
-    previous_snapshot = manifest.get("previous_snapshot") or {}
-    previous_performance = manifest.get("previous_performance") or {}
-    prior_value = float(
-        previous_performance.get("hypothetical_value") or manifest["portfolio_value"]
-    )
-    hypothetical_return = 0.0
-    benchmark_return = 0.0
-    previous_as_of = previous_snapshot.get("effective_date") or previous_snapshot.get("as_of_date")
-    previous_holdings = previous_snapshot.get("holdings") or []
-    if previous_as_of and previous_holdings:
-        held = [str(item["instrument"]) for item in previous_holdings]
-        close = D.features(
-            held,
-            ["$close"],
-            start_time=previous_as_of,
-            end_time=as_of.date().isoformat(),
-            freq="day",
-        )["$close"].unstack("instrument")
-        close.index = pd.to_datetime(close.index).tz_localize(None)
-        returns = close.ffill().iloc[-1] / close.ffill().iloc[0] - 1.0
-        hypothetical_return = float(
-            sum(
-                float(item["weight"]) * float(returns.get(str(item["instrument"]), 0.0))
-                for item in previous_holdings
-            )
-        )
-        benchmark_close = D.features(
-            [manifest["benchmark"]],
-            ["$close"],
-            start_time=previous_as_of,
-            end_time=as_of.date().isoformat(),
-            freq="day",
-        )["$close"]
-        if len(benchmark_close) >= 2:
-            benchmark_return = float(benchmark_close.iloc[-1] / benchmark_close.iloc[0] - 1.0)
-    gross_value = max(0.0, prior_value * (1.0 + hypothetical_return))
-    previous_peak = float(previous_performance.get("high_water_mark") or prior_value)
-    current_peak = max(previous_peak, gross_value)
-    current_drawdown = gross_value / current_peak - 1.0 if current_peak > 0 else 0.0
-    cost_basis = {
-        str(item["instrument"]): float(item.get("average_cost") or 0.0)
-        for item in previous_holdings
-        if float(item.get("average_cost") or 0.0) > 0
-    }
-    take_profit_stages = {
-        str(item["instrument"]): int(item.get("take_profit_stage") or 0)
-        for item in previous_holdings
-    }
+    construction_notional = float(manifest["construction_notional"])
     decision = policy.decide(
         signal,
         previous,
@@ -220,41 +202,17 @@ def main() -> None:
         benchmark_style_exposure=styles.reindex(benchmark.index).mul(
             benchmark, axis=0
         ).sum(),
+        return_covariance=risk_returns.cov(),
         prices=pd.to_numeric(point_metadata["$open"], errors="coerce"),
         current_prices=pd.to_numeric(point_metadata["$close"], errors="coerce"),
-        cost_basis=cost_basis,
-        take_profit_stages=take_profit_stages,
-        execution_state=(previous_snapshot.get("position_state") or {}).get("execution"),
-        portfolio_drawdown=current_drawdown,
-        daily_return=hypothetical_return,
+        portfolio_drawdown=0.0,
+        daily_return=0.0,
         average_daily_values=(
             pd.to_numeric(point_metadata["Ref(Mean($amount, 20), 1)"], errors="coerce") * 1000.0
         ),
-        portfolio_value=max(gross_value, 1.0),
+        portfolio_value=construction_notional,
         risk_exposure=float(manifest.get("risk_exposure", 1.0)),
     )
-    average_values = (
-        pd.to_numeric(point_metadata["Ref(Mean($amount, 20), 1)"], errors="coerce") * 1000.0
-    )
-    estimated_cost = 0.0
-    for change in decision.changes:
-        gross = abs(float(change["weight_change"])) * prior_value
-        if gross <= 0:
-            continue
-        adv = float(average_values.get(change["instrument"], 0.0))
-        participation = (
-            min(cost_model.max_volume_participation, gross / adv)
-            if adv > 0
-            else cost_model.max_volume_participation
-        )
-        estimated_cost += cost_model.estimate(
-            side="buy" if change["action"] == "increase" else "sell",
-            gross_value=gross,
-            participation=participation,
-        )
-    hypothetical_value = max(0.0, gross_value - estimated_cost)
-    high_water_mark = max(previous_peak, hypothetical_value)
-    drawdown = hypothetical_value / high_water_mark - 1.0 if high_water_mark > 0 else 0.0
     calendar = pd.DatetimeIndex(
         D.calendar(
             start_time=as_of.date().isoformat(),
@@ -266,17 +224,6 @@ def main() -> None:
     if not len(future):
         raise ValueError("Qlib calendar has no effective trading date")
     changes = {item["instrument"]: item for item in decision.changes}
-
-    def next_average_cost(instrument: str, target_weight: float) -> float:
-        mark = float(point_metadata.loc[instrument, "$close"])
-        old_weight = float(previous.get(instrument, 0.0))
-        old_cost = float(cost_basis.get(instrument, mark))
-        increase = max(0.0, target_weight - old_weight)
-        if old_weight <= 0 or increase <= 0:
-            return mark if old_weight <= 0 else old_cost
-        old_shares = old_weight * max(gross_value, 1.0) / old_cost
-        new_shares = increase * max(gross_value, 1.0) / mark
-        return (old_shares * old_cost + new_shares * mark) / (old_shares + new_shares)
 
     result = {
         "status": "ok",
@@ -292,21 +239,10 @@ def main() -> None:
         "position_state": decision.position_state,
         "risk_summary": {
             "expected_turnover": decision.expected_turnover,
-            "drawdown": drawdown,
-            "high_water_mark": high_water_mark,
             "events": decision.risk_events,
             "execution_method": config.get("execution_method", "open"),
             "execution_days": int(config.get("execution_days", 1)),
-        },
-        "hypothetical_observation": {
-            "trade_date": as_of.date().isoformat(),
-            "hypothetical_value": hypothetical_value,
-            "daily_return": hypothetical_return,
-            "benchmark_return": benchmark_return,
-            "drawdown": drawdown,
-            "high_water_mark": high_water_mark,
-            "turnover": decision.expected_turnover,
-            "estimated_cost": estimated_cost,
+            "eligibility": eligibility_evidence,
         },
         "reasons": decision.reasons,
         "cash_weight": max(0.0, 1.0 - sum(decision.target_weights.values())),
@@ -318,10 +254,6 @@ def main() -> None:
                 "weight_change": changes.get(instrument, {}).get("weight_change", 0.0),
                 "action": changes.get(instrument, {}).get("action", "hold"),
                 "reason": changes.get(instrument, {}).get("reason", "unchanged target"),
-                "average_cost": next_average_cost(instrument, weight),
-                "take_profit_stage": int(
-                    decision.position_state.get("take_profit_stages", {}).get(instrument, 0)
-                ),
             }
             for instrument, weight in decision.target_weights.items()
         ],

@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-RECIPE_VERSION = "docx-2026-07-13"
+RECIPE_VERSION = "financial-correctness-2026-07-16"
 
 _RECIPES: tuple[dict[str, Any], ...] = (
     {
@@ -92,6 +92,7 @@ _RECIPES: tuple[dict[str, Any], ...] = (
             "max_industry_weight": 0.30,
             "min_average_daily_amount": 500_000_000,
             "liquidity_lookback_days": 20,
+            "require_regulatory_events": True,
             "capacity_notional": 5_000_000,
             "max_volume_participation": 0.01,
             "execution_days": 2,

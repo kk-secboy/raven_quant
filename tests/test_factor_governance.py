@@ -12,7 +12,7 @@ PERIODS = {
     "train_end": date(2021, 12, 31),
     "valid_start": date(2022, 1, 1),
     "valid_end": date(2023, 12, 31),
-    "test_start": date(2024, 1, 1),
+    "test_start": date(2024, 1, 8),
     "test_end": date(2026, 7, 10),
 }
 DATASET_IDENTITY = "a" * 64
@@ -35,6 +35,9 @@ def _passing_metrics() -> dict:
         "mean_coverage_ratio": 0.95,
         "constant_day_rate": 0.0,
         "direction": "inverted",
+        "hac_p_value": 0.01,
+        "bh_q_value": 0.02,
+        "statistical_contract_version": "research-statistics-v1-hac-bh-dsr",
     }
 
 
@@ -93,6 +96,7 @@ def _recompute_args(store: ResearchStore, candidate_id: str, tmp_path: Path) -> 
         "recomputed_values_sha256": recomputed_sha256,
         "recompute_evidence": {
             "executor_version": "factor-recompute-v1",
+            "label_horizon_days": 1,
             "code_sha256": candidate["code_sha256"],
             "dataset_identity_sha256": DATASET_IDENTITY,
             "provider_input_sha256": "1" * 64,

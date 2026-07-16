@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 from statsmodels.tsa.stattools import coint
 
+from .cost_model import COST_SCHEDULE_VERSION, CostModelConfig, infer_cn_asset_type
+
 
 @dataclass(frozen=True, slots=True)
 class PairTradingConfig:
@@ -23,10 +25,17 @@ class PairTradingConfig:
     pair_gross_fraction: float = 0.20
     max_volume_participation: float = 0.01
     min_capacity_fill_ratio: float = 0.95
-    open_cost: float = 0.0005
-    close_cost: float = 0.0015
+    cost_schedule_version: str = COST_SCHEDULE_VERSION
+    effective_from: str = "2000-01-01"
+    effective_to: str | None = None
+    buy_commission_rate: float = 0.0005
+    sell_commission_rate: float = 0.0005
+    stock_sell_stamp_duty_rate: float = 0.0010
+    etf_sell_stamp_duty_rate: float = 0.0
+    transfer_fee_rate: float = 0.0
     min_commission: float = 5.0
-    slippage: float = 0.0005
+    fixed_slippage_rate: float = 0.0005
+    impact_at_max_participation: float = 0.0010
     annual_borrow_rate: float = 0.08
     lot_size: int = 100
     kalman_process_variance: float = 1e-5
@@ -61,10 +70,9 @@ class PairTradingConfig:
             raise ValueError("max_volume_participation must be in (0, 0.20]")
         if not 0 < self.min_capacity_fill_ratio <= 1:
             raise ValueError("min_capacity_fill_ratio must be in (0, 1]")
-        if min(self.open_cost, self.close_cost, self.min_commission, self.slippage) < 0:
-            raise ValueError("costs and slippage must be non-negative")
-        if self.annual_borrow_rate < 0:
-            raise ValueError("annual_borrow_rate must be non-negative")
+        _pair_cost_model(self)
+        if self.annual_borrow_rate <= 0:
+            raise ValueError("pair shorting requires a positive annual borrow cost")
         if self.lot_size <= 0:
             raise ValueError("lot_size must be positive")
         if min(self.kalman_process_variance, self.kalman_observation_variance) <= 0:
@@ -83,6 +91,25 @@ class PairTradingConfig:
             raise ValueError("min_rolling_cointegration_pass_rate must be between zero and one")
         if not 0 <= self.min_robustness_pass_rate <= 1:
             raise ValueError("min_robustness_pass_rate must be between zero and one")
+
+
+def _pair_cost_model(config: PairTradingConfig) -> CostModelConfig:
+    return CostModelConfig(
+        version=config.cost_schedule_version,
+        effective_from=config.effective_from,
+        effective_to=config.effective_to,
+        buy_commission_rate=config.buy_commission_rate,
+        sell_commission_rate=config.sell_commission_rate,
+        stock_sell_stamp_duty_rate=config.stock_sell_stamp_duty_rate,
+        etf_sell_stamp_duty_rate=config.etf_sell_stamp_duty_rate,
+        transfer_fee_rate=config.transfer_fee_rate,
+        annual_borrow_rate=config.annual_borrow_rate,
+        min_commission=config.min_commission,
+        fixed_slippage_rate=config.fixed_slippage_rate,
+        max_volume_participation=config.max_volume_participation,
+        impact_at_max_participation=config.impact_at_max_participation,
+        lot_size=config.lot_size,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,7 +303,9 @@ def _performance(daily: pd.DataFrame) -> dict[str, float | int | None]:
         }
     annualized = float((1.0 + returns).prod() ** (252.0 / len(returns)) - 1.0)
     volatility = float(returns.std(ddof=1))
-    downside = float(returns[returns < 0].std(ddof=1))
+    downside = float(
+        np.sqrt(np.mean(np.square(np.minimum(returns.to_numpy(dtype=float), 0.0))))
+    )
     nav = daily["nav"]
     drawdown = nav / nav.cummax() - 1.0
     return {
@@ -286,6 +315,7 @@ def _performance(daily: pd.DataFrame) -> dict[str, float | int | None]:
         if volatility > 0
         else None,
         "sortino_ratio": float(returns.mean() / downside * sqrt(252.0)) if downside > 0 else None,
+        "sortino_status": "ok" if downside > 0 else "undefined_no_downside",
         "max_drawdown": float(drawdown.min()),
         "trading_days": len(daily),
     }
@@ -300,6 +330,7 @@ def run_pair_backtest(
     config: PairTradingConfig | None = None,
 ) -> dict[str, Any]:
     config = config or PairTradingConfig()
+    cost_model = _pair_cost_model(config)
     if not leg_y or not leg_x or leg_y == leg_x:
         raise ValueError("pair legs must be two distinct instruments")
     daily = _normalize_market(daily_market, minute=False)
@@ -338,9 +369,9 @@ def run_pair_backtest(
     planned_entry_notional = 0.0
     filled_entry_notional = 0.0
 
-    def mark_nav(trade_date: pd.Timestamp) -> float:
+    def mark_nav(mark_date: pd.Timestamp) -> float:
         return cash + sum(
-            quantities[instrument] * float(prices.loc[trade_date, instrument])
+            quantities[instrument] * float(prices.loc[mark_date, instrument])
             for instrument in (leg_y, leg_x)
         )
 
@@ -352,17 +383,20 @@ def run_pair_backtest(
             pending = {"action": "exit", "reason": "end_of_test", "signal_date": trade_date}
         if pending:
             action = str(pending["action"])
+            signal_date = pd.Timestamp(pending["signal_date"]).tz_localize(None)
             target_quantities = {leg_y: 0, leg_x: 0}
-            hedge_ratio = float(pending.get("hedge_ratio") or kalman.loc[trade_date, "hedge_ratio"])
+            hedge_ratio = float(
+                pending.get("hedge_ratio") or kalman.loc[signal_date, "hedge_ratio"]
+            )
             direction = int(pending.get("direction") or position_direction)
-            nav_before = mark_nav(trade_date)
+            nav_before = mark_nav(signal_date)
             if action == "entry":
                 gross = max(0.0, nav_before * config.pair_gross_fraction)
                 y_weight = 1.0 / (1.0 + abs(hedge_ratio))
                 x_weight = 1.0 - y_weight
                 reference = {
-                    leg_y: float(prices.loc[trade_date, leg_y]),
-                    leg_x: float(prices.loc[trade_date, leg_x]),
+                    leg_y: float(prices.loc[signal_date, leg_y]),
+                    leg_x: float(prices.loc[signal_date, leg_x]),
                 }
                 target_quantities[leg_y] = (
                     direction
@@ -389,7 +423,7 @@ def run_pair_backtest(
                     trade_date,
                     instrument,
                     side,
-                    config.slippage,
+                    0.0,
                 )
                 if execution is None:
                     rejection_reason = f"{instrument}:missing_valid_minute_execution_window"
@@ -410,18 +444,39 @@ def run_pair_backtest(
                     floor(minute_volume * config.max_volume_participation / config.lot_size)
                     * config.lot_size
                 )
-                fill_ratio = min(1.0, capacity / abs(delta)) if delta else 1.0
-                if fill_ratio < config.min_capacity_fill_ratio:
-                    rejection_reason = f"{instrument}:insufficient_minute_capacity"
-                    break
                 orders.append(
                     {
                         "instrument": instrument,
-                        "delta": int(delta),
+                        "requested_delta": int(delta),
+                        "capacity": int(capacity),
                         "side": side,
                         "price": execution_price,
+                        "minute_volume": minute_volume,
                     }
                 )
+            if not rejection_reason and orders:
+                common_fill_ratio = min(
+                    1.0,
+                    *(order["capacity"] / abs(order["requested_delta"]) for order in orders),
+                )
+                if common_fill_ratio < config.min_capacity_fill_ratio:
+                    rejection_reason = "pair:insufficient_minute_capacity"
+                else:
+                    for order in orders:
+                        requested = int(order["requested_delta"])
+                        filled = (
+                            floor(
+                                abs(requested)
+                                * common_fill_ratio
+                                / config.lot_size
+                            )
+                            * config.lot_size
+                        )
+                        order["delta"] = filled if requested > 0 else -filled
+                        order["fill_ratio"] = filled / abs(requested) if requested else 1.0
+                    actual_common_ratio = min(order["fill_ratio"] for order in orders)
+                    if actual_common_ratio < config.min_capacity_fill_ratio:
+                        rejection_reason = "pair:insufficient_lot_rounded_capacity"
             if rejection_reason:
                 rejections.append(
                     {
@@ -436,10 +491,20 @@ def run_pair_backtest(
                 total_notional = 0.0
                 for order in orders:
                     notional = float(order["delta"]) * float(order["price"])
-                    rate = config.open_cost if action == "entry" else config.close_cost
-                    commission = max(config.min_commission, abs(notional) * rate)
-                    cash -= notional + commission
-                    total_cost += commission
+                    participation = abs(int(order["delta"])) / float(
+                        order["minute_volume"]
+                    )
+                    breakdown = cost_model.estimate_breakdown(
+                        side=order["side"],
+                        gross_value=abs(notional),
+                        participation=participation,
+                        asset_type=infer_cn_asset_type(str(order["instrument"])),
+                        trade_date=pd.Timestamp(trade_date).date(),
+                    )
+                    fee = float(breakdown["total"])
+                    order["cost_breakdown"] = breakdown
+                    cash -= notional + fee
+                    total_cost += fee
                     total_notional += abs(notional)
                     quantities[str(order["instrument"])] += int(order["delta"])
                 if action == "entry":
@@ -476,7 +541,7 @@ def run_pair_backtest(
                 for item in (leg_y, leg_x)
                 if quantities[item] < 0
             )
-            borrow_cost = short_value * config.annual_borrow_rate / 252.0
+            borrow_cost = short_value * cost_model.annual_borrow_rate / 252.0
             cash -= borrow_cost
             nav -= borrow_cost
             holding_days += 1
@@ -572,6 +637,7 @@ def run_pair_backtest(
         "atomic_pair_execution_enforced": True,
         "transaction_costs_enforced": True,
         "borrow_cost_enforced": True,
+        "cost_schedule_version": cost_model.version,
         "config": asdict(config),
     }
     return {
@@ -596,9 +662,14 @@ def run_pair_robustness_suite(
         "base": config,
         "double_costs": replace(
             config,
-            open_cost=config.open_cost * 2.0,
-            close_cost=config.close_cost * 2.0,
-            slippage=config.slippage * 2.0,
+            buy_commission_rate=config.buy_commission_rate * 2.0,
+            sell_commission_rate=config.sell_commission_rate * 2.0,
+            stock_sell_stamp_duty_rate=config.stock_sell_stamp_duty_rate * 2.0,
+            etf_sell_stamp_duty_rate=config.etf_sell_stamp_duty_rate * 2.0,
+            transfer_fee_rate=config.transfer_fee_rate * 2.0,
+            fixed_slippage_rate=config.fixed_slippage_rate * 2.0,
+            impact_at_max_participation=config.impact_at_max_participation * 2.0,
+            min_commission=config.min_commission * 2.0,
             annual_borrow_rate=config.annual_borrow_rate * 2.0,
         ),
         "lower_entry": replace(

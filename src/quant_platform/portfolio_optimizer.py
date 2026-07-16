@@ -7,12 +7,15 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
+from .risk_math import COVARIANCE_MODEL_VERSION, regularize_covariance
+
 
 @dataclass(frozen=True)
 class PortfolioOptimizationResult:
     weights: pd.Series
     objective: float
-    tracking_risk_proxy: float
+    tracking_risk: float
+    covariance_model_version: str
     active_share: float
     expected_turnover: float
     max_industry_deviation: float | None
@@ -30,6 +33,7 @@ def optimize_benchmark_relative_weights(
     benchmark_industry_weights: pd.Series,
     style_exposures: pd.Series | pd.DataFrame,
     benchmark_style_exposure: float | pd.Series | dict[str, float],
+    return_covariance: pd.DataFrame,
     max_position_weight: float,
     max_industry_weight: float,
     max_industry_deviation: float,
@@ -97,21 +101,42 @@ def optimize_benchmark_relative_weights(
         initial_seed.to_numpy(dtype=float), max_position_weight, total=1.0
     )
     alpha_values = normalized_alpha.to_numpy(dtype=float)
-    benchmark_values = benchmark.to_numpy(dtype=float)
     previous_values = previous.to_numpy(dtype=float)
+    risk_universe = instruments.union(
+        pd.Index(benchmark_weights.index.astype(str), name="instrument")
+    )
+    covariance = return_covariance.copy()
+    if not isinstance(covariance, pd.DataFrame) or covariance.empty:
+        raise ValueError("optimizer requires a point-in-time return covariance matrix")
+    covariance.index = covariance.index.astype(str)
+    covariance.columns = covariance.columns.astype(str)
+    covariance = covariance.reindex(index=risk_universe, columns=risk_universe)
+    if covariance.isna().any().any():
+        raise ValueError("optimizer return covariance is incomplete")
+    annual_covariance = regularize_covariance(covariance.to_numpy(dtype=float)) * 252.0
+    selected_locations = np.array([risk_universe.get_loc(item) for item in instruments], dtype=int)
+    benchmark_risk = pd.to_numeric(benchmark_weights, errors="coerce")
+    benchmark_risk.index = benchmark_risk.index.astype(str)
+    benchmark_risk = benchmark_risk.reindex(risk_universe, fill_value=0.0).to_numpy(dtype=float)
+
+    def active_risk_vector(weights: np.ndarray) -> np.ndarray:
+        portfolio = np.zeros(len(risk_universe), dtype=float)
+        portfolio[selected_locations] = weights
+        return portfolio - benchmark_risk
 
     def objective(weights: np.ndarray) -> float:
-        active = weights - benchmark_values
+        active = active_risk_vector(weights)
         traded = weights - previous_values
         return float(
-            tracking_penalty * np.dot(active, active)
+            tracking_penalty * (active @ annual_covariance @ active)
             - alpha_weight * np.dot(alpha_values, weights)
             + turnover_penalty * np.dot(traded, traded)
         )
 
     def objective_jacobian(weights: np.ndarray) -> np.ndarray:
+        active = active_risk_vector(weights)
         return (
-            2.0 * tracking_penalty * (weights - benchmark_values)
+            2.0 * tracking_penalty * (annual_covariance @ active)[selected_locations]
             - alpha_weight * alpha_values
             + 2.0 * turnover_penalty * (weights - previous_values)
         )
@@ -204,10 +229,13 @@ def optimize_benchmark_relative_weights(
         for column in styles.columns
     }
     active = weights - benchmark
+    full_active = active_risk_vector(weights.to_numpy(dtype=float))
+    tracking_risk = float(np.sqrt(max(0.0, full_active @ annual_covariance @ full_active)))
     return PortfolioOptimizationResult(
         weights=weights[weights > 0].sort_values(ascending=False),
         objective=float(result.fun),
-        tracking_risk_proxy=float(np.sqrt(np.dot(active, active) + omitted_benchmark_weight**2)),
+        tracking_risk=tracking_risk,
+        covariance_model_version=COVARIANCE_MODEL_VERSION,
         active_share=0.5 * (float(active.abs().sum()) + omitted_benchmark_weight),
         expected_turnover=0.5 * (float((weights - previous).abs().sum()) + previous_cash),
         max_industry_deviation=measured_industry_deviation,

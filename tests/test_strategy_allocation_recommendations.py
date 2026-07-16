@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -17,10 +18,13 @@ from sqlalchemy import func, insert, select
 from quant_data.database import (
     open_database,
     paper_portfolios,
-    recommendation_nav,
     recommendation_portfolios,
+    simulation_nav,
+    simulation_portfolios,
 )
 from quant_platform.allocation_store import AllocationStore
+from quant_platform.cost_model import COST_SCHEDULE_VERSION
+from quant_platform.simulation_engine import SIMULATION_ENGINE_VERSION
 from quant_platform.strategy_store import StrategyStore
 
 
@@ -122,16 +126,51 @@ def test_allocation_uses_recommendation_ledgers_and_propagates_risk(
                     recommendation_portfolios.c.id == portfolio_id
                 )
             ).scalar_one()
+            simulation_id = uuid.uuid4().hex
+            simulation_value = Decimal(initial) * Decimal("0.80")
             connection.execute(
-                insert(recommendation_nav).values(
-                    portfolio_id=portfolio_id,
+                insert(simulation_portfolios).values(
+                    id=simulation_id,
+                    name=f"simulation-{portfolio_id}",
+                    recommendation_portfolio_id=portfolio_id,
+                    status="active",
+                    base_currency="CNY",
+                    initial_cash=Decimal(initial),
+                    cash=simulation_value,
+                    nav=simulation_value,
+                    high_water_mark=Decimal(initial),
+                    execution_algorithm="twap",
+                    execution_dataset="allocation-5m",
+                    daily_dataset="allocation-data",
+                    daily_dataset_identity_sha256="a" * 64,
+                    daily_dataset_lineage_id="b" * 64,
+                    daily_field_contract_version="daily-qlib-field-v2-share-volume",
+                    execution_dataset_identity_sha256="c" * 64,
+                    execution_dataset_lineage_id="d" * 64,
+                    execution_field_contract_version=(
+                        "minute-qlib-execution-v4-source-units"
+                    ),
+                    execution_engine_version=SIMULATION_ENGINE_VERSION,
+                    cost_schedule_version=COST_SCHEDULE_VERSION,
+                    execution_policy_json={"execution_algorithm": "twap"},
+                    created_by="test",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            connection.execute(
+                insert(simulation_nav).values(
+                    portfolio_id=simulation_id,
                     trade_date=date(2026, 7, 10),
-                    hypothetical_value=Decimal(initial) * Decimal("0.80"),
+                    cash=simulation_value,
+                    market_value=Decimal("0"),
+                    nav=simulation_value,
                     daily_return=-0.20,
-                    benchmark_return=-0.01,
                     drawdown=-0.20,
-                    turnover=0.0,
-                    estimated_cost=Decimal("0"),
+                    market_date=date(2026, 7, 10),
+                    has_stale_prices=False,
+                    status="ok",
+                    performance_certified=True,
                     created_at=now,
                 )
             )

@@ -146,7 +146,7 @@ def test_research_readiness_requires_complete_evidence_chain(
     result = DeploymentReadinessStore(settings, PROJECT_ROOT).assess(now=current)
 
     research, recommendation, allocation, pair = result["profiles"]
-    assert result["highest_ready_profile"] == "recommendation_tracking"
+    assert result["highest_ready_profile"] == "research"
     assert research["status"] == "ready"
     assert research["passed"] == research["total"]
     assert pair["status"] == "blocked"
@@ -154,7 +154,21 @@ def test_research_readiness_requires_complete_evidence_chain(
         next(item for item in pair["checks"] if item["id"] == "pair_minute_data")["status"]
         == "block"
     )
-    assert recommendation["status"] == "ready"
+    assert recommendation["status"] == "blocked"
+    assert (
+        next(item for item in recommendation["checks"] if item["id"] == "simulation_accounts")[
+            "status"
+        ]
+        == "block"
+    )
+    assert (
+        next(
+            item
+            for item in recommendation["checks"]
+            if item["id"] == "simulation_60_day_replay"
+        )["status"]
+        == "block"
+    )
     assert (
         next(
             item

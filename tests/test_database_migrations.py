@@ -16,6 +16,14 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "recommendation_snapshots",
         "recommendation_holdings",
         "recommendation_nav",
+        "simulation_portfolios",
+        "simulation_batches",
+        "simulation_orders",
+        "simulation_fills",
+        "simulation_positions",
+        "simulation_cash_flows",
+        "simulation_nav",
+        "simulation_events",
         "research_events",
         "strategies",
         "strategy_versions",
@@ -75,12 +83,15 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0035_research_policy_v2"
+    assert revision == "0036_financial_correctness"
     assert {"research_program_id", "dataset_identity_sha256"} <= {
         column["name"]
         for column in inspector.get_columns("research_campaigns", schema="quantlab")
     }
     assert {
+        "experiment_family_id",
+        "label_horizon_days",
+        "experiment_count",
         "values_sha256",
         "promoted_evaluation_id",
         "promotion_evidence_sha256",
@@ -103,6 +114,11 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "submitted_values_sha256",
         "recomputed_values_sha256",
         "recompute_evidence_json",
+        "hac_p_value",
+        "bh_q_value",
+        "statistical_contract_version",
+        "final_test_key",
+        "final_test_consumed_at",
     } <= {
         column["name"]
         for column in inspector.get_columns("factor_evaluations", schema="quantlab")

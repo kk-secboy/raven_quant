@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import numpy as np
 import pandas as pd
 
+from .eligibility import ELIGIBILITY_CONTRACT_VERSION
 from .factor_evaluator import normalize_series
 
 
@@ -45,6 +46,7 @@ def build_governed_signal(
     industry_memberships: pd.DataFrame | None = None,
     benchmark_weights: pd.DataFrame | None = None,
     style_exposures: pd.DataFrame | None = None,
+    eligibility_matrix: pd.DataFrame | None = None,
     max_industry_weight: float = 1.0,
     max_industry_deviation: float = 1.0,
     min_average_daily_amount: float = 0.0,
@@ -71,9 +73,15 @@ def build_governed_signal(
     memberships = _normalize_memberships(industry_memberships)
     styles = _normalize_style_snapshots(style_exposures)
     benchmark = _normalize_snapshots(benchmark_weights, "weight")
+    eligibility = _normalize_eligibility(eligibility_matrix)
     rows: list[pd.Series] = []
     for timestamp, daily in score.groupby(level="datetime", sort=True):
         ranking = daily.droplevel("datetime").dropna()
+        if eligibility is not None:
+            qualified = eligibility[
+                (eligibility["datetime"] == timestamp) & eligibility["eligible"]
+            ]["instrument"]
+            ranking = ranking[ranking.index.astype(str).isin(set(qualified.astype(str)))]
         daily_styles = _style_snapshot(styles, timestamp).reindex(ranking.index)
         design = pd.concat([ranking.rename("score"), daily_styles], axis=1).dropna()
         style_columns = [column for column in design.columns if column != "score"]
@@ -173,6 +181,22 @@ def _normalize_style_snapshots(values: pd.DataFrame | None) -> pd.DataFrame | No
         [np.inf, -np.inf], np.nan
     )
     return result.dropna()
+
+
+def _normalize_eligibility(values: pd.DataFrame | None) -> pd.DataFrame | None:
+    if values is None:
+        return None
+    required = {"datetime", "instrument", "eligible", "contract_version"}
+    if not required.issubset(values.columns):
+        raise ValueError("point-in-time eligibility metadata is incomplete")
+    result = values.copy()
+    result["datetime"] = pd.to_datetime(result["datetime"], errors="coerce")
+    result["instrument"] = result["instrument"].astype(str)
+    if set(result["contract_version"].dropna()) != {ELIGIBILITY_CONTRACT_VERSION}:
+        raise ValueError("point-in-time eligibility contract is obsolete")
+    if result.duplicated(["datetime", "instrument"]).any():
+        raise ValueError("point-in-time eligibility metadata is duplicated")
+    return result.dropna(subset=["datetime", "instrument"])
 
 
 def _snapshot(values: pd.DataFrame | None, timestamp: pd.Timestamp, column: str) -> pd.Series:

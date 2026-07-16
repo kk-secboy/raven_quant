@@ -6,7 +6,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from quant_data.qlib_builder import QlibBuilder, _to_wsl_path
+from quant_data.qlib_builder import (
+    DAILY_QLIB_FIELD_CONTRACT_VERSION,
+    QlibBuilder,
+    _to_wsl_path,
+)
 
 pytestmark = pytest.mark.no_database
 
@@ -29,7 +33,7 @@ def _write_market_control_snapshot(
             "low": 9.0,
             "close": 10.0,
             "vol": 100.0,
-            "amount": 1000.0,
+            "amount": 100.0,
             "pct_chg": 0.0,
         },
         "adj_factor": {
@@ -77,6 +81,27 @@ def _write_required_research_inputs(snapshot: Path) -> None:
             "con_code": "000001.SZ",
             "trade_date": "2024-01-02",
             "weight": 4.5,
+        },
+        "stock_basic": {
+            "ts_code": "000001.SZ",
+            "list_date": "2020-01-02",
+            "delist_date": None,
+        },
+        "balancesheet": {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "total_hldr_eqy_exc_min_int": 10_000_000.0,
+        },
+        "fina_audit": {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "audit_result": "standard_unqualified",
+        },
+        "namechange": {
+            "ts_code": "000001.SZ",
+            "name": "平安银行",
+            "start_date": "2020-01-02",
+            "end_date": None,
         },
     }
     for dataset, row in fixtures.items():
@@ -158,7 +183,7 @@ def test_builds_per_symbol_normalized_qlib_staging(tmp_path: Path) -> None:
     assert frame["symbol"].tolist() == ["SZ000001", "SZ000001"]
     assert frame["close"].tolist() == pytest.approx([1.0, 1.0])
     assert frame["factor"].tolist() == pytest.approx([0.1, 0.2])
-    assert frame["volume"].tolist() == pytest.approx([1000.0, 250.0])
+    assert frame["volume"].tolist() == pytest.approx([100_000.0, 25_000.0])
     assert frame["vwap"].tolist() == pytest.approx([1.0, 1.0])
     assert frame["up_limit"].tolist() == pytest.approx([1.1, 1.1])
     assert frame["down_limit"].tolist() == pytest.approx([0.9, 0.9])
@@ -177,7 +202,7 @@ def test_adds_point_in_time_research_features_without_announcement_leakage(
             "low": 9.0,
             "close": 10.0,
             "vol": 100.0,
-            "amount": 1000.0,
+            "amount": 100.0,
             "pct_chg": 0.0,
         }
         for day in ("2024-01-02", "2024-01-03", "2024-01-04")
@@ -311,7 +336,7 @@ def test_adds_normalized_index_staging(tmp_path: Path) -> None:
                 "low": 10,
                 "close": 10,
                 "vol": 10,
-                "amount": 100,
+                "amount": 10,
                 "pct_chg": 0,
             }
         ]
@@ -351,6 +376,8 @@ def test_adds_normalized_index_staging(tmp_path: Path) -> None:
     index = pd.read_parquet(by_symbol / "SH000300.parquet")
     assert index["close"].tolist() == pytest.approx([1.0])
     assert index["vwap"].tolist() == pytest.approx([1.0])
+    assert index["volume"].tolist() == [0.0]
+    assert index["paused"].tolist() == [0.0]
 
 
 def test_windows_path_maps_to_wsl() -> None:
@@ -401,6 +428,19 @@ def test_writes_point_in_time_industry_metadata(tmp_path: Path) -> None:
         ]
     ).to_parquet(style_source / "styles.parquet")
     qlib_dir = tmp_path / "qlib"
+    daily_source = snapshot / "parquet" / "daily"
+    daily_source.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": "2024-01-31",
+                "amount": 600_000.0,
+                "vol": 100.0,
+            }
+        ]
+    ).to_parquet(daily_source / "daily.parquet")
+    _write_required_research_inputs(snapshot)
 
     QlibBuilder(snapshot)._write_portfolio_metadata(qlib_dir)
 
@@ -415,6 +455,8 @@ def test_writes_point_in_time_industry_metadata(tmp_path: Path) -> None:
     styles = pd.read_parquet(qlib_dir / "metadata" / "style_exposures.parquet")
     assert styles.loc[0, "instrument"] == "SZ000001"
     assert styles.loc[0, "log_market_cap"] == pytest.approx(11.736069, rel=1e-6)
+    eligibility = pd.read_parquet(qlib_dir / "metadata" / "eligibility_matrix.parquet")
+    assert eligibility.loc[0, "instrument"] == "SZ000001"
 
 
 def test_writes_normalized_market_context_without_stock_level_duplication(
@@ -475,6 +517,11 @@ def test_writes_reproducible_qlib_dataset_provenance(tmp_path: Path) -> None:
     ).hexdigest()
     assert len(provenance["dataset_identity_sha256"]) == 64
     assert len(provenance["qlib_builder_sha256"]) == 64
+    assert provenance["field_contract_version"] == DAILY_QLIB_FIELD_CONTRACT_VERSION
+    assert provenance["source_volume_unit"] == "hand"
+    assert provenance["qlib_volume_unit"] == "share"
+    assert provenance["source_hand_size"] == 100
+    assert provenance["index_volume_policy"] == "excluded_non_tradable_benchmark"
     assert provenance["lineage_verified"] is False
     assert provenance["dataset_lineage_id"] is None
 
@@ -500,6 +547,22 @@ def test_derives_stable_qlib_lineage_only_from_verified_source_lineage(tmp_path:
     assert provenance["lineage_verified"] is True
     assert len(provenance["dataset_lineage_id"]) == 64
     assert provenance["source_lineage_generation"] == 2
+
+
+def test_rejects_daily_amount_and_hand_volume_with_impossible_vwap(tmp_path: Path) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    daily = next((snapshot / "parquet" / "daily").rglob("*.parquet"))
+    frame = pd.read_parquet(daily)
+    frame["amount"] = 1_000.0
+    frame.to_parquet(daily, index=False)
+
+    with pytest.raises(RuntimeError, match="hand/amount price contract"):
+        QlibBuilder(snapshot).build_staging(tmp_path / "staging")
 
 
 def test_rejects_tampered_snapshot_content(tmp_path: Path) -> None:

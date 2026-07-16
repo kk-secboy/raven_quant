@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .cost_model import CostModelConfig
+from .statistical_validation import STATISTICAL_CONTRACT_VERSION, newey_west_mean_test
 
 
 def normalize_series(values: pd.Series | pd.DataFrame, name: str) -> pd.Series:
@@ -111,6 +112,7 @@ def evaluate_factor_values(
     min_coverage_ratio: float = 0.80,
     min_good_day_rate: float = 0.95,
     max_constant_day_rate: float = 0.05,
+    label_horizon_days: int = 1,
 ) -> dict[str, Any]:
     if valid_end >= test_start or test_start > test_end:
         raise ValueError("validation and reserved final-test windows must not overlap")
@@ -120,6 +122,8 @@ def evaluate_factor_values(
         raise ValueError("coverage thresholds must be in (0, 1]")
     if not 0 <= max_constant_day_rate < 1:
         raise ValueError("max_constant_day_rate must be in [0, 1)")
+    if label_horizon_days < 1:
+        raise ValueError("label_horizon_days must be positive")
     factor = normalize_series(_validation_window(factor_values, valid_start, valid_end), "factor")
     label = normalize_series(_validation_window(forward_returns, valid_start, valid_end), "label")
     joined = pd.concat([factor, label], axis=1, join="inner").dropna()
@@ -156,6 +160,7 @@ def evaluate_factor_values(
     icir = float(ic / ic_daily.std(ddof=1)) if ic_daily.std(ddof=1) > 0 else None
     rank_std = rank_ic_daily.std(ddof=1)
     rank_icir = float(rank_ic / rank_std) if rank_std > 0 else None
+    hac = newey_west_mean_test(ic_daily, max_lag=label_horizon_days)
     costs = cost_model or CostModelConfig()
     screening_cost_rate = costs.factor_screening_rate(reference_order_value=reference_order_value)
     turnover, gross_return, cost_adjusted_return = _long_short_returns(
@@ -202,6 +207,13 @@ def evaluate_factor_values(
         "icir": icir,
         "rank_ic": rank_ic,
         "rank_icir": rank_icir,
+        "hac_p_value": hac["p_value"],
+        "hac_test": hac,
+        "daily_ic": [
+            {"date": timestamp.date().isoformat(), "ic": float(value)}
+            for timestamp, value in ic_daily.items()
+        ],
+        "statistical_contract_version": STATISTICAL_CONTRACT_VERSION,
         "turnover": turnover,
         "max_correlation": max(correlations, default=0.0),
         "cost_adjusted_return": cost_adjusted_return,

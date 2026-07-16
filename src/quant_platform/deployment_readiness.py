@@ -17,6 +17,8 @@ from quant_data.database import (
     recommendation_portfolios,
     recommendation_snapshots,
     schedules,
+    simulation_nav,
+    simulation_portfolios,
     strategy_allocation_events,
     strategy_allocation_members,
     strategy_allocation_nav,
@@ -113,6 +115,32 @@ class DeploymentReadinessStore:
             snapshot_count = int(
                 connection.scalar(select(func.count()).select_from(recommendation_snapshots)) or 0
             )
+            simulation_count = int(
+                connection.scalar(select(func.count()).select_from(simulation_portfolios)) or 0
+            )
+            certified_nav_count = int(
+                connection.scalar(
+                    select(func.count()).select_from(simulation_nav).where(
+                        simulation_nav.c.performance_certified.is_(True)
+                    )
+                )
+                or 0
+            )
+            degraded_nav_count = int(
+                connection.scalar(
+                    select(func.count()).select_from(simulation_nav).where(
+                        simulation_nav.c.status == "degraded"
+                    )
+                )
+                or 0
+            )
+            nav_history = connection.execute(
+                select(
+                    simulation_nav.c.portfolio_id,
+                    simulation_nav.c.status,
+                    simulation_nav.c.performance_certified,
+                )
+            ).all()
             unsupported_active = int(
                 connection.scalar(
                     select(func.count())
@@ -124,7 +152,45 @@ class DeploymentReadinessStore:
                 )
                 or 0
             )
+        nav_by_portfolio: dict[str, list[Any]] = {}
+        for row in nav_history:
+            nav_by_portfolio.setdefault(str(row.portfolio_id), []).append(row)
+        replay_ready = any(
+            len(rows) >= 60
+            and all(
+                bool(row.performance_certified) and row.status == "healthy"
+                for row in rows
+            )
+            for rows in nav_by_portfolio.values()
+        )
+        maximum_replay_days = max(
+            (len(rows) for rows in nav_by_portfolio.values()), default=0
+        )
         return [
+            _check(
+                "simulation_accounts",
+                "Recommendation targets are bound to simulation accounts",
+                simulation_count > 0,
+                f"transactional simulation accounts: {simulation_count}",
+                "Create and activate a 5-minute simulation account for a recommendation target",
+            ),
+            _check(
+                "certified_simulation_nav",
+                "Simulation NAV is certifiable",
+                certified_nav_count > 0 and degraded_nav_count == 0,
+                (
+                    f"certified NAV rows: {certified_nav_count}; "
+                    f"degraded NAV rows: {degraded_nav_count}"
+                ),
+                "Run simulation booking and resolve stale or missing valuations",
+            ),
+            _check(
+                "simulation_60_day_replay",
+                "A simulation account has at least 60 certified trading days",
+                replay_ready,
+                f"maximum simulation history: {maximum_replay_days} days",
+                "Replay at least 60 trading days with no degraded or uncertified NAV rows",
+            ),
             _check(
                 "recommendation_schema",
                 "推荐领域模型已启用",

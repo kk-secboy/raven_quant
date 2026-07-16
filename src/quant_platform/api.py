@@ -15,12 +15,16 @@ import requests
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 from sqlalchemy import text
 
 from quant_data.checkpoint import CheckpointStore
 from quant_data.config import Settings, normalize_api_url
 from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES
+from quant_data.execution_contract import (
+    require_daily_qlib_contract,
+    require_minute_execution_contract,
+)
 from quant_data.execution_data import MINUTE_DATASETS, MINUTE_FREQUENCIES
 
 from .alert_store import AlertStore
@@ -29,6 +33,7 @@ from .auth_policy import ROLE_PERMISSIONS, has_permission, permission_for
 from .auth_store import AuthenticationError, AuthStore
 from .autonomous_research import AutonomousResearchOrchestrator
 from .continuous_research import ContinuousResearchController
+from .cost_model import COST_SCHEDULE_VERSION, CostModelConfig
 from .data_rollover import select_qlib_dataset
 from .data_task_store import DataTaskStore
 from .deployment_readiness import DeploymentReadinessStore
@@ -55,6 +60,7 @@ from .services import (
     resolve_snapshot_manifest,
     system_summary,
 )
+from .simulation_store import SimulationStore
 from .strategy_recipes import RECIPE_VERSION, get_strategy_recipe, list_strategy_recipes
 from .strategy_store import StrategyStore
 from .worker import LocalJobWorker
@@ -231,7 +237,7 @@ class ResearchPeriods(BaseModel):
     train_end: date = date(2021, 12, 31)
     valid_start: date = date(2022, 1, 1)
     valid_end: date = date(2023, 12, 31)
-    test_start: date = date(2024, 1, 1)
+    test_start: date = date(2024, 1, 8)
     test_end: date = Field(default_factory=date.today)
 
     @model_validator(mode="after")
@@ -335,13 +341,15 @@ class StrategyConfigRequest(BaseModel):
     optimizer_turnover_penalty: float = Field(default=0.10, ge=0, le=100.0)
     min_average_daily_amount: float = Field(default=500_000_000, ge=1_000_000, le=100_000_000_000)
     liquidity_lookback_days: int = Field(default=20, ge=5, le=252)
+    require_regulatory_events: bool = False
     max_tracking_error: float = Field(default=0.12, gt=0, le=1.0)
     max_drawdown: float = Field(default=0.25, gt=0, le=1.0)
     max_turnover: float = Field(default=0.60, gt=0, le=2.0)
     min_information_ratio: float = Field(default=0.0, ge=-5, le=10)
     min_sharpe_ratio: float = Field(default=0.0, ge=-5, le=10)
     min_sortino_ratio: float = Field(default=0.0, ge=-5, le=20)
-    min_robustness_pass_rate: float = Field(default=0.75, ge=0, le=1)
+    min_robustness_pass_rate: float = Field(default=1.0, ge=0, le=1)
+    annual_minimum_acceptable_return: float = Field(default=0.0, gt=-1.0, le=1.0)
     rolling_window_days: int = Field(default=252, ge=60, le=1260)
     rolling_step_days: int = Field(default=63, ge=20, le=504)
     min_rolling_windows: int = Field(default=3, ge=2, le=20)
@@ -363,10 +371,22 @@ class StrategyConfigRequest(BaseModel):
     min_profit_loss_ratio: float = Field(default=0.0, ge=0.0, le=100.0)
     execution_days: int = Field(default=1, ge=1, le=5)
     execution_method: Literal["open", "twap", "vwap"] = "open"
+    execution_slice_minutes: int = Field(default=20, ge=5, le=30)
+    max_execution_slices: int = Field(default=24, ge=1, le=64)
+    vwap_lookback_days: int = Field(default=20, ge=5, le=60)
     max_volume_participation: float = Field(default=0.01, gt=0, le=0.20)
     min_capacity_fill_ratio: float = Field(default=0.95, ge=0, le=1)
-    open_cost: float = Field(default=0.0005, ge=0, le=0.02)
-    close_cost: float = Field(default=0.0015, ge=0, le=0.02)
+    cost_schedule_version: Literal["cn-effective-cost-v1"] = COST_SCHEDULE_VERSION
+    effective_from: str = "2000-01-01"
+    effective_to: str | None = None
+    buy_commission_rate: float = Field(default=0.0005, ge=0, le=0.02)
+    sell_commission_rate: float = Field(default=0.0005, ge=0, le=0.02)
+    stock_sell_stamp_duty_rate: float = Field(default=0.0010, ge=0, le=0.02)
+    etf_sell_stamp_duty_rate: float = Field(default=0.0, ge=0, le=0.02)
+    transfer_fee_rate: float = Field(default=0.0, ge=0, le=0.02)
+    annual_borrow_rate: float = Field(default=0.0, ge=0, le=1.0)
+    fixed_slippage_rate: float = Field(default=0.0005, ge=0, le=0.02)
+    impact_at_max_participation: float = Field(default=0.0010, ge=0, le=0.10)
     min_commission: float = Field(default=5.0, ge=0, le=1000)
     execution_model: Literal["next_open"] = "next_open"
 
@@ -403,6 +423,9 @@ class StrategyConfigRequest(BaseModel):
             raise ValueError("capacity curve requires at least three distinct positive notionals")
         if self.rolling_step_days > self.rolling_window_days:
             raise ValueError("rolling_step_days must not exceed rolling_window_days")
+        if self.execution_slice_minutes % 5:
+            raise ValueError("execution_slice_minutes must be a multiple of five")
+        CostModelConfig.from_mapping(self.model_dump())
         return self
 
 
@@ -442,11 +465,18 @@ class PairStrategyConfigRequest(BaseModel):
     pair_gross_fraction: float = Field(default=0.20, gt=0, le=1)
     max_volume_participation: float = Field(default=0.01, gt=0, le=0.20)
     min_capacity_fill_ratio: float = Field(default=0.95, gt=0, le=1)
-    open_cost: float = Field(default=0.0005, ge=0, le=0.02)
-    close_cost: float = Field(default=0.0015, ge=0, le=0.02)
+    cost_schedule_version: Literal["cn-effective-cost-v1"] = COST_SCHEDULE_VERSION
+    effective_from: str = "2000-01-01"
+    effective_to: str | None = None
+    buy_commission_rate: float = Field(default=0.0005, ge=0, le=0.02)
+    sell_commission_rate: float = Field(default=0.0005, ge=0, le=0.02)
+    stock_sell_stamp_duty_rate: float = Field(default=0.0010, ge=0, le=0.02)
+    etf_sell_stamp_duty_rate: float = Field(default=0.0, ge=0, le=0.02)
+    transfer_fee_rate: float = Field(default=0.0, ge=0, le=0.02)
     min_commission: float = Field(default=5.0, ge=0, le=1000)
-    slippage: float = Field(default=0.0005, ge=0, le=0.02)
-    annual_borrow_rate: float = Field(default=0.08, ge=0, le=1)
+    fixed_slippage_rate: float = Field(default=0.0005, ge=0, le=0.02)
+    impact_at_max_participation: float = Field(default=0.0010, ge=0, le=0.10)
+    annual_borrow_rate: float = Field(default=0.08, gt=0, le=1)
     lot_size: int = Field(default=100, ge=1, le=10000)
     kalman_process_variance: float = Field(default=1e-5, gt=0, le=1)
     kalman_observation_variance: float = Field(default=1e-3, gt=0, le=1)
@@ -465,6 +495,7 @@ class PairStrategyConfigRequest(BaseModel):
             raise ValueError("z-score thresholds must satisfy exit < entry < stop")
         if self.min_hedge_ratio >= self.max_hedge_ratio:
             raise ValueError("min_hedge_ratio must be below max_hedge_ratio")
+        CostModelConfig.from_mapping(self.model_dump())
         return self
 
 
@@ -507,6 +538,7 @@ class PairStrategyBacktestRequest(BaseModel):
 
 class StrategyBacktestRequest(BaseModel):
     dataset: str
+    execution_dataset: str | None = None
     start: date
     end: date
 
@@ -686,12 +718,32 @@ class RecommendationPortfolioCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=150)
     strategy_version_id: str
     dataset: str
-    hypothetical_initial_value: float = Field(default=5_000_000, ge=100_000)
+    construction_notional: float = Field(
+        default=5_000_000,
+        ge=100_000,
+        validation_alias=AliasChoices(
+            "construction_notional", "hypothetical_initial_value"
+        ),
+    )
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
 
 
 class RecommendationRefreshRequest(BaseModel):
     as_of_date: date
+
+
+class SimulationPortfolioCreateRequest(BaseModel):
+    name: str = Field(min_length=3, max_length=150)
+    recommendation_portfolio_id: str
+    execution_dataset: str
+    initial_cash: float = Field(ge=100_000)
+    execution_algorithm: Literal["twap", "vwap"] = "twap"
+    slice_minutes: int = Field(default=20, ge=5, le=30, multiple_of=5)
+    max_slices: int = Field(default=24, ge=1, le=64)
+    max_participation: float = Field(default=0.01, gt=0, le=0.20)
+    volume_profile: list[dict[str, Any]] | None = None
+    cost_schedule_version: str = COST_SCHEDULE_VERSION
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
 
 
 class ScheduleCreateRequest(BaseModel):
@@ -881,6 +933,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     research = ResearchStore(settings.database_url)
     strategies = StrategyStore(settings.database_url)
     recommendations = RecommendationStore(settings.database_url)
+    simulations = SimulationStore(settings.database_url)
     parameter_experiments = ParameterExperimentStore(settings.database_url)
     autonomous_research = AutonomousResearchOrchestrator(settings)
     continuous_research = ContinuousResearchController(settings)
@@ -989,6 +1042,16 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 f"{purpose} requires a {frequency} Qlib dataset; selected dataset is "
                 f"{dataset.get('frequency') or 'unknown'}",
             )
+        try:
+            provenance = dataset.get("provenance") or {}
+            if dataset.get("frequency") == "day":
+                require_daily_qlib_contract(provenance)
+            else:
+                require_minute_execution_contract(
+                    provenance, frequency=str(dataset.get("frequency") or "")
+                )
+        except ValueError as exc:
+            raise HTTPException(409, f"{purpose}: {exc}") from exc
         return dataset
 
     def require_research_calendar(dataset: dict, periods: dict[str, str]) -> None:
@@ -2074,13 +2137,48 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         if dataset.get("end_date") and payload.end.isoformat() > dataset["end_date"]:
             raise HTTPException(409, "backtest ends after the selected dataset")
         artifact_root = settings.data_root / "artifacts" / "backtests"
+        execution_dataset: dict | None = None
         try:
             version = strategies.get_version(version_id)
             if version.get("strategy_type") != "multifactor":
                 raise ValueError("pair strategy versions require the pair-backtests endpoint")
+            execution_method = str(version.get("config", {}).get("execution_method", "open"))
+            if execution_method in {"twap", "vwap"}:
+                if not payload.execution_dataset:
+                    raise ValueError(
+                        "TWAP/VWAP strategy backtests require a minute execution dataset"
+                    )
+                execution_dataset = require_qlib_dataset(
+                    payload.execution_dataset, purpose="strategy minute execution"
+                )
+                frequency = str(execution_dataset.get("frequency") or "")
+                if frequency not in MINUTE_FREQUENCIES:
+                    raise ValueError(
+                        "strategy minute execution requires a supported minute frequency"
+                    )
+                execution_start = str(execution_dataset.get("start_date") or "")[:10]
+                execution_end = str(execution_dataset.get("end_date") or "")[:10]
+                if execution_start and payload.start.isoformat() < execution_start:
+                    raise ValueError("backtest starts before the minute execution dataset")
+                if execution_end and payload.end.isoformat() > execution_end:
+                    raise ValueError("backtest ends after the minute execution dataset")
+                bar_minutes = int(frequency.removesuffix("min"))
+                slice_minutes = int(
+                    version.get("config", {}).get("execution_slice_minutes", 20)
+                )
+                if bar_minutes > slice_minutes or slice_minutes % bar_minutes:
+                    raise ValueError(
+                        "execution_slice_minutes must be an integer multiple of the "
+                        "minute dataset bar"
+                    )
+            elif payload.execution_dataset:
+                raise ValueError(
+                    "open execution backtests must not specify a minute execution dataset"
+                )
             backtest = strategies.create_backtest(
                 version_id=version_id,
                 dataset=payload.dataset,
+                execution_dataset=payload.execution_dataset,
                 periods={"start": payload.start.isoformat(), "end": payload.end.isoformat()},
                 artifact_path=artifact_root,
             )
@@ -2095,6 +2193,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "strategy_version_id": version_id,
                     "dataset": payload.dataset,
                     "dataset_path": dataset["path"],
+                    "execution_dataset": execution_dataset,
                     "periods": backtest["periods"],
                 },
                 log_path,
@@ -2402,7 +2501,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 name=payload.name,
                 strategy_version_id=payload.strategy_version_id,
                 dataset=payload.dataset,
-                hypothetical_initial_value=payload.hypothetical_initial_value,
+                hypothetical_initial_value=payload.construction_notional,
                 actor=authenticated_actor(request, payload.actor),
             )
         except KeyError as exc:
@@ -2439,10 +2538,13 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.get("/api/recommendation-portfolios/{portfolio_id}/hypothetical-performance")
     def get_recommendation_hypothetical_performance(portfolio_id: str) -> list[dict]:
         try:
-            portfolio = recommendations.get(portfolio_id)
+            recommendations.get(portfolio_id)
         except KeyError as exc:
             raise HTTPException(404, "recommendation portfolio not found") from exc
-        return list(portfolio.get("hypothetical_performance") or [])
+        raise HTTPException(
+            410,
+            "hypothetical recommendation performance is retired; use simulation NAV",
+        )
 
     @app.post("/api/recommendation-portfolios/{portfolio_id}/refresh", status_code=202)
     def refresh_recommendation_portfolio(
@@ -2485,6 +2587,82 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         recommendations.attach_job(snapshot["id"], job["id"])
         worker.notify()
         return recommendations.get_snapshot(snapshot["id"])
+
+    @app.get("/api/simulation-portfolios")
+    def list_simulation_portfolios(
+        limit: int = Query(100, ge=1, le=500),
+    ) -> list[dict]:
+        return simulations.list(limit)
+
+    @app.post("/api/simulation-portfolios", status_code=201)
+    def create_simulation_portfolio(
+        payload: SimulationPortfolioCreateRequest, request: Request
+    ) -> dict:
+        try:
+            recommendation = recommendations.get(payload.recommendation_portfolio_id)
+        except KeyError as exc:
+            raise HTTPException(404, "recommendation portfolio not found") from exc
+        daily = require_qlib_dataset(
+            recommendation["dataset"], purpose="simulation daily data", frequency="day"
+        )
+        execution = require_qlib_dataset(
+            payload.execution_dataset,
+            purpose="simulation execution data",
+            frequency="5min",
+        )
+        try:
+            return simulations.create(
+                name=payload.name,
+                recommendation_portfolio_id=payload.recommendation_portfolio_id,
+                daily_dataset=daily,
+                execution_dataset=execution,
+                initial_cash=payload.initial_cash,
+                execution_policy={
+                    "execution_algorithm": payload.execution_algorithm,
+                    "slice_minutes": payload.slice_minutes,
+                    "max_slices": payload.max_slices,
+                    "max_participation": payload.max_participation,
+                    "volume_profile": payload.volume_profile,
+                },
+                cost_schedule_version=payload.cost_schedule_version,
+                actor=authenticated_actor(request, payload.actor),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "recommendation portfolio not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/simulation-portfolios/{portfolio_id}")
+    def get_simulation_portfolio(portfolio_id: str) -> dict:
+        try:
+            return simulations.get(portfolio_id)
+        except KeyError as exc:
+            raise HTTPException(404, "simulation portfolio not found") from exc
+
+    @app.post("/api/simulation-portfolios/{portfolio_id}/activate")
+    def activate_simulation_portfolio(portfolio_id: str) -> dict:
+        try:
+            return simulations.set_status(portfolio_id, "active")
+        except KeyError as exc:
+            raise HTTPException(404, "simulation portfolio not found") from exc
+
+    @app.post("/api/simulation-portfolios/{portfolio_id}/pause")
+    def pause_simulation_portfolio(portfolio_id: str) -> dict:
+        try:
+            return simulations.set_status(portfolio_id, "paused")
+        except KeyError as exc:
+            raise HTTPException(404, "simulation portfolio not found") from exc
+
+    @app.get("/api/simulation-portfolios/{portfolio_id}/{resource}")
+    def get_simulation_resource(
+        portfolio_id: str,
+        resource: Literal["orders", "fills", "positions", "nav", "events"],
+    ) -> list[dict]:
+        try:
+            simulations.get(portfolio_id)
+            return simulations.rows(portfolio_id, resource)
+        except KeyError as exc:
+            raise HTTPException(404, "simulation portfolio not found") from exc
 
     @app.get("/api/schedules")
     def list_schedules(limit: int = Query(200, ge=1, le=500)) -> list[dict]:

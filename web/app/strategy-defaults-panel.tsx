@@ -84,8 +84,13 @@ const groups: FieldGroup[] = [
   {
     title: "交易成本",
     fields: [
-      { key: "open_cost", label: "买入成本（bp）", min: 0, max: 200, step: 0.1, scale: 10000 },
-      { key: "close_cost", label: "卖出成本（bp）", min: 0, max: 200, step: 0.1, scale: 10000 },
+      { key: "buy_commission_rate", label: "买入佣金（bp）", min: 0, max: 200, step: 0.1, scale: 10000 },
+      { key: "sell_commission_rate", label: "卖出佣金（bp）", min: 0, max: 200, step: 0.1, scale: 10000 },
+      { key: "stock_sell_stamp_duty_rate", label: "股票卖出印花税（bp）", min: 0, max: 200, step: 0.1, scale: 10000 },
+      { key: "etf_sell_stamp_duty_rate", label: "ETF卖出印花税（bp）", min: 0, max: 200, step: 0.1, scale: 10000 },
+      { key: "transfer_fee_rate", label: "过户费（bp）", min: 0, max: 200, step: 0.1, scale: 10000 },
+      { key: "fixed_slippage_rate", label: "固定冲击（bp）", min: 0, max: 200, step: 0.1, scale: 10000 },
+      { key: "impact_at_max_participation", label: "容量上限冲击（bp）", min: 0, max: 1000, step: 0.1, scale: 10000 },
       { key: "min_commission", label: "最低佣金（元）", min: 0, max: 1000, step: 0.1 },
     ],
   },

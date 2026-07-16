@@ -6,7 +6,7 @@ import numpy as np
 from qlib.backtest.decision import Order
 from qlib.backtest.exchange import Exchange
 
-from .cost_model import CostModelConfig
+from .cost_model import CostModelConfig, infer_cn_asset_type
 
 
 class SquareRootImpactExchange(Exchange):
@@ -64,13 +64,21 @@ class SquareRootImpactExchange(Exchange):
             side=side,
             gross_value=trade_value,
             participation=participation,
+            asset_type=infer_cn_asset_type(str(order.stock_id)),
+            trade_date=order.start_time.date(),
         )
         self.fill_log.append(
             {
                 "instrument": str(order.stock_id),
                 "date": str(order.start_time),
                 "side": side,
+                "requested_amount": float(order.amount),
                 "amount": float(trade_value / trade_price) if trade_price else 0.0,
+                "capacity_fill_ratio": (
+                    min(1.0, float(trade_value / trade_price) / float(order.amount))
+                    if trade_price and float(order.amount) > 0
+                    else 0.0
+                ),
                 "trade_price": float(trade_price),
                 "trade_value": float(trade_value),
                 "cost": float(actual_cost),

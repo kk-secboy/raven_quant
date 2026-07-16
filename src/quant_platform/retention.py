@@ -15,9 +15,11 @@ from quant_data.database import (
     open_database,
     paper_portfolios,
     parameter_experiments,
+    recommendation_portfolios,
     research_campaigns,
     research_programs,
     research_runs,
+    simulation_portfolios,
 )
 
 RETENTION_CONFIRMATION = "DELETE_UNREFERENCED_DATASETS"
@@ -116,6 +118,8 @@ class DataRetentionManager:
         protected: dict[str, set[str]] = {}
 
         def add(value: Any, reason: str) -> None:
+            if isinstance(value, dict):
+                value = value.get("name")
             name = str(value or "").strip()
             if name:
                 protected.setdefault(name, set()).add(reason)
@@ -127,6 +131,8 @@ class DataRetentionManager:
                 add(value, "factor evaluation")
             for value in connection.scalars(select(backtest_runs.c.dataset)):
                 add(value, "strategy backtest")
+            for value in connection.scalars(select(backtest_runs.c.execution_dataset)):
+                add(value, "strategy execution backtest")
             for value in connection.scalars(select(parameter_experiments.c.dataset)):
                 add(value, "parameter experiment")
             for value in connection.scalars(select(research_campaigns.c.dataset)):
@@ -135,6 +141,12 @@ class DataRetentionManager:
                 add(value, "continuous research program")
             for value in connection.scalars(select(paper_portfolios.c.dataset)):
                 add(value, "paper portfolio")
+            for value in connection.scalars(select(recommendation_portfolios.c.dataset)):
+                add(value, "recommendation target portfolio")
+            for value in connection.scalars(select(simulation_portfolios.c.daily_dataset)):
+                add(value, "simulation daily ledger")
+            for value in connection.scalars(select(simulation_portfolios.c.execution_dataset)):
+                add(value, "simulation execution ledger")
             active_jobs = connection.execute(
                 select(jobs.c.kind, jobs.c.payload_json).where(
                     jobs.c.status.in_(("queued", "running"))
@@ -143,6 +155,7 @@ class DataRetentionManager:
             for row in active_jobs:
                 payload = dict(row.payload_json or {})
                 add(payload.get("dataset"), f"active {row.kind} job")
+                add(payload.get("execution_dataset"), f"active {row.kind} job")
                 add(payload.get("snapshot_name"), f"active {row.kind} job")
         return protected
 

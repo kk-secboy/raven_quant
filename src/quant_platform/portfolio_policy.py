@@ -102,6 +102,7 @@ class PortfolioPolicy:
         benchmark_industry_weights: pd.Series | None = None,
         style_exposures: pd.Series | pd.DataFrame | None = None,
         benchmark_style_exposure: float | pd.Series | dict[str, float] | None = None,
+        return_covariance: pd.DataFrame | None = None,
         prices: pd.Series | None = None,
         average_daily_values: pd.Series | None = None,
         portfolio_value: float | None = None,
@@ -174,6 +175,7 @@ class PortfolioPolicy:
                 benchmark_industry_weights,
                 style_exposures,
                 benchmark_style_exposure,
+                return_covariance,
             )
             if any(item is None for item in required):
                 raise ValueError(
@@ -187,6 +189,7 @@ class PortfolioPolicy:
                 benchmark_industry_weights=benchmark_industry_weights,  # type: ignore[arg-type]
                 style_exposures=style_exposures,  # type: ignore[arg-type]
                 benchmark_style_exposure=benchmark_style_exposure,
+                return_covariance=return_covariance,  # type: ignore[arg-type]
                 max_position_weight=self.config.max_position_weight,
                 max_industry_weight=self.config.max_industry_weight,
                 max_industry_deviation=self.config.max_industry_deviation,
