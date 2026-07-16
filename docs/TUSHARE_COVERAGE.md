@@ -105,7 +105,9 @@ again from the first post-deployment snapshot.
 
 The six pre-existing institutional interfaces `report_rc`, `etf_sh_cons`,
 `etf_sz_cons`, `ci_daily`, `shibor_quote`, and `major_news` retain separate
-pagination and permission gates. `major_news` explicitly requests article
+pagination and permission gates. ETF basket history is initialized as one full-range
+partition per listed ETF instead of one full-market request per ETF/date; capped
+partitions are bisected by date. `major_news` explicitly requests article
 content in addition to title, source, and publication time. Their production
 probe remains pending until the active production queue is idle.
 

@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from quant_data.coverage_data import COVERAGE_BUNDLES, coverage_bundle_datasets
@@ -13,6 +13,42 @@ from quant_data.database import data_tasks, jobs, open_database, row_dict, work_
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+DEFAULT_REQUEST_STRATEGY = (
+    "按接口密度批量规划；成功 checkpoint 会复用，旧的未完成请求保留审计并由新计划替代。"
+)
+
+
+REQUEST_STRATEGIES = {
+    "cn_ashare_daily_full": "尽量按完整日期窗口批量下载，分页后验证终止页。",
+    "cn_extended_daily": "普通日期区间批量分页；offset 或满页触顶时自动二分日期。",
+    "cn_funds": "基金份额按月，净值按日分页；分红和持仓按日历日避免漏掉周末公告。",
+    "cn_institutional": (
+        "ETF 申赎清单按每只 ETF 整段历史获取；分页或行数触顶后自动二分日期。"
+    ),
+    "cn_capital_flow": "稀疏资金流按月或按年，密集全市场个股资金流继续逐日分页。",
+    "research_corpus": "财经新闻按来源和整日请求，达到 1500 条时按时间中点递归拆分。",
+    "hk_market": "先下载港股 master 和交易日历，再只规划开市日；自动股票池按上市区间过滤。",
+    "us_market": "先下载美股 master 和交易日历，再只规划开市日；财务指标按有效股票池获取。",
+    "liquid_intraday_1m": "1 分钟数据保持安全窗口，分页触顶后进入可恢复的自适应分区。",
+    "pair_execution_1m": "1 分钟数据保持安全窗口，分页触顶后进入可恢复的自适应分区。",
+    "cn_ashare_5m": (
+        "每只股票最多 150 个实际交易日一个初始窗口；达到 8000 行时无重叠二分。"
+    ),
+}
+
+
+_RATE_LIMIT_PATTERNS = (
+    "%rate limit%",
+    "%too many request%",
+    "%frequency limit%",
+    "%限频%",
+    "%请求过于频繁%",
+    "%请求次数超限%",
+    "%每分钟%",
+    "%冷却%",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,13 +246,14 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         3,
         35,
         "机构研究与增强数据",
-        "券商盈利预测、沪深ETF申赎清单、中信行业指数、Shibor报价明细和长篇财经新闻。所有限额接口均分页并验证终止页。",
+        "券商盈利预测、沪深ETF申赎清单、中信行业指数、Shibor报价明细和长篇财经新闻。ETF清单按标的整段获取，所有限额接口均分页并在触顶时自动二分日期。",
         "研究增强",
         "Tushare",
         "ready",
         ("cn_macro",),
         (
             "report_rc",
+            "etf_basic",
             "etf_sh_cons",
             "etf_sz_cons",
             "ci_daily",
@@ -482,7 +519,7 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         6,
         100,
         "全A股5分钟线",
-        "2024年至今全市场5分钟行情；15/30/60分钟由5分钟数据本地聚合。",
+        "2024年至今全市场5分钟行情；每个标的按最多150个实际交易日规划，触及8000行时自动二分，15/30/60分钟由5分钟数据本地聚合。",
         "分钟行情",
         "Tushare",
         "ready",
@@ -564,6 +601,9 @@ class DataTaskStore:
                         "frequency": definition.frequency,
                         "range_start": definition.range_start,
                         "range_end": definition.range_end,
+                        "request_strategy": REQUEST_STRATEGIES.get(
+                            definition.task_key, DEFAULT_REQUEST_STRATEGY
+                        ),
                     },
                     "estimated_storage_gb": raw["estimated_storage_gb"],
                     "created_at": now,
@@ -722,27 +762,68 @@ class DataTaskStore:
             job_states = (
                 {
                     str(row.id): {
+                        "id": str(row.id),
+                        "kind": str(row.kind),
                         "status": str(row.status),
                         "error": row.error,
                         "progress": row.progress_json,
+                        "payload": row.payload_json,
+                        "created_at": row.created_at,
+                        "started_at": row.started_at,
+                        "finished_at": row.finished_at,
+                        "next_attempt_at": row.next_attempt_at,
+                        "attempts": int(row.attempts or 0),
+                        "max_attempts": int(row.max_attempts or 0),
                     }
                     for row in connection.execute(
                         select(
                             jobs.c.id,
+                            jobs.c.kind,
                             jobs.c.status,
                             jobs.c.error,
                             jobs.c.progress_json,
+                            jobs.c.payload_json,
+                            jobs.c.created_at,
+                            jobs.c.started_at,
+                            jobs.c.finished_at,
+                            jobs.c.next_attempt_at,
+                            jobs.c.attempts,
+                            jobs.c.max_attempts,
                         ).where(jobs.c.id.in_(job_ids))
                     )
                 }
                 if job_ids
                 else {}
             )
+            retryable_failure = and_(
+                work_units.c.status == "failed",
+                work_units.c.attempts < work_units.c.max_attempts,
+            )
+            terminal_failure = and_(
+                work_units.c.status == "failed",
+                work_units.c.attempts >= work_units.c.max_attempts,
+            )
+            rate_limited_failure = and_(
+                retryable_failure,
+                or_(
+                    *[
+                        func.lower(func.coalesce(work_units.c.last_error, "")).like(pattern)
+                        for pattern in _RATE_LIMIT_PATTERNS
+                    ]
+                ),
+            )
             unit_counts = {
                 str(row.dataset): {
-                    "planned": int(row.planned or 0),
+                    "planned": int(row.planned or 0) - int(row.superseded or 0),
                     "succeeded": int(row.succeeded or 0),
+                    "pending": int(row.pending or 0),
+                    "running": int(row.running or 0),
+                    "retry_waiting": int(row.retry_waiting or 0),
+                    "terminal_failed": int(row.terminal_failed or 0),
+                    "rate_limited": int(row.rate_limited or 0),
+                    "superseded": int(row.superseded or 0),
                     "rows": int(row.rows or 0),
+                    "next_retry_at": row.next_retry_at,
                 }
                 for row in connection.execute(
                     select(
@@ -751,7 +832,28 @@ class DataTaskStore:
                         func.sum(case((work_units.c.status == "succeeded", 1), else_=0)).label(
                             "succeeded"
                         ),
+                        func.sum(
+                            case((work_units.c.status == "pending", 1), else_=0)
+                        ).label("pending"),
+                        func.sum(
+                            case((work_units.c.status == "running", 1), else_=0)
+                        ).label("running"),
+                        func.sum(case((retryable_failure, 1), else_=0)).label(
+                            "retry_waiting"
+                        ),
+                        func.sum(case((terminal_failure, 1), else_=0)).label(
+                            "terminal_failed"
+                        ),
+                        func.sum(case((rate_limited_failure, 1), else_=0)).label(
+                            "rate_limited"
+                        ),
+                        func.sum(
+                            case((work_units.c.status == "superseded", 1), else_=0)
+                        ).label("superseded"),
                         func.sum(work_units.c.row_count).label("rows"),
+                        func.min(
+                            case((retryable_failure, work_units.c.next_retry_at), else_=None)
+                        ).label("next_retry_at"),
                     ).group_by(work_units.c.dataset)
                 )
             }
@@ -761,6 +863,7 @@ class DataTaskStore:
                     row["status"] = state["status"]
                     row["error"] = state["error"]
                     row["progress"] = state["progress"]
+                    row["job"] = state
         for row in rows:
             dependencies = row.pop("depends_on_json")
             row["depends_on"] = dependencies
@@ -809,10 +912,59 @@ class DataTaskStore:
                     else 0.0
                 )
             row["rows"] = sum(item["rows"] for item in counts)
+            row["unit_stats"] = {
+                "planned": sum(item["planned"] for item in counts),
+                "succeeded": sum(item["succeeded"] for item in counts),
+                "pending": sum(item["pending"] for item in counts),
+                "running": sum(item["running"] for item in counts),
+                "retry_waiting": sum(item["retry_waiting"] for item in counts),
+                "terminal_failed": sum(item["terminal_failed"] for item in counts),
+                "rate_limited": sum(item["rate_limited"] for item in counts),
+                "superseded": sum(item["superseded"] for item in counts),
+                "rows": sum(item["rows"] for item in counts),
+                "next_retry_at": min(
+                    (
+                        item["next_retry_at"]
+                        for item in counts
+                        if item["next_retry_at"] is not None
+                    ),
+                    default=None,
+                ),
+            }
         status_by_key = {str(row["task_key"]): str(row["status"]) for row in rows}
         for row in rows:
             dependencies = row["depends_on"]
             row["dependencies_satisfied"] = all(
                 status_by_key.get(key) == "succeeded" for key in dependencies
             )
+            stats = row["unit_stats"]
+            job = row.get("job") or {}
+            progress = row.get("progress") or {}
+            status = str(row["status"])
+            next_attempt_at = job.get("next_attempt_at")
+            if not row["dependencies_satisfied"] and status not in {
+                "queued",
+                "running",
+                "succeeded",
+            }:
+                phase = "blocked_prerequisite"
+            elif status == "queued" and next_attempt_at is not None:
+                phase = "retry_waiting"
+            elif status == "queued":
+                phase = "queued"
+            elif status == "running" and stats["rate_limited"] and not stats["running"]:
+                phase = "rate_limit_cooldown"
+            elif status == "running":
+                phase = str(progress.get("execution_phase") or "planning")
+            elif status == "failed" and stats["retry_waiting"]:
+                phase = "recoverable_failure"
+            elif status == "failed":
+                phase = "terminal_failure"
+            elif status == "succeeded":
+                phase = "verified"
+            elif status == "partial":
+                phase = "partial"
+            else:
+                phase = "ready_to_start"
+            row["execution_phase"] = phase
         return rows

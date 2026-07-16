@@ -154,6 +154,21 @@ class JobStore:
                 )
             )
 
+    def update_progress(self, job_id: str, progress: dict[str, Any]) -> None:
+        """Persist a live subprocess progress snapshot without changing job state."""
+
+        with self.engine.begin() as connection:
+            updated = connection.execute(
+                update(jobs)
+                .where(jobs.c.id == job_id, jobs.c.status == "running")
+                .values(progress_json=progress)
+            )
+        if not int(updated.rowcount or 0):
+            current = self.get(job_id)
+            if current["status"] != "running":
+                return
+            raise KeyError(job_id)
+
     def finish_or_retry(
         self,
         job_id: str,

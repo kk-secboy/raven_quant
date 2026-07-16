@@ -76,7 +76,11 @@ class DownloadRunner:
             if self.on_result:
                 self.on_result(unit.spec.dataset, True, result.row_count)
         except Exception as exc:
-            retry_after = 30 if isinstance(exc, ProviderError) and exc.retryable else 0
+            retry_after = (
+                int(exc.retry_after_seconds or 30)
+                if isinstance(exc, ProviderError) and exc.retryable
+                else 0
+            )
             terminal = isinstance(exc, ProviderError) and not exc.retryable
             self.checkpoint.fail(
                 unit.unit_key,

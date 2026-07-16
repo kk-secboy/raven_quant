@@ -136,3 +136,23 @@ def test_bulk_status_updates_are_chunked(
     ) == 4
     rows = store.unit_rows(item.unit_key for item in items)
     assert {row["status"] for row in rows} == {"superseded"}
+
+
+def test_unfinished_units_returns_only_pending_and_failed(database_url: str) -> None:
+    store = CheckpointStore(database_url)
+    pending = spec()
+    failed = FetchSpec("daily", "daily", {"trade_date": "20240103"}, {"trade_date": "20240103"})
+    succeeded = FetchSpec(
+        "daily", "daily", {"trade_date": "20240104"}, {"trade_date": "20240104"}
+    )
+    store.add([pending, failed, succeeded])
+    store.fail(failed.unit_key, "temporary")
+    store.succeed(
+        succeeded.unit_key,
+        UnitResult(output_path="units/succeeded.parquet", row_count=1, sha256="abc"),
+    )
+
+    assert {row["unit_key"] for row in store.unfinished_units("daily")} == {
+        pending.unit_key,
+        failed.unit_key,
+    }

@@ -2,6 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
+import { DataJob, JobProgress, UnitStats, phaseLabel, retryTimeText } from "./data-progress";
 
 export type DataTask = {
   task_key: string;
@@ -19,11 +20,16 @@ export type DataTask = {
   error?: string | null;
   coverage: number;
   rows: number;
+  execution_phase: string;
+  unit_stats: UnitStats;
+  progress?: JobProgress | null;
+  job?: DataJob | null;
   config: {
     datasets: string[];
     frequency: string;
     range_start: string;
     range_end: string;
+    request_strategy: string;
   };
 };
 
@@ -37,6 +43,13 @@ const statusText: Record<string, string> = {
   partial: "需补齐",
   failed: "失败",
 };
+
+function taskStateText(task: DataTask) {
+  if (["queued", "running", "failed", "partial"].includes(task.status)) {
+    return phaseLabel(task.execution_phase);
+  }
+  return statusText[task.status] ?? phaseLabel(task.execution_phase);
+}
 
 const implementationText: Record<string, string> = {
   ready: "可直接下载",
@@ -218,13 +231,13 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
                   {groupTasks.map((task) => (
                     <article className={`catalog-task ${task.status}`} key={task.task_key}>
                       <div className="catalog-task-main">
-                        <span className={`task-status ${task.status}`}>{statusText[task.status] ?? task.status}</span>
+                        <span className={`task-status ${task.status}`}>{taskStateText(task)}</span>
                         <div><strong>{task.title}</strong><p>{task.description}</p></div>
                       </div>
                       <div className="catalog-task-facts">
                         <span>{task.config.frequency}</span>
                         <span>{task.config.range_start} 至最新</span>
-                        <span>{task.coverage}%</span>
+                        <span>目录可用度 {task.coverage}%</span>
                       </div>
                       <div className="catalog-task-actions">
                         {supplementalBundles.has(task.task_key) && task.task_key !== "strategy_specialty_minutes" && !["queued", "running"].includes(task.status) ? (
@@ -233,12 +246,19 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
                         {task.task_key === "strategy_specialty_minutes" && !["queued", "running"].includes(task.status) ? <button type="button" onClick={() => onMessage("请到“新建任务”填写证券代码后启动策略分钟专项数据。")}>配置后下载</button> : null}
                         {["liquid_intraday_qlib", "cn_ashare_5m_qlib"].includes(task.task_key) && !["queued", "running"].includes(task.status) ? (() => { const snapshot = minuteSnapshots.find((item) => item.frequency === task.config.frequency)?.name ?? ""; return <button type="button" disabled={submitting !== null || !task.dependencies_satisfied || !snapshot} onClick={() => startMinuteQlib(snapshot)}>构建 Qlib</button>; })() : null}
                         {task.task_key === "cn_ashare_5m" && !["queued", "running"].includes(task.status) ? <button type="button" disabled={submitting !== null || !task.dependencies_satisfied} onClick={startAshare5m}>下载/更新</button> : null}
-                        {task.status === "failed" && task.job_id ? <button className="danger-button" type="button" disabled={submitting !== null} onClick={() => retryTask(task)}>重试</button> : null}
+                        {task.status === "failed" && task.job_id ? <button className={task.execution_phase === "terminal_failure" ? "danger-button" : ""} type="button" disabled={submitting !== null} onClick={() => retryTask(task)}>{task.execution_phase === "recoverable_failure" ? "继续恢复" : "重试"}</button> : null}
                         <details>
                           <summary>详情</summary>
                           <div className="task-detail-popover">
                             <span>来源：{task.source}</span>
+                            <span>请求策略：{task.config.request_strategy}</span>
+                            <span>当前阶段：{phaseLabel(task.execution_phase)}</span>
                             <span>数据量：{task.rows.toLocaleString("zh-CN")} 行</span>
+                            <span>
+                              checkpoint：{task.unit_stats.succeeded.toLocaleString("zh-CN")} 成功 · {task.unit_stats.running.toLocaleString("zh-CN")} 运行 · {task.unit_stats.retry_waiting.toLocaleString("zh-CN")} 待重试
+                            </span>
+                            {task.unit_stats.superseded ? <span>替代审计：{task.unit_stats.superseded.toLocaleString("zh-CN")} 个旧单元</span> : null}
+                            {task.unit_stats.next_retry_at ? <span>下次可重试：{retryTimeText(task.unit_stats.next_retry_at)}</span> : null}
                             <span>预计空间：{task.estimated_storage_gb ? `${task.estimated_storage_gb} GB` : "按实际数据量"}</span>
                             <span>{implementationText[task.implementation_status] ?? task.implementation_status}</span>
                             {task.error ? <b>{task.error}</b> : null}

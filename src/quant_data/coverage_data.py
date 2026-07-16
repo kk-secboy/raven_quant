@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from .models import FetchSpec
+from .partitioning import partition_metadata
 from .planner import compact_date
 from .reference_data import apply_reference_refresh
 
@@ -19,6 +20,13 @@ DEFAULT_COVERAGE_BUNDLES = {
 }
 OPTIONAL_COVERAGE_BUNDLES = {"strategy_specialty", "strategy_specialty_minutes"}
 COVERAGE_BUNDLES = DEFAULT_COVERAGE_BUNDLES | OPTIONAL_COVERAGE_BUNDLES
+_ADAPTIVE_CAPITAL_FLOW_DATASETS = {
+    "moneyflow_hsgt",
+    "moneyflow_cnt_ths",
+    "moneyflow_ind_ths",
+    "moneyflow_ind_dc",
+    "moneyflow_mkt_dc",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,13 +80,13 @@ _RULES: dict[str, tuple[CoverageRule, ...]] = {
         CoverageRule("slb_len", "daily", 5_000, 4),
     ),
     "cn_capital_flow": (
-        CoverageRule("moneyflow_hsgt", "daily", 300, 4),
+        CoverageRule("moneyflow_hsgt", "year", 300, 4),
         CoverageRule("moneyflow_ths", "daily", 5_000, 4),
         CoverageRule("moneyflow_dc", "daily", 6_000, 4),
-        CoverageRule("moneyflow_cnt_ths", "daily", 5_000, 4),
-        CoverageRule("moneyflow_ind_ths", "daily", 5_000, 4),
-        CoverageRule("moneyflow_ind_dc", "daily", 5_000, 4),
-        CoverageRule("moneyflow_mkt_dc", "daily", 3_000, 4),
+        CoverageRule("moneyflow_cnt_ths", "month_range", 5_000, 4),
+        CoverageRule("moneyflow_ind_ths", "month_range", 5_000, 4),
+        CoverageRule("moneyflow_ind_dc", "month_range", 5_000, 4),
+        CoverageRule("moneyflow_mkt_dc", "year", 3_000, 4),
     ),
     "cn_fund_index_enhanced": (
         CoverageRule("etf_share_size", "daily", 5_000, 4),
@@ -313,6 +321,20 @@ def coverage_specs(
                         params,
                         f"{rule.dataset}:{params['start_date']}:{params['end_date']}",
                         max_attempts,
+                        partition=(
+                            partition_metadata(
+                                "date",
+                                window_start,
+                                window_end,
+                                values=[
+                                    value
+                                    for value in dates
+                                    if params["start_date"] <= value <= params["end_date"]
+                                ],
+                            )
+                            if rule.dataset in _ADAPTIVE_CAPITAL_FLOW_DATASETS
+                            else None
+                        ),
                     )
                 )
         elif rule.mode in {"year", "year_week"}:
@@ -333,6 +355,23 @@ def coverage_specs(
                         params,
                         f"{rule.dataset}:{window_start.year}",
                         max_attempts,
+                        partition=(
+                            partition_metadata(
+                                "date",
+                                window_start,
+                                window_end,
+                                values=[
+                                    value
+                                    for value in dates
+                                    if compact_date(window_start)
+                                    <= value
+                                    <= compact_date(window_end)
+                                ],
+                            )
+                            if rule.mode == "year"
+                            and rule.dataset in _ADAPTIVE_CAPITAL_FLOW_DATASETS
+                            else None
+                        ),
                     )
                 )
         else:
@@ -399,6 +438,7 @@ def _paged(
     max_attempts: int,
     *,
     expected_date: str | None = None,
+    partition: dict[str, Any] | None = None,
 ) -> list[FetchSpec]:
     scope: dict[str, Any] = {
         **base_params,
@@ -406,12 +446,23 @@ def _paged(
         "page_size": rule.page_size,
         "max_pages": rule.max_pages,
         "offset": 0,
+        **(partition or {}),
     }
     if expected_date:
         scope.update(
             {
                 "expected_date_field": rule.date_field,
                 "expected_date": expected_date,
+            }
+        )
+    elif partition:
+        scope.update(
+            {
+                "expected_date_field": rule.date_field,
+                "expected_date_start": str(partition["partition_start"])
+                .replace("-", "")[:8],
+                "expected_date_end": str(partition["partition_end"])
+                .replace("-", "")[:8],
             }
         )
     return [

@@ -13,6 +13,8 @@ from quant_data.checkpoint import CheckpointStore
 from quant_data.cli import (
     _historical_a_share_active_ranges,
     _historical_a_share_symbols,
+    _historically_active_symbols,
+    _open_market_dates,
 )
 from quant_data.config import Settings
 from quant_data.execution_data import margin_specs, minute_specs
@@ -142,6 +144,55 @@ def test_full_a_share_windows_are_clipped_to_each_stock_lifecycle() -> None:
         ("920001.BJ", "2026-02-15 00:00:00", "2026-02-28 23:59:59"),
         ("920001.BJ", "2026-03-01 00:00:00", "2026-03-31 23:59:59"),
     }
+
+
+@pytest.mark.no_database
+def test_hk_financial_universe_intersects_listing_lifecycle() -> None:
+    master = pd.DataFrame(
+        [
+            {
+                "ts_code": "00700.HK",
+                "list_date": "20040616",
+                "delist_date": None,
+                "list_status": "L",
+            },
+            {
+                "ts_code": "00001.HK",
+                "list_date": "19860101",
+                "delist_date": "20231231",
+                "list_status": "D",
+            },
+            {
+                "ts_code": "09999.HK",
+                "list_date": "20250102",
+                "delist_date": None,
+                "list_status": "P",
+            },
+        ]
+    )
+
+    assert _historically_active_symbols(
+        master,
+        start=date(2024, 1, 1),
+        end=date(2024, 12, 31),
+        suffixes=(".HK",),
+    ) == ["00700.HK"]
+
+
+@pytest.mark.no_database
+def test_market_calendar_helper_keeps_only_open_sessions() -> None:
+    calendar = pd.DataFrame(
+        [
+            {"cal_date": "20240101", "is_open": 0},
+            {"cal_date": "20240102", "is_open": 1},
+            {"cal_date": "20240103", "is_open": "true"},
+            {"cal_date": "20240104", "is_open": 0},
+        ]
+    )
+
+    assert _open_market_dates(
+        calendar, start=date(2024, 1, 1), end=date(2024, 1, 4)
+    ) == ["20240102", "20240103"]
 
 
 def test_runner_normalizes_shortability_and_minute_timestamp(

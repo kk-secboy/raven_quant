@@ -9,7 +9,8 @@ from quant_data.supplemental_data import (
     a_share_bulk_history_specs,
     bond_reference_specs,
     bundle_datasets,
-    etf_constituent_overflow_repartition_specs,
+    etf_constituent_history_specs,
+    market_daily_specs,
     market_financial_specs,
     next_pagination_specs,
     require_pagination_terminated,
@@ -56,8 +57,7 @@ def test_institutional_bundle_matches_its_declared_interface_contract() -> None:
     )
     assert {spec.dataset for spec in specs} == {
         "report_rc",
-        "etf_sh_cons",
-        "etf_sz_cons",
+        "etf_basic",
         "ci_daily",
         "shibor_quote",
         "major_news",
@@ -79,7 +79,11 @@ def test_institutional_bundle_matches_its_declared_interface_contract() -> None:
         "pub_time",
         "src",
     )
-    assert bundle_datasets("cn_institutional") == {spec.dataset for spec in specs}
+    assert bundle_datasets("cn_institutional") == {
+        *{spec.dataset for spec in specs},
+        "etf_sh_cons",
+        "etf_sz_cons",
+    }
 
 
 def test_institutional_pages_advance_instead_of_accepting_provider_caps() -> None:
@@ -269,6 +273,10 @@ def test_fund_bundle_covers_research_master_and_time_series() -> None:
     }
     nav = next(spec for spec in specs if spec.dataset == "fund_nav")
     assert nav.params["nav_date"] == "20240102"
+    share = next(spec for spec in specs if spec.dataset == "fund_share")
+    assert share.params["start_date"] == "20240102"
+    assert share.params["end_date"] == "20240102"
+    assert share.scope["partition_axis"] == "date"
     masters = [spec for spec in specs if spec.dataset == "fund_basic"]
     assert {spec.params["market"] for spec in masters} == {"E", "O"}
     assert {spec.params["status"] for spec in masters} == {"L", "I", "D"}
@@ -289,6 +297,27 @@ def test_fund_bundle_covers_research_master_and_time_series() -> None:
     etf_masters = [spec for spec in specs if spec.dataset == "etf_basic"]
     assert {spec.params["list_status"] for spec in etf_masters} == {"L", "D", "P"}
     assert next(spec for spec in specs if spec.dataset == "etf_index").scope["page_size"] == 5_000
+
+
+def test_fund_share_uses_month_ranges_but_announcements_use_calendar_days() -> None:
+    specs = supplemental_specs(
+        "cn_funds",
+        start=date(2024, 1, 5),
+        end=date(2024, 2, 4),
+        trading_dates=["20240105", "20240108", "20240202"],
+        max_attempts=3,
+    )
+
+    shares = [spec for spec in specs if spec.dataset == "fund_share"]
+    assert [(spec.params["start_date"], spec.params["end_date"]) for spec in shares] == [
+        ("20240105", "20240131"),
+        ("20240201", "20240204"),
+    ]
+    dividends = [spec for spec in specs if spec.dataset == "fund_div"]
+    portfolios = [spec for spec in specs if spec.dataset == "fund_portfolio"]
+    assert len(dividends) == 31
+    assert len(portfolios) == 31
+    assert {spec.params["ann_date"] for spec in dividends} >= {"20240106", "20240107"}
 
 
 def test_dense_fund_portfolio_can_continue_beyond_the_old_256_page_ceiling() -> None:
@@ -659,45 +688,59 @@ def test_share_float_offset_cap_repartitions_the_whole_month_by_day() -> None:
     )
 
 
-def test_etf_constituent_offset_cap_repartitions_the_date_by_symbol() -> None:
-    parent = next(
-        spec
-        for spec in supplemental_specs(
-            "cn_institutional",
-            start=date(2026, 3, 16),
-            end=date(2026, 3, 16),
-            trading_dates=["20260316"],
-            max_attempts=5,
-        )
-        if spec.dataset == "etf_sh_cons"
-    )
-    failed = parent
-    for _ in range(34):
-        failed = next_pagination_specs(
-            [failed],
-            [{"unit_key": failed.unit_key, "row_count": 3_000}],
-        )[0]
-    assert failed.params["offset"] == 102_000
-
-    symbols = etf_constituent_overflow_repartition_specs(
-        failed,
+def test_etf_constituent_history_starts_one_full_range_partition_per_symbol() -> None:
+    specs = etf_constituent_history_specs(
         ["510050.SH", "159001.SZ", "512000.SH", "510050.SH"],
-    )
-    assert [item.params["ts_code"] for item in symbols] == ["510050.SH", "512000.SH"]
-    assert all(item.params["trade_date"] == "20260316" for item in symbols)
-    assert all(item.params["offset"] == 0 for item in symbols)
-    assert all(
-        item.scope["supersedes_page_group"] == parent.scope["page_group"]
-        for item in symbols
+        start=date(2026, 1, 2),
+        end=date(2026, 3, 16),
+        trading_dates=["20260102", "20260316"],
+        max_attempts=5,
     )
 
-    require_pagination_terminated(
-        [parent, *symbols],
-        [
-            {"unit_key": parent.unit_key, "row_count": 3_000},
-            *[{"unit_key": item.unit_key, "row_count": 0} for item in symbols],
-        ],
+    assert len(specs) == 3
+    assert {item.params["ts_code"] for item in specs} == {
+        "510050.SH",
+        "512000.SH",
+        "159001.SZ",
+    }
+    assert all(item.params["start_date"] == "20260102" for item in specs)
+    assert all(item.params["end_date"] == "20260316" for item in specs)
+    assert all(item.scope["partition_axis"] == "date" for item in specs)
+
+
+def test_market_daily_specs_use_only_calendar_open_dates() -> None:
+    specs = market_daily_specs(
+        "hk", ["20240102", "20240104"], max_attempts=3
     )
+
+    assert {spec.dataset for spec in specs} == {"hk_daily", "hk_daily_adj"}
+    assert {spec.params["trade_date"] for spec in specs} == {
+        "20240102",
+        "20240104",
+    }
+
+
+def test_hk_and_us_initial_market_plans_contain_only_master_and_calendar() -> None:
+    hk = supplemental_specs(
+        "hk_market",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 7),
+        trading_dates=[],
+        max_attempts=3,
+    )
+    us = supplemental_specs(
+        "us_market",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 7),
+        trading_dates=[],
+        max_attempts=3,
+    )
+
+    assert {spec.dataset for spec in hk} == {"hk_basic", "hk_tradecal"}
+    assert {
+        spec.params["list_status"] for spec in hk if spec.dataset == "hk_basic"
+    } == {"L", "D", "P"}
+    assert {spec.dataset for spec in us} == {"us_basic", "us_tradecal"}
 
 
 def test_share_float_has_a_natural_date_and_duplicate_gate() -> None:

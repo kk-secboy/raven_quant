@@ -4,6 +4,7 @@ import { CSSProperties, FormEvent, useCallback, useEffect, useMemo, useState } f
 import { apiFetch } from "./api-client";
 import { BacktestPanel } from "./backtest-panel";
 import { DataTask, DataTaskCenter } from "./data-task-center";
+import { phaseLabel, targetText } from "./data-progress";
 import { AuthPanel, AuthState } from "./auth-panel";
 import { FactorLibraryPanel } from "./factor-library-panel";
 import { JobRunCenter } from "./job-run-center";
@@ -34,6 +35,10 @@ type Overview = {
   failed_tasks: number;
   running_tasks: number;
   waiting_tasks: number;
+  retry_waiting_tasks: number;
+  blocked_tasks: number;
+  terminal_failed_tasks: number;
+  startable_tasks: number;
   components: { name: string; state: string }[];
 };
 
@@ -47,15 +52,6 @@ type Dataset = {
   rows: number;
   coverage: number;
   state: "ready" | "partial" | "empty";
-};
-
-type Job = {
-  id: string;
-  kind: string;
-  status: string;
-  payload: { profile?: string; start?: string; end?: string; snapshot_name?: string };
-  created_at: string;
-  error?: string | null;
 };
 
 type RetentionEntry = {
@@ -114,7 +110,6 @@ export default function Home() {
   const [dataView, setDataView] = useState("overview");
   const [overview, setOverview] = useState<Overview | null>(null);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
-  const [jobs, setJobs] = useState<Job[]>([]);
   const [dataTasks, setDataTasks] = useState<DataTask[]>([]);
   const [retention, setRetention] = useState<RetentionPlan | null>(null);
   const [retentionSelection, setRetentionSelection] = useState<Record<string, boolean>>({});
@@ -137,17 +132,15 @@ export default function Home() {
 
   const refresh = useCallback(async () => {
     try {
-      const [overviewResponse, datasetsResponse, jobsResponse, dataTasksResponse, retentionResponse] = await Promise.all([
+      const [overviewResponse, datasetsResponse, dataTasksResponse, retentionResponse] = await Promise.all([
         apiFetch(`${API}/api/overview`, { cache: "no-store" }),
         apiFetch(`${API}/api/datasets`, { cache: "no-store" }),
-        apiFetch(`${API}/api/jobs`, { cache: "no-store" }),
         apiFetch(`${API}/api/data-tasks`, { cache: "no-store" }),
         apiFetch(`${API}/api/data-retention`, { cache: "no-store" }),
       ]);
-      if (!overviewResponse.ok || !datasetsResponse.ok || !jobsResponse.ok || !dataTasksResponse.ok || !retentionResponse.ok) throw new Error("API unavailable");
+      if (!overviewResponse.ok || !datasetsResponse.ok || !dataTasksResponse.ok || !retentionResponse.ok) throw new Error("API unavailable");
       setOverview(await overviewResponse.json());
       setDatasets(await datasetsResponse.json());
-      setJobs(await jobsResponse.json());
       setDataTasks(await dataTasksResponse.json());
       setRetention(await retentionResponse.json());
       setMessage("");
@@ -178,6 +171,19 @@ export default function Home() {
   const visibleDatasets = useMemo(
     () => datasets.filter((item) => profile === "full" || item.profile === profile || (profile === "research" && item.profile === "core")),
     [datasets, profile],
+  );
+  const activeDataTasks = useMemo(
+    () => {
+      const seenJobs = new Set<string>();
+      return dataTasks.filter((task) => {
+        if (!["queued", "running"].includes(task.status)) return false;
+        if (!task.job_id) return true;
+        if (seenJobs.has(task.job_id)) return false;
+        seenJobs.add(task.job_id);
+        return true;
+      });
+    },
+    [dataTasks],
   );
 
   async function startBootstrap(event: FormEvent) {
@@ -298,25 +304,35 @@ export default function Home() {
 
             {dataView === "overview" ? <>
               <section className="readiness-hero">
-                <div className="readiness-copy"><span className="status-chip">{loading ? "正在连接" : overview?.active_jobs ? "数据准备中" : (overview?.partial_tasks || overview?.waiting_tasks) ? "仍有数据待处理" : "数据已就绪"}</span><h2>{overview?.ready_tasks ?? 0} / {overview?.actionable_tasks ?? 0} 项数据已可用</h2><p>这是按当前数据目录计算的真实就绪度；基金、宏观、衍生品、海外和分钟数据都会计入。</p></div>
-                <div className="readiness-ring" style={{ "--progress": `${overview?.readiness_percent ?? 0}%` } as CSSProperties}><strong>{overview?.readiness_percent ?? 0}%</strong><span>当前计划</span></div>
+                <div className="readiness-copy"><span className="status-chip">{loading ? "正在连接" : overview?.active_jobs ? "下载器正在工作" : (overview?.partial_tasks || overview?.waiting_tasks) ? "仍有数据能力待准备" : "数据能力已就绪"}</span><h2>{overview?.ready_tasks ?? 0} / {overview?.actionable_tasks ?? 0} 项数据能力已可用</h2><p>这里表示目录能力是否可用于研究，不代表某个下载任务的执行百分比。当前执行阶段、checkpoint 和恢复状态在下方单独展示。</p></div>
+                <div className="readiness-ring" style={{ "--progress": `${overview?.readiness_percent ?? 0}%` } as CSSProperties}><strong>{overview?.readiness_percent ?? 0}%</strong><span>目录就绪度</span></div>
               </section>
               <section className="status-strip">
                 <article><span>正在运行</span><strong>{overview?.running_tasks ?? 0}</strong></article>
-                <article><span>需要补齐</span><strong>{overview?.partial_tasks ?? 0}</strong></article>
-                <article><span>等待开始</span><strong>{overview?.waiting_tasks ?? 0}</strong></article>
-                <article><span>失败</span><strong className={overview?.failed_tasks ? "danger" : ""}>{overview?.failed_tasks ?? 0}</strong></article>
-                <article><span>基础日线下载</span><strong>{overview?.legacy_download_coverage ?? 0}%</strong><small>旧工作单元，仅供核对</small></article>
+                <article><span>冷却 / 待恢复</span><strong>{overview?.retry_waiting_tasks ?? 0}</strong></article>
+                <article><span>等待前置数据</span><strong>{overview?.blocked_tasks ?? 0}</strong></article>
+                <article><span>终止失败</span><strong className={overview?.terminal_failed_tasks ? "danger" : ""}>{overview?.terminal_failed_tasks ?? 0}</strong></article>
+                <article><span>现在可启动</span><strong>{overview?.startable_tasks ?? 0}</strong><small>依赖已满足</small></article>
               </section>
               <section className="overview-grid data-overview-grid">
-                <article className="workspace-card next-actions">
-                  <div className="section-heading"><div><h2>需要处理</h2><p>优先显示运行中、失败和可以启动的数据。</p></div><button onClick={() => setDataView("catalog")}>查看全部</button></div>
-                  {dataTasks.filter((task) => task.status !== "succeeded" && !["permission_probe", "external_source_required"].includes(task.implementation_status)).slice(0, 6).map((task) => <div className="action-row" key={task.task_key}><span className={`task-status ${task.status}`}>{({ planned: "待开始", queued: "排队中", running: "下载中", partial: "需补齐", failed: "失败" } as Record<string, string>)[task.status] ?? task.status}</span><div><strong>{task.title}</strong><small>{task.status === "running" ? `${task.coverage}% · ${formatNumber(task.rows)} 行` : task.dependencies_satisfied ? "已具备启动条件" : "等待前置数据"}</small></div></div>)}
+                <article className="workspace-card live-downloads">
+                  <div className="section-heading"><div><h2>当前下载执行</h2><p>展示真实阶段与 checkpoint 状态；工作单元会随自适应拆分动态变化。</p></div><button onClick={() => setDataView("runs")}>运行记录</button></div>
+                  {activeDataTasks.slice(0, 3).map((task) => <div className="live-download" key={task.job_id ?? task.task_key}>
+                    <div className="live-download-head"><div><span className={`task-status ${task.status}`}>{phaseLabel(task.execution_phase)}</span><strong>{task.title}</strong><small>{targetText(task.job?.payload, task.progress)}</small></div><span className="live-updated">{task.progress?.updated_at ? `更新于 ${new Date(task.progress.updated_at).toLocaleTimeString("zh-CN")}` : statusLabel(task.status)}</span></div>
+                    <p>{task.config.request_strategy}</p>
+                    <div className="checkpoint-metrics">
+                      <div><span>成功 checkpoint</span><strong>{formatNumber(Number(task.progress?.checkpoint?.succeeded ?? task.unit_stats.succeeded))}</strong></div>
+                      <div><span>正在请求</span><strong>{formatNumber(Number(task.progress?.checkpoint?.running ?? task.unit_stats.running))}</strong></div>
+                      <div><span>等待重试</span><strong>{formatNumber(Number(task.progress?.checkpoint?.retry_waiting ?? task.unit_stats.retry_waiting))}</strong></div>
+                      <div><span>终止失败</span><strong className={Number(task.progress?.checkpoint?.terminal_failed ?? task.unit_stats.terminal_failed) ? "danger" : ""}>{formatNumber(Number(task.progress?.checkpoint?.terminal_failed ?? task.unit_stats.terminal_failed))}</strong></div>
+                      <div><span>替代审计</span><strong>{formatNumber(Number(task.progress?.checkpoint?.superseded ?? task.unit_stats.superseded))}</strong></div>
+                    </div>
+                  </div>)}
+                  {!activeDataTasks.length ? <div className="empty compact">当前没有运行中的下载；已完成的数据仍会从 checkpoint 直接复用。</div> : null}
                 </article>
-                <article className="workspace-card active-runs">
-                  <div className="section-heading"><div><h2>当前队列</h2><p>任务在后台持续运行，关闭浏览器不会中断。</p></div><button onClick={() => setDataView("runs")}>运行记录</button></div>
-                  {jobs.filter((job) => ["queued", "running"].includes(job.status)).slice(0, 5).map((job) => <div className="run-row" key={job.id}><span className={`job-state ${job.status}`} /><div><strong>{job.payload.snapshot_name ?? job.payload.profile ?? job.kind}</strong><small>{statusLabel(job.status)} · {new Date(job.created_at).toLocaleString("zh-CN")}</small></div></div>)}
-                  {!jobs.some((job) => ["queued", "running"].includes(job.status)) ? <div className="empty compact">当前没有运行中的任务。</div> : null}
+                <article className="workspace-card next-actions">
+                  <div className="section-heading"><div><h2>需要处理</h2><p>区分可启动、等待依赖、可恢复失败和终止失败。</p></div><button onClick={() => setDataView("catalog")}>查看全部</button></div>
+                  {dataTasks.filter((task) => task.status !== "succeeded" && !["queued", "running"].includes(task.status) && !["permission_probe", "external_source_required"].includes(task.implementation_status)).slice(0, 6).map((task) => <div className="action-row" key={task.task_key}><span className={`task-status ${task.status}`}>{phaseLabel(task.execution_phase)}</span><div><strong>{task.title}</strong><small>{task.dependencies_satisfied ? task.config.request_strategy : "等待前置数据完成"}</small></div></div>)}
                 </article>
               </section>
             </> : null}

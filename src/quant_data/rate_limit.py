@@ -25,7 +25,13 @@ class GlobalRateGate:
         if delay > 0:
             time.sleep(delay)
 
-    def cooldown(self, seconds: float) -> None:
+    def cooldown(self, seconds: float) -> bool:
+        """Start one shared cooldown without letting other workers extend it."""
+
         with self._lock:
+            now = time.monotonic()
+            if self._cooldown_until > now:
+                return False
             jitter = random.uniform(0, min(5.0, seconds * 0.05))
-            self._cooldown_until = max(self._cooldown_until, time.monotonic() + seconds + jitter)
+            self._cooldown_until = now + seconds + jitter
+            return True

@@ -94,6 +94,8 @@ class LocalJobWorker:
             return
         log_path = Path(job["log_path"])
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        if result_path is not None:
+            result_path.unlink(missing_ok=True)
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         try:
             with log_path.open("a", encoding="utf-8") as log:
@@ -107,7 +109,11 @@ class LocalJobWorker:
                     env={**os.environ, **extra_env},
                 )
                 cancelled = False
+                progress_mtime_ns: int | None = None
                 while process.poll() is None:
+                    progress_mtime_ns = self._sync_live_progress(
+                        job["id"], result_path, progress_mtime_ns
+                    )
                     if self.store.cancellation_requested(job["id"]):
                         cancelled = True
                         process.terminate()
@@ -131,6 +137,7 @@ class LocalJobWorker:
                         parameter_experiment_id, "failed", error=cancellation_error
                     )
                 return
+            self._sync_live_progress(job["id"], result_path, progress_mtime_ns)
             process_error = (
                 None
                 if exit_code == 0
@@ -257,6 +264,25 @@ class LocalJobWorker:
                 self.parameter_experiments.mark(parameter_experiment_id, "failed", error=str(exc))
             if recommendation_snapshot_id:
                 self.recommendations.mark_failed(recommendation_snapshot_id, str(exc))
+
+    def _sync_live_progress(
+        self,
+        job_id: str,
+        result_path: Path | None,
+        previous_mtime_ns: int | None,
+    ) -> int | None:
+        if result_path is None or not result_path.exists():
+            return previous_mtime_ns
+        try:
+            mtime_ns = result_path.stat().st_mtime_ns
+            if mtime_ns == previous_mtime_ns:
+                return previous_mtime_ns
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return previous_mtime_ns
+        if isinstance(payload, dict):
+            self.store.update_progress(job_id, payload)
+        return mtime_ns
 
     def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
         payload = job["payload"]

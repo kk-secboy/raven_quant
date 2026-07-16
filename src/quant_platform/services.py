@@ -307,6 +307,22 @@ def system_summary(
     partial_tasks = sum(task.get("status") == "partial" for task in actionable_tasks)
     failed_tasks = sum(task.get("status") == "failed" for task in actionable_tasks)
     running_tasks = sum(task.get("status") in {"queued", "running"} for task in actionable_tasks)
+    retry_waiting_tasks = sum(
+        task.get("execution_phase")
+        in {"rate_limit_cooldown", "retry_waiting", "recoverable_failure"}
+        for task in actionable_tasks
+    )
+    blocked_tasks = sum(
+        task.get("execution_phase") == "blocked_prerequisite" for task in actionable_tasks
+    )
+    terminal_failed_tasks = sum(
+        task.get("execution_phase") == "terminal_failure" for task in actionable_tasks
+    )
+    startable_tasks = sum(
+        task.get("execution_phase") in {"ready_to_start", "partial"}
+        and task.get("dependencies_satisfied") is True
+        for task in actionable_tasks
+    )
     waiting_tasks = max(
         len(actionable_tasks) - ready_tasks - partial_tasks - failed_tasks - running_tasks,
         0,
@@ -342,6 +358,10 @@ def system_summary(
         "failed_tasks": failed_tasks,
         "running_tasks": running_tasks,
         "waiting_tasks": waiting_tasks,
+        "retry_waiting_tasks": retry_waiting_tasks,
+        "blocked_tasks": blocked_tasks,
+        "terminal_failed_tasks": terminal_failed_tasks,
+        "startable_tasks": startable_tasks,
         "snapshots": len(snapshots),
         "qlib_datasets": qlib_datasets,
         "active_jobs": active_jobs,

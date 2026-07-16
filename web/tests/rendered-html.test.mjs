@@ -61,6 +61,11 @@ test("ships the recommendation-only research interface", async () => {
   assert.match(sourceByName["research-campaign-panel.tsx"], /\/api\/research-programs/);
   assert.match(sourceByName["market-overview-panel.tsx"], /\/api\/market\/overview/);
   assert.match(sourceByName["job-run-center.tsx"], /\/api\/jobs\/\$\{job\.id\}\/log/);
+  assert.match(sourceByName["page.tsx"], /目录就绪度/);
+  assert.match(sourceByName["page.tsx"], /成功 checkpoint/);
+  assert.match(sourceByName["data-task-center.tsx"], /请求策略/);
+  assert.match(sourceByName["job-run-center.tsx"], /job-progress-card/);
+  assert.match(sourceByName["data-progress.ts"], /adaptive_recovery:\s*"自适应拆分恢复"/);
   assert.doesNotMatch(allSource, /SQLite/i);
   assert.doesNotMatch(allSource, /\/api\/broker|\/api\/pair-portfolios|settings\/broker/i);
 

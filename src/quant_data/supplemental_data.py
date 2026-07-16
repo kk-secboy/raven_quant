@@ -8,6 +8,7 @@ from typing import Any
 
 from .coverage_data import COVERAGE_BUNDLES, coverage_bundle_datasets, coverage_specs
 from .models import FetchSpec, ProviderResult
+from .partitioning import partition_metadata
 from .planner import compact_date
 from .provider import ProviderError
 from .reference_data import apply_reference_refresh
@@ -198,6 +199,17 @@ def validate_supplemental(spec: FetchSpec, result: ProviderResult) -> ProviderRe
                 raise ProviderError(
                     f"{spec.dataset} returned {expected_field}={actual!r}, "
                     f"expected {expected_date}",
+                    retryable=False,
+                )
+    expected_start = spec.scope.get("expected_date_start")
+    expected_end = spec.scope.get("expected_date_end")
+    if expected_field and expected_start and expected_end:
+        for row in result.rows:
+            actual = str(row.get(str(expected_field)) or "").replace("-", "")[:8]
+            if not str(expected_start) <= actual <= str(expected_end):
+                raise ProviderError(
+                    f"{spec.dataset} returned {expected_field}={actual!r} outside "
+                    f"{expected_start}..{expected_end}",
                     retryable=False,
                 )
     return result
@@ -425,6 +437,8 @@ def bundle_datasets(bundle: str) -> set[str]:
         market = bundle.split("_", 1)[0]
         datasets.update(
             {
+                f"{market}_daily",
+                f"{market}_daily_adj",
                 f"{market}_income",
                 f"{market}_balancesheet",
                 f"{market}_cashflow",
@@ -441,6 +455,8 @@ def bundle_datasets(bundle: str) -> set[str]:
                 "top10_cb_holders",
             }
         )
+    if bundle == "cn_institutional":
+        datasets.update(ETF_CONSTITUENT_DATASETS)
     return datasets
 
 
@@ -542,6 +558,7 @@ def _paged_specs(
     fields: tuple[str, ...] = (),
     expected_date_field: str | None = None,
     expected_date: str | None = None,
+    partition: dict[str, Any] | None = None,
 ) -> list[FetchSpec]:
     configured_max = _PAGINATION_MAX_PAGES.get(dataset)
     if configured_max != max_pages:
@@ -553,9 +570,19 @@ def _paged_specs(
         "page_group": group,
         "page_size": page_size,
         "offset": 0,
+        **(partition or {}),
+        **({"max_pages": max_pages} if partition else {}),
     }
     if expected_date_field and expected_date:
         scope.update({"expected_date_field": expected_date_field, "expected_date": expected_date})
+    elif expected_date_field and partition:
+        scope.update(
+            {
+                "expected_date_field": expected_date_field,
+                "expected_date_start": str(partition["partition_start"]).replace("-", "")[:8],
+                "expected_date_end": str(partition["partition_end"]).replace("-", "")[:8],
+            }
+        )
     return [
         _spec(
             dataset,
@@ -805,19 +832,58 @@ def _cn_fund_specs(start: date, end: date, dates: list[str], max_attempts: int) 
             )
         )
     fund_dates = dates or _weekdays(start, end)
-    for dataset, date_param, date_field, page_size, max_pages in (
-        ("fund_nav", "nav_date", "nav_date", 2_000, 64),
-        ("fund_share", "trade_date", "trade_date", 2_000, 64),
-        ("fund_div", "ann_date", "ann_date", 1_000, 32),
-        ("fund_portfolio", "ann_date", "ann_date", 2_000, 1_024),
+    specs.extend(
+        _daily_paged_specs(
+            "fund_nav",
+            "fund_nav",
+            fund_dates,
+            date_param="nav_date",
+            date_field="nav_date",
+            page_size=2_000,
+            max_pages=64,
+            max_attempts=max_attempts,
+        )
+    )
+    for window_start, window_end in _month_ranges(start, end):
+        window_dates = [
+            value
+            for value in fund_dates
+            if compact_date(window_start) <= value <= compact_date(window_end)
+        ]
+        params = {
+            "start_date": compact_date(window_start),
+            "end_date": compact_date(window_end),
+        }
+        specs.extend(
+            _paged_specs(
+                "fund_share",
+                "fund_share",
+                params,
+                group=f"fund_share:{params['start_date']}:{params['end_date']}",
+                page_size=2_000,
+                max_pages=64,
+                max_attempts=max_attempts,
+                expected_date_field="trade_date",
+                partition=partition_metadata(
+                    "date",
+                    window_start,
+                    window_end,
+                    values=window_dates,
+                ),
+            )
+        )
+    announcement_dates = _calendar_dates(start, end)
+    for dataset, page_size, max_pages in (
+        ("fund_div", 1_000, 32),
+        ("fund_portfolio", 2_000, 1_024),
     ):
         specs.extend(
             _daily_paged_specs(
                 dataset,
                 dataset,
-                fund_dates,
-                date_param=date_param,
-                date_field=date_field,
+                announcement_dates,
+                date_param="ann_date",
+                date_field="ann_date",
                 page_size=page_size,
                 max_pages=max_pages,
                 max_attempts=max_attempts,
@@ -926,14 +992,15 @@ def _cn_institutional_specs(
             )
 
     market_dates = dates or _weekdays(start, end)
-    for dataset in ("etf_sh_cons", "etf_sz_cons"):
+    for status in ("L", "D", "P"):
         specs.extend(
-            _daily_paged_specs(
-                dataset,
-                dataset,
-                market_dates,
-                page_size=3_000,
-                max_pages=256,
+            _paged_specs(
+                "etf_basic",
+                "etf_basic",
+                {"list_status": status},
+                group=f"etf_basic:{status}",
+                page_size=5_000,
+                max_pages=4,
                 max_attempts=max_attempts,
             )
         )
@@ -948,6 +1015,55 @@ def _cn_institutional_specs(
         )
     )
 
+    return specs
+
+
+def etf_constituent_history_specs(
+    symbols: Iterable[str],
+    *,
+    start: date,
+    end: date,
+    trading_dates: Iterable[str],
+    max_attempts: int,
+) -> list[FetchSpec]:
+    """Plan one full-range paginated PCF history partition per ETF symbol."""
+
+    market_dates = sorted(set(trading_dates))
+    specs: list[FetchSpec] = []
+    for symbol in sorted({str(value).strip().upper() for value in symbols if str(value).strip()}):
+        if symbol.endswith(".SH"):
+            dataset = "etf_sh_cons"
+        elif symbol.endswith(".SZ"):
+            dataset = "etf_sz_cons"
+        else:
+            continue
+        params = {
+            "ts_code": symbol,
+            "start_date": compact_date(start),
+            "end_date": compact_date(end),
+        }
+        specs.extend(
+            _paged_specs(
+                dataset,
+                dataset,
+                params,
+                group=f"{dataset}:{symbol}:{params['start_date']}:{params['end_date']}",
+                page_size=3_000,
+                max_pages=256,
+                max_attempts=max_attempts,
+                expected_date_field="trade_date",
+                partition=partition_metadata(
+                    "date",
+                    start,
+                    end,
+                    values=[
+                        value
+                        for value in market_dates
+                        if params["start_date"] <= value <= params["end_date"]
+                    ],
+                ),
+            )
+        )
     return specs
 
 
@@ -1120,15 +1236,19 @@ def bond_reference_specs(
 
 
 def _hk_market_specs(start: date, end: date, max_attempts: int) -> list[FetchSpec]:
-    specs = _paged_specs(
-        "hk_basic",
-        "hk_basic",
-        {},
-        group="hk_basic:all",
-        page_size=1_000,
-        max_pages=8,
-        max_attempts=max_attempts,
-    )
+    specs: list[FetchSpec] = []
+    for status in ("L", "D", "P"):
+        specs.extend(
+            _paged_specs(
+                "hk_basic",
+                "hk_basic",
+                {"list_status": status},
+                group=f"hk_basic:{status}",
+                page_size=1_000,
+                max_pages=8,
+                max_attempts=max_attempts,
+            )
+        )
     specs.append(
         _spec(
             "hk_tradecal",
@@ -1138,18 +1258,6 @@ def _hk_market_specs(start: date, end: date, max_attempts: int) -> list[FetchSpe
             max_attempts=max_attempts,
         )
     )
-    dates = _weekdays(start, end)
-    for dataset in ("hk_daily", "hk_daily_adj"):
-        specs.extend(
-            _daily_paged_specs(
-                dataset,
-                dataset,
-                dates,
-                page_size=1_000,
-                max_pages=8,
-                max_attempts=max_attempts,
-            )
-        )
     return specs
 
 
@@ -1172,15 +1280,30 @@ def _us_market_specs(start: date, end: date, max_attempts: int) -> list[FetchSpe
             max_attempts=max_attempts,
         )
     )
-    dates = _weekdays(start, end)
-    for dataset in ("us_daily", "us_daily_adj"):
+    return specs
+
+
+def market_daily_specs(
+    market: str,
+    open_dates: Iterable[str],
+    *,
+    max_attempts: int,
+) -> list[FetchSpec]:
+    """Plan HK/US daily pages only after the official calendar is available."""
+
+    if market not in {"hk", "us"}:
+        raise ValueError("market must be hk or us")
+    dates = sorted(set(open_dates))
+    page_size, max_pages = ((1_000, 8) if market == "hk" else (2_000, 16))
+    specs: list[FetchSpec] = []
+    for dataset in (f"{market}_daily", f"{market}_daily_adj"):
         specs.extend(
             _daily_paged_specs(
                 dataset,
                 dataset,
                 dates,
-                page_size=2_000,
-                max_pages=16,
+                page_size=page_size,
+                max_pages=max_pages,
                 max_attempts=max_attempts,
             )
         )

@@ -269,6 +269,8 @@ active exchange ETF options from downloaded masters. It requests monthly symbol 
 OHLCV, and creates one immutable `pair_execution` snapshot containing both minute bars,
 selection evidence and the matching margin dataset. The Web task center exposes the same
 configuration through `/api/jobs/margin-eligibility` and `/api/jobs/core-intraday`.
+The separate all-A-share 5-minute job uses at most 150 real trading sessions per symbol,
+then bisects only a provider-capped window while preserving successful checkpoint units.
 
 The supplemental task center also has independently resumable bundles for public funds,
 macroeconomics, futures mappings/calendars, options and convertible-bond lifecycle data,

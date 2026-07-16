@@ -6,6 +6,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from .models import FetchSpec, ProviderResult
+from .partitioning import partition_metadata
 from .provider import ProviderError
 
 MARGIN_DATASET = "margin_eligibility"
@@ -22,7 +23,7 @@ NEWS_SOURCES = (
     "yicai",
 )
 NEWS_FIELDS = ("datetime", "content", "title", "channels")
-NEWS_WINDOW_HOURS = 12
+NEWS_WINDOW_HOURS = 24
 MINUTE_DATASETS: dict[str, str] = {
     "ashare_5m": "stk_mins",
     "indices_1m": "idx_mins",
@@ -65,7 +66,7 @@ def news_specs(
     sources: Iterable[str] = NEWS_SOURCES,
     window_hours: int = NEWS_WINDOW_HOURS,
 ) -> list[FetchSpec]:
-    """Plan bounded, source-aware news requests without accepting capped days."""
+    """Plan one source/day request; capped windows are split after execution."""
 
     if end < start:
         raise ValueError("end must not be before start")
@@ -90,32 +91,55 @@ def news_specs(
                     window_start + timedelta(hours=window_hours) - timedelta(seconds=1),
                     day_end,
                 )
-                start_text = window_start.strftime("%Y-%m-%d %H:%M:%S")
-                end_text = window_end.strftime("%Y-%m-%d %H:%M:%S")
                 specs.append(
-                    FetchSpec(
-                        dataset=NEWS_DATASET,
-                        api_name="news",
-                        scope={
-                            "date": cursor.isoformat(),
-                            "source": source,
-                            "start": start_text,
-                            "end": end_text,
-                            "row_limit": _NEWS_ROW_LIMIT,
-                        },
-                        params={
-                            "src": source,
-                            "start_date": start_text,
-                            "end_date": end_text,
-                        },
-                        fields=NEWS_FIELDS,
-                        allow_empty=True,
+                    news_window_spec(
+                        source,
+                        window_start,
+                        window_end,
                         max_attempts=max_attempts,
                     )
                 )
                 window_start = window_end + timedelta(seconds=1)
         cursor += timedelta(days=1)
     return specs
+
+
+def news_window_spec(
+    source: str,
+    window_start: datetime,
+    window_end: datetime,
+    *,
+    max_attempts: int,
+) -> FetchSpec:
+    """Build one resumable news window, including adaptive partition metadata."""
+
+    start_text = window_start.strftime("%Y-%m-%d %H:%M:%S")
+    end_text = window_end.strftime("%Y-%m-%d %H:%M:%S")
+    return FetchSpec(
+        dataset=NEWS_DATASET,
+        api_name="news",
+        scope={
+            "date": window_start.date().isoformat(),
+            "source": source,
+            "start": start_text,
+            "end": end_text,
+            "row_limit": _NEWS_ROW_LIMIT,
+            **partition_metadata(
+                "datetime",
+                window_start,
+                window_end,
+                value_format="timestamp",
+            ),
+        },
+        params={
+            "src": source,
+            "start_date": start_text,
+            "end_date": end_text,
+        },
+        fields=NEWS_FIELDS,
+        allow_empty=True,
+        max_attempts=max_attempts,
+    )
 
 
 def minute_specs(
@@ -128,6 +152,10 @@ def minute_specs(
     active_ranges_by_dataset: Mapping[
         str, Mapping[str, tuple[date, date]]
     ] | None = None,
+    trading_dates: Iterable[str] | None = None,
+    windows_by_dataset: Mapping[
+        str, Mapping[str, Iterable[tuple[date, date]]]
+    ] | None = None,
 ) -> list[FetchSpec]:
     if end < start:
         raise ValueError("end must not be before start")
@@ -137,6 +165,9 @@ def minute_specs(
     if unknown:
         raise ValueError(f"unsupported minute datasets: {', '.join(sorted(unknown))}")
 
+    session_dates = (
+        _normalize_trading_dates(trading_dates) if trading_dates is not None else None
+    )
     specs: list[FetchSpec] = []
     for dataset, raw_symbols in sorted(symbols_by_dataset.items()):
         symbols = sorted({_normalize_symbol(value) for value in raw_symbols if str(value).strip()})
@@ -150,11 +181,22 @@ def minute_specs(
             symbol_end = min(end, symbol_end)
             if symbol_end < symbol_start:
                 continue
-            windows = (
-                _fortnight_ranges(symbol_start, symbol_end)
-                if dataset == "futures_1m"
-                else _month_ranges(symbol_start, symbol_end)
-            )
+            requested_windows = (windows_by_dataset or {}).get(dataset, {}).get(symbol)
+            if requested_windows is not None:
+                windows = list(requested_windows)
+            elif dataset == "ashare_5m" and freq == "5min" and session_dates is not None:
+                windows = _trading_session_ranges(
+                    symbol_start,
+                    symbol_end,
+                    session_dates,
+                    max_sessions=150,
+                )
+            else:
+                windows = (
+                    _fortnight_ranges(symbol_start, symbol_end)
+                    if dataset == "futures_1m"
+                    else _month_ranges(symbol_start, symbol_end)
+                )
             for window_start, window_end in windows:
                 start_time = datetime.combine(window_start, time.min).strftime("%Y-%m-%d %H:%M:%S")
                 end_time = datetime.combine(window_end, time.max.replace(microsecond=0)).strftime(
@@ -169,6 +211,12 @@ def minute_specs(
                             "start": start_time,
                             "end": end_time,
                             "freq": freq,
+                            **partition_metadata(
+                                "date",
+                                window_start,
+                                window_end,
+                                value_format="date_timestamp",
+                            ),
                         },
                         params={
                             "ts_code": symbol,
@@ -391,3 +439,28 @@ def _fortnight_ranges(start: date, end: date) -> list[tuple[date, date]]:
         ranges.append((current, window_end))
         current = window_end + timedelta(days=1)
     return ranges
+
+
+def _trading_session_ranges(
+    start: date,
+    end: date,
+    trading_dates: Iterable[date],
+    *,
+    max_sessions: int,
+) -> list[tuple[date, date]]:
+    if max_sessions <= 0:
+        raise ValueError("max_sessions must be positive")
+    sessions = [value for value in trading_dates if start <= value <= end]
+    return [
+        (sessions[offset], sessions[min(offset + max_sessions - 1, len(sessions) - 1)])
+        for offset in range(0, len(sessions), max_sessions)
+    ]
+
+
+def _normalize_trading_dates(values: Iterable[str]) -> list[date]:
+    return sorted(
+        {
+            datetime.strptime(str(value).replace("-", "")[:8], "%Y%m%d").date()
+            for value in values
+        }
+    )

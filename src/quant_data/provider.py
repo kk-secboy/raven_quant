@@ -20,11 +20,13 @@ class ProviderError(RuntimeError):
         retryable: bool,
         rate_limited: bool = False,
         status_code: int | None = None,
+        retry_after_seconds: int | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.rate_limited = rate_limited
         self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 def _records(columns: list[str], rows: Any) -> list[dict[str, Any]]:
@@ -50,40 +52,70 @@ def decode_response(api_name: str, body: bytes, status_code: int = 200) -> Provi
         preview = body[:160].decode("utf-8", errors="replace")
         raise ProviderError(
             f"provider returned non-JSON content (HTTP {status_code}): {preview}",
-            retryable=True,
+            retryable=status_code == 429 or status_code >= 500 or status_code == 200,
+            rate_limited=status_code == 429,
             status_code=status_code,
         ) from exc
 
     code = root.get("code", 0)
     message = str(root.get("msg") or root.get("message") or "").strip()
     message_lower = message.lower()
-    # ``rate_limited`` means that every caller should observe the shared
-    # provider cooldown.  Tushare maintenance responses are provider-wide in
-    # exactly the same way as a rate-limit response: immediately retrying the
-    # next work unit only turns a short outage into a failed job.
-    provider_cooldown = any(
+    explicit_rate_limit = any(
         token in message_lower
         for token in (
-            "rate",
-            "频率",
-            "限速",
-            "冷却",
+            "rate limit",
+            "request limit",
             "too many request",
+            "too frequent",
+            "frequency limit",
+            "频率",
+            "限频",
+            "请求过于频繁",
+            "请求次数超限",
+            "每分钟",
+            "冷却",
+        )
+    )
+    maintenance = any(
+        token in message_lower
+        for token in (
             "服务升级",
+            "系统维护",
             "稍后再试",
             "maintenance",
             "temporarily unavailable",
             "service unavailable",
         )
     )
-    rate_limited = status_code in {429, 502, 503, 504} or provider_cooldown
+    rate_limited = status_code == 429 or explicit_rate_limit
     if status_code < 200 or status_code >= 300 or str(code) not in {"0", "", "None"}:
         permission_error = any(
-            token in message_lower for token in ("permission", "权限", "积分", "forbidden")
+            token in message_lower
+            for token in (
+                "permission",
+                "forbidden",
+                "unauthorized",
+                "权限",
+                "无权",
+                "积分不足",
+            )
         )
+        validation_error = any(
+            token in message_lower
+            for token in (
+                "invalid parameter",
+                "missing parameter",
+                "bad request",
+                "参数错误",
+                "参数不能为空",
+                "必填参数",
+                "格式错误",
+            )
+        )
+        transient = status_code in {502, 503, 504} or maintenance
         raise ProviderError(
             f"provider error code={code} http={status_code}: {message or 'unknown error'}",
-            retryable=not permission_error,
+            retryable=rate_limited or transient or not (permission_error or validation_error),
             rate_limited=rate_limited,
             status_code=status_code,
         )
@@ -166,12 +198,15 @@ class TushareHttpProvider:
             except ProviderError as exc:
                 last_error = exc
 
-            if last_error is None or not last_error.retryable or attempt >= self.max_attempts:
+            if last_error is None or not last_error.retryable:
                 break
             if last_error.rate_limited:
                 self.rate_gate.cooldown(self.cooldown_seconds)
-            else:
-                delay = min(30.0, (2 ** (attempt - 1)) + random.uniform(0.0, 1.0))
-                time.sleep(delay)
+                last_error.retry_after_seconds = max(1, int(self.cooldown_seconds))
+                break
+            if attempt >= self.max_attempts:
+                break
+            delay = min(30.0, (2 ** (attempt - 1)) + random.uniform(0.0, 1.0))
+            time.sleep(delay)
         assert last_error is not None
         raise last_error

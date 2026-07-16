@@ -2,19 +2,11 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
+import { DataJob, jobDisplayName, phaseLabel, targetText } from "./data-progress";
 
-type Job = {
-  id: string;
-  kind: string;
-  status: string;
-  payload: Record<string, unknown>;
-  progress?: Record<string, unknown> | null;
-  created_at: string;
-  started_at?: string | null;
-  finished_at?: string | null;
+type Job = DataJob & {
   cancel_requested_at?: string | null;
   exit_code?: number | null;
-  error?: string | null;
 };
 
 const statusOptions = [
@@ -36,10 +28,6 @@ const statusText: Record<string, string> = {
 
 function timeText(value?: string | null) {
   return value ? new Date(value).toLocaleString("zh-CN") : "—";
-}
-
-function displayName(job: Job) {
-  return String(job.payload.output_name ?? job.payload.snapshot_name ?? job.payload.bundle ?? job.payload.profile ?? job.kind);
 }
 
 type Props = {
@@ -118,7 +106,7 @@ export function JobRunCenter({ api, canControl, onChanged, onMessage }: Props) {
       <div className="job-run-list">
         {jobs.map((job) => <button type="button" className={selected?.id === job.id ? "selected" : ""} onClick={() => openJob(job)} key={job.id}>
           <span className={`job-state ${job.status}`} />
-          <div><strong>{displayName(job)}</strong><small>{job.kind} · {timeText(job.created_at)}</small>{job.error ? <em>{job.error}</em> : null}</div>
+          <div><strong>{jobDisplayName(job)}</strong><small>{phaseLabel(job.progress?.execution_phase ?? (job.status === "running" ? "planning" : job.status === "queued" ? "queued" : null))} · {targetText(job.payload, job.progress)} · {timeText(job.created_at)}</small>{job.error ? <em>{job.error}</em> : null}</div>
           <code>{job.id.slice(0, 10)}</code>
           <span className={`task-status ${job.status}`}>{statusText[job.status] ?? job.status}</span>
         </button>)}
@@ -126,8 +114,18 @@ export function JobRunCenter({ api, canControl, onChanged, onMessage }: Props) {
         <footer><span>共 {total} 条 · 第 {page + 1}/{pageCount} 页</span><div><button type="button" disabled={page === 0} onClick={() => setPage(page - 1)}>上一页</button><button type="button" disabled={page + 1 >= pageCount} onClick={() => setPage(page + 1)}>下一页</button></div></footer>
       </div>
       {selected ? <aside className="job-run-detail">
-        <header><div><span>{selected.kind}</span><h3>{displayName(selected)}</h3></div><button type="button" onClick={() => setSelected(null)}>关闭</button></header>
+        <header><div><span>{selected.kind}</span><h3>{jobDisplayName(selected)}</h3></div><button type="button" onClick={() => setSelected(null)}>关闭</button></header>
         <dl><div><dt>任务 ID</dt><dd><code>{selected.id}</code></dd></div><div><dt>状态</dt><dd>{statusText[selected.status] ?? selected.status}{selected.cancel_requested_at && selected.status === "running" ? " · 正在安全停止" : ""}</dd></div><div><dt>开始 / 结束</dt><dd>{timeText(selected.started_at)} / {timeText(selected.finished_at)}</dd></div><div><dt>退出码</dt><dd>{selected.exit_code ?? "—"}</dd></div></dl>
+        {selected.progress ? <section className="job-progress-card">
+          <div><span>当前阶段</span><strong>{phaseLabel(selected.progress.execution_phase ?? (selected.progress.status === "succeeded" ? "verified" : null))}</strong><small>{selected.progress.phase_label ?? targetText(selected.payload, selected.progress)}</small></div>
+          {selected.progress.checkpoint ? <div className="job-progress-metrics">
+            <span><small>成功 checkpoint</small><strong>{Number(selected.progress.checkpoint.succeeded ?? 0).toLocaleString("zh-CN")}</strong></span>
+            <span><small>正在请求</small><strong>{Number(selected.progress.checkpoint.running ?? 0).toLocaleString("zh-CN")}</strong></span>
+            <span><small>等待重试</small><strong>{Number(selected.progress.checkpoint.retry_waiting ?? 0).toLocaleString("zh-CN")}</strong></span>
+            <span><small>终止失败</small><strong>{Number(selected.progress.checkpoint.terminal_failed ?? 0).toLocaleString("zh-CN")}</strong></span>
+            <span><small>替代审计</small><strong>{Number(selected.progress.checkpoint.superseded ?? 0).toLocaleString("zh-CN")}</strong></span>
+          </div> : null}
+        </section> : null}
         {selected.error ? <div className="job-run-error"><strong>失败原因</strong><p>{selected.error}</p></div> : null}
         <details><summary>任务参数</summary><pre>{JSON.stringify(selected.payload, null, 2)}</pre></details>
         <div className="job-log-head"><strong>最近日志</strong><button type="button" onClick={() => openJob(selected)}>刷新日志</button></div>

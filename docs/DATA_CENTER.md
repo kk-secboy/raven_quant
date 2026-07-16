@@ -60,8 +60,11 @@ permissions and cost controls.
 Weekly and monthly bars are derived locally from daily data instead of being downloaded
 again.
 
-Hong Kong and US downloads always fetch the market master, calendar and requested
-daily price window. US income, balance-sheet and cash-flow history uses reporting-
+Hong Kong and US downloads first fetch the market master and official calendar, then
+plan daily and adjusted-price pages only for rows where `is_open=1`. Hong Kong masters
+request `L`, `D` and `P` statuses, and the automatic financial universe keeps only
+symbols whose listing lifecycle intersects the requested range. Explicit `--symbols`
+values are used unchanged. US income, balance-sheet and cash-flow history uses reporting-
 period cross sections through the available VIP interfaces. The US financial-indicator
 interface and all Hong Kong financial interfaces require exactly one `ts_code`;
 `--symbols` (or the Web “financial universe” field) therefore bounds those unavoidable
@@ -100,6 +103,25 @@ The page ceiling is only a runaway-request guard. It is deliberately above the d
 partitions seen in production (fund portfolios, company holders, futures holdings and
 option masters/daily bars), while still requiring a short terminal page before a task
 can be reported as complete.
+
+Date and time partitions use one recovery contract: request the largest reviewed
+window, paginate it, and bisect it only when a provider row/offset ceiling is reached.
+Child windows are adjacent and carry their parent/supersession identity in `FetchSpec.scope`.
+A single day or second that still reaches the limit fails explicitly. Successful legacy
+units remain immutable; only old pending/failed units are marked `superseded`.
+
+The all-A-share 5-minute task budgets at most 150 actual exchange sessions per symbol,
+so a 130-session range normally starts with one request per stock instead of monthly
+fan-out. News starts with one source/day request and splits by seconds only for a capped
+source/day. Existing successful monthly minute units and paired half-day news units are
+reused when they are fully contained in the requested range.
+
+Sparse interfaces use wider initial partitions: `fund_share` and THS/Eastmoney concept
+or industry flows use month ranges; northbound/southbound and market-wide Eastmoney
+flows use year ranges. Dense fund NAV, stock-level money flow and CCASS detail remain
+daily. Fund dividends and portfolios use calendar days so weekend announcements are not
+omitted. ETF creation/redemption baskets are planned per ETF over the full requested
+history and bisected by date only if pagination cannot prove termination.
 
 Provider limits are part of the download contract. For example, overseas FX daily
 requests use the documented 1,000-row page, fund masters separately request the `E`
@@ -159,6 +181,12 @@ python -m quant_data.cli core-intraday `
   --max-stocks 100 --max-options 100
 ```
 
-The Web data center exposes the same configuration, task coverage, provider row counts,
-failure reason and retry-by-original-parameters action. Tick, transactions and Level-2
-remain outside the Tushare-only beginner scope and require a separately licensed source.
+The Web data center separates catalog readiness from live download execution. Catalog
+readiness describes which research capabilities are available; it is not a percentage
+for the currently running job. Active jobs publish their target range, request strategy,
+adaptive-partition phase and checkpoint counters through `jobs.progress_json`. The UI
+therefore distinguishes queued/running work, shared rate-limit cooldown, scheduled retry,
+blocked prerequisites, recoverable failure and terminal failure. Successful, pending,
+running, retrying and superseded work units remain visible for resume and audit, and retry
+actions preserve the original parameters. Tick, transactions and Level-2 remain outside
+the Tushare-only beginner scope and require a separately licensed source.

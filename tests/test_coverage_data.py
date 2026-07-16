@@ -106,6 +106,28 @@ def test_coverage_pagination_uses_rule_owned_page_ceiling() -> None:
     assert page.scope["max_pages"] == 4
 
 
+def test_capital_flow_uses_year_month_and_daily_grains_by_density() -> None:
+    dates = ["20240102", "20241231", "20250102"]
+    specs = supplemental_specs(
+        "cn_capital_flow",
+        start=date(2024, 1, 2),
+        end=date(2025, 2, 2),
+        trading_dates=dates,
+        max_attempts=3,
+    )
+
+    assert len([spec for spec in specs if spec.dataset == "moneyflow_hsgt"]) == 2
+    assert len([spec for spec in specs if spec.dataset == "moneyflow_mkt_dc"]) == 2
+    for dataset in ("moneyflow_cnt_ths", "moneyflow_ind_ths", "moneyflow_ind_dc"):
+        monthly = [spec for spec in specs if spec.dataset == dataset]
+        assert len(monthly) == 14
+        assert all(spec.scope["partition_axis"] == "date" for spec in monthly)
+    for dataset in ("moneyflow_ths", "moneyflow_dc"):
+        daily = [spec for spec in specs if spec.dataset == dataset]
+        assert len(daily) == len(dates)
+        assert all("trade_date" in spec.params for spec in daily)
+
+
 def test_only_provider_mandated_symbol_paths_expand_by_symbol() -> None:
     governance = coverage_secondary_specs(
         "cn_governance_risk",

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+import threading
+import time
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import pandas as pd
 import typer
@@ -25,6 +27,13 @@ from .coverage_data import coverage_secondary_specs
 from .execution_data import MARGIN_DATASET, MINUTE_DATASETS, margin_specs
 from .minute_qlib_builder import MinuteQlibBuilder
 from .models import FetchSpec
+from .partitioning import (
+    is_adaptive_partition,
+    is_partition_overflow_error,
+    partition_bounds,
+    resize_partition_spec,
+    split_partition_spec,
+)
 from .planner import BootstrapPlanner, ExecutionDataPlanner, compact_date, parse_date
 from .provider import TushareHttpProvider
 from .qlib_builder import QlibBuilder
@@ -37,7 +46,9 @@ from .supplemental_data import (
     SUPPORTED_BUNDLES,
     a_share_bulk_history_specs,
     bond_reference_specs,
+    etf_constituent_history_specs,
     etf_constituent_overflow_repartition_specs,
+    market_daily_specs,
     market_financial_specs,
     next_pagination_specs,
     require_pagination_terminated,
@@ -51,8 +62,59 @@ app = typer.Typer(no_args_is_help=True, help="Resumable Tushare-to-Parquet boots
 console = Console()
 
 
+class ExecutionProgressReporter:
+    """Write atomic live progress snapshots for the durable job worker."""
+
+    def __init__(self, path: Path | None, target: dict[str, Any] | None = None) -> None:
+        self.path = path
+        self.target = dict(target or {})
+        self._lock = threading.Lock()
+        self._last_write = 0.0
+
+    def set_target(self, **values: Any) -> None:
+        self.target.update({key: value for key, value in values.items() if value is not None})
+
+    def publish(
+        self,
+        context: Context,
+        *,
+        execution_phase: str,
+        phase_label: str,
+        datasets: set[str],
+        force: bool = False,
+    ) -> None:
+        if self.path is None:
+            return
+        with self._lock:
+            current = time.monotonic()
+            if not force and current - self._last_write < 2.0:
+                return
+            checkpoint = context.checkpoint.progress_summary(datasets)
+            next_retry_at = checkpoint.get("next_retry_at")
+            if isinstance(next_retry_at, datetime):
+                checkpoint["next_retry_at"] = next_retry_at.isoformat()
+            payload = {
+                "status": "running",
+                "execution_phase": execution_phase,
+                "phase_label": phase_label,
+                "datasets": sorted(datasets),
+                "target": self.target,
+                "checkpoint": checkpoint,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+            _write_optional_result(self.path, payload)
+            self._last_write = current
+
+
 class Context:
-    def __init__(self, settings: Settings, on_result=None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        on_result=None,
+        *,
+        progress_path: Path | None = None,
+        progress_target: dict[str, Any] | None = None,
+    ) -> None:
         self.settings = settings
         self.checkpoint = CheckpointStore(settings.database_url)
         self.storage = ParquetStore(settings.data_root, keep_raw=settings.keep_raw)
@@ -74,29 +136,78 @@ class Context:
             workers=settings.workers,
             on_result=on_result,
         )
+        self.progress = ExecutionProgressReporter(progress_path, progress_target)
+
+    def report_progress(
+        self,
+        execution_phase: str,
+        phase_label: str,
+        datasets: set[str],
+        *,
+        force: bool = False,
+    ) -> None:
+        self.progress.publish(
+            self,
+            execution_phase=execution_phase,
+            phase_label=phase_label,
+            datasets=datasets,
+            force=force,
+        )
 
 
-def load_context(*, require_credentials: bool = True, on_result=None) -> Context:
+def load_context(
+    *,
+    require_credentials: bool = True,
+    on_result=None,
+    progress_path: Path | None = None,
+    progress_target: dict[str, Any] | None = None,
+) -> Context:
     settings = Settings.from_env()
     if require_credentials:
         settings.require_credentials()
     settings.data_root.mkdir(parents=True, exist_ok=True)
-    return Context(settings, on_result=on_result)
+    return Context(
+        settings,
+        on_result=on_result,
+        progress_path=progress_path,
+        progress_target=progress_target,
+    )
+
+
+def _phase_for_label(label: str) -> str:
+    normalized = label.lower()
+    if "overflow continuation" in normalized or "partition continuation" in normalized:
+        return "adaptive_recovery"
+    if "pagination" in normalized:
+        return "pagination"
+    if "calendar" in normalized or "master" in normalized or "basic" in normalized:
+        return "prerequisites"
+    return "downloading"
 
 
 def _run_phase(context: Context, label: str, datasets: set[str]) -> None:
     total = context.checkpoint.remaining_count(datasets)
     if total == 0:
         console.print(f"[green]{label}: already complete[/green]")
+        context.report_progress(_phase_for_label(label), label, datasets, force=True)
         return
+    context.report_progress(_phase_for_label(label), label, datasets, force=True)
     with Progress(console=console) as progress:
         task = progress.add_task(label, total=total)
+        previous_on_result = context.runner.on_result
 
-        def on_result(_dataset: str, _succeeded: bool, _rows: int) -> None:
+        def on_result(dataset: str, succeeded: bool, rows: int) -> None:
             progress.advance(task)
+            context.report_progress(_phase_for_label(label), label, datasets)
+            if previous_on_result:
+                previous_on_result(dataset, succeeded, rows)
 
         context.runner.on_result = on_result
-        summary = context.runner.run(datasets)
+        try:
+            summary = context.runner.run(datasets)
+        finally:
+            context.runner.on_result = previous_on_result
+    context.report_progress(_phase_for_label(label), label, datasets, force=True)
     console.print(
         f"{label}: succeeded={summary.succeeded} failed={summary.failed} rows={summary.rows}"
     )
@@ -105,11 +216,25 @@ def _run_phase(context: Context, label: str, datasets: set[str]) -> None:
 def _run_paginated_specs(
     context: Context, label: str, initial_specs: list[FetchSpec]
 ) -> tuple[list[FetchSpec], list[dict], int]:
-    specs = list(initial_specs)
+    if not initial_specs:
+        return [], [], 0
+    initial_datasets = {spec.dataset for spec in initial_specs}
+    context.report_progress("planning", f"{label} planning", initial_datasets, force=True)
+    specs = _reconcile_range_plan(context, list(initial_specs))
+    if not specs:
+        return [], [], 0
     inserted = context.checkpoint.add(specs)
-    context.checkpoint.retry_failed_units(spec.unit_key for spec in specs)
     datasets = {spec.dataset for spec in specs}
     ignored_keys: set[str] = set()
+    recovery_specs, recovered_keys = _pagination_overflow_recovery(
+        context, specs, ignored_keys
+    )
+    if recovered_keys:
+        ignored_keys.update(recovered_keys)
+        known = {spec.unit_key for spec in specs}
+        recovery_specs = [spec for spec in recovery_specs if spec.unit_key not in known]
+        specs.extend(recovery_specs)
+        inserted += context.checkpoint.add(recovery_specs)
     _run_phase(context, label, datasets)
 
     while True:
@@ -122,7 +247,6 @@ def _run_paginated_specs(
             recovery_specs = [spec for spec in recovery_specs if spec.unit_key not in known]
             specs.extend(recovery_specs)
             inserted += context.checkpoint.add(recovery_specs)
-            context.checkpoint.retry_failed_units(spec.unit_key for spec in recovery_specs)
             _run_phase(context, f"{label} overflow continuation", datasets)
             continue
 
@@ -130,7 +254,20 @@ def _run_paginated_specs(
         rows = _require_specs_complete(context, active_specs)
         next_specs = next_pagination_specs(active_specs, rows)
         if not next_specs:
+            recovery_specs, recovered_keys = _full_page_partition_recovery(
+                context, active_specs, rows, ignored_keys
+            )
+            if recovered_keys:
+                known = {spec.unit_key for spec in specs}
+                recovery_specs = [spec for spec in recovery_specs if spec.unit_key not in known]
+                specs.extend(recovery_specs)
+                inserted += context.checkpoint.add(recovery_specs)
+                _run_phase(context, f"{label} partition continuation", datasets)
+                continue
             require_pagination_terminated(active_specs, rows)
+            context.report_progress(
+                "verifying", f"{label} pagination verified", datasets, force=True
+            )
             return specs, rows, inserted
 
         specs.extend(next_specs)
@@ -143,13 +280,183 @@ def _run_paginated_specs(
             recovery_specs = [spec for spec in recovery_specs if spec.unit_key not in known]
             specs.extend(recovery_specs)
             inserted += context.checkpoint.add(recovery_specs)
-            context.checkpoint.retry_failed_units(spec.unit_key for spec in recovery_specs)
             _run_phase(context, f"{label} overflow continuation", datasets)
             continue
 
         inserted += context.checkpoint.add(next_specs)
-        context.checkpoint.retry_failed_units(spec.unit_key for spec in next_specs)
         _run_phase(context, f"{label} pagination", datasets)
+
+
+_RANGE_REUSE_DATASETS = {
+    "fund_share",
+    "moneyflow_hsgt",
+    "moneyflow_cnt_ths",
+    "moneyflow_ind_ths",
+    "moneyflow_ind_dc",
+    "moneyflow_mkt_dc",
+    "etf_sh_cons",
+    "etf_sz_cons",
+}
+
+
+def _reconcile_range_plan(context: Context, specs: list[FetchSpec]) -> list[FetchSpec]:
+    """Reuse complete legacy partitions and plan only uncovered session gaps."""
+
+    targets = [
+        spec
+        for spec in specs
+        if spec.dataset in _RANGE_REUSE_DATASETS and is_adaptive_partition(spec)
+    ]
+    if not targets:
+        return specs
+    untouched = [spec for spec in specs if spec not in targets]
+    rows_by_dataset = {
+        dataset: context.checkpoint.successful(dataset)
+        for dataset in {spec.dataset for spec in targets}
+    }
+    success_index: dict[
+        str, dict[tuple[tuple[str, object], ...], list[FetchSpec]]
+    ] = {}
+    for dataset, rows in rows_by_dataset.items():
+        by_identity: dict[tuple[tuple[str, object], ...], list[FetchSpec]] = {}
+        for candidate in _complete_success_specs(rows):
+            identity = tuple(sorted(_partition_identity(candidate).items()))
+            by_identity.setdefault(identity, []).append(candidate)
+        success_index[dataset] = by_identity
+    reusable: dict[str, FetchSpec] = {}
+    replacements: list[FetchSpec] = []
+    for target in targets:
+        _, target_start, target_end = partition_bounds(target)
+        assert isinstance(target_start, date) and not isinstance(target_start, datetime)
+        assert isinstance(target_end, date) and not isinstance(target_end, datetime)
+        target_identity = tuple(sorted(_partition_identity(target).items()))
+        index = success_index[target.dataset]
+        successful = [*index.get((), [])]
+        if target_identity:
+            successful.extend(index.get(target_identity, []))
+        matching: list[FetchSpec] = []
+        for candidate in successful:
+            bounds = _date_partition_bounds(candidate)
+            if bounds is None:
+                continue
+            candidate_start, candidate_end = bounds
+            if target_start <= candidate_start <= candidate_end <= target_end:
+                matching.append(candidate)
+        if not matching:
+            replacements.append(target)
+            continue
+
+        raw_values = target.scope.get("partition_values")
+        values = (
+            [datetime.strptime(str(value), "%Y%m%d").date() for value in raw_values]
+            if isinstance(raw_values, list)
+            else [
+                target_start + timedelta(days=offset)
+                for offset in range((target_end - target_start).days + 1)
+            ]
+        )
+        covered: set[date] = set()
+        for candidate in matching:
+            reusable[candidate.unit_key] = candidate
+            candidate_start, candidate_end = _date_partition_bounds(candidate) or (
+                target_start,
+                target_end,
+            )
+            covered.update(
+                value for value in values if candidate_start <= value <= candidate_end
+            )
+        segment: list[date] = []
+        for value in values:
+            if value in covered:
+                if segment:
+                    replacements.append(
+                        resize_partition_spec(target, segment[0], segment[-1])
+                    )
+                    segment = []
+            else:
+                segment.append(value)
+        if segment:
+            replacements.append(resize_partition_spec(target, segment[0], segment[-1]))
+
+    planned = [*untouched, *reusable.values(), *replacements]
+    planned_keys = {spec.unit_key for spec in planned}
+    stale = []
+    for dataset in {spec.dataset for spec in targets}:
+        for row in context.checkpoint.unfinished_units(dataset):
+            spec = _checkpoint_row_spec(row)
+            if spec.unit_key not in planned_keys and not is_adaptive_partition(spec):
+                stale.append(spec.unit_key)
+    context.checkpoint.supersede_units(
+        stale,
+        "legacy unfinished unit superseded by adaptive range planning",
+    )
+    return planned
+
+
+def _complete_success_specs(rows: list[dict]) -> list[FetchSpec]:
+    specs_by_group: dict[str, list[tuple[FetchSpec, int]]] = {}
+    result: list[FetchSpec] = []
+    for row in rows:
+        spec = _checkpoint_row_spec(row)
+        group = spec.scope.get("page_group")
+        if not group:
+            result.append(spec)
+            continue
+        specs_by_group.setdefault(str(group), []).append(
+            (spec, int(row.get("row_count") or 0))
+        )
+    for pages in specs_by_group.values():
+        ordered = sorted(pages, key=lambda item: int(item[0].scope.get("offset") or 0))
+        if ordered[-1][1] < int(ordered[-1][0].scope["page_size"]):
+            result.extend(spec for spec, _ in ordered)
+    return result
+
+
+def _checkpoint_row_spec(row: dict) -> FetchSpec:
+    return FetchSpec(
+        dataset=str(row["dataset"]),
+        api_name=str(row["api_name"]),
+        scope=dict(row.get("scope_json") or {}),
+        params=dict(row.get("params_json") or {}),
+        fields=tuple(row.get("fields_json") or ()),
+        allow_empty=bool(row.get("allow_empty")),
+        max_attempts=int(row.get("max_attempts") or 1),
+    )
+
+
+def _partition_identity(spec: FetchSpec) -> dict[str, object]:
+    ignored = {
+        "start_date",
+        "end_date",
+        "trade_date",
+        "nav_date",
+        "ann_date",
+        "limit",
+        "offset",
+    }
+    return {key: value for key, value in spec.params.items() if key not in ignored}
+
+
+def _date_partition_bounds(spec: FetchSpec) -> tuple[date, date] | None:
+    if is_adaptive_partition(spec):
+        axis, start, end = partition_bounds(spec)
+        if axis == "date" and isinstance(start, date) and isinstance(end, date):
+            return start, end
+    params = spec.params
+    start_value = params.get("start_date") or params.get("trade_date")
+    end_value = params.get("end_date") or params.get("trade_date")
+    if not start_value or not end_value:
+        return None
+    try:
+        start = datetime.fromisoformat(str(start_value)).date()
+        end = datetime.fromisoformat(str(end_value)).date()
+    except ValueError:
+        try:
+            start = datetime.strptime(str(start_value)[:8], "%Y%m%d").date()
+            end = datetime.strptime(str(end_value)[:8], "%Y%m%d").date()
+        except ValueError:
+            return None
+    return start, end
 
 
 def _share_float_overflow_recovery(
@@ -202,6 +509,26 @@ def _pagination_overflow_recovery(
         str(row["unit_key"]): row
         for row in context.checkpoint.unit_rows(spec.unit_key for spec in specs)
     }
+    for failed_spec in specs:
+        if (
+            failed_spec.unit_key in ignored_keys
+            or failed_spec.unit_key in recovered_keys
+            or not is_adaptive_partition(failed_spec)
+        ):
+            continue
+        row = rows_by_key.get(failed_spec.unit_key)
+        if not row or str(row.get("status")) not in {"failed", "superseded"}:
+            continue
+        error = str(row.get("last_error") or "")
+        if not is_partition_overflow_error(error):
+            continue
+        recovery_specs.extend(split_partition_spec(failed_spec))
+        recovered_keys.add(failed_spec.unit_key)
+        context.checkpoint.supersede_units(
+            [failed_spec.unit_key],
+            f"{error}; superseded by disjoint adaptive child partitions",
+        )
+
     etf_master: pd.DataFrame | None = None
     for failed_spec in specs:
         if (
@@ -240,6 +567,55 @@ def _pagination_overflow_recovery(
             f"{error}; pagination offset cap superseded by ETF symbol partitions",
         )
     return recovery_specs, recovered_keys
+
+
+def _full_page_partition_recovery(
+    context: Context,
+    specs: list[FetchSpec],
+    rows: list[dict],
+    ignored_keys: set[str],
+) -> tuple[list[FetchSpec], set[str]]:
+    """Split a bisectable page group whose final allowed page is still full."""
+
+    row_counts = {str(row["unit_key"]): int(row.get("row_count") or 0) for row in rows}
+    continued = {
+        str(parent)
+        for spec in specs
+        if (
+            parent := spec.scope.get("continues_page_group")
+            or spec.scope.get("supersedes_page_group")
+        )
+    }
+    groups: dict[str, list[FetchSpec]] = {}
+    for spec in specs:
+        group = spec.scope.get("page_group")
+        if group and spec.unit_key not in ignored_keys:
+            groups.setdefault(str(group), []).append(spec)
+
+    children: list[FetchSpec] = []
+    recovered: set[str] = set()
+    for group, pages in groups.items():
+        if group in continued:
+            continue
+        current = max(pages, key=lambda item: int(item.scope.get("offset") or 0))
+        if not is_adaptive_partition(current):
+            continue
+        page_size = int(current.scope["page_size"])
+        max_pages = int(current.scope["max_pages"])
+        page_index = int(
+            current.scope.get(
+                "page_index", int(current.scope.get("offset") or 0) // page_size
+            )
+        )
+        if page_index + 1 < max_pages or row_counts.get(current.unit_key, -1) < page_size:
+            continue
+        children.extend(split_partition_spec(current))
+        recovered.add(current.unit_key)
+        context.checkpoint.supersede_units(
+            [page.unit_key for page in pages],
+            "full final pagination page superseded by disjoint adaptive child partitions",
+        )
+    return children, recovered
 
 
 def _eligible_etf_symbols(
@@ -367,17 +743,42 @@ def bootstrap(
             trading_dates=context.planner.trading_dates(start_date, end_date),
             max_attempts=max_attempts,
         )
-        _, _, institutional_inserted = _run_paginated_specs(
+        institutional_specs, _, institutional_inserted = _run_paginated_specs(
             context,
             "institutional research and enhanced data",
             institutional_specs,
         )
+        etf_master = context.storage.read_units(context.checkpoint.successful("etf_basic"))
+        etf_symbols = (
+            _historically_active_symbols(
+                etf_master,
+                start=start_date,
+                end=end_date,
+                suffixes=(".SH", ".SZ"),
+            )
+            if not etf_master.empty and "ts_code" in etf_master.columns
+            else []
+        )
+        pcf_specs = etf_constituent_history_specs(
+            etf_symbols,
+            start=start_date,
+            end=end_date,
+            trading_dates=context.planner.trading_dates(start_date, end_date),
+            max_attempts=max_attempts,
+        )
+        _, _, pcf_inserted = _run_paginated_specs(
+            context,
+            "ETF creation-redemption basket history",
+            pcf_specs,
+        )
+        institutional_inserted += pcf_inserted
         console.print(
             "planned institutional research units: "
             f"{len(institutional_specs)} initial, "
             f"+{institutional_inserted} inserted with pagination"
         )
-        _run_phase(context, "market news", {"news"})
+        news_plan = context.planner.news_specs(start_date, end_date, max_attempts)
+        _run_paginated_specs(context, "market news", news_plan)
 
     if download_only:
         console.print("[bold green]download phase complete[/bold green]")
@@ -487,7 +888,15 @@ def margin_eligibility(
     end_date = parse_date(end, latest=date.today())
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
-    context = load_context()
+    context = load_context(
+        progress_path=result_path,
+        progress_target={
+            "kind": "margin_eligibility_download",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+    )
+    context.report_progress("planning", "margin eligibility planning", {MARGIN_DATASET}, force=True)
     calendar = FetchSpec(
         dataset="trade_cal",
         api_name="trade_cal",
@@ -568,7 +977,14 @@ def core_intraday(
         }.items()
         if values
     }
-    context = load_context()
+    context = load_context(
+        progress_path=result_path,
+        progress_target={
+            "kind": "core_intraday_download",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+    )
     universe_evidence: dict | None = None
     if auto_universe:
         selected = select_intraday_universe_from_store(
@@ -589,6 +1005,13 @@ def core_intraday(
         raise typer.BadParameter(
             "at least one ETF, stock, index, future, or option code is required"
         )
+    context.progress.set_target(
+        symbols=sum(len(values) for values in symbols_by_dataset.values()),
+        frequency="1min",
+    )
+    context.report_progress(
+        "planning", "core intraday planning", set(symbols_by_dataset), force=True
+    )
     trading_dates = context.planner.trading_dates(start_date, end_date)
     required_margin_specs = margin_specs(
         trading_dates,
@@ -606,8 +1029,7 @@ def core_intraday(
         context.settings.max_request_attempts,
     )
     minute_datasets = set(symbols_by_dataset)
-    _run_phase(context, "core intraday", minute_datasets)
-    minute_rows = _require_specs_complete(context, specs)
+    specs, minute_rows, _ = _run_paginated_specs(context, "core intraday", specs)
     _require_symbol_coverage(specs, minute_rows)
     normalized_symbols = {
         dataset: sorted({str(spec.params["ts_code"]) for spec in specs if spec.dataset == dataset})
@@ -621,6 +1043,9 @@ def core_intraday(
     for dataset in sorted(minute_datasets):
         keys = {spec.unit_key for spec in specs if spec.dataset == dataset}
         selected[dataset] = [row for row in minute_rows if row["unit_key"] in keys]
+    context.report_progress(
+        "snapshot", "building immutable execution snapshot", minute_datasets, force=True
+    )
     snapshot_path = _build_execution_snapshot(
         context,
         name=name,
@@ -662,7 +1087,15 @@ def ashare_5m(
     end_date = parse_date(end, latest=date.today())
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
-    context = load_context()
+    context = load_context(
+        progress_path=result_path,
+        progress_target={
+            "kind": "ashare_5m_download",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "frequency": "5min",
+        },
+    )
     master = context.storage.read_units(context.checkpoint.successful("stock_basic"))
     active_ranges = _historical_a_share_active_ranges(
         master, start=start_date, end=end_date
@@ -671,6 +1104,10 @@ def ashare_5m(
 
     if not symbols:
         raise RuntimeError("stock_basic produced an empty historical A-share universe")
+    context.progress.set_target(symbols=len(symbols))
+    context.report_progress(
+        "planning", "full A-share 5-minute planning", {"ashare_5m"}, force=True
+    )
     specs = context.execution_planner.plan_minutes(
         {"ashare_5m": symbols},
         start_date,
@@ -678,13 +1115,18 @@ def ashare_5m(
         context.settings.max_request_attempts,
         freq="5min",
         active_ranges_by_dataset={"ashare_5m": active_ranges},
+        trading_dates=context.planner.trading_dates(start_date, end_date),
     )
-    _run_phase(context, "full A-share 5-minute bars", {"ashare_5m"})
-    rows = _require_specs_complete(context, specs)
+    specs, rows, _ = _run_paginated_specs(
+        context, "full A-share 5-minute bars", specs
+    )
     _require_symbol_coverage(specs, rows)
     name = snapshot_name or (
         f"ashare-5m-{start_date:%Y%m%d}-{end_date:%Y%m%d}-"
         f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+    )
+    context.report_progress(
+        "snapshot", "building immutable 5-minute snapshot", {"ashare_5m"}, force=True
     )
     snapshot_path = _build_execution_snapshot(
         context,
@@ -759,6 +1201,45 @@ def _historical_a_share_active_ranges(
     return ranges
 
 
+def _historically_active_symbols(
+    master: pd.DataFrame,
+    *,
+    start: date,
+    end: date,
+    suffixes: tuple[str, ...],
+) -> list[str]:
+    """Select master rows whose listing lifecycle intersects the request range."""
+
+    if master.empty or "ts_code" not in master.columns:
+        raise RuntimeError("market master is unavailable or missing ts_code")
+    frame = master.copy()
+    symbols = frame["ts_code"].fillna("").astype(str).str.strip().str.upper()
+    mask = symbols.ne("")
+    if suffixes:
+        mask &= symbols.str.endswith(suffixes)
+    if "list_date" in frame.columns:
+        listed = pd.to_datetime(frame["list_date"], errors="coerce")
+        mask &= listed.isna() | listed.le(pd.Timestamp(end))
+    if "delist_date" in frame.columns:
+        delisted = pd.to_datetime(frame["delist_date"], errors="coerce")
+        mask &= delisted.isna() | delisted.ge(pd.Timestamp(start))
+    return sorted(set(symbols.loc[mask].tolist()))
+
+
+def _open_market_dates(
+    calendar: pd.DataFrame, *, start: date, end: date
+) -> list[str]:
+    if calendar.empty or "is_open" not in calendar.columns:
+        raise RuntimeError("market trade calendar is unavailable or missing is_open")
+    date_field = "cal_date" if "cal_date" in calendar.columns else "date"
+    if date_field not in calendar.columns:
+        raise RuntimeError("market trade calendar is missing cal_date/date")
+    values = pd.to_datetime(calendar[date_field], errors="coerce")
+    is_open = calendar["is_open"].astype(str).str.lower().isin({"1", "true", "t", "yes"})
+    selected = is_open & values.between(pd.Timestamp(start), pd.Timestamp(end))
+    return sorted(values.loc[selected].dt.strftime("%Y%m%d").dropna().unique().tolist())
+
+
 @app.command("supplemental-download")
 def supplemental_download(
     bundle: Annotated[str, typer.Option(help="Independent supplemental data bundle")],
@@ -777,7 +1258,16 @@ def supplemental_download(
     end_date = parse_date(end, latest=date.today())
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
-    context = load_context()
+    context = load_context(
+        progress_path=result_path,
+        progress_target={
+            "kind": "supplemental_download",
+            "bundle": bundle,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "requested_symbols": len(_split_codes(symbols)),
+        },
+    )
     trading_dates = (
         context.planner.trading_dates(start_date, end_date)
         if bundle.startswith("cn_") and bundle != "cn_macro"
@@ -791,6 +1281,7 @@ def supplemental_download(
         max_attempts=context.settings.max_request_attempts,
     )
     datasets = {spec.dataset for spec in specs}
+    context.report_progress("planning", f"{bundle} planning", datasets, force=True)
     rows: list[dict] = []
     inserted = 0
     if specs:
@@ -827,6 +1318,32 @@ def supplemental_download(
         specs.extend(secondary_specs)
         rows.extend(secondary_rows)
         datasets.update(secondary_datasets)
+    if bundle == "cn_institutional":
+        etf_master = context.storage.read_units(context.checkpoint.successful("etf_basic"))
+        etf_symbols = (
+            _historically_active_symbols(
+                etf_master,
+                start=start_date,
+                end=end_date,
+                suffixes=(".SH", ".SZ"),
+            )
+            if not etf_master.empty and "ts_code" in etf_master.columns
+            else []
+        )
+        pcf_specs = etf_constituent_history_specs(
+            etf_symbols,
+            start=start_date,
+            end=end_date,
+            trading_dates=trading_dates,
+            max_attempts=context.settings.max_request_attempts,
+        )
+        pcf_specs, pcf_rows, pcf_inserted = _run_paginated_specs(
+            context, f"{bundle} ETF basket history", pcf_specs
+        )
+        inserted += pcf_inserted
+        specs.extend(pcf_specs)
+        rows.extend(pcf_rows)
+        datasets.update(spec.dataset for spec in pcf_specs)
     if bundle == "strategy_specialty_minutes":
         requested = _split_codes(symbols)
         if not requested:
@@ -881,6 +1398,23 @@ def supplemental_download(
     if bundle in {"hk_market", "us_market"}:
         market = bundle.split("_", 1)[0]
         basic_dataset = f"{market}_basic"
+        calendar_dataset = f"{market}_tradecal"
+        calendar = context.storage.read_units(
+            context.checkpoint.successful(calendar_dataset)
+        )
+        open_dates = _open_market_dates(calendar, start=start_date, end=end_date)
+        daily_specs = market_daily_specs(
+            market,
+            open_dates,
+            max_attempts=context.settings.max_request_attempts,
+        )
+        daily_specs, daily_rows, daily_inserted = _run_paginated_specs(
+            context, f"{bundle} open-session prices", daily_specs
+        )
+        inserted += daily_inserted
+        specs.extend(daily_specs)
+        rows.extend(daily_rows)
+        datasets.update(spec.dataset for spec in daily_specs)
         financial_symbols = _split_codes(symbols)
         if not financial_symbols:
             master = context.storage.read_units(context.checkpoint.successful(basic_dataset))
@@ -888,12 +1422,11 @@ def supplemental_download(
                 raise RuntimeError(
                     f"{basic_dataset} did not provide ts_code for financial planning"
                 )
-            financial_symbols = sorted(
-                {
-                    str(value).strip()
-                    for value in master["ts_code"].dropna().tolist()
-                    if str(value).strip()
-                }
+            financial_symbols = _historically_active_symbols(
+                master,
+                start=start_date,
+                end=end_date,
+                suffixes=((".HK",) if market == "hk" else ()),
             )
         if not financial_symbols:
             raise RuntimeError(f"{basic_dataset} produced an empty financial universe")
@@ -1151,7 +1684,9 @@ def _write_optional_result(path: Path | None, payload: dict) -> None:
     if path is None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
 def _build_execution_snapshot(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 import pandas as pd
 
@@ -18,8 +18,14 @@ from .catalog import (
     DatasetDefinition,
 )
 from .checkpoint import CheckpointStore
-from .execution_data import margin_specs, minute_specs, news_specs
-from .models import FetchSpec
+from .execution_data import (
+    NEWS_DATASET,
+    margin_specs,
+    minute_specs,
+    news_specs,
+    news_window_spec,
+)
+from .models import FetchSpec, canonical_json
 from .reference_data import apply_reference_refresh
 from .storage import ParquetStore
 
@@ -248,7 +254,84 @@ class BootstrapPlanner:
         return self.plan_daily(dates, ETF_DAILY, max_attempts)
 
     def plan_news(self, start: date, end: date, max_attempts: int) -> int:
-        return self.checkpoint.add(news_specs(start, end, max_attempts=max_attempts))
+        return self.checkpoint.add(self.news_specs(start, end, max_attempts))
+
+    def news_specs(self, start: date, end: date, max_attempts: int) -> list[FetchSpec]:
+        desired = news_specs(start, end, max_attempts=max_attempts)
+        successful_rows = self.checkpoint.successful(NEWS_DATASET)
+        successful = [_checkpoint_spec(row) for row in successful_rows]
+        successful_by_source_day: dict[
+            tuple[str, date], list[tuple[datetime, datetime, FetchSpec]]
+        ] = {}
+        for candidate in successful:
+            try:
+                candidate_start = datetime.fromisoformat(str(candidate.params["start_date"]))
+                candidate_end = datetime.fromisoformat(str(candidate.params["end_date"]))
+            except (KeyError, ValueError):
+                continue
+            source = str(candidate.params.get("src") or "")
+            if candidate_start.date() != candidate_end.date() or not source:
+                continue
+            successful_by_source_day.setdefault(
+                (source, candidate_start.date()), []
+            ).append((candidate_start, candidate_end, candidate))
+        reusable: dict[str, FetchSpec] = {}
+        missing: list[FetchSpec] = []
+        for target in desired:
+            source = str(target.params["src"])
+            day = datetime.fromisoformat(str(target.params["start_date"])).date()
+            day_start = datetime.combine(day, time.min)
+            day_end = datetime.combine(day, time.max.replace(microsecond=0))
+            windows = [
+                item
+                for item in successful_by_source_day.get((source, day), [])
+                if day_start <= item[0] <= item[1] <= day_end
+            ]
+            if not windows:
+                missing.append(target)
+                continue
+
+            cursor = day_start
+            for window_start, window_end, candidate in sorted(windows, key=lambda item: item[0]):
+                reusable[candidate.unit_key] = candidate
+                if window_start > cursor:
+                    missing.append(
+                        news_window_spec(
+                            source,
+                            cursor,
+                            window_start - timedelta(seconds=1),
+                            max_attempts=max_attempts,
+                        )
+                    )
+                cursor = max(cursor, window_end + timedelta(seconds=1))
+            if cursor <= day_end:
+                missing.append(
+                    news_window_spec(
+                        source,
+                        cursor,
+                        day_end,
+                        max_attempts=max_attempts,
+                    )
+                )
+
+        planned_keys = {spec.unit_key for spec in [*reusable.values(), *missing]}
+        legacy_unfinished = []
+        for row in self.checkpoint.unfinished_units(NEWS_DATASET):
+            spec = _checkpoint_spec(row)
+            if spec.unit_key in planned_keys or spec.scope.get("partition_axis"):
+                continue
+            try:
+                window_start = datetime.fromisoformat(str(spec.params["start_date"]))
+                window_end = datetime.fromisoformat(str(spec.params["end_date"]))
+            except (KeyError, ValueError):
+                continue
+            if window_start.date() <= end and window_end.date() >= start:
+                legacy_unfinished.append(spec.unit_key)
+        self.checkpoint.supersede_units(
+            legacy_unfinished,
+            "legacy news window superseded by whole-day adaptive planning",
+        )
+        return [*reusable.values(), *missing]
 
     def plan_profile(
         self, profile: str, start: date, end: date, max_attempts: int
@@ -290,6 +373,7 @@ class ExecutionDataPlanner:
         active_ranges_by_dataset: dict[
             str, dict[str, tuple[date, date]]
         ] | None = None,
+        trading_dates: Iterable[str] | None = None,
     ) -> list[FetchSpec]:
         specs = minute_specs(
             symbols_by_dataset,
@@ -298,10 +382,194 @@ class ExecutionDataPlanner:
             max_attempts=max_attempts,
             freq=freq,
             active_ranges_by_dataset=active_ranges_by_dataset,
+            trading_dates=trading_dates,
         )
+        if (
+            freq == "5min"
+            and set(symbols_by_dataset) == {"ashare_5m"}
+            and trading_dates is not None
+        ):
+            specs = self._reuse_a_share_five_minute_history(
+                specs,
+                symbols_by_dataset["ashare_5m"],
+                start=start,
+                end=end,
+                active_ranges=(active_ranges_by_dataset or {}).get("ashare_5m", {}),
+                trading_dates=trading_dates,
+                max_attempts=max_attempts,
+            )
+        else:
+            specs = self._reuse_exact_minute_windows(specs)
         self.checkpoint.add(specs)
-        self.checkpoint.retry_failed_units(spec.unit_key for spec in specs)
         return specs
+
+    def _reuse_exact_minute_windows(self, planned: list[FetchSpec]) -> list[FetchSpec]:
+        """Keep legacy 1-minute/futures successes when only scope metadata changed."""
+
+        datasets = {spec.dataset for spec in planned}
+        successful: dict[tuple[str, str, str, tuple[str, ...]], FetchSpec] = {}
+        for dataset in datasets:
+            for row in self.checkpoint.successful(dataset):
+                candidate = _checkpoint_spec(row)
+                key = (
+                    candidate.dataset,
+                    candidate.api_name,
+                    canonical_json(candidate.params),
+                    candidate.fields,
+                )
+                successful[key] = candidate
+        result: list[FetchSpec] = []
+        for target in planned:
+            key = (
+                target.dataset,
+                target.api_name,
+                canonical_json(target.params),
+                target.fields,
+            )
+            candidate = successful.get(key)
+            result.append(candidate or target)
+
+        result_keys = {spec.unit_key for spec in result}
+        stale = []
+        target_params = {
+            (spec.dataset, spec.api_name, canonical_json(spec.params), spec.fields)
+            for spec in planned
+        }
+        for dataset in datasets:
+            for row in self.checkpoint.unfinished_units(dataset):
+                candidate = _checkpoint_spec(row)
+                identity = (
+                    candidate.dataset,
+                    candidate.api_name,
+                    canonical_json(candidate.params),
+                    candidate.fields,
+                )
+                if (
+                    identity in target_params
+                    and candidate.unit_key not in result_keys
+                    and not candidate.scope.get("partition_axis")
+                ):
+                    stale.append(candidate.unit_key)
+        self.checkpoint.supersede_units(
+            stale,
+            "legacy minute window superseded by adaptive scope metadata",
+        )
+        return result
+
+    def _reuse_a_share_five_minute_history(
+        self,
+        planned: list[FetchSpec],
+        symbols: Iterable[str],
+        *,
+        start: date,
+        end: date,
+        active_ranges: dict[str, tuple[date, date]],
+        trading_dates: Iterable[str],
+        max_attempts: int,
+    ) -> list[FetchSpec]:
+        sessions = sorted(
+            {
+                datetime.strptime(str(value).replace("-", "")[:8], "%Y%m%d").date()
+                for value in trading_dates
+            }
+        )
+        successful_by_symbol: dict[str, list[tuple[date, date, FetchSpec]]] = {}
+        for row in self.checkpoint.successful("ashare_5m"):
+            candidate = _checkpoint_spec(row)
+            if str(candidate.params.get("freq") or "") != "5min":
+                continue
+            try:
+                window_start = datetime.fromisoformat(
+                    str(candidate.params["start_date"])
+                ).date()
+                window_end = datetime.fromisoformat(
+                    str(candidate.params["end_date"])
+                ).date()
+            except (KeyError, ValueError):
+                continue
+            symbol = str(candidate.params.get("ts_code") or "").upper()
+            successful_by_symbol.setdefault(symbol, []).append(
+                (window_start, window_end, candidate)
+            )
+        reusable: dict[str, FetchSpec] = {}
+        windows: dict[str, list[tuple[date, date]]] = {}
+        normalized_symbols = sorted({str(value).strip().upper() for value in symbols})
+        for symbol in normalized_symbols:
+            active_start, active_end = active_ranges.get(symbol, (start, end))
+            desired_sessions = [
+                value
+                for value in sessions
+                if max(start, active_start) <= value <= min(end, active_end)
+            ]
+            covered: set[date] = set()
+            for window_start, window_end, candidate in successful_by_symbol.get(symbol, []):
+                if not (start <= window_start <= window_end <= end):
+                    continue
+                reusable[candidate.unit_key] = candidate
+                covered.update(
+                    value for value in desired_sessions if window_start <= value <= window_end
+                )
+            missing_sessions = [value for value in desired_sessions if value not in covered]
+            symbol_windows: list[tuple[date, date]] = []
+            segment: list[date] = []
+            for value in desired_sessions:
+                if value in covered:
+                    if segment:
+                        symbol_windows.extend(_session_chunks(segment, 150))
+                        segment = []
+                else:
+                    segment.append(value)
+            if segment:
+                symbol_windows.extend(_session_chunks(segment, 150))
+            if missing_sessions:
+                windows[symbol] = symbol_windows
+
+        new_specs = (
+            minute_specs(
+                {"ashare_5m": windows},
+                start=start,
+                end=end,
+                max_attempts=max_attempts,
+                freq="5min",
+                active_ranges_by_dataset={"ashare_5m": active_ranges},
+                trading_dates=sessions,
+                windows_by_dataset={"ashare_5m": windows},
+            )
+            if windows
+            else []
+        )
+        planned_keys = {spec.unit_key for spec in [*reusable.values(), *new_specs]}
+        legacy_unfinished = []
+        for row in self.checkpoint.unfinished_units("ashare_5m"):
+            spec = _checkpoint_spec(row)
+            if spec.unit_key in planned_keys or spec.scope.get("partition_axis"):
+                continue
+            if str(spec.params.get("ts_code") or "").upper() in normalized_symbols:
+                legacy_unfinished.append(spec.unit_key)
+        self.checkpoint.supersede_units(
+            legacy_unfinished,
+            "legacy monthly A-share 5-minute unit superseded by session-budget planning",
+        )
+        return [*reusable.values(), *new_specs]
+
+
+def _checkpoint_spec(row: dict[str, object]) -> FetchSpec:
+    return FetchSpec(
+        dataset=str(row["dataset"]),
+        api_name=str(row["api_name"]),
+        scope=dict(row.get("scope_json") or {}),
+        params=dict(row.get("params_json") or {}),
+        fields=tuple(row.get("fields_json") or ()),
+        allow_empty=bool(row.get("allow_empty")),
+        max_attempts=int(row.get("max_attempts") or 1),
+    )
+
+
+def _session_chunks(values: list[date], size: int) -> list[tuple[date, date]]:
+    return [
+        (values[offset], values[min(offset + size - 1, len(values) - 1)])
+        for offset in range(0, len(values), size)
+    ]
 
 
 def parse_date(value: str, *, latest: date | None = None) -> date:

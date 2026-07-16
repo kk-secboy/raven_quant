@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import case, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .database import open_database, row_dict, work_units
@@ -241,6 +241,89 @@ class CheckpointStore:
         statement = statement.order_by(work_units.c.dataset, work_units.c.unit_key)
         with self.engine.connect() as connection:
             return [row_dict(row) for row in connection.execute(statement)]
+
+    def unfinished_units(self, dataset: str | None = None) -> list[dict[str, Any]]:
+        """Return auditable pending/failed rows that an updated plan may supersede."""
+
+        statement = select(work_units).where(work_units.c.status.in_(("pending", "failed")))
+        if dataset:
+            statement = statement.where(work_units.c.dataset == dataset)
+        statement = statement.order_by(work_units.c.dataset, work_units.c.unit_key)
+        with self.engine.connect() as connection:
+            return [row_dict(row) for row in connection.execute(statement)]
+
+    def progress_summary(self, datasets: set[str]) -> dict[str, Any]:
+        """Return UI-safe checkpoint state without treating superseded units as planned work."""
+
+        if not datasets:
+            return {
+                "planned": 0,
+                "succeeded": 0,
+                "pending": 0,
+                "running": 0,
+                "retry_waiting": 0,
+                "terminal_failed": 0,
+                "rate_limited": 0,
+                "superseded": 0,
+                "rows": 0,
+                "next_retry_at": None,
+            }
+        retryable_failure = and_(
+            work_units.c.status == "failed",
+            work_units.c.attempts < work_units.c.max_attempts,
+        )
+        terminal_failure = and_(
+            work_units.c.status == "failed",
+            work_units.c.attempts >= work_units.c.max_attempts,
+        )
+        error_text = func.lower(func.coalesce(work_units.c.last_error, ""))
+        rate_limited_failure = and_(
+            retryable_failure,
+            or_(
+                error_text.like("%rate limit%"),
+                error_text.like("%too many request%"),
+                error_text.like("%frequency limit%"),
+                error_text.like("%限频%"),
+                error_text.like("%请求过于频繁%"),
+                error_text.like("%请求次数超限%"),
+                error_text.like("%每分钟%"),
+                error_text.like("%冷却%"),
+            ),
+        )
+        statement = select(
+            func.sum(case((work_units.c.status != "superseded", 1), else_=0)).label(
+                "planned"
+            ),
+            func.sum(case((work_units.c.status == "succeeded", 1), else_=0)).label(
+                "succeeded"
+            ),
+            func.sum(case((work_units.c.status == "pending", 1), else_=0)).label("pending"),
+            func.sum(case((work_units.c.status == "running", 1), else_=0)).label("running"),
+            func.sum(case((retryable_failure, 1), else_=0)).label("retry_waiting"),
+            func.sum(case((terminal_failure, 1), else_=0)).label("terminal_failed"),
+            func.sum(case((rate_limited_failure, 1), else_=0)).label("rate_limited"),
+            func.sum(case((work_units.c.status == "superseded", 1), else_=0)).label(
+                "superseded"
+            ),
+            func.coalesce(func.sum(work_units.c.row_count), 0).label("rows"),
+            func.min(case((retryable_failure, work_units.c.next_retry_at), else_=None)).label(
+                "next_retry_at"
+            ),
+        ).where(work_units.c.dataset.in_(sorted(datasets)))
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).one()
+        return {
+            "planned": int(row.planned or 0),
+            "succeeded": int(row.succeeded or 0),
+            "pending": int(row.pending or 0),
+            "running": int(row.running or 0),
+            "retry_waiting": int(row.retry_waiting or 0),
+            "terminal_failed": int(row.terminal_failed or 0),
+            "rate_limited": int(row.rate_limited or 0),
+            "superseded": int(row.superseded or 0),
+            "rows": int(row.rows or 0),
+            "next_retry_at": row.next_retry_at,
+        }
 
     def successful_units(self, unit_keys: Iterable[str]) -> list[dict[str, Any]]:
         """Return successful rows for an explicit plan without scanning all history."""

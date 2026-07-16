@@ -322,3 +322,56 @@ def test_verified_current_plan_ignores_superseded_failed_units(
 
     assert task["status"] == "succeeded"
     assert task["coverage"] == 100.0
+
+
+def test_task_card_exposes_adaptive_checkpoint_and_cooldown_state(
+    database_url: str, tmp_path: Path
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    retrying = FetchSpec(
+        dataset="etf_sh_cons",
+        api_name="etf_sh_cons",
+        scope={"ts_code": "510300.SH", "partition_start": "2024-01-01"},
+        params={"ts_code": "510300.SH", "start_date": "20240101"},
+        max_attempts=3,
+    )
+    obsolete = FetchSpec(
+        dataset="etf_sh_cons",
+        api_name="etf_sh_cons",
+        scope={"ts_code": "510300.SH", "trade_date": "20240102"},
+        params={"ts_code": "510300.SH", "trade_date": "20240102"},
+        max_attempts=3,
+    )
+    checkpoint.add([retrying])
+    claimed = checkpoint.claim({"etf_sh_cons"})
+    assert claimed is not None
+    checkpoint.fail(
+        claimed.unit_key,
+        "provider rate limit: requests per minute exceeded",
+        retry_after_seconds=180,
+    )
+    checkpoint.add([obsolete])
+    checkpoint.supersede_units([obsolete.unit_key], "repartitioned by adaptive child windows")
+
+    jobs = JobStore(database_url)
+    job = jobs.create(
+        "supplemental_cn_institutional",
+        {
+            "bundle": "cn_institutional",
+            "start": "2024-01-01",
+            "end": "2024-01-31",
+        },
+        tmp_path / "institutional.log",
+    )
+    assert jobs.claim_next()["id"] == job["id"]
+
+    store = DataTaskStore(database_url)
+    store.sync_catalog()
+    task = next(item for item in store.list() if item["task_key"] == "cn_institutional")
+
+    assert task["execution_phase"] == "rate_limit_cooldown"
+    assert task["unit_stats"]["retry_waiting"] == 1
+    assert task["unit_stats"]["rate_limited"] == 1
+    assert task["unit_stats"]["superseded"] == 1
+    assert task["unit_stats"]["next_retry_at"] is not None
+    assert "整段历史" in task["config"]["request_strategy"]

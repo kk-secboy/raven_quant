@@ -23,10 +23,10 @@ def _news_result(spec, rows):
     )
 
 
-def test_news_planner_uses_source_aware_half_day_windows() -> None:
+def test_news_planner_starts_with_one_whole_day_window_per_source() -> None:
     specs = news_specs(date(2024, 1, 2), date(2024, 1, 2), max_attempts=5)
 
-    assert len(specs) == len(NEWS_SOURCES) * 2
+    assert len(specs) == len(NEWS_SOURCES)
     assert {spec.params["src"] for spec in specs} == set(NEWS_SOURCES)
     assert {spec.scope["row_limit"] for spec in specs} == {1_500}
     assert {spec.fields for spec in specs} == {NEWS_FIELDS}
@@ -35,9 +35,9 @@ def test_news_planner_uses_source_aware_half_day_windows() -> None:
         for spec in specs
         if spec.params["src"] == "sina"
     } == {
-        ("00:00:00", "11:59:59"),
-        ("12:00:00", "23:59:59"),
+        ("00:00:00", "23:59:59"),
     }
+    assert {spec.scope["partition_axis"] for spec in specs} == {"datetime"}
 
 
 def test_news_validator_persists_source_and_deduplicates_response_rows() -> None:
