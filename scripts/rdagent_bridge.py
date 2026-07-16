@@ -12,10 +12,13 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+
+RDAGENT_COMMIT = "4f9ecb005881cddc08df0124a2e894c018007679"
 
 
 def _version() -> str:
@@ -24,7 +27,74 @@ def _version() -> str:
             return importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError:
             continue
-    return "source-checkout"
+    return "unknown"
+
+
+def _commit_from_version(version: str) -> str | None:
+    match = re.search(r"(?:\+g|\.g)([0-9a-f]{7,40})(?:\b|$)", version.lower())
+    if not match:
+        return None
+    candidate = match.group(1)
+    if RDAGENT_COMMIT.startswith(candidate):
+        return RDAGENT_COMMIT
+    return candidate if len(candidate) == 40 else None
+
+
+def _repo_commit(path: str | None) -> str | None:
+    if not path:
+        return None
+    root = Path(path)
+    if not (root / ".git").exists():
+        return None
+    try:
+        value = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip().lower()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return value if len(value) == 40 else None
+
+
+def _runtime_identity() -> dict[str, Any]:
+    version = _version()
+    environment_commit = str(os.getenv("RDAGENT_COMMIT") or "").lower()
+    if environment_commit and environment_commit != RDAGENT_COMMIT:
+        raise RuntimeError(
+            "RD-Agent configured commit does not match the validated pin: "
+            f"expected {RDAGENT_COMMIT}, got {environment_commit}"
+        )
+    if version == "unknown":
+        raise RuntimeError("RD-Agent runtime distribution version is unavailable")
+    verified = {
+        source: value
+        for source, value in {
+            "repository": _repo_commit(os.getenv("RDAGENT_REPO")),
+            "distribution": _commit_from_version(version),
+        }.items()
+        if value
+    }
+    if not verified:
+        raise RuntimeError(
+            "RD-Agent runtime commit has no verifiable repository or distribution evidence"
+        )
+    if len(set(verified.values())) != 1:
+        raise RuntimeError(f"RD-Agent runtime commit evidence disagrees: {verified}")
+    commit = next(iter(verified.values()))
+    if commit != RDAGENT_COMMIT:
+        raise RuntimeError(
+            "RD-Agent runtime commit is not the validated pin: "
+            f"expected {RDAGENT_COMMIT}, got {commit}"
+        )
+    return {
+        "name": "rdagent",
+        "version": version,
+        "commit": commit,
+        "commit_evidence": sorted(verified),
+    }
 
 
 def probe(args: argparse.Namespace) -> dict[str, Any]:
@@ -54,9 +124,12 @@ def probe(args: argparse.Namespace) -> dict[str, Any]:
             )
         except (OSError, subprocess.SubprocessError):
             docker_available = False
+    identity = _runtime_identity()
     return {
         "status": "ok",
-        "version": _version(),
+        "version": identity["version"],
+        "commit": identity["commit"],
+        "commit_evidence": identity["commit_evidence"],
         "python": os.sys.executable,
         "docker_available": docker_available,
         "qlib_data_ready": all(path.exists() for path in required),
@@ -190,6 +263,7 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
 
     result = {
         "status": "ok",
+        "rdagent_runtime": _runtime_identity(),
         "trace_path": str(trace),
         "rounds": len(rounds),
         "candidates": candidates,

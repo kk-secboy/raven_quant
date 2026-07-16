@@ -166,6 +166,12 @@ def test_role_permission_matrix_is_closed_by_default() -> None:
     assert has_permission(
         "operator", permission_for("POST", "/api/recommendation-portfolios")
     )
+    nav_review_permission = permission_for(
+        "POST",
+        "/api/simulation-portfolios/account-id/nav/2026-07-13/review",
+    )
+    assert has_permission("admin", nav_review_permission)
+    assert not has_permission("operator", nav_review_permission)
     assert has_permission("researcher", permission_for("POST", "/api/strategy-allocations"))
     assert not has_permission(
         "researcher",

@@ -155,8 +155,20 @@ export function StrategyDefaultsPanel({ api }: { api: string }) {
     <form onSubmit={save}>
       <section className="settings-card">
         <div className="card-heading"><div><span>PORTFOLIO CONSTRUCTION</span><strong>组合构建方式</strong></div></div>
-        <label>默认方式<select value={String(draft.portfolio_construction ?? "topk_equal_weight")} onChange={(event) => setDraft({ ...draft, portfolio_construction: event.target.value })}><option value="topk_equal_weight">Top-K 等权</option><option value="benchmark_relative_qp">基准相对优化</option></select></label>
-        <p>指数增强建议使用基准相对优化；波段策略可继续使用 Top-K 等权。</p>
+        <label>默认方式<select value={String(draft.portfolio_construction ?? "topk_equal_weight")} onChange={(event) => setDraft({ ...draft, portfolio_construction: event.target.value })}><option value="topk_equal_weight">Top-K 等权</option><option value="benchmark_relative_qp">指数增强 · 基准相对 QP</option><option value="industry_neutral_qp">全市场 · 行业中性 QP</option></select></label>
+        <p>指数增强使用基准相对优化；全市场核心使用行业中性优化；波段可继续使用 Top-K 等权。</p>
+      </section>
+      <section className="settings-card">
+        <div className="card-heading"><div><span>IMMUTABLE EXECUTION CONTRACT</span><strong>信号、调仓与执行频率</strong></div></div>
+        <div className="risk-grid">
+          <label>信号频率<select value={String(draft.signal_frequency ?? "day")} onChange={(event) => setDraft({ ...draft, signal_frequency: event.target.value })}>{["day", "1min", "5min", "15min", "30min", "60min"].map((item) => <option key={item}>{item}</option>)}</select></label>
+          <label>信号周期（Bar）<input type="number" min="1" max="1260" value={Number(draft.signal_period ?? 1)} onChange={(event) => setDraft({ ...draft, signal_period: Number(event.target.value) })} /></label>
+          <label>执行频率<select value={String(draft.execution_frequency ?? "day")} onChange={(event) => setDraft({ ...draft, execution_frequency: event.target.value })}>{["day", "1min", "5min", "15min", "30min", "60min"].map((item) => <option key={item}>{item}</option>)}</select></label>
+          <label>调仓频率<select value={String(draft.rebalance_frequency ?? "day")} onChange={(event) => setDraft({ ...draft, rebalance_frequency: event.target.value })}><option value="day">每日</option><option value="week">每周</option><option value="month">每月</option></select></label>
+          <label>目标波动率（%）<input type="number" min="0.1" max="50" step="0.5" value={Number(draft.target_volatility ?? 0.15) * 100} onChange={(event) => setDraft({ ...draft, target_volatility: Number(event.target.value) / 100 })} /></label>
+          <label>执行滞后（Bar）<input value="1 · 固定" disabled /></label>
+        </div>
+        <p>日线、1 分钟和 5 分钟可直接使用；15/30/60 分钟由 Qlib 重采样。保存时服务端会重新生成执行契约哈希。</p>
       </section>
       {groups.map((group) => <section key={group.title} className="settings-card">
         <div className="card-heading"><div><span>CONFIGURATION GROUP</span><strong>{group.title}</strong></div></div>
@@ -172,7 +184,7 @@ export function StrategyDefaultsPanel({ api }: { api: string }) {
           /></label>)}
         </div>
       </section>)}
-      <div className="execution-note"><b>固定安全语义</b><span>执行模型始终为 next_open；实盘开关、密钥和部署硬上限不能在这里放宽。</span></div>
+      <div className="execution-note"><b>固定安全语义</b><span>执行始终滞后一 Bar，禁止同 Bar 成交；实盘开关、QMT 和部署硬上限不能在这里放宽。</span></div>
       <label>修改理由<textarea minLength={10} maxLength={2000} value={reason} onChange={(event) => setReason(event.target.value)} placeholder="至少 10 个字符，说明为什么调整默认参数。" /></label>
       <button className="primary" disabled={saving || reason.trim().length < 10}>{saving ? "保存中……" : "保存为新的默认模板版本"}</button>
     </form>

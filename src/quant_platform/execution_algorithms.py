@@ -12,8 +12,8 @@ ASHARE_SESSIONS = ((time(10, 0), time(11, 20)), (time(13, 30), time(14, 50)))
 def normalize_execution_policy(config: dict[str, Any] | None = None) -> dict[str, Any]:
     raw = config or {}
     algorithm = str(raw.get("execution_algorithm", "twap")).strip().lower()
-    if algorithm not in {"twap", "vwap"}:
-        raise ValueError("execution_algorithm must be twap or vwap")
+    if algorithm not in {"twap", "vwap", "next_bar"}:
+        raise ValueError("execution_algorithm must be twap, vwap, or next_bar")
     slice_minutes = int(raw.get("slice_minutes", 20))
     if slice_minutes < 5 or slice_minutes > 30 or slice_minutes % 5:
         raise ValueError("slice_minutes must be a multiple of 5 between 5 and 30")
@@ -26,6 +26,11 @@ def normalize_execution_policy(config: dict[str, Any] | None = None) -> dict[str
     profile = raw.get("volume_profile")
     if profile is not None and not isinstance(profile, list):
         raise ValueError("volume_profile must be a list")
+    execution_frequency = str(
+        raw.get("execution_frequency") or raw.get("frequency") or "5min"
+    ).strip()
+    if execution_frequency not in {"1min", "5min"}:
+        raise ValueError("execution_frequency must be 1min or 5min")
     cash_tolerance = float(raw.get("cash_tolerance", 1.0))
     equity_tolerance = float(raw.get("equity_tolerance", 10.0))
     position_tolerance = float(raw.get("position_tolerance", 0.0))
@@ -39,6 +44,7 @@ def normalize_execution_policy(config: dict[str, Any] | None = None) -> dict[str
         "slice_minutes": slice_minutes,
         "max_slices": max_slices,
         "max_participation": max_participation,
+        "execution_frequency": execution_frequency,
         "lot_size": 100,
         "sessions": [["10:00", "11:20"], ["13:30", "14:50"]],
         "volume_profile": profile,
@@ -55,6 +61,7 @@ def build_execution_slices(
     side: str,
     trade_date: date,
     policy: dict[str, Any],
+    signal_at: datetime | None = None,
 ) -> list[dict[str, Any]]:
     normalized = normalize_execution_policy(policy)
     integer_quantity = int(quantity)
@@ -67,7 +74,16 @@ def build_execution_slices(
     if normalized_side == "buy" and integer_quantity % lot_size:
         raise ValueError("A-share buy quantity must be a multiple of 100 shares")
 
-    if normalized["execution_algorithm"] == "twap":
+    if normalized["execution_algorithm"] == "next_bar":
+        slots = [
+            _next_bar_slot(
+                trade_date,
+                signal_at=signal_at,
+                frequency=str(normalized["execution_frequency"]),
+            )
+        ]
+        weights = [1.0]
+    elif normalized["execution_algorithm"] == "twap":
         slots = _twap_slots(
             trade_date,
             int(normalized["slice_minutes"]),
@@ -114,15 +130,59 @@ def build_execution_slices(
     return result
 
 
-def execution_time_slots(*, trade_date: date, policy: dict[str, Any]) -> list[datetime]:
+def execution_time_slots(
+    *,
+    trade_date: date,
+    policy: dict[str, Any],
+    signal_at: datetime | None = None,
+) -> list[datetime]:
     """Return the configured intraday slice timestamps without requiring an order quantity."""
 
     normalized = normalize_execution_policy(policy)
+    if normalized["execution_algorithm"] == "next_bar":
+        return [
+            _next_bar_slot(
+                trade_date,
+                signal_at=signal_at,
+                frequency=str(normalized["execution_frequency"]),
+            )
+        ]
     return _twap_slots(
         trade_date,
         int(normalized["slice_minutes"]),
         int(normalized["max_slices"]),
     )
+
+
+def _next_bar_slot(
+    trade_date: date,
+    *,
+    signal_at: datetime | None,
+    frequency: str,
+) -> datetime:
+    interval_minutes = 1 if frequency == "1min" else 5
+    slots: list[datetime] = []
+    for start, end in ASHARE_SESSIONS:
+        current = datetime.combine(trade_date, start, ASHARE_TIMEZONE)
+        boundary = datetime.combine(trade_date, end, ASHARE_TIMEZONE)
+        while current <= boundary:
+            slots.append(current)
+            current += timedelta(minutes=interval_minutes)
+    if signal_at is None:
+        return slots[0]
+    normalized_signal = (
+        signal_at.replace(tzinfo=ASHARE_TIMEZONE)
+        if signal_at.tzinfo is None
+        else signal_at.astimezone(ASHARE_TIMEZONE)
+    )
+    if normalized_signal.date() > trade_date:
+        raise ValueError("next-bar signal timestamp is after the execution date")
+    if normalized_signal.date() < trade_date:
+        return slots[0]
+    next_slot = next((slot for slot in slots if slot > normalized_signal), None)
+    if next_slot is None:
+        raise ValueError("next-bar signal has no later execution bar in the governed window")
+    return next_slot
 
 
 def _twap_slots(trade_date: date, interval_minutes: int, max_slices: int) -> list[datetime]:

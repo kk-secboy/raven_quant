@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
-from .risk_math import COVARIANCE_MODEL_VERSION, regularize_covariance
+from .risk_math import COVARIANCE_MODEL_VERSION, validate_covariance
 
 
 @dataclass(frozen=True)
@@ -15,6 +15,7 @@ class PortfolioOptimizationResult:
     weights: pd.Series
     objective: float
     tracking_risk: float
+    portfolio_volatility: float
     covariance_model_version: str
     active_share: float
     expected_turnover: float
@@ -42,6 +43,7 @@ def optimize_benchmark_relative_weights(
     alpha_weight: float = 0.05,
     tracking_penalty: float = 1.0,
     turnover_penalty: float = 0.10,
+    max_tracking_error: float = 1.0,
 ) -> PortfolioOptimizationResult:
     """Assign long-only weights to a governed candidate set relative to a benchmark.
 
@@ -62,6 +64,8 @@ def optimize_benchmark_relative_weights(
         raise ValueError("optimizer size limit must be non-negative")
     if min(alpha_weight, tracking_penalty, turnover_penalty) < 0:
         raise ValueError("optimizer objective weights must be non-negative")
+    if not 0 < max_tracking_error <= 1:
+        raise ValueError("optimizer tracking-error limit must be between zero and one")
     if tracking_penalty == 0 and alpha_weight == 0 and turnover_penalty == 0:
         raise ValueError("optimizer objective must contain a positive weight")
 
@@ -113,7 +117,7 @@ def optimize_benchmark_relative_weights(
     covariance = covariance.reindex(index=risk_universe, columns=risk_universe)
     if covariance.isna().any().any():
         raise ValueError("optimizer return covariance is incomplete")
-    annual_covariance = regularize_covariance(covariance.to_numpy(dtype=float)) * 252.0
+    annual_covariance = validate_covariance(covariance.to_numpy(dtype=float)) * 252.0
     selected_locations = np.array([risk_universe.get_loc(item) for item in instruments], dtype=int)
     benchmark_risk = pd.to_numeric(benchmark_weights, errors="coerce")
     benchmark_risk.index = benchmark_risk.index.astype(str)
@@ -146,7 +150,18 @@ def optimize_benchmark_relative_weights(
             "type": "eq",
             "fun": lambda weights: float(weights.sum() - 1.0),
             "jac": lambda weights: np.ones_like(weights),
-        }
+        },
+        {
+            "type": "ineq",
+            "fun": lambda weights: float(
+                max_tracking_error**2
+                - active_risk_vector(weights) @ annual_covariance @ active_risk_vector(weights)
+            ),
+            "jac": lambda weights: (
+                -2.0
+                * (annual_covariance @ active_risk_vector(weights))[selected_locations]
+            ),
+        },
     ]
     industry_names = list(dict.fromkeys([*industry.tolist(), *benchmark_industries.index]))
     for name in industry_names:
@@ -231,10 +246,16 @@ def optimize_benchmark_relative_weights(
     active = weights - benchmark
     full_active = active_risk_vector(weights.to_numpy(dtype=float))
     tracking_risk = float(np.sqrt(max(0.0, full_active @ annual_covariance @ full_active)))
+    portfolio_risk = np.zeros(len(risk_universe), dtype=float)
+    portfolio_risk[selected_locations] = weights.to_numpy(dtype=float)
+    portfolio_volatility = float(
+        np.sqrt(max(0.0, portfolio_risk @ annual_covariance @ portfolio_risk))
+    )
     return PortfolioOptimizationResult(
         weights=weights[weights > 0].sort_values(ascending=False),
         objective=float(result.fun),
         tracking_risk=tracking_risk,
+        portfolio_volatility=portfolio_volatility,
         covariance_model_version=COVARIANCE_MODEL_VERSION,
         active_share=0.5 * (float(active.abs().sum()) + omitted_benchmark_weight),
         expected_turnover=0.5 * (float((weights - previous).abs().sum()) + previous_cash),

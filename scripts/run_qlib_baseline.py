@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from quant_platform.qlib_workflow import (
+    qlib_workflow_run,
+    require_qlib_workflow_identity,
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a reproducible Qlib Alpha158 baseline")
@@ -64,7 +69,6 @@ def main() -> None:
     from qlib.contrib.strategy import TopkDropoutStrategy
     from qlib.data import D
     from qlib.data.dataset import DatasetH
-    from qlib.workflow import R
 
     provider_uri = Path(args.provider_uri).resolve()
     provenance_path = provider_uri / "metadata" / "provenance.json"
@@ -76,8 +80,13 @@ def main() -> None:
         completed = output / "result.json"
         if completed.exists():
             result = json.loads(completed.read_text(encoding="utf-8"))
-            print(json.dumps(result, ensure_ascii=False))
-            return
+            try:
+                require_qlib_workflow_identity(result.get("qlib_workflow"))
+            except ValueError:
+                pass
+            else:
+                print(json.dumps(result, ensure_ascii=False))
+                return
         shutil.rmtree(output)
     output.mkdir(parents=True, exist_ok=False)
     qlib.init(provider_uri=str(provider_uri), region=REG_CN)
@@ -116,23 +125,29 @@ def main() -> None:
         num_boost_round=300,
         early_stopping_rounds=30,
     )
-    experiment_name = f"quantlab-{datetime.now(timezone.utc):%Y%m%d}"  # noqa: UP017
-    with R.start(experiment_name=experiment_name, uri=args.tracking_uri):
-        R.log_params(
-            model="lightgbm",
-            features="Alpha158",
-            market=args.market,
-            benchmark=args.benchmark,
-            account=args.account,
-            topk=args.topk,
-            n_drop=args.n_drop,
-            open_cost=args.open_cost,
-            close_cost=args.close_cost,
+    workflow = qlib_workflow_run(
+        run_kind="model-baseline",
+        run_id=output.name,
+        tracking_uri=args.tracking_uri,
+        dataset_identity_sha256=dataset_provenance.get("dataset_identity_sha256"),
+    )
+    with workflow:
+        workflow.log_params(
+            {
+                "model": "lightgbm",
+                "features": "Alpha158",
+                "market": args.market,
+                "benchmark": args.benchmark,
+                "account": args.account,
+                "topk": args.topk,
+                "n_drop": args.n_drop,
+                "open_cost": args.open_cost,
+                "close_cost": args.close_cost,
+            }
         )
         model.fit(dataset)
-        recorder = R.get_recorder()
-        recorder_id = recorder.id
-        training_metrics = recorder.list_metrics()
+        recorder_id = workflow.identity_dict()["recorder_id"]
+        training_metrics = workflow.list_metrics()
 
     predictions = model.predict(dataset, segment="test").rename("score")
     labels = dataset.prepare("test", col_set="label")
@@ -189,6 +204,7 @@ def main() -> None:
         "market": args.market,
         "benchmark": args.benchmark,
         "recorder_id": recorder_id,
+        "qlib_workflow": workflow.identity_dict(),
         "segments": {
             name: [str(pd.Timestamp(bounds[0]).date()), str(pd.Timestamp(bounds[1]).date())]
             for name, bounds in segments.items()
@@ -200,7 +216,8 @@ def main() -> None:
             "dataset_identity_sha256": dataset_provenance.get("dataset_identity_sha256"),
             "snapshot_manifest_sha256": dataset_provenance.get("snapshot_manifest_sha256"),
             "qlib_builder_sha256": dataset_provenance.get("qlib_builder_sha256"),
-            "qlib_version": getattr(qlib, "__version__", "unknown"),
+            "qlib_version": workflow.identity_dict()["qlib_version"],
+            "qlib_commit": workflow.identity_dict()["qlib_commit"],
             "baseline_config_sha256": hashlib.sha256(
                 json.dumps(
                     {
@@ -226,9 +243,12 @@ def main() -> None:
             "daily_ic.parquet",
         ],
     }
-    (output / "result.json").write_text(
-        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    with workflow:
+        workflow.log_metrics(metrics)
+        (output / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        workflow.save_artifacts(output)
     print(json.dumps(result, ensure_ascii=False))
 
 

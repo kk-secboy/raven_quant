@@ -16,12 +16,14 @@ def test_catalog_is_ordered_and_dependency_aware(database_url: str) -> None:
 
     tasks = store.list()
     assert tasks[0]["task_key"] == "cn_ashare_daily_full"
-    assert tasks[-1]["task_key"] == "tick_level2"
+    assert tasks[-1]["task_key"] == "strategy_specialty_minutes"
     assert tasks[1]["task_key"] == "cn_data_verify"
     assert tasks[1]["depends_on"] == ["cn_ashare_daily_full"]
     assert tasks[5]["depends_on"] == ["cn_qlib_baseline"]
     assert tasks[5]["dependencies_satisfied"] is False
-    assert tasks[-1]["implementation_status"] == "external_source_required"
+    assert all(item["source"] in {"Tushare", "QuantLab", "Qlib"} for item in tasks)
+    assert all(item["config"]["frequency"] != "tick" for item in tasks)
+    assert "tick_level2" not in {item["task_key"] for item in tasks}
 
 
 def test_supplemental_task_catalog_matches_real_downloader_contracts() -> None:

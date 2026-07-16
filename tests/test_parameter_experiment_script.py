@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from qlib_test_doubles import qlib_workflow_identity
 
 pytestmark = pytest.mark.no_database
 
@@ -26,6 +27,7 @@ def test_completed_segment_is_reused_only_when_period_and_config_match(
     periods = {"start": "2024-01-01", "end": "2024-12-31"}
     result = {
         "periods": periods,
+        "qlib_workflow": qlib_workflow_identity(),
         "metrics": {
             "backtest_engine": "qlib",
             "qlib_native_backtest": True,

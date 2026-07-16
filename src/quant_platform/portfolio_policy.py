@@ -12,6 +12,33 @@ from .portfolio_optimizer import optimize_benchmark_relative_weights
 POLICY_VERSION = "portfolio-policy-v2"
 
 
+def rebalance_period_key(value: Any, frequency: str) -> tuple[int, ...]:
+    timestamp = pd.Timestamp(value).tz_localize(None)
+    if frequency == "bar":
+        return (
+            timestamp.year,
+            timestamp.month,
+            timestamp.day,
+            timestamp.hour,
+            timestamp.minute,
+        )
+    if frequency == "day":
+        return (timestamp.year, timestamp.month, timestamp.day)
+    if frequency == "week":
+        iso = timestamp.isocalendar()
+        return (int(iso.year), int(iso.week))
+    if frequency == "month":
+        return (timestamp.year, timestamp.month)
+    raise ValueError("rebalance frequency must be bar, day, week, or month")
+
+
+def is_rebalance_due(current: Any, previous_rebalance: Any | None, frequency: str) -> bool:
+    current_key = rebalance_period_key(current, frequency)
+    return previous_rebalance is None or current_key != rebalance_period_key(
+        previous_rebalance, frequency
+    )
+
+
 @dataclass(frozen=True)
 class PortfolioPolicyConfig:
     topk: int = 50
@@ -20,6 +47,7 @@ class PortfolioPolicyConfig:
     max_daily_turnover: float = 0.15
     max_industry_weight: float = 0.30
     max_industry_deviation: float = 0.03
+    max_tracking_error: float = 0.12
     max_size_deviation: float = 0.30
     max_value_deviation: float = 0.30
     max_growth_deviation: float = 0.30
@@ -38,6 +66,8 @@ class PortfolioPolicyConfig:
     optimizer_alpha_weight: float = 0.05
     optimizer_tracking_penalty: float = 1.0
     optimizer_turnover_penalty: float = 0.10
+    target_volatility: float | None = None
+    rebalance_frequency: str = "day"
 
     @classmethod
     def from_mapping(cls, values: dict[str, Any]) -> PortfolioPolicyConfig:
@@ -60,8 +90,19 @@ class PortfolioPolicyConfig:
             raise ValueError("drawdown reduction exposure is invalid")
         if not 1 <= self.execution_days <= 5:
             raise ValueError("execution days must be between one and five")
-        if self.execution_method not in {"open", "twap", "vwap"}:
-            raise ValueError("execution method must be open, twap, or vwap")
+        if self.execution_method not in {"open", "twap", "vwap", "next_bar"}:
+            raise ValueError("execution method must be open, twap, vwap, or next_bar")
+        if self.portfolio_construction not in {
+            "topk_equal_weight",
+            "benchmark_relative_qp",
+            "industry_neutral_qp",
+        }:
+            raise ValueError("unsupported portfolio construction method")
+        if not 0 < self.max_tracking_error <= 1:
+            raise ValueError("tracking-error limit must be between zero and one")
+        if self.target_volatility is not None and not 0 < self.target_volatility <= 0.50:
+            raise ValueError("target volatility must be between zero and 0.50")
+        rebalance_period_key("2026-01-01", self.rebalance_frequency)
 
 
 @dataclass(frozen=True)
@@ -107,12 +148,14 @@ class PortfolioPolicy:
         average_daily_values: pd.Series | None = None,
         portfolio_value: float | None = None,
         risk_exposure: float = 1.0,
+        allow_new_risk: bool = True,
         current_prices: pd.Series | None = None,
         cost_basis: pd.Series | dict[str, float] | None = None,
         take_profit_stages: dict[str, int] | None = None,
         execution_state: dict[str, Any] | None = None,
         portfolio_drawdown: float = 0.0,
         daily_return: float = 0.0,
+        rebalance_due: bool = True,
     ) -> PolicyDecision:
         signal = pd.to_numeric(scores, errors="coerce").dropna().astype(float)
         signal.index = signal.index.astype(str)
@@ -168,7 +211,11 @@ class PortfolioPolicy:
         if selected_scores.empty:
             raise ValueError("policy has no eligible instruments")
 
-        if self.config.portfolio_construction == "benchmark_relative_qp":
+        target_volatility_evidence: dict[str, float] = {}
+        if self.config.portfolio_construction in {
+            "benchmark_relative_qp",
+            "industry_neutral_qp",
+        }:
             required = (
                 industries,
                 benchmark_weights,
@@ -179,7 +226,7 @@ class PortfolioPolicy:
             )
             if any(item is None for item in required):
                 raise ValueError(
-                    "benchmark-relative policy requires complete point-in-time metadata"
+                    "constrained Qlib policy requires complete point-in-time target metadata"
                 )
             optimized = optimize_benchmark_relative_weights(
                 selected_scores,
@@ -204,11 +251,32 @@ class PortfolioPolicy:
                 alpha_weight=self.config.optimizer_alpha_weight,
                 tracking_penalty=self.config.optimizer_tracking_penalty,
                 turnover_penalty=self.config.optimizer_turnover_penalty,
+                max_tracking_error=self.config.max_tracking_error,
             )
             target = optimized.weights
+            if (
+                self.config.portfolio_construction == "industry_neutral_qp"
+                and self.config.target_volatility is not None
+            ):
+                if optimized.portfolio_volatility <= 0:
+                    raise ValueError("target-volatility scaling requires positive portfolio risk")
+                exposure_scale = min(
+                    1.0,
+                    self.config.target_volatility / optimized.portfolio_volatility,
+                )
+                target *= exposure_scale
+                target_volatility_evidence = {
+                    "unscaled_annualized_volatility": optimized.portfolio_volatility,
+                    "target_annualized_volatility": self.config.target_volatility,
+                    "exposure_scale": exposure_scale,
+                }
         else:
             target_weight = min(1.0 / len(selected_scores), self.config.max_position_weight)
             target = pd.Series(target_weight, index=selected_scores.index, dtype=float)
+
+        cadence_hold = not rebalance_due
+        if cadence_hold:
+            target = previous.reindex(target.index.union(previous.index), fill_value=0.0)
 
         if portfolio_drawdown <= -self.config.max_drawdown_liquidate:
             target *= 0.0
@@ -234,6 +302,16 @@ class PortfolioPolicy:
         all_instruments = target.index.union(previous.index)
         target = target.reindex(all_instruments, fill_value=0.0)
         previous = previous.reindex(all_instruments, fill_value=0.0)
+        if not allow_new_risk:
+            target = pd.concat([target, previous], axis=1).min(axis=1)
+            risk_events.append(
+                self._risk_event(
+                    "member_drawdown_pause_new_risk",
+                    1.0,
+                    1.0,
+                    "no_new_buys",
+                )
+            )
         if current_prices is not None:
             marks = pd.to_numeric(current_prices, errors="coerce").reindex(all_instruments)
             for instrument in previous[previous > 0].index:
@@ -381,12 +459,18 @@ class PortfolioPolicy:
             if abs(float(delta)) > 1e-10
         ]
         reasons = ["ranked signal", "position cap", "turnover cap"]
+        if cadence_hold:
+            reasons.append(f"{self.config.rebalance_frequency} rebalance cadence hold")
         if self.config.execution_days > 1:
             reasons.append(
                 f"{self.config.execution_method} execution over {self.config.execution_days} days"
             )
         if risk_exposure < 1:
             reasons.append("risk exposure reduction")
+        if target_volatility_evidence:
+            reasons.append("target volatility exposure scaling")
+        if not allow_new_risk:
+            reasons.append("member drawdown gate pauses new risk")
         reasons.extend(str(item["rule"]) for item in risk_events)
         return PolicyDecision(
             target_weights={key: float(value) for key, value in target[target > 0].items()},
@@ -399,6 +483,11 @@ class PortfolioPolicy:
             position_state={
                 "take_profit_stages": stages,
                 "execution": next_execution_state,
+                **(
+                    {"target_volatility": target_volatility_evidence}
+                    if target_volatility_evidence
+                    else {}
+                ),
             },
         )
 

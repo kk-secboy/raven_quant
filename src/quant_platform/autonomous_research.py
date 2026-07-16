@@ -8,6 +8,12 @@ from quant_data.config import Settings
 from .cost_model import CostModelConfig
 from .job_store import JobStore
 from .parameter_experiment_store import ParameterExperimentStore
+from .qlib_factor_baseline import (
+    FACTOR_SOURCE_QLIB_BASELINE,
+    FACTOR_SOURCE_QLIB_BASELINE_PLUS_CHALLENGER,
+    FACTOR_SOURCE_QLIB_CHALLENGER_REPLACEMENT,
+    QLIB_BASELINE_RECIPE_IDS,
+)
 from .recommendation_store import RecommendationStore
 from .research_automation import rank_factor_candidates
 from .research_campaign_store import ResearchCampaignStore
@@ -249,20 +255,79 @@ class AutonomousResearchOrchestrator:
         strategy = self.strategies.get_by_name(campaign["name"])
         if strategy is not None and strategy["created_by"] != actor:
             raise ValueError("strategy name is already owned by another workflow")
-        if strategy is None:
-            strategy = self.strategies.create(
-                name=campaign["name"],
-                description=(
-                    "Autonomous governed research campaign. Final recommendation "
-                    "admission remains subject to explicit human approval."
+        strategy_config = dict(campaign["config"]["strategy_config"])
+        if campaign["recipe_id"] in QLIB_BASELINE_RECIPE_IDS:
+            requested_mode = str(strategy_config.get("factor_source_mode") or "")
+            if requested_mode not in {
+                FACTOR_SOURCE_QLIB_BASELINE_PLUS_CHALLENGER,
+                FACTOR_SOURCE_QLIB_CHALLENGER_REPLACEMENT,
+            }:
+                requested_mode = FACTOR_SOURCE_QLIB_BASELINE_PLUS_CHALLENGER
+            requested_weight = float(strategy_config.get("challenger_weight") or 0.0)
+            if requested_mode == FACTOR_SOURCE_QLIB_CHALLENGER_REPLACEMENT:
+                requested_weight = 1.0
+            elif not 0.0 < requested_weight < 1.0:
+                requested_weight = 0.30
+            if strategy is None:
+                strategy = self.strategies.create(
+                    name=campaign["name"],
+                    description=(
+                        "Autonomous governed research campaign. The immutable Qlib "
+                        "baseline is version 1; RD-Agent challengers require later versions."
+                    ),
+                    benchmark=campaign["benchmark"],
+                    universe=campaign["universe"],
+                    factors=[],
+                    config={
+                        **strategy_config,
+                        "factor_source_mode": FACTOR_SOURCE_QLIB_BASELINE,
+                        "challenger_weight": 0.0,
+                    },
+                    actor=actor,
+                )
+            strategy = self.strategies.get(strategy["id"])
+            candidate_ids = {item["candidate_id"] for item in factors}
+            baseline_version = next(
+                (
+                    version
+                    for version in strategy["versions"]
+                    if version["created_by"] == actor
+                    and version["config"].get("factor_source_mode") == requested_mode
+                    and {
+                        item["factor_candidate_id"] for item in version["factors"]
+                    }
+                    == candidate_ids
                 ),
-                benchmark=campaign["benchmark"],
-                universe=campaign["universe"],
-                factors=factors,
-                config=campaign["config"]["strategy_config"],
-                actor=actor,
+                None,
             )
-        baseline_version = strategy["versions"][0]
+            if baseline_version is None:
+                baseline_version = self.strategies.create_version(
+                    strategy["id"],
+                    benchmark=campaign["benchmark"],
+                    universe=campaign["universe"],
+                    factors=factors,
+                    config={
+                        **strategy_config,
+                        "factor_source_mode": requested_mode,
+                        "challenger_weight": requested_weight,
+                    },
+                    actor=actor,
+                )
+        else:
+            if strategy is None:
+                strategy = self.strategies.create(
+                    name=campaign["name"],
+                    description=(
+                        "Autonomous governed research campaign. Final recommendation "
+                        "admission remains subject to explicit human approval."
+                    ),
+                    benchmark=campaign["benchmark"],
+                    universe=campaign["universe"],
+                    factors=factors,
+                    config=strategy_config,
+                    actor=actor,
+                )
+            baseline_version = strategy["versions"][0]
         config = campaign["config"]
         experiment = self.experiments.create(
             strategy_version_id=baseline_version["id"],

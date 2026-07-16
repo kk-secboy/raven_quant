@@ -4,6 +4,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+from qlib_test_doubles import qlib_workflow_identity
 
 from quant_platform.research_store import ResearchStore
 
@@ -75,6 +76,7 @@ def _write_evaluation_artifact(path: Path, candidate_id: str, metrics: dict) -> 
         json.dumps(
             {
                 "status": "ok",
+                "qlib_workflow": qlib_workflow_identity(),
                 "evaluations": [{"candidate_id": candidate_id, "status": "ok", "metrics": metrics}],
             },
             ensure_ascii=False,

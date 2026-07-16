@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -14,11 +15,26 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from quant_data.execution_contract import require_daily_qlib_contract
+from quant_data.execution_contract import (
+    require_daily_qlib_contract,
+    require_minute_execution_contract,
+    require_strategy_execution_contract,
+)
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.eligibility import eligibility_statistics
-from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
+from quant_platform.portfolio_policy import (
+    PortfolioPolicy,
+    PortfolioPolicyConfig,
+    is_rebalance_due,
+)
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
+from quant_platform.qlib_factor_baseline import (
+    FACTOR_SOURCE_PROMOTED_ONLY,
+    combine_factor_sources,
+    normalize_qlib_baseline_values,
+)
+from quant_platform.qlib_workflow import qlib_workflow_run
+from quant_platform.risk_math import estimate_covariance
 from quant_platform.strategy_backtest import build_governed_signal, compose_factor_scores
 
 
@@ -29,6 +45,121 @@ def _load(path: str) -> pd.DataFrame:
     if source.suffix.lower() == ".parquet":
         return pd.read_parquet(source)
     raise ValueError(f"unsupported factor artifact: {source}")
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _write_qlib_order_plan(
+    *,
+    manifest: dict[str, Any],
+    result: dict[str, Any],
+    dataset_provenance: dict[str, Any],
+    order_plan_root: Path,
+    tracking_uri: str,
+) -> dict[str, Any]:
+    target_payload = {
+        "target_weights": dict(
+            sorted(
+                (
+                    str(item["instrument"]).upper(),
+                    float(item["weight"]),
+                )
+                for item in result["holdings"]
+            )
+        )
+    }
+    target_bytes = _canonical_bytes(target_payload)
+    target_file_sha256 = _sha256_bytes(target_bytes)
+    signal_at = manifest.get("signal_at")
+    signal_date = str(manifest.get("signal_date") or result["as_of_date"])
+    plan = {
+        "format_version": "qlib-order-plan-v1",
+        "produced_by": "qlib-workflow-recorder",
+        "source_type": "strategy_version",
+        "source_id": manifest["strategy_version_id"],
+        "formal_backtest_id": manifest["formal_backtest_id"],
+        "execution_contract_hash": manifest["config"]["execution_contract_hash"],
+        "daily_dataset": manifest["dataset"],
+        "signal_date": signal_date,
+        "trade_date": result["effective_date"],
+        "source_snapshot": {
+            "id": dataset_provenance["dataset_identity_sha256"],
+            "dataset_identity_sha256": dataset_provenance[
+                "dataset_identity_sha256"
+            ],
+            "dataset_lineage_id": dataset_provenance["dataset_lineage_id"],
+        },
+        "target_weights_file_sha256": target_file_sha256,
+        "target_weights_sha256": _sha256_bytes(target_bytes),
+    }
+    if signal_at is not None:
+        plan["signal_at"] = str(signal_at)
+    if manifest.get("execution_not_before") is not None:
+        plan["execution_not_before"] = str(manifest["execution_not_before"])
+    if isinstance(manifest.get("signal_dataset"), dict):
+        plan["signal_snapshot"] = dict(manifest["signal_dataset"])
+    run_id = str(manifest["order_plan_job_id"])
+    with qlib_workflow_run(
+        run_kind="simulation-order-plan",
+        run_id=run_id,
+        tracking_uri=tracking_uri,
+        dataset_identity_sha256=dataset_provenance["dataset_identity_sha256"],
+    ) as workflow:
+        workflow.log_params(
+            {
+                "simulation_portfolio_id": manifest["simulation_portfolio_id"],
+                "strategy_version_id": manifest["strategy_version_id"],
+                "formal_backtest_id": manifest["formal_backtest_id"],
+                "dataset": manifest["dataset"],
+                "signal_date": signal_date,
+                "signal_at": signal_at,
+                "execution_contract_hash": manifest["config"][
+                    "execution_contract_hash"
+                ],
+            }
+        )
+        plan["qlib_workflow"] = workflow.identity_dict()
+        manifest_bytes = _canonical_bytes(plan)
+        manifest_sha256 = _sha256_bytes(manifest_bytes)
+        artifact = (order_plan_root / manifest_sha256).resolve()
+        allowed_root = order_plan_root.resolve()
+        try:
+            artifact.relative_to(allowed_root)
+        except ValueError as exc:
+            raise ValueError("Qlib order-plan output path is unsafe") from exc
+        artifact.mkdir(parents=True, exist_ok=True)
+        manifest_path = artifact / "manifest.json"
+        target_path = artifact / "target_weights.json"
+        for path, expected in (
+            (manifest_path, manifest_bytes),
+            (target_path, target_bytes),
+        ):
+            if path.exists() and path.read_bytes() != expected:
+                raise ValueError(
+                    "Qlib order-plan retry encountered different immutable content"
+                )
+            path.write_bytes(expected)
+        workflow.log_metrics(
+            {
+                "target_count": len(target_payload["target_weights"]),
+                "target_weight_sum": sum(target_payload["target_weights"].values()),
+            }
+        )
+        workflow.save_artifacts(artifact)
+    return {
+        **result,
+        "order_plan_manifest_sha256": manifest_sha256,
+        "order_plan_artifact_path": str(artifact),
+        "qlib_workflow": plan["qlib_workflow"],
+    }
 
 
 def _latest(frame: pd.DataFrame, when: pd.Timestamp, column: str) -> pd.Series:
@@ -70,18 +201,103 @@ def main() -> None:
     parser.add_argument("--provider-uri", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--tracking-uri")
+    parser.add_argument("--order-plan-root")
+    parser.add_argument("--signal-provider-uri")
     args = parser.parse_args()
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     provenance_path = Path(args.provider_uri) / "metadata" / "provenance.json"
     if not provenance_path.exists():
         raise ValueError("recommendation refresh requires dataset provenance metadata")
-    require_daily_qlib_contract(json.loads(provenance_path.read_text(encoding="utf-8")))
-    as_of = pd.Timestamp(manifest["as_of_date"]).tz_localize(None)
-    factors = [
-        (_load(item["values_path"]), float(item["weight"]), int(item["direction"]))
-        for item in manifest["factors"]
-    ]
-    scores = compose_factor_scores(factors)
+    dataset_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    require_daily_qlib_contract(dataset_provenance)
+    as_of = pd.Timestamp(
+        manifest.get("signal_at") or manifest["as_of_date"]
+    ).tz_localize(None)
+
+    import qlib
+    from qlib.data import D
+
+    config = manifest["config"]
+    require_strategy_execution_contract(config)
+    signal_frequency = str(config.get("signal_frequency") or "day").lower()
+    signal_provider_uri = args.signal_provider_uri or args.provider_uri
+    if signal_frequency != "day":
+        if not args.signal_provider_uri:
+            raise ValueError(
+                "minute simulation order-plan requires a Qlib signal provider"
+            )
+        signal_provenance_path = (
+            Path(signal_provider_uri) / "metadata" / "provenance.json"
+        )
+        if not signal_provenance_path.exists():
+            raise ValueError("minute Qlib signal dataset has no provenance metadata")
+        signal_provenance = json.loads(
+            signal_provenance_path.read_text(encoding="utf-8")
+        )
+        require_minute_execution_contract(
+            signal_provenance,
+            frequency=signal_frequency,
+            simulation_eligible=True,
+        )
+        expected_signal = dict(manifest.get("signal_dataset") or {})
+        if Path(signal_provider_uri).name != str(expected_signal.get("name") or ""):
+            raise ValueError(
+                "minute Qlib signal provider name does not match the order-plan manifest"
+            )
+        for field in (
+            "dataset_identity_sha256",
+            "dataset_lineage_id",
+            "source_lineage_id",
+            "frequency",
+        ):
+            if str(signal_provenance.get(field) or "") != str(
+                expected_signal.get(field) or ""
+            ):
+                raise ValueError(
+                    "minute Qlib signal dataset does not match the order-plan manifest"
+                )
+    qlib.init(provider_uri=signal_provider_uri, region="cn")
+    challenger = None
+    if manifest["factors"]:
+        challenger = compose_factor_scores(
+            [
+                (
+                    _load(item["values_path"]),
+                    float(item["weight"]),
+                    int(item["direction"]),
+                )
+                for item in manifest["factors"]
+            ]
+        )
+    baseline_definition = config.get("baseline_definition")
+    if isinstance(baseline_definition, dict):
+        expressions = [
+            str(item["qlib_expression"])
+            for item in baseline_definition.get("factors") or []
+        ]
+        baseline_values = D.features(
+            D.instruments(manifest.get("universe") or "cn_all"),
+            expressions,
+            start_time=(as_of - pd.Timedelta(days=400)).isoformat(),
+            end_time=as_of.isoformat(),
+            freq=str(baseline_definition.get("frequency") or "day"),
+        )
+        _, _, baseline = normalize_qlib_baseline_values(
+            baseline_values, baseline_definition
+        )
+        scores = combine_factor_sources(
+            mode=str(config.get("factor_source_mode") or ""),
+            baseline=baseline,
+            challenger=challenger,
+            challenger_weight=float(config.get("challenger_weight") or 0.0),
+        )
+    else:
+        if str(config.get("factor_source_mode") or FACTOR_SOURCE_PROMOTED_ONLY) != (
+            FACTOR_SOURCE_PROMOTED_ONLY
+        ) or challenger is None:
+            raise ValueError("recommendation source has no governed Qlib factor scores")
+        scores = challenger
     dates = pd.to_datetime(scores.index.get_level_values("datetime")).tz_localize(None)
     scores.index = pd.MultiIndex.from_arrays(
         [dates, scores.index.get_level_values("instrument").astype(str)],
@@ -89,12 +305,13 @@ def main() -> None:
     )
     if as_of not in set(dates):
         raise ValueError("factor artifacts do not contain the requested recommendation date")
-
-    import qlib
-    from qlib.data import D
-
-    qlib.init(provider_uri=args.provider_uri, region="cn")
-    config = manifest["config"]
+    if signal_frequency != "day":
+        qlib.init(
+            provider_uri=args.provider_uri,
+            region="cn",
+            clear_mem_cache=True,
+        )
+    market_as_of = as_of.normalize()
     instruments = sorted(set(scores.index.get_level_values("instrument")))
     lookback = (as_of - pd.Timedelta(days=60)).date().isoformat()
     liquidity = D.features(
@@ -121,13 +338,16 @@ def main() -> None:
         ],
         names=["datetime", "instrument"],
     )
-    point_metadata = execution_metadata.xs(as_of, level="datetime")
+    point_metadata = execution_metadata.xs(market_as_of, level="datetime")
     metadata_root = Path(args.provider_uri) / "metadata"
     memberships = pd.read_parquet(metadata_root / "industry_memberships.parquet")
-    benchmark_frame = pd.read_parquet(metadata_root / "benchmark_weights.parquet")
-    benchmark_frame = benchmark_frame[benchmark_frame["benchmark"] == manifest["benchmark"]].drop(
-        columns=["benchmark"]
-    )
+    if config.get("portfolio_construction") == "industry_neutral_qp":
+        benchmark_frame = pd.read_parquet(metadata_root / "full_market_weights.parquet")
+    else:
+        benchmark_frame = pd.read_parquet(metadata_root / "benchmark_weights.parquet")
+        benchmark_frame = benchmark_frame[
+            benchmark_frame["benchmark"] == manifest["benchmark"]
+        ].drop(columns=["benchmark"])
     style_fields = {
         "Log($total_mv)": "size",
         "1/$pb": "value",
@@ -191,6 +411,12 @@ def main() -> None:
     previous = {
         item["instrument"]: item["weight"] for item in manifest.get("previous_holdings", [])
     }
+    previous_snapshot = manifest.get("previous_snapshot") or {}
+    rebalance_due = is_rebalance_due(
+        as_of,
+        previous_snapshot.get("as_of_date"),
+        str(config.get("rebalance_frequency", "day")),
+    )
     construction_notional = float(manifest["construction_notional"])
     decision = policy.decide(
         signal,
@@ -202,7 +428,7 @@ def main() -> None:
         benchmark_style_exposure=styles.reindex(benchmark.index).mul(
             benchmark, axis=0
         ).sum(),
-        return_covariance=risk_returns.cov(),
+        return_covariance=estimate_covariance(risk_returns),
         prices=pd.to_numeric(point_metadata["$open"], errors="coerce"),
         current_prices=pd.to_numeric(point_metadata["$close"], errors="coerce"),
         portfolio_drawdown=0.0,
@@ -212,17 +438,25 @@ def main() -> None:
         ),
         portfolio_value=construction_notional,
         risk_exposure=float(manifest.get("risk_exposure", 1.0)),
+        allow_new_risk=bool(manifest.get("allow_new_risk", True)),
+        rebalance_due=rebalance_due,
     )
-    calendar = pd.DatetimeIndex(
-        D.calendar(
-            start_time=as_of.date().isoformat(),
-            end_time=(as_of + pd.Timedelta(days=14)).date().isoformat(),
-            freq="day",
-        )
-    ).tz_localize(None)
-    future = calendar[calendar > as_of]
-    if not len(future):
-        raise ValueError("Qlib calendar has no effective trading date")
+    if signal_frequency == "day":
+        calendar = pd.DatetimeIndex(
+            D.calendar(
+                start_time=as_of.date().isoformat(),
+                end_time=(as_of + pd.Timedelta(days=14)).date().isoformat(),
+                freq="day",
+            )
+        ).tz_localize(None)
+        future = calendar[calendar > market_as_of]
+        if not len(future):
+            raise ValueError("Qlib calendar has no effective trading date")
+        effective_date = future[0].date().isoformat()
+    else:
+        if manifest.get("signal_at") is None:
+            raise ValueError("minute Qlib order-plan generation requires signal_at")
+        effective_date = as_of.date().isoformat()
     changes = {item["instrument"]: item for item in decision.changes}
 
     result = {
@@ -230,9 +464,10 @@ def main() -> None:
         "portfolio_id": manifest["portfolio_id"],
         "strategy_version_id": manifest["strategy_version_id"],
         "as_of_date": as_of.date().isoformat(),
-        "effective_date": future[0].date().isoformat(),
+        "effective_date": effective_date,
         "policy_version": decision.policy_version,
         "backtest_engine_version": QLIB_ENGINE_VERSION,
+        "execution_contract_hash": config["execution_contract_hash"],
         "dataset": manifest["dataset"],
         "dataset_identity_sha256": manifest["dataset_identity_sha256"],
         "cost_model": decision.cost_model,
@@ -242,6 +477,11 @@ def main() -> None:
             "events": decision.risk_events,
             "execution_method": config.get("execution_method", "open"),
             "execution_days": int(config.get("execution_days", 1)),
+            "execution_frequency": config.get("execution_frequency", "day"),
+            "execution_contract_hash": config["execution_contract_hash"],
+            "rebalance_frequency": config.get("rebalance_frequency", "day"),
+            "rebalance_due": rebalance_due,
+            "member_risk_state": dict(manifest.get("member_risk_state") or {}),
             "eligibility": eligibility_evidence,
         },
         "reasons": decision.reasons,
@@ -259,6 +499,18 @@ def main() -> None:
         ],
         "changes": decision.changes,
     }
+    if manifest.get("artifact_kind") == "simulation_order_plan":
+        if not args.tracking_uri or not args.order_plan_root:
+            raise ValueError(
+                "simulation order-plan generation requires tracking URI and artifact root"
+            )
+        result = _write_qlib_order_plan(
+            manifest=manifest,
+            result=result,
+            dataset_provenance=dataset_provenance,
+            order_plan_root=Path(args.order_plan_root),
+            tracking_uri=args.tracking_uri,
+        )
     target = Path(args.output)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -7,11 +7,47 @@ import pandas as pd
 MINUTE_FACTOR_EXPRESSIONS: dict[str, str] = {
     "momentum_5m": "$close/Ref($close,5)-1",
     "momentum_15m": "$close/Ref($close,15)-1",
+    "oversold_60m": "-($close/Mean($close,60)-1)",
+    "lower_band_120m": "-(($close-Mean($close,120))/(Std($close,120)+1e-12))",
     "vwap_deviation": "$close/$vwap-1",
     "volume_surprise_30m": "$volume/Mean($volume,30)-1",
     "range_pressure": "($close-$low)/($high-$low+1e-12)-0.5",
     "realized_volatility_30m": "Std($close/Ref($close,1)-1,30)",
 }
+
+
+def minute_bar_minutes(frequency: str) -> int:
+    normalized = str(frequency).lower()
+    if normalized not in {"1min", "5min", "15min", "30min", "60min"}:
+        raise ValueError("unsupported minute research frequency")
+    return int(normalized.removesuffix("min"))
+
+
+def minute_factor_expressions(frequency: str) -> dict[str, str]:
+    """Return duration-stable Qlib expressions for the selected minute bar."""
+
+    bar_minutes = minute_bar_minutes(frequency)
+
+    def bars(duration: int) -> int:
+        return max(1, duration // bar_minutes)
+
+    return {
+        "momentum_5m": f"$close/Ref($close,{bars(5)})-1",
+        "momentum_15m": f"$close/Ref($close,{bars(15)})-1",
+        "oversold_60m": f"-($close/Mean($close,{bars(60)})-1)",
+        "lower_band_120m": (
+            f"-(($close-Mean($close,{bars(120)}))/"
+            f"(Std($close,{bars(120)})+1e-12))"
+        ),
+        "vwap_deviation": "$close/$vwap-1",
+        "volume_surprise_30m": (
+            f"$volume/Mean($volume,{bars(30)})-1"
+        ),
+        "range_pressure": "($close-$low)/($high-$low+1e-12)-0.5",
+        "realized_volatility_30m": (
+            f"Std($close/Ref($close,1)-1,{bars(30)})"
+        ),
+    }
 
 
 def normalize_minute_series(values: pd.Series | pd.DataFrame, name: str) -> pd.Series:
@@ -40,16 +76,20 @@ def evaluate_minute_factor(
     horizon_minutes: int,
     cost_rate: float,
     top_fraction: float = 0.20,
+    bar_minutes: int = 1,
 ) -> dict[str, float | int | None]:
     if horizon_minutes < 1:
         raise ValueError("horizon_minutes must be positive")
+    if bar_minutes < 1 or horizon_minutes % bar_minutes:
+        raise ValueError("horizon_minutes must be an integer multiple of the bar")
     if not 0 < top_fraction <= 0.5:
         raise ValueError("top_fraction must be between 0 and 0.5")
     factor = normalize_minute_series(factor_values, "factor")
     label = normalize_minute_series(forward_returns, "label")
     joined = pd.concat([factor, label], axis=1, join="inner").dropna()
     timestamps = joined.index.get_level_values("datetime").unique().sort_values()
-    selected = timestamps[::horizon_minutes]
+    horizon_bars = horizon_minutes // bar_minutes
+    selected = timestamps[::horizon_bars]
     joined = joined[joined.index.get_level_values("datetime").isin(selected)]
     if joined.empty:
         raise ValueError("factor and forward returns have no aligned minute observations")

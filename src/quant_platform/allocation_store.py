@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -9,6 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sqlalchemy import insert, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
@@ -24,6 +27,15 @@ from quant_data.database import (
     strategy_allocations,
 )
 
+from .member_risk_gate import (
+    ALLOCATION_LIQUIDATION_RULE,
+    ALLOCATION_REDUCTION_RULE,
+    has_open_allocation_gate,
+    has_open_member_gate,
+    load_allocation_risk_state,
+    load_member_risk_state,
+    load_strategy_risk_state,
+)
 from .risk_math import COVARIANCE_MODEL_VERSION
 from .strategy_allocation import analyze_strategy_allocation
 from .strategy_store import StrategyStore
@@ -35,6 +47,14 @@ def _now() -> datetime:
 
 def _decimal(value: Any) -> Decimal:
     return Decimal(str(value))
+
+
+def _canonical_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 class AllocationStore:
@@ -92,6 +112,7 @@ class AllocationStore:
         max_drawdown_liquidate: float,
         fixed_weights: dict[str, float] | None,
         actor: str,
+        member_specs: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         version_ids = list(
             dict.fromkeys(item.strip() for item in strategy_version_ids if item.strip())
@@ -104,6 +125,32 @@ class AllocationStore:
             raise ValueError("strategy allocation capital must be at least 500000")
         if not 0 < max_member_drawdown < max_drawdown_reduce < max_drawdown_liquidate <= 0.50:
             raise ValueError("member, reduction and liquidation drawdowns must be increasing")
+        supplied = {
+            str(item.get("strategy_version_id") or "").strip(): dict(item)
+            for item in (member_specs or [])
+        }
+        if supplied and set(supplied) != set(version_ids):
+            raise ValueError("allocation member specifications do not match strategy versions")
+        governance: dict[str, dict[str, Any]] = {}
+        for version_id in version_ids:
+            item = supplied.get(version_id, {})
+            role = str(item.get("role") or "core")
+            if role not in {"core", "satellite"}:
+                raise ValueError("allocation member role must be core or satellite")
+            risk_budget = float(item.get("risk_budget", 1.0))
+            default_cap = min(max_strategy_weight, 0.15 if role == "satellite" else 0.70)
+            member_cap = float(item.get("member_cap") or default_cap)
+            if not 0 < risk_budget <= 1:
+                raise ValueError("allocation member risk budget must be between zero and one")
+            if not 0 < member_cap <= min(max_strategy_weight, 0.70):
+                raise ValueError("allocation member cap exceeds the strategy limit")
+            if role == "satellite" and member_cap > 0.15:
+                raise ValueError("a satellite member cap may not exceed 15%")
+            governance[version_id] = {
+                "role": role,
+                "risk_budget": risk_budget,
+                "member_cap": member_cap,
+            }
 
         returns: dict[str, pd.Series] = {}
         members: list[dict[str, Any]] = []
@@ -112,6 +159,11 @@ class AllocationStore:
                 version = self.strategies.get_version(version_id)
                 if version["status"] != "approved" or version.get("is_legacy"):
                     raise ValueError("allocations require approved non-legacy strategy versions")
+                if (
+                    version.get("strategy_type") == "pair"
+                    and governance[version_id]["role"] != "satellite"
+                ):
+                    raise ValueError("pair strategies may only enter an allocation as satellites")
                 backtest_row = connection.execute(
                     select(backtest_runs)
                     .where(
@@ -146,9 +198,48 @@ class AllocationStore:
             lookback_days=lookback_days,
             target_volatility=target_volatility,
             max_pairwise_correlation=max_pairwise_correlation,
-            max_strategy_weight=max_strategy_weight,
+            # Qlib/RD-Agent are the numerical baseline; product-level core,
+            # satellite and member caps are enforced immediately below.  Solving
+            # the requested risk budgets with those caps inside the numerical
+            # optimizer can turn a clear governance rejection into a misleading
+            # solver-tolerance failure.
+            max_strategy_weight=1.0,
             fixed_weights=fixed_weights,
+            risk_budgets={
+                version_id: governance[version_id]["risk_budget"]
+                for version_id in version_ids
+            },
         )
+        unscaled = {
+            version_id: float(analysis["members"][version_id]["unscaled_weight"])
+            for version_id in version_ids
+        }
+        for version_id, weight in unscaled.items():
+            if weight > governance[version_id]["member_cap"] + 1e-9:
+                raise ValueError(
+                    f"strategy {version_id} weight exceeds its core/satellite member cap"
+                )
+        core_weight = sum(
+            weight
+            for version_id, weight in unscaled.items()
+            if governance[version_id]["role"] == "core"
+        )
+        satellite_weight = sum(
+            weight
+            for version_id, weight in unscaled.items()
+            if governance[version_id]["role"] == "satellite"
+        )
+        if core_weight < 0.70 - 1e-9 or satellite_weight > 0.30 + 1e-9:
+            raise ValueError("allocation must keep at least 70% core and at most 30% satellite")
+        analysis["core_satellite"] = {
+            "core_weight": core_weight,
+            "satellite_weight": satellite_weight,
+            "members": governance,
+        }
+        analysis["solver"]["allocation_governance_wrapper"] = (
+            "project_core_satellite_caps_v1"
+        )
+        analysis["solver"]["governed_max_strategy_weight"] = max_strategy_weight
         allocation_id = uuid.uuid4().hex
         now = _now()
         capital = _decimal(total_capital)
@@ -187,6 +278,13 @@ class AllocationStore:
                             strategy_version_id=member["strategy_version_id"],
                             backtest_id=member["backtest_id"],
                             target_weight=evidence["target_weight"],
+                            role=governance[member["strategy_version_id"]]["role"],
+                            risk_budget=governance[member["strategy_version_id"]][
+                                "risk_budget"
+                            ],
+                            member_cap=governance[member["strategy_version_id"]][
+                                "member_cap"
+                            ],
                             annualized_volatility=evidence["annualized_volatility"],
                             risk_contribution=evidence["risk_contribution"],
                             created_at=now,
@@ -248,6 +346,54 @@ class AllocationStore:
                     strategy_allocation_members.c.allocation_id == allocation_id
                 )
             ).all()
+            certified_evidence: dict[str, Any] = {}
+            member_by_version = {
+                str(member.strategy_version_id): member for member in members
+            }
+            for member in members:
+                evidence = self._certified_simulation_evidence(
+                    connection, str(member.strategy_version_id)
+                )
+                if evidence is None:
+                    raise ValueError(
+                        "allocation approval requires five independently reviewed and "
+                        "certified simulation NAV days "
+                        f"for strategy {member.strategy_version_id}"
+                    )
+                evidence["target_weight"] = float(member.target_weight)
+                certified_evidence[str(member.strategy_version_id)] = evidence
+            analysis["approval_simulation_evidence"] = certified_evidence
+            date_sets = {
+                tuple(item["trade_date"] for item in evidence["nav_rows"])
+                for evidence in certified_evidence.values()
+            }
+            if len(date_sets) != 1:
+                raise ValueError("allocation member simulation NAV dates are not aligned")
+            aligned_dates = next(iter(date_sets))
+            total_capital = float(allocation.total_capital)
+            cash_reserve = float(allocation.cash_reserve)
+            combined_nav = [
+                cash_reserve
+                + sum(
+                    total_capital
+                    * float(member_by_version[version_id].target_weight)
+                    * float(evidence["nav_rows"][index]["nav"])
+                    / float(evidence["initial_cash"])
+                    for version_id, evidence in certified_evidence.items()
+                )
+                for index in range(len(aligned_dates))
+            ]
+            combined_peak = max(combined_nav)
+            analysis["approval_simulation_nav"] = {
+                "performance_certified": True,
+                "review_status": "independently_reviewed",
+                "reviewed_days": len(aligned_dates),
+                "period_start": aligned_dates[0],
+                "period_end": aligned_dates[-1],
+                "latest_nav": combined_nav[-1],
+                "drawdown": combined_nav[-1] / combined_peak - 1.0,
+                "evidence_sha256": _canonical_hash(certified_evidence),
+            }
             for member in members:
                 version = self.strategies.get_version(str(member.strategy_version_id))
                 strategy_name = connection.execute(
@@ -256,6 +402,8 @@ class AllocationStore:
                 initial_value = _decimal(allocation.total_capital) * _decimal(member.target_weight)
                 if initial_value < Decimal("100000"):
                     raise ValueError(f"allocated value for {strategy_name} is below 100000")
+                if version.get("strategy_type") == "pair":
+                    continue
                 portfolio_id = uuid.uuid4().hex
                 connection.execute(
                     insert(recommendation_portfolios).values(
@@ -289,6 +437,7 @@ class AllocationStore:
                     approved_by=actor.strip(),
                     approval_reason=reason.strip(),
                     approved_at=now,
+                    analysis_json=analysis,
                     updated_at=now,
                 )
             )
@@ -301,6 +450,71 @@ class AllocationStore:
                 details={"actor": actor.strip(), "reason": reason.strip()},
             )
         return self.get(allocation_id)
+
+    @staticmethod
+    def _certified_simulation_evidence(
+        connection: Any, strategy_version_id: str
+    ) -> dict[str, Any] | None:
+        simulations = connection.execute(
+            select(simulation_portfolios)
+            .where(
+                simulation_portfolios.c.source_type == "strategy_version",
+                simulation_portfolios.c.source_id == strategy_version_id,
+                simulation_portfolios.c.status.in_(["active", "paused"]),
+            )
+            .order_by(simulation_portfolios.c.updated_at.desc())
+        ).all()
+        for simulation in simulations:
+            rows = connection.execute(
+                select(simulation_nav)
+                .where(
+                    simulation_nav.c.portfolio_id == simulation.id,
+                    simulation_nav.c.performance_certified.is_(True),
+                    simulation_nav.c.reviewed_at.is_not(None),
+                    simulation_nav.c.nav_scope == "member_ledger",
+                )
+                .order_by(simulation_nav.c.trade_date.desc())
+                .limit(5)
+            ).all()
+            if len(rows) == 5:
+                return {
+                    "simulation_portfolio_id": str(simulation.id),
+                    "execution_contract_hash": str(simulation.execution_contract_hash),
+                    "initial_cash": float(simulation.initial_cash),
+                    "first_trade_date": rows[-1].trade_date.isoformat(),
+                    "last_trade_date": rows[0].trade_date.isoformat(),
+                    "reviewed_days": 5,
+                    "latest_nav": float(rows[0].nav),
+                    "review_audit_sha256": _canonical_hash(
+                        {
+                            row.trade_date.isoformat(): {
+                                "reviewed_by": str(row.reviewed_by),
+                                "reviewed_at": row.reviewed_at.isoformat(),
+                                "review_evidence_sha256": str(
+                                    row.review_evidence_sha256
+                                ),
+                                "review_note": str(row.review_note),
+                            }
+                            for row in reversed(rows)
+                        }
+                    ),
+                    "nav_rows": [
+                        {
+                            "trade_date": row.trade_date.isoformat(),
+                            "nav": float(row.nav),
+                            "daily_return": float(row.daily_return),
+                            "drawdown": float(row.drawdown),
+                            "reviewed_by": str(row.reviewed_by),
+                            "reviewed_at": row.reviewed_at.isoformat(),
+                            "review_evidence_sha256": str(
+                                row.review_evidence_sha256
+                            ),
+                            "review_note": str(row.review_note),
+                        }
+                        for row in reversed(rows)
+                    ],
+                }
+        return None
 
     def set_status(self, allocation_id: str, status: str, *, actor: str) -> dict[str, Any]:
         if status not in {"active", "paused"}:
@@ -331,6 +545,13 @@ class AllocationStore:
                 if unresolved is not None:
                     raise ValueError("critical allocation events must be resolved first")
             portfolio_ids = self._portfolio_ids(connection, allocation_id)
+            member_version_ids = list(
+                connection.scalars(
+                    select(strategy_allocation_members.c.strategy_version_id).where(
+                        strategy_allocation_members.c.allocation_id == allocation_id
+                    )
+                )
+            )
             connection.execute(
                 update(recommendation_portfolios)
                 .where(recommendation_portfolios.c.id.in_(portfolio_ids))
@@ -343,7 +564,18 @@ class AllocationStore:
             connection.execute(
                 update(simulation_portfolios)
                 .where(
-                    simulation_portfolios.c.recommendation_portfolio_id.in_(portfolio_ids)
+                    (
+                        (simulation_portfolios.c.source_type == "recommendation")
+                        & simulation_portfolios.c.source_id.in_(portfolio_ids)
+                    )
+                    | (
+                        (simulation_portfolios.c.source_type == "strategy_version")
+                        & simulation_portfolios.c.source_id.in_(member_version_ids)
+                    )
+                    | (
+                        (simulation_portfolios.c.source_type == "allocation")
+                        & (simulation_portfolios.c.source_id == allocation_id)
+                    )
                 )
                 .values(status=status, updated_at=now)
             )
@@ -362,7 +594,15 @@ class AllocationStore:
             )
         return self.get(allocation_id)
 
-    def refresh(self, allocation_id: str) -> dict[str, Any]:
+    def refresh(
+        self,
+        allocation_id: str,
+        *,
+        actor: str = "allocation-engine",
+    ) -> dict[str, Any]:
+        producer = actor.strip()
+        if len(producer) < 2:
+            raise ValueError("allocation NAV producer is required")
         now = _now()
         with self.engine.begin() as connection:
             allocation = connection.execute(
@@ -381,18 +621,26 @@ class AllocationStore:
                     strategy_allocation_members.c.allocation_id == allocation_id
                 )
             ).all()
-            latest: dict[str, Any] = {}
+            latest: dict[str, dict[str, Any]] = {}
             for member in members:
                 portfolio_id = member.recommendation_portfolio_id
-                if not portfolio_id:
-                    raise ValueError(
-                        "strategy allocation has an unprovisioned recommendation member"
-                    )
                 simulation = connection.execute(
                     select(simulation_portfolios).where(
-                        simulation_portfolios.c.recommendation_portfolio_id == portfolio_id
+                        simulation_portfolios.c.source_type == "strategy_version",
+                        simulation_portfolios.c.source_id == member.strategy_version_id,
                     )
+                    .order_by(simulation_portfolios.c.updated_at.desc())
+                    .limit(1)
                 ).first()
+                if simulation is None and portfolio_id:
+                    simulation = connection.execute(
+                        select(simulation_portfolios).where(
+                            simulation_portfolios.c.source_type == "recommendation",
+                            simulation_portfolios.c.source_id == portfolio_id,
+                        )
+                        .order_by(simulation_portfolios.c.updated_at.desc())
+                        .limit(1)
+                    ).first()
                 if simulation is None:
                     return {
                         "id": allocation_id,
@@ -417,8 +665,12 @@ class AllocationStore:
                         "status": allocation.status,
                         "refresh_status": "waiting_for_certified_simulation_nav",
                     }
-                latest[str(portfolio_id)] = nav_row
-            dates = {item.trade_date for item in latest.values()}
+                latest[str(member.strategy_version_id)] = {
+                    "nav": nav_row,
+                    "simulation": simulation,
+                    "target_weight": _decimal(member.target_weight),
+                }
+            dates = {item["nav"].trade_date for item in latest.values()}
             if len(dates) != 1:
                 return {
                     "id": allocation_id,
@@ -437,10 +689,19 @@ class AllocationStore:
                     "status": allocation.status,
                     "refresh_status": "already_recorded",
                 }
-            member_nav = {
-                portfolio_id: float(item.nav)
-                for portfolio_id, item in latest.items()
-            }
+            total_capital = _decimal(allocation.total_capital)
+            member_nav: dict[str, float] = {}
+            for version_id, item in latest.items():
+                initial_cash = _decimal(item["simulation"].initial_cash)
+                if initial_cash <= 0:
+                    raise ValueError("member simulation initial cash is invalid")
+                normalized_value = (
+                    total_capital
+                    * item["target_weight"]
+                    * _decimal(item["nav"].nav)
+                    / initial_cash
+                )
+                member_nav[version_id] = float(normalized_value)
             nav = _decimal(allocation.cash_reserve) + sum(
                 (_decimal(value) for value in member_nav.values()), Decimal("0")
             )
@@ -473,59 +734,90 @@ class AllocationStore:
                 for key, value in member_nav.items()
             }
             drawdown_loss = abs(min(drawdown, 0.0))
-            next_status = str(allocation.status)
-            override = 1.0
             if drawdown_loss >= float(allocation.max_drawdown_liquidate):
-                next_status, override = "liquidation_pending", 0.0
-                self._event(
+                if not has_open_allocation_gate(
                     connection,
-                    allocation_id,
-                    event_type="allocation_circuit_breaker",
-                    severity="critical",
-                    rule="max_drawdown_liquidate",
-                    observed=drawdown_loss,
-                    limit=float(allocation.max_drawdown_liquidate),
-                    details={"trade_date": trade_date.isoformat()},
-                )
-            elif drawdown_loss >= float(allocation.max_drawdown_reduce):
-                next_status, override = "risk_reduction_pending", 0.5
-                self._event(
-                    connection,
-                    allocation_id,
-                    event_type="allocation_circuit_breaker",
-                    severity="critical",
-                    rule="max_drawdown_reduce",
-                    observed=drawdown_loss,
-                    limit=float(allocation.max_drawdown_reduce),
-                    details={"trade_date": trade_date.isoformat()},
-                )
-            for member in members:
-                portfolio_id = str(member.recommendation_portfolio_id)
-                member_loss = abs(min(float(latest[portfolio_id].drawdown), 0.0))
-                member_override = override
-                if member_loss >= float(allocation.max_member_drawdown):
-                    member_override = min(member_override, 0.5)
-                    next_status = (
-                        next_status
-                        if next_status == "liquidation_pending"
-                        else "risk_reduction_pending"
-                    )
+                    allocation_id=allocation_id,
+                    rule=ALLOCATION_LIQUIDATION_RULE,
+                ):
                     self._event(
                         connection,
                         allocation_id,
-                        recommendation_portfolio_id=portfolio_id,
-                        event_type="member_circuit_breaker",
+                        event_type="allocation_circuit_breaker",
                         severity="critical",
-                        rule="max_member_drawdown",
-                        observed=member_loss,
-                        limit=float(allocation.max_member_drawdown),
-                        details={"trade_date": trade_date.isoformat()},
+                        rule=ALLOCATION_LIQUIDATION_RULE,
+                        observed=drawdown_loss,
+                        limit=float(allocation.max_drawdown_liquidate),
+                        details={
+                            "trade_date": trade_date.isoformat(),
+                            "risk_state": "liquidation",
+                            "risk_exposure_override": 0.0,
+                        },
                     )
-                connection.execute(
-                    update(recommendation_portfolios)
-                    .where(recommendation_portfolios.c.id == portfolio_id)
-                    .values(risk_exposure_override=member_override, updated_at=now)
+            elif drawdown_loss >= float(allocation.max_drawdown_reduce):
+                if not has_open_allocation_gate(
+                    connection,
+                    allocation_id=allocation_id,
+                    rule=ALLOCATION_REDUCTION_RULE,
+                ):
+                    self._event(
+                        connection,
+                        allocation_id,
+                        event_type="allocation_circuit_breaker",
+                        severity="critical",
+                        rule=ALLOCATION_REDUCTION_RULE,
+                        observed=drawdown_loss,
+                        limit=float(allocation.max_drawdown_reduce),
+                        details={
+                            "trade_date": trade_date.isoformat(),
+                            "risk_state": "risk_reduction",
+                            "risk_exposure_override": 0.5,
+                        },
+                    )
+            allocation_gate = load_allocation_risk_state(connection, allocation_id)
+            override = float(allocation_gate["risk_exposure_override"])
+            if override <= 0.0:
+                next_status = "liquidation_pending"
+            elif override < 1.0:
+                next_status = "risk_reduction_pending"
+            else:
+                next_status = str(allocation.status)
+            for member in members:
+                version_id = str(member.strategy_version_id)
+                portfolio_id = (
+                    str(member.recommendation_portfolio_id)
+                    if member.recommendation_portfolio_id
+                    else None
                 )
+                member_loss = abs(min(float(latest[version_id]["nav"].drawdown), 0.0))
+                if member_loss >= float(allocation.max_member_drawdown):
+                    if not has_open_member_gate(
+                        connection,
+                        allocation_id=allocation_id,
+                        strategy_version_id=version_id,
+                        recommendation_portfolio_id=portfolio_id,
+                    ):
+                        self._event(
+                            connection,
+                            allocation_id,
+                            recommendation_portfolio_id=portfolio_id,
+                            event_type="member_circuit_breaker",
+                            severity="critical",
+                            rule="max_member_drawdown",
+                            observed=member_loss,
+                            limit=float(allocation.max_member_drawdown),
+                            details={
+                                "trade_date": trade_date.isoformat(),
+                                "strategy_version_id": version_id,
+                                "risk_state": "pause_new_risk",
+                            },
+                        )
+                if portfolio_id:
+                    connection.execute(
+                        update(recommendation_portfolios)
+                        .where(recommendation_portfolios.c.id == portfolio_id)
+                        .values(risk_exposure_override=override, updated_at=now)
+                    )
             connection.execute(
                 insert(strategy_allocation_nav).values(
                     allocation_id=allocation_id,
@@ -549,10 +841,83 @@ class AllocationStore:
                     updated_at=now,
                 )
             )
+            self._sync_allocation_simulation_nav(
+                connection,
+                allocation=allocation,
+                trade_date=trade_date,
+                allocation_nav=nav,
+                daily_return=daily_return,
+                drawdown=drawdown,
+                produced_by=producer,
+                now=now,
+            )
         result = self.get(allocation_id)
         result["refresh_status"] = "recorded"
         return result
 
+    @staticmethod
+    def _sync_allocation_simulation_nav(
+        connection: Any,
+        *,
+        allocation: Any,
+        trade_date: Any,
+        allocation_nav: Decimal,
+        daily_return: float,
+        drawdown: float,
+        produced_by: str,
+        now: datetime,
+    ) -> None:
+        accounts = connection.execute(
+            select(simulation_portfolios).where(
+                simulation_portfolios.c.source_type == "allocation",
+                simulation_portfolios.c.source_id == allocation.id,
+                simulation_portfolios.c.status.in_(["active", "paused"]),
+            )
+        ).all()
+        total_capital = _decimal(allocation.total_capital)
+        if total_capital <= 0:
+            raise ValueError("allocation total capital is invalid")
+        allocation_ratio = allocation_nav / total_capital
+        reserve_ratio = _decimal(allocation.cash_reserve) / total_capital
+        for account in accounts:
+            account_nav = _decimal(account.initial_cash) * allocation_ratio
+            account_cash = _decimal(account.initial_cash) * reserve_ratio
+            account_market_value = account_nav - account_cash
+            connection.execute(
+                pg_insert(simulation_nav)
+                .values(
+                    portfolio_id=account.id,
+                    trade_date=trade_date,
+                    cash=account_cash,
+                    market_value=account_market_value,
+                    nav=account_nav,
+                    daily_return=daily_return,
+                    drawdown=drawdown,
+                    market_date=trade_date,
+                    has_stale_prices=False,
+                    status="healthy",
+                    performance_certified=True,
+                    nav_scope="aggregate_view",
+                    produced_by=produced_by,
+                    created_at=now,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        simulation_nav.c.portfolio_id,
+                        simulation_nav.c.trade_date,
+                    ]
+                )
+            )
+            connection.execute(
+                update(simulation_portfolios)
+                .where(simulation_portfolios.c.id == account.id)
+                .values(
+                    cash=account_cash,
+                    nav=account_nav,
+                    high_water_mark=max(_decimal(account.high_water_mark), account_nav),
+                    updated_at=now,
+                )
+            )
     def acknowledge_event(self, allocation_id: str, event_id: int, *, actor: str) -> dict[str, Any]:
         return self._update_event(allocation_id, event_id, actor=actor, resolution=None)
 
@@ -664,7 +1029,30 @@ class AllocationStore:
             ]
         return [self.get(item) for item in ids]
 
-    def refresh_for_portfolio(self, portfolio_id: str) -> list[dict[str, Any]]:
+    def member_risk_state(self, strategy_version_id: str) -> dict[str, Any]:
+        """Return the original 8% member-only new-risk gate."""
+
+        normalized_id = strategy_version_id.strip()
+        if not normalized_id:
+            raise ValueError("strategy version id is required")
+        with self.engine.connect() as connection:
+            return load_member_risk_state(connection, normalized_id)
+
+    def strategy_risk_state(self, strategy_version_id: str) -> dict[str, Any]:
+        """Return member and allocation circuit breakers for one strategy version."""
+
+        normalized_id = strategy_version_id.strip()
+        if not normalized_id:
+            raise ValueError("strategy version id is required")
+        with self.engine.connect() as connection:
+            return load_strategy_risk_state(connection, normalized_id)
+
+    def refresh_for_portfolio(
+        self,
+        portfolio_id: str,
+        *,
+        actor: str = "allocation-engine",
+    ) -> list[dict[str, Any]]:
         with self.engine.connect() as connection:
             allocation_ids = list(
                 connection.execute(
@@ -673,7 +1061,39 @@ class AllocationStore:
                     )
                 ).scalars()
             )
-        return [self.refresh(str(item)) for item in allocation_ids]
+        return [self.refresh(str(item), actor=actor) for item in allocation_ids]
+
+    def refresh_for_simulation_source(
+        self,
+        source_type: str,
+        source_id: str,
+        *,
+        actor: str = "simulation-worker",
+    ) -> list[dict[str, Any]]:
+        if source_type == "recommendation":
+            return self.refresh_for_portfolio(source_id, actor=actor)
+        if source_type == "allocation":
+            try:
+                return [self.refresh(source_id, actor=actor)]
+            except ValueError:
+                return []
+        if source_type != "strategy_version":
+            return []
+        with self.engine.connect() as connection:
+            allocation_ids = list(
+                connection.scalars(
+                    select(strategy_allocation_members.c.allocation_id).where(
+                        strategy_allocation_members.c.strategy_version_id == source_id
+                    )
+                )
+            )
+        results: list[dict[str, Any]] = []
+        for allocation_id in allocation_ids:
+            try:
+                results.append(self.refresh(str(allocation_id), actor=actor))
+            except ValueError:
+                continue
+        return results
 
     @staticmethod
     def _portfolio_ids(connection: Any, allocation_id: str) -> list[str]:
@@ -682,10 +1102,7 @@ class AllocationStore:
                 strategy_allocation_members.c.allocation_id == allocation_id
             )
         ).scalars()
-        result = [str(item) for item in rows if item]
-        if not result:
-            raise ValueError("strategy allocation has no recommendation portfolios")
-        return result
+        return [str(item) for item in rows if item]
 
     @staticmethod
     def _event(

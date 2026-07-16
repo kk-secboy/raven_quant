@@ -484,6 +484,31 @@ class QlibBuilder:
                 styles.sort_values(["datetime", "instrument"], inplace=True)
                 if not styles.empty:
                     target.mkdir(parents=True, exist_ok=True)
+                    float_cap_column = "circ_mv" if "circ_mv" in frame.columns else "total_mv"
+                    float_cap = pd.DataFrame(
+                        {
+                            "instrument": frame["ts_code"].map(_qlib_symbol),
+                            "datetime": pd.to_datetime(frame["trade_date"], errors="coerce"),
+                            "float_market_cap": pd.to_numeric(
+                                frame[float_cap_column], errors="coerce"
+                            ),
+                        }
+                    ).dropna()
+                    float_cap = float_cap[float_cap["float_market_cap"] > 0]
+                    float_cap.drop_duplicates(
+                        ["instrument", "datetime"], keep="last", inplace=True
+                    )
+                    totals = float_cap.groupby("datetime")["float_market_cap"].transform(
+                        "sum"
+                    )
+                    float_cap["weight"] = float_cap["float_market_cap"] / totals
+                    float_cap[["instrument", "datetime", "weight"]].sort_values(
+                        ["datetime", "instrument"]
+                    ).to_parquet(
+                        target / "full_market_weights.parquet",
+                        index=False,
+                        compression="zstd",
+                    )
                     styles.to_parquet(target / "style_exposures.parquet", index=False)
                     wrote_metadata = True
 

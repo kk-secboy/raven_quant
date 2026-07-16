@@ -15,7 +15,7 @@ import requests
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import AliasChoices, BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
 
 from quant_data.checkpoint import CheckpointStore
@@ -24,8 +24,15 @@ from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES
 from quant_data.execution_contract import (
     require_daily_qlib_contract,
     require_minute_execution_contract,
+    require_minute_signal_contract,
+    require_strategy_execution_contract,
+    strategy_execution_contract_hash,
 )
-from quant_data.execution_data import MINUTE_DATASETS, MINUTE_FREQUENCIES
+from quant_data.execution_data import (
+    MINUTE_DATASETS,
+    MINUTE_FREQUENCIES,
+    NATIVE_MINUTE_FREQUENCIES,
+)
 
 from .alert_store import AlertStore
 from .allocation_store import AllocationStore
@@ -212,6 +219,9 @@ class MinuteQlibRequest(BaseModel):
         max_length=120,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
     )
+    target_frequency: Literal["1min", "5min", "15min", "30min", "60min"] | None = (
+        None
+    )
 
 
 class MinuteResearchRequest(BaseModel):
@@ -313,8 +323,37 @@ class StrategyFactorRequest(BaseModel):
 
 
 class StrategyConfigRequest(BaseModel):
-    recipe_id: Literal["custom", "index_enhancement", "swing_trend"] = "custom"
+    recipe_id: Literal[
+        "custom",
+        "index_enhancement",
+        "swing_trend",
+        "full_market_multifactor",
+        "minute_mean_reversion",
+    ] = "custom"
     recipe_version: str = Field(default="custom", min_length=1, max_length=100)
+    factor_source_mode: Literal[
+        "promoted_only",
+        "qlib_baseline",
+        "qlib_baseline_plus_challenger",
+        "qlib_challenger_replacement",
+    ] = "promoted_only"
+    challenger_weight: float = Field(default=1.0, ge=0.0, le=1.0)
+    baseline_definition: dict[str, Any] | None = None
+    baseline_definition_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    signal_frequency: Literal["day", "1min", "5min", "15min", "30min", "60min"] = (
+        "day"
+    )
+    signal_period: int = Field(default=1, ge=1, le=1260)
+    execution_frequency: Literal[
+        "day", "1min", "5min", "15min", "30min", "60min"
+    ] = "day"
+    execution_lag_bars: Literal[1] = 1
+    execution_contract_hash: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    rebalance_frequency: Literal["bar", "day", "week", "month"] = "day"
     topk: int = Field(default=50, ge=5, le=500)
     n_drop: int = Field(default=5, ge=0, le=100)
     max_position_weight: float = Field(default=0.02, gt=0, le=0.20)
@@ -333,9 +372,9 @@ class StrategyConfigRequest(BaseModel):
     max_value_deviation: float = Field(default=0.30, ge=0, le=2.0)
     max_growth_deviation: float = Field(default=0.30, ge=0, le=2.0)
     max_volatility_deviation: float = Field(default=0.30, ge=0, le=2.0)
-    portfolio_construction: Literal["topk_equal_weight", "benchmark_relative_qp"] = (
-        "topk_equal_weight"
-    )
+    portfolio_construction: Literal[
+        "topk_equal_weight", "benchmark_relative_qp", "industry_neutral_qp"
+    ] = "topk_equal_weight"
     optimizer_alpha_weight: float = Field(default=0.05, ge=0, le=10.0)
     optimizer_tracking_penalty: float = Field(default=1.0, ge=0, le=100.0)
     optimizer_turnover_penalty: float = Field(default=0.10, ge=0, le=100.0)
@@ -343,6 +382,7 @@ class StrategyConfigRequest(BaseModel):
     liquidity_lookback_days: int = Field(default=20, ge=5, le=252)
     require_regulatory_events: bool = False
     max_tracking_error: float = Field(default=0.12, gt=0, le=1.0)
+    target_volatility: float = Field(default=0.15, gt=0, le=0.50)
     max_drawdown: float = Field(default=0.25, gt=0, le=1.0)
     max_turnover: float = Field(default=0.60, gt=0, le=2.0)
     min_information_ratio: float = Field(default=0.0, ge=-5, le=10)
@@ -370,7 +410,7 @@ class StrategyConfigRequest(BaseModel):
     min_win_rate: float = Field(default=0.0, ge=0.0, le=1.0)
     min_profit_loss_ratio: float = Field(default=0.0, ge=0.0, le=100.0)
     execution_days: int = Field(default=1, ge=1, le=5)
-    execution_method: Literal["open", "twap", "vwap"] = "open"
+    execution_method: Literal["open", "twap", "vwap", "next_bar"] = "open"
     execution_slice_minutes: int = Field(default=20, ge=5, le=30)
     max_execution_slices: int = Field(default=24, ge=1, le=64)
     vwap_lookback_days: int = Field(default=20, ge=5, le=60)
@@ -401,7 +441,7 @@ class StrategyConfigRequest(BaseModel):
         if self.max_industry_weight < self.max_position_weight:
             raise ValueError("max_industry_weight must not be below max_position_weight")
         if (
-            self.portfolio_construction == "benchmark_relative_qp"
+            self.portfolio_construction in {"benchmark_relative_qp", "industry_neutral_qp"}
             and self.topk * self.max_position_weight < 1.0
         ):
             raise ValueError(
@@ -426,7 +466,22 @@ class StrategyConfigRequest(BaseModel):
         if self.execution_slice_minutes % 5:
             raise ValueError("execution_slice_minutes must be a multiple of five")
         CostModelConfig.from_mapping(self.model_dump())
+        config = self.model_dump(exclude={"execution_contract_hash"})
+        expected_contract_hash = strategy_execution_contract_hash(config)
+        if (
+            self.execution_contract_hash is not None
+            and self.execution_contract_hash != expected_contract_hash
+        ):
+            raise ValueError("execution_contract_hash does not match the strategy contract")
+        self.execution_contract_hash = expected_contract_hash
+        require_strategy_execution_contract(self.model_dump())
         return self
+
+
+def _rebind_strategy_execution_contract(values: dict[str, Any]) -> StrategyConfigRequest:
+    rebound = dict(values)
+    rebound.pop("execution_contract_hash", None)
+    return StrategyConfigRequest.model_validate(rebound)
 
 
 class StrategyCreateRequest(BaseModel):
@@ -434,7 +489,7 @@ class StrategyCreateRequest(BaseModel):
     description: str = Field(min_length=10, max_length=2000)
     benchmark: str = "SH000300"
     universe: str = "cn_all"
-    factors: list[StrategyFactorRequest] = Field(min_length=1, max_length=20)
+    factors: list[StrategyFactorRequest] = Field(default_factory=list, max_length=20)
     config: StrategyConfigRequest | None = None
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
 
@@ -442,7 +497,7 @@ class StrategyCreateRequest(BaseModel):
 class StrategyVersionCreateRequest(BaseModel):
     benchmark: str = "SH000300"
     universe: str = "cn_all"
-    factors: list[StrategyFactorRequest] = Field(min_length=1, max_length=20)
+    factors: list[StrategyFactorRequest] = Field(default_factory=list, max_length=20)
     config: StrategyConfigRequest | None = None
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
 
@@ -551,6 +606,7 @@ class StrategyBacktestRequest(BaseModel):
 
 class ParameterExperimentRequest(BaseModel):
     dataset: str
+    execution_dataset: str | None = None
     start: date
     end: date
     parameter_grid: dict[str, list[int | float]]
@@ -567,7 +623,9 @@ class ResearchCampaignCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=150)
     objective: str = Field(min_length=10, max_length=2000)
     dataset: str
-    recipe_id: Literal["index_enhancement", "swing_trend"] = "index_enhancement"
+    recipe_id: Literal[
+        "index_enhancement", "swing_trend", "full_market_multifactor"
+    ] = "index_enhancement"
     benchmark: str | None = None
     universe: str | None = None
     loop_n: int = Field(default=2, ge=1, le=20)
@@ -612,7 +670,9 @@ class ResearchCampaignStatusRequest(BaseModel):
 class ResearchProgramCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=100)
     dataset: str
-    recipe_id: Literal["index_enhancement", "swing_trend"] = "index_enhancement"
+    recipe_id: Literal[
+        "index_enhancement", "swing_trend", "full_market_multifactor"
+    ] = "index_enhancement"
     objective: str | None = Field(default=None, min_length=10, max_length=2000)
     benchmark: str | None = None
     universe: str | None = None
@@ -666,6 +726,9 @@ class StrategyApprovalRequest(BaseModel):
 class StrategyAllocationMemberRequest(BaseModel):
     strategy_version_id: str
     weight: float | None = Field(default=None, gt=0, le=1)
+    role: Literal["core", "satellite"] = "core"
+    risk_budget: float = Field(default=1.0, gt=0, le=1)
+    member_cap: float | None = Field(default=None, gt=0, le=0.70)
 
 
 class StrategyAllocationCreateRequest(BaseModel):
@@ -733,17 +796,76 @@ class RecommendationRefreshRequest(BaseModel):
 
 
 class SimulationPortfolioCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=3, max_length=150)
-    recommendation_portfolio_id: str
+    recommendation_portfolio_id: str | None = None
+    source_type: Literal["recommendation", "strategy_version", "allocation"] | None = None
+    source_id: str | None = None
     execution_dataset: str
+    execution_frequency: Literal["1min", "5min"] = "5min"
+    execution_adapter: Literal["long_only", "pair"] | None = None
+    execution_contract_hash: str | None = Field(default=None, min_length=64, max_length=64)
     initial_cash: float = Field(ge=100_000)
-    execution_algorithm: Literal["twap", "vwap"] = "twap"
-    slice_minutes: int = Field(default=20, ge=5, le=30, multiple_of=5)
-    max_slices: int = Field(default=24, ge=1, le=64)
-    max_participation: float = Field(default=0.01, gt=0, le=0.20)
-    volume_profile: list[dict[str, Any]] | None = None
+    execution_algorithm: Literal["twap", "vwap", "next_bar"] | None = None
+    slice_minutes: int | None = Field(default=None, ge=5, le=30, multiple_of=5)
+    max_slices: int | None = Field(default=None, ge=1, le=64)
+    max_participation: float | None = Field(default=None, gt=0, le=0.20)
     cost_schedule_version: str = COST_SCHEDULE_VERSION
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> SimulationPortfolioCreateRequest:
+        if self.recommendation_portfolio_id:
+            if self.source_type not in {None, "recommendation"}:
+                raise ValueError("recommendation_portfolio_id conflicts with source_type")
+            if self.source_id and self.source_id != self.recommendation_portfolio_id:
+                raise ValueError("recommendation source identifiers disagree")
+        elif not self.source_type or not self.source_id:
+            raise ValueError("simulation source_type and source_id are required")
+        return self
+
+
+class SimulationOrderPlanBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    order_plan_manifest_sha256: str = Field(min_length=64, max_length=64)
+    actor: str = Field(default="simulation-operator", min_length=2, max_length=100)
+
+
+class SimulationOrderPlanGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    signal_date: date
+    signal_at: datetime | None = None
+    actor: str = Field(default="simulation-operator", min_length=2, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_signal_time(self) -> SimulationOrderPlanGenerationRequest:
+        if self.signal_at is None:
+            return self
+        if self.signal_at.tzinfo is None or self.signal_at.utcoffset() is None:
+            raise ValueError("simulation signal timestamp must include a timezone")
+        shanghai_date = self.signal_at.astimezone(
+            ZoneInfo("Asia/Shanghai")
+        ).date()
+        if shanghai_date != self.signal_date:
+            raise ValueError("simulation signal timestamp does not match signal_date")
+        return self
+
+
+class PairSimulationReplayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    backtest_id: str = Field(min_length=1, max_length=200)
+    trade_date: date
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+
+class SimulationNavReviewRequest(BaseModel):
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+    evidence_sha256: str = Field(min_length=64, max_length=64)
+    note: str = Field(min_length=10, max_length=2000)
 
 
 class ScheduleCreateRequest(BaseModel):
@@ -1679,7 +1801,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             actor = authenticated_actor(request, payload.actor)
             objective = payload.objective or recipe["rdagent_objective"]
             if payload.strategy_config is None:
-                strategy_config = StrategyConfigRequest.model_validate(
+                strategy_config = _rebind_strategy_execution_contract(
                     {
                         **strategy_defaults_state()["config"],
                         **recipe["config_overrides"],
@@ -1695,7 +1817,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             experiment_trials = [
                 {
                     "parameters": parameters,
-                    "config": StrategyConfigRequest.model_validate(
+                    "config": _rebind_strategy_execution_contract(
                         {**strategy_config, **parameters}
                     ).model_dump(),
                 }
@@ -1818,7 +1940,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 max_loops=settings.rdagent_max_loops,
             )
             if payload.strategy_config is None:
-                strategy_config = StrategyConfigRequest.model_validate(
+                strategy_config = _rebind_strategy_execution_contract(
                     {
                         **strategy_defaults_state()["config"],
                         **recipe["config_overrides"],
@@ -1834,7 +1956,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             experiment_trials = [
                 {
                     "parameters": parameters,
-                    "config": StrategyConfigRequest.model_validate(
+                    "config": _rebind_strategy_execution_contract(
                         {**strategy_config, **parameters}
                     ).model_dump(),
                 }
@@ -2085,12 +2207,38 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             version = strategies.get_version(version_id)
             if version.get("strategy_type") != "multifactor":
                 raise ValueError("parameter experiments require a multifactor strategy")
+            execution_method = str(version.get("config", {}).get("execution_method", "open"))
+            execution_dataset: dict[str, Any] | None = None
+            if execution_method in {"twap", "vwap", "next_bar"}:
+                if not payload.execution_dataset:
+                    raise ValueError(
+                        "minute parameter experiments require a minute execution dataset"
+                    )
+                execution_dataset = require_qlib_dataset(
+                    payload.execution_dataset,
+                    purpose="parameter experiment minute execution",
+                )
+                if execution_dataset.get("frequency") != version["config"].get(
+                    "execution_frequency"
+                ):
+                    raise ValueError(
+                        "parameter experiment execution dataset frequency does not match "
+                        "the immutable strategy contract"
+                    )
+                if execution_dataset.get("frequency") not in NATIVE_MINUTE_FREQUENCIES:
+                    raise ValueError(
+                        "parameter experiment execution requires native 1/5-minute data"
+                    )
+            elif payload.execution_dataset:
+                raise ValueError(
+                    "daily-open parameter experiments must not specify minute execution data"
+                )
             parameter_grid, trial_parameters = normalize_parameter_grid(
                 payload.parameter_grid, max_trials=payload.max_trials
             )
             trial_configs = []
             for parameters in trial_parameters:
-                config = StrategyConfigRequest.model_validate(
+                config = _rebind_strategy_execution_contract(
                     {**version["config"], **parameters}
                 ).model_dump()
                 trial_configs.append({"parameters": parameters, "config": config})
@@ -2117,6 +2265,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "strategy_version_id": version_id,
                     "dataset": payload.dataset,
                     "dataset_path": dataset["path"],
+                    "execution_dataset": execution_dataset,
                 },
                 log_path,
             )
@@ -2143,18 +2292,18 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             if version.get("strategy_type") != "multifactor":
                 raise ValueError("pair strategy versions require the pair-backtests endpoint")
             execution_method = str(version.get("config", {}).get("execution_method", "open"))
-            if execution_method in {"twap", "vwap"}:
+            if execution_method in {"twap", "vwap", "next_bar"}:
                 if not payload.execution_dataset:
                     raise ValueError(
-                        "TWAP/VWAP strategy backtests require a minute execution dataset"
+                        "minute strategy backtests require a minute execution dataset"
                     )
                 execution_dataset = require_qlib_dataset(
                     payload.execution_dataset, purpose="strategy minute execution"
                 )
                 frequency = str(execution_dataset.get("frequency") or "")
-                if frequency not in MINUTE_FREQUENCIES:
+                if frequency not in NATIVE_MINUTE_FREQUENCIES:
                     raise ValueError(
-                        "strategy minute execution requires a supported minute frequency"
+                        "strategy execution requires a native 1/5-minute Qlib dataset"
                     )
                 execution_start = str(execution_dataset.get("start_date") or "")[:10]
                 execution_end = str(execution_dataset.get("end_date") or "")[:10]
@@ -2325,6 +2474,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 max_drawdown_liquidate=payload.max_drawdown_liquidate,
                 fixed_weights=fixed_weights,
                 actor=authenticated_actor(request, payload.actor),
+                member_specs=[item.model_dump() for item in payload.members],
             )
         except KeyError as exc:
             raise HTTPException(404, "strategy version not found") from exc
@@ -2412,9 +2562,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/strategy-allocations/{allocation_id}/refresh")
-    def refresh_strategy_allocation(allocation_id: str) -> dict:
+    def refresh_strategy_allocation(allocation_id: str, request: Request) -> dict:
         try:
-            return allocations.refresh(allocation_id)
+            return allocations.refresh(
+                allocation_id,
+                actor=authenticated_actor(request),
+            )
         except KeyError as exc:
             raise HTTPException(404, "strategy allocation not found") from exc
         except ValueError as exc:
@@ -2598,39 +2751,196 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def create_simulation_portfolio(
         payload: SimulationPortfolioCreateRequest, request: Request
     ) -> dict:
+        source_type = payload.source_type or "recommendation"
+        source_id = payload.source_id or payload.recommendation_portfolio_id or ""
         try:
-            recommendation = recommendations.get(payload.recommendation_portfolio_id)
+            if source_type == "recommendation":
+                source = recommendations.get(source_id)
+                daily_dataset_name = str(source["dataset"])
+            elif source_type == "strategy_version":
+                version = strategies.get_version(source_id)
+                if version["status"] != "approved" or version.get("is_legacy"):
+                    raise ValueError(
+                        "simulation requires an approved non-legacy strategy version"
+                    )
+                formal = next(
+                    (
+                        item
+                        for item in strategies.list_backtests(source_id)
+                        if item["status"] == "succeeded" and not item.get("is_legacy")
+                    ),
+                    None,
+                )
+                if formal is None:
+                    raise ValueError(
+                        "strategy simulation requires a successful formal Qlib backtest"
+                    )
+                daily_dataset_name = str(formal["dataset"])
+            else:
+                source = allocations.get(source_id)
+                daily_dataset_name = str(source["dataset"])
         except KeyError as exc:
-            raise HTTPException(404, "recommendation portfolio not found") from exc
+            raise HTTPException(404, "simulation source not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         daily = require_qlib_dataset(
-            recommendation["dataset"], purpose="simulation daily data", frequency="day"
+            daily_dataset_name, purpose="simulation daily data", frequency="day"
         )
         execution = require_qlib_dataset(
             payload.execution_dataset,
             purpose="simulation execution data",
-            frequency="5min",
+            frequency=payload.execution_frequency,
         )
         try:
             return simulations.create(
                 name=payload.name,
                 recommendation_portfolio_id=payload.recommendation_portfolio_id,
+                source_type=source_type,
+                source_id=source_id,
                 daily_dataset=daily,
                 execution_dataset=execution,
                 initial_cash=payload.initial_cash,
                 execution_policy={
-                    "execution_algorithm": payload.execution_algorithm,
-                    "slice_minutes": payload.slice_minutes,
-                    "max_slices": payload.max_slices,
-                    "max_participation": payload.max_participation,
-                    "volume_profile": payload.volume_profile,
+                    key: value
+                    for key, value in {
+                        "execution_algorithm": payload.execution_algorithm,
+                        "slice_minutes": payload.slice_minutes,
+                        "max_slices": payload.max_slices,
+                        "max_participation": payload.max_participation,
+                    }.items()
+                    if value is not None
                 },
                 cost_schedule_version=payload.cost_schedule_version,
                 actor=authenticated_actor(request, payload.actor),
+                execution_adapter=payload.execution_adapter,
+                execution_contract_hash=payload.execution_contract_hash,
             )
         except KeyError as exc:
-            raise HTTPException(404, "recommendation portfolio not found") from exc
+            raise HTTPException(404, "simulation source not found") from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+
+    @app.post(
+        "/api/simulation-portfolios/{portfolio_id}/order-plans",
+        status_code=202,
+    )
+    def generate_simulation_order_plan(
+        portfolio_id: str,
+        payload: SimulationOrderPlanGenerationRequest,
+        request: Request,
+    ) -> dict:
+        try:
+            portfolio = simulations.get(portfolio_id)
+            if portfolio["status"] != "active":
+                raise ValueError("simulation portfolio is not active")
+            if (
+                portfolio["source_type"] != "strategy_version"
+                or portfolio["execution_adapter"] != "long_only"
+            ):
+                raise ValueError(
+                    "Qlib order-plan generation requires an active long-only "
+                    "strategy-version simulation"
+                )
+            version = strategies.get_version(portfolio["source_id"])
+            if (
+                str(version.get("signal_frequency") or "day") != "day"
+                and payload.signal_at is None
+            ):
+                raise ValueError(
+                    "minute strategy order-plan generation requires signal_at"
+                )
+        except KeyError as exc:
+            raise HTTPException(404, "simulation portfolio or strategy source not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        actor = authenticated_actor(request, payload.actor)
+        signal_identity = (
+            payload.signal_at.isoformat()
+            if payload.signal_at is not None
+            else payload.signal_date.isoformat()
+        )
+        job = jobs.create(
+            "simulation_order_plan",
+            {
+                "simulation_portfolio_id": portfolio_id,
+                "signal_date": payload.signal_date.isoformat(),
+                "signal_at": (
+                    payload.signal_at.isoformat()
+                    if payload.signal_at is not None
+                    else None
+                ),
+                "actor": actor,
+            },
+            platform_root / "logs" / f"simulation-order-plan-{portfolio_id}.log",
+            dedupe_active_kind=False,
+            idempotency_key=(
+                f"simulation-order-plan:{portfolio_id}:{signal_identity}"
+            ),
+        )
+        worker.notify()
+        return job
+
+    @app.post("/api/simulation-portfolios/{portfolio_id}/batches", status_code=202)
+    def create_simulation_target_batch(
+        portfolio_id: str,
+        payload: SimulationOrderPlanBatchRequest,
+        request: Request,
+    ) -> dict:
+        try:
+            batch, created = simulations.create_batch_from_order_plan(
+                portfolio_id,
+                order_plan_manifest_sha256=payload.order_plan_manifest_sha256,
+                data_root=settings.data_root,
+                actor=authenticated_actor(request, payload.actor),
+            )
+            portfolio = simulations.get(portfolio_id)
+        except KeyError as exc:
+            raise HTTPException(404, "simulation portfolio not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if created and portfolio["execution_adapter"] == "long_only":
+            jobs.create(
+                "simulation_replay",
+                {"simulation_batch_id": batch["id"]},
+                platform_root
+                / "logs"
+                / f"simulation-replay-{batch['id']}.log",
+                dedupe_active_kind=False,
+                idempotency_key=f"simulation-replay:{batch['id']}",
+            )
+            worker.notify()
+        return batch
+
+    @app.post(
+        "/api/simulation-portfolios/{portfolio_id}/pair-replays",
+        status_code=202,
+    )
+    def create_pair_simulation_replay(
+        portfolio_id: str, payload: PairSimulationReplayRequest, request: Request
+    ) -> dict:
+        try:
+            batch, created = simulations.create_pair_batch_from_backtest(
+                portfolio_id,
+                backtest_id=payload.backtest_id,
+                trade_date=payload.trade_date,
+                data_root=settings.data_root,
+                actor=authenticated_actor(request, payload.actor),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "simulation portfolio or pair backtest not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if created:
+            jobs.create(
+                "simulation_replay",
+                {"simulation_batch_id": batch["id"]},
+                platform_root / "logs" / f"simulation-replay-{batch['id']}.log",
+                dedupe_active_kind=False,
+                idempotency_key=f"simulation-replay:{batch['id']}",
+            )
+            worker.notify()
+        batch["operational_status"] = "queued_with_tushare_shortability_evidence"
+        return batch
 
     @app.get("/api/simulation-portfolios/{portfolio_id}")
     def get_simulation_portfolio(portfolio_id: str) -> dict:
@@ -2652,6 +2962,28 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             return simulations.set_status(portfolio_id, "paused")
         except KeyError as exc:
             raise HTTPException(404, "simulation portfolio not found") from exc
+
+    @app.post(
+        "/api/simulation-portfolios/{portfolio_id}/nav/{trade_date}/review"
+    )
+    def review_simulation_nav(
+        portfolio_id: str,
+        trade_date: date,
+        payload: SimulationNavReviewRequest,
+        request: Request,
+    ) -> dict:
+        try:
+            return simulations.review_nav(
+                portfolio_id,
+                trade_date,
+                actor=authenticated_actor(request, payload.actor),
+                evidence_sha256=payload.evidence_sha256,
+                note=payload.note,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "simulation portfolio or NAV row not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/simulation-portfolios/{portfolio_id}/{resource}")
     def get_simulation_resource(
@@ -3071,18 +3403,28 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         manifest = snapshot["manifest"]
-        frequency = str(manifest.get("frequency") or "")
-        if frequency not in MINUTE_FREQUENCIES:
+        source_frequency = str(manifest.get("frequency") or "")
+        if source_frequency not in NATIVE_MINUTE_FREQUENCIES:
             raise HTTPException(409, "minute Qlib requires a supported minute snapshot")
         supported = set(MINUTE_DATASETS)
         if not supported.intersection(manifest.get("datasets", {})):
             raise HTTPException(409, "execution snapshot has no supported minute datasets")
-        output_name = payload.output_name or f"{payload.snapshot_name}-{frequency}"
+        target_frequency = payload.target_frequency or source_frequency
+        if (
+            target_frequency in NATIVE_MINUTE_FREQUENCIES
+            and target_frequency != source_frequency
+        ):
+            raise HTTPException(
+                409, "native minute Qlib output must match the snapshot frequency"
+            )
+        output_name = payload.output_name or f"{payload.snapshot_name}-{target_frequency}"
         serialized = {
             "snapshot_name": payload.snapshot_name,
             "snapshot_manifest_sha256": snapshot["manifest_sha256"],
             "output_name": output_name,
-            "frequency": frequency,
+            "source_frequency": source_frequency,
+            "target_frequency": target_frequency,
+            "frequency": target_frequency,
         }
         log_path = platform_root / "logs" / f"minute-qlib-{output_name}.log"
         try:
@@ -3090,7 +3432,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 "minute_qlib",
                 serialized,
                 log_path,
-                idempotency_key=f"minute-qlib:{payload.snapshot_name}:{output_name}",
+                idempotency_key=(
+                    f"minute-qlib:{payload.snapshot_name}:{output_name}:"
+                    f"{target_frequency}"
+                ),
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -3100,12 +3445,27 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.post("/api/jobs/minute-research", status_code=202)
     def create_minute_research(payload: MinuteResearchRequest) -> dict:
         dataset = require_qlib_dataset(
-            payload.dataset, purpose="minute factor research", frequency="1min"
+            payload.dataset, purpose="minute factor research"
         )
+        frequency = str(dataset.get("frequency") or "")
+        if frequency not in MINUTE_FREQUENCIES:
+            raise HTTPException(409, "minute research requires a minute Qlib dataset")
+        try:
+            require_minute_signal_contract(
+                dataset["provenance"], frequency=frequency
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        bar_minutes = int(frequency.removesuffix("min"))
+        if any(horizon % bar_minutes for horizon in payload.horizons):
+            raise HTTPException(
+                409, "research horizons must be multiples of the dataset frequency"
+            )
         serialized = {
             "dataset": payload.dataset,
             "dataset_path": dataset["path"],
             "dataset_identity_sha256": dataset["provenance"]["dataset_identity_sha256"],
+            "frequency": frequency,
             "start": payload.start.isoformat(),
             "end": payload.end.isoformat(),
             "horizons": sorted(payload.horizons),

@@ -9,6 +9,7 @@ import { AuthPanel, AuthState } from "./auth-panel";
 import { FactorLibraryPanel } from "./factor-library-panel";
 import { JobRunCenter } from "./job-run-center";
 import { MarketOverviewPanel } from "./market-overview-panel";
+import { PairSatellitePanel } from "./pair-satellite-panel";
 import { PortfolioPanel } from "./portfolio-panel";
 import { QlibPanel } from "./qlib-panel";
 import { RDAgentPanel } from "./rdagent-panel";
@@ -65,29 +66,25 @@ type RetentionPlan = {
 
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8765";
 const navGroups = [
-  { label: "主页", items: [{ index: 0, label: "总览" }, { index: 11, label: "行情总览" }] },
-  { label: "数据与研究", items: [{ index: 1, label: "数据中心" }, { index: 2, label: "Qlib 研究" }, { index: 3, label: "RD-Agent" }, { index: 4, label: "自动研究" }, { index: 5, label: "因子库" }] },
-  { label: "策略与推荐", items: [{ index: 6, label: "回测" }, { index: 7, label: "配对研究" }, { index: 8, label: "推荐组合" }, { index: 12, label: "多策略组合" }] },
+  { label: "工作台", items: [{ index: 0, label: "总览" }, { index: 11, label: "行情总览" }] },
+  { label: "单主线", items: [{ index: 1, label: "数据快照" }, { index: 3, label: "RD-Agent 研究" }, { index: 5, label: "因子准入" }, { index: 6, label: "Qlib 回测与审批" }, { index: 12, label: "核心 / 卫星分配" }, { index: 8, label: "统一模拟盘" }] },
+  { label: "研究支持", items: [{ index: 2, label: "Qlib 实验记录" }, { index: 4, label: "连续研究" }, { index: 7, label: "配对卫星" }] },
   { label: "系统", items: [{ index: 9, label: "任务与告警" }, { index: 10, label: "系统设置" }] },
 ];
-const visibleNavGroups = navGroups.map((group) => ({
-  ...group,
-  items: group.items.filter((item) => item.index !== 7),
-}));
 const headings: Record<number, [string, string]> = {
   0: ["QUANTLAB / WORKSPACE", "总览"],
-  1: ["DATA OPERATIONS / A-SHARE", "数据中心"],
-  2: ["MODEL RESEARCH / QLIB", "Qlib 研究"],
+  1: ["TUSHARE SNAPSHOTS / QLIB DATASET", "数据快照"],
+  2: ["MODEL RESEARCH / QLIB", "Qlib 实验记录"],
   3: ["AUTONOMOUS RESEARCH / GOVERNED", "RD-Agent 研究"],
-  4: ["RESEARCH AUTOPILOT / GOVERNED PIPELINE", "自动研究"],
-  5: ["FACTOR GOVERNANCE / REGISTRY", "因子库"],
-  6: ["STRATEGY RESEARCH / RISK GATES", "策略回测"],
-  7: ["STATISTICAL ARBITRAGE / MINUTE EXECUTION", "配对交易"],
-  8: ["RECOMMENDATION TRACKING / RESEARCH ONLY", "推荐组合"],
+  4: ["RESEARCH AUTOPILOT / GOVERNED PIPELINE", "连续研究"],
+  5: ["FACTOR GOVERNANCE / REGISTRY", "因子准入"],
+  6: ["QLIB BACKTEST / RISK APPROVAL", "Qlib 回测与审批"],
+  7: ["STATISTICAL ARBITRAGE / UNIFIED SIMULATION", "配对卫星"],
+  8: ["APPROVED SOURCES / DURABLE LEDGER", "统一模拟盘"],
   9: ["AUTOMATION / ALERTS / RECOVERY", "任务与告警"],
   10: ["SERVER CONFIGURATION / ENCRYPTED", "系统设置"],
   11: ["MARKET INTELLIGENCE / RESEARCH SNAPSHOT", "行情总览"],
-  12: ["MULTI-STRATEGY / RISK PARITY", "多策略推荐组合"],
+  12: ["CORE SATELLITE / RISK BUDGET", "核心 / 卫星分配"],
 };
 
 function formatNumber(value: number) {
@@ -246,7 +243,7 @@ export default function Home() {
       <aside className="sidebar">
         <div className="brand"><span className="brand-mark">Q</span><span>Quant<span>Lab</span></span></div>
         <nav aria-label="主导航">
-          {visibleNavGroups.map((group) => (
+          {navGroups.map((group) => (
             <div className="nav-group" key={group.label}>
               <span className="nav-group-label">{group.label}</span>
               {group.items.map((item) => (
@@ -290,9 +287,9 @@ export default function Home() {
                 <button onClick={() => { setActiveNav(1); setDataView("create"); }}><b>补充市场数据</b><span>新建日线、分钟线或海外数据任务</span></button>
                 <button onClick={() => setActiveNav(11)}><b>查看研究行情</b><span>指数、市场宽度、行业强弱与自选观察池</span></button>
                 <button onClick={() => setActiveNav(2)}><b>训练 Qlib 模型</b><span>管理数据集和基线实验</span></button>
-                <button onClick={() => setActiveNav(4)}><b>启动自动研究</b><span>因子、参数实验、Qlib 回测和推荐候选</span></button>
-                <button onClick={() => setActiveNav(6)}><b>运行策略回测</b><span>验证收益、风险和交易约束</span></button>
-                <button onClick={() => setActiveNav(8)}><b>查看推荐组合</b><span>建议权重、调整原因和假设表现</span></button>
+                <button onClick={() => setActiveNav(4)}><b>启动连续研究</b><span>RD-Agent 候选、独立复算与 Qlib 挑战者实验</span></button>
+                <button onClick={() => setActiveNav(6)}><b>运行 Qlib 回测并审批</b><span>验证收益、风险、执行契约和样本外证据</span></button>
+                <button onClick={() => setActiveNav(8)}><b>进入统一模拟盘</b><span>只消费推荐、已审批策略或已审批分配版本</span></button>
               </article>
             </section>
           </div>
@@ -358,7 +355,7 @@ export default function Home() {
               <section className="data-panel"><div className="panel-heading"><div><h2>基础数据集</h2><p>用于核对旧初始化流水线的工作单元。</p></div><div className="segmented">{["core", "research", "full"].map((value) => <button className={profile === value ? "selected" : ""} onClick={() => setProfile(value)} key={value}>{value}</button>)}</div></div><div className="table-wrap"><table><thead><tr><th>数据集</th><th>层级</th><th>状态</th><th>进度</th><th>数据行</th><th>失败</th></tr></thead><tbody>{visibleDatasets.map((item) => <tr key={item.name}><td><code>{item.name}</code></td><td><span className={`tier ${item.profile}`}>{item.profile}</span></td><td><span className={`state ${item.state}`}>{item.state === "ready" ? "已就绪" : item.state === "partial" ? "部分完成" : "未下载"}</span></td><td><div className="mini-progress"><i style={{ width: `${item.coverage}%` }} /></div><small>{item.coverage}%</small></td><td>{formatNumber(item.rows)}</td><td className={item.failed ? "danger" : "muted"}>{item.failed}</td></tr>)}</tbody></table></div></section>
             </div> : null}
           </div>
-        ) : activeNav === 11 ? <MarketOverviewPanel api={API} onOpenData={() => { setActiveNav(1); setDataView("overview"); }} /> : activeNav === 2 ? <QlibPanel api={API} /> : activeNav === 3 ? <RDAgentPanel api={API} /> : activeNav === 4 ? <ResearchCampaignPanel api={API} /> : activeNav === 5 ? <FactorLibraryPanel api={API} /> : activeNav === 6 ? <BacktestPanel api={API} /> : activeNav === 8 ? <PortfolioPanel api={API} /> : activeNav === 12 ? <StrategyAllocationPanel api={API} /> : activeNav === 9 ? <JobRunCenter api={API} canControl={auth.user?.role === "admin" || auth.user?.role === "operator"} onChanged={refresh} onMessage={setMessage} /> : <SettingsPanel api={API} />}
+        ) : activeNav === 11 ? <MarketOverviewPanel api={API} onOpenData={() => { setActiveNav(1); setDataView("overview"); }} /> : activeNav === 2 ? <QlibPanel api={API} /> : activeNav === 3 ? <RDAgentPanel api={API} /> : activeNav === 4 ? <ResearchCampaignPanel api={API} /> : activeNav === 5 ? <FactorLibraryPanel api={API} /> : activeNav === 6 ? <BacktestPanel api={API} /> : activeNav === 7 ? <PairSatellitePanel api={API} /> : activeNav === 8 ? <PortfolioPanel api={API} /> : activeNav === 12 ? <StrategyAllocationPanel api={API} /> : activeNav === 9 ? <JobRunCenter api={API} canControl={auth.user?.role === "admin" || auth.user?.role === "operator"} onChanged={refresh} onMessage={setMessage} /> : <SettingsPanel api={API} />}
       </section>
     </main>
   );

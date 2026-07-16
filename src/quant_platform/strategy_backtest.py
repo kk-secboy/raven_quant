@@ -78,12 +78,27 @@ def build_governed_signal(
     for timestamp, daily in score.groupby(level="datetime", sort=True):
         ranking = daily.droplevel("datetime").dropna()
         if eligibility is not None:
-            qualified = eligibility[
-                (eligibility["datetime"] == timestamp) & eligibility["eligible"]
-            ]["instrument"]
+            available = eligibility[eligibility["datetime"] <= timestamp]
+            eligible_at = (
+                available[available["datetime"] == available["datetime"].max()]
+                if not available.empty
+                else available
+            )
+            qualified = eligible_at[eligible_at["eligible"]]["instrument"]
             ranking = ranking[ranking.index.astype(str).isin(set(qualified.astype(str)))]
+        daily_industries = _industries_at(memberships, timestamp)
+        industry_design = pd.DataFrame(index=ranking.index)
+        if memberships is not None:
+            assigned = daily_industries.reindex(ranking.index)
+            ranking = ranking[assigned.notna()]
+            assigned = assigned.reindex(ranking.index)
+            industry_design = pd.get_dummies(
+                assigned.astype(str), prefix="industry", drop_first=True, dtype=float
+            )
         daily_styles = _style_snapshot(styles, timestamp).reindex(ranking.index)
-        design = pd.concat([ranking.rename("score"), daily_styles], axis=1).dropna()
+        design = pd.concat(
+            [ranking.rename("score"), daily_styles, industry_design], axis=1
+        ).dropna()
         style_columns = [column for column in design.columns if column != "score"]
         if style_columns and len(design) >= max(5, min(topk, len(ranking))):
             matrix = design[style_columns].to_numpy(dtype=float)
@@ -93,9 +108,14 @@ def build_governed_signal(
             )
             ranking.loc[design.index] = design["score"] - matrix @ coefficients
         if min_average_daily_amount > 0:
+            eligible_liquidity = (
+                rolling_liquidity.index[rolling_liquidity.index <= timestamp]
+                if rolling_liquidity is not None
+                else pd.Index([])
+            )
             daily_amount = (
-                rolling_liquidity.loc[timestamp]
-                if rolling_liquidity is not None and timestamp in rolling_liquidity.index
+                rolling_liquidity.loc[eligible_liquidity[-1]]
+                if rolling_liquidity is not None and len(eligible_liquidity)
                 else pd.Series(dtype=float)
             )
             ranking = ranking[
@@ -104,7 +124,7 @@ def build_governed_signal(
         ranking = ranking.sort_values(ascending=False)
         if len(ranking) < topk:
             continue
-        industries = _industries_at(memberships, timestamp)
+        industries = daily_industries
         benchmark_day = _snapshot(benchmark, timestamp, "weight")
         benchmark_industry = (
             benchmark_day.groupby(industries.reindex(benchmark_day.index)).sum()

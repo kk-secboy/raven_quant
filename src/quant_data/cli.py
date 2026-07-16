@@ -1571,15 +1571,19 @@ def build_qlib_command(
 def build_minute_qlib_command(
     snapshot_name: Annotated[str, typer.Option("--snapshot")],
     output_name: Annotated[str | None, typer.Option("--output-name")] = None,
+    target_frequency: Annotated[
+        str | None, typer.Option("--target-frequency")
+    ] = None,
     staging_only: Annotated[bool, typer.Option("--staging-only")] = False,
 ) -> None:
-    """Build an independent Qlib dataset at a minute snapshot's native frequency."""
+    """Build native or Qlib-resampled data without another download path."""
     context = load_context(require_credentials=False)
     snapshot_path = context.storage.snapshots_root / snapshot_name
     result = _build_minute_qlib(
         context,
         snapshot_path,
         output_name=output_name,
+        target_frequency=target_frequency,
         staging_only=staging_only,
     )
     console.print(result)
@@ -1690,9 +1694,10 @@ def _build_minute_qlib(
     snapshot_path: Path,
     *,
     output_name: str | None,
+    target_frequency: str | None = None,
     staging_only: bool,
 ) -> Path:
-    builder = MinuteQlibBuilder(snapshot_path)
+    builder = MinuteQlibBuilder(snapshot_path, target_frequency=target_frequency)
     output_name = output_name or f"{snapshot_path.name}-{builder.frequency}"
     staging = context.settings.data_root / "qlib_staging" / output_name
     output = context.settings.data_root / "qlib" / output_name
@@ -1710,7 +1715,19 @@ def _build_minute_qlib(
         raise ValueError(
             f"existing minute Qlib output is incomplete and requires operator review: {output}"
         )
-    by_symbol = builder.build_staging(staging)
+    native_staging = (
+        staging.with_name(f"{staging.name}.native")
+        if builder.requires_resampling
+        else staging
+    )
+    by_symbol = builder.build_staging(native_staging)
+    if builder.requires_resampling:
+        by_symbol = builder.resample_staging(
+            native_by_symbol=by_symbol,
+            staging_path=staging,
+            qlib_python=context.settings.qlib_python,
+            wsl_distro=context.settings.qlib_wsl_distro,
+        )
     if staging_only:
         return by_symbol
     return builder.dump_bin(

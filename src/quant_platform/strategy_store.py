@@ -26,11 +26,20 @@ from quant_data.database import (
 from quant_data.execution_contract import (
     require_daily_qlib_contract,
     require_minute_execution_contract,
+    require_strategy_execution_contract,
+    strategy_execution_contract_hash,
 )
 from quant_platform.cost_model import COST_SCHEDULE_VERSION, CostModelConfig
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
 from quant_platform.pair_trading import PairTradingConfig
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
+from quant_platform.qlib_factor_baseline import (
+    FACTOR_SOURCE_QLIB_BASELINE,
+    baseline_manifest_failures,
+    bind_factor_source_config,
+)
+from quant_platform.qlib_workflow import require_qlib_workflow_identity
+from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
 
 def _now() -> datetime:
@@ -50,6 +59,62 @@ def _is_sha256(value: Any) -> bool:
 def _canonical_sha256(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _version_contract_columns(
+    config: dict[str, Any], *, strategy_type: str
+) -> dict[str, Any]:
+    if strategy_type == "pair":
+        signal_frequency = "day"
+        signal_horizon = "1d"
+        execution_frequency = "1min"
+        contract_hash = _canonical_sha256(
+            {
+                "strategy_type": "pair",
+                "signal_frequency": signal_frequency,
+                "signal_horizon": signal_horizon,
+                "execution_frequency": execution_frequency,
+                "config": config,
+            }
+        )
+    else:
+        signal_frequency = str(config.get("signal_frequency") or "day")
+        signal_horizon = f"{int(config.get('signal_period') or 1)}bar"
+        execution_frequency = str(config.get("execution_frequency") or "day")
+        contract_hash = str(config.get("execution_contract_hash") or "")
+        if not _is_sha256(contract_hash):
+            raise ValueError("strategy execution contract hash is required")
+    return {
+        "signal_frequency": signal_frequency,
+        "signal_horizon": signal_horizon,
+        "execution_frequency": execution_frequency,
+        "execution_contract_hash": contract_hash,
+        "qlib_version": f"0.0.dev0+g{QLIB_COMMIT}",
+        "qlib_commit": QLIB_COMMIT,
+        "rdagent_version": f"0.0.dev0+g{RDAGENT_COMMIT}",
+        "rdagent_commit": RDAGENT_COMMIT,
+    }
+
+
+def _normalize_multifactor_contract(
+    config: dict[str, Any], *, factor_count: int, creating_family: bool
+) -> dict[str, Any]:
+    normalized = bind_factor_source_config(
+        config,
+        factor_count=factor_count,
+        creating_family=creating_family,
+    )
+    normalized.setdefault("signal_frequency", "day")
+    normalized.setdefault("signal_period", 1)
+    normalized.setdefault("execution_frequency", "day")
+    normalized.setdefault("execution_lag_bars", 1)
+    normalized.setdefault("execution_method", "open")
+    normalized.setdefault("execution_days", 1)
+    normalized.setdefault("execution_slice_minutes", 20)
+    normalized.setdefault("max_execution_slices", 24)
+    normalized["execution_contract_hash"] = strategy_execution_contract_hash(normalized)
+    require_strategy_execution_contract(normalized)
+    return normalized
 
 
 def _sha256_file(path: Path) -> str:
@@ -77,6 +142,10 @@ def _multifactor_manifest_failures(
         return ["strategy backtest manifest artifact must be a JSON object"]
 
     failures: list[str] = []
+    try:
+        require_qlib_workflow_identity(provenance.get("qlib_workflow"))
+    except ValueError as exc:
+        failures.append(str(exc))
     manifest_sha256 = provenance.get("execution_manifest_sha256")
     if not _is_sha256(manifest_sha256) or _sha256_file(manifest_path) != manifest_sha256:
         failures.append("strategy backtest manifest does not match its SHA-256 provenance")
@@ -91,6 +160,7 @@ def _multifactor_manifest_failures(
         ("dataset", backtest.get("dataset")),
         ("execution_dataset", backtest.get("execution_dataset")),
         ("benchmark", version.get("benchmark")),
+        ("universe", version.get("universe")),
     ):
         if manifest.get(field) != expected:
             failures.append(f"strategy backtest manifest {field} does not match the run")
@@ -156,6 +226,92 @@ def _multifactor_manifest_failures(
                 failures.append(
                     f"factor {candidate_id} {artifact_kind} artifact does not match provenance"
                 )
+    failures.extend(
+        baseline_manifest_failures(
+            config=version.get("config") or {},
+            factor_count=len(version.get("factors") or []),
+            artifact_root=artifact_root,
+            manifest=manifest,
+            provenance=provenance,
+        )
+    )
+    return failures
+
+
+def _pair_artifact_failures(
+    version: dict[str, Any], backtest: dict[str, Any], metrics: dict[str, Any]
+) -> list[str]:
+    artifact_root = Path(str(backtest["artifact_path"]))
+    manifest_path = artifact_root / "manifest.json"
+    pair_manifest_path = artifact_root / "pair_artifact_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        pair_manifest = json.loads(pair_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ["pair backtest artifact manifests are missing or unreadable"]
+    if not isinstance(manifest, dict) or not isinstance(pair_manifest, dict):
+        return ["pair backtest artifact manifests must be JSON objects"]
+    provenance = metrics.get("provenance")
+    provenance = provenance if isinstance(provenance, dict) else {}
+    failures: list[str] = []
+    try:
+        require_qlib_workflow_identity(provenance.get("qlib_workflow"))
+    except ValueError as exc:
+        failures.append(str(exc))
+    if provenance.get("execution_manifest_sha256") != _sha256_file(manifest_path):
+        failures.append("pair execution manifest does not match its SHA-256 provenance")
+    if provenance.get("pair_artifact_manifest_sha256") != _sha256_file(
+        pair_manifest_path
+    ):
+        failures.append("pair artifact manifest does not match its SHA-256 provenance")
+    expected_config_sha256 = _canonical_sha256(version.get("config") or {})
+    expected_pair = {
+        key: (version.get("pair") or {}).get(key)
+        for key in ("leg_y", "leg_x", "asset_class", "shorting_mode")
+    }
+    for candidate in (manifest, pair_manifest):
+        observed_pair = {
+            key: dict(candidate.get("pair") or {}).get(key) for key in expected_pair
+        }
+        if (
+            candidate.get("backtest_id") != backtest.get("id")
+            or candidate.get("strategy_version_id") != version.get("id")
+            or candidate.get("dataset") != backtest.get("dataset")
+            or candidate.get("periods") != backtest.get("periods")
+            or candidate.get("execution_contract_hash")
+            != version.get("execution_contract_hash")
+            or observed_pair != expected_pair
+        ):
+            failures.append(
+                "pair artifact manifest does not match the immutable strategy/backtest"
+            )
+            break
+    if pair_manifest.get("format_version") != "pair-replay-artifact-v1":
+        failures.append("pair artifact manifest format is unsupported")
+    if pair_manifest.get("strategy_config_sha256") != expected_config_sha256:
+        failures.append("pair artifact strategy config identity does not match the version")
+    if _canonical_sha256(manifest.get("config") or {}) != expected_config_sha256:
+        failures.append("pair execution manifest config does not match the version")
+    files = pair_manifest.get("files")
+    if not isinstance(files, dict):
+        failures.append("pair artifact file manifest is missing")
+        return failures
+    for name in (
+        "daily_returns.parquet",
+        "daily_ledger.parquet",
+        "kalman_spread.parquet",
+        "trades.json",
+        "rejections.json",
+    ):
+        evidence = files.get(name)
+        path = artifact_root / name
+        if (
+            not isinstance(evidence, dict)
+            or not path.is_file()
+            or path.stat().st_size != int(evidence.get("bytes") or -1)
+            or _sha256_file(path) != str(evidence.get("sha256") or "")
+        ):
+            failures.append(f"pair artifact {name} failed immutable verification")
     return failures
 
 
@@ -251,12 +407,13 @@ class StrategyStore:
         config: dict[str, Any],
         actor: str,
     ) -> dict[str, Any]:
-        if not factors:
-            raise ValueError("a strategy must contain at least one promoted factor")
+        config = _normalize_multifactor_contract(
+            config, factor_count=len(factors), creating_family=True
+        )
         if len({item["candidate_id"] for item in factors}) != len(factors):
             raise ValueError("factor candidates must be unique within a strategy version")
         total_weight = sum(abs(float(item["weight"])) for item in factors)
-        if total_weight <= 0:
+        if factors and total_weight <= 0:
             raise ValueError("factor weights must not all be zero")
         strategy_id = uuid.uuid4().hex
         version_id = uuid.uuid4().hex
@@ -282,6 +439,7 @@ class StrategyStore:
                         version=1,
                         status="draft",
                         strategy_type="multifactor",
+                        **_version_contract_columns(config, strategy_type="multifactor"),
                         benchmark=benchmark,
                         universe=universe,
                         config_json=config,
@@ -289,9 +447,7 @@ class StrategyStore:
                         created_at=now,
                     )
                 )
-                connection.execute(
-                    insert(strategy_factors),
-                    [
+                factor_rows = [
                         {
                             "strategy_version_id": version_id,
                             "factor_candidate_id": item["candidate_id"],
@@ -301,8 +457,9 @@ class StrategyStore:
                             "created_at": now,
                         }
                         for item in factors
-                    ],
-                )
+                    ]
+                if factor_rows:
+                    connection.execute(insert(strategy_factors), factor_rows)
                 self._event(
                     connection,
                     strategy_id=strategy_id,
@@ -325,12 +482,13 @@ class StrategyStore:
         config: dict[str, Any],
         actor: str,
     ) -> dict[str, Any]:
-        if not factors:
-            raise ValueError("a strategy must contain at least one promoted factor")
+        config = _normalize_multifactor_contract(
+            config, factor_count=len(factors), creating_family=False
+        )
         if len({item["candidate_id"] for item in factors}) != len(factors):
             raise ValueError("factor candidates must be unique within a strategy version")
         total_weight = sum(abs(float(item["weight"])) for item in factors)
-        if total_weight <= 0:
+        if factors and total_weight <= 0:
             raise ValueError("factor weights must not all be zero")
         version_id = uuid.uuid4().hex
         now = _now()
@@ -362,6 +520,7 @@ class StrategyStore:
                         version=version_number,
                         status="draft",
                         strategy_type="multifactor",
+                        **_version_contract_columns(config, strategy_type="multifactor"),
                         benchmark=benchmark,
                         universe=universe,
                         config_json=config,
@@ -369,9 +528,7 @@ class StrategyStore:
                         created_at=now,
                     )
                 )
-                connection.execute(
-                    insert(strategy_factors),
-                    [
+                factor_rows = [
                         {
                             "strategy_version_id": version_id,
                             "factor_candidate_id": item["candidate_id"],
@@ -381,8 +538,9 @@ class StrategyStore:
                             "created_at": now,
                         }
                         for item in factors
-                    ],
-                )
+                    ]
+                if factor_rows:
+                    connection.execute(insert(strategy_factors), factor_rows)
                 connection.execute(
                     update(strategies).where(strategies.c.id == strategy_id).values(updated_at=now)
                 )
@@ -472,6 +630,9 @@ class StrategyStore:
                         version=1,
                         status="draft",
                         strategy_type="pair",
+                        **_version_contract_columns(
+                            definition["config"], strategy_type="pair"
+                        ),
                         benchmark="CASH",
                         universe=f"pair:{definition['leg_y']}:{definition['leg_x']}",
                         config_json=definition["config"],
@@ -550,6 +711,9 @@ class StrategyStore:
                         version=version_number,
                         status="draft",
                         strategy_type="pair",
+                        **_version_contract_columns(
+                            definition["config"], strategy_type="pair"
+                        ),
                         benchmark="CASH",
                         universe=f"pair:{definition['leg_y']}:{definition['leg_x']}",
                         config_json=definition["config"],
@@ -647,6 +811,12 @@ class StrategyStore:
         result["config"] = result.pop("config_json")
         result["factors"] = [row_dict(item) for item in factor_rows]
         result["pair"] = row_dict(pair_row) if pair_row else None
+        result["factor_source_mode"] = result["config"].get(
+            "factor_source_mode", "promoted_only"
+        )
+        result["baseline_definition_sha256"] = result["config"].get(
+            "baseline_definition_sha256"
+        )
         return result
 
     def create_backtest(
@@ -660,6 +830,11 @@ class StrategyStore:
     ) -> dict[str, Any]:
         version = self.get_version(version_id)
         backtest_id = uuid.uuid4().hex
+        artifact_directory = (
+            artifact_path / backtest_id
+            if artifact_path.name == "backtests"
+            else artifact_path
+        )
         with self.engine.begin() as connection:
             if version.get("strategy_type") == "multifactor":
                 prior = connection.execute(
@@ -669,6 +844,11 @@ class StrategyStore:
                 ).first()
                 if prior is not None:
                     raise ValueError("a frozen strategy version may run the final test only once")
+                baseline_only = (
+                    version["config"].get("factor_source_mode")
+                    == FACTOR_SOURCE_QLIB_BASELINE
+                    and not version["factors"]
+                )
                 factor_windows = connection.execute(
                     select(
                         factor_evaluations.c.id,
@@ -686,13 +866,13 @@ class StrategyStore:
                 ).all()
                 requested_start = date.fromisoformat(periods["start"])
                 requested_end = date.fromisoformat(periods["end"])
-                if not factor_windows or any(
+                if not baseline_only and (not factor_windows or any(
                     item.dataset != dataset
                     or str(item.evaluator_version) != "factor-gate-v3-hac-bh"
                     or requested_start != item.test_start
                     or requested_end != item.test_end
                     for item in factor_windows
-                ):
+                )):
                     raise ValueError(
                         "formal backtest must exactly match the reserved final-test window"
                     )
@@ -717,9 +897,16 @@ class StrategyStore:
                     strategy_version_id=version_id,
                     dataset=dataset,
                     execution_dataset=execution_dataset,
+                    signal_frequency=version["signal_frequency"],
+                    execution_frequency=version["execution_frequency"],
+                    execution_contract_hash=version["execution_contract_hash"],
+                    qlib_version=version["qlib_version"],
+                    qlib_commit=version["qlib_commit"],
+                    rdagent_version=version["rdagent_version"],
+                    rdagent_commit=version["rdagent_commit"],
                     status="queued",
                     periods_json=periods,
-                    artifact_path=str(artifact_path),
+                    artifact_path=str(artifact_directory),
                     created_at=_now(),
                 )
             )
@@ -786,13 +973,15 @@ class StrategyStore:
             )
 
     def validate_backtest_artifacts(self, backtest_id: str, metrics: dict[str, Any]) -> None:
-        """Validate immutable multifactor artifacts before a worker reports success."""
+        """Validate immutable strategy artifacts before a worker reports success."""
 
         backtest = self.get_backtest(backtest_id)
         version = self.get_version(backtest["strategy_version_id"])
-        if version.get("strategy_type") != "multifactor":
-            return
-        failures = _multifactor_manifest_failures(version, backtest, metrics)
+        failures = (
+            _pair_artifact_failures(version, backtest, metrics)
+            if version.get("strategy_type") == "pair"
+            else _multifactor_manifest_failures(version, backtest, metrics)
+        )
         if failures:
             raise ValueError("strategy backtest artifact validation failed: " + "; ".join(failures))
 
@@ -921,6 +1110,10 @@ class StrategyStore:
         if not isinstance(provenance, dict):
             failures.append("reproducible pair backtest provenance is required")
         else:
+            try:
+                require_qlib_workflow_identity(provenance.get("qlib_workflow"))
+            except ValueError as exc:
+                failures.append(str(exc))
             for field in (
                 "daily_dataset_identity_sha256",
                 "daily_snapshot_manifest_sha256",
@@ -1078,13 +1271,17 @@ class StrategyStore:
             ),
         }
         execution_method = str(config.get("execution_method", "open"))
-        if execution_method in {"twap", "vwap"}:
+        if execution_method in {"twap", "vwap", "next_bar"}:
             checks["capacity_fill_ratio"] = (
                 metrics.get("capacity_fill_ratio"),
                 config.get("min_capacity_fill_ratio", 0.95),
                 "min",
             )
         failures = []
+        try:
+            require_strategy_execution_contract(config)
+        except ValueError as exc:
+            failures.append(str(exc))
         if (
             metrics.get("backtest_engine") != "qlib"
             or metrics.get("qlib_native_backtest") is not True
@@ -1095,6 +1292,10 @@ class StrategyStore:
         if not isinstance(provenance, dict):
             failures.append("reproducible backtest provenance is required for approval")
         else:
+            try:
+                require_qlib_workflow_identity(provenance.get("qlib_workflow"))
+            except ValueError as exc:
+                failures.append(str(exc))
             for field in (
                 "dataset_identity_sha256",
                 "snapshot_manifest_sha256",
@@ -1110,7 +1311,7 @@ class StrategyStore:
                     failures.append(f"provenance {field} does not match strategy factors")
                 elif not all(_is_sha256(value) for value in hashes.values()):
                     failures.append(f"provenance {field} contains an invalid SHA-256 digest")
-            if execution_method in {"twap", "vwap"}:
+            if execution_method in {"twap", "vwap", "next_bar"}:
                 for field in (
                     "execution_dataset_identity_sha256",
                     "execution_snapshot_manifest_sha256",
@@ -1123,6 +1324,11 @@ class StrategyStore:
                 or provenance.get("qlib_version") == "unknown"
             ):
                 failures.append("provenance qlib_version is required")
+            qlib_commit = str(provenance.get("qlib_commit") or "")
+            if len(qlib_commit) != 40 or any(
+                character not in "0123456789abcdef" for character in qlib_commit.lower()
+            ):
+                failures.append("provenance qlib_commit must identify the pinned upstream")
             try:
                 require_daily_qlib_contract(provenance)
             except ValueError as exc:
@@ -1135,6 +1341,13 @@ class StrategyStore:
             "policy_version"
         ):
             failures.append("PortfolioPolicy version is missing or inconsistent")
+        execution_model_evidence = metrics.get("execution_model")
+        if (
+            not isinstance(execution_model_evidence, dict)
+            or execution_model_evidence.get("strategy_contract_hash")
+            != config.get("execution_contract_hash")
+        ):
+            failures.append("strategy execution contract evidence is missing or inconsistent")
         if metrics.get("event_stress_passed") is not True:
             failures.append("event stress scenarios did not satisfy the configured result gate")
         if (metrics.get("event_stress") or {}).get("state_source") != (
@@ -1215,18 +1428,21 @@ class StrategyStore:
             "regulatory_data_available"
         ):
             failures.append("required regulatory violation data is unavailable")
-        if execution_method in {"twap", "vwap"}:
+        if execution_method in {"twap", "vwap", "next_bar"}:
             execution_model = metrics.get("execution_model")
             if not backtests[0].get("execution_dataset"):
-                failures.append("minute execution dataset is required for TWAP/VWAP approval")
+                failures.append("minute execution dataset is required for approval")
             if (
                 not isinstance(execution_model, dict)
                 or execution_model.get("method") != execution_method
                 or execution_model.get("frequency") in {None, "day"}
-                or execution_model.get("price_assumption") != "minute bar vwap fills"
+                or execution_model.get("price_assumption")
+                not in {"minute bar vwap fills", "next eligible minute bar vwap"}
+                or execution_model.get("strategy_contract_hash")
+                != config.get("execution_contract_hash")
                 or metrics.get("minute_execution_enforced") is not True
             ):
-                failures.append("minute-native TWAP/VWAP execution evidence is required")
+                failures.append("minute-native execution evidence is required")
             try:
                 require_minute_execution_contract(
                     {

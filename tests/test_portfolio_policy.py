@@ -1,11 +1,16 @@
 import sys
 import types
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from quant_platform.cost_model import CostModelConfig, infer_cn_asset_type
-from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
+from quant_platform.portfolio_policy import (
+    PortfolioPolicy,
+    PortfolioPolicyConfig,
+    is_rebalance_due,
+)
 
 pytestmark = pytest.mark.no_database
 
@@ -88,6 +93,32 @@ def test_same_policy_inputs_produce_identical_targets() -> None:
     assert qlib_decision.target_weights == recommendation_decision.target_weights
 
 
+def test_member_drawdown_gate_allows_exits_but_never_adds_risk() -> None:
+    scores = pd.Series({"SH600001": 2.0, "SH600000": 1.0})
+    previous = {"SH600000": 0.40}
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=0.70,
+            max_daily_turnover=1.0,
+        )
+    )
+
+    decision = policy.decide(
+        scores,
+        previous,
+        allow_new_risk=False,
+    )
+
+    assert decision.target_weights.get("SH600001", 0.0) == 0.0
+    assert decision.target_weights.get("SH600000", 0.0) <= 0.40
+    assert all(change["action"] != "increase" for change in decision.changes)
+    assert "member_drawdown_pause_new_risk" in {
+        event["rule"] for event in decision.risk_events
+    }
+
+
 def test_policy_applies_liquidity_and_round_lot_constraints() -> None:
     scores = pd.Series({"SH600000": 2.0, "SH600001": 1.0})
     policy = PortfolioPolicy(
@@ -136,6 +167,65 @@ def test_policy_enforces_industry_weight_cap() -> None:
         if industries[instrument] == "bank"
     )
     assert bank_weight <= 0.60 + 1e-12
+
+
+def test_industry_neutral_policy_scales_the_stock_sleeve_to_target_volatility() -> None:
+    instruments = pd.Index([f"S{index:02d}" for index in range(10)])
+    scores = pd.Series(range(10), index=instruments, dtype=float)
+    benchmark = pd.Series(0.10, index=instruments)
+    industries = pd.Series(["bank"] * 5 + ["technology"] * 5, index=instruments)
+    styles = pd.DataFrame(
+        {
+            "size": 0.0,
+            "value": 0.0,
+            "growth": 0.0,
+            "volatility": 0.0,
+        },
+        index=instruments,
+    )
+    covariance = pd.DataFrame(
+        np.eye(len(instruments)) * 0.001,
+        index=instruments,
+        columns=instruments,
+    )
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=10,
+            n_drop=0,
+            max_position_weight=0.15,
+            max_daily_turnover=1.0,
+            max_industry_weight=0.60,
+            max_industry_deviation=0.10,
+            max_size_deviation=0.10,
+            max_value_deviation=0.10,
+            max_growth_deviation=0.10,
+            max_volatility_deviation=0.10,
+            max_tracking_error=1.0,
+            portfolio_construction="industry_neutral_qp",
+            target_volatility=0.10,
+        )
+    )
+
+    decision = policy.decide(
+        scores,
+        {},
+        industries=industries,
+        benchmark_weights=benchmark,
+        benchmark_industry_weights=pd.Series({"bank": 0.50, "technology": 0.50}),
+        style_exposures=styles,
+        benchmark_style_exposure={column: 0.0 for column in styles.columns},
+        return_covariance=covariance,
+    )
+
+    evidence = decision.position_state["target_volatility"]
+    assert evidence["unscaled_annualized_volatility"] > 0.10
+    assert evidence["exposure_scale"] == pytest.approx(
+        0.10 / evidence["unscaled_annualized_volatility"]
+    )
+    assert sum(decision.target_weights.values()) == pytest.approx(
+        evidence["exposure_scale"]
+    )
+    assert "target volatility exposure scaling" in decision.reasons
 
 
 def test_policy_applies_position_and_portfolio_risk_rules() -> None:
@@ -191,6 +281,70 @@ def test_policy_execution_plan_reaches_target_on_configured_day() -> None:
     assert second.target_weights == {"one": pytest.approx(1 / 3), "two": pytest.approx(1 / 3)}
     assert third.target_weights == {"one": pytest.approx(0.5), "two": pytest.approx(0.5)}
     assert third.position_state["execution"] == {}
+
+
+def test_monthly_rebalance_holds_targets_but_allows_risk_exits() -> None:
+    scores = pd.Series({"one": 1.0, "two": 2.0})
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_daily_turnover=1.0,
+            rebalance_frequency="month",
+        )
+    )
+    held = policy.decide(scores, {"one": 0.5, "two": 0.5}, rebalance_due=False)
+    assert held.target_weights == {"one": pytest.approx(0.5), "two": pytest.approx(0.5)}
+    assert held.changes == []
+    assert "month rebalance cadence hold" in held.reasons
+
+    stopped = policy.decide(
+        scores,
+        {"one": 0.5, "two": 0.5},
+        rebalance_due=False,
+        current_prices=pd.Series({"one": 9.0, "two": 10.0}),
+        cost_basis={"one": 10.0, "two": 10.0},
+    )
+    assert "one" not in stopped.target_weights
+    assert stopped.target_weights["two"] == pytest.approx(0.5)
+    assert {item["rule"] for item in stopped.risk_events} == {"stop_loss"}
+
+
+def test_non_rebalance_day_continues_governed_multiday_execution() -> None:
+    scores = pd.Series({"one": 2.0, "two": 1.0})
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_daily_turnover=1.0,
+            execution_days=3,
+            execution_method="vwap",
+            rebalance_frequency="month",
+        )
+    )
+    first = policy.decide(scores, {}, rebalance_due=True)
+    second = policy.decide(
+        scores,
+        first.target_weights,
+        execution_state=first.position_state["execution"],
+        rebalance_due=False,
+    )
+    assert second.target_weights == {"one": pytest.approx(1 / 3), "two": pytest.approx(1 / 3)}
+    assert second.position_state["execution"]["remaining_days"] == 1
+
+
+def test_rebalance_period_gate_handles_day_week_and_month() -> None:
+    assert is_rebalance_due("2026-07-16", None, "month")
+    assert not is_rebalance_due("2026-07-16", "2026-07-01", "month")
+    assert is_rebalance_due("2026-08-03", "2026-07-31", "month")
+    assert not is_rebalance_due("2026-07-17", "2026-07-13", "week")
+    assert is_rebalance_due("2026-07-20", "2026-07-17", "week")
+    assert is_rebalance_due("2026-07-17", "2026-07-16", "day")
+    assert is_rebalance_due(
+        "2026-07-17 10:05", "2026-07-17 10:00", "bar"
+    )
 
 
 def test_qlib_adapter_and_recommendation_call_return_identical_targets(monkeypatch) -> None:
@@ -254,3 +408,17 @@ def test_qlib_adapter_and_recommendation_call_return_identical_targets(monkeypat
     ).target_weights
     assert qlib_targets == recommendation_targets
     assert metadata_dates == [pd.Timestamp("2026-07-09")]
+
+
+def test_qlib_t1_floor_keeps_stock_bought_today_but_not_etf() -> None:
+    from quant_platform.qlib_policy_strategy import apply_t1_target_floor
+
+    result = apply_t1_target_floor(
+        {},
+        locked_quantities={"SH600000": 1000, "SH510300": 1000},
+        current_prices=pd.Series({"SH600000": 10.0, "SH510300": 4.0}),
+        portfolio_value=1_000_000,
+    )
+
+    assert result["SH600000"] == pytest.approx(0.01)
+    assert "SH510300" not in result

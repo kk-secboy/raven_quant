@@ -6,7 +6,10 @@ import uuid
 from datetime import date
 from pathlib import Path
 
+from qlib_test_doubles import qlib_workflow_identity
+
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
+from quant_platform.api import StrategyConfigRequest
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
@@ -87,6 +90,7 @@ def create_promoted_factor(
         json.dumps(
             {
                 "status": "ok",
+                "qlib_workflow": qlib_workflow_identity(),
                 "evaluations": [
                     {"candidate_id": candidate["id"], "status": "ok", "metrics": metrics}
                 ],
@@ -153,6 +157,9 @@ def create_strategy_version(
     }
     config.update(CostModelConfig().to_dict())
     config.update(config_overrides or {})
+    if config.get("execution_method") in {"twap", "vwap", "next_bar"}:
+        config.setdefault("execution_frequency", "5min")
+    config = StrategyConfigRequest.model_validate(config).model_dump()
     strategy = StrategyStore(database_url).create(
         name=f"strategy-{uuid.uuid4().hex}",
         description="Governed strategy fixture for v2 tests.",
@@ -166,7 +173,7 @@ def create_strategy_version(
 
 
 def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
-    factor = version["factors"][0]
+    factor = version["factors"][0] if version["factors"] else None
     config_hash = hashlib.sha256(
         json.dumps(
             version["config"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -197,8 +204,17 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
         "backtest_engine_version": QLIB_ENGINE_VERSION,
         "qlib_native_backtest": True,
         "policy_version": POLICY_VERSION,
+        "execution_model": {
+            "method": version["config"].get("execution_method", "open"),
+            "frequency": version["config"].get("execution_frequency", "day"),
+            "price_assumption": "next-day open",
+            "strategy_contract_hash": version["config"]["execution_contract_hash"],
+        },
         "cost_model": CostModelConfig().to_dict(),
-        "tracking_error": 0.05,
+        "tracking_error": min(
+            0.05,
+            float(version["config"]["max_tracking_error"]) * 0.5,
+        ),
         "max_drawdown": -0.10,
         "average_turnover": 0.10,
         "information_ratio": 1.0,
@@ -272,14 +288,24 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
             "source_lineage_id": "9" * 64,
             "strategy_config_sha256": config_hash,
             "execution_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
-            "factor_values_sha256": {
-                factor["factor_candidate_id"]: hashlib.sha256(
-                    Path(factor["values_path"]).read_bytes()
-                ).hexdigest()
-            },
-            "factor_code_sha256": {factor["factor_candidate_id"]: factor["code_sha256"]},
+            "factor_values_sha256": (
+                {
+                    factor["factor_candidate_id"]: hashlib.sha256(
+                        Path(factor["values_path"]).read_bytes()
+                    ).hexdigest()
+                }
+                if factor
+                else {}
+            ),
+            "factor_code_sha256": (
+                {factor["factor_candidate_id"]: factor["code_sha256"]}
+                if factor
+                else {}
+            ),
             "qlib_version": "0.9.8",
+            "qlib_commit": "d5379c520f66a39953bad76234a7019a72796fd0",
             "backtest_engine_version": QLIB_ENGINE_VERSION,
             "policy_version": POLICY_VERSION,
+            "qlib_workflow": qlib_workflow_identity(),
         },
     }

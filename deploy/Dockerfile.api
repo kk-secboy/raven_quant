@@ -1,10 +1,24 @@
-FROM python:3.13-slim
+FROM python:3.11-slim
 
+ARG QLIB_COMMIT=d5379c520f66a39953bad76234a7019a72796fd0
 ARG PIP_INDEX_URL=https://pypi.org/simple
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_INDEX_URL=${PIP_INDEX_URL}
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    QLIB_REPO=/opt/qlib \
+    QLIB_COMMIT=${QLIB_COMMIT}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates curl libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/qlib \
+    && curl --fail --location --retry 5 --retry-all-errors \
+        --connect-timeout 20 --max-time 300 \
+        "https://codeload.github.com/microsoft/qlib/tar.gz/${QLIB_COMMIT}" \
+      | tar -xz --strip-components=1 -C /opt/qlib \
+    && SETUPTOOLS_SCM_PRETEND_VERSION="0.0.dev0+g${QLIB_COMMIT}" \
+       python -m pip install /opt/qlib
 
 WORKDIR /app
 COPY pyproject.toml README.md alembic.ini ./

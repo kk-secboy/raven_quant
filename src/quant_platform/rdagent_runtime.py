@@ -12,6 +12,11 @@ import requests
 from quant_data.config import Settings
 from quant_data.path_utils import to_wsl_path as _to_wsl_path
 
+from .upstream_versions import (
+    RDAGENT_COMMIT,
+    require_upstream_runtime_identity,
+)
+
 _DURATION = re.compile(r"^[1-9][0-9]*(?:m|h)$")
 
 
@@ -20,6 +25,10 @@ def validate_duration(value: str) -> str:
     if not _DURATION.fullmatch(value):
         raise ValueError("duration must be a positive number followed by m or h")
     return value
+
+
+def require_rdagent_runtime_identity(value: Any) -> dict[str, Any]:
+    return require_upstream_runtime_identity("rdagent", value)
 
 
 def probe_rdagent(
@@ -34,7 +43,11 @@ def probe_rdagent(
                 timeout=8,
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            identity = require_rdagent_runtime_identity(
+                result.get("rdagent_runtime", result)
+            )
+            return {**result, **identity}
         except (requests.RequestException, ValueError) as exc:
             return {"status": "unavailable", "ready": False, "error": str(exc)}
     if not settings.rdagent_enabled:
@@ -60,6 +73,22 @@ def probe_rdagent(
             settings.rdagent_llm_key_env,
         ]
     )
+    repository_path = (
+        _to_wsl_path(settings.rdagent_repo) if is_wsl else str(settings.rdagent_repo)
+    )
+    probe_env = {
+        **os.environ,
+        **(runtime_env or {}),
+        "RDAGENT_COMMIT": RDAGENT_COMMIT,
+        "RDAGENT_REPO": repository_path,
+    }
+    if is_wsl:
+        existing_wslenv = probe_env.get("WSLENV", "")
+        probe_env["WSLENV"] = ":".join(
+            item
+            for item in (existing_wslenv, "RDAGENT_COMMIT", "RDAGENT_REPO")
+            if item
+        )
     try:
         completed = subprocess.run(
             command,
@@ -67,14 +96,21 @@ def probe_rdagent(
             text=True,
             timeout=60,
             check=True,
-            env={**os.environ, **(runtime_env or {})},
+            env=probe_env,
         )
         line = next(
             (item for item in reversed(completed.stdout.splitlines()) if item.startswith("{")),
             "{}",
         )
         result = json.loads(line)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        identity = require_rdagent_runtime_identity(result)
+        result = {**result, **identity}
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
         return {"status": "unavailable", "ready": False, "error": str(exc)}
     blockers = []
     if not result.get("llm_credentials_configured"):
@@ -167,6 +203,12 @@ def rdagent_command(
         "LOG_TRACE_PATH": trace_arg,
         "RDAGENT_COMMAND": settings.rdagent_command,
         "RDAGENT_PYTHON": settings.rdagent_python,
+        "RDAGENT_COMMIT": RDAGENT_COMMIT,
+        "RDAGENT_REPO": (
+            _to_wsl_path(settings.rdagent_repo)
+            if is_wsl
+            else str(settings.rdagent_repo)
+        ),
         "LOOP_N": str(loop_n),
         "DURATION": duration,
         "BRIDGE": bridge_arg,

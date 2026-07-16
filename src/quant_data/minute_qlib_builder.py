@@ -15,9 +15,15 @@ from .execution_contract import (
     MINUTE_EXECUTION_CONTRACT_VERSION,
     MINUTE_SOURCE_UNIT_CONTRACTS,
 )
-from .execution_data import MINUTE_DATASETS, MINUTE_FREQUENCIES
+from .execution_data import (
+    MINUTE_DATASETS,
+    MINUTE_FREQUENCIES,
+    NATIVE_MINUTE_FREQUENCIES,
+    QLIB_RESAMPLED_MINUTE_FREQUENCIES,
+)
 from .path_utils import to_wsl_path
 from .qlib_builder import QlibBuilder, _sql_string
+from .qlib_minute_resample import QLIB_MINUTE_RESAMPLE_CONTRACT_VERSION
 
 MINUTE_QLIB_FIELDS = (
     "open",
@@ -37,22 +43,44 @@ MINUTE_QLIB_FIELDS = (
 
 
 class MinuteQlibBuilder:
-    """Build a Qlib minute dataset at the immutable snapshot's native frequency."""
+    """Build native or Qlib-resampled minute data from one immutable snapshot."""
 
-    def __init__(self, snapshot_path: Path) -> None:
+    def __init__(
+        self, snapshot_path: Path, *, target_frequency: str | None = None
+    ) -> None:
         self.snapshot_path = snapshot_path.resolve()
         manifest_path = self.snapshot_path / "manifest.json"
         try:
             self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError) as exc:
             raise ValueError("minute snapshot manifest is missing or invalid") from exc
-        self.frequency = str(self.manifest.get("frequency") or "")
-        if self.frequency not in MINUTE_FREQUENCIES:
+        self.source_frequency = str(self.manifest.get("frequency") or "")
+        if self.source_frequency not in NATIVE_MINUTE_FREQUENCIES:
             raise ValueError(
-                "minute Qlib builder requires a supported minute execution snapshot"
+                "minute Qlib builder requires a supported minute snapshot at "
+                "native 1/5-minute frequency"
             )
+        self.frequency = str(target_frequency or self.source_frequency).lower()
+        if self.frequency not in MINUTE_FREQUENCIES:
+            raise ValueError("minute Qlib target frequency is unsupported")
+        if (
+            self.frequency in NATIVE_MINUTE_FREQUENCIES
+            and self.frequency != self.source_frequency
+        ):
+            raise ValueError("native minute Qlib output must match the snapshot frequency")
+        if self.frequency in QLIB_RESAMPLED_MINUTE_FREQUENCIES:
+            source_minutes = int(self.source_frequency.removesuffix("min"))
+            target_minutes = int(self.frequency.removesuffix("min"))
+            if target_minutes % source_minutes:
+                raise ValueError(
+                    "Qlib resample target must be an integer multiple of the source"
+                )
         if not set(self.manifest.get("datasets", {})).intersection(MINUTE_DATASETS):
             raise ValueError("minute snapshot contains no supported bar datasets")
+
+    @property
+    def requires_resampling(self) -> bool:
+        return self.frequency != self.source_frequency
 
     def build_staging(self, staging_path: Path) -> Path:
         staging_path = staging_path.resolve()
@@ -120,6 +148,68 @@ class MinuteQlibBuilder:
         if staging_path.exists():
             shutil.rmtree(staging_path)
         os.replace(temporary, staging_path)
+        return staging_path / "by_symbol"
+
+    def resample_staging(
+        self,
+        *,
+        native_by_symbol: Path,
+        staging_path: Path,
+        qlib_python: str,
+        wsl_distro: str,
+    ) -> Path:
+        if not self.requires_resampling:
+            raise ValueError("native minute output does not require Qlib resampling")
+        script = Path(__file__).resolve().parents[2] / "scripts" / "resample_minute_qlib.py"
+        if not script.is_file():
+            raise FileNotFoundError(f"Qlib minute resample script not found: {script}")
+        staging_path = staging_path.resolve()
+        temporary = staging_path.with_name(f".{staging_path.name}.tmp")
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        output = temporary / "by_symbol"
+        command = (
+            [
+                "wsl",
+                "-d",
+                wsl_distro,
+                "--exec",
+                qlib_python,
+                to_wsl_path(script),
+                "--source",
+                to_wsl_path(native_by_symbol),
+                "--output",
+                to_wsl_path(output),
+            ]
+            if os.name == "nt" and qlib_python.startswith("/")
+            else [
+                qlib_python,
+                str(script),
+                "--source",
+                str(native_by_symbol),
+                "--output",
+                str(output),
+            ]
+        )
+        command.extend(
+            [
+                "--source-frequency",
+                self.source_frequency,
+                "--target-frequency",
+                self.frequency,
+            ]
+        )
+        try:
+            subprocess.run(command, check=True)
+            if not any(output.glob("*.parquet")):
+                raise RuntimeError("Qlib minute resampling produced no instrument files")
+            if staging_path.exists():
+                shutil.rmtree(staging_path)
+            os.replace(temporary, staging_path)
+        except Exception:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+            raise
         return staging_path / "by_symbol"
 
     def dump_bin(
@@ -193,13 +283,38 @@ class MinuteQlibBuilder:
     def _write_provenance(self, qlib_dir: Path) -> None:
         manifest_path = self.snapshot_path / "manifest.json"
         QlibBuilder(self.snapshot_path)._snapshot_manifest_digest()
+        builder_files = [Path(__file__)]
+        if self.requires_resampling:
+            builder_files.extend(
+                [
+                    Path(__file__).with_name("qlib_minute_resample.py"),
+                    Path(__file__).resolve().parents[2]
+                    / "scripts"
+                    / "resample_minute_qlib.py",
+                ]
+            )
+        builder_digest = hashlib.sha256(
+            b"".join(path.read_bytes() for path in builder_files)
+        ).hexdigest()
         identity = {
             "snapshot_name": self.snapshot_path.name,
             "snapshot_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-            "qlib_builder_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "qlib_builder_sha256": builder_digest,
             "frequency": self.frequency,
+            "source_frequency": self.source_frequency,
             "fields": list(MINUTE_QLIB_FIELDS),
             "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
+            "resampled": self.requires_resampling,
+            "resample_contract_version": (
+                QLIB_MINUTE_RESAMPLE_CONTRACT_VERSION
+                if self.requires_resampling
+                else None
+            ),
+            "resample_engine": (
+                "qlib.utils.resam.resam_calendar"
+                if self.requires_resampling
+                else None
+            ),
             "source_datasets": sorted(
                 dataset
                 for dataset in MINUTE_DATASETS

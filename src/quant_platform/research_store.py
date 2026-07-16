@@ -19,6 +19,8 @@ from quant_data.database import (
     research_runs,
     row_dict,
 )
+from quant_platform.qlib_workflow import require_qlib_workflow_identity
+from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
 
 def _now() -> datetime:
@@ -66,6 +68,9 @@ def _evaluation_artifact_metrics(path_value: str, candidate_id: str) -> dict[str
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Qlib evaluation artifact is unreadable") from exc
     evaluations = payload.get("evaluations") if isinstance(payload, dict) else None
+    require_qlib_workflow_identity(
+        payload.get("qlib_workflow") if isinstance(payload, dict) else None
+    )
     if not isinstance(evaluations, list):
         raise ValueError("Qlib evaluation artifact has no evaluations list")
     matches = [
@@ -613,6 +618,14 @@ class ResearchStore:
                     hac_p_value=metrics.get("hac_p_value"),
                     bh_q_value=metrics.get("bh_q_value"),
                     statistical_contract_version="research-statistics-v1-hac-bh-dsr",
+                    signal_frequency="day",
+                    signal_horizon=f"{int(candidate.get('label_horizon_days') or 1)}d",
+                    execution_frequency="day",
+                    execution_contract_hash=evidence_sha256,
+                    qlib_version=f"0.0.dev0+g{QLIB_COMMIT}",
+                    qlib_commit=QLIB_COMMIT,
+                    rdagent_version=f"0.0.dev0+g{RDAGENT_COMMIT}",
+                    rdagent_commit=RDAGENT_COMMIT,
                     metrics_sha256=metrics_sha256,
                     policy_json=policy,
                     policy_sha256=policy_sha256,

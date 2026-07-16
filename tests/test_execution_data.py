@@ -99,6 +99,19 @@ def test_full_a_share_five_minute_plans_monthly_resumable_windows() -> None:
 
 
 @pytest.mark.no_database
+def test_15_30_60_minute_bars_never_create_a_tushare_download_path() -> None:
+    for frequency in ("15min", "30min", "60min"):
+        with pytest.raises(ValueError, match="resampled by Qlib"):
+            minute_specs(
+                {"ashare_5m": ["600000.SH"]},
+                start=date(2024, 1, 2),
+                end=date(2024, 1, 31),
+                max_attempts=3,
+                freq=frequency,
+            )
+
+
+@pytest.mark.no_database
 def test_full_a_share_history_includes_delisted_names_without_survivorship_bias() -> None:
     master = pd.DataFrame(
         [
@@ -461,8 +474,10 @@ def test_execution_data_api_and_worker_commands(
     assert minute_qlib_env == {}
     assert any("run_minute_factor_research.py" in item for item in minute_research_command)
     assert "5,15" in minute_research_command
+    assert "--tracking-uri" in minute_research_command
+    assert settings.mlflow_tracking_uri in minute_research_command
     assert minute_research_result.name == "result.json"
-    assert minute_research_env == {}
+    assert set(minute_research_env) == {"_MLFLOW_SERVER_ARTIFACT_ROOT"}
 
 
 def test_minute_qlib_api_rejects_daily_snapshot(
@@ -514,6 +529,40 @@ def test_minute_qlib_api_accepts_five_minute_snapshot(
     assert response.status_code == 202
     assert response.json()["payload"]["frequency"] == "5min"
     assert response.json()["payload"]["output_name"] == "ashare-five-minute-5min"
+
+
+def test_minute_qlib_api_builds_30min_from_existing_5min_snapshot(
+    tmp_path: Path, monkeypatch, database_url: str
+) -> None:
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
+    snapshot = tmp_path / "data" / "snapshots" / "ashare-five-minute"
+    snapshot.mkdir(parents=True)
+    (snapshot / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": "ashare-five-minute",
+                "frequency": "5min",
+                "datasets": {"ashare_5m": {"rows": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with TestClient(create_app(tmp_path)) as client:
+        response = client.post(
+            "/api/jobs/minute-qlib",
+            json={
+                "snapshot_name": "ashare-five-minute",
+                "target_frequency": "30min",
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json()["payload"]["source_frequency"] == "5min"
+    assert response.json()["payload"]["target_frequency"] == "30min"
+    assert response.json()["payload"]["frequency"] == "30min"
+    assert response.json()["payload"]["output_name"] == "ashare-five-minute-30min"
 
 
 def test_completed_supplemental_job_can_be_created_again_for_missing_units(

@@ -29,6 +29,7 @@ def create_qlib_execution_strategy(policy: dict[str, Any]) -> Any:
             self._filled_value = 0.0
             self._scheduled_slice_count = 0
             self._submitted_slice_count = 0
+            self._next_bar_submitted = False
             super().__init__()
 
         def reset(self, *args: Any, **kwargs: Any) -> None:
@@ -37,6 +38,7 @@ def create_qlib_execution_strategy(policy: dict[str, Any]) -> Any:
             self._filled_amounts = {}
             self._cumulative_plans = {}
             self._last_slots = {}
+            self._next_bar_submitted = False
             decision = getattr(self, "outer_trade_decision", None)
             if decision is None:
                 return
@@ -46,6 +48,13 @@ def create_qlib_execution_strategy(policy: dict[str, Any]) -> Any:
                 if not isfinite(amount) or amount <= 0 or abs(amount - integer_amount) > 1e-6:
                     raise ValueError("minute execution requires positive whole-share parent orders")
                 side = "buy" if parent.direction == Order.BUY else "sell"
+                instrument = str(parent.stock_id)
+                self._parents[instrument] = parent
+                self._filled_amounts[instrument] = 0.0
+                self._planned_parent_amount += amount
+                if self.execution_algorithm == "next_bar":
+                    self._scheduled_slice_count += 1
+                    continue
                 slices = build_execution_slices(
                     quantity=integer_amount,
                     side=side,
@@ -60,12 +69,8 @@ def create_qlib_execution_strategy(policy: dict[str, Any]) -> Any:
                     plan[slot] = cumulative
                 if not plan:
                     raise ValueError(f"minute execution produced no slices for {parent.stock_id}")
-                instrument = str(parent.stock_id)
-                self._parents[instrument] = parent
-                self._filled_amounts[instrument] = 0.0
                 self._cumulative_plans[instrument] = plan
                 self._last_slots[instrument] = next(reversed(plan))
-                self._planned_parent_amount += amount
                 self._scheduled_slice_count += len(plan)
 
         def post_exe_step(self, execute_result: list | None) -> None:
@@ -84,6 +89,26 @@ def create_qlib_execution_strategy(policy: dict[str, Any]) -> Any:
             del execute_result
             trade_step = self.trade_calendar.get_trade_step()
             trade_start, trade_end = self.trade_calendar.get_step_time(trade_step)
+            if self.execution_algorithm == "next_bar":
+                if self._next_bar_submitted:
+                    return TradeDecisionWO([], self)
+                orders = []
+                for instrument, parent in self._parents.items():
+                    amount = float(parent.amount) - self._filled_amounts.get(instrument, 0.0)
+                    if amount <= 1e-5:
+                        continue
+                    orders.append(
+                        Order(
+                            stock_id=instrument,
+                            amount=amount,
+                            start_time=trade_start,
+                            end_time=trade_end,
+                            direction=parent.direction,
+                        )
+                    )
+                    self._submitted_slice_count += 1
+                self._next_bar_submitted = True
+                return TradeDecisionWO(orders, self)
             slot = trade_start.strftime("%H:%M")
             orders = []
             for instrument, parent in self._parents.items():

@@ -85,9 +85,10 @@ def test_v2_research_to_final_test_and_recommendation_snapshot(
         json.dumps(
             {
                 "strategy_version_id": version_id,
-                "dataset": "synthetic-qlib",
-                "benchmark": version["benchmark"],
-                "periods": periods,
+                    "dataset": "synthetic-qlib",
+                    "benchmark": version["benchmark"],
+                    "universe": version["universe"],
+                    "periods": periods,
                 "config": version["config"],
                 "factors": [
                     {

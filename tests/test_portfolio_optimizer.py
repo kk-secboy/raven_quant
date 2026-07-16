@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from quant_platform.portfolio_optimizer import optimize_benchmark_relative_weights
-from quant_platform.risk_math import regularize_covariance
+from quant_platform.risk_math import validate_covariance
 
 pytestmark = pytest.mark.no_database
 
@@ -44,6 +44,7 @@ def test_benchmark_relative_optimizer_enforces_exposure_limits() -> None:
         alpha_weight=0.10,
         tracking_penalty=1.0,
         turnover_penalty=0.20,
+        max_tracking_error=0.01,
     )
 
     assert result.weights.sum() == pytest.approx(1.0)
@@ -59,11 +60,13 @@ def test_benchmark_relative_optimizer_enforces_exposure_limits() -> None:
     expected_tracking_risk = float(
         np.sqrt(
             active.to_numpy()
-            @ (regularize_covariance(_covariance(instruments).to_numpy()) * 252.0)
+            @ (validate_covariance(_covariance(instruments).to_numpy()) * 252.0)
             @ active
         )
     )
     assert result.tracking_risk == pytest.approx(expected_tracking_risk)
+    assert result.tracking_risk <= 0.01 + 1e-6
+    assert result.portfolio_volatility > 0
 
 
 def test_benchmark_relative_optimizer_fails_closed_on_infeasible_book() -> None:

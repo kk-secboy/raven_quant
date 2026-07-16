@@ -2,6 +2,7 @@ import json
 from datetime import date, timedelta
 from pathlib import Path
 
+import pandas as pd
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
@@ -191,6 +192,81 @@ def test_worker_cooperatively_terminates_cancelled_child(
 
     assert process.terminated is True
     assert store.get(created["id"])["status"] == "cancelled"
+
+
+def test_simulation_job_finishes_only_after_ledger_commit(
+    tmp_path: Path, monkeypatch, database_url: str
+) -> None:
+    store = JobStore(database_url)
+    created = store.create(
+        "simulation_replay",
+        {"simulation_batch_id": "batch-1"},
+        tmp_path / "simulation.log",
+    )
+    claimed = store.claim_next()
+    assert claimed and claimed["id"] == created["id"]
+    result_path = tmp_path / "result.json"
+    events: list[str] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def poll(self) -> int:
+            return 0
+
+    def fake_popen(*args, **kwargs) -> FakeProcess:
+        del args, kwargs
+        result_path.write_text(
+            json.dumps(
+                {
+                    "minute_bars_file": "minute.parquet",
+                    "closing_prices": {},
+                    "batch_id": "batch-1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return FakeProcess()
+
+    class FakeSimulations:
+        def process_batch(self, batch_id: str, **kwargs) -> dict:
+            del kwargs
+            assert batch_id == "batch-1"
+            assert store.get(created["id"])["status"] == "running"
+            events.append("ledger_committed")
+            return {"id": batch_id, "status": "succeeded"}
+
+        def execution_manifest(self, batch_id: str) -> dict:
+            assert batch_id == "batch-1"
+            return {"source_type": "strategy_version", "source_id": "version-1"}
+
+        def mark_batch_failed(self, batch_id: str, error: str) -> None:
+            raise AssertionError(f"unexpected simulation failure {batch_id}: {error}")
+
+    class FakeAllocations:
+        def refresh_for_simulation_source(self, source_type: str, source_id: str) -> None:
+            assert (source_type, source_id) == ("strategy_version", "version-1")
+            events.append("allocation_refreshed")
+
+    settings = Settings(
+        api_url="",
+        token="",
+        data_root=tmp_path / "data",
+        database_url=database_url,
+    )
+    worker = LocalJobWorker(store, tmp_path, settings)
+    worker.simulations = FakeSimulations()  # type: ignore[assignment]
+    worker.allocations = FakeAllocations()  # type: ignore[assignment]
+    monkeypatch.setattr(worker, "_command", lambda job: (["fake"], result_path, {}))
+    monkeypatch.setattr("quant_platform.worker.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "quant_platform.worker.pd.read_parquet", lambda path: pd.DataFrame()
+    )
+
+    worker._run(claimed)
+
+    assert events == ["ledger_committed", "allocation_refreshed"]
+    assert store.get(created["id"])["status"] == "succeeded"
 
 
 def test_api_keeps_optional_broker_plugin_outside_research_routes(

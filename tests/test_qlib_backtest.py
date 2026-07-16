@@ -2,16 +2,26 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
+from qlib_test_doubles import risk_analysis
 
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.qlib_backtest import (
     QlibBacktestResult,
+    aggregate_intraday_report,
     calculate_qlib_metrics,
     calculate_trade_metrics,
     run_qlib_validation_suites,
 )
 
 pytestmark = pytest.mark.no_database
+
+
+@pytest.fixture(autouse=True)
+def _qlib_analysis_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "quant_platform.qlib_backtest._load_qlib_risk_analysis",
+        lambda: risk_analysis,
+    )
 
 
 def _result(
@@ -99,9 +109,49 @@ def test_sortino_uses_target_shortfall_not_std_of_negative_observations() -> Non
 
     metrics = calculate_qlib_metrics(report)
 
+    assert metrics["analysis_engine"] == "qlib.contrib.evaluate.risk_analysis"
+    assert metrics["annualization_periods"] == 252
+    assert metrics["return_accumulation"] == "geometric"
+    assert metrics["cumulative_return"] == pytest.approx((0.99**40) - 1.0)
     assert metrics["sortino_status"] == "ok"
     assert metrics["annualized_downside_deviation"] == pytest.approx(0.01 * 252**0.5)
     assert metrics["sortino_ratio"] == pytest.approx(-252**0.5)
+
+
+def test_intraday_report_is_geometrically_aggregated_to_daily_metrics() -> None:
+    index = pd.to_datetime(
+        [
+            "2026-07-10 09:35",
+            "2026-07-10 09:40",
+            "2026-07-13 09:35",
+        ]
+    )
+    report = pd.DataFrame(
+        {
+            "return": [0.01, -0.005, 0.02],
+            "cost": [0.001, 0.002, 0.001],
+            "bench": [0.002, 0.003, -0.001],
+            "turnover": [0.1, 0.2, 0.1],
+            "account": [101.0, 100.495, 102.5049],
+        },
+        index=index,
+    )
+
+    daily = aggregate_intraday_report(report)
+
+    assert daily.index.tolist() == [
+        pd.Timestamp("2026-07-10"),
+        pd.Timestamp("2026-07-13"),
+    ]
+    assert daily.loc["2026-07-10", "return"] == pytest.approx(
+        (1.01 * 0.995) - 1.0
+    )
+    assert daily.loc["2026-07-10", "bench"] == pytest.approx(
+        (1.002 * 1.003) - 1.0
+    )
+    assert daily.loc["2026-07-10", "cost"] == pytest.approx(0.003)
+    assert daily.loc["2026-07-10", "turnover"] == pytest.approx(0.3)
+    assert daily.loc["2026-07-10", "account"] == pytest.approx(100.495)
 
 
 def test_robustness_runs_all_four_configured_scenarios() -> None:

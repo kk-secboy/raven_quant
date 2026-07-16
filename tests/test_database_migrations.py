@@ -83,7 +83,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0036_financial_correctness"
+    assert revision == "0037_single_mainline_contract"
     assert {"research_program_id", "dataset_identity_sha256"} <= {
         column["name"]
         for column in inspector.get_columns("research_campaigns", schema="quantlab")
@@ -119,6 +119,14 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "statistical_contract_version",
         "final_test_key",
         "final_test_consumed_at",
+        "signal_frequency",
+        "signal_horizon",
+        "execution_frequency",
+        "execution_contract_hash",
+        "qlib_version",
+        "qlib_commit",
+        "rdagent_version",
+        "rdagent_commit",
     } <= {
         column["name"]
         for column in inspector.get_columns("factor_evaluations", schema="quantlab")
@@ -155,7 +163,27 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
     }
     assert "strategy_type" in strategy_version_columns
     assert "is_legacy" in strategy_version_columns
-    assert {"execution_dataset", "is_legacy"} <= {
+    assert {
+        "signal_frequency",
+        "signal_horizon",
+        "execution_frequency",
+        "execution_contract_hash",
+        "qlib_version",
+        "qlib_commit",
+        "rdagent_version",
+        "rdagent_commit",
+    } <= strategy_version_columns
+    assert {
+        "execution_dataset",
+        "is_legacy",
+        "signal_frequency",
+        "execution_frequency",
+        "execution_contract_hash",
+        "qlib_version",
+        "qlib_commit",
+        "rdagent_version",
+        "rdagent_commit",
+    } <= {
         column["name"] for column in inspector.get_columns("backtest_runs", schema="quantlab")
     }
     for table_name in (
@@ -198,3 +226,69 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         column["name"]
         for column in inspector.get_columns("strategy_allocations", schema="quantlab")
     }
+    assert {"role", "risk_budget", "member_cap"} <= {
+        column["name"]
+        for column in inspector.get_columns("strategy_allocation_members", schema="quantlab")
+    }
+    assert {
+        "source_type",
+        "source_id",
+        "execution_adapter",
+        "execution_frequency",
+        "execution_contract_hash",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("simulation_portfolios", schema="quantlab")
+    }
+    assert {
+        "source_snapshot_id",
+        "target_payload_json",
+        "execution_adapter",
+        "execution_contract_hash",
+        "created_by",
+        "signal_at",
+        "execution_not_before",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("simulation_batches", schema="quantlab")
+    }
+    batch_checks = {
+        item["name"]: str(item.get("sqltext") or "")
+        for item in inspector.get_check_constraints(
+            "simulation_batches", schema="quantlab"
+        )
+    }
+    next_bar_check = batch_checks["ck_simulation_batches_next_bar_time"]
+    assert "execution_not_before > signal_at" in next_bar_check
+    assert "Asia/Shanghai" in next_bar_check
+    batch_indexes = {
+        item["name"]: item
+        for item in inspector.get_indexes("simulation_batches", schema="quantlab")
+    }
+    recommendation_index = batch_indexes[
+        "uq_simulation_batches_portfolio_recommendation"
+    ]
+    assert recommendation_index["unique"] is True
+    assert recommendation_index["column_names"] == [
+        "portfolio_id",
+        "recommendation_snapshot_id",
+    ]
+    assert "recommendation_snapshot_id IS NOT NULL" in str(
+        recommendation_index.get("dialect_options") or {}
+    )
+    assert {
+        "nav_scope",
+        "produced_by",
+        "reviewed_by",
+        "reviewed_at",
+        "review_evidence_sha256",
+        "review_note",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("simulation_nav", schema="quantlab")
+    }
+    for table_name in ("simulation_orders", "simulation_fills", "simulation_positions"):
+        assert {"atomic_group_id", "leg_no", "position_side", "borrow_cost"} <= {
+            column["name"]
+            for column in inspector.get_columns(table_name, schema="quantlab")
+        }

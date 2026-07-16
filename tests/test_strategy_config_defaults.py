@@ -3,8 +3,12 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from qlib_test_doubles import qlib_workflow_identity
 
-from quant_platform.api import StrategyConfigRequest
+from quant_platform.api import (
+    StrategyConfigRequest,
+    _rebind_strategy_execution_contract,
+)
 from quant_platform.strategy_store import (
     _canonical_sha256,
     _multifactor_manifest_failures,
@@ -44,6 +48,36 @@ def test_benchmark_relative_optimizer_rejects_an_impossible_position_cap() -> No
         )
 
 
+def test_strategy_frequency_contract_is_immutable_and_fail_closed() -> None:
+    minute = StrategyConfigRequest(
+        signal_frequency="5min",
+        signal_period=3,
+        execution_frequency="1min",
+        execution_method="vwap",
+    )
+    assert len(minute.execution_contract_hash or "") == 64
+
+    with pytest.raises(ValidationError, match="signal inputs"):
+        StrategyConfigRequest(
+            signal_frequency="5min",
+            execution_frequency="15min",
+            execution_method="vwap",
+        )
+    with pytest.raises(ValidationError, match="equal to or finer"):
+        StrategyConfigRequest(
+            signal_frequency="1min",
+            execution_frequency="5min",
+            execution_method="vwap",
+        )
+    with pytest.raises(ValidationError, match="contract_hash"):
+        StrategyConfigRequest(execution_contract_hash="0" * 64)
+
+    rebound = _rebind_strategy_execution_contract(
+        {**minute.model_dump(), "max_daily_turnover": 0.10}
+    )
+    assert rebound.execution_contract_hash != minute.execution_contract_hash
+
+
 def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path: Path) -> None:
     config = StrategyConfigRequest().model_dump()
     code_path = tmp_path / "factor-1.py"
@@ -55,6 +89,7 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
     version = {
         "id": "version-1",
         "benchmark": "SH000300",
+        "universe": "cn_all",
         "config": dict(config),
         "factors": [
             {
@@ -76,6 +111,7 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
         "strategy_version_id": version["id"],
         "dataset": backtest["dataset"],
         "benchmark": version["benchmark"],
+        "universe": version["universe"],
         "periods": backtest["periods"],
         "config": config,
         "factors": [
@@ -96,6 +132,7 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
             "strategy_config_sha256": _canonical_sha256(config),
             "factor_code_sha256": {"factor-1": code_sha256},
             "factor_values_sha256": {"factor-1": values_sha256},
+            "qlib_workflow": qlib_workflow_identity(),
         }
     }
     assert _multifactor_manifest_failures(version, backtest, metrics) == []

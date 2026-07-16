@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -107,3 +107,52 @@ def test_execution_time_slots_expose_the_same_schedule_used_for_orders() -> None
         "14:30",
         "14:50",
     ]
+
+
+def test_next_bar_execution_uses_one_governed_native_minute_slice() -> None:
+    slices = build_execution_slices(
+        quantity=1_000,
+        side="buy",
+        trade_date=date(2026, 7, 13),
+        policy={"execution_algorithm": "next_bar", "max_slices": 1},
+    )
+
+    assert len(slices) == 1
+    assert slices[0]["scheduled_for"][11:16] == "10:00"
+    assert slices[0]["quantity"] == 1_000
+
+
+def test_next_bar_uses_the_first_strictly_later_intraday_bar() -> None:
+    policy = {
+        "execution_algorithm": "next_bar",
+        "execution_frequency": "5min",
+        "slice_minutes": 5,
+        "max_slices": 1,
+    }
+    signal_at = datetime.fromisoformat("2025-06-03T10:05:00+08:00")
+    slices = build_execution_slices(
+        quantity=100,
+        side="buy",
+        trade_date=date(2025, 6, 3),
+        policy=policy,
+        signal_at=signal_at,
+    )
+
+    assert slices[0]["scheduled_for"] == "2025-06-03T10:10:00+08:00"
+
+
+def test_next_bar_can_cross_the_lunch_break_but_not_reuse_the_signal_bar() -> None:
+    policy = {
+        "execution_algorithm": "next_bar",
+        "execution_frequency": "1min",
+        "slice_minutes": 5,
+        "max_slices": 1,
+    }
+
+    slots = execution_time_slots(
+        trade_date=date(2025, 6, 3),
+        policy=policy,
+        signal_at=datetime.fromisoformat("2025-06-03T11:20:00+08:00"),
+    )
+
+    assert slots[0].isoformat() == "2025-06-03T13:30:00+08:00"

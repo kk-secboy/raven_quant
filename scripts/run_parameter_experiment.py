@@ -16,6 +16,10 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from quant_platform.parameter_experiments import evaluate_trial, summarize_trials
+from quant_platform.qlib_workflow import (
+    qlib_workflow_run,
+    require_qlib_workflow_identity,
+)
 from quant_platform.statistical_validation import deflated_sharpe_probability
 
 
@@ -42,6 +46,7 @@ def _read_completed_result(
             or metrics.get("qlib_native_backtest") is not True
         ):
             return None
+        require_qlib_workflow_identity(result.get("qlib_workflow"))
         return result
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
@@ -51,10 +56,13 @@ def _run_segment(
     *,
     backtest_script: Path,
     provider_uri: str,
+    execution_provider_uri: str | None,
+    execution_frequency: str | None,
     base_manifest: dict[str, Any],
     config: dict[str, Any],
     periods: dict[str, str],
     output: Path,
+    tracking_uri: str,
 ) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
     result_path = output / "result.json"
@@ -65,6 +73,7 @@ def _run_segment(
         "strategy_version_id": base_manifest["strategy_version_id"],
         "dataset": base_manifest["dataset"],
         "benchmark": base_manifest["benchmark"],
+        "execution_dataset": base_manifest.get("execution_dataset"),
         "periods": periods,
         "config": config,
         "factors": base_manifest["factors"],
@@ -72,18 +81,30 @@ def _run_segment(
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     log_path = output / "backtest.log"
+    command = [
+        sys.executable,
+        str(backtest_script),
+        "--provider-uri",
+        provider_uri,
+        "--manifest",
+        str(manifest_path),
+        "--output",
+        str(output),
+        "--tracking-uri",
+        tracking_uri,
+    ]
+    if execution_provider_uri and execution_frequency:
+        command.extend(
+            [
+                "--execution-provider-uri",
+                execution_provider_uri,
+                "--execution-frequency",
+                execution_frequency,
+            ]
+        )
     with log_path.open("a", encoding="utf-8") as log:
         process = subprocess.run(
-            [
-                sys.executable,
-                str(backtest_script),
-                "--provider-uri",
-                provider_uri,
-                "--manifest",
-                str(manifest_path),
-                "--output",
-                str(output),
-            ],
+            command,
             stdout=log,
             stderr=subprocess.STDOUT,
             text=True,
@@ -101,12 +122,22 @@ def _run_segment(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-uri", required=True)
+    parser.add_argument("--execution-provider-uri")
+    parser.add_argument("--execution-frequency")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--tracking-uri", required=True)
     args = parser.parse_args()
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
+    provenance_path = Path(args.provider_uri) / "metadata" / "provenance.json"
+    if not provenance_path.is_file():
+        raise ValueError("parameter experiment requires Qlib dataset provenance")
+    provider_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    import qlib
+
+    qlib.init(provider_uri=args.provider_uri, region="cn")
     backtest_script = Path(__file__).with_name("run_multifactor_backtest.py")
     trial_results: list[dict[str, Any]] = []
     for trial in manifest["trials"]:
@@ -127,10 +158,13 @@ def main() -> None:
                 result = _run_segment(
                     backtest_script=backtest_script,
                     provider_uri=args.provider_uri,
+                    execution_provider_uri=args.execution_provider_uri,
+                    execution_frequency=args.execution_frequency,
                     base_manifest=manifest,
                     config=trial["config"],
                     periods=manifest["periods"][segment],
                     output=trial_output / segment,
+                    tracking_uri=args.tracking_uri,
                 )
                 segment_metrics[segment] = result["metrics"]
                 if segment == "out_of_sample":
@@ -193,9 +227,38 @@ def main() -> None:
         "trials": trial_results,
         "summary": summary,
     }
-    (output / "result.json").write_text(
-        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    with qlib_workflow_run(
+        run_kind="portfolio-experiment",
+        run_id=str(manifest["experiment_id"]),
+        tracking_uri=args.tracking_uri,
+        dataset_identity_sha256=provider_provenance.get("dataset_identity_sha256"),
+    ) as workflow:
+        workflow.log_params(
+            {
+                "experiment_id": manifest["experiment_id"],
+                "strategy_version_id": manifest["strategy_version_id"],
+                "dataset": manifest["dataset"],
+                "benchmark": manifest["benchmark"],
+                "trial_count": len(manifest["trials"]),
+                "parameter_grid_sha256": _canonical_sha256(manifest["parameter_grid"]),
+            }
+        )
+        workflow.log_metrics(
+            {
+                "trial_count": len(trial_results),
+                "succeeded_count": summary["succeeded_count"],
+                "failed_count": summary["failed_count"],
+                "best_trial_index": summary.get("best_trial_index"),
+                "best_score": (
+                    summary["leaderboard"][0]["score"] if summary.get("leaderboard") else None
+                ),
+            }
+        )
+        result["qlib_workflow"] = workflow.identity_dict()
+        (output / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        workflow.save_artifacts(output)
     print(json.dumps({"status": "ok", "summary": summary}, ensure_ascii=False))
 
 

@@ -335,7 +335,7 @@ export function DataTaskCenter({ tasks, api, mode, onCreated, onMessage }: DataT
           {!minuteTask?.dependencies_satisfied ? <p className="form-warning">需先完成期货、期权和同区间融券资格数据。</p> : null}
           <div className="form-intro"><strong>下载完成后构建分钟 Qlib</strong><span>转换是独立任务；失败只重试构建，不会重新下载分钟行情。</span></div>
           <label>分钟不可变快照<select value={minuteSnapshot} onChange={(event) => setMinuteSnapshot(event.target.value)}><option value="">尚无可用快照</option>{minuteSnapshots.map((item) => <option value={item.name} key={item.name}>{item.name} · {item.frequency}{item.end_date ? ` · 至 ${item.end_date}` : ""}</option>)}</select></label>
-          <button type="button" onClick={startMinuteQlib} disabled={submitting !== null || !minuteSnapshot || !minuteQlibTask?.dependencies_satisfied || ["queued", "running"].includes(minuteQlibTask?.status ?? "")}>构建分钟 Qlib 数据集</button>
+          <button type="button" onClick={() => startMinuteQlib()} disabled={submitting !== null || !minuteSnapshot || !minuteQlibTask?.dependencies_satisfied || ["queued", "running"].includes(minuteQlibTask?.status ?? "")}>构建分钟 Qlib 数据集</button>
           <div className="form-intro"><strong>全 A 股 5 分钟线</strong><span>从 stock_basic 自动读取区间内曾上市的沪、深、北股票（含退市股），按股票和月份断点续传。</span></div>
           <button type="button" onClick={startAshare5m} disabled={submitting !== null || !ashare5mTask?.dependencies_satisfied || ["queued", "running"].includes(ashare5mTask?.status ?? "")}>{ashare5mTask?.status === "succeeded" ? "创建增量更新" : "创建全市场 5 分钟下载"}</button>
         </form>

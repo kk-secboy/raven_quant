@@ -7,8 +7,9 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -17,15 +18,25 @@ from quant_data.path_utils import to_wsl_path as _to_wsl_path
 
 from .allocation_store import AllocationStore
 from .cost_model import CostModelConfig
+from .execution_algorithms import execution_time_slots
 from .job_store import JobStore
 from .parameter_experiment_store import ParameterExperimentStore
-from .rdagent_runtime import rdagent_command
+from .rdagent_runtime import rdagent_command, require_rdagent_runtime_identity
 from .recommendation_store import RecommendationStore
 from .research_store import ResearchStore
 from .runtime_secret_store import RuntimeSecretStore
-from .services import list_qlib_datasets
+from .services import list_qlib_datasets, resolve_snapshot_dataset
 from .simulation_store import SimulationStore
 from .strategy_store import StrategyStore
+
+
+def _qlib_workflow_environment(settings: Settings, *, is_wsl: bool) -> dict[str, str]:
+    artifact_root = settings.data_root / "artifacts" / "mlflow"
+    return {
+        "_MLFLOW_SERVER_ARTIFACT_ROOT": (
+            _to_wsl_path(artifact_root) if is_wsl else str(artifact_root)
+        )
+    }
 
 
 class LocalJobWorker:
@@ -78,6 +89,9 @@ class LocalJobWorker:
         backtest_id = job["payload"].get("backtest_id")
         parameter_experiment_id = job["payload"].get("parameter_experiment_id")
         recommendation_snapshot_id = job["payload"].get("recommendation_snapshot_id")
+        simulation_order_plan_portfolio_id = job["payload"].get(
+            "simulation_portfolio_id"
+        ) if job["kind"] == "simulation_order_plan" else None
         simulation_batch_id = job["payload"].get("simulation_batch_id")
         if research_run_id:
             self.research.mark_run(research_run_id, "running")
@@ -155,6 +169,17 @@ class LocalJobWorker:
             if exit_code == 0 and result_path and result_path.exists():
                 result = json.loads(result_path.read_text(encoding="utf-8"))
             logical_error = None
+            rdagent_identity = None
+            if exit_code == 0 and job["kind"] == "rdagent_factor":
+                try:
+                    if not isinstance(result, dict):
+                        raise ValueError("RD-Agent result is missing")
+                    rdagent_identity = require_rdagent_runtime_identity(
+                        result.get("rdagent_runtime")
+                    )
+                except (TypeError, ValueError) as exc:
+                    logical_error = str(exc)
+                    exit_code = 3
             if job["kind"] == "factor_evaluate" and result:
                 failures = [
                     item for item in result.get("evaluations", []) if item.get("status") != "ok"
@@ -165,7 +190,10 @@ class LocalJobWorker:
                         for item in failures
                     )
                     exit_code = 3
-            if exit_code == 0 and job["kind"] == "strategy_backtest":
+            if exit_code == 0 and job["kind"] in {
+                "strategy_backtest",
+                "pair_backtest",
+            }:
                 try:
                     if not isinstance(result, dict) or not isinstance(result.get("metrics"), dict):
                         raise ValueError("strategy backtest result is missing metrics")
@@ -181,6 +209,16 @@ class LocalJobWorker:
                 except (KeyError, TypeError, ValueError) as exc:
                     logical_error = str(exc)
                     exit_code = 3
+            if exit_code == 0 and simulation_batch_id and not isinstance(result, dict):
+                logical_error = "simulation replay result is missing"
+                exit_code = 3
+            if exit_code == 0 and job["kind"] == "simulation_order_plan":
+                if (
+                    not isinstance(result, dict)
+                    or len(str(result.get("order_plan_manifest_sha256") or "")) != 64
+                ):
+                    logical_error = "Qlib simulation order-plan result is missing"
+                    exit_code = 3
             pipeline_stage = job["kind"] in {"data_verify", "data_snapshot", "data_qlib"}
             bootstrap_finalize = job["kind"] == "bootstrap" and bool(
                 job["payload"].get("finalize_after_download")
@@ -192,9 +230,7 @@ class LocalJobWorker:
                 except Exception as exc:
                     logical_error = f"could not enqueue next data pipeline stage: {exc}"
                     exit_code = 4
-            if exit_code == 0:
-                self.store.finish(job["id"], exit_code=0, result=result)
-            else:
+            if exit_code != 0:
                 failure_error = logical_error or process_error or "job failed"
                 requeued = self.store.finish_or_retry(
                     job["id"],
@@ -214,6 +250,7 @@ class LocalJobWorker:
                             research_run_id,
                             "evaluating",
                             runtime={
+                                "rdagent_runtime": rdagent_identity,
                                 "trace_path": (result or {}).get("trace_path"),
                                 "rounds": (result or {}).get("rounds", 0),
                                 "candidates": len(candidates),
@@ -250,26 +287,50 @@ class LocalJobWorker:
             if recommendation_snapshot_id:
                 if exit_code == 0 and result:
                     snapshot = self.recommendations.apply_result(recommendation_snapshot_id, result)
-                    batch, created = self.simulations.create_batch_for_snapshot(
+                    batches = self.simulations.create_batches_for_snapshot(
                         recommendation_snapshot_id
                     )
-                    if created and batch:
-                        self.store.create(
-                            "simulation_replay",
-                            {"simulation_batch_id": batch["id"]},
-                            self.settings.data_root
-                            / "platform"
-                            / "logs"
-                            / f"simulation-replay-{batch['id']}.log",
-                            dedupe_active_kind=False,
-                            idempotency_key=f"simulation-replay:{batch['id']}",
-                        )
+                    for batch, created in batches:
+                        if created:
+                            self.store.create(
+                                "simulation_replay",
+                                {"simulation_batch_id": batch["id"]},
+                                self.settings.data_root
+                                / "platform"
+                                / "logs"
+                                / f"simulation-replay-{batch['id']}.log",
+                                dedupe_active_kind=False,
+                                idempotency_key=f"simulation-replay:{batch['id']}",
+                            )
                     self.allocations.refresh_for_portfolio(str(snapshot["portfolio_id"]))
                 else:
                     self.recommendations.mark_failed(
                         recommendation_snapshot_id, logical_error or process_error
                     )
-            if simulation_batch_id and exit_code == 0 and result:
+            if simulation_order_plan_portfolio_id and exit_code == 0 and result:
+                batch, created = self.simulations.create_batch_from_order_plan(
+                    str(simulation_order_plan_portfolio_id),
+                    order_plan_manifest_sha256=str(
+                        result["order_plan_manifest_sha256"]
+                    ),
+                    data_root=self.settings.data_root,
+                    actor=str(job["payload"].get("actor") or "simulation-order-plan-worker"),
+                )
+                if created:
+                    self.store.create(
+                        "simulation_replay",
+                        {"simulation_batch_id": batch["id"]},
+                        self.settings.data_root
+                        / "platform"
+                        / "logs"
+                        / f"simulation-replay-{batch['id']}.log",
+                        dedupe_active_kind=False,
+                        idempotency_key=f"simulation-replay:{batch['id']}",
+                    )
+                result["simulation_batch_id"] = batch["id"]
+                result["simulation_batch_created"] = created
+                self.store.finish(job["id"], exit_code=0, result=result)
+            elif simulation_batch_id and exit_code == 0 and result:
                 if result_path is None:
                     raise ValueError("simulation replay result path is missing")
                 bars = pd.read_parquet(result_path.parent / result["minute_bars_file"])
@@ -280,13 +341,16 @@ class LocalJobWorker:
                     execution_evidence=result,
                 )
                 manifest = self.simulations.execution_manifest(simulation_batch_id)
-                self.allocations.refresh_for_portfolio(
-                    str(manifest["recommendation_portfolio_id"])
+                self.allocations.refresh_for_simulation_source(
+                    str(manifest["source_type"]), str(manifest["source_id"])
                 )
+                self.store.finish(job["id"], exit_code=0, result=result)
             elif simulation_batch_id:
                 self.simulations.mark_batch_failed(
                     simulation_batch_id, logical_error or process_error
                 )
+            elif exit_code == 0:
+                self.store.finish(job["id"], exit_code=0, result=result)
         except Exception as exc:
             requeued = self.store.finish_or_retry(
                 job["id"],
@@ -470,20 +534,21 @@ class LocalJobWorker:
                 {},
             )
         if job["kind"] == "minute_qlib":
-            return (
-                [
-                    sys.executable,
-                    "-m",
-                    "quant_data.cli",
-                    "build-minute-qlib",
-                    "--snapshot",
-                    payload["snapshot_name"],
-                    "--output-name",
-                    payload["output_name"],
-                ],
-                None,
-                {},
-            )
+            command = [
+                sys.executable,
+                "-m",
+                "quant_data.cli",
+                "build-minute-qlib",
+                "--snapshot",
+                payload["snapshot_name"],
+                "--output-name",
+                payload["output_name"],
+            ]
+            if payload.get("target_frequency"):
+                command.extend(
+                    ["--target-frequency", str(payload["target_frequency"])]
+                )
+            return command, None, {}
         if job["kind"] == "minute_research":
             output = self.settings.data_root / "artifacts" / "minute-research" / job["id"]
             result_path = output / "result.json"
@@ -517,9 +582,15 @@ class LocalJobWorker:
                     ",".join(str(item) for item in payload["horizons"]),
                     "--cost-rate",
                     str(payload["cost_rate"]),
+                    "--tracking-uri",
+                    self.settings.mlflow_tracking_uri,
                 ]
             )
-            return command, result_path, {}
+            return (
+                command,
+                result_path,
+                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
+            )
         if job["kind"] == "bootstrap":
             stored = self.runtime_secrets.get("tushare")
             api_url = (stored or {}).get("api_url") or self.settings.api_url
@@ -591,7 +662,11 @@ class LocalJobWorker:
                     str(payload["min_cost"]),
                 ]
             )
-            return command, output / "result.json", {}
+            return (
+                command,
+                output / "result.json",
+                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
+            )
         if job["kind"] == "rdagent_factor":
             output = self.settings.data_root / "artifacts" / "rdagent" / payload["research_run_id"]
             trace = output / "trace"
@@ -631,6 +706,7 @@ class LocalJobWorker:
 
             promoted = self.research.list_candidates(status="promoted", limit=500)
             manifest = {
+                "research_run_id": payload["research_run_id"],
                 "candidates": [
                     {
                         **item,
@@ -679,9 +755,15 @@ class LocalJobWorker:
                     _to_wsl_path(manifest_path) if is_wsl else str(manifest_path),
                     "--output",
                     _to_wsl_path(result_path) if is_wsl else str(result_path),
+                    "--tracking-uri",
+                    self.settings.mlflow_tracking_uri,
                 ]
             )
-            return command, result_path, {}
+            return (
+                command,
+                result_path,
+                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
+            )
         if job["kind"] == "parameter_experiment":
             experiment = self.parameter_experiments.get(payload["parameter_experiment_id"])
             output = Path(experiment["artifact_path"])
@@ -701,6 +783,9 @@ class LocalJobWorker:
                 "strategy_version_id": version["id"],
                 "dataset": experiment["dataset"],
                 "benchmark": version["benchmark"],
+                "execution_dataset": (
+                    (payload.get("execution_dataset") or {}).get("name")
+                ),
                 "periods": experiment["periods"],
                 "parameter_grid": experiment["parameter_grid"],
                 "factors": [
@@ -748,9 +833,25 @@ class LocalJobWorker:
                     _to_wsl_path(manifest_path) if is_wsl else str(manifest_path),
                     "--output",
                     _to_wsl_path(output) if is_wsl else str(output),
+                    "--tracking-uri",
+                    self.settings.mlflow_tracking_uri,
                 ]
             )
-            return command, result_path, {}
+            execution_dataset = payload.get("execution_dataset")
+            if execution_dataset:
+                command.extend(
+                    [
+                        "--execution-provider-uri",
+                        runtime_path(str(execution_dataset["path"])),
+                        "--execution-frequency",
+                        str(execution_dataset["frequency"]),
+                    ]
+                )
+            return (
+                command,
+                result_path,
+                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
+            )
         if job["kind"] == "strategy_backtest":
             output = self.settings.data_root / "artifacts" / "backtests" / payload["backtest_id"]
             output.mkdir(parents=True, exist_ok=True)
@@ -770,6 +871,7 @@ class LocalJobWorker:
                     family_trials.get(family, 0), int(factor.get("experiment_count") or 1)
                 )
             manifest = {
+                "backtest_id": payload["backtest_id"],
                 "strategy_version_id": version["id"],
                 "dataset": payload["dataset"],
                 "execution_dataset": (
@@ -788,6 +890,19 @@ class LocalJobWorker:
                     else None
                 ),
                 "benchmark": version["benchmark"],
+                "universe": version["universe"],
+                "factor_source_mode": version["config"].get("factor_source_mode"),
+                "challenger_weight": version["config"].get("challenger_weight"),
+                "baseline": (
+                    {
+                        "definition": version["config"].get("baseline_definition"),
+                        "definition_sha256": version["config"].get(
+                            "baseline_definition_sha256"
+                        ),
+                    }
+                    if version["config"].get("baseline_definition")
+                    else None
+                ),
                 "strategy_trial_count": max(1, sum(family_trials.values())),
                 "periods": payload["periods"],
                 "config": version["config"],
@@ -828,6 +943,8 @@ class LocalJobWorker:
                     _to_wsl_path(manifest_path) if is_wsl else str(manifest_path),
                     "--output",
                     _to_wsl_path(output) if is_wsl else str(output),
+                    "--tracking-uri",
+                    self.settings.mlflow_tracking_uri,
                 ]
             )
             if isinstance(execution_dataset, dict):
@@ -839,7 +956,11 @@ class LocalJobWorker:
                         str(execution_dataset["frequency"]),
                     ]
                 )
-            return command, result_path, {}
+            return (
+                command,
+                result_path,
+                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
+            )
         if job["kind"] == "pair_backtest":
             output = self.settings.data_root / "artifacts" / "backtests" / payload["backtest_id"]
             output.mkdir(parents=True, exist_ok=True)
@@ -854,12 +975,17 @@ class LocalJobWorker:
                 return _to_wsl_path(Path(value)) if is_wsl else str(Path(value))
 
             manifest = {
+                "backtest_id": payload["backtest_id"],
                 "strategy_version_id": version["id"],
                 "dataset": payload["dataset"],
                 "execution_snapshot": payload["execution_snapshot"],
+                "execution_contract_hash": version["execution_contract_hash"],
                 "periods": payload["periods"],
                 "config": version["config"],
-                "pair": version["pair"],
+                "pair": {
+                    key: version["pair"][key]
+                    for key in ("leg_y", "leg_x", "asset_class", "shorting_mode")
+                },
                 "daily_provenance": payload["daily_provenance"],
                 "minute_dataset": payload["minute_dataset"],
                 "shortability_dataset": payload["shortability_dataset"],
@@ -892,9 +1018,265 @@ class LocalJobWorker:
                     runtime_path(str(manifest_path)),
                     "--output",
                     runtime_path(str(output)),
+                    "--tracking-uri",
+                    self.settings.mlflow_tracking_uri,
                 ]
             )
-            return command, result_path, {}
+            return (
+                command,
+                result_path,
+                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
+            )
+        if job["kind"] == "simulation_order_plan":
+            portfolio = self.simulations.get(payload["simulation_portfolio_id"])
+            if (
+                portfolio["status"] != "active"
+                or portfolio["source_type"] != "strategy_version"
+                or portfolio["execution_adapter"] != "long_only"
+            ):
+                raise ValueError(
+                    "simulation order-plan generation requires an active long-only "
+                    "strategy-version simulation"
+                )
+            version = self.strategies.get_version(portfolio["source_id"])
+            if version["status"] != "approved" or version.get("is_legacy"):
+                raise ValueError(
+                    "simulation order-plan generation requires an approved "
+                    "non-legacy strategy version"
+                )
+            formal = next(
+                (
+                    item
+                    for item in self.strategies.list_backtests(version["id"])
+                    if item["status"] == "succeeded" and not item.get("is_legacy")
+                ),
+                None,
+            )
+            if formal is None:
+                raise ValueError(
+                    "simulation order-plan generation requires a successful "
+                    "formal Qlib backtest"
+                )
+            datasets = {
+                item["name"]: item
+                for item in list_qlib_datasets(self.settings.data_root)
+                if item.get("ready")
+            }
+            dataset = datasets.get(portfolio["daily_dataset"])
+            if dataset is None:
+                raise ValueError("simulation order-plan Qlib daily dataset is unavailable")
+            provenance = dict(dataset.get("provenance") or {})
+            if (
+                provenance.get("dataset_identity_sha256")
+                != portfolio["daily_dataset_identity_sha256"]
+                or provenance.get("dataset_lineage_id")
+                != portfolio["daily_dataset_lineage_id"]
+            ):
+                raise ValueError(
+                    "simulation order-plan Qlib dataset no longer matches the "
+                    "bound account snapshot"
+                )
+            signal_frequency = str(
+                version.get("signal_frequency") or "day"
+            ).lower()
+            signal_at = payload.get("signal_at")
+            execution_not_before: str | None = None
+            signal_dataset: dict | None = None
+            if signal_frequency != "day":
+                if not signal_at:
+                    raise ValueError("minute simulation order-plan requires signal_at")
+                try:
+                    signal_timestamp = datetime.fromisoformat(
+                        str(signal_at).replace("Z", "+00:00")
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "minute simulation order-plan signal_at is invalid"
+                    ) from exc
+                if (
+                    signal_timestamp.tzinfo is None
+                    or signal_timestamp.utcoffset() is None
+                ):
+                    raise ValueError(
+                        "minute simulation order-plan signal_at requires a timezone"
+                    )
+                local_signal = signal_timestamp.astimezone(
+                    ZoneInfo("Asia/Shanghai")
+                )
+                if local_signal.date().isoformat() != str(payload["signal_date"]):
+                    raise ValueError(
+                        "minute simulation order-plan signal_at does not match signal_date"
+                    )
+                source_lineage = str(provenance.get("source_lineage_id") or "")
+                candidates = [
+                    item
+                    for item in datasets.values()
+                    if item.get("reproducible") is True
+                    and dict(item.get("provenance") or {}).get("lineage_verified")
+                    is True
+                    and str(
+                        dict(item.get("provenance") or {}).get("frequency") or ""
+                    )
+                    == signal_frequency
+                    and str(
+                        dict(item.get("provenance") or {}).get(
+                            "source_lineage_id"
+                        )
+                        or ""
+                    )
+                    == source_lineage
+                ]
+                signal_dataset = next(
+                    (
+                        item
+                        for item in candidates
+                        if item["name"] == portfolio["execution_dataset"]
+                    ),
+                    candidates[0] if candidates else None,
+                )
+                if signal_dataset is None:
+                    raise ValueError(
+                        "minute simulation order-plan requires a ready Qlib signal "
+                        f"dataset at {signal_frequency} from the bound Tushare lineage"
+                    )
+                first_slot = execution_time_slots(
+                    trade_date=local_signal.date(),
+                    policy=dict(portfolio["execution_policy"]),
+                    signal_at=signal_timestamp,
+                )[0]
+                execution_not_before = first_slot.isoformat()
+            positions = self.simulations.rows(portfolio["id"], "positions")
+            nav = float(portfolio["nav"])
+            previous_holdings = [
+                {
+                    "instrument": str(item["instrument"]),
+                    "weight": max(0.0, float(item.get("market_value") or 0.0))
+                    / nav,
+                }
+                for item in positions
+                if nav > 0
+                and str(item.get("position_side") or "long") == "long"
+                and float(item.get("market_value") or 0.0) > 0
+            ]
+            strategy_risk_state = self.allocations.strategy_risk_state(
+                str(version["id"])
+            )
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "order-plan-jobs"
+                / job["id"]
+            )
+            output.mkdir(parents=True, exist_ok=True)
+            manifest_path = output / "manifest.json"
+            result_path = output / "result.json"
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+
+            def runtime_path(value: str | Path) -> str:
+                return _to_wsl_path(Path(value)) if is_wsl else str(value)
+
+            manifest = {
+                "artifact_kind": "simulation_order_plan",
+                "order_plan_job_id": job["id"],
+                "simulation_portfolio_id": portfolio["id"],
+                "portfolio_id": portfolio["id"],
+                "strategy_version_id": version["id"],
+                "formal_backtest_id": formal["id"],
+                "dataset": portfolio["daily_dataset"],
+                "dataset_identity_sha256": portfolio[
+                    "daily_dataset_identity_sha256"
+                ],
+                "dataset_lineage_id": portfolio["daily_dataset_lineage_id"],
+                "signal_date": payload["signal_date"],
+                "signal_at": signal_at,
+                "execution_not_before": execution_not_before,
+                "as_of_date": signal_at or payload["signal_date"],
+                "benchmark": version["benchmark"],
+                "universe": version["universe"],
+                "config": version["config"],
+                "construction_notional": nav,
+                "risk_exposure": float(
+                    strategy_risk_state["risk_exposure_override"]
+                ),
+                "risk_exposure_override": float(
+                    strategy_risk_state["risk_exposure_override"]
+                ),
+                "allow_new_risk": bool(strategy_risk_state["allow_new_risk"]),
+                "member_risk_state": strategy_risk_state,
+                "previous_holdings": previous_holdings,
+                "previous_snapshot": None,
+                "signal_dataset": (
+                    {
+                        "name": signal_dataset["name"],
+                        "dataset_identity_sha256": dict(
+                            signal_dataset.get("provenance") or {}
+                        ).get("dataset_identity_sha256"),
+                        "dataset_lineage_id": dict(
+                            signal_dataset.get("provenance") or {}
+                        ).get("dataset_lineage_id"),
+                        "source_lineage_id": dict(
+                            signal_dataset.get("provenance") or {}
+                        ).get("source_lineage_id"),
+                        "frequency": signal_frequency,
+                    }
+                    if signal_dataset is not None
+                    else None
+                ),
+                "factors": [
+                    {
+                        "candidate_id": item["factor_candidate_id"],
+                        "values_path": runtime_path(item["values_path"]),
+                        "weight": item["weight"],
+                        "direction": item["direction"],
+                    }
+                    for item in version["factors"]
+                ],
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            script = self.project_root / "scripts" / "run_recommendation_refresh.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    runtime_path(dataset["path"]),
+                    "--manifest",
+                    runtime_path(manifest_path),
+                    "--output",
+                    runtime_path(result_path),
+                    "--tracking-uri",
+                    self.settings.mlflow_tracking_uri,
+                    "--order-plan-root",
+                    runtime_path(
+                        self.settings.data_root / "artifacts" / "order-plans"
+                    ),
+                ]
+            )
+            if signal_dataset is not None:
+                command.extend(
+                    [
+                        "--signal-provider-uri",
+                        runtime_path(signal_dataset["path"]),
+                    ]
+                )
+            return (
+                command,
+                result_path,
+                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
+            )
         if job["kind"] == "recommendation_refresh":
             output = (
                 self.settings.data_root
@@ -910,6 +1292,11 @@ class LocalJobWorker:
             version = self.strategies.get_version(portfolio["strategy_version_id"])
             if version["status"] != "approved":
                 raise ValueError("recommendation refresh requires an approved strategy version")
+            member_risk_state = self.allocations.strategy_risk_state(str(version["id"]))
+            risk_exposure = min(
+                float(portfolio.get("risk_exposure_override", 1.0)),
+                float(member_risk_state["risk_exposure_override"]),
+            )
             is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
 
             def runtime_path(value: str) -> str:
@@ -923,9 +1310,13 @@ class LocalJobWorker:
                 "dataset_identity_sha256": payload["dataset_identity_sha256"],
                 "as_of_date": payload["as_of_date"],
                 "benchmark": version["benchmark"],
+                "universe": version["universe"],
                 "config": version["config"],
                 "construction_notional": float(portfolio["construction_notional"]),
-                "risk_exposure": float(portfolio.get("risk_exposure_override", 1.0)),
+                "risk_exposure": risk_exposure,
+                "risk_exposure_override": risk_exposure,
+                "allow_new_risk": bool(member_risk_state["allow_new_risk"]),
+                "member_risk_state": member_risk_state,
                 "previous_holdings": latest_snapshot.get("holdings") or [],
                 "previous_snapshot": (
                     {
@@ -985,6 +1376,52 @@ class LocalJobWorker:
             minute_dataset = datasets.get(manifest["execution_dataset"])
             if minute_dataset is None:
                 raise ValueError("simulation execution Qlib dataset is unavailable")
+            pair_plan = manifest.get("governed_pair_plan")
+            shortability_dataset = None
+            if manifest.get("execution_adapter") == "pair":
+                if not isinstance(pair_plan, dict):
+                    raise ValueError("pair simulation replay has no governed artifact plan")
+                minute_binding = pair_plan.get("minute_dataset")
+                shortability_binding = pair_plan.get("shortability_dataset")
+                if not isinstance(minute_binding, dict) or not isinstance(
+                    shortability_binding, dict
+                ):
+                    raise ValueError("pair replay artifact has incomplete Tushare bindings")
+                snapshot_name = str(pair_plan.get("execution_snapshot") or "")
+                resolved_minute = resolve_snapshot_dataset(
+                    self.settings.data_root,
+                    snapshot_name=snapshot_name,
+                    dataset_name=str(minute_binding.get("dataset_name") or ""),
+                )
+                shortability_dataset = resolve_snapshot_dataset(
+                    self.settings.data_root,
+                    snapshot_name=snapshot_name,
+                    dataset_name=str(shortability_binding.get("dataset_name") or ""),
+                )
+                for resolved, binding, label in (
+                    (resolved_minute, minute_binding, "minute"),
+                    (shortability_dataset, shortability_binding, "shortability"),
+                ):
+                    if (
+                        resolved["manifest_sha256"] != binding.get("manifest_sha256")
+                        or resolved["source_sha256"] != binding.get("source_sha256")
+                    ):
+                        raise ValueError(
+                            f"pair replay {label} snapshot no longer matches "
+                            "the approved backtest artifact"
+                        )
+                minute_provenance = dict(minute_dataset.get("provenance") or {})
+                if (
+                    minute_provenance.get("snapshot_name") != snapshot_name
+                    or minute_provenance.get("snapshot_manifest_sha256")
+                    != resolved_minute["manifest_sha256"]
+                    or str(minute_binding.get("dataset_name") or "")
+                    not in set(minute_provenance.get("source_datasets") or [])
+                ):
+                    raise ValueError(
+                        "pair simulation Qlib minute dataset is not derived from "
+                        "the approved Tushare execution snapshot"
+                    )
             output = (
                 self.settings.data_root
                 / "artifacts"
@@ -1024,6 +1461,20 @@ class LocalJobWorker:
                     _to_wsl_path(result_path) if is_wsl else str(result_path),
                 ]
             )
+            if shortability_dataset is not None:
+                shortability_path = Path(shortability_dataset["dataset_path"])
+                command.extend(
+                    [
+                        "--shortability-path",
+                        _to_wsl_path(shortability_path)
+                        if is_wsl
+                        else str(shortability_path),
+                        "--shortability-source-sha256",
+                        str(shortability_dataset["source_sha256"]),
+                        "--shortability-manifest-sha256",
+                        str(shortability_dataset["manifest_sha256"]),
+                    ]
+                )
             return command, result_path, {}
         raise ValueError(f"unsupported job kind: {job['kind']}")
 

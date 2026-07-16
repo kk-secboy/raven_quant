@@ -41,6 +41,7 @@ def test_only_v2_qlib_policy_backtest_can_be_approved(tmp_path: Path, database_u
                 "strategy_version_id": version_id,
                 "dataset": "snapshot",
                 "benchmark": version["benchmark"],
+                "universe": version["universe"],
                 "periods": periods,
                 "config": version["config"],
                 "factors": [
@@ -136,6 +137,7 @@ def test_twap_approval_requires_minute_native_execution_evidence(
                 "dataset": "snapshot",
                 "execution_dataset": "ashare-5m",
                 "benchmark": version["benchmark"],
+                "universe": version["universe"],
                 "periods": periods,
                 "config": version["config"],
                 "factors": [
@@ -161,6 +163,7 @@ def test_twap_approval_requires_minute_native_execution_evidence(
                 "method": "twap",
                 "frequency": "5min",
                 "price_assumption": "minute bar vwap fills",
+                "strategy_contract_hash": version["config"]["execution_contract_hash"],
             },
         }
     )

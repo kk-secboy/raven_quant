@@ -35,6 +35,7 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
             return {
                 "id": "version-1",
                 "benchmark": "SH000300",
+                "universe": "cn_all",
                 "config": {"execution_method": "twap"},
                 "factors": [
                     {
@@ -53,6 +54,7 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
         data_root=tmp_path,
         qlib_python="python",
         qlib_wsl_distro="Ubuntu-22.04",
+        mlflow_tracking_uri="postgresql://tracking",
     )
     worker.strategies = Strategies()
     execution_path = tmp_path / "qlib" / "ashare-5m"
@@ -80,8 +82,11 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
 
     assert command[command.index("--execution-provider-uri") + 1] == str(execution_path)
     assert command[command.index("--execution-frequency") + 1] == "5min"
+    assert command[command.index("--tracking-uri") + 1] == "postgresql://tracking"
     assert result_path == tmp_path / "artifacts" / "backtests" / "backtest-1" / "result.json"
-    assert environment == {}
+    assert environment == {
+        "_MLFLOW_SERVER_ARTIFACT_ROOT": str(tmp_path / "artifacts" / "mlflow")
+    }
     manifest = json.loads(
         (tmp_path / "artifacts" / "backtests" / "backtest-1" / "manifest.json").read_text(
             encoding="utf-8"
@@ -90,3 +95,153 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
     assert manifest["execution_dataset"] == "ashare-5m"
     assert manifest["execution_frequency"] == "5min"
     assert manifest["execution_contract_version"] == MINUTE_EXECUTION_CONTRACT_VERSION
+
+
+def test_worker_builds_production_qlib_order_plan_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Simulations:
+        @staticmethod
+        def get(_portfolio_id: str) -> dict:
+            return {
+                "id": "simulation-1",
+                "status": "active",
+                "source_type": "strategy_version",
+                "source_id": "version-1",
+                "execution_adapter": "long_only",
+                    "daily_dataset": "daily",
+                    "daily_dataset_identity_sha256": "a" * 64,
+                    "daily_dataset_lineage_id": "b" * 64,
+                    "execution_dataset": "minute-5m",
+                    "execution_policy": {
+                        "execution_algorithm": "next_bar",
+                        "execution_frequency": "5min",
+                    },
+                    "nav": 1_000_000,
+            }
+
+        @staticmethod
+        def rows(_portfolio_id: str, _resource: str) -> list[dict]:
+            return []
+
+    class Strategies:
+        @staticmethod
+        def get_version(_version_id: str) -> dict:
+            return {
+                "id": "version-1",
+                "status": "approved",
+                "is_legacy": False,
+                "benchmark": "SH000300",
+                "universe": "cn_all",
+                "signal_frequency": "5min",
+                "config": {"execution_contract_hash": "c" * 64},
+                "factors": [
+                    {
+                        "factor_candidate_id": "factor-1",
+                        "values_path": str(tmp_path / "factor.parquet"),
+                        "weight": 1.0,
+                        "direction": 1,
+                    }
+                ],
+            }
+
+        @staticmethod
+        def list_backtests(_version_id: str) -> list[dict]:
+            return [
+                {
+                    "id": "backtest-1",
+                    "status": "succeeded",
+                    "is_legacy": False,
+                }
+            ]
+
+    class Allocations:
+        @staticmethod
+        def strategy_risk_state(_version_id: str) -> dict:
+            return {
+                "risk_exposure_override": 1.0,
+                "allow_new_risk": True,
+            }
+
+    monkeypatch.setattr(
+        "quant_platform.worker.list_qlib_datasets",
+        lambda _root: [
+            {
+                "name": "daily",
+                "ready": True,
+                "path": str(tmp_path / "qlib" / "daily"),
+                    "provenance": {
+                        "dataset_identity_sha256": "a" * 64,
+                        "dataset_lineage_id": "b" * 64,
+                        "source_lineage_id": "c" * 64,
+                    },
+                },
+                {
+                    "name": "minute-5m",
+                    "ready": True,
+                    "reproducible": True,
+                    "path": str(tmp_path / "qlib" / "minute-5m"),
+                    "provenance": {
+                        "frequency": "5min",
+                        "dataset_identity_sha256": "d" * 64,
+                        "dataset_lineage_id": "e" * 64,
+                        "source_lineage_id": "c" * 64,
+                        "lineage_verified": True,
+                    },
+                },
+            ],
+    )
+    worker = object.__new__(LocalJobWorker)
+    worker.project_root = tmp_path
+    worker.settings = SimpleNamespace(
+        data_root=tmp_path,
+        qlib_python="python",
+        qlib_wsl_distro="Ubuntu-22.04",
+        mlflow_tracking_uri="postgresql://tracking",
+    )
+    worker.simulations = Simulations()
+    worker.strategies = Strategies()
+    worker.allocations = Allocations()
+    job = {
+        "id": "order-plan-job-1",
+        "kind": "simulation_order_plan",
+        "payload": {
+            "simulation_portfolio_id": "simulation-1",
+            "signal_date": "2026-07-13",
+            "signal_at": "2026-07-13T10:05:00+08:00",
+            "actor": "simulation-operator",
+        },
+    }
+
+    command, result_path, environment = worker._command(job)
+
+    assert "--tracking-uri" in command
+    assert "--order-plan-root" in command
+    assert result_path == (
+        tmp_path / "artifacts" / "order-plan-jobs" / job["id"] / "result.json"
+    )
+    manifest = json.loads(
+        (
+            tmp_path
+            / "artifacts"
+            / "order-plan-jobs"
+            / job["id"]
+            / "manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert manifest["artifact_kind"] == "simulation_order_plan"
+    assert manifest["formal_backtest_id"] == "backtest-1"
+    assert manifest["signal_at"] == "2026-07-13T10:05:00+08:00"
+    assert manifest["execution_not_before"] == "2026-07-13T10:10:00+08:00"
+    assert manifest["signal_dataset"] == {
+        "name": "minute-5m",
+        "dataset_identity_sha256": "d" * 64,
+        "dataset_lineage_id": "e" * 64,
+        "source_lineage_id": "c" * 64,
+        "frequency": "5min",
+    }
+    assert manifest["dataset_identity_sha256"] == "a" * 64
+    assert "--signal-provider-uri" in command
+    assert environment == {
+        "_MLFLOW_SERVER_ARTIFACT_ROOT": str(tmp_path / "artifacts" / "mlflow")
+    }

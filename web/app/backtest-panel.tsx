@@ -5,10 +5,11 @@ import { apiFetch } from "./api-client";
 import { ParameterExperimentPanel } from "./parameter-experiment-panel";
 
 type Factor = { id: string; name: string; description: string; status: string };
-type Dataset = { name: string; ready: boolean; reproducible: boolean; start_date: string; end_date: string; trading_days: number };
+type Dataset = { name: string; ready: boolean; reproducible: boolean; frequency: string; start_date: string; end_date: string; trading_days: number };
 type StrategyFactor = { factor_candidate_id: string; name: string; weight: number; direction: number };
 type StrategyVersion = {
   id: string; version: number; status: string; benchmark: string; universe: string;
+  signal_frequency?: string; execution_frequency?: string; execution_contract_hash?: string;
   config: Record<string, number | string>; factors: StrategyFactor[];
 };
 type Strategy = { id: string; name: string; description: string; status: string; versions: StrategyVersion[] };
@@ -50,6 +51,8 @@ export function BacktestPanel({ api }: { api: string }) {
   const [backtests, setBacktests] = useState<Backtest[]>([]);
   const [recipes, setRecipes] = useState<StrategyRecipe[]>([]);
   const [recipeId, setRecipeId] = useState("custom");
+  const [factorSourceMode, setFactorSourceMode] = useState("promoted_only");
+  const [challengerWeight, setChallengerWeight] = useState(0.30);
   const [selectedFactors, setSelectedFactors] = useState<Record<string, number>>({});
   const [name, setName] = useState("沪深300 多因子增强");
   const [description, setDescription] = useState("使用已晋级因子构建下一交易日开盘执行的受约束 Top-K 策略。");
@@ -76,6 +79,11 @@ export function BacktestPanel({ api }: { api: string }) {
   const [maxIndustryDeviation, setMaxIndustryDeviation] = useState(0.05);
   const [maxSizeDeviation, setMaxSizeDeviation] = useState(0.30);
   const [portfolioConstruction, setPortfolioConstruction] = useState("topk_equal_weight");
+  const [signalFrequency, setSignalFrequency] = useState("day");
+  const [signalPeriod, setSignalPeriod] = useState(1);
+  const [executionFrequency, setExecutionFrequency] = useState("day");
+  const [rebalanceFrequency, setRebalanceFrequency] = useState("day");
+  const [targetVolatility, setTargetVolatility] = useState(0.15);
   const [optimizerAlphaWeight, setOptimizerAlphaWeight] = useState(0.05);
   const [optimizerTrackingPenalty, setOptimizerTrackingPenalty] = useState(1.0);
   const [optimizerTurnoverPenalty, setOptimizerTurnoverPenalty] = useState(0.10);
@@ -83,6 +91,7 @@ export function BacktestPanel({ api }: { api: string }) {
   const [minCapacityFill, setMinCapacityFill] = useState(0.95);
   const [selectedVersion, setSelectedVersion] = useState("");
   const [dataset, setDataset] = useState("");
+  const [executionDataset, setExecutionDataset] = useState("");
   const [start, setStart] = useState("2024-01-01");
   const [end, setEnd] = useState(new Date().toISOString().slice(0, 10));
   const [approvalReason, setApprovalReason] = useState("");
@@ -91,6 +100,8 @@ export function BacktestPanel({ api }: { api: string }) {
   const defaultsApplied = useRef(false);
 
   function applyVisibleConfig(config: Record<string, number | string>) {
+    setFactorSourceMode(String(config.factor_source_mode ?? "promoted_only"));
+    setChallengerWeight(Number(config.challenger_weight ?? 1.0));
     setTopk(Number(config.topk));
     setNDrop(Number(config.n_drop));
     setMaxPositionWeight(Number(config.max_position_weight));
@@ -114,6 +125,11 @@ export function BacktestPanel({ api }: { api: string }) {
     setMaxIndustryDeviation(Number(config.max_industry_deviation ?? 0.05));
     setMaxSizeDeviation(Number(config.max_size_deviation ?? 0.30));
     setPortfolioConstruction(String(config.portfolio_construction ?? "topk_equal_weight"));
+    setSignalFrequency(String(config.signal_frequency ?? "day"));
+    setSignalPeriod(Number(config.signal_period ?? 1));
+    setExecutionFrequency(String(config.execution_frequency ?? "day"));
+    setRebalanceFrequency(String(config.rebalance_frequency ?? "day"));
+    setTargetVolatility(Number(config.target_volatility ?? 0.15));
     setOptimizerAlphaWeight(Number(config.optimizer_alpha_weight ?? 0.05));
     setOptimizerTrackingPenalty(Number(config.optimizer_tracking_penalty ?? 1.0));
     setOptimizerTurnoverPenalty(Number(config.optimizer_turnover_penalty ?? 0.10));
@@ -151,12 +167,20 @@ export function BacktestPanel({ api }: { api: string }) {
         setSelectedFactors({ [nextFactors[0].id]: 1 });
       }
       if (!dataset && nextDatasets.length) {
-        const eligible = nextDatasets.find((item: Dataset) => item.ready && item.reproducible);
+        const eligible = nextDatasets.find((item: Dataset) =>
+          item.ready && item.reproducible && item.frequency === "day",
+        );
         if (eligible) {
           setDataset(eligible.name);
           setStart(eligible.start_date);
           setEnd(eligible.end_date);
         }
+      }
+      if (!executionDataset) {
+        const eligibleExecution = nextDatasets.find((item: Dataset) =>
+          item.ready && item.reproducible && ["1min", "5min"].includes(item.frequency),
+        );
+        if (eligibleExecution) setExecutionDataset(eligibleExecution.name);
       }
       if (!selectedVersion && nextStrategies.length) {
         setSelectedVersion(nextStrategies[0].versions[0]?.id ?? "");
@@ -176,14 +200,41 @@ export function BacktestPanel({ api }: { api: string }) {
   const versions = strategies.flatMap((strategy) => strategy.versions.map((version) => ({ strategy, version })));
   const current = versions.find((item) => item.version.id === selectedVersion);
   const currentBacktest = backtests.find((item) => item.strategy_version_id === selectedVersion);
+  const currentExecutionFrequency = String(
+    current?.version.execution_frequency
+    ?? current?.version.config.execution_frequency
+    ?? "day",
+  );
+  const minuteExecutionDatasets = datasets.filter((item) =>
+    item.ready && item.reproducible && item.frequency === currentExecutionFrequency,
+  );
+  const activeExecutionDataset = minuteExecutionDatasets.some((item) => item.name === executionDataset)
+    ? executionDataset
+    : minuteExecutionDatasets[0]?.name ?? "";
   const active = useMemo(() => backtests.some((item) => ["queued", "running"].includes(item.status)), [backtests]);
   const riskConfigurationValid = takeProfitPartial < takeProfit
     && maxDrawdownReduce < maxDrawdownLiquidate
     && maxIndustryWeight >= maxPositionWeight
     && maxIndustryDeviation >= 0
     && maxSizeDeviation >= 0
-    && (portfolioConstruction !== "benchmark_relative_qp" || topk * maxPositionWeight >= 1)
+    && (!["benchmark_relative_qp", "industry_neutral_qp"].includes(portfolioConstruction) || topk * maxPositionWeight >= 1)
     && optimizerAlphaWeight + optimizerTrackingPenalty + optimizerTurnoverPenalty > 0;
+  const isCoreBaselineRecipe = ["index_enhancement", "full_market_multifactor"].includes(recipeId);
+  const factorSelectionRequired = factorSourceMode !== "qlib_baseline";
+  const factorSourceValid = (
+    (!isCoreBaselineRecipe && factorSourceMode === "promoted_only")
+    || (isCoreBaselineRecipe && factorSourceMode === "qlib_baseline")
+    || (
+      isCoreBaselineRecipe
+      && factorSourceMode === "qlib_baseline_plus_challenger"
+      && challengerWeight > 0
+      && challengerWeight < 1
+    )
+    || (
+      isCoreBaselineRecipe
+      && factorSourceMode === "qlib_challenger_replacement"
+    )
+  ) && (!factorSelectionRequired || Object.keys(selectedFactors).length > 0);
 
   function toggleFactor(factorId: string) {
     const next = { ...selectedFactors };
@@ -201,20 +252,32 @@ export function BacktestPanel({ api }: { api: string }) {
     if (!recipe) return;
     const merged = { ...serverDefaults, ...recipe.config_overrides } as Record<string, number | string>;
     applyVisibleConfig(merged);
+    if (["index_enhancement", "full_market_multifactor"].includes(recipe.id)) {
+      setSelectedFactors({});
+    }
     setName(recipe.name);
     setDescription(recipe.description);
   }
 
   function strategyDefinition() {
     const recipe = recipes.find((item) => item.id === recipeId);
+    const selected = factorSourceMode === "qlib_baseline"
+      ? []
+      : Object.entries(selectedFactors).map(([candidate_id, weight]) => ({ candidate_id, weight }));
     return {
       benchmark: recipe?.benchmark ?? "SH000300", universe: recipe?.universe ?? "cn_all",
-      factors: Object.entries(selectedFactors).map(([candidate_id, weight]) => ({ candidate_id, weight })),
+      factors: selected,
       config: {
         ...serverDefaults,
         ...(recipe?.config_overrides ?? {}),
         recipe_id: recipe?.id ?? "custom",
         recipe_version: recipe?.version ?? "custom",
+        factor_source_mode: factorSourceMode,
+        challenger_weight: factorSourceMode === "qlib_baseline"
+          ? 0
+          : factorSourceMode === "qlib_challenger_replacement"
+            ? 1
+            : challengerWeight,
         topk, n_drop: nDrop, max_position_weight: maxPositionWeight,
         max_daily_turnover: maxDailyTurnover,
         max_daily_loss: maxDailyLoss, stop_loss: stopLoss, take_profit: takeProfit,
@@ -225,6 +288,12 @@ export function BacktestPanel({ api }: { api: string }) {
         max_industry_deviation: maxIndustryDeviation,
         max_size_deviation: maxSizeDeviation,
         portfolio_construction: portfolioConstruction,
+        signal_frequency: signalFrequency,
+        signal_period: signalPeriod,
+        execution_frequency: executionFrequency,
+        execution_lag_bars: 1,
+        rebalance_frequency: rebalanceFrequency,
+        target_volatility: targetVolatility,
         optimizer_alpha_weight: optimizerAlphaWeight,
         optimizer_tracking_penalty: optimizerTrackingPenalty,
         optimizer_turnover_penalty: optimizerTurnoverPenalty,
@@ -271,7 +340,14 @@ export function BacktestPanel({ api }: { api: string }) {
     if (!selectedVersion) return;
     const response = await apiFetch(`${api}/api/strategy-versions/${selectedVersion}/backtests`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ dataset, start, end }),
+      body: JSON.stringify({
+        dataset,
+        execution_dataset: currentExecutionFrequency !== "day"
+          ? activeExecutionDataset
+          : undefined,
+        start,
+        end,
+      }),
     });
     const body = await response.json();
     if (!response.ok) { setMessage(body.detail ?? "回测创建失败"); return; }
@@ -315,12 +391,18 @@ export function BacktestPanel({ api }: { api: string }) {
         {selectedRecipe && <div className="execution-note"><b>不可变配方基线 · {selectedRecipe.name}</b><span>{selectedRecipe.description}</span>{selectedRecipe.factor_guidance.map((item) => <span key={item}>{item}</span>)}</div>}
         <div className="form-row"><label>策略名称<input value={name} onChange={(event) => setName(event.target.value)} /></label><label>基准<input value="沪深300 · SH000300" disabled /></label></div>
         <label>策略说明<textarea value={description} onChange={(event) => setDescription(event.target.value)} /></label>
-        <div className="factor-picker"><span>选择已晋级因子</span>{factors.map((item) => <label key={item.id}><input type="checkbox" checked={item.id in selectedFactors} onChange={() => toggleFactor(item.id)} /><b>{item.name}</b><small>{item.description}</small>{item.id in selectedFactors ? <input type="number" step="0.1" value={selectedFactors[item.id]} onChange={(event) => setSelectedFactors({ ...selectedFactors, [item.id]: Number(event.target.value) })} /> : null}</label>)}{!factors.length && <div className="empty compact">因子库中还没有已晋级因子。先完成 RD-Agent → Qlib → 人工晋级。</div>}</div>
+        {isCoreBaselineRecipe && <div className="execution-note"><b>Qlib 六因子正式基线</b><span>v1 必须先独立运行固定 20/10/20/20/10/20 基线；RD-Agent 候选只能在新版本中显式增强或替换。</span><label>信号来源<select value={factorSourceMode} onChange={(event) => setFactorSourceMode(event.target.value)}><option value="qlib_baseline">固定 Qlib 基线</option><option value="qlib_baseline_plus_challenger">基线 + RD-Agent 挑战者</option><option value="qlib_challenger_replacement">RD-Agent 挑战者替换</option></select></label>{factorSourceMode === "qlib_baseline_plus_challenger" && <label>挑战者权重（%）<input type="number" min="1" max="99" step="1" value={challengerWeight * 100} onChange={(event) => setChallengerWeight(Number(event.target.value) / 100)} /></label>}</div>}
+        <div className="factor-picker"><span>{factorSelectionRequired ? "选择已晋级挑战者因子" : "固定基线无需 RD-Agent 因子"}</span>{factorSelectionRequired && factors.map((item) => <label key={item.id}><input type="checkbox" checked={item.id in selectedFactors} onChange={() => toggleFactor(item.id)} /><b>{item.name}</b><small>{item.description}</small>{item.id in selectedFactors ? <input type="number" step="0.1" value={selectedFactors[item.id]} onChange={(event) => setSelectedFactors({ ...selectedFactors, [item.id]: Number(event.target.value) })} /> : null}</label>)}{factorSelectionRequired && !factors.length && <div className="empty compact">因子库中还没有已晋级因子。先完成 RD-Agent → Qlib → 人工晋级。</div>}{!factorSelectionRequired && <div className="empty compact">正式回测会直接调用 Qlib D.features 复算六个表达式，并固化数值制品、SHA256 与 Recorder 身份。</div>}</div>
         <details className="advanced-options strategy-risk-options">
           <summary>风控与容量参数（使用系统默认值，可展开修改）</summary>
           <div className="execution-note"><b>默认风控模板</b><span>比例直接按百分数填写，例如 7 = 7%</span><span>已审批版本不会被修改；调整参数会创建新的不可变策略版本</span></div>
           <div className="risk-grid">
-          <label>组合构建方式<select value={portfolioConstruction} onChange={(event) => setPortfolioConstruction(event.target.value)}><option value="topk_equal_weight">Top-K 等权</option><option value="benchmark_relative_qp">基准相对优化</option></select></label>
+          <label>组合构建方式<select value={portfolioConstruction} onChange={(event) => setPortfolioConstruction(event.target.value)}><option value="topk_equal_weight">Top-K 等权</option><option value="benchmark_relative_qp">指数增强 · 基准相对 QP</option><option value="industry_neutral_qp">全市场 · 行业中性 QP</option></select></label>
+          <label>信号频率<select value={signalFrequency} onChange={(event) => setSignalFrequency(event.target.value)}>{["day", "1min", "5min", "15min", "30min", "60min"].map((item) => <option key={item}>{item}</option>)}</select></label>
+          <label>信号周期（Bar）<input type="number" min="1" max="1260" value={signalPeriod} onChange={(event) => setSignalPeriod(Number(event.target.value))} /></label>
+          <label>执行频率<select value={executionFrequency} onChange={(event) => setExecutionFrequency(event.target.value)}>{["day", "1min", "5min", "15min", "30min", "60min"].map((item) => <option key={item}>{item}</option>)}</select></label>
+          <label>调仓频率<select value={rebalanceFrequency} onChange={(event) => setRebalanceFrequency(event.target.value)}><option value="day">每日</option><option value="week">每周</option><option value="month">每月</option></select></label>
+          <label>目标波动率（%）<input type="number" min="0.1" max="50" step="0.5" value={targetVolatility * 100} onChange={(event) => setTargetVolatility(Number(event.target.value) / 100)} /></label>
           <label>持仓数量<input type="number" min="5" max="500" value={topk} onChange={(event) => setTopk(Number(event.target.value))} /></label>
           <label>缓冲替换<input type="number" min="0" max={topk} value={nDrop} onChange={(event) => setNDrop(Number(event.target.value))} /></label>
           <label>单票权重上限（%）<input type="number" step="0.1" min="0.1" max="20" value={maxPositionWeight * 100} onChange={(event) => setMaxPositionWeight(Number(event.target.value) / 100)} /></label>
@@ -336,7 +418,7 @@ export function BacktestPanel({ api }: { api: string }) {
           <label>行业权重上限（%）<input type="number" step="5" min="5" max="100" value={maxIndustryWeight * 100} onChange={(event) => setMaxIndustryWeight(Number(event.target.value) / 100)} /></label>
           <label>相对基准行业偏离（%）<input type="number" step="0.5" min="0" max="30" value={maxIndustryDeviation * 100} onChange={(event) => setMaxIndustryDeviation(Number(event.target.value) / 100)} /></label>
           <label>市值风格偏离（标准差）<input type="number" step="0.05" min="0" max="2" value={maxSizeDeviation} onChange={(event) => setMaxSizeDeviation(Number(event.target.value))} /></label>
-          {portfolioConstruction === "benchmark_relative_qp" && <>
+          {["benchmark_relative_qp", "industry_neutral_qp"].includes(portfolioConstruction) && <>
           <label>因子收益权重<input type="number" step="0.01" min="0" max="10" value={optimizerAlphaWeight} onChange={(event) => setOptimizerAlphaWeight(Number(event.target.value))} /></label>
           <label>基准跟踪惩罚<input type="number" step="0.1" min="0" max="100" value={optimizerTrackingPenalty} onChange={(event) => setOptimizerTrackingPenalty(Number(event.target.value))} /></label>
           <label>换手惩罚<input type="number" step="0.01" min="0" max="100" value={optimizerTurnoverPenalty} onChange={(event) => setOptimizerTurnoverPenalty(Number(event.target.value))} /></label>
@@ -353,17 +435,18 @@ export function BacktestPanel({ api }: { api: string }) {
           </div>
         </details>
         {!riskConfigurationValid && <div className="notice">参数无效：请检查止盈/回撤阈值、行业与单票上限；基准相对优化还要求持仓数 × 单票上限不低于 100%，且目标函数至少有一个正权重。</div>}
-        <button className="primary" disabled={!riskConfigurationValid || !Object.keys(selectedFactors).length || name.length < 3 || description.length < 10}>创建策略 v1</button>
-        <button type="button" onClick={createNextVersion} disabled={!riskConfigurationValid || !current || !Object.keys(selectedFactors).length}>基于当前参数创建 vNext</button>
+        <button className="primary" disabled={!riskConfigurationValid || !factorSourceValid || (isCoreBaselineRecipe && factorSourceMode !== "qlib_baseline") || name.length < 3 || description.length < 10}>创建策略 v1</button>
+        <button type="button" onClick={createNextVersion} disabled={!riskConfigurationValid || !factorSourceValid || !current}>基于当前参数创建 vNext</button>
       </form>
 
       <form className="backtest-launcher" onSubmit={runBacktest}>
-        <div className="card-heading"><div><span>策略回测</span><strong>下一交易日开盘执行</strong></div></div>
+        <div className="card-heading"><div><span>QLIB FORMAL BACKTEST</span><strong>下一 Bar / 下一交易日执行</strong></div></div>
         <label>策略版本<select value={selectedVersion} onChange={(event) => setSelectedVersion(event.target.value)}>{versions.length ? versions.map(({ strategy, version }) => <option key={version.id} value={version.id}>{strategy.name} · v{version.version} · {version.status}</option>) : <option value="">无策略版本</option>}</select></label>
-        <label>Qlib 快照<select value={dataset} onChange={(event) => { const value = event.target.value; setDataset(value); const item = datasets.find((candidate) => candidate.name === value); if (item) { setStart(item.start_date); setEnd(item.end_date); } }}>{datasets.map((item) => <option key={item.name} value={item.name} disabled={!item.ready || !item.reproducible}>{item.name} · {item.trading_days} 日 · {item.reproducible ? "可复现" : "缺少溯源"}</option>)}</select></label>
+        <label>日线 Qlib 快照<select value={dataset} onChange={(event) => { const value = event.target.value; setDataset(value); const item = datasets.find((candidate) => candidate.name === value); if (item) { setStart(item.start_date); setEnd(item.end_date); } }}>{datasets.filter((item) => item.frequency === "day").map((item) => <option key={item.name} value={item.name} disabled={!item.ready || !item.reproducible}>{item.name} · {item.trading_days} 日 · {item.reproducible ? "可复现" : "缺少溯源"}</option>)}</select></label>
+        {currentExecutionFrequency !== "day" && <label>{currentExecutionFrequency} Qlib 执行数据<select value={activeExecutionDataset} onChange={(event) => setExecutionDataset(event.target.value)}><option value="">无可用执行数据</option>{minuteExecutionDatasets.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>}
         <div className="form-row"><label>开始<input type="date" value={start} onChange={(event) => setStart(event.target.value)} /></label><label>结束<input type="date" value={end} onChange={(event) => setEnd(event.target.value)} /></label></div>
-        <div className="execution-note"><b>执行与压力测试</b><span>信号日 t 收盘后生成，t+1 开盘成交</span><span>审批至少需要 504 个交易日，且必须位于全部因子的独立测试窗</span><span>买入 5bp / 卖出 15bp，并额外运行双倍成本</span><span>重跑持仓数量、缓冲区和换手参数扰动</span><span>按执行日成交额限制资金容量</span></div>
-        <button className="primary" disabled={!selectedVersion || !dataset || active}>运行策略回测</button>
+        <div className="execution-note"><b>不可变执行契约</b><span>信号与执行频率写入策略版本，固定滞后一 Bar，禁止同 Bar 成交</span><span>15/30/60 分钟只由 Qlib 从分钟数据重采样，不增加下载线路</span><span>审批至少需要 504 个交易日，且必须位于全部因子的独立测试窗</span><span>额外运行双倍成本、收紧换手/持仓和容量压力测试</span><span>回测、回放和模拟盘必须共享同一执行契约哈希</span></div>
+        <button className="primary" disabled={!selectedVersion || !dataset || active || (currentExecutionFrequency !== "day" && !activeExecutionDataset)}>运行策略回测</button>
       </form>
     </section>}
 

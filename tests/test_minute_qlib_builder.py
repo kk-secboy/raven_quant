@@ -9,6 +9,10 @@ from quant_data.execution_contract import (
     MINUTE_SOURCE_UNIT_CONTRACTS,
 )
 from quant_data.minute_qlib_builder import MINUTE_QLIB_FIELDS, MinuteQlibBuilder
+from quant_data.qlib_minute_resample import (
+    QLIB_MINUTE_RESAMPLE_CONTRACT_VERSION,
+    resample_minute_frame,
+)
 
 pytestmark = pytest.mark.no_database
 
@@ -148,6 +152,143 @@ def test_zero_volume_minute_is_marked_paused(tmp_path: Path) -> None:
 def test_rejects_non_minute_snapshot(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="supported minute"):
         MinuteQlibBuilder(_snapshot(tmp_path, frequency="day"))
+
+
+def test_qllib_resamples_native_bars_with_ohlcv_semantics() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-02 09:31:00",
+                "symbol": "SH510300",
+                "open": 3.50,
+                "high": 3.52,
+                "low": 3.49,
+                "close": 3.51,
+                "vwap": 3.51,
+                "volume": 1000,
+                "factor": 1.0,
+                "change": None,
+                "amount": 3510,
+                "paused": 0.0,
+                "up_limit": 3.85,
+                "down_limit": 3.15,
+                "oi": None,
+            },
+            {
+                "date": "2024-01-02 09:34:00",
+                "symbol": "SH510300",
+                "open": 3.51,
+                "high": 3.54,
+                "low": 3.50,
+                "close": 3.53,
+                "vwap": 3.53,
+                "volume": 1200,
+                "factor": 1.0,
+                "change": 3.53 / 3.51 - 1,
+                "amount": 4236,
+                "paused": 0.0,
+                "up_limit": 3.85,
+                "down_limit": 3.15,
+                "oi": None,
+            },
+            {
+                "date": "2024-01-02 09:46:00",
+                "symbol": "SH510300",
+                "open": 3.52,
+                "high": 3.55,
+                "low": 3.51,
+                "close": 3.54,
+                "vwap": 3.54,
+                "volume": 800,
+                "factor": 1.0,
+                "change": 3.54 / 3.53 - 1,
+                "amount": 2832,
+                "paused": 0.0,
+                "up_limit": 3.85,
+                "down_limit": 3.15,
+                "oi": None,
+            },
+        ]
+    )
+
+    def qlib_calendar(
+        _index: pd.DatetimeIndex, _source: str, _target: str
+    ) -> pd.DatetimeIndex:
+        return pd.DatetimeIndex(
+            ["2024-01-02 09:30:00", "2024-01-02 09:45:00"]
+        )
+
+    result = resample_minute_frame(
+        frame,
+        source_frequency="1min",
+        target_frequency="15min",
+        calendar_resampler=qlib_calendar,
+    )
+
+    assert result["date"].dt.strftime("%H:%M").tolist() == ["09:30", "09:45"]
+    assert result["open"].tolist() == pytest.approx([3.50, 3.52])
+    assert result["high"].tolist() == pytest.approx([3.54, 3.55])
+    assert result["low"].tolist() == pytest.approx([3.49, 3.51])
+    assert result["close"].tolist() == pytest.approx([3.53, 3.54])
+    assert result["volume"].tolist() == pytest.approx([2200, 800])
+    assert result["vwap"].iloc[0] == pytest.approx(
+        (3.51 * 1000 + 3.53 * 1200) / 2200
+    )
+    assert pd.isna(result["change"].iloc[0])
+    assert result["change"].iloc[1] == pytest.approx(3.54 / 3.53 - 1)
+
+
+def test_resampled_builder_uses_pinned_qlib_runtime_and_records_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = MinuteQlibBuilder(_snapshot(tmp_path), target_frequency="30min")
+    native = tmp_path / "native"
+    native.mkdir()
+    pd.DataFrame({"date": ["2024-01-02"], "symbol": ["SH510300"]}).to_parquet(
+        native / "SH510300.parquet", index=False
+    )
+    staging = tmp_path / "resampled"
+    captured: list[str] = []
+
+    def fake_run(command: list[str], *, check: bool) -> None:
+        assert check is True
+        captured.extend(command)
+        output = Path(command[command.index("--output") + 1])
+        output.mkdir(parents=True)
+        pd.DataFrame(
+            {"date": [pd.Timestamp("2024-01-02 09:30")], "symbol": ["SH510300"]}
+        ).to_parquet(output / "SH510300.parquet", index=False)
+
+    monkeypatch.setattr("quant_data.minute_qlib_builder.subprocess.run", fake_run)
+    by_symbol = builder.resample_staging(
+        native_by_symbol=native,
+        staging_path=staging,
+        qlib_python="python",
+        wsl_distro="Ubuntu",
+    )
+
+    assert (by_symbol / "SH510300.parquet").is_file()
+    assert "resample_minute_qlib.py" in " ".join(captured)
+    assert captured[captured.index("--source-frequency") + 1] == "1min"
+    assert captured[captured.index("--target-frequency") + 1] == "30min"
+
+    qlib_dir = tmp_path / "qlib-output"
+    monkeypatch.setattr(
+        "quant_data.minute_qlib_builder.QlibBuilder._snapshot_manifest_digest",
+        lambda _self: "c" * 64,
+    )
+    builder._write_provenance(qlib_dir)
+    provenance = json.loads(
+        (qlib_dir / "metadata" / "provenance.json").read_text(encoding="utf-8")
+    )
+    assert provenance["frequency"] == "30min"
+    assert provenance["source_frequency"] == "1min"
+    assert provenance["resampled"] is True
+    assert (
+        provenance["resample_contract_version"]
+        == QLIB_MINUTE_RESAMPLE_CONTRACT_VERSION
+    )
+    assert provenance["resample_engine"] == "qlib.utils.resam.resam_calendar"
 
 
 def test_five_minute_snapshot_uses_native_qlib_frequency(

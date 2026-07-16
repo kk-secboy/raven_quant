@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from quant_data.execution_contract import (
     require_daily_qlib_contract,
     require_minute_execution_contract,
+    require_strategy_execution_contract,
 )
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.eligibility import eligibility_statistics
@@ -28,9 +29,17 @@ from quant_platform.qlib_backtest import (
     run_formal_qlib_backtest,
     run_qlib_validation_suites,
 )
+from quant_platform.qlib_factor_baseline import (
+    FACTOR_SOURCE_PROMOTED_ONLY,
+    combine_factor_sources,
+    normalize_qlib_baseline_values,
+)
 from quant_platform.qlib_policy_strategy import create_qlib_policy_strategy
+from quant_platform.qlib_workflow import qlib_workflow_run
+from quant_platform.risk_math import estimate_covariance
 from quant_platform.statistical_validation import deflated_sharpe_probability
 from quant_platform.strategy_backtest import build_governed_signal, compose_factor_scores
+from quant_platform.upstream_versions import upstream_runtime_identity
 
 
 def _load(path: str) -> pd.DataFrame:
@@ -53,6 +62,59 @@ def _sha256_file(path: str | Path) -> str:
 def _canonical_sha256(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _recompute_qlib_baseline(
+    data_api: Any,
+    *,
+    universe: str,
+    definition: dict[str, Any],
+    start_time: str,
+    end_time: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+    expressions = [
+        str(item["qlib_expression"]) for item in definition.get("factors") or []
+    ]
+    values = data_api.features(
+        data_api.instruments(universe),
+        expressions,
+        start_time=start_time,
+        end_time=end_time,
+        freq=str(definition.get("frequency") or "day"),
+    )
+    return normalize_qlib_baseline_values(values, definition)
+
+
+def _write_baseline_artifacts(
+    output: Path,
+    *,
+    raw: pd.DataFrame,
+    normalized: pd.DataFrame,
+    composite: pd.Series,
+) -> dict[str, Any]:
+    artifacts: dict[str, Any] = {"raw": {}, "normalized": {}}
+    for artifact_kind, frame in (("raw", raw), ("normalized", normalized)):
+        root = output / "baseline" / artifact_kind
+        root.mkdir(parents=True, exist_ok=True)
+        for factor_id in frame.columns:
+            path = root / f"{factor_id}.parquet"
+            frame[factor_id].rename("value").to_frame().to_parquet(
+                path, compression="zstd"
+            )
+            artifacts[artifact_kind][str(factor_id)] = {
+                "path": str(path.relative_to(output)).replace("\\", "/"),
+                "sha256": _sha256_file(path),
+            }
+    composite_path = output / "baseline" / "composite.parquet"
+    composite_path.parent.mkdir(parents=True, exist_ok=True)
+    composite.rename("score").to_frame().to_parquet(
+        composite_path, compression="zstd"
+    )
+    artifacts["composite"] = {
+        "path": str(composite_path.relative_to(output)).replace("\\", "/"),
+        "sha256": _sha256_file(composite_path),
+    }
+    return artifacts
 
 
 def _qlib_instruments(provider_uri: str | Path) -> set[str]:
@@ -192,6 +254,7 @@ def _metadata_provider(
     *,
     open_field: str = "$open",
     close_field: str = "$close",
+    intraday_prices: pd.DataFrame | None = None,
 ):
     membership = memberships.copy()
     membership["in_date"] = pd.to_datetime(membership["in_date"], errors="coerce")
@@ -200,22 +263,34 @@ def _metadata_provider(
 
     def provide(when: Any, instruments: pd.Index) -> dict[str, Any]:
         timestamp = pd.Timestamp(when).tz_localize(None)
+        market_timestamp = (
+            timestamp.normalize() - pd.Timedelta(nanoseconds=1)
+            if timestamp != timestamp.normalize()
+            else timestamp
+        )
         active = (
             membership[
-                (membership["in_date"] <= timestamp)
-                & (membership["out_date"].isna() | (membership["out_date"] >= timestamp))
+                (membership["in_date"] <= market_timestamp)
+                & (
+                    membership["out_date"].isna()
+                    | (membership["out_date"] >= market_timestamp)
+                )
             ]
             .sort_values("in_date")
             .drop_duplicates("instrument", keep="last")
         )
         industries = active.set_index(active["instrument"].astype(str))["industry"].astype(str)
-        benchmark = _latest_cross_section(benchmark_weights, timestamp, "weight")
-        style = _latest_style_cross_section(styles, timestamp)
+        benchmark = _latest_cross_section(
+            benchmark_weights, market_timestamp, "weight"
+        )
+        style = _latest_style_cross_section(styles, market_timestamp)
         benchmark_industries = industries.reindex(benchmark.index)
         if benchmark_industries.isna().any():
             raise ValueError("benchmark constituents are missing point-in-time industries")
         risk_instruments = instruments.astype(str).union(benchmark.index.astype(str))
-        history = close_matrix.loc[:timestamp].reindex(columns=risk_instruments).tail(61)
+        history = close_matrix.loc[:market_timestamp].reindex(
+            columns=risk_instruments
+        ).tail(61)
         returns = history.pct_change(fill_method=None).dropna(how="any")
         if len(returns) < 60:
             raise ValueError("optimizer requires 60 complete point-in-time return observations")
@@ -227,16 +302,22 @@ def _metadata_provider(
             "benchmark_style_exposure": style.reindex(benchmark.index).mul(
                 benchmark, axis=0
             ).sum(),
-            "return_covariance": returns.cov(),
-            "prices": _qlib_cross_section(execution_metadata, timestamp, open_field).reindex(
-                instruments.astype(str)
-            ),
+            "return_covariance": estimate_covariance(returns),
+            "prices": _qlib_cross_section(
+                intraday_prices if intraday_prices is not None else execution_metadata,
+                timestamp if intraday_prices is not None else market_timestamp,
+                "$vwap" if intraday_prices is not None else open_field,
+            ).reindex(instruments.astype(str)),
             "current_prices": _qlib_cross_section(
-                execution_metadata, timestamp, close_field
+                intraday_prices if intraday_prices is not None else execution_metadata,
+                timestamp if intraday_prices is not None else market_timestamp,
+                "$close" if intraday_prices is not None else close_field,
             ).reindex(instruments.astype(str)),
             "average_daily_values": (
                 _qlib_cross_section(
-                    execution_metadata, timestamp, "Ref(Mean($amount, 20), 1)"
+                    execution_metadata,
+                    market_timestamp,
+                    "Ref(Mean($amount, 20), 1)",
                 ).reindex(instruments.astype(str))
                 * 1000.0
             ),
@@ -252,6 +333,7 @@ def main() -> None:
     parser.add_argument("--execution-frequency")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--tracking-uri", required=True)
     args = parser.parse_args()
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -268,19 +350,34 @@ def main() -> None:
         str(item["candidate_id"]): item.get("code_sha256") for item in manifest["factors"]
     }
 
-    factors = [
+    challenger_factors = [
         (_load(item["values_path"]), float(item["weight"]), int(item["direction"]))
         for item in manifest["factors"]
     ]
-    scores = compose_factor_scores(factors)
-    instruments = sorted(set(scores.index.get_level_values("instrument")))
     config = manifest["config"]
+    strategy_contract = require_strategy_execution_contract(config)
+    factor_source_mode = str(
+        config.get("factor_source_mode") or FACTOR_SOURCE_PROMOTED_ONLY
+    )
+    signal_frequency = str(config.get("signal_frequency") or "day")
     execution_method = str(config.get("execution_method", "open"))
-    minute_execution = execution_method in {"twap", "vwap"}
+    minute_execution = execution_method in {"twap", "vwap", "next_bar"}
+    minute_signal = signal_frequency != "day"
+    if minute_signal and execution_method != "next_bar":
+        raise ValueError(
+            "minute signals currently require the Qlib next_bar execution adapter"
+        )
+    configured_execution_frequency = str(config.get("execution_frequency") or "day")
+    if minute_execution and args.execution_frequency != configured_execution_frequency:
+        raise ValueError(
+            "execution dataset frequency does not match the immutable strategy contract"
+        )
+    if not minute_execution and configured_execution_frequency != "day":
+        raise ValueError("daily open execution requires a day strategy execution frequency")
     execution_provenance: dict[str, Any] = {}
     if minute_execution:
         if not args.execution_provider_uri or not args.execution_frequency:
-            raise ValueError("TWAP/VWAP formal backtests require a minute Qlib dataset")
+            raise ValueError("minute formal backtests require a minute Qlib dataset")
         execution_provenance_path = (
             Path(args.execution_provider_uri) / "metadata" / "provenance.json"
         )
@@ -292,18 +389,10 @@ def main() -> None:
         require_minute_execution_contract(
             execution_provenance, frequency=args.execution_frequency
         )
-        available_instruments = _qlib_instruments(args.execution_provider_uri)
-        missing_instruments = sorted(set(instruments) - available_instruments)
-        if missing_instruments:
-            preview = ", ".join(missing_instruments[:10])
-            raise ValueError(
-                "minute execution dataset is missing "
-                f"{len(missing_instruments)} strategy instruments: "
-                + preview
-            )
-
     import qlib
     from qlib.data import D
+
+    qlib_runtime = upstream_runtime_identity("qlib")
 
     provider_uri: str | dict[str, str] = args.provider_uri
     if minute_execution:
@@ -313,6 +402,56 @@ def main() -> None:
         }
     qlib.init(provider_uri=provider_uri, region="cn")
     periods = manifest["periods"]
+    challenger_scores = (
+        compose_factor_scores(challenger_factors) if challenger_factors else None
+    )
+    baseline_artifacts: dict[str, Any] | None = None
+    baseline_definition = config.get("baseline_definition")
+    baseline_scores: pd.Series | None = None
+    if isinstance(baseline_definition, dict):
+        baseline_raw, baseline_normalized, baseline_scores = _recompute_qlib_baseline(
+            D,
+            universe=str(manifest.get("universe") or "cn_all"),
+            definition=baseline_definition,
+            start_time=periods["start"],
+            end_time=periods["end"],
+        )
+        baseline_artifacts = _write_baseline_artifacts(
+            output,
+            raw=baseline_raw,
+            normalized=baseline_normalized,
+            composite=baseline_scores,
+        )
+        manifest["baseline"] = {
+            "definition": baseline_definition,
+            "definition_sha256": config.get("baseline_definition_sha256"),
+            "computed_by": "qlib.data.D.features",
+            "artifacts": baseline_artifacts,
+        }
+    if factor_source_mode == FACTOR_SOURCE_PROMOTED_ONLY:
+        if challenger_scores is None:
+            raise ValueError("a promoted-only strategy has no challenger factor values")
+        scores = challenger_scores
+    else:
+        if baseline_scores is None:
+            raise ValueError("a core strategy has no governed Qlib baseline definition")
+        scores = combine_factor_sources(
+            mode=factor_source_mode,
+            baseline=baseline_scores,
+            challenger=challenger_scores,
+            challenger_weight=float(config.get("challenger_weight") or 0.0),
+        )
+    instruments = sorted(set(scores.index.get_level_values("instrument")))
+    if minute_execution:
+        available_instruments = _qlib_instruments(args.execution_provider_uri)
+        missing_instruments = sorted(set(instruments) - available_instruments)
+        if missing_instruments:
+            preview = ", ".join(missing_instruments[:10])
+            raise ValueError(
+                "minute execution dataset is missing "
+                f"{len(missing_instruments)} strategy instruments: "
+                + preview
+            )
     liquidity_amount = D.features(
         instruments,
         ["$amount"],
@@ -337,19 +476,40 @@ def main() -> None:
         end_time=periods["end"],
         freq="day",
     )
+    intraday_prices = (
+        D.features(
+            instruments,
+            ["$vwap", "$close"],
+            start_time=periods["start"],
+            end_time=periods["end"],
+            freq=str(args.execution_frequency),
+        )
+        if minute_signal
+        else None
+    )
     industry_path = Path(args.provider_uri) / "metadata" / "industry_memberships.parquet"
     industry_memberships = pd.read_parquet(industry_path) if industry_path.exists() else None
     industry_cap_enabled = float(manifest["config"].get("max_industry_weight", 1.0)) < 1.0
     if industry_cap_enabled and industry_memberships is None:
         raise ValueError("industry-constrained backtest requires point-in-time industry metadata")
-    benchmark_weight_path = Path(args.provider_uri) / "metadata" / "benchmark_weights.parquet"
-    benchmark_weights = (
-        pd.read_parquet(benchmark_weight_path) if benchmark_weight_path.exists() else None
-    )
-    if benchmark_weights is not None:
-        benchmark_weights = benchmark_weights[
-            benchmark_weights["benchmark"] == manifest["benchmark"]
-        ].drop(columns=["benchmark"])
+    if config.get("portfolio_construction") == "industry_neutral_qp":
+        target_weight_path = (
+            Path(args.provider_uri) / "metadata" / "full_market_weights.parquet"
+        )
+        benchmark_weights = (
+            pd.read_parquet(target_weight_path) if target_weight_path.exists() else None
+        )
+        target_weight_label = "full-market float-cap"
+    else:
+        target_weight_path = Path(args.provider_uri) / "metadata" / "benchmark_weights.parquet"
+        benchmark_weights = (
+            pd.read_parquet(target_weight_path) if target_weight_path.exists() else None
+        )
+        if benchmark_weights is not None:
+            benchmark_weights = benchmark_weights[
+                benchmark_weights["benchmark"] == manifest["benchmark"]
+            ].drop(columns=["benchmark"])
+        target_weight_label = "index benchmark"
     style_fields = {
         "Log($total_mv)": "size",
         "1/$pb": "value",
@@ -364,7 +524,7 @@ def main() -> None:
         freq="day",
     ).rename(columns=style_fields).reset_index()
     if benchmark_weights is None or benchmark_weights.empty:
-        raise ValueError("index-enhancement backtest requires historical benchmark weights")
+        raise ValueError(f"constrained backtest requires historical {target_weight_label} weights")
     if style_exposures.empty:
         raise ValueError("index-enhancement backtest requires point-in-time style exposures")
     eligibility_path = Path(args.provider_uri) / "metadata" / "eligibility_matrix.parquet"
@@ -407,6 +567,7 @@ def main() -> None:
         close_history,
         open_field=open_field,
         close_field=close_field,
+        intraday_prices=intraday_prices,
     )
     execution_policy: dict[str, Any] | None = None
     vwap_profile_evidence: dict[str, Any] | None = None
@@ -469,6 +630,7 @@ def main() -> None:
             benchmark=manifest["benchmark"],
             cost_model=costs,
             execution_method=execution_method,
+            signal_frequency=signal_frequency,
             execution_frequency=args.execution_frequency if minute_execution else None,
             execution_policy=execution_policy,
             instruments=instruments,
@@ -551,7 +713,12 @@ def main() -> None:
         "execution_model": {
             "method": execution_method,
             "days": int(config.get("execution_days", 1)),
-            "price_assumption": "minute bar vwap fills" if minute_execution else "next-day open",
+            "price_assumption": (
+                "next eligible minute bar vwap"
+                if execution_method == "next_bar"
+                else ("minute bar vwap fills" if minute_execution else "next-day open")
+            ),
+            "signal_frequency": signal_frequency,
             "frequency": args.execution_frequency if minute_execution else "day",
             "dataset": (
                 manifest.get("execution_dataset") if minute_execution else manifest["dataset"]
@@ -564,6 +731,8 @@ def main() -> None:
             "slice_minutes": execution_policy.get("slice_minutes") if execution_policy else None,
             "max_slices": execution_policy.get("max_slices") if execution_policy else None,
             "vwap_profile": vwap_profile_evidence,
+            "strategy_contract": strategy_contract,
+            "strategy_contract_hash": config["execution_contract_hash"],
         },
         "robustness": validation["robustness"],
         "robustness_passed": validation["robustness"]["passed"],
@@ -607,10 +776,50 @@ def main() -> None:
             "execution_source_lineage_id": execution_provenance.get("source_lineage_id"),
             "execution_lineage_verified": execution_provenance.get("lineage_verified"),
             "strategy_config_sha256": _canonical_sha256(config),
-            "execution_manifest_sha256": _sha256_file(args.manifest),
+            "execution_manifest_sha256": None,
             "factor_values_sha256": factor_value_hashes,
             "factor_code_sha256": factor_code_hashes,
-            "qlib_version": getattr(qlib, "__version__", "unknown"),
+            "factor_source_mode": factor_source_mode,
+            "challenger_weight": float(config.get("challenger_weight") or 0.0),
+            "baseline_definition_sha256": config.get(
+                "baseline_definition_sha256"
+            ),
+            "baseline_qlib_expressions": (
+                {
+                    str(item["id"]): str(item["qlib_expression"])
+                    for item in baseline_definition.get("factors") or []
+                }
+                if isinstance(baseline_definition, dict)
+                else None
+            ),
+            "baseline_preprocessing": (
+                baseline_definition.get("preprocessing")
+                if isinstance(baseline_definition, dict)
+                else None
+            ),
+            "baseline_raw_values_sha256": (
+                {
+                    factor_id: entry["sha256"]
+                    for factor_id, entry in baseline_artifacts["raw"].items()
+                }
+                if baseline_artifacts
+                else None
+            ),
+            "baseline_normalized_values_sha256": (
+                {
+                    factor_id: entry["sha256"]
+                    for factor_id, entry in baseline_artifacts["normalized"].items()
+                }
+                if baseline_artifacts
+                else None
+            ),
+            "baseline_composite_values_sha256": (
+                baseline_artifacts["composite"]["sha256"]
+                if baseline_artifacts
+                else None
+            ),
+            "qlib_version": qlib_runtime["version"],
+            "qlib_commit": qlib_runtime["commit"],
             "backtest_engine_version": QLIB_ENGINE_VERSION,
             "policy_version": policy.version,
         },
@@ -667,9 +876,54 @@ def main() -> None:
             "capacity_curve": str(output / "capacity_curve.json"),
         },
     }
-    (output / "result.json").write_text(
-        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    workflow_run_id = str(
+        manifest.get("backtest_id")
+        or (
+            f"{manifest['strategy_version_id']}-"
+            f"{_canonical_sha256({'periods': periods, 'config': config})[:16]}"
+        )
     )
+    with qlib_workflow_run(
+        run_kind="formal-backtest",
+        run_id=workflow_run_id,
+        tracking_uri=args.tracking_uri,
+        dataset_identity_sha256=provider_provenance.get("dataset_identity_sha256"),
+    ) as workflow:
+        workflow.log_params(
+            {
+                "backtest_id": manifest.get("backtest_id") or workflow_run_id,
+                "strategy_version_id": manifest["strategy_version_id"],
+                "dataset": manifest["dataset"],
+                "execution_dataset": manifest.get("execution_dataset"),
+                "benchmark": manifest["benchmark"],
+                "start": periods["start"],
+                "end": periods["end"],
+                "execution_method": execution_method,
+                "execution_frequency": (
+                    args.execution_frequency if minute_execution else "day"
+                ),
+                "strategy_config_sha256": metrics["provenance"]["strategy_config_sha256"],
+            }
+        )
+        workflow.log_metrics(metrics)
+        recorder_identity = workflow.identity_dict()
+        manifest["qlib_workflow"] = recorder_identity
+        manifest["factor_source_mode"] = factor_source_mode
+        manifest["challenger_weight"] = float(
+            config.get("challenger_weight") or 0.0
+        )
+        Path(args.manifest).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        metrics["provenance"]["execution_manifest_sha256"] = _sha256_file(
+            args.manifest
+        )
+        metrics["provenance"]["qlib_workflow"] = recorder_identity
+        result["qlib_workflow"] = recorder_identity
+        (output / "result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        workflow.save_artifacts(output)
     print(json.dumps(result, ensure_ascii=False))
 
 

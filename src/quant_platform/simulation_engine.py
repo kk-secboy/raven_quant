@@ -11,7 +11,7 @@ import pandas as pd
 from .cost_model import CostModelConfig, infer_cn_asset_type
 from .execution_algorithms import build_execution_slices, normalize_execution_policy
 
-SIMULATION_ENGINE_VERSION = "ashare-minute-simulation-v1"
+SIMULATION_ENGINE_VERSION = "ashare-minute-simulation-v2"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
@@ -27,8 +27,9 @@ def execute_simulation_day(
     closing_prices: dict[str, dict[str, Any]],
     cost_model: CostModelConfig,
     execution_policy: dict[str, Any],
+    signal_at: datetime | None = None,
 ) -> dict[str, Any]:
-    """Execute one close-to-next-day A-share/ETF rebalance with an auditable ledger."""
+    """Execute one next-eligible-bar A-share/ETF rebalance with an auditable ledger."""
 
     if not isfinite(cash) or cash < 0 or prior_nav <= 0 or high_water_mark <= 0:
         raise ValueError("simulation account balances are invalid")
@@ -122,6 +123,7 @@ def execute_simulation_day(
             side=side,
             trade_date=trade_date,
             policy=policy,
+            signal_at=signal_at,
         )
         remaining = requested
         order_fills: list[dict[str, Any]] = []
@@ -269,6 +271,457 @@ def execute_simulation_day(
             "negative_positions": sum(
                 1 for item in state.values() if int(item.get("quantity", 0)) < 0
             ),
+        },
+    }
+
+
+def execute_atomic_pair_day(
+    *,
+    trade_date: date,
+    cash: float,
+    prior_nav: float,
+    high_water_mark: float,
+    positions: dict[str, dict[str, Any]],
+    target_payload: dict[str, Any],
+    minute_bars: pd.DataFrame,
+    closing_prices: dict[str, dict[str, Any]],
+    shortability: dict[str, bool],
+    cost_model: CostModelConfig,
+    execution_policy: dict[str, Any],
+) -> dict[str, Any]:
+    """Execute a governed pair target as one all-filled or all-rejected atomic group."""
+
+    if not isfinite(cash) or cash < 0 or prior_nav <= 0 or high_water_mark <= 0:
+        raise ValueError("simulation account balances are invalid")
+    policy = normalize_execution_policy(execution_policy)
+    group_id = str(target_payload.get("atomic_group_id") or "").strip()
+    legs = [dict(item) for item in (target_payload.get("legs") or [])]
+    if not group_id or len(legs) != 2:
+        raise ValueError("pair execution requires exactly one governed atomic group")
+    if {int(item.get("leg_no") or 0) for item in legs} != {1, 2}:
+        raise ValueError("pair execution leg numbers must be 1 and 2")
+    if {str(item.get("position_side")) for item in legs} != {"long", "short"}:
+        raise ValueError("pair execution requires one long and one short leg")
+    state = deepcopy(positions)
+    bars = _normalize_bars(minute_bars, trade_date)
+    specs: list[dict[str, Any]] = []
+    rejection: str | None = None
+    for leg in sorted(legs, key=lambda item: int(item["leg_no"])):
+        instrument = str(leg["instrument"]).upper()
+        position_side = str(leg["position_side"])
+        target = int(leg["target_quantity"])
+        if target < 0 or target % 100:
+            raise ValueError("pair target quantities must be non-negative board lots")
+        current_row = state.get(instrument) or {}
+        current = int(current_row.get("quantity", 0))
+        current_side = str(current_row.get("position_side") or position_side)
+        if current and current_side != position_side:
+            raise ValueError("pair target cannot reverse an existing leg in one batch")
+        if (
+            position_side == "long"
+            and current
+            and (
+                current_row.get("last_trade_date") is None
+                or _as_date(current_row["last_trade_date"]) < trade_date
+            )
+        ):
+            current_row["available_quantity"] = current
+        delta = target - current
+        side = (
+            ("buy" if delta > 0 else "sell")
+            if position_side == "long"
+            else ("sell_short" if delta > 0 else "buy_to_cover")
+        )
+        specs.append(
+            {
+                "instrument": instrument,
+                "side": side,
+                "cost_side": "buy" if side in {"buy", "buy_to_cover"} else "sell",
+                "atomic_group_id": group_id,
+                "leg_no": int(leg["leg_no"]),
+                "position_side": position_side,
+                "annual_borrow_rate": float(leg.get("annual_borrow_rate") or 0.0),
+                "target_quantity": target,
+                "starting_quantity": current,
+                "target_weight": 0.0,
+                "requested_quantity": abs(delta),
+            }
+        )
+    active = [item for item in specs if item["requested_quantity"] > 0]
+    if len(active) == 1:
+        rejection = "unbalanced_pair_target"
+    short_leg = next(item for item in specs if item["position_side"] == "short")
+    starting_cash = cash
+    cash_flows: list[dict[str, Any]] = []
+    carry_borrow_cost = 0.0
+    starting_short = int(short_leg["starting_quantity"])
+    if starting_short:
+        if not 0 < short_leg["annual_borrow_rate"] <= 1:
+            raise ValueError("an existing short leg requires a governed borrow rate")
+        reference = _execution_reference_prices(bars).get(short_leg["instrument"])
+        closing_quote = closing_prices.get(short_leg["instrument"])
+        if reference is None and closing_quote is not None:
+            market_date = closing_quote.get("market_date")
+            closing_date = _as_date(market_date) if market_date is not None else None
+            closing_value = float(closing_quote.get("price") or 0.0)
+            if closing_date == trade_date and isfinite(closing_value) and closing_value > 0:
+                reference = closing_value
+        if reference is None or not isfinite(float(reference)) or float(reference) <= 0:
+            raise ValueError("existing pair short borrow carry cannot be priced for the trade date")
+        carry_borrow_cost = (
+            starting_short
+            * float(reference)
+            * float(short_leg["annual_borrow_rate"])
+            / 252.0
+        )
+        if cash < carry_borrow_cost:
+            raise RuntimeError("pair borrow cost would create negative cash")
+        cash -= carry_borrow_cost
+        state[short_leg["instrument"]]["borrow_cost"] = float(
+            state[short_leg["instrument"]].get("borrow_cost", 0.0)
+        ) + carry_borrow_cost
+        cash_flows.append(
+            {
+                "trade_date": trade_date,
+                "flow_type": "pair_borrow_carry",
+                "amount": -carry_borrow_cost,
+                "balance_after": cash,
+            }
+        )
+    if (
+        short_leg["target_quantity"] > 0
+        and shortability.get(short_leg["instrument"]) is not True
+    ):
+        rejection = "short_borrow_not_authorized"
+    if short_leg["target_quantity"] > 0 and not 0 < short_leg["annual_borrow_rate"] <= 1:
+        rejection = "borrow_cost_not_governed"
+    for spec in active:
+        if spec["side"] == "sell":
+            available = int(state.get(spec["instrument"], {}).get("available_quantity", 0))
+            if available < spec["requested_quantity"]:
+                rejection = "t_plus_one_unavailable"
+
+    execution_rows: dict[str, pd.Series] = {}
+    executed_at: pd.Timestamp | None = None
+    if active and rejection is None:
+        leg_frames: dict[str, pd.DataFrame] = {}
+        for spec in active:
+            frame = bars[bars["instrument"] == spec["instrument"]].set_index("datetime")
+            leg_frames[spec["instrument"]] = frame
+        common = set.intersection(*(set(frame.index) for frame in leg_frames.values()))
+        allowed = sorted(
+            value
+            for value in common
+            if time(10, 0) <= value.time() <= time(11, 20)
+            or time(13, 30) <= value.time() <= time(14, 50)
+        )
+        if not allowed:
+            rejection = "missing_common_execution_bar"
+        else:
+            executed_at = pd.Timestamp(allowed[0])
+            for spec in active:
+                row = leg_frames[spec["instrument"]].loc[executed_at]
+                if isinstance(row, pd.DataFrame):
+                    raise ValueError("pair minute bars contain duplicate timestamps")
+                reason = _bar_rejection_reason(row, spec["cost_side"])
+                if reason:
+                    rejection = reason
+                    break
+                capacity = int(
+                    floor(float(row["volume"]) * float(policy["max_participation"]))
+                )
+                if capacity < spec["requested_quantity"]:
+                    rejection = "atomic_capacity"
+                    break
+                execution_rows[spec["instrument"]] = row
+
+    prepared: list[tuple[dict[str, Any], dict[str, Any], float, float]] = []
+    cash_delta_total = 0.0
+    if active and rejection is None and executed_at is not None:
+        for spec in active:
+            row = execution_rows[spec["instrument"]]
+            quantity = int(spec["requested_quantity"])
+            price = float(row["vwap"])
+            minute_volume = int(floor(float(row["volume"])))
+            participation = quantity / minute_volume
+            costs = cost_model
+            borrow_days = 0
+            if spec["side"] == "sell_short":
+                costs = CostModelConfig(
+                    **{
+                        **cost_model.to_dict(),
+                        "annual_borrow_rate": spec["annual_borrow_rate"],
+                    }
+                )
+                borrow_days = 1
+            breakdown = costs.estimate_breakdown(
+                side=spec["cost_side"],
+                gross_value=quantity * price,
+                participation=participation,
+                asset_type=infer_cn_asset_type(spec["instrument"]),
+                trade_date=trade_date,
+                borrow_days=borrow_days,
+            )
+            gross = quantity * price
+            fee = float(breakdown["total"])
+            delta = -(gross + fee) if spec["cost_side"] == "buy" else gross - fee
+            cash_delta_total += delta
+            prepared.append((spec, breakdown, gross, delta))
+        if cash + cash_delta_total < -1e-6:
+            rejection = "insufficient_cash"
+
+    if rejection is not None:
+        orders = [
+            {
+                **spec,
+                "requested_value": float(spec["requested_quantity"])
+                * float(_execution_reference_prices(bars).get(spec["instrument"], 0.0)),
+                "filled_quantity": 0,
+                "filled_value": 0.0,
+                "capacity_fill_ratio": 0.0,
+                "status": "rejected",
+                "reject_reason": rejection,
+                "expires_at": datetime.combine(trade_date, time(15, 0), _SHANGHAI),
+                "borrow_cost": 0.0,
+            }
+            for spec in specs
+        ]
+        events = [
+            {
+                "severity": "critical",
+                "event_type": "atomic_pair_rejected",
+                "instrument": None,
+                "reason": rejection,
+                "details": {"atomic_group_id": group_id},
+            }
+        ]
+        return _pair_result(
+            trade_date=trade_date,
+            starting_cash=starting_cash,
+            cash=cash,
+            prior_nav=prior_nav,
+            high_water_mark=high_water_mark,
+            state=state,
+            closing_prices=closing_prices,
+            orders=orders,
+            fills=[],
+            cash_flows=cash_flows,
+            events=events,
+            certified=False,
+        )
+
+    orders: list[dict[str, Any]] = []
+    fills: list[dict[str, Any]] = []
+    if not active:
+        return _pair_result(
+            trade_date=trade_date,
+            starting_cash=starting_cash,
+            cash=cash,
+            prior_nav=prior_nav,
+            high_water_mark=high_water_mark,
+            state=state,
+            closing_prices=closing_prices,
+            orders=[],
+            fills=[],
+            cash_flows=cash_flows,
+            events=[],
+            certified=True,
+        )
+    assert executed_at is not None
+    for spec, breakdown, gross, cash_delta in prepared:
+        quantity = int(spec["requested_quantity"])
+        row = execution_rows[spec["instrument"]]
+        price = float(row["vwap"])
+        borrow_cost = float(breakdown["borrow_cost"])
+        fill = {
+            **{
+                key: spec[key]
+                for key in (
+                    "instrument",
+                    "side",
+                    "atomic_group_id",
+                    "leg_no",
+                    "position_side",
+                )
+            },
+            "executed_at": executed_at.to_pydatetime().replace(tzinfo=_SHANGHAI),
+            "quantity": quantity,
+            "price": price,
+            "gross_value": gross,
+            "fee": float(breakdown["total"]),
+            "borrow_cost": borrow_cost,
+            "cost_breakdown": breakdown,
+            "minute_volume": int(floor(float(row["volume"]))),
+            "capacity_quantity": int(
+                floor(float(row["volume"]) * float(policy["max_participation"]))
+            ),
+        }
+        fills.append(fill)
+        orders.append(
+            {
+                **spec,
+                "requested_value": gross,
+                "filled_quantity": quantity,
+                "filled_value": gross,
+                "capacity_fill_ratio": 1.0,
+                "status": "filled",
+                "reject_reason": None,
+                "expires_at": datetime.combine(trade_date, time(15, 0), _SHANGHAI),
+                "borrow_cost": borrow_cost,
+            }
+        )
+        cash += cash_delta
+        cash_flows.append(
+            {
+                "trade_date": trade_date,
+                "flow_type": f"pair_{spec['side']}",
+                "amount": cash_delta,
+                "balance_after": cash,
+            }
+        )
+        _apply_pair_fill(state, fill, trade_date)
+    return _pair_result(
+        trade_date=trade_date,
+        starting_cash=starting_cash,
+        cash=cash,
+        prior_nav=prior_nav,
+        high_water_mark=high_water_mark,
+        state=state,
+        closing_prices=closing_prices,
+        orders=orders,
+        fills=fills,
+        cash_flows=cash_flows,
+        events=[],
+        certified=True,
+    )
+
+
+def _apply_pair_fill(
+    state: dict[str, dict[str, Any]], fill: dict[str, Any], trade_date: date
+) -> None:
+    instrument = str(fill["instrument"])
+    side = str(fill["side"])
+    filled = int(fill["quantity"])
+    position = state.setdefault(
+        instrument,
+        {
+            "quantity": 0,
+            "available_quantity": 0,
+            "average_cost": 0.0,
+            "position_side": fill["position_side"],
+            "borrow_cost": 0.0,
+        },
+    )
+    quantity = int(position.get("quantity", 0))
+    if side in {"buy", "sell_short"}:
+        prior_cost = quantity * float(position.get("average_cost", 0.0))
+        position["quantity"] = quantity + filled
+        position["average_cost"] = (prior_cost + float(fill["gross_value"])) / position[
+            "quantity"
+        ]
+        if side == "sell_short":
+            position["available_quantity"] = position["quantity"]
+    else:
+        if filled > quantity:
+            raise RuntimeError("pair close quantity exceeds its governed leg")
+        position["quantity"] = quantity - filled
+        if side == "sell":
+            available = int(position.get("available_quantity", 0))
+            if filled > available:
+                raise RuntimeError("pair long leg violates T+1")
+            position["available_quantity"] = available - filled
+        else:
+            position["available_quantity"] = position["quantity"]
+        if position["quantity"] == 0:
+            position["average_cost"] = 0.0
+    position.update(
+        atomic_group_id=fill["atomic_group_id"],
+        leg_no=int(fill["leg_no"]),
+        position_side=fill["position_side"],
+        borrow_cost=float(position.get("borrow_cost", 0.0))
+        + float(fill.get("borrow_cost", 0.0)),
+        last_trade_date=trade_date,
+    )
+
+
+def _pair_result(
+    *,
+    trade_date: date,
+    starting_cash: float,
+    cash: float,
+    prior_nav: float,
+    high_water_mark: float,
+    state: dict[str, dict[str, Any]],
+    closing_prices: dict[str, dict[str, Any]],
+    orders: list[dict[str, Any]],
+    fills: list[dict[str, Any]],
+    cash_flows: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    certified: bool,
+) -> dict[str, Any]:
+    market_value = 0.0
+    market_dates: list[date] = []
+    stale = False
+    for instrument in list(state):
+        position = state[instrument]
+        quantity = int(position.get("quantity", 0))
+        if quantity == 0:
+            del state[instrument]
+            continue
+        quote = closing_prices.get(instrument)
+        if quote:
+            price = float(quote["price"])
+            market_date = _as_date(quote["market_date"])
+            is_stale = market_date != trade_date
+        else:
+            price = float(position.get("market_price") or 0.0)
+            previous_date = position.get("market_date")
+            market_date = _as_date(previous_date) if previous_date else None
+            is_stale = True
+        sign = -1.0 if position.get("position_side") == "short" else 1.0
+        value = sign * quantity * price
+        position.update(
+            market_price=price,
+            market_date=market_date,
+            stale=is_stale,
+            market_value=value,
+        )
+        market_value += value
+        stale = stale or is_stale
+        if market_date:
+            market_dates.append(market_date)
+    nav = cash + market_value
+    peak = max(high_water_mark, nav)
+    certified = certified and not stale
+    cash_difference = cash - (starting_cash + sum(item["amount"] for item in cash_flows))
+    if abs(cash_difference) < 1e-9:
+        cash_difference = 0.0
+    return {
+        "engine_version": SIMULATION_ENGINE_VERSION,
+        "trade_date": trade_date,
+        "cash": cash,
+        "nav": nav,
+        "high_water_mark": peak,
+        "positions": state,
+        "orders": orders,
+        "fills": fills,
+        "cash_flows": cash_flows,
+        "nav_row": {
+            "trade_date": trade_date,
+            "cash": cash,
+            "market_value": market_value,
+            "nav": nav,
+            "daily_return": nav / prior_nav - 1.0,
+            "drawdown": nav / peak - 1.0,
+            "market_date": min(market_dates) if market_dates else None,
+            "has_stale_prices": stale,
+            "status": "healthy" if certified else "degraded",
+            "performance_certified": certified,
+        },
+        "events": events,
+        "conservation": {
+            "cash_difference": cash_difference,
+            "negative_positions": 0,
         },
     }
 

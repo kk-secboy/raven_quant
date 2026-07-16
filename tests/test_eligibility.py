@@ -156,3 +156,40 @@ def test_governed_signal_cannot_select_an_ineligible_high_score() -> None:
     )
     result = build_governed_signal(scores, topk=1, eligibility_matrix=eligibility)
     assert result.index.get_level_values("instrument").tolist() == ["SZ000001"]
+
+
+def test_governed_signal_neutralizes_point_in_time_industry_bias() -> None:
+    timestamp = pd.Timestamp("2026-07-10")
+    instruments = [
+        "SH600001",
+        "SH600002",
+        "SH600003",
+        "SZ000001",
+        "SZ000002",
+        "SZ000003",
+    ]
+    scores = pd.Series(
+        [100.0, 90.0, 80.0, 3.0, 2.0, 1.0],
+        index=pd.MultiIndex.from_product(
+            [[timestamp], instruments], names=["datetime", "instrument"]
+        ),
+    )
+    memberships = pd.DataFrame(
+        {
+            "instrument": instruments,
+            "industry": ["bank", "bank", "bank", "technology", "technology", "technology"],
+            "in_date": [pd.Timestamp("2020-01-01")] * 6,
+            "out_date": [pd.NaT] * 6,
+        }
+    )
+
+    governed = build_governed_signal(
+        scores,
+        topk=6,
+        industry_memberships=memberships,
+        max_industry_weight=1.0,
+        max_industry_deviation=1.0,
+    ).droplevel("datetime")
+    by_industry = memberships.set_index("instrument")["industry"]
+
+    assert governed.groupby(by_industry).mean().abs().max() < 1e-10

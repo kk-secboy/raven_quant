@@ -21,6 +21,7 @@ from quant_platform.factor_recompute import (
     execute_factor_code,
     sha256_file,
 )
+from quant_platform.qlib_workflow import qlib_workflow_run
 from quant_platform.statistical_validation import benjamini_hochberg
 
 
@@ -38,6 +39,7 @@ def main() -> None:
     parser.add_argument("--provider-uri", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--tracking-uri", required=True)
     args = parser.parse_args()
 
     import qlib
@@ -153,7 +155,32 @@ def main() -> None:
                 item["metrics"]["experiment_count"] = declared
     result = {"status": "ok", "evaluations": evaluations}
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    with qlib_workflow_run(
+        run_kind="factor-evaluation",
+        run_id=str(manifest.get("research_run_id") or output.parent.name),
+        tracking_uri=args.tracking_uri,
+        dataset_identity_sha256=str(manifest["dataset_identity_sha256"]),
+    ) as workflow:
+        workflow.log_params(
+            {
+                "research_run_id": manifest.get("research_run_id") or output.parent.name,
+                "universe": manifest.get("universe") or "cn_all",
+                "candidate_count": len(candidates),
+                "train_start": periods["train_start"],
+                "valid_end": periods["valid_end"],
+                "test_end": periods["test_end"],
+            }
+        )
+        workflow.log_metrics(
+            {
+                "candidate_count": len(evaluations),
+                "succeeded_count": sum(item.get("status") == "ok" for item in evaluations),
+                "failed_count": sum(item.get("status") != "ok" for item in evaluations),
+            }
+        )
+        result["qlib_workflow"] = workflow.identity_dict()
+        output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        workflow.save_artifacts(output.parent)
     print(json.dumps(result, ensure_ascii=False))
 
 

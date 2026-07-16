@@ -27,7 +27,7 @@ test("server-renders the QuantLab authenticated application shell", async () => 
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|SQLite/i);
 });
 
-test("ships the recommendation-only research interface", async () => {
+test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   const appRoot = new URL("../app/", import.meta.url);
   const files = (await readdir(appRoot)).filter((name) => /\.(tsx|ts)$/.test(name));
   const sources = await Promise.all(
@@ -40,19 +40,42 @@ test("ships the recommendation-only research interface", async () => {
   assert.match(sourceByName["page.tsx"], /\/api\/auth\/state/);
   assert.match(sourceByName["auth-panel.tsx"], /bootstrap.*login|login.*bootstrap/s);
   assert.match(sourceByName["page.tsx"], /StrategyAllocationPanel/);
+  assert.match(sourceByName["page.tsx"], /PairSatellitePanel/);
+  assert.match(sourceByName["page.tsx"], /数据快照/);
+  assert.match(sourceByName["page.tsx"], /因子准入/);
+  assert.match(sourceByName["page.tsx"], /Qlib 回测与审批/);
+  assert.match(sourceByName["page.tsx"], /核心 \/ 卫星分配/);
+  assert.match(sourceByName["page.tsx"], /统一模拟盘/);
   assert.doesNotMatch(sourceByName["page.tsx"], /PairTradingPanel/);
 
   const portfolio = sourceByName["portfolio-panel.tsx"];
   assert.match(portfolio, /\/api\/recommendation-portfolios/);
   assert.match(portfolio, /RECOMMENDATION TRACKING/);
-  assert.match(portfolio, /TRUE SIMULATION LEDGER/);
+  assert.match(portfolio, /UNIFIED SIMULATION LEDGER/);
   assert.match(portfolio, /\/api\/simulation-portfolios/);
+  assert.match(portfolio, /source_type/);
+  assert.match(portfolio, /strategy_version/);
+  assert.match(portfolio, /allocation/);
+  assert.match(portfolio, /execution_frequency/);
   assert.doesNotMatch(portfolio, /hypothetical_performance/);
   assert.match(portfolio, /不产生订单、成交或券商指令/);
+
+  const pair = sourceByName["pair-satellite-panel.tsx"];
+  assert.match(pair, /\/api\/pair-strategies/);
+  assert.match(pair, /\/pair-backtests/);
+  assert.match(pair, /\/api\/strategy-versions\/\$\{selectedVersion\}\/approve/);
+  assert.match(pair, /\/api\/simulation-portfolios/);
+  assert.match(pair, /execution_adapter:\s*"pair"/);
+  assert.match(pair, /source_type:\s*"strategy_version"/);
+  assert.doesNotMatch(pair, /\/api\/pair-portfolios|pair_paper|paper[_ -]trading/i);
 
   const allocation = sourceByName["strategy-allocation-panel.tsx"];
   assert.match(allocation, /\/api\/strategy-allocations/);
   assert.match(allocation, /risk_parity/);
+  assert.match(allocation, /role/);
+  assert.match(allocation, /risk_budget/);
+  assert.match(allocation, /member_cap/);
+  assert.match(allocation, /核心 \/ 卫星/);
   assert.match(allocation, /max_drawdown_liquidate/);
   assert.match(allocation, /recommendation_portfolio_id/);
   assert.match(allocation, /推荐组合自动刷新/);
@@ -61,6 +84,10 @@ test("ships the recommendation-only research interface", async () => {
   assert.doesNotMatch(allocation, /模拟滑点/);
 
   assert.match(sourceByName["rdagent-panel.tsx"], /\/api\/strategy-recipes/);
+  assert.match(sourceByName["backtest-panel.tsx"], /full_market_multifactor|文档策略配方/);
+  assert.match(sourceByName["backtest-panel.tsx"], /industry_neutral_qp/);
+  assert.match(sourceByName["backtest-panel.tsx"], /execution_dataset/);
+  assert.match(sourceByName["backtest-panel.tsx"], /执行契约哈希/);
   assert.match(sourceByName["research-campaign-panel.tsx"], /\/api\/research-programs/);
   assert.match(sourceByName["market-overview-panel.tsx"], /\/api\/market\/overview/);
   assert.match(sourceByName["job-run-center.tsx"], /\/api\/jobs\/\$\{job\.id\}\/log/);

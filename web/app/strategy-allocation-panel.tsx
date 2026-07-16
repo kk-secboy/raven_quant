@@ -4,10 +4,11 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
 
 type Dataset = { name: string; ready: boolean; reproducible: boolean; end_date: string };
-type StrategyVersion = { id: string; version: number; status: string };
+type StrategyVersion = { id: string; version: number; status: string; strategy_type: string };
 type Strategy = { id: string; name: string; versions: StrategyVersion[] };
 type Member = {
   strategy_version_id: string; recommendation_portfolio_id?: string | null; target_weight: number;
+  role: "core" | "satellite"; risk_budget: number; member_cap: number;
   annualized_volatility: number; risk_contribution: number;
 };
 type AllocationEvent = {
@@ -42,6 +43,9 @@ export function StrategyAllocationPanel({ api }: { api: string }) {
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [selectedVersions, setSelectedVersions] = useState<Record<string, boolean>>({});
+  const [memberRoles, setMemberRoles] = useState<Record<string, "core" | "satellite">>({});
+  const [memberRiskBudgets, setMemberRiskBudgets] = useState<Record<string, number>>({});
+  const [memberCaps, setMemberCaps] = useState<Record<string, number>>({});
   const [name, setName] = useState("低相关核心卫星组合");
   const [dataset, setDataset] = useState("");
   const [capital, setCapital] = useState(5_000_000);
@@ -105,9 +109,16 @@ export function StrategyAllocationPanel({ api }: { api: string }) {
         max_pairwise_correlation: maxPairwiseCorrelation, max_strategy_weight: maxStrategyWeight,
         max_member_drawdown: maxMemberDrawdown, max_drawdown_reduce: maxDrawdownReduce,
         max_drawdown_liquidate: maxDrawdownLiquidate,
-        members: ids.map((strategy_version_id) => ({
-          strategy_version_id, weight: method === "fixed" ? 1 / ids.length : undefined,
-        })), actor: "allocation-owner",
+        members: ids.map((strategy_version_id) => {
+          const role = memberRoles[strategy_version_id] ?? "core";
+          return {
+            strategy_version_id,
+            weight: method === "fixed" ? 1 / ids.length : undefined,
+            role,
+            risk_budget: memberRiskBudgets[strategy_version_id] ?? 1,
+            member_cap: memberCaps[strategy_version_id] ?? (role === "satellite" ? 0.15 : 0.70),
+          };
+        }), actor: "allocation-owner",
       }),
     });
     const body = await response.json();
@@ -126,7 +137,7 @@ export function StrategyAllocationPanel({ api }: { api: string }) {
     });
     const body = await response.json();
     if (!response.ok) { setMessage(body.detail ?? "策略组合审批失败"); return; }
-    setMessage("组合已审批，成员推荐组合已按风险权重创建。");
+    setMessage("核心 / 卫星分配已审批，可作为统一模拟盘的受治理来源。");
     setApprovalReason("");
     await load();
   }
@@ -203,11 +214,15 @@ export function StrategyAllocationPanel({ api }: { api: string }) {
   }
 
   const selectedCount = Object.values(selectedVersions).filter(Boolean).length;
+  const selectedCoreCount = approved.filter(({ version }) =>
+    selectedVersions[version.id]
+    && (memberRoles[version.id] ?? (version.strategy_type === "pair" ? "satellite" : "core")) === "core",
+  ).length;
   const validDrawdownThresholds = maxMemberDrawdown < maxDrawdownReduce
     && maxDrawdownReduce < maxDrawdownLiquidate;
   const latestNav = selected?.nav_history[0];
   return <section className="data-panel strategy-allocation-panel">
-    <div className="panel-heading"><div><p className="eyebrow">MULTI-STRATEGY / RISK PARITY</p><h2>低相关策略组合与组合级风控</h2></div><span className={`state ${selected?.status === "active" ? "ready" : "partial"}`}>{selected?.status ?? "尚未创建"}</span></div>
+    <div className="panel-heading"><div><p className="eyebrow">CORE SATELLITE / QLIB OPTIMIZER</p><h2>核心 / 卫星风险预算与组合级风控</h2><p>核心权重不少于 70%，卫星不高于 30%，单卫星上限 15%；风险数值求解复用 Qlib，项目只执行治理上限。</p></div><span className={`state ${selected?.status === "active" ? "ready" : "partial"}`}>{selected?.status ?? "尚未创建"}</span></div>
     {message && <div className="notice">{message}</div>}
     <div className="portfolio-lower">
       <form className="portfolio-launcher" onSubmit={create}>
@@ -225,8 +240,31 @@ export function StrategyAllocationPanel({ api }: { api: string }) {
           <label>组合回撤清仓（%）<input type="number" min="0.1" max="50" step="0.5" value={maxDrawdownLiquidate * 100} onChange={(event) => setMaxDrawdownLiquidate(Number(event.target.value) / 100)} /></label>
         </div>
         {!validDrawdownThresholds && <small className="danger-text">成员熔断、组合减仓、组合清仓阈值必须依次递增。</small>}
-        <div className="strategy-picker"><span>已审批策略（至少两个）</span>{approved.map(({ strategy, version }) => <label key={version.id}><input type="checkbox" checked={Boolean(selectedVersions[version.id])} onChange={(event) => setSelectedVersions((current) => ({ ...current, [version.id]: event.target.checked }))} />{strategy.name} · v{version.version}</label>)}</div>
-        <button className="primary" disabled={selectedCount < 2 || !dataset || !validDrawdownThresholds}>计算风险预算并创建草案</button>
+        <div className="strategy-picker"><span>已审批策略（至少两个，至少一个核心）</span>{approved.map(({ strategy, version }) => {
+          const selectedMember = Boolean(selectedVersions[version.id]);
+          const role = memberRoles[version.id] ?? (version.strategy_type === "pair" ? "satellite" : "core");
+          const cap = memberCaps[version.id] ?? (role === "satellite" ? 0.15 : 0.70);
+          return <div className="allocation-member-editor" key={version.id}>
+            <label><input type="checkbox" checked={selectedMember} onChange={(event) => {
+              setSelectedVersions((current) => ({ ...current, [version.id]: event.target.checked }));
+              if (event.target.checked) {
+                setMemberRoles((current) => ({ ...current, [version.id]: role }));
+                setMemberRiskBudgets((current) => ({ ...current, [version.id]: current[version.id] ?? 1 }));
+                setMemberCaps((current) => ({ ...current, [version.id]: current[version.id] ?? cap }));
+              }
+            }} />{strategy.name} · v{version.version} · {version.strategy_type === "pair" ? "配对" : "多因子"}</label>
+            {selectedMember && <div className="form-row">
+              <label>角色<select value={role} onChange={(event) => {
+                const nextRole = event.target.value as "core" | "satellite";
+                setMemberRoles((current) => ({ ...current, [version.id]: nextRole }));
+                setMemberCaps((current) => ({ ...current, [version.id]: Math.min(current[version.id] ?? (nextRole === "satellite" ? 0.15 : 0.70), nextRole === "satellite" ? 0.15 : 0.70) }));
+              }}><option value="core">核心</option><option value="satellite">卫星</option></select></label>
+              <label>风险预算<input type="number" min="0.01" max="1" step="0.05" value={memberRiskBudgets[version.id] ?? 1} onChange={(event) => setMemberRiskBudgets((current) => ({ ...current, [version.id]: Number(event.target.value) }))} /></label>
+              <label>成员上限（%）<input type="number" min="1" max={role === "satellite" ? 15 : 70} step="1" value={cap * 100} onChange={(event) => setMemberCaps((current) => ({ ...current, [version.id]: Number(event.target.value) / 100 }))} /></label>
+            </div>}
+          </div>;
+        })}</div>
+        <button className="primary" disabled={selectedCount < 2 || selectedCoreCount < 1 || !dataset || !validDrawdownThresholds}>计算风险预算并创建草案</button>
       </form>
       <article className="portfolio-summary">
         <label>当前主组合<select value={selected?.id ?? ""} onChange={(event) => setSelectedId(event.target.value)}>{allocations.length ? allocations.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.status}</option>) : <option value="">尚无主组合</option>}</select></label>
@@ -235,7 +273,7 @@ export function StrategyAllocationPanel({ api }: { api: string }) {
         {selected && selected.status !== "draft" && <><button className="secondary-action" onClick={refreshAllocation}>刷新组合净值与风险状态</button><button className="secondary-action" disabled={["liquidation_pending", "risk_reduction_pending"].includes(selected.status)} onClick={() => changeStatus(selected.status === "active" ? "paused" : "active")}>{selected.status === "active" ? "暂停组合" : "恢复组合"}</button><div className="approval-panel"><strong>推荐组合自动刷新</strong><small>组合状态和风控暂停分开保存；风险减仓与清仓不会被人工暂停覆盖。</small><label>盘后刷新时间<input type="time" min="15:10" value={scheduleTime} onChange={(event) => setScheduleTime(event.target.value)} /></label><label>错过宽限（秒）<input type="number" min="60" max="86400" step="60" value={scheduleMisfireGrace} onChange={(event) => setScheduleMisfireGrace(Number(event.target.value))} /></label><div><button className="primary" onClick={configureAutomation}>{selected.automation ? "更新全部推荐刷新计划" : "启用全部推荐刷新计划"}</button>{selected.automation && <><button className="secondary-action" onClick={() => changeAutomationStatus(selected.automation?.status === "active" ? "paused" : "active")}>{selected.automation.status === "active" ? "暂停自动刷新" : "恢复自动刷新"}</button><button className="secondary-action" onClick={retireAutomation}>退休自动刷新</button></>}</div>{selected.automation && <small>状态：{selected.automation.effective_status ?? selected.automation.status} · {selected.automation.members.filter((item) => item.status === "active").length}/{selected.automation.members.length} 个推荐刷新计划运行中</small>}</div></>}
       </article>
     </div>
-    {selected && <div className="table-wrap"><table className="portfolio-table"><thead><tr><th>策略版本</th><th>目标权重</th><th>策略波动率</th><th>风险贡献</th><th>推荐组合</th></tr></thead><tbody>{selected.members.map((member) => <tr key={member.strategy_version_id}><td><code>{member.strategy_version_id.slice(0, 12)}</code></td><td>{pct(member.target_weight)}</td><td>{pct(member.annualized_volatility)}</td><td>{pct(member.risk_contribution)}</td><td>{member.recommendation_portfolio_id ? <code>{member.recommendation_portfolio_id.slice(0, 12)}</code> : "待审批"}</td></tr>)}</tbody></table></div>}
+    {selected && <div className="table-wrap"><table className="portfolio-table"><thead><tr><th>策略版本</th><th>角色</th><th>目标权重 / 上限</th><th>风险预算 / 贡献</th><th>策略波动率</th><th>研究推荐</th></tr></thead><tbody>{selected.members.map((member) => <tr key={member.strategy_version_id}><td><code>{member.strategy_version_id.slice(0, 12)}</code></td><td>{member.role === "satellite" ? "卫星" : "核心"}</td><td>{pct(member.target_weight)} / {pct(member.member_cap)}</td><td>{member.risk_budget.toFixed(2)} / {pct(member.risk_contribution)}</td><td>{pct(member.annualized_volatility)}</td><td>{member.recommendation_portfolio_id ? <code>{member.recommendation_portfolio_id.slice(0, 12)}</code> : "—"}</td></tr>)}</tbody></table></div>}
     {selected && <div className="portfolio-lower"><label>组合级处置结论<textarea value={riskResolution} onChange={(event) => setRiskResolution(event.target.value)} placeholder="记录清仓/减仓执行、子账本核对和恢复依据（至少 10 字）" /></label><div className="risk-list">{selected.events.filter((item) => item.severity === "critical").map((item) => <article key={item.id}><span className="job-state failed" /><div><strong>{item.rule}</strong><small>{item.event_type} · {pct(item.observed)} / {pct(item.limit_value)}{item.resolution_reason ? ` · ${item.resolution_reason}` : ""}</small></div><span>{item.status}</span><div>{item.status === "open" && <button className="inline-action" onClick={() => actOnRisk(item, "acknowledge")}>确认</button>}{["open", "acknowledged"].includes(item.status) && <button className="inline-action" disabled={riskResolution.trim().length < 10} onClick={() => actOnRisk(item, "resolve")}>完成处置</button>}</div></article>)}</div></div>}
   </section>;
 }

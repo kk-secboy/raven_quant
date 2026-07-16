@@ -20,6 +20,7 @@ from quant_platform.pair_trading import (
     run_pair_backtest,
     run_pair_robustness_suite,
 )
+from quant_platform.qlib_workflow import qlib_workflow_run
 
 
 def _sha256_file(path: str | Path) -> str:
@@ -237,6 +238,7 @@ def main() -> None:
     parser.add_argument("--shortability-path", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--tracking-uri", required=True)
     args = parser.parse_args()
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -326,10 +328,95 @@ def main() -> None:
         json.dumps(result["rejections"], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    (output / "result.json").write_text(
-        json.dumps({"status": "ok", "metrics": result["metrics"]}, ensure_ascii=False, indent=2),
+    governed_files = {
+        name: {
+            "sha256": _sha256_file(output / name),
+            "bytes": (output / name).stat().st_size,
+        }
+        for name in (
+            "daily_returns.parquet",
+            "daily_ledger.parquet",
+            "kalman_spread.parquet",
+            "trades.json",
+            "rejections.json",
+        )
+    }
+    pair_artifact_manifest = {
+        "format_version": "pair-replay-artifact-v1",
+        "backtest_id": manifest["backtest_id"],
+        "strategy_version_id": manifest["strategy_version_id"],
+        "execution_contract_hash": manifest["execution_contract_hash"],
+        "dataset": manifest["dataset"],
+        "periods": manifest["periods"],
+        "pair": manifest["pair"],
+        "strategy_config_sha256": result["metrics"]["provenance"][
+            "strategy_config_sha256"
+        ],
+        "execution_snapshot": manifest["execution_snapshot"],
+        "minute_dataset": {
+            key: manifest["minute_dataset"].get(key)
+            for key in (
+                "snapshot_name",
+                "dataset_name",
+                "manifest_sha256",
+                "source_sha256",
+                "snapshot_lineage_id",
+            )
+        },
+        "shortability_dataset": {
+            key: manifest["shortability_dataset"].get(key)
+            for key in (
+                "snapshot_name",
+                "dataset_name",
+                "manifest_sha256",
+                "source_sha256",
+                "snapshot_lineage_id",
+            )
+        },
+        "files": governed_files,
+    }
+    pair_artifact_manifest_path = output / "pair_artifact_manifest.json"
+    pair_artifact_manifest_path.write_text(
+        json.dumps(pair_artifact_manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    result["metrics"]["provenance"]["pair_artifact_manifest_sha256"] = _sha256_file(
+        pair_artifact_manifest_path
+    )
+    with qlib_workflow_run(
+        run_kind="pair-backtest",
+        run_id=str(manifest.get("backtest_id") or manifest["strategy_version_id"]),
+        tracking_uri=args.tracking_uri,
+        dataset_identity_sha256=daily_provenance["dataset_identity_sha256"],
+    ) as workflow:
+        workflow.log_params(
+            {
+                "backtest_id": manifest.get("backtest_id") or output.name,
+                "strategy_version_id": manifest["strategy_version_id"],
+                "dataset": manifest["dataset"],
+                "execution_snapshot": manifest["execution_snapshot"],
+                "leg_y": legs[0],
+                "leg_x": legs[1],
+                "start": manifest["periods"]["start"],
+                "end": manifest["periods"]["end"],
+                "strategy_config_sha256": result["metrics"]["provenance"][
+                    "strategy_config_sha256"
+                ],
+            }
+        )
+        workflow.log_metrics(result["metrics"])
+        recorder_identity = workflow.identity_dict()
+        result["metrics"]["provenance"]["qlib_workflow"] = recorder_identity
+        persisted_result = {
+            "status": "ok",
+            "metrics": result["metrics"],
+            "qlib_workflow": recorder_identity,
+        }
+        (output / "result.json").write_text(
+            json.dumps(persisted_result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        workflow.save_artifacts(output)
 
 
 if __name__ == "__main__":

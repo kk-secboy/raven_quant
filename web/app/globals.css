@@ -380,4 +380,7 @@ td:nth-child(4) { display:flex; align-items:center; gap:8px; }.mini-progress { w
 .research-schedule-list article { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; }
 .research-schedule-list article div { display: grid; gap: 4px; }
 .research-schedule-list small { color: var(--muted); }
+.strategy-picker { display:grid; gap:8px; }
+.allocation-member-editor { display:grid; gap:8px; border:1px solid var(--line); border-radius:8px; padding:10px; background:#fff; }
+.allocation-member-editor>.form-row { grid-template-columns:repeat(3,minmax(0,1fr)); }
 @media (max-width: 900px) { .research-automation-body { grid-template-columns: 1fr; } }

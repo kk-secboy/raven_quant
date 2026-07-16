@@ -14,6 +14,7 @@ from quant_data.database import jobs, open_database, row_dict
 AUTO_RETRY_ATTEMPTS = {
     "rdagent_factor": 3,
     "recommendation_refresh": 3,
+    "simulation_order_plan": 3,
 }
 
 

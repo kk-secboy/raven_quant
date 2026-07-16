@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 
 import pytest
+from qlib_test_doubles import qlib_workflow_identity
 
 from quant_platform.cost_model import COST_SCHEDULE_VERSION
 from quant_platform.pair_trading import PairTradingConfig
@@ -58,6 +59,7 @@ def _passing_metrics() -> dict:
             "execution_manifest_sha256": digest,
             "pair_engine_sha256": digest,
             "shortability_evidence_sha256": digest,
+            "qlib_workflow": qlib_workflow_identity(),
         },
     }
 

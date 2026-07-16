@@ -32,7 +32,11 @@ MINUTE_DATASETS: dict[str, str] = {
     "options_1m": "opt_mins",
     "liquid_stocks_1m": "stk_mins",
 }
-MINUTE_FREQUENCIES = frozenset({"1min", "5min", "15min", "30min", "60min"})
+NATIVE_MINUTE_FREQUENCIES = frozenset({"1min", "5min"})
+QLIB_RESAMPLED_MINUTE_FREQUENCIES = frozenset({"15min", "30min", "60min"})
+MINUTE_FREQUENCIES = frozenset(
+    {*NATIVE_MINUTE_FREQUENCIES, *QLIB_RESAMPLED_MINUTE_FREQUENCIES}
+)
 
 MARGIN_FIELDS = ("trade_date", "ts_code", "name", "exchange")
 MINUTE_FIELDS = ("ts_code", "trade_time", "open", "close", "high", "low", "vol", "amount")
@@ -159,7 +163,11 @@ def minute_specs(
 ) -> list[FetchSpec]:
     if end < start:
         raise ValueError("end must not be before start")
-    if freq not in MINUTE_FREQUENCIES:
+    if freq not in NATIVE_MINUTE_FREQUENCIES:
+        if freq in QLIB_RESAMPLED_MINUTE_FREQUENCIES:
+            raise ValueError(
+                "15/30/60-minute bars must be resampled by Qlib from a 1/5-minute snapshot"
+            )
         raise ValueError("unsupported minute frequency")
     unknown = set(symbols_by_dataset) - set(MINUTE_DATASETS)
     if unknown:

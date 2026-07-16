@@ -15,7 +15,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     RDAGENT_PYTHON=/usr/local/bin/python \
     RDAGENT_COMMAND=/usr/local/bin/rdagent \
     QLIB_PYTHON=/usr/local/bin/python \
-    WORKER_JOB_KINDS=rdagent_factor
+    WORKER_JOB_KINDS=rdagent_factor \
+    RDAGENT_COMMIT=${RDAGENT_COMMIT}
 
 RUN sed -i "s|deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Retries=${APT_RETRIES} \

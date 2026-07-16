@@ -424,6 +424,7 @@ def test_writes_point_in_time_industry_metadata(tmp_path: Path) -> None:
                 "ts_code": "000001.SZ",
                 "trade_date": "20240131",
                 "total_mv": 125000.0,
+                "circ_mv": 100000.0,
             }
         ]
     ).to_parquet(style_source / "styles.parquet")
@@ -455,6 +456,11 @@ def test_writes_point_in_time_industry_metadata(tmp_path: Path) -> None:
     styles = pd.read_parquet(qlib_dir / "metadata" / "style_exposures.parquet")
     assert styles.loc[0, "instrument"] == "SZ000001"
     assert styles.loc[0, "log_market_cap"] == pytest.approx(11.736069, rel=1e-6)
+    full_market = pd.read_parquet(
+        qlib_dir / "metadata" / "full_market_weights.parquet"
+    )
+    assert full_market.loc[0, "instrument"] == "SZ000001"
+    assert full_market.loc[0, "weight"] == pytest.approx(1.0)
     eligibility = pd.read_parquet(qlib_dir / "metadata" / "eligibility_matrix.parquet")
     assert eligibility.loc[0, "instrument"] == "SZ000001"
 

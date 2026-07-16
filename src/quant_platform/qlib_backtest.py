@@ -10,7 +10,31 @@ import pandas as pd
 from .cost_model import CostModelConfig
 from .qlib_execution_strategy import create_qlib_execution_strategy
 
-QLIB_ENGINE_VERSION = "qlib-policy-engine-v4-financial-correctness"
+QLIB_ENGINE_VERSION = "qlib-policy-engine-v5-single-mainline"
+
+
+def _load_qlib_risk_analysis() -> Callable[..., pd.DataFrame]:
+    try:
+        from qlib.contrib.evaluate import risk_analysis
+    except ImportError as exc:  # pragma: no cover - configured runtime assertion
+        raise RuntimeError("Qlib analysis runtime is unavailable") from exc
+    return risk_analysis
+
+
+def _risk_value(analysis: pd.DataFrame, name: str) -> float:
+    if name not in analysis.index or analysis.shape[1] != 1:
+        raise ValueError(f"Qlib risk analysis does not contain {name}")
+    value = float(analysis.loc[name].iloc[0])
+    if not np.isfinite(value):
+        raise ValueError(f"Qlib risk analysis returned a non-finite {name}")
+    return value
+
+
+def _optional_risk_value(analysis: pd.DataFrame, name: str) -> float | None:
+    if name not in analysis.index or analysis.shape[1] != 1:
+        raise ValueError(f"Qlib risk analysis does not contain {name}")
+    value = float(analysis.loc[name].iloc[0])
+    return value if np.isfinite(value) else None
 
 
 @dataclass(frozen=True)
@@ -64,7 +88,10 @@ def calculate_trade_metrics(fills: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def calculate_qlib_metrics(
-    report: pd.DataFrame, *, annual_minimum_acceptable_return: float = 0.0
+    report: pd.DataFrame,
+    *,
+    annual_minimum_acceptable_return: float = 0.0,
+    risk_analysis_fn: Callable[..., pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
     required = {"return", "cost", "bench", "turnover"}
     if not required.issubset(report.columns) or report.empty:
@@ -84,34 +111,38 @@ def calculate_qlib_metrics(
         raise ValueError("annual minimum acceptable return must be greater than -100%")
     excess = net - benchmark
     nav = (1.0 + net).cumprod()
-    drawdown = nav / nav.cummax() - 1.0
+    analyzer = risk_analysis_fn or _load_qlib_risk_analysis()
+    net_geometric = analyzer(net, N=252, freq=None, mode="product")
+    net_standard = analyzer(net, N=252, freq=None, mode="sum")
+    excess_standard = analyzer(excess, N=252, freq=None, mode="sum")
     daily_mar = (1.0 + annual_minimum_acceptable_return) ** (1.0 / 252.0) - 1.0
     downside_shortfall = np.minimum(net.to_numpy(dtype=float) - daily_mar, 0.0)
     annualized_downside = float(np.sqrt(np.mean(np.square(downside_shortfall))) * np.sqrt(252))
     annualized_mar_excess = float((net.mean() - daily_mar) * 252)
     sortino_ok = annualized_downside > 0 and np.isfinite(annualized_downside)
-    excess_std = excess.std(ddof=1)
-    net_std = net.std(ddof=1)
+    excess_std = _risk_value(excess_standard, "std")
     return {
         "backtest_engine": "qlib",
         "backtest_engine_version": QLIB_ENGINE_VERSION,
         "qlib_native_backtest": True,
-        "annualized_return": float(nav.iloc[-1] ** (252 / len(net)) - 1.0),
-        "annualized_excess_return": float(excess.mean() * 252),
+        "analysis_engine": "qlib.contrib.evaluate.risk_analysis",
+        "annualization_periods": 252,
+        "return_accumulation": "geometric",
+        "cumulative_return": float(nav.iloc[-1] - 1.0),
+        "annualized_return": _risk_value(net_geometric, "annualized_return"),
+        "annualized_excess_return": _risk_value(excess_standard, "annualized_return"),
         "tracking_error": float(excess_std * np.sqrt(252)),
-        "information_ratio": float(excess.mean() / excess_std * np.sqrt(252))
-        if excess_std and np.isfinite(excess_std)
-        else None,
-        "sharpe_ratio": float(net.mean() / net_std * np.sqrt(252))
-        if net_std and np.isfinite(net_std)
-        else None,
+        "information_ratio": _optional_risk_value(
+            excess_standard, "information_ratio"
+        ),
+        "sharpe_ratio": _optional_risk_value(net_standard, "information_ratio"),
         "sortino_ratio": float(annualized_mar_excess / annualized_downside)
         if sortino_ok
         else None,
         "sortino_status": "ok" if sortino_ok else "undefined_no_downside",
         "annual_minimum_acceptable_return": float(annual_minimum_acceptable_return),
         "annualized_downside_deviation": annualized_downside,
-        "max_drawdown": float(drawdown.min()),
+        "max_drawdown": _risk_value(net_geometric, "max_drawdown"),
         "average_turnover": float(pd.to_numeric(report["turnover"]).mean()),
         "total_cost": float(pd.to_numeric(report["cost"]).sum()),
         "trading_days": int(len(report)),
@@ -127,6 +158,7 @@ def run_formal_qlib_backtest(
     benchmark: str,
     cost_model: CostModelConfig,
     execution_method: str = "open",
+    signal_frequency: str = "day",
     execution_frequency: str | None = None,
     execution_policy: dict[str, Any] | None = None,
     instruments: list[str] | None = None,
@@ -138,9 +170,9 @@ def run_formal_qlib_backtest(
         raise RuntimeError("the formal backtest runtime does not contain Qlib") from exc
     from .qlib_exchange import SquareRootImpactExchange
 
-    if execution_method not in {"open", "twap", "vwap"}:
+    if execution_method not in {"open", "twap", "vwap", "next_bar"}:
         raise ValueError("unsupported formal execution method")
-    if execution_method in {"twap", "vwap"}:
+    if execution_method in {"twap", "vwap", "next_bar"}:
         return _run_formal_minute_backtest(
             strategy=strategy,
             start_time=start_time,
@@ -149,6 +181,7 @@ def run_formal_qlib_backtest(
             benchmark=benchmark,
             cost_model=cost_model,
             execution_method=execution_method,
+            signal_frequency=signal_frequency,
             execution_frequency=execution_frequency,
             execution_policy=execution_policy,
             instruments=instruments,
@@ -199,15 +232,16 @@ def _run_formal_minute_backtest(
     benchmark: str,
     cost_model: CostModelConfig,
     execution_method: str,
+    signal_frequency: str,
     execution_frequency: str | None,
     execution_policy: dict[str, Any] | None,
     instruments: list[str] | None,
     annual_minimum_acceptable_return: float,
 ) -> QlibBacktestResult:
     if not execution_frequency or execution_frequency == "day":
-        raise ValueError("TWAP/VWAP formal backtests require a minute execution frequency")
+        raise ValueError("minute formal backtests require a minute execution frequency")
     if not execution_policy:
-        raise ValueError("TWAP/VWAP formal backtests require an execution policy")
+        raise ValueError("minute formal backtests require an execution policy")
     if str(execution_policy.get("execution_algorithm") or "").lower() != execution_method:
         raise ValueError("execution policy algorithm does not match the formal execution method")
     if not instruments:
@@ -235,7 +269,7 @@ def _run_formal_minute_backtest(
         ),
     )
     executor = NestedExecutor(
-        time_per_step="day",
+        time_per_step=signal_frequency,
         inner_executor=SimulatorExecutor(
             time_per_step=execution_frequency,
             generate_portfolio_metrics=False,
@@ -252,10 +286,16 @@ def _run_formal_minute_backtest(
         benchmark=benchmark,
         exchange_kwargs={"exchange": exchange},
     )
-    daily = portfolio_metrics.get("1day")
-    if daily is None:
-        raise RuntimeError("nested Qlib backtest did not produce daily portfolio metrics")
-    report, positions = daily
+    result = portfolio_metrics.get(signal_frequency)
+    if result is None and signal_frequency == "day":
+        result = portfolio_metrics.get("1day")
+    if result is None:
+        raise RuntimeError(
+            "nested Qlib backtest did not produce the configured signal-frequency metrics"
+        )
+    report, positions = result
+    if signal_frequency != "day":
+        report = aggregate_intraday_report(report)
     execution_stats = slice_strategy.statistics()
     metrics = {
         **calculate_qlib_metrics(
@@ -266,8 +306,38 @@ def _run_formal_minute_backtest(
         **execution_stats,
         "minute_execution_enforced": True,
         "execution_frequency": execution_frequency,
+        "signal_frequency": signal_frequency,
     }
     return QlibBacktestResult(metrics, report, positions, exchange.fill_log)
+
+
+def aggregate_intraday_report(report: pd.DataFrame) -> pd.DataFrame:
+    """Convert Qlib intraday portfolio metrics to the governed daily metric contract."""
+
+    if report.empty or not isinstance(report.index, pd.DatetimeIndex):
+        raise ValueError("intraday Qlib portfolio report is empty or has no datetime index")
+    required = {"return", "cost", "bench", "turnover"}
+    if not required.issubset(report.columns):
+        raise ValueError("intraday Qlib portfolio report is incomplete")
+    values = report.copy()
+    if values.index.tz is not None:
+        values.index = values.index.tz_localize(None)
+    dates = values.index.normalize()
+    result: dict[str, pd.Series] = {}
+    for column in values.columns:
+        numeric = pd.to_numeric(values[column], errors="coerce")
+        if numeric.isna().any():
+            raise ValueError("intraday Qlib portfolio report contains non-numeric values")
+        grouped = numeric.groupby(dates)
+        if column in {"return", "bench"}:
+            result[column] = grouped.apply(lambda item: float((1.0 + item).prod() - 1.0))
+        elif column in {"cost", "turnover"}:
+            result[column] = grouped.sum()
+        else:
+            result[column] = grouped.last()
+    daily = pd.DataFrame(result)
+    daily.index.name = report.index.name or "datetime"
+    return daily.sort_index()
 
 
 def run_qlib_validation_suites(

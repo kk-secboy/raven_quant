@@ -1,9 +1,14 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
 
-type Strategy = { id: string; versions: { id: string; status: string }[] };
+type StrategyVersion = {
+  id: string; status: string; strategy_type: string; execution_frequency?: string;
+  config?: { execution_frequency?: string; execution_method?: string };
+};
+type Strategy = { id: string; name: string; versions: StrategyVersion[] };
+type Allocation = { id: string; name: string; status: string };
 type Dataset = { name: string; ready: boolean; reproducible: boolean; frequency?: string };
 type Holding = {
   instrument: string; weight: number; previous_weight: number; weight_change: number;
@@ -27,7 +32,10 @@ type SimulationPosition = {
   market_price?: number | null; market_date?: string | null; stale: boolean; market_value: number;
 };
 type SimulationPortfolio = {
-  id: string; name: string; recommendation_portfolio_id: string; status: string; cash: number;
+  id: string; name: string; recommendation_portfolio_id?: string | null;
+  source_type: "recommendation" | "strategy_version" | "allocation"; source_id: string;
+  execution_adapter: "long_only" | "pair"; execution_frequency: "1min" | "5min";
+  execution_contract_hash: string; status: string; cash: number;
   nav: number; execution_algorithm: string; execution_dataset: string; daily_dataset: string;
   cost_schedule_version: string; latest_nav?: SimulationNav | null;
 };
@@ -38,6 +46,7 @@ export function PortfolioPanel({ api }: { api: string }) {
   const [portfolios, setPortfolios] = useState<RecommendationPortfolio[]>([]);
   const [simulations, setSimulations] = useState<SimulationPortfolio[]>([]);
   const [strategies, setStrategies] = useState<Strategy[]>([]);
+  const [allocations, setAllocations] = useState<Allocation[]>([]);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [name, setName] = useState("沪深300 推荐组合");
@@ -47,18 +56,21 @@ export function PortfolioPanel({ api }: { api: string }) {
   const [message, setMessage] = useState("");
   const [selectedSimulationId, setSelectedSimulationId] = useState("");
   const [simulationName, setSimulationName] = useState("A股真实模拟账户");
+  const [simulationSourceType, setSimulationSourceType] = useState<"recommendation" | "strategy_version" | "allocation">("recommendation");
+  const [simulationSourceId, setSimulationSourceId] = useState("");
+  const [executionFrequency, setExecutionFrequency] = useState<"1min" | "5min">("5min");
   const [executionDataset, setExecutionDataset] = useState("");
   const [initialCash, setInitialCash] = useState(5_000_000);
-  const [executionAlgorithm, setExecutionAlgorithm] = useState<"twap" | "vwap">("twap");
   const [simulationNav, setSimulationNav] = useState<SimulationNav[]>([]);
   const [simulationPositions, setSimulationPositions] = useState<SimulationPosition[]>([]);
 
   const load = useCallback(async () => {
-    const [portfolioResponse, strategyResponse, datasetResponse, simulationResponse] = await Promise.all([
+    const [portfolioResponse, strategyResponse, datasetResponse, simulationResponse, allocationResponse] = await Promise.all([
       apiFetch(`${api}/api/recommendation-portfolios`, { cache: "no-store" }),
       apiFetch(`${api}/api/strategies`, { cache: "no-store" }),
       apiFetch(`${api}/api/qlib/datasets`, { cache: "no-store" }),
       apiFetch(`${api}/api/simulation-portfolios`, { cache: "no-store" }),
+      apiFetch(`${api}/api/strategy-allocations`, { cache: "no-store" }),
     ]);
     if (!portfolioResponse.ok) throw new Error("recommendations unavailable");
     const nextPortfolios = await portfolioResponse.json() as RecommendationPortfolio[];
@@ -66,8 +78,9 @@ export function PortfolioPanel({ api }: { api: string }) {
     const nextDatasets = datasetResponse.ok ? await datasetResponse.json() as Dataset[] : [];
     const nextSimulations = simulationResponse.ok
       ? await simulationResponse.json() as SimulationPortfolio[] : [];
+    const nextAllocations = allocationResponse.ok ? await allocationResponse.json() as Allocation[] : [];
     setPortfolios(nextPortfolios); setStrategies(nextStrategies); setDatasets(nextDatasets);
-    setSimulations(nextSimulations);
+    setSimulations(nextSimulations); setAllocations(nextAllocations);
     if (!selectedId && nextPortfolios.length) setSelectedId(nextPortfolios[0].id);
     if (!versionId) {
       const approved = nextStrategies.flatMap((item) => item.versions).find((item) => item.status === "approved");
@@ -81,8 +94,23 @@ export function PortfolioPanel({ api }: { api: string }) {
       const readyExecution = nextDatasets.find((item) => item.ready && item.reproducible && item.frequency === "5min");
       if (readyExecution) setExecutionDataset(readyExecution.name);
     }
+    if (!simulationSourceId) {
+      const approvedVersion = nextStrategies.flatMap((item) => item.versions)
+        .find((item) => item.status === "approved" && item.strategy_type !== "pair");
+      const activeAllocation = nextAllocations.find((item) => item.status === "active");
+      if (nextPortfolios[0]) {
+        setSimulationSourceType("recommendation");
+        setSimulationSourceId(nextPortfolios[0].id);
+      } else if (approvedVersion) {
+        setSimulationSourceType("strategy_version");
+        setSimulationSourceId(approvedVersion.id);
+      } else if (activeAllocation) {
+        setSimulationSourceType("allocation");
+        setSimulationSourceId(activeAllocation.id);
+      }
+    }
     if (!selectedSimulationId && nextSimulations.length) setSelectedSimulationId(nextSimulations[0].id);
-  }, [api, dataset, executionDataset, selectedId, selectedSimulationId, versionId]);
+  }, [api, dataset, executionDataset, selectedId, selectedSimulationId, simulationSourceId, versionId]);
 
   useEffect(() => {
     const initial = window.setTimeout(() => {
@@ -109,6 +137,41 @@ export function PortfolioPanel({ api }: { api: string }) {
   const snapshot = selected?.latest_snapshot;
   const selectedSimulation = simulations.find((item) => item.id === selectedSimulationId);
   const latestSimulationNav = simulationNav.at(-1) ?? selectedSimulation?.latest_nav;
+  const approvedLongVersions = useMemo(() => strategies.flatMap((strategy) => strategy.versions
+    .filter((version) => version.status === "approved" && version.strategy_type !== "pair")
+    .map((version) => ({ id: version.id, label: `${strategy.name} · ${version.id.slice(0, 10)}`, version }))), [strategies]);
+  const activeAllocations = useMemo(() => allocations.filter((item) => item.status === "active"), [allocations]);
+  const sourceOptions = simulationSourceType === "recommendation"
+    ? portfolios.map((item) => ({ id: item.id, label: item.name }))
+    : simulationSourceType === "strategy_version"
+      ? approvedLongVersions
+      : activeAllocations.map((item) => ({ id: item.id, label: item.name }));
+  const activeSimulationSourceId = sourceOptions.some((item) => item.id === simulationSourceId)
+    ? simulationSourceId
+    : sourceOptions[0]?.id ?? "";
+  const governedVersion = simulationSourceType === "strategy_version"
+    ? approvedLongVersions.find((item) => item.id === activeSimulationSourceId)?.version
+    : simulationSourceType === "recommendation"
+      ? strategies.flatMap((item) => item.versions).find(
+        (version) => version.id === portfolios.find((item) => item.id === activeSimulationSourceId)?.strategy_version_id,
+      )
+      : undefined;
+  const governedExecutionFrequency = governedVersion?.execution_frequency
+    ?? governedVersion?.config?.execution_frequency;
+  const governedExecutionAlgorithm = simulationSourceType === "allocation"
+    ? "twap"
+    : governedVersion?.config?.execution_method ?? "—";
+  const activeExecutionFrequency = governedExecutionFrequency === "1min"
+    ? "1min"
+    : governedExecutionFrequency === "5min"
+      ? "5min"
+      : executionFrequency;
+  const executionDatasets = datasets.filter((item) =>
+    item.ready && item.reproducible && item.frequency === activeExecutionFrequency,
+  );
+  const activeExecutionDataset = executionDatasets.some((item) => item.name === executionDataset)
+    ? executionDataset
+    : executionDatasets[0]?.name ?? "";
 
   async function create(event: FormEvent) {
     event.preventDefault();
@@ -132,18 +195,23 @@ export function PortfolioPanel({ api }: { api: string }) {
   }
 
   async function createSimulation(event: FormEvent) {
-    event.preventDefault(); if (!selected) return;
+    event.preventDefault(); if (!activeSimulationSourceId) return;
     const response = await apiFetch(`${api}/api/simulation-portfolios`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        name: simulationName, recommendation_portfolio_id: selected.id,
-        execution_dataset: executionDataset, initial_cash: initialCash,
-        execution_algorithm: executionAlgorithm, cost_schedule_version: "cn-effective-cost-v1",
+        name: simulationName,
+        source_type: simulationSourceType,
+        source_id: activeSimulationSourceId,
+        execution_dataset: activeExecutionDataset,
+        execution_frequency: activeExecutionFrequency,
+        execution_adapter: "long_only",
+        initial_cash: initialCash,
+        cost_schedule_version: "cn-effective-cost-v1",
       }),
     });
     const body = await response.json();
     if (!response.ok) { setMessage(body.detail ?? "模拟账户创建失败"); return; }
-    setSelectedSimulationId(body.id); setMessage("模拟账户已创建，激活后从下一份推荐快照开始撮合。");
+    setSelectedSimulationId(body.id); setMessage("统一模拟账户已创建；只消费受治理来源并按执行契约撮合。");
     await load();
   }
 
@@ -186,20 +254,23 @@ export function PortfolioPanel({ api }: { api: string }) {
       <div className="table-wrap"><table className="portfolio-table"><thead><tr><th>证券</th><th>目标权重</th><th>原权重</th><th>变化</th><th>建议</th><th>原因</th></tr></thead><tbody>{snapshot?.holdings.map((item) => <tr key={item.instrument}><td><code>{item.instrument}</code></td><td>{pct(item.weight)}</td><td>{pct(item.previous_weight)}</td><td>{pct(item.weight_change)}</td><td>{({ increase: "增加", decrease: "减少", hold: "维持" } as Record<string, string>)[item.action] ?? item.action}</td><td>{item.reason}</td></tr>)}</tbody></table>{!snapshot?.holdings.length && <div className="empty">尚无推荐快照。</div>}</div>
     </section>
     <section className="data-panel">
-      <div className="panel-heading"><div><p className="eyebrow">TRUE SIMULATION LEDGER</p><h2>真实模拟撮合账户</h2></div><span className={`state ${latestSimulationNav?.performance_certified ? "ready" : "partial"}`}>{latestSimulationNav?.performance_certified ? "绩效可认证" : "尚无可认证净值"}</span></div>
+      <div className="panel-heading"><div><p className="eyebrow">UNIFIED SIMULATION LEDGER</p><h2>统一持久模拟盘</h2><p>推荐组合、已审批策略版本和已审批核心/卫星分配共用这一套现金、订单、成交、持仓和 NAV 账本。</p></div><span className={`state ${latestSimulationNav?.performance_certified ? "ready" : "partial"}`}>{latestSimulationNav?.performance_certified ? "绩效可认证" : "尚无可认证净值"}</span></div>
       <div className="portfolio-hero">
         <form className="portfolio-launcher" onSubmit={createSimulation}>
           <label>账户名称<input value={simulationName} onChange={(event) => setSimulationName(event.target.value)} /></label>
-          <label>5 分钟执行数据<select value={executionDataset} onChange={(event) => setExecutionDataset(event.target.value)}>{datasets.filter((item) => item.ready && item.reproducible && item.frequency === "5min").map((item) => <option key={item.name}>{item.name}</option>)}</select></label>
+          <label>受治理来源<select value={simulationSourceType} onChange={(event) => { setSimulationSourceType(event.target.value as typeof simulationSourceType); setSimulationSourceId(""); }}><option value="recommendation">推荐组合</option><option value="strategy_version">已审批策略版本</option><option value="allocation">已审批核心 / 卫星分配</option></select></label>
+          <label>来源版本<select value={activeSimulationSourceId} onChange={(event) => setSimulationSourceId(event.target.value)}><option value="">无可用来源</option>{sourceOptions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+          <label>执行频率<select value={activeExecutionFrequency} disabled={governedExecutionFrequency === "1min" || governedExecutionFrequency === "5min"} onChange={(event) => setExecutionFrequency(event.target.value as "1min" | "5min")}><option value="1min">1 分钟</option><option value="5min">5 分钟</option></select></label>
+          <label>{activeExecutionFrequency === "1min" ? "1 分钟" : "5 分钟"}执行数据<select value={activeExecutionDataset} onChange={(event) => setExecutionDataset(event.target.value)}><option value="">无可用数据</option>{executionDatasets.map((item) => <option key={item.name}>{item.name}</option>)}</select></label>
           <label>初始现金<input type="number" min="100000" step="100000" value={initialCash} onChange={(event) => setInitialCash(Number(event.target.value))} /></label>
-          <label>执行算法<select value={executionAlgorithm} onChange={(event) => setExecutionAlgorithm(event.target.value as "twap" | "vwap")}><option value="twap">TWAP</option><option value="vwap">VWAP</option></select></label>
-          <button className="primary" disabled={!selected || !executionDataset || simulationName.length < 3}>创建模拟账户</button>
+          <label>受控执行算法<input value={governedExecutionAlgorithm.toUpperCase()} disabled /></label>
+          <button className="primary" disabled={!activeSimulationSourceId || !activeExecutionDataset || simulationName.length < 3}>创建模拟账户</button>
         </form>
         <article className="portfolio-summary">
           <label>模拟账户<select value={selectedSimulation?.id ?? ""} onChange={(event) => setSelectedSimulationId(event.target.value)}><option value="">尚未选择</option>{simulations.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-          <div className="metric-strip portfolio-metrics"><div><span>状态</span><strong>{selectedSimulation?.status ?? "—"}</strong></div><div><span>现金</span><strong>¥{Number(selectedSimulation?.cash ?? 0).toFixed(2)}</strong></div><div><span>NAV</span><strong>¥{Number(latestSimulationNav?.nav ?? selectedSimulation?.nav ?? 0).toFixed(2)}</strong></div><div><span>行情状态</span><strong>{latestSimulationNav?.has_stale_prices ? "陈旧/降级" : latestSimulationNav ? "正常" : "待运行"}</strong></div></div>
+          <div className="metric-strip portfolio-metrics"><div><span>状态</span><strong>{selectedSimulation?.status ?? "—"}</strong></div><div><span>来源</span><strong>{selectedSimulation ? ({ recommendation: "推荐", strategy_version: "策略", allocation: "分配" } as Record<string, string>)[selectedSimulation.source_type] : "—"}</strong></div><div><span>频率</span><strong>{selectedSimulation?.execution_frequency ?? "—"}</strong></div><div><span>现金</span><strong>¥{Number(selectedSimulation?.cash ?? 0).toFixed(2)}</strong></div><div><span>NAV</span><strong>¥{Number(latestSimulationNav?.nav ?? selectedSimulation?.nav ?? 0).toFixed(2)}</strong></div><div><span>行情状态</span><strong>{latestSimulationNav?.has_stale_prices ? "陈旧/降级" : latestSimulationNav ? "正常" : "待运行"}</strong></div></div>
           <div className="button-row"><button type="button" className="primary" disabled={!selectedSimulation || selectedSimulation.status === "active"} onClick={() => setSimulationStatus("active")}>激活</button><button type="button" disabled={!selectedSimulation || selectedSimulation.status === "paused"} onClick={() => setSimulationStatus("pause")}>暂停</button></div>
-          <small>推荐只提供目标权重；此处净值只来自 T+1 分钟撮合、成交、费用、现金和持仓账本。</small>
+          <small>净值只来自 T+1 分钟撮合、成交、费用、现金和持仓账本；页面和任务不会向 QMT 或券商网关发单。</small>
         </article>
       </div>
       <div className="table-wrap"><table><thead><tr><th>证券</th><th>持仓</th><th>可卖</th><th>成本</th><th>行情日</th><th>市值</th><th>估值状态</th></tr></thead><tbody>{simulationPositions.map((position) => <tr key={position.instrument}><td><code>{position.instrument}</code></td><td>{position.quantity}</td><td>{position.available_quantity}</td><td>{Number(position.average_cost).toFixed(4)}</td><td>{position.market_date ?? "—"}</td><td>¥{Number(position.market_value).toFixed(2)}</td><td><span className={`state ${position.stale ? "failed" : "ready"}`}>{position.stale ? "stale" : "current"}</span></td></tr>)}</tbody></table>{selectedSimulation && !simulationPositions.length && <div className="empty">账户尚无持仓；等待下一次成功的推荐快照进入 T+1 撮合。</div>}</div>

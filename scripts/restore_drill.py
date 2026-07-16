@@ -222,59 +222,78 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                     "'restore drill pair strategy', 'active', 'restore-drill', now(), now());"
                     "INSERT INTO quantlab.strategy_versions "
                     "(id, strategy_id, version, status, strategy_type, benchmark, universe, "
-                    "config_json, created_by, approved_by, approval_reason, "
+                    "config_json, signal_frequency, signal_horizon, execution_frequency, "
+                    "execution_contract_hash, created_by, approved_by, approval_reason, "
                     "created_at, approved_at) "
                     "VALUES ("
                     f"'restore-pair-version-{sentinel}', 'restore-pair-strategy-{sentinel}', "
                     "1, 'approved', 'pair', 'SH000300', 'cn_all', '{}'::jsonb, "
+                    f"'day', '1d', '5min', '{sentinel}{sentinel}', "
                     "'restore-drill', 'restore-reviewer', 'restore drill approval', now(), now());"
                     "INSERT INTO quantlab.strategy_pairs "
                     "(strategy_version_id, leg_y, leg_x, asset_class, shorting_mode, created_at) "
                     f"VALUES ('restore-pair-version-{sentinel}', 'SH510300', 'SZ159919', "
                     "'etf', 'margin_borrow', now());"
-                    "INSERT INTO quantlab.pair_paper_portfolios "
-                    "(id, name, strategy_version_id, dataset, execution_snapshot, minute_dataset, "
-                    "shortability_dataset, status, base_currency, initial_cash, cash, nav, "
-                    "high_water_mark, position_direction, quantity_y, quantity_x, entry_nav, "
-                    "holding_days, last_signal_date, last_trade_date, created_by, "
-                    "created_at, updated_at) "
-                    "VALUES ("
-                    f"'restore-pair-{sentinel}', 'Restore pair ledger {sentinel}', "
-                    f"'restore-pair-version-{sentinel}', 'restore-daily', 'restore-execution', "
-                    "'restore-minute', 'restore-shortability', 'active', 'CNY', 5000000, "
-                    "4999990, 5000010, 5000010, 1, 1000, -800, 4999990, 1, current_date - 1, "
-                    "current_date, 'restore-drill', now(), now());"
-                    "INSERT INTO quantlab.pair_portfolio_batches "
-                    "(id, portfolio_id, as_of_date, trade_date, status, idempotency_key, "
-                    "starting_state_sha256, artifact_path, created_at, started_at, "
-                    "finished_at) VALUES ("
-                    f"'restore-pair-batch-{sentinel}', 'restore-pair-{sentinel}', "
-                    "current_date - 1, "
-                    f"current_date, 'succeeded', 'restore-pair-batch:{sentinel}', "
-                    f"'{sentinel}{sentinel}', '/data/restore-drill', now(), now(), now());"
-                    "INSERT INTO quantlab.pair_portfolio_nav "
-                    "(portfolio_id, trade_date, cash, long_value, short_value, nav, daily_return, "
-                    "drawdown, gross_exposure, net_exposure, turnover, fees, borrow_cost, zscore, "
-                    "correlation, cointegration_pvalue, position_direction, quantity_y, "
-                    "quantity_x, "
-                    "price_y, price_x, created_at) VALUES ("
-                    f"'restore-pair-{sentinel}', current_date, 4999990, 4000, 4000, 5000010, "
-                    "0.000002, 0, 0.0016, 0, 0.0016, 10, 1.27, -1.7, 0.92, 0.01, 1, "
-                    "1000, -800, 4, 5, now());"
-                    "INSERT INTO quantlab.pair_portfolio_risk_events "
-                    "(portfolio_id, batch_id, severity, event_type, rule, observed, limit_value, "
-                    "status, details_json, created_at, acknowledged_by, acknowledged_at, "
-                    "resolved_by, resolved_at, resolution_reason) VALUES ("
-                    f"'restore-pair-{sentinel}', 'restore-pair-batch-{sentinel}', 'critical', "
-                    "'restore_drill', 'pair_risk_restore', -0.2, -0.15, 'resolved', "
-                    f"'{{\"sentinel\":\"{sentinel}\"}}'::jsonb, now(), 'pair-ack', now(), "
-                    "'pair-resolver', now(), 'pair restore drill resolution');"
-                    "INSERT INTO quantlab.pair_portfolio_reviews "
-                    "(id, portfolio_id, batch_id, trade_date, status, summary_json, "
-                    "created_at) VALUES ("
-                    f"'restore-pair-review-{sentinel}', 'restore-pair-{sentinel}', "
-                    f"'restore-pair-batch-{sentinel}', current_date, 'completed', "
-                    f'\'{{"sentinel":"{sentinel}","action":"entry"}}\'::jsonb, now());'
+                    "INSERT INTO quantlab.simulation_portfolios "
+                    "(id, name, recommendation_portfolio_id, source_type, source_id, status, "
+                    "base_currency, initial_cash, cash, nav, high_water_mark, "
+                    "execution_algorithm, execution_adapter, execution_frequency, "
+                    "execution_contract_hash, execution_dataset, daily_dataset, "
+                    "daily_dataset_identity_sha256, daily_dataset_lineage_id, "
+                    "daily_field_contract_version, execution_dataset_identity_sha256, "
+                    "execution_dataset_lineage_id, execution_field_contract_version, "
+                    "execution_engine_version, cost_schedule_version, execution_policy_json, "
+                    "created_by, created_at, updated_at) VALUES ("
+                    f"'restore-simulation-{sentinel}', 'Restore simulation ledger {sentinel}', "
+                    f"null, 'strategy_version', 'restore-pair-version-{sentinel}', 'paused', "
+                    "'CNY', 5000000, 5000010, 5000010, 5000010, 'twap', 'pair', '5min', "
+                    f"'{sentinel}{sentinel}', 'restore-minute', 'restore-daily', "
+                    f"'{sentinel}{sentinel}', '{sentinel}{sentinel}', "
+                    "'daily-qlib-field-v2-share-volume', "
+                    f"'{sentinel}{sentinel}', '{sentinel}{sentinel}', "
+                    "'minute-qlib-execution-v4-source-units', 'ashare-minute-simulation-v2', "
+                    "'cn-effective-cost-v1', '{\"execution_algorithm\":\"twap\"}'::jsonb, "
+                    "'restore-drill', now(), now());"
+                    "INSERT INTO quantlab.simulation_batches "
+                    "(id, portfolio_id, recommendation_snapshot_id, source_snapshot_id, "
+                    "target_payload_json, execution_adapter, execution_contract_hash, "
+                    "signal_date, trade_date, status, idempotency_key, summary_json, "
+                    "created_at, started_at, finished_at) VALUES ("
+                    f"'restore-simulation-batch-{sentinel}', 'restore-simulation-{sentinel}', "
+                    f"null, '{sentinel}{sentinel}', "
+                    "'{\"atomic_group_id\":\"restore-group\","
+                    "\"legs\":[{\"instrument\":\"SH510300\",\"leg_no\":1,"
+                    "\"position_side\":\"long\",\"target_quantity\":1000,"
+                    "\"annual_borrow_rate\":0.0},{\"instrument\":\"SZ159919\","
+                    "\"leg_no\":2,\"position_side\":\"short\",\"target_quantity\":800,"
+                    "\"annual_borrow_rate\":0.08}]}'::jsonb, "
+                    f"'pair', '{sentinel}{sentinel}', current_date - 1, current_date, "
+                    f"'succeeded', 'restore-simulation:{sentinel}', "
+                    f"'{{\"sentinel\":\"{sentinel}\",\"execution_adapter\":\"pair\"}}'::jsonb, "
+                    "now(), now(), now());"
+                    "INSERT INTO quantlab.simulation_positions "
+                    "(portfolio_id, instrument, atomic_group_id, leg_no, position_side, "
+                    "borrow_cost, quantity, available_quantity, average_cost, last_trade_date, "
+                    "market_price, market_date, stale, market_value, updated_at) VALUES "
+                    f"('restore-simulation-{sentinel}', 'SH510300', 'restore-group', 1, "
+                    "'long', 0, 1000, 1000, 4, current_date - 1, 4, current_date, "
+                    "false, 4000, now()), "
+                    f"('restore-simulation-{sentinel}', 'SZ159919', 'restore-group', 2, "
+                    "'short', 1.27, 800, 800, 5, current_date - 1, 5, current_date, "
+                    "false, -4000, now());"
+                    "INSERT INTO quantlab.simulation_nav "
+                    "(portfolio_id, trade_date, cash, market_value, nav, daily_return, "
+                    "drawdown, market_date, has_stale_prices, status, "
+                    "performance_certified, created_at) VALUES ("
+                    f"'restore-simulation-{sentinel}', current_date, 5000010, 0, 5000010, "
+                    "0.000002, 0, current_date, false, 'healthy', true, now());"
+                    "INSERT INTO quantlab.simulation_events "
+                    "(id, portfolio_id, batch_id, trade_date, severity, event_type, "
+                    "instrument, reason, details_json, created_at) VALUES ("
+                    f"'restore-simulation-event-{sentinel}', 'restore-simulation-{sentinel}', "
+                    f"'restore-simulation-batch-{sentinel}', current_date, 'info', "
+                    f"'restore_drill', null, 'simulation_ledger_restore', "
+                    f"'{{\"sentinel\":\"{sentinel}\"}}'::jsonb, now());"
                 ),
             )
             source.run(
@@ -388,7 +407,7 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
             ).strip()
             if schedule_state_sentinel != "active|paused|portfolio:paused":
                 raise RuntimeError("schedule intent and suspension state did not survive restore")
-            pair_ledger_sentinel = target.run(
+            simulation_ledger_sentinel = target.run(
                 "exec",
                 "-T",
                 "postgres",
@@ -399,18 +418,25 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                 "quantlab",
                 "-Atc",
                 (
-                    "SELECT p.name || '|' || n.quantity_y || '|' || n.quantity_x || '|' || "
-                    "e.status || '|' || r.status FROM quantlab.pair_paper_portfolios p "
-                    "JOIN quantlab.pair_portfolio_nav n ON n.portfolio_id=p.id "
-                    "JOIN quantlab.pair_portfolio_risk_events e ON e.portfolio_id=p.id "
-                    "JOIN quantlab.pair_portfolio_reviews r ON r.portfolio_id=p.id "
-                    f"WHERE p.id='restore-pair-{sentinel}';"
+                    "SELECT p.name || '|' || long_leg.quantity || '|' || "
+                    "short_leg.quantity || '|' || n.status || '|' || e.reason "
+                    "FROM quantlab.simulation_portfolios p "
+                    "JOIN quantlab.simulation_positions long_leg "
+                    "ON long_leg.portfolio_id=p.id AND long_leg.position_side='long' "
+                    "JOIN quantlab.simulation_positions short_leg "
+                    "ON short_leg.portfolio_id=p.id AND short_leg.position_side='short' "
+                    "JOIN quantlab.simulation_nav n ON n.portfolio_id=p.id "
+                    "JOIN quantlab.simulation_events e ON e.portfolio_id=p.id "
+                    f"WHERE p.id='restore-simulation-{sentinel}';"
                 ),
                 capture=True,
             ).strip()
-            expected_pair_ledger = f"Restore pair ledger {sentinel}|1000|-800|resolved|completed"
-            if pair_ledger_sentinel != expected_pair_ledger:
-                raise RuntimeError("pair paper ledger evidence did not survive restore")
+            expected_simulation_ledger = (
+                f"Restore simulation ledger {sentinel}|1000|800|healthy|"
+                "simulation_ledger_restore"
+            )
+            if simulation_ledger_sentinel != expected_simulation_ledger:
+                raise RuntimeError("unified simulation ledger evidence did not survive restore")
             table_count = int(
                 target.run(
                     "exec",
@@ -470,7 +496,7 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                 "strategy_allocation_sentinel": "matched",
                 "risk_lifecycle_sentinel": "matched",
                 "schedule_state_sentinel": "matched",
-                "pair_paper_ledger_sentinel": "matched",
+                "simulation_ledger_sentinel": "matched",
                 "data_sentinel": "matched",
                 "runtime_secret_sentinel": "matched",
             }
