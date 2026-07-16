@@ -32,12 +32,18 @@ def test_retention_protects_references_and_requires_explicit_confirmation(
 ) -> None:
     data_root = tmp_path / "data"
     _dataset(data_root, "protected", "2025-01-01T00:00:00+00:00")
+    _dataset(data_root, "execution", "2025-01-01T12:00:00+00:00")
     _dataset(data_root, "eligible", "2025-01-02T00:00:00+00:00")
     _dataset(data_root, "latest", "2025-01-03T00:00:00+00:00")
     JobStore(database_url).create(
         "qlib_baseline",
         {"dataset": "protected"},
         tmp_path / "baseline.log",
+    )
+    JobStore(database_url).create(
+        "strategy_backtest",
+        {"execution_dataset": {"name": "execution"}},
+        tmp_path / "strategy-backtest.log",
     )
     manager = DataRetentionManager(data_root, database_url)
     plan = manager.plan(
@@ -47,6 +53,7 @@ def test_retention_protects_references_and_requires_explicit_confirmation(
     )
     entries = {item["name"]: item for item in plan["entries"]}
     assert entries["protected"]["state"] == "protected"
+    assert entries["execution"]["state"] == "protected"
     assert entries["latest"]["state"] == "keep_latest"
     assert entries["eligible"]["state"] == "eligible"
     assert plan["eligible_bytes"] == entries["eligible"]["bytes"]

@@ -11,6 +11,10 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
+from .execution_contract import (
+    MINUTE_EXECUTION_CONTRACT_VERSION,
+    MINUTE_SOURCE_UNIT_CONTRACTS,
+)
 from .execution_data import MINUTE_DATASETS, MINUTE_FREQUENCIES
 from .path_utils import to_wsl_path
 from .qlib_builder import QlibBuilder, _sql_string
@@ -26,6 +30,8 @@ MINUTE_QLIB_FIELDS = (
     "change",
     "amount",
     "paused",
+    "up_limit",
+    "down_limit",
     "oi",
 )
 
@@ -71,9 +77,30 @@ class MinuteQlibBuilder:
             )
         if not sources:
             raise FileNotFoundError("snapshot does not contain minute Parquet data")
-        query = self._normalized_query(" UNION ALL ".join(sources))
+        limit_root = self.snapshot_path / "parquet" / "stk_limit"
+        if not limit_root.exists() or not any(limit_root.rglob("*.parquet")):
+            raise FileNotFoundError(
+                "minute execution snapshot does not contain daily A-share price limits"
+            )
+        limit_glob = _sql_string(str((limit_root / "**" / "*.parquet").resolve()))
+        query = self._normalized_query(" UNION ALL ".join(sources), limit_glob)
         connection = duckdb.connect()
         try:
+            invalid_share_units = connection.execute(
+                self._invalid_share_unit_query(" UNION ALL ".join(sources))
+            ).fetchone()[0]
+            if invalid_share_units:
+                raise RuntimeError(
+                    f"{invalid_share_units} stock/ETF minute rows violate the "
+                    "share-volume/CNY-amount contract"
+                )
+            missing_controls = connection.execute(
+                f"SELECT count(*) FROM ({query}) WHERE up_limit IS NULL OR down_limit IS NULL"
+            ).fetchone()[0]
+            if missing_controls:
+                raise RuntimeError(
+                    f"{missing_controls} minute rows have no same-lineage daily price limits"
+                )
             connection.execute(
                 f"COPY ({query}) TO {_sql_string(str(partitions))} "
                 "(FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (symbol), ROW_GROUP_SIZE 100000)"
@@ -172,6 +199,16 @@ class MinuteQlibBuilder:
             "qlib_builder_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "frequency": self.frequency,
             "fields": list(MINUTE_QLIB_FIELDS),
+            "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
+            "source_datasets": sorted(
+                dataset
+                for dataset in MINUTE_DATASETS
+                if dataset in self.manifest.get("datasets", {})
+            ),
+        }
+        identity["source_unit_contracts"] = {
+            dataset: MINUTE_SOURCE_UNIT_CONTRACTS[dataset]
+            for dataset in identity["source_datasets"]
         }
         canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
         provenance = {
@@ -189,7 +226,7 @@ class MinuteQlibBuilder:
         target.write_text(json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8")
 
     @staticmethod
-    def _normalized_query(sources: str) -> str:
+    def _normalized_query(sources: str, limit_glob: str) -> str:
         return f"""
             WITH bars AS ({sources}), deduplicated AS (
                 SELECT * FROM bars
@@ -198,25 +235,64 @@ class MinuteQlibBuilder:
                     PARTITION BY ts_code, try_cast(trade_time AS TIMESTAMP)
                     ORDER BY source_dataset
                 ) = 1
+            ), limits AS (
+                SELECT ts_code, try_cast(trade_date AS DATE) AS trade_date,
+                       try_cast(up_limit AS DOUBLE) AS up_limit,
+                       try_cast(down_limit AS DOUBLE) AS down_limit
+                FROM read_parquet({limit_glob}, hive_partitioning=true, union_by_name=true)
+                QUALIFY row_number() OVER (
+                    PARTITION BY ts_code, try_cast(trade_date AS DATE)
+                    ORDER BY try_cast(trade_date AS DATE)
+                ) = 1
             )
             SELECT
                 try_cast(trade_time AS TIMESTAMP) AS date,
-                upper(split_part(ts_code, '.', 2) || split_part(ts_code, '.', 1)) AS symbol,
+                upper(split_part(deduplicated.ts_code, '.', 2) ||
+                      split_part(deduplicated.ts_code, '.', 1)) AS symbol,
                 try_cast(open AS DOUBLE) AS open,
                 try_cast(high AS DOUBLE) AS high,
                 try_cast(low AS DOUBLE) AS low,
                 try_cast(close AS DOUBLE) AS close,
-                CASE WHEN try_cast(vol AS DOUBLE) > 0
+                CASE WHEN source_dataset IN ('ashare_5m', 'liquid_stocks_1m', 'etf_1m')
+                          AND try_cast(vol AS DOUBLE) > 0
                     THEN try_cast(amount AS DOUBLE) / try_cast(vol AS DOUBLE)
                     ELSE try_cast(close AS DOUBLE) END AS vwap,
                 try_cast(vol AS DOUBLE) AS volume,
                 1.0::DOUBLE AS factor,
                 try_cast(close AS DOUBLE) / lag(try_cast(close AS DOUBLE)) OVER (
-                    PARTITION BY ts_code ORDER BY try_cast(trade_time AS TIMESTAMP)
+                    PARTITION BY deduplicated.ts_code
+                    ORDER BY try_cast(deduplicated.trade_time AS TIMESTAMP)
                 ) - 1.0 AS change,
                 try_cast(amount AS DOUBLE) AS amount,
-                0.0::DOUBLE AS paused,
+                CASE WHEN try_cast(vol AS DOUBLE) IS NULL OR try_cast(vol AS DOUBLE) <= 0
+                    THEN 1.0 ELSE 0.0 END AS paused,
+                CASE WHEN source_dataset IN ('ashare_5m', 'liquid_stocks_1m', 'etf_1m')
+                    THEN l.up_limit ELSE 99999.0 END AS up_limit,
+                CASE WHEN source_dataset IN ('ashare_5m', 'liquid_stocks_1m', 'etf_1m')
+                    THEN l.down_limit ELSE 0.0 END AS down_limit,
                 normalized_oi AS oi
             FROM deduplicated
+            LEFT JOIN limits l
+              ON deduplicated.ts_code = l.ts_code
+             AND try_cast(deduplicated.trade_time AS DATE) = l.trade_date
             WHERE try_cast(open AS DOUBLE) > 0 AND try_cast(close AS DOUBLE) > 0
+        """
+
+    @staticmethod
+    def _invalid_share_unit_query(sources: str) -> str:
+        return f"""
+            WITH bars AS ({sources})
+            SELECT count(*)
+            FROM bars
+            WHERE source_dataset IN ('ashare_5m', 'liquid_stocks_1m', 'etf_1m')
+              AND try_cast(vol AS DOUBLE) > 0
+              AND (
+                  try_cast(amount AS DOUBLE) IS NULL
+                  OR try_cast(amount AS DOUBLE) <= 0
+                  OR try_cast(low AS DOUBLE) <= 0
+                  OR try_cast(high AS DOUBLE) <= 0
+                  OR try_cast(amount AS DOUBLE) / try_cast(vol AS DOUBLE)
+                     NOT BETWEEN try_cast(low AS DOUBLE) * 0.95
+                         AND try_cast(high AS DOUBLE) * 1.05
+              )
         """

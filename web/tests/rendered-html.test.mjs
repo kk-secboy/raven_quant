@@ -45,6 +45,9 @@ test("ships the recommendation-only research interface", async () => {
   const portfolio = sourceByName["portfolio-panel.tsx"];
   assert.match(portfolio, /\/api\/recommendation-portfolios/);
   assert.match(portfolio, /RECOMMENDATION TRACKING/);
+  assert.match(portfolio, /TRUE SIMULATION LEDGER/);
+  assert.match(portfolio, /\/api\/simulation-portfolios/);
+  assert.doesNotMatch(portfolio, /hypothetical_performance/);
   assert.match(portfolio, /不产生订单、成交或券商指令/);
 
   const allocation = sourceByName["strategy-allocation-panel.tsx"];

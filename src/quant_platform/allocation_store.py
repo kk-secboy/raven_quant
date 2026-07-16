@@ -13,9 +13,10 @@ from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
     backtest_runs,
-    recommendation_nav,
     recommendation_portfolios,
     row_dict,
+    simulation_nav,
+    simulation_portfolios,
     strategies,
     strategy_allocation_events,
     strategy_allocation_members,
@@ -23,6 +24,7 @@ from quant_data.database import (
     strategy_allocations,
 )
 
+from .risk_math import COVARIANCE_MODEL_VERSION
 from .strategy_allocation import analyze_strategy_allocation
 from .strategy_store import StrategyStore
 
@@ -36,7 +38,7 @@ def _decimal(value: Any) -> Decimal:
 
 
 class AllocationStore:
-    """Low-correlation strategy allocations backed only by recommendation ledgers."""
+    """Low-correlation strategy allocations measured only from simulation NAV."""
 
     def __init__(self, database_url: str) -> None:
         self.strategies = StrategyStore(database_url)
@@ -222,6 +224,25 @@ class AllocationStore:
                 raise ValueError("only draft strategy allocations may be approved")
             if actor.strip() == allocation.created_by:
                 raise ValueError("strategy allocation approval requires a second operator")
+            analysis = dict(allocation.analysis_json or {})
+            if analysis.get("covariance_model_version") != COVARIANCE_MODEL_VERSION:
+                raise ValueError("allocation covariance evidence is obsolete")
+            if allocation.allocation_method == "risk_parity":
+                solver = analysis.get("solver") or {}
+                contributions = [
+                    float(item.get("risk_contribution", -1.0))
+                    for item in (analysis.get("members") or {}).values()
+                ]
+                if (
+                    solver.get("success") is not True
+                    or solver.get("maximum_risk_budget_error") is None
+                    or float(solver["maximum_risk_budget_error"]) > 0.02
+                    or not contributions
+                    or min(contributions) < -1e-8
+                ):
+                    raise ValueError(
+                        "risk parity solver evidence is invalid; use inverse_volatility or fixed"
+                    )
             members = connection.execute(
                 select(strategy_allocation_members).where(
                     strategy_allocation_members.c.allocation_id == allocation_id
@@ -320,6 +341,13 @@ class AllocationStore:
                 )
             )
             connection.execute(
+                update(simulation_portfolios)
+                .where(
+                    simulation_portfolios.c.recommendation_portfolio_id.in_(portfolio_ids)
+                )
+                .values(status=status, updated_at=now)
+            )
+            connection.execute(
                 update(strategy_allocations)
                 .where(strategy_allocations.c.id == allocation_id)
                 .values(status=status, updated_at=now)
@@ -360,10 +388,21 @@ class AllocationStore:
                     raise ValueError(
                         "strategy allocation has an unprovisioned recommendation member"
                     )
+                simulation = connection.execute(
+                    select(simulation_portfolios).where(
+                        simulation_portfolios.c.recommendation_portfolio_id == portfolio_id
+                    )
+                ).first()
+                if simulation is None:
+                    return {
+                        "id": allocation_id,
+                        "status": allocation.status,
+                        "refresh_status": "waiting_for_simulation_portfolio",
+                    }
                 nav_row = connection.execute(
-                    select(recommendation_nav)
-                    .where(recommendation_nav.c.portfolio_id == portfolio_id)
-                    .order_by(recommendation_nav.c.trade_date.desc())
+                    select(simulation_nav)
+                    .where(simulation_nav.c.portfolio_id == simulation.id)
+                    .order_by(simulation_nav.c.trade_date.desc())
                     .limit(1)
                 ).first()
                 if nav_row is None:
@@ -371,6 +410,12 @@ class AllocationStore:
                         "id": allocation_id,
                         "status": allocation.status,
                         "refresh_status": "waiting_for_member_nav",
+                    }
+                if not nav_row.performance_certified:
+                    return {
+                        "id": allocation_id,
+                        "status": allocation.status,
+                        "refresh_status": "waiting_for_certified_simulation_nav",
                     }
                 latest[str(portfolio_id)] = nav_row
             dates = {item.trade_date for item in latest.values()}
@@ -393,7 +438,7 @@ class AllocationStore:
                     "refresh_status": "already_recorded",
                 }
             member_nav = {
-                portfolio_id: float(item.hypothetical_value)
+                portfolio_id: float(item.nav)
                 for portfolio_id, item in latest.items()
             }
             nav = _decimal(allocation.cash_reserve) + sum(

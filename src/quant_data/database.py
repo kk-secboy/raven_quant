@@ -156,6 +156,9 @@ factor_candidates = Table(
         Column("variables_json", json_type, nullable=False),
         Column("status", String, nullable=False),
         Column("source_iteration", Integer),
+        Column("experiment_family_id", String),
+        Column("label_horizon_days", Integer),
+        Column("experiment_count", Integer),
         Column("code_path", Text),
         Column("values_path", Text),
         Column("code_sha256", String),
@@ -220,6 +223,11 @@ factor_evaluations = Table(
         Column("submitted_values_sha256", String),
         Column("recomputed_values_sha256", String),
         Column("recompute_evidence_json", json_type),
+        Column("hac_p_value", Float),
+        Column("bh_q_value", Float),
+        Column("statistical_contract_version", String),
+        Column("final_test_key", String),
+        Column("final_test_consumed_at", DateTime(timezone=True)),
         Column("metrics_sha256", String),
         Column("policy_json", json_type),
         Column("policy_sha256", String),
@@ -707,6 +715,234 @@ recommendation_nav = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
 )
 Index("idx_recommendation_nav_trade_date", recommendation_nav.c.trade_date.desc())
+
+simulation_portfolios = Table(
+    "simulation_portfolios",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("name", String, nullable=False, unique=True),
+    Column(
+        "recommendation_portfolio_id",
+        String,
+        ForeignKey("quantlab.recommendation_portfolios.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("status", String, nullable=False),
+    Column("base_currency", String, nullable=False),
+    Column("initial_cash", Numeric(20, 6), nullable=False),
+    Column("cash", Numeric(20, 6), nullable=False),
+    Column("nav", Numeric(20, 6), nullable=False),
+    Column("high_water_mark", Numeric(20, 6), nullable=False),
+    Column("execution_algorithm", String, nullable=False),
+    Column("execution_dataset", String, nullable=False),
+    Column("daily_dataset", String, nullable=False),
+    Column("daily_dataset_identity_sha256", String, nullable=False),
+    Column("daily_dataset_lineage_id", String, nullable=False),
+    Column("daily_field_contract_version", String, nullable=False),
+    Column("execution_dataset_identity_sha256", String, nullable=False),
+    Column("execution_dataset_lineage_id", String, nullable=False),
+    Column("execution_field_contract_version", String, nullable=False),
+    Column("execution_engine_version", String, nullable=False),
+    Column("cost_schedule_version", String, nullable=False),
+    Column("execution_policy_json", json_type, nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_simulation_portfolios_status_updated",
+    simulation_portfolios.c.status,
+    simulation_portfolios.c.updated_at.desc(),
+)
+
+simulation_batches = Table(
+    "simulation_batches",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "recommendation_snapshot_id",
+        String,
+        ForeignKey("quantlab.recommendation_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("signal_date", Date, nullable=False),
+    Column("trade_date", Date, nullable=False),
+    Column("status", String, nullable=False),
+    Column("idempotency_key", String, nullable=False, unique=True),
+    Column("summary_json", json_type),
+    Column("error", Text),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("started_at", DateTime(timezone=True)),
+    Column("finished_at", DateTime(timezone=True)),
+)
+Index(
+    "idx_simulation_batches_portfolio_date",
+    simulation_batches.c.portfolio_id,
+    simulation_batches.c.trade_date.desc(),
+)
+
+simulation_orders = Table(
+    "simulation_orders",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "batch_id",
+        String,
+        ForeignKey("quantlab.simulation_batches.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("instrument", String, nullable=False),
+    Column("side", String, nullable=False),
+    Column("target_weight", Float, nullable=False),
+    Column("requested_quantity", Integer, nullable=False),
+    Column("filled_quantity", Integer, nullable=False),
+    Column("status", String, nullable=False),
+    Column("reject_reason", String),
+    Column("requested_value", Numeric(20, 6), nullable=False),
+    Column("filled_value", Numeric(20, 6), nullable=False),
+    Column("capacity_fill_ratio", Float, nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index("idx_simulation_orders_batch", simulation_orders.c.batch_id, simulation_orders.c.instrument)
+
+simulation_fills = Table(
+    "simulation_fills",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "order_id",
+        String,
+        ForeignKey("quantlab.simulation_orders.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "batch_id",
+        String,
+        ForeignKey("quantlab.simulation_batches.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("instrument", String, nullable=False),
+    Column("side", String, nullable=False),
+    Column("executed_at", DateTime(timezone=True), nullable=False),
+    Column("quantity", Integer, nullable=False),
+    Column("price", Numeric(20, 8), nullable=False),
+    Column("gross_value", Numeric(20, 6), nullable=False),
+    Column("fee", Numeric(20, 6), nullable=False),
+    Column("cost_breakdown_json", json_type, nullable=False),
+    Column("minute_volume", Integer, nullable=False),
+    Column("capacity_quantity", Integer, nullable=False),
+)
+Index("idx_simulation_fills_batch", simulation_fills.c.batch_id, simulation_fills.c.executed_at)
+
+simulation_positions = Table(
+    "simulation_positions",
+    metadata,
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("instrument", String, primary_key=True),
+    Column("quantity", Integer, nullable=False),
+    Column("available_quantity", Integer, nullable=False),
+    Column("average_cost", Numeric(20, 8), nullable=False),
+    Column("last_trade_date", Date),
+    Column("market_price", Numeric(20, 8)),
+    Column("market_date", Date),
+    Column("stale", Boolean, nullable=False),
+    Column("market_value", Numeric(20, 6), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+simulation_cash_flows = Table(
+    "simulation_cash_flows",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "batch_id",
+        String,
+        ForeignKey("quantlab.simulation_batches.id", ondelete="CASCADE"),
+    ),
+    Column("trade_date", Date, nullable=False),
+    Column("flow_type", String, nullable=False),
+    Column("amount", Numeric(20, 6), nullable=False),
+    Column("balance_after", Numeric(20, 6), nullable=False),
+    Column("reference_id", String),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_simulation_cash_flows_portfolio_date",
+    simulation_cash_flows.c.portfolio_id,
+    simulation_cash_flows.c.trade_date,
+)
+
+simulation_nav = Table(
+    "simulation_nav",
+    metadata,
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("trade_date", Date, primary_key=True),
+    Column("cash", Numeric(20, 6), nullable=False),
+    Column("market_value", Numeric(20, 6), nullable=False),
+    Column("nav", Numeric(20, 6), nullable=False),
+    Column("daily_return", Float, nullable=False),
+    Column("drawdown", Float, nullable=False),
+    Column("market_date", Date),
+    Column("has_stale_prices", Boolean, nullable=False),
+    Column("status", String, nullable=False),
+    Column("performance_certified", Boolean, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index("idx_simulation_nav_trade_date", simulation_nav.c.trade_date.desc())
+
+simulation_events = Table(
+    "simulation_events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "batch_id",
+        String,
+        ForeignKey("quantlab.simulation_batches.id", ondelete="CASCADE"),
+    ),
+    Column("trade_date", Date, nullable=False),
+    Column("severity", String, nullable=False),
+    Column("event_type", String, nullable=False),
+    Column("instrument", String),
+    Column("reason", String, nullable=False),
+    Column("details_json", json_type, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_simulation_events_portfolio_date",
+    simulation_events.c.portfolio_id,
+    simulation_events.c.trade_date.desc(),
+)
 
 paper_portfolios = Table(
     "paper_portfolios",

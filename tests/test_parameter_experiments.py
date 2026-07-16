@@ -33,8 +33,10 @@ def test_parameter_grid_is_deterministic_and_bounded() -> None:
 
 def test_period_split_is_non_overlapping_and_requires_history() -> None:
     periods = split_research_period(date(2024, 1, 1), date(2026, 1, 1))
-    assert periods["in_sample"] == {"start": "2024-01-01", "end": "2025-03-15"}
-    assert periods["out_of_sample"] == {"start": "2025-03-16", "end": "2026-01-01"}
+    assert periods["in_sample"] == {"start": "2024-01-01", "end": "2025-03-14"}
+    assert periods["out_of_sample"] == {"start": "2025-03-20", "end": "2026-01-01"}
+    assert periods["purge_days"] == 1
+    assert periods["embargo_days"] == 5
     with pytest.raises(ValueError, match="126"):
         split_research_period(date(2025, 1, 1), date(2025, 4, 1))
 
@@ -48,6 +50,7 @@ def test_trial_evaluation_flags_sample_decay_and_summary_risk() -> None:
             "max_drawdown": -0.30,
             "average_turnover": 0.4,
             "robustness_pass_rate": 0.4,
+            "deflated_sharpe_probability": 0.50,
         },
     )
     assert score < 0
@@ -56,6 +59,7 @@ def test_trial_evaluation_flags_sample_decay_and_summary_risk() -> None:
         "performance_decay",
         "oos_drawdown_high",
         "oos_robustness_low",
+        "deflated_sharpe_failed",
     }
     trials = [
         {
@@ -66,7 +70,11 @@ def test_trial_evaluation_flags_sample_decay_and_summary_risk() -> None:
             "warnings": [],
             "metrics": {
                 "in_sample": {"information_ratio": 1.2, "robustness": {"large": True}},
-                "out_of_sample": {"information_ratio": 0.8, "robustness": {"large": True}},
+                "out_of_sample": {
+                    "information_ratio": 0.8,
+                    "robustness": {"large": True},
+                    "deflated_sharpe_probability": 0.99,
+                },
             },
         },
         {
@@ -75,7 +83,10 @@ def test_trial_evaluation_flags_sample_decay_and_summary_risk() -> None:
             "status": "succeeded",
             "score": 0.98,
             "warnings": [],
-            "metrics": {"in_sample": {}, "out_of_sample": {}},
+            "metrics": {
+                "in_sample": {},
+                "out_of_sample": {"deflated_sharpe_probability": 0.98},
+            },
         },
     ]
     summary = summarize_trials(trials, {"topk": [30, 50]})

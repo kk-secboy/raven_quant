@@ -11,6 +11,8 @@ from quant_platform.pair_trading import (
     run_pair_robustness_suite,
 )
 
+pytestmark = pytest.mark.no_database
+
 
 def _markets(
     *, shortable: bool = True, include_minutes: bool = True
@@ -156,6 +158,83 @@ def test_pair_backtest_rejects_missing_minute_execution_evidence() -> None:
     assert any(
         "missing_valid_minute_execution_window" in item["reason"]
         for item in result["rejections"]
+    )
+
+
+def test_pair_entry_sizing_does_not_use_execution_day_close() -> None:
+    daily, minute = _markets()
+    baseline = run_pair_backtest(
+        daily,
+        minute,
+        leg_y="SH510300",
+        leg_x="SZ159919",
+        config=_config(),
+    )
+    first_entry = next(item for item in baseline["trades"] if item["action"] == "entry")
+    trade_date = pd.Timestamp(first_entry["trade_date"]).tz_localize(None)
+    changed = daily.copy()
+    for instrument in ("SH510300", "SZ159919"):
+        changed.loc[(trade_date, instrument), "close"] *= 2.0
+
+    repeated = run_pair_backtest(
+        changed,
+        minute,
+        leg_y="SH510300",
+        leg_x="SZ159919",
+        config=_config(),
+    )
+    repeated_entry = next(item for item in repeated["trades"] if item["action"] == "entry")
+
+    assert repeated_entry["signal_date"] == first_entry["signal_date"]
+    assert [item["requested_delta"] for item in repeated_entry["orders"]] == [
+        item["requested_delta"] for item in first_entry["orders"]
+    ]
+
+
+def test_pair_capacity_uses_one_common_partial_fill_ratio() -> None:
+    daily, minute = _markets()
+    config = _config(min_capacity_fill_ratio=0.80)
+    baseline = run_pair_backtest(
+        daily,
+        minute,
+        leg_y="SH510300",
+        leg_x="SZ159919",
+        config=config,
+    )
+    entry = next(item for item in baseline["trades"] if item["action"] == "entry")
+    trade_date = pd.Timestamp(entry["trade_date"]).tz_localize(None)
+    constrained = minute.copy()
+    for order in entry["orders"]:
+        instrument = order["instrument"]
+        mask = (
+            constrained.index.get_level_values("datetime").normalize() == trade_date
+        ) & (constrained.index.get_level_values("instrument") == instrument)
+        bar_count = int(mask.sum())
+        constrained.loc[mask, "volume"] = (
+            abs(order["requested_delta"])
+            * 0.90
+            / config.max_volume_participation
+            / bar_count
+        )
+        constrained.loc[mask, "amount"] = (
+            constrained.loc[mask, "close"] * constrained.loc[mask, "volume"]
+        )
+
+    result = run_pair_backtest(
+        daily,
+        constrained,
+        leg_y="SH510300",
+        leg_x="SZ159919",
+        config=config,
+    )
+    constrained_entry = next(item for item in result["trades"] if item["action"] == "entry")
+    ratios = [item["fill_ratio"] for item in constrained_entry["orders"]]
+
+    assert max(ratios) - min(ratios) <= 0.01
+    assert all(abs(item["delta"]) <= item["capacity"] for item in constrained_entry["orders"])
+    assert any(
+        abs(item["delta"]) < abs(item["requested_delta"])
+        for item in constrained_entry["orders"]
     )
 
 

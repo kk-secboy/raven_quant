@@ -59,16 +59,21 @@ class ParameterExperimentStore:
             if not evidence or any(
                 item.dataset != dataset
                 or item.is_legacy
-                or not str(item.evaluator_version).startswith("factor-gate-v2")
+                or str(item.evaluator_version) != "factor-gate-v3-hac-bh"
                 for item in evidence
             ):
                 raise ValueError(
                     "parameter experiments require matching factor evaluation v2 evidence"
                 )
-            experiment_start = min(
-                date.fromisoformat(section["start"]) for section in periods.values()
-            )
-            experiment_end = max(date.fromisoformat(section["end"]) for section in periods.values())
+            windows = [
+                section
+                for section in periods.values()
+                if isinstance(section, dict) and {"start", "end"}.issubset(section)
+            ]
+            if len(windows) < 2:
+                raise ValueError("parameter experiments require separated research windows")
+            experiment_start = min(date.fromisoformat(section["start"]) for section in windows)
+            experiment_end = max(date.fromisoformat(section["end"]) for section in windows)
             valid_start = max(
                 date.fromisoformat(str(dict(item.metrics_json)["selection_start"]))
                 for item in evidence

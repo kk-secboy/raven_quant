@@ -58,6 +58,14 @@ from quant_data.database import (
     runtime_secrets,
     schedule_runs,
     schedules,
+    simulation_batches,
+    simulation_cash_flows,
+    simulation_events,
+    simulation_fills,
+    simulation_nav,
+    simulation_orders,
+    simulation_portfolios,
+    simulation_positions,
     strategies,
     strategy_allocation_events,
     strategy_allocation_members,
@@ -121,6 +129,14 @@ def database_state(monkeypatch, request: pytest.FixtureRequest) -> str:
         connection.execute(delete(strategy_allocation_nav))
         connection.execute(delete(strategy_allocation_members))
         connection.execute(delete(strategy_allocations))
+        connection.execute(delete(simulation_events))
+        connection.execute(delete(simulation_nav))
+        connection.execute(delete(simulation_cash_flows))
+        connection.execute(delete(simulation_fills))
+        connection.execute(delete(simulation_orders))
+        connection.execute(delete(simulation_positions))
+        connection.execute(delete(simulation_batches))
+        connection.execute(delete(simulation_portfolios))
         connection.execute(delete(recommendation_nav))
         connection.execute(delete(recommendation_holdings))
         connection.execute(delete(recommendation_snapshots))

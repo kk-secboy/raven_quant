@@ -52,7 +52,7 @@ class RecommendationStore:
         versions = {str(row.id): (str(row.evaluator_version), bool(row.is_legacy)) for row in rows}
         if len(versions) != len(evaluation_ids) or any(
             versions.get(str(item), ("", True))[1]
-            or not versions.get(str(item), ("", True))[0].startswith("factor-gate-v2")
+            or versions.get(str(item), ("", True))[0] != "factor-gate-v3-hac-bh"
             for item in evaluation_ids
         ):
             raise ValueError("legacy factor evaluations cannot generate recommendations")
@@ -124,7 +124,8 @@ class RecommendationStore:
             ]
         result["snapshots"] = snapshots
         result["latest_snapshot"] = snapshots[0] if snapshots else None
-        result["hypothetical_performance"] = nav
+        result["construction_notional"] = result.pop("hypothetical_initial_value")
+        result["historical_hypothetical_observations"] = nav
         return result
 
     def list(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -306,30 +307,6 @@ class RecommendationStore:
                 .where(recommendation_portfolios.c.id == snapshot.portfolio_id)
                 .values(updated_at=now)
             )
-            observation = result.get("hypothetical_observation")
-            if isinstance(observation, dict):
-                prior_peak = connection.scalar(
-                    select(recommendation_nav.c.hypothetical_value)
-                    .where(recommendation_nav.c.portfolio_id == snapshot.portfolio_id)
-                    .order_by(recommendation_nav.c.hypothetical_value.desc())
-                    .limit(1)
-                )
-                value = Decimal(str(observation["hypothetical_value"]))
-                peak = max(value, Decimal(str(prior_peak or value)))
-                drawdown = float(value / peak - 1) if peak else 0.0
-                connection.execute(
-                    insert(recommendation_nav).values(
-                        portfolio_id=snapshot.portfolio_id,
-                        trade_date=date.fromisoformat(observation["trade_date"]),
-                        hypothetical_value=value,
-                        daily_return=float(observation["daily_return"]),
-                        benchmark_return=float(observation["benchmark_return"]),
-                        drawdown=drawdown,
-                        turnover=float(observation["turnover"]),
-                        estimated_cost=Decimal(str(observation["estimated_cost"])),
-                        created_at=now,
-                    )
-                )
         return self.get_snapshot(snapshot_id)
 
     def mark_failed(self, snapshot_id: str, error: str) -> None:

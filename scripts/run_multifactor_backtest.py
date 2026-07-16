@@ -15,7 +15,13 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from quant_data.execution_contract import (
+    require_daily_qlib_contract,
+    require_minute_execution_contract,
+)
 from quant_platform.cost_model import CostModelConfig
+from quant_platform.eligibility import eligibility_statistics
+from quant_platform.execution_algorithms import execution_time_slots
 from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
 from quant_platform.qlib_backtest import (
     QLIB_ENGINE_VERSION,
@@ -23,6 +29,7 @@ from quant_platform.qlib_backtest import (
     run_qlib_validation_suites,
 )
 from quant_platform.qlib_policy_strategy import create_qlib_policy_strategy
+from quant_platform.statistical_validation import deflated_sharpe_probability
 from quant_platform.strategy_backtest import build_governed_signal, compose_factor_scores
 
 
@@ -46,6 +53,83 @@ def _sha256_file(path: str | Path) -> str:
 def _canonical_sha256(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _qlib_instruments(provider_uri: str | Path) -> set[str]:
+    root = Path(provider_uri) / "instruments"
+    candidates = (root / "cn_all.txt", root / "liquid_all.txt", root / "all.txt")
+    source = next((path for path in candidates if path.exists()), None)
+    if source is None:
+        raise ValueError("minute execution Qlib dataset has no instrument universe")
+    return {
+        line.split("\t", 1)[0].strip()
+        for line in source.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+
+def _minute_warmup_window(
+    provider_uri: str | Path, frequency: str, start_time: str, lookback_days: int
+) -> tuple[str, str]:
+    calendar_path = Path(provider_uri) / "calendars" / f"{frequency}.txt"
+    try:
+        timestamps = pd.to_datetime(
+            [
+                line.strip()
+                for line in calendar_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ],
+            errors="raise",
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError("minute execution calendar is missing or invalid") from exc
+    start_date = pd.Timestamp(start_time).date()
+    prior_days = sorted({value.date() for value in timestamps if value.date() < start_date})
+    if len(prior_days) < lookback_days:
+        raise ValueError(
+            f"VWAP execution requires {lookback_days} complete pre-backtest minute trading days"
+        )
+    selected = prior_days[-lookback_days:]
+    return selected[0].isoformat(), selected[-1].isoformat()
+
+
+def _historical_vwap_profile(
+    *,
+    instruments: list[str],
+    start_time: str,
+    end_time: str,
+    frequency: str,
+    slice_minutes: int,
+    max_slices: int,
+) -> list[dict[str, Any]]:
+    from qlib.data import D
+
+    volume = D.features(
+        instruments,
+        ["$volume"],
+        start_time=start_time,
+        end_time=end_time,
+        freq=frequency,
+    ).reset_index()
+    if volume.empty or not {"datetime", "$volume"}.issubset(volume.columns):
+        raise ValueError("VWAP warm-up window contains no minute volume evidence")
+    volume["datetime"] = pd.to_datetime(volume["datetime"], errors="coerce")
+    volume["volume"] = pd.to_numeric(volume["$volume"], errors="coerce")
+    volume = volume.dropna(subset=["datetime", "volume"])
+    volume = volume[volume["volume"] > 0]
+    slots = execution_time_slots(
+        trade_date=pd.Timestamp(start_time).date(),
+        policy={"slice_minutes": slice_minutes, "max_slices": max_slices},
+    )
+    slot_names = [item.strftime("%H:%M") for item in slots]
+    volume["time"] = volume["datetime"].dt.strftime("%H:%M")
+    by_time = volume[volume["time"].isin(slot_names)].groupby("time")["volume"].mean()
+    missing = [slot for slot in slot_names if slot not in by_time or not np.isfinite(by_time[slot])]
+    if missing:
+        raise ValueError(
+            "VWAP warm-up evidence is missing configured execution slots: " + ", ".join(missing)
+        )
+    return [{"time": slot, "weight": float(by_time[slot])} for slot in slot_names]
 
 
 def _latest_cross_section(frame: pd.DataFrame, when: pd.Timestamp, column: str) -> pd.Series:
@@ -104,10 +188,15 @@ def _metadata_provider(
     benchmark_weights: pd.DataFrame,
     styles: pd.DataFrame,
     execution_metadata: pd.DataFrame,
+    close_history: pd.DataFrame,
+    *,
+    open_field: str = "$open",
+    close_field: str = "$close",
 ):
     membership = memberships.copy()
     membership["in_date"] = pd.to_datetime(membership["in_date"], errors="coerce")
     membership["out_date"] = pd.to_datetime(membership["out_date"], errors="coerce")
+    close_matrix = close_history["$close"].unstack("instrument").sort_index()
 
     def provide(when: Any, instruments: pd.Index) -> dict[str, Any]:
         timestamp = pd.Timestamp(when).tz_localize(None)
@@ -125,6 +214,11 @@ def _metadata_provider(
         benchmark_industries = industries.reindex(benchmark.index)
         if benchmark_industries.isna().any():
             raise ValueError("benchmark constituents are missing point-in-time industries")
+        risk_instruments = instruments.astype(str).union(benchmark.index.astype(str))
+        history = close_matrix.loc[:timestamp].reindex(columns=risk_instruments).tail(61)
+        returns = history.pct_change(fill_method=None).dropna(how="any")
+        if len(returns) < 60:
+            raise ValueError("optimizer requires 60 complete point-in-time return observations")
         return {
             "industries": industries.reindex(instruments.astype(str)),
             "benchmark_weights": benchmark,
@@ -133,11 +227,12 @@ def _metadata_provider(
             "benchmark_style_exposure": style.reindex(benchmark.index).mul(
                 benchmark, axis=0
             ).sum(),
-            "prices": _qlib_cross_section(execution_metadata, timestamp, "$open").reindex(
+            "return_covariance": returns.cov(),
+            "prices": _qlib_cross_section(execution_metadata, timestamp, open_field).reindex(
                 instruments.astype(str)
             ),
             "current_prices": _qlib_cross_section(
-                execution_metadata, timestamp, "$close"
+                execution_metadata, timestamp, close_field
             ).reindex(instruments.astype(str)),
             "average_daily_values": (
                 _qlib_cross_section(
@@ -153,14 +248,19 @@ def _metadata_provider(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-uri", required=True)
+    parser.add_argument("--execution-provider-uri")
+    parser.add_argument("--execution-frequency")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     provider_provenance_path = Path(args.provider_uri) / "metadata" / "provenance.json"
     if not provider_provenance_path.exists():
         raise ValueError("formal Qlib backtest requires dataset provenance metadata")
     provider_provenance = json.loads(provider_provenance_path.read_text(encoding="utf-8"))
+    require_daily_qlib_contract(provider_provenance)
     factor_value_hashes = {
         str(item["candidate_id"]): _sha256_file(item["values_path"]) for item in manifest["factors"]
     }
@@ -174,11 +274,44 @@ def main() -> None:
     ]
     scores = compose_factor_scores(factors)
     instruments = sorted(set(scores.index.get_level_values("instrument")))
+    config = manifest["config"]
+    execution_method = str(config.get("execution_method", "open"))
+    minute_execution = execution_method in {"twap", "vwap"}
+    execution_provenance: dict[str, Any] = {}
+    if minute_execution:
+        if not args.execution_provider_uri or not args.execution_frequency:
+            raise ValueError("TWAP/VWAP formal backtests require a minute Qlib dataset")
+        execution_provenance_path = (
+            Path(args.execution_provider_uri) / "metadata" / "provenance.json"
+        )
+        if not execution_provenance_path.exists():
+            raise ValueError("minute execution Qlib dataset requires provenance metadata")
+        execution_provenance = json.loads(
+            execution_provenance_path.read_text(encoding="utf-8")
+        )
+        require_minute_execution_contract(
+            execution_provenance, frequency=args.execution_frequency
+        )
+        available_instruments = _qlib_instruments(args.execution_provider_uri)
+        missing_instruments = sorted(set(instruments) - available_instruments)
+        if missing_instruments:
+            preview = ", ".join(missing_instruments[:10])
+            raise ValueError(
+                "minute execution dataset is missing "
+                f"{len(missing_instruments)} strategy instruments: "
+                + preview
+            )
 
     import qlib
     from qlib.data import D
 
-    qlib.init(provider_uri=args.provider_uri, region="cn")
+    provider_uri: str | dict[str, str] = args.provider_uri
+    if minute_execution:
+        provider_uri = {
+            "day": args.provider_uri,
+            str(args.execution_frequency): str(args.execution_provider_uri),
+        }
+    qlib.init(provider_uri=provider_uri, region="cn")
     periods = manifest["periods"]
     liquidity_amount = D.features(
         instruments,
@@ -187,10 +320,20 @@ def main() -> None:
         end_time=periods["end"],
         freq="day",
     ).mul(1000.0)
+    open_field = "$open/$factor" if minute_execution else "$open"
+    close_field = "$close/$factor" if minute_execution else "$close"
     execution_metadata = D.features(
         instruments,
-        ["$open", "$close", "Ref(Mean($amount, 20), 1)"],
+        [open_field, close_field, "Ref(Mean($amount, 20), 1)"],
         start_time=periods["start"],
+        end_time=periods["end"],
+        freq="day",
+    )
+    covariance_start = (pd.Timestamp(periods["start"]) - pd.Timedelta(days=120)).date().isoformat()
+    close_history = D.features(
+        instruments,
+        ["$close"],
+        start_time=covariance_start,
         end_time=periods["end"],
         freq="day",
     )
@@ -224,31 +367,97 @@ def main() -> None:
         raise ValueError("index-enhancement backtest requires historical benchmark weights")
     if style_exposures.empty:
         raise ValueError("index-enhancement backtest requires point-in-time style exposures")
-    config = manifest["config"]
-    governed_signal = build_governed_signal(
-        scores,
-        topk=int(config["topk"]),
-        liquidity_amount=liquidity_amount,
-        industry_memberships=industry_memberships,
-        benchmark_weights=benchmark_weights,
-        style_exposures=style_exposures,
-        max_industry_weight=float(config.get("max_industry_weight", 1.0)),
-        max_industry_deviation=float(config.get("max_industry_deviation", 1.0)),
-        min_average_daily_amount=float(config.get("min_average_daily_amount", 0.0)),
-        liquidity_lookback_days=int(config.get("liquidity_lookback_days", 20)),
-    )
+    eligibility_path = Path(args.provider_uri) / "metadata" / "eligibility_matrix.parquet"
+    if not eligibility_path.is_file():
+        raise ValueError("Qlib daily dataset has no point-in-time eligibility matrix")
+    eligibility_matrix = pd.read_parquet(eligibility_path)
+    eligibility_evidence = eligibility_statistics(eligibility_matrix)
+    if config.get("require_regulatory_events") and not eligibility_evidence[
+        "regulatory_data_available"
+    ]:
+        raise ValueError("strategy requires regulatory events but no reliable source is available")
+
+    def governed_for(scenario_config: dict[str, Any]) -> pd.Series:
+        return build_governed_signal(
+            scores,
+            topk=int(scenario_config["topk"]),
+            liquidity_amount=liquidity_amount,
+            industry_memberships=industry_memberships,
+            benchmark_weights=benchmark_weights,
+            style_exposures=style_exposures,
+            eligibility_matrix=eligibility_matrix,
+            max_industry_weight=float(scenario_config.get("max_industry_weight", 1.0)),
+            max_industry_deviation=float(scenario_config.get("max_industry_deviation", 1.0)),
+            min_average_daily_amount=float(
+                scenario_config.get("min_average_daily_amount", 0.0)
+            ),
+            liquidity_lookback_days=int(
+                scenario_config.get("liquidity_lookback_days", 20)
+            ),
+        )
+
+    governed_signal = governed_for(config)
     cost_model = CostModelConfig.from_mapping(config)
     policy = PortfolioPolicy(PortfolioPolicyConfig.from_mapping(config), cost_model)
     metadata = _metadata_provider(
-        industry_memberships, benchmark_weights, style_exposures, execution_metadata
+        industry_memberships,
+        benchmark_weights,
+        style_exposures,
+        execution_metadata,
+        close_history,
+        open_field=open_field,
+        close_field=close_field,
     )
+    execution_policy: dict[str, Any] | None = None
+    vwap_profile_evidence: dict[str, Any] | None = None
+    if minute_execution:
+        slice_minutes = int(config.get("execution_slice_minutes", 20))
+        max_slices = int(config.get("max_execution_slices", 24))
+        volume_profile = None
+        if execution_method == "vwap":
+            lookback_days = int(config.get("vwap_lookback_days", 20))
+            warmup_start, warmup_end = _minute_warmup_window(
+                args.execution_provider_uri,
+                args.execution_frequency,
+                periods["start"],
+                lookback_days,
+            )
+            volume_profile = _historical_vwap_profile(
+                instruments=instruments,
+                start_time=warmup_start,
+                end_time=warmup_end,
+                frequency=args.execution_frequency,
+                slice_minutes=slice_minutes,
+                max_slices=max_slices,
+            )
+            vwap_profile_evidence = {
+                "start": warmup_start,
+                "end": warmup_end,
+                "trading_days": lookback_days,
+                "profile_sha256": _canonical_sha256(volume_profile),
+                "future_data_used": False,
+            }
+        execution_policy = {
+            "execution_algorithm": execution_method,
+            "slice_minutes": slice_minutes,
+            "max_slices": max_slices,
+            "max_participation": cost_model.max_volume_participation,
+            "volume_profile": volume_profile,
+        }
 
     def run(
-        start: str, end: str, costs: CostModelConfig, account: float | None = None
+        start: str,
+        end: str,
+        costs: CostModelConfig,
+        account: float | None = None,
+        scenario_config: dict[str, Any] | None = None,
     ):
-        scenario_policy = PortfolioPolicy(PortfolioPolicyConfig.from_mapping(config), costs)
+        effective_config = {**config, **(scenario_config or {})}
+        scenario_policy = PortfolioPolicy(
+            PortfolioPolicyConfig.from_mapping(effective_config), costs
+        )
         strategy = create_qlib_policy_strategy(
-            signal=governed_signal,
+            signal=governed_for(effective_config) if scenario_config else governed_signal,
             policy=scenario_policy,
             metadata_provider=metadata,
         )
@@ -259,10 +468,53 @@ def main() -> None:
             account=float(account if account is not None else config["capacity_notional"]),
             benchmark=manifest["benchmark"],
             cost_model=costs,
-            execution_method=str(config.get("execution_method", "open")),
+            execution_method=execution_method,
+            execution_frequency=args.execution_frequency if minute_execution else None,
+            execution_policy=execution_policy,
+            instruments=instruments,
+            annual_minimum_acceptable_return=float(
+                effective_config.get("annual_minimum_acceptable_return", 0.0)
+            ),
         )
 
     formal = run(periods["start"], periods["end"], cost_model)
+
+    def write_robustness_artifacts(name: str, result: Any) -> dict[str, Any]:
+        target = output / "robustness" / name
+        target.mkdir(parents=True, exist_ok=True)
+        report_path = target / "daily_report.parquet"
+        fills_path = target / "fills.parquet"
+        metrics_path = target / "metrics.json"
+        result.report.to_parquet(report_path, compression="zstd")
+        pd.DataFrame(
+            result.fills,
+            columns=[
+                "instrument",
+                "date",
+                "side",
+                "requested_amount",
+                "amount",
+                "capacity_fill_ratio",
+                "trade_price",
+                "trade_value",
+                "cost",
+            ],
+        ).to_parquet(fills_path, index=False, compression="zstd")
+        metrics_path.write_text(
+            json.dumps(result.metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return {
+            key: {
+                "path": str(path.relative_to(output)).replace("\\", "/"),
+                "sha256": _sha256_file(path),
+            }
+            for key, path in {
+                "daily_report": report_path,
+                "fills": fills_path,
+                "metrics": metrics_path,
+            }.items()
+        }
+
     validation = run_qlib_validation_suites(
         runner=run,
         full_result=formal,
@@ -275,27 +527,47 @@ def main() -> None:
             if abs(notional - float(config["capacity_notional"])) < 1e-6
             else run(periods["start"], periods["end"], cost_model, notional)
         ),
+        robustness_runner=lambda overrides, costs: run(
+            periods["start"], periods["end"], costs, scenario_config=overrides
+        ),
+        robustness_artifact_writer=write_robustness_artifacts,
     )
     qlib_report = formal.report
     qlib_positions = formal.positions
+    net_daily_returns = pd.to_numeric(qlib_report["return"], errors="coerce") - pd.to_numeric(
+        qlib_report.get("cost", 0.0), errors="coerce"
+    )
+    deflated_sharpe = deflated_sharpe_probability(
+        net_daily_returns,
+        trials=int(manifest.get("strategy_trial_count") or 1),
+    )
     metrics = {
         **formal.metrics,
         "policy_version": policy.version,
         "cost_model": cost_model.to_dict(),
+        "eligibility": eligibility_evidence,
+        "deflated_sharpe": deflated_sharpe,
+        "deflated_sharpe_probability": deflated_sharpe["probability"],
         "execution_model": {
-            "method": str(config.get("execution_method", "open")),
+            "method": execution_method,
             "days": int(config.get("execution_days", 1)),
-            "price_assumption": (
-                "daily OHLC mean proxy"
-                if config.get("execution_method") == "twap"
-                else "daily vwap"
-                if config.get("execution_method") == "vwap"
-                else "next-day open"
+            "price_assumption": "minute bar vwap fills" if minute_execution else "next-day open",
+            "frequency": args.execution_frequency if minute_execution else "day",
+            "dataset": (
+                manifest.get("execution_dataset") if minute_execution else manifest["dataset"]
             ),
+            "contract_version": (
+                execution_provenance.get("execution_contract_version")
+                if minute_execution
+                else None
+            ),
+            "slice_minutes": execution_policy.get("slice_minutes") if execution_policy else None,
+            "max_slices": execution_policy.get("max_slices") if execution_policy else None,
+            "vwap_profile": vwap_profile_evidence,
         },
-        "robustness": {"double_cost": validation["double_cost"]},
-        "robustness_passed": validation["double_cost"]["passed"],
-        "robustness_pass_rate": 1.0 if validation["double_cost"]["passed"] else 0.0,
+        "robustness": validation["robustness"],
+        "robustness_passed": validation["robustness"]["passed"],
+        "robustness_pass_rate": validation["robustness"]["pass_rate"],
         "rolling": validation["rolling"],
         "rolling_pass_rate": validation["rolling"]["pass_rate"],
         "rolling_passed": validation["rolling"]["passed"],
@@ -311,6 +583,29 @@ def main() -> None:
             "dataset_identity_sha256": provider_provenance.get("dataset_identity_sha256"),
             "snapshot_manifest_sha256": provider_provenance.get("snapshot_manifest_sha256"),
             "qlib_builder_sha256": provider_provenance.get("qlib_builder_sha256"),
+            "field_contract_version": provider_provenance.get("field_contract_version"),
+            "source_volume_unit": provider_provenance.get("source_volume_unit"),
+            "qlib_volume_unit": provider_provenance.get("qlib_volume_unit"),
+            "source_hand_size": provider_provenance.get("source_hand_size"),
+            "lineage_verified": provider_provenance.get("lineage_verified"),
+            "source_lineage_id": provider_provenance.get("source_lineage_id"),
+            "execution_dataset_identity_sha256": execution_provenance.get(
+                "dataset_identity_sha256"
+            ),
+            "execution_snapshot_manifest_sha256": execution_provenance.get(
+                "snapshot_manifest_sha256"
+            ),
+            "execution_qlib_builder_sha256": execution_provenance.get("qlib_builder_sha256"),
+            "execution_contract_version": execution_provenance.get(
+                "execution_contract_version"
+            ),
+            "execution_fields": execution_provenance.get("fields"),
+            "execution_source_datasets": execution_provenance.get("source_datasets"),
+            "execution_source_unit_contracts": execution_provenance.get(
+                "source_unit_contracts"
+            ),
+            "execution_source_lineage_id": execution_provenance.get("source_lineage_id"),
+            "execution_lineage_verified": execution_provenance.get("lineage_verified"),
             "strategy_config_sha256": _canonical_sha256(config),
             "execution_manifest_sha256": _sha256_file(args.manifest),
             "factor_values_sha256": factor_value_hashes,
@@ -320,12 +615,27 @@ def main() -> None:
             "policy_version": policy.version,
         },
     }
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
     qlib_report.reset_index().to_parquet(output / "daily_returns.parquet", index=False)
     governed_signal.to_frame().to_parquet(output / "governed_signal.parquet")
     qlib_report.to_parquet(output / "qlib_portfolio_report.parquet")
     pd.to_pickle(qlib_positions, output / "qlib_positions.pkl")
+    pd.DataFrame(
+        formal.fills,
+        columns=[
+            "instrument",
+            "date",
+            "side",
+            "requested_amount",
+            "amount",
+            "capacity_fill_ratio",
+            "trade_price",
+            "trade_value",
+            "cost",
+        ],
+    ).to_parquet(output / "execution_fills.parquet", index=False)
+    (output / "execution_model.json").write_text(
+        json.dumps(metrics["execution_model"], ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     (output / "robustness.json").write_text(
         json.dumps(metrics["robustness"], ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -349,6 +659,8 @@ def main() -> None:
             "governed_signal": str(output / "governed_signal.parquet"),
             "qlib_portfolio_report": str(output / "qlib_portfolio_report.parquet"),
             "qlib_positions": str(output / "qlib_positions.pkl"),
+            "execution_fills": str(output / "execution_fills.parquet"),
+            "execution_model": str(output / "execution_model.json"),
             "robustness": str(output / "robustness.json"),
             "rolling": str(output / "rolling.json"),
             "event_stress": str(output / "event_stress.json"),

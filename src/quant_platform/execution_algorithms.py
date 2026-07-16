@@ -114,6 +114,17 @@ def build_execution_slices(
     return result
 
 
+def execution_time_slots(*, trade_date: date, policy: dict[str, Any]) -> list[datetime]:
+    """Return the configured intraday slice timestamps without requiring an order quantity."""
+
+    normalized = normalize_execution_policy(policy)
+    return _twap_slots(
+        trade_date,
+        int(normalized["slice_minutes"]),
+        int(normalized["max_slices"]),
+    )
+
+
 def _twap_slots(trade_date: date, interval_minutes: int, max_slices: int) -> list[datetime]:
     slots = []
     for start, end in ASHARE_SESSIONS:

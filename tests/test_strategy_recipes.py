@@ -36,6 +36,7 @@ def test_document_strategy_recipes_are_versioned_and_defensive() -> None:
         "max_industry_weight": 0.30,
         "min_average_daily_amount": 500_000_000,
         "liquidity_lookback_days": 20,
+        "require_regulatory_events": True,
         "capacity_notional": 5_000_000,
         "max_volume_participation": 0.01,
         "execution_days": 2,

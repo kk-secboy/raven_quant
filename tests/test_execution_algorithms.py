@@ -4,8 +4,11 @@ import pytest
 
 from quant_platform.execution_algorithms import (
     build_execution_slices,
+    execution_time_slots,
     normalize_execution_policy,
 )
+
+pytestmark = pytest.mark.no_database
 
 
 def test_twap_respects_ashare_sessions_lots_and_reconciliation() -> None:
@@ -85,3 +88,22 @@ def test_vwap_requires_point_in_time_profile_inside_execution_sessions() -> None
     )
     assert [item["quantity"] for item in slices] == [700, 300]
     assert [item["scheduled_for"][11:16] for item in slices] == ["10:20", "14:30"]
+
+
+def test_execution_time_slots_expose_the_same_schedule_used_for_orders() -> None:
+    slots = execution_time_slots(
+        trade_date=date(2026, 7, 13),
+        policy={"slice_minutes": 20, "max_slices": 24},
+    )
+    assert [item.strftime("%H:%M") for item in slots] == [
+        "10:00",
+        "10:20",
+        "10:40",
+        "11:00",
+        "11:20",
+        "13:30",
+        "13:50",
+        "14:10",
+        "14:30",
+        "14:50",
+    ]

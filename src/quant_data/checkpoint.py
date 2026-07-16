@@ -242,11 +242,17 @@ class CheckpointStore:
         with self.engine.connect() as connection:
             return [row_dict(row) for row in connection.execute(statement)]
 
-    def unfinished_units(self, dataset: str | None = None) -> list[dict[str, Any]]:
+    def unfinished_units(
+        self, dataset: str | set[str] | None = None
+    ) -> list[dict[str, Any]]:
         """Return auditable pending/failed rows that an updated plan may supersede."""
 
         statement = select(work_units).where(work_units.c.status.in_(("pending", "failed")))
-        if dataset:
+        if isinstance(dataset, set):
+            if not dataset:
+                return []
+            statement = statement.where(work_units.c.dataset.in_(sorted(dataset)))
+        elif dataset:
             statement = statement.where(work_units.c.dataset == dataset)
         statement = statement.order_by(work_units.c.dataset, work_units.c.unit_key)
         with self.engine.connect() as connection:

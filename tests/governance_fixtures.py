@@ -6,6 +6,7 @@ import uuid
 from datetime import date
 from pathlib import Path
 
+from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
@@ -18,7 +19,7 @@ PERIODS = {
     "train_end": date(2021, 12, 31),
     "valid_start": date(2022, 1, 1),
     "valid_end": date(2023, 12, 31),
-    "test_start": date(2024, 1, 1),
+    "test_start": date(2024, 1, 8),
     "test_end": date(2026, 7, 10),
 }
 
@@ -40,6 +41,9 @@ def passing_factor_metrics() -> dict:
         "mean_coverage_ratio": 0.95,
         "constant_day_rate": 0.0,
         "direction": "inverted",
+        "hac_p_value": 0.01,
+        "bh_q_value": 0.02,
+        "statistical_contract_version": "research-statistics-v1-hac-bh-dsr",
     }
 
 
@@ -104,6 +108,7 @@ def create_promoted_factor(
         recomputed_values_sha256=recomputed_sha256,
         recompute_evidence={
             "executor_version": "factor-recompute-v1",
+            "label_horizon_days": 1,
             "code_sha256": hashlib.sha256(code_path.read_bytes()).hexdigest(),
             "dataset_identity_sha256": DATASET_IDENTITY,
             "provider_input_sha256": "1" * 64,
@@ -121,33 +126,40 @@ def create_promoted_factor(
     )
 
 
-def create_strategy_version(database_url: str, tmp_path: Path, *, dataset: str = "snapshot") -> str:
+def create_strategy_version(
+    database_url: str,
+    tmp_path: Path,
+    *,
+    dataset: str = "snapshot",
+    config_overrides: dict | None = None,
+) -> str:
     factor = create_promoted_factor(database_url, tmp_path, dataset=dataset)
+    config = {
+        "topk": 50,
+        "n_drop": 5,
+        "max_tracking_error": 0.12,
+        "max_drawdown": 0.25,
+        "max_turnover": 0.60,
+        "min_information_ratio": 0.0,
+        "min_sharpe_ratio": 0.0,
+        "min_sortino_ratio": 0.0,
+        "min_rolling_pass_rate": 0.60,
+        "min_rolling_windows": 3,
+        "event_count": 5,
+        "min_backtest_days": 504,
+        "capacity_notional": 5_000_000,
+        "max_volume_participation": 0.01,
+        "min_commission": 5.0,
+    }
+    config.update(CostModelConfig().to_dict())
+    config.update(config_overrides or {})
     strategy = StrategyStore(database_url).create(
         name=f"strategy-{uuid.uuid4().hex}",
         description="Governed strategy fixture for v2 tests.",
         benchmark="SH000300",
         universe="cn_all",
         factors=[{"candidate_id": factor["id"], "weight": 1.0}],
-        config={
-            "topk": 50,
-            "n_drop": 5,
-            "max_tracking_error": 0.12,
-            "max_drawdown": 0.25,
-            "max_turnover": 0.60,
-            "min_information_ratio": 0.0,
-            "min_sharpe_ratio": 0.0,
-            "min_sortino_ratio": 0.0,
-            "min_rolling_pass_rate": 0.60,
-            "min_rolling_windows": 3,
-            "event_count": 5,
-            "min_backtest_days": 504,
-            "capacity_notional": 5_000_000,
-            "max_volume_participation": 0.01,
-            "min_commission": 5.0,
-            "open_cost": 0.0005,
-            "close_cost": 0.0015,
-        },
+        config=config,
         actor="test",
     )
     return str(strategy["versions"][0]["id"])
@@ -160,6 +172,26 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
             version["config"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode()
     ).hexdigest()
+    robustness_scenarios = {}
+    for name in ("double_cost", "turnover_75pct", "topk_80pct", "zero_retention_buffer"):
+        scenario_artifacts = {}
+        for artifact_name, suffix in (
+            ("daily_report", "parquet"),
+            ("fills", "parquet"),
+            ("metrics", "json"),
+        ):
+            relative = Path("robustness") / name / f"{artifact_name}.{suffix}"
+            path = manifest.parent / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"{name}:{artifact_name}".encode())
+            scenario_artifacts[artifact_name] = {
+                "path": relative.as_posix(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        robustness_scenarios[name] = {
+            "passed": True,
+            "artifacts": scenario_artifacts,
+        }
     return {
         "backtest_engine": "qlib",
         "backtest_engine_version": QLIB_ENGINE_VERSION,
@@ -172,12 +204,37 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
         "information_ratio": 1.0,
         "sharpe_ratio": 1.0,
         "sortino_ratio": 1.0,
+        "sortino_status": "ok",
+        "deflated_sharpe_probability": 0.99,
+        "deflated_sharpe": {
+            "status": "ok",
+            "probability": 0.99,
+            "trial_count": 1,
+        },
         "robustness_pass_rate": 1.0,
+        "robustness": {
+            "passed": True,
+            "pass_rate": 1.0,
+            "scenarios": robustness_scenarios,
+        },
         "rolling_pass_rate": 1.0,
         "rolling_window_count": 4,
         "event_stress_count": 5,
         "event_stress_pass_rate": 1.0,
         "event_stress_passed": True,
+        "event_stress": {
+            "state_source": "full_backtest_carried_positions",
+            "position_state_method": "formal_fill_ledger_v1",
+            "events": [
+                {
+                    "state_source": "full_backtest_carried_positions",
+                    "return_state_source": "full_backtest_report_slice",
+                    "start_holdings": {"SH600000": 100.0},
+                    "state_fill_count": 1,
+                }
+                for _ in range(5)
+            ],
+        },
         "closed_trade_count": 40,
         "win_rate": 0.55,
         "average_win": 100.0,
@@ -195,10 +252,24 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
             "passed": True,
         },
         "trading_days": 600,
+        "eligibility": {
+            "contract_version": "ashare-point-in-time-eligibility-v1",
+            "rows": 1000,
+            "eligible_rows": 800,
+            "regulatory_data_available": True,
+        },
         "provenance": {
+            "frequency": "day",
             "dataset_identity_sha256": DATASET_IDENTITY,
             "snapshot_manifest_sha256": "b" * 64,
             "qlib_builder_sha256": "c" * 64,
+            "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+            "source_volume_unit": "hand",
+            "qlib_volume_unit": "share",
+            "source_hand_size": 100,
+            "index_volume_policy": "excluded_non_tradable_benchmark",
+            "lineage_verified": True,
+            "source_lineage_id": "9" * 64,
             "strategy_config_sha256": config_hash,
             "execution_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
             "factor_values_sha256": {

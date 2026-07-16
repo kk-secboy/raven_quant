@@ -120,7 +120,7 @@ def _evaluation_evidence(
 class FactorGatePolicy:
     """Versioned, deterministic admission policy for production factor candidates."""
 
-    version: str = "factor-gate-v2"
+    version: str = "factor-gate-v3-hac-bh"
     min_abs_ic: float = 0.02
     min_abs_icir: float = 0.50
     min_abs_rank_ic: float = 0.025
@@ -129,6 +129,7 @@ class FactorGatePolicy:
     max_correlation: float = 0.75
     min_cost_adjusted_return: float = 0.0
     min_selection_days: int = 100
+    max_bh_q_value: float = 0.10
 
     def evaluate(self, metrics: dict[str, float | None]) -> tuple[str, list[str]]:
         checks = (
@@ -182,6 +183,16 @@ class FactorGatePolicy:
                 "constant_day_rate",
                 lambda value: value <= 0.05,
                 "constant factor days <= 0.05",
+            ),
+            (
+                "hac_p_value",
+                lambda value: 0 <= value <= self.max_bh_q_value,
+                f"HAC p-value <= {self.max_bh_q_value}",
+            ),
+            (
+                "bh_q_value",
+                lambda value: 0 <= value <= self.max_bh_q_value,
+                f"BH-FDR q-value <= {self.max_bh_q_value}",
             ),
         )
         reasons: list[str] = []
@@ -349,6 +360,9 @@ class ResearchStore:
         code_sha256: str | None,
         rdagent_decision: bool | None,
         rdagent_feedback: str | None,
+        experiment_family_id: str | None = None,
+        label_horizon_days: int = 1,
+        experiment_count: int = 1,
         actor: str = "rdagent-importer",
     ) -> dict[str, Any]:
         candidate_id = uuid.uuid4().hex
@@ -357,6 +371,9 @@ class ResearchStore:
         requires_artifacts = rdagent_decision is not False
         actual_code_sha256 = _artifact_hash(code_path, "factor code", required=requires_artifacts)
         values_sha256 = _artifact_hash(values_path, "factor values", required=requires_artifacts)
+        family_id = str(experiment_family_id or run_id).strip()
+        if not family_id or label_horizon_days < 1 or experiment_count < 1:
+            raise ValueError("factor experiment family, label horizon and count are required")
         if code_sha256 and actual_code_sha256 and code_sha256 != actual_code_sha256:
             raise ValueError("factor code artifact does not match RD-Agent SHA-256")
         try:
@@ -371,6 +388,9 @@ class ResearchStore:
                         variables_json=variables,
                         status=status,
                         source_iteration=source_iteration,
+                        experiment_family_id=family_id,
+                        label_horizon_days=label_horizon_days,
+                        experiment_count=experiment_count,
                         code_path=code_path,
                         values_path=values_path,
                         code_sha256=actual_code_sha256,
@@ -453,9 +473,19 @@ class ResearchStore:
         if not _is_sha256(dataset_identity_sha256):
             raise ValueError("factor evaluation requires immutable dataset identity")
         candidate = self.get_candidate(candidate_id)
+        embargo_days = max(5, int(candidate["label_horizon_days"]))
+        if (test_start - valid_end).days <= embargo_days:
+            raise ValueError(
+                f"reserved final test requires purge/embargo gap greater than {embargo_days} days"
+            )
         if candidate["status"] in {"promoted", "retired"}:
             raise ValueError(f"cannot evaluate candidate in {candidate['status']} state")
         gate_status, reasons = self.policy.evaluate(metrics)
+        if metrics.get("statistical_contract_version") not in {
+            None,
+            "research-statistics-v1-hac-bh-dsr",
+        }:
+            raise ValueError("factor statistical contract is obsolete")
         current_code_sha256 = _artifact_hash(
             candidate.get("code_path"), "factor code", required=True
         )
@@ -479,6 +509,10 @@ class ResearchStore:
             raise ValueError("factor recomputation evidence is not bound to authoritative values")
         if recompute_evidence.get("executor_version") != "factor-recompute-v1":
             raise ValueError("factor recomputation evidence has an unsupported executor version")
+        if int(recompute_evidence.get("label_horizon_days") or 0) != int(
+            candidate["label_horizon_days"]
+        ):
+            raise ValueError("factor recomputation evidence has the wrong label horizon")
         if not recompute_evidence.get("provider_input_sha256"):
             raise ValueError("factor recomputation evidence is not bound to provider input")
         expected_periods = {
@@ -576,6 +610,9 @@ class ResearchStore:
                     submitted_values_sha256=submitted_values_sha256,
                     recomputed_values_sha256=actual_recomputed_sha256,
                     recompute_evidence_json=recompute_evidence,
+                    hac_p_value=metrics.get("hac_p_value"),
+                    bh_q_value=metrics.get("bh_q_value"),
+                    statistical_contract_version="research-statistics-v1-hac-bh-dsr",
                     metrics_sha256=metrics_sha256,
                     policy_json=policy,
                     policy_sha256=policy_sha256,

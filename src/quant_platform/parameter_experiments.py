@@ -60,17 +60,27 @@ def normalize_parameter_grid(
     return normalized, trials
 
 
-def split_research_period(start: date, end: date) -> dict[str, dict[str, str]]:
+def split_research_period(
+    start: date, end: date, *, label_horizon_days: int = 1
+) -> dict[str, Any]:
     days = (end - start).days
     if days < 126:
         raise ValueError("parameter experiments require at least 126 calendar days")
+    if label_horizon_days < 1:
+        raise ValueError("label horizon must be positive")
     split = start + timedelta(days=round(days * 0.60))
+    embargo = max(5, label_horizon_days)
     return {
-        "in_sample": {"start": start.isoformat(), "end": split.isoformat()},
+        "in_sample": {
+            "start": start.isoformat(),
+            "end": (split - timedelta(days=label_horizon_days)).isoformat(),
+        },
         "out_of_sample": {
-            "start": (split + timedelta(days=1)).isoformat(),
+            "start": (split + timedelta(days=embargo)).isoformat(),
             "end": end.isoformat(),
         },
+        "purge_days": label_horizon_days,
+        "embargo_days": embargo,
     }
 
 
@@ -91,6 +101,7 @@ def evaluate_trial(
     oos_drawdown = abs(_number(out_of_sample, "max_drawdown"))
     oos_turnover = _number(out_of_sample, "average_turnover")
     robustness = _number(out_of_sample, "robustness_pass_rate")
+    deflated_sharpe = _number(out_of_sample, "deflated_sharpe_probability")
     score = oos_ir + 0.50 * oos_excess + 0.25 * robustness - 0.50 * oos_drawdown
     score -= 0.10 * oos_turnover
     warnings: list[str] = []
@@ -102,17 +113,28 @@ def evaluate_trial(
         warnings.append("oos_drawdown_high")
     if robustness < 0.60:
         warnings.append("oos_robustness_low")
+    if deflated_sharpe < 0.95:
+        warnings.append("deflated_sharpe_failed")
     return round(score, 8), warnings
 
 
 def summarize_trials(
     trials: list[dict[str, Any]], parameter_grid: dict[str, list[int | float]]
 ) -> dict[str, Any]:
-    successful = [item for item in trials if item.get("status") == "succeeded"]
+    successful = [
+        item
+        for item in trials
+        if item.get("status") == "succeeded"
+        and _number(
+            (item.get("metrics") or {}).get("out_of_sample", {}),
+            "deflated_sharpe_probability",
+        )
+        >= 0.95
+    ]
     ranked = sorted(successful, key=lambda item: float(item.get("score", -math.inf)), reverse=True)
     warnings: list[str] = []
-    if len(trials) >= 20:
-        warnings.append("multiple_testing_risk")
+    if any(item.get("status") == "succeeded" for item in trials) and not successful:
+        warnings.append("all_trials_failed_deflated_sharpe")
     if len(ranked) >= 2 and float(ranked[0]["score"]) - float(ranked[1]["score"]) < 0.05:
         warnings.append("fragile_ranking")
     if ranked:
@@ -129,6 +151,10 @@ def summarize_trials(
         "trial_count": len(trials),
         "succeeded_count": len(successful),
         "failed_count": len(trials) - len(successful),
+        "statistically_rejected_count": sum(
+            item.get("status") == "succeeded" for item in trials
+        )
+        - len(successful),
         "best_trial_index": ranked[0]["trial_index"] if ranked else None,
         "best_parameters": best_parameters,
         "warnings": warnings,
@@ -155,6 +181,7 @@ def _compact_metrics(metrics: dict[str, Any]) -> dict[str, float | int | bool | 
         "max_drawdown",
         "average_turnover",
         "robustness_pass_rate",
+        "deflated_sharpe_probability",
         "trading_days",
     )
     return {key: metrics.get(key) for key in keys}

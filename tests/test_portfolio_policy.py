@@ -4,7 +4,7 @@ import types
 import pandas as pd
 import pytest
 
-from quant_platform.cost_model import CostModelConfig
+from quant_platform.cost_model import CostModelConfig, infer_cn_asset_type
 from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
 
 pytestmark = pytest.mark.no_database
@@ -30,7 +30,9 @@ def test_policy_enforces_position_and_turnover_caps() -> None:
 def test_cost_model_is_shared_and_doubles_every_variable_cost() -> None:
     costs = CostModelConfig()
     assert costs.buy_commission_rate == pytest.approx(0.0005)
-    assert costs.sell_commission_rate == pytest.approx(0.0015)
+    assert costs.sell_commission_rate == pytest.approx(0.0005)
+    assert costs.stock_sell_stamp_duty_rate == pytest.approx(0.0010)
+    assert costs.etf_sell_stamp_duty_rate == pytest.approx(0.0)
     assert costs.max_volume_participation == pytest.approx(0.01)
     assert costs.market_impact_rate(0.01) == pytest.approx(0.0010)
     assert costs.factor_screening_rate(reference_order_value=100_000) == pytest.approx(0.005)
@@ -39,6 +41,43 @@ def test_cost_model_is_shared_and_doubles_every_variable_cost() -> None:
     assert doubled.fixed_slippage_rate == pytest.approx(0.0010)
     assert doubled.impact_at_max_participation == pytest.approx(0.0020)
     assert doubled.min_commission == pytest.approx(10.0)
+
+
+def test_cost_schedule_is_asset_and_effective_date_specific() -> None:
+    costs = CostModelConfig(effective_from="2025-01-01", effective_to="2025-12-31")
+    stock = costs.estimate_breakdown(
+        side="sell",
+        gross_value=100_000,
+        participation=0,
+        asset_type="stock",
+        trade_date=pd.Timestamp("2025-06-03").date(),
+    )
+    etf = costs.estimate_breakdown(
+        side="sell",
+        gross_value=100_000,
+        participation=0,
+        asset_type="etf",
+        trade_date=pd.Timestamp("2025-06-03").date(),
+    )
+    assert stock["stamp_duty"] == pytest.approx(100.0)
+    assert etf["stamp_duty"] == pytest.approx(0.0)
+    assert stock["total"] - etf["total"] == pytest.approx(100.0)
+    with pytest.raises(ValueError, match="no effective cost schedule"):
+        costs.estimate(
+            side="buy",
+            gross_value=100_000,
+            participation=0,
+            trade_date=pd.Timestamp("2024-12-31").date(),
+        )
+
+
+def test_chinese_asset_type_classifier_distinguishes_stock_and_etf() -> None:
+    assert infer_cn_asset_type("SH600000") == "stock"
+    assert infer_cn_asset_type("SZ000001") == "stock"
+    assert infer_cn_asset_type("SH510300") == "etf"
+    assert infer_cn_asset_type("SZ159919") == "etf"
+    with pytest.raises(ValueError, match="cannot classify"):
+        infer_cn_asset_type("UNKNOWN")
 
 
 def test_same_policy_inputs_produce_identical_targets() -> None:

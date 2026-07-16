@@ -6,6 +6,7 @@ import pytest
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.qlib_backtest import (
     QlibBacktestResult,
+    calculate_qlib_metrics,
     calculate_trade_metrics,
     run_qlib_validation_suites,
 )
@@ -13,11 +14,20 @@ from quant_platform.qlib_backtest import (
 pytestmark = pytest.mark.no_database
 
 
-def _result(report: pd.DataFrame, excess: float = 0.10) -> QlibBacktestResult:
+def _result(
+    report: pd.DataFrame,
+    excess: float = 0.10,
+    fills: list[dict] | None = None,
+) -> QlibBacktestResult:
     return QlibBacktestResult(
-        metrics={"annualized_excess_return": excess, "max_drawdown": -0.10},
+        metrics={
+            "annualized_excess_return": excess,
+            "max_drawdown": -0.10,
+            "capacity_fill_ratio": 1.0,
+        },
         report=report,
         positions=None,
+        fills=fills or [],
     )
 
 
@@ -25,7 +35,7 @@ def test_event_stress_requires_results_to_pass_not_only_event_count() -> None:
     dates = pd.bdate_range("2024-01-02", periods=100)
     full_report = pd.DataFrame(
         {
-            "return": 0.0,
+            "return": -0.01,
             "cost": 0.0,
             "bench": [-0.03 if index in {30, 70} else 0.001 for index in range(len(dates))],
             "turnover": 0.0,
@@ -43,7 +53,17 @@ def test_event_stress_requires_results_to_pass_not_only_event_count() -> None:
 
     validation = run_qlib_validation_suites(
         runner=runner,
-        full_result=_result(full_report),
+        full_result=_result(
+            full_report,
+            fills=[
+                {
+                    "instrument": "SH600000",
+                    "date": "2024-01-03 10:00:00",
+                    "side": "buy",
+                    "amount": 100.0,
+                }
+            ],
+        ),
         start_time="2024-01-02",
         end_time=dates[-1].date().isoformat(),
         cost_model=CostModelConfig(),
@@ -63,6 +83,66 @@ def test_event_stress_requires_results_to_pass_not_only_event_count() -> None:
     assert event_stress["pass_rate"] == 0.0
     assert event_stress["passed"] is False
     assert {item["status"] for item in event_stress["events"]} == {"failed"}
+    assert {item["state_source"] for item in event_stress["events"]} == {
+        "full_backtest_carried_positions"
+    }
+    assert event_stress["position_state_method"] == "formal_fill_ledger_v1"
+    assert all(item["start_holdings"] == {"SH600000": 100.0} for item in event_stress["events"])
+
+
+def test_sortino_uses_target_shortfall_not_std_of_negative_observations() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=40)
+    report = pd.DataFrame(
+        {"return": -0.01, "cost": 0.0, "bench": 0.0, "turnover": 0.0},
+        index=dates,
+    )
+
+    metrics = calculate_qlib_metrics(report)
+
+    assert metrics["sortino_status"] == "ok"
+    assert metrics["annualized_downside_deviation"] == pytest.approx(0.01 * 252**0.5)
+    assert metrics["sortino_ratio"] == pytest.approx(-252**0.5)
+
+
+def test_robustness_runs_all_four_configured_scenarios() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=80)
+    report = pd.DataFrame(
+        {"return": 0.001, "cost": 0.0, "bench": 0.0, "turnover": 0.0}, index=dates
+    )
+    seen: list[dict] = []
+
+    def runner(start: str, end: str, _costs: CostModelConfig) -> QlibBacktestResult:
+        return _result(report.loc[start:end])
+
+    def robustness(overrides: dict, _costs: CostModelConfig) -> QlibBacktestResult:
+        seen.append(overrides)
+        return _result(report)
+
+    validation = run_qlib_validation_suites(
+        runner=runner,
+        full_result=_result(report),
+        start_time=dates[0].date().isoformat(),
+        end_time=dates[-1].date().isoformat(),
+        cost_model=CostModelConfig(),
+        config={
+            "topk": 50,
+            "n_drop": 5,
+            "max_daily_turnover": 0.20,
+            "event_count": 0,
+            "min_robustness_pass_rate": 1.0,
+        },
+        robustness_runner=robustness,
+    )
+
+    assert seen == [
+        {},
+        {"max_daily_turnover": pytest.approx(0.15)},
+        {"topk": 40, "n_drop": 5},
+        {"n_drop": 0},
+    ]
+    assert validation["robustness"]["scenario_count"] == 4
+    assert validation["robustness"]["pass_rate"] == 1.0
+    assert validation["robustness"]["passed"] is True
 
 
 def test_trade_metrics_report_win_rate_and_profit_loss_ratio() -> None:
@@ -134,6 +214,33 @@ def test_capacity_curve_repeats_formal_runner_at_three_notionals() -> None:
     )
     assert notionals == [5_000_000.0, 20_000_000.0, 100_000_000.0]
     assert validation["capacity"]["passed"] is True
+
+
+def test_capacity_curve_fails_when_minute_fill_ratio_is_below_gate() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=80)
+    report = pd.DataFrame(
+        {"return": 0.001, "cost": 0.0, "bench": 0.0, "turnover": 0.0}, index=dates
+    )
+
+    def runner(start: str, end: str, _costs: CostModelConfig) -> QlibBacktestResult:
+        return _result(report.loc[start:end])
+
+    def capacity_runner(_notional: float) -> QlibBacktestResult:
+        result = _result(report, excess=0.05)
+        result.metrics["capacity_fill_ratio"] = 0.80
+        return result
+
+    validation = run_qlib_validation_suites(
+        runner=runner,
+        full_result=_result(report),
+        start_time=dates[0].date().isoformat(),
+        end_time=dates[-1].date().isoformat(),
+        cost_model=CostModelConfig(),
+        config={"event_count": 0, "min_capacity_fill_ratio": 0.95},
+        capacity_runner=capacity_runner,
+    )
+    assert validation["capacity"]["passed"] is False
+    assert validation["capacity"]["minimum_fill_ratio"] == pytest.approx(0.95)
 
 
 def test_capacity_curve_accepts_zero_when_zero_is_the_configured_floor() -> None:

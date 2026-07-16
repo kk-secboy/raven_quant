@@ -4,6 +4,10 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from quant_data.execution_contract import (
+    MINUTE_EXECUTION_CONTRACT_VERSION,
+    MINUTE_SOURCE_UNIT_CONTRACTS,
+)
 from quant_data.minute_qlib_builder import MINUTE_QLIB_FIELDS, MinuteQlibBuilder
 
 pytestmark = pytest.mark.no_database
@@ -37,6 +41,18 @@ def _snapshot(tmp_path: Path, *, frequency: str = "1min") -> Path:
             },
         ]
     ).to_parquet(target / "bars.parquet")
+    limits = snapshot / "parquet" / "stk_limit" / "partition_year=2024"
+    limits.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "510300.SH",
+                "trade_date": "2024-01-02",
+                "up_limit": 3.85,
+                "down_limit": 3.15,
+            }
+        ]
+    ).to_parquet(limits / "limits.parquet")
     (snapshot / "manifest.json").write_text(
         json.dumps(
             {
@@ -44,7 +60,10 @@ def _snapshot(tmp_path: Path, *, frequency: str = "1min") -> Path:
                 "lineage_id": "a" * 64,
                 "start_date": "2024-01-02",
                 "end_date": "2024-01-02",
-                "datasets": {"etf_1m": {"source_sha256": "b" * 64}},
+                "datasets": {
+                    "etf_1m": {"source_sha256": "b" * 64},
+                    "stk_limit": {"source_sha256": "c" * 64},
+                },
             }
         ),
         encoding="utf-8",
@@ -61,6 +80,8 @@ def test_builds_minute_qlib_staging_from_execution_snapshot(tmp_path: Path) -> N
     assert frame["symbol"].tolist() == ["SH510300", "SH510300"]
     assert frame["date"].dt.strftime("%H:%M").tolist() == ["09:31", "09:32"]
     assert frame["vwap"].tolist() == pytest.approx([3.51, 3.53])
+    assert frame["up_limit"].tolist() == pytest.approx([3.85, 3.85])
+    assert frame["down_limit"].tolist() == pytest.approx([3.15, 3.15])
     assert pd.isna(frame["change"].iloc[0])
     assert frame["change"].iloc[1] == pytest.approx(3.53 / 3.51 - 1)
     assert set(MINUTE_QLIB_FIELDS).issubset(frame.columns)
@@ -97,7 +118,31 @@ def test_builds_staging_from_minute_datasets_with_different_source_columns(
 
     future = pd.read_parquet(by_symbol / "CFXIF2401.parquet")
     assert future["oi"].tolist() == [80000.0]
+    assert future["vwap"].tolist() == [3300.5]
     assert (by_symbol / "SH510300.parquet").is_file()
+
+
+def test_zero_volume_minute_is_marked_paused(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    source = next((snapshot / "parquet" / "etf_1m").rglob("*.parquet"))
+    frame = pd.read_parquet(source)
+    frame.loc[len(frame)] = {
+        "ts_code": "510300.SH",
+        "trade_time": "2024-01-02 09:33:00",
+        "open": 3.53,
+        "high": 3.53,
+        "low": 3.53,
+        "close": 3.53,
+        "vol": 0,
+        "amount": 0,
+    }
+    frame.to_parquet(source, index=False)
+
+    by_symbol = MinuteQlibBuilder(snapshot).build_staging(tmp_path / "paused-staging")
+    result = pd.read_parquet(by_symbol / "SH510300.parquet")
+
+    assert result["paused"].tolist() == [0.0, 0.0, 1.0]
+    assert result["vwap"].iloc[-1] == pytest.approx(3.53)
 
 
 def test_rejects_non_minute_snapshot(tmp_path: Path) -> None:
@@ -141,3 +186,19 @@ def test_five_minute_snapshot_uses_native_qlib_frequency(
         (qlib_dir / "metadata" / "provenance.json").read_text(encoding="utf-8")
     )
     assert provenance["frequency"] == "5min"
+    assert provenance["execution_contract_version"] == MINUTE_EXECUTION_CONTRACT_VERSION
+    assert provenance["source_datasets"] == ["etf_1m"]
+    assert provenance["source_unit_contracts"] == {
+        "etf_1m": MINUTE_SOURCE_UNIT_CONTRACTS["etf_1m"]
+    }
+
+
+def test_rejects_stock_or_etf_amount_volume_unit_mismatch(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    source = next((snapshot / "parquet" / "etf_1m").rglob("*.parquet"))
+    frame = pd.read_parquet(source)
+    frame["vol"] *= 100
+    frame.to_parquet(source, index=False)
+
+    with pytest.raises(RuntimeError, match="share-volume/CNY-amount"):
+        MinuteQlibBuilder(snapshot).build_staging(tmp_path / "invalid-units")

@@ -241,13 +241,19 @@ def test_api_creates_bounded_rdagent_research_run(
     (dataset / "metadata").mkdir()
     (dataset / "metadata" / "provenance.json").write_text(
         json.dumps(
-            {
-                "dataset_identity_sha256": "a" * 64,
-                "snapshot_manifest_sha256": "b" * 64,
-                "qlib_builder_sha256": "c" * 64,
-                "dataset_lineage_id": "lineage-research",
-                "lineage_verified": True,
-            }
+                {
+                    "frequency": "day",
+                    "dataset_identity_sha256": "a" * 64,
+                    "snapshot_manifest_sha256": "b" * 64,
+                    "qlib_builder_sha256": "c" * 64,
+                    "dataset_lineage_id": "lineage-research",
+                    "field_contract_version": "daily-qlib-field-v2-share-volume",
+                    "source_volume_unit": "hand",
+                    "qlib_volume_unit": "share",
+                    "source_hand_size": 100,
+                    "index_volume_policy": "excluded_non_tradable_benchmark",
+                    "lineage_verified": True,
+                }
         ),
         encoding="utf-8",
     )

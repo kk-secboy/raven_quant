@@ -4,6 +4,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
+
+from .risk_math import COVARIANCE_MODEL_VERSION, regularize_covariance
 
 
 def _capped(weights: np.ndarray, maximum: float) -> np.ndarray:
@@ -30,22 +33,58 @@ def _capped(weights: np.ndarray, maximum: float) -> np.ndarray:
     return values / values.sum()
 
 
-def _risk_parity(covariance: np.ndarray, maximum: float) -> np.ndarray:
+def _risk_parity(
+    covariance: np.ndarray, maximum: float, *, tolerance: float = 0.02
+) -> tuple[np.ndarray, dict[str, Any]]:
     count = covariance.shape[0]
-    weights = np.ones(count, dtype=float) / count
-    for _ in range(1000):
+    target = np.full(count, 1.0 / count, dtype=float)
+
+    def contributions(weights: np.ndarray) -> np.ndarray:
         marginal = covariance @ weights
         variance = float(weights @ marginal)
-        if variance <= 0:
-            raise ValueError("strategy covariance does not define positive portfolio risk")
-        contributions = weights * marginal
-        target = variance / count
-        updated = weights * np.sqrt(target / np.clip(contributions, 1e-12, None))
-        updated = _capped(updated, maximum)
-        if np.max(np.abs(updated - weights)) < 1e-10:
-            return updated
-        weights = updated
-    return weights
+        if variance <= 0 or not np.isfinite(variance):
+            return np.full(count, np.nan)
+        return weights * marginal / variance
+
+    def objective(weights: np.ndarray) -> float:
+        measured = contributions(weights)
+        if not np.isfinite(measured).all():
+            return 1e12
+        return float(np.square(measured - target).sum())
+
+    initial = _capped(1.0 / np.sqrt(np.diag(covariance)), maximum)
+    result = minimize(
+        objective,
+        initial,
+        method="SLSQP",
+        bounds=[(0.0, maximum)] * count,
+        constraints={"type": "eq", "fun": lambda weights: float(weights.sum() - 1.0)},
+        options={"ftol": 1e-12, "maxiter": 2000, "disp": False},
+    )
+    weights = np.asarray(result.x, dtype=float)
+    measured = contributions(weights)
+    error = float(np.max(np.abs(measured - target))) if np.isfinite(measured).all() else np.inf
+    if (
+        not result.success
+        or not np.isfinite(weights).all()
+        or abs(float(weights.sum()) - 1.0) > 1e-7
+        or float(weights.min()) < -1e-9
+        or float(weights.max()) > maximum + 1e-7
+        or not np.isfinite(measured).all()
+        or float(measured.min()) < -1e-8
+        or error > tolerance
+    ):
+        raise ValueError(
+            "risk parity optimization did not produce a feasible equal-risk allocation; "
+            "use inverse_volatility or fixed weights"
+        )
+    return weights, {
+        "success": True,
+        "message": str(result.message),
+        "iterations": int(result.nit),
+        "maximum_risk_budget_error": error,
+        "risk_budget_tolerance": tolerance,
+    }
 
 
 def analyze_strategy_allocation(
@@ -92,9 +131,16 @@ def analyze_strategy_allocation(
         raise ValueError(
             f"strategy correlation {highest_correlation:.4f} exceeds {max_pairwise_correlation:.4f}"
         )
-    covariance = frame.cov().to_numpy(dtype=float) * 252.0
+    covariance = regularize_covariance(frame.cov().to_numpy(dtype=float)) * 252.0
+    solver: dict[str, Any] = {
+        "success": True,
+        "message": "closed-form allocation",
+        "iterations": 0,
+        "maximum_risk_budget_error": None,
+        "risk_budget_tolerance": None,
+    }
     if method == "risk_parity":
-        base_weights = _risk_parity(covariance, max_strategy_weight)
+        base_weights, solver = _risk_parity(covariance, max_strategy_weight)
     elif method == "inverse_volatility":
         inverse = 1.0 / (daily_volatility.to_numpy(dtype=float) * np.sqrt(252.0))
         base_weights = _capped(inverse, max_strategy_weight)
@@ -129,6 +175,8 @@ def analyze_strategy_allocation(
         "portfolio_volatility": portfolio_volatility,
         "target_volatility": target_volatility,
         "exposure_scale": exposure_scale,
+        "covariance_model_version": COVARIANCE_MODEL_VERSION,
+        "solver": solver,
         "cash_weight": 1.0 - float(target_weights.sum()),
         "members": {
             column: {

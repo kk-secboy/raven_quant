@@ -23,7 +23,14 @@ from quant_data.database import (
     strategy_pairs,
     strategy_versions,
 )
+from quant_data.execution_contract import (
+    require_daily_qlib_contract,
+    require_minute_execution_contract,
+)
+from quant_platform.cost_model import COST_SCHEDULE_VERSION, CostModelConfig
+from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
 from quant_platform.pair_trading import PairTradingConfig
+from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 
 
 def _now() -> datetime:
@@ -82,6 +89,7 @@ def _multifactor_manifest_failures(
     for field, expected in (
         ("strategy_version_id", version.get("id")),
         ("dataset", backtest.get("dataset")),
+        ("execution_dataset", backtest.get("execution_dataset")),
         ("benchmark", version.get("benchmark")),
     ):
         if manifest.get(field) != expected:
@@ -193,7 +201,7 @@ class StrategyStore:
             if (
                 evaluation.gate_status != "passed"
                 or evaluation.is_legacy
-                or not str(evaluation.evaluator_version).startswith("factor-gate-v2")
+                or str(evaluation.evaluator_version) != "factor-gate-v3-hac-bh"
                 or evaluation.evidence_sha256 != candidate.promotion_evidence_sha256
                 or not _is_sha256(evaluation.evidence_sha256)
             ):
@@ -622,6 +630,9 @@ class StrategyStore:
                     factor_candidates.c.code_path,
                     factor_candidates.c.values_path,
                     factor_candidates.c.code_sha256,
+                    factor_candidates.c.experiment_family_id,
+                    factor_candidates.c.label_horizon_days,
+                    factor_candidates.c.experiment_count,
                 )
                 .join(
                     factor_candidates,
@@ -660,10 +671,12 @@ class StrategyStore:
                     raise ValueError("a frozen strategy version may run the final test only once")
                 factor_windows = connection.execute(
                     select(
+                        factor_evaluations.c.id,
                         factor_evaluations.c.dataset,
                         factor_evaluations.c.test_start,
                         factor_evaluations.c.test_end,
                         factor_evaluations.c.evaluator_version,
+                        factor_evaluations.c.final_test_consumed_at,
                     )
                     .join(
                         strategy_factors,
@@ -675,13 +688,28 @@ class StrategyStore:
                 requested_end = date.fromisoformat(periods["end"])
                 if not factor_windows or any(
                     item.dataset != dataset
-                    or not str(item.evaluator_version).startswith("factor-gate-v2")
+                    or str(item.evaluator_version) != "factor-gate-v3-hac-bh"
                     or requested_start != item.test_start
                     or requested_end != item.test_end
                     for item in factor_windows
                 ):
                     raise ValueError(
                         "formal backtest must exactly match the reserved final-test window"
+                    )
+                if any(item.final_test_consumed_at is not None for item in factor_windows):
+                    raise ValueError("reserved final test has already been consumed")
+                consumed_at = _now()
+                for item in factor_windows:
+                    key = hashlib.sha256(
+                        f"{version_id}:{item.id}:{dataset}:{periods['start']}:{periods['end']}".encode()
+                    ).hexdigest()
+                    connection.execute(
+                        update(factor_evaluations)
+                        .where(
+                            factor_evaluations.c.id == item.id,
+                            factor_evaluations.c.final_test_consumed_at.is_(None),
+                        )
+                        .values(final_test_key=key, final_test_consumed_at=consumed_at)
                     )
             connection.execute(
                 insert(backtest_runs).values(
@@ -887,6 +915,8 @@ class StrategyStore:
                 failures.append(f"{name} is required for pair strategy approval")
         if metrics.get("open_position_at_end") is not False:
             failures.append("pair backtest must finish without an open spread position")
+        if metrics.get("cost_schedule_version") != COST_SCHEDULE_VERSION:
+            failures.append("pair backtest cost schedule is missing or obsolete")
         provenance = metrics.get("provenance")
         if not isinstance(provenance, dict):
             failures.append("reproducible pair backtest provenance is required")
@@ -995,6 +1025,11 @@ class StrategyStore:
                 config.get("min_sortino_ratio", 0.0),
                 "min",
             ),
+            "deflated_sharpe_probability": (
+                metrics.get("deflated_sharpe_probability"),
+                0.95,
+                "min",
+            ),
             "robustness_pass_rate": (metrics.get("robustness_pass_rate"), 1.0, "min"),
             "rolling_pass_rate": (
                 metrics.get("rolling_pass_rate"),
@@ -1042,6 +1077,13 @@ class StrategyStore:
                 "min",
             ),
         }
+        execution_method = str(config.get("execution_method", "open"))
+        if execution_method in {"twap", "vwap"}:
+            checks["capacity_fill_ratio"] = (
+                metrics.get("capacity_fill_ratio"),
+                config.get("min_capacity_fill_ratio", 0.95),
+                "min",
+            )
         failures = []
         if (
             metrics.get("backtest_engine") != "qlib"
@@ -1068,13 +1110,25 @@ class StrategyStore:
                     failures.append(f"provenance {field} does not match strategy factors")
                 elif not all(_is_sha256(value) for value in hashes.values()):
                     failures.append(f"provenance {field} contains an invalid SHA-256 digest")
+            if execution_method in {"twap", "vwap"}:
+                for field in (
+                    "execution_dataset_identity_sha256",
+                    "execution_snapshot_manifest_sha256",
+                    "execution_qlib_builder_sha256",
+                ):
+                    if not _is_sha256(provenance.get(field)):
+                        failures.append(f"provenance {field} must be a SHA-256 digest")
             if (
                 not str(provenance.get("qlib_version") or "").strip()
                 or provenance.get("qlib_version") == "unknown"
             ):
                 failures.append("provenance qlib_version is required")
-            if not str(provenance.get("backtest_engine_version") or "").strip():
-                failures.append("backtest engine version is required")
+            try:
+                require_daily_qlib_contract(provenance)
+            except ValueError as exc:
+                failures.append(str(exc))
+            if provenance.get("backtest_engine_version") != QLIB_ENGINE_VERSION:
+                failures.append("backtest engine version is obsolete or inconsistent")
             if not str(provenance.get("policy_version") or "").strip():
                 failures.append("PortfolioPolicy provenance is required")
         if not isinstance(provenance, dict) or metrics.get("policy_version") != provenance.get(
@@ -1083,11 +1137,143 @@ class StrategyStore:
             failures.append("PortfolioPolicy version is missing or inconsistent")
         if metrics.get("event_stress_passed") is not True:
             failures.append("event stress scenarios did not satisfy the configured result gate")
+        if (metrics.get("event_stress") or {}).get("state_source") != (
+            "full_backtest_carried_positions"
+        ):
+            failures.append("event stress did not inherit the formal backtest state")
+        event_stress = metrics.get("event_stress") or {}
+        event_items = event_stress.get("events")
+        if (
+            event_stress.get("position_state_method") != "formal_fill_ledger_v1"
+            or not isinstance(event_items, list)
+            or len(event_items) < int(config.get("event_count", 5))
+            or any(
+                not isinstance(item, dict)
+                or item.get("state_source") != "full_backtest_carried_positions"
+                or item.get("return_state_source") != "full_backtest_report_slice"
+                or not isinstance(item.get("start_holdings"), dict)
+                or not isinstance(item.get("state_fill_count"), int)
+                for item in event_items
+            )
+        ):
+            failures.append("event stress carried-position evidence is incomplete")
+        robustness = metrics.get("robustness")
+        if (
+            not isinstance(robustness, dict)
+            or robustness.get("passed") is not True
+            or robustness.get("pass_rate") != 1.0
+            or set(robustness.get("scenarios") or {})
+            != {"double_cost", "turnover_75pct", "topk_80pct", "zero_retention_buffer"}
+        ):
+            failures.append("all four independent robustness scenarios are required")
+        else:
+            artifact_root = Path(backtests[0]["artifact_path"]).resolve()
+            for scenario_name, scenario in robustness["scenarios"].items():
+                artifacts = scenario.get("artifacts") if isinstance(scenario, dict) else None
+                valid_artifacts = isinstance(artifacts, dict) and set(artifacts) == {
+                    "daily_report",
+                    "fills",
+                    "metrics",
+                }
+                if valid_artifacts:
+                    for entry in artifacts.values():
+                        if not isinstance(entry, dict) or not _is_sha256(entry.get("sha256")):
+                            valid_artifacts = False
+                            break
+                        try:
+                            artifact_path = (artifact_root / str(entry["path"])).resolve()
+                            artifact_path.relative_to(artifact_root)
+                        except (KeyError, ValueError):
+                            valid_artifacts = False
+                            break
+                        if (
+                            not artifact_path.is_file()
+                            or _sha256_file(artifact_path) != entry["sha256"]
+                        ):
+                            valid_artifacts = False
+                            break
+                if not valid_artifacts:
+                    failures.append(
+                        f"robustness scenario {scenario_name} has no complete immutable artifacts"
+                    )
+        if metrics.get("sortino_status") != "ok":
+            failures.append("Sortino is undefined or non-finite")
+        deflated = metrics.get("deflated_sharpe")
+        if not isinstance(deflated, dict) or deflated.get("status") != "ok":
+            failures.append("Deflated Sharpe evidence is missing or invalid")
         if metrics.get("capacity_curve_passed") is not True:
             failures.append("capacity curve did not satisfy the configured result gate")
+        eligibility = metrics.get("eligibility")
+        if (
+            not isinstance(eligibility, dict)
+            or eligibility.get("contract_version") != ELIGIBILITY_CONTRACT_VERSION
+            or int(eligibility.get("rows") or 0) <= 0
+            or int(eligibility.get("eligible_rows") or 0) <= 0
+        ):
+            failures.append("point-in-time eligibility evidence is missing or empty")
+        elif config.get("require_regulatory_events") and not eligibility.get(
+            "regulatory_data_available"
+        ):
+            failures.append("required regulatory violation data is unavailable")
+        if execution_method in {"twap", "vwap"}:
+            execution_model = metrics.get("execution_model")
+            if not backtests[0].get("execution_dataset"):
+                failures.append("minute execution dataset is required for TWAP/VWAP approval")
+            if (
+                not isinstance(execution_model, dict)
+                or execution_model.get("method") != execution_method
+                or execution_model.get("frequency") in {None, "day"}
+                or execution_model.get("price_assumption") != "minute bar vwap fills"
+                or metrics.get("minute_execution_enforced") is not True
+            ):
+                failures.append("minute-native TWAP/VWAP execution evidence is required")
+            try:
+                require_minute_execution_contract(
+                    {
+                        "frequency": (execution_model or {}).get("frequency"),
+                        "execution_contract_version": provenance.get(
+                            "execution_contract_version"
+                        )
+                        if isinstance(provenance, dict)
+                        else None,
+                        "lineage_verified": provenance.get("execution_lineage_verified")
+                        if isinstance(provenance, dict)
+                        else None,
+                        "fields": provenance.get("execution_fields")
+                        if isinstance(provenance, dict)
+                        else None,
+                        "source_datasets": provenance.get("execution_source_datasets")
+                        if isinstance(provenance, dict)
+                        else None,
+                        "source_unit_contracts": provenance.get(
+                            "execution_source_unit_contracts"
+                        )
+                        if isinstance(provenance, dict)
+                        else None,
+                    },
+                    frequency=(execution_model or {}).get("frequency"),
+                )
+            except ValueError as exc:
+                failures.append(str(exc))
+            if isinstance(provenance, dict) and provenance.get(
+                "source_lineage_id"
+            ) != provenance.get("execution_source_lineage_id"):
+                failures.append("daily and minute backtest datasets do not share source lineage")
         cost_model = metrics.get("cost_model")
         if not isinstance(cost_model, dict):
             failures.append("the unified cost model is required for approval")
+        else:
+            try:
+                effective_costs = CostModelConfig.from_mapping(cost_model)
+                backtest_start_date = date.fromisoformat(backtests[0]["periods"]["start"])
+                backtest_end_date = date.fromisoformat(backtests[0]["periods"]["end"])
+                if date.fromisoformat(effective_costs.effective_from) > backtest_start_date or (
+                    effective_costs.effective_to is not None
+                    and date.fromisoformat(effective_costs.effective_to) < backtest_end_date
+                ):
+                    failures.append("cost schedule does not cover the full backtest period")
+            except (TypeError, ValueError) as exc:
+                failures.append(f"cost schedule is invalid: {exc}")
         failures.extend(_multifactor_manifest_failures(version, backtests[0], metrics))
         if isinstance(cost_model, dict) and float(cost_model.get("min_commission", -1.0)) < float(
             config.get("min_commission", 5.0)
@@ -1120,8 +1306,8 @@ class StrategyStore:
                     failures.append(
                         f"factor {factor['factor_candidate_id']} has no out-of-sample evidence"
                     )
-                elif evaluation.is_legacy or not str(evaluation.evaluator_version).startswith(
-                    "factor-gate-v2"
+                elif evaluation.is_legacy or str(evaluation.evaluator_version) != (
+                    "factor-gate-v3-hac-bh"
                 ):
                     failures.append(
                         f"factor {factor['factor_candidate_id']} uses a legacy evaluation"

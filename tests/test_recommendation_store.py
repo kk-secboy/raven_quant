@@ -8,7 +8,6 @@ from governance_fixtures import DATASET_IDENTITY, create_strategy_version
 from sqlalchemy import func, select, update
 
 from quant_data.database import paper_fills, paper_orders, strategy_versions
-from quant_platform.cost_model import CostModelConfig
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.recommendation_store import RecommendationStore
@@ -53,7 +52,7 @@ def test_recommendation_snapshot_is_independent_of_paper_orders_and_fills(
         "policy_version": POLICY_VERSION,
         "backtest_engine_version": QLIB_ENGINE_VERSION,
         "effective_date": "2026-07-13",
-        "cost_model": CostModelConfig().to_dict(),
+        "cost_model": snapshot["cost_model"],
         "cash_weight": 0.98,
         "holdings": [
             {
@@ -79,7 +78,9 @@ def test_recommendation_snapshot_is_independent_of_paper_orders_and_fills(
     assert completed["status"] == "succeeded"
     assert completed["holdings"][0]["instrument"] == "SH600000"
     tracked = store.get(portfolio["id"])
-    assert float(tracked["hypothetical_performance"][0]["hypothetical_value"]) == 4_999_000
+    assert tracked["historical_hypothetical_observations"] == []
+    assert tracked["construction_notional"] == 5_000_000
+    assert "hypothetical_performance" not in tracked
     with store.engine.connect() as connection:
         after = (
             connection.scalar(select(func.count()).select_from(paper_orders)),
@@ -122,7 +123,7 @@ def test_recommendation_result_identity_is_bound_and_cash_only_is_valid(
         "effective_date": "2026-07-13",
         "policy_version": POLICY_VERSION,
         "backtest_engine_version": QLIB_ENGINE_VERSION,
-        "cost_model": CostModelConfig().to_dict(),
+        "cost_model": snapshot["cost_model"],
         "cash_weight": 1.0,
         "holdings": [],
         "changes": [{"instrument": "SH600000", "action": "sell", "target_weight": 0.0}],
