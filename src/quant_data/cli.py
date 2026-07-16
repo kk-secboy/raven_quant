@@ -37,6 +37,7 @@ from .supplemental_data import (
     SUPPORTED_BUNDLES,
     a_share_bulk_history_specs,
     bond_reference_specs,
+    etf_constituent_history_specs,
     etf_constituent_overflow_repartition_specs,
     market_financial_specs,
     next_pagination_specs,
@@ -215,29 +216,41 @@ def _pagination_overflow_recovery(
             continue
         error = str(row.get("last_error") or "")
         offset = int(failed_spec.params.get("offset") or 0)
-        if offset < 100_000 or "code=50101" not in error:
+        normalized_error = error.replace("-", " ")
+        if offset < 100_000 or (
+            "code=50101" not in error and "offset cap" not in normalized_error
+        ):
             continue
 
-        if etf_master is None:
-            etf_master = context.storage.read_units(
-                context.checkpoint.successful("etf_basic")
+        if (
+            failed_spec.params.get("ts_code")
+            and failed_spec.params.get("start_date")
+            and failed_spec.params.get("end_date")
+        ):
+            recovery_specs.extend(
+                etf_constituent_overflow_repartition_specs(failed_spec)
             )
-            if "ts_code" not in etf_master.columns:
-                raise RuntimeError(
-                    "etf_basic did not provide ts_code for constituent overflow recovery"
+        else:
+            if etf_master is None:
+                etf_master = context.storage.read_units(
+                    context.checkpoint.successful("etf_basic")
                 )
-        symbols = _eligible_etf_symbols(
-            etf_master,
-            dataset=failed_spec.dataset,
-            trade_date=str(failed_spec.params["trade_date"]),
-        )
-        recovery_specs.extend(
-            etf_constituent_overflow_repartition_specs(failed_spec, symbols)
-        )
+                if "ts_code" not in etf_master.columns:
+                    raise RuntimeError(
+                        "etf_basic did not provide ts_code for constituent overflow recovery"
+                    )
+            symbols = _eligible_etf_symbols(
+                etf_master,
+                dataset=failed_spec.dataset,
+                trade_date=str(failed_spec.params["trade_date"]),
+            )
+            recovery_specs.extend(
+                etf_constituent_overflow_repartition_specs(failed_spec, symbols)
+            )
         recovered_keys.add(failed_spec.unit_key)
         context.checkpoint.supersede_units(
             [failed_spec.unit_key],
-            f"{error}; pagination offset cap superseded by ETF symbol partitions",
+            f"{error}; pagination offset cap superseded by smaller ETF partitions",
         )
     return recovery_specs, recovered_keys
 
@@ -259,6 +272,111 @@ def _eligible_etf_symbols(
             if str(value).strip().upper().endswith(suffix)
         }
     )
+
+
+def _historical_etf_active_ranges(
+    master: pd.DataFrame, *, start: date, end: date
+) -> dict[str, tuple[date, date]]:
+    """Clip each ETF to the requested history window using the current master."""
+
+    if master.empty or "ts_code" not in master.columns:
+        raise RuntimeError("etf_basic is unavailable for constituent history planning")
+    frame = master.copy()
+    if "list_status" in frame.columns:
+        frame = frame[frame["list_status"].astype("string").isin(["L", "D"])]
+    ranges: dict[str, tuple[date, date]] = {}
+    for _, row in frame.iterrows():
+        raw_symbol = row.get("ts_code")
+        if pd.isna(raw_symbol):
+            continue
+        symbol = str(raw_symbol).strip().upper()
+        if not symbol.endswith((".SH", ".SZ")):
+            continue
+        listed_value = pd.to_datetime(row.get("list_date"), errors="coerce")
+        delisted_value = pd.to_datetime(row.get("delist_date"), errors="coerce")
+        listed_at = start if pd.isna(listed_value) else listed_value.date()
+        delisted_at = end if pd.isna(delisted_value) else delisted_value.date()
+        clipped = (max(start, listed_at), min(end, delisted_at))
+        if clipped[1] < clipped[0]:
+            continue
+        previous = ranges.get(symbol)
+        ranges[symbol] = (
+            (min(previous[0], clipped[0]), max(previous[1], clipped[1]))
+            if previous
+            else clipped
+        )
+    if not ranges:
+        raise RuntimeError("etf_basic did not provide active Shanghai/Shenzhen ETFs")
+    return ranges
+
+
+def _institutional_history_specs(
+    context: Context,
+    *,
+    start: date,
+    end: date,
+    trading_dates: list[str],
+    max_attempts: int,
+) -> list[FetchSpec]:
+    """Plan dense ETF baskets by symbol/range while retaining the bundle contract."""
+
+    base_specs = supplemental_specs(
+        "cn_institutional",
+        start=start,
+        end=end,
+        trading_dates=trading_dates,
+        max_attempts=max_attempts,
+    )
+    fund_specs = supplemental_specs(
+        "cn_funds",
+        start=end,
+        end=end,
+        trading_dates=[],
+        max_attempts=max_attempts,
+    )
+    master_specs = [spec for spec in fund_specs if spec.dataset == "etf_basic"]
+    _, master_rows, _ = _run_paginated_specs(
+        context,
+        "complete ETF master for constituent planning",
+        master_specs,
+    )
+    master = context.storage.read_units(
+        [row for row in master_rows if row["dataset"] == "etf_basic"]
+    )
+    active_ranges = _historical_etf_active_ranges(master, start=start, end=end)
+    constituent_specs = etf_constituent_history_specs(
+        active_ranges,
+        max_attempts=max_attempts,
+    )
+
+    start_text = compact_date(start)
+    end_text = compact_date(end)
+    legacy_keys = []
+    for row in context.checkpoint.unfinished_units(
+        {"etf_sh_cons", "etf_sz_cons"}
+    ):
+        scope = dict(row.get("scope_json") or {})
+        trade_date = str(scope.get("trade_date") or "")
+        if (
+            len(trade_date) == 8
+            and start_text <= trade_date <= end_text
+            and not scope.get("start_date")
+        ):
+            legacy_keys.append(str(row["unit_key"]))
+    superseded = context.checkpoint.supersede_units(
+        legacy_keys,
+        "replaced by ETF symbol/date-range pagination",
+    )
+    if superseded:
+        console.print(
+            f"retired legacy per-ETF/per-day constituent units: {superseded}"
+        )
+
+    return [
+        spec
+        for spec in base_specs
+        if spec.dataset not in {"etf_sh_cons", "etf_sz_cons"}
+    ] + constituent_specs
 
 
 @app.command()
@@ -360,8 +478,8 @@ def bootstrap(
             f"planned full-market financial/event units: "
             f"{len(bulk_specs)} initial, +{bulk_inserted} inserted with pagination"
         )
-        institutional_specs = supplemental_specs(
-            "cn_institutional",
+        institutional_specs = _institutional_history_specs(
+            context,
             start=start_date,
             end=end_date,
             trading_dates=context.planner.trading_dates(start_date, end_date),
@@ -783,13 +901,22 @@ def supplemental_download(
         if bundle.startswith("cn_") and bundle != "cn_macro"
         else []
     )
-    specs = supplemental_specs(
-        bundle,
-        start=start_date,
-        end=end_date,
-        trading_dates=trading_dates,
-        max_attempts=context.settings.max_request_attempts,
-    )
+    if bundle == "cn_institutional":
+        specs = _institutional_history_specs(
+            context,
+            start=start_date,
+            end=end_date,
+            trading_dates=trading_dates,
+            max_attempts=context.settings.max_request_attempts,
+        )
+    else:
+        specs = supplemental_specs(
+            bundle,
+            start=start_date,
+            end=end_date,
+            trading_dates=trading_dates,
+            max_attempts=context.settings.max_request_attempts,
+        )
     datasets = {spec.dataset for spec in specs}
     rows: list[dict] = []
     inserted = 0

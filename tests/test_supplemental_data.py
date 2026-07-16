@@ -9,6 +9,7 @@ from quant_data.supplemental_data import (
     a_share_bulk_history_specs,
     bond_reference_specs,
     bundle_datasets,
+    etf_constituent_history_specs,
     etf_constituent_overflow_repartition_specs,
     market_financial_specs,
     next_pagination_specs,
@@ -697,6 +698,52 @@ def test_etf_constituent_offset_cap_repartitions_the_date_by_symbol() -> None:
             {"unit_key": parent.unit_key, "row_count": 3_000},
             *[{"unit_key": item.unit_key, "row_count": 0} for item in symbols],
         ],
+    )
+
+
+def test_etf_constituent_history_uses_symbol_date_windows() -> None:
+    specs = etf_constituent_history_specs(
+        {
+            "510050.SH": (date(2026, 1, 2), date(2026, 7, 15)),
+            "159001.SZ": (date(2026, 3, 2), date(2026, 7, 15)),
+        },
+        max_attempts=5,
+    )
+
+    assert len(specs) == 2
+    shanghai = next(spec for spec in specs if spec.dataset == "etf_sh_cons")
+    assert shanghai.params == {
+        "ts_code": "510050.SH",
+        "start_date": "20260102",
+        "end_date": "20260715",
+        "limit": 3_000,
+        "offset": 0,
+    }
+    assert shanghai.scope["expected_date_start"] == "20260102"
+    assert shanghai.scope["expected_date_end"] == "20260715"
+
+
+def test_etf_symbol_window_offset_cap_bisects_the_date_range() -> None:
+    failed = etf_constituent_history_specs(
+        {"510050.SH": (date(2026, 1, 2), date(2026, 7, 15))},
+        max_attempts=5,
+    )[0]
+    for _ in range(34):
+        failed = next_pagination_specs(
+            [failed],
+            [{"unit_key": failed.unit_key, "row_count": 3_000}],
+        )[0]
+    assert failed.params["offset"] == 102_000
+
+    children = etf_constituent_overflow_repartition_specs(failed)
+    assert len(children) == 2
+    assert all(child.params["ts_code"] == "510050.SH" for child in children)
+    assert children[0].params["start_date"] == "20260102"
+    assert children[-1].params["end_date"] == "20260715"
+    assert children[0].params["end_date"] < children[1].params["start_date"]
+    assert all(
+        child.scope["supersedes_page_group"] == failed.scope["page_group"]
+        for child in children
     )
 
 

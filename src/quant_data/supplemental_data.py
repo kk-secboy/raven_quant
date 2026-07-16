@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from calendar import monthrange
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import date, timedelta
 from typing import Any
 
@@ -200,6 +200,17 @@ def validate_supplemental(spec: FetchSpec, result: ProviderResult) -> ProviderRe
                     f"expected {expected_date}",
                     retryable=False,
                 )
+    expected_start = spec.scope.get("expected_date_start")
+    expected_end = spec.scope.get("expected_date_end")
+    if expected_field and expected_start and expected_end:
+        for row in result.rows:
+            actual = str(row.get(str(expected_field)) or "").replace("-", "")[:8]
+            if not str(expected_start) <= actual <= str(expected_end):
+                raise ProviderError(
+                    f"{spec.dataset} returned {expected_field}={actual!r}, expected "
+                    f"{expected_start}..{expected_end}",
+                    retryable=False,
+                )
     return result
 
 
@@ -340,26 +351,131 @@ def share_float_overflow_repartition_specs(failed_spec: FetchSpec) -> list[Fetch
     return result
 
 
-def etf_constituent_overflow_repartition_specs(
-    failed_spec: FetchSpec, symbols: Iterable[str]
+def etf_constituent_history_specs(
+    active_ranges: Mapping[str, tuple[date, date]], *, max_attempts: int
 ) -> list[FetchSpec]:
-    """Replace an offset-capped ETF date partition with symbol partitions.
+    """Plan ETF constituent history by symbol and the largest safe date window.
 
-    The ETF constituent endpoints accept both ``trade_date`` and ``ts_code``
-    but reject offsets beyond 100,000 for dense full-market dates.  A
-    per-symbol partition is the provider-documented escape hatch.  Existing
-    successful date pages remain immutable; the replacement groups explicitly
-    supersede the parent date group and snapshot ``DISTINCT`` removes overlap.
+    Full-market date partitions exceed the provider's 100,000-row offset cap
+    and previously expanded into one request per ETF per trading day.  A
+    symbol/date-range partition keeps the same rows while allowing the normal
+    pagination loop to cover many trading days per request series.
+    """
+
+    specs: list[FetchSpec] = []
+    for symbol, (window_start, window_end) in sorted(active_ranges.items()):
+        normalized = str(symbol).strip().upper()
+        if normalized.endswith(".SH"):
+            dataset = "etf_sh_cons"
+        elif normalized.endswith(".SZ"):
+            dataset = "etf_sz_cons"
+        else:
+            continue
+        if window_end < window_start:
+            continue
+        start_text = compact_date(window_start)
+        end_text = compact_date(window_end)
+        specs.extend(
+            _paged_specs(
+                dataset,
+                dataset,
+                {
+                    "ts_code": normalized,
+                    "start_date": start_text,
+                    "end_date": end_text,
+                },
+                group=f"{dataset}:{normalized}:{start_text}:{end_text}",
+                page_size=3_000,
+                max_pages=_PAGINATION_MAX_PAGES[dataset],
+                max_attempts=max_attempts,
+                expected_date_field="trade_date",
+                expected_date_start=start_text,
+                expected_date_end=end_text,
+            )
+        )
+    return specs
+
+
+def etf_constituent_overflow_repartition_specs(
+    failed_spec: FetchSpec, symbols: Iterable[str] = ()
+) -> list[FetchSpec]:
+    """Replace an offset-capped ETF partition with a smaller documented grain.
+
+    New history plans are already partitioned by ETF symbol, so an oversized
+    range is bisected by date.  The legacy full-market/date plan remains
+    recoverable by symbol for old checkpoints.  Existing successful pages stay
+    immutable; replacement groups supersede the capped parent group.
     """
 
     if failed_spec.dataset not in ETF_CONSTITUENT_DATASETS:
         raise ValueError("ETF overflow continuation requires an ETF constituent dataset")
-    trade_date = str(failed_spec.params.get("trade_date") or "")
-    if len(trade_date) != 8:
-        raise ValueError("ETF overflow continuation requires a compact trade_date")
     offset = int(failed_spec.params.get("offset") or 0)
     if offset < 100_000:
         raise ValueError("ETF overflow continuation requires an offset-capped page")
+
+    symbol = str(failed_spec.params.get("ts_code") or "").strip().upper()
+    start_text = str(failed_spec.params.get("start_date") or "")
+    end_text = str(failed_spec.params.get("end_date") or "")
+    if symbol and len(start_text) == 8 and len(end_text) == 8:
+        window_start = date.fromisoformat(
+            f"{start_text[:4]}-{start_text[4:6]}-{start_text[6:8]}"
+        )
+        window_end = date.fromisoformat(
+            f"{end_text[:4]}-{end_text[4:6]}-{end_text[6:8]}"
+        )
+        if window_end <= window_start:
+            raise RuntimeError(
+                f"single-day ETF constituent partition {symbol}/{start_text} "
+                "exceeded the provider offset cap"
+            )
+        midpoint = window_start + timedelta(days=(window_end - window_start).days // 2)
+        parent_group = str(failed_spec.scope["page_group"])
+        result: list[FetchSpec] = []
+        for child_start, child_end in (
+            (window_start, midpoint),
+            (midpoint + timedelta(days=1), window_end),
+        ):
+            child_start_text = compact_date(child_start)
+            child_end_text = compact_date(child_end)
+            group = (
+                f"{failed_spec.dataset}:{symbol}:"
+                f"{child_start_text}:{child_end_text}"
+            )
+            result.append(
+                _spec(
+                    failed_spec.dataset,
+                    failed_spec.api_name,
+                    {
+                        "ts_code": symbol,
+                        "start_date": child_start_text,
+                        "end_date": child_end_text,
+                        "limit": 3_000,
+                        "offset": 0,
+                    },
+                    scope={
+                        "ts_code": symbol,
+                        "start_date": child_start_text,
+                        "end_date": child_end_text,
+                        "page_group": group,
+                        "offset": 0,
+                        "page_size": 3_000,
+                        "max_pages": _PAGINATION_MAX_PAGES[failed_spec.dataset],
+                        "expected_date_field": "trade_date",
+                        "expected_date_start": child_start_text,
+                        "expected_date_end": child_end_text,
+                        "supersedes_page_group": parent_group,
+                    },
+                    allow_empty=True,
+                    max_attempts=failed_spec.max_attempts,
+                )
+            )
+        return result
+
+    trade_date = str(failed_spec.params.get("trade_date") or "")
+    if len(trade_date) != 8:
+        raise ValueError(
+            "ETF overflow continuation requires a compact date range or trade_date"
+        )
 
     suffix = ".SH" if failed_spec.dataset == "etf_sh_cons" else ".SZ"
     eligible = sorted(
@@ -542,6 +658,8 @@ def _paged_specs(
     fields: tuple[str, ...] = (),
     expected_date_field: str | None = None,
     expected_date: str | None = None,
+    expected_date_start: str | None = None,
+    expected_date_end: str | None = None,
 ) -> list[FetchSpec]:
     configured_max = _PAGINATION_MAX_PAGES.get(dataset)
     if configured_max != max_pages:
@@ -556,6 +674,14 @@ def _paged_specs(
     }
     if expected_date_field and expected_date:
         scope.update({"expected_date_field": expected_date_field, "expected_date": expected_date})
+    if expected_date_field and expected_date_start and expected_date_end:
+        scope.update(
+            {
+                "expected_date_field": expected_date_field,
+                "expected_date_start": expected_date_start,
+                "expected_date_end": expected_date_end,
+            }
+        )
     return [
         _spec(
             dataset,

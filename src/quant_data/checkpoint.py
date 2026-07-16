@@ -273,6 +273,27 @@ class CheckpointStore:
                 rows.extend(row_dict(row) for row in connection.execute(statement))
         return sorted(rows, key=lambda row: (str(row["dataset"]), str(row["unit_key"])))
 
+    def unfinished_units(self, datasets: set[str]) -> list[dict[str, Any]]:
+        """Return pending or failed units so an obsolete plan can be retired safely."""
+
+        if not datasets:
+            return []
+        statement = (
+            select(
+                work_units.c.unit_key,
+                work_units.c.dataset,
+                work_units.c.scope_json,
+                work_units.c.status,
+            )
+            .where(
+                work_units.c.dataset.in_(sorted(datasets)),
+                work_units.c.status.in_(("pending", "failed")),
+            )
+            .order_by(work_units.c.dataset, work_units.c.unit_key)
+        )
+        with self.engine.connect() as connection:
+            return [row_dict(row) for row in connection.execute(statement)]
+
     def datasets(self) -> list[str]:
         statement = select(work_units.c.dataset).distinct().order_by(work_units.c.dataset)
         with self.engine.connect() as connection:

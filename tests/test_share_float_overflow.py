@@ -116,4 +116,4 @@ def test_etf_overflow_recovery_uses_listed_exchange_symbols(
     assert all(item.params["trade_date"] == "20260316" for item in continuations)
     failed_row = checkpoint.unit_rows([failed.unit_key])[0]
     assert failed_row["status"] == "superseded"
-    assert "ETF symbol partitions" in failed_row["last_error"]
+    assert "smaller ETF partitions" in failed_row["last_error"]
