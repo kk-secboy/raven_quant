@@ -77,3 +77,31 @@ def test_strategy_request_accepts_dated_version_labels() -> None:
             recipe_version="custom",
             cost_schedule_version="cn-effective-cost-1990-01-01",
         )
+
+
+def test_historical_stamp_duty_versions_match_announcements() -> None:
+    from quant_platform.cost_model import CN_COST_SCHEDULE_BOOK
+
+    # 2005-01-24 起 1‰ 双边（卖出侧合并等效 0.002）；此前无记录版本，fail-closed
+    assert CN_COST_SCHEDULE_BOOK.as_of(date(2005, 1, 24)).stock_sell_stamp_duty_rate == 0.002
+    with pytest.raises(ValueError, match="no effective cost schedule"):
+        CN_COST_SCHEDULE_BOOK.as_of(date(2005, 1, 23))
+    # 2007-05-30 起 3‰ 双边（等效 0.006）
+    assert CN_COST_SCHEDULE_BOOK.as_of(date(2007, 5, 29)).stock_sell_stamp_duty_rate == 0.002
+    assert CN_COST_SCHEDULE_BOOK.as_of(date(2007, 5, 30)).stock_sell_stamp_duty_rate == 0.006
+    # 2008-04-24 回到 1‰ 双边（等效 0.002）
+    assert CN_COST_SCHEDULE_BOOK.as_of(date(2008, 4, 23)).stock_sell_stamp_duty_rate == 0.006
+    assert CN_COST_SCHEDULE_BOOK.as_of(date(2008, 4, 24)).stock_sell_stamp_duty_rate == 0.002
+    # 2008-09-19 起卖出单边 1‰
+    assert CN_COST_SCHEDULE_BOOK.as_of(date(2008, 9, 18)).stock_sell_stamp_duty_rate == 0.002
+    assert CN_COST_SCHEDULE_BOOK.as_of(date(2008, 9, 19)).stock_sell_stamp_duty_rate == 0.001
+    # 无重叠且仅最新版本开口
+    versions = CN_COST_SCHEDULE_BOOK.versions
+    assert [v.effective_to for v in versions[:-1]] == [
+        "2007-05-29",
+        "2008-04-23",
+        "2008-09-18",
+        "2015-07-31",
+        "2022-04-28",
+        "2023-08-27",
+    ]

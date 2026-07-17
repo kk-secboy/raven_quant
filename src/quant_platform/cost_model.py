@@ -8,7 +8,10 @@ from typing import Any
 COST_SCHEDULE_VERSION = "cn-effective-cost-v1"
 
 # Effective-dated schedule versions recorded from the named announcements.
-COST_SCHEDULE_VERSION_2000 = "cn-effective-cost-2000-01-01"
+COST_SCHEDULE_VERSION_2005 = "cn-effective-cost-2005-01-24"
+COST_SCHEDULE_VERSION_2007 = "cn-effective-cost-2007-05-30"
+COST_SCHEDULE_VERSION_2008_04 = "cn-effective-cost-2008-04-24"
+COST_SCHEDULE_VERSION_2008_09 = "cn-effective-cost-2008-09-19"
 COST_SCHEDULE_VERSION_2015 = "cn-effective-cost-2015-08-01"
 COST_SCHEDULE_VERSION_2022 = "cn-effective-cost-2022-04-29"
 COST_SCHEDULE_VERSION_2023 = "cn-effective-cost-2023-08-28"
@@ -16,7 +19,10 @@ COST_SCHEDULE_VERSION_2023 = "cn-effective-cost-2023-08-28"
 KNOWN_COST_SCHEDULE_VERSIONS = frozenset(
     {
         COST_SCHEDULE_VERSION,
-        COST_SCHEDULE_VERSION_2000,
+        COST_SCHEDULE_VERSION_2005,
+        COST_SCHEDULE_VERSION_2007,
+        COST_SCHEDULE_VERSION_2008_04,
+        COST_SCHEDULE_VERSION_2008_09,
         COST_SCHEDULE_VERSION_2015,
         COST_SCHEDULE_VERSION_2022,
         COST_SCHEDULE_VERSION_2023,
@@ -257,15 +263,55 @@ _BROKER_ASSUMPTIONS: dict[str, Any] = {
 
 CN_COST_SCHEDULE_VERSIONS: tuple[CostModelConfig, ...] = (
     CostModelConfig(
-        version=COST_SCHEDULE_VERSION_2000,
-        effective_from="2000-01-01",
+        version=COST_SCHEDULE_VERSION_2005,
+        effective_from="2005-01-24",
+        effective_to="2007-05-29",
+        stock_sell_stamp_duty_rate=0.002,
+        transfer_fee_rate=0.00002,
+        source=(
+            "财政部 2005-01：2005-01-24 起证券交易印花税税率由 2‰ 下调为 1‰，"
+            "立据双方分别缴纳；双边各 1‰ 按卖出侧合并等效为 0.002（回合成本等价）。"
+            "过户费实为沪市按成交面值 0.3‰、深市按成交金额 0.0255‰ 双边收取，"
+            "此处按成交金额 0.00002 双边近似"
+        ),
+        **_BROKER_ASSUMPTIONS,
+    ),
+    CostModelConfig(
+        version=COST_SCHEDULE_VERSION_2007,
+        effective_from="2007-05-30",
+        effective_to="2008-04-23",
+        stock_sell_stamp_duty_rate=0.006,
+        transfer_fee_rate=0.00002,
+        source=(
+            "财政部 2007-05-29 公告：2007-05-30 起证券交易印花税税率由 1‰ "
+            "调整为 3‰，立据双方分别缴纳；双边各 3‰ 按卖出侧合并等效为 0.006"
+            "（回合成本等价）。过户费同前近似"
+        ),
+        **_BROKER_ASSUMPTIONS,
+    ),
+    CostModelConfig(
+        version=COST_SCHEDULE_VERSION_2008_04,
+        effective_from="2008-04-24",
+        effective_to="2008-09-18",
+        stock_sell_stamp_duty_rate=0.002,
+        transfer_fee_rate=0.00002,
+        source=(
+            "财政部 国家税务总局 2008-04：2008-04-24 起证券交易印花税税率由 3‰ "
+            "调整为 1‰，仍双边征收；双边各 1‰ 按卖出侧合并等效为 0.002。"
+            "过户费同前近似"
+        ),
+        **_BROKER_ASSUMPTIONS,
+    ),
+    CostModelConfig(
+        version=COST_SCHEDULE_VERSION_2008_09,
+        effective_from="2008-09-19",
         effective_to="2015-07-31",
         stock_sell_stamp_duty_rate=0.001,
         transfer_fee_rate=0.00002,
         source=(
-            "近似基线：卖出印花税 0.001（2008-09-19 单边 0.001 起的费率，"
-            "此前更早历史按同一值近似）；过户费 0.00002（2015-08-01 前历史上"
-            "仅沪市收取，此处按双边收取近似）"
+            "财政部 国家税务总局 2008-09：2008-09-19 起证券交易印花税改由出让方"
+            "单边缴纳，税率 1‰ 不变。过户费实为沪市按成交面值 0.3‰、深市按成交"
+            "金额 0.0255‰ 双边收取，此处按成交金额 0.00002 双边近似"
         ),
         **_BROKER_ASSUMPTIONS,
     ),
