@@ -3,7 +3,7 @@
 QuantLab 是面向 A 股中低频量化研究与模拟交易的本地优先平台。项目只使用
 Tushare 数据，并以 Qlib 和 RD-Agent 组成唯一技术主线。
 
-> **权威关系：**[根目录 Markdown](%E5%A6%82%E4%BD%95%E6%90%AD%E5%BB%BA%E8%87%AA%E5%B7%B1%E7%9A%84%E9%87%8F%E5%8C%96%E4%BA%A4%E6%98%93%E7%B3%BB%E7%BB%9F.md)
+> **权威关系：**[根目录 Markdown](%E4%B8%AA%E4%BA%BA%E9%87%8F%E5%8C%96%E6%8A%95%E8%B5%84%E4%B8%8E%E6%A8%A1%E6%8B%9F%E7%9B%98%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E7%A8%BF.md)
 > 是产品、策略和风险基准，Qlib/RD-Agent 是技术基准。本 README 只提供项目入口和
 > 使用方法，不定义另一套产品方案。
 
@@ -101,6 +101,6 @@ docker compose --env-file deploy\.env -f deploy\compose.yaml ps
 
 ## 文档
 
-- [产品、策略和风险基准 Markdown](%E5%A6%82%E4%BD%95%E6%90%AD%E5%BB%BA%E8%87%AA%E5%B7%B1%E7%9A%84%E9%87%8F%E5%8C%96%E4%BA%A4%E6%98%93%E7%B3%BB%E7%BB%9F.md)
+- [产品、策略和风险基准 Markdown](%E4%B8%AA%E4%BA%BA%E9%87%8F%E5%8C%96%E6%8A%95%E8%B5%84%E4%B8%8E%E6%A8%A1%E6%8B%9F%E7%9B%98%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E7%A8%BF.md)
 - [3.0 定稿 DOCX 快照](%E5%A6%82%E4%BD%95%E6%90%AD%E5%BB%BA%E8%87%AA%E5%B7%B1%E7%9A%84%E9%87%8F%E5%8C%96%E4%BA%A4%E6%98%93%E7%B3%BB%E7%BB%9F.docx)
 - [部署手册](docs/DEPLOYMENT.md)

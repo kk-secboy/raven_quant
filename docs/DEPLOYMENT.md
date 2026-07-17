@@ -1,7 +1,7 @@
 # QuantLab 部署手册
 
 本文只记录安装、配置、迁移、启动和运维命令。产品、策略与风险要求以
-[根目录 Markdown](../%E5%A6%82%E4%BD%95%E6%90%AD%E5%BB%BA%E8%87%AA%E5%B7%B1%E7%9A%84%E9%87%8F%E5%8C%96%E4%BA%A4%E6%98%93%E7%B3%BB%E7%BB%9F.md)
+[根目录 Markdown](../%E4%B8%AA%E4%BA%BA%E9%87%8F%E5%8C%96%E6%8A%95%E8%B5%84%E4%B8%8E%E6%A8%A1%E6%8B%9F%E7%9B%98%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E7%A8%BF.md)
 为准，技术实现以 Qlib/RD-Agent 为准。
 
 ## 1. 安装
