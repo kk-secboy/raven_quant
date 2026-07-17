@@ -73,6 +73,11 @@ class MinuteQlibBuilder:
             self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError) as exc:
             raise ValueError("minute snapshot manifest is missing or invalid") from exc
+        quality_gate = self.manifest.get("quality_gate")
+        if quality_gate is not None and (
+            not isinstance(quality_gate, dict) or quality_gate.get("ok") is not True
+        ):
+            raise ValueError("minute snapshot quality gate did not pass")
         self.source_frequency = str(self.manifest.get("frequency") or "")
         if self.source_frequency not in NATIVE_MINUTE_FREQUENCIES:
             raise ValueError(

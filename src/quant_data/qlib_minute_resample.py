@@ -120,6 +120,7 @@ def resample_minute_frame(
         if column in values:
             values[column] = pd.to_numeric(values[column], errors="coerce")
     values["_vwap_notional"] = values["vwap"] * values["volume"].clip(lower=0).fillna(0)
+    values["_source_bars"] = 1
     aggregation: dict[str, Any] = {
         "open": "first",
         "high": "max",
@@ -131,6 +132,7 @@ def resample_minute_frame(
         "up_limit": "last",
         "down_limit": "last",
         "_vwap_notional": "sum",
+        "_source_bars": "sum",
     }
     if "oi" in values:
         aggregation["oi"] = "last"
@@ -139,6 +141,13 @@ def resample_minute_frame(
         .agg(aggregation)
         .reindex(target_index)
     )
+    # Closed-bar guard: emit a target bar only when the source bars fully cover
+    # its window.  Intraday snapshots otherwise leak unclosed tail bars whose
+    # open/high/low/close/volume are indistinguishable from complete bars.
+    expected_source_bars = int(target_frequency.removesuffix("min")) // int(
+        source_frequency.removesuffix("min")
+    )
+    sampled = sampled[sampled["_source_bars"] == expected_source_bars]
     sampled = sampled.dropna(subset=["open", "high", "low", "close"])
     if sampled.empty:
         raise ValueError("Qlib minute resampling produced no complete bars")
@@ -151,7 +160,7 @@ def resample_minute_frame(
     sampled["paused"] = (~positive_volume).astype(float)
     sampled["change"] = sampled["close"].pct_change(fill_method=None)
     sampled["symbol"] = symbols[0]
-    sampled.drop(columns=["_vwap_notional"], inplace=True)
+    sampled.drop(columns=["_vwap_notional", "_source_bars"], inplace=True)
     sampled.reset_index(names="date", inplace=True)
     ordered = [
         "date",

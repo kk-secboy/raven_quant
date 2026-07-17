@@ -154,60 +154,40 @@ def test_rejects_non_minute_snapshot(tmp_path: Path) -> None:
         MinuteQlibBuilder(_snapshot(tmp_path, frequency="day"))
 
 
+def _minute_bars(start: str, count: int, *, base: float, volume: float) -> list[dict]:
+    hour, minute = (int(part) for part in start.split(":"))
+    bars = []
+    for index in range(count):
+        open_price = base + index * 0.01
+        bars.append(
+            {
+                "date": f"2024-01-02 {hour:02d}:{minute + index:02d}:00",
+                "symbol": "SH510300",
+                "open": open_price,
+                "high": open_price + 0.02,
+                "low": open_price - 0.02,
+                "close": open_price + 0.01,
+                "vwap": open_price + 0.01,
+                "volume": volume,
+                "factor": 1.0,
+                "change": None,
+                "amount": (open_price + 0.01) * volume,
+                "paused": 0.0,
+                "up_limit": 9.99,
+                "down_limit": 0.01,
+                "oi": None,
+            }
+        )
+    return bars
+
+
 def test_qllib_resamples_native_bars_with_ohlcv_semantics() -> None:
     frame = pd.DataFrame(
         [
-            {
-                "date": "2024-01-02 09:31:00",
-                "symbol": "SH510300",
-                "open": 3.50,
-                "high": 3.52,
-                "low": 3.49,
-                "close": 3.51,
-                "vwap": 3.51,
-                "volume": 1000,
-                "factor": 1.0,
-                "change": None,
-                "amount": 3510,
-                "paused": 0.0,
-                "up_limit": 3.85,
-                "down_limit": 3.15,
-                "oi": None,
-            },
-            {
-                "date": "2024-01-02 09:34:00",
-                "symbol": "SH510300",
-                "open": 3.51,
-                "high": 3.54,
-                "low": 3.50,
-                "close": 3.53,
-                "vwap": 3.53,
-                "volume": 1200,
-                "factor": 1.0,
-                "change": 3.53 / 3.51 - 1,
-                "amount": 4236,
-                "paused": 0.0,
-                "up_limit": 3.85,
-                "down_limit": 3.15,
-                "oi": None,
-            },
-            {
-                "date": "2024-01-02 09:46:00",
-                "symbol": "SH510300",
-                "open": 3.52,
-                "high": 3.55,
-                "low": 3.51,
-                "close": 3.54,
-                "vwap": 3.54,
-                "volume": 800,
-                "factor": 1.0,
-                "change": 3.54 / 3.53 - 1,
-                "amount": 2832,
-                "paused": 0.0,
-                "up_limit": 3.85,
-                "down_limit": 3.15,
-                "oi": None,
-            },
+            *_minute_bars("09:30", 15, base=3.50, volume=1000),
+            *_minute_bars("09:45", 15, base=3.70, volume=800),
+            # unclosed intraday tail: only 3 of the 15 source bars exist
+            *_minute_bars("10:00", 3, base=3.90, volume=500),
         ]
     )
 
@@ -215,7 +195,7 @@ def test_qllib_resamples_native_bars_with_ohlcv_semantics() -> None:
         _index: pd.DatetimeIndex, _source: str, _target: str
     ) -> pd.DatetimeIndex:
         return pd.DatetimeIndex(
-            ["2024-01-02 09:30:00", "2024-01-02 09:45:00"]
+            ["2024-01-02 09:30:00", "2024-01-02 09:45:00", "2024-01-02 10:00:00"]
         )
 
     result = resample_minute_frame(
@@ -226,16 +206,33 @@ def test_qllib_resamples_native_bars_with_ohlcv_semantics() -> None:
     )
 
     assert result["date"].dt.strftime("%H:%M").tolist() == ["09:30", "09:45"]
-    assert result["open"].tolist() == pytest.approx([3.50, 3.52])
-    assert result["high"].tolist() == pytest.approx([3.54, 3.55])
-    assert result["low"].tolist() == pytest.approx([3.49, 3.51])
-    assert result["close"].tolist() == pytest.approx([3.53, 3.54])
-    assert result["volume"].tolist() == pytest.approx([2200, 800])
-    assert result["vwap"].iloc[0] == pytest.approx(
-        (3.51 * 1000 + 3.53 * 1200) / 2200
-    )
+    assert result["open"].tolist() == pytest.approx([3.50, 3.70])
+    assert result["high"].tolist() == pytest.approx([3.66, 3.86])
+    assert result["low"].tolist() == pytest.approx([3.48, 3.68])
+    assert result["close"].tolist() == pytest.approx([3.65, 3.85])
+    assert result["volume"].tolist() == pytest.approx([15_000, 12_000])
+    assert result["vwap"].iloc[0] == pytest.approx(3.58)
+    expected_amount = sum((3.70 + index * 0.01 + 0.01) * 800 for index in range(15))
+    assert result["amount"].iloc[1] == pytest.approx(expected_amount)
     assert pd.isna(result["change"].iloc[0])
-    assert result["change"].iloc[1] == pytest.approx(3.54 / 3.53 - 1)
+    assert result["change"].iloc[1] == pytest.approx(3.85 / 3.65 - 1)
+
+
+def test_resample_drops_windows_without_full_source_coverage() -> None:
+    frame = pd.DataFrame(_minute_bars("09:30", 14, base=3.50, volume=1000))
+
+    def qlib_calendar(
+        _index: pd.DatetimeIndex, _source: str, _target: str
+    ) -> pd.DatetimeIndex:
+        return pd.DatetimeIndex(["2024-01-02 09:30:00"])
+
+    with pytest.raises(ValueError, match="no complete bars"):
+        resample_minute_frame(
+            frame,
+            source_frequency="1min",
+            target_frequency="15min",
+            calendar_resampler=qlib_calendar,
+        )
 
 
 def test_resampled_builder_uses_pinned_qlib_runtime_and_records_provenance(
@@ -345,3 +342,30 @@ def test_rejects_stock_or_etf_amount_volume_unit_mismatch(tmp_path: Path) -> Non
 
     with pytest.raises(RuntimeError, match="share-volume/CNY-amount"):
         MinuteQlibBuilder(snapshot).build_staging(tmp_path / "invalid-units")
+
+
+def _record_quality_gate(snapshot: Path, gate: dict) -> None:
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["quality_gate"] = gate
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_minute_builder_enforces_a_recorded_quality_gate(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    _record_quality_gate(snapshot, {"ok": False, "errors": ["daily: boom"]})
+
+    with pytest.raises(ValueError, match="quality gate"):
+        MinuteQlibBuilder(snapshot)
+
+
+def test_minute_builder_accepts_a_passing_quality_gate(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    _record_quality_gate(
+        snapshot,
+        {"ok": True, "verified_at": "2026-07-17T00:00:00+00:00", "errors": []},
+    )
+
+    by_symbol = MinuteQlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+    assert (by_symbol / "SH510300.parquet").is_file()
