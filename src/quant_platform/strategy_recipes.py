@@ -5,7 +5,7 @@ from typing import Any
 
 RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-07-16-v3"
 
-nananazhenyi QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
+QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},
     {"id": "reversal", "weight": 0.10, "qlib_expression": "-(Ref($close,1)/Ref($close,21)-1)"},
     {"id": "value", "weight": 0.20, "qlib_expression": "(1/$pe_ttm+1/$pb)/2"},
@@ -52,7 +52,7 @@ SWING_QLIB_BASELINE: tuple[dict[str, Any], ...] = (
         "qlib_expression": (
             "Greater(Mean($close,5),Mean($close,10))"
             "+Greater($close,Mean($close,20))"
-na            "+Greater(Mean($close,20),Mean($close,60))"
+            "+Greater(Mean($close,20),Mean($close,60))"
         ),
     },
     {
