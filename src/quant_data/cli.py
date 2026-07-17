@@ -56,7 +56,7 @@ from .supplemental_data import (
     supplemental_specs,
 )
 from .universe import select_intraday_universe_from_store
-from .verify import verify_downloads, write_report
+from .verify import quality_gate_payload, verify_downloads, write_report
 
 app = typer.Typer(no_args_is_help=True, help="Resumable Tushare-to-Parquet bootstrap pipeline")
 console = Console()
@@ -894,7 +894,9 @@ def bootstrap(
     name = snapshot_name or (
         f"cn-{start_date:%Y%m%d}-{end_date:%Y%m%d}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
     )
-    snapshot_path = _build_snapshot(context, name, start_date, end_date, profile)
+    snapshot_path = _build_snapshot(
+        context, name, start_date, end_date, profile, quality_gate=quality_gate_payload(report)
+    )
     write_report(report, snapshot_path / "verification.json")
     if build_qlib:
         qlib_path = _build_qlib(context, snapshot_path, staging_only=False)
@@ -966,7 +968,23 @@ def snapshot(
     start_date = parse_date(start)
     end_date = parse_date(end, latest=date.today())
     name = name or f"cn-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
-    path = _build_snapshot(context, name, start_date, end_date, profile)
+    # Verify before building so every snapshot manifest records an explicit
+    # quality gate; Qlib builds refuse snapshots without quality_gate.ok=true.
+    report = verify_downloads(
+        context.checkpoint,
+        context.settings.data_root,
+        snapshot_end=end_date,
+        require_all_planned=False,
+    )
+    write_report(report, context.settings.data_root / "verification" / "latest.json")
+    if not report["ok"]:
+        console.print("[red]verification failed; snapshot records quality_gate.ok=false[/red]")
+        for error in report["errors"][:20]:
+            console.print(f"  - {error}")
+    path = _build_snapshot(
+        context, name, start_date, end_date, profile, quality_gate=quality_gate_payload(report)
+    )
+    write_report(report, path / "verification.json")
     console.print(path)
 
 
@@ -1551,6 +1569,13 @@ def supplemental_download(
 def build_qlib_command(
     snapshot_name: Annotated[str | None, typer.Option("--snapshot")] = None,
     staging_only: Annotated[bool, typer.Option("--staging-only")] = False,
+    skip_quality_gate: Annotated[
+        bool,
+        typer.Option(
+            "--skip-quality-gate",
+            help="Build even when the snapshot manifest has no passing quality gate",
+        ),
+    ] = False,
 ) -> None:
     """Normalize a Parquet snapshot and build Qlib binary data."""
     context = load_context(require_credentials=False)
@@ -1563,7 +1588,9 @@ def build_qlib_command(
         if not candidates:
             raise typer.BadParameter("no snapshots are available")
         snapshot_path = candidates[-1]
-    result = _build_qlib(context, snapshot_path, staging_only=staging_only)
+    result = _build_qlib(
+        context, snapshot_path, staging_only=staging_only, skip_quality_gate=skip_quality_gate
+    )
     console.print(result)
 
 
@@ -1575,6 +1602,13 @@ def build_minute_qlib_command(
         str | None, typer.Option("--target-frequency")
     ] = None,
     staging_only: Annotated[bool, typer.Option("--staging-only")] = False,
+    skip_quality_gate: Annotated[
+        bool,
+        typer.Option(
+            "--skip-quality-gate",
+            help="Build even when the snapshot manifest has no passing quality gate",
+        ),
+    ] = False,
 ) -> None:
     """Build native or Qlib-resampled data without another download path."""
     context = load_context(require_credentials=False)
@@ -1585,12 +1619,35 @@ def build_minute_qlib_command(
         output_name=output_name,
         target_frequency=target_frequency,
         staging_only=staging_only,
+        skip_quality_gate=skip_quality_gate,
     )
     console.print(result)
 
 
+def _require_snapshot_quality_gate(snapshot_path: Path, *, skip: bool = False) -> None:
+    """Refuse Qlib builds for snapshots whose manifest has no passing quality gate."""
+
+    if skip:
+        return
+    try:
+        manifest = json.loads((snapshot_path / "manifest.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise ValueError(f"snapshot manifest is missing or invalid: {snapshot_path}") from exc
+    gate = manifest.get("quality_gate")
+    if not isinstance(gate, dict) or gate.get("ok") is not True:
+        raise ValueError(
+            "snapshot has no passing quality gate; rebuild it through the verify "
+            "and snapshot commands, or pass --skip-quality-gate to override"
+        )
+
+
 def _build_snapshot(
-    context: Context, name: str, start_date: date, end_date: date, profile: str
+    context: Context,
+    name: str,
+    start_date: date,
+    end_date: date,
+    profile: str,
+    quality_gate: dict[str, Any] | None = None,
 ) -> Path:
     module_root = Path(__file__).resolve().parent
     lineage_id = make_lineage_id(
@@ -1653,12 +1710,20 @@ def _build_snapshot(
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
             "provider": "tushare-compatible",
+            **({"quality_gate": quality_gate} if quality_gate else {}),
             **lineage,
         },
     )
 
 
-def _build_qlib(context: Context, snapshot_path: Path, *, staging_only: bool) -> Path:
+def _build_qlib(
+    context: Context,
+    snapshot_path: Path,
+    *,
+    staging_only: bool,
+    skip_quality_gate: bool = False,
+) -> Path:
+    _require_snapshot_quality_gate(snapshot_path, skip=skip_quality_gate)
     builder = QlibBuilder(snapshot_path)
     staging = context.settings.data_root / "qlib_staging" / snapshot_path.name
     output = context.settings.data_root / "qlib" / snapshot_path.name
@@ -1696,7 +1761,9 @@ def _build_minute_qlib(
     output_name: str | None,
     target_frequency: str | None = None,
     staging_only: bool,
+    skip_quality_gate: bool = False,
 ) -> Path:
+    _require_snapshot_quality_gate(snapshot_path, skip=skip_quality_gate)
     builder = MinuteQlibBuilder(snapshot_path, target_frequency=target_frequency)
     output_name = output_name or f"{snapshot_path.name}-{builder.frequency}"
     staging = context.settings.data_root / "qlib_staging" / output_name

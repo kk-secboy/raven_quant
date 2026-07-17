@@ -148,6 +148,14 @@ def verify_downloads(
             snapshot_end=effective_snapshot_end,
         )
         errors.extend(completeness_errors)
+        ohlc_errors, ohlc_warnings, ohlc_checks = _verify_daily_ohlc(
+            connection,
+            selected_by_dataset,
+            data_root,
+            snapshot_end=effective_snapshot_end,
+        )
+        errors.extend(ohlc_errors)
+        warnings.extend(ohlc_warnings)
     finally:
         connection.close()
 
@@ -157,6 +165,7 @@ def verify_downloads(
         "datasets": datasets,
         "duplicate_checks": duplicate_checks,
         "completeness_checks": completeness_checks,
+        "ohlc_checks": ohlc_checks,
         "errors": errors,
         "warnings": warnings,
     }
@@ -279,6 +288,112 @@ def _verify_daily_completeness(
                 f"(sample: {sample})"
             )
     return errors, checks
+
+
+def _verify_daily_ohlc(
+    connection: duckdb.DuckDBPyConnection,
+    selected_by_dataset: dict[str, list[dict[str, Any]]],
+    data_root: Path,
+    *,
+    snapshot_end: date,
+) -> tuple[list[str], list[str], dict[str, int]]:
+    """Check OHLC relationships and adjustment-factor coverage on selected daily units."""
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    checks = {
+        "daily_ohlc_rows": 0,
+        "daily_nonpositive_price_rows": 0,
+        "daily_high_below_low_rows": 0,
+        "daily_open_close_outside_range_rows": 0,
+        "daily_missing_adj_factor_keys": 0,
+        "daily_large_pct_chg_rows": 0,
+    }
+    daily_paths = _selected_parquet_paths(selected_by_dataset, "daily", data_root)
+    if not daily_paths:
+        return errors, warnings, checks
+    daily = _parquet_relation(daily_paths)
+    trade_date = _date_sql("trade_date")
+    daily_sql = f"""
+        SELECT ts_code, {trade_date} AS trade_date,
+               try_cast(open AS DOUBLE) AS open,
+               try_cast(high AS DOUBLE) AS high,
+               try_cast(low AS DOUBLE) AS low,
+               try_cast(close AS DOUBLE) AS close,
+               try_cast(pct_chg AS DOUBLE) AS pct_chg
+        FROM {daily}
+        WHERE ts_code IS NOT NULL AND {trade_date} IS NOT NULL
+          AND {trade_date} <= DATE {_sql_string(snapshot_end.isoformat())}
+    """
+    checks["daily_ohlc_rows"] = int(
+        connection.execute(f"SELECT count(*) FROM ({daily_sql})").fetchone()[0]
+    )
+    violations = {
+        "daily_nonpositive_price_rows": (
+            "open <= 0 OR high <= 0 OR low <= 0 OR close <= 0",
+            "non-positive OHLC prices",
+        ),
+        "daily_high_below_low_rows": ("high < low", "high below low"),
+        "daily_open_close_outside_range_rows": (
+            "open > high OR open < low OR close > high OR close < low",
+            "open/close outside the [low, high] range",
+        ),
+    }
+    for check, (predicate, label) in violations.items():
+        query = f"SELECT ts_code, trade_date FROM ({daily_sql}) WHERE {predicate}"
+        count = int(connection.execute(f"SELECT count(*) FROM ({query})").fetchone()[0])
+        checks[check] = count
+        if count:
+            errors.append(
+                f"daily: {count} rows have {label} "
+                f"(sample: {_key_sample(connection, query)})"
+            )
+
+    adj_paths = _selected_parquet_paths(selected_by_dataset, "adj_factor", data_root)
+    if adj_paths:
+        adj = _parquet_relation(adj_paths)
+        adj_sql = f"""
+            SELECT ts_code, {trade_date} AS trade_date,
+                   try_cast(adj_factor AS DOUBLE) AS adj_factor
+            FROM {adj}
+        """
+        missing_sql = f"""
+            SELECT d.ts_code, d.trade_date
+            FROM ({daily_sql}) d
+            LEFT JOIN ({adj_sql}) a
+              ON d.ts_code = a.ts_code AND d.trade_date = a.trade_date
+            WHERE a.adj_factor IS NULL
+        """
+    else:
+        missing_sql = f"SELECT ts_code, trade_date FROM ({daily_sql})"
+    missing_adj = int(connection.execute(f"SELECT count(*) FROM ({missing_sql})").fetchone()[0])
+    checks["daily_missing_adj_factor_keys"] = missing_adj
+    if missing_adj:
+        errors.append(
+            f"daily: {missing_adj} stock/date keys have no adjustment factor "
+            f"(sample: {_key_sample(connection, missing_sql)})"
+        )
+
+    jumps_sql = f"SELECT ts_code, trade_date FROM ({daily_sql}) WHERE abs(pct_chg) > 35.0"
+    jumps = int(connection.execute(f"SELECT count(*) FROM ({jumps_sql})").fetchone()[0])
+    checks["daily_large_pct_chg_rows"] = jumps
+    if jumps:
+        warnings.append(
+            f"daily: {jumps} rows move more than 35% in one session "
+            f"(board rules differ; review the price-limit data, sample: "
+            f"{_key_sample(connection, jumps_sql)})"
+        )
+    return errors, warnings, checks
+
+
+def quality_gate_payload(report: dict[str, Any]) -> dict[str, Any]:
+    """Compact quality-gate marker stored in snapshot manifests."""
+
+    return {
+        "ok": bool(report["ok"]),
+        "verified_at": str(report["checked_at"]),
+        "errors": list(report["errors"]),
+    }
 
 
 def _selected_parquet_paths(
