@@ -60,6 +60,7 @@ def create_qlib_execution_strategy(policy: dict[str, Any]) -> Any:
                     side=side,
                     trade_date=parent.start_time.date(),
                     policy=normalized,
+                    instrument=instrument,
                 )
                 cumulative = 0
                 plan: dict[str, int] = {}

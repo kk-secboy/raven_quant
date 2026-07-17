@@ -5,6 +5,8 @@ from math import floor
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .market_rules import order_unit_rules, validate_order_quantity
+
 ASHARE_TIMEZONE = ZoneInfo("Asia/Shanghai")
 ASHARE_SESSIONS = ((time(10, 0), time(11, 20)), (time(13, 30), time(14, 50)))
 
@@ -45,7 +47,9 @@ def normalize_execution_policy(config: dict[str, Any] | None = None) -> dict[str
         "max_slices": max_slices,
         "max_participation": max_participation,
         "execution_frequency": execution_frequency,
-        "lot_size": 100,
+        # Fallback slice granularity used only when the instrument (and so its
+        # board order-unit rules from market_rules) is not supplied.
+        "lot_size": int(raw.get("lot_size", 100)),
         "sessions": [["10:00", "11:20"], ["13:30", "14:50"]],
         "volume_profile": profile,
         "cash_tolerance": cash_tolerance,
@@ -62,6 +66,7 @@ def build_execution_slices(
     trade_date: date,
     policy: dict[str, Any],
     signal_at: datetime | None = None,
+    instrument: str | None = None,
 ) -> list[dict[str, Any]]:
     normalized = normalize_execution_policy(policy)
     integer_quantity = int(quantity)
@@ -70,9 +75,21 @@ def build_execution_slices(
     normalized_side = side.strip().lower()
     if normalized_side not in {"buy", "sell"}:
         raise ValueError("execution side must be buy or sell")
+    rules = order_unit_rules(instrument, trade_date) if instrument is not None else None
     lot_size = int(normalized["lot_size"])
-    if normalized_side == "buy" and integer_quantity % lot_size:
-        raise ValueError("A-share buy quantity must be a multiple of 100 shares")
+    if rules is not None:
+        # Slice chunks must themselves be valid per-board buy quantities.
+        if lot_size < rules.min_lot or (lot_size - rules.min_lot) % rules.lot_increment:
+            lot_size = rules.min_lot
+    if normalized_side == "buy":
+        if rules is not None:
+            violations = validate_order_quantity(
+                instrument, integer_quantity, side="buy", trade_date=trade_date
+            )
+            if violations:
+                raise ValueError("; ".join(violations))
+        elif integer_quantity % lot_size:
+            raise ValueError("A-share buy quantity must be a multiple of 100 shares")
 
     if normalized["execution_algorithm"] == "next_bar":
         slots = [

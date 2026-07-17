@@ -9,6 +9,7 @@ import pandas as pd
 from statsmodels.tsa.stattools import coint
 
 from .cost_model import COST_SCHEDULE_VERSION, CostModelConfig, infer_cn_asset_type
+from .market_rules import lot_floor, order_unit_rules
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +38,8 @@ class PairTradingConfig:
     fixed_slippage_rate: float = 0.0005
     impact_at_max_participation: float = 0.0010
     annual_borrow_rate: float = 0.08
-    lot_size: int = 100
+    # None resolves each leg's lot rules from market_rules at the trade date.
+    lot_size: int | None = None
     kalman_process_variance: float = 1e-5
     kalman_observation_variance: float = 1e-3
     min_hedge_ratio: float = 0.10
@@ -73,7 +75,7 @@ class PairTradingConfig:
         _pair_cost_model(self)
         if self.annual_borrow_rate <= 0:
             raise ValueError("pair shorting requires a positive annual borrow cost")
-        if self.lot_size <= 0:
+        if self.lot_size is not None and self.lot_size <= 0:
             raise ValueError("lot_size must be positive")
         if min(self.kalman_process_variance, self.kalman_observation_variance) <= 0:
             raise ValueError("Kalman variances must be positive")
@@ -108,7 +110,22 @@ def _pair_cost_model(config: PairTradingConfig) -> CostModelConfig:
         fixed_slippage_rate=config.fixed_slippage_rate,
         max_volume_participation=config.max_volume_participation,
         impact_at_max_participation=config.impact_at_max_participation,
-        lot_size=config.lot_size,
+        # Conservative global fallback for the shared cost value object;
+        # pair order sizing resolves per-leg board rules via market_rules.
+        lot_size=config.lot_size if config.lot_size is not None else 100,
+    )
+
+
+def _pair_lot_floor(
+    config: PairTradingConfig, instrument: str, trade_date: Any, quantity: float
+) -> int:
+    """Round a raw quantity down to a valid board order-unit quantity."""
+
+    value = int(floor(quantity))
+    if config.lot_size is not None:
+        return value // config.lot_size * config.lot_size
+    return lot_floor(
+        value, order_unit_rules(instrument, pd.Timestamp(trade_date).date())
     )
 
 
@@ -398,15 +415,11 @@ def run_pair_backtest(
                     leg_y: float(prices.loc[signal_date, leg_y]),
                     leg_x: float(prices.loc[signal_date, leg_x]),
                 }
-                target_quantities[leg_y] = (
-                    direction
-                    * floor(gross * y_weight / reference[leg_y] / config.lot_size)
-                    * config.lot_size
+                target_quantities[leg_y] = direction * _pair_lot_floor(
+                    config, leg_y, trade_date, gross * y_weight / reference[leg_y]
                 )
-                target_quantities[leg_x] = (
-                    -direction
-                    * floor(gross * x_weight / reference[leg_x] / config.lot_size)
-                    * config.lot_size
+                target_quantities[leg_x] = -direction * _pair_lot_floor(
+                    config, leg_x, trade_date, gross * x_weight / reference[leg_x]
                 )
                 planned_entry_notional += sum(
                     abs(target_quantities[item]) * reference[item] for item in target_quantities
@@ -440,9 +453,11 @@ def run_pair_backtest(
                 if rejection_reason:
                     rejection_reason = f"{instrument}:{rejection_reason}"
                     break
-                capacity = (
-                    floor(minute_volume * config.max_volume_participation / config.lot_size)
-                    * config.lot_size
+                capacity = _pair_lot_floor(
+                    config,
+                    instrument,
+                    trade_date,
+                    minute_volume * config.max_volume_participation,
                 )
                 orders.append(
                     {
@@ -464,13 +479,11 @@ def run_pair_backtest(
                 else:
                     for order in orders:
                         requested = int(order["requested_delta"])
-                        filled = (
-                            floor(
-                                abs(requested)
-                                * common_fill_ratio
-                                / config.lot_size
-                            )
-                            * config.lot_size
+                        filled = _pair_lot_floor(
+                            config,
+                            order["instrument"],
+                            trade_date,
+                            abs(requested) * common_fill_ratio,
                         )
                         order["delta"] = filled if requested > 0 else -filled
                         order["fill_ratio"] = filled / abs(requested) if requested else 1.0

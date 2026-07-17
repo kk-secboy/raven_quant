@@ -10,6 +10,12 @@ import pandas as pd
 
 from .cost_model import CostModelConfig, CostScheduleBook, infer_cn_asset_type
 from .execution_algorithms import build_execution_slices, normalize_execution_policy
+from .market_rules import (
+    OrderUnitRules,
+    is_valid_order_quantity,
+    lot_floor,
+    order_unit_rules,
+)
 
 SIMULATION_ENGINE_VERSION = "ashare-minute-simulation-v2"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -63,14 +69,15 @@ def execute_simulation_day(
 
     reference_prices = _execution_reference_prices(bars)
     instruments = sorted(set(state) | set(targets))
+    lot_rules = {instrument: order_unit_rules(instrument, trade_date) for instrument in instruments}
     desired: dict[str, int] = {}
     for instrument in instruments:
         price = reference_prices.get(instrument)
         if price is None:
             desired[instrument] = int(state.get(instrument, {}).get("quantity", 0))
             continue
-        desired[instrument] = (
-            floor(targets.get(instrument, 0.0) * prior_nav / price / 100.0) * 100
+        desired[instrument] = lot_floor(
+            int(targets.get(instrument, 0.0) * prior_nav / price), lot_rules[instrument]
         )
 
     order_specs: list[dict[str, Any]] = []
@@ -135,6 +142,7 @@ def execute_simulation_day(
             trade_date=trade_date,
             policy=policy,
             signal_at=signal_at,
+            instrument=instrument,
         )
         remaining = requested
         order_fills: list[dict[str, Any]] = []
@@ -163,7 +171,7 @@ def execute_simulation_day(
             slice_request = min(remaining, int(execution_slice["quantity"]))
             fill_quantity = min(slice_request, capacity)
             if side == "buy":
-                fill_quantity = fill_quantity // 100 * 100
+                fill_quantity = lot_floor(fill_quantity, lot_rules[instrument])
                 fill_quantity = _affordable_buy_quantity(
                     fill_quantity,
                     cash=cash,
@@ -172,6 +180,7 @@ def execute_simulation_day(
                     asset_type=infer_cn_asset_type(instrument),
                     trade_date=trade_date,
                     costs=cost_model,
+                    rules=lot_rules[instrument],
                 )
             if side == "sell":
                 fill_quantity = min(
@@ -180,7 +189,9 @@ def execute_simulation_day(
                 )
             if fill_quantity <= 0:
                 rejection_reasons.append(
-                    "insufficient_cash" if side == "buy" and cash <= price * 100 else "capacity"
+                    "insufficient_cash"
+                    if side == "buy" and cash <= price * lot_rules[instrument].min_lot
+                    else "capacity"
                 )
                 continue
             participation = fill_quantity / minute_volume
@@ -323,8 +334,9 @@ def execute_atomic_pair_day(
         instrument = str(leg["instrument"]).upper()
         position_side = str(leg["position_side"])
         target = int(leg["target_quantity"])
-        if target < 0 or target % 100:
-            raise ValueError("pair target quantities must be non-negative board lots")
+        lot_rule = order_unit_rules(instrument, trade_date)
+        if target < 0 or (target and not is_valid_order_quantity(target, lot_rule)):
+            raise ValueError("pair target quantities must satisfy board order-unit rules")
         current_row = state.get(instrument) or {}
         current = int(current_row.get("quantity", 0))
         current_side = str(current_row.get("position_side") or position_side)
@@ -796,8 +808,9 @@ def _affordable_buy_quantity(
     asset_type: str,
     trade_date: date,
     costs: CostModelConfig,
+    rules: OrderUnitRules,
 ) -> int:
-    result = quantity // 100 * 100
+    result = lot_floor(min(quantity, int(cash / price)), rules) if price > 0 else 0
     while result > 0:
         gross = result * price
         fee = costs.estimate(
@@ -809,7 +822,7 @@ def _affordable_buy_quantity(
         )
         if gross + fee <= cash + 1e-9:
             return result
-        result -= 100
+        result = lot_floor(result - rules.lot_increment, rules)
     return 0
 
 
