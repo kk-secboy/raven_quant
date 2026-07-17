@@ -226,7 +226,8 @@ def _daily_market(
         ],
         names=["datetime", "instrument"],
     )
-    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce") * 1000.0
+    # $amount is CNY yuan under the v3 daily field contract.
+    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce")
     frame = frame.join(shortability[["shortable"]], how="left")
     return frame.sort_index()
 

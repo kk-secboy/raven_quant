@@ -109,6 +109,8 @@ def _daily_dataset() -> dict:
             "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
             "source_volume_unit": "hand",
             "qlib_volume_unit": "share",
+            "source_amount_unit": "thousand_cny",
+            "qlib_amount_unit": "cny",
             "source_hand_size": 100,
             "index_volume_policy": "excluded_non_tradable_benchmark",
             "lineage_verified": True,
@@ -235,7 +237,7 @@ def test_allocation_uses_recommendation_ledgers_and_propagates_risk(
                     daily_dataset="allocation-data",
                     daily_dataset_identity_sha256="a" * 64,
                     daily_dataset_lineage_id="b" * 64,
-                    daily_field_contract_version="daily-qlib-field-v2-share-volume",
+                    daily_field_contract_version="daily-qlib-field-v3-cny-amount",
                     execution_dataset_identity_sha256="c" * 64,
                     execution_dataset_lineage_id="d" * 64,
                     execution_field_contract_version=(

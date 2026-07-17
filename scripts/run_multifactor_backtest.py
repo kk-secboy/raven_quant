@@ -313,13 +313,13 @@ def _metadata_provider(
                 timestamp if intraday_prices is not None else market_timestamp,
                 "$close" if intraday_prices is not None else close_field,
             ).reindex(instruments.astype(str)),
+            # $amount is CNY yuan under the v3 daily field contract.
             "average_daily_values": (
                 _qlib_cross_section(
                     execution_metadata,
                     market_timestamp,
                     "Ref(Mean($amount, 20), 1)",
                 ).reindex(instruments.astype(str))
-                * 1000.0
             ),
         }
 
@@ -452,13 +452,14 @@ def main() -> None:
                 f"{len(missing_instruments)} strategy instruments: "
                 + preview
             )
+    # $amount is CNY yuan under the v3 daily field contract.
     liquidity_amount = D.features(
         instruments,
         ["$amount"],
         start_time=periods["start"],
         end_time=periods["end"],
         freq="day",
-    ).mul(1000.0)
+    )
     open_field = "$open/$factor" if minute_execution else "$open"
     close_field = "$close/$factor" if minute_execution else "$close"
     execution_metadata = D.features(

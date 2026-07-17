@@ -22,7 +22,9 @@ from quant_platform.eligibility import (
 from .execution_contract import (
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
     INDEX_VOLUME_POLICY,
+    QLIB_DAILY_AMOUNT_UNIT,
     QLIB_DAILY_VOLUME_UNIT,
+    TUSHARE_DAILY_AMOUNT_UNIT,
     TUSHARE_DAILY_VOLUME_UNIT,
     TUSHARE_HAND_SIZE,
 )
@@ -65,6 +67,25 @@ _FUNDAMENTAL_RESEARCH_FIELDS = {
     "netprofit_yoy": "fund_netprofit_yoy",
     "q_sales_yoy": "fund_quarter_revenue_yoy",
     "q_profit_yoy": "fund_quarter_profit_yoy",
+}
+
+# Explicit per-field unit declarations written into the dataset provenance.
+# Prices are normalized to 1.0 at the snapshot anchor (first adjusted close),
+# volume is value-consistent shares (price x volume = true CNY turnover), and
+# amount is CNY yuan (converted from the Tushare thousand-CNY source unit).
+_DAILY_FIELD_UNITS = {
+    "open": "snapshot_anchor_normalized_price",
+    "high": "snapshot_anchor_normalized_price",
+    "low": "snapshot_anchor_normalized_price",
+    "close": "snapshot_anchor_normalized_price",
+    "vwap": "snapshot_anchor_normalized_price",
+    "volume": "value_consistent_shares_price_times_volume_equals_cny_amount",
+    "factor": "adj_factor_div_base_price",
+    "change": "decimal_return",
+    "amount": "cny_yuan",
+    "paused": "flag_1_when_no_volume",
+    "up_limit": "snapshot_anchor_normalized_price",
+    "down_limit": "snapshot_anchor_normalized_price",
 }
 
 
@@ -240,8 +261,11 @@ class QlibBuilder:
             "fields": fields,
             "source_volume_unit": TUSHARE_DAILY_VOLUME_UNIT,
             "qlib_volume_unit": QLIB_DAILY_VOLUME_UNIT,
+            "source_amount_unit": TUSHARE_DAILY_AMOUNT_UNIT,
+            "qlib_amount_unit": QLIB_DAILY_AMOUNT_UNIT,
             "source_hand_size": int(TUSHARE_HAND_SIZE),
             "index_volume_policy": INDEX_VOLUME_POLICY,
+            "field_units": _DAILY_FIELD_UNITS,
             "research_features": self.research_feature_contract,
             "eligibility_contract_version": ELIGIBILITY_CONTRACT_VERSION,
         }
@@ -276,8 +300,11 @@ class QlibBuilder:
             "fields": fields,
             "source_volume_unit": TUSHARE_DAILY_VOLUME_UNIT,
             "qlib_volume_unit": QLIB_DAILY_VOLUME_UNIT,
+            "source_amount_unit": TUSHARE_DAILY_AMOUNT_UNIT,
+            "qlib_amount_unit": QLIB_DAILY_AMOUNT_UNIT,
             "source_hand_size": int(TUSHARE_HAND_SIZE),
             "index_volume_policy": INDEX_VOLUME_POLICY,
+            "field_units": _DAILY_FIELD_UNITS,
             "research_features": self.research_feature_contract,
             "eligibility_contract_version": ELIGIBILITY_CONTRACT_VERSION,
         }
@@ -350,7 +377,9 @@ class QlibBuilder:
                 continue
             exchange, code = str(ts_code).split(".", 1)[1], str(ts_code).split(".", 1)[0]
             symbol = f"{exchange.upper()}{code}"
-            amount = pd.to_numeric(group.get("amount", 0.0), errors="coerce").fillna(0.0)
+            amount = (
+                pd.to_numeric(group.get("amount", 0.0), errors="coerce").fillna(0.0) * 1000.0
+            )
             close = pd.to_numeric(group["close"], errors="coerce")
             normalized = pd.DataFrame(
                 {
@@ -839,7 +868,8 @@ class QlibBuilder:
                 vol * {float(TUSHARE_HAND_SIZE)} * base_price / adj_factor AS volume,
                 adj_factor / base_price AS factor,
                 pct_chg / 100.0 AS change,
-                amount,
+                -- Tushare amount is thousand-CNY; the Qlib field contract is CNY yuan
+                amount * 1000.0 AS amount,
                 CASE WHEN vol IS NULL OR vol <= 0 THEN 1.0 ELSE 0.0 END AS paused
                 , up_limit * adj_factor / base_price AS up_limit
                 , down_limit * adj_factor / base_price AS down_limit

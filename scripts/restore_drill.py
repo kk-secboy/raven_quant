@@ -249,7 +249,7 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                     "'CNY', 5000000, 5000010, 5000010, 5000010, 'twap', 'pair', '5min', "
                     f"'{sentinel}{sentinel}', 'restore-minute', 'restore-daily', "
                     f"'{sentinel}{sentinel}', '{sentinel}{sentinel}', "
-                    "'daily-qlib-field-v2-share-volume', "
+                    "'daily-qlib-field-v3-cny-amount', "
                     f"'{sentinel}{sentinel}', '{sentinel}{sentinel}', "
                     "'minute-qlib-execution-v4-source-units', 'ashare-minute-simulation-v2', "
                     "'cn-effective-cost-v1', '{\"execution_algorithm\":\"twap\"}'::jsonb, "

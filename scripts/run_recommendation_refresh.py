@@ -314,9 +314,10 @@ def main() -> None:
     market_as_of = as_of.normalize()
     instruments = sorted(set(scores.index.get_level_values("instrument")))
     lookback = (as_of - pd.Timedelta(days=60)).date().isoformat()
+    # $amount is CNY yuan under the v3 daily field contract.
     liquidity = D.features(
         instruments, ["$amount"], start_time=lookback, end_time=as_of.date().isoformat(), freq="day"
-    ).mul(1000.0)
+    )
     execution_metadata = D.features(
         instruments,
         ["$open", "$close", "Ref(Mean($amount, 20), 1)"],
@@ -433,8 +434,9 @@ def main() -> None:
         current_prices=pd.to_numeric(point_metadata["$close"], errors="coerce"),
         portfolio_drawdown=0.0,
         daily_return=0.0,
+        # $amount is CNY yuan under the v3 daily field contract.
         average_daily_values=(
-            pd.to_numeric(point_metadata["Ref(Mean($amount, 20), 1)"], errors="coerce") * 1000.0
+            pd.to_numeric(point_metadata["Ref(Mean($amount, 20), 1)"], errors="coerce")
         ),
         portfolio_value=construction_notional,
         risk_exposure=float(manifest.get("risk_exposure", 1.0)),

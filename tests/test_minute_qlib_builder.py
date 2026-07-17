@@ -328,6 +328,8 @@ def test_five_minute_snapshot_uses_native_qlib_frequency(
     )
     assert provenance["frequency"] == "5min"
     assert provenance["execution_contract_version"] == MINUTE_EXECUTION_CONTRACT_VERSION
+    assert provenance["field_units"]["amount"] == "cny_yuan"
+    assert provenance["field_units"]["vwap"] == "source_price_cny_amount_div_volume"
     assert provenance["source_datasets"] == ["etf_1m"]
     assert provenance["source_unit_contracts"] == {
         "etf_1m": MINUTE_SOURCE_UNIT_CONTRACTS["etf_1m"]

@@ -41,6 +41,25 @@ MINUTE_QLIB_FIELDS = (
     "oi",
 )
 
+# Explicit per-field unit declarations written into the dataset provenance.
+# Minute bars keep source (unadjusted) CNY prices; volume units are declared
+# per source dataset in MINUTE_SOURCE_UNIT_CONTRACTS.
+MINUTE_QLIB_FIELD_UNITS = {
+    "open": "source_price_cny",
+    "high": "source_price_cny",
+    "low": "source_price_cny",
+    "close": "source_price_cny",
+    "vwap": "source_price_cny_amount_div_volume",
+    "volume": "per_dataset_see_source_unit_contracts",
+    "factor": "constant_1_unadjusted",
+    "change": "decimal_return",
+    "amount": "cny_yuan",
+    "paused": "flag_1_when_no_volume",
+    "up_limit": "source_price_cny",
+    "down_limit": "source_price_cny",
+    "oi": "open_interest_contracts",
+}
+
 
 class MinuteQlibBuilder:
     """Build native or Qlib-resampled minute data from one immutable snapshot."""
@@ -303,6 +322,7 @@ class MinuteQlibBuilder:
             "frequency": self.frequency,
             "source_frequency": self.source_frequency,
             "fields": list(MINUTE_QLIB_FIELDS),
+            "field_units": MINUTE_QLIB_FIELD_UNITS,
             "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
             "resampled": self.requires_resampling,
             "resample_contract_version": (

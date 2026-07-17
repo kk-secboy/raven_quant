@@ -26,6 +26,8 @@ def test_daily_contract_requires_share_volume_and_verified_lineage() -> None:
         "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
         "source_volume_unit": "hand",
         "qlib_volume_unit": "share",
+        "source_amount_unit": "thousand_cny",
+        "qlib_amount_unit": "cny",
         "source_hand_size": 100,
         "index_volume_policy": "excluded_non_tradable_benchmark",
         "lineage_verified": True,

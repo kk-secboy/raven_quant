@@ -97,7 +97,7 @@ def test_unresolved_member_event_gates_long_and_pair_sources_until_resolution(
                 daily_dataset="risk-gate-data",
                 daily_dataset_identity_sha256="a" * 64,
                 daily_dataset_lineage_id="b" * 64,
-                daily_field_contract_version="daily-qlib-field-v2-share-volume",
+                daily_field_contract_version="daily-qlib-field-v3-cny-amount",
                 execution_dataset_identity_sha256="c" * 64,
                 execution_dataset_lineage_id="d" * 64,
                 execution_field_contract_version="minute-qlib-execution-v4-source-units",

@@ -187,6 +187,11 @@ def test_builds_per_symbol_normalized_qlib_staging(tmp_path: Path) -> None:
     assert frame["vwap"].tolist() == pytest.approx([1.0, 1.0])
     assert frame["up_limit"].tolist() == pytest.approx([1.1, 1.1])
     assert frame["down_limit"].tolist() == pytest.approx([0.9, 0.9])
+    # amount is CNY yuan: source 100/25 thousand-CNY becomes 100_000/25_000 yuan,
+    # so amount / (hands x 100 shares) stays at the raw price scale.
+    assert frame["amount"].tolist() == pytest.approx([100_000.0, 25_000.0])
+    raw_hands = pd.Series([100.0, 50.0])
+    assert (frame["amount"] / (raw_hands * 100)).tolist() == pytest.approx([10.0, 5.0])
 
 
 def test_adds_point_in_time_research_features_without_announcement_leakage(
@@ -378,6 +383,7 @@ def test_adds_normalized_index_staging(tmp_path: Path) -> None:
     assert index["vwap"].tolist() == pytest.approx([1.0])
     assert index["volume"].tolist() == [0.0]
     assert index["paused"].tolist() == [0.0]
+    assert index["amount"].tolist() == pytest.approx([30_000_000.0])
 
 
 def test_windows_path_maps_to_wsl() -> None:
@@ -526,8 +532,17 @@ def test_writes_reproducible_qlib_dataset_provenance(tmp_path: Path) -> None:
     assert provenance["field_contract_version"] == DAILY_QLIB_FIELD_CONTRACT_VERSION
     assert provenance["source_volume_unit"] == "hand"
     assert provenance["qlib_volume_unit"] == "share"
+    assert provenance["source_amount_unit"] == "thousand_cny"
+    assert provenance["qlib_amount_unit"] == "cny"
     assert provenance["source_hand_size"] == 100
     assert provenance["index_volume_policy"] == "excluded_non_tradable_benchmark"
+    assert provenance["field_units"]["amount"] == "cny_yuan"
+    assert provenance["field_units"]["close"] == "snapshot_anchor_normalized_price"
+    assert provenance["field_units"]["factor"] == "adj_factor_div_base_price"
+    assert provenance["field_units"]["change"] == "decimal_return"
+    assert provenance["field_units"]["volume"] == (
+        "value_consistent_shares_price_times_volume_equals_cny_amount"
+    )
     assert provenance["lineage_verified"] is False
     assert provenance["dataset_lineage_id"] is None
 

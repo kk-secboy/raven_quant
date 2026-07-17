@@ -5,9 +5,11 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
-DAILY_QLIB_FIELD_CONTRACT_VERSION = "daily-qlib-field-v2-share-volume"
+DAILY_QLIB_FIELD_CONTRACT_VERSION = "daily-qlib-field-v3-cny-amount"
 TUSHARE_DAILY_VOLUME_UNIT = "hand"
 QLIB_DAILY_VOLUME_UNIT = "share"
+TUSHARE_DAILY_AMOUNT_UNIT = "thousand_cny"
+QLIB_DAILY_AMOUNT_UNIT = "cny"
 TUSHARE_HAND_SIZE = 100
 INDEX_VOLUME_POLICY = "excluded_non_tradable_benchmark"
 
@@ -242,10 +244,12 @@ def require_daily_qlib_contract(provenance: dict[str, Any]) -> None:
     if (
         provenance.get("source_volume_unit") != TUSHARE_DAILY_VOLUME_UNIT
         or provenance.get("qlib_volume_unit") != QLIB_DAILY_VOLUME_UNIT
+        or provenance.get("source_amount_unit") != TUSHARE_DAILY_AMOUNT_UNIT
+        or provenance.get("qlib_amount_unit") != QLIB_DAILY_AMOUNT_UNIT
         or int(provenance.get("source_hand_size") or 0) != TUSHARE_HAND_SIZE
         or provenance.get("index_volume_policy") != INDEX_VOLUME_POLICY
     ):
-        raise ValueError("daily Qlib dataset volume units are missing or invalid")
+        raise ValueError("daily Qlib dataset volume/amount units are missing or invalid")
     if provenance.get("lineage_verified") is not True:
         raise ValueError("daily Qlib dataset lineage is not verified")
 
