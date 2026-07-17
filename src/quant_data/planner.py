@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -32,6 +33,23 @@ from .storage import ParquetStore
 
 def compact_date(value: date) -> str:
     return value.strftime("%Y%m%d")
+
+
+CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def today_cn(now: datetime | None = None) -> date:
+    """Return "today" in the A-share market timezone (Asia/Shanghai).
+
+    Naive datetimes are interpreted as UTC.  All pipeline date defaults must
+    use the market timezone so an evening UTC run does not plan for the wrong
+    trading day.
+    """
+
+    current = now if now is not None else datetime.now(CN_MARKET_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    return current.astimezone(CN_MARKET_TIMEZONE).date()
 
 
 class BootstrapPlanner:
@@ -574,7 +592,7 @@ def _session_chunks(values: list[date], size: int) -> list[tuple[date, date]]:
 
 def parse_date(value: str, *, latest: date | None = None) -> date:
     if value.lower() == "latest":
-        return latest or date.today()
+        return latest or today_cn()
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 

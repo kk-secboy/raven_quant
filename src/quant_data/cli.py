@@ -34,7 +34,7 @@ from .partitioning import (
     resize_partition_spec,
     split_partition_spec,
 )
-from .planner import BootstrapPlanner, ExecutionDataPlanner, compact_date, parse_date
+from .planner import BootstrapPlanner, ExecutionDataPlanner, compact_date, parse_date, today_cn
 from .provider import TushareHttpProvider
 from .qlib_builder import QlibBuilder
 from .rate_limit import GlobalRateGate
@@ -787,7 +787,7 @@ def bootstrap(
     if profile not in {"core", "research", "full"}:
         raise typer.BadParameter("profile must be core, research, or full")
     start_date = parse_date(start)
-    end_date = parse_date(end, latest=date.today())
+    end_date = parse_date(end, latest=today_cn())
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
     context = load_context()
@@ -946,7 +946,7 @@ def verify(
     report = verify_downloads(
         context.checkpoint,
         context.settings.data_root,
-        snapshot_end=parse_date(snapshot_end, latest=date.today()),
+        snapshot_end=parse_date(snapshot_end, latest=today_cn()),
         require_all_planned=not allow_incomplete_plans,
     )
     path = context.settings.data_root / "verification" / "latest.json"
@@ -966,7 +966,7 @@ def snapshot(
     """Build an immutable compacted Parquet snapshot from successful units."""
     context = load_context(require_credentials=False)
     start_date = parse_date(start)
-    end_date = parse_date(end, latest=date.today())
+    end_date = parse_date(end, latest=today_cn())
     name = name or f"cn-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
     # Verify before building so every snapshot manifest records an explicit
     # quality gate; Qlib builds refuse snapshots without quality_gate.ok=true.
@@ -996,7 +996,7 @@ def margin_eligibility(
 ) -> None:
     """Download daily full-market margin-eligible security evidence."""
     start_date = parse_date(start)
-    end_date = parse_date(end, latest=date.today())
+    end_date = parse_date(end, latest=today_cn())
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
     context = load_context(
@@ -1074,7 +1074,7 @@ def core_intraday(
 ) -> None:
     """Download bounded 1-minute windows and build pair-execution evidence."""
     start_date = parse_date(start)
-    end_date = parse_date(end, latest=date.today())
+    end_date = parse_date(end, latest=today_cn())
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
     symbols_by_dataset = {
@@ -1195,7 +1195,7 @@ def ashare_5m(
     """Download resumable 5-minute bars for every A-share active in the range."""
 
     start_date = parse_date(start)
-    end_date = parse_date(end, latest=date.today())
+    end_date = parse_date(end, latest=today_cn())
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
     context = load_context(
@@ -1366,7 +1366,7 @@ def supplemental_download(
     if bundle not in SUPPORTED_BUNDLES:
         raise typer.BadParameter("bundle must be one of: " + ", ".join(sorted(SUPPORTED_BUNDLES)))
     start_date = parse_date(start)
-    end_date = parse_date(end, latest=date.today())
+    end_date = parse_date(end, latest=today_cn())
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
     context = load_context(
