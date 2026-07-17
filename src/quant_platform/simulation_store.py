@@ -41,7 +41,11 @@ from quant_data.execution_contract import (
     require_strategy_execution_contract,
 )
 
-from .cost_model import COST_SCHEDULE_VERSION, CostModelConfig, CostScheduleBook
+from .cost_model import (
+    KNOWN_COST_SCHEDULE_VERSIONS,
+    CostModelConfig,
+    CostScheduleBook,
+)
 from .execution_algorithms import execution_time_slots, normalize_execution_policy
 from .member_risk_gate import (
     load_allocation_risk_state,
@@ -282,7 +286,7 @@ class SimulationStore:
     ) -> dict[str, Any]:
         if initial_cash < 100_000:
             raise ValueError("simulation initial cash must be at least 100000")
-        if cost_schedule_version != COST_SCHEDULE_VERSION:
+        if cost_schedule_version not in KNOWN_COST_SCHEDULE_VERSIONS:
             raise ValueError("simulation cost schedule version is unavailable")
         daily_provenance = dict(daily_dataset.get("provenance") or {})
         execution_provenance = dict(execution_dataset.get("provenance") or {})

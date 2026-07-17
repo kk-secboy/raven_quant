@@ -8,7 +8,13 @@ import numpy as np
 import pandas as pd
 from statsmodels.tsa.stattools import coint
 
-from .cost_model import COST_SCHEDULE_VERSION, CostModelConfig, infer_cn_asset_type
+from .cost_model import (
+    COST_SCHEDULE_VERSION,
+    CURRENT_STOCK_SELL_STAMP_DUTY_RATE,
+    CURRENT_TRANSFER_FEE_RATE,
+    CostModelConfig,
+    infer_cn_asset_type,
+)
 from .market_rules import lot_floor, order_unit_rules
 
 
@@ -31,9 +37,9 @@ class PairTradingConfig:
     effective_to: str | None = None
     buy_commission_rate: float = 0.0005
     sell_commission_rate: float = 0.0005
-    stock_sell_stamp_duty_rate: float = 0.0010
+    stock_sell_stamp_duty_rate: float = CURRENT_STOCK_SELL_STAMP_DUTY_RATE
     etf_sell_stamp_duty_rate: float = 0.0
-    transfer_fee_rate: float = 0.0
+    transfer_fee_rate: float = CURRENT_TRANSFER_FEE_RATE
     min_commission: float = 5.0
     fixed_slippage_rate: float = 0.0005
     impact_at_max_participation: float = 0.0010

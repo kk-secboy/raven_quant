@@ -8,6 +8,7 @@ from qlib.backtest.decision import Order
 from qlib.backtest.exchange import Exchange
 
 from .cost_model import CostModelConfig, CostScheduleBook, infer_cn_asset_type
+from .market_rules import OrderUnitRules, order_unit_rules
 
 
 class SquareRootImpactExchange(Exchange):
@@ -67,9 +68,38 @@ class SquareRootImpactExchange(Exchange):
         position: Any,
         dealt_order_amount: dict,
     ) -> tuple[float, float, float]:
-        trade_price, trade_value, _ = super()._calc_trade_info_by_order(
-            order, position, dealt_order_amount
-        )
+        rules: OrderUnitRules | None = None
+        try:
+            rules = order_unit_rules(str(order.stock_id), order.start_time.date())
+        except ValueError:
+            self.logger.warning(
+                "no board order-unit rules for %s on %s; using flat trade_unit",
+                order.stock_id,
+                order.start_time,
+            )
+        original_trade_unit = self.trade_unit
+        if rules is not None:
+            # Buys round down by the board lot increment (100 on the main
+            # boards, 1 above the 200-share minimum on STAR, 1 above 100 on
+            # BSE).  Sells round only to whole shares so odd-lot positions can
+            # be reduced or exited.
+            self.trade_unit = 1 if order.direction == Order.SELL else rules.lot_increment
+        try:
+            trade_price, trade_value, _ = super()._calc_trade_info_by_order(
+                order, position, dealt_order_amount
+            )
+        finally:
+            self.trade_unit = original_trade_unit
+        if (
+            rules is not None
+            and order.direction == Order.BUY
+            and trade_value > 1e-5
+            and order.deal_amount * (order.factor or 1.0) < rules.min_lot
+        ):
+            # Below the board minimum declaration (for example fewer than 200
+            # shares on STAR): the exchange would reject the order outright.
+            order.deal_amount = 0.0
+            return trade_price, 0.0, 0.0
         if trade_value <= 1e-5:
             return trade_price, trade_value, 0.0
         trade_date = order.start_time.date()

@@ -40,7 +40,12 @@ from .auth_policy import ROLE_PERMISSIONS, has_permission, permission_for
 from .auth_store import AuthenticationError, AuthStore
 from .autonomous_research import AutonomousResearchOrchestrator
 from .continuous_research import ContinuousResearchController
-from .cost_model import COST_SCHEDULE_VERSION, CostModelConfig
+from .cost_model import (
+    COST_SCHEDULE_VERSION,
+    CURRENT_STOCK_SELL_STAMP_DUTY_RATE,
+    CURRENT_TRANSFER_FEE_RATE,
+    CostModelConfig,
+)
 from .data_rollover import select_qlib_dataset
 from .data_task_store import DataTaskStore
 from .deployment_readiness import DeploymentReadinessStore
@@ -416,14 +421,16 @@ class StrategyConfigRequest(BaseModel):
     vwap_lookback_days: int = Field(default=20, ge=5, le=60)
     max_volume_participation: float = Field(default=0.01, gt=0, le=0.20)
     min_capacity_fill_ratio: float = Field(default=0.95, ge=0, le=1)
-    cost_schedule_version: Literal["cn-effective-cost-v1"] = COST_SCHEDULE_VERSION
+    cost_schedule_version: str = COST_SCHEDULE_VERSION
     effective_from: str = "2000-01-01"
     effective_to: str | None = None
     buy_commission_rate: float = Field(default=0.0005, ge=0, le=0.02)
     sell_commission_rate: float = Field(default=0.0005, ge=0, le=0.02)
-    stock_sell_stamp_duty_rate: float = Field(default=0.0010, ge=0, le=0.02)
+    stock_sell_stamp_duty_rate: float = Field(
+        default=CURRENT_STOCK_SELL_STAMP_DUTY_RATE, ge=0, le=0.02
+    )
     etf_sell_stamp_duty_rate: float = Field(default=0.0, ge=0, le=0.02)
-    transfer_fee_rate: float = Field(default=0.0, ge=0, le=0.02)
+    transfer_fee_rate: float = Field(default=CURRENT_TRANSFER_FEE_RATE, ge=0, le=0.02)
     annual_borrow_rate: float = Field(default=0.0, ge=0, le=1.0)
     fixed_slippage_rate: float = Field(default=0.0005, ge=0, le=0.02)
     impact_at_max_participation: float = Field(default=0.0010, ge=0, le=0.10)
@@ -520,19 +527,22 @@ class PairStrategyConfigRequest(BaseModel):
     pair_gross_fraction: float = Field(default=0.20, gt=0, le=1)
     max_volume_participation: float = Field(default=0.01, gt=0, le=0.20)
     min_capacity_fill_ratio: float = Field(default=0.95, gt=0, le=1)
-    cost_schedule_version: Literal["cn-effective-cost-v1"] = COST_SCHEDULE_VERSION
+    cost_schedule_version: str = COST_SCHEDULE_VERSION
     effective_from: str = "2000-01-01"
     effective_to: str | None = None
     buy_commission_rate: float = Field(default=0.0005, ge=0, le=0.02)
     sell_commission_rate: float = Field(default=0.0005, ge=0, le=0.02)
-    stock_sell_stamp_duty_rate: float = Field(default=0.0010, ge=0, le=0.02)
+    stock_sell_stamp_duty_rate: float = Field(
+        default=CURRENT_STOCK_SELL_STAMP_DUTY_RATE, ge=0, le=0.02
+    )
     etf_sell_stamp_duty_rate: float = Field(default=0.0, ge=0, le=0.02)
-    transfer_fee_rate: float = Field(default=0.0, ge=0, le=0.02)
+    transfer_fee_rate: float = Field(default=CURRENT_TRANSFER_FEE_RATE, ge=0, le=0.02)
     min_commission: float = Field(default=5.0, ge=0, le=1000)
     fixed_slippage_rate: float = Field(default=0.0005, ge=0, le=0.02)
     impact_at_max_participation: float = Field(default=0.0010, ge=0, le=0.10)
     annual_borrow_rate: float = Field(default=0.08, gt=0, le=1)
-    lot_size: int = Field(default=100, ge=1, le=10000)
+    # None resolves per-leg board order-unit rules via market_rules.
+    lot_size: int | None = Field(default=None, ge=1, le=10000)
     kalman_process_variance: float = Field(default=1e-5, gt=0, le=1)
     kalman_observation_variance: float = Field(default=1e-3, gt=0, le=1)
     min_hedge_ratio: float = Field(default=0.10, gt=0, le=100)

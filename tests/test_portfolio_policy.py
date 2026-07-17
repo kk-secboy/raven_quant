@@ -36,13 +36,16 @@ def test_cost_model_is_shared_and_doubles_every_variable_cost() -> None:
     costs = CostModelConfig()
     assert costs.buy_commission_rate == pytest.approx(0.0005)
     assert costs.sell_commission_rate == pytest.approx(0.0005)
-    assert costs.stock_sell_stamp_duty_rate == pytest.approx(0.0010)
+    assert costs.stock_sell_stamp_duty_rate == pytest.approx(0.0005)
     assert costs.etf_sell_stamp_duty_rate == pytest.approx(0.0)
     assert costs.max_volume_participation == pytest.approx(0.01)
     assert costs.market_impact_rate(0.01) == pytest.approx(0.0010)
-    assert costs.factor_screening_rate(reference_order_value=100_000) == pytest.approx(0.005)
+    assert costs.factor_screening_rate(reference_order_value=100_000) == pytest.approx(
+        0.00452
+    )
     doubled = costs.doubled()
     assert doubled.buy_commission_rate == pytest.approx(0.0010)
+    assert doubled.stock_sell_stamp_duty_rate == pytest.approx(0.0010)
     assert doubled.fixed_slippage_rate == pytest.approx(0.0010)
     assert doubled.impact_at_max_participation == pytest.approx(0.0020)
     assert doubled.min_commission == pytest.approx(10.0)
@@ -64,9 +67,9 @@ def test_cost_schedule_is_asset_and_effective_date_specific() -> None:
         asset_type="etf",
         trade_date=pd.Timestamp("2025-06-03").date(),
     )
-    assert stock["stamp_duty"] == pytest.approx(100.0)
+    assert stock["stamp_duty"] == pytest.approx(50.0)
     assert etf["stamp_duty"] == pytest.approx(0.0)
-    assert stock["total"] - etf["total"] == pytest.approx(100.0)
+    assert stock["total"] - etf["total"] == pytest.approx(50.0)
     with pytest.raises(ValueError, match="no effective cost schedule"):
         costs.estimate(
             side="buy",

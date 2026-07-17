@@ -29,7 +29,7 @@ from quant_data.execution_contract import (
     require_strategy_execution_contract,
     strategy_execution_contract_hash,
 )
-from quant_platform.cost_model import COST_SCHEDULE_VERSION, CostModelConfig
+from quant_platform.cost_model import KNOWN_COST_SCHEDULE_VERSIONS, CostModelConfig
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
 from quant_platform.pair_trading import PairTradingConfig
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
@@ -1104,7 +1104,7 @@ class StrategyStore:
                 failures.append(f"{name} is required for pair strategy approval")
         if metrics.get("open_position_at_end") is not False:
             failures.append("pair backtest must finish without an open spread position")
-        if metrics.get("cost_schedule_version") != COST_SCHEDULE_VERSION:
+        if metrics.get("cost_schedule_version") not in KNOWN_COST_SCHEDULE_VERSIONS:
             failures.append("pair backtest cost schedule is missing or obsolete")
         provenance = metrics.get("provenance")
         if not isinstance(provenance, dict):

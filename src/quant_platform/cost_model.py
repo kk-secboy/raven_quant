@@ -23,6 +23,13 @@ KNOWN_COST_SCHEDULE_VERSIONS = frozenset(
     }
 )
 
+# Current-law rates, shared by the bare CostModelConfig defaults below and the
+# latest recorded schedule version.  When a new schedule version is recorded,
+# append it to CN_COST_SCHEDULE_VERSIONS and update these two constants to its
+# rates so bare defaults always track current law.
+CURRENT_STOCK_SELL_STAMP_DUTY_RATE = 0.0005
+CURRENT_TRANSFER_FEE_RATE = 0.00001
+
 
 def infer_cn_asset_type(instrument: str) -> str:
     value = str(instrument).upper()
@@ -49,9 +56,9 @@ class CostModelConfig:
     effective_to: str | None = None
     buy_commission_rate: float = 0.0005
     sell_commission_rate: float = 0.0005
-    stock_sell_stamp_duty_rate: float = 0.0010
+    stock_sell_stamp_duty_rate: float = CURRENT_STOCK_SELL_STAMP_DUTY_RATE
     etf_sell_stamp_duty_rate: float = 0.0
-    transfer_fee_rate: float = 0.0
+    transfer_fee_rate: float = CURRENT_TRANSFER_FEE_RATE
     annual_borrow_rate: float = 0.0
     min_commission: float = 5.0
     fixed_slippage_rate: float = 0.0005
@@ -94,7 +101,9 @@ class CostModelConfig:
         }
         normalized: dict[str, Any] = {}
         for key in cls.__dataclass_fields__:
-            if key in source:
+            # None means "not supplied": fall back to the field default so
+            # request models with optional cost fields validate cleanly.
+            if key in source and source[key] is not None:
                 normalized[key] = source[key]
         for old, new in aliases.items():
             if old in source and new not in normalized:
