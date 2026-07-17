@@ -314,13 +314,23 @@ def _verify_daily_ohlc(
         return errors, warnings, checks
     daily = _parquet_relation(daily_paths)
     trade_date = _date_sql("trade_date")
+    daily_columns = {
+        str(row[0]) for row in connection.execute(f"DESCRIBE SELECT * FROM {daily}").fetchall()
+    }
+    # Referencing an absent pct_chg binds to the SELECT alias itself and fails,
+    # so fall back to NULL and simply produce no jump warnings on sparse fixtures.
+    pct_chg_select = (
+        "try_cast(pct_chg AS DOUBLE) AS pct_chg"
+        if "pct_chg" in daily_columns
+        else "NULL AS pct_chg"
+    )
     daily_sql = f"""
         SELECT ts_code, {trade_date} AS trade_date,
                try_cast(open AS DOUBLE) AS open,
                try_cast(high AS DOUBLE) AS high,
                try_cast(low AS DOUBLE) AS low,
                try_cast(close AS DOUBLE) AS close,
-               try_cast(pct_chg AS DOUBLE) AS pct_chg
+               {pct_chg_select}
         FROM {daily}
         WHERE ts_code IS NOT NULL AND {trade_date} IS NOT NULL
           AND {trade_date} <= DATE {_sql_string(snapshot_end.isoformat())}

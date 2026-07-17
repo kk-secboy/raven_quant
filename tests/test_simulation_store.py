@@ -768,6 +768,7 @@ def test_process_batch_uses_full_cost_parameters_from_approved_source_contract(
             "buy_commission_rate": 0.01,
             "sell_commission_rate": 0.01,
             "stock_sell_stamp_duty_rate": 0.0,
+            "transfer_fee_rate": 0.0,
             "fixed_slippage_rate": 0.0,
             "impact_at_max_participation": 0.0,
             "min_commission": 0.0,
