@@ -14,17 +14,26 @@ from quant_data.verify import verify_downloads
 class FakeProvider:
     def fetch(self, api_name, params, fields=()):
         trade_date = params["trade_date"]
-        rows = [
-            {
-                "ts_code": "000001.SZ",
-                "trade_date": trade_date,
-                "open": 10.0,
-                "high": 11.0,
-                "low": 9.5,
-                "close": 10.5,
-                "vol": 100.0,
-            }
-        ]
+        if api_name == "adj_factor":
+            rows = [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": trade_date,
+                    "adj_factor": 1.0,
+                }
+            ]
+        else:
+            rows = [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": trade_date,
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.5,
+                    "close": 10.5,
+                    "vol": 100.0,
+                }
+            ]
         return ProviderResult(api_name, list(rows[0]), rows, json.dumps(rows).encode())
 
 
@@ -41,6 +50,16 @@ def test_runner_writes_atomic_parquet_and_snapshot(tmp_path: Path, database_url:
         )
         for day in ("20240102", "20240103")
     ]
+    specs += [
+        FetchSpec(
+            dataset="adj_factor",
+            api_name="adj_factor",
+            scope={"trade_date": day},
+            params={"trade_date": day},
+            fields=("ts_code", "trade_date", "adj_factor"),
+        )
+        for day in ("20240102", "20240103")
+    ]
     checkpoint.add(specs)
     runner = DownloadRunner(
         checkpoint=checkpoint,
@@ -48,8 +67,8 @@ def test_runner_writes_atomic_parquet_and_snapshot(tmp_path: Path, database_url:
         provider=FakeProvider(),
         workers=2,
     )
-    summary = runner.run({"daily"})
-    assert summary.succeeded == 2
+    summary = runner.run({"daily", "adj_factor"})
+    assert summary.succeeded == 4
     assert summary.failed == 0
     assert not list((tmp_path / "units").rglob("*.tmp"))
 

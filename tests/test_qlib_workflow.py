@@ -153,8 +153,9 @@ def test_workflow_resumes_the_same_recorder(
 
 def test_workflow_does_not_fallback_when_recorder_import_fails(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
-    monkeypatch.setenv("_MLFLOW_SERVER_ARTIFACT_ROOT", "E:/data/mlflow")
+    monkeypatch.setenv("_MLFLOW_SERVER_ARTIFACT_ROOT", str(tmp_path))
     monkeypatch.setattr(
         qlib_workflow,
         "upstream_runtime_identity",
