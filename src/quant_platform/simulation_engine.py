@@ -8,11 +8,20 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from .cost_model import CostModelConfig, infer_cn_asset_type
+from .cost_model import CostModelConfig, CostScheduleBook, infer_cn_asset_type
 from .execution_algorithms import build_execution_slices, normalize_execution_policy
 
 SIMULATION_ENGINE_VERSION = "ashare-minute-simulation-v2"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _resolve_cost_schedule(
+    cost_model: CostModelConfig | None,
+    cost_schedule: CostScheduleBook | None,
+) -> CostScheduleBook:
+    if (cost_model is None) == (cost_schedule is None):
+        raise ValueError("exactly one of cost_model or cost_schedule is required")
+    return cost_schedule or CostScheduleBook.from_versions([cost_model])
 
 
 def execute_simulation_day(
@@ -25,7 +34,8 @@ def execute_simulation_day(
     target_weights: dict[str, float],
     minute_bars: pd.DataFrame,
     closing_prices: dict[str, dict[str, Any]],
-    cost_model: CostModelConfig,
+    cost_model: CostModelConfig | None = None,
+    cost_schedule: CostScheduleBook | None = None,
     execution_policy: dict[str, Any],
     signal_at: datetime | None = None,
 ) -> dict[str, Any]:
@@ -33,6 +43,7 @@ def execute_simulation_day(
 
     if not isfinite(cash) or cash < 0 or prior_nav <= 0 or high_water_mark <= 0:
         raise ValueError("simulation account balances are invalid")
+    cost_model = _resolve_cost_schedule(cost_model, cost_schedule).as_of(trade_date)
     policy = normalize_execution_policy(execution_policy)
     targets = {str(key): float(value) for key, value in target_weights.items()}
     if any(not isfinite(value) or value < 0 for value in targets.values()):
@@ -286,13 +297,15 @@ def execute_atomic_pair_day(
     minute_bars: pd.DataFrame,
     closing_prices: dict[str, dict[str, Any]],
     shortability: dict[str, bool],
-    cost_model: CostModelConfig,
+    cost_model: CostModelConfig | None = None,
+    cost_schedule: CostScheduleBook | None = None,
     execution_policy: dict[str, Any],
 ) -> dict[str, Any]:
     """Execute a governed pair target as one all-filled or all-rejected atomic group."""
 
     if not isfinite(cash) or cash < 0 or prior_nav <= 0 or high_water_mark <= 0:
         raise ValueError("simulation account balances are invalid")
+    cost_model = _resolve_cost_schedule(cost_model, cost_schedule).as_of(trade_date)
     policy = normalize_execution_policy(execution_policy)
     group_id = str(target_payload.get("atomic_group_id") or "").strip()
     legs = [dict(item) for item in (target_payload.get("legs") or [])]

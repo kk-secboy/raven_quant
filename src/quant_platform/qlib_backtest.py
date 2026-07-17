@@ -7,10 +7,19 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .cost_model import CostModelConfig
+from .cost_model import CostModelConfig, CostScheduleBook
 from .qlib_execution_strategy import create_qlib_execution_strategy
 
 QLIB_ENGINE_VERSION = "qlib-policy-engine-v5-single-mainline"
+
+
+def _resolve_cost_schedule(
+    cost_model: CostModelConfig | None,
+    cost_schedule: CostScheduleBook | None,
+) -> CostScheduleBook:
+    if (cost_model is None) == (cost_schedule is None):
+        raise ValueError("exactly one of cost_model or cost_schedule is required")
+    return cost_schedule or CostScheduleBook.from_versions([cost_model])
 
 
 def _load_qlib_risk_analysis() -> Callable[..., pd.DataFrame]:
@@ -156,7 +165,8 @@ def run_formal_qlib_backtest(
     end_time: str,
     account: float,
     benchmark: str,
-    cost_model: CostModelConfig,
+    cost_model: CostModelConfig | None = None,
+    cost_schedule: CostScheduleBook | None = None,
     execution_method: str = "open",
     signal_frequency: str = "day",
     execution_frequency: str | None = None,
@@ -170,6 +180,7 @@ def run_formal_qlib_backtest(
         raise RuntimeError("the formal backtest runtime does not contain Qlib") from exc
     from .qlib_exchange import SquareRootImpactExchange
 
+    schedule = _resolve_cost_schedule(cost_model, cost_schedule)
     if execution_method not in {"open", "twap", "vwap", "next_bar"}:
         raise ValueError("unsupported formal execution method")
     if execution_method in {"twap", "vwap", "next_bar"}:
@@ -179,7 +190,7 @@ def run_formal_qlib_backtest(
             end_time=end_time,
             account=account,
             benchmark=benchmark,
-            cost_model=cost_model,
+            cost_schedule=schedule,
             execution_method=execution_method,
             signal_frequency=signal_frequency,
             execution_frequency=execution_frequency,
@@ -188,7 +199,7 @@ def run_formal_qlib_backtest(
             annual_minimum_acceptable_return=annual_minimum_acceptable_return,
         )
     exchange = SquareRootImpactExchange(
-        cost_model=cost_model,
+        cost_schedule=schedule,
         freq="day",
         start_time=start_time,
         end_time=end_time,
@@ -230,7 +241,7 @@ def _run_formal_minute_backtest(
     end_time: str,
     account: float,
     benchmark: str,
-    cost_model: CostModelConfig,
+    cost_schedule: CostScheduleBook,
     execution_method: str,
     signal_frequency: str,
     execution_frequency: str | None,
@@ -257,7 +268,7 @@ def _run_formal_minute_backtest(
 
     slice_strategy = create_qlib_execution_strategy(execution_policy)
     exchange = SquareRootImpactExchange(
-        cost_model=cost_model,
+        cost_schedule=cost_schedule,
         freq=execution_frequency,
         start_time=start_time,
         end_time=end_time,
@@ -342,22 +353,25 @@ def aggregate_intraday_report(report: pd.DataFrame) -> pd.DataFrame:
 
 def run_qlib_validation_suites(
     *,
-    runner: Callable[[str, str, CostModelConfig], QlibBacktestResult],
+    runner: Callable[[str, str, CostScheduleBook], QlibBacktestResult],
     full_result: QlibBacktestResult,
     start_time: str,
     end_time: str,
-    cost_model: CostModelConfig,
+    cost_model: CostModelConfig | None = None,
+    cost_schedule: CostScheduleBook | None = None,
     config: dict[str, Any],
     capacity_runner: Callable[[float], QlibBacktestResult] | None = None,
-    robustness_runner: Callable[[dict[str, Any], CostModelConfig], QlibBacktestResult]
+    robustness_runner: Callable[[dict[str, Any], CostScheduleBook], QlibBacktestResult]
     | None = None,
     robustness_artifact_writer: Callable[[str, QlibBacktestResult], dict[str, Any]]
     | None = None,
 ) -> dict[str, Any]:
     """Repeat the same Qlib runner for cost, rolling and event validation."""
 
+    schedule = _resolve_cost_schedule(cost_model, cost_schedule)
+
     def scenario_result(
-        overrides: dict[str, Any], costs: CostModelConfig
+        overrides: dict[str, Any], costs: CostScheduleBook
     ) -> QlibBacktestResult:
         if robustness_runner is not None:
             return robustness_runner(overrides, costs)
@@ -365,10 +379,10 @@ def run_qlib_validation_suites(
 
     topk = int(config.get("topk", 50))
     robustness_specs = {
-        "double_cost": ({}, cost_model.doubled()),
+        "double_cost": ({}, schedule.doubled()),
         "turnover_75pct": (
             {"max_daily_turnover": float(config.get("max_daily_turnover", 0.15)) * 0.75},
-            cost_model,
+            schedule,
         ),
         "topk_80pct": (
             {
@@ -377,9 +391,9 @@ def run_qlib_validation_suites(
                     int(config.get("n_drop", 0)), max(5, int(np.floor(topk * 0.80)))
                 ),
             },
-            cost_model,
+            schedule,
         ),
-        "zero_retention_buffer": ({"n_drop": 0}, cost_model),
+        "zero_retention_buffer": ({"n_drop": 0}, schedule),
     }
     robustness: dict[str, dict[str, Any]] = {}
     for name, (overrides, costs) in robustness_specs.items():
@@ -414,7 +428,7 @@ def run_qlib_validation_suites(
         selected = dates[offset : offset + window]
         if len(selected) != window:
             continue
-        result = runner(selected[0].date().isoformat(), selected[-1].date().isoformat(), cost_model)
+        result = runner(selected[0].date().isoformat(), selected[-1].date().isoformat(), schedule)
         rolling.append(
             {
                 "start": selected[0].date().isoformat(),

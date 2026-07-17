@@ -20,7 +20,7 @@ from quant_data.execution_contract import (
     require_minute_execution_contract,
     require_strategy_execution_contract,
 )
-from quant_platform.cost_model import CostModelConfig
+from quant_platform.cost_model import CostScheduleBook
 from quant_platform.eligibility import eligibility_statistics
 from quant_platform.execution_algorithms import execution_time_slots
 from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
@@ -557,8 +557,11 @@ def main() -> None:
         )
 
     governed_signal = governed_for(config)
-    cost_model = CostModelConfig.from_mapping(config)
-    policy = PortfolioPolicy(PortfolioPolicyConfig.from_mapping(config), cost_model)
+    cost_schedule = CostScheduleBook.from_mapping(config)
+    # PortfolioPolicy only consumes date-independent broker assumptions (lot size
+    # and participation), resolved here at the backtest start date.
+    policy_costs = cost_schedule.as_of(pd.Timestamp(periods["start"]).date())
+    policy = PortfolioPolicy(PortfolioPolicyConfig.from_mapping(config), policy_costs)
     metadata = _metadata_provider(
         industry_memberships,
         benchmark_weights,
@@ -602,20 +605,21 @@ def main() -> None:
             "execution_algorithm": execution_method,
             "slice_minutes": slice_minutes,
             "max_slices": max_slices,
-            "max_participation": cost_model.max_volume_participation,
+            "max_participation": policy_costs.max_volume_participation,
             "volume_profile": volume_profile,
         }
 
     def run(
         start: str,
         end: str,
-        costs: CostModelConfig,
+        costs: CostScheduleBook,
         account: float | None = None,
         scenario_config: dict[str, Any] | None = None,
     ):
         effective_config = {**config, **(scenario_config or {})}
         scenario_policy = PortfolioPolicy(
-            PortfolioPolicyConfig.from_mapping(effective_config), costs
+            PortfolioPolicyConfig.from_mapping(effective_config),
+            costs.as_of(pd.Timestamp(start).date()),
         )
         strategy = create_qlib_policy_strategy(
             signal=governed_for(effective_config) if scenario_config else governed_signal,
@@ -628,7 +632,7 @@ def main() -> None:
             end_time=end,
             account=float(account if account is not None else config["capacity_notional"]),
             benchmark=manifest["benchmark"],
-            cost_model=costs,
+            cost_schedule=costs,
             execution_method=execution_method,
             signal_frequency=signal_frequency,
             execution_frequency=args.execution_frequency if minute_execution else None,
@@ -639,7 +643,7 @@ def main() -> None:
             ),
         )
 
-    formal = run(periods["start"], periods["end"], cost_model)
+    formal = run(periods["start"], periods["end"], cost_schedule)
 
     def write_robustness_artifacts(name: str, result: Any) -> dict[str, Any]:
         target = output / "robustness" / name
@@ -682,12 +686,12 @@ def main() -> None:
         full_result=formal,
         start_time=periods["start"],
         end_time=periods["end"],
-        cost_model=cost_model,
+        cost_schedule=cost_schedule,
         config=config,
         capacity_runner=lambda notional: (
             formal
             if abs(notional - float(config["capacity_notional"])) < 1e-6
-            else run(periods["start"], periods["end"], cost_model, notional)
+            else run(periods["start"], periods["end"], cost_schedule, notional)
         ),
         robustness_runner=lambda overrides, costs: run(
             periods["start"], periods["end"], costs, scenario_config=overrides
@@ -706,7 +710,7 @@ def main() -> None:
     metrics = {
         **formal.metrics,
         "policy_version": policy.version,
-        "cost_model": cost_model.to_dict(),
+        "cost_model": cost_schedule.to_dict(),
         "eligibility": eligibility_evidence,
         "deflated_sharpe": deflated_sharpe,
         "deflated_sharpe_probability": deflated_sharpe["probability"],

@@ -41,7 +41,7 @@ from quant_data.execution_contract import (
     require_strategy_execution_contract,
 )
 
-from .cost_model import COST_SCHEDULE_VERSION, CostModelConfig
+from .cost_model import COST_SCHEDULE_VERSION, CostModelConfig, CostScheduleBook
 from .execution_algorithms import execution_time_slots, normalize_execution_policy
 from .member_risk_gate import (
     load_allocation_risk_state,
@@ -1858,7 +1858,7 @@ class SimulationStore:
                 batch=batch,
                 execution_evidence=execution_evidence,
             )
-            cost_model = CostModelConfig.from_mapping(
+            cost_schedule = CostScheduleBook.from_mapping(
                 dict(portfolio.execution_policy_json or {}).get("cost_model")
             )
             if str(portfolio.execution_adapter) == "pair":
@@ -1908,7 +1908,7 @@ class SimulationStore:
                         str(key).upper(): value is True
                         for key, value in shortability.items()
                     },
-                    cost_model=cost_model,
+                    cost_schedule=cost_schedule,
                     execution_policy=execution_policy,
                 )
                 result["shortability_evidence_sha256"] = str(shortability_sha256)
@@ -1922,7 +1922,7 @@ class SimulationStore:
                     target_weights=dict(target_payload["target_weights"]),
                     minute_bars=minute_bars,
                     closing_prices=closing_prices,
-                    cost_model=cost_model,
+                    cost_schedule=cost_schedule,
                     execution_policy=execution_policy,
                     signal_at=batch.signal_at,
                 )

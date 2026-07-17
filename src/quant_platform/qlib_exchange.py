@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 import numpy as np
 from qlib.backtest.decision import Order
 from qlib.backtest.exchange import Exchange
 
-from .cost_model import CostModelConfig, infer_cn_asset_type
+from .cost_model import CostModelConfig, CostScheduleBook, infer_cn_asset_type
 
 
 class SquareRootImpactExchange(Exchange):
@@ -14,29 +15,49 @@ class SquareRootImpactExchange(Exchange):
 
     Qlib still performs suspension, price-limit, participation and lot-size
     clipping.  The returned transaction cost is replaced with the exact shared
-    model after Qlib determines the executable amount.
+    model after Qlib determines the executable amount, resolved per trade date
+    from the effective-dated cost schedule.
     """
 
-    def __init__(self, *, cost_model: CostModelConfig, **kwargs: Any) -> None:
-        self.cost_model = cost_model
+    def __init__(
+        self,
+        *,
+        cost_model: CostModelConfig | None = None,
+        cost_schedule: CostScheduleBook | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if (cost_model is None) == (cost_schedule is None):
+            raise ValueError("exactly one of cost_model or cost_schedule is required")
+        self.cost_schedule = cost_schedule or CostScheduleBook.from_versions([cost_model])
         self.fill_log: list[dict[str, Any]] = []
+        # Qlib's Exchange accepts only one flat open/close/min cost triple, so it
+        # is resolved at the backtest start date via flat_view.  A backtest span
+        # crossing 2023-08-28 is therefore approximate at this Qlib adapter layer;
+        # the authoritative per-fill cost is resolved per trade date from the
+        # schedule in _calc_trade_info_by_order below (ExecutionCore semantics).
+        start_time = kwargs.get("start_time")
+        start_config = (
+            self.cost_schedule.as_of(_as_date(start_time))
+            if start_time is not None
+            else self.cost_schedule.versions[-1]
+        )
         conservative_buy = (
-            cost_model.buy_commission_rate
-            + cost_model.fixed_slippage_rate
-            + cost_model.impact_at_max_participation
+            start_config.buy_commission_rate
+            + start_config.fixed_slippage_rate
+            + start_config.impact_at_max_participation
         )
         conservative_sell = (
-            cost_model.sell_commission_rate
-            + cost_model.fixed_slippage_rate
-            + cost_model.impact_at_max_participation
+            start_config.sell_commission_rate
+            + start_config.fixed_slippage_rate
+            + start_config.impact_at_max_participation
         )
         super().__init__(
             open_cost=conservative_buy,
             close_cost=conservative_sell,
-            min_cost=cost_model.min_commission,
+            min_cost=start_config.min_commission,
             impact_cost=0.0,
-            trade_unit=cost_model.lot_size,
-            volume_threshold=("current", f"{cost_model.max_volume_participation} * $volume"),
+            trade_unit=start_config.lot_size,
+            volume_threshold=("current", f"{start_config.max_volume_participation} * $volume"),
             **kwargs,
         )
 
@@ -51,21 +72,23 @@ class SquareRootImpactExchange(Exchange):
         )
         if trade_value <= 1e-5:
             return trade_price, trade_value, 0.0
+        trade_date = order.start_time.date()
+        cost_model = self.cost_schedule.as_of(trade_date)
         market_value = float(
             self.get_volume(order.stock_id, order.start_time, order.end_time) * trade_price
         )
         participation = (
-            min(self.cost_model.max_volume_participation, trade_value / market_value)
+            min(cost_model.max_volume_participation, trade_value / market_value)
             if market_value > 0 and np.isfinite(market_value)
-            else self.cost_model.max_volume_participation
+            else cost_model.max_volume_participation
         )
         side = "buy" if order.direction == Order.BUY else "sell"
-        actual_cost = self.cost_model.estimate(
+        actual_cost = cost_model.estimate(
             side=side,
             gross_value=trade_value,
             participation=participation,
             asset_type=infer_cn_asset_type(str(order.stock_id)),
-            trade_date=order.start_time.date(),
+            trade_date=trade_date,
         )
         self.fill_log.append(
             {
@@ -85,3 +108,8 @@ class SquareRootImpactExchange(Exchange):
             }
         )
         return trade_price, trade_value, actual_cost
+
+
+def _as_date(value: Any) -> date:
+    text = str(value)
+    return date.fromisoformat(text[:10])
