@@ -947,6 +947,108 @@ simulation_positions = Table(
     Column("updated_at", DateTime(timezone=True), nullable=False),
 )
 
+simulation_position_lots = Table(
+    "simulation_position_lots",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("instrument", String, nullable=False),
+    Column("lot_key", String, nullable=False),
+    # NULL = acquired date unknown (legacy lots); dividend tax uses the top rate.
+    Column("acquired_at", Date),
+    Column("sellable_from", Date, nullable=False),
+    Column("quantity", Integer, nullable=False),
+    Column("cost_basis_total", Numeric(20, 6), nullable=False),
+    Column("origin", String, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "portfolio_id", "instrument", "lot_key", name="uq_simulation_position_lots_key"
+    ),
+)
+Index(
+    "idx_simulation_position_lots_portfolio",
+    simulation_position_lots.c.portfolio_id,
+    simulation_position_lots.c.instrument,
+)
+
+simulation_dividend_entitlements = Table(
+    "simulation_dividend_entitlements",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("instrument", String, nullable=False),
+    Column("lot_key", String, nullable=False),
+    Column("record_date", Date, nullable=False),
+    # cash = pretax cash dividend per share; bonus_par = bonus ratio x par value.
+    Column("kind", String, nullable=False),
+    Column("income_per_share", Numeric(20, 8), nullable=False),
+    Column("untaxed_quantity", Integer, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "portfolio_id",
+        "instrument",
+        "lot_key",
+        "record_date",
+        "kind",
+        name="uq_simulation_dividend_entitlements_key",
+    ),
+)
+Index(
+    "idx_simulation_dividend_entitlements_portfolio",
+    simulation_dividend_entitlements.c.portfolio_id,
+    simulation_dividend_entitlements.c.instrument,
+)
+
+simulation_dividend_actions = Table(
+    "simulation_dividend_actions",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("instrument", String, nullable=False),
+    Column("ex_date", Date, nullable=False),
+    Column("record_date", Date),
+    Column("pay_date", Date),
+    Column("eligible_quantity", Integer, nullable=False),
+    Column("cash_per_share", Numeric(20, 8), nullable=False, server_default="0"),
+    Column("receivable_amount", Numeric(20, 6), nullable=False, server_default="0"),
+    Column("bonus_share_ratio", Float, nullable=False, server_default="0"),
+    Column("conversion_ratio", Float, nullable=False, server_default="0"),
+    Column("new_shares", Integer, nullable=False, server_default="0"),
+    Column("div_listdate", Date),
+    # accrued = confirmed at ex-date; paid = reclassified to cash at pay-date.
+    Column("status", String, nullable=False, server_default="accrued"),
+    Column("tax_rule_version", String, nullable=False),
+    Column("valuation_uncertain", Boolean, nullable=False, server_default="false"),
+    Column("payload_sha256", String, nullable=False),
+    Column("batch_id", String),
+    Column("paid_batch_id", String),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "portfolio_id", "instrument", "ex_date", name="uq_simulation_dividend_actions_key"
+    ),
+)
+Index(
+    "idx_simulation_dividend_actions_status",
+    simulation_dividend_actions.c.portfolio_id,
+    simulation_dividend_actions.c.status,
+)
+
 simulation_cash_flows = Table(
     "simulation_cash_flows",
     metadata,
@@ -987,6 +1089,7 @@ simulation_nav = Table(
     Column("trade_date", Date, primary_key=True),
     Column("cash", Numeric(20, 6), nullable=False),
     Column("market_value", Numeric(20, 6), nullable=False),
+    Column("corporate_receivables", Numeric(20, 6), nullable=False, server_default="0"),
     Column("nav", Numeric(20, 6), nullable=False),
     Column("daily_return", Float, nullable=False),
     Column("drawdown", Float, nullable=False),

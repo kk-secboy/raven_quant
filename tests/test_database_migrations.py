@@ -83,7 +83,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0037_single_mainline_contract"
+    assert revision == "0038_corporate_actions"
     assert {"research_program_id", "dataset_identity_sha256"} <= {
         column["name"]
         for column in inspector.get_columns("research_campaigns", schema="quantlab")

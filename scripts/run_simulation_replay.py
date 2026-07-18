@@ -16,6 +16,10 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from quant_data.execution_contract import require_minute_execution_contract
+from quant_platform.corporate_actions import (
+    corporate_actions_sha256,
+    normalize_dividend_rows,
+)
 from quant_platform.execution_algorithms import (
     execution_time_slots,
     normalize_execution_policy,
@@ -224,11 +228,60 @@ def _load_shortability(
     return values
 
 
+def _load_dividend_actions(
+    path: Path,
+    *,
+    instruments: list[str],
+    trade_date: str,
+) -> list[dict[str, Any]]:
+    """Load normalized cash-dividend/bonus-share rows due on or before the trade date.
+
+    Rows are filtered to the manifest instruments (targets plus holdings) and to
+    ex_dates not after the trade date (earlier ex_dates let the engine classify
+    applied versus late) or pay_dates already due.  Normalization is
+    fail-closed on corrupt magnitudes (quant_platform.corporate_actions).
+    """
+
+    glob = str((path / "**" / "*.parquet").resolve())
+    connection = duckdb.connect()
+    try:
+        source = (
+            f"read_parquet({_sql_string(glob)}, hive_partitioning=true, "
+            "union_by_name=true)"
+        )
+        columns = {
+            str(row[0])
+            for row in connection.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
+        }
+        if "ts_code" not in columns:
+            raise ValueError("Tushare dividend snapshot requires a ts_code column")
+        symbols = ",".join(
+            _sql_string(value) for value in sorted(_source_symbols(instruments))
+        )
+        frame = connection.execute(
+            f"SELECT * FROM {source} "
+            f"WHERE upper(CAST(ts_code AS VARCHAR)) IN ({symbols})"
+        ).fetchdf()
+    finally:
+        connection.close()
+    if frame.empty:
+        return []
+    session = pd.Timestamp(trade_date).date()
+    selected = []
+    for action in normalize_dividend_rows(frame.to_dict("records")):
+        if action.ex_date <= session or (
+            action.pay_date is not None and action.pay_date <= session
+        ):
+            selected.append(action.to_dict())
+    return sorted(selected, key=lambda item: (item["instrument"], item["ex_date"]))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-uri", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--dividend-path")
     parser.add_argument("--shortability-path")
     parser.add_argument("--shortability-source-sha256")
     parser.add_argument("--shortability-manifest-sha256")
@@ -385,6 +438,15 @@ def main() -> None:
                 ),
             }
         )
+    corporate_actions: list[dict[str, Any]] = []
+    if args.dividend_path:
+        corporate_actions = _load_dividend_actions(
+            Path(args.dividend_path),
+            instruments=instruments,
+            trade_date=trade_date,
+        )
+    result["corporate_actions"] = corporate_actions
+    result["corporate_actions_sha256"] = corporate_actions_sha256(corporate_actions)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False))
 

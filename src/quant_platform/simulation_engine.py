@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from math import floor, isfinite
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from .corporate_actions import (
+    LOT_ORIGIN_BUY,
+    CorporateAction,
+    apply_ex_dividend,
+    consume_lots_fifo,
+    position_lots,
+    settle_dividend_tax,
+)
 from .cost_model import CostModelConfig, CostScheduleBook, infer_cn_asset_type
+from .dividend_tax import DIVIDEND_TAX_RULE_BOOK, DividendTaxRuleBook
 from .execution_algorithms import build_execution_slices, normalize_execution_policy
 from .market_rules import (
     OrderUnitRules,
@@ -44,6 +53,9 @@ def execute_simulation_day(
     cost_schedule: CostScheduleBook | None = None,
     execution_policy: dict[str, Any],
     signal_at: datetime | None = None,
+    corporate_actions: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+    dividend_receivables: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+    dividend_tax_book: DividendTaxRuleBook | None = None,
 ) -> dict[str, Any]:
     """Execute one next-eligible-bar A-share/ETF rebalance with an auditable ledger."""
 
@@ -67,6 +79,167 @@ def execute_simulation_day(
         if last_trade is None or _as_date(last_trade) < trade_date:
             position["available_quantity"] = quantity
 
+    orders: list[dict[str, Any]] = []
+    fills: list[dict[str, Any]] = []
+    cash_flows: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    starting_cash = cash
+    tax_book = dividend_tax_book or DIVIDEND_TAX_RULE_BOOK
+    open_receivables: list[dict[str, Any]] = [dict(item) for item in dividend_receivables]
+    corporate_actions_applied: list[dict[str, Any]] = []
+    late_corporate_action = False
+    ex_applied_this_run: set[tuple[str, date]] = set()
+    parsed_actions = [
+        raw_action
+        if isinstance(raw_action, CorporateAction)
+        else CorporateAction.from_mapping(raw_action)
+        for raw_action in corporate_actions
+    ]
+    # 应收创建时 pay_date 可能未知：用同批公司行动行里的到账日补齐（不改金额）。
+    pay_date_lookup = {
+        (item.instrument, item.ex_date): item.pay_date
+        for item in parsed_actions
+        if item.pay_date is not None
+    }
+    # 盘前公司行动：先到账（应收→现金，NAV 不变），后除权（应收/送转，NAV 连续）。
+    for receivable in list(open_receivables):
+        pay_date = receivable.get("pay_date")
+        if pay_date is None:
+            pay_date = pay_date_lookup.get(
+                (str(receivable["instrument"]), _as_date(receivable["ex_date"]))
+            )
+            if pay_date is not None:
+                receivable["pay_date"] = pay_date
+        if pay_date is None or _as_date(pay_date) > trade_date:
+            continue
+        amount = float(receivable["amount"])
+        cash += amount
+        cash_flows.append(
+            {
+                "trade_date": trade_date,
+                "flow_type": "dividend_payment",
+                "amount": amount,
+                "balance_after": cash,
+            }
+        )
+        open_receivables.remove(receivable)
+        corporate_actions_applied.append(
+            {
+                "kind": "pay",
+                "instrument": str(receivable["instrument"]),
+                "ex_date": _as_date(receivable["ex_date"]).isoformat(),
+            }
+        )
+        events.append(
+            {
+                "severity": "info",
+                "event_type": "corporate_action_pay",
+                "instrument": str(receivable["instrument"]),
+                "reason": "dividend_payment_received",
+                "details": {
+                    "event_key": (
+                        f"corporate_action:pay:{receivable['instrument']}:"
+                        f"{_as_date(receivable['ex_date'])}"
+                    ),
+                    "amount": amount,
+                    "scheduled_pay_date": _as_date(pay_date).isoformat(),
+                },
+            }
+        )
+    for action in parsed_actions:
+        if action.ex_date < trade_date:
+            late_position = state.get(action.instrument) or {}
+            if action.ex_date.isoformat() in (
+                late_position.get("_applied_ca_ex_dates") or ()
+            ):
+                continue  # 已入账的除权日被重复供给，忽略。
+            relevant = (
+                int(late_position.get("quantity", 0)) > 0
+                or bool(late_position.get("_applied_ca_ex_dates"))
+                or any(
+                    str(item.get("instrument")) == action.instrument
+                    for item in open_receivables
+                )
+            )
+            if not relevant:
+                continue  # 除权日前后均未持有，与账户无关。
+            # 迟到的公司行动只标记复核，不回写历史（设计 §3.2 禁止静默改写）。
+            # 已知边界：除权后、数据到达前已清仓的证券无法由此处发现，
+            # 由数据库唯一约束与人工复核兜底。
+            late_corporate_action = True
+            events.append(
+                {
+                    "severity": "critical",
+                    "event_type": "corporate_action_late",
+                    "instrument": action.instrument,
+                    "reason": "ex_date_already_passed",
+                    "details": {
+                        "event_key": (
+                            f"corporate_action:late:{action.instrument}:{action.ex_date}"
+                        ),
+                        "ex_date": action.ex_date.isoformat(),
+                    },
+                }
+            )
+            continue
+        if action.ex_date > trade_date:
+            continue
+        position = state.get(action.instrument)
+        if position is None or int(position.get("quantity", 0)) <= 0:
+            events.append(
+                {
+                    "severity": "info",
+                    "event_type": "corporate_action_no_position",
+                    "instrument": action.instrument,
+                    "reason": "ex_dividend_without_position",
+                    "details": {
+                        "event_key": (
+                            f"corporate_action:ex:{action.instrument}:{action.ex_date}"
+                        ),
+                        "ex_date": action.ex_date.isoformat(),
+                    },
+                }
+            )
+            continue
+        applied_ex_dates = position.get("_applied_ca_ex_dates") or ()
+        if action.ex_date.isoformat() in applied_ex_dates:
+            continue  # 状态级幂等：该除权日已入账（数据库唯一约束兜底）。
+        if (action.instrument, action.ex_date) in ex_applied_this_run:
+            continue  # 上游行重复：同一除权日在本次运行中只能入账一次。
+        ex_applied_this_run.add((action.instrument, action.ex_date))
+        tax_rule = tax_book.as_of(action.record_date or action.ex_date)
+        outcome = apply_ex_dividend(
+            position=position,
+            action=action,
+            tax_rule=tax_rule,
+            trade_date=trade_date,
+        )
+        events.extend(outcome["events"])
+        applied = {
+            "kind": "ex",
+            "instrument": action.instrument,
+            "ex_date": action.ex_date.isoformat(),
+            "record_date": action.record_date.isoformat() if action.record_date else None,
+            "pay_date": action.pay_date.isoformat() if action.pay_date else None,
+            "list_date": action.list_date.isoformat() if action.list_date else None,
+            "eligible_quantity": int(position.get("quantity", 0)) - outcome["new_shares"],
+            "new_shares": outcome["new_shares"],
+            "bonus_share_ratio": action.bonus_share_ratio,
+            "conversion_ratio": action.conversion_ratio,
+            "cash_per_share": 0.0,
+            "receivable_amount": 0.0,
+            "tax_rule_version": tax_rule.version,
+            "payload_sha256": action.payload_sha256,
+            "valuation_uncertain": False,
+        }
+        receivable = outcome["receivable"]
+        if receivable is not None:
+            open_receivables.append(receivable)
+            applied["cash_per_share"] = float(receivable["cash_per_share"])
+            applied["receivable_amount"] = float(receivable["amount"])
+            applied["valuation_uncertain"] = bool(receivable["valuation_uncertain"])
+        corporate_actions_applied.append(applied)
+
     reference_prices = _execution_reference_prices(bars)
     instruments = sorted(set(state) | set(targets))
     lot_rules = {instrument: order_unit_rules(instrument, trade_date) for instrument in instruments}
@@ -89,7 +262,7 @@ def execute_simulation_day(
         side = "buy" if delta > 0 else "sell"
         requested = abs(delta)
         if side == "sell":
-            available = int(state[instrument].get("available_quantity", 0))
+            available = _sellable_quantity(state[instrument], trade_date)
             requested = min(requested, available)
             if desired[instrument] > 0:
                 requested = requested // 100 * 100
@@ -117,11 +290,6 @@ def execute_simulation_day(
 
     # A-share sell proceeds are available for buys on the same trading day.
     order_specs.sort(key=lambda item: 0 if item["side"] == "sell" else 1)
-    orders: list[dict[str, Any]] = []
-    fills: list[dict[str, Any]] = []
-    cash_flows: list[dict[str, Any]] = []
-    events: list[dict[str, Any]] = []
-    starting_cash = cash
     for spec in order_specs:
         if "status" in spec:
             orders.append(spec)
@@ -183,9 +351,10 @@ def execute_simulation_day(
                     rules=lot_rules[instrument],
                 )
             if side == "sell":
+                sell_position = state.get(instrument) or {}
                 fill_quantity = min(
                     fill_quantity,
-                    int(state.get(instrument, {}).get("available_quantity", 0)),
+                    _sellable_quantity(sell_position, trade_date),
                 )
             if fill_quantity <= 0:
                 rejection_reasons.append(
@@ -221,6 +390,7 @@ def execute_simulation_day(
                 "capacity_quantity": capacity,
             }
             order_fills.append(fill)
+            fill["_seq"] = len(fills)
             fills.append(fill)
             cash_flows.append(
                 {
@@ -230,7 +400,31 @@ def execute_simulation_day(
                     "balance_after": cash,
                 }
             )
-            _apply_fill(state, fill, trade_date)
+            consumed_lots = _apply_fill(state, fill, trade_date)
+            if side == "sell" and consumed_lots:
+                dividend_tax, dividend_tax_details = settle_dividend_tax(
+                    instrument=instrument,
+                    consumed=consumed_lots,
+                    sale_date=trade_date,
+                    tax_book=tax_book,
+                )
+                if dividend_tax > 0:
+                    if cash - dividend_tax < -1e-6:
+                        raise RuntimeError("dividend tax would create negative cash")
+                    cash -= dividend_tax
+                    cash_flows.append(
+                        {
+                            "trade_date": trade_date,
+                            "flow_type": "dividend_tax",
+                            "amount": -dividend_tax,
+                            "balance_after": cash,
+                        }
+                    )
+                    fill["cost_breakdown"] = {
+                        **fill["cost_breakdown"],
+                        "dividend_tax": dividend_tax,
+                        "dividend_tax_details": dividend_tax_details,
+                    }
             remaining -= fill_quantity
         filled = requested - remaining
         status = (
@@ -258,22 +452,26 @@ def execute_simulation_day(
         raise RuntimeError("simulation ledger cash conservation failed")
     if abs(cash - (starting_cash + sum(item["amount"] for item in cash_flows))) > 1e-6:
         raise RuntimeError("simulation ledger cash flows do not reconcile")
+    receivables_total = round(
+        sum(float(item.get("amount", 0.0)) for item in open_receivables), 2
+    )
     valuation = _value_positions(state, closing_prices, trade_date)
     events.extend(valuation["events"])
-    nav = cash + valuation["market_value"]
+    nav = cash + valuation["market_value"] + receivables_total
     new_peak = max(high_water_mark, nav)
     has_stale = valuation["has_stale_prices"]
     nav_row = {
         "trade_date": trade_date,
         "cash": cash,
         "market_value": valuation["market_value"],
+        "corporate_receivables": receivables_total,
         "nav": nav,
         "daily_return": nav / prior_nav - 1.0,
         "drawdown": nav / new_peak - 1.0,
         "market_date": valuation["market_date"],
         "has_stale_prices": has_stale,
         "status": "degraded" if has_stale else "healthy",
-        "performance_certified": not has_stale,
+        "performance_certified": (not has_stale) and not late_corporate_action,
     }
     return {
         "engine_version": SIMULATION_ENGINE_VERSION,
@@ -287,11 +485,18 @@ def execute_simulation_day(
         "cash_flows": cash_flows,
         "nav_row": nav_row,
         "events": events,
+        "dividend_receivables": open_receivables,
+        "corporate_actions_applied": corporate_actions_applied,
         "conservation": {
             "cash_difference": cash
             - (starting_cash + sum(item["amount"] for item in cash_flows)),
             "negative_positions": sum(
                 1 for item in state.values() if int(item.get("quantity", 0)) < 0
+            ),
+            **(
+                {"corporate_receivables": receivables_total}
+                if receivables_total
+                else {}
             ),
         },
     }
@@ -826,7 +1031,29 @@ def _affordable_buy_quantity(
     return 0
 
 
-def _apply_fill(state: dict[str, dict[str, Any]], fill: dict[str, Any], trade_date: date) -> None:
+def _sellable_quantity(position: dict[str, Any], trade_date: date) -> int:
+    """Sellable shares: stored T+1 availability, tightened by per-lot sellable_from.
+
+    无批次的旧持仓行为不变；有批次时取 min(存储可卖, Σ sellable_from<=当日 的批次)，
+    送转新增股份在新增股份上市日前由此锁定。
+    """
+
+    available = int(position.get("available_quantity", 0))
+    lots = position.get("lots")
+    if not lots:
+        return available
+    sellable = 0
+    for lot in lots:
+        sellable_from = lot.get("sellable_from")
+        lot_sellable_from = _as_date(sellable_from) if sellable_from else date.min
+        if lot_sellable_from <= trade_date:
+            sellable += int(lot.get("quantity", 0))
+    return min(available, sellable)
+
+
+def _apply_fill(
+    state: dict[str, dict[str, Any]], fill: dict[str, Any], trade_date: date
+) -> list[tuple[dict, int]]:
     instrument = fill["instrument"]
     position = state.setdefault(
         instrument,
@@ -834,11 +1061,24 @@ def _apply_fill(state: dict[str, dict[str, Any]], fill: dict[str, Any], trade_da
     )
     quantity = int(position["quantity"])
     filled = int(fill["quantity"])
+    lots = position_lots(position, trade_date=trade_date)
     if fill["side"] == "buy":
         total_cost = quantity * float(position.get("average_cost", 0.0))
         total_cost += float(fill["gross_value"]) + float(fill["fee"])
         position["quantity"] = quantity + filled
         position["average_cost"] = total_cost / position["quantity"]
+        lots.append(
+            {
+                "lot_key": f"buy:{fill['executed_at'].isoformat()}:{fill.get('_seq', 0)}",
+                "acquired_at": trade_date,
+                # 买入批次按 T+1 锁定到下一自然日；日初解锁逻辑与之叠加后等价。
+                "sellable_from": trade_date + timedelta(days=1),
+                "quantity": filled,
+                "cost_basis_total": float(fill["gross_value"]) + float(fill["fee"]),
+                "origin": LOT_ORIGIN_BUY,
+                "entitlements": [],
+            }
+        )
         # New buys stay unavailable until the next trading day.
     else:
         available = int(position.get("available_quantity", 0))
@@ -848,7 +1088,10 @@ def _apply_fill(state: dict[str, dict[str, Any]], fill: dict[str, Any], trade_da
         position["available_quantity"] = available - filled
         if position["quantity"] == 0:
             position["average_cost"] = 0.0
+        position["last_trade_date"] = trade_date
+        return consume_lots_fifo(lots, filled, trade_date=trade_date)
     position["last_trade_date"] = trade_date
+    return []
 
 
 def _value_positions(
@@ -864,6 +1107,8 @@ def _value_positions(
         position = state[instrument]
         quantity = int(position.get("quantity", 0))
         if quantity == 0:
+            if position.get("lots"):
+                raise RuntimeError(f"position lot invariant violated for {instrument}")
             del state[instrument]
             continue
         quote = closing_prices.get(instrument)

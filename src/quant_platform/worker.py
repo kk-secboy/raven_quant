@@ -339,6 +339,7 @@ class LocalJobWorker:
                     minute_bars=bars,
                     closing_prices=result["closing_prices"],
                     execution_evidence=result,
+                    corporate_actions=result.get("corporate_actions"),
                 )
                 manifest = self.simulations.execution_manifest(simulation_batch_id)
                 self.allocations.refresh_for_simulation_source(
@@ -1461,6 +1462,34 @@ class LocalJobWorker:
                     _to_wsl_path(result_path) if is_wsl else str(result_path),
                 ]
             )
+            dividend_dataset = None
+            if manifest.get("execution_adapter") != "pair":
+                daily_dataset = datasets.get(manifest["daily_dataset"])
+                daily_provenance = (
+                    dict(daily_dataset.get("provenance") or {}) if daily_dataset else {}
+                )
+                dividend_snapshot_name = str(daily_provenance.get("snapshot_name") or "")
+                if dividend_snapshot_name:
+                    try:
+                        resolved_dividend = resolve_snapshot_dataset(
+                            self.settings.data_root,
+                            snapshot_name=dividend_snapshot_name,
+                            dataset_name="dividend",
+                        )
+                    except (FileNotFoundError, ValueError, KeyError):
+                        resolved_dividend = None
+                    if resolved_dividend is not None:
+                        expected_manifest = str(
+                            daily_provenance.get("snapshot_manifest_sha256") or ""
+                        )
+                        if expected_manifest and expected_manifest != str(
+                            resolved_dividend["manifest_sha256"]
+                        ):
+                            raise ValueError(
+                                "dividend snapshot no longer matches the bound "
+                                "daily dataset"
+                            )
+                        dividend_dataset = resolved_dividend
             if shortability_dataset is not None:
                 shortability_path = Path(shortability_dataset["dataset_path"])
                 command.extend(
@@ -1473,6 +1502,16 @@ class LocalJobWorker:
                         str(shortability_dataset["source_sha256"]),
                         "--shortability-manifest-sha256",
                         str(shortability_dataset["manifest_sha256"]),
+                    ]
+                )
+            if dividend_dataset is not None:
+                dividend_path = Path(dividend_dataset["dataset_path"])
+                command.extend(
+                    [
+                        "--dividend-path",
+                        _to_wsl_path(dividend_path)
+                        if is_wsl
+                        else str(dividend_path),
                     ]
                 )
             return command, result_path, {}

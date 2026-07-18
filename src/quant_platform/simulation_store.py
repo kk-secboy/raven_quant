@@ -24,11 +24,14 @@ from quant_data.database import (
     row_dict,
     simulation_batches,
     simulation_cash_flows,
+    simulation_dividend_actions,
+    simulation_dividend_entitlements,
     simulation_events,
     simulation_fills,
     simulation_nav,
     simulation_orders,
     simulation_portfolios,
+    simulation_position_lots,
     simulation_positions,
     strategy_allocations,
     strategy_pairs,
@@ -41,6 +44,7 @@ from quant_data.execution_contract import (
     require_strategy_execution_contract,
 )
 
+from .corporate_actions import corporate_actions_sha256
 from .cost_model import (
     KNOWN_COST_SCHEDULE_VERSIONS,
     CostModelConfig,
@@ -1722,6 +1726,7 @@ class SimulationStore:
         minute_bars: pd.DataFrame,
         closing_prices: dict[str, dict[str, Any]],
         execution_evidence: dict[str, Any],
+        corporate_actions: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Compute, book and value a simulation day in one database transaction."""
 
@@ -1774,6 +1779,17 @@ class SimulationStore:
                 )
             if str(execution_evidence.get("batch_id") or "") != str(batch.id):
                 raise ValueError("simulation execution evidence does not match the batch")
+            normalized_actions = [dict(item) for item in (corporate_actions or [])]
+            if corporate_actions is not None:
+                # 公司行动与行情一样属于不可变执行输入：必须与证据哈希绑定。
+                actions_hash = corporate_actions_sha256(normalized_actions)
+                if (
+                    str(execution_evidence.get("corporate_actions_sha256") or "")
+                    != actions_hash
+                ):
+                    raise ValueError(
+                        "simulation corporate actions do not match the execution evidence"
+                    )
             for field in ("signal_at", "execution_not_before"):
                 expected_timestamp = getattr(batch, field)
                 observed_timestamp = execution_evidence.get(field)
@@ -1828,6 +1844,73 @@ class SimulationStore:
                     )
                 )
             }
+            # 持仓批次、股息权利与未结应收随持仓一起加载；无批次的旧持仓
+            # 不附加 lots 键，由引擎按遗留语义合成（行为不变）。
+            lots_by_instrument: dict[str, list[dict[str, Any]]] = {}
+            for lot_row in connection.execute(
+                select(simulation_position_lots).where(
+                    simulation_position_lots.c.portfolio_id == portfolio.id
+                )
+            ):
+                lots_by_instrument.setdefault(str(lot_row.instrument), []).append(
+                    {
+                        "lot_key": str(lot_row.lot_key),
+                        "acquired_at": lot_row.acquired_at,
+                        "sellable_from": lot_row.sellable_from,
+                        "quantity": int(lot_row.quantity),
+                        "cost_basis_total": float(lot_row.cost_basis_total),
+                        "origin": str(lot_row.origin),
+                        "entitlements": [],
+                    }
+                )
+            for entitlement_row in connection.execute(
+                select(simulation_dividend_entitlements).where(
+                    simulation_dividend_entitlements.c.portfolio_id == portfolio.id
+                )
+            ):
+                for lot in lots_by_instrument.get(str(entitlement_row.instrument), []):
+                    if lot["lot_key"] == str(entitlement_row.lot_key):
+                        lot["entitlements"].append(
+                            {
+                                "record_date": entitlement_row.record_date,
+                                "kind": str(entitlement_row.kind),
+                                "income_per_share": float(entitlement_row.income_per_share),
+                                "untaxed_quantity": int(entitlement_row.untaxed_quantity),
+                            }
+                        )
+            for instrument, lots in lots_by_instrument.items():
+                if instrument in position_state:
+                    position_state[instrument]["lots"] = lots
+            applied_ex_dates: dict[str, set[str]] = {}
+            open_receivables: list[dict[str, Any]] = []
+            for action_row in connection.execute(
+                select(simulation_dividend_actions).where(
+                    simulation_dividend_actions.c.portfolio_id == portfolio.id
+                )
+            ):
+                instrument = str(action_row.instrument)
+                applied_ex_dates.setdefault(instrument, set()).add(
+                    action_row.ex_date.isoformat()
+                )
+                if str(action_row.status) == "accrued":
+                    open_receivables.append(
+                        {
+                            "instrument": instrument,
+                            "ex_date": action_row.ex_date,
+                            "record_date": action_row.record_date,
+                            "pay_date": action_row.pay_date,
+                            "quantity": int(action_row.eligible_quantity),
+                            "cash_per_share": float(action_row.cash_per_share),
+                            "amount": float(action_row.receivable_amount),
+                            "tax_rule_version": str(action_row.tax_rule_version),
+                            "valuation_uncertain": bool(action_row.valuation_uncertain),
+                        }
+                    )
+            for instrument, ex_dates in applied_ex_dates.items():
+                if instrument in position_state:
+                    position_state[instrument]["_applied_ca_ex_dates"] = tuple(
+                        sorted(ex_dates)
+                    )
             strategy_version_id = self._source_strategy_version_id(connection, portfolio)
             strategy_risk_state = (
                 load_strategy_risk_state(connection, str(strategy_version_id))
@@ -1929,7 +2012,33 @@ class SimulationStore:
                     cost_schedule=cost_schedule,
                     execution_policy=execution_policy,
                     signal_at=batch.signal_at,
+                    corporate_actions=normalized_actions,
+                    dividend_receivables=open_receivables,
                 )
+                result.setdefault("dividend_receivables", list(open_receivables))
+                result.setdefault("corporate_actions_applied", [])
+            if str(portfolio.execution_adapter) == "pair":
+                # 配对账户按设计只作离线研究：公司行动不入账，但必须留痕。
+                pair_relevant = [
+                    action
+                    for action in normalized_actions
+                    if str(action.get("instrument") or "").upper() in position_state
+                ]
+                if pair_relevant:
+                    result["events"].append(
+                        {
+                            "severity": "warning",
+                            "event_type": "corporate_action_unhandled_pair",
+                            "instrument": None,
+                            "reason": "pair_adapter_does_not_book_corporate_actions",
+                            "details": {
+                                "instruments": sorted(
+                                    str(item["instrument"]).upper()
+                                    for item in pair_relevant
+                                ),
+                            },
+                        }
+                    )
             if (
                 not strategy_risk_state["allow_new_risk"]
                 or risk_exposure_override < 1.0
@@ -2066,6 +2175,103 @@ class SimulationStore:
                     updated_at=now,
                 )
             )
+        # 批次与股息权利与持仓同生命周期：随结果全量重写（与 positions 同事务）。
+        connection.execute(
+            delete(simulation_position_lots).where(
+                simulation_position_lots.c.portfolio_id == portfolio.id
+            )
+        )
+        connection.execute(
+            delete(simulation_dividend_entitlements).where(
+                simulation_dividend_entitlements.c.portfolio_id == portfolio.id
+            )
+        )
+        for instrument, position in result["positions"].items():
+            for lot in position.get("lots") or []:
+                connection.execute(
+                    insert(simulation_position_lots).values(
+                        id=uuid.uuid4().hex,
+                        portfolio_id=portfolio.id,
+                        instrument=instrument,
+                        lot_key=str(lot["lot_key"]),
+                        acquired_at=lot.get("acquired_at"),
+                        sellable_from=lot.get("sellable_from") or date.min,
+                        quantity=int(lot["quantity"]),
+                        cost_basis_total=Decimal(str(lot.get("cost_basis_total", 0.0))),
+                        origin=str(lot.get("origin") or "buy"),
+                        updated_at=now,
+                    )
+                )
+                for entitlement in lot.get("entitlements") or []:
+                    connection.execute(
+                        insert(simulation_dividend_entitlements).values(
+                            id=uuid.uuid4().hex,
+                            portfolio_id=portfolio.id,
+                            instrument=instrument,
+                            lot_key=str(lot["lot_key"]),
+                            record_date=entitlement["record_date"],
+                            kind=str(entitlement["kind"]),
+                            income_per_share=Decimal(str(entitlement["income_per_share"])),
+                            untaxed_quantity=int(entitlement["untaxed_quantity"]),
+                            updated_at=now,
+                        )
+                    )
+        # 公司行动是追加式历史：除权确认用唯一键幂等插入，到账只做状态重分类。
+        for applied in result.get("corporate_actions_applied") or []:
+            if applied["kind"] == "ex":
+                connection.execute(
+                    pg_insert(simulation_dividend_actions)
+                    .values(
+                        id=uuid.uuid4().hex,
+                        portfolio_id=portfolio.id,
+                        instrument=str(applied["instrument"]),
+                        ex_date=date.fromisoformat(str(applied["ex_date"])),
+                        record_date=(
+                            date.fromisoformat(str(applied["record_date"]))
+                            if applied.get("record_date")
+                            else None
+                        ),
+                        pay_date=(
+                            date.fromisoformat(str(applied["pay_date"]))
+                            if applied.get("pay_date")
+                            else None
+                        ),
+                        eligible_quantity=int(applied["eligible_quantity"]),
+                        cash_per_share=Decimal(str(applied["cash_per_share"])),
+                        receivable_amount=Decimal(str(applied["receivable_amount"])),
+                        bonus_share_ratio=float(applied.get("bonus_share_ratio") or 0.0),
+                        conversion_ratio=float(applied.get("conversion_ratio") or 0.0),
+                        new_shares=int(applied.get("new_shares") or 0),
+                        div_listdate=(
+                            date.fromisoformat(str(applied["list_date"]))
+                            if applied.get("list_date")
+                            else None
+                        ),
+                        status="accrued",
+                        tax_rule_version=str(applied["tax_rule_version"]),
+                        valuation_uncertain=bool(applied.get("valuation_uncertain")),
+                        payload_sha256=str(applied["payload_sha256"]),
+                        batch_id=batch.id,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    .on_conflict_do_nothing(
+                        constraint="uq_simulation_dividend_actions_key"
+                    )
+                )
+            elif applied["kind"] == "pay":
+                connection.execute(
+                    update(simulation_dividend_actions)
+                    .where(
+                        simulation_dividend_actions.c.portfolio_id == portfolio.id,
+                        simulation_dividend_actions.c.instrument
+                        == str(applied["instrument"]),
+                        simulation_dividend_actions.c.ex_date
+                        == date.fromisoformat(str(applied["ex_date"])),
+                        simulation_dividend_actions.c.status == "accrued",
+                    )
+                    .values(status="paid", paid_batch_id=batch.id, updated_at=now)
+                )
         nav = result["nav_row"]
         connection.execute(
             insert(simulation_nav).values(
@@ -2073,6 +2279,7 @@ class SimulationStore:
                 trade_date=batch.trade_date,
                 cash=Decimal(str(nav["cash"])),
                 market_value=Decimal(str(nav["market_value"])),
+                corporate_receivables=Decimal(str(nav.get("corporate_receivables", 0.0))),
                 nav=Decimal(str(nav["nav"])),
                 daily_return=float(nav["daily_return"]),
                 drawdown=float(nav["drawdown"]),
@@ -2114,6 +2321,7 @@ class SimulationStore:
             "cash": result["cash"],
             "nav": result["nav"],
             "conservation": result["conservation"],
+            "corporate_actions": len(result.get("corporate_actions_applied") or []),
         }
         if result.get("shortability_evidence_sha256"):
             summary["shortability_evidence_sha256"] = result[
