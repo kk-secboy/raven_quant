@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from typing import Any
 import duckdb
 import pandas as pd
 
+from .availability import availability_contract_label, recoverability_level
 from .models import ProviderResult, UnitResult
 from .reference_data import reference_manifest_metadata
 
@@ -55,9 +57,19 @@ def _normalize_frame(rows: list[dict[str, Any]], columns: list[str]) -> pd.DataF
 
 
 class ParquetStore:
-    def __init__(self, root: Path, *, keep_raw: bool = False) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        keep_raw: bool = False,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.root = root
         self.keep_raw = keep_raw
+        # Row-level ingestion timestamp (design draft 3.3 ``ingested_at``):
+        # recorded once per written unit, tz-aware UTC, so every parquet row can
+        # answer "when did the platform actually obtain this row".
+        self._clock = clock or (lambda: datetime.now(UTC))
         self.units_root = root / "units"
         self.raw_root = root / "raw"
         self.snapshots_root = root / "snapshots"
@@ -71,6 +83,10 @@ class ParquetStore:
         target = directory / f"{unit_key}.parquet"
         temporary = target.with_suffix(".parquet.tmp")
         frame = _normalize_frame(result.rows, result.columns)
+        ingested_at = self._clock()
+        if ingested_at.tzinfo is None:
+            ingested_at = ingested_at.replace(tzinfo=UTC)
+        frame["ingested_at"] = pd.Timestamp(ingested_at)
         frame.to_parquet(temporary, index=False, compression="zstd", engine="pyarrow")
         os.replace(temporary, target)
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
@@ -175,6 +191,10 @@ class ParquetStore:
                         "date_field": None,
                         "date_min": None,
                         "date_max": None,
+                        "ingested_at_min": None,
+                        "ingested_at_max": None,
+                        "recoverability": recoverability_level(dataset),
+                        "availability_policy": availability_contract_label(dataset),
                         "reference_refresh": refresh_metadata,
                         "source_sha256": source_sha256,
                         "source_units": source_identity,
@@ -225,6 +245,16 @@ class ParquetStore:
                         )
                     )
                 row_count = connection.execute(f"SELECT count(*) FROM ({source_sql})").fetchone()[0]
+                # Row-level ingestion provenance: old units predate the column
+                # and merge as NULL via union_by_name, so a NULL bound simply
+                # means "ingested before this column existed".
+                ingested_min = None
+                ingested_max = None
+                if "ingested_at" in columns:
+                    ingested_min, ingested_max = connection.execute(
+                        "SELECT min(ingested_at)::VARCHAR, max(ingested_at)::VARCHAR "
+                        f"FROM ({source_sql}) WHERE ingested_at IS NOT NULL"
+                    ).fetchone()
                 files = [
                     {
                         "path": path.relative_to(temporary).as_posix(),
@@ -240,6 +270,10 @@ class ParquetStore:
                     "date_field": date_field,
                     "date_min": date_min,
                     "date_max": date_max,
+                    "ingested_at_min": ingested_min,
+                    "ingested_at_max": ingested_max,
+                    "recoverability": recoverability_level(dataset),
+                    "availability_policy": availability_contract_label(dataset),
                     "reference_refresh": refresh_metadata,
                     "source_sha256": source_sha256,
                     "source_units": source_identity,

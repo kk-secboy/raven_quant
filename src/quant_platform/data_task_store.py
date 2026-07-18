@@ -36,6 +36,14 @@ REQUEST_STRATEGIES = {
     "cn_ashare_5m": (
         "每只股票最多 150 个实际交易日一个初始窗口；达到 8000 行时无重叠二分。"
     ),
+    "cn_cninfo_announcements": (
+        "以已落盘 anns_d 为清单按 URL 下载巨潮 PDF；内容寻址文件已存在且校验一致时跳过，"
+        "每次运行落独立下载日志 parquet。"
+    ),
+    "cn_announcement_nlp": (
+        "对公告 PDF 做文本抽取后调用 OpenAI 兼容端点做严格 JSON 抽取；"
+        "以 sha256+prompt_version+model 为处理键幂等，失败行记录后可重跑。"
+    ),
 }
 
 
@@ -346,6 +354,35 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         tuple(sorted(coverage_bundle_datasets("research_corpus"))),
         "daily/monthly",
         estimated_storage_gb=80,
+    ),
+    DataTaskDefinition(
+        "cn_cninfo_announcements",
+        5,
+        87,
+        "巨潮公告正文与监管函件",
+        "以 anns_d 公告索引为清单下载巨潮 PDF 正文，按标题识别问询函、关注函、监管函、"
+        "警示函和纪律处分，落内容寻址不可变文件与含 available_at/ingested_at 的元数据索引。",
+        "研究语料",
+        "QuantLab",
+        "ready",
+        ("cn_ashare_daily_full",),
+        ("cninfo_announcements",),
+        "daily",
+    ),
+    DataTaskDefinition(
+        "cn_announcement_nlp",
+        5,
+        88,
+        "公告 NLP 信号加工",
+        "对巨潮公告正文做 PDF 文本抽取与 LLM 结构化抽取（事件类型、语气分数、关键数值），"
+        "按 sha256+prompt_version+model 幂等落不可变 parquet 单元与派生索引，"
+        "并生成带 sha256 的 PIT 因子值 artifact。",
+        "研究语料",
+        "QuantLab",
+        "ready",
+        ("cn_cninfo_announcements",),
+        ("announcement_nlp_fields",),
+        "daily",
     ),
     DataTaskDefinition(
         "strategy_specialty",

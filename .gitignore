@@ -26,3 +26,4 @@ tmp/
 log/
 selector.log
 *.tsbuildinfo
+.pytest-tmp/

@@ -156,6 +156,12 @@ def verify_downloads(
         )
         errors.extend(ohlc_errors)
         warnings.extend(ohlc_warnings)
+        disclosure_warnings, disclosure_checks = _verify_disclosure_reconciliation(
+            connection,
+            selected_by_dataset,
+            data_root,
+        )
+        warnings.extend(disclosure_warnings)
     finally:
         connection.close()
 
@@ -166,6 +172,7 @@ def verify_downloads(
         "duplicate_checks": duplicate_checks,
         "completeness_checks": completeness_checks,
         "ohlc_checks": ohlc_checks,
+        "disclosure_checks": disclosure_checks,
         "errors": errors,
         "warnings": warnings,
     }
@@ -394,6 +401,101 @@ def _verify_daily_ohlc(
             f"{_key_sample(connection, jumps_sql)})"
         )
     return errors, warnings, checks
+
+
+_FINANCIAL_STATEMENT_DATASETS = (
+    "income",
+    "balancesheet",
+    "cashflow",
+    "fina_indicator",
+    "forecast",
+    "express",
+)
+
+
+def _verify_disclosure_reconciliation(
+    connection: duckdb.DuckDBPyConnection,
+    selected_by_dataset: dict[str, list[dict[str, Any]]],
+    data_root: Path,
+) -> tuple[list[str], dict[str, int]]:
+    """Reconcile financial ann_date rows against the disclosure_date calendar.
+
+    Flag-only (never blocking): rows whose ann_date disagrees with the
+    disclosure calendar's actual_date (or planned ann_date when no actual date
+    was recorded) are counted as warnings so availability drift is visible
+    without failing the download gate.
+    """
+
+    warnings: list[str] = []
+    checks = {
+        "disclosure_calendar_rows": 0,
+        "compared_rows": 0,
+        "mismatched_ann_date_rows": 0,
+        "rows_without_calendar_entry": 0,
+    }
+    disclosure_paths = _selected_parquet_paths(selected_by_dataset, "disclosure_date", data_root)
+    if not disclosure_paths:
+        return warnings, checks
+    disclosure = _parquet_relation(disclosure_paths)
+    calendar_sql = f"""
+        SELECT ts_code, {_date_sql("end_date")} AS end_date,
+               max(coalesce({_date_sql("actual_date")}, {_date_sql("ann_date")}))
+                   AS disclosed_date
+        FROM {disclosure}
+        WHERE ts_code IS NOT NULL AND {_date_sql("end_date")} IS NOT NULL
+        GROUP BY ts_code, {_date_sql("end_date")}
+    """
+    checks["disclosure_calendar_rows"] = int(
+        connection.execute(f"SELECT count(*) FROM ({calendar_sql})").fetchone()[0]
+    )
+    for dataset in _FINANCIAL_STATEMENT_DATASETS:
+        paths = _selected_parquet_paths(selected_by_dataset, dataset, data_root)
+        if not paths:
+            continue
+        relation = _parquet_relation(paths)
+        columns = {
+            str(row[0])
+            for row in connection.execute(
+                f"DESCRIBE SELECT * FROM {relation}"
+            ).fetchall()
+        }
+        if not {"ts_code", "ann_date", "end_date"}.issubset(columns):
+            continue
+        financial_sql = f"""
+            SELECT ts_code, {_date_sql("ann_date")} AS ann_date,
+                   {_date_sql("end_date")} AS end_date
+            FROM {relation}
+            WHERE ts_code IS NOT NULL
+              AND {_date_sql("ann_date")} IS NOT NULL
+              AND {_date_sql("end_date")} IS NOT NULL
+        """
+        compared = connection.execute(
+            f"""
+            SELECT count(*),
+                   count(*) FILTER (f.ann_date <> c.disclosed_date)
+            FROM ({financial_sql}) f
+            INNER JOIN ({calendar_sql}) c
+              ON f.ts_code = c.ts_code AND f.end_date = c.end_date
+            """
+        ).fetchone()
+        unmatched = connection.execute(
+            f"""
+            SELECT count(*)
+            FROM ({financial_sql}) f
+            LEFT JOIN ({calendar_sql}) c
+              ON f.ts_code = c.ts_code AND f.end_date = c.end_date
+            WHERE c.disclosed_date IS NULL
+            """
+        ).fetchone()[0]
+        checks["compared_rows"] += int(compared[0])
+        checks["mismatched_ann_date_rows"] += int(compared[1])
+        checks["rows_without_calendar_entry"] += int(unmatched)
+        if int(compared[1]):
+            warnings.append(
+                f"{dataset}: {int(compared[1])} rows have ann_date disagreeing with the "
+                "disclosure_date calendar (flagged only; availability still uses ann_date)"
+            )
+    return warnings, checks
 
 
 def quality_gate_payload(report: dict[str, Any]) -> dict[str, Any]:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
+
+from quant_data.availability import METADATA_AVAILABILITY_LAG_DAYS
 
 from .eligibility import ELIGIBILITY_CONTRACT_VERSION
 from .factor_evaluator import normalize_series
@@ -51,8 +54,17 @@ def build_governed_signal(
     max_industry_deviation: float = 1.0,
     min_average_daily_amount: float = 0.0,
     liquidity_lookback_days: int = 20,
+    metadata_availability_lag_days: int = METADATA_AVAILABILITY_LAG_DAYS,
 ) -> pd.Series:
-    """Apply eligibility gates before the shared PortfolioPolicy assigns weights."""
+    """Apply eligibility gates before the shared PortfolioPolicy assigns weights.
+
+    Industry membership and benchmark-weight snapshots are consumed with the
+    conservative publication lag from quant_data.availability (versioned by
+    AVAILABILITY_LAG_CONFIG_VERSION): the true announcement lag of index and
+    industry metadata has no source data, so decisions only use metadata whose
+    effective date is at least metadata_availability_lag_days old. Style
+    exposures keep the same-trade-date-after-close policy (lag 0).
+    """
 
     if topk < 1 or liquidity_lookback_days < 2:
         raise ValueError("topk and liquidity lookback are invalid")
@@ -86,7 +98,9 @@ def build_governed_signal(
             )
             qualified = eligible_at[eligible_at["eligible"]]["instrument"]
             ranking = ranking[ranking.index.astype(str).isin(set(qualified.astype(str)))]
-        daily_industries = _industries_at(memberships, timestamp)
+        daily_industries = _industries_at(
+            memberships, timestamp, lag_days=metadata_availability_lag_days
+        )
         industry_design = pd.DataFrame(index=ranking.index)
         if memberships is not None:
             assigned = daily_industries.reindex(ranking.index)
@@ -125,7 +139,9 @@ def build_governed_signal(
         if len(ranking) < topk:
             continue
         industries = daily_industries
-        benchmark_day = _snapshot(benchmark, timestamp, "weight")
+        benchmark_day = _snapshot(
+            benchmark, timestamp, "weight", lag_days=metadata_availability_lag_days
+        )
         benchmark_industry = (
             benchmark_day.groupby(industries.reindex(benchmark_day.index)).sum()
             if not benchmark_day.empty and not industries.empty
@@ -219,10 +235,17 @@ def _normalize_eligibility(values: pd.DataFrame | None) -> pd.DataFrame | None:
     return result.dropna(subset=["datetime", "instrument"])
 
 
-def _snapshot(values: pd.DataFrame | None, timestamp: pd.Timestamp, column: str) -> pd.Series:
+def _snapshot(
+    values: pd.DataFrame | None,
+    timestamp: pd.Timestamp,
+    column: str,
+    *,
+    lag_days: int = 0,
+) -> pd.Series:
     if values is None:
         return pd.Series(dtype=float)
-    eligible = values[values["datetime"] <= timestamp]
+    cutoff = timestamp - timedelta(days=lag_days) if lag_days else timestamp
+    eligible = values[values["datetime"] <= cutoff]
     if eligible.empty:
         return pd.Series(dtype=float)
     current = eligible[eligible["datetime"] == eligible["datetime"].max()]
@@ -241,12 +264,15 @@ def _style_snapshot(values: pd.DataFrame | None, timestamp: pd.Timestamp) -> pd.
     )
 
 
-def _industries_at(values: pd.DataFrame | None, timestamp: pd.Timestamp) -> pd.Series:
+def _industries_at(
+    values: pd.DataFrame | None, timestamp: pd.Timestamp, *, lag_days: int = 0
+) -> pd.Series:
     if values is None:
         return pd.Series(dtype=str)
+    cutoff = timestamp - timedelta(days=lag_days) if lag_days else timestamp
     active = values[
-        (values["in_date"] <= timestamp)
-        & (values["out_date"].isna() | (values["out_date"] >= timestamp))
+        (values["in_date"] <= cutoff)
+        & (values["out_date"].isna() | (values["out_date"] >= cutoff))
     ]
     return (
         active.sort_values("in_date")

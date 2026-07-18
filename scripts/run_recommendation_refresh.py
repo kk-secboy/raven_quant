@@ -15,6 +15,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from quant_data.availability import filter_available
 from quant_data.execution_contract import (
     require_daily_qlib_contract,
     require_minute_execution_contract,
@@ -382,18 +383,16 @@ def main() -> None:
         liquidity_lookback_days=int(config.get("liquidity_lookback_days", 20)),
     )
     signal = governed.xs(as_of, level="datetime")
-    memberships["in_date"] = pd.to_datetime(memberships["in_date"], errors="coerce")
-    memberships["out_date"] = pd.to_datetime(memberships["out_date"], errors="coerce")
+    # Read-side availability guard (design draft 3.3): industry membership and
+    # benchmark weights are only usable after the versioned conservative
+    # publication lag, applied here through the shared registry policy.
     active = (
-        memberships[
-            (memberships["in_date"] <= as_of)
-            & (memberships["out_date"].isna() | (memberships["out_date"] >= as_of))
-        ]
+        filter_available("index_member_all", memberships, as_of)
         .sort_values("in_date")
         .drop_duplicates("instrument", keep="last")
     )
     industries = active.set_index(active["instrument"].astype(str))["industry"].astype(str)
-    benchmark = _latest(benchmark_frame, as_of, "weight")
+    benchmark = _latest(filter_available("index_weight", benchmark_frame, as_of), as_of, "weight")
     styles = _latest_styles(styles_frame, as_of)
     benchmark_industries = industries.reindex(benchmark.index)
     if benchmark_industries.isna().any() or styles.reindex(benchmark.index).isna().any().any():

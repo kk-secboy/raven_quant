@@ -19,6 +19,11 @@ from quant_platform.eligibility import (
     build_point_in_time_eligibility,
 )
 
+from .availability import (
+    AVAILABILITY_POLICY_VERSION,
+    availability_contract_label,
+    recoverability_level,
+)
 from .execution_contract import (
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
     INDEX_VOLUME_POLICY,
@@ -808,8 +813,10 @@ class QlibBuilder:
                 f"\n                    , try_cast(fi.{source} AS DOUBLE) AS {target}"
                 for source, target in fundamental_features.items()
             )
-            projected = ", ".join(
-                ["ts_code", "ann_date", "end_date", *fundamental_features]
+            projected_columns = ["ts_code", "ann_date", "end_date", *fundamental_features]
+            projected = ", ".join(projected_columns)
+            revision_order = _fundamental_revision_order(
+                projected_columns, self._parquet_columns("fina_indicator")
             )
             fundamental_join = f"""
                 ASOF LEFT JOIN (
@@ -818,7 +825,7 @@ class QlibBuilder:
                     WHERE ts_code IS NOT NULL AND try_cast(ann_date AS DATE) IS NOT NULL
                     QUALIFY row_number() OVER (
                         PARTITION BY ts_code, try_cast(ann_date AS DATE)
-                        ORDER BY try_cast(end_date AS DATE) DESC NULLS LAST
+                        ORDER BY {revision_order}
                     ) = 1
                 ) fi
                   ON d.ts_code = fi.ts_code
@@ -909,14 +916,28 @@ class QlibBuilder:
             for source, target in _FUNDAMENTAL_RESEARCH_FIELDS.items()
             if source in fundamental_columns
         }
+        # Version 2: availability policies and recoverability levels come from
+        # the shared registry in quant_data.availability and now also cover the
+        # index/industry metadata consumed next to the feature fields.
+        availability_datasets = (
+            "daily_basic",
+            "fina_indicator",
+            "index_weight",
+            "index_member_all",
+        )
         return {
-            "version": 1,
+            "version": 2,
             "daily_fields": daily_fields,
             "fundamental_fields": fundamental_fields,
             "fields": [*daily_fields, *fundamental_fields.values()],
+            "availability_policy_version": AVAILABILITY_POLICY_VERSION,
             "availability_policy": {
-                "daily_basic": "same_trade_date_after_close",
-                "fina_indicator": "strictly_after_announcement_date",
+                dataset: availability_contract_label(dataset)
+                for dataset in availability_datasets
+            },
+            "recoverability": {
+                dataset: recoverability_level(dataset)
+                for dataset in availability_datasets
             },
         }
 
@@ -1082,6 +1103,33 @@ def _as_date_sql(column: str) -> str:
         f"coalesce(try_cast({identifier} AS DATE), "
         f"try_strptime(CAST({identifier} AS VARCHAR), '%Y%m%d')::DATE)"
     )
+
+
+def _fundamental_revision_order(
+    projected_columns: list[str], source_columns: set[str]
+) -> str:
+    """Deterministic total order for conflicting financial revision rows.
+
+    Rows sharing (ts_code, ann_date, end_date) conflict when a report is
+    re-announced or silently revised and both versions survive in the snapshot.
+    Resolve them deterministically: newest f_ann_date / update_flag when the
+    source provides them, then the newest row-level ingested_at, and finally a
+    content hash over the projected columns so the chosen row never depends on
+    parquet file or row order.
+    """
+
+    ordering = ["try_cast(end_date AS DATE) DESC NULLS LAST"]
+    if "f_ann_date" in source_columns:
+        ordering.append("try_cast(f_ann_date AS DATE) DESC NULLS LAST")
+    if "update_flag" in source_columns:
+        ordering.append("try_cast(update_flag AS DOUBLE) DESC NULLS LAST")
+    if "ingested_at" in source_columns:
+        ordering.append("ingested_at DESC NULLS LAST")
+    hashed = ", ".join(
+        f'coalesce(CAST("{column}" AS VARCHAR), \'\')' for column in projected_columns
+    )
+    ordering.append(f"md5(concat_ws('|', {hashed})) ASC")
+    return ", ".join(ordering)
 
 
 def _sha256_file(path: Path) -> str:

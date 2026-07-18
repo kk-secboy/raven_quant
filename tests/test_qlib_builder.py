@@ -6,6 +6,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from quant_data.availability import (
+    EVIDENCE_RECOVERABILITY_LEVELS,
+    METADATA_AVAILABILITY_LAG_DAYS,
+    recoverability_level,
+)
 from quant_data.qlib_builder import (
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
     QlibBuilder,
@@ -266,9 +271,18 @@ def test_adds_point_in_time_research_features_without_announcement_leakage(
     assert frame["fund_roe"].iloc[2] == pytest.approx(12.5)
     assert frame["fund_debt_to_assets"].iloc[2] == pytest.approx(45.0)
     assert frame["fund_netprofit_yoy"].iloc[2] == pytest.approx(18.0)
+    lag_label = f"effective_date_with_lag(days={METADATA_AVAILABILITY_LAG_DAYS})"
     assert builder.research_feature_contract["availability_policy"] == {
         "daily_basic": "same_trade_date_after_close",
         "fina_indicator": "strictly_after_announcement_date",
+        "index_weight": lag_label,
+        "index_member_all": lag_label,
+    }
+    assert builder.research_feature_contract["recoverability"] == {
+        "daily_basic": "native_history",
+        "fina_indicator": "native_history",
+        "index_weight": "native_history",
+        "index_member_all": "reconstructed",
     }
     assert "fund_roe" in builder.qlib_fields
 
@@ -651,3 +665,199 @@ def test_failed_qlib_dump_removes_partial_output(tmp_path: Path, monkeypatch) ->
             wsl_distro="Ubuntu-22.04",
         )
     assert not output.exists()
+
+
+def _write_revision_fixture(
+    snapshot: Path,
+    fina_rows: list[dict],
+    daily_days: tuple[str, ...] = ("2024-01-02",),
+) -> None:
+    rows = [
+        {
+            "ts_code": "000001.SZ",
+            "trade_date": day,
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.0,
+            "vol": 100.0,
+            "amount": 100.0,
+            "pct_chg": 0.0,
+        }
+        for day in daily_days
+    ]
+    fixtures = {
+        "daily": rows,
+        "adj_factor": [
+            {"ts_code": "000001.SZ", "trade_date": row["trade_date"], "adj_factor": 1.0}
+            for row in rows
+        ],
+        "stk_limit": [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": row["trade_date"],
+                "up_limit": 11.0,
+                "down_limit": 9.0,
+            }
+            for row in rows
+        ],
+        "daily_basic": [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": row["trade_date"],
+                "total_mv": 100_000.0,
+            }
+            for row in rows
+        ],
+        "fina_indicator": fina_rows,
+    }
+    for dataset, data in fixtures.items():
+        target = snapshot / "parquet" / dataset / "partition_year=2024"
+        target.mkdir(parents=True)
+        pd.DataFrame(data).to_parquet(target / "data.parquet")
+    _write_required_research_inputs(snapshot)
+
+
+def _fund_roe(by_symbol: Path) -> list[float]:
+    return pd.read_parquet(by_symbol / "SZ000001.parquet")["fund_roe"].tolist()
+
+
+def test_fundamental_revision_conflict_prefers_newest_f_ann_date(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 10.0,
+                "f_ann_date": "2024-01-01",
+                "update_flag": 0,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 20.0,
+                "f_ann_date": "2024-01-05",
+                "update_flag": 1,
+            },
+        ],
+    )
+
+    by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+    # Same (ts_code, ann_date, end_date) conflict: the revision with the newer
+    # f_ann_date / update_flag wins deterministically.
+    assert _fund_roe(by_symbol) == pytest.approx([20.0])
+
+
+def test_fundamental_revision_conflict_uses_latest_ingested_at(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 10.0,
+                "ingested_at": pd.Timestamp("2026-01-01T00:00:00Z"),
+            },
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 20.0,
+                "ingested_at": pd.Timestamp("2026-06-01T00:00:00Z"),
+            },
+        ],
+    )
+
+    by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+    assert _fund_roe(by_symbol) == pytest.approx([20.0])
+
+
+def test_fundamental_revision_dedup_is_deterministic_across_row_order(
+    tmp_path: Path,
+) -> None:
+    base_rows = [
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-12-31",
+            "roe": 10.0,
+        },
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-12-31",
+            "roe": 20.0,
+        },
+    ]
+    frames = []
+    for name, rows in (("forward", base_rows), ("reversed", list(reversed(base_rows)))):
+        snapshot = tmp_path / name / "snapshot"
+        _write_revision_fixture(snapshot, rows)
+        by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / name / "staging")
+        frames.append(pd.read_parquet(by_symbol / "SZ000001.parquet"))
+
+    # With no revision columns at all, the content-hash tie-break still makes
+    # the surviving row independent of parquet row order.
+    pd.testing.assert_frame_equal(frames[0], frames[1])
+
+    # Rebuilding the same snapshot twice produces the identical frame.
+    snapshot = tmp_path / "forward" / "snapshot"
+    again = QlibBuilder(snapshot).build_staging(tmp_path / "forward" / "staging-again")
+    pd.testing.assert_frame_equal(frames[0], pd.read_parquet(again / "SZ000001.parquet"))
+
+
+def test_financial_restatement_applies_only_after_the_new_announcement(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 10.0,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-05",
+                "end_date": "2023-12-31",
+                "roe": 99.0,
+            },
+        ],
+        daily_days=("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-08"),
+    )
+
+    by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+    # Restatement scenario: the revised value is invisible before its own
+    # announcement date and fully replaces the old one afterwards.
+    assert _fund_roe(by_symbol) == pytest.approx([10.0, 10.0, 10.0, 99.0])
+
+    rebuilt = QlibBuilder(snapshot).build_staging(tmp_path / "staging-again")
+    assert _fund_roe(rebuilt) == pytest.approx([10.0, 10.0, 10.0, 99.0])
+
+
+def test_research_contract_admits_only_evidence_grade_recoverability(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path, ts_code="000001.SZ", up_limit=11.0, down_limit=9.0
+    )
+
+    contract = QlibBuilder(snapshot).research_feature_contract
+
+    # current_only / unavailable datasets must never feed formal evidence
+    # features or their point-in-time metadata (design draft 3.3).
+    assert contract["availability_policy"]
+    for dataset in contract["availability_policy"]:
+        assert recoverability_level(dataset) in EVIDENCE_RECOVERABILITY_LEVELS

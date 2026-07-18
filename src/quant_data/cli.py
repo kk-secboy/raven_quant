@@ -13,6 +13,9 @@ from rich.console import Console
 from rich.progress import Progress
 from rich.table import Table
 
+from quant_platform.announcement_nlp import process_announcements
+from quant_platform.runtime_secret_store import RuntimeSecretStore
+
 from .catalog import (
     CORE_DAILY,
     CORPORATE_EVENTS,
@@ -22,6 +25,7 @@ from .catalog import (
     RESEARCH_DAILY,
 )
 from .checkpoint import CheckpointStore
+from .cninfo_announcements import download_cninfo_announcements
 from .config import Settings
 from .coverage_data import coverage_secondary_specs
 from .execution_data import MARGIN_DATASET, MINUTE_DATASETS, margin_specs
@@ -1265,6 +1269,117 @@ def ashare_5m(
         "units": len(rows),
         "rows": sum(int(row.get("row_count") or 0) for row in rows),
         "frequency": "5min",
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+@app.command("cninfo-announcements")
+def cninfo_announcements_command(
+    ts_code: Annotated[
+        str, typer.Option(help="Comma-separated Tushare codes to include")
+    ] = "",
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD announcement date")] = "2024-01-01",
+    end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
+    limit: Annotated[
+        int, typer.Option(min=0, help="Maximum announcements to download (0 = all)")
+    ] = 0,
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Download cninfo announcement PDFs discovered through the anns_d index."""
+    start_date = parse_date(start)
+    end_date = parse_date(end, latest=today_cn())
+    if end_date < start_date:
+        raise typer.BadParameter("end must not be before start")
+    context = load_context(
+        require_credentials=False,
+        progress_path=result_path,
+        progress_target={
+            "kind": "cninfo_announcements_download",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+    )
+    context.report_progress(
+        "downloading", "cninfo announcement bodies", {"cninfo_announcements"}, force=True
+    )
+    summary = download_cninfo_announcements(
+        context.settings.data_root,
+        ts_codes=set(_split_codes(ts_code)) or None,
+        start=start_date,
+        end=end_date,
+        limit=limit or None,
+        rate_gate=context.rate_gate,
+        timeout_seconds=context.settings.timeout_seconds,
+        max_attempts=context.settings.max_request_attempts,
+        cooldown_seconds=context.settings.cooldown_seconds,
+    )
+    result = {
+        "dataset": "cninfo_announcements",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "ts_codes": _split_codes(ts_code),
+        **summary.as_dict(),
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+@app.command("announcement-nlp")
+def announcement_nlp_command(
+    ts_code: Annotated[
+        str, typer.Option(help="Comma-separated Tushare codes to include")
+    ] = "",
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD announcement date")] = "2024-01-01",
+    end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
+    category: Annotated[
+        str,
+        typer.Option(help="Comma-separated announcement|regulatory_letter; empty = all"),
+    ] = "",
+    limit: Annotated[
+        int, typer.Option(min=0, help="Maximum announcements to process (0 = all)")
+    ] = 0,
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Extract structured NLP signal fields from downloaded announcement PDFs."""
+    start_date = parse_date(start)
+    end_date = parse_date(end, latest=today_cn())
+    if end_date < start_date:
+        raise typer.BadParameter("end must not be before start")
+    categories = {part.strip() for part in category.split(",") if part.strip()}
+    unknown = categories - {"announcement", "regulatory_letter"}
+    if unknown:
+        raise typer.BadParameter(f"unknown category: {sorted(unknown)}")
+    context = load_context(
+        require_credentials=False,
+        progress_path=result_path,
+        progress_target={
+            "kind": "announcement_nlp",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+    )
+    context.report_progress(
+        "processing", "announcement NLP extraction", {"announcement_nlp"}, force=True
+    )
+    settings = context.settings
+    secret_store = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
+    summary = process_announcements(
+        settings.data_root,
+        ts_codes=set(_split_codes(ts_code)) or None,
+        start=start_date,
+        end=end_date,
+        categories=categories or None,
+        limit=limit or None,
+        secret_store=secret_store,
+    )
+    result = {
+        "dataset": "announcement_nlp",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "ts_codes": _split_codes(ts_code),
+        "category": sorted(categories),
+        **summary.as_dict(),
     }
     _write_optional_result(result_path, result)
     console.print_json(json.dumps(result, ensure_ascii=False))

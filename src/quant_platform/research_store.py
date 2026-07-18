@@ -434,6 +434,24 @@ class ResearchStore:
         candidate["latest_evaluation"] = self.latest_evaluation(candidate_id)
         return candidate
 
+    def find_candidate(self, *, name: str, values_sha256: str) -> dict[str, Any] | None:
+        statement = (
+            select(factor_candidates)
+            .where(
+                factor_candidates.c.name == name,
+                factor_candidates.c.values_sha256 == values_sha256,
+            )
+            .order_by(factor_candidates.c.created_at.asc())
+            .limit(1)
+        )
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).first()
+        if row is None:
+            return None
+        candidate = self._decode_candidate(row_dict(row))
+        candidate["latest_evaluation"] = self.latest_evaluation(candidate["id"])
+        return candidate
+
     def list_candidates(
         self, *, run_id: str | None = None, status: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:

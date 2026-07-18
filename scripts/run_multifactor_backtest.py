@@ -15,6 +15,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from quant_data.availability import filter_available
 from quant_data.execution_contract import (
     require_daily_qlib_contract,
     require_minute_execution_contract,
@@ -268,20 +269,19 @@ def _metadata_provider(
             if timestamp != timestamp.normalize()
             else timestamp
         )
+        # Read-side availability guard (design draft 3.3): membership intervals
+        # and weight snapshots become usable only after the versioned
+        # conservative publication lag from the shared registry policy.
         active = (
-            membership[
-                (membership["in_date"] <= market_timestamp)
-                & (
-                    membership["out_date"].isna()
-                    | (membership["out_date"] >= market_timestamp)
-                )
-            ]
+            filter_available("index_member_all", membership, market_timestamp)
             .sort_values("in_date")
             .drop_duplicates("instrument", keep="last")
         )
         industries = active.set_index(active["instrument"].astype(str))["industry"].astype(str)
         benchmark = _latest_cross_section(
-            benchmark_weights, market_timestamp, "weight"
+            filter_available("index_weight", benchmark_weights, market_timestamp),
+            market_timestamp,
+            "weight",
         )
         style = _latest_style_cross_section(styles, market_timestamp)
         benchmark_industries = industries.reindex(benchmark.index)

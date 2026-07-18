@@ -24,6 +24,7 @@ dependencies = [
   "statsmodels>=0.14,<1",
   "tables>=3.10,<4",
   "psycopg[binary]>=3.2,<4",
+  "pypdf>=4.2,<7",
   "typer>=0.15,<1",
   "uvicorn[standard]>=0.35,<1",
 ]
