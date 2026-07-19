@@ -205,3 +205,58 @@ def test_verifier_rejects_missing_trading_day_and_stock_quote(
     assert report["completeness_checks"]["stocks_missing_daily_quotes"] == 1
     assert any("open trading days have no quotes" in item for item in report["errors"])
     assert any("stock/date quotes are missing" in item for item in report["errors"])
+def test_verifier_ignores_b_share_codes_outside_market_scope(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    fixtures = {
+        "trade_cal": [
+            {"exchange": "SSE", "cal_date": "20240102", "is_open": "1"},
+        ],
+        "daily": [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": "20240102",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.0,
+                "vol": 100.0,
+            }
+        ],
+        "daily_basic": [
+            {"ts_code": "000001.SZ", "trade_date": "20240102", "total_mv": 100.0},
+            # B-share rows (200xxx.SZ / 900xxx.SH) are outside the product's
+            # market scope and must not fail the cross-dataset check.
+            {"ts_code": "200011.SZ", "trade_date": "20240102", "total_mv": 50.0},
+            {"ts_code": "900901.SH", "trade_date": "20240102", "total_mv": 60.0},
+        ],
+        "adj_factor": [
+            {"ts_code": "000001.SZ", "trade_date": "20240102", "adj_factor": 1.0},
+        ],
+    }
+    specs = [
+        FetchSpec(
+            dataset=dataset,
+            api_name=dataset,
+            scope={"fixture": dataset},
+            params={"fixture": dataset},
+        )
+        for dataset in fixtures
+    ]
+    checkpoint.add(specs)
+    for spec in specs:
+        rows = fixtures[spec.dataset]
+        written = storage.write_unit(
+            spec.dataset,
+            spec.unit_key,
+            ProviderResult(spec.api_name, list(rows[0]), rows, b"{}"),
+        )
+        checkpoint.succeed(spec.unit_key, written)
+
+    report = verify_downloads(checkpoint, tmp_path)
+
+    assert report["ok"] is True
+    assert report["completeness_checks"]["stocks_missing_daily_quotes"] == 0
+    assert report["completeness_checks"]["stocks_missing_daily_basic"] == 0

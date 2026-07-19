@@ -247,16 +247,23 @@ def _verify_daily_completeness(
         daily = _parquet_relation(paths["daily"])
         daily_basic = _parquet_relation(paths["daily_basic"])
         trade_date = _date_sql("trade_date")
+        # B-share codes (200xxx.SZ, 900xxx.SH) are outside the product's market
+        # scope (A-shares and exchange-traded ETFs only) and the provider's
+        # per-date coverage for them is inherently incomplete, so the
+        # cross-dataset completeness check is defined on the A-share universe.
+        b_share_filter = "left(ts_code, 3) NOT IN ('200', '900')"
         daily_keys = f"""
             SELECT DISTINCT ts_code, {trade_date} AS trade_date
             FROM {daily}
             WHERE ts_code IS NOT NULL AND {trade_date} IS NOT NULL
+              AND {b_share_filter}
               AND {trade_date} <= DATE {_sql_string(snapshot_end.isoformat())}
         """
         basic_keys = f"""
             SELECT DISTINCT ts_code, {trade_date} AS trade_date
             FROM {daily_basic}
             WHERE ts_code IS NOT NULL AND {trade_date} IS NOT NULL
+              AND {b_share_filter}
               AND {trade_date} <= DATE {_sql_string(snapshot_end.isoformat())}
         """
         checks["daily_rows"] = int(
