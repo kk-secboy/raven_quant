@@ -252,11 +252,19 @@ def _verify_daily_completeness(
         # per-date coverage for them is inherently incomplete, so the
         # cross-dataset completeness check is defined on the A-share universe.
         b_share_filter = "left(ts_code, 3) NOT IN ('200', '900')"
+        # Codes absent from the security master (upstream ghost rows that have
+        # no quotes anywhere) cannot be required to have daily quotes either.
+        master_paths = _selected_parquet_paths(selected_by_dataset, "stock_basic", data_root)
+        master_filter = "1 = 1"
+        if master_paths:
+            master = _parquet_relation(master_paths)
+            master_filter = f"ts_code IN (SELECT DISTINCT ts_code FROM {master})"
         daily_keys = f"""
             SELECT DISTINCT ts_code, {trade_date} AS trade_date
             FROM {daily}
             WHERE ts_code IS NOT NULL AND {trade_date} IS NOT NULL
               AND {b_share_filter}
+              AND {master_filter}
               AND {trade_date} <= DATE {_sql_string(snapshot_end.isoformat())}
         """
         basic_keys = f"""
@@ -264,6 +272,7 @@ def _verify_daily_completeness(
             FROM {daily_basic}
             WHERE ts_code IS NOT NULL AND {trade_date} IS NOT NULL
               AND {b_share_filter}
+              AND {master_filter}
               AND {trade_date} <= DATE {_sql_string(snapshot_end.isoformat())}
         """
         checks["daily_rows"] = int(

@@ -260,3 +260,62 @@ def test_verifier_ignores_b_share_codes_outside_market_scope(
     assert report["ok"] is True
     assert report["completeness_checks"]["stocks_missing_daily_quotes"] == 0
     assert report["completeness_checks"]["stocks_missing_daily_basic"] == 0
+
+
+def test_verifier_ignores_ghost_codes_absent_from_security_master(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    fixtures = {
+        "trade_cal": [
+            {"exchange": "SSE", "cal_date": "20240102", "is_open": "1"},
+        ],
+        "stock_basic": [
+            {"ts_code": "000001.SZ", "name": "PA", "list_status": "L"},
+        ],
+        "daily": [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": "20240102",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.0,
+                "vol": 100.0,
+            }
+        ],
+        "daily_basic": [
+            {"ts_code": "000001.SZ", "trade_date": "20240102", "total_mv": 100.0},
+            # Ghost code: present in daily_basic upstream but absent from the
+            # security master and from every quotes interface.
+            {"ts_code": "201872.SZ", "trade_date": "20240102", "total_mv": 50.0},
+        ],
+        "adj_factor": [
+            {"ts_code": "000001.SZ", "trade_date": "20240102", "adj_factor": 1.0},
+        ],
+    }
+    specs = [
+        FetchSpec(
+            dataset=dataset,
+            api_name=dataset,
+            scope={"fixture": dataset},
+            params={"fixture": dataset},
+        )
+        for dataset in fixtures
+    ]
+    checkpoint.add(specs)
+    for spec in specs:
+        rows = fixtures[spec.dataset]
+        written = storage.write_unit(
+            spec.dataset,
+            spec.unit_key,
+            ProviderResult(spec.api_name, list(rows[0]), rows, b"{}"),
+        )
+        checkpoint.succeed(spec.unit_key, written)
+
+    report = verify_downloads(checkpoint, tmp_path)
+
+    assert report["ok"] is True
+    assert report["completeness_checks"]["stocks_missing_daily_quotes"] == 0
+    assert report["completeness_checks"]["stocks_missing_daily_basic"] == 0
