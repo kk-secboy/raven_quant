@@ -44,6 +44,10 @@ REQUEST_STRATEGIES = {
         "对公告 PDF 做文本抽取后调用 OpenAI 兼容端点做严格 JSON 抽取；"
         "以 sha256+prompt_version+model 为处理键幂等，失败行记录后可重跑。"
     ),
+    "cn_corpus_nlp": (
+        "对 major_news 长篇新闻与沪深互动易问答调用 OpenAI 兼容端点做严格 JSON 抽取；"
+        "以内容 sha256+prompt_version+model 为处理键幂等，失败行记录后可重跑。"
+    ),
 }
 
 
@@ -382,6 +386,22 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         "ready",
         ("cn_cninfo_announcements",),
         ("announcement_nlp_fields",),
+        "daily",
+    ),
+    DataTaskDefinition(
+        "cn_corpus_nlp",
+        5,
+        89,
+        "文本语料 NLP 信号加工",
+        "对已下载的长篇财经新闻（major_news）与沪深互动易问答（irm_qa_sh/irm_qa_sz）"
+        "做 LLM 结构化抽取（情感分、主题、置信度），按内容 sha256+prompt_version+model 幂等"
+        "落不可变 parquet 单元与派生字段索引，并生成市场级 news_sentiment_daily 与个股级 "
+        "irm_qa_sentiment_daily 因子 artifact。",
+        "研究语料",
+        "QuantLab",
+        "ready",
+        ("cn_institutional", "research_corpus"),
+        ("corpus_nlp_fields",),
         "daily",
     ),
     DataTaskDefinition(

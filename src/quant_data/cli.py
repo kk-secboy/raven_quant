@@ -14,6 +14,7 @@ from rich.progress import Progress
 from rich.table import Table
 
 from quant_platform.announcement_nlp import process_announcements
+from quant_platform.corpus_nlp import SUPPORTED_CORPUS_DATASETS, process_corpus
 from quant_platform.runtime_secret_store import RuntimeSecretStore
 
 from .catalog import (
@@ -1379,6 +1380,66 @@ def announcement_nlp_command(
         "end_date": end_date.isoformat(),
         "ts_codes": _split_codes(ts_code),
         "category": sorted(categories),
+        **summary.as_dict(),
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+@app.command("corpus-nlp")
+def corpus_nlp_command(
+    dataset: Annotated[
+        str,
+        typer.Option(help="Comma-separated major_news,irm_qa_sh,irm_qa_sz; empty = all"),
+    ] = "",
+    ts_code: Annotated[
+        str, typer.Option(help="Comma-separated Tushare codes to include")
+    ] = "",
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD publication date")] = "2024-01-01",
+    end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
+    limit: Annotated[
+        int, typer.Option(min=0, help="Maximum corpus items to process (0 = all)")
+    ] = 0,
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Extract structured NLP signal fields from downloaded Tushare text corpora."""
+    start_date = parse_date(start)
+    end_date = parse_date(end, latest=today_cn())
+    if end_date < start_date:
+        raise typer.BadParameter("end must not be before start")
+    datasets = {part.strip() for part in dataset.split(",") if part.strip()}
+    unknown = datasets - set(SUPPORTED_CORPUS_DATASETS)
+    if unknown:
+        raise typer.BadParameter(f"unknown dataset: {sorted(unknown)}")
+    context = load_context(
+        require_credentials=False,
+        progress_path=result_path,
+        progress_target={
+            "kind": "corpus_nlp",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+    )
+    context.report_progress(
+        "processing", "corpus NLP extraction", {"corpus_nlp"}, force=True
+    )
+    settings = context.settings
+    secret_store = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
+    summary = process_corpus(
+        settings.data_root,
+        datasets=datasets or None,
+        ts_codes=set(_split_codes(ts_code)) or None,
+        start=start_date,
+        end=end_date,
+        limit=limit or None,
+        secret_store=secret_store,
+    )
+    result = {
+        "dataset": "corpus_nlp",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "datasets": sorted(datasets) or list(SUPPORTED_CORPUS_DATASETS),
+        "ts_codes": _split_codes(ts_code),
         **summary.as_dict(),
     }
     _write_optional_result(result_path, result)

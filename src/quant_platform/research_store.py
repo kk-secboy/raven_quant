@@ -220,6 +220,204 @@ class FactorGatePolicy:
         return ("passed" if not reasons else "failed", reasons)
 
 
+# Executor version bound into external factor evaluation evidence. Mirrors the
+# hardcoded "factor-recompute-v1" check in record_evaluation: the version lives
+# here because this module validates the evidence chain.
+EXTERNAL_EVALUATOR_VERSION = "external-factor-eval-v1"
+
+# Gate status produced when an external factor lacks enough independent events
+# or signal days; the candidate keeps full records and may be re-evaluated.
+EXTERNAL_GATE_INSUFFICIENT = "insufficient_evidence"
+
+
+def _shared_sign_check_reasons(metrics: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    raw_valid_ic = metrics.get("raw_valid_ic")
+    raw_selection_ic = metrics.get("raw_selection_ic")
+    ic = metrics.get("ic")
+    rank_ic = metrics.get("rank_ic")
+    if raw_valid_ic is None or raw_selection_ic is None:
+        reasons.append("raw direction and selection IC are required")
+    elif float(raw_valid_ic) * float(raw_selection_ic) <= 0:
+        reasons.append("raw direction and selection IC must have the same sign")
+    if ic is not None and rank_ic is not None and float(ic) * float(rank_ic) <= 0:
+        reasons.append("IC and RankIC must have the same direction")
+    return reasons
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalEventGatePolicy:
+    """Admission gate for sparse event-driven external NLP factors.
+
+    Sparse event factors (announcement_tone, irm_qa_sentiment_daily) only carry
+    values on a few event days/instruments, so the cross-sectional coverage
+    gates of FactorGatePolicy can never apply (design draft 4.3/6.9). Evidence
+    is gated on the number of independent event days (effective decisions)
+    instead of daily universe coverage; when that count is too low the gate
+    reports "insufficient_evidence" rather than relaxing thresholds.
+
+    候选参数：以下阈值均为保守默认值，需预注册评审后冻结，不作为已评审依据。
+    """
+
+    version: str = "external-event-gate-v1"
+    min_abs_ic: float = 0.02
+    min_abs_icir: float = 0.50
+    min_abs_rank_ic: float = 0.025
+    min_abs_rank_icir: float = 0.50
+    max_turnover: float = 0.60
+    max_correlation: float = 0.75
+    min_cost_adjusted_return: float = 0.0
+    min_event_days: int = 30
+    max_bh_q_value: float = 0.10
+
+    def evaluate(self, metrics: dict[str, float | None]) -> tuple[str, list[str]]:
+        checks = (
+            ("ic", lambda value: value >= self.min_abs_ic, f"directed IC >= {self.min_abs_ic}"),
+            (
+                "icir",
+                lambda value: value >= self.min_abs_icir,
+                f"directed ICIR >= {self.min_abs_icir}",
+            ),
+            (
+                "rank_ic",
+                lambda value: value >= self.min_abs_rank_ic,
+                f"directed RankIC >= {self.min_abs_rank_ic}",
+            ),
+            (
+                "rank_icir",
+                lambda value: value >= self.min_abs_rank_icir,
+                f"directed RankICIR >= {self.min_abs_rank_icir}",
+            ),
+            (
+                "turnover",
+                lambda value: value <= self.max_turnover,
+                f"turnover <= {self.max_turnover}",
+            ),
+            (
+                "max_correlation",
+                lambda value: abs(value) <= self.max_correlation,
+                f"|correlation| <= {self.max_correlation}",
+            ),
+            (
+                "cost_adjusted_return",
+                lambda value: value > self.min_cost_adjusted_return,
+                f"cost-adjusted return > {self.min_cost_adjusted_return}",
+            ),
+            (
+                "hac_p_value",
+                lambda value: 0 <= value <= self.max_bh_q_value,
+                f"HAC p-value <= {self.max_bh_q_value}",
+            ),
+            (
+                "bh_q_value",
+                lambda value: 0 <= value <= self.max_bh_q_value,
+                f"BH-FDR q-value <= {self.max_bh_q_value}",
+            ),
+        )
+        reasons: list[str] = []
+        for name, predicate, expectation in checks:
+            value = metrics.get(name)
+            if value is None:
+                reasons.append(f"{name} is missing; expected {expectation}")
+            elif not predicate(float(value)):
+                reasons.append(f"{name}={value:g} failed; expected {expectation}")
+        reasons.extend(_shared_sign_check_reasons(metrics))
+        selection_days = metrics.get("selection_days")
+        if selection_days is None:
+            reasons.append(
+                "selection_days is missing; expected "
+                f"independent event days >= {self.min_event_days}"
+            )
+        elif float(selection_days) < self.min_event_days:
+            return (
+                EXTERNAL_GATE_INSUFFICIENT,
+                [
+                    f"independent event days={selection_days:g} below {self.min_event_days}; "
+                    "evidence is insufficient and gate thresholds were not relaxed",
+                    *reasons,
+                ],
+            )
+        return ("passed" if not reasons else "failed", reasons)
+
+
+@dataclass(frozen=True, slots=True)
+class MarketTimeseriesGatePolicy:
+    """Admission gate for market-level timeseries external NLP factors.
+
+    news_sentiment_daily carries a single MARKET pseudo-instrument, so there is
+    no cross-section: the signal is evaluated as a timeseries against benchmark
+    forward returns and gated on the number of independent signal days (design
+    draft 4.3 effective decisions), never on cross-sectional coverage.
+
+    候选参数：以下阈值均为保守默认值，需预注册评审后冻结，不作为已评审依据。
+    """
+
+    version: str = "external-market-gate-v1"
+    min_abs_ic: float = 0.02
+    min_abs_rank_ic: float = 0.025
+    max_turnover: float = 1.0
+    min_cost_adjusted_return: float = 0.0
+    min_signal_days: int = 60
+    max_bh_q_value: float = 0.10
+
+    def evaluate(self, metrics: dict[str, float | None]) -> tuple[str, list[str]]:
+        checks = (
+            ("ic", lambda value: value >= self.min_abs_ic, f"directed IC >= {self.min_abs_ic}"),
+            (
+                "rank_ic",
+                lambda value: value >= self.min_abs_rank_ic,
+                f"directed RankIC >= {self.min_abs_rank_ic}",
+            ),
+            (
+                "turnover",
+                lambda value: value <= self.max_turnover,
+                f"turnover <= {self.max_turnover}",
+            ),
+            (
+                "cost_adjusted_return",
+                lambda value: value > self.min_cost_adjusted_return,
+                f"cost-adjusted return > {self.min_cost_adjusted_return}",
+            ),
+            (
+                "hac_p_value",
+                lambda value: 0 <= value <= self.max_bh_q_value,
+                f"HAC p-value <= {self.max_bh_q_value}",
+            ),
+            (
+                "bh_q_value",
+                lambda value: 0 <= value <= self.max_bh_q_value,
+                f"BH-FDR q-value <= {self.max_bh_q_value}",
+            ),
+        )
+        reasons: list[str] = []
+        for name, predicate, expectation in checks:
+            value = metrics.get(name)
+            if value is None:
+                reasons.append(f"{name} is missing; expected {expectation}")
+            elif not predicate(float(value)):
+                reasons.append(f"{name}={value:g} failed; expected {expectation}")
+        reasons.extend(_shared_sign_check_reasons(metrics))
+        selection_days = metrics.get("selection_days")
+        if selection_days is None:
+            reasons.append(
+                "selection_days is missing; expected "
+                f"independent signal days >= {self.min_signal_days}"
+            )
+        elif float(selection_days) < self.min_signal_days:
+            return (
+                EXTERNAL_GATE_INSUFFICIENT,
+                [
+                    f"independent signal days={selection_days:g} below {self.min_signal_days}; "
+                    "evidence is insufficient and gate thresholds were not relaxed",
+                    *reasons,
+                ],
+            )
+        return ("passed" if not reasons else "failed", reasons)
+
+
+ExternalGatePolicy = ExternalEventGatePolicy | MarketTimeseriesGatePolicy
+
+
 class ResearchStore:
     """PostgreSQL repository for RD-Agent runs and governed factor promotion."""
 
@@ -671,6 +869,231 @@ class ResearchStore:
                     "evaluation_id": evaluation_id,
                     "reasons": reasons,
                     "evidence_sha256": evidence_sha256,
+                },
+            )
+        return self.get_evaluation(evaluation_id)
+
+    def record_external_evaluation(
+        self,
+        candidate_id: str,
+        *,
+        policy: ExternalGatePolicy,
+        dataset: str,
+        dataset_identity_sha256: str,
+        train_start: date,
+        train_end: date,
+        valid_start: date,
+        valid_end: date,
+        test_start: date,
+        test_end: date,
+        evaluation_shape: str,
+        metrics: dict[str, Any] | None,
+        insufficient_reasons: list[str] | None,
+        external_evidence: dict[str, Any],
+        artifact_path: str | None,
+        actor: str = "external-factor-evaluator",
+    ) -> dict[str, Any]:
+        """Record an external NLP factor evaluation with the same anchoring chain.
+
+        External factors (announcement/corpus NLP artifacts) cannot be
+        recomputed from market data, so the registered values artifact is the
+        authoritative values: ``recomputed_values_sha256`` and
+        ``submitted_values_sha256`` are both anchored to the candidate values
+        sha256, and ``recompute_evidence_json`` carries the external evaluator
+        evidence instead of a factor-recompute proof. Gate outcomes advance the
+        candidate through the same state machine, plus the explicit
+        ``insufficient_evidence`` state when independent events/signal days are
+        too few (fail-closed, thresholds are not relaxed).
+        """
+
+        if not (train_start <= train_end < valid_start <= valid_end < test_start <= test_end):
+            raise ValueError(
+                "train, validation, and test windows must be ordered and non-overlapping"
+            )
+        if not _is_sha256(dataset_identity_sha256):
+            raise ValueError("factor evaluation requires immutable dataset identity")
+        candidate = self.get_candidate(candidate_id)
+        embargo_days = max(5, int(candidate["label_horizon_days"]))
+        if (test_start - valid_end).days <= embargo_days:
+            raise ValueError(
+                f"reserved final test requires purge/embargo gap greater than {embargo_days} days"
+            )
+        if candidate["status"] in {"promoted", "retired"}:
+            raise ValueError(f"cannot evaluate candidate in {candidate['status']} state")
+        expected_policy = {
+            "sparse_event": ExternalEventGatePolicy,
+            "market_timeseries": MarketTimeseriesGatePolicy,
+        }.get(evaluation_shape)
+        if expected_policy is None:
+            raise ValueError(f"unknown external evaluation shape: {evaluation_shape!r}")
+        if not isinstance(policy, expected_policy):
+            raise ValueError(
+                f"external evaluation shape {evaluation_shape!r} requires "
+                f"{expected_policy.__name__}"
+            )
+        if metrics is not None and metrics.get("statistical_contract_version") not in {
+            None,
+            "research-statistics-v1-hac-bh-dsr",
+        }:
+            raise ValueError("factor statistical contract is obsolete")
+        current_code_sha256 = _artifact_hash(
+            candidate.get("code_path"), "factor code", required=True
+        )
+        current_values_sha256 = _artifact_hash(
+            candidate.get("values_path"), "factor values", required=True
+        )
+        if current_code_sha256 != candidate.get("code_sha256"):
+            raise ValueError("factor code artifact changed after import")
+        if current_values_sha256 != candidate.get("values_sha256"):
+            raise ValueError("factor values artifact changed after import")
+        if external_evidence.get("executor_version") != EXTERNAL_EVALUATOR_VERSION:
+            raise ValueError("external evaluation evidence has an unsupported executor version")
+        if external_evidence.get("evaluation_shape") != evaluation_shape:
+            raise ValueError("external evaluation evidence is not bound to the evaluation shape")
+        if external_evidence.get("candidate_code_sha256") != current_code_sha256:
+            raise ValueError("external evaluation evidence is not bound to candidate code")
+        if external_evidence.get("candidate_values_sha256") != current_values_sha256:
+            raise ValueError("external evaluation evidence is not bound to candidate values")
+        if external_evidence.get("authoritative_values_sha256") != current_values_sha256:
+            raise ValueError("external evaluation evidence is not bound to authoritative values")
+        if external_evidence.get("dataset_identity_sha256") != dataset_identity_sha256:
+            raise ValueError("external evaluation evidence is not bound to the Qlib dataset")
+        if external_evidence.get("policy") != asdict(policy):
+            raise ValueError("external evaluation evidence is not bound to the gate policy")
+        if int(external_evidence.get("label_horizon_days") or 0) != int(
+            candidate["label_horizon_days"]
+        ):
+            raise ValueError("external evaluation evidence has the wrong label horizon")
+        expected_periods = {
+            "train_start": train_start.isoformat(),
+            "train_end": train_end.isoformat(),
+            "valid_start": valid_start.isoformat(),
+            "valid_end": valid_end.isoformat(),
+            "test_start": test_start.isoformat(),
+            "test_end": test_end.isoformat(),
+        }
+        if external_evidence.get("periods") != expected_periods:
+            raise ValueError("external evaluation evidence is not bound to evaluation periods")
+        if not _is_sha256(str(external_evidence.get("input_data_sha256") or "")):
+            raise ValueError("external evaluation evidence is not bound to the price input")
+        metrics = dict(metrics) if metrics is not None else None
+        if metrics is None:
+            gate_status = EXTERNAL_GATE_INSUFFICIENT
+            reasons = [str(reason) for reason in (insufficient_reasons or []) if str(reason)]
+            if not reasons:
+                raise ValueError("insufficient-evidence evaluations require explicit reasons")
+        else:
+            gate_status, reasons = policy.evaluate(metrics)
+        if gate_status == "passed" and not artifact_path:
+            raise ValueError("passed external evaluation requires a durable result artifact")
+        artifact_sha256 = _artifact_hash(
+            artifact_path, "external evaluation", required=gate_status == "passed"
+        )
+        if artifact_path and metrics is not None:
+            artifact_metrics = _evaluation_artifact_metrics(artifact_path, candidate_id)
+            if _canonical_sha256(artifact_metrics) != _canonical_sha256(metrics):
+                raise ValueError(
+                    "external evaluation artifact metrics do not match imported metrics"
+                )
+        metrics_payload = metrics if metrics is not None else {}
+        metrics_sha256 = _canonical_sha256(metrics_payload)
+        policy_dict = asdict(policy)
+        policy_sha256 = _canonical_sha256(policy_dict)
+        evidence = _evaluation_evidence(
+            candidate_id=candidate_id,
+            dataset=dataset,
+            dataset_identity_sha256=dataset_identity_sha256,
+            periods=expected_periods,
+            gate_status=gate_status,
+            gate_reasons=reasons,
+            evaluator_version=policy.version,
+            candidate_code_sha256=current_code_sha256,
+            candidate_values_sha256=current_values_sha256,
+            submitted_values_sha256=current_values_sha256,
+            recompute_evidence_sha256=_canonical_sha256(external_evidence),
+            artifact_sha256=artifact_sha256 or "",
+            metrics_sha256=metrics_sha256,
+            policy_sha256=policy_sha256,
+        )
+        evidence_sha256 = _canonical_sha256(evidence)
+        evaluation_id = uuid.uuid4().hex
+        now = _now()
+        scalars = {
+            key: metrics_payload.get(key)
+            for key in (
+                "ic",
+                "icir",
+                "rank_ic",
+                "rank_icir",
+                "turnover",
+                "max_correlation",
+                "cost_adjusted_return",
+            )
+        }
+        candidate_status = {
+            "passed": "gate_passed",
+            "failed": "gate_failed",
+            EXTERNAL_GATE_INSUFFICIENT: EXTERNAL_GATE_INSUFFICIENT,
+        }[gate_status]
+        with self.engine.begin() as connection:
+            connection.execute(
+                insert(factor_evaluations).values(
+                    id=evaluation_id,
+                    factor_candidate_id=candidate_id,
+                    dataset=dataset,
+                    dataset_identity_sha256=dataset_identity_sha256,
+                    train_start=train_start,
+                    train_end=train_end,
+                    valid_start=valid_start,
+                    valid_end=valid_end,
+                    test_start=test_start,
+                    test_end=test_end,
+                    **scalars,
+                    metrics_json=metrics_payload,
+                    gate_status=gate_status,
+                    gate_reasons_json=reasons,
+                    evaluator_version=policy.version,
+                    artifact_path=artifact_path,
+                    artifact_sha256=artifact_sha256,
+                    candidate_code_sha256=current_code_sha256,
+                    candidate_values_sha256=current_values_sha256,
+                    submitted_values_sha256=current_values_sha256,
+                    recomputed_values_sha256=current_values_sha256,
+                    recompute_evidence_json=external_evidence,
+                    hac_p_value=metrics_payload.get("hac_p_value"),
+                    bh_q_value=metrics_payload.get("bh_q_value"),
+                    statistical_contract_version="research-statistics-v1-hac-bh-dsr",
+                    signal_frequency="day",
+                    signal_horizon=f"{int(candidate.get('label_horizon_days') or 1)}d",
+                    execution_frequency="day",
+                    execution_contract_hash=evidence_sha256,
+                    qlib_version=f"0.0.dev0+g{QLIB_COMMIT}",
+                    qlib_commit=QLIB_COMMIT,
+                    rdagent_version=f"0.0.dev0+g{RDAGENT_COMMIT}",
+                    rdagent_commit=RDAGENT_COMMIT,
+                    metrics_sha256=metrics_sha256,
+                    policy_json=policy_dict,
+                    policy_sha256=policy_sha256,
+                    evidence_sha256=evidence_sha256,
+                    created_at=now,
+                )
+            )
+            connection.execute(
+                update(factor_candidates)
+                .where(factor_candidates.c.id == candidate_id)
+                .values(status=candidate_status, updated_at=now)
+            )
+            self._event(
+                connection,
+                run_id=candidate["research_run_id"],
+                candidate_id=candidate_id,
+                event_type=f"candidate.{candidate_status}",
+                actor=actor,
+                payload={
+                    "evaluation_id": evaluation_id,
+                    "reasons": reasons,
+                    "evidence_sha256": evidence_sha256,
+                    "evaluation_shape": evaluation_shape,
                 },
             )
         return self.get_evaluation(evaluation_id)

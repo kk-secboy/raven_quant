@@ -1,0 +1,692 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import UTC, date, datetime
+from pathlib import Path
+
+import pandas as pd
+import pytest
+from typer.testing import CliRunner
+
+import quant_data.cli as cli_module
+from quant_data.cli import app
+from quant_platform import corpus_nlp as corpus
+from quant_platform.announcement_nlp import LlmCredentialsError, LlmExtractionError
+
+pytestmark = pytest.mark.no_database
+
+NOW = datetime(2026, 7, 18, 12, 0, 0, tzinfo=UTC)
+STORE_RECORD = {
+    "api_key": "sk-test-fake-key",
+    "api_base": "https://llm.example.invalid/v1",
+    "chat_model": "test-model",
+}
+# Trading calendar with a mid-week holiday (2024-01-03) so tests prove the
+# persisted trade_cal — not weekday rules — drives availability and factor dates.
+OPEN_DAYS = [
+    date(2024, 1, 2),
+    date(2024, 1, 4),
+    date(2024, 1, 5),
+    date(2024, 1, 8),
+    date(2024, 1, 9),
+]
+CALENDAR_DAYS = [
+    (date(2024, 1, 2), 1),
+    (date(2024, 1, 3), 0),  # Wednesday holiday
+    (date(2024, 1, 4), 1),
+    (date(2024, 1, 5), 1),
+    (date(2024, 1, 6), 0),
+    (date(2024, 1, 7), 0),
+    (date(2024, 1, 8), 1),
+    (date(2024, 1, 9), 1),
+]
+
+
+def _payload(**overrides) -> str:
+    body = {"sentiment": 0.6, "topic": "company", "confidence": 0.9}
+    body.update(overrides)
+    return json.dumps(body, ensure_ascii=False)
+
+
+class FakeChatClient:
+    """Scripted ChatCompleter stand-in; fails the test on unscripted calls."""
+
+    def __init__(self, script: list) -> None:
+        self.script = list(script)
+        self.calls: list[tuple[list[dict], str]] = []
+
+    def complete(self, messages: list[dict], *, model: str) -> str:
+        self.calls.append((messages, model))
+        if not self.script:
+            raise AssertionError("unexpected LLM call")
+        outcome = self.script.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class FakeSecretStore:
+    def __init__(self, record: dict | None) -> None:
+        self.record = record
+
+    def get(self, name: str) -> dict | None:
+        assert name == "llm"
+        return self.record
+
+
+def _write_parquet(directory: Path, rows: list[dict], name: str = "data.parquet") -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(directory / name, index=False)
+
+
+def _seed_trade_cal(data_root: Path) -> None:
+    _write_parquet(
+        data_root / "units" / "trade_cal",
+        [
+            {"cal_date": day.strftime("%Y%m%d"), "is_open": flag, "pretrade_date": ""}
+            for day, flag in CALENDAR_DAYS
+        ],
+    )
+
+
+def _news_row(title: str, content: str, pub_time: str, src: str = "财联社") -> dict:
+    return {"title": title, "content": content, "pub_time": pub_time, "src": src}
+
+
+def _seed_corpus(data_root: Path) -> None:
+    """Seed the three datasets across both units and snapshots layouts."""
+    _write_parquet(
+        data_root / "units" / "major_news",
+        [
+            _news_row("央行降准释放流动性", "正文：降准0.5个百分点", "2024-01-02 10:00:00"),
+            _news_row("市场情绪受挫", "正文：两市午后跳水", "2024-01-02 16:30:00"),
+        ],
+    )
+    _write_parquet(
+        data_root / "snapshots" / "snap1" / "parquet" / "major_news",
+        [
+            # Exact duplicate of a units row: must collapse onto one item.
+            _news_row("央行降准释放流动性", "正文：降准0.5个百分点", "2024-01-02 10:00:00"),
+            _news_row("周末宏观综述", "正文：假期政策汇总", "2024-01-06 09:00:00"),
+        ],
+    )
+    _write_parquet(
+        data_root / "units" / "irm_qa_sh",
+        [
+            {
+                "trade_date": "20240102",
+                "ts_code": "000001.SH",
+                "q": "公司产能利用率如何？",
+                "a": "产能利用率维持在90%以上。",
+            }
+        ],
+    )
+    _write_parquet(
+        data_root / "units" / "irm_qa_sz",
+        [
+            {"trade_date": "20240105", "ts_code": "000002.SZ", "q": "新业务进展如何？"},
+        ],
+    )
+
+
+def _run(data_root: Path, chat, **kwargs) -> corpus.CorpusNlpSummary:
+    return corpus.process_corpus(
+        data_root,
+        secret_store=FakeSecretStore(STORE_RECORD),
+        chat_client=chat,
+        now=lambda: NOW,
+        environ={},
+        **kwargs,
+    )
+
+
+# --- corpus loading ----------------------------------------------------------
+
+
+def test_load_corpus_items_reads_units_and_snapshots(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+
+    items = corpus.load_corpus_items(tmp_path)
+
+    assert len(items) == 5  # the duplicated news row collapses onto one item
+    by_dataset = {}
+    for item in items:
+        by_dataset.setdefault(item.source_dataset, []).append(item)
+    assert set(by_dataset) == {"major_news", "irm_qa_sh", "irm_qa_sz"}
+    assert len(by_dataset["major_news"]) == 3
+    news = by_dataset["major_news"][0]
+    assert news.ts_code is None
+    assert news.pub_time == datetime(2024, 1, 2, 10, 0, 0)
+    assert len(news.item_id) == 64  # content sha256 hexdigest
+    sh = by_dataset["irm_qa_sh"][0]
+    assert sh.ts_code == "000001.SH"
+    assert sh.content == "问：公司产能利用率如何？\n答：产能利用率维持在90%以上。"
+    assert sh.pub_time == datetime(2024, 1, 2, 0, 0, 0)
+
+
+def test_load_corpus_items_missing_dataset_fail_closed(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError) as captured:
+        corpus.load_corpus_items(tmp_path)
+    message = str(captured.value)
+    for dataset in ("major_news", "irm_qa_sh", "irm_qa_sz"):
+        assert dataset in message
+    assert str(tmp_path / "units" / "major_news") in message
+    assert "snapshots" in message
+
+    _write_parquet(tmp_path / "units" / "irm_qa_sz", [{"trade_date": "20240102"}])
+    with pytest.raises(RuntimeError, match="irm_qa_sz"):
+        corpus.load_corpus_items(tmp_path, datasets={"irm_qa_sz"})
+
+
+def test_load_corpus_items_rejects_unknown_dataset(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unsupported corpus dataset"):
+        corpus.load_corpus_items(tmp_path, datasets={"ths_hot"})
+
+
+def test_load_irm_qa_tolerates_column_variants(tmp_path: Path) -> None:
+    # question/answer naming instead of q, and no answer column for irm_qa_sz.
+    _write_parquet(
+        tmp_path / "units" / "irm_qa_sh",
+        [
+            {
+                "trade_date": "2024-01-02",
+                "ts_code": "600000.SH",
+                "question": "分红计划？",
+                "answer": "拟10派3元。",
+            }
+        ],
+    )
+    _write_parquet(
+        tmp_path / "units" / "irm_qa_sz",
+        [{"trade_date": "20240103", "ts_code": "000002.SZ", "q": "订单情况？"}],
+    )
+
+    items = corpus.load_corpus_items(tmp_path, datasets={"irm_qa_sh", "irm_qa_sz"})
+
+    assert len(items) == 2
+    sh = next(item for item in items if item.source_dataset == "irm_qa_sh")
+    assert sh.content == "问：分红计划？\n答：拟10派3元。"
+    sz = next(item for item in items if item.source_dataset == "irm_qa_sz")
+    assert sz.content == "问：订单情况？"  # missing answer column: question only
+
+
+def test_load_irm_qa_missing_question_column_fail_closed(tmp_path: Path) -> None:
+    _write_parquet(
+        tmp_path / "units" / "irm_qa_sh",
+        [{"trade_date": "20240102", "ts_code": "600000.SH", "note": "x"}],
+    )
+
+    with pytest.raises(RuntimeError, match="q\\|question"):
+        corpus.load_corpus_items(tmp_path, datasets={"irm_qa_sh"})
+
+
+def test_load_major_news_missing_content_column_fail_closed(tmp_path: Path) -> None:
+    _write_parquet(
+        tmp_path / "units" / "major_news",
+        [{"title": "t", "pub_time": "2024-01-02 10:00:00"}],
+    )
+
+    with pytest.raises(RuntimeError, match="content"):
+        corpus.load_corpus_items(tmp_path, datasets={"major_news"})
+
+
+def test_load_major_news_drops_unusable_rows(tmp_path: Path) -> None:
+    _write_parquet(
+        tmp_path / "units" / "major_news",
+        [
+            _news_row("有效", "正文", "2024-01-02 10:00:00"),
+            _news_row("时间无法解析", "正文", "not-a-timestamp"),
+            _news_row("", "", "2024-01-02 11:00:00"),
+        ],
+    )
+
+    items = corpus.load_corpus_items(tmp_path, datasets={"major_news"})
+
+    assert [item.title for item in items] == ["有效"]
+
+
+# --- availability and factor-date rules --------------------------------------
+
+
+def test_available_at_rules_per_dataset() -> None:
+    news = corpus.CorpusItem(
+        source_dataset="major_news",
+        item_id="n",
+        ts_code=None,
+        title="t",
+        content="c",
+        pub_time=datetime(2024, 1, 2, 16, 30, 0),
+    )
+    assert corpus.available_at_for(news, OPEN_DAYS) == datetime(2024, 1, 2, 16, 30, 0)
+
+    irm = corpus.CorpusItem(
+        source_dataset="irm_qa_sh",
+        item_id="i",
+        ts_code="600000.SH",
+        title="q",
+        content="c",
+        pub_time=datetime(2024, 1, 2, 0, 0, 0),
+    )
+    # Date-only source: next trading day, skipping the Wednesday holiday.
+    assert corpus.available_at_for(irm, OPEN_DAYS) == datetime(2024, 1, 4, 0, 0, 0)
+
+    late = corpus.CorpusItem(
+        source_dataset="irm_qa_sz",
+        item_id="j",
+        ts_code="000002.SZ",
+        title="q",
+        content="c",
+        pub_time=datetime(2024, 1, 9, 0, 0, 0),
+    )
+    with pytest.raises(LookupError, match="no trading day after"):
+        corpus.available_at_for(late, OPEN_DAYS)
+
+
+def test_factor_date_rule_uses_trade_cal_not_weekdays() -> None:
+    assert corpus.factor_date_for(datetime(2024, 1, 2, 14, 59), OPEN_DAYS) == date(2024, 1, 2)
+    # Exactly 15:00 counts as "after": next trading day, skipping the holiday.
+    assert corpus.factor_date_for(datetime(2024, 1, 2, 15, 0), OPEN_DAYS) == date(2024, 1, 4)
+    assert corpus.factor_date_for(datetime(2024, 1, 2, 16, 30), OPEN_DAYS) == date(2024, 1, 4)
+    # Wednesday holiday morning: before 15:00 but not a trading day.
+    assert corpus.factor_date_for(datetime(2024, 1, 3, 9, 0), OPEN_DAYS) == date(2024, 1, 4)
+    # Saturday: rolls to Monday via the calendar.
+    assert corpus.factor_date_for(datetime(2024, 1, 6, 12, 0), OPEN_DAYS) == date(2024, 1, 8)
+    with pytest.raises(LookupError, match="no trading day after"):
+        corpus.factor_date_for(datetime(2024, 1, 9, 16, 0), OPEN_DAYS)
+
+
+# --- LLM payload validation ----------------------------------------------------
+
+
+def test_parse_extraction_payload_accepts_valid_fenced_and_integer() -> None:
+    result = corpus.parse_extraction_payload(_payload())
+    assert result.sentiment == 0.6
+    assert result.topic == "company"
+    assert result.confidence == 0.9
+
+    fenced = f"```json\n{_payload(topic='macro', sentiment=-0.25)}\n```"
+    fenced_result = corpus.parse_extraction_payload(fenced)
+    assert fenced_result.topic == "macro"
+    assert fenced_result.sentiment == -0.25
+
+    integers = corpus.parse_extraction_payload(_payload(sentiment=1, confidence=0))
+    assert integers.sentiment == 1.0
+    assert integers.confidence == 0.0
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "this is not json",
+        "[1, 2, 3]",
+        _payload(sentiment=None),
+        _payload(sentiment=1.01),
+        _payload(sentiment=-1.5),
+        _payload(sentiment="very positive"),
+        _payload(sentiment=True),
+        _payload(topic="sector"),
+        _payload(topic=42),
+        _payload(confidence=1.5),
+        _payload(confidence=-0.1),
+    ],
+)
+def test_parse_extraction_payload_fail_closed(raw: str) -> None:
+    with pytest.raises(LlmExtractionError) as captured:
+        corpus.parse_extraction_payload(raw)
+    assert captured.value.stage == "llm_parse"
+
+
+def test_parse_extraction_payload_requires_all_keys() -> None:
+    for missing in ("sentiment", "topic", "confidence"):
+        body = json.loads(_payload())
+        del body[missing]
+        with pytest.raises(LlmExtractionError, match="misses keys"):
+            corpus.parse_extraction_payload(json.dumps(body))
+
+
+# --- end-to-end processing -----------------------------------------------------
+
+
+def test_process_end_to_end(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    chat = FakeChatClient(
+        [
+            _payload(sentiment=0.8, topic="policy"),
+            _payload(sentiment=-0.4, topic="market"),
+            _payload(sentiment=0.6, topic="macro"),
+            _payload(sentiment=0.7, topic="company"),
+            _payload(sentiment=-0.2, topic="industry"),
+        ]
+    )
+
+    summary = _run(tmp_path, chat)
+
+    assert summary.planned == 5
+    assert summary.processed == 5
+    assert summary.failed == 0
+    assert summary.skipped == 0
+    assert len(chat.calls) == 5
+    assert chat.calls[0][1] == "test-model"
+    assert corpus.PROMPT_VERSION in chat.calls[0][0][0]["content"]
+    # Items are processed in pub_time order: the irm_qa_sh question comes first.
+    assert "000001.SH" in chat.calls[0][0][1]["content"]
+    assert "问：公司产能利用率如何？" in chat.calls[0][0][1]["content"]
+    assert "market-level (MARKET)" in chat.calls[1][0][1]["content"]
+
+    fields = pd.read_parquet(summary.fields_path)
+    assert list(fields.columns) == list(corpus.FIELDS_COLUMNS)
+    assert len(fields) == 5
+    assert fields["ingested_at"].eq(pd.Timestamp(NOW)).all()
+    assert fields["processed_at"].eq(pd.Timestamp(NOW)).all()
+    assert set(fields["prompt_version"]) == {corpus.PROMPT_VERSION}
+    assert set(fields["model"]) == {"test-model"}
+
+    news = fields[fields["source_dataset"] == "major_news"].sort_values("pub_time")
+    assert news["ts_code"].isna().all()
+    # major_news: available_at is the exact publication moment.
+    assert news["available_at"].tolist() == list(news["pub_time"])
+    irm = fields[fields["source_dataset"] != "major_news"].sort_values("pub_time")
+    # irm_qa: next trading day after the trade date (holiday-aware).
+    assert irm["available_at"].tolist() == [
+        pd.Timestamp(date(2024, 1, 4)),
+        pd.Timestamp(date(2024, 1, 8)),
+    ]
+
+    state = pd.read_parquet(summary.state_path)
+    assert state["status"].tolist() == ["succeeded"] * 5
+    assert set(state["stage"]) == {"completed"}
+
+    unit = pd.read_parquet(summary.unit_path)
+    assert len(unit) == 5
+
+    factors_dir = tmp_path / "corpus_nlp" / "factors"
+    news_factor = pd.read_parquet(factors_dir / "news_sentiment_daily.parquet")
+    assert list(news_factor.columns) == ["datetime", "instrument", "news_sentiment_daily"]
+    assert set(news_factor["instrument"]) == {"MARKET"}
+    # In pub_time order the scripted sentiments are: irm_sh 0.8, news 10:00 -0.4,
+    # news 16:30 0.6, irm_sz 0.7, Saturday news -0.2. The 10:00 news stays on
+    # 01-02, the 16:30 one rolls past the holiday to 01-04, Saturday to 01-08.
+    assert news_factor["datetime"].tolist() == [
+        pd.Timestamp(date(2024, 1, 2)),
+        pd.Timestamp(date(2024, 1, 4)),
+        pd.Timestamp(date(2024, 1, 8)),
+    ]
+    assert news_factor["news_sentiment_daily"].tolist() == [-0.4, 0.6, -0.2]
+
+    irm_factor = pd.read_parquet(factors_dir / "irm_qa_sentiment_daily.parquet")
+    assert list(irm_factor.columns) == ["datetime", "instrument", "irm_qa_sentiment_daily"]
+    assert irm_factor["datetime"].tolist() == [
+        pd.Timestamp(date(2024, 1, 4)),
+        pd.Timestamp(date(2024, 1, 8)),
+    ]
+    assert irm_factor["instrument"].tolist() == ["000001.SH", "000002.SZ"]
+    assert irm_factor["irm_qa_sentiment_daily"].tolist() == [0.8, 0.7]
+
+    news_manifest = json.loads(
+        (factors_dir / "news_sentiment_daily.json").read_text(encoding="utf-8")
+    )
+    assert news_manifest["factor"] == "news_sentiment_daily"
+    assert news_manifest["rows"] == 3
+    assert news_manifest["sha256"] == summary.factors["news_sentiment_daily"]["manifest"][
+        "sha256"
+    ]
+    assert news_manifest["sha256"] == hashlib.sha256(
+        (factors_dir / "news_sentiment_daily.parquet").read_bytes()
+    ).hexdigest()
+    assert "pub_time" in news_manifest["availability_policy"]["news_sentiment_daily"]
+    assert "15:00" in news_manifest["availability_policy"]["news_sentiment_daily"]
+    assert "MARKET" in news_manifest["instrument_convention"]
+    assert news_manifest["source"]["source_datasets"] == ["major_news"]
+    assert news_manifest["source"]["prompt_version"] == corpus.PROMPT_VERSION
+
+    irm_manifest = json.loads(
+        (factors_dir / "irm_qa_sentiment_daily.json").read_text(encoding="utf-8")
+    )
+    assert irm_manifest["rows"] == 2
+    assert irm_manifest["source"]["source_datasets"] == ["irm_qa_sh", "irm_qa_sz"]
+    assert "next trade_cal trading day" in irm_manifest["availability_policy"][
+        "irm_qa_sentiment_daily"
+    ]
+
+
+def test_process_is_idempotent_on_processing_key(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    first = _run(tmp_path, FakeChatClient([_payload()] * 5))
+    assert first.processed == 5
+
+    chat = FakeChatClient([])
+    second = _run(tmp_path, chat)
+
+    assert second.planned == 5
+    assert second.skipped == 5
+    assert second.processed == 0
+    assert second.failed == 0
+    assert second.unit_path is None
+    assert chat.calls == []
+    assert len(pd.read_parquet(second.fields_path)) == 5
+    assert second.factors["news_sentiment_daily"]["manifest"]["rows"] == 3
+
+
+def test_process_reprocesses_when_prompt_version_changes(tmp_path: Path, monkeypatch) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    _run(tmp_path, FakeChatClient([_payload()] * 5))
+
+    monkeypatch.setattr(corpus, "PROMPT_VERSION", "corpus-nlp.v2")
+    chat = FakeChatClient([_payload(sentiment=0.1)] * 5)
+    summary = _run(tmp_path, chat)
+
+    assert summary.processed == 5
+    assert summary.skipped == 0
+    fields = pd.read_parquet(summary.fields_path)
+    assert len(fields) == 10  # v1 and v2 rows coexist under distinct processing keys
+    assert set(fields["prompt_version"]) == {"corpus-nlp.v1", "corpus-nlp.v2"}
+    # Duplicate (datetime, instrument) observations are averaged for the factor.
+    assert summary.factors["news_sentiment_daily"]["manifest"]["rows"] == 3
+
+
+def test_process_records_llm_failures_without_signals(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    chat = FakeChatClient(
+        [
+            "definitely not json",
+            LlmExtractionError("LLM endpoint returned HTTP 500", stage="llm_call"),
+            _payload(sentiment=0.5),
+            _payload(sentiment=0.5),
+            _payload(sentiment=0.5),
+        ]
+    )
+
+    summary = _run(tmp_path, chat)
+
+    assert summary.processed == 3
+    assert summary.failed == 2
+    state = pd.read_parquet(summary.state_path)
+    failures = state[state["status"] == "failed"]
+    assert set(failures["stage"]) == {"llm_parse", "llm_call"}
+    assert len(pd.read_parquet(summary.fields_path)) == 3
+    # Factor artifacts only aggregate the successful rows.
+    assert summary.factors["news_sentiment_daily"]["manifest"]["rows"] == 2
+
+
+def test_process_retries_failed_rows_on_rerun(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    failing = FakeChatClient(
+        [LlmExtractionError("LLM request failed: boom", stage="llm_call")]
+        + [_payload()] * 4
+    )
+    first = _run(tmp_path, failing)
+    assert first.failed == 1
+    assert first.processed == 4
+
+    chat = FakeChatClient([_payload(sentiment=0.3)])
+    second = _run(tmp_path, chat)
+
+    assert second.planned == 5
+    assert second.skipped == 4
+    assert second.processed == 1
+    assert second.failed == 0
+    state = pd.read_parquet(second.state_path)
+    assert set(state["status"]) == {"succeeded"}
+    assert len(pd.read_parquet(second.fields_path)) == 5
+
+
+def test_process_records_availability_failure_and_continues(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    # An irm_qa row dated on the last calendar day cannot derive available_at.
+    _write_parquet(
+        tmp_path / "units" / "irm_qa_sz",
+        [{"trade_date": "20240109", "ts_code": "000003.SZ", "q": "年内规划？"}],
+        name="extra.parquet",
+    )
+    chat = FakeChatClient([_payload()] * 5)
+
+    summary = _run(tmp_path, chat)
+
+    assert summary.planned == 6
+    assert summary.processed == 5
+    assert summary.failed == 1
+    assert len(chat.calls) == 5  # the unavailable row never reaches the LLM
+    state = pd.read_parquet(summary.state_path)
+    failure = state[state["status"] == "failed"].iloc[0]
+    assert failure["stage"] == "availability"
+    assert failure["source_dataset"] == "irm_qa_sz"
+    assert "no trading day after" in failure["error"]
+
+
+def test_process_missing_corpus_fail_closed(tmp_path: Path) -> None:
+    _seed_trade_cal(tmp_path)
+    with pytest.raises(RuntimeError, match="major_news"):
+        _run(tmp_path, FakeChatClient([]))
+
+
+def test_process_missing_trade_cal_fail_closed(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    with pytest.raises(RuntimeError, match="trade_cal"):
+        _run(tmp_path, FakeChatClient([]))
+    assert not (tmp_path / "corpus_nlp" / "state.parquet").exists()
+
+
+def test_process_requires_real_credentials(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    chat = FakeChatClient([])
+
+    with pytest.raises(LlmCredentialsError, match="POST /api/settings/llm"):
+        corpus.process_corpus(
+            tmp_path,
+            secret_store=FakeSecretStore(None),
+            chat_client=chat,
+            now=lambda: NOW,
+            environ={},
+        )
+
+    assert chat.calls == []
+    assert not (tmp_path / "corpus_nlp" / "state.parquet").exists()
+    assert not (tmp_path / "corpus_nlp" / "fields.parquet").exists()
+
+
+def test_process_fail_closed_when_factor_date_beyond_calendar(tmp_path: Path) -> None:
+    # News published after the cutoff on the last calendar day: the factor date
+    # cannot be derived, so the run must fail before writing any artifact.
+    _write_parquet(
+        tmp_path / "units" / "major_news",
+        [_news_row("盘后快讯", "正文", "2024-01-09 16:00:00")],
+    )
+    _write_parquet(
+        tmp_path / "units" / "irm_qa_sh",
+        [{"trade_date": "20240102", "ts_code": "000001.SH", "q": "产能如何？"}],
+    )
+    _write_parquet(
+        tmp_path / "units" / "irm_qa_sz",
+        [{"trade_date": "20240102", "ts_code": "000002.SZ", "q": "订单如何？"}],
+    )
+    _seed_trade_cal(tmp_path)
+
+    with pytest.raises(LookupError, match="no trading day after"):
+        _run(tmp_path, FakeChatClient([_payload()] * 3))
+
+    assert not (tmp_path / "corpus_nlp" / "fields.parquet").exists()
+
+
+def test_process_filters_datasets_ts_codes_dates_and_limit(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+
+    irm_only = _run(
+        tmp_path,
+        FakeChatClient([_payload()] * 2),
+        datasets={"irm_qa_sh", "irm_qa_sz"},
+    )
+    assert irm_only.planned == 2
+
+    by_code = _run(tmp_path, FakeChatClient([]), ts_codes={"000001.SH"})
+    # A ts_code filter excludes the market-level major_news items.
+    assert by_code.planned == 1
+
+    windowed = _run(tmp_path, FakeChatClient([]), start=date(2024, 2, 1))
+    assert windowed.planned == 0
+
+
+def test_process_honors_limit(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+
+    limited = _run(tmp_path, FakeChatClient([_payload()]), limit=1)
+
+    assert limited.planned == 1
+    assert limited.processed == 1
+
+
+# --- CLI -----------------------------------------------------------------------
+
+
+def test_cli_runs_with_injected_fakes(tmp_path: Path, monkeypatch) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    chat = FakeChatClient([_payload()] * 5)
+    monkeypatch.setattr(
+        cli_module, "RuntimeSecretStore", lambda *args, **kwargs: FakeSecretStore(STORE_RECORD)
+    )
+    monkeypatch.setattr(corpus, "OpenAIChatClient", lambda *args, **kwargs: chat)
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "corpus-nlp",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-31",
+            "--limit",
+            "10",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["dataset"] == "corpus_nlp"
+    assert payload["datasets"] == ["major_news", "irm_qa_sh", "irm_qa_sz"]
+    assert payload["planned"] == 5
+    assert payload["processed"] == 5
+    assert payload["failed"] == 0
+    assert payload["factors"]["news_sentiment_daily"]["rows"] == 3
+    assert payload["factors"]["irm_qa_sentiment_daily"]["rows"] == 2
+    assert len(chat.calls) == 5
+    assert Path(payload["fields_path"]).is_file()
+
+
+def test_cli_rejects_unknown_dataset(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+
+    result = CliRunner().invoke(app, ["corpus-nlp", "--dataset", "ths_hot"])
+
+    assert result.exit_code != 0
