@@ -275,12 +275,18 @@ def test_adds_point_in_time_research_features_without_announcement_leakage(
     assert builder.research_feature_contract["availability_policy"] == {
         "daily_basic": "same_trade_date_after_close",
         "fina_indicator": "strictly_after_announcement_date",
+        "income": "strictly_after_announcement_date",
+        "balancesheet": "strictly_after_announcement_date",
+        "cashflow": "strictly_after_announcement_date",
         "index_weight": lag_label,
         "index_member_all": lag_label,
     }
     assert builder.research_feature_contract["recoverability"] == {
         "daily_basic": "native_history",
         "fina_indicator": "native_history",
+        "income": "native_history",
+        "balancesheet": "native_history",
+        "cashflow": "native_history",
         "index_weight": "native_history",
         "index_member_all": "reconstructed",
     }
@@ -476,6 +482,28 @@ def test_writes_point_in_time_industry_metadata(tmp_path: Path) -> None:
     styles = pd.read_parquet(qlib_dir / "metadata" / "style_exposures.parquet")
     assert styles.loc[0, "instrument"] == "SZ000001"
     assert styles.loc[0, "log_market_cap"] == pytest.approx(11.736069, rel=1e-6)
+    # Extended Barra-style schema: the standardized style columns are present
+    # alongside the backward-compatible raw log_market_cap.
+    for column in (
+        "size",
+        "nonlinear_size",
+        "value",
+        "momentum",
+        "volatility",
+        "liquidity",
+        "growth",
+        "profitability",
+        "leverage",
+    ):
+        assert column in styles.columns
+    # A single-stock cross-section standardizes to the (zero) weighted mean.
+    assert styles.loc[0, "size"] == pytest.approx(0.0)
+    # The fina_indicator fixture (ann_date 2024-01-01, strictly before the
+    # trade date) feeds the profitability descriptor.
+    assert styles.loc[0, "profitability"] == pytest.approx(0.0)
+    # No adjusted-close history in this fixture: market-derived descriptors
+    # stay honestly NaN instead of being fabricated.
+    assert pd.isna(styles.loc[0, "momentum"])
     full_market = pd.read_parquet(
         qlib_dir / "metadata" / "full_market_weights.parquet"
     )
@@ -861,3 +889,250 @@ def test_research_contract_admits_only_evidence_grade_recoverability(
     assert contract["availability_policy"]
     for dataset in contract["availability_policy"]:
         assert recoverability_level(dataset) in EVIDENCE_RECOVERABILITY_LEVELS
+
+
+_EXTENDED_FINA_ROW = {
+    "ts_code": "000001.SZ",
+    "ann_date": "2024-01-03",
+    "end_date": "2023-12-31",
+    "roe": 12.5,
+    "eps": 0.85,
+    "bps": 6.4,
+    "ocfps": 1.1,
+    "roe_waa": 13.0,
+    "roe_dt": 12.1,
+    "roic": 9.5,
+    "netprofit_margin": 21.0,
+    "assets_turn": 0.8,
+    "inv_turn": 5.2,
+    "ar_turn": 7.6,
+    "quick_ratio": 1.3,
+    "debt_to_eqt": 80.0,
+    "saleexp_of_gr": 4.5,
+    "adminexp_of_gr": 6.5,
+    "finaexp_of_gr": 1.2,
+    "op_yoy": 15.0,
+    "equity_yoy": 8.0,
+    "ocf_to_or": 0.18,
+    "ocf_to_profit": 1.05,
+    "salescash_to_or": 1.12,
+    "interestdebt": 3.5e8,
+}
+
+_EXTENDED_FUND_TARGETS = {
+    "fund_eps": 0.85,
+    "fund_bps": 6.4,
+    "fund_ocfps": 1.1,
+    "fund_roe_weighted": 13.0,
+    "fund_roe_diluted": 12.1,
+    "fund_roic": 9.5,
+    "fund_netprofit_margin": 21.0,
+    "fund_assets_turnover": 0.8,
+    "fund_inventory_turnover": 5.2,
+    "fund_receivables_turnover": 7.6,
+    "fund_quick_ratio": 1.3,
+    "fund_debt_to_equity": 80.0,
+    "fund_sales_expense_ratio": 4.5,
+    "fund_admin_expense_ratio": 6.5,
+    "fund_finance_expense_ratio": 1.2,
+    "fund_op_profit_yoy": 15.0,
+    "fund_equity_yoy": 8.0,
+    "fund_ocf_to_revenue": 0.18,
+    "fund_ocf_to_profit": 1.05,
+    "fund_sales_cash_to_revenue": 1.12,
+    "fund_interest_debt": 3.5e8,
+}
+
+
+def test_extended_fina_indicator_fields_enter_bin_point_in_time(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [dict(_EXTENDED_FINA_ROW)],
+        daily_days=("2024-01-02", "2024-01-03", "2024-01-04"),
+    )
+
+    builder = QlibBuilder(snapshot)
+    by_symbol = builder.build_staging(tmp_path / "staging")
+    frame = pd.read_parquet(by_symbol / "SZ000001.parquet")
+
+    # Every extended field lands in the binary staging frame and is invisible
+    # before its announcement date (ann_date 2024-01-03 -> first value on
+    # the strictly later trade date 2024-01-04).
+    for target, value in _EXTENDED_FUND_TARGETS.items():
+        assert target in builder.qlib_fields
+        assert frame[target].iloc[:2].isna().all()
+        assert frame[target].iloc[2] == pytest.approx(value)
+
+    units = builder._field_units()
+    assert units["fund_eps"] == "cny_yuan_per_share"
+    assert units["fund_bps"] == "cny_yuan_per_share"
+    assert units["fund_ocfps"] == "cny_yuan_per_share"
+    assert units["fund_roic"] == "percent"
+    assert units["fund_assets_turnover"] == "turnover_times"
+    assert units["fund_quick_ratio"] == "ratio_unitless"
+    assert units["fund_interest_debt"] == "cny_yuan"
+
+
+def _write_statement_fixture(
+    snapshot: Path,
+    *,
+    income_rows: list[dict],
+    balancesheet_rows: list[dict],
+    cashflow_rows: list[dict],
+    daily_days: tuple[str, ...] = ("2024-01-02",),
+) -> None:
+    # Statement parquet files must be written before _write_revision_fixture so
+    # the default research inputs do not create a second, differently-schemad
+    # balancesheet parquet in the same dataset directory.
+    for dataset, rows in (
+        ("income", income_rows),
+        ("balancesheet", balancesheet_rows),
+        ("cashflow", cashflow_rows),
+    ):
+        target = snapshot / "parquet" / dataset / "partition_year=2024"
+        target.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_parquet(target / "data.parquet")
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 10.0,
+            }
+        ],
+        daily_days=daily_days,
+    )
+
+
+def test_statement_line_items_follow_announcement_dates_without_lookahead(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_statement_fixture(
+        snapshot,
+        income_rows=[
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "n_income_attr_p": 1.0e6,
+                "rd_exp": 5.0e4,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-05",
+                "end_date": "2023-12-31",
+                "n_income_attr_p": 2.0e6,
+                "rd_exp": 6.0e4,
+            },
+        ],
+        balancesheet_rows=[
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-02",
+                "end_date": "2023-12-31",
+                "total_assets": 5.0e7,
+                "money_cap": 8.0e6,
+                "goodwill": 1.0e6,
+            }
+        ],
+        cashflow_rows=[
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-03",
+                "end_date": "2023-12-31",
+                "n_cashflow_act": 3.0e6,
+                "c_pay_acq_const_fiolta": 9.0e5,
+            }
+        ],
+        daily_days=("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-08"),
+    )
+
+    builder = QlibBuilder(snapshot)
+    by_symbol = builder.build_staging(tmp_path / "staging")
+    frame = pd.read_parquet(by_symbol / "SZ000001.parquet")
+
+    # Income restatement: the revised value is invisible before its own
+    # announcement date (2024-01-05) and fully replaces the old one after.
+    assert frame["fund_net_profit"].tolist() == pytest.approx(
+        [1.0e6, 1.0e6, 1.0e6, 2.0e6]
+    )
+    assert frame["fund_rd_expense"].tolist() == pytest.approx(
+        [5.0e4, 5.0e4, 5.0e4, 6.0e4]
+    )
+    # Balance sheet announced 2024-01-02: visible strictly after that date.
+    assert pd.isna(frame["fund_total_assets"].iloc[0])
+    assert frame["fund_total_assets"].iloc[1:].tolist() == pytest.approx([5.0e7] * 3)
+    assert frame["fund_money_cap"].iloc[1:].tolist() == pytest.approx([8.0e6] * 3)
+    assert frame["fund_goodwill"].iloc[1:].tolist() == pytest.approx([1.0e6] * 3)
+    # Cash flow announced 2024-01-03: visible from 2024-01-04 onwards.
+    assert frame["fund_ocf_net"].iloc[:2].isna().all()
+    assert frame["fund_ocf_net"].iloc[2:].tolist() == pytest.approx([3.0e6] * 2)
+    assert frame["fund_capex"].iloc[:2].isna().all()
+    assert frame["fund_capex"].iloc[2:].tolist() == pytest.approx([9.0e5] * 2)
+
+    for target in (
+        "fund_net_profit",
+        "fund_rd_expense",
+        "fund_total_assets",
+        "fund_money_cap",
+        "fund_goodwill",
+        "fund_ocf_net",
+        "fund_capex",
+    ):
+        assert target in builder.qlib_fields
+    units = builder._field_units()
+    assert units["fund_net_profit"] == "cny_yuan"
+    assert units["fund_total_assets"] == "cny_yuan"
+    assert units["fund_ocf_net"] == "cny_yuan"
+
+
+def test_statement_revision_conflict_prefers_newest_update_flag(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_statement_fixture(
+        snapshot,
+        income_rows=[
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "n_income_attr_p": 1.0e6,
+                "f_ann_date": "2024-01-01",
+                "update_flag": 0,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "n_income_attr_p": 2.0e6,
+                "f_ann_date": "2024-01-02",
+                "update_flag": 1,
+            },
+        ],
+        balancesheet_rows=[
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "total_assets": 5.0e7,
+            }
+        ],
+        cashflow_rows=[
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "n_cashflow_act": 3.0e6,
+            }
+        ],
+    )
+
+    by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+    frame = pd.read_parquet(by_symbol / "SZ000001.parquet")
+
+    # Same (ts_code, ann_date, end_date) conflict in the income statement: the
+    # revision with the newer f_ann_date / update_flag wins deterministically.
+    assert frame["fund_net_profit"].tolist() == pytest.approx([2.0e6])

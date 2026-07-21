@@ -128,6 +128,28 @@ def _seed_corpus(data_root: Path) -> None:
             {"trade_date": "20240105", "ts_code": "000002.SZ", "q": "新业务进展如何？"},
         ],
     )
+    _write_parquet(
+        data_root / "units" / "npr",
+        [
+            {
+                "title": "国务院关于促进资本市场健康发展的意见",
+                "pubtime": "2024-01-04 09:00:00",
+                "pcode": "国发〔2024〕1号",
+                "puborg": "国务院",
+                "ptype": "金融",
+            }
+        ],
+    )
+    _write_parquet(
+        data_root / "units" / "cctv_news",
+        [
+            {
+                "date": "20240105",
+                "title": "国务院常务会议部署稳增长政策",
+                "content": "会议指出，要加大宏观政策调控力度。",
+            }
+        ],
+    )
 
 
 def _run(data_root: Path, chat, **kwargs) -> corpus.CorpusNlpSummary:
@@ -149,12 +171,19 @@ def test_load_corpus_items_reads_units_and_snapshots(tmp_path: Path) -> None:
 
     items = corpus.load_corpus_items(tmp_path)
 
-    assert len(items) == 5  # the duplicated news row collapses onto one item
+    assert len(items) == 7  # the duplicated news row collapses onto one item
     by_dataset = {}
     for item in items:
         by_dataset.setdefault(item.source_dataset, []).append(item)
-    assert set(by_dataset) == {"major_news", "irm_qa_sh", "irm_qa_sz"}
+    assert set(by_dataset) == {"major_news", "irm_qa_sh", "irm_qa_sz", "npr", "cctv_news"}
     assert len(by_dataset["major_news"]) == 3
+    npr = by_dataset["npr"][0]
+    assert npr.ts_code is None
+    assert npr.pub_time == datetime(2024, 1, 4, 9, 0, 0)
+    # Title-level fallback: no content column in the seeded npr parquet.
+    assert npr.content == npr.title
+    cctv = by_dataset["cctv_news"][0]
+    assert cctv.pub_time == datetime(2024, 1, 5, 0, 0, 0)
     news = by_dataset["major_news"][0]
     assert news.ts_code is None
     assert news.pub_time == datetime(2024, 1, 2, 10, 0, 0)
@@ -169,7 +198,7 @@ def test_load_corpus_items_missing_dataset_fail_closed(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError) as captured:
         corpus.load_corpus_items(tmp_path)
     message = str(captured.value)
-    for dataset in ("major_news", "irm_qa_sh", "irm_qa_sz"):
+    for dataset in ("major_news", "irm_qa_sh", "irm_qa_sz", "npr", "cctv_news"):
         assert dataset in message
     assert str(tmp_path / "units" / "major_news") in message
     assert "snapshots" in message
@@ -271,6 +300,28 @@ def test_available_at_rules_per_dataset() -> None:
     # Date-only source: next trading day, skipping the Wednesday holiday.
     assert corpus.available_at_for(irm, OPEN_DAYS) == datetime(2024, 1, 4, 0, 0, 0)
 
+    npr = corpus.CorpusItem(
+        source_dataset="npr",
+        item_id="p",
+        ts_code=None,
+        title="t",
+        content="c",
+        pub_time=datetime(2024, 1, 2, 17, 30, 0),
+    )
+    # npr carries an exact publication moment, like major_news.
+    assert corpus.available_at_for(npr, OPEN_DAYS) == datetime(2024, 1, 2, 17, 30, 0)
+
+    cctv = corpus.CorpusItem(
+        source_dataset="cctv_news",
+        item_id="c",
+        ts_code=None,
+        title="t",
+        content="c",
+        pub_time=datetime(2024, 1, 2, 0, 0, 0),
+    )
+    # Date-only source: next trading day, skipping the Wednesday holiday.
+    assert corpus.available_at_for(cctv, OPEN_DAYS) == datetime(2024, 1, 4, 0, 0, 0)
+
     late = corpus.CorpusItem(
         source_dataset="irm_qa_sz",
         item_id="j",
@@ -356,6 +407,8 @@ def test_process_end_to_end(tmp_path: Path) -> None:
             _payload(sentiment=0.8, topic="policy"),
             _payload(sentiment=-0.4, topic="market"),
             _payload(sentiment=0.6, topic="macro"),
+            _payload(sentiment=0.5, topic="policy"),
+            _payload(sentiment=0.3, topic="policy"),
             _payload(sentiment=0.7, topic="company"),
             _payload(sentiment=-0.2, topic="industry"),
         ]
@@ -363,11 +416,11 @@ def test_process_end_to_end(tmp_path: Path) -> None:
 
     summary = _run(tmp_path, chat)
 
-    assert summary.planned == 5
-    assert summary.processed == 5
+    assert summary.planned == 7
+    assert summary.processed == 7
     assert summary.failed == 0
     assert summary.skipped == 0
-    assert len(chat.calls) == 5
+    assert len(chat.calls) == 7
     assert chat.calls[0][1] == "test-model"
     assert corpus.PROMPT_VERSION in chat.calls[0][0][0]["content"]
     # Items are processed in pub_time order: the irm_qa_sh question comes first.
@@ -377,7 +430,7 @@ def test_process_end_to_end(tmp_path: Path) -> None:
 
     fields = pd.read_parquet(summary.fields_path)
     assert list(fields.columns) == list(corpus.FIELDS_COLUMNS)
-    assert len(fields) == 5
+    assert len(fields) == 7
     assert fields["ingested_at"].eq(pd.Timestamp(NOW)).all()
     assert fields["processed_at"].eq(pd.Timestamp(NOW)).all()
     assert set(fields["prompt_version"]) == {corpus.PROMPT_VERSION}
@@ -387,19 +440,30 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     assert news["ts_code"].isna().all()
     # major_news: available_at is the exact publication moment.
     assert news["available_at"].tolist() == list(news["pub_time"])
-    irm = fields[fields["source_dataset"] != "major_news"].sort_values("pub_time")
+    irm = fields[fields["source_dataset"].isin(["irm_qa_sh", "irm_qa_sz"])].sort_values(
+        "pub_time"
+    )
     # irm_qa: next trading day after the trade date (holiday-aware).
     assert irm["available_at"].tolist() == [
         pd.Timestamp(date(2024, 1, 4)),
         pd.Timestamp(date(2024, 1, 8)),
     ]
+    policy = fields[fields["source_dataset"].isin(["npr", "cctv_news"])].sort_values(
+        "pub_time"
+    )
+    # npr: exact publication moment; cctv_news: next trading day after the
+    # broadcast date (2024-01-05 -> 2024-01-08 over the weekend).
+    assert policy["available_at"].tolist() == [
+        pd.Timestamp(datetime(2024, 1, 4, 9, 0, 0)),
+        pd.Timestamp(date(2024, 1, 8)),
+    ]
 
     state = pd.read_parquet(summary.state_path)
-    assert state["status"].tolist() == ["succeeded"] * 5
+    assert state["status"].tolist() == ["succeeded"] * 7
     assert set(state["stage"]) == {"completed"}
 
     unit = pd.read_parquet(summary.unit_path)
-    assert len(unit) == 5
+    assert len(unit) == 7
 
     factors_dir = tmp_path / "corpus_nlp" / "factors"
     news_factor = pd.read_parquet(factors_dir / "news_sentiment_daily.parquet")
@@ -414,6 +478,21 @@ def test_process_end_to_end(tmp_path: Path) -> None:
         pd.Timestamp(date(2024, 1, 8)),
     ]
     assert news_factor["news_sentiment_daily"].tolist() == [-0.4, 0.6, -0.2]
+
+    policy_factor = pd.read_parquet(factors_dir / "policy_sentiment_daily.parquet")
+    assert list(policy_factor.columns) == [
+        "datetime",
+        "instrument",
+        "policy_sentiment_daily",
+    ]
+    assert set(policy_factor["instrument"]) == {"MARKET"}
+    # The npr item stays on 01-04 (available 09:00, before the 15:00 cutoff);
+    # the cctv_news item becomes visible on 01-08.
+    assert policy_factor["datetime"].tolist() == [
+        pd.Timestamp(date(2024, 1, 4)),
+        pd.Timestamp(date(2024, 1, 8)),
+    ]
+    assert policy_factor["policy_sentiment_daily"].tolist() == [0.5, 0.3]
 
     irm_factor = pd.read_parquet(factors_dir / "irm_qa_sentiment_daily.parquet")
     assert list(irm_factor.columns) == ["datetime", "instrument", "irm_qa_sentiment_daily"]
@@ -450,39 +529,49 @@ def test_process_end_to_end(tmp_path: Path) -> None:
         "irm_qa_sentiment_daily"
     ]
 
+    policy_manifest = json.loads(
+        (factors_dir / "policy_sentiment_daily.json").read_text(encoding="utf-8")
+    )
+    assert policy_manifest["rows"] == 2
+    assert policy_manifest["source"]["source_datasets"] == ["npr", "cctv_news"]
+    assert "MARKET" in policy_manifest["instrument_convention"]
+    assert policy_manifest["sha256"] == hashlib.sha256(
+        (factors_dir / "policy_sentiment_daily.parquet").read_bytes()
+    ).hexdigest()
+
 
 def test_process_is_idempotent_on_processing_key(tmp_path: Path) -> None:
     _seed_corpus(tmp_path)
     _seed_trade_cal(tmp_path)
-    first = _run(tmp_path, FakeChatClient([_payload()] * 5))
-    assert first.processed == 5
+    first = _run(tmp_path, FakeChatClient([_payload()] * 7))
+    assert first.processed == 7
 
     chat = FakeChatClient([])
     second = _run(tmp_path, chat)
 
-    assert second.planned == 5
-    assert second.skipped == 5
+    assert second.planned == 7
+    assert second.skipped == 7
     assert second.processed == 0
     assert second.failed == 0
     assert second.unit_path is None
     assert chat.calls == []
-    assert len(pd.read_parquet(second.fields_path)) == 5
+    assert len(pd.read_parquet(second.fields_path)) == 7
     assert second.factors["news_sentiment_daily"]["manifest"]["rows"] == 3
 
 
 def test_process_reprocesses_when_prompt_version_changes(tmp_path: Path, monkeypatch) -> None:
     _seed_corpus(tmp_path)
     _seed_trade_cal(tmp_path)
-    _run(tmp_path, FakeChatClient([_payload()] * 5))
+    _run(tmp_path, FakeChatClient([_payload()] * 7))
 
     monkeypatch.setattr(corpus, "PROMPT_VERSION", "corpus-nlp.v2")
-    chat = FakeChatClient([_payload(sentiment=0.1)] * 5)
+    chat = FakeChatClient([_payload(sentiment=0.1)] * 7)
     summary = _run(tmp_path, chat)
 
-    assert summary.processed == 5
+    assert summary.processed == 7
     assert summary.skipped == 0
     fields = pd.read_parquet(summary.fields_path)
-    assert len(fields) == 10  # v1 and v2 rows coexist under distinct processing keys
+    assert len(fields) == 14  # v1 and v2 rows coexist under distinct processing keys
     assert set(fields["prompt_version"]) == {"corpus-nlp.v1", "corpus-nlp.v2"}
     # Duplicate (datetime, instrument) observations are averaged for the factor.
     assert summary.factors["news_sentiment_daily"]["manifest"]["rows"] == 3
@@ -498,17 +587,19 @@ def test_process_records_llm_failures_without_signals(tmp_path: Path) -> None:
             _payload(sentiment=0.5),
             _payload(sentiment=0.5),
             _payload(sentiment=0.5),
+            _payload(sentiment=0.5),
+            _payload(sentiment=0.5),
         ]
     )
 
     summary = _run(tmp_path, chat)
 
-    assert summary.processed == 3
+    assert summary.processed == 5
     assert summary.failed == 2
     state = pd.read_parquet(summary.state_path)
     failures = state[state["status"] == "failed"]
     assert set(failures["stage"]) == {"llm_parse", "llm_call"}
-    assert len(pd.read_parquet(summary.fields_path)) == 3
+    assert len(pd.read_parquet(summary.fields_path)) == 5
     # Factor artifacts only aggregate the successful rows.
     assert summary.factors["news_sentiment_daily"]["manifest"]["rows"] == 2
 
@@ -518,22 +609,22 @@ def test_process_retries_failed_rows_on_rerun(tmp_path: Path) -> None:
     _seed_trade_cal(tmp_path)
     failing = FakeChatClient(
         [LlmExtractionError("LLM request failed: boom", stage="llm_call")]
-        + [_payload()] * 4
+        + [_payload()] * 6
     )
     first = _run(tmp_path, failing)
     assert first.failed == 1
-    assert first.processed == 4
+    assert first.processed == 6
 
     chat = FakeChatClient([_payload(sentiment=0.3)])
     second = _run(tmp_path, chat)
 
-    assert second.planned == 5
-    assert second.skipped == 4
+    assert second.planned == 7
+    assert second.skipped == 6
     assert second.processed == 1
     assert second.failed == 0
     state = pd.read_parquet(second.state_path)
     assert set(state["status"]) == {"succeeded"}
-    assert len(pd.read_parquet(second.fields_path)) == 5
+    assert len(pd.read_parquet(second.fields_path)) == 7
 
 
 def test_process_records_availability_failure_and_continues(tmp_path: Path) -> None:
@@ -545,14 +636,14 @@ def test_process_records_availability_failure_and_continues(tmp_path: Path) -> N
         [{"trade_date": "20240109", "ts_code": "000003.SZ", "q": "年内规划？"}],
         name="extra.parquet",
     )
-    chat = FakeChatClient([_payload()] * 5)
+    chat = FakeChatClient([_payload()] * 7)
 
     summary = _run(tmp_path, chat)
 
-    assert summary.planned == 6
-    assert summary.processed == 5
+    assert summary.planned == 8
+    assert summary.processed == 7
     assert summary.failed == 1
-    assert len(chat.calls) == 5  # the unavailable row never reaches the LLM
+    assert len(chat.calls) == 7  # the unavailable row never reaches the LLM
     state = pd.read_parquet(summary.state_path)
     failure = state[state["status"] == "failed"].iloc[0]
     assert failure["stage"] == "availability"
@@ -607,10 +698,18 @@ def test_process_fail_closed_when_factor_date_beyond_calendar(tmp_path: Path) ->
         tmp_path / "units" / "irm_qa_sz",
         [{"trade_date": "20240102", "ts_code": "000002.SZ", "q": "订单如何？"}],
     )
+    _write_parquet(
+        tmp_path / "units" / "npr",
+        [{"title": "政策", "pubtime": "2024-01-02 09:00:00"}],
+    )
+    _write_parquet(
+        tmp_path / "units" / "cctv_news",
+        [{"date": "20240102", "title": "联播", "content": "正文"}],
+    )
     _seed_trade_cal(tmp_path)
 
     with pytest.raises(LookupError, match="no trading day after"):
-        _run(tmp_path, FakeChatClient([_payload()] * 3))
+        _run(tmp_path, FakeChatClient([_payload()] * 5))
 
     assert not (tmp_path / "corpus_nlp" / "fields.parquet").exists()
 
@@ -650,7 +749,7 @@ def test_process_honors_limit(tmp_path: Path) -> None:
 def test_cli_runs_with_injected_fakes(tmp_path: Path, monkeypatch) -> None:
     _seed_corpus(tmp_path)
     _seed_trade_cal(tmp_path)
-    chat = FakeChatClient([_payload()] * 5)
+    chat = FakeChatClient([_payload()] * 7)
     monkeypatch.setattr(
         cli_module, "RuntimeSecretStore", lambda *args, **kwargs: FakeSecretStore(STORE_RECORD)
     )
@@ -674,13 +773,20 @@ def test_cli_runs_with_injected_fakes(tmp_path: Path, monkeypatch) -> None:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["dataset"] == "corpus_nlp"
-    assert payload["datasets"] == ["major_news", "irm_qa_sh", "irm_qa_sz"]
-    assert payload["planned"] == 5
-    assert payload["processed"] == 5
+    assert payload["datasets"] == [
+        "major_news",
+        "npr",
+        "cctv_news",
+        "irm_qa_sh",
+        "irm_qa_sz",
+    ]
+    assert payload["planned"] == 7
+    assert payload["processed"] == 7
     assert payload["failed"] == 0
     assert payload["factors"]["news_sentiment_daily"]["rows"] == 3
     assert payload["factors"]["irm_qa_sentiment_daily"]["rows"] == 2
-    assert len(chat.calls) == 5
+    assert payload["factors"]["policy_sentiment_daily"]["rows"] == 2
+    assert len(chat.calls) == 7
     assert Path(payload["fields_path"]).is_file()
 
 
@@ -690,3 +796,149 @@ def test_cli_rejects_unknown_dataset(tmp_path: Path, monkeypatch) -> None:
     result = CliRunner().invoke(app, ["corpus-nlp", "--dataset", "ths_hot"])
 
     assert result.exit_code != 0
+
+
+# --- factor registration (fail closed, no database) ---------------------------
+
+from quant_platform.research_store import ResearchStore  # noqa: E402
+
+DUMMY_URL = "postgresql+psycopg://quantlab:quantlab@127.0.0.1:55433/quantlab_test"
+
+
+def _unused_store() -> ResearchStore:
+    return ResearchStore(DUMMY_URL)
+
+
+def test_register_rejects_unknown_factor_name(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unknown corpus factor"):
+        corpus.register_corpus_factor(_unused_store(), tmp_path, factor_name="nope")
+
+
+def test_register_missing_manifest_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="manifest is missing"):
+        corpus.register_corpus_factor(
+            _unused_store(), tmp_path, factor_name=corpus.POLICY_FACTOR_NAME
+        )
+
+
+def test_register_tampered_artifact_fails_closed(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    summary = _run(tmp_path, FakeChatClient([_payload()] * 7))
+    entry = summary.factors[corpus.POLICY_FACTOR_NAME]
+    tampered = pd.read_parquet(entry["artifact_path"])
+    tampered[corpus.POLICY_FACTOR_NAME] = tampered[corpus.POLICY_FACTOR_NAME] + 1
+    tampered.to_parquet(entry["artifact_path"], index=False)
+    with pytest.raises(ValueError, match="does not match the manifest sha256"):
+        corpus.register_corpus_factor(
+            _unused_store(),
+            corpus.default_factors_dir(tmp_path),
+            factor_name=corpus.POLICY_FACTOR_NAME,
+        )
+
+
+def test_register_unexpected_source_identity_fails_closed(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    summary = _run(tmp_path, FakeChatClient([_payload()] * 7))
+    entry = summary.factors[corpus.NEWS_FACTOR_NAME]
+    manifest = {**entry["manifest"], "source": {"dataset": "somewhere_else"}}
+    entry["manifest_path"].write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="source identity"):
+        corpus.register_corpus_factor(
+            _unused_store(),
+            corpus.default_factors_dir(tmp_path),
+            factor_name=corpus.NEWS_FACTOR_NAME,
+        )
+
+
+def test_code_artifact_recomputes_registered_values(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    summary = _run(tmp_path, FakeChatClient([_payload()] * 7))
+    fields = pd.read_parquet(summary.fields_path)
+    builders = {
+        corpus.NEWS_FACTOR_NAME: corpus.build_news_sentiment_series,
+        corpus.IRM_QA_FACTOR_NAME: corpus.build_irm_qa_sentiment_series,
+        corpus.POLICY_FACTOR_NAME: corpus.build_policy_sentiment_series,
+    }
+    for name, builder in builders.items():
+        manifest = summary.factors[name]["manifest"]
+        source = corpus._corpus_code_artifact_source(
+            factor_name=name, manifest=manifest, values_sha256=manifest["sha256"]
+        )
+        assert corpus.PROMPT_VERSION in source
+        assert manifest["sha256"] in source
+        namespace: dict = {}
+        exec(compile(source, "<code-artifact>", "exec"), namespace)
+        recomputed = namespace["compute_factor"](fields, OPEN_DAYS)
+        assert recomputed.equals(builder(fields, OPEN_DAYS))
+
+
+# --- policy corpus loading (npr / cctv_news) ------------------------------------
+
+
+def test_load_npr_tolerates_column_variants_and_drops_bad_rows(tmp_path: Path) -> None:
+    _write_parquet(
+        tmp_path / "units" / "npr",
+        [
+            # pub_time variant + content_html carried: body text wins.
+            {
+                "title": "政策甲",
+                "pub_time": "2024-01-02 08:00:00",
+                "content_html": "<p>全文</p>",
+            },
+            # Exact pubtime, title-only (the interface default fields).
+            {"title": "政策乙", "pubtime": "2024-01-02 17:00:00"},
+            # Unparseable timestamp and empty title: dropped.
+            {"title": "政策丙", "pubtime": "not-a-timestamp"},
+            {"title": "", "pubtime": "2024-01-02 18:00:00"},
+        ],
+    )
+
+    items = corpus.load_corpus_items(tmp_path, datasets={"npr"})
+
+    assert len(items) == 2
+    by_title = {item.title: item for item in items}
+    assert by_title["政策甲"].content == "<p>全文</p>"
+    assert by_title["政策甲"].pub_time == datetime(2024, 1, 2, 8, 0, 0)
+    # Title-level fallback when no content column value exists.
+    assert by_title["政策乙"].content == "政策乙"
+
+
+def test_load_npr_missing_required_columns_fail_closed(tmp_path: Path) -> None:
+    _write_parquet(tmp_path / "units" / "npr", [{"pcode": "国发〔2024〕1号"}])
+
+    with pytest.raises(RuntimeError, match="title"):
+        corpus.load_corpus_items(tmp_path, datasets={"npr"})
+    _write_parquet(
+        tmp_path / "units" / "npr", [{"title": "政策"}], name="other.parquet"
+    )
+    with pytest.raises(RuntimeError, match=r"pubtime\|pub_time"):
+        corpus.load_corpus_items(tmp_path, datasets={"npr"})
+
+
+def test_load_cctv_news_parses_dates_and_drops_bad_rows(tmp_path: Path) -> None:
+    _write_parquet(
+        tmp_path / "units" / "cctv_news",
+        [
+            {"date": "20240102", "title": "联播甲", "content": "内容甲"},
+            {"date": "2024-01-04", "title": "联播乙", "content": "内容乙"},
+            {"date": "bad-date", "title": "联播丙", "content": "内容丙"},
+            {"date": "20240105", "title": "", "content": ""},
+        ],
+    )
+
+    items = corpus.load_corpus_items(tmp_path, datasets={"cctv_news"})
+
+    assert len(items) == 2
+    assert items[0].pub_time == datetime(2024, 1, 2, 0, 0, 0)
+    assert items[1].pub_time == datetime(2024, 1, 4, 0, 0, 0)
+    assert items[0].content == "内容甲"
+
+
+def test_load_cctv_news_missing_columns_fail_closed(tmp_path: Path) -> None:
+    _write_parquet(tmp_path / "units" / "cctv_news", [{"date": "20240102"}])
+
+    with pytest.raises(RuntimeError, match="content"):
+        corpus.load_corpus_items(tmp_path, datasets={"cctv_news"})

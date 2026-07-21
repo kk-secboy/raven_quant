@@ -15,6 +15,9 @@ from rich.table import Table
 
 from quant_platform.announcement_nlp import process_announcements
 from quant_platform.corpus_nlp import SUPPORTED_CORPUS_DATASETS, process_corpus
+from quant_platform.major_news_mentions import process_major_news_mentions
+from quant_platform.news_flash_factors import process_news_flash
+from quant_platform.report_rc_factors import process_report_rc
 from quant_platform.runtime_secret_store import RuntimeSecretStore
 
 from .catalog import (
@@ -1390,7 +1393,10 @@ def announcement_nlp_command(
 def corpus_nlp_command(
     dataset: Annotated[
         str,
-        typer.Option(help="Comma-separated major_news,irm_qa_sh,irm_qa_sz; empty = all"),
+        typer.Option(
+            help="Comma-separated major_news,npr,cctv_news,irm_qa_sh,irm_qa_sz; "
+            "empty = all"
+        ),
     ] = "",
     ts_code: Annotated[
         str, typer.Option(help="Comma-separated Tushare codes to include")
@@ -1442,6 +1448,111 @@ def corpus_nlp_command(
         "ts_codes": _split_codes(ts_code),
         **summary.as_dict(),
     }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+@app.command("report-rc-factors")
+def report_rc_factors_command(
+    ts_code: Annotated[
+        str, typer.Option(help="Comma-separated Tushare codes to include")
+    ] = "",
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD report date")] = "2010-01-01",
+    end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Build structured factor artifacts from the downloaded report_rc dataset."""
+    start_date = parse_date(start)
+    end_date = parse_date(end, latest=today_cn())
+    if end_date < start_date:
+        raise typer.BadParameter("end must not be before start")
+    context = load_context(
+        require_credentials=False,
+        progress_path=result_path,
+        progress_target={
+            "kind": "report_rc_factors",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+    )
+    context.report_progress(
+        "processing", "report_rc structured factor production", {"report_rc"}, force=True
+    )
+    summary = process_report_rc(
+        context.settings.data_root,
+        ts_codes=set(_split_codes(ts_code)) or None,
+        start=start_date,
+        end=end_date,
+    )
+    result = {
+        "dataset": "report_rc",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "ts_codes": _split_codes(ts_code),
+        **summary.as_dict(),
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+@app.command("major-news-mentions")
+def major_news_mentions_command(
+    ts_code: Annotated[
+        str, typer.Option(help="Comma-separated Tushare codes to include")
+    ] = "",
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD publication date")] = "2024-01-01",
+    end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Map major_news mentions onto instruments and build mention factor artifacts."""
+    start_date = parse_date(start)
+    end_date = parse_date(end, latest=today_cn())
+    if end_date < start_date:
+        raise typer.BadParameter("end must not be before start")
+    context = load_context(
+        require_credentials=False,
+        progress_path=result_path,
+        progress_target={
+            "kind": "major_news_mentions",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+    )
+    context.report_progress(
+        "processing", "major_news mention mapping", {"major_news"}, force=True
+    )
+    summary = process_major_news_mentions(
+        context.settings.data_root,
+        ts_codes=set(_split_codes(ts_code)) or None,
+        start=start_date,
+        end=end_date,
+    )
+    result = {
+        "dataset": "major_news",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "ts_codes": _split_codes(ts_code),
+        **summary.as_dict(),
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+@app.command("news-flash-factors")
+def news_flash_factors_command(
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Build the market-level news-flash intensity factor artifact."""
+    context = load_context(
+        require_credentials=False,
+        progress_path=result_path,
+        progress_target={"kind": "news_flash_factors"},
+    )
+    context.report_progress(
+        "processing", "news flash intensity factor production", {"news"}, force=True
+    )
+    summary = process_news_flash(context.settings.data_root)
+    result = {"dataset": "news", **summary.as_dict()}
     _write_optional_result(result_path, result)
     console.print_json(json.dumps(result, ensure_ascii=False))
 
@@ -1878,6 +1989,12 @@ def _build_snapshot(
         end_date=end_date,
         successful_units=units,
     )
+    base_snapshot: Path | None = None
+    parent_name = lineage.get("parent_snapshot")
+    if parent_name:
+        parent_path = context.storage.snapshots_root / str(parent_name)
+        if (parent_path / "manifest.json").exists():
+            base_snapshot = parent_path
     return context.storage.build_snapshot(
         name=name,
         successful_units=units,
@@ -1889,6 +2006,7 @@ def _build_snapshot(
             **({"quality_gate": quality_gate} if quality_gate else {}),
             **lineage,
         },
+        base_snapshot=base_snapshot,
     )
 
 

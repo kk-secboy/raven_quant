@@ -83,3 +83,96 @@
 - 可复现端到端入口：`tests/test_announcement_live_e2e.py` 已实现全真实链路判定（Tushare anns_d/trade_cal → cninfo PDF → NLP 结构化字段 → 因子 artifact → available_at 之前不可见），无任何 mock；凭证缺席时干净跳过，在环境中配置 `OPENAI_API_KEY`（及可选 `TUSHARE_TOKEN`）后运行 `pytest tests/test_announcement_live_e2e.py` 即完成第三条判定的最终验证。
 - 【2026-07-18 已通过】真实链路验证：以 deepseek-v4-pro 为 LLM、巨潮公开查询接口为发现源（本环境 TUSHARE_TOKEN 未配置时的替代发现路径，Tushare 路径在同测试内保留），`pytest tests/test_announcement_live_e2e.py` **1 passed**：300093.SZ 权益变动公告 → 真实下载 PDF → LLM 产出 `event_type=equity_change`、`tone_score=-0.1`、`confidence=0.98`、关键数值（持股数/比例）→ 字段 `available_at=2026-07-20`（周末公告顺延）、`ingested_at` UTC 时间戳 → 因子 artifact 在 `available_at` 前不可见。同跑全量套件退出码 0（该 live 测试在未注入凭证的常规套件中保持跳过）。
 - `tests/test_document_governance.py` 的 24 个失败为本目标开始前的既有状态（用户文档迁移：v4.4 旧稿与两个 docx 已删、治理测试尚在重指向 v1.1 设计稿的过程中）。【已于 2026-07-18 关闭】：经用户确认后，治理测试按 v1.1 设计稿重写（28 个用例全过），被删旧 md 从 git 原样恢复（v1.1 §14.1 链接所需），全量套件 `pytest tests/ -q` 复核退出码 0（655 tests / 0 failures / 1 skipped=credential-gated live e2e）。
+
+## 七、report_rc 结构化消费（2026-07-20 追加）
+
+Tushare `report_rc`（券商研报盈利预测与评级，cn_institutional 任务按月 3,000 行分页下载，`supplemental_data.py:1060-1070`）此前无消费方；本节记录其结构化因子产出与注册通道的落地：
+
+- **PIT 注册**：`report_date` 为研报发布日期（提供商当日 19-22 点刷新），按 `strictly_after_announcement_date` 同族保守处理（发布次日可用），政策注册于 `availability.py`（`AVAILABILITY_POLICIES["report_rc"]`），recoverability 标注 `native_history`（按 report_date 可回拉 2010 年以来历史）。
+- **生产者** `src/quant_platform/report_rc_factors.py`（无 LLM，纯结构化）：读 units/snapshots 双层 parquet（duckdb union_by_name，缺必需列/缺 trade_cal fail-closed），行级 `available_at` = report_date 之后首个 trade_cal 交易日；周频观察网格（ISO 周最后一个交易日）聚合，只计入 grid 日及之前可用的行。产出 `fields.parquet`（含 eps/np/max_price/min_price/quarter 原始预测列，作为预期差类因子的扩展位）、评级变化/EPS 修正事件帧、覆盖度帧，以及三个带 sha256 manifest 的因子 artifact：`report_rc_rating_change`（机构内评级档位变化事件均值，5 档精确映射表 `rating-ladder.v1`，未知评级 fail-closed 不进事件但计入覆盖）、`report_rc_coverage_20d`（近 20 个开放日覆盖研报数，分析师关注度）、`report_rc_eps_revision`（最近预测季度 EPS 相对上修幅度，机构内链，分母下限 0.01 元）。周频网格同时满足外部评估通道 sparse_event 形态门槛（日覆盖 ≤ 50%）。
+- **注册通道**：`announcement_factor_registry.register_announcement_factor` 重构为通用 `register_external_factor`（manifest sha256 fail-closed 校验、确定性谱系 code artifact、研究运行谱系、`ResearchStore.add_candidate`、幂等键 name+values_sha256，原公告 NLP 行为不变），report_rc 以 `source.dataset=report_rc` + `producer_version` 身份接入同一通道；CLI `quant-data report-rc-factors`（生产）与 `quant-db register-report-rc-factor`（注册，`--factor-name all` 默认三个全注册）。
+- **评估通道**：因子 artifact 直接适配 `external_factor_evaluation` 的 sparse_event 形态（事件日 IC/RankIC、HAC、BH 校正），经 `scripts/evaluate_external_factor_batch.py` 评估落 `factor_evaluations`。
+- **测试**：`tests/test_report_rc_factors.py` 29 个（评级映射正/反例、机构内链与匿名/未知评级排除、PIT 发布日不可见、周末顺延、周网格不早于可用日、覆盖度窗口计数与过期、EPS 最近季度与分母下限、端到端 artifact+manifest+确定性重跑、sparse_event 形态兼容与评估、注册 fail-closed/幂等/新版本、code artifact 重算一致、CLI 幂等），全部通过；回归 `test_announcement_factor_registry.py`/`test_external_factor_evaluation.py`/`test_pit_semantics.py`/`test_corpus_nlp.py`/`test_announcement_nlp.py`/`test_supplemental_data.py` 90 个通过，`ruff check src tests` 通过。
+- **覆盖度限制**：`report_rc` 仅覆盖有卖方跟踪的个股（A 股约 5,400 只中通常 2,000-3,000 只，小盘/冷门股无覆盖）；历史深度自 2010 年起；评级口径因券商而异（已用机构内比较 + 精确映射表缓解，跨机构绝对档位仍不可比）；本机无已下载数据，真实覆盖统计待凭证就位跑 `quant-data report-rc-factors` 后核实。
+
+## 八、其余语料 NLP 消费与 major_news 个股映射（2026-07-20 追加）
+
+继 corpus_nlp（major_news 市场级 + irm_qa 个股级）与 report_rc 结构化消费之后，本节记录剩余已下载语料的处置决定与落地。原则：复用 corpus_nlp 的 LLM 调用/PIT 时间戳/artifact/注册通道，不发明第二条通道；宁保守勿滥造。
+
+### 各语料处置决定
+
+| 语料 | 决定 | 理由 |
+| --- | --- | --- |
+| `major_news`（个股级映射） | **接入**（确定性方法，零新增 LLM 调用） | content 全文里识别被提及的上市公司，复用 corpus_nlp fields 已有的逐条 LLM 情绪，映射到个股形成稀疏事件因子 |
+| `news`（9 源快讯） | **接入，但只做聚合特征** | 快讯与 major_news 报道同一批市场事件，再做逐条 LLM 情绪与市场级 `news_sentiment_daily` 高度重复且成本高出一个数量级；快讯流真正的增量是其**量能动态**（major_news 是编辑筛选过的薄信息流，无法度量），故只产确定性的快讯强度因子，不产第二个情绪分 |
+| `npr`（国家政策法规库） | **接入**（LLM，市场级） | 一手政策文本，与新闻报道不重复（是新闻的上游源头）；`pubtime` 精确发布时间。注意 `content_html` 非接口默认字段，下载通常只有标题+发文字号+发文机关，故实为标题级处理——法规/批复标题本身是信息主体，可辩护 |
+| `cctv_news`（新闻联播） | **接入**（LLM，市场级，与 npr 合并为一个政策因子） | 政策信号语料，date-only 保守顺延次一交易日；与 major_news 有部分重叠但作为独立政策通道仍有增量，优先级低于前两项 |
+| `wc_list` / `wc_cnt`（微信） | **跳过** | 接口 schema 决定不可用：`wc_list` 为公众号文章列表（id/title/pub_time/url 等，无正文），`wc_cnt` 为阅读计数（sn/account/publish_time/title + 计数，无文本）；两者均无个股键，需单独权限，且本机无已下载数据可验证质量。标题级处理与快讯/要闻重复且 PIT 依据弱。结论：在当前接口形态下不具消费价值 |
+| `research_report`（研报文本） | **跳过 LLM** | 同一批研报的评级/EPS/目标价已由 report_rc 结构化消费（第七节）；`research_report` 只有标题+摘要（`abstr`）无正文，摘要情绪与评级强相关、增量低，而 LLM 成本为每日数百条。记录结论，不硬做 |
+
+### 新因子清单
+
+| 因子 | 形态 | 来源 | 说明 |
+| --- | --- | --- | --- |
+| `major_news_mention_sentiment_daily` | sparse_event | major_news × stock_basic/namechange | 提及该股的长篇新闻 LLM 情绪均值（复用 corpus_nlp fields，无新增 LLM 调用） |
+| `major_news_mention_count_daily` | sparse_event | 同上 | 当日提及该股的distinct新闻条数（新闻关注度变量） |
+| `news_flash_intensity_daily` | market_timeseries（MARKET） | news（9 源快讯） | 当日 15:00 截点前快讯数 / 此前 20 个开放日均值（min 5 天历史，严格只用历史日，无 look-ahead） |
+| `policy_sentiment_daily` | market_timeseries（MARKET） | npr + cctv_news | 政策语料 LLM 情绪日均值（corpus_nlp 同一 pipeline 产出） |
+
+### 个股映射消歧策略（`mention-rules.v1`，`src/quant_platform/major_news_mentions.py`）
+
+确定性规则，不用 LLM 抽取（成本与可复现性考虑）：
+
+1. **别名候选**：`stock_basic.name`（简称，自 `list_date` 起有效）+ `stock_basic.fullname`（全称，下载含该列时）+ `namechange` 历史名及其 `[start_date, end_date]` 有效区间。**按新闻 pub_time 当日的有效别名匹配**——用 PIT 的名字而非今天的名字，避免改名股的前视/幸存者偏差。
+2. **高歧义直接放弃**：别名长度 < 3 字符一律不用。"平安"类两字简称正是高歧义情形，漏掉好于猜错；匹配字符串是完整简称为子串（"中国平安"四字命中才映射 601318.SH，单独"平安"二字不会误命中）。
+3. **跨股冲突丢弃**：同一别名串映射到多个 ts_code 且有效区间重叠 → 对所有涉事股票整体丢弃该别名；区间不重叠的序贯复用保留。
+4. **匹配规则**：从左到右扫描，每个位置取最长匹配别名，命中区间消费不重叠；同一股票在一条新闻里只记一次提及。
+
+### PIT 注册（`availability.py`）
+
+- 精确时间戳语料 `major_news`（pub_time）/`news`（datetime）/`npr`（pubtime，兼容 pub_time 列名）：`same_trade_date_after_close`（注册表为整日粒度，与平台"决策日在收盘后"的既有约定一致；生产者在因子日期上另施加 15:00 细粒度截点规则）。
+- date-only 语料 `cctv_news`（date）/`irm_qa_sh`/`irm_qa_sz`（trade_date）与评估后跳过的 `research_report`（trade_date）：`strictly_after_announcement_date`（保守顺延）。
+- recoverability 均标注 `native_history`（按发布日期/时间可回拉历史，provider 不改写旧行）。
+
+### 落地与接线
+
+- **corpus_nlp 扩展**（`src/quant_platform/corpus_nlp.py`）：新增 `_npr_items`/`_cctv_news_items` 归一化（pubtime/pub_time、content_html/content 列名按行 coalesce 容错；npr 无正文时标题级回退），`available_at_for` 按精确/仅日期两类分派，新增 `build_policy_sentiment_series` 与 `policy_sentiment_daily` artifact；新增通用 `register_corpus_factor`（三个 corpus 因子统一走 `register_external_factor`，补上了 news_sentiment_daily/irm_qa_sentiment_daily 此前没有注册入口的缺口）。
+- **major_news 个股映射**（`src/quant_platform/major_news_mentions.py`，无 LLM）：aliases.parquet（审计用别名表）+ events.parquet（含 matched_alias、行级 available_at/factor_date）+ 两个因子 artifact + `register_major_news_mentions_factor`。
+- **快讯强度**（`src/quant_platform/news_flash_factors.py`，无 LLM）：daily_counts.parquet（范围内每个开放日零填充，作为谱系重算的精确输入）+ `news_flash_intensity_daily` artifact + `register_news_flash_factor`。
+- **CLI**：`quant-data major-news-mentions`、`quant-data news-flash-factors`（生产）；`quant-db register-corpus-factor`、`register-major-news-mentions-factor`、`register-news-flash-factor`（注册，`--factor-name all` 默认全量，幂等）。
+
+### 测试
+
+- `tests/test_corpus_nlp.py` 扩展至 45 个：npr/cctv 加载正反例（列名变体、坏行丢弃、缺列 fail-closed）、`available_at_for` 新语料规则、端到端 7 条语料 + policy 因子 artifact/manifest、注册 fail-closed（未知名/缺 manifest/篡改/来源身份）与 code artifact 重算一致。
+- `tests/test_major_news_mentions.py` 20 个（16 no_database + 4 真实 PG）：别名表规则（全称/历史名/最短长度/跨股冲突/序贯复用）、最长匹配与单次提及、PIT 有效区间正反例（过期别名不匹配）、端到端事件与因子值、确定性重跑 sha256 一致、无成功抽取行不产生事件、缺输入 fail-closed、sparse_event 形态兼容、注册成功/幂等/篡改不落库/CLI 幂等。
+- `tests/test_news_flash_factors.py` 19 个（16 no_database + 3 真实 PG）：15:00 截点映射、零填充网格、严格历史窗口均值、最小历史天数、零快讯日不出值、端到端 artifact+确定性、market_timeseries 形态兼容、availability 注册与 `filter_available` 执行、注册成功/幂等/CLI。
+- `tests/test_corpus_factor_registration.py` 4 个（真实 PG）：corpus 注册成功/幂等/篡改不落库/CLI 幂等。
+- 回归：`test_report_rc_factors.py`/`test_announcement_factor_registry.py`/`test_external_factor_evaluation.py`/`test_pit_semantics.py` 等 no_database 子集通过，`ruff check src tests` 通过。
+
+### 限制与说明
+
+- 提及情绪是**整篇新闻的情绪**按提及传播（一篇提到三只股票则三者同分），不是针对每只股票的目标级情绪；目标级抽取需要新一轮 LLM 调用，本轮刻意不做。
+- `stock_basic` 为 current_only 快照：未改过名的股票其当前名按 `list_date` 起有效处理（近似，依据是未改名则名称自上市起有效）；已改名股票由 `namechange`（native_history）区间覆盖。若 `namechange` 未下载则回退仅用 stock_basic。
+- 快讯强度因子的"零快讯日不出值"把缺数据与真零区分不开，按保守处理（不出值而非填零）；零仍进入后续分母。
+- 本机无已下载真实语料，真实覆盖率/别名命中率统计待凭证就位后跑 `quant-data corpus-nlp && quant-data major-news-mentions && quant-data news-flash-factors` 核实。
+
+## 九、Known limitations（经评估后明确不修复）
+
+以下两项于 2026-07-20 评估后确认对 A 股中低频主线无实际影响，记录为已知限制而非待办缺口：
+
+1. **指数权重/行业成员可用时间 = 生效日 + 5 自然日近似**（`availability.py` 的 `effective_date_with_lag(days=5)` 政策）。指数公司与中证/申万没有机器可读的真实发布时间源，5 日滞后是保守近似；权重调整对中低频组合的影响远小于这个时滞误差，除非接入付费数据源，否则无修复路径。
+2. **分钟线覆盖与非复权**：A 股分钟数据只有 5min 全市场（`stk_mins`），1min 仅限流动性股票子集；分钟线不做复权（`minute_qlib_builder.py`）。分钟线只服务执行细节研究，不在"日线中低频因子 → 回测 → 模拟"主线上，不补。
+
+若未来策略频率提高到日内或接入付费指数数据源，再重新评估这两项。
+
+## 十、Barra 风格结构化风险模型（2026-07-21 追加）
+
+平台原有风险能力只有 qlib metadata 中 size（log 市值）单风格暴露 + qlib `ShrinkCovEstimator` 收缩协方差。本节记录 Barra CNE5/6 简化版结构化风险模型的落地，目标是服务因子评估中性化与（将来的）组合优化；定位中低频月度/周度再平衡，不追求高频精度。
+
+- **风格暴露扩展**：新增 `src/quant_data/style_exposure_panel.py`（原始描述子面板，纯快照输入、无平台依赖）与 `src/quant_platform/style_exposures.py`（截面标准化，纯 pandas/numpy）。风格集共 9 个：size（log 市值）、nonlinear_size（size³ 对 size 正交化，Barra NLSIZE）、value（BP=1/PB 与 EP=1/PE_TTM 等权合成）、momentum（过去 252 交易日收益剔除近 21 日）、volatility（120 日收益波动率，最少 60 个观测）、liquidity（21 日平均换手率的 log）、growth（fund 通道营收/净利同比等权合成）、profitability（ROE）、leverage（资产负债率）。标准化管线为 Barra 经典三段：MAD 去极值（±3 个 1.4826 缩放 MAD）→ 流通市值加权 z-score → 对 size 做市值加权回归取残差正交化后再 z-score；行业正交刻意不做（结构化风险模型自带行业因子，避免双重中性化）。横截面不足 2 个有效观测或加权方差为零时输出 0.0（加权均值），保证单行 metadata 有限。
+- **PIT 纪律**：量价/估值/换手描述子来自 daily_basic 与复权收盘，沿用 `same_trade_date_after_close` 语义（t 日暴露服务 t 日收盘后决策）；基本面描述子走 `fina_indicator` 公告日 ASOF 通道（`trade_date > ann_date` 严格晚于公告日，`end_date` 永不参与可用性）；行业暴露用申万 L1 `industry_memberships` 的 in/out_date 区间，经 `filter_available` 平台可用性守卫（生效日 + 保守发布滞后）消费。
+- **qlib metadata 集成**：`qlib_builder.py` 的 `_build_style_exposures` 在保留历史 `log_market_cap` 原始列的同时追加全部标准化风格列（向后兼容的 schema 扩展），同次构建顺带产出 `full_market_weights.parquet`（全市场流通市值权重，供因子收益回归的市值加权用）。消费方（portfolio_policy / portfolio_optimizer / strategy_backtest）读取原列不受影响。
+- **结构化风险模型**（`src/quant_platform/risk_math.py`，`barra-lite-cne6-v1`）：因子收益用逐日截面市值加权最小二乘（市场因子 + 风格 + 行业 dummy，最大行业为参照类；等权回退）估计；因子协方差为因子收益序列的指数加权协方差（半衰期 90 交易日），特征值裁剪到 PSD；特质风险为各股回归残差的同半衰期 EWMA 方差，历史不足 20 个观测（新股/长期停牌）收缩到截面中位数并设下限 `1e-8`。产出 `StructuredRiskModel` artifact（exposures/factor_covariance/specific_variance 三件分开可取，组合优化器直接消费因子结构），`covariance()` 给出稠密 `B F B' + D`（`estimate_covariance` 的 drop-in），`portfolio_risk()` 做组合波动率与市场/风格/行业/特质四段风险分解，`save/load` 持久化（parquet + JSON manifest，版本校验）。行业 dummy 缺失的个股降级为"风格 + 特质"风险而非失败。
+- **与 ShrinkCov 路径的关系**：`estimate_covariance`（qlib `ShrinkCovEstimator`，alpha=0.10/const_var，钉住 qlib commit 校验）原样保留，作为样本协方差对照与回退；结构化模型是并行新增路径，两者接口（输入收益率帧 → 协方差 DataFrame）对齐，可互换。
+- **测试**：`tests/test_style_exposure_panel.py`、`tests/test_style_exposures.py`、`tests/test_structured_risk_model.py` 共 29 个全部通过（小手算数据集验证暴露值、PIT 未来数据不进暴露/行业成员区间正反例、z-score 加权均值方差与 size 正交性、因子协方差正定性、组合风险端到端、ShrinkCov 回退共存、artifact 往返）。回归 `test_qlib_builder.py`/`test_portfolio_policy.py`/`test_portfolio_optimizer.py`/`test_strategy_allocation_math.py` 45 个通过；`ruff check src tests` 通过。`test_strategy_allocation_recommendations.py` 的唯一用例需真实 PG（127.0.0.1:55432），本次运行环境 PG 不可达（连接超时），与本次改动无关。
+- **已知局限**：① 新股/长期停牌股特质风险历史不足时收缩到截面中位数（不区分行业/风格特征，粗糙但保守）；② 行业因子用静态 L1 dummy，未做行业因子收益的多重共线性处理（参照类 + 满秩检查跳过退化日）；③ EWMA 半衰期 90 日为固定参数，未按因子类型分层；④ 组合风险接口当前不做交易成本/约束优化，优化器为后续独立开发项；⑤ 本机未对全量真实数据跑过结构化模型构建，真实覆盖率/因子收益平稳性待数据就位后验证。

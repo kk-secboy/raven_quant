@@ -98,6 +98,37 @@ AVAILABILITY_POLICIES: dict[str, AvailabilityPolicy] = {
         interval=True,
         note=_METADATA_LAG_NOTE,
     ),
+    # Major-violation events derived from anns_d titles (regulatory_events.py):
+    # a row is knowable from its known_date — the first open trading day
+    # strictly after the announcement date — onward.
+    "regulatory_events": AvailabilityPolicy(
+        SAME_TRADE_DATE_AFTER_CLOSE, ("known_date",)
+    ),
+    # Sell-side research reports (report_rc): report_date is the report
+    # publication date (the provider refreshes each evening 19-22 for that
+    # day's reports). Conservative treatment, same family as financial
+    # announcements: a row is usable strictly after its report_date.
+    "report_rc": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("report_date",)),
+    # Text corpora consumed by quant_platform.corpus_nlp / news_flash_factors.
+    # Exact-timestamp corpora (major_news pub_time, news datetime, npr pubtime):
+    # at the registry's whole-date granularity a row is knowable after that
+    # calendar date's close (same convention as trade-date market fields); the
+    # producers additionally apply the fine-grained 15:00 cutoff rule for
+    # factor dates. Date-only corpora (cctv_news broadcast date, irm_qa
+    # trade_date) conservatively become usable strictly after their date.
+    "major_news": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("pub_time",)),
+    "news": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("datetime",)),
+    "npr": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("pubtime", "pub_time")),
+    "cctv_news": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("date",)),
+    "irm_qa_sh": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("trade_date",)),
+    "irm_qa_sz": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("trade_date",)),
+    # Sell-side research report metadata (research_report, 研报中心): trade_date
+    # is the report publication date and the provider refreshes incrementally
+    # twice a day; date-only, so strictly-after is the conservative rule. The
+    # platform does not consume this dataset for NLP (see
+    # docs/pit-nlp-gap-report.md section 八) — the policy is registered so the
+    # read guard fails open nowhere.
+    "research_report": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("trade_date",)),
 }
 
 # Recoverability level per dataset (design draft 3.3). Datasets not listed are
@@ -155,6 +186,24 @@ RECOVERABILITY_LEVELS: dict[str, str] = {
     # intervals carried by the current full dump; the intervals themselves are
     # the reconstruction source, not a native version history.
     "index_member_all": RECONSTRUCTED,
+    # Major-violation events are deterministically reconstructed from the
+    # anns_d announcement titles plus trade_cal by the versioned title rules in
+    # regulatory_events.py (rule version recorded per row).
+    "regulatory_events": RECONSTRUCTED,
+    # Sell-side research reports are keyed by report_date and re-pullable for
+    # any historical day since 2010; the provider does not rewrite old rows.
+    "report_rc": NATIVE_HISTORY,
+    # Text corpora keyed by publication date/datetime are re-pullable for any
+    # historical window (major_news/news since 2018+, npr since 2008+,
+    # cctv_news since 2017, irm_qa per exchange record, research_report since
+    # 2017); the provider does not rewrite old rows.
+    "major_news": NATIVE_HISTORY,
+    "news": NATIVE_HISTORY,
+    "npr": NATIVE_HISTORY,
+    "cctv_news": NATIVE_HISTORY,
+    "irm_qa_sh": NATIVE_HISTORY,
+    "irm_qa_sz": NATIVE_HISTORY,
+    "research_report": NATIVE_HISTORY,
     # As-of masters: the provider exposes only the latest revision. Pulls are
     # versioned going forward, but history before the first pull is
     # unrecoverable (the 2026-07-15 audit in reference_data.py covers the

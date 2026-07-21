@@ -22,6 +22,11 @@ changed artifact (new sha256) creates a new candidate in a new run — candidate
 rows are immutable once imported, so a new row is the existing versioning
 mechanism.
 
+:func:`register_external_factor` is the generic form of this channel, reused
+by other external producers (e.g. the structured report_rc factors in
+``quant_platform.report_rc_factors``) with their own source identity and
+metadata instead of a parallel registry.
+
 The standard RD-Agent recompute path (factor code executed against the
 daily_pv provider input) does not apply to this factor family: the values
 derive from announcement NLP fields, not market data. Wiring an evaluation
@@ -34,6 +39,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -68,13 +75,19 @@ def _is_sha256(value: Any) -> bool:
 
 
 def _verified_artifact(
-    factors_dir: Path, factor_name: str
+    factors_dir: Path,
+    factor_name: str,
+    *,
+    source_dataset: str = SOURCE_DATASET,
+    required_source_keys: tuple[str, ...] = ("prompt_version", "model"),
 ) -> tuple[dict[str, Any], Path, str]:
     """Load the manifest, validate its schema and checksum; fail closed.
 
     Returns (manifest, artifact_path, values_sha256). Any missing file,
     malformed manifest, or checksum mismatch raises ValueError before the
-    database is touched.
+    database is touched. The manifest ``source`` block must carry the
+    expected dataset identity plus non-empty values for every
+    ``required_source_keys`` entry.
     """
 
     if not factor_name or not factor_name.replace("_", "").isalnum():
@@ -108,9 +121,10 @@ def _verified_artifact(
     source = manifest.get("source")
     if (
         not isinstance(source, dict)
-        or source.get("dataset") != SOURCE_DATASET
-        or not str(source.get("prompt_version") or "").strip()
-        or not str(source.get("model") or "").strip()
+        or source.get("dataset") != source_dataset
+        or any(
+            not str(source.get(key) or "").strip() for key in required_source_keys
+        )
     ):
         raise ValueError("factor manifest carries an unexpected source identity")
     rows = manifest.get("rows")
@@ -178,21 +192,53 @@ def _write_code_artifact(path: Path, source: str) -> None:
     os.replace(temporary, path)
 
 
-def register_announcement_factor(
+@dataclass(frozen=True, slots=True)
+class ExternalFactorMetadata:
+    """Per-source registration metadata consumed by register_external_factor.
+
+    ``variables`` is stored in factor_candidates.variables_json; ``run_config``
+    is merged into the research run config on top of the common identity keys.
+    """
+
+    description: str
+    formulation: str
+    variables: dict[str, Any]
+    code_source: str
+    run_config: dict[str, Any]
+    rdagent_feedback: str
+
+
+def register_external_factor(
     store: ResearchStore,
     factors_dir: Path,
     *,
-    factor_name: str = FACTOR_NAME,
-    actor: str = IMPORT_ACTOR,
+    factor_name: str,
+    run_kind: str,
+    actor: str,
+    build_metadata: Callable[[dict[str, Any], str], ExternalFactorMetadata],
+    source_dataset: str = SOURCE_DATASET,
+    required_source_keys: tuple[str, ...] = ("prompt_version", "model"),
 ) -> dict[str, Any]:
-    """Verify and register the announcement NLP factor artifact; idempotent.
+    """Verify and register an external factor artifact; idempotent.
+
+    This is the single governed channel for externally produced factors
+    (announcement NLP, report_rc structured, ...): manifest sha256 fail-closed
+    verification, deterministic provenance code artifact, research-run
+    lineage, ResearchStore.add_candidate, idempotency key
+    (name, values_sha256). ``build_metadata(manifest, values_sha256)`` supplies
+    the source-specific description/formulation/variables/code artifact.
 
     Returns a JSON-able summary. ``created`` is False when the same artifact
     (name + values sha256) was already registered; the existing candidate is
     then returned untouched and no new research run is created.
     """
 
-    manifest, artifact_path, values_sha256 = _verified_artifact(factors_dir, factor_name)
+    manifest, artifact_path, values_sha256 = _verified_artifact(
+        factors_dir,
+        factor_name,
+        source_dataset=source_dataset,
+        required_source_keys=required_source_keys,
+    )
 
     existing = store.find_candidate(name=factor_name, values_sha256=values_sha256)
     if existing is not None:
@@ -206,41 +252,25 @@ def register_announcement_factor(
             "code_sha256": existing["code_sha256"],
         }
 
+    metadata = build_metadata(manifest, values_sha256)
     code_path = factors_dir / f"{factor_name}_factor.py"
-    _write_code_artifact(
-        code_path,
-        _code_artifact_source(
-            factor_name=factor_name, manifest=manifest, values_sha256=values_sha256
-        ),
-    )
+    _write_code_artifact(code_path, metadata.code_source)
 
-    source = manifest["source"]
-    policy = manifest["availability_policy"]
     manifest_path = factors_dir / f"{factor_name}.json"
-    description = (
-        "Announcement NLP tone factor: mean LLM tone score per "
-        "(available_at, instrument). Availability: "
-        f"{policy[factor_name]} — values become visible at available_at, the first "
-        "trading day strictly after the announcement date; source fields carry "
-        "available_at/ingested_at. Externally produced by announcement_nlp "
-        f"(prompt_version={source['prompt_version']}, model={source['model']})."
-    )
     run = store.create_run(
-        kind=IMPORT_RUN_KIND,
+        kind=run_kind,
         objective=(
             f"Register the externally produced {factor_name} factor artifact "
             "into the governed factor library."
         ),
-        dataset=SOURCE_DATASET,
+        dataset=source_dataset,
         requested_by=actor,
         budget={"loop_n": 0},
         config={
             "factor_name": factor_name,
             "values_sha256": values_sha256,
             "manifest": str(manifest_path),
-            "prompt_version": source["prompt_version"],
-            "model": source["model"],
-            "availability_policy": policy,
+            **metadata.run_config,
         },
         artifact_path=factors_dir,
     )
@@ -248,28 +278,15 @@ def register_announcement_factor(
         candidate = store.add_candidate(
             run["id"],
             name=factor_name,
-            description=description,
-            formulation=(
-                "mean(tone_score) over announcements grouped by (available_at, ts_code); "
-                "available_at = first trading day strictly after the announcement date"
-            ),
-            variables={
-                "availability_policy": policy,
-                "source": source,
-                "values_sha256": values_sha256,
-                "manifest": str(manifest_path),
-                "rows": manifest["rows"],
-                "ingested_fields": ["available_at", "ingested_at"],
-            },
+            description=metadata.description,
+            formulation=metadata.formulation,
+            variables=metadata.variables,
             source_iteration=None,
             code_path=str(code_path),
             values_path=str(artifact_path),
             code_sha256=None,
             rdagent_decision=None,
-            rdagent_feedback=(
-                "externally produced announcement NLP factor; "
-                "manifest sha256 verified at registration"
-            ),
+            rdagent_feedback=metadata.rdagent_feedback,
             actor=actor,
         )
     except Exception as exc:
@@ -297,3 +314,73 @@ def register_announcement_factor(
         "values_sha256": values_sha256,
         "code_sha256": candidate["code_sha256"],
     }
+
+
+def _announcement_metadata(manifest: dict[str, Any], values_sha256: str) -> ExternalFactorMetadata:
+    """Announcement NLP registration metadata (tone factor family)."""
+
+    factor_name = str(manifest["factor"])
+    source = manifest["source"]
+    policy = manifest["availability_policy"]
+    return ExternalFactorMetadata(
+        description=(
+            "Announcement NLP tone factor: mean LLM tone score per "
+            "(available_at, instrument). Availability: "
+            f"{policy[factor_name]} — values become visible at available_at, the first "
+            "trading day strictly after the announcement date; source fields carry "
+            "available_at/ingested_at. Externally produced by announcement_nlp "
+            f"(prompt_version={source['prompt_version']}, model={source['model']})."
+        ),
+        formulation=(
+            "mean(tone_score) over announcements grouped by (available_at, ts_code); "
+            "available_at = first trading day strictly after the announcement date"
+        ),
+        variables={
+            "availability_policy": policy,
+            "source": source,
+            "values_sha256": values_sha256,
+            "manifest": None,  # filled below with the manifest path
+            "rows": manifest["rows"],
+            "ingested_fields": ["available_at", "ingested_at"],
+        },
+        code_source=_code_artifact_source(
+            factor_name=factor_name, manifest=manifest, values_sha256=values_sha256
+        ),
+        run_config={
+            "prompt_version": source["prompt_version"],
+            "model": source["model"],
+            "availability_policy": policy,
+        },
+        rdagent_feedback=(
+            "externally produced announcement NLP factor; "
+            "manifest sha256 verified at registration"
+        ),
+    )
+
+
+def register_announcement_factor(
+    store: ResearchStore,
+    factors_dir: Path,
+    *,
+    factor_name: str = FACTOR_NAME,
+    actor: str = IMPORT_ACTOR,
+) -> dict[str, Any]:
+    """Verify and register the announcement NLP factor artifact; idempotent.
+
+    Thin wrapper over :func:`register_external_factor` with the announcement
+    NLP source identity and metadata.
+    """
+
+    def build_metadata(manifest: dict[str, Any], values_sha256: str) -> ExternalFactorMetadata:
+        metadata = _announcement_metadata(manifest, values_sha256)
+        metadata.variables["manifest"] = str(factors_dir / f"{factor_name}.json")
+        return metadata
+
+    return register_external_factor(
+        store,
+        factors_dir,
+        factor_name=factor_name,
+        run_kind=IMPORT_RUN_KIND,
+        actor=actor,
+        build_metadata=build_metadata,
+    )

@@ -393,10 +393,11 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         5,
         89,
         "文本语料 NLP 信号加工",
-        "对已下载的长篇财经新闻（major_news）与沪深互动易问答（irm_qa_sh/irm_qa_sz）"
+        "对已下载的长篇财经新闻（major_news）、政策法规库（npr）、新闻联播（cctv_news）"
+        "与沪深互动易问答（irm_qa_sh/irm_qa_sz）"
         "做 LLM 结构化抽取（情感分、主题、置信度），按内容 sha256+prompt_version+model 幂等"
-        "落不可变 parquet 单元与派生字段索引，并生成市场级 news_sentiment_daily 与个股级 "
-        "irm_qa_sentiment_daily 因子 artifact。",
+        "落不可变 parquet 单元与派生字段索引，并生成市场级 news_sentiment_daily、"
+        "policy_sentiment_daily 与个股级 irm_qa_sentiment_daily 因子 artifact。",
         "研究语料",
         "QuantLab",
         "ready",

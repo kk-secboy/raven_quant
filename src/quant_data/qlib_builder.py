@@ -5,19 +5,21 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import duckdb
-import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from quant_platform.eligibility import (
     ELIGIBILITY_CONTRACT_VERSION,
     EligibilityPolicy,
     build_point_in_time_eligibility,
 )
+from quant_platform.style_exposures import standardize_panel
 
 from .availability import (
     AVAILABILITY_POLICY_VERSION,
@@ -34,6 +36,12 @@ from .execution_contract import (
     TUSHARE_HAND_SIZE,
 )
 from .path_utils import to_wsl_path as _to_wsl_path
+from .regulatory_events import (
+    REGULATORY_EVENTS_RULE_VERSION,
+    derive_regulatory_events,
+    open_days_from_trade_cal,
+)
+from .style_exposure_panel import build_adjusted_close, build_raw_style_panel
 
 _BASE_QLIB_FIELDS = (
     "open",
@@ -62,16 +70,101 @@ _DAILY_RESEARCH_FIELDS = (
     "circ_mv",
 )
 
+# Fundamental research fields dumped into the Qlib binaries, grouped by the
+# source statement table. Every table feeds the same point-in-time channel:
+# an ASOF join keyed on the announcement date (trade_date > ann_date), never
+# on the report period (end_date), so no field here can leak an unpublished
+# report. Fundamentals are never price-normalized: absolute amounts stay in
+# CNY yuan and per-share values in yuan per share.
 _FUNDAMENTAL_RESEARCH_FIELDS = {
-    "roe": "fund_roe",
-    "roa": "fund_roa",
-    "grossprofit_margin": "fund_grossprofit_margin",
-    "debt_to_assets": "fund_debt_to_assets",
-    "current_ratio": "fund_current_ratio",
-    "or_yoy": "fund_revenue_yoy",
-    "netprofit_yoy": "fund_netprofit_yoy",
-    "q_sales_yoy": "fund_quarter_revenue_yoy",
-    "q_profit_yoy": "fund_quarter_profit_yoy",
+    "fina_indicator": {
+        "roe": "fund_roe",
+        "roa": "fund_roa",
+        "grossprofit_margin": "fund_grossprofit_margin",
+        "debt_to_assets": "fund_debt_to_assets",
+        "current_ratio": "fund_current_ratio",
+        "or_yoy": "fund_revenue_yoy",
+        "netprofit_yoy": "fund_netprofit_yoy",
+        "q_sales_yoy": "fund_quarter_revenue_yoy",
+        "q_profit_yoy": "fund_quarter_profit_yoy",
+        "eps": "fund_eps",
+        "bps": "fund_bps",
+        "ocfps": "fund_ocfps",
+        "roe_waa": "fund_roe_weighted",
+        "roe_dt": "fund_roe_diluted",
+        "roic": "fund_roic",
+        "netprofit_margin": "fund_netprofit_margin",
+        "assets_turn": "fund_assets_turnover",
+        "inv_turn": "fund_inventory_turnover",
+        "ar_turn": "fund_receivables_turnover",
+        "quick_ratio": "fund_quick_ratio",
+        "debt_to_eqt": "fund_debt_to_equity",
+        "saleexp_of_gr": "fund_sales_expense_ratio",
+        "adminexp_of_gr": "fund_admin_expense_ratio",
+        "finaexp_of_gr": "fund_finance_expense_ratio",
+        "op_yoy": "fund_op_profit_yoy",
+        "equity_yoy": "fund_equity_yoy",
+        "ocf_to_or": "fund_ocf_to_revenue",
+        "ocf_to_profit": "fund_ocf_to_profit",
+        "salescash_to_or": "fund_sales_cash_to_revenue",
+        "interestdebt": "fund_interest_debt",
+    },
+    "income": {
+        "n_income_attr_p": "fund_net_profit",
+        "rd_exp": "fund_rd_expense",
+    },
+    "balancesheet": {
+        "total_assets": "fund_total_assets",
+        "money_cap": "fund_money_cap",
+        "goodwill": "fund_goodwill",
+    },
+    "cashflow": {
+        "n_cashflow_act": "fund_ocf_net",
+        "c_pay_acq_const_fiolta": "fund_capex",
+    },
+}
+
+# Per-field unit declarations for the fundamental research fields, merged
+# into the provenance field_units next to _DAILY_FIELD_UNITS. Ratios reported
+# by Tushare in percent keep the percent scale (no 0-1 rescaling).
+_FUNDAMENTAL_FIELD_UNITS = {
+    "fund_roe": "percent",
+    "fund_roa": "percent",
+    "fund_grossprofit_margin": "percent",
+    "fund_debt_to_assets": "percent",
+    "fund_revenue_yoy": "percent",
+    "fund_netprofit_yoy": "percent",
+    "fund_quarter_revenue_yoy": "percent",
+    "fund_quarter_profit_yoy": "percent",
+    "fund_roe_weighted": "percent",
+    "fund_roe_diluted": "percent",
+    "fund_roic": "percent",
+    "fund_netprofit_margin": "percent",
+    "fund_sales_expense_ratio": "percent",
+    "fund_admin_expense_ratio": "percent",
+    "fund_finance_expense_ratio": "percent",
+    "fund_op_profit_yoy": "percent",
+    "fund_equity_yoy": "percent",
+    "fund_debt_to_equity": "percent",
+    "fund_current_ratio": "ratio_unitless",
+    "fund_quick_ratio": "ratio_unitless",
+    "fund_ocf_to_revenue": "ratio_unitless",
+    "fund_ocf_to_profit": "ratio_unitless",
+    "fund_sales_cash_to_revenue": "ratio_unitless",
+    "fund_assets_turnover": "turnover_times",
+    "fund_inventory_turnover": "turnover_times",
+    "fund_receivables_turnover": "turnover_times",
+    "fund_eps": "cny_yuan_per_share",
+    "fund_bps": "cny_yuan_per_share",
+    "fund_ocfps": "cny_yuan_per_share",
+    "fund_interest_debt": "cny_yuan",
+    "fund_net_profit": "cny_yuan",
+    "fund_rd_expense": "cny_yuan",
+    "fund_total_assets": "cny_yuan",
+    "fund_money_cap": "cny_yuan",
+    "fund_goodwill": "cny_yuan",
+    "fund_ocf_net": "cny_yuan",
+    "fund_capex": "cny_yuan",
 }
 
 # Explicit per-field unit declarations written into the dataset provenance.
@@ -253,6 +346,16 @@ class QlibBuilder:
             raise
         return qlib_dir
 
+    def _field_units(self) -> dict[str, str]:
+        """Unit declarations for every dumped field, including fundamentals."""
+
+        units = dict(_DAILY_FIELD_UNITS)
+        for field in self.research_feature_contract["fields"]:
+            unit = _FUNDAMENTAL_FIELD_UNITS.get(field)
+            if unit is not None:
+                units[field] = unit
+        return units
+
     def _write_provenance(self, qlib_dir: Path) -> None:
         snapshot_digest = self._snapshot_manifest_digest()
         snapshot_manifest = json.loads(
@@ -260,6 +363,7 @@ class QlibBuilder:
         )
         builder_digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         fields = list(self.qlib_fields)
+        field_units = self._field_units()
         contract = {
             "version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
             "frequency": "day",
@@ -270,7 +374,7 @@ class QlibBuilder:
             "qlib_amount_unit": QLIB_DAILY_AMOUNT_UNIT,
             "source_hand_size": int(TUSHARE_HAND_SIZE),
             "index_volume_policy": INDEX_VOLUME_POLICY,
-            "field_units": _DAILY_FIELD_UNITS,
+            "field_units": field_units,
             "research_features": self.research_feature_contract,
             "eligibility_contract_version": ELIGIBILITY_CONTRACT_VERSION,
         }
@@ -309,7 +413,7 @@ class QlibBuilder:
             "qlib_amount_unit": QLIB_DAILY_AMOUNT_UNIT,
             "source_hand_size": int(TUSHARE_HAND_SIZE),
             "index_volume_policy": INDEX_VOLUME_POLICY,
-            "field_units": _DAILY_FIELD_UNITS,
+            "field_units": field_units,
             "research_features": self.research_feature_contract,
             "eligibility_contract_version": ELIGIBILITY_CONTRACT_VERSION,
         }
@@ -506,16 +610,7 @@ class QlibBuilder:
             frame = pd.concat([pd.read_parquet(path) for path in style_files], ignore_index=True)
             required = {"ts_code", "trade_date", "total_mv"}
             if required.issubset(frame.columns):
-                market_cap = pd.to_numeric(frame["total_mv"], errors="coerce")
-                styles = pd.DataFrame(
-                    {
-                        "instrument": frame["ts_code"].map(_qlib_symbol),
-                        "datetime": pd.to_datetime(frame["trade_date"], errors="coerce"),
-                        "log_market_cap": market_cap.where(market_cap > 0).map(np.log),
-                    }
-                ).dropna()
-                styles.drop_duplicates(["instrument", "datetime"], keep="last", inplace=True)
-                styles.sort_values(["datetime", "instrument"], inplace=True)
+                styles = self._build_style_exposures(frame)
                 if not styles.empty:
                     target.mkdir(parents=True, exist_ok=True)
                     float_cap_column = "circ_mv" if "circ_mv" in frame.columns else "total_mv"
@@ -555,6 +650,46 @@ class QlibBuilder:
 
         if not wrote_metadata and target.exists() and not any(target.iterdir()):
             target.rmdir()
+
+    def _build_style_exposures(self, daily_basic: pd.DataFrame) -> pd.DataFrame:
+        """Extended Barra-style exposure panel with a backward-compatible schema.
+
+        The historical raw ``log_market_cap`` column is preserved; the
+        standardized style columns of quant_platform.style_exposures are added
+        alongside it. Rows keep daily_basic's same-trade-date-after-close
+        semantics (an exposure dated ``t`` supports decisions after the close
+        of ``t``); fundamental descriptors arrive through the
+        announcement-date ASOF channel inside style_exposure_panel.
+        """
+
+        panel = build_raw_style_panel(
+            daily_basic,
+            adjusted_close=self._load_adjusted_close(),
+            fina_indicator=self._load_fina_indicator(),
+        )
+        panel = panel.rename(columns={"ts_code": "instrument", "trade_date": "datetime"})
+        panel["instrument"] = panel["instrument"].map(_qlib_symbol)
+        return standardize_panel(panel)
+
+    def _load_adjusted_close(self) -> pd.DataFrame | None:
+        daily_root = self.snapshot_path / "parquet" / "daily"
+        daily_files = sorted(daily_root.rglob("*.parquet")) if daily_root.exists() else []
+        daily = _read_parquet_columns(daily_files, {"ts_code", "trade_date", "close"})
+        if daily is None:
+            return None
+        adj_root = self.snapshot_path / "parquet" / "adj_factor"
+        adj_files = sorted(adj_root.rglob("*.parquet")) if adj_root.exists() else []
+        factors = _read_parquet_columns(adj_files, {"ts_code", "trade_date", "adj_factor"})
+        return build_adjusted_close(daily, factors)
+
+    def _load_fina_indicator(self) -> pd.DataFrame | None:
+        root = self.snapshot_path / "parquet" / "fina_indicator"
+        files = sorted(root.rglob("*.parquet")) if root.exists() else []
+        return _read_parquet_columns(
+            files,
+            {"ts_code", "ann_date", "roe", "or_yoy", "netprofit_yoy", "debt_to_assets"},
+            required={"ts_code", "ann_date"},
+        )
 
     def _write_market_context_metadata(self, target: Path) -> bool:
         """Store non-equity daily context once, without copying it into every stock."""
@@ -745,12 +880,20 @@ class QlibBuilder:
         )
         regulatory_source = read("regulatory_events")
         regulatory = None
+        regulatory_origin: str | None = None
         if not regulatory_source.empty:
             required = {"ts_code", "event_date", "known_date", "major"}
             if not required.issubset(regulatory_source.columns):
                 raise ValueError("regulatory event source violates its data contract")
             regulatory = regulatory_source.rename(columns={"ts_code": "instrument"}).copy()
             regulatory["instrument"] = regulatory["instrument"].map(_qlib_symbol)
+            regulatory_origin = "materialized_dataset"
+        else:
+            # Fail-soft fallback: derive major-violation events from the anns_d
+            # announcement titles persisted in the same immutable snapshot.
+            regulatory = self._derive_regulatory_events(read)
+            if regulatory is not None:
+                regulatory_origin = f"anns_d_title_rules({REGULATORY_EVENTS_RULE_VERSION})"
         matrix = build_point_in_time_eligibility(
             market=market,
             listings=listings,
@@ -768,6 +911,7 @@ class QlibBuilder:
                 {
                     "version": ELIGIBILITY_CONTRACT_VERSION,
                     "regulatory_data_available": regulatory is not None,
+                    "regulatory_origin": regulatory_origin,
                     "financial_availability": "strictly_after_announcement_date",
                     "delisting_availability": "effective_date_only_no_backfill",
                 },
@@ -778,6 +922,27 @@ class QlibBuilder:
         )
         return True
 
+    def _derive_regulatory_events(
+        self, read: Callable[[str], pd.DataFrame]
+    ) -> pd.DataFrame | None:
+        """Derive major-violation events from snapshot anns_d titles.
+
+        Returns None (current fail-soft behavior) when the snapshot carries no
+        anns_d parquet; otherwise applies the versioned conservative title
+        rules with the snapshot trade_cal as the known_date calendar. The
+        derivation is deterministic over immutable snapshot inputs, so the
+        snapshot lineage already covers the result.
+        """
+
+        anns_root = self.snapshot_path / "parquet" / "anns_d"
+        if not anns_root.is_dir() or not any(anns_root.rglob("*.parquet")):
+            return None
+        open_days = open_days_from_trade_cal(read("trade_cal"))
+        events = derive_regulatory_events(read("anns_d"), open_days)
+        regulatory = events.rename(columns={"ts_code": "instrument"}).copy()
+        regulatory["instrument"] = regulatory["instrument"].map(_qlib_symbol)
+        return regulatory
+
     def _normalized_query(self, daily_glob: Path, adj_glob: Path, limit_glob: Path) -> str:
         daily = _sql_string(str(daily_glob.resolve()))
         adj = _sql_string(str(adj_glob.resolve()))
@@ -785,7 +950,6 @@ class QlibBuilder:
         daily_features = self.research_feature_contract["daily_fields"]
         fundamental_features = self.research_feature_contract["fundamental_fields"]
         daily_basic_root = self.snapshot_path / "parquet" / "daily_basic"
-        fina_indicator_root = self.snapshot_path / "parquet" / "fina_indicator"
 
         joined_daily_select = ""
         daily_join = ""
@@ -805,31 +969,33 @@ class QlibBuilder:
 
         joined_fundamental_select = ""
         fundamental_join = ""
-        if fundamental_features:
-            fina_indicator = _sql_string(
-                str((fina_indicator_root / "**" / "*.parquet").resolve())
+        for dataset, features in fundamental_features.items():
+            if not features:
+                continue
+            statement = _sql_string(
+                str((self.snapshot_path / "parquet" / dataset / "**" / "*.parquet").resolve())
             )
-            joined_fundamental_select = "".join(
-                f"\n                    , try_cast(fi.{source} AS DOUBLE) AS {target}"
-                for source, target in fundamental_features.items()
+            joined_fundamental_select += "".join(
+                f"\n                    , try_cast({dataset}.{source} AS DOUBLE) AS {target}"
+                for source, target in features.items()
             )
-            projected_columns = ["ts_code", "ann_date", "end_date", *fundamental_features]
+            projected_columns = ["ts_code", "ann_date", "end_date", *features]
             projected = ", ".join(projected_columns)
             revision_order = _fundamental_revision_order(
-                projected_columns, self._parquet_columns("fina_indicator")
+                projected_columns, self._parquet_columns(dataset)
             )
-            fundamental_join = f"""
+            fundamental_join += f"""
                 ASOF LEFT JOIN (
                     SELECT {projected}
-                    FROM read_parquet({fina_indicator}, hive_partitioning=true)
+                    FROM read_parquet({statement}, hive_partitioning=true)
                     WHERE ts_code IS NOT NULL AND try_cast(ann_date AS DATE) IS NOT NULL
                     QUALIFY row_number() OVER (
                         PARTITION BY ts_code, try_cast(ann_date AS DATE)
                         ORDER BY {revision_order}
                     ) = 1
-                ) fi
-                  ON d.ts_code = fi.ts_code
-                 AND try_cast(d.trade_date AS DATE) > try_cast(fi.ann_date AS DATE)
+                ) {dataset}
+                  ON d.ts_code = {dataset}.ts_code
+                 AND try_cast(d.trade_date AS DATE) > try_cast({dataset}.ann_date AS DATE)
             """
         return f"""
             WITH joined AS (
@@ -881,7 +1047,11 @@ class QlibBuilder:
                 , up_limit * adj_factor / base_price AS up_limit
                 , down_limit * adj_factor / base_price AS down_limit
                 {''.join(f', {field}' for field in daily_features)}
-                {''.join(f', {field}' for field in fundamental_features.values())}
+                {''.join(
+                    f', {target}'
+                    for features in fundamental_features.values()
+                    for target in features.values()
+                )}
             FROM joined
             WHERE adj_factor IS NOT NULL AND adj_factor > 0 AND base_price > 0
         """
@@ -909,27 +1079,46 @@ class QlibBuilder:
 
     def _research_feature_contract(self) -> dict[str, object]:
         daily_columns = self._parquet_columns("daily_basic")
-        fundamental_columns = self._parquet_columns("fina_indicator")
+        fundamental_columns = {
+            dataset: self._parquet_columns(dataset)
+            for dataset in _FUNDAMENTAL_RESEARCH_FIELDS
+        }
         daily_fields = [field for field in _DAILY_RESEARCH_FIELDS if field in daily_columns]
         fundamental_fields = {
-            source: target
-            for source, target in _FUNDAMENTAL_RESEARCH_FIELDS.items()
-            if source in fundamental_columns
+            dataset: {
+                source: target
+                for source, target in mapping.items()
+                if source in fundamental_columns[dataset]
+            }
+            for dataset, mapping in _FUNDAMENTAL_RESEARCH_FIELDS.items()
+        }
+        fundamental_fields = {
+            dataset: fields
+            for dataset, fields in fundamental_fields.items()
+            if fields
         }
         # Version 2: availability policies and recoverability levels come from
         # the shared registry in quant_data.availability and now also cover the
         # index/industry metadata consumed next to the feature fields.
+        # Version 3: fundamental fields are grouped by source statement table
+        # (fina_indicator plus the income/balancesheet/cashflow line items).
         availability_datasets = (
             "daily_basic",
             "fina_indicator",
+            "income",
+            "balancesheet",
+            "cashflow",
             "index_weight",
             "index_member_all",
         )
         return {
-            "version": 2,
+            "version": 3,
             "daily_fields": daily_fields,
             "fundamental_fields": fundamental_fields,
-            "fields": [*daily_fields, *fundamental_fields.values()],
+            "fields": [
+                *daily_fields,
+                *(target for fields in fundamental_fields.values() for target in fields.values()),
+            ],
             "availability_policy_version": AVAILABILITY_POLICY_VERSION,
             "availability_policy": {
                 dataset: availability_contract_label(dataset)
@@ -968,9 +1157,9 @@ class QlibBuilder:
                 issues.append(f"{dataset} missing columns: {', '.join(missing)}")
 
         financial_columns = columns_by_dataset["fina_indicator"]
-        if financial_columns and not set(_FUNDAMENTAL_RESEARCH_FIELDS).intersection(
-            financial_columns
-        ):
+        if financial_columns and not set(
+            _FUNDAMENTAL_RESEARCH_FIELDS["fina_indicator"]
+        ).intersection(financial_columns):
             issues.append("fina_indicator has no supported financial factor columns")
 
         industry_columns = columns_by_dataset["index_member_all"]
@@ -995,7 +1184,7 @@ class QlibBuilder:
                     f"AND {_as_date_sql('end_date')} IS NOT NULL AND ("
                     + " OR ".join(
                         f"try_cast({field} AS DOUBLE) IS NOT NULL"
-                        for field in _FUNDAMENTAL_RESEARCH_FIELDS
+                        for field in _FUNDAMENTAL_RESEARCH_FIELDS["fina_indicator"]
                         if field in financial_columns
                     )
                     + ")"
@@ -1096,6 +1285,22 @@ class QlibBuilder:
 def _sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
+
+def _read_parquet_columns(
+    files: list[Path], wanted: set[str], *, required: set[str] | None = None
+) -> pd.DataFrame | None:
+    """Concatenate parquet files projected to the wanted columns they have."""
+
+    needed = set(wanted) if required is None else set(required)
+    frames = []
+    for path in files:
+        available = wanted.intersection(pq.read_schema(path).names)
+        if not needed.issubset(available):
+            continue
+        frames.append(pd.read_parquet(path, columns=sorted(available)))
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
 
 def _as_date_sql(column: str) -> str:
     identifier = '"' + column.replace('"', '""') + '"'
