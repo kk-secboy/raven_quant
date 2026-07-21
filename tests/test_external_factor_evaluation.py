@@ -841,3 +841,27 @@ def test_shape_detection_still_fails_closed_for_dense_daily_factor() -> None:
         ext.detect_external_factor_shape(
             factor, label, valid_start=PERIODS["valid_start"], valid_end=PERIODS["valid_end"]
         )
+
+
+@pytest.mark.no_database
+def test_to_qlib_instrument_format_maps_tushare_codes() -> None:
+    frame = pd.DataFrame(
+        [
+            ("2024-01-02", "600000.SH", 0.1),
+            ("2024-01-02", "000001.SZ", 0.2),
+            ("2024-01-02", "830799.BJ", 0.3),
+            ("2024-01-02", "SH600519", 0.4),
+        ],
+        columns=["datetime", "instrument", "value"],
+    )
+    mapped = ext.to_qlib_instrument_format(frame)
+    assert mapped["instrument"].tolist() == ["SH600000", "SZ000001", "BJ830799", "SH600519"]
+
+    series = frame.set_index(["datetime", "instrument"])["value"]
+    mapped_series = ext.to_qlib_instrument_format(series)
+    assert set(mapped_series.index.get_level_values("instrument")) == {
+        "SH600000",
+        "SZ000001",
+        "BJ830799",
+        "SH600519",
+    }

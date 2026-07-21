@@ -49,9 +49,11 @@ from quant_platform.qlib_workflow import qlib_workflow_run
 
 
 def _load_values(path: str) -> pd.DataFrame:
+    from quant_platform.external_factor_evaluation import to_qlib_instrument_format
+
     source = Path(path)
     if source.suffix.lower() in {".h5", ".hdf", ".hdf5"}:
-        return pd.read_hdf(source)
+        return to_qlib_instrument_format(pd.read_hdf(source))
     if source.suffix.lower() == ".parquet":
         frame = pd.read_parquet(source)
         # NLP-produced artifacts store flat datetime/instrument columns; the
@@ -63,8 +65,10 @@ def _load_values(path: str) -> pd.DataFrame:
                 if column not in {"datetime", "instrument"}
             ]
             if len(value_columns) == 1:
-                return frame.set_index(["datetime", "instrument"])[value_columns[0]]
-        return frame
+                return to_qlib_instrument_format(
+                    frame.set_index(["datetime", "instrument"])[value_columns[0]]
+                )
+        return to_qlib_instrument_format(frame)
     raise ValueError(f"unsupported factor values format: {source.suffix}")
 
 

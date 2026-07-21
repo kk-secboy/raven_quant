@@ -29,6 +29,7 @@ multiple-testing correction reuses ``benjamini_hochberg`` exactly like
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import date
@@ -128,6 +129,37 @@ def _coverage_stats(
     day_coverage_rate = float((aligned > 0).mean())
     mean_coverage_ratio = float(aligned.div(universe_counts).mean())
     return day_coverage_rate, mean_coverage_ratio
+
+
+_TUSHARE_INSTRUMENT_RE = re.compile(r"^(\d{6})\.(SH|SZ|BJ)$", re.IGNORECASE)
+
+
+def to_qlib_instrument_format(values: Any) -> Any:
+    """Normalize Tushare-style instruments (``600000.SH``) to qlib (``SH600000``).
+
+    NLP pipelines persist Tushare ``ts_code`` values while qlib label
+    universes use the exchange-prefixed form; without the mapping, factor and
+    label never join. Already-normalized instruments pass through unchanged.
+    """
+
+    def convert(value: Any) -> Any:
+        match = _TUSHARE_INSTRUMENT_RE.match(str(value))
+        if match:
+            return f"{match.group(2).upper()}{match.group(1)}"
+        return value
+
+    if isinstance(values, pd.DataFrame) and "instrument" in values.columns:
+        frame = values.copy()
+        frame["instrument"] = frame["instrument"].map(convert)
+        return frame
+    if isinstance(values.index, pd.MultiIndex):
+        names = list(values.index.names)
+        level = names.index("instrument") if "instrument" in names else 1
+        mapped = values.index.get_level_values(level).map(convert)
+        frame_or_series = values.copy()
+        frame_or_series.index = frame_or_series.index.set_levels(mapped, level=level)
+        return frame_or_series
+    return values
 
 
 def detect_external_factor_shape(
