@@ -76,12 +76,17 @@ class ExternalEvaluationConfig:
     version: str = EXTERNAL_EVALUATOR_VERSION
     # Shape detection boundaries. A factor covering almost the whole universe
     # on almost every day is a dense cross-sectional factor (rejected: use the
-    # standard RD-Agent evaluation path); a factor present on at most half of
-    # the universe days is treated as event-sparse; anything in between is
-    # ambiguous and fails closed.
+    # standard RD-Agent evaluation path). A factor is event-sparse when it is
+    # present on at most half of the universe days OR when its mean per-day
+    # instrument coverage is small — real announcement/event factors appear on
+    # more than half of trading days (companies disclose on most days) while
+    # still covering only a handful of instruments per day, so day coverage
+    # alone cannot discriminate them from dense factors; anything in between
+    # is ambiguous and fails closed.
     dense_day_coverage_rate: float = 0.95
     dense_mean_coverage_ratio: float = 0.80
     max_event_day_coverage_rate: float = 0.50
+    sparse_mean_coverage_ratio: float = 0.25
     # Quantile bucket count for the market-timeseries long/short diagnostic.
     quantile_count: int = 5
 
@@ -164,10 +169,14 @@ def detect_external_factor_shape(
                 f"(day coverage {day_coverage_rate:.3f}, mean ratio {mean_coverage_ratio:.3f}); "
                 "dense factors must use the standard RD-Agent evaluation path"
             )
-        if day_coverage_rate > config.max_event_day_coverage_rate:
+        if (
+            day_coverage_rate > config.max_event_day_coverage_rate
+            and mean_coverage_ratio > config.sparse_mean_coverage_ratio
+        ):
             raise ValueError(
                 "factor day coverage "
-                f"{day_coverage_rate:.3f} is neither event-sparse nor dense; shape unknown"
+                f"{day_coverage_rate:.3f} with mean instrument ratio {mean_coverage_ratio:.3f} "
+                "is neither event-sparse nor dense; shape unknown"
             )
         observed = SHAPE_SPARSE_EVENT
     if shape_hint is not None:

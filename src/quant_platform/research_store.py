@@ -223,7 +223,7 @@ class FactorGatePolicy:
 # Executor version bound into external factor evaluation evidence. Mirrors the
 # hardcoded "factor-recompute-v1" check in record_evaluation: the version lives
 # here because this module validates the evidence chain.
-EXTERNAL_EVALUATOR_VERSION = "external-factor-eval-v1"
+EXTERNAL_EVALUATOR_VERSION = "external-factor-eval-v2"
 
 # Gate status produced when an external factor lacks enough independent events
 # or signal days; the candidate keeps full records and may be re-evaluated.

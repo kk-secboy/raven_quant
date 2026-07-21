@@ -53,7 +53,18 @@ def _load_values(path: str) -> pd.DataFrame:
     if source.suffix.lower() in {".h5", ".hdf", ".hdf5"}:
         return pd.read_hdf(source)
     if source.suffix.lower() == ".parquet":
-        return pd.read_parquet(source)
+        frame = pd.read_parquet(source)
+        # NLP-produced artifacts store flat datetime/instrument columns; the
+        # evaluator contract expects a datetime/instrument MultiIndex.
+        if {"datetime", "instrument"} <= set(frame.columns):
+            value_columns = [
+                column
+                for column in frame.columns
+                if column not in {"datetime", "instrument"}
+            ]
+            if len(value_columns) == 1:
+                return frame.set_index(["datetime", "instrument"])[value_columns[0]]
+        return frame
     raise ValueError(f"unsupported factor values format: {source.suffix}")
 
 

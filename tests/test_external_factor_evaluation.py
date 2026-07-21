@@ -217,7 +217,7 @@ def test_shape_detection_fails_closed_on_ambiguous_and_mixed_shapes() -> None:
     ambiguous_rows = [
         (day, instrument, float(rng.standard_normal()))
         for day in DAYS[:100]
-        for instrument in INSTRUMENTS[:3]
+        for instrument in INSTRUMENTS[:10]
     ]
     with pytest.raises(ValueError, match="neither event-sparse nor dense"):
         ext.detect_external_factor_shape(
@@ -805,3 +805,39 @@ def test_import_external_evaluations_end_to_end(tmp_path: Path, database_url: st
     assert len(imported) == 1
     assert imported[0]["gate_status"] == "passed"
     assert store.get_candidate(candidate["id"])["status"] == "gate_passed"
+
+
+@pytest.mark.no_database
+def test_shape_detection_event_factor_on_most_days_is_still_sparse() -> None:
+    """Announcement-style factors appear on most trading days but cover only a
+    handful of instruments per day; day coverage alone must not reject them."""
+
+    _, label = _sparse_event_inputs(event_days=40)
+    event_instruments = INSTRUMENTS[:2]
+    factor_rows = [
+        (day, instrument, 0.1 * index)
+        for day in DAYS
+        for index, instrument in enumerate(event_instruments)
+    ]
+    factor = _series(factor_rows, "factor")
+    shape = ext.detect_external_factor_shape(
+        factor, label, valid_start=PERIODS["valid_start"], valid_end=PERIODS["valid_end"]
+    )
+    assert shape == ext.SHAPE_SPARSE_EVENT
+
+
+@pytest.mark.no_database
+def test_shape_detection_still_fails_closed_for_dense_daily_factor() -> None:
+    """A factor present every day on most of the universe stays ambiguous."""
+
+    _, label = _sparse_event_inputs(event_days=40)
+    factor_rows = [
+        (day, instrument, 0.01 * index)
+        for day in DAYS
+        for index, instrument in enumerate(INSTRUMENTS[:10])
+    ]
+    factor = _series(factor_rows, "factor")
+    with pytest.raises(ValueError, match="neither event-sparse nor dense"):
+        ext.detect_external_factor_shape(
+            factor, label, valid_start=PERIODS["valid_start"], valid_end=PERIODS["valid_end"]
+        )
