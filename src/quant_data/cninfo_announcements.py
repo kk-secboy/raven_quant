@@ -10,6 +10,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import duckdb
 import pandas as pd
@@ -210,6 +211,34 @@ def _read_parquet_union(paths: list[str], query: str) -> pd.DataFrame:
         connection.close()
 
 
+def resolve_pdf_url(url: str, ann_date: date) -> str:
+    """Resolve a cninfo disclosure detail-page url to its static PDF url.
+
+    Tushare ``anns_d`` ships two url shapes: direct ``static.cninfo.com.cn``
+    PDF links, and ``www.cninfo.com.cn/new/disclosure/detail?...`` viewer
+    pages.  The viewer page is a JavaScript shell, so the PDF location is
+    derived deterministically from its query parameters instead of being
+    scraped: ``static.cninfo.com.cn/finalpage/<date>/<announcementId>.PDF``.
+    Anything that does not match the detail-page shape is returned unchanged
+    (the %PDF magic check in ``_validate_body`` stays the fail-closed guard).
+    """
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if not parts.netloc.endswith("cninfo.com.cn"):
+        return url
+    if not parts.path.startswith("/new/disclosure/detail"):
+        return url
+    params = parse_qs(parts.query)
+    announcement_id = (params.get("announcementId") or [""])[0].strip()
+    if not announcement_id:
+        return url
+    when = (params.get("announcementTime") or [""])[0].strip() or ann_date.isoformat()
+    return f"http://static.cninfo.com.cn/finalpage/{when}/{announcement_id}.PDF"
+
+
 def load_announcement_manifest(
     data_root: Path,
     *,
@@ -267,7 +296,7 @@ def load_announcement_manifest(
             ts_code=str(row.ts_code),
             ann_date=row.ann_date.date(),
             title="" if pd.isna(row.title) else str(row.title),
-            url=str(row.url),
+            url=resolve_pdf_url(str(row.url), row.ann_date.date()),
         )
         for row in frame.itertuples()
     ]

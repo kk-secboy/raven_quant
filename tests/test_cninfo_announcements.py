@@ -443,3 +443,38 @@ def test_cli_downloads_with_filters_and_limit(tmp_path: Path, monkeypatch) -> No
     index = pd.read_parquet(tmp_path / "announcements" / "index.parquet")
     assert index["url"].tolist() == [rows[0]["url"]]
     assert index.iloc[0]["category"] == "regulatory_letter"
+
+
+def test_resolve_pdf_url_maps_detail_page_to_static_pdf() -> None:
+    detail = (
+        "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=000858"
+        "&announcementId=1225343261&orgId=gssz0000858&announcementTime=2026-06-02"
+    )
+    assert cninfo.resolve_pdf_url(detail, date(2026, 6, 2)) == (
+        "http://static.cninfo.com.cn/finalpage/2026-06-02/1225343261.PDF"
+    )
+
+
+def test_resolve_pdf_url_fallbacks_and_passthrough() -> None:
+    no_time = "http://www.cninfo.com.cn/new/disclosure/detail?announcementId=1225343261"
+    assert cninfo.resolve_pdf_url(no_time, date(2026, 6, 3)) == (
+        "http://static.cninfo.com.cn/finalpage/2026-06-03/1225343261.PDF"
+    )
+    direct = "http://static.cninfo.com.cn/finalpage/2026-06-02/1225343261.PDF"
+    assert cninfo.resolve_pdf_url(direct, date(2026, 6, 2)) == direct
+    external = "https://example.com/x.pdf"
+    assert cninfo.resolve_pdf_url(external, date(2026, 6, 2)) == external
+    no_id = "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=000858"
+    assert cninfo.resolve_pdf_url(no_id, date(2026, 6, 2)) == no_id
+
+
+def test_manifest_resolves_detail_page_urls(tmp_path: Path) -> None:
+    detail = (
+        "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=000858"
+        "&announcementId=1225343261&orgId=gssz0000858&announcementTime=2026-06-02"
+    )
+    _seed_data(tmp_path, [_ann_row("000858.SZ", "20240102", "年度股东会议案", detail)])
+    manifest = cninfo.load_announcement_manifest(tmp_path)
+    assert [ref.url for ref in manifest] == [
+        "http://static.cninfo.com.cn/finalpage/2026-06-02/1225343261.PDF"
+    ]
