@@ -851,11 +851,20 @@ def test_to_qlib_instrument_format_maps_tushare_codes() -> None:
             ("2024-01-02", "000001.SZ", 0.2),
             ("2024-01-02", "830799.BJ", 0.3),
             ("2024-01-02", "SH600519", 0.4),
+            ("2024-01-03", "600000.SH", 0.5),
+            ("2024-01-03", "600000.SH", 0.6),
         ],
         columns=["datetime", "instrument", "value"],
     )
     mapped = ext.to_qlib_instrument_format(frame)
-    assert mapped["instrument"].tolist() == ["SH600000", "SZ000001", "BJ830799", "SH600519"]
+    assert mapped["instrument"].tolist() == [
+        "SH600000",
+        "SZ000001",
+        "BJ830799",
+        "SH600519",
+        "SH600000",
+        "SH600000",
+    ]
 
     series = frame.set_index(["datetime", "instrument"])["value"]
     mapped_series = ext.to_qlib_instrument_format(series)

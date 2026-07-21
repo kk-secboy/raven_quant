@@ -155,9 +155,14 @@ def to_qlib_instrument_format(values: Any) -> Any:
     if isinstance(values.index, pd.MultiIndex):
         names = list(values.index.names)
         level = names.index("instrument") if "instrument" in names else 1
-        mapped = values.index.get_level_values(level).map(convert)
+        arrays = [
+            values.index.get_level_values(position).map(convert)
+            if position == level
+            else values.index.get_level_values(position)
+            for position in range(values.index.nlevels)
+        ]
         frame_or_series = values.copy()
-        frame_or_series.index = frame_or_series.index.set_levels(mapped, level=level)
+        frame_or_series.index = pd.MultiIndex.from_arrays(arrays, names=names)
         return frame_or_series
     return values
 
