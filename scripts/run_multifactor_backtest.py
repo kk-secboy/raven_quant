@@ -865,6 +865,27 @@ def main() -> None:
     (output / "capacity_curve.json").write_text(
         json.dumps(metrics["capacity"], ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    # Dataset descriptors consumed by the promotion chain: after the formal
+    # hard gate approves the version, the isolated paper simulation account is
+    # created from these verbatim dataset provenance records (design 6.11).
+    (output / "datasets.json").write_text(
+        json.dumps(
+            {
+                "daily": {"name": manifest["dataset"], "provenance": provider_provenance},
+                "execution": (
+                    {
+                        "name": manifest["execution_dataset"],
+                        "provenance": execution_provenance,
+                    }
+                    if minute_execution
+                    else None
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     result = {
         "status": "ok",
         "backtest_engine": "qlib",

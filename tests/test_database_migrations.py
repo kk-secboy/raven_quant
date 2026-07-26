@@ -9,6 +9,8 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
     assert set(inspector.get_table_names(schema="quantlab")) >= {
         "alembic_version",
         "account_netting_plans",
+        "strategy_forward_gates",
+        "strategy_promotion_stages",
         "jobs",
         "research_runs",
         "factor_candidates",
@@ -85,7 +87,35 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0042_account_netting_plans"
+    assert revision == "0044_recommendation_actions"
+    assert {"promotion_stage"} <= {
+        column["name"]
+        for column in inspector.get_columns("strategy_versions", schema="quantlab")
+    }
+    assert {
+        "min_forward_calendar_days",
+        "min_decision_batches",
+        "min_completed_cycles",
+        "min_data_completeness",
+        "min_reconciliation_rate",
+        "max_cost_deviation",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("strategy_forward_gates", schema="quantlab")
+    }
+    assert {
+        "strategy_version_id",
+        "stage_index",
+        "simulation_portfolio_id",
+        "status",
+        "source_contract_hash",
+        "opened_at",
+        "frozen_at",
+        "freeze_reason",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("strategy_promotion_stages", schema="quantlab")
+    }
     assert {"liability_per_share"} <= {
         column["name"]
         for column in inspector.get_columns(

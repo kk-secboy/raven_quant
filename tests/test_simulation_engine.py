@@ -378,3 +378,27 @@ def test_pair_execution_rejects_both_legs_when_either_leg_is_ineligible(reason: 
     assert result["fills"] == []
     assert result["positions"] == {}
     assert result["nav_row"]["performance_certified"] is False
+
+
+def test_non_liquidating_sell_uses_board_lot_increment() -> None:
+    # STAR board: minimum declaration 200 shares, increments of 1 above it.
+    # Selling 150 of a 450-share position toward a 300-share target must keep
+    # 150 (board increment 1), not be floored to the main-board 100.
+    result = _run(
+        positions={
+            "SH688001": {
+                "quantity": 450,
+                "available_quantity": 450,
+                "average_cost": 10.0,
+                "last_trade_date": date(2025, 1, 2),
+            }
+        },
+        target_weights={"SH688001": 0.03},
+        minute_bars=_bars(instrument="SH688001"),
+        closing_prices={"SH688001": {"price": 10.0, "market_date": date(2025, 1, 3)}},
+    )
+    order = result["orders"][0]
+    assert order["side"] == "sell"
+    assert order["requested_quantity"] == 150
+    assert order["filled_quantity"] == 150
+    assert result["positions"]["SH688001"]["quantity"] == 300

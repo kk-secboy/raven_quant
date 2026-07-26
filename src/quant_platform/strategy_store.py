@@ -358,6 +358,7 @@ class StrategyStore:
     """Immutable strategy versions backed by promoted factors and audited approvals."""
 
     def __init__(self, database_url: str) -> None:
+        self.database_url = database_url
         self.engine = open_database(database_url)
 
     @staticmethod
@@ -1693,6 +1694,10 @@ class StrategyStore:
                 .where(strategy_versions.c.id == version_id)
                 .values(
                     status="approved",
+                    # Design 6.11: passing the formal hard gate automatically
+                    # moves the version to the isolated paper stage; forward
+                    # evidence starts accumulating from zero.
+                    promotion_stage="paper",
                     approved_by=actor,
                     approval_reason=reason,
                     approved_at=now,
@@ -1715,6 +1720,17 @@ class StrategyStore:
                     "gate_evidence": {name: value[0] for name, value in checks.items()},
                 },
             )
+        # Design 6.11/7.4: candidate -> paper is automatic once the formal
+        # hard gate passes. The isolated paper stage opens after the approval
+        # commit; a stage-opening failure never rolls back a passed gate and
+        # is traceable through strategy events (retry via open_paper_stage).
+        from .promotion import PromotionStore
+
+        promotion = PromotionStore(self.database_url)
+        try:
+            promotion.open_paper_stage(version_id, actor=actor)
+        except Exception as exc:  # noqa: BLE001 - approval is already committed
+            promotion.record_paper_stage_failure(version_id, actor=actor, error=str(exc))
         return self.get_version(version_id)
 
     @staticmethod

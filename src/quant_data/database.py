@@ -354,6 +354,11 @@ strategy_versions = Table(
     Column("benchmark", String, nullable=False),
     Column("universe", String, nullable=False),
     Column("config_json", json_type, nullable=False),
+    # Design 6.11 promotion stage: NULL = candidate (pre-gate) or legacy
+    # ungated; "paper" is set automatically when the formal hard gate approves
+    # the version; "recommendation_enabled" requires the forward evidence gate
+    # plus human approval. Only "paper" blocks standalone recommendations.
+    Column("promotion_stage", String),
     Column("created_by", String, nullable=False),
     Column("approved_by", String),
     Column("approval_reason", Text),
@@ -738,6 +743,11 @@ recommendation_snapshots = Table(
     Column("effective_date", Date),
     Column("status", String, nullable=False),
     Column("snapshot_json", json_type),
+    # Two-dimension account action plan (design 8.4): per-instrument
+    # action x execution_state with projected_position and the
+    # keep/cancel/replace/new order plan. Holdings keep their legacy
+    # increase/decrease export; this JSON carries the richer model.
+    Column("account_actions_json", json_type),
     Column("cost_model_json", json_type, nullable=False),
     Column("policy_version", String, nullable=False),
     Column("backtest_engine_version", String, nullable=False),
@@ -2307,6 +2317,67 @@ def open_database(database_url: str) -> Engine:
         raise ValueError("DATABASE_URL must point to PostgreSQL")
     engine = create_engine(database_url, pool_pre_ping=True, pool_size=5, max_overflow=10)
     return engine
+
+
+# Design 4.5/6.11: per-version pre-registered forward evidence gate. The gate
+# may only be registered or changed before the version enters paper.
+strategy_forward_gates = Table(
+    "strategy_forward_gates",
+    metadata,
+    Column(
+        "strategy_version_id",
+        String,
+        ForeignKey("quantlab.strategy_versions.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("min_forward_calendar_days", Integer, nullable=False),
+    Column("min_decision_batches", Integer, nullable=False),
+    Column("min_completed_cycles", Integer, nullable=False),
+    Column("min_data_completeness", Float, nullable=False),
+    Column("min_reconciliation_rate", Float, nullable=False),
+    Column("max_cost_deviation", Float, nullable=False),
+    Column("registered_by", String, nullable=False),
+    Column("registered_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+# Design 9.5: each isolated forward paper stage owns its simulation account,
+# contract hash and evidence scope. A substantive contract drift freezes the
+# old stage read-only and opens a new one; evidence is never concatenated.
+strategy_promotion_stages = Table(
+    "strategy_promotion_stages",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "strategy_version_id",
+        String,
+        ForeignKey("quantlab.strategy_versions.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("stage_index", Integer, nullable=False),
+    Column(
+        "simulation_portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
+    Column("status", String, nullable=False),
+    Column("source_contract_hash", String),
+    Column("initial_cash", Numeric(20, 6)),
+    Column("opened_at", DateTime(timezone=True), nullable=False),
+    Column("frozen_at", DateTime(timezone=True)),
+    Column("freeze_reason", Text),
+    Column("promoted_at", DateTime(timezone=True)),
+    Column("created_by", String, nullable=False),
+    UniqueConstraint(
+        "strategy_version_id", "stage_index", name="uq_strategy_promotion_stages_index"
+    ),
+)
+Index(
+    "idx_strategy_promotion_stages_version",
+    strategy_promotion_stages.c.strategy_version_id,
+    strategy_promotion_stages.c.status,
+)
 
 
 def row_dict(row: Any) -> dict[str, Any]:

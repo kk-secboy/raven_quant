@@ -268,7 +268,11 @@ def execute_simulation_day(
             available = _sellable_quantity(state[instrument], trade_date)
             requested = min(requested, available)
             if desired[instrument] > 0:
-                requested = requested // 100 * 100
+                # Non-liquidating sells keep the board lot increment (100 on the
+                # main boards, 1 above the minimum on STAR/BSE); full exits may
+                # sell the odd lot.
+                increment = lot_rules[instrument].lot_increment
+                requested = requested // increment * increment
         if requested <= 0:
             order_specs.append(
                 _rejected_order(
