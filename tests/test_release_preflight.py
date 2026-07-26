@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
@@ -8,6 +9,26 @@ import pytest
 from quant_platform import release_preflight
 
 pytestmark = pytest.mark.no_database
+
+
+def _expected_migration_head(project_root: Path) -> str:
+    """Latest alembic revision: the one nobody lists as down_revision."""
+    revisions: dict[str, str | None] = {}
+    for path in sorted((project_root / "migrations" / "versions").glob("*.py")):
+        values: dict[str, object] = {}
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            target = node.targets[0] if isinstance(node, ast.Assign) else node.target
+            if isinstance(target, ast.Name) and target.id in {"revision", "down_revision"}:
+                values[target.id] = ast.literal_eval(node.value)
+        revision = values.get("revision")
+        if isinstance(revision, str):
+            down = values.get("down_revision")
+            revisions[revision] = down if isinstance(down, str) else None
+    heads = [rev for rev, down in revisions.items() if rev not in set(revisions.values()) - {None}]
+    assert len(heads) == 1, f"expected a single migration head, got {heads}"
+    return heads[0]
 
 
 class FakeComposeContext:
@@ -223,7 +244,7 @@ def test_known_older_database_revision_has_upgrade_path() -> None:
         "0017_qmt_execution_state",
     )
 
-    assert code_revision == "0038_corporate_actions"
+    assert code_revision == _expected_migration_head(project_root)
     assert state == "upgrade_required"
     assert compatible is True
 
@@ -236,6 +257,6 @@ def test_unknown_database_revision_fails_closed() -> None:
         "9999_unknown_revision",
     )
 
-    assert code_revision == "0038_corporate_actions"
+    assert code_revision == _expected_migration_head(project_root)
     assert state == "unknown_database_revision"
     assert compatible is False

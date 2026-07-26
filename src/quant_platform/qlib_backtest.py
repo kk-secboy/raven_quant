@@ -12,6 +12,22 @@ from .qlib_execution_strategy import create_qlib_execution_strategy
 
 QLIB_ENGINE_VERSION = "qlib-policy-engine-v5-single-mainline"
 
+# Per-component cost stress scenarios (design draft 7.3): each entry degrades
+# exactly the named CostModelConfig fields via CostScheduleBook.scaled, so a
+# scenario can be attributed to one cost channel. ``fill_rate_75pct`` tightens
+# the volume-participation cap, stressing the achievable fill rate rather than
+# a fee. ``double_cost`` (all components x2) stays as the aggregate scenario.
+COMPONENT_COST_STRESS_MULTIPLIERS: dict[str, dict[str, float]] = {
+    "commission_2x": {
+        "buy_commission_rate": 2.0,
+        "sell_commission_rate": 2.0,
+        "min_commission": 2.0,
+    },
+    "slippage_2x": {"fixed_slippage_rate": 2.0},
+    "impact_2x": {"impact_at_max_participation": 2.0},
+    "fill_rate_75pct": {"max_volume_participation": 0.75},
+}
+
 
 def _resolve_cost_schedule(
     cost_model: CostModelConfig | None,
@@ -96,6 +112,27 @@ def calculate_trade_metrics(fills: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _max_drawdown_recovery(nav: pd.Series) -> tuple[int | None, str]:
+    """Trading days from the max-drawdown trough back to the prior peak.
+
+    Returns ``(None, "ongoing")`` when the NAV has not recovered by the end of
+    the report and ``(0, "no_drawdown")`` when the NAV never trades below its
+    running peak.
+    """
+
+    peaks = nav.cummax()
+    drawdown = nav / peaks - 1.0
+    if not bool((drawdown < 0).any()):
+        return 0, "no_drawdown"
+    trough_position = int(drawdown.to_numpy(dtype=float).argmin())
+    peak_level = float(peaks.iloc[trough_position])
+    after = nav.iloc[trough_position + 1 :].to_numpy(dtype=float)
+    hits = np.flatnonzero(after >= peak_level * (1.0 - 1e-12))
+    if len(hits) == 0:
+        return None, "ongoing"
+    return int(hits[0]) + 1, "recovered"
+
+
 def calculate_qlib_metrics(
     report: pd.DataFrame,
     *,
@@ -130,6 +167,7 @@ def calculate_qlib_metrics(
     annualized_mar_excess = float((net.mean() - daily_mar) * 252)
     sortino_ok = annualized_downside > 0 and np.isfinite(annualized_downside)
     excess_std = _risk_value(excess_standard, "std")
+    recovery_days, recovery_status = _max_drawdown_recovery(nav)
     return {
         "backtest_engine": "qlib",
         "backtest_engine_version": QLIB_ENGINE_VERSION,
@@ -152,6 +190,8 @@ def calculate_qlib_metrics(
         "annual_minimum_acceptable_return": float(annual_minimum_acceptable_return),
         "annualized_downside_deviation": annualized_downside,
         "max_drawdown": _risk_value(net_geometric, "max_drawdown"),
+        "max_drawdown_recovery_days": recovery_days,
+        "max_drawdown_recovery_status": recovery_status,
         "average_turnover": float(pd.to_numeric(report["turnover"]).mean()),
         "total_cost": float(pd.to_numeric(report["cost"]).sum()),
         "trading_days": int(len(report)),
@@ -395,8 +435,10 @@ def run_qlib_validation_suites(
         ),
         "zero_retention_buffer": ({"n_drop": 0}, schedule),
     }
-    robustness: dict[str, dict[str, Any]] = {}
-    for name, (overrides, costs) in robustness_specs.items():
+
+    def scenario_entry(
+        name: str, overrides: dict[str, Any], costs: CostScheduleBook
+    ) -> dict[str, Any]:
         result = scenario_result(overrides, costs)
         excess_return = result.metrics.get("annualized_excess_return")
         drawdown = result.metrics.get("max_drawdown")
@@ -408,7 +450,7 @@ def run_qlib_validation_suites(
             and np.isfinite(float(drawdown))
             and float(drawdown) >= -float(config.get("max_drawdown", 0.25))
         )
-        robustness[name] = {
+        return {
             "passed": passed,
             "overrides": overrides,
             "cost_model": costs.to_dict(),
@@ -419,7 +461,19 @@ def run_qlib_validation_suites(
                 else {}
             ),
         }
+
+    robustness = {
+        name: scenario_entry(name, overrides, costs)
+        for name, (overrides, costs) in robustness_specs.items()
+    }
     robustness_pass_rate = sum(item["passed"] for item in robustness.values()) / len(robustness)
+    component_cost_stress = {
+        name: scenario_entry(name, {}, schedule.scaled(**multipliers))
+        for name, multipliers in COMPONENT_COST_STRESS_MULTIPLIERS.items()
+    }
+    component_pass_rate = sum(
+        item["passed"] for item in component_cost_stress.values()
+    ) / len(component_cost_stress)
     dates = pd.DatetimeIndex(full_result.report.index).tz_localize(None)
     window = int(config.get("rolling_window_days", 252))
     step = int(config.get("rolling_step_days", 63))
@@ -541,6 +595,15 @@ def run_qlib_validation_suites(
             "scenarios": robustness,
         },
         "double_cost": robustness["double_cost"],
+        "component_cost_stress": {
+            "scenario_count": len(component_cost_stress),
+            "pass_rate": component_pass_rate,
+            "passed": len(component_cost_stress) == len(COMPONENT_COST_STRESS_MULTIPLIERS)
+            and component_pass_rate
+            >= float(config.get("min_component_stress_pass_rate", 1.0)),
+            "minimum_pass_rate": float(config.get("min_component_stress_pass_rate", 1.0)),
+            "scenarios": component_cost_stress,
+        },
         "rolling": {
             "window_count": len(rolling),
             "pass_rate": rolling_pass_rate,

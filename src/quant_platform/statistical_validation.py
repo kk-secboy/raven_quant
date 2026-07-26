@@ -26,10 +26,17 @@ def newey_west_mean_test(values: pd.Series | list[float], *, max_lag: int) -> di
     long_run_variance = max(0.0, long_run_variance)
     standard_error = sqrt(long_run_variance / len(sample))
     mean = float(sample.mean())
-    if standard_error == 0:
-        statistic = float("inf") if mean != 0 else 0.0
-        p_value = 0.0 if mean != 0 else 1.0
-        status = "zero_hac_variance"
+    # Degenerate long-run variance (constant series or exact cancellation):
+    # no finite statistic exists. Report an explicit undefined state (same
+    # pattern as sortino_status) instead of inf so downstream gates treat it
+    # as insufficient evidence. The tolerance is relative to the sample scale
+    # because floating-point residue keeps a truly constant series' variance
+    # marginally above zero.
+    scale = max(float(np.abs(sample).max()), 1e-8)
+    if standard_error <= scale * 1e-12:
+        statistic = None
+        p_value = None
+        status = "undefined_zero_hac_variance"
     else:
         statistic = mean / standard_error
         p_value = float(2.0 * norm.sf(abs(statistic)))

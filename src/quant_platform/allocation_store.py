@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from quant_data.database import (
     simulation_nav,
     simulation_portfolios,
     strategies,
+    strategy_allocation_artifacts,
     strategy_allocation_events,
     strategy_allocation_members,
     strategy_allocation_nav,
@@ -37,7 +39,10 @@ from .member_risk_gate import (
     load_strategy_risk_state,
 )
 from .risk_math import COVARIANCE_MODEL_VERSION
-from .strategy_allocation import analyze_strategy_allocation
+from .strategy_allocation import (
+    analyze_strategy_allocation,
+    renormalize_budgets_for_suspended,
+)
 from .strategy_store import StrategyStore
 
 
@@ -47,6 +52,23 @@ def _now() -> datetime:
 
 def _decimal(value: Any) -> Decimal:
     return Decimal(str(value))
+
+
+DECISION_FREQUENCIES = frozenset({"weekly", "monthly"})
+
+
+def next_decision_date(decision_date: date, frequency: str) -> date:
+    """Next frozen decision day; the artifact stays valid strictly before it."""
+
+    if frequency == "weekly":
+        return decision_date + timedelta(days=7)
+    if frequency == "monthly":
+        month = decision_date.month + 1
+        year = decision_date.year + (1 if month > 12 else 0)
+        month = month - 12 if month > 12 else month
+        day = min(decision_date.day, calendar.monthrange(year, month)[1])
+        return date(year, month, day)
+    raise ValueError(f"unknown decision frequency: {frequency}")
 
 
 def _canonical_hash(value: Any) -> str:
@@ -113,12 +135,15 @@ class AllocationStore:
         fixed_weights: dict[str, float] | None,
         actor: str,
         member_specs: list[dict[str, Any]] | None = None,
+        decision_frequency: str = "monthly",
     ) -> dict[str, Any]:
         version_ids = list(
             dict.fromkeys(item.strip() for item in strategy_version_ids if item.strip())
         )
         if len(version_ids) < 2 or len(version_ids) > 10:
             raise ValueError("a strategy allocation requires 2 to 10 unique strategy versions")
+        if decision_frequency not in DECISION_FREQUENCIES:
+            raise ValueError("allocation decision frequency must be weekly or monthly")
         if not name.strip() or not dataset.strip() or not actor.strip():
             raise ValueError("name, dataset and actor are required")
         if total_capital < 500_000:
@@ -210,38 +235,11 @@ class AllocationStore:
                 for version_id in version_ids
             },
         )
-        unscaled = {
-            version_id: float(analysis["members"][version_id]["unscaled_weight"])
-            for version_id in version_ids
-        }
-        for version_id, weight in unscaled.items():
-            if weight > governance[version_id]["member_cap"] + 1e-9:
-                raise ValueError(
-                    f"strategy {version_id} weight exceeds its core/satellite member cap"
-                )
-        core_weight = sum(
-            weight
-            for version_id, weight in unscaled.items()
-            if governance[version_id]["role"] == "core"
-        )
-        satellite_weight = sum(
-            weight
-            for version_id, weight in unscaled.items()
-            if governance[version_id]["role"] == "satellite"
-        )
-        if core_weight < 0.70 - 1e-9 or satellite_weight > 0.30 + 1e-9:
-            raise ValueError("allocation must keep at least 70% core and at most 30% satellite")
-        analysis["core_satellite"] = {
-            "core_weight": core_weight,
-            "satellite_weight": satellite_weight,
-            "members": governance,
-        }
-        analysis["solver"]["allocation_governance_wrapper"] = (
-            "project_core_satellite_caps_v1"
-        )
-        analysis["solver"]["governed_max_strategy_weight"] = max_strategy_weight
+        analysis = self._apply_member_governance(analysis, governance, max_strategy_weight)
         allocation_id = uuid.uuid4().hex
         now = _now()
+        decision_date = now.date()
+        valid_until = next_decision_date(decision_date, decision_frequency)
         capital = _decimal(total_capital)
         try:
             with self.engine.begin() as connection:
@@ -253,6 +251,7 @@ class AllocationStore:
                         status="draft",
                         is_legacy=False,
                         allocation_method=allocation_method,
+                        decision_frequency=decision_frequency,
                         lookback_days=lookback_days,
                         target_volatility=target_volatility,
                         max_pairwise_correlation=max_pairwise_correlation,
@@ -290,6 +289,13 @@ class AllocationStore:
                             created_at=now,
                         )
                     )
+                self._write_artifact(
+                    connection,
+                    allocation_id,
+                    decision_date=decision_date,
+                    analysis=analysis,
+                    valid_until=valid_until,
+                )
                 self._event(
                     connection,
                     allocation_id,
@@ -303,6 +309,314 @@ class AllocationStore:
         except IntegrityError as exc:
             raise ValueError(f"strategy allocation name {name!r} already exists") from exc
         return self.get(allocation_id)
+
+    @staticmethod
+    def _apply_member_governance(
+        analysis: dict[str, Any],
+        governance: dict[str, dict[str, Any]],
+        max_strategy_weight: float,
+    ) -> dict[str, Any]:
+        """Enforce product-level core/satellite member caps on a solved analysis."""
+
+        unscaled = {
+            version_id: float(analysis["members"][version_id]["unscaled_weight"])
+            for version_id in governance
+        }
+        for version_id, weight in unscaled.items():
+            if weight > governance[version_id]["member_cap"] + 1e-9:
+                raise ValueError(
+                    f"strategy {version_id} weight exceeds its core/satellite member cap"
+                )
+        core_weight = sum(
+            weight
+            for version_id, weight in unscaled.items()
+            if governance[version_id]["role"] == "core"
+        )
+        satellite_weight = sum(
+            weight
+            for version_id, weight in unscaled.items()
+            if governance[version_id]["role"] == "satellite"
+        )
+        if core_weight < 0.70 - 1e-9 or satellite_weight > 0.30 + 1e-9:
+            raise ValueError("allocation must keep at least 70% core and at most 30% satellite")
+        analysis["core_satellite"] = {
+            "core_weight": core_weight,
+            "satellite_weight": satellite_weight,
+            "members": governance,
+        }
+        analysis["solver"]["allocation_governance_wrapper"] = (
+            "project_core_satellite_caps_v1"
+        )
+        analysis["solver"]["governed_max_strategy_weight"] = max_strategy_weight
+        return analysis
+
+    @staticmethod
+    def _assert_single_active_allocation(connection: Any, allocation_id: str) -> None:
+        other = connection.execute(
+            select(strategy_allocations.c.id, strategy_allocations.c.name).where(
+                strategy_allocations.c.status == "active",
+                strategy_allocations.c.id != allocation_id,
+            )
+        ).first()
+        if other is not None:
+            raise ValueError(
+                f"strategy allocation {other.name!r} is already active; pause it before "
+                "activating another one (design 6.10: a single active allocation policy)"
+            )
+
+    def _write_artifact(
+        self,
+        connection: Any,
+        allocation_id: str,
+        *,
+        decision_date: date,
+        analysis: dict[str, Any],
+        valid_until: date,
+    ) -> str:
+        """Persist one AllocationArtifact (design 6.10) inside the transaction."""
+
+        member_weights = {
+            version_id: float(evidence["target_weight"])
+            for version_id, evidence in analysis["members"].items()
+        }
+        inputs_as_of = pd.Timestamp(analysis["period_end"]).date()
+        artifact_hash = _canonical_hash(
+            {
+                "allocation_id": allocation_id,
+                "decision_date": decision_date.isoformat(),
+                "inputs_as_of": inputs_as_of.isoformat(),
+                "valid_until": valid_until.isoformat(),
+                "member_weights": member_weights,
+                "covariance_model_version": analysis.get("covariance_model_version"),
+                "solver": analysis.get("solver"),
+            }
+        )
+        artifact_id = uuid.uuid4().hex
+        connection.execute(
+            insert(strategy_allocation_artifacts).values(
+                id=artifact_id,
+                allocation_id=allocation_id,
+                decision_date=decision_date,
+                inputs_as_of=inputs_as_of,
+                valid_until=valid_until,
+                member_weights_json=member_weights,
+                analysis_json=analysis,
+                artifact_hash=artifact_hash,
+                created_at=_now(),
+            )
+        )
+        return artifact_id
+
+    @staticmethod
+    def _suspended_member_weights(
+        connection: Any, members: Any
+    ) -> dict[str, float]:
+        """Members whose recommendation portfolio is paused or fully de-risked.
+
+        Suspension only takes effect on the next frozen decision day (budgets
+        are never re-estimated mid-cycle); detection is deterministic: a paused
+        member portfolio or ``risk_exposure_override <= 0`` marks the member.
+        """
+
+        suspended: dict[str, float] = {}
+        for member in members:
+            portfolio_id = member.recommendation_portfolio_id
+            if not portfolio_id:
+                continue
+            portfolio = connection.execute(
+                select(
+                    recommendation_portfolios.c.status,
+                    recommendation_portfolios.c.risk_exposure_override,
+                ).where(recommendation_portfolios.c.id == portfolio_id)
+            ).first()
+            if portfolio is None:
+                continue
+            override = portfolio.risk_exposure_override
+            if str(portfolio.status) == "paused" or (
+                override is not None and float(override) <= 0.0
+            ):
+                suspended[str(member.strategy_version_id)] = float(member.target_weight)
+        return suspended
+
+    def _solve_member_budgets(
+        self, connection: Any, allocation: Any, members: Any
+    ) -> dict[str, Any]:
+        """Load member evidence and solve budgets with the frozen policy method."""
+
+        returns: dict[str, pd.Series] = {}
+        governance: dict[str, dict[str, Any]] = {}
+        for member in members:
+            version_id = str(member.strategy_version_id)
+            backtest = connection.execute(
+                select(backtest_runs).where(backtest_runs.c.id == member.backtest_id)
+            ).first()
+            if backtest is None:
+                raise ValueError(f"member {version_id} backtest evidence is missing")
+            returns[version_id] = self._daily_returns(row_dict(backtest))
+            governance[version_id] = {
+                "role": str(member.role),
+                "risk_budget": float(member.risk_budget),
+                "member_cap": float(member.member_cap),
+            }
+        # A fixed-budget policy re-applies the frozen user weights instead of
+        # fabricating a new optimization input (design 6.10 fallback semantics).
+        fixed_weights = (
+            {
+                version_id: float(member.target_weight)
+                for version_id, member in (
+                    (str(item.strategy_version_id), item) for item in members
+                )
+            }
+            if allocation.allocation_method == "fixed"
+            else None
+        )
+        analysis = analyze_strategy_allocation(
+            pd.concat(returns, axis=1, join="inner"),
+            method=allocation.allocation_method,
+            lookback_days=int(allocation.lookback_days),
+            target_volatility=float(allocation.target_volatility),
+            max_pairwise_correlation=float(allocation.max_pairwise_correlation),
+            max_strategy_weight=1.0,
+            fixed_weights=fixed_weights,
+            risk_budgets={
+                version_id: governance[version_id]["risk_budget"] for version_id in governance
+            },
+        )
+        return self._apply_member_governance(
+            analysis, governance, float(allocation.max_strategy_weight)
+        )
+
+    def _resolve_with_suspended(
+        self,
+        connection: Any,
+        allocation: Any,
+        members: Any,
+        suspended: dict[str, float],
+        decision_date: date,
+    ) -> dict[str, Any]:
+        """Decision-day re-solve with suspended members (design 6.10 fallback).
+
+        The policy method re-solves on the active set when at least two active
+        members remain; a single active member keeps its frozen budget as the
+        simple baseline (no re-estimation is possible with fewer than two
+        return series), and with no active member everything falls to cash.
+        The suspended budget always moves to cash via
+        ``renormalize_budgets_for_suspended`` — never redistributed as
+        leverage, never re-estimated outside the frozen decision day.
+        """
+
+        previous_weights = {
+            str(member.strategy_version_id): float(member.target_weight) for member in members
+        }
+        active = [
+            member
+            for member in members
+            if str(member.strategy_version_id) not in suspended
+        ]
+        if len(active) >= 2:
+            analysis = self._solve_member_budgets(connection, allocation, active)
+        else:
+            fallback: dict[str, Any] = {
+                "method": str(allocation.allocation_method),
+                "period_start": decision_date.isoformat(),
+                "period_end": decision_date.isoformat(),
+                "covariance_model_version": None,
+                "solver": {"success": True},
+            }
+            if len(active) == 1:
+                version_id = str(active[0].strategy_version_id)
+                weight = previous_weights[version_id]
+                fallback.update(
+                    {
+                        "fallback_reason": "single_active_member_keeps_frozen_budget",
+                        "solver": {"success": True, "engine": "frozen_budget_fallback_v1"},
+                        "members": {
+                            version_id: {
+                                "unscaled_weight": weight,
+                                "target_weight": weight,
+                                "annualized_volatility": None,
+                                "risk_contribution": None,
+                                "risk_budget": None,
+                            }
+                        },
+                    }
+                )
+            else:
+                fallback.update(
+                    {
+                        "fallback_reason": "no_active_members_all_cash",
+                        "solver": {"success": True, "engine": "cash_fallback_v1"},
+                        "members": {},
+                    }
+                )
+            analysis = fallback
+        return renormalize_budgets_for_suspended(
+            analysis, previous_weights=previous_weights, suspended=suspended
+        )
+
+    def _resolve_artifact(
+        self, connection: Any, allocation: Any, decision_date: date
+    ) -> None:
+        """Re-solve member budgets on a frozen decision day and apply them once."""
+
+        members = connection.execute(
+            select(strategy_allocation_members).where(
+                strategy_allocation_members.c.allocation_id == allocation.id
+            )
+        ).all()
+        if not members:
+            raise ValueError("allocation has no members to re-solve")
+        suspended = self._suspended_member_weights(connection, members)
+        if suspended:
+            analysis = self._resolve_with_suspended(
+                connection, allocation, members, suspended, decision_date
+            )
+        else:
+            analysis = self._solve_member_budgets(connection, allocation, members)
+        frequency = str(getattr(allocation, "decision_frequency", None) or "monthly")
+        valid_until = next_decision_date(decision_date, frequency)
+        for member in members:
+            version_id = str(member.strategy_version_id)
+            connection.execute(
+                update(strategy_allocation_members)
+                .where(
+                    strategy_allocation_members.c.allocation_id == allocation.id,
+                    strategy_allocation_members.c.strategy_version_id == version_id,
+                )
+                .values(target_weight=analysis["members"][version_id]["target_weight"])
+            )
+        connection.execute(
+            update(strategy_allocations)
+            .where(strategy_allocations.c.id == allocation.id)
+            .values(
+                cash_reserve=_decimal(allocation.total_capital)
+                * _decimal(analysis["cash_weight"]),
+                updated_at=_now(),
+            )
+        )
+        self._write_artifact(
+            connection,
+            str(allocation.id),
+            decision_date=decision_date,
+            analysis=analysis,
+            valid_until=valid_until,
+        )
+        self._event(
+            connection,
+            str(allocation.id),
+            event_type="allocation.artifact_resolved",
+            severity="info",
+            rule="frozen_decision_day",
+            details={
+                "decision_date": decision_date.isoformat(),
+                "valid_until": valid_until.isoformat(),
+                **(
+                    {"suspended_members": suspended, "renormalization": analysis["renormalization"]}
+                    if suspended
+                    else {}
+                ),
+            },
+        )
 
     def approve(self, allocation_id: str, *, actor: str, reason: str) -> dict[str, Any]:
         if not actor.strip() or len(reason.strip()) < 10:
@@ -322,6 +636,7 @@ class AllocationStore:
                 raise ValueError("only draft strategy allocations may be approved")
             if actor.strip() == allocation.created_by:
                 raise ValueError("strategy allocation approval requires a second operator")
+            self._assert_single_active_allocation(connection, allocation_id)
             analysis = dict(allocation.analysis_json or {})
             if analysis.get("covariance_model_version") != COVARIANCE_MODEL_VERSION:
                 raise ValueError("allocation covariance evidence is obsolete")
@@ -415,6 +730,7 @@ class AllocationStore:
                         base_currency="CNY",
                         hypothetical_initial_value=initial_value,
                         risk_exposure_override=1.0,
+                        recommendation_scope="allocation_member",
                         created_by=allocation.created_by,
                         created_at=now,
                         updated_at=now,
@@ -544,6 +860,7 @@ class AllocationStore:
                 ).first()
                 if unresolved is not None:
                     raise ValueError("critical allocation events must be resolved first")
+                self._assert_single_active_allocation(connection, allocation_id)
             portfolio_ids = self._portfolio_ids(connection, allocation_id)
             member_version_ids = list(
                 connection.scalars(
@@ -616,6 +933,42 @@ class AllocationStore:
                 raise ValueError("legacy paper-backed allocations are read-only")
             if allocation.status not in {"active", "risk_reduction_pending", "liquidation_pending"}:
                 raise ValueError("strategy allocation is not refreshable")
+            # Frozen-decision-day gate (design 6.10/8.1): member budgets are
+            # only re-solved when the current artifact has expired; every
+            # other refresh reuses the still-valid artifact and never
+            # re-estimates risk on the fly.
+            if allocation.status == "active":
+                current_artifact = connection.execute(
+                    select(strategy_allocation_artifacts)
+                    .where(
+                        strategy_allocation_artifacts.c.allocation_id == allocation_id
+                    )
+                    .order_by(
+                        strategy_allocation_artifacts.c.decision_date.desc(),
+                        strategy_allocation_artifacts.c.created_at.desc(),
+                    )
+                    .limit(1)
+                ).first()
+                if current_artifact is None or now.date() >= current_artifact.valid_until:
+                    try:
+                        self._resolve_artifact(connection, allocation, now.date())
+                    except ValueError as exc:
+                        # A failed re-solve never blocks NAV recording: the
+                        # previous budgets stay in force and the next refresh
+                        # retries the decision day.
+                        self._event(
+                            connection,
+                            allocation_id,
+                            event_type="allocation.artifact_reschedule_failed",
+                            severity="info",
+                            rule="frozen_decision_day",
+                            details={"error": str(exc)},
+                        )
+                    allocation = connection.execute(
+                        select(strategy_allocations)
+                        .where(strategy_allocations.c.id == allocation_id)
+                        .with_for_update()
+                    ).first()
             members = connection.execute(
                 select(strategy_allocation_members).where(
                     strategy_allocation_members.c.allocation_id == allocation_id
@@ -1015,6 +1368,21 @@ class AllocationStore:
                     .limit(500)
                 )
             ]
+            artifacts = []
+            for item in connection.execute(
+                select(strategy_allocation_artifacts)
+                .where(strategy_allocation_artifacts.c.allocation_id == allocation_id)
+                .order_by(
+                    strategy_allocation_artifacts.c.decision_date.desc(),
+                    strategy_allocation_artifacts.c.created_at.desc(),
+                )
+                .limit(50)
+            ):
+                artifact = row_dict(item)
+                artifact["member_weights"] = artifact.pop("member_weights_json")
+                artifact["analysis"] = artifact.pop("analysis_json")
+                artifacts.append(artifact)
+            result["artifacts"] = artifacts
         return result
 
     def list(self, limit: int = 100) -> list[dict[str, Any]]:

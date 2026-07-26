@@ -1098,6 +1098,146 @@ class ResearchStore:
             )
         return self.get_evaluation(evaluation_id)
 
+    def record_failed_evaluation(
+        self,
+        candidate_id: str,
+        *,
+        dataset: str,
+        dataset_identity_sha256: str,
+        train_start: date,
+        train_end: date,
+        valid_start: date,
+        valid_end: date,
+        test_start: date,
+        test_end: date,
+        error: str,
+        actor: str = "qlib-evaluator",
+    ) -> dict[str, Any]:
+        """Ledger an operationally failed/timed-out/aborted evaluation.
+
+        Design draft 4.2/6.6: failed trials must be recorded, never silently
+        dropped. ``evaluation_failed`` is distinct from ``gate_failed`` — the
+        evaluation itself produced no metrics, so there is no gate outcome;
+        downstream consumers (promotion requires a *passed* latest gate,
+        deterministic ranking requires ``gate_status == "passed"``) treat it
+        as unqualified. The candidate may be re-evaluated later; the failure
+        row stays in the immutable ledger either way.
+        """
+
+        if not (train_start <= train_end < valid_start <= valid_end < test_start <= test_end):
+            raise ValueError(
+                "train, validation, and test windows must be ordered and non-overlapping"
+            )
+        if not _is_sha256(dataset_identity_sha256):
+            raise ValueError("factor evaluation requires immutable dataset identity")
+        candidate = self.get_candidate(candidate_id)
+        if candidate["status"] in {"promoted", "retired"}:
+            raise ValueError(
+                f"cannot record a failed evaluation in {candidate['status']} state"
+            )
+        summary = " ".join(str(error or "").split())[:1000] or "evaluation failed"
+        periods = {
+            "train_start": train_start.isoformat(),
+            "train_end": train_end.isoformat(),
+            "valid_start": valid_start.isoformat(),
+            "valid_end": valid_end.isoformat(),
+            "test_start": test_start.isoformat(),
+            "test_end": test_end.isoformat(),
+        }
+        run_context = {
+            "candidate_id": candidate_id,
+            "dataset": dataset,
+            "dataset_identity_sha256": dataset_identity_sha256,
+            "periods": periods,
+            "evaluator_version": self.policy.version,
+            "label_horizon_days": int(candidate.get("label_horizon_days") or 1),
+        }
+        run_context_sha256 = _canonical_sha256(run_context)
+        failure_evidence = {
+            "executor_version": "evaluation-failure-v1",
+            "error": summary,
+            "run_context": run_context,
+            "run_context_sha256": run_context_sha256,
+        }
+        metrics_sha256 = _canonical_sha256({})
+        policy = asdict(self.policy)
+        policy_sha256 = _canonical_sha256(policy)
+        evidence = _evaluation_evidence(
+            candidate_id=candidate_id,
+            dataset=dataset,
+            dataset_identity_sha256=dataset_identity_sha256,
+            periods=periods,
+            gate_status="evaluation_failed",
+            gate_reasons=[summary],
+            evaluator_version=self.policy.version,
+            candidate_code_sha256=str(candidate.get("code_sha256") or ""),
+            candidate_values_sha256=str(candidate.get("values_sha256") or ""),
+            submitted_values_sha256=str(candidate.get("values_sha256") or ""),
+            recompute_evidence_sha256=_canonical_sha256(failure_evidence),
+            artifact_sha256="",
+            metrics_sha256=metrics_sha256,
+            policy_sha256=policy_sha256,
+        )
+        evidence_sha256 = _canonical_sha256(evidence)
+        evaluation_id = uuid.uuid4().hex
+        now = _now()
+        with self.engine.begin() as connection:
+            connection.execute(
+                insert(factor_evaluations).values(
+                    id=evaluation_id,
+                    factor_candidate_id=candidate_id,
+                    dataset=dataset,
+                    dataset_identity_sha256=dataset_identity_sha256,
+                    train_start=train_start,
+                    train_end=train_end,
+                    valid_start=valid_start,
+                    valid_end=valid_end,
+                    test_start=test_start,
+                    test_end=test_end,
+                    metrics_json={},
+                    gate_status="evaluation_failed",
+                    gate_reasons_json=[summary],
+                    evaluator_version=self.policy.version,
+                    artifact_path=None,
+                    candidate_code_sha256=candidate.get("code_sha256"),
+                    candidate_values_sha256=candidate.get("values_sha256"),
+                    submitted_values_sha256=candidate.get("values_sha256"),
+                    recompute_evidence_json=failure_evidence,
+                    statistical_contract_version="research-statistics-v1-hac-bh-dsr",
+                    signal_frequency="day",
+                    signal_horizon=f"{int(candidate.get('label_horizon_days') or 1)}d",
+                    execution_frequency="day",
+                    execution_contract_hash=evidence_sha256,
+                    qlib_version=f"0.0.dev0+g{QLIB_COMMIT}",
+                    qlib_commit=QLIB_COMMIT,
+                    rdagent_version=f"0.0.dev0+g{RDAGENT_COMMIT}",
+                    rdagent_commit=RDAGENT_COMMIT,
+                    metrics_sha256=metrics_sha256,
+                    policy_json=policy,
+                    policy_sha256=policy_sha256,
+                    evidence_sha256=evidence_sha256,
+                    created_at=now,
+                )
+            )
+            connection.execute(
+                update(factor_candidates)
+                .where(factor_candidates.c.id == candidate_id)
+                .values(status="evaluation_failed", updated_at=now)
+            )
+            self._event(
+                connection,
+                run_id=candidate["research_run_id"],
+                candidate_id=candidate_id,
+                event_type="candidate.evaluation_failed",
+                actor=actor,
+                payload={
+                    "evaluation_id": evaluation_id,
+                    "error": summary,
+                    "run_context_sha256": run_context_sha256,
+                },
+            )
+        return self.get_evaluation(evaluation_id)
+
     def promote(self, candidate_id: str, *, actor: str, reason: str) -> dict[str, Any]:
         actor = actor.strip()
         reason = reason.strip()

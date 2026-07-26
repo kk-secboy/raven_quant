@@ -260,6 +260,15 @@ class LocalJobWorker:
                         self._import_factor_evaluations(job, result or {})
                         self.research.mark_run(research_run_id, "succeeded")
                 else:
+                    if (
+                        job["kind"] == "factor_evaluate"
+                        and isinstance(result, dict)
+                        and result.get("evaluations")
+                    ):
+                        # A partially failed batch still owes the trial ledger
+                        # every outcome: import ok and failed evaluations before
+                        # marking the run failed (design draft 4.2/6.6).
+                        self._import_factor_evaluations(job, result)
                     self.research.mark_run(
                         research_run_id,
                         "failed",
@@ -1707,6 +1716,15 @@ class LocalJobWorker:
         )
         for item in result.get("evaluations", []):
             if item.get("status") != "ok":
+                # Design draft 4.2/6.6: failed/timed-out trials are ledgered as
+                # evaluation_failed, never silently dropped.
+                self.research.record_failed_evaluation(
+                    str(item["candidate_id"]),
+                    dataset=payload["dataset"],
+                    dataset_identity_sha256=payload["dataset_identity_sha256"],
+                    **periods,
+                    error=str(item.get("error") or "evaluation failed"),
+                )
                 continue
             self.research.record_evaluation(
                 item["candidate_id"],

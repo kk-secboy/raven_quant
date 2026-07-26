@@ -145,7 +145,11 @@ def main() -> None:
     for family in families.values():
         declared = max(int(item.get("experiment_count") or len(family)) for item in family)
         p_values = [
-            float((item.get("metrics") or {}).get("hac_p_value", 1.0)) for item in family
+            float(
+                1.0 if (p_value := (item.get("metrics") or {}).get("hac_p_value")) is None
+                else p_value
+            )
+            for item in family
         ]
         p_values.extend([1.0] * max(0, declared - len(p_values)))
         q_values = benjamini_hochberg(p_values)

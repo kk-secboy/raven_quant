@@ -790,7 +790,10 @@ def test_import_external_evaluations_end_to_end(tmp_path: Path, database_url: st
         "experiment_count": 1,
         "evidence": _evidence(store, candidate["id"], ext.SHAPE_SPARSE_EVENT),
     }
-    failed = {"candidate_id": "unrelated", "status": "failed", "error": "boom"}
+    failed_candidate = _external_candidate(
+        store, tmp_path, factor, name="irm_qa_sentiment_daily", run_kind="external_import_eval_2"
+    )
+    failed = {"candidate_id": failed_candidate["id"], "status": "failed", "error": "boom"}
     result = {"status": "ok", "evaluations": [entry, failed]}
     ext.apply_family_bh_correction(result["evaluations"])
     artifact = _write_result_artifact(tmp_path / "result.json", candidate["id"], entry["metrics"])
@@ -805,6 +808,26 @@ def test_import_external_evaluations_end_to_end(tmp_path: Path, database_url: st
     assert len(imported) == 1
     assert imported[0]["gate_status"] == "passed"
     assert store.get_candidate(candidate["id"])["status"] == "gate_passed"
+    # Failed trials are ledgered, not silently dropped (design draft 4.2/6.6).
+    failed_state = store.get_candidate(failed_candidate["id"])
+    assert failed_state["status"] == "evaluation_failed"
+    assert failed_state["latest_evaluation"]["gate_status"] == "evaluation_failed"
+    assert failed_state["latest_evaluation"]["gate_reasons"] == ["boom"]
+    # A failure that cannot be attributed to a ledgered candidate is a
+    # producer bug and must raise instead of being silently skipped.
+    bogus = {
+        "status": "ok",
+        "evaluations": [{"candidate_id": "unrelated", "status": "failed", "error": "boom"}],
+    }
+    with pytest.raises(KeyError):
+        ext.import_external_evaluations(
+            store,
+            bogus,
+            dataset="snapshot-external",
+            dataset_identity_sha256=DATASET_IDENTITY,
+            periods=PERIODS,
+            artifact_path=artifact,
+        )
 
 
 @pytest.mark.no_database

@@ -65,6 +65,8 @@ POLICY_BY_SHAPE: dict[str, type[ExternalGatePolicy]] = {
     SHAPE_MARKET_TIMESERIES: MarketTimeseriesGatePolicy,
 }
 
+PLACEBO_DIAGNOSTICS_VERSION = "placebo-leakage-sentinel-v1"
+
 
 @dataclass(frozen=True, slots=True)
 class ExternalEvaluationConfig:
@@ -90,6 +92,20 @@ class ExternalEvaluationConfig:
     sparse_mean_coverage_ratio: float = 0.25
     # Quantile bucket count for the market-timeseries long/short diagnostic.
     quantile_count: int = 5
+    # Negative-control (shuffled-label placebo) and leakage-sentinel knobs
+    # (design draft 6.8). Placebo rounds permute the factor/label link with a
+    # fixed seed so the diagnostic is reproducible; the real statistic must sit
+    # above placebo_percentile_threshold of the placebo distribution or the
+    # evaluation is flagged. The leakage sentinel replays the statistic with
+    # the factor shifted +/-1 trading day per instrument: a signal whose
+    # aligned IC collapses (below leakage_collapse_ratio of the aligned value)
+    # under a one-day shift has suspiciously exact timing (look-ahead or
+    # same-bar contamination). Both are recorded as diagnostics, never as
+    # hard rejections.
+    placebo_rounds: int = 20
+    placebo_seed: int = 20260721
+    placebo_percentile_threshold: float = 0.95
+    leakage_collapse_ratio: float = 0.5
 
 
 # ValueError messages raised by evaluate_factor_values for caller/config bugs;
@@ -231,6 +247,179 @@ def _insufficient(shape: str, reasons: list[str]) -> dict[str, Any]:
     return {"status": "insufficient_evidence", "shape": shape, "metrics": None, "reasons": reasons}
 
 
+# ---------------------------------------------------------------------------
+# Negative-control (placebo) and leakage-sentinel diagnostics (design 6.8)
+# ---------------------------------------------------------------------------
+
+
+def _joined_frame(
+    factor: pd.Series, label: pd.Series
+) -> tuple[pd.DataFrame, bool]:
+    """Inner-joined factor/label frame; timeseries mode for single-instrument pairs."""
+
+    factor_instruments = set(factor.index.get_level_values("instrument").unique())
+    label_instruments = set(label.index.get_level_values("instrument").unique())
+    timeseries = len(factor_instruments) == 1 and len(label_instruments) == 1
+    if timeseries:
+        frame = pd.concat(
+            [factor.droplevel("instrument"), label.droplevel("instrument")],
+            axis=1,
+            join="inner",
+        ).dropna()
+    else:
+        frame = pd.concat([factor, label], axis=1, join="inner").dropna()
+    return frame.sort_index(), timeseries
+
+
+def _ic_statistic(frame: pd.DataFrame, timeseries: bool) -> float:
+    """Mean daily Spearman IC (cross-sectional) or full-series Spearman (timeseries)."""
+
+    if frame.empty:
+        return float("nan")
+    if timeseries:
+        if len(frame) < 5 or frame["factor"].nunique() < 2 or frame["label"].nunique() < 2:
+            return float("nan")
+        return float(frame["factor"].rank().corr(frame["label"].rank()))
+
+    def daily(group: pd.DataFrame) -> float:
+        if len(group) < 5 or group["factor"].nunique() < 2 or group["label"].nunique() < 2:
+            return float("nan")
+        return float(group["factor"].rank().corr(group["label"].rank()))
+
+    daily_ic = frame.groupby(level="datetime", sort=True).apply(daily).dropna()
+    return float(daily_ic.mean()) if len(daily_ic) else float("nan")
+
+
+def _placebo_statistic(
+    frame: pd.DataFrame, timeseries: bool, rng: np.random.Generator
+) -> float:
+    """One shuffled-label placebo round: same marginals, broken factor/label link."""
+
+    if timeseries:
+        if len(frame) < 2:
+            return float("nan")
+        shifted = frame.copy()
+        offset = int(rng.integers(1, len(frame)))
+        shifted["label"] = np.roll(frame["label"].to_numpy(dtype=float), offset)
+        return _ic_statistic(shifted, timeseries)
+    labels = frame["label"]
+    permuted = labels.groupby(level="datetime", group_keys=False).apply(
+        lambda series: pd.Series(
+            rng.permutation(series.to_numpy(dtype=float)), index=series.index
+        )
+    )
+    shuffled = frame.copy()
+    shuffled["label"] = permuted
+    return _ic_statistic(shuffled, timeseries)
+
+
+def _shifted_factor_stat(
+    frame: pd.DataFrame, timeseries: bool, periods: int
+) -> float:
+    """IC with the factor shifted ``periods`` trading days within each instrument.
+
+    ``periods=-1`` pairs today's label with tomorrow's factor (look-ahead
+    simulation); ``periods=+1`` replays the signal one day late.
+    """
+
+    if timeseries:
+        shifted = frame.copy()
+        shifted["factor"] = frame["factor"].shift(periods)
+        return _ic_statistic(shifted.dropna(), timeseries)
+    shifted_factor = frame.groupby(level="instrument")["factor"].shift(periods)
+    shifted = frame.copy()
+    shifted["factor"] = shifted_factor
+    return _ic_statistic(shifted.dropna(), timeseries)
+
+
+def evaluate_placebo_leakage_diagnostics(
+    factor: pd.Series,
+    label: pd.Series,
+    *,
+    config: ExternalEvaluationConfig | None = None,
+) -> dict[str, Any]:
+    """Shuffled-label placebo distribution and label-shift leakage sentinel.
+
+    Both inputs must already be normalized to the evaluation window (the
+    callers pass their own normalized, windowed series). The same-bar fill
+    side of the leakage contract is enforced at the execution layer
+    (open-price dealing plus limit thresholds in qlib_exchange); here the
+    +/-1 trading-day shift replay covers same-bar/look-ahead contamination
+    of the factor values themselves. Diagnostics are recorded, never hard
+    rejections.
+    """
+
+    config = config or ExternalEvaluationConfig()
+    base: dict[str, Any] = {
+        "version": PLACEBO_DIAGNOSTICS_VERSION,
+        "rounds": int(config.placebo_rounds),
+        "seed": int(config.placebo_seed),
+        "placebo_percentile_threshold": float(config.placebo_percentile_threshold),
+        "leakage_collapse_ratio": float(config.leakage_collapse_ratio),
+    }
+    if config.placebo_rounds <= 0:
+        return {**base, "status": "disabled", "placebo_warning": False, "leakage_warning": False}
+    frame, timeseries = _joined_frame(factor, label)
+    real = _ic_statistic(frame, timeseries)
+    if not np.isfinite(real):
+        return {
+            **base,
+            "status": "undefined",
+            "placebo_warning": False,
+            "leakage_warning": False,
+        }
+    rng = np.random.default_rng(int(config.placebo_seed))
+    placebo = [
+        value
+        for value in (
+            _placebo_statistic(frame, timeseries, rng)
+            for _ in range(int(config.placebo_rounds))
+        )
+        if np.isfinite(value)
+    ]
+    if not placebo:
+        return {
+            **base,
+            "status": "undefined",
+            "placebo_warning": False,
+            "leakage_warning": False,
+        }
+    placebo_abs = np.abs(np.asarray(placebo, dtype=float))
+    real_abs = abs(real)
+    percentile = float((placebo_abs <= real_abs).mean())
+    placebo_warning = percentile < float(config.placebo_percentile_threshold)
+
+    forward = _shifted_factor_stat(frame, timeseries, -1)
+    lagged = _shifted_factor_stat(frame, timeseries, 1)
+    shifted_magnitudes = [
+        abs(value) for value in (forward, lagged) if np.isfinite(value)
+    ]
+    if real_abs > 1e-12 and shifted_magnitudes:
+        collapse_ratio = float(max(shifted_magnitudes) / real_abs)
+    else:
+        collapse_ratio = None
+    leakage_warning = bool(
+        not placebo_warning
+        and collapse_ratio is not None
+        and collapse_ratio < float(config.leakage_collapse_ratio)
+    )
+    return {
+        **base,
+        "status": "ok",
+        "mode": "market_timeseries" if timeseries else "cross_sectional",
+        "ic_aligned": real,
+        "real_abs_ic": real_abs,
+        "placebo_abs_ic_mean": float(placebo_abs.mean()),
+        "placebo_abs_ic_max": float(placebo_abs.max()),
+        "placebo_percentile": percentile,
+        "placebo_warning": bool(placebo_warning),
+        "ic_factor_shift_forward1": forward if np.isfinite(forward) else None,
+        "ic_factor_shift_lag1": lagged if np.isfinite(lagged) else None,
+        "shift_collapse_ratio": collapse_ratio,
+        "leakage_warning": leakage_warning,
+    }
+
+
 def evaluate_sparse_event_factor(
     factor_values: pd.Series | pd.DataFrame,
     forward_returns: pd.Series | pd.DataFrame,
@@ -295,6 +484,9 @@ def evaluate_sparse_event_factor(
             "event_observations": int(len(joined)),
             "external_evaluator_version": config.version,
         }
+    )
+    metrics["placebo_diagnostics"] = evaluate_placebo_leakage_diagnostics(
+        factor, label, config=config
     )
     return {"status": "ok", "shape": SHAPE_SPARSE_EVENT, "metrics": metrics, "reasons": []}
 
@@ -442,6 +634,9 @@ def evaluate_market_timeseries_factor(
         "cost_model": costs.to_dict(),
         "cost_reference_order_value": reference_order_value,
     }
+    metrics["placebo_diagnostics"] = evaluate_placebo_leakage_diagnostics(
+        factor, label, config=config
+    )
     return {"status": "ok", "shape": SHAPE_MARKET_TIMESERIES, "metrics": metrics, "reasons": []}
 
 
@@ -456,7 +651,13 @@ def apply_family_bh_correction(evaluations: list[dict[str, Any]]) -> None:
     for family in families.values():
         declared = max(int(item.get("experiment_count") or len(family)) for item in family)
         p_values = [
-            float((item.get("metrics") or {}).get("hac_p_value", 1.0)) for item in family
+            # Undefined HAC (zero long-run variance) pads to 1.0: undefined is
+            # treated as insufficient evidence, never as a significant result.
+            float(
+                1.0 if (p_value := (item.get("metrics") or {}).get("hac_p_value")) is None
+                else p_value
+            )
+            for item in family
         ]
         p_values.extend([1.0] * max(0, declared - len(p_values)))
         q_values = benjamini_hochberg(p_values)
@@ -506,15 +707,26 @@ def import_external_evaluations(
 ) -> list[dict[str, Any]]:
     """Persist successful/insufficient external evaluations into factor_evaluations.
 
-    Items with status "failed" (operational errors) are skipped, mirroring the
-    RD-Agent import in worker._import_factor_evaluations; the candidate then
-    stays in its previous state for a later retry.
+    Items with status "failed" (operational errors) are ledgered through
+    :meth:`ResearchStore.record_failed_evaluation` as ``evaluation_failed``
+    (design draft 4.2/6.6: failed trials are recorded, never silently
+    dropped); the candidate may be re-evaluated later. Items referencing an
+    unknown candidate id raise, because a trial that cannot be attributed to a
+    ledgered candidate is a producer bug, not a skippable row.
     """
 
     imported = []
     for item in result.get("evaluations", []):
         status = item.get("status")
         if status not in {"ok", "insufficient_evidence"}:
+            store.record_failed_evaluation(
+                str(item["candidate_id"]),
+                dataset=dataset,
+                dataset_identity_sha256=dataset_identity_sha256,
+                **periods,
+                error=str(item.get("error") or "evaluation failed"),
+                actor=actor,
+            )
             continue
         shape = str(item.get("shape") or "")
         policy_type = POLICY_BY_SHAPE.get(shape)

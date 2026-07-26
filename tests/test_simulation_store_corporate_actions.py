@@ -291,6 +291,9 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
     action_row = action_rows[0]
     assert action_row.status == "accrued"
     assert float(action_row.receivable_amount) == pytest.approx(50.0)
+    # 除权计提：批次取得日 2026-07-13 → 除权 2026-07-14 ≤1 个月 → 20% 档，
+    # 负债 = 100×(0.5+0.2)×20% = 14（设计 §5.6 保守负债，NAV 减项）。
+    assert float(action_row.tax_liability_amount) == pytest.approx(14.0)
     assert action_row.eligible_quantity == 100
     assert action_row.new_shares == 30
     assert action_row.tax_rule_version == "cn-dividend-tax-2015-09-08"
@@ -301,12 +304,19 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
     assert bonus.acquired_at == DAY_BUY  # 取得日继承父批次（持有期连续计算）
     assert {row.kind for row in entitlement_rows} == {"cash", "bonus_par"}
     assert all(row.untaxed_quantity == 100 for row in entitlement_rows)
+    entitlement_liability = {row.kind: float(row.liability_per_share) for row in entitlement_rows}
+    assert entitlement_liability == {
+        "cash": pytest.approx(0.5 * 0.20),
+        "bonus_par": pytest.approx(0.2 * 0.20),
+    }
     positions = store.rows(simulation["id"], "positions")
     assert positions[0]["quantity"] == 130
     nav_rows = store.rows(simulation["id"], "nav")
     assert nav_rows[-1]["corporate_receivables"] == pytest.approx(50.0)
+    assert nav_rows[-1]["corporate_tax_liabilities"] == pytest.approx(14.0)
+    # NAV = 现金 + 市值 + 应收 − 应付税负债（旧行为不含减项，虚高 14）
     assert nav_rows[-1]["nav"] == pytest.approx(
-        nav_rows[-1]["cash"] + nav_rows[-1]["market_value"] + 50.0
+        nav_rows[-1]["cash"] + nav_rows[-1]["market_value"] + 50.0 - 14.0
     )
 
     # Day 3（新增股份上市日）：全部卖出；红利税 100×0.5×20% + 100×0.2×20% = 14。
@@ -335,8 +345,11 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
             )
         ).all()
     assert len(tax_flows) >= 1
+    # 卖出仍在 20% 档：实际税额 = 已提负债 = 14，差额确认为 0，NAV 不跳变
     assert sum(float(flow.amount) for flow in tax_flows) == pytest.approx(-14.0)
     assert store.rows(simulation["id"], "positions") == []
+    nav_after_sale = store.rows(simulation["id"], "nav")[-1]
+    assert nav_after_sale["corporate_tax_liabilities"] == pytest.approx(0.0)
 
     # Day 4（到账日后）：应收 50 重分类为现金，NAV 不变，状态 paid；清仓后应收仍在。
     batch_pay = _make_batch(

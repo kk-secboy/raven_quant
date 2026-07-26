@@ -20,6 +20,20 @@ def test_newey_west_detects_persistent_daily_ic() -> None:
     assert result["max_lag"] == 5
 
 
+def test_newey_west_zero_variance_is_explicitly_undefined() -> None:
+    """A constant series has zero long-run variance: no finite statistic
+    exists, so the result is an explicit undefined state (the Sortino
+    ``undefined`` pattern), not inf/0.0."""
+
+    result = newey_west_mean_test(pd.Series([0.03] * 60), max_lag=5)
+
+    assert result["status"] == "undefined_zero_hac_variance"
+    assert result["test_statistic"] is None
+    assert result["p_value"] is None
+    assert result["mean"] == pytest.approx(0.03)
+    assert result["standard_error"] == pytest.approx(0.0, abs=1e-12)
+
+
 def test_benjamini_hochberg_controls_one_experiment_family() -> None:
     q_values = benjamini_hochberg([0.01, 0.04, 0.20, 0.80])
     assert q_values == pytest.approx([0.04, 0.08, 0.2666666667, 0.80])

@@ -110,6 +110,33 @@ def test_doubled_doubles_every_recorded_version() -> None:
     )
 
 
+def test_scaled_stresses_only_the_named_components() -> None:
+    original = CostModelConfig()
+    stressed = original.scaled(fixed_slippage_rate=2.0)
+    assert stressed.fixed_slippage_rate == pytest.approx(original.fixed_slippage_rate * 2)
+    assert stressed.buy_commission_rate == pytest.approx(original.buy_commission_rate)
+    assert stressed.min_commission == pytest.approx(original.min_commission)
+    assert stressed.impact_at_max_participation == pytest.approx(
+        original.impact_at_max_participation
+    )
+    assert stressed.version == original.version
+
+
+def test_scaled_rejects_unknown_fields() -> None:
+    with pytest.raises(ValueError, match="unknown cost model fields"):
+        CostModelConfig().scaled(unknown_rate=2.0)
+
+
+def test_book_scaled_applies_to_every_recorded_version() -> None:
+    stressed = CN_COST_SCHEDULE_BOOK.scaled(max_volume_participation=0.75)
+    assert len(stressed.versions) == len(CN_COST_SCHEDULE_VERSIONS)
+    for original, view in zip(CN_COST_SCHEDULE_VERSIONS, stressed.versions, strict=True):
+        assert view.max_volume_participation == pytest.approx(
+            original.max_volume_participation * 0.75
+        )
+        assert view.fixed_slippage_rate == pytest.approx(original.fixed_slippage_rate)
+
+
 def test_flat_view_resolves_qlib_triple_at_explicit_date() -> None:
     flat = CN_COST_SCHEDULE_BOOK.flat_view(as_of=date(2024, 1, 2))
     assert flat["open_cost"] == pytest.approx(0.0005)
