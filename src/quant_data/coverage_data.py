@@ -70,7 +70,9 @@ _RULES: dict[str, tuple[CoverageRule, ...]] = {
         CoverageRule("ggt_daily", "daily", 1_000, 2),
         CoverageRule("stk_shock", "daily", 1_000, 8),
         CoverageRule("stk_high_shock", "daily", 1_000, 8),
-        CoverageRule("stk_alert", "daily", 1_000, 8),
+        # stk_alert rows carry start_date/end_date (alert effective period), not
+        # trade_date; validate against start_date or every row fails the date check.
+        CoverageRule("stk_alert", "daily", 1_000, 8, "trade_date", "start_date"),
         CoverageRule("cyq_perf", "daily", 6_000, 4),
         CoverageRule("cyq_chips", "daily", 6_000, 4),
         CoverageRule("ccass_hold", "daily", 5_000, 8),
