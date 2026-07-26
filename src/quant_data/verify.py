@@ -13,6 +13,12 @@ from .checkpoint import CheckpointStore
 from .coverage_data import COVERAGE_DATASETS, coverage_primary_key_candidates
 from .reference_data import select_current_reference_units
 
+# Interfaces whose provider pagination reorders rows between pages, making
+# overlapping pages (and therefore duplicate primary keys) inherent.  Snapshot
+# builds already deduplicate rows with SELECT DISTINCT, so duplicates for these
+# datasets are reported as warnings instead of hard errors.
+UNSTABLE_PAGINATION_DATASETS = frozenset({"share_float"})
+
 
 def verify_downloads(
     checkpoint: CheckpointStore,
@@ -138,7 +144,14 @@ def verify_downloads(
                 """
             ).fetchone()[0]
             duplicate_checks[dataset] = int(duplicates)
-            if duplicates:
+            if duplicates and dataset in UNSTABLE_PAGINATION_DATASETS:
+                warnings.append(
+                    f"{dataset}: {duplicates} duplicate primary-key rows "
+                    "(provider paginates this interface with an unstable sort order, "
+                    "so overlapping pages are inherent; snapshot builds deduplicate "
+                    "with SELECT DISTINCT)"
+                )
+            elif duplicates:
                 errors.append(f"{dataset}: {duplicates} duplicate primary-key rows")
 
         completeness_errors, completeness_checks = _verify_daily_completeness(
