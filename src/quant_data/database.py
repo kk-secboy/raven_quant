@@ -24,6 +24,7 @@ from sqlalchemy import (
     Time,
     UniqueConstraint,
     create_engine,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
@@ -253,6 +254,34 @@ Index(
     "idx_factor_evaluations_candidate_created",
     factor_evaluations.c.factor_candidate_id,
     factor_evaluations.c.created_at.desc(),
+)
+
+# Sealed one-shot consumption ledger for reserved final out-of-sample windows
+# (design draft 4.1/12.1). The vintage key binds an immutable research scope
+# (research program id when the lineage has one, otherwise the dataset itself)
+# plus the dataset identity and the calendar window — never a campaign,
+# hypothesis-family or strategy name, so renaming cannot mint a new vintage.
+oos_vintages = Table(
+    "oos_vintages",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("scope", String, nullable=False),
+    Column("dataset_identity", String, nullable=False),
+    Column("test_start", Date, nullable=False),
+    Column("test_end", Date, nullable=False),
+    Column("sealed_at", DateTime(timezone=True), nullable=False),
+    Column("first_opened_at", DateTime(timezone=True), nullable=False),
+    Column("consumed_at", DateTime(timezone=True)),
+    Column("sealed_candidate_set_json", json_type, nullable=False),
+    Column("sealed_candidate_set_sha256", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "scope",
+        "dataset_identity",
+        "test_start",
+        "test_end",
+        name="uq_oos_vintage_window",
+    ),
 )
 
 research_events = Table(
@@ -671,6 +700,10 @@ recommendation_portfolios = Table(
     Column("base_currency", String, nullable=False),
     Column("hypothetical_initial_value", Numeric(20, 6), nullable=False),
     Column("risk_exposure_override", Float, nullable=False, server_default="1"),
+    # standalone = sender candidate created via RecommendationStore;
+    # allocation_member = structural sub-account owned by an allocation and
+    # never eligible as the unique recommendation sender.
+    Column("recommendation_scope", String, nullable=False, server_default="standalone"),
     Column("created_by", String, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
@@ -679,6 +712,15 @@ Index(
     "idx_recommendation_portfolios_status_updated",
     recommendation_portfolios.c.status,
     recommendation_portfolios.c.updated_at.desc(),
+)
+# Design 8.1/9.1: a single active recommendation sender at any moment.
+Index(
+    "uq_recommendation_portfolios_single_active_sender",
+    recommendation_portfolios.c.status,
+    unique=True,
+    postgresql_where=text(
+        "status = 'active' AND recommendation_scope = 'standalone'"
+    ),
 )
 
 recommendation_snapshots = Table(
@@ -993,6 +1035,9 @@ simulation_dividend_entitlements = Table(
     Column("kind", String, nullable=False),
     Column("income_per_share", Numeric(20, 8), nullable=False),
     Column("untaxed_quantity", Integer, nullable=False),
+    # 除权日按除权时点持有期档位（逐批次保守上界）计提的每股应付税负债；
+    # 随 untaxed_quantity 消耗同比例释放。旧行缺省 0 = 未计提。
+    Column("liability_per_share", Numeric(20, 8), nullable=False, server_default="0"),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     UniqueConstraint(
         "portfolio_id",
@@ -1026,6 +1071,8 @@ simulation_dividend_actions = Table(
     Column("eligible_quantity", Integer, nullable=False),
     Column("cash_per_share", Numeric(20, 8), nullable=False, server_default="0"),
     Column("receivable_amount", Numeric(20, 6), nullable=False, server_default="0"),
+    # 除权确认时按保守档位计提的应付股息税负债（含现金分红与送股面值两类）。
+    Column("tax_liability_amount", Numeric(20, 6), nullable=False, server_default="0"),
     Column("bonus_share_ratio", Float, nullable=False, server_default="0"),
     Column("conversion_ratio", Float, nullable=False, server_default="0"),
     Column("new_shares", Integer, nullable=False, server_default="0"),
@@ -1090,6 +1137,8 @@ simulation_nav = Table(
     Column("cash", Numeric(20, 6), nullable=False),
     Column("market_value", Numeric(20, 6), nullable=False),
     Column("corporate_receivables", Numeric(20, 6), nullable=False, server_default="0"),
+    # 除权日按保守档位计提的未结算股息税负债（NAV 减项，随卖出结算释放）。
+    Column("corporate_tax_liabilities", Numeric(20, 6), nullable=False, server_default="0"),
     Column("nav", Numeric(20, 6), nullable=False),
     Column("daily_return", Float, nullable=False),
     Column("drawdown", Float, nullable=False),
@@ -1592,6 +1641,10 @@ strategy_allocations = Table(
     Column("status", String, nullable=False),
     Column("is_legacy", Boolean, nullable=False, server_default="false"),
     Column("allocation_method", String, nullable=False),
+    # Frozen decision calendar for AllocationArtifacts: member budgets are
+    # only re-solved on decision days (weekly/monthly); every other task
+    # reuses the still-valid artifact (design 6.10).
+    Column("decision_frequency", String, nullable=False, server_default="monthly"),
     Column("lookback_days", Integer, nullable=False),
     Column("target_volatility", Float, nullable=False),
     Column("max_pairwise_correlation", Float, nullable=False),
@@ -1615,6 +1668,70 @@ Index(
     "idx_strategy_allocations_status_updated",
     strategy_allocations.c.status,
     strategy_allocations.c.updated_at.desc(),
+)
+# Design 6.10: a single user-selected active allocation policy at any moment.
+Index(
+    "uq_strategy_allocations_single_active",
+    strategy_allocations.c.status,
+    unique=True,
+    postgresql_where=text("status = 'active'"),
+)
+
+strategy_allocation_artifacts = Table(
+    "strategy_allocation_artifacts",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "allocation_id",
+        String,
+        ForeignKey("quantlab.strategy_allocations.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("decision_date", Date, nullable=False),
+    Column("inputs_as_of", Date, nullable=False),
+    Column("valid_until", Date, nullable=False),
+    Column("member_weights_json", json_type, nullable=False),
+    Column("analysis_json", json_type, nullable=False),
+    Column("artifact_hash", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_strategy_allocation_artifacts_allocation",
+    strategy_allocation_artifacts.c.allocation_id,
+    strategy_allocation_artifacts.c.decision_date.desc(),
+)
+
+# Design 6.10/8.1/9.2: account-level netted target plans. One row per
+# idempotent plan key (account + artifact + decision date + inputs as_of +
+# policy version + tranche index); the full plan (net targets, signed net
+# trades, strategy_contributions, cash remainder, execution policy reference)
+# lives in plan_json for the execution layer to consume.
+account_netting_plans = Table(
+    "account_netting_plans",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("plan_key", String, nullable=False, unique=True),
+    Column("account_id", String, nullable=False),
+    Column(
+        "allocation_artifact_id",
+        String,
+        ForeignKey("quantlab.strategy_allocation_artifacts.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("decision_date", Date, nullable=False),
+    Column("inputs_as_of", Date, nullable=False),
+    Column("policy_version", String, nullable=False),
+    Column("execution_policy", String, nullable=False),
+    Column("tranche_index", Integer, nullable=False, server_default="0"),
+    Column("plan_hash", String, nullable=False),
+    Column("plan_json", json_type, nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_account_netting_plans_account",
+    account_netting_plans.c.account_id,
+    account_netting_plans.c.decision_date.desc(),
 )
 
 strategy_allocation_members = Table(

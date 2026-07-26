@@ -13,6 +13,7 @@ from .corporate_actions import (
     CorporateAction,
     apply_ex_dividend,
     consume_lots_fifo,
+    pending_dividend_tax_liability,
     position_lots,
     settle_dividend_tax,
 )
@@ -228,6 +229,7 @@ def execute_simulation_day(
             "conversion_ratio": action.conversion_ratio,
             "cash_per_share": 0.0,
             "receivable_amount": 0.0,
+            "tax_liability": 0.0,
             "tax_rule_version": tax_rule.version,
             "payload_sha256": action.payload_sha256,
             "valuation_uncertain": False,
@@ -238,6 +240,7 @@ def execute_simulation_day(
             applied["cash_per_share"] = float(receivable["cash_per_share"])
             applied["receivable_amount"] = float(receivable["amount"])
             applied["valuation_uncertain"] = bool(receivable["valuation_uncertain"])
+        applied["tax_liability"] = float(outcome["tax_liability"])
         corporate_actions_applied.append(applied)
 
     reference_prices = _execution_reference_prices(bars)
@@ -402,11 +405,13 @@ def execute_simulation_day(
             )
             consumed_lots = _apply_fill(state, fill, trade_date)
             if side == "sell" and consumed_lots:
-                dividend_tax, dividend_tax_details = settle_dividend_tax(
-                    instrument=instrument,
-                    consumed=consumed_lots,
-                    sale_date=trade_date,
-                    tax_book=tax_book,
+                dividend_tax, dividend_tax_details, dividend_tax_released = (
+                    settle_dividend_tax(
+                        instrument=instrument,
+                        consumed=consumed_lots,
+                        sale_date=trade_date,
+                        tax_book=tax_book,
+                    )
                 )
                 if dividend_tax > 0:
                     if cash - dividend_tax < -1e-6:
@@ -420,10 +425,14 @@ def execute_simulation_day(
                             "balance_after": cash,
                         }
                     )
+                if dividend_tax > 0 or dividend_tax_released > 0:
+                    # 现金只流出实际税额；已提负债随批次消耗释放（见 NAV 减项），
+                    # 卖出对 NAV 的净影响 = 释放额 − 实际税额（差额确认）。
                     fill["cost_breakdown"] = {
                         **fill["cost_breakdown"],
                         "dividend_tax": dividend_tax,
                         "dividend_tax_details": dividend_tax_details,
+                        "dividend_tax_liability_released": dividend_tax_released,
                     }
             remaining -= fill_quantity
         filled = requested - remaining
@@ -455,9 +464,12 @@ def execute_simulation_day(
     receivables_total = round(
         sum(float(item.get("amount", 0.0)) for item in open_receivables), 2
     )
+    # 应付股息税负债是 NAV 减项（设计 §5.6：税额未定须记保守税费负债）：
+    # 除权日按保守档位计提，卖出结算只确认实际与计提的差额，到账重分类不动它。
+    tax_liabilities_total = pending_dividend_tax_liability(state)
     valuation = _value_positions(state, closing_prices, trade_date)
     events.extend(valuation["events"])
-    nav = cash + valuation["market_value"] + receivables_total
+    nav = cash + valuation["market_value"] + receivables_total - tax_liabilities_total
     new_peak = max(high_water_mark, nav)
     has_stale = valuation["has_stale_prices"]
     nav_row = {
@@ -465,6 +477,7 @@ def execute_simulation_day(
         "cash": cash,
         "market_value": valuation["market_value"],
         "corporate_receivables": receivables_total,
+        "corporate_tax_liabilities": tax_liabilities_total,
         "nav": nav,
         "daily_return": nav / prior_nav - 1.0,
         "drawdown": nav / new_peak - 1.0,
@@ -496,6 +509,11 @@ def execute_simulation_day(
             **(
                 {"corporate_receivables": receivables_total}
                 if receivables_total
+                else {}
+            ),
+            **(
+                {"corporate_tax_liabilities": tax_liabilities_total}
+                if tax_liabilities_total
                 else {}
             ),
         },

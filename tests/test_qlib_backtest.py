@@ -6,6 +6,7 @@ from qlib_test_doubles import risk_analysis
 
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.qlib_backtest import (
+    COMPONENT_COST_STRESS_MULTIPLIERS,
     QlibBacktestResult,
     aggregate_intraday_report,
     calculate_qlib_metrics,
@@ -184,15 +185,135 @@ def test_robustness_runs_all_four_configured_scenarios() -> None:
         robustness_runner=robustness,
     )
 
+    # The four governed scenarios keep their overrides; the four supplementary
+    # component cost stress scenarios reuse the same runner with empty
+    # overrides (only the cost book is stressed).
     assert seen == [
         {},
         {"max_daily_turnover": pytest.approx(0.15)},
         {"topk": 40, "n_drop": 5},
         {"n_drop": 0},
+        {},
+        {},
+        {},
+        {},
     ]
     assert validation["robustness"]["scenario_count"] == 4
     assert validation["robustness"]["pass_rate"] == 1.0
     assert validation["robustness"]["passed"] is True
+
+
+def test_component_cost_stress_scenarios_touch_only_their_own_channel() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=80)
+    report = pd.DataFrame(
+        {"return": 0.001, "cost": 0.0, "bench": 0.0, "turnover": 0.0}, index=dates
+    )
+
+    def runner(start: str, end: str, _costs: CostModelConfig) -> QlibBacktestResult:
+        return _result(report.loc[start:end])
+
+    validation = run_qlib_validation_suites(
+        runner=runner,
+        full_result=_result(report),
+        start_time=dates[0].date().isoformat(),
+        end_time=dates[-1].date().isoformat(),
+        cost_model=CostModelConfig(),
+        config={"event_count": 0},
+    )
+
+    base = CostModelConfig().to_dict()
+    stress = validation["component_cost_stress"]
+    assert stress["scenario_count"] == len(COMPONENT_COST_STRESS_MULTIPLIERS)
+    assert set(stress["scenarios"]) == set(COMPONENT_COST_STRESS_MULTIPLIERS)
+    assert stress["passed"] is True
+    for name, multipliers in COMPONENT_COST_STRESS_MULTIPLIERS.items():
+        stressed = stress["scenarios"][name]["cost_model"]["versions"][0]
+        expected = {
+            key: (base[key] * multipliers[key] if key in multipliers else base[key])
+            for key in base
+            if isinstance(base[key], (int, float))
+        }
+        for key, value in expected.items():
+            assert stressed[key] == pytest.approx(value), f"{name} unexpectedly changed {key}"
+
+
+def test_component_cost_stress_gate_fails_when_a_scenario_fails() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=80)
+    report = pd.DataFrame(
+        {"return": 0.001, "cost": 0.0, "bench": 0.0, "turnover": 0.0}, index=dates
+    )
+
+    def runner(start: str, end: str, _costs: CostModelConfig) -> QlibBacktestResult:
+        return _result(report.loc[start:end])
+
+    def robustness(overrides: dict, costs) -> QlibBacktestResult:
+        base = CostModelConfig()
+        version = costs.to_dict()["versions"][0]
+        only_slippage_stressed = (
+            version["fixed_slippage_rate"] > base.fixed_slippage_rate
+            and version["buy_commission_rate"] == base.buy_commission_rate
+        )
+        excess = -0.05 if only_slippage_stressed else 0.10
+        return _result(report, excess=excess)
+
+    validation = run_qlib_validation_suites(
+        runner=runner,
+        full_result=_result(report),
+        start_time=dates[0].date().isoformat(),
+        end_time=dates[-1].date().isoformat(),
+        cost_model=CostModelConfig(),
+        config={"event_count": 0},
+        robustness_runner=robustness,
+    )
+
+    stress = validation["component_cost_stress"]
+    assert stress["scenarios"]["slippage_2x"]["passed"] is False
+    assert stress["scenarios"]["commission_2x"]["passed"] is True
+    assert stress["pass_rate"] == pytest.approx(0.75)
+    assert stress["passed"] is False
+    # The governed four-scenario block is unaffected by the component gate.
+    assert validation["robustness"]["passed"] is True
+
+
+def test_max_drawdown_recovery_counts_trading_days_back_to_the_peak() -> None:
+    # NAV: 1.10 -> 0.88 (trough, -20%) -> 0.88 -> 0.924 -> 1.0164 -> 1.11804.
+    # The NAV first closes back at/above the 1.10 peak on the 4th trading day
+    # after the trough.
+    returns = [0.10, -0.20, 0.0, 0.05, 0.10, 0.10] + [0.0] * 34
+    dates = pd.bdate_range("2024-01-02", periods=len(returns))
+    report = pd.DataFrame(
+        {"return": returns, "cost": 0.0, "bench": 0.0, "turnover": 0.0}, index=dates
+    )
+
+    metrics = calculate_qlib_metrics(report)
+
+    assert metrics["max_drawdown_recovery_status"] == "recovered"
+    assert metrics["max_drawdown_recovery_days"] == 4
+
+
+def test_max_drawdown_recovery_is_ongoing_when_the_peak_is_not_regained() -> None:
+    returns = [0.10, -0.20] + [0.0] * 38
+    dates = pd.bdate_range("2024-01-02", periods=len(returns))
+    report = pd.DataFrame(
+        {"return": returns, "cost": 0.0, "bench": 0.0, "turnover": 0.0}, index=dates
+    )
+
+    metrics = calculate_qlib_metrics(report)
+
+    assert metrics["max_drawdown_recovery_status"] == "ongoing"
+    assert metrics["max_drawdown_recovery_days"] is None
+
+
+def test_max_drawdown_recovery_is_zero_without_any_drawdown() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=40)
+    report = pd.DataFrame(
+        {"return": 0.01, "cost": 0.0, "bench": 0.0, "turnover": 0.0}, index=dates
+    )
+
+    metrics = calculate_qlib_metrics(report)
+
+    assert metrics["max_drawdown_recovery_status"] == "no_drawdown"
+    assert metrics["max_drawdown_recovery_days"] == 0
 
 
 def test_trade_metrics_report_win_rate_and_profit_loss_ratio() -> None:

@@ -8,6 +8,7 @@ from quant_platform.corporate_actions import (
     apply_ex_dividend,
     consume_lots_fifo,
     normalize_dividend_rows,
+    pending_dividend_tax_liability,
     position_lots,
     settle_dividend_tax,
 )
@@ -197,17 +198,21 @@ def test_dividend_tax_brackets_and_single_charge() -> None:
     ]
     # 持有 <1 个月卖出 60 股：税 = 60×0.5×20% = 6
     consumed = consume_lots_fifo(lots, 60, trade_date=date(2024, 6, 5))
-    tax, details = settle_dividend_tax(
+    tax, details, released = settle_dividend_tax(
         instrument="SH600000", consumed=consumed, sale_date=date(2024, 6, 5), tax_book=book
     )
     assert tax == pytest.approx(6.0)
+    # 旧账本权利无 liability_per_share：无负债可释放，卖出全额确认税额
+    assert released == pytest.approx(0.0)
     assert details[0]["tax_rule_version"] == "cn-dividend-tax-2015-09-08"
+    assert details[0]["liability_released"] == pytest.approx(0.0)
     # 剩余 40 股再卖：只税剩余 40，不重复（税 = 40×0.5×20% = 4）
     consumed = consume_lots_fifo(lots, 40, trade_date=date(2024, 6, 5))
-    tax, _ = settle_dividend_tax(
+    tax, _, released = settle_dividend_tax(
         instrument="SH600000", consumed=consumed, sale_date=date(2024, 6, 5), tax_book=book
     )
     assert tax == pytest.approx(4.0)
+    assert released == pytest.approx(0.0)
     assert lots == []
 
 
@@ -234,7 +239,7 @@ def test_dividend_tax_rates_by_holding_period() -> None:
             }
         ]
         consumed = consume_lots_fifo(lots, 100, trade_date=sale)
-        tax, _ = settle_dividend_tax(
+        tax, _, _released = settle_dividend_tax(
             instrument="SH600000", consumed=consumed, sale_date=sale, tax_book=book
         )
         return tax
@@ -264,13 +269,13 @@ def test_dividend_tax_skips_etf() -> None:
         }
     ]
     consumed = consume_lots_fifo(lots, 100, trade_date=date(2024, 6, 3))
-    tax, details = settle_dividend_tax(
+    tax, details, released = settle_dividend_tax(
         instrument="SH510300",
         consumed=consumed,
         sale_date=date(2024, 6, 3),
         tax_book=DIVIDEND_TAX_RULE_BOOK,
     )
-    assert tax == 0.0 and details == []
+    assert tax == 0.0 and details == [] and released == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -297,9 +302,14 @@ def _run_day(**overrides):
 
 def test_ex_date_nav_continuity_with_receivable() -> None:
     result = _run_day(corporate_actions=[_action()])
-    # 除权日：市值降、应收升，NAV 在容差内连续（60000 → 60003）
+    # 除权日：市值降、应收升（税前 500 = 1000×0.5），同时按除权时点持有期
+    # 档位（2024-05-20 取得 → ≤1 个月 → 20%）计提保守应付税负债
+    # 1000×(0.5+0.2)×20% = 140；NAV = 50000 + 1300×7.31 + 500 − 140 = 59863，
+    # 不含税前全额虚高（设计 §5.6 冲突 2.6 修正：旧行为 60003 即虚高 140）。
     assert result["nav_row"]["corporate_receivables"] == pytest.approx(500.0)
-    assert result["nav"] == pytest.approx(60_003.0, abs=2.0)
+    assert result["nav_row"]["corporate_tax_liabilities"] == pytest.approx(140.0)
+    assert result["nav"] == pytest.approx(59_863.0, abs=2.0)
+    assert result["corporate_actions_applied"][0]["tax_liability"] == pytest.approx(140.0)
     assert result["positions"]["SH600000"]["quantity"] == 1300
     assert result["corporate_actions_applied"][0]["kind"] == "ex"
     assert result["nav_row"]["performance_certified"] is True
@@ -459,3 +469,198 @@ def test_duplicate_action_rows_apply_once() -> None:
         item for item in result["corporate_actions_applied"] if item["kind"] == "ex"
     ]
     assert len(ex_applied) == 1
+
+
+# ---------------------------------------------------------------------------
+# 股息税保守负债（设计 §5.6 冲突 2.6：计提/比例释放/差额确认/重放幂等）
+# ---------------------------------------------------------------------------
+
+
+def test_ex_date_accrues_conservative_liability_per_ex_date_bracket() -> None:
+    position = _position(
+        lots=[
+            {
+                "lot_key": "b1",
+                "acquired_at": date(2024, 5, 1),  # 除权日持有 >1 个月 → 10% 档
+                "sellable_from": date.min,
+                "quantity": 1000,
+                "cost_basis_total": 10_000.0,
+                "origin": "buy",
+                "entitlements": [],
+            }
+        ]
+    )
+    outcome = apply_ex_dividend(
+        position=position,
+        action=CorporateAction.from_mapping(_action()),
+        tax_rule=DIVIDEND_TAX_RULE_BOOK.as_of(date(2024, 5, 31)),
+        trade_date=date(2024, 6, 3),
+    )
+    # 每股负债 = (现金 0.5 + 送股面值 0.2) × 10% = 0.07；1000 股合计 70
+    assert outcome["tax_liability"] == pytest.approx(70.0)
+    entitlements = {item["kind"]: item for item in position["lots"][0]["entitlements"]}
+    assert entitlements["cash"]["liability_per_share"] == pytest.approx(0.05)
+    assert entitlements["bonus_par"]["liability_per_share"] == pytest.approx(0.02)
+
+
+def test_fifo_partial_sale_releases_liability_proportionally() -> None:
+    lots = [
+        {
+            "lot_key": "b1",
+            "acquired_at": date(2024, 5, 20),
+            "sellable_from": date.min,
+            "quantity": 100,
+            "cost_basis_total": 1000.0,
+            "origin": "buy",
+            "entitlements": [
+                {
+                    "record_date": date(2024, 5, 31),
+                    "kind": "cash",
+                    "income_per_share": 0.5,
+                    "untaxed_quantity": 100,
+                    "liability_per_share": 0.1,
+                }
+            ],
+        },
+        {
+            "lot_key": "b2",
+            "acquired_at": date(2024, 5, 20),
+            "sellable_from": date.min,
+            "quantity": 100,
+            "cost_basis_total": 1000.0,
+            "origin": "buy",
+            "entitlements": [
+                {
+                    "record_date": date(2024, 5, 31),
+                    "kind": "cash",
+                    "income_per_share": 0.5,
+                    "untaxed_quantity": 100,
+                    "liability_per_share": 0.2,
+                }
+            ],
+        },
+    ]
+    # FIFO 卖 150：批次一 100 全消耗（释放 100×0.1），批次二 50（释放 50×0.2）
+    consumed = consume_lots_fifo(lots, 150, trade_date=date(2024, 6, 5))
+    tax, _, released = settle_dividend_tax(
+        instrument="SH600000", consumed=consumed, sale_date=date(2024, 6, 5),
+        tax_book=DIVIDEND_TAX_RULE_BOOK,
+    )
+    assert tax == pytest.approx(150 * 0.5 * 0.20)
+    assert released == pytest.approx(100 * 0.1 + 50 * 0.2)
+    # 剩余负债只来自批次二未消耗的 50 股：50×0.2 = 10
+    state = {"SH600000": {"quantity": 50, "lots": lots}}
+    assert pending_dividend_tax_liability(state) == pytest.approx(10.0)
+
+
+def test_sale_recognizes_only_difference_when_bracket_drops() -> None:
+    # 除权日按 20% 档计提（每股 0.10 + 0.04），卖出日持有跨过 1 个月 → 10%
+    lots = [
+        {
+            "lot_key": "b1",
+            "acquired_at": date(2024, 5, 10),
+            "sellable_from": date.min,
+            "quantity": 100,
+            "cost_basis_total": 1000.0,
+            "origin": "buy",
+            "entitlements": [
+                {
+                    "record_date": date(2024, 5, 31),
+                    "kind": "cash",
+                    "income_per_share": 0.5,
+                    "untaxed_quantity": 100,
+                    "liability_per_share": 0.10,
+                },
+                {
+                    "record_date": date(2024, 5, 31),
+                    "kind": "bonus_par",
+                    "income_per_share": 0.2,
+                    "untaxed_quantity": 100,
+                    "liability_per_share": 0.04,
+                },
+            ],
+        }
+    ]
+    consumed = consume_lots_fifo(lots, 100, trade_date=date(2024, 6, 11))
+    tax, details, released = settle_dividend_tax(
+        instrument="SH600000", consumed=consumed, sale_date=date(2024, 6, 11),
+        tax_book=DIVIDEND_TAX_RULE_BOOK,
+    )
+    # 实际税 = 100×(0.5+0.2)×10% = 7；释放 100×0.14 = 14；多提冲回 7
+    assert tax == pytest.approx(7.0)
+    assert released == pytest.approx(14.0)
+    assert released - tax == pytest.approx(7.0)
+    assert sorted(item["liability_released"] for item in details) == [
+        pytest.approx(4.0),
+        pytest.approx(10.0),
+    ]
+    assert pending_dividend_tax_liability({"SH600000": {"lots": lots}}) == pytest.approx(0.0)
+
+
+def test_engine_sale_day_nav_moves_only_by_tax_difference() -> None:
+    position = _position(
+        lots=[
+            {
+                "lot_key": "b1",
+                "acquired_at": date(2024, 5, 20),
+                "sellable_from": date.min,
+                "quantity": 1000,
+                "cost_basis_total": 10_000.0,
+                "origin": "buy",
+                "entitlements": [],
+            }
+        ]
+    )
+    ex_day = _run_day(
+        corporate_actions=[_action(bonus_share_ratio=0.0, conversion_ratio=0.0)],
+        positions={"SH600000": position},
+    )
+    # 除权日 ≤1 个月 → 20% 档计提 1000×0.5×20% = 100
+    assert ex_day["nav_row"]["corporate_tax_liabilities"] == pytest.approx(100.0)
+    assert ex_day["nav"] == pytest.approx(50_000 + 7_310 + 500 - 100, abs=1e-6)
+    # 持有跨过 1 个月（2024-05-20 → 2024-06-21）后清仓：实际税 10% = 50
+    sale_day = date(2024, 6, 21)
+    result = _run_day(
+        trade_date=sale_day,
+        cash=ex_day["cash"],
+        prior_nav=ex_day["nav"],
+        high_water_mark=ex_day["high_water_mark"],
+        positions=ex_day["positions"],
+        target_weights={"SH600000": 0.0},
+        minute_bars=_bars("2024-06-21", 7.31),
+        closing_prices={"SH600000": {"price": 7.31, "market_date": sale_day}},
+        dividend_receivables=ex_day["dividend_receivables"],
+    )
+    tax_flows = [flow for flow in result["cash_flows"] if flow["flow_type"] == "dividend_tax"]
+    assert sum(-flow["amount"] for flow in tax_flows) == pytest.approx(50.0)
+    sell_fill = [fill for fill in result["fills"] if fill["side"] == "sell"][0]
+    assert sell_fill["cost_breakdown"]["dividend_tax_liability_released"] == pytest.approx(
+        100.0
+    )
+    assert result["nav_row"]["corporate_tax_liabilities"] == pytest.approx(0.0)
+    # 差额确认（多提冲回）：价格不变时 NAV 变动 = (释放100 − 实税50) − 卖出成本
+    assert result["nav"] - ex_day["nav"] == pytest.approx(50.0, abs=20.0)
+    # NAV 手算：50000 + (7310 − 成本≈14.69) − 50 税 + 500 应收 − 0 负债
+    assert result["nav"] == pytest.approx(57_745.3, abs=0.5)
+    assert result["conservation"]["cash_difference"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_ex_date_replay_does_not_double_accrue_liability() -> None:
+    first = _run_day(corporate_actions=[_action()])
+    assert first["nav_row"]["corporate_tax_liabilities"] == pytest.approx(140.0)
+    # 模拟 store 重建后的同日重放：除权日已入账标记 + 携带负债的权利随状态回灌
+    replay_positions = first["positions"]
+    replay_positions["SH600000"]["_applied_ca_ex_dates"] = ("2024-06-03",)
+    second = _run_day(
+        corporate_actions=[_action()],
+        positions=replay_positions,
+        cash=first["cash"],
+        prior_nav=first["nav"],
+        high_water_mark=first["high_water_mark"],
+        dividend_receivables=first["dividend_receivables"],
+    )
+    assert second["corporate_actions_applied"] == []
+    assert second["nav_row"]["corporate_receivables"] == pytest.approx(500.0)
+    # 负债由状态重算：既不重复计提（≠280）也不丢失（≠0）
+    assert second["nav_row"]["corporate_tax_liabilities"] == pytest.approx(140.0)
+    assert second["nav"] == pytest.approx(first["nav"])

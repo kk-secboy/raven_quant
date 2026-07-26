@@ -15,7 +15,9 @@ from quant_data.database import (
     backtest_runs,
     factor_candidates,
     factor_evaluations,
+    oos_vintages,
     open_database,
+    research_campaigns,
     row_dict,
     strategies,
     strategy_events,
@@ -32,7 +34,10 @@ from quant_data.execution_contract import (
 from quant_platform.cost_model import KNOWN_COST_SCHEDULE_VERSIONS, CostModelConfig
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
 from quant_platform.pair_trading import PairTradingConfig
-from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
+from quant_platform.qlib_backtest import (
+    COMPONENT_COST_STRESS_MULTIPLIERS,
+    QLIB_ENGINE_VERSION,
+)
 from quant_platform.qlib_factor_baseline import (
     FACTOR_SOURCE_QLIB_BASELINE,
     baseline_manifest_failures,
@@ -123,6 +128,40 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _scenario_artifact_failures(
+    scenarios: dict[str, Any], artifact_root: Path
+) -> list[str]:
+    """Validate each scenario's immutable artifacts against the artifact root."""
+
+    failures: list[str] = []
+    for scenario_name, scenario in scenarios.items():
+        artifacts = scenario.get("artifacts") if isinstance(scenario, dict) else None
+        valid_artifacts = isinstance(artifacts, dict) and set(artifacts) == {
+            "daily_report",
+            "fills",
+            "metrics",
+        }
+        if valid_artifacts:
+            for entry in artifacts.values():
+                if not isinstance(entry, dict) or not _is_sha256(entry.get("sha256")):
+                    valid_artifacts = False
+                    break
+                try:
+                    artifact_path = (artifact_root / str(entry["path"])).resolve()
+                    artifact_path.relative_to(artifact_root)
+                except (KeyError, ValueError):
+                    valid_artifacts = False
+                    break
+                if not artifact_path.is_file() or _sha256_file(artifact_path) != entry["sha256"]:
+                    valid_artifacts = False
+                    break
+        if not valid_artifacts:
+            failures.append(
+                f"robustness scenario {scenario_name} has no complete immutable artifacts"
+            )
+    return failures
 
 
 def _multifactor_manifest_failures(
@@ -852,7 +891,9 @@ class StrategyStore:
                 factor_windows = connection.execute(
                     select(
                         factor_evaluations.c.id,
+                        factor_evaluations.c.factor_candidate_id,
                         factor_evaluations.c.dataset,
+                        factor_evaluations.c.dataset_identity_sha256,
                         factor_evaluations.c.test_start,
                         factor_evaluations.c.test_end,
                         factor_evaluations.c.evaluator_version,
@@ -879,6 +920,24 @@ class StrategyStore:
                 if any(item.final_test_consumed_at is not None for item in factor_windows):
                     raise ValueError("reserved final test has already been consumed")
                 consumed_at = _now()
+                if factor_windows:
+                    # Cross-campaign seal (design draft 4.1/12.1): the reserved
+                    # final OOS window is a one-time vintage keyed by research
+                    # scope + dataset identity + calendar window. New evaluation
+                    # rows from renamed or new campaigns cannot re-open it.
+                    self._seal_and_consume_oos_vintage(
+                        connection,
+                        candidate_ids=sorted(
+                            {str(item.factor_candidate_id) for item in factor_windows}
+                        ),
+                        dataset_identities={
+                            str(item.dataset_identity_sha256 or "") for item in factor_windows
+                        },
+                        dataset=dataset,
+                        test_start=requested_start,
+                        test_end=requested_end,
+                        consumed_at=consumed_at,
+                    )
                 for item in factor_windows:
                     key = hashlib.sha256(
                         f"{version_id}:{item.id}:{dataset}:{periods['start']}:{periods['end']}".encode()
@@ -911,6 +970,93 @@ class StrategyStore:
                 )
             )
         return self.get_backtest(backtest_id)
+
+    @staticmethod
+    def _seal_and_consume_oos_vintage(
+        connection: Any,
+        *,
+        candidate_ids: list[str],
+        dataset_identities: set[str],
+        dataset: str,
+        test_start: date,
+        test_end: date,
+        consumed_at: datetime,
+    ) -> str:
+        """Seal and consume the OOS vintage for a reserved final-test window.
+
+        The vintage key is (scope, dataset identity, calendar window). Scope is
+        the immutable research program id when the candidate lineage belongs to
+        exactly one program, otherwise the dataset identity itself; it never
+        contains campaign/hypothesis-family/strategy names, so renaming or
+        recreating those cannot mint a fresh vintage for the same window.
+        """
+
+        dataset_identity = (
+            next(iter(dataset_identities))
+            if len(dataset_identities) == 1 and dataset_identities != {""}
+            else f"name:{dataset}"
+        )
+        program_ids = {
+            str(row.research_program_id)
+            for row in connection.execute(
+                select(research_campaigns.c.research_program_id).where(
+                    research_campaigns.c.research_run_id.in_(
+                        select(factor_candidates.c.research_run_id).where(
+                            factor_candidates.c.id.in_(candidate_ids)
+                        )
+                    ),
+                    research_campaigns.c.research_program_id.is_not(None),
+                )
+            )
+        }
+        scope = (
+            f"program:{next(iter(program_ids))}"
+            if len(program_ids) == 1
+            else f"dataset:{dataset_identity}"
+        )
+        row = connection.execute(
+            select(oos_vintages)
+            .where(
+                oos_vintages.c.scope == scope,
+                oos_vintages.c.dataset_identity == dataset_identity,
+                oos_vintages.c.test_start == test_start,
+                oos_vintages.c.test_end == test_end,
+            )
+            .with_for_update()
+        ).first()
+        if row is not None:
+            sealed = set((row.sealed_candidate_set_json or {}).get("candidate_ids") or [])
+            if not set(candidate_ids) <= sealed:
+                raise ValueError(
+                    "final test window is sealed and this candidate is not in the "
+                    "sealed candidate set"
+                )
+            if row.consumed_at is not None:
+                raise ValueError("reserved final test has already been consumed")
+            connection.execute(
+                update(oos_vintages)
+                .where(oos_vintages.c.id == row.id)
+                .values(consumed_at=consumed_at)
+            )
+            return str(row.id)
+        sealed_set = {"candidate_ids": candidate_ids}
+        vintage_id = uuid.uuid4().hex
+        connection.execute(
+            insert(oos_vintages).values(
+                id=vintage_id,
+                scope=scope,
+                dataset_identity=dataset_identity,
+                test_start=test_start,
+                test_end=test_end,
+                sealed_at=consumed_at,
+                first_opened_at=consumed_at,
+                consumed_at=consumed_at,
+                sealed_candidate_set_json=sealed_set,
+                sealed_candidate_set_sha256=_canonical_sha256(sealed_set),
+                created_at=consumed_at,
+            )
+        )
+        return vintage_id
 
     def attach_job(self, backtest_id: str, job_id: str) -> None:
         with self.engine.begin() as connection:
@@ -1371,6 +1517,7 @@ class StrategyStore:
         ):
             failures.append("event stress carried-position evidence is incomplete")
         robustness = metrics.get("robustness")
+        artifact_root = Path(backtests[0]["artifact_path"]).resolve()
         if (
             not isinstance(robustness, dict)
             or robustness.get("passed") is not True
@@ -1380,35 +1527,25 @@ class StrategyStore:
         ):
             failures.append("all four independent robustness scenarios are required")
         else:
-            artifact_root = Path(backtests[0]["artifact_path"]).resolve()
-            for scenario_name, scenario in robustness["scenarios"].items():
-                artifacts = scenario.get("artifacts") if isinstance(scenario, dict) else None
-                valid_artifacts = isinstance(artifacts, dict) and set(artifacts) == {
-                    "daily_report",
-                    "fills",
-                    "metrics",
-                }
-                if valid_artifacts:
-                    for entry in artifacts.values():
-                        if not isinstance(entry, dict) or not _is_sha256(entry.get("sha256")):
-                            valid_artifacts = False
-                            break
-                        try:
-                            artifact_path = (artifact_root / str(entry["path"])).resolve()
-                            artifact_path.relative_to(artifact_root)
-                        except (KeyError, ValueError):
-                            valid_artifacts = False
-                            break
-                        if (
-                            not artifact_path.is_file()
-                            or _sha256_file(artifact_path) != entry["sha256"]
-                        ):
-                            valid_artifacts = False
-                            break
-                if not valid_artifacts:
-                    failures.append(
-                        f"robustness scenario {scenario_name} has no complete immutable artifacts"
-                    )
+            failures.extend(
+                _scenario_artifact_failures(robustness["scenarios"], artifact_root)
+            )
+        component_stress = metrics.get("component_cost_stress")
+        if (
+            not isinstance(component_stress, dict)
+            or component_stress.get("passed") is not True
+            or component_stress.get("pass_rate") != 1.0
+            or set(component_stress.get("scenarios") or {})
+            != set(COMPONENT_COST_STRESS_MULTIPLIERS)
+        ):
+            failures.append(
+                "all component cost stress scenarios are required "
+                "(commission/slippage/impact/fill-rate)"
+            )
+        else:
+            failures.extend(
+                _scenario_artifact_failures(component_stress["scenarios"], artifact_root)
+            )
         if metrics.get("sortino_status") != "ok":
             failures.append("Sortino is undefined or non-finite")
         deflated = metrics.get("deflated_sharpe")

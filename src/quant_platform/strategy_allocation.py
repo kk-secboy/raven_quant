@@ -210,3 +210,57 @@ def analyze_strategy_allocation(
             for index, column in enumerate(columns)
         },
     }
+
+
+def renormalize_budgets_for_suspended(
+    analysis: dict[str, Any],
+    *,
+    previous_weights: dict[str, float],
+    suspended: dict[str, float],
+) -> dict[str, Any]:
+    """Re-normalize a frozen-decision-day solve onto the active member set.
+
+    Design 6.10 (cash_fallback_policy): when members are suspended, the policy
+    method re-solves on the active set but the suspended members' frozen budget
+    moves to cash instead of being redistributed as leverage. The solved
+    weights (which sum to at most one over the active set) are therefore
+    rescaled to the *previous active mass*; suspended members are zeroed and
+    the residual becomes the cash weight, so the budget total never exceeds
+    investable capital. This runs only inside the frozen-decision-day artifact
+    resolution — never as an ad-hoc mid-cycle re-estimate.
+    """
+
+    if not suspended:
+        raise ValueError("renormalization requires at least one suspended member")
+    result = dict(analysis)
+    members = {key: dict(value) for key, value in (analysis.get("members") or {}).items()}
+    unknown = set(members).difference(previous_weights)
+    if unknown:
+        raise ValueError(f"solved members are unknown to the allocation: {sorted(unknown)}")
+    active_mass = sum(
+        float(previous_weights[version_id]) for version_id in members
+    )
+    solved_sum = sum(float(evidence["target_weight"]) for evidence in members.values())
+    scale = active_mass / solved_sum if solved_sum > 1e-12 else 0.0
+    for evidence in members.values():
+        evidence["target_weight"] = float(evidence["target_weight"]) * scale
+    for version_id, previous in suspended.items():
+        members[version_id] = {
+            "unscaled_weight": 0.0,
+            "target_weight": 0.0,
+            "annualized_volatility": None,
+            "risk_contribution": None,
+            "risk_budget": None,
+            "suspended": True,
+            "previous_weight": float(previous),
+        }
+    result["members"] = members
+    result["cash_weight"] = 1.0 - active_mass
+    result["suspended_members"] = {key: float(value) for key, value in suspended.items()}
+    result["renormalization"] = {
+        "rule": "suspended_budget_to_cash_v1",
+        "active_mass": active_mass,
+        "suspended_share": float(sum(suspended.values())),
+        "scale": scale,
+    }
+    return result

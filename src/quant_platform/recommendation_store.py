@@ -65,6 +65,7 @@ class RecommendationStore:
         dataset: str,
         hypothetical_initial_value: float,
         actor: str,
+        recommendation_scope: str = "standalone",
     ) -> dict[str, Any]:
         version = self.strategies.get_version(strategy_version_id)
         self._assert_v2_strategy(version)
@@ -72,10 +73,28 @@ class RecommendationStore:
             raise ValueError("hypothetical initial value must be at least 100000")
         if not name.strip() or not dataset.strip() or not actor.strip():
             raise ValueError("name, dataset and actor are required")
+        if recommendation_scope not in {"standalone", "allocation_member"}:
+            raise ValueError("recommendation_scope must be standalone or allocation_member")
         portfolio_id = uuid.uuid4().hex
         now = _now()
         try:
             with self.engine.begin() as connection:
+                # Design 8.1/9.1: a single active recommendation sender at any
+                # moment. The partial unique index enforces this at the
+                # database layer; fail closed here with a readable error.
+                conflict = connection.execute(
+                    select(recommendation_portfolios.c.id, recommendation_portfolios.c.name)
+                    .where(
+                        recommendation_portfolios.c.status == "active",
+                        recommendation_portfolios.c.recommendation_scope == "standalone",
+                    )
+                    .limit(1)
+                ).first()
+                if conflict is not None:
+                    raise ValueError(
+                        f"recommendation portfolio {conflict.name!r} is already the active "
+                        "sender; pause it before creating a new one"
+                    )
                 connection.execute(
                     insert(recommendation_portfolios).values(
                         id=portfolio_id,
@@ -86,6 +105,7 @@ class RecommendationStore:
                         base_currency="CNY",
                         hypothetical_initial_value=Decimal(str(hypothetical_initial_value)),
                         risk_exposure_override=1.0,
+                        recommendation_scope=recommendation_scope,
                         created_by=actor.strip(),
                         created_at=now,
                         updated_at=now,
@@ -137,17 +157,46 @@ class RecommendationStore:
             ).all()
         return [self.get(str(item)) for item in ids]
 
-    def set_status(self, portfolio_id: str, status: str) -> dict[str, Any]:
+    def set_status(
+        self, portfolio_id: str, status: str, *, actor: str = "recommendation-operator"
+    ) -> dict[str, Any]:
         if status not in {"active", "paused", "retired"}:
             raise ValueError("recommendation status must be active, paused or retired")
+        if len(actor.strip()) < 2:
+            raise ValueError("a responsible actor is required")
         with self.engine.begin() as connection:
-            result = connection.execute(
+            portfolio = connection.execute(
+                select(recommendation_portfolios)
+                .where(recommendation_portfolios.c.id == portfolio_id)
+                .with_for_update()
+            ).first()
+            if portfolio is None:
+                raise KeyError(portfolio_id)
+            if portfolio.recommendation_scope != "standalone":
+                raise ValueError(
+                    "allocation member portfolios are managed by their allocation"
+                )
+            if status == "active":
+                # Design 8.1/9.1: a single active recommendation sender.
+                conflict = connection.execute(
+                    select(recommendation_portfolios.c.id, recommendation_portfolios.c.name)
+                    .where(
+                        recommendation_portfolios.c.status == "active",
+                        recommendation_portfolios.c.recommendation_scope == "standalone",
+                        recommendation_portfolios.c.id != portfolio_id,
+                    )
+                    .limit(1)
+                ).first()
+                if conflict is not None:
+                    raise ValueError(
+                        f"recommendation portfolio {conflict.name!r} is already the active "
+                        "sender; pause it before activating another one"
+                    )
+            connection.execute(
                 update(recommendation_portfolios)
                 .where(recommendation_portfolios.c.id == portfolio_id)
                 .values(status=status, updated_at=_now())
             )
-            if not result.rowcount:
-                raise KeyError(portfolio_id)
         return self.get(portfolio_id)
 
     def create_snapshot(

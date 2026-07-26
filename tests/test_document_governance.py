@@ -22,6 +22,7 @@ FROZEN_SOURCE_NAMES = {DOCX_BACKUP_NAME, SOURCE_MARKDOWN_NAME}
 CONTROLLED_DOCUMENTS = {
     Path("README.md"),
     Path("docs/DEPLOYMENT.md"),
+    Path("docs/design-gap-analysis.md"),
     Path("docs/pit-nlp-gap-report.md"),
     Path(MARKDOWN_NAME),
     Path(DOCX_NAME),

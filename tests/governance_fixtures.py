@@ -12,7 +12,10 @@ from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_platform.api import StrategyConfigRequest
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.portfolio_policy import POLICY_VERSION
-from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
+from quant_platform.qlib_backtest import (
+    COMPONENT_COST_STRESS_MULTIPLIERS,
+    QLIB_ENGINE_VERSION,
+)
 from quant_platform.research_store import ResearchStore
 from quant_platform.strategy_store import StrategyStore
 
@@ -55,7 +58,9 @@ def create_promoted_factor(
     tmp_path: Path,
     *,
     dataset: str = "snapshot",
+    periods: dict | None = None,
 ) -> dict:
+    periods = periods or PERIODS
     suffix = uuid.uuid4().hex
     store = ResearchStore(database_url)
     run = store.create_run(
@@ -105,7 +110,7 @@ def create_promoted_factor(
         candidate["id"],
         dataset=dataset,
         dataset_identity_sha256=DATASET_IDENTITY,
-        **PERIODS,
+        **periods,
         metrics=metrics,
         artifact_path=str(artifact),
         recomputed_values_path=str(recomputed_path),
@@ -116,7 +121,7 @@ def create_promoted_factor(
             "code_sha256": hashlib.sha256(code_path.read_bytes()).hexdigest(),
             "dataset_identity_sha256": DATASET_IDENTITY,
             "provider_input_sha256": "1" * 64,
-            "periods": {key: value.isoformat() for key, value in PERIODS.items()},
+            "periods": {key: value.isoformat() for key, value in periods.items()},
             "submitted_comparison": {
                 "available": True,
                 "exact_match": True,
@@ -136,8 +141,9 @@ def create_strategy_version(
     *,
     dataset: str = "snapshot",
     config_overrides: dict | None = None,
+    periods: dict | None = None,
 ) -> str:
-    factor = create_promoted_factor(database_url, tmp_path, dataset=dataset)
+    factor = create_promoted_factor(database_url, tmp_path, dataset=dataset, periods=periods)
     config = {
         "topk": 50,
         "n_drop": 5,
@@ -199,6 +205,26 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
             "passed": True,
             "artifacts": scenario_artifacts,
         }
+    component_scenarios = {}
+    for name in COMPONENT_COST_STRESS_MULTIPLIERS:
+        scenario_artifacts = {}
+        for artifact_name, suffix in (
+            ("daily_report", "parquet"),
+            ("fills", "parquet"),
+            ("metrics", "json"),
+        ):
+            relative = Path("component_cost_stress") / name / f"{artifact_name}.{suffix}"
+            path = manifest.parent / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"{name}:{artifact_name}".encode())
+            scenario_artifacts[artifact_name] = {
+                "path": relative.as_posix(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        component_scenarios[name] = {
+            "passed": True,
+            "artifacts": scenario_artifacts,
+        }
     return {
         "backtest_engine": "qlib",
         "backtest_engine_version": QLIB_ENGINE_VERSION,
@@ -232,6 +258,12 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
             "passed": True,
             "pass_rate": 1.0,
             "scenarios": robustness_scenarios,
+        },
+        "component_cost_stress_pass_rate": 1.0,
+        "component_cost_stress": {
+            "passed": True,
+            "pass_rate": 1.0,
+            "scenarios": component_scenarios,
         },
         "rolling_pass_rate": 1.0,
         "rolling_window_count": 4,

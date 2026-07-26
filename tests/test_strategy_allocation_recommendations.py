@@ -43,21 +43,29 @@ from quant_platform.strategy_store import StrategyStore
 
 
 def _approve_version(
-    database_url: str, tmp_path: Path, *, suffix: str, returns: pd.Series
+    database_url: str,
+    tmp_path: Path,
+    *,
+    suffix: str,
+    returns: pd.Series,
+    periods: dict | None = None,
 ) -> str:
-    version_id = create_strategy_version(database_url, tmp_path, dataset="allocation-data")
+    periods = periods or PERIODS
+    version_id = create_strategy_version(
+        database_url, tmp_path, dataset="allocation-data", periods=periods
+    )
     strategies = StrategyStore(database_url)
     version = strategies.get_version(version_id)
     artifact = tmp_path / f"backtest-{suffix}"
     artifact.mkdir()
-    periods = {
-        "start": PERIODS["test_start"].isoformat(),
-        "end": PERIODS["test_end"].isoformat(),
+    backtest_periods = {
+        "start": periods["test_start"].isoformat(),
+        "end": periods["test_end"].isoformat(),
     }
     backtest = strategies.create_backtest(
         version_id=version_id,
         dataset="allocation-data",
-        periods=periods,
+        periods=backtest_periods,
         artifact_path=artifact,
     )
     factor = version["factors"][0]
@@ -69,7 +77,7 @@ def _approve_version(
                 "dataset": "allocation-data",
                 "benchmark": version["benchmark"],
                 "universe": version["universe"],
-                "periods": periods,
+                "periods": backtest_periods,
                 "config": version["config"],
                 "factors": [
                     {
@@ -155,9 +163,16 @@ def test_allocation_uses_recommendation_ledgers_and_propagates_risk(
     dates = pd.bdate_range("2024-01-02", periods=160)
     first = pd.Series(np.sin(np.arange(len(dates)) / 5) * 0.01, index=dates)
     second = pd.Series(np.cos(np.arange(len(dates)) / 7) * 0.012, index=dates)
+    # Each independently researched candidate reserves its own final OOS
+    # window: the vintage seal (design draft 4.1/12.1) makes one calendar
+    # window a one-time resource per scope, so two unrelated candidates can no
+    # longer both consume the same window as this test previously did.
+    second_window = {**PERIODS, "test_start": date(2024, 2, 8)}
     version_ids = [
         _approve_version(database_url, tmp_path, suffix="one", returns=first),
-        _approve_version(database_url, tmp_path, suffix="two", returns=second),
+        _approve_version(
+            database_url, tmp_path, suffix="two", returns=second, periods=second_window
+        ),
     ]
     store = AllocationStore(database_url)
     with pytest.raises(ValueError, match="core/satellite member cap"):

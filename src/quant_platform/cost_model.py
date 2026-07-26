@@ -135,6 +135,23 @@ class CostModelConfig:
             min_commission=self.min_commission * 2,
         )
 
+    def scaled(self, **multipliers: float) -> CostModelConfig:
+        """Per-component stress view: multiply named fields, keep the rest.
+
+        Unlike :meth:`doubled`, each stress scenario degrades exactly the
+        components named in ``multipliers`` (design draft 7.3: commission,
+        spread/slippage, impact and fill capacity are stressed separately).
+        """
+
+        unknown = set(multipliers).difference(self.__dataclass_fields__)
+        if unknown:
+            raise ValueError(f"unknown cost model fields for scaling: {sorted(unknown)}")
+        updates = {
+            name: float(getattr(self, name)) * float(multiplier)
+            for name, multiplier in multipliers.items()
+        }
+        return replace(self, **updates)
+
     def covers(self, trade_date: date) -> bool:
         start = date.fromisoformat(self.effective_from)
         end = date.fromisoformat(self.effective_to) if self.effective_to else None
@@ -408,6 +425,11 @@ class CostScheduleBook:
         """Stress-test view: every recorded version is doubled consistently."""
 
         return CostScheduleBook(tuple(version.doubled() for version in self.versions))
+
+    def scaled(self, **multipliers: float) -> CostScheduleBook:
+        """Per-component stress view applied to every recorded version."""
+
+        return CostScheduleBook(tuple(version.scaled(**multipliers) for version in self.versions))
 
     def flat_view(self, *, as_of: date) -> dict[str, Any]:
         """Flat Qlib-style cost view resolved at one explicit date."""

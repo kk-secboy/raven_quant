@@ -8,10 +8,12 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
     inspector = inspect(engine)
     assert set(inspector.get_table_names(schema="quantlab")) >= {
         "alembic_version",
+        "account_netting_plans",
         "jobs",
         "research_runs",
         "factor_candidates",
         "factor_evaluations",
+        "oos_vintages",
         "recommendation_portfolios",
         "recommendation_snapshots",
         "recommendation_holdings",
@@ -83,7 +85,50 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0038_corporate_actions"
+    assert revision == "0042_account_netting_plans"
+    assert {"liability_per_share"} <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "simulation_dividend_entitlements", schema="quantlab"
+        )
+    }
+    assert {"tax_liability_amount"} <= {
+        column["name"]
+        for column in inspector.get_columns("simulation_dividend_actions", schema="quantlab")
+    }
+    assert {"corporate_tax_liabilities"} <= {
+        column["name"]
+        for column in inspector.get_columns("simulation_nav", schema="quantlab")
+    }
+    assert {
+        "plan_key",
+        "account_id",
+        "allocation_artifact_id",
+        "decision_date",
+        "inputs_as_of",
+        "policy_version",
+        "execution_policy",
+        "tranche_index",
+        "plan_hash",
+        "plan_json",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("account_netting_plans", schema="quantlab")
+    }
+    assert {
+        "scope",
+        "dataset_identity",
+        "test_start",
+        "test_end",
+        "sealed_at",
+        "first_opened_at",
+        "consumed_at",
+        "sealed_candidate_set_json",
+        "sealed_candidate_set_sha256",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("oos_vintages", schema="quantlab")
+    }
     assert {"research_program_id", "dataset_identity_sha256"} <= {
         column["name"]
         for column in inspector.get_columns("research_campaigns", schema="quantlab")

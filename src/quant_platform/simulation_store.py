@@ -1876,6 +1876,9 @@ class SimulationStore:
                                 "kind": str(entitlement_row.kind),
                                 "income_per_share": float(entitlement_row.income_per_share),
                                 "untaxed_quantity": int(entitlement_row.untaxed_quantity),
+                                "liability_per_share": float(
+                                    entitlement_row.liability_per_share
+                                ),
                             }
                         )
             for instrument, lots in lots_by_instrument.items():
@@ -2213,6 +2216,9 @@ class SimulationStore:
                             kind=str(entitlement["kind"]),
                             income_per_share=Decimal(str(entitlement["income_per_share"])),
                             untaxed_quantity=int(entitlement["untaxed_quantity"]),
+                            liability_per_share=Decimal(
+                                str(entitlement.get("liability_per_share", 0.0))
+                            ),
                             updated_at=now,
                         )
                     )
@@ -2239,6 +2245,9 @@ class SimulationStore:
                         eligible_quantity=int(applied["eligible_quantity"]),
                         cash_per_share=Decimal(str(applied["cash_per_share"])),
                         receivable_amount=Decimal(str(applied["receivable_amount"])),
+                        tax_liability_amount=Decimal(
+                            str(applied.get("tax_liability", 0.0))
+                        ),
                         bonus_share_ratio=float(applied.get("bonus_share_ratio") or 0.0),
                         conversion_ratio=float(applied.get("conversion_ratio") or 0.0),
                         new_shares=int(applied.get("new_shares") or 0),
@@ -2280,6 +2289,9 @@ class SimulationStore:
                 cash=Decimal(str(nav["cash"])),
                 market_value=Decimal(str(nav["market_value"])),
                 corporate_receivables=Decimal(str(nav.get("corporate_receivables", 0.0))),
+                corporate_tax_liabilities=Decimal(
+                    str(nav.get("corporate_tax_liabilities", 0.0))
+                ),
                 nav=Decimal(str(nav["nav"])),
                 daily_return=float(nav["daily_return"]),
                 drawdown=float(nav["drawdown"]),

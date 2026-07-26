@@ -10,6 +10,12 @@ explicit deltas.  All rounding rules live here and are deterministic:
   属于保守近似并在事件中标明）。
 - 除权日资格量 = 除权日盘前持仓量（A 股除权日恒为登记日次一交易日，
   登记收盘与除权开盘之间无法交易，二者等价）。
+- at_sale 税制下除权确认应收（税前）的同时，按批次在股息权利上登记
+  ``liability_per_share``＝每股应税所得 × 除权日时点持有期档位税率。持有期
+  只会随时间变长、税率只降不升，因此该估计是逐批次保守上界；NAV 须减去
+  未结算负债（``pending_dividend_tax_liability``），卖出结算时只确认实际
+  税额与已提负债的差额（多提冲回），NAV 在除权日不虚高、卖出日不跳变
+  （设计 §5.6 保守税费负债原则）。
 
 设计出处：个人量化投资与模拟盘系统设计稿 §5.6/§5.7。
 """
@@ -293,18 +299,25 @@ def settle_dividend_tax(
     consumed: list[tuple[dict, int]],
     sale_date: date,
     tax_book: DividendTaxRuleBook,
-) -> tuple[float, list[dict[str, Any]]]:
+) -> tuple[float, list[dict[str, Any]], float]:
     """Settle differentiated dividend tax for one sale (2013+ at-sale regime).
 
     对本次卖出的每个批次，按该批次的股息权利（entitlements）以
     记录日定版本、取得日→卖出日持有期定档计税；同时消耗对应的
     ``untaxed_quantity``，保证同一笔股息所得只被征税一次。
-    ETF/基金分配免征（财税字[1998]55号）。返回（税额, 明细）。
+    ETF/基金分配免征（财税字[1998]55号）。
+
+    返回（税额, 明细, 已提负债释放额）。释放额按同一消耗量
+    ``take × liability_per_share`` 计算——除权日按保守档位计提的负债随
+    批次消耗同比例释放，卖出对 NAV 的净影响只有 实际税额 − 释放额
+    （差额确认）；旧账本没有 ``liability_per_share`` 的权利释放为零，
+    差额即全额税额（少提方向，向后兼容）。
     """
 
     if is_dividend_tax_exempt(infer_cn_asset_type(instrument)):
-        return 0.0, []
+        return 0.0, [], 0.0
     total = 0.0
+    released = 0.0
     details: list[dict[str, Any]] = []
     for lot, quantity in consumed:
         entitlements = sorted(
@@ -331,6 +344,7 @@ def settle_dividend_tax(
             income = take * float(entitlement.get("income_per_share", 0.0))
             tax = income * rate
             total += tax
+            released += take * float(entitlement.get("liability_per_share", 0.0) or 0.0)
             if tax > 0:
                 details.append(
                     {
@@ -341,11 +355,32 @@ def settle_dividend_tax(
                         "income": _round_money(income),
                         "rate": rate,
                         "tax": _round_money(tax),
+                        "liability_released": _round_money(
+                            take * float(entitlement.get("liability_per_share", 0.0) or 0.0)
+                        ),
                         "tax_rule_version": rule.version,
                     }
                 )
             entitlement["untaxed_quantity"] = untaxed - take
-    return _round_money(total), details
+    return _round_money(total), details, _round_money(released)
+
+
+def pending_dividend_tax_liability(positions: Mapping[str, Any]) -> float:
+    """未结算股息税负债总额：逐批次 未税数量 × 除权日计提的每股负债。
+
+    负债随 ``settle_dividend_tax`` 消耗 ``untaxed_quantity`` 同比例自动释放，
+    不需要独立状态机；NAV = 现金 + 市值 + 应收 − 本函数结果。没有
+    ``liability_per_share`` 的旧账本权利贡献零（差额在卖出时全额确认）。
+    """
+
+    total = 0.0
+    for position in positions.values():
+        for lot in position.get("lots") or []:
+            for entitlement in lot.get("entitlements") or []:
+                total += int(entitlement.get("untaxed_quantity", 0)) * float(
+                    entitlement.get("liability_per_share", 0.0) or 0.0
+                )
+    return _round_money(total)
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +399,10 @@ def apply_ex_dividend(
 
     - 现金分红：确认应收（at_sale 版本按税前额；at_payment 版本按税后额，
       税后缺失时按 税前×(1-税率) 保守折算并标记估值不确定）。
-    - at_sale 且非豁免时按批次生成股息权利（现金 + 送股面值两类）。
+    - at_sale 且非豁免时按批次生成股息权利（现金 + 送股面值两类），并按
+      除权日时点持有期档位（逐批次保守上界，持有期只增税率只降）在权利上
+      登记 ``liability_per_share`` 计提应付税负债；返回 ``tax_liability``
+      为本次除权计提总额，NAV 须将其作为减项。
     - 送转：按批次派生红利股批次（取得日继承父批次＝持有期连续计算的明示
       假设；``sellable_from`` 取新增股份上市日，缺失时回退除权日次一自然日
       并标记估值不确定）。总成本基础不变，单位成本随数量摊薄。
@@ -372,7 +410,7 @@ def apply_ex_dividend(
 
     quantity = int(position.get("quantity", 0))
     if quantity <= 0:
-        return {"receivable": None, "events": [], "new_shares": 0}
+        return {"receivable": None, "events": [], "new_shares": 0, "tax_liability": 0.0}
     instrument = action.instrument
     events: list[dict[str, Any]] = []
     valuation_uncertain = False
@@ -395,6 +433,7 @@ def apply_ex_dividend(
         raise ValueError(f"negative dividend per share for {instrument}")
 
     lots = position_lots(position, trade_date=trade_date)
+    tax_liability = 0.0
     if (
         not exempt
         and tax_rule.settlement_mode == SETTLEMENT_AT_SALE
@@ -404,24 +443,40 @@ def apply_ex_dividend(
             lot_quantity = int(lot.get("quantity", 0))
             if lot_quantity <= 0:
                 continue
+            # 保守计提：以除权日时点的持有期定档——卖出日只会更晚、税率只降
+            # 不升，该档即本批次可能适用的最高税率（取得日不可知时为最高档）。
+            liability_rate = rate_for_holding(
+                rule=tax_rule,
+                acquired_at=lot.get("acquired_at"),
+                sale_date=trade_date,
+            )
             if action.cash_div_pretax > 0:
+                liability_per_share = action.cash_div_pretax * liability_rate
                 lot.setdefault("entitlements", []).append(
                     {
                         "record_date": action.record_date,
                         "kind": ENTITLEMENT_KIND_CASH,
                         "income_per_share": action.cash_div_pretax,
                         "untaxed_quantity": lot_quantity,
+                        "liability_per_share": liability_per_share,
                     }
                 )
+                tax_liability += lot_quantity * liability_per_share
             if action.bonus_share_ratio > 0:
+                liability_per_share = action.bonus_share_ratio * DIVIDEND_PAR_VALUE_CNY * (
+                    liability_rate
+                )
                 lot.setdefault("entitlements", []).append(
                     {
                         "record_date": action.record_date,
                         "kind": ENTITLEMENT_KIND_BONUS_PAR,
                         "income_per_share": action.bonus_share_ratio * DIVIDEND_PAR_VALUE_CNY,
                         "untaxed_quantity": lot_quantity,
+                        "liability_per_share": liability_per_share,
                     }
                 )
+                tax_liability += lot_quantity * liability_per_share
+    tax_liability = _round_money(tax_liability)
 
     receivable: dict[str, Any] | None = None
     amount = _round_money(quantity * per_share)
@@ -518,9 +573,15 @@ def apply_ex_dividend(
                 "cash_per_share": per_share,
                 "receivable_amount": amount,
                 "new_shares": new_shares_total,
+                "tax_liability": tax_liability,
                 "tax_rule_version": tax_rule.version,
                 "valuation_uncertain": valuation_uncertain,
             },
         }
     )
-    return {"receivable": receivable, "events": events, "new_shares": new_shares_total}
+    return {
+        "receivable": receivable,
+        "events": events,
+        "new_shares": new_shares_total,
+        "tax_liability": tax_liability,
+    }
