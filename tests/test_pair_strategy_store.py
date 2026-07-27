@@ -64,7 +64,7 @@ def _passing_metrics() -> dict:
     }
 
 
-def test_pair_strategy_uses_shared_version_and_backtest_governance(
+def test_pair_strategy_versions_stay_research_only_at_the_approval_gate(
     database_url: str, tmp_path
 ) -> None:
     store = StrategyStore(database_url)
@@ -81,16 +81,18 @@ def test_pair_strategy_uses_shared_version_and_backtest_governance(
         artifact_path=tmp_path,
     )
     store.mark_backtest(backtest["id"], "succeeded", metrics=_passing_metrics())
-    approved = store.approve(
-        version["id"],
-        actor="risk-approver-b",
-        reason="协整、成本压力、容量和融券证据均通过独立复核。",
-    )
-    assert approved["status"] == "approved"
-    assert approved["approved_by"] == "risk-approver-b"
+    # Research-only (design 6.4.3/13): even a fully passing backtest cannot be
+    # approved; the gate reads the strategy catalog, the single source of truth.
+    with pytest.raises(ValueError, match="research_only"):
+        store.approve(
+            version["id"],
+            actor="risk-approver-b",
+            reason="协整、成本压力、容量和融券证据均通过独立复核。",
+        )
+    assert store.get_version(version["id"])["status"] == "draft"
 
 
-def test_pair_strategy_requires_second_person_and_minute_dataset(
+def test_pair_approval_gate_fires_before_evidence_checks(
     database_url: str, tmp_path
 ) -> None:
     store = StrategyStore(database_url)
@@ -102,18 +104,56 @@ def test_pair_strategy_requires_second_person_and_minute_dataset(
         artifact_path=tmp_path,
     )
     store.mark_backtest(backtest["id"], "succeeded", metrics=_passing_metrics())
-    with pytest.raises(ValueError, match="second operator"):
+    # The catalog gate is fail-closed and precedes the old evidence checks, so
+    # the rejection names research_only rather than second-operator/dataset gaps.
+    with pytest.raises(ValueError, match="research_only"):
         store.approve(
             version["id"],
             actor="researcher-a",
             reason="创建人不得自行批准这套配对策略进入下一阶段。",
         )
-    with pytest.raises(ValueError, match="minute execution dataset"):
+    with pytest.raises(ValueError, match="research_only"):
         store.approve(
             version["id"],
             actor="risk-approver-b",
             reason="没有分钟执行数据时必须保持失败关闭。",
         )
+
+
+def test_pair_approval_gate_reads_the_catalog(
+    monkeypatch: pytest.MonkeyPatch, database_url: str, tmp_path
+) -> None:
+    # Single-source-of-truth proof: when the catalog role stops being
+    # research_only the same approve call proceeds to the evidence gates.
+    from quant_platform import strategy_catalog
+
+    entry = strategy_catalog.get_catalog_entry("stock_pair_stat_arb")
+    assert entry["catalog_role"] == "research_only"
+    promoted_entry = {**entry, "catalog_role": "alpha_template"}
+    monkeypatch.setattr(
+        strategy_catalog,
+        "get_catalog_entry",
+        lambda template_id: promoted_entry
+        if template_id == "stock_pair_stat_arb"
+        else entry,
+    )
+    store = StrategyStore(database_url)
+    version = _pair(store)["versions"][0]
+    backtest = store.create_backtest(
+        version_id=version["id"],
+        dataset="daily-2024-2026",
+        execution_dataset="minute-2024-2026/liquid_stocks_1m",
+        periods={"start": "2024-01-01", "end": "2025-12-31"},
+        artifact_path=tmp_path,
+    )
+    store.mark_backtest(backtest["id"], "succeeded", metrics=_passing_metrics())
+    approved = store.approve(
+        version["id"],
+        actor="risk-approver-b",
+        reason="目录角色变更后同一批准调用进入既有证据门并通过。",
+    )
+    assert approved["status"] == "approved"
+    assert approved["approved_by"] == "risk-approver-b"
 
 
 def test_recommendation_portfolio_rejects_pair_research_version(
@@ -129,11 +169,8 @@ def test_recommendation_portfolio_rejects_pair_research_version(
         artifact_path=tmp_path,
     )
     strategies.mark_backtest(backtest["id"], "succeeded", metrics=_passing_metrics())
-    strategies.approve(
-        version["id"],
-        actor="risk-approver-b",
-        reason="批准研究版本，但尚未接入专用价差模拟账本。",
-    )
+    # Pair versions can no longer be approved at all (research-only), so the
+    # recommendation chain rejects them on the approved-multifactor contract.
     with pytest.raises(ValueError, match="approved multifactor strategy"):
         RecommendationStore(database_url).create(
             name="invalid-pair-recommendation",
@@ -141,4 +178,51 @@ def test_recommendation_portfolio_rejects_pair_research_version(
             dataset="daily-2024-2026",
             hypothetical_initial_value=5_000_000,
             actor="operator-c",
+        )
+
+
+def test_allocation_rejects_pair_members(database_url: str, tmp_path) -> None:
+    # Research-only (design 6.4.3/13): a pair version may not enter a capital
+    # allocation, not even as a satellite member.
+    from sqlalchemy import update
+
+    from quant_data.database import strategy_versions
+    from quant_platform.allocation_store import AllocationStore
+
+    strategies = StrategyStore(database_url)
+    first = str(_pair(strategies)["versions"][0]["id"])
+    second = str(
+        strategies.create_pair(
+            name="沪深300 ETF 配对（二号）",
+            description="分配成员资格需要至少两个版本；第二个配对族仅作陪绑。",
+            leg_y="SH510300",
+            leg_x="SZ159919",
+            asset_class="etf",
+            shorting_mode="margin_borrow",
+            config=asdict(PairTradingConfig()),
+            actor="researcher-a",
+        )["versions"][0]["id"]
+    )
+    with strategies.engine.begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id.in_([first, second]))
+            .values(status="approved")
+        )
+    with pytest.raises(ValueError, match="research_only"):
+        AllocationStore(database_url).create(
+            name="invalid-pair-allocation",
+            strategy_version_ids=[first, second],
+            dataset="daily-2024-2026",
+            total_capital=1_000_000,
+            allocation_method="fixed",
+            lookback_days=120,
+            target_volatility=0.20,
+            max_pairwise_correlation=0.80,
+            max_strategy_weight=0.70,
+            max_member_drawdown=0.08,
+            max_drawdown_reduce=0.10,
+            max_drawdown_liquidate=0.15,
+            fixed_weights=None,
+            actor="allocation-author",
         )

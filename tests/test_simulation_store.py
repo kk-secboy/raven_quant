@@ -920,63 +920,17 @@ def test_legacy_or_changed_source_contract_cannot_be_activated(database_url: str
         store.set_status(simulation["id"], "active")
 
 
-def test_pair_source_persists_atomic_legs_and_borrow_cost(database_url: str, tmp_path) -> None:
-    store, simulation, backtest, trade_date = _governed_pair_replay_fixture(database_url, tmp_path)
-    batch, _ = store.create_pair_batch_from_backtest(
-        simulation["id"],
-        backtest_id=backtest["id"],
-        trade_date=trade_date,
-        data_root=tmp_path / "data",
-        actor="simulation-operator",
-    )
-    bars = pd.concat(
-        [
-            _bars(),
-            _bars().assign(instrument="SH600001", close=20.0, vwap=20.0),
-        ],
-        ignore_index=True,
-    )
-    evidence = _execution_evidence(batch["id"], simulation["execution_contract_hash"])
-    evidence["shortability"] = {"SH600001": True}
-    evidence["shortability_trade_date"] = TRADE_DATE.isoformat()
-    evidence["shortability_evidence_sha256"] = "7" * 64
-    plan = batch["target_payload"]["governed_pair_plan"]
-    evidence["pair_plan_sha256"] = plan["pair_plan_sha256"]
-    evidence["pair_artifact_manifest_sha256"] = plan["pair_artifact_manifest_sha256"]
-    evidence["shortability_source_sha256"] = plan["shortability_dataset"]["source_sha256"]
-    evidence["shortability_snapshot_manifest_sha256"] = plan["shortability_dataset"][
-        "manifest_sha256"
-    ]
-    completed = store.process_batch(
-        batch["id"],
-        minute_bars=bars,
-        closing_prices={
-            "SH600000": {"price": 10.0, "market_date": TRADE_DATE.isoformat()},
-            "SH600001": {"price": 20.0, "market_date": TRADE_DATE.isoformat()},
-        },
-        execution_evidence=evidence,
-    )
-    assert completed["status"] == "succeeded"
-    assert completed["summary"]["shortability_evidence_sha256"] == "7" * 64
-    orders = store.rows(simulation["id"], "orders")
-    fills = store.rows(simulation["id"], "fills")
-    positions = store.rows(simulation["id"], "positions")
-    assert {item["atomic_group_id"] for item in orders} == {
-        batch["target_payload"]["atomic_group_id"]
-    }
-    assert {item["leg_no"] for item in fills} == {1, 2}
-    assert {item["position_side"] for item in positions} == {"long", "short"}
-    assert next(item for item in fills if item["position_side"] == "short")["borrow_cost"] > 0
+def test_pair_simulation_creation_is_research_only(database_url: str, tmp_path) -> None:
+    """Persistent pair simulation ledgers are research-only rejects (design 6.4.3/13).
 
+    The offline pair backtest path stays available, but the capitalized
+    forward ledger can no longer be opened even for an approved pair version.
+    """
 
-def _governed_pair_replay_fixture(
-    database_url: str, tmp_path
-) -> tuple[SimulationStore, dict, dict, date]:
-    data_root = tmp_path / "data"
     strategies = StrategyStore(database_url)
     created = strategies.create_pair(
-        name="governed pair replay",
-        description="approved pair artifact is the only source of replay targets",
+        name="research only pair simulation",
+        description="pair strategies keep offline backtests but no persistent ledger",
         leg_y="SH600000",
         leg_x="SH600001",
         asset_class="stock",
@@ -990,114 +944,9 @@ def _governed_pair_replay_fixture(
         dataset="snapshot",
         execution_dataset="execution-snapshot/liquid_stocks_1m+margin_eligibility",
         periods={"start": "2024-01-01", "end": "2026-07-13"},
-        artifact_path=data_root / "artifacts" / "backtests",
+        artifact_path=tmp_path / "data" / "artifacts" / "backtests",
     )
-    artifact = data_root / "artifacts" / "backtests" / backtest["id"]
-    artifact.mkdir(parents=True)
-    trade_date = date(2026, 7, 13)
-    trade = {
-        "trade_date": trade_date.isoformat(),
-        "signal_date": "2026-07-10",
-        "action": "entry",
-        "direction": 1,
-        "hedge_ratio": 1.0,
-        "orders": [
-            {"instrument": "SH600000", "delta": 1000},
-            {"instrument": "SH600001", "delta": -500},
-        ],
-    }
-    pd.DataFrame(
-        {
-            "datetime": [pd.Timestamp(trade_date)],
-            "nav": [float(PairTradingConfig().initial_capital)],
-            "quantity_y": [1000],
-            "quantity_x": [-500],
-        }
-    ).set_index("datetime").to_parquet(artifact / "daily_ledger.parquet")
-    pd.DataFrame({"datetime": [pd.Timestamp(trade_date)], "daily_return": [0.0]}).set_index(
-        "datetime"
-    ).to_parquet(artifact / "daily_returns.parquet")
-    pd.DataFrame({"datetime": [pd.Timestamp(trade_date)], "spread": [0.0]}).set_index(
-        "datetime"
-    ).to_parquet(artifact / "kalman_spread.parquet")
-    (artifact / "trades.json").write_text(json.dumps([trade]), encoding="utf-8")
-    (artifact / "rejections.json").write_text("[]", encoding="utf-8")
-    main_manifest = {
-        "backtest_id": backtest["id"],
-        "strategy_version_id": version["id"],
-        "dataset": "snapshot",
-        "execution_snapshot": "execution-snapshot",
-        "execution_contract_hash": version["execution_contract_hash"],
-        "periods": backtest["periods"],
-        "config": version["config"],
-        "pair": version["pair"],
-    }
-    (artifact / "manifest.json").write_text(
-        json.dumps(main_manifest, default=str), encoding="utf-8"
-    )
-    files = {
-        name: {
-            "bytes": (artifact / name).stat().st_size,
-            "sha256": hashlib.sha256((artifact / name).read_bytes()).hexdigest(),
-        }
-        for name in (
-            "daily_returns.parquet",
-            "daily_ledger.parquet",
-            "kalman_spread.parquet",
-            "trades.json",
-            "rejections.json",
-        )
-    }
-    pair_manifest = {
-        "format_version": "pair-replay-artifact-v1",
-        "backtest_id": backtest["id"],
-        "strategy_version_id": version["id"],
-        "execution_contract_hash": version["execution_contract_hash"],
-        "dataset": "snapshot",
-        "periods": backtest["periods"],
-        "pair": version["pair"],
-        "strategy_config_sha256": hashlib.sha256(
-            json.dumps(
-                version["config"],
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest(),
-        "execution_snapshot": "execution-snapshot",
-        "minute_dataset": {
-            "snapshot_name": "execution-snapshot",
-            "dataset_name": "liquid_stocks_1m",
-            "manifest_sha256": "1" * 64,
-            "source_sha256": "2" * 64,
-            "snapshot_lineage_id": SOURCE_LINEAGE,
-        },
-        "shortability_dataset": {
-            "snapshot_name": "execution-snapshot",
-            "dataset_name": "margin_eligibility",
-            "manifest_sha256": "1" * 64,
-            "source_sha256": "3" * 64,
-            "snapshot_lineage_id": SOURCE_LINEAGE,
-        },
-        "files": files,
-    }
-    (artifact / "pair_artifact_manifest.json").write_text(
-        json.dumps(pair_manifest, default=str), encoding="utf-8"
-    )
-    strategies.mark_backtest(
-        backtest["id"],
-        "succeeded",
-        metrics={
-            "provenance": {
-                "execution_manifest_sha256": hashlib.sha256(
-                    (artifact / "manifest.json").read_bytes()
-                ).hexdigest(),
-                "pair_artifact_manifest_sha256": hashlib.sha256(
-                    (artifact / "pair_artifact_manifest.json").read_bytes()
-                ).hexdigest(),
-            }
-        },
-    )
+    strategies.mark_backtest(backtest["id"], "succeeded", metrics={"provenance": {}})
     with strategies.engine.begin() as connection:
         connection.execute(
             update(strategy_versions)
@@ -1105,99 +954,24 @@ def _governed_pair_replay_fixture(
             .values(status="approved")
         )
     store = SimulationStore(database_url)
-    simulation = store.create(
-        name="governed pair replay simulation",
-        source_type="strategy_version",
-        source_id=version["id"],
-        daily_dataset=_daily_dataset(),
-        execution_dataset=_execution_dataset("1min"),
-        initial_cash=PairTradingConfig().initial_capital,
-        execution_policy={
-            "execution_algorithm": "vwap",
-            "slice_minutes": 5,
-            "max_slices": 1,
-            "max_participation": 0.01,
-            "volume_profile": [{"time": "10:00", "weight": 1.0}],
-        },
-        cost_schedule_version=COST_SCHEDULE_VERSION,
-        actor="simulation-operator",
-        execution_adapter="pair",
-    )
-    store.set_status(simulation["id"], "active")
-    return store, simulation, backtest, trade_date
-
-
-def test_pair_batches_only_accept_governed_formal_backtest_artifacts(
-    database_url: str, tmp_path
-) -> None:
-    store, simulation, backtest, trade_date = _governed_pair_replay_fixture(database_url, tmp_path)
-    with pytest.raises(ValueError, match="direct simulation target payloads are forbidden"):
-        store.create_batch_for_targets(
-            simulation["id"],
-            source_snapshot_id="client-controlled-pair-plan",
-            signal_date=date(2026, 7, 10),
-            trade_date=trade_date,
-            target_payload={
-                "atomic_group_id": "client-group",
-                "legs": [
-                    {
-                        "instrument": "SH600000",
-                        "leg_no": 1,
-                        "position_side": "long",
-                        "target_quantity": 9_900,
-                        "annual_borrow_rate": 0.0,
-                    },
-                    {
-                        "instrument": "SH600001",
-                        "leg_no": 2,
-                        "position_side": "short",
-                        "target_quantity": 9_900,
-                        "annual_borrow_rate": 0.99,
-                    },
-                ],
+    with pytest.raises(ValueError, match="research_only"):
+        store.create(
+            name="research only pair simulation ledger",
+            source_type="strategy_version",
+            source_id=version["id"],
+            daily_dataset=_daily_dataset(),
+            execution_dataset=_execution_dataset("1min"),
+            initial_cash=PairTradingConfig().initial_capital,
+            execution_policy={
+                "execution_algorithm": "vwap",
+                "slice_minutes": 5,
+                "max_slices": 1,
+                "max_participation": 0.01,
+                "volume_profile": [{"time": "10:00", "weight": 1.0}],
             },
-            execution_contract_hash=simulation["execution_contract_hash"],
-            idempotency_key="client-pair-plan",
-        )
-
-    batch, created = store.create_pair_batch_from_backtest(
-        simulation["id"],
-        backtest_id=backtest["id"],
-        trade_date=trade_date,
-        data_root=tmp_path / "data",
-        actor="simulation-operator",
-    )
-
-    assert created is True
-    assert batch["target_payload"]["legs"] == [
-        {
-            "instrument": "SH600000",
-            "leg_no": 1,
-            "position_side": "long",
-            "target_quantity": 1000,
-            "annual_borrow_rate": 0.0,
-        },
-        {
-            "instrument": "SH600001",
-            "leg_no": 2,
-            "position_side": "short",
-            "target_quantity": 500,
-            "annual_borrow_rate": PairTradingConfig().annual_borrow_rate,
-        },
-    ]
-    assert batch["target_payload"]["governed_pair_plan"]["backtest_id"] == backtest["id"]
-    assert batch["created_by"] == "simulation-operator"
-
-    (tmp_path / "data" / "artifacts" / "backtests" / backtest["id"] / "trades.json").write_text(
-        "[]", encoding="utf-8"
-    )
-    with pytest.raises(ValueError, match="failed immutable verification"):
-        store.create_pair_batch_from_backtest(
-            simulation["id"],
-            backtest_id=backtest["id"],
-            trade_date=trade_date,
-            data_root=tmp_path / "data",
+            cost_schedule_version=COST_SCHEDULE_VERSION,
             actor="simulation-operator",
+            execution_adapter="pair",
         )
 
 

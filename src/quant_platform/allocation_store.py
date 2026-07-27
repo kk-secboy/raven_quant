@@ -43,6 +43,7 @@ from .strategy_allocation import (
     analyze_strategy_allocation,
     renormalize_budgets_for_suspended,
 )
+from .strategy_catalog import require_capital_eligible_strategy_type
 from .strategy_store import StrategyStore
 
 
@@ -184,11 +185,11 @@ class AllocationStore:
                 version = self.strategies.get_version(version_id)
                 if version["status"] != "approved" or version.get("is_legacy"):
                     raise ValueError("allocations require approved non-legacy strategy versions")
-                if (
-                    version.get("strategy_type") == "pair"
-                    and governance[version_id]["role"] != "satellite"
-                ):
-                    raise ValueError("pair strategies may only enter an allocation as satellites")
+                # Research-only gate (design 6.4.3/13): pair strategies are
+                # offline research and may never enter a capital allocation,
+                # not even as satellites.
+                if version.get("strategy_type") == "pair":
+                    require_capital_eligible_strategy_type("pair", action="分配")
                 backtest_row = connection.execute(
                     select(backtest_runs)
                     .where(

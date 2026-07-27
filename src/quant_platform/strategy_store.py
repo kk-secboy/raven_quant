@@ -44,6 +44,7 @@ from quant_platform.qlib_factor_baseline import (
     bind_factor_source_config,
 )
 from quant_platform.qlib_workflow import require_qlib_workflow_identity
+from quant_platform.strategy_catalog import require_capital_eligible_strategy_type
 from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
 
@@ -1166,6 +1167,10 @@ class StrategyStore:
         actor: str,
         reason: str,
     ) -> dict[str, Any]:
+        # Research-only gate (design 6.4.3/13): pair strategies are offline
+        # statistical research and can never be approved for capital use.
+        # The verdict comes from the strategy catalog, the single source of truth.
+        require_capital_eligible_strategy_type("pair", action="批准")
         config = PairTradingConfig(**version["config"])
         metrics = dict(backtest["metrics"] or {})
         failures: list[str] = []

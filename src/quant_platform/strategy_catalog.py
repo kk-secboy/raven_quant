@@ -334,6 +334,37 @@ def get_catalog_entry(template_id: str) -> dict[str, Any]:
     raise KeyError(template_id)
 
 
+# Strategy-type → design template binding. This is the single source of truth
+# for which strategy types are research-only: the gates below read the catalog
+# role instead of hardcoding strategy names, so promoting a template back to a
+# capital-eligible role reopens the gates without touching call sites.
+STRATEGY_TYPE_TEMPLATE_IDS: dict[str, str] = {
+    "pair": "stock_pair_stat_arb",
+}
+
+RESEARCH_ONLY_MESSAGE = (
+    "research_only：{name}只做离线统计研究，不可{action}（设计稿 §6.4.3/§13）"
+)
+
+
+def require_capital_eligible_strategy_type(strategy_type: str, *, action: str) -> None:
+    """Fail closed when the catalog marks this strategy type research-only.
+
+    ``action`` names the blocked transition (批准/分配/持久模拟) and is
+    interpolated into the error message. Strategy types without a template
+    binding are unaffected.
+    """
+
+    template_id = STRATEGY_TYPE_TEMPLATE_IDS.get(str(strategy_type))
+    if template_id is None:
+        return
+    entry = get_catalog_entry(template_id)
+    if entry["catalog_role"] == "research_only":
+        raise ValueError(
+            RESEARCH_ONLY_MESSAGE.format(name=entry["name"], action=action)
+        )
+
+
 def catalog_entries_by_status(implementation_status: str) -> list[dict[str, Any]]:
     if implementation_status not in IMPLEMENTATION_STATUSES:
         raise ValueError(f"unknown implementation status: {implementation_status}")
@@ -372,3 +403,9 @@ def validate_recipe_catalog() -> None:
     missing = {item["id"] for item in list_strategy_recipes()} - linked
     if missing:
         raise ValueError(f"implemented recipes missing from the catalog: {sorted(missing)}")
+    known_templates = {entry["template_id"] for entry in entries}
+    for strategy_type, template_id in STRATEGY_TYPE_TEMPLATE_IDS.items():
+        if template_id not in known_templates:
+            raise ValueError(
+                f"strategy type {strategy_type!r} binds unknown template {template_id!r}"
+            )

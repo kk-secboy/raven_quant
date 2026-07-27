@@ -48,6 +48,7 @@ IGNORED_ARTIFACT_PARTS = {
     ".git",
     ".venv",
     ".pytest-tmp",
+    ".worktrees",
     "node_modules",
     ".next",
     ".vinext",

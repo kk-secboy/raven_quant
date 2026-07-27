@@ -87,7 +87,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0044_recommendation_actions"
+    assert revision == "0045_research_only_pair"
     assert {"promotion_stage"} <= {
         column["name"]
         for column in inspector.get_columns("strategy_versions", schema="quantlab")
@@ -367,3 +367,66 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
             column["name"]
             for column in inspector.get_columns(table_name, schema="quantlab")
         }
+
+
+def test_0045_retires_legacy_approved_pair_versions(database_url: str) -> None:
+    """Seed a pre-gate approved pair version, replay 0045, expect retirement."""
+
+    import uuid
+    from dataclasses import asdict
+
+    from alembic import command
+    from sqlalchemy import select, update
+
+    from quant_data.database import strategies, strategy_events, strategy_versions
+    from quant_platform.db_cli import alembic_config
+    from quant_platform.pair_trading import PairTradingConfig
+    from quant_platform.strategy_store import StrategyStore
+
+    store = StrategyStore(database_url)
+    created = store.create_pair(
+        name=f"legacy-approved-pair-{uuid.uuid4().hex}",
+        description="pre-gate approved pair version retired by migration 0045",
+        leg_y="SH510300",
+        leg_x="SZ159919",
+        asset_class="etf",
+        shorting_mode="margin_borrow",
+        config=asdict(PairTradingConfig()),
+        actor="legacy-researcher",
+    )
+    version = created["versions"][0]
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id == version["id"])
+            .values(status="approved")
+        )
+        connection.execute(
+            update(strategies)
+            .where(strategies.c.id == version["strategy_id"])
+            .values(status="approved")
+        )
+
+    config = alembic_config(database_url)
+    command.stamp(config, "0044_recommendation_actions")
+    command.upgrade(config, "head")
+
+    with engine.connect() as connection:
+        retired = connection.execute(
+            select(strategy_versions.c.status).where(
+                strategy_versions.c.id == version["id"]
+            )
+        ).scalar_one()
+        family = connection.execute(
+            select(strategies.c.status).where(strategies.c.id == version["strategy_id"])
+        ).scalar_one()
+        audit = connection.execute(
+            select(strategy_events.c.event_type, strategy_events.c.actor).where(
+                strategy_events.c.strategy_version_id == version["id"],
+                strategy_events.c.event_type == "strategy.pair_retired_research_only",
+            )
+        ).first()
+    assert retired == "retired"
+    assert family == "retired"
+    assert audit is not None and audit[1] == "migration-0045"

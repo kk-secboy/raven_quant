@@ -75,3 +75,21 @@ def test_catalog_query_interfaces() -> None:
         get_catalog_entry("missing_template")
     with pytest.raises(ValueError, match="unknown implementation status"):
         catalog_entries_by_status("deployed")
+
+
+def test_research_only_gate_reads_catalog_role(monkeypatch: pytest.MonkeyPatch) -> None:
+    import quant_platform.strategy_catalog as catalog
+
+    with pytest.raises(ValueError, match="research_only"):
+        catalog.require_capital_eligible_strategy_type("pair", action="批准")
+    # Unbound strategy types are unaffected by the gate.
+    catalog.require_capital_eligible_strategy_type("multifactor", action="批准")
+    # The verdict is read from the catalog entry, not hardcoded at call sites:
+    # a role change reopens the gate.
+    entry = catalog.get_catalog_entry("stock_pair_stat_arb")
+    monkeypatch.setattr(
+        catalog,
+        "get_catalog_entry",
+        lambda template_id: {**entry, "catalog_role": "alpha_template"},
+    )
+    catalog.require_capital_eligible_strategy_type("pair", action="批准")

@@ -31,6 +31,8 @@
 - 决策选项：A) 修订设计稿把"默认关闭的 sandbox 网关"纳入合同；B) 按
   设计稿移除网关代码。README 称 QMT 为"默认关闭的可选插件"，说明现状是
   有意为之，倾向 A，但须用户定夺。
+- 已决议（2026-07-22）：按选项 A 执行——QMT 保留为默认关闭的可选沙箱
+  插件，设计稿 §1.3/§2.2/§8.6/§11.3/§13/§14 已修订纳入合同。
 
 ### 1.2 ⛔ 股票配对策略全链路上线 vs "永久 research_only"
 
@@ -45,6 +47,14 @@
 - 决策选项：A) 修订设计稿承认配对为已实现的专项能力（需补齐召回/受限
   回款等卖空语义）；B) 按设计稿降级为仅离线研究（下线批准门/模拟/分配
   入口，保留研究代码）。须用户定夺。
+- 已决议（2026-07-22）：按选项 B 执行——配对策略降为 research-only。
+  机制：`strategy_catalog.require_capital_eligible_strategy_type` 以目录
+  `catalog_role` 为单一事实源；`strategy_store._approve_pair`、
+  `allocation_store` 成员校验、`simulation_store.create`（pair 适配器）
+  三处 fail-closed；promotion/recommendation 链因要求 approved/multifactor
+  被传递覆盖；离线 `run_pair_backtest` 与脚本保留；迁移
+  `0045_research_only_pair` 将存量 approved pair 版本降级 retired 并留
+  审计事件。
 
 ## 2. 冲突（可直接修正，本期处理或登记）
 

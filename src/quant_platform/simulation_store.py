@@ -61,6 +61,7 @@ from .simulation_engine import (
     execute_atomic_pair_day,
     execute_simulation_day,
 )
+from .strategy_catalog import require_capital_eligible_strategy_type
 
 
 def _now() -> datetime:
@@ -332,6 +333,11 @@ class SimulationStore:
             raise ValueError("simulation execution adapter must be long_only or pair")
         if normalized_adapter != source["execution_adapter"]:
             raise ValueError("simulation adapter does not match the governed strategy source")
+        # Research-only gate (design 6.4.3/13): pair strategies keep offline
+        # backtests but never get a persistent capitalized simulation ledger.
+        # The pair adapter string doubles as the strategy type here.
+        if normalized_adapter == "pair":
+            require_capital_eligible_strategy_type("pair", action="持久模拟")
         governed_frequency = str(source.get("execution_frequency") or "")
         if governed_frequency and governed_frequency != execution_frequency:
             raise ValueError("simulation frequency does not match the governed strategy source")
