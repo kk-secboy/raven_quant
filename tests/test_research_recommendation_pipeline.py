@@ -10,7 +10,9 @@ from governance_fixtures import (
     create_strategy_version,
     formal_backtest_metrics,
 )
+from sqlalchemy import update
 
+from quant_data.database import strategy_versions
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.parameter_experiment_store import ParameterExperimentStore
 from quant_platform.portfolio_policy import POLICY_VERSION
@@ -113,6 +115,16 @@ def test_v2_research_to_final_test_and_recommendation_snapshot(
         reason="Approved the frozen strategy after its one reserved final test.",
     )
     assert approved["status"] == "approved"
+    # Fixture shortcut: the promotion chain sets promotion_stage="paper" on
+    # approval; this pipeline test predates the forward gate, so it marks the
+    # version enabled directly (production must pass the forward evidence
+    # gate via PromotionStore.promote).
+    with strategies.engine.begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id == version_id)
+            .values(promotion_stage="recommendation_enabled")
+        )
 
     recommendations = RecommendationStore(database_url)
     portfolio = recommendations.create(

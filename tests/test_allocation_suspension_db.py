@@ -28,6 +28,7 @@ from quant_data.database import (
     strategy_allocation_artifacts,
     strategy_allocation_members,
     strategy_allocations,
+    strategy_versions,
 )
 from quant_platform.allocation_store import AllocationStore
 from quant_platform.recommendation_store import RecommendationStore
@@ -144,6 +145,20 @@ def _pause_member(
         )
 
 
+def _enable_recommendations(database_url: str, version_ids: list[str]) -> None:
+    """Fixture shortcut: real approval sets promotion_stage="paper"; these
+    tests exercise suspension, not the forward gate (production must pass
+    PromotionStore.promote)."""
+
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id.in_(version_ids))
+            .values(promotion_stage="recommendation_enabled")
+        )
+
+
 def _activate(database_url: str, allocation_id: str) -> None:
     engine = open_database(database_url)
     with engine.begin() as connection:
@@ -176,6 +191,7 @@ def test_suspension_waits_for_decision_day_then_renormalizes(
 ) -> None:
     _qlib_doubles(monkeypatch)
     version_ids = _three_versions(database_url, tmp_path)
+    _enable_recommendations(database_url, version_ids)
     store = AllocationStore(database_url)
     allocation = _create_allocation(store, version_ids, "suspension renormalization")
     _activate(database_url, allocation["id"])
@@ -218,6 +234,7 @@ def test_single_active_member_keeps_frozen_budget(
 ) -> None:
     _qlib_doubles(monkeypatch)
     version_ids = _two_versions(database_url, tmp_path)
+    _enable_recommendations(database_url, version_ids)
     store = AllocationStore(database_url)
     allocation = _create_allocation(store, version_ids, "single active fallback")
     _activate(database_url, allocation["id"])

@@ -57,6 +57,41 @@
   Bar 逻辑；仅共享成本模型、整手、公司行动原语。差分测试完全缺失（仅
   `test_document_governance.py:673` 校验设计稿文本含此要求）。
 - 影响：「回测成绩=模拟成交」无任何测试保障，回测→模拟差异无法归因。
+- 已修正（2026-07-26）：黄金案例差分套件上线
+  （`tests/test_execution_core_differential.py`，16 案例；Qlib 链由
+  `tests/execution_core_harness.py` 经 shim 加载 pinned qlib
+  `backtest/exchange.py` 真实源码驱动，仅数据访问层替换）。收敛一处板级
+  bug：模拟链非清仓卖出取整硬编码 100 股，科创板/北交所（步长 1）被错误
+  压到主板整手——`simulation_engine.py` 改用
+  `lot_rules[instrument].lot_increment`，回归测试
+  `test_simulation_engine.py::test_non_liquidating_sell_uses_board_lot_increment`。
+  差分确认完全一致面：正常下一 Bar 成交（数量/价格/费用/现金影响逐项
+  一致）、停牌不成交、一字涨停买拒/跌停卖拒、参与率部分成交且余量当日
+  过期、买入整手取整、成本六分项（佣金/最低佣金/印花税/过户费/滑点/
+  冲击）逐组件一致、零股清仓卖出、T+1 解锁后卖出、现金充足买入。
+- 已登记口径差异（差分套件以声明行为固定，编号 D1–D6 与测试一一对应）：
+  - D1 涨跌停判定价位：Qlib 分钟链按 bar `vwap` 判定
+    （`qlib_backtest.py` limit_threshold on `$vwap`），模拟链按 bar
+    `close` 判定（`simulation_engine.py:_bar_rejection_reason`）。方向：
+    close 触板而 vwap 未触板时 Qlib 成交、模拟拒单（模拟更保守）。
+  - D2 日线正式链按日 `$open` 判定涨跌停与成交价，模拟链按分钟 bar；
+    开盘一字板时 Qlib 日线拒单而模拟分钟链成交（结构性：两条链的数据
+    频率不同，无法低成本统一）。
+  - D3 T+1 执法层不同：Qlib Exchange 层为 T+0（T+1 由策略层
+    `qlib_policy_strategy.apply_t1_target_floor` 在生成目标时拦截），
+    模拟链在引擎层锁当日买入批次（`_sellable_quantity`）。订单层输入
+    相同时结果一致；绕过策略层直接下单时 Qlib 链会成交当日买入——登记
+    为分层差异而非行为错误。
+  - D4 买入现金约束模型：Qlib 适配层现金检查用扁平保守费率
+    （`qlib_exchange.py:34-38` 已自述）且 qlib 取整含 +0.1 epsilon，
+    边界现金下可成交（如现金 1004 买 100 股 @10）；模拟链用精确共享
+    成本模型迭代缩减，同例拒单（模拟更保守，方向有利于可信回测）。
+  - D5 多 bar 窗口聚合语义：Qlib 对订单窗口用 `all` 判定停牌/涨跌停
+    （窗口内全部 bar 受限才拒单），模拟链逐 slice bar 判定；模拟侧无
+    多 bar 窗口概念，属结构性不可比，测试中固定 Qlib 侧行为防漂移。
+  - D6 非清仓卖出取整：Qlib 按 1 股取整（零股减持全成交），模拟链按
+    板块步长保守下取整（主板 150→100）；修正板级步长后该差异仅存在于
+    主板/创业板/基金非清仓减持场景，方向为模拟少卖（更保守）。
 
 ### 2.2 ⛔ 最终样本外一次性消费存在跨 campaign 重开漏洞（§4.1、§12.1）
 
@@ -108,6 +143,16 @@
 - 现状：无 `paper`/`recommendation_enabled` 状态；最终回测硬门→
   `awaiting_approval`→人工 approve→直接进推荐。唯一前向证据（5 天人工
   复核 NAV）只挂在 allocation 审批上。
+- ✅ 已修正（2026-07-26）：迁移 `0043_promotion_stages`
+  （`strategy_versions.promotion_stage` + `strategy_forward_gates` 预注册
+  门槛表 + `strategy_promotion_stages` 阶段表）；`StrategyStore.approve`
+  硬门通过自动置 `paper` 并打开隔离阶段（审批 artifact 带 `datasets.json`
+  时同事务链自动绑定独立 paper 模拟账户，缺失则 `awaiting_simulation`
+  不阻断审批）；`PromotionStore` 提供门槛注册（仅 paper 前）、证据评估
+  （NAV 跨度/成功批次/完整往返/数据完整率/对账率/成本偏差六子项，
+  不足 fail-closed 标 insufficient_evidence）与四人眼人工晋升；来源合同
+  漂移按 §9.5 冻结旧阶段只读、新阶段证据从零不拼接；standalone 推荐组合
+  创建拒绝 paper 阶段版本（NULL 阶段为迁移前旧行/夹具的祖父语义）。
 
 ### 2.6 ⛔ 股息税负债缺失导致 NAV 阶段性虚高（§5.6）
 
@@ -228,8 +273,11 @@
 
 ### 阶段 9-10 推荐与运行日历
 
-- ❌ BUY/SELL/EXIT/HOLD/NO_ACTION × READY/WAIT/PARTIAL/CANCELLED/EXPIRED/
+- ✅ BUY/SELL/EXIT/HOLD/NO_ACTION × READY/WAIT/PARTIAL/CANCELLED/EXPIRED/
   BLOCKED 两维模型；`projected_position`；keep/cancel/replace/new
+  （2026-07-26 已完成：`recommendation_actions.py` 纯规则计划层 +
+  迁移 `0044_recommendation_actions` 的 `account_actions_json` 快照集成；
+  模拟订单当日 15:00 过期的未成交余量按 EXPIRED 重报而非当作仍有效）
 - ❌ 两路径（继续旧目标/切换候选）换仓成本比较；成本感知 no-trade band
 - ❌ 周报、月度决策日、盘前检查、盘中执行检查调度；对账通过才生成建议
   的顺序门（现 recommendation_refresh 与模拟对账独立）

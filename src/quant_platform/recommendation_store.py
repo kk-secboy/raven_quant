@@ -19,8 +19,13 @@ from quant_data.database import (
 )
 
 from .cost_model import CostModelConfig
+from .market_rules import lot_floor, order_unit_rules
 from .portfolio_policy import POLICY_VERSION
 from .qlib_backtest import QLIB_ENGINE_VERSION
+from .recommendation_actions import (
+    RECOMMENDATION_ACTION_MODEL_VERSION,
+    plan_account_actions,
+)
 from .strategy_store import StrategyStore
 
 
@@ -40,6 +45,15 @@ class RecommendationStore:
             raise ValueError("legacy strategy versions cannot generate recommendations")
         if version["status"] != "approved" or version.get("strategy_type") != "multifactor":
             raise ValueError("recommendations require an approved multifactor strategy")
+        # Design 6.11: standalone recommendations require the version to have
+        # passed the forward evidence gate. NULL promotion_stage marks legacy
+        # rows/fixtures that predate the promotion chain; "paper" is the only
+        # stage that blocks.
+        if version.get("promotion_stage") == "paper":
+            raise ValueError(
+                "strategy version is in the paper stage; standalone recommendations "
+                "require recommendation_enabled (forward evidence gate plus human approval)"
+            )
         evaluation_ids = [item.get("factor_evaluation_id") for item in version["factors"]]
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -382,6 +396,7 @@ class RecommendationStore:
     def _snapshot_row(row: Any, connection: Any) -> dict[str, Any]:
         result = row_dict(row)
         result["snapshot"] = result.pop("snapshot_json")
+        result["account_actions"] = result.pop("account_actions_json")
         result["cost_model"] = result.pop("cost_model_json")
         result["holdings"] = [
             row_dict(item)
@@ -392,3 +407,85 @@ class RecommendationStore:
             )
         ]
         return result
+
+    def attach_account_actions(
+        self,
+        snapshot_id: str,
+        *,
+        account_state: dict[str, dict[str, Any]],
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Attach the two-dimension account action plan (design 8.4) to a snapshot.
+
+        ``account_state`` maps instrument → account-side facts:
+        ``filled_position`` (confirmed fills), ``sellable_quantity``,
+        ``open_orders`` (simulation-ledger rows with side/requested/filled/
+        expires_at), ``reference_price`` and optional ``target_quantity``
+        overrides, plus ``hard_blocked_reason`` / ``not_executable_reason``.
+        Target quantities default to ``lot_floor(weight × hypothetical initial
+        value ÷ reference_price)``; instruments present in the account state
+        but absent from the holdings get target zero (EXIT semantics).  The
+        plan is stored in ``account_actions_json``; the legacy
+        increase/decrease holdings export is left untouched.
+        """
+
+        snapshot = self.get_snapshot(snapshot_id)
+        if snapshot["status"] != "succeeded":
+            raise ValueError("account actions require a succeeded recommendation snapshot")
+        portfolio = self.get(str(snapshot["portfolio_id"]))
+        initial_value = float(portfolio["construction_notional"])
+        rule_date = snapshot["effective_date"] or snapshot["as_of_date"]
+        weights = {
+            str(item["instrument"]): float(item["weight"]) for item in snapshot["holdings"]
+        }
+        instruments: list[dict[str, Any]] = []
+        for instrument in sorted(set(weights) | set(account_state)):
+            state = dict(account_state.get(instrument) or {})
+            target_quantity = state.pop("target_quantity", None)
+            if instrument in weights and target_quantity is None:
+                reference_price = state.pop("reference_price", None)
+                if reference_price is None or float(reference_price) <= 0:
+                    raise ValueError(
+                        f"account state for {instrument} needs a reference price or "
+                        "an explicit target quantity"
+                    )
+                rules = order_unit_rules(instrument, rule_date)
+                target_quantity = lot_floor(
+                    int(weights[instrument] * initial_value / float(reference_price)),
+                    rules,
+                )
+            elif instrument not in weights:
+                target_quantity = 0
+            lot_rules = order_unit_rules(instrument, rule_date)
+            instruments.append(
+                {
+                    "instrument": instrument,
+                    "target_quantity": target_quantity,
+                    "filled_position": int(state.pop("filled_position", 0)),
+                    "sellable_quantity": state.pop("sellable_quantity", None),
+                    "open_orders": state.pop("open_orders", []),
+                    "lot_increment": lot_rules.lot_increment,
+                    "min_lot": lot_rules.min_lot,
+                    "hard_blocked_reason": state.pop("hard_blocked_reason", None),
+                    "not_executable_reason": state.pop("not_executable_reason", None),
+                }
+            )
+        computed_at = now or _now()
+        plan = {
+            "model_version": RECOMMENDATION_ACTION_MODEL_VERSION,
+            "computed_at": computed_at.isoformat(),
+            "rule_date": rule_date.isoformat(),
+            "items": plan_account_actions(instruments, now=computed_at),
+        }
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(recommendation_snapshots)
+                .where(
+                    recommendation_snapshots.c.id == snapshot_id,
+                    recommendation_snapshots.c.status == "succeeded",
+                )
+                .values(account_actions_json=plan)
+            )
+            if not result.rowcount:
+                raise KeyError(snapshot_id)
+        return self.get_snapshot(snapshot_id)

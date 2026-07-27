@@ -14,6 +14,7 @@ from quant_data.database import (
     strategy_allocation_artifacts,
     strategy_allocation_members,
     strategy_allocations,
+    strategy_versions,
 )
 from quant_platform.account_netting import (
     NETTING_PLAN_VERSION,
@@ -268,6 +269,16 @@ def test_build_plan_for_allocation(database_url: str, tmp_path: Path, monkeypatc
     version_ids = _two_versions(database_url, tmp_path)
     store = AllocationStore(database_url)
     allocation = _create_allocation(store, version_ids, "netting allocation")
+    # Fixture shortcut: real approval sets promotion_stage="paper"; this test
+    # exercises netting, not the forward gate, so it marks the versions
+    # enabled directly (production must pass PromotionStore.promote).
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id.in_(version_ids))
+            .values(promotion_stage="recommendation_enabled")
+        )
     recommendations = RecommendationStore(database_url)
     engine = open_database(database_url)
     targets = [
