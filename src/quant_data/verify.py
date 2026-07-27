@@ -14,11 +14,24 @@ from .coverage_data import COVERAGE_DATASETS, coverage_primary_key_candidates
 from .execution_contract import SIMULATION_MINUTE_SOURCE_DATASETS, TUSHARE_HAND_SIZE
 from .reference_data import select_current_reference_units
 
-# Interfaces whose provider pagination reorders rows between pages, making
-# overlapping pages (and therefore duplicate primary keys) inherent.  Snapshot
-# builds already deduplicate rows with SELECT DISTINCT, so duplicates for these
-# datasets are reported as warnings instead of hard errors.
-UNSTABLE_PAGINATION_DATASETS = frozenset({"share_float"})
+# Interfaces whose provider pagination reorders rows between pages, or whose
+# intraday snapshots drift between polls, making overlapping pages (and
+# therefore duplicate primary keys) inherent.  Snapshot builds already
+# deduplicate rows with SELECT DISTINCT, so duplicates for these datasets are
+# reported as warnings instead of hard errors.
+UNSTABLE_PAGINATION_DATASETS = frozenset(
+    {
+        "share_float",
+        "ccass_hold",
+        "ccass_hold_detail",
+        "dc_member",
+        "dc_hot",
+        "eco_cal",
+        "moneyflow_ind_dc",
+        "irm_qa_sh",
+        "irm_qa_sz",
+    }
+)
 
 
 def verify_downloads(
@@ -148,9 +161,9 @@ def verify_downloads(
             if duplicates and dataset in UNSTABLE_PAGINATION_DATASETS:
                 warnings.append(
                     f"{dataset}: {duplicates} duplicate primary-key rows "
-                    "(provider paginates this interface with an unstable sort order, "
-                    "so overlapping pages are inherent; snapshot builds deduplicate "
-                    "with SELECT DISTINCT)"
+                    "(provider paginates this interface with an unstable sort order "
+                    "or drifts intraday snapshots between polls, so duplicate rows "
+                    "are inherent; snapshot builds deduplicate with SELECT DISTINCT)"
                 )
             elif duplicates:
                 errors.append(f"{dataset}: {duplicates} duplicate primary-key rows")

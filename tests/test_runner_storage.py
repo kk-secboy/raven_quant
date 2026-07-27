@@ -153,6 +153,56 @@ def test_verifier_uses_successor_generation_and_can_ignore_dormant_plans(
     assert any("daily: 0/1 units succeeded" in item for item in relaxed["warnings"])
 
 
+def test_verifier_downgrades_duplicates_only_for_unstable_pagination_datasets(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    unstable = FetchSpec(
+        dataset="dc_hot",
+        api_name="dc_hot",
+        params={"trade_date": "20240102"},
+        scope={"page_group": "dc_hot:20240102", "offset": 0},
+    )
+    stable = FetchSpec(
+        dataset="adj_factor",
+        api_name="adj_factor",
+        params={"trade_date": "20240102"},
+        scope={"trade_date": "20240102"},
+    )
+    checkpoint.add([unstable, stable])
+    hot_row = {
+        "trade_date": "20240102",
+        "ts_code": "000001.SZ",
+        "market": "concept",
+        "hot_type": "popularity",
+        "rank": 1,
+    }
+    adj_row = {"ts_code": "000001.SZ", "trade_date": "20240102", "adj_factor": 1.0}
+    for spec, row in ((unstable, hot_row), (stable, adj_row)):
+        written = storage.write_unit(
+            spec.dataset,
+            spec.unit_key,
+            ProviderResult(
+                api_name=spec.api_name,
+                columns=list(row),
+                rows=[row, dict(row)],
+                raw_body=b"{}",
+            ),
+        )
+        checkpoint.succeed(spec.unit_key, written)
+
+    result = verify_downloads(checkpoint, tmp_path)
+
+    assert result["duplicate_checks"] == {"adj_factor": 1, "dc_hot": 1}
+    assert any(
+        "dc_hot: 1 duplicate primary-key rows" in item for item in result["warnings"]
+    )
+    assert any(
+        "adj_factor: 1 duplicate primary-key rows" in item for item in result["errors"]
+    )
+
+
 def test_verifier_rejects_missing_trading_day_and_stock_quote(
     tmp_path: Path, database_url: str
 ) -> None:
