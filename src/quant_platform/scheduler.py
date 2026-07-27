@@ -17,12 +17,21 @@ from .continuous_research import ContinuousResearchController
 from .data_rollover import select_qlib_dataset
 from .health_store import OperationalHealthStore
 from .job_store import JobStore
+from .ops_calendar import (
+    evaluate_recommendation_gate,
+    is_monthly_decision_day,
+    is_weekly_report_day,
+    load_calendar_days,
+    select_ops_dataset,
+)
 from .recommendation_store import RecommendationStore
 from .research_automation import normalize_research_schedule_payload
 from .research_store import ResearchStore
 from .runtime_secret_store import RuntimeSecretStore
+from .safe_mode import SafeModeStore
 from .schedule_store import ScheduleStore
 from .services import list_qlib_datasets
+from .simulation_store import SimulationStore
 
 AUTOMATED_DATA_BUNDLES = (
     "cn_extended_daily",
@@ -54,6 +63,8 @@ class SchedulerEngine:
         )
         self.autonomous_research = AutonomousResearchOrchestrator(settings)
         self.continuous_research = ContinuousResearchController(settings)
+        self.simulations = SimulationStore(settings.database_url)
+        self.safe_mode = SafeModeStore(settings.database_url)
 
     def tick(self, now: datetime | None = None) -> dict[str, int]:
         current = now or datetime.now(UTC)
@@ -128,6 +139,10 @@ class SchedulerEngine:
                     return
             elif run["kind"] == "recommendation_refresh":
                 job = self._enqueue_recommendation(run, scheduled_for)
+                if job is None:
+                    return
+            elif run["kind"] in ("weekly_report", "monthly_decision_day", "preopen_check"):
+                job = self._enqueue_ops_task(run, scheduled_for)
                 if job is None:
                     return
             else:
@@ -338,6 +353,75 @@ class SchedulerEngine:
         self.research.attach_job(research_run["id"], job["id"])
         return job
 
+    def _enqueue_ops_task(
+        self,
+        run: dict[str, Any],
+        scheduled_for: datetime,
+    ) -> dict[str, Any] | None:
+        """Enqueue one operational run-calendar task (design draft §10.4).
+
+        Cadence rules (never weekday guesses beyond the weekly report's fixed
+        Saturday, and never a bypass of the calendar gate):
+        - weekly_report: Saturday local time only; other days skip.
+        - monthly_decision_day: first trading day of the month per the
+          persisted Qlib calendar; a calendar that cannot decide fails closed.
+        - preopen_check: trading days only per the same calendar.
+        """
+
+        kind = str(run["kind"])
+        local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
+        if kind == "weekly_report":
+            if not is_weekly_report_day(local_date):
+                self.schedules.finish_run(
+                    run["id"], "skipped", message="not the weekly report day (Saturday)"
+                )
+                return None
+        else:
+            dataset = select_ops_dataset(
+                self.settings.data_root,
+                str(run["payload"].get("dataset") or "") or None,
+            )
+            calendar_days = load_calendar_days(dataset["path"])
+            if kind == "monthly_decision_day":
+                if local_date not in calendar_days:
+                    self.schedules.finish_run(
+                        run["id"], "skipped", message="not a Qlib trading day"
+                    )
+                    return None
+                if not is_monthly_decision_day(local_date, calendar_days):
+                    self.schedules.finish_run(
+                        run["id"],
+                        "skipped",
+                        message="not the first trading day of the month",
+                    )
+                    return None
+            elif local_date not in calendar_days:
+                self.schedules.finish_run(
+                    run["id"], "skipped", message="not a Qlib trading day"
+                )
+                return None
+        payload = {
+            "local_date": local_date.isoformat(),
+            "schedule_run_id": run["id"],
+            **{
+                key: value
+                for key, value in dict(run["payload"]).items()
+                if key != "schedule_run_id"
+            },
+        }
+        log_path = (
+            self.settings.data_root
+            / "platform"
+            / "logs"
+            / f"{kind.replace('_', '-')}-{run['id']}.log"
+        )
+        return self.jobs.create(
+            kind,
+            payload,
+            log_path,
+            idempotency_key=f"schedule-run:{run['id']}",
+        )
+
     def _enqueue_recommendation(
         self,
         run: dict[str, Any],
@@ -345,6 +429,35 @@ class SchedulerEngine:
     ) -> dict[str, Any] | None:
         portfolio_id = str(run["payload"]["recommendation_portfolio_id"])
         portfolio = self.recommendations.get(portfolio_id)
+        signal_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
+        # Safe mode (design draft 11.3) is the first check of the
+        # recommendation gate: while it is active no new recommendation is
+        # generated, regardless of reconciliation health.
+        safe_state = self.safe_mode.status()
+        if safe_state["active"]:
+            self.schedules.finish_run(
+                run["id"],
+                "skipped",
+                message=(
+                    f"safe_mode active since {safe_state['triggered_at']}: "
+                    f"{safe_state['reason']}"
+                ),
+            )
+            self.alerts.create(
+                source_type="recommendation_portfolio",
+                source_id=portfolio_id,
+                severity="critical",
+                category="safe_mode_recommendation_blocked",
+                title=f"建议生成被 safe_mode 阻断：{portfolio['name']}",
+                message=(
+                    f"safe_mode 自 {safe_state['triggered_at']} 起生效"
+                    f"（来源 {safe_state['source']}）：{safe_state['reason']}。"
+                    "不生成新建议；既有建议快照保留。人工解除 safe_mode 后恢复。"
+                ),
+                dedupe_key=f"safe-mode-blocked:recommendation:{portfolio_id}:{signal_date.isoformat()}",
+                details={"safe_mode": safe_state},
+            )
+            return None
         if portfolio["status"] != "active":
             self.schedules.finish_run(
                 run["id"],
@@ -352,7 +465,6 @@ class SchedulerEngine:
                 message=f"recommendation portfolio is {portfolio['status']}",
             )
             return None
-        signal_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
         dataset = select_qlib_dataset(
             self.settings.data_root,
             anchor_name=portfolio["dataset"],
@@ -360,19 +472,56 @@ class SchedulerEngine:
             lineage_id=None,
             required_date=signal_date,
         )
+        calendar_days = load_calendar_days(dataset["path"])
         if run["trading_days_only"]:
-            calendar = set(
-                (Path(dataset["path"]) / "calendars" / "day.txt")
-                .read_text(encoding="utf-8")
-                .splitlines()
-            )
-            if signal_date.isoformat() not in calendar:
+            if signal_date not in calendar_days:
                 self.schedules.finish_run(
                     run["id"],
                     "skipped",
                     message="not a Qlib trading day",
                 )
                 return None
+        # Ordering gate (design draft §10.4): recommendations are only
+        # generated after the linked simulation account's latest batch has
+        # reconciled and its NAV is healthy/certified/fresh. Failing the gate
+        # blocks the new snapshot fail-closed; the previous snapshot stays in
+        # place and is explicitly reported as retained/stale, never silently
+        # reused as if it were a fresh recommendation.
+        gate = evaluate_recommendation_gate(
+            self.simulations, portfolio, signal_date, calendar_days
+        )
+        if not gate["passed"]:
+            latest_snapshot = portfolio.get("latest_snapshot") or {}
+            message = "; ".join(gate["reasons"])
+            self.schedules.finish_run(
+                run["id"],
+                "skipped",
+                message=f"reconciliation gate blocked: {message}",
+            )
+            self.alerts.create(
+                source_type="recommendation_portfolio",
+                source_id=portfolio_id,
+                severity="critical",
+                category="recommendation_reconciliation_blocked",
+                title=f"建议生成被对账顺序门阻断：{portfolio['name']}",
+                message=(
+                    f"{message}。不生成新建议；既有建议快照 "
+                    f"{latest_snapshot.get('id', '无')}（as_of "
+                    f"{latest_snapshot.get('as_of_date', '无')}）保留并视为过期，"
+                    "需先恢复模拟对账健康。"
+                ),
+                dedupe_key=f"recommendation-gate:{portfolio_id}:{signal_date.isoformat()}",
+                details={
+                    "reasons": gate["reasons"],
+                    "gate": gate["details"],
+                    "retained_snapshot": {
+                        "id": latest_snapshot.get("id"),
+                        "as_of_date": str(latest_snapshot.get("as_of_date") or ""),
+                        "status": "retained_stale",
+                    },
+                },
+            )
+            return None
         snapshot, created = self.recommendations.create_snapshot(
             portfolio_id=portfolio_id,
             as_of_date=signal_date,
@@ -412,6 +561,10 @@ class SchedulerEngine:
 
     def project_alerts(self) -> int:
         created = 0
+        # Safe-mode auto trigger (design 11.3): persistent degraded or
+        # uncertified NAV on any active simulation account is a severe ledger
+        # anomaly. Idempotent while safe mode is already active.
+        self.safe_mode.check_persistent_nav_anomalies()
         with self.jobs.engine.connect() as connection:
             failed_jobs = connection.execute(
                 select(jobs).where(jobs.c.status == "failed").order_by(jobs.c.finished_at.desc())

@@ -222,9 +222,12 @@
 - 🟡 event_stress 按已实现收益最差窗口选取，字面违反"市场阶段不得事后
   挑选"（确定性偏保守，建议登记为已知偏差或改为预注册窗口）
 - ❌ 「重跑一致」可复现实测（五种结论区分之一）
-- 🟡 现金收益参数（cash_yield）与 XIRR 仍缺；恢复期指标已完成
-  （2026-07-22：`qlib_backtest.py` max_drawdown_recovery_days /
-  max_drawdown_recovery_status，recovered/ongoing/no_drawdown 三态）
+- 🟡 现金收益参数（cash_yield）仍缺；XIRR 已完成（2026-07-27：模拟账户
+  `performance_summary` 资金加权补充指标，退化输出状态而非伪精确）；
+  恢复期指标已完成（2026-07-22：`qlib_backtest.py`
+  max_drawdown_recovery_days / max_drawdown_recovery_status，
+  recovered/ongoing/no_drawdown 三态；2026-07-27 模拟链
+  `unitized_performance.py` 基于单位化曲线的恢复期）
 
 ### 阶段 5 账户政策（本期优先级 1）
 
@@ -254,19 +257,92 @@
 
 ### 阶段 4/9 模拟与账本（补强）
 
-- ❌ 拆并股/配股/换股/代码变更/ETF 折算/基金清盘公司行动类型
-- ❌ 公告阶段信息事件（现公告行直接丢弃）
-- ❌ 需持有人选择的复杂事件提醒+人工处理
-- ❌ 订单 planned/open/cancelled 持久态；价格保护/执行窗口/策略贡献字段
-- ❌ 外部现金流（出入金）与单位化 TWR/XIRR（§4.4、§8.3、§12.1）
+- ✅ 拆并股/配股/换股/代码变更/ETF 折算/基金清盘公司行动类型
+  - 已完成（2026-07-27）：`corporate_actions.py` 新增 `CorporateEvent`
+    信封（唯一事件键 + effective_date + 载荷哈希）；拆股/并股/ETF 份额
+    折算经 `apply_share_split` 在经济生效日按比例调整数量与单位成本
+    （总成本不变、不产生现金、不动 NAV 口径，防虚假亏损；并股不足 1 股
+    的尾仓不臆造份额，critical 留痕人工处理）；检测走 adj_factor/
+    fund_adj 跳变（`detect_split_events`，dividend 行已解释的跳变剔除）
+    或显式录入；代码变更经 `apply_code_change` 迁移持仓身份（数量/批次/
+    成本原样、应收跟随、无经济损益，双活持仓 fail-closed），namechange
+    行驱动（`normalize_namechange_rows`，仅名称变更时为信息事件）；
+    迁移 `0050_corporate_event_types` 新增 `simulation_corporate_events`
+    append-only 台账（portfolio_id+event_key 唯一，只应用一次）；
+    引擎 `corporate_events`/`applied_event_keys` 入口，迟到事件只标记
+    复核不回写；store 证据哈希绑定 `corporate_events_sha256`。
+  - 有据跳过：配股（无配股发行表）、换股（无要约结构化工单）、基金清盘
+    （fund_basic 仅摘牌日期、无清算回收金额，设计 §5.6 禁止统一假设现金
+    结算）→ `UNSUPPORTED_EVENT_TYPES` fail-closed：事件流 critical 记
+    `unsupported_event_type:<type>` 原因并入台账幂等留痕，永不自动入账；
+    清盘公告经 anns_d 关键词（`detect_liquidation_events`）接入该路径
+- ✅ 公告阶段信息事件（原公告行直接丢弃）
+  - 已完成（2026-07-27）：`normalize_announcement_rows` 把 dividend 预案行
+    （无 ex_date）转为 plan 阶段 informational 事件（不改现金/持仓/NAV），
+    实施公告行携带 `linked_ex_event_key`/`related_event_key_prefix` 与
+    后续除权事件唯一键关联；事件键 `corporate_action:announcement:
+    {instrument}:{ann_date}` 幂等，重放不重复入账
+- ✅ 需持有人选择的复杂事件提醒+人工处理
+  - 已完成（2026-07-27）：通用 `choice_required` 事件类型——anns_d 标题
+    关键词（配股/换股/要约/现金选择权/吸收合并，
+    `detect_choice_required_events`）或显式录入识别；产生 warning 提醒
+    事件并在持仓上置 `choice_pending` 待人工处理标记（store 从台账重推导）；
+    处置前卖出不硬阻断但产生 `corporate_action_choice_pending_sale` 可见
+    提示；系统永不代客提交选择。遗留：人工处置回写（解除标记）与
+    alert_store 外发接线待后续队列项
+- ✅ 订单 planned/open/cancelled 持久态；价格保护/执行窗口/策略贡献字段
+  （2026-07-23 已完成：迁移 `0046_simulation_order_states` 给
+  `simulation_orders` 增加 portfolio_id/limit_price/not_before/not_after/
+  target_version/account_netting_plan_id/strategy_contributions_json/
+  plan_op/cancel_reason/updated_at 与状态检查约束；`simulation_order_state.py`
+  纯状态机消费 keep/cancel/replace/new；`SimulationStore.
+  create_order_plan_batch` 单事务提交计划（取消只释放未用余量一次、事件入
+  流、幂等键防重），`process_batch` 计划模式执行工作单（跨日窗口留存
+  open、过期 fail-closed、风险门阻断新增买单），引擎支持价格保护与执行
+  窗口；净额计划绑定校验账户归属并落 strategy_contributions）
+- ✅ 外部现金流（出入金）与单位化 TWR/XIRR（§4.4、§8.3、§12.1）
+  - 已完成（2026-07-27）：迁移 `0049_external_cash_flows` 新增
+    `simulation_external_flows`（flow_key 幂等、open/close 时点、事件流
+    落账、已结算交易日 fail-closed）与 `simulation_nav`/`simulation_portfolios`
+    单位化列；`unitized_performance.py` 实现 F_t_open/F_t_close TWR 链
+    （r_t=(V_t−F_close)/(V_{t−1}+F_open)−1，分母非正/断链标记
+    undefined/broken_chain 且不跳过续乘）、单位化回撤与恢复期（recovered/
+    ongoing）、XIRR（网格夹逼+二分，undefined_single_sign/no_root/
+    multiple_roots 状态）；引擎 open 流盘前可投资、close 流盘后入 NAV
+    不可交易，守恒校验含现金流；人民币 NAV 口径并存不替换；
+    `SimulationStore.record_external_flow`/`performance_summary` 对外输出
 - ❌ 现金批次/冻结桶/可取现金视图（现为单一 cash 浮点）
 - ❌ 日终最终费用导入与差额确认；日终归因存档
 - ❌ 离散化后约束重检（现金/单票/行业/TE/换手/容量）
-- ❌ 手动/CSV 影子账户（manual_shadow）全链路（§8.6）
-- ❌ 个人市场权限模型（buy_sell/sell_only/disabled/unknown + as_of/有效期
+- ✅ 手动/CSV 影子账户（manual_shadow）全链路（§8.6）
+  - 已完成（2026-07-27）：迁移 `0048_permission_shadow_account` 新增
+    `shadow_account_snapshots`（持仓/现金/可卖/未完成订单快照，含
+    import_source/imported_by/imported_at/content_sha256）；
+    `shadow_account.py` 提供手工/CSV 导入（schema fail-closed）、
+    自然日新鲜度判定与 `account_state_for_actions`；推荐链接入
+    `attach_account_actions(account_context=...)`，影子/模型/模拟账户
+    以 `account_context.account_type` 分离展示，陈旧/缺失状态降级为
+    simulation_only（WAIT + 原因），不静默回退模拟账本。
+- ✅ 个人市场权限模型（buy_sell/sell_only/disabled/unknown + as_of/有效期
   + 只能收紧 + simulation_only 降级）（§8.7）
-- ❌ ETF 子类型白名单门禁（现为注释预留，任何基金前缀均可模拟交易；
-  方向保守但与合同不符）
+  - 已完成（2026-07-27）：同迁移新增 `market_permission_versions`
+    （scope=exchange/board/risk_warning/etf_subtype + 权限 +
+    confirmation_source + as_of/valid_until + relaxation_confirmed）；
+    `market_permission.py` 收紧纪律（buy_sell→sell_only→disabled→unknown
+    方向放行，放宽需显式确认）、过期/未确认判 unknown；动作层接入
+    `attach_account_actions(permission_store=...)`：disabled/sell_only
+    阻断买入（BLOCKED 记原因，SELL/EXIT 放行），unknown/过期标
+    simulation_only（WAIT，建议保留）。
+- ✅ ETF 子类型白名单门禁（2026-07-27 已完成：
+  `etf_subtypes.py` 版本化注册表（子类型+验收状态+验收日期/依据，参考
+  strategy_catalog 模式；仅股票型 equity 标注已验收，跨境/债券/黄金/
+  商品/货币登记待验收项，未验收默认拒绝；代码段启发式+显式代码覆盖
+  分类，LOF/封基等无法归类者 unclassified 一并拒绝）；与
+  market_permission 刻意分建——后者是个人授权 unknown→simulation_only
+  降级语义，不满足平台验收硬拒单语义；门禁挂在 `simulation_engine.
+  execute_simulation_day` 成交判定处，未验收子类型订单 fail-closed 拒单
+  记原因（etf_subtype_not_accepted:<subtype>），买卖双向、权重推导与
+  持久订单两路径同门；研究/回测（含配对台账）不受限）
 
 ### 阶段 6-8 模板与研究体系
 
@@ -276,8 +352,22 @@
 - ❌ ModelArtifact 与例行 refit 日历；回滚只切同 spec 合格历史制品
 - ❌ `economic_hypothesis_group` 统一试验计数与资本上限
 - ❌ 8 插槽形式化模板结构与空槽行为声明
-- ❌ ExecutionPolicy 缺 3 个（wait_cancel_replace、multi_day_transition、
-  participation_capped_slicing 完整版）；按证券/流动性路由
+- ✅ ExecutionPolicy 缺 3 个（wait_cancel_replace、multi_day_transition、
+  participation_capped_slicing 完整版）——已完成（2026-07-27）：
+  `execution_algorithms.py` 补齐 6 政策目录并输出版本化
+  `execution_policy_id`（next_bar_baseline/twap_execution/vwap_execution 为
+  既有三者的规范名映射）；`plan_participation_capped_slices` 显式政策形态
+  （slot_volumes 量能证据 × max_participation 整手容量，切片参与率恒
+  ≤上限，容量不足的余量显式报 `unallocated_quantity` 过期/重报，绝不当
+  已成交）；`plan_wait_cancel_replace` 限价等待→按 wait_checks（1min/
+  5min 检查节奏）未成交取消→按 replace_step_bps 逐档激进改价重报
+  （买上取/卖下取 0.01 tick），max_replaces 后余量过期，语义与
+  simulation_order_state 对齐（取消只释放未成交余量一次、replace=取消+
+  新价新单且永不放大订单）；`plan_multi_day_transition` 跨日切片（每日
+  基数=剩余量/剩余天数向上整手，daily_volumes 证据下按参与率封顶，每日
+  not_before 10:00/not_after 15:00 与订单窗口对齐，Σ切片+未分配=总量
+  守恒，可选 intraday_algorithm 日内复切）。全部纯函数确定性。
+  遗留：按证券/流动性路由（多政策组合路由）仍未实现
 - 🟡 ResearchBrief 缺禁止项/失败条件/LLM 段；台账缺 LLM 提供商/模型/
   提示词版本记录；无读审计
 
@@ -288,17 +378,57 @@
   （2026-07-26 已完成：`recommendation_actions.py` 纯规则计划层 +
   迁移 `0044_recommendation_actions` 的 `account_actions_json` 快照集成；
   模拟订单当日 15:00 过期的未成交余量按 EXPIRED 重报而非当作仍有效）
-- ❌ 两路径（继续旧目标/切换候选）换仓成本比较；成本感知 no-trade band
-- ❌ 周报、月度决策日、盘前检查、盘中执行检查调度；对账通过才生成建议
-  的顺序门（现 recommendation_refresh 与模拟对账独立）
-- ❌ `safe_mode`（严重异常停新建议新订单但保留查看/对账/恢复）
+- ✅ 两路径（继续旧目标/切换候选）换仓成本比较；成本感知 no-trade band
+  ——已完成（2026-07-27）：新模块 `transition_decision.py`
+  （`transition-decision-v1`）。`estimate_transition_cost` 用共享
+  CostModelConfig 对每条权重变动腿按买/卖分别计佣金+印花税（股票卖出）
+  +过户费+滑点+冲击（ADV 证据参与率，缺省保守 max_volume_participation）
+  得完整人民币换仓成本；`compare_transition_paths` 输出 hold_path（成本 0
+  保旧目标）与 switch_path 全量对照、增量收益、模式与决策原因入证据。
+  增量预期收益只走显式冻结映射 `expected_returns_from_scores`（截面
+  z-score × 冻结 slope × horizon，硬封顶），再乘 conservative haircut 与
+  完整成本比较（≤成本→HOLD）；直接把 rank score 当人民币传入触发
+  fail-closed 校验。无校准收益时退化为预冻结漂移带（min_weight_change/
+  min_turnover/min_order_value，不重复计成本）。现金缺口/失效/权限收紧/
+  风险退出等 hard_constraints 绕过 band（决策 forced 并记原因）。
+  遗留：与 PortfolioPolicy.decide/推荐链的接线（消费决策入快照）为后续
+  队列项
+- 🟡 周报、月度决策日、盘前检查、盘中执行检查调度；对账通过才生成建议
+  的顺序门（2026-07-27 部分完成：新调度 kind `weekly_report`（周六本地
+  时间，汇总模拟 NAV/批次/成交费用/风险事件/数据健康，落
+  `artifacts/ops-reports/` + 去重告警）、`monthly_decision_day`（每月首个
+  交易日，到期 allocation artifact 走 0039 decision_frequency 语义触发
+  `AllocationStore.refresh` 重估 + 月度健康汇总）、`preopen_check`（交易日
+  盘前：日历确认/数据就绪/账户状态/未完成订单/停牌与风险摘要）；
+  顺序门 `ops_calendar.evaluate_recommendation_gate`：`recommendation_refresh`
+  入队前校验关联模拟账户最近批次对账通过 + NAV healthy/certified/无
+  stale/不滞后，阻断则 fail-closed 跳过并产 critical 告警，旧快照保留并
+  标注 `retained_stale`；均遵守 trading_days_only 日历门、misfire
+  fail-closed、幂等与 worker 分发纪律。遗留：盘中执行检查调度）
+- ✅ `safe_mode`（严重异常停新建议新订单但保留查看/对账/恢复；
+  2026-07-27 完成：迁移 `0047_safe_mode` 单例状态行 + `safe_mode.py`
+  SafeModeStore（自动/人工开启、人工 actor+reason 恢复、可选健康门、幂等
+  告警）；自动触发=模拟批次账本守恒失败（mark_batch_failed 识别
+  ledger-integrity 错误）/数据质量门 verify 失败（cli verify+snapshot）/
+  任一活跃模拟账户连续 3 期 NAV degraded 或未认证（scheduler
+  project_alerts）；阻断面=顺序门首检 + create_snapshot +
+  模拟账户/批次/订单计划/配对批次创建 fail-closed；放行=读路径、
+  process_batch 既有批次对账、mark_batch_failed 恢复登记；健康组件
+  safe_mode 入 OperationalHealthStore，API GET/engage/release）
 - ❌ 风险状态三档 normal/caution/risk_off 与 `risk_scope` 标记
 - ❌ 数据过期硬阻断新开仓/新建议的显式门（现为 degraded 标记，阻断链不完整）
 
 ### 运维与验收
 
 - 🟡 备份恢复演练只有校验和，无订单/成交/NAV 对账（§11.4）
-- ❌ 日线↔分钟聚合一致性检查（§3.5）
+- ✅ 日线↔分钟聚合一致性检查（§3.5）（2026-07-27 已完成：
+  `verify._verify_minute_daily_consistency` 对同一 (ts_code, trade_date)
+  将分钟 bar 聚合（开=首 bar 开、高/低=max/min、收=末 bar 收、量额=Σ）
+  与日线对比；价格相对容差 1e-4，量额按换算契约折算（分钟股/CNY →
+  日线手/千元）后同容差；仅覆盖契约明确的股票/ETF 分钟数据集
+  （SIMULATION_MINUTE_SOURCE_DATASETS，指数/期货/期权不在换算契约内）；
+  公共键取值矛盾记 error（与 OHLC 矛盾同级），分钟覆盖缺失与反向键只
+  记 minute_daily_checks coverage 计数不硬失败）
 - 🟡 原始响应体默认不保留（`keep_raw=False`，偏离 §3.2 字面要求；
   登记为已知偏差或改默认）
 - 🟡 披露日历对账只 warning 不阻断（已知，此前评估接受）
@@ -330,7 +460,9 @@
    - ✅ 追加完成（2026-07-22）：负对照/泄漏哨兵（placebo 对照 +
      标签平移哨兵，诊断标记不硬拒）、逐项成本压力（见 2.8）、HAC 零方差
      "未定义"、恢复期指标均已完成；latency/退市专项情景、消融、衰减曲线、
-     Holm/PBO/区块 Bootstrap、现金收益与 XIRR 仍在清单。
+     Holm/PBO/区块 Bootstrap、现金收益仍在清单。
+   - ✅ 追加完成（2026-07-27）：外部现金流（出入金）与模拟链单位化
+     TWR/XIRR（见第 3 节阶段 4/9 对应行）。
 3. **冲突修正（无需用户决策的）**：股息税保守负债（2.6）；披露/成本
    等登记类偏差入档。
 4. **其余缺失项**：按清单顺序量力推进；本 goal 内未完成的项在文档中

@@ -349,6 +349,7 @@ class LocalJobWorker:
                     closing_prices=result["closing_prices"],
                     execution_evidence=result,
                     corporate_actions=result.get("corporate_actions"),
+                    corporate_events=result.get("corporate_events"),
                 )
                 manifest = self.simulations.execution_manifest(simulation_batch_id)
                 self.allocations.refresh_for_simulation_source(
@@ -497,6 +498,25 @@ class LocalJobWorker:
                 if payload.get("symbols"):
                     command.extend(["--symbols", ",".join(payload["symbols"])])
             return command, result_path, {"TUSHARE_API_URL": api_url, "TUSHARE_TOKEN": token}
+        if job["kind"] in {"weekly_report", "monthly_decision_day", "preopen_check"}:
+            output = (
+                self.settings.data_root / "artifacts" / "ops-reports" / job["kind"] / job["id"]
+            )
+            output.mkdir(parents=True, exist_ok=True)
+            result_path = output / "result.json"
+            command = [
+                sys.executable,
+                "-m",
+                "quant_platform.ops_tasks",
+                job["kind"],
+                "--date",
+                str(payload["local_date"]),
+                "--result",
+                str(result_path),
+            ]
+            if payload.get("dataset"):
+                command.extend(["--dataset", str(payload["dataset"])])
+            return command, result_path, {}
         if job["kind"] == "data_verify":
             return (
                 [

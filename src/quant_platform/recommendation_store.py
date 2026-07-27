@@ -26,6 +26,7 @@ from .recommendation_actions import (
     RECOMMENDATION_ACTION_MODEL_VERSION,
     plan_account_actions,
 )
+from .safe_mode import SafeModeStore
 from .strategy_store import StrategyStore
 
 
@@ -39,6 +40,7 @@ class RecommendationStore:
     def __init__(self, database_url: str) -> None:
         self.strategies = StrategyStore(database_url)
         self.engine = self.strategies.engine
+        self.safe_mode = SafeModeStore(database_url)
 
     def _assert_v2_strategy(self, version: dict[str, Any]) -> None:
         if version.get("is_legacy"):
@@ -221,6 +223,8 @@ class RecommendationStore:
         dataset: str,
         dataset_identity_sha256: str,
     ) -> tuple[dict[str, Any], bool]:
+        # Design 11.3: new recommendations stop while safe mode is active.
+        self.safe_mode.assert_inactive(action="recommendation snapshot creation")
         portfolio = self.get(portfolio_id)
         if portfolio["status"] != "active":
             raise ValueError("only active recommendation portfolios may refresh")
@@ -414,6 +418,8 @@ class RecommendationStore:
         *,
         account_state: dict[str, dict[str, Any]],
         now: datetime | None = None,
+        permission_store: Any | None = None,
+        account_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Attach the two-dimension account action plan (design 8.4) to a snapshot.
 
@@ -427,6 +433,16 @@ class RecommendationStore:
         but absent from the holdings get target zero (EXIT semantics).  The
         plan is stored in ``account_actions_json``; the legacy
         increase/decrease holdings export is left untouched.
+
+        When ``permission_store`` (a :class:`MarketPermissionStore`) is given,
+        the personal market permission (design 8.7) gates every line at the
+        rule date: ``disabled``/``sell_only`` block buy actions with a recorded
+        reason (SELL/EXIT stay allowed), ``unknown``/expired permissions mark
+        the line not executable (``simulation_only``) without erasing the
+        advice. ``account_context`` records which account the state came from
+        (``main_paper`` by default; ``manual_shadow`` with freshness/degraded
+        flags when built from :class:`ShadowAccountStore`) so shadow, model
+        and simulation accounts stay visibly separate (design 8.6/8.1).
         """
 
         snapshot = self.get_snapshot(snapshot_id)
@@ -457,17 +473,31 @@ class RecommendationStore:
             elif instrument not in weights:
                 target_quantity = 0
             lot_rules = order_unit_rules(instrument, rule_date)
+            filled_position = int(state.pop("filled_position", 0))
+            hard_blocked_reason = state.pop("hard_blocked_reason", None)
+            not_executable_reason = state.pop("not_executable_reason", None)
+            if permission_store is not None and target_quantity is not None:
+                gate = permission_store.gate_for_instrument(
+                    instrument,
+                    on_date=rule_date,
+                    is_buy_action=int(target_quantity) > filled_position,
+                )
+                if gate is not None:
+                    if gate["kind"] == "hard" and not hard_blocked_reason:
+                        hard_blocked_reason = gate["reason"]
+                    elif gate["kind"] == "soft" and not not_executable_reason:
+                        not_executable_reason = gate["reason"]
             instruments.append(
                 {
                     "instrument": instrument,
                     "target_quantity": target_quantity,
-                    "filled_position": int(state.pop("filled_position", 0)),
+                    "filled_position": filled_position,
                     "sellable_quantity": state.pop("sellable_quantity", None),
                     "open_orders": state.pop("open_orders", []),
                     "lot_increment": lot_rules.lot_increment,
                     "min_lot": lot_rules.min_lot,
-                    "hard_blocked_reason": state.pop("hard_blocked_reason", None),
-                    "not_executable_reason": state.pop("not_executable_reason", None),
+                    "hard_blocked_reason": hard_blocked_reason,
+                    "not_executable_reason": not_executable_reason,
                 }
             )
         computed_at = now or _now()
@@ -475,6 +505,8 @@ class RecommendationStore:
             "model_version": RECOMMENDATION_ACTION_MODEL_VERSION,
             "computed_at": computed_at.isoformat(),
             "rule_date": rule_date.isoformat(),
+            "account_context": account_context
+            or {"account_type": "main_paper", "degraded": False},
             "items": plan_account_actions(instruments, now=computed_at),
         }
         with self.engine.begin() as connection:

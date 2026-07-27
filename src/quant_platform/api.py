@@ -61,6 +61,7 @@ from .research_automation import normalize_research_schedule_payload
 from .research_store import ResearchStore
 from .retention import DataRetentionManager
 from .runtime_secret_store import RuntimeSecretStore
+from .safe_mode import SafeModeStore
 from .schedule_store import ScheduleStore
 from .services import (
     dataset_catalog,
@@ -192,6 +193,17 @@ class RetentionApplyRequest(BaseModel):
     confirmation: str
     keep_latest: int = Field(default=7, ge=1, le=100)
     min_age_days: int = Field(default=14, ge=1, le=3650)
+
+
+class SafeModeEngageRequest(BaseModel):
+    actor: str = Field(default="", max_length=100)
+    reason: str = Field(min_length=5, max_length=1000)
+
+
+class SafeModeReleaseRequest(BaseModel):
+    actor: str = Field(default="", max_length=100)
+    reason: str = Field(min_length=10, max_length=1000)
+    require_health_ok: bool = False
 
 
 class QlibBaselineRequest(BaseModel):
@@ -886,6 +898,9 @@ class ScheduleCreateRequest(BaseModel):
         "ashare_5m_sync",
         "rdagent_research",
         "recommendation_refresh",
+        "weekly_report",
+        "monthly_decision_day",
+        "preopen_check",
     ]
     timezone: str = "Asia/Shanghai"
     run_time: time = time(15, 30)
@@ -917,6 +932,12 @@ class ScheduleCreateRequest(BaseModel):
             lookback_days = int(self.payload.get("lookback_days", 3))
             if not 1 <= lookback_days <= 30:
                 raise ValueError("ashare_5m_sync lookback_days must be between 1 and 30")
+        elif self.kind in {"weekly_report", "monthly_decision_day", "preopen_check"}:
+            # Operational run-calendar kinds carry no profile/bundle payload;
+            # an optional Qlib dataset anchor name is the only recognized key.
+            unknown = set(self.payload) - {"dataset"}
+            if unknown:
+                raise ValueError(f"unsupported {self.kind} payload keys: {sorted(unknown)}")
         else:
             profile = self.payload.get("profile", "full")
             if profile not in {"core", "research", "full"}:
@@ -1073,6 +1094,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     schedules = ScheduleStore(settings.database_url)
     alerts = AlertStore(settings.database_url)
     health_history = OperationalHealthStore(settings)
+    safe_mode = SafeModeStore(settings.database_url)
     auth = AuthStore(settings.database_url)
     runtime_secrets = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
     platform_configs = PlatformConfigStore(settings.database_url)
@@ -3121,6 +3143,36 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.get("/api/operations/readiness")
     def operational_readiness() -> dict:
         return deployment_readiness.assess()
+
+    @app.get("/api/platform/safe-mode")
+    def get_safe_mode() -> dict:
+        return safe_mode.status()
+
+    @app.post("/api/platform/safe-mode/engage")
+    def engage_safe_mode(payload: SafeModeEngageRequest, request: Request) -> dict:
+        actor = authenticated_actor(request, payload.actor or "local-operator")
+        return safe_mode.activate(
+            reason=payload.reason,
+            source="manual",
+            actor=actor,
+        )
+
+    @app.post("/api/platform/safe-mode/release")
+    def release_safe_mode(payload: SafeModeReleaseRequest, request: Request) -> dict:
+        actor = authenticated_actor(request, payload.actor or "local-operator")
+        health_status = None
+        if payload.require_health_ok:
+            latest = health_history.latest()
+            health_status = str((latest or {}).get("status") or "")
+        try:
+            return safe_mode.deactivate(
+                actor=actor,
+                reason=payload.reason,
+                require_health_ok=payload.require_health_ok,
+                health_status=health_status,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/jobs")
     def list_jobs(

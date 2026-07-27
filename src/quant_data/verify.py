@@ -11,6 +11,7 @@ import duckdb
 from .catalog import ALL_DEFINITIONS
 from .checkpoint import CheckpointStore
 from .coverage_data import COVERAGE_DATASETS, coverage_primary_key_candidates
+from .execution_contract import SIMULATION_MINUTE_SOURCE_DATASETS, TUSHARE_HAND_SIZE
 from .reference_data import select_current_reference_units
 
 # Interfaces whose provider pagination reorders rows between pages, making
@@ -169,6 +170,16 @@ def verify_downloads(
         )
         errors.extend(ohlc_errors)
         warnings.extend(ohlc_warnings)
+        minute_errors, minute_warnings, minute_daily_checks = (
+            _verify_minute_daily_consistency(
+                connection,
+                selected_by_dataset,
+                data_root,
+                snapshot_end=effective_snapshot_end,
+            )
+        )
+        errors.extend(minute_errors)
+        warnings.extend(minute_warnings)
         disclosure_warnings, disclosure_checks = _verify_disclosure_reconciliation(
             connection,
             selected_by_dataset,
@@ -185,6 +196,7 @@ def verify_downloads(
         "duplicate_checks": duplicate_checks,
         "completeness_checks": completeness_checks,
         "ohlc_checks": ohlc_checks,
+        "minute_daily_checks": minute_daily_checks,
         "disclosure_checks": disclosure_checks,
         "errors": errors,
         "warnings": warnings,
@@ -429,6 +441,133 @@ def _verify_daily_ohlc(
             f"(board rules differ; review the price-limit data, sample: "
             f"{_key_sample(connection, jumps_sql)})"
         )
+    return errors, warnings, checks
+
+
+# 设计 §3.5 质量门：日线↔分钟聚合一致性。只比对换算契约明确的股票/ETF
+# 分钟数据集（execution_contract.SIMULATION_MINUTE_SOURCE_DATASETS，分钟
+# vol 为股、amount 为 CNY）；指数 amount 是成分均价、期货/期权有合约乘数，
+# 均不在日线换算契约内。日线 vol 为手（=100 股）、amount 为千元。
+MINUTE_DAILY_PRICE_TOLERANCE = 1e-4
+_DAILY_AMOUNT_CNY_PER_UNIT = 1000.0
+
+
+def _verify_minute_daily_consistency(
+    connection: duckdb.DuckDBPyConnection,
+    selected_by_dataset: dict[str, list[dict[str, Any]]],
+    data_root: Path,
+    *,
+    snapshot_end: date,
+) -> tuple[list[str], list[str], dict[str, int]]:
+    """Reconcile minute bars aggregated to daily against the daily dataset.
+
+    对同一 (ts_code, trade_date)：开=首 bar 开、高=max、低=min、收=末 bar
+    收、量额=Σ（按换算契约折算成日线单位）。价格相对容差 1e-4；量额折算
+    后同容差（分母取 max(|日线值|, 1) 防零）。公共键上的取值矛盾记 error
+    （与日线 OHLC 矛盾/重复主键同级）；分钟覆盖缺失只记 coverage 计数，
+    不硬失败——分钟本来就是子集/区间下载（1min 流动性子集、5min 全市场
+    分区间），反向键（分钟有、日线无）同样只计数。
+    """
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    checks: dict[str, int] = {}
+    daily_paths = _selected_parquet_paths(selected_by_dataset, "daily", data_root)
+    if not daily_paths:
+        return errors, warnings, checks
+    daily = _parquet_relation(daily_paths)
+    trade_date = _date_sql("trade_date")
+    daily_sql = f"""
+        SELECT ts_code, {trade_date} AS trade_date,
+               try_cast(open AS DOUBLE) AS open,
+               try_cast(high AS DOUBLE) AS high,
+               try_cast(low AS DOUBLE) AS low,
+               try_cast(close AS DOUBLE) AS close,
+               try_cast(vol AS DOUBLE) AS vol_hands,
+               try_cast(amount AS DOUBLE) AS amount_thousand_cny
+        FROM {daily}
+        WHERE ts_code IS NOT NULL AND {trade_date} IS NOT NULL
+          AND {trade_date} <= DATE {_sql_string(snapshot_end.isoformat())}
+    """
+    tolerance = MINUTE_DAILY_PRICE_TOLERANCE
+    for dataset in sorted(SIMULATION_MINUTE_SOURCE_DATASETS):
+        minute_paths = _selected_parquet_paths(selected_by_dataset, dataset, data_root)
+        if not minute_paths:
+            continue
+        minute = _parquet_relation(minute_paths)
+        columns = {
+            str(row[0])
+            for row in connection.execute(f"DESCRIBE SELECT * FROM {minute}").fetchall()
+        }
+        required = {"ts_code", "trade_time", "open", "high", "low", "close", "vol", "amount"}
+        if not required.issubset(columns):
+            warnings.append(
+                f"{dataset}: minute units lack the columns required for the daily "
+                "aggregation consistency check"
+            )
+            continue
+        stamp = "try_cast(trade_time AS TIMESTAMP)"
+        minute_sql = f"""
+            SELECT ts_code,
+                   CAST({stamp} AS DATE) AS trade_date,
+                   arg_min(try_cast(open AS DOUBLE), {stamp}) AS open,
+                   max(try_cast(high AS DOUBLE)) AS high,
+                   min(try_cast(low AS DOUBLE)) AS low,
+                   arg_max(try_cast(close AS DOUBLE), {stamp}) AS close,
+                   sum(try_cast(vol AS DOUBLE)) AS vol_shares,
+                   sum(try_cast(amount AS DOUBLE)) AS amount_cny
+            FROM {minute}
+            WHERE ts_code IS NOT NULL AND {stamp} IS NOT NULL
+              AND CAST({stamp} AS DATE) <= DATE {_sql_string(snapshot_end.isoformat())}
+            GROUP BY ts_code, CAST({stamp} AS DATE)
+        """
+        compared_sql = f"""
+            SELECT m.ts_code, m.trade_date
+            FROM ({minute_sql}) m
+            INNER JOIN ({daily_sql}) d
+              ON m.ts_code = d.ts_code AND m.trade_date = d.trade_date
+        """
+        compared = int(
+            connection.execute(f"SELECT count(*) FROM ({compared_sql})").fetchone()[0]
+        )
+        mismatch_predicate = f"""
+            abs(m.open - d.open) > {tolerance} * abs(d.open)
+            OR abs(m.high - d.high) > {tolerance} * abs(d.high)
+            OR abs(m.low - d.low) > {tolerance} * abs(d.low)
+            OR abs(m.close - d.close) > {tolerance} * abs(d.close)
+            OR abs(m.vol_shares / {TUSHARE_HAND_SIZE} - d.vol_hands)
+               > {tolerance} * greatest(abs(d.vol_hands), 1)
+            OR abs(m.amount_cny / {_DAILY_AMOUNT_CNY_PER_UNIT} - d.amount_thousand_cny)
+               > {tolerance} * greatest(abs(d.amount_thousand_cny), 1)
+        """
+        mismatched_sql = f"{compared_sql} WHERE {mismatch_predicate}"
+        mismatched = int(
+            connection.execute(f"SELECT count(*) FROM ({mismatched_sql})").fetchone()[0]
+        )
+        daily_keys_sql = f"SELECT ts_code, trade_date FROM ({daily_sql})"
+        minute_keys_sql = f"SELECT ts_code, trade_date FROM ({minute_sql})"
+        daily_without_minute = int(
+            connection.execute(
+                f"SELECT count(*) FROM ({daily_keys_sql} EXCEPT {minute_keys_sql})"
+            ).fetchone()[0]
+        )
+        minute_without_daily = int(
+            connection.execute(
+                f"SELECT count(*) FROM ({minute_keys_sql} EXCEPT {daily_keys_sql})"
+            ).fetchone()[0]
+        )
+        checks[f"minute_daily_{dataset}_compared_keys"] = compared
+        checks[f"minute_daily_{dataset}_mismatched_keys"] = mismatched
+        checks[f"minute_daily_{dataset}_daily_keys_without_minute_coverage"] = (
+            daily_without_minute
+        )
+        checks[f"minute_daily_{dataset}_minute_keys_without_daily"] = minute_without_daily
+        if mismatched:
+            errors.append(
+                f"{dataset}: {mismatched} stock/date keys disagree between the "
+                f"aggregated minute bars and the daily dataset "
+                f"(sample: {_key_sample(connection, mismatched_sql)})"
+            )
     return errors, warnings, checks
 
 

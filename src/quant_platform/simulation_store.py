@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from math import isfinite
 from pathlib import Path
@@ -11,11 +11,12 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
+    account_netting_plans,
     backtest_runs,
     open_database,
     recommendation_holdings,
@@ -24,9 +25,11 @@ from quant_data.database import (
     row_dict,
     simulation_batches,
     simulation_cash_flows,
+    simulation_corporate_events,
     simulation_dividend_actions,
     simulation_dividend_entitlements,
     simulation_events,
+    simulation_external_flows,
     simulation_fills,
     simulation_nav,
     simulation_orders,
@@ -56,12 +59,35 @@ from .member_risk_gate import (
     load_strategy_risk_state,
 )
 from .qlib_workflow import require_qlib_workflow_identity
+from .safe_mode import SafeModeStore
 from .simulation_engine import (
     SIMULATION_ENGINE_VERSION,
     execute_atomic_pair_day,
     execute_simulation_day,
 )
+from .simulation_order_state import (
+    OPEN_STATUSES,
+    ORDER_PLAN_MODEL_VERSION,
+    STATUS_CANCELLED,
+    STATUS_EXPIRED,
+    STATUS_OPEN,
+    STATUS_PLANNED,
+    apply_order_plan,
+)
 from .strategy_catalog import require_capital_eligible_strategy_type
+from .unitized_performance import (
+    UNITIZED_PERFORMANCE_VERSION,
+    unitized_drawdown_recovery,
+    xirr,
+)
+
+# Batch-failure messages that indicate ledger-integrity corruption (as
+# opposed to data/capacity rejections); they engage the platform safe mode.
+LEDGER_INTEGRITY_ERROR_MARKERS = (
+    "cash conservation failed",
+    "cash flows do not reconcile",
+    "would create negative cash",
+)
 
 
 def _now() -> datetime:
@@ -162,7 +188,9 @@ class SimulationStore:
     """Transactional T+1 ledger for governed recommendation, strategy and allocation targets."""
 
     def __init__(self, database_url: str) -> None:
+        self.database_url = database_url
         self.engine = open_database(database_url)
+        self.safe_mode = SafeModeStore(database_url)
 
     @staticmethod
     def _governed_execution_policy(
@@ -289,6 +317,7 @@ class SimulationStore:
         execution_adapter: str | None = None,
         execution_contract_hash: str | None = None,
     ) -> dict[str, Any]:
+        self.safe_mode.assert_inactive(action="simulation account creation")
         if initial_cash < 100_000:
             raise ValueError("simulation initial cash must be at least 100000")
         if cost_schedule_version not in KNOWN_COST_SCHEDULE_VERSIONS:
@@ -411,6 +440,8 @@ class SimulationStore:
                         execution_engine_version=SIMULATION_ENGINE_VERSION,
                         cost_schedule_version=source_cost_model.version,
                         execution_policy_json=policy,
+                        investment_wealth=1.0,
+                        twr_high_water_mark=1.0,
                         created_by=actor.strip(),
                         created_at=now,
                         updated_at=now,
@@ -433,6 +464,145 @@ class SimulationStore:
                 "simulation name or source/execution dataset is already in use"
             ) from exc
         return self.get(portfolio_id)
+
+    def record_external_flow(
+        self,
+        portfolio_id: str,
+        *,
+        trade_date: date,
+        timing: str,
+        amount: float,
+        actor: str,
+        flow_key: str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Record a confirmed external cash flow (design 4.4/12.1).
+
+        Deposits are positive, withdrawals negative. ``timing`` is ``open``
+        (confirmed before the open, investable the same day) or ``close``
+        (confirmed after the open, investable from the next day). The flow is
+        idempotent on ``flow_key`` (default: a hash of the payload, so a retry
+        of the same request replays cleanly); a settled trade date (one that
+        already has a NAV row) rejects new flows — the ledger must be rebuilt
+        from the last verified state instead.
+        """
+
+        self.safe_mode.assert_inactive(action="simulation external cash flow")
+        day = trade_date if isinstance(trade_date, date) else date.fromisoformat(
+            str(trade_date)
+        )
+        normalized_timing = str(timing).strip().lower()
+        if normalized_timing not in {"open", "close"}:
+            raise ValueError("external cash flow timing must be open or close")
+        value = float(amount)
+        if not isfinite(value) or value == 0.0:
+            raise ValueError("external cash flow amount must be finite and non-zero")
+        payload = {
+            "portfolio_id": str(portfolio_id),
+            "trade_date": day.isoformat(),
+            "timing": normalized_timing,
+            "amount": value,
+        }
+        key = str(flow_key).strip() if flow_key else _canonical_hash(payload)
+        now = _now()
+        with self.engine.begin() as connection:
+            portfolio = connection.execute(
+                select(simulation_portfolios).where(
+                    simulation_portfolios.c.id == portfolio_id
+                )
+            ).first()
+            if portfolio is None:
+                raise ValueError("simulation portfolio does not exist")
+            if str(portfolio.execution_adapter) == "pair":
+                raise ValueError("pair research ledgers do not accept external cash flows")
+            settled = connection.execute(
+                select(func.count())
+                .select_from(simulation_nav)
+                .where(
+                    simulation_nav.c.portfolio_id == portfolio_id,
+                    simulation_nav.c.trade_date == day,
+                )
+            ).scalar_one()
+            if settled:
+                raise ValueError(
+                    "external cash flows cannot be recorded for a settled trade date; "
+                    "rebuild the ledger from the last verified state"
+                )
+            row = connection.execute(
+                select(simulation_external_flows).where(
+                    simulation_external_flows.c.portfolio_id == portfolio_id,
+                    simulation_external_flows.c.flow_key == key,
+                )
+            ).first()
+            created = row is None
+            if created:
+                connection.execute(
+                    pg_insert(simulation_external_flows)
+                    .values(
+                        id=uuid.uuid4().hex,
+                        portfolio_id=portfolio_id,
+                        flow_key=key,
+                        trade_date=day,
+                        timing=normalized_timing,
+                        amount=Decimal(str(value)),
+                        note=(str(note).strip() or None) if note else None,
+                        created_by=actor.strip(),
+                        created_at=now,
+                    )
+                    .on_conflict_do_nothing(
+                        index_elements=[
+                            simulation_external_flows.c.portfolio_id,
+                            simulation_external_flows.c.flow_key,
+                        ]
+                    )
+                )
+                row = connection.execute(
+                    select(simulation_external_flows).where(
+                        simulation_external_flows.c.portfolio_id == portfolio_id,
+                        simulation_external_flows.c.flow_key == key,
+                    )
+                ).first()
+            if row is None:  # pragma: no cover - defensive
+                raise RuntimeError("external cash flow ledger write did not land")
+            stored = {
+                "portfolio_id": str(row.portfolio_id),
+                "trade_date": row.trade_date.isoformat(),
+                "timing": str(row.timing),
+                "amount": float(row.amount),
+            }
+            if stored != payload:
+                raise ValueError(
+                    "external cash flow key was reused with a different payload"
+                )
+            if created:
+                connection.execute(
+                    insert(simulation_events).values(
+                        id=uuid.uuid4().hex,
+                        portfolio_id=portfolio_id,
+                        batch_id=None,
+                        trade_date=day,
+                        severity="info",
+                        event_type="external_cash_flow_recorded",
+                        instrument=None,
+                        reason=f"external_{normalized_timing}_flow",
+                        details_json={
+                            "flow_id": str(row.id),
+                            "flow_key": key,
+                            "timing": normalized_timing,
+                            "amount": value,
+                        },
+                        created_at=now,
+                    )
+                )
+        return {
+            "id": str(row.id),
+            "portfolio_id": str(portfolio_id),
+            "flow_key": key,
+            "trade_date": day.isoformat(),
+            "timing": normalized_timing,
+            "amount": value,
+            "created": created,
+        }
 
     @staticmethod
     def _resolve_source(connection: Any, source_type: str, source_id: str) -> dict[str, Any]:
@@ -695,6 +865,7 @@ class SimulationStore:
         *,
         actor: str = "recommendation-worker",
     ) -> list[tuple[dict[str, Any], bool]]:
+        self.safe_mode.assert_inactive(action="simulation batch creation")
         producer = actor.strip()
         if len(producer) < 2:
             raise ValueError("simulation batch producer is required")
@@ -802,6 +973,7 @@ class SimulationStore:
     ) -> tuple[dict[str, Any], bool]:
         """Queue one long-only replay from an immutable Qlib order-plan artifact."""
 
+        self.safe_mode.assert_inactive(action="simulation batch creation")
         manifest_sha256 = str(order_plan_manifest_sha256 or "").lower()
         if not _is_sha256(manifest_sha256):
             raise ValueError("Qlib order-plan manifest requires a SHA-256 identity")
@@ -1004,6 +1176,275 @@ class SimulationStore:
                 return self._batch_dict(existing), False
         return self.get_batch(batch_id), True
 
+    def create_order_plan_batch(
+        self,
+        portfolio_id: str,
+        *,
+        trade_date: date,
+        actions: list[dict[str, Any]],
+        target_version: str,
+        actor: str,
+        account_netting_plan_id: str | None = None,
+        limit_prices: dict[str, float] | None = None,
+        not_before: datetime | None = None,
+        not_after: datetime | None = None,
+        signal_date: date | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Commit a keep/cancel/replace/new order plan and queue its execution batch.
+
+        One transaction is the design 8.1 step-8 commit point: the execution
+        batch, the cancel/replace mutations on the live order book, the new
+        ``planned`` orders and the cancel/replace events land together.
+        ``actions`` are per-instrument outputs of
+        :mod:`quant_platform.recommendation_actions` (each carries an
+        ``order_plan`` list). Retrying with identical inputs replays the stored
+        batch via the idempotency key — no order is re-created and no remainder
+        is released twice. ``account_netting_plan_id`` optionally binds the
+        batch (and its new orders) to a persisted account netting plan; the
+        plan's ``strategy_contributions`` land on the order rows.
+        """
+
+        self.safe_mode.assert_inactive(action="simulation order plan creation")
+        producer = actor.strip()
+        if len(producer) < 2:
+            raise ValueError("simulation batch producer is required")
+        normalized_target_version = str(target_version or "").strip()
+        if not normalized_target_version:
+            raise ValueError("order-plan batches require the final target version")
+        if not isinstance(actions, list) or not all(isinstance(item, dict) for item in actions):
+            raise ValueError("order-plan actions must be a list of instrument plans")
+        plan_entries: list[dict[str, Any]] = []
+        for action in actions:
+            entries = action.get("order_plan")
+            if not isinstance(entries, list):
+                raise ValueError("order-plan actions must carry an order_plan list")
+            for entry in entries:
+                normalized = dict(entry)
+                if not str(normalized.get("instrument") or ""):
+                    normalized["instrument"] = str(action.get("instrument") or "")
+                plan_entries.append(normalized)
+        if not plan_entries:
+            raise ValueError("order-plan actions contain no keep/cancel/replace/new entry")
+        prices = {
+            str(key).upper(): float(value) for key, value in (limit_prices or {}).items()
+        }
+        if any(value <= 0 for value in prices.values()):
+            raise ValueError("order-plan limit prices must be positive")
+        normalized_signal_date = signal_date or trade_date
+        if normalized_signal_date > trade_date:
+            raise ValueError("order-plan signal date must not follow the trade date")
+        now = _now()
+        plan_hash = _canonical_hash(
+            {
+                "plan_version": ORDER_PLAN_MODEL_VERSION,
+                "portfolio_id": str(portfolio_id),
+                "trade_date": trade_date.isoformat(),
+                "target_version": normalized_target_version,
+                "actions": actions,
+                "account_netting_plan_id": account_netting_plan_id,
+                "limit_prices": prices,
+                "not_before": not_before.isoformat() if not_before else None,
+                "not_after": not_after.isoformat() if not_after else None,
+            }
+        )
+        idempotency_key = f"order-plan:{portfolio_id}:{plan_hash}"
+        with self.engine.begin() as connection:
+            portfolio = connection.execute(
+                select(simulation_portfolios)
+                .where(simulation_portfolios.c.id == portfolio_id)
+                .with_for_update()
+            ).first()
+            if portfolio is None:
+                raise KeyError(portfolio_id)
+            if portfolio.status != "active":
+                raise ValueError("simulation portfolio is not active")
+            self._require_current_source_contract(connection, portfolio)
+            if str(portfolio.execution_adapter) != "long_only":
+                raise ValueError("order-plan batches require the long_only adapter")
+            contributions: dict[str, Any] = {}
+            if account_netting_plan_id is not None:
+                plan_row = connection.execute(
+                    select(account_netting_plans).where(
+                        account_netting_plans.c.id == account_netting_plan_id
+                    )
+                ).first()
+                if plan_row is None:
+                    raise KeyError(account_netting_plan_id)
+                if str(portfolio.source_type) != "allocation" or str(
+                    portfolio.source_id
+                ) != str(plan_row.account_id):
+                    raise ValueError(
+                        "account netting plan does not match the simulation account"
+                    )
+                contributions = {
+                    str(instrument): entry
+                    for instrument, entry in (
+                        dict(plan_row.plan_json or {}).get("strategy_contributions") or {}
+                    ).items()
+                }
+            existing = connection.execute(
+                select(simulation_batches).where(
+                    simulation_batches.c.idempotency_key == idempotency_key
+                )
+            ).first()
+            if existing is not None:
+                # 幂等重放：计划已提交过，不重复建单、不重复释放余量。
+                return self._batch_dict(existing), False
+            order_rows = connection.execute(
+                select(simulation_orders)
+                .where(simulation_orders.c.portfolio_id == portfolio.id)
+                .with_for_update()
+            ).all()
+            book = {
+                str(row.id): row
+                for row in order_rows
+                if str(row.status) in OPEN_STATUSES
+            }
+            outcome = apply_order_plan(
+                open_orders=[dict(row_dict(row)) for row in order_rows],
+                plan_entries=plan_entries,
+            )
+            batch_id = uuid.uuid4().hex
+            connection.execute(
+                insert(simulation_batches).values(
+                    id=batch_id,
+                    portfolio_id=portfolio.id,
+                    recommendation_snapshot_id=None,
+                    source_snapshot_id=None,
+                    target_payload_json={
+                        "order_plan": {
+                            "plan_version": ORDER_PLAN_MODEL_VERSION,
+                            "target_version": normalized_target_version,
+                            "account_netting_plan_id": account_netting_plan_id,
+                            "actions": actions,
+                        }
+                    },
+                    execution_adapter=str(portfolio.execution_adapter),
+                    execution_contract_hash=portfolio.execution_contract_hash,
+                    signal_date=normalized_signal_date,
+                    trade_date=trade_date,
+                    signal_at=None,
+                    execution_not_before=None,
+                    status="queued",
+                    idempotency_key=idempotency_key,
+                    account_netting_plan_id=account_netting_plan_id,
+                    created_by=producer,
+                    created_at=now,
+                )
+            )
+
+            def _order_event(
+                *, event_type: str, instrument: str | None, reason: str, details: dict
+            ) -> None:
+                connection.execute(
+                    insert(simulation_events).values(
+                        id=uuid.uuid4().hex,
+                        portfolio_id=portfolio.id,
+                        batch_id=batch_id,
+                        trade_date=trade_date,
+                        severity="info",
+                        event_type=event_type,
+                        instrument=instrument,
+                        reason=reason,
+                        details_json=details,
+                        created_at=now,
+                    )
+                )
+
+            for cancel in outcome["cancels"]:
+                row = book[cancel["order_id"]]
+                updated = connection.execute(
+                    update(simulation_orders)
+                    .where(
+                        simulation_orders.c.id == cancel["order_id"],
+                        simulation_orders.c.status.in_(OPEN_STATUSES),
+                    )
+                    .values(
+                        status=STATUS_CANCELLED,
+                        cancel_reason=cancel["reason"],
+                        updated_at=now,
+                    )
+                )
+                if int(updated.rowcount or 0) != 1:
+                    raise ValueError(
+                        f"order {cancel['order_id']} changed state while the plan committed"
+                    )
+                _order_event(
+                    event_type="order_cancelled",
+                    instrument=str(row.instrument),
+                    reason=cancel["reason"],
+                    details={
+                        "order_id": cancel["order_id"],
+                        "released_quantity": cancel["released_quantity"],
+                    },
+                )
+            for replace in outcome["replaces"]:
+                row = book[replace["order_id"]]
+                updated = connection.execute(
+                    update(simulation_orders)
+                    .where(
+                        simulation_orders.c.id == replace["order_id"],
+                        simulation_orders.c.status.in_(OPEN_STATUSES),
+                    )
+                    .values(
+                        requested_quantity=replace["new_requested_quantity"],
+                        plan_op="replace",
+                        updated_at=now,
+                    )
+                )
+                if int(updated.rowcount or 0) != 1:
+                    raise ValueError(
+                        f"order {replace['order_id']} changed state while the plan committed"
+                    )
+                _order_event(
+                    event_type="order_replaced",
+                    instrument=str(row.instrument),
+                    reason=replace["reason"],
+                    details={
+                        "order_id": replace["order_id"],
+                        "previous_requested_quantity": int(row.requested_quantity),
+                        "new_requested_quantity": replace["new_requested_quantity"],
+                        "released_quantity": replace["released_quantity"],
+                    },
+                )
+            for new in outcome["news"]:
+                instrument = new["instrument"]
+                limit_price = prices.get(instrument)
+                connection.execute(
+                    insert(simulation_orders).values(
+                        id=uuid.uuid4().hex,
+                        batch_id=batch_id,
+                        portfolio_id=portfolio.id,
+                        instrument=instrument,
+                        side=new["side"],
+                        target_weight=0.0,
+                        requested_quantity=int(new["quantity"]),
+                        filled_quantity=0,
+                        status=STATUS_PLANNED,
+                        reject_reason=None,
+                        requested_value=Decimal(
+                            str(int(new["quantity"]) * limit_price)
+                            if limit_price is not None
+                            else "0"
+                        ),
+                        filled_value=Decimal("0"),
+                        capacity_fill_ratio=0.0,
+                        expires_at=not_after
+                        or datetime.combine(trade_date, time(15, 0), ZoneInfo("Asia/Shanghai")),
+                        limit_price=(
+                            Decimal(str(limit_price)) if limit_price is not None else None
+                        ),
+                        not_before=not_before,
+                        not_after=not_after,
+                        target_version=normalized_target_version,
+                        account_netting_plan_id=account_netting_plan_id,
+                        strategy_contributions_json=contributions.get(instrument),
+                        plan_op="new",
+                        created_at=now,
+                    )
+                )
+        return self.get_batch(batch_id), True
+
     @staticmethod
     def _validate_order_plan_timing(
         *,
@@ -1089,6 +1530,7 @@ class SimulationStore:
     ) -> tuple[dict[str, Any], bool]:
         """Derive an atomic pair target from one immutable approved formal backtest trade."""
 
+        self.safe_mode.assert_inactive(action="simulation batch creation")
         producer = actor.strip()
         if len(producer) < 2:
             raise ValueError("simulation batch producer is required")
@@ -1725,6 +2167,81 @@ class SimulationStore:
             "volume_profile": profile,
         }
 
+    def _open_order_book(
+        self, connection: Any, portfolio: Any, batch: Any, now: datetime
+    ) -> dict[str, Any]:
+        """Activate this batch's planned orders and load the working order book.
+
+        planned -> open for every portfolio order whose window allows today
+        (a superseding plan re-activates orders created by an earlier queued
+        batch); still-open orders from earlier batches carry over; orders
+        whose window lapsed before today expire (fail closed, never
+        executed). Returns the executable rows keyed by order id.
+        """
+
+        day_start = datetime.combine(
+            batch.trade_date, time(0, 0), ZoneInfo("Asia/Shanghai")
+        )
+        day_end = datetime.combine(
+            batch.trade_date, time(15, 0), ZoneInfo("Asia/Shanghai")
+        )
+        connection.execute(
+            update(simulation_orders)
+            .where(
+                simulation_orders.c.portfolio_id == portfolio.id,
+                simulation_orders.c.status == STATUS_PLANNED,
+                or_(
+                    simulation_orders.c.not_before.is_(None),
+                    simulation_orders.c.not_before <= day_end,
+                ),
+            )
+            .values(status=STATUS_OPEN, updated_at=now)
+        )
+        stale = connection.execute(
+            select(simulation_orders).where(
+                simulation_orders.c.portfolio_id == portfolio.id,
+                simulation_orders.c.status.in_(OPEN_STATUSES),
+                func.coalesce(simulation_orders.c.not_after, simulation_orders.c.expires_at)
+                < day_start,
+            )
+        ).all()
+        for row in stale:
+            connection.execute(
+                update(simulation_orders)
+                .where(simulation_orders.c.id == row.id)
+                .values(status=STATUS_EXPIRED, updated_at=now)
+            )
+            connection.execute(
+                insert(simulation_events).values(
+                    id=uuid.uuid4().hex,
+                    portfolio_id=portfolio.id,
+                    batch_id=batch.id,
+                    trade_date=batch.trade_date,
+                    severity="info",
+                    event_type="order_expired",
+                    instrument=str(row.instrument),
+                    reason="execution_window_elapsed",
+                    details_json={"order_id": str(row.id)},
+                    created_at=now,
+                )
+            )
+        rows = connection.execute(
+            select(simulation_orders).where(
+                simulation_orders.c.portfolio_id == portfolio.id,
+                simulation_orders.c.status == STATUS_OPEN,
+            )
+        ).all()
+        working: dict[str, Any] = {}
+        for row in rows:
+            if int(row.requested_quantity) - int(row.filled_quantity) <= 0:
+                continue
+            if row.not_before is not None and row.not_before > day_end:
+                continue
+            if row.not_after is not None and row.not_after < day_start:
+                continue
+            working[str(row.id)] = row
+        return working
+
     def process_batch(
         self,
         batch_id: str,
@@ -1733,6 +2250,7 @@ class SimulationStore:
         closing_prices: dict[str, dict[str, Any]],
         execution_evidence: dict[str, Any],
         corporate_actions: list[dict[str, Any]] | None = None,
+        corporate_events: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Compute, book and value a simulation day in one database transaction."""
 
@@ -1796,6 +2314,17 @@ class SimulationStore:
                     raise ValueError(
                         "simulation corporate actions do not match the execution evidence"
                     )
+            normalized_events = [dict(item) for item in (corporate_events or [])]
+            if corporate_events is not None:
+                # 非分红类公司行动（公告/拆并股/代码变更等）同样绑定证据哈希。
+                events_hash = corporate_actions_sha256(normalized_events)
+                if (
+                    str(execution_evidence.get("corporate_events_sha256") or "")
+                    != events_hash
+                ):
+                    raise ValueError(
+                        "simulation corporate events do not match the execution evidence"
+                    )
             for field in ("signal_at", "execution_not_before"):
                 expected_timestamp = getattr(batch, field)
                 observed_timestamp = execution_evidence.get(field)
@@ -1813,6 +2342,8 @@ class SimulationStore:
                         "simulation execution evidence does not match order-plan timing"
                     )
             target_payload = dict(batch.target_payload_json or {})
+            order_plan_mode = False
+            working_orders: dict[str, Any] = {}
             if batch.recommendation_snapshot_id:
                 snapshot = connection.execute(
                     select(recommendation_snapshots).where(
@@ -1831,10 +2362,24 @@ class SimulationStore:
                         )
                     }
                 }
+            elif target_payload.get("order_plan") is not None:
+                order_plan = dict(target_payload["order_plan"])
+                if order_plan.get("plan_version") != ORDER_PLAN_MODEL_VERSION:
+                    raise ValueError("simulation order-plan batch has an unsupported version")
+                if str(portfolio.execution_adapter) != "long_only":
+                    raise ValueError("order-plan batches require the long_only adapter")
+                if not str(order_plan.get("target_version") or ""):
+                    raise ValueError("simulation order-plan batch has no target version")
+                bound_plan = order_plan.get("account_netting_plan_id")
+                if str(bound_plan or "") != str(batch.account_netting_plan_id or ""):
+                    raise ValueError("order-plan batch netting binding has drifted")
+                order_plan_mode = True
+                working_orders = self._open_order_book(connection, portfolio, batch, now)
             elif not target_payload:
                 raise ValueError("simulation batch has no governed target payload")
             if (
-                not batch.recommendation_snapshot_id
+                not order_plan_mode
+                and not batch.recommendation_snapshot_id
                 and str(portfolio.execution_adapter) == "long_only"
             ):
                 self._require_governed_long_only_target(
@@ -1920,6 +2465,25 @@ class SimulationStore:
                     position_state[instrument]["_applied_ca_ex_dates"] = tuple(
                         sorted(ex_dates)
                     )
+            # 非分红类公司行动台账：已应用事件键是幂等状态；持有人选择事件
+            # 重新推导持仓的 choice_pending 标记（处置前卖出仅提示不阻断）。
+            applied_event_keys: list[str] = []
+            for event_row in connection.execute(
+                select(simulation_corporate_events).where(
+                    simulation_corporate_events.c.portfolio_id == portfolio.id
+                )
+            ):
+                event_key = str(event_row.event_key)
+                applied_event_keys.append(event_key)
+                if str(event_row.event_type) == "choice_required":
+                    instrument = str(event_row.instrument)
+                    if instrument in position_state:
+                        position_state[instrument]["choice_pending"] = {
+                            "event_key": event_key,
+                            "since": event_row.effective_date.isoformat(),
+                            "title": (event_row.details_json or {}).get("title"),
+                            "manual_action_required": True,
+                        }
             strategy_version_id = self._source_strategy_version_id(connection, portfolio)
             strategy_risk_state = (
                 load_strategy_risk_state(connection, str(strategy_version_id))
@@ -1957,7 +2521,125 @@ class SimulationStore:
             cost_schedule = CostScheduleBook.from_mapping(
                 dict(portfolio.execution_policy_json or {}).get("cost_model")
             )
-            if str(portfolio.execution_adapter) == "pair":
+            # 当日已确认外部现金流（设计 4.4/12.1）：open 当日可投资，close 次日起。
+            flow_open = 0.0
+            flow_close = 0.0
+            for flow_row in connection.execute(
+                select(simulation_external_flows).where(
+                    simulation_external_flows.c.portfolio_id == portfolio.id,
+                    simulation_external_flows.c.trade_date == batch.trade_date,
+                )
+            ):
+                if str(flow_row.timing) == "open":
+                    flow_open += float(flow_row.amount)
+                else:
+                    flow_close += float(flow_row.amount)
+            prior_investment_wealth = (
+                float(portfolio.investment_wealth)
+                if portfolio.investment_wealth is not None
+                else None
+            )
+            twr_high_water_mark = (
+                float(portfolio.twr_high_water_mark)
+                if portfolio.twr_high_water_mark is not None
+                else None
+            )
+            if prior_investment_wealth is None:
+                settled_days = connection.execute(
+                    select(func.count())
+                    .select_from(simulation_nav)
+                    .where(simulation_nav.c.portfolio_id == portfolio.id)
+                ).scalar_one()
+                if not settled_days:
+                    # 迁移前创建但尚无 NAV 行的账户：单位化链从 1.0 起。
+                    prior_investment_wealth = 1.0
+                    twr_high_water_mark = 1.0
+            if order_plan_mode:
+                blocked_buys: list[str] = []
+                specs: list[dict[str, Any]] = []
+                for row in working_orders.values():
+                    side = str(row.side)
+                    if side == "buy" and not strategy_risk_state["allow_new_risk"]:
+                        # 风险硬门：只阻断新增风险，工作买单保留待风险解除。
+                        blocked_buys.append(str(row.id))
+                        continue
+                    specs.append(
+                        {
+                            "instrument": str(row.instrument),
+                            "side": side,
+                            "requested_quantity": int(row.requested_quantity)
+                            - int(row.filled_quantity),
+                            "target_weight": float(row.target_weight),
+                            "order_ref": str(row.id),
+                            "limit_price": (
+                                float(row.limit_price) if row.limit_price is not None else None
+                            ),
+                            "not_before": row.not_before,
+                            "not_after": row.not_after,
+                        }
+                    )
+                result = execute_simulation_day(
+                    trade_date=batch.trade_date,
+                    cash=float(portfolio.cash),
+                    prior_nav=float(portfolio.nav),
+                    high_water_mark=float(portfolio.high_water_mark),
+                    positions=position_state,
+                    target_weights={},
+                    minute_bars=minute_bars,
+                    closing_prices=closing_prices,
+                    cost_schedule=cost_schedule,
+                    execution_policy=execution_policy,
+                    signal_at=batch.signal_at,
+                    corporate_actions=normalized_actions,
+                    dividend_receivables=open_receivables,
+                    corporate_events=normalized_events,
+                    applied_event_keys=applied_event_keys,
+                    order_specs_override=specs,
+                    external_flow_open=flow_open,
+                    external_flow_close=flow_close,
+                    prior_investment_wealth=prior_investment_wealth,
+                    twr_high_water_mark=twr_high_water_mark,
+                )
+                result.setdefault("dividend_receivables", list(open_receivables))
+                result.setdefault("corporate_actions_applied", [])
+                day_end = datetime.combine(
+                    batch.trade_date, time(15, 0), ZoneInfo("Asia/Shanghai")
+                )
+                for order in result["orders"]:
+                    row = working_orders[str(order["order_ref"])]
+                    requested_total = int(row.requested_quantity)
+                    cumulative_filled = int(row.filled_quantity) + int(
+                        order["filled_quantity"]
+                    )
+                    order["filled_quantity"] = cumulative_filled
+                    order["filled_value"] = float(row.filled_value) + float(
+                        order["filled_value"]
+                    )
+                    order["requested_quantity"] = requested_total
+                    order["requested_value"] = float(row.requested_value)
+                    order["capacity_fill_ratio"] = cumulative_filled / requested_total
+                    window_end = row.not_after or row.expires_at
+                    window_closed = window_end is not None and window_end <= day_end
+                    if cumulative_filled >= requested_total:
+                        order["status"] = "filled"
+                    elif window_closed:
+                        order["status"] = (
+                            "partial_filled_expired" if cumulative_filled else "expired"
+                        )
+                    else:
+                        # 执行窗口未结束：工作单保持 open，余量留给后续批次。
+                        order["status"] = "open"
+                if blocked_buys:
+                    result["events"].append(
+                        {
+                            "severity": "warning",
+                            "event_type": "order_plan_buys_blocked",
+                            "instrument": None,
+                            "reason": "strategy_risk_gate_pauses_new_risk",
+                            "details": {"order_ids": sorted(blocked_buys)},
+                        }
+                    )
+            elif str(portfolio.execution_adapter) == "pair":
                 governed_plan = target_payload.get("governed_pair_plan")
                 if not isinstance(governed_plan, dict):
                     raise ValueError("pair simulation batch has no governed artifact plan")
@@ -2006,6 +2688,10 @@ class SimulationStore:
                     },
                     cost_schedule=cost_schedule,
                     execution_policy=execution_policy,
+                    external_flow_open=flow_open,
+                    external_flow_close=flow_close,
+                    prior_investment_wealth=prior_investment_wealth,
+                    twr_high_water_mark=twr_high_water_mark,
                 )
                 result["shortability_evidence_sha256"] = str(shortability_sha256)
             else:
@@ -2023,6 +2709,12 @@ class SimulationStore:
                     signal_at=batch.signal_at,
                     corporate_actions=normalized_actions,
                     dividend_receivables=open_receivables,
+                    corporate_events=normalized_events,
+                    applied_event_keys=applied_event_keys,
+                    external_flow_open=flow_open,
+                    external_flow_close=flow_close,
+                    prior_investment_wealth=prior_investment_wealth,
+                    twr_high_water_mark=twr_high_water_mark,
                 )
                 result.setdefault("dividend_receivables", list(open_receivables))
                 result.setdefault("corporate_actions_applied", [])
@@ -2032,6 +2724,11 @@ class SimulationStore:
                     action
                     for action in normalized_actions
                     if str(action.get("instrument") or "").upper() in position_state
+                ]
+                pair_relevant += [
+                    item
+                    for item in normalized_events
+                    if str(item.get("instrument") or "").upper() in position_state
                 ]
                 if pair_relevant:
                     result["events"].append(
@@ -2082,12 +2779,39 @@ class SimulationStore:
                 ).first()
                 if existing is None:
                     raise KeyError(batch_id)
+        # Design 11.3: a ledger-integrity failure is a severe anomaly and
+        # engages the platform safe mode (new recommendations and simulation
+        # orders stop until a manual release).
+        if any(marker in error for marker in LEDGER_INTEGRITY_ERROR_MARKERS):
+            SafeModeStore(self.database_url).activate(
+                reason=f"simulation batch {batch_id} ledger integrity failure: {error[:500]}",
+                source="simulation_ledger",
+                actor="system",
+                details={"batch_id": batch_id, "error": error[:2000]},
+            )
 
     def _persist_result(
         self, connection: Any, batch: Any, portfolio: Any, result: dict[str, Any], now: datetime
     ) -> None:
-        order_ids: dict[tuple[str, str], str] = {}
+        order_ids: dict[Any, str] = {}
         for order in result["orders"]:
+            ref = order.get("order_ref")
+            if ref is not None:
+                # 持久订单：更新既有行（累计成交/终态或继续 open），不新建行。
+                order_ids[str(ref)] = str(ref)
+                connection.execute(
+                    update(simulation_orders)
+                    .where(simulation_orders.c.id == str(ref))
+                    .values(
+                        filled_quantity=int(order["filled_quantity"]),
+                        status=order["status"],
+                        reject_reason=order.get("reject_reason"),
+                        filled_value=Decimal(str(order["filled_value"])),
+                        capacity_fill_ratio=float(order["capacity_fill_ratio"]),
+                        updated_at=now,
+                    )
+                )
+                continue
             order_id = uuid.uuid4().hex
             key = (str(order["instrument"]), str(order["side"]))
             order_ids[key] = order_id
@@ -2098,6 +2822,7 @@ class SimulationStore:
                 insert(simulation_orders).values(
                     id=order_id,
                     batch_id=batch.id,
+                    portfolio_id=portfolio.id,
                     instrument=order["instrument"],
                     side=order["side"],
                     atomic_group_id=order.get("atomic_group_id"),
@@ -2114,16 +2839,21 @@ class SimulationStore:
                     capacity_fill_ratio=float(order["capacity_fill_ratio"]),
                     expires_at=expires_at,
                     created_at=now,
+                    updated_at=now,
                 )
             )
         fill_ids: list[str] = []
         for fill in result["fills"]:
             fill_id = uuid.uuid4().hex
             fill_ids.append(fill_id)
+            fill_key = fill.get("order_ref") or (
+                str(fill["instrument"]),
+                str(fill["side"]),
+            )
             connection.execute(
                 insert(simulation_fills).values(
                     id=fill_id,
-                    order_id=order_ids[(str(fill["instrument"]), str(fill["side"]))],
+                    order_id=order_ids[fill_key],
                     batch_id=batch.id,
                     instrument=fill["instrument"],
                     side=fill["side"],
@@ -2287,6 +3017,26 @@ class SimulationStore:
                     )
                     .values(status="paid", paid_batch_id=batch.id, updated_at=now)
                 )
+        # 非分红类公司行动台账：事件键唯一幂等插入，重放不产生第二行。
+        for applied in result.get("corporate_events_applied") or []:
+            connection.execute(
+                pg_insert(simulation_corporate_events)
+                .values(
+                    id=uuid.uuid4().hex,
+                    portfolio_id=portfolio.id,
+                    event_key=str(applied["event_key"]),
+                    event_type=str(applied["event_type"]),
+                    instrument=str(applied["instrument"]),
+                    effective_date=date.fromisoformat(str(applied["effective_date"])),
+                    payload_sha256=str(applied.get("payload_sha256") or ""),
+                    details_json=applied.get("details") or {},
+                    batch_id=batch.id,
+                    created_at=now,
+                )
+                .on_conflict_do_nothing(
+                    constraint="uq_simulation_corporate_events_key"
+                )
+            )
         nav = result["nav_row"]
         connection.execute(
             insert(simulation_nav).values(
@@ -2301,6 +3051,24 @@ class SimulationStore:
                 nav=Decimal(str(nav["nav"])),
                 daily_return=float(nav["daily_return"]),
                 drawdown=float(nav["drawdown"]),
+                external_flow_open=Decimal(str(nav.get("external_flow_open", 0.0))),
+                external_flow_close=Decimal(str(nav.get("external_flow_close", 0.0))),
+                twr_daily_return=(
+                    float(nav["twr_daily_return"])
+                    if nav.get("twr_daily_return") is not None
+                    else None
+                ),
+                investment_wealth=(
+                    float(nav["investment_wealth"])
+                    if nav.get("investment_wealth") is not None
+                    else None
+                ),
+                twr_drawdown=(
+                    float(nav["twr_drawdown"])
+                    if nav.get("twr_drawdown") is not None
+                    else None
+                ),
+                twr_status=str(nav.get("twr_status") or "unavailable_legacy"),
                 market_date=nav["market_date"],
                 has_stale_prices=bool(nav["has_stale_prices"]),
                 status=nav["status"],
@@ -2340,6 +3108,7 @@ class SimulationStore:
             "nav": result["nav"],
             "conservation": result["conservation"],
             "corporate_actions": len(result.get("corporate_actions_applied") or []),
+            "corporate_events": len(result.get("corporate_events_applied") or []),
         }
         if result.get("shortability_evidence_sha256"):
             summary["shortability_evidence_sha256"] = result[
@@ -2354,6 +3123,16 @@ class SimulationStore:
                 cash=Decimal(str(result["cash"])),
                 nav=Decimal(str(result["nav"])),
                 high_water_mark=Decimal(str(result["high_water_mark"])),
+                investment_wealth=(
+                    float(result["investment_wealth"])
+                    if result.get("investment_wealth") is not None
+                    else None
+                ),
+                twr_high_water_mark=(
+                    float(result["twr_high_water_mark"])
+                    if result.get("twr_high_water_mark") is not None
+                    else None
+                ),
                 updated_at=now,
             )
         )
@@ -2548,6 +3327,111 @@ class SimulationStore:
                 raise KeyError(batch_id)
             return self._batch_dict(row)
 
+    def latest_batch(self, portfolio_id: str) -> dict[str, Any] | None:
+        """Most recent batch by trade_date (reconciliation status source)."""
+
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(simulation_batches)
+                .where(simulation_batches.c.portfolio_id == portfolio_id)
+                .order_by(
+                    simulation_batches.c.trade_date.desc(),
+                    simulation_batches.c.created_at.desc(),
+                )
+                .limit(1)
+            ).first()
+        return self._batch_dict(row) if row is not None else None
+
+    def latest_nav(self, portfolio_id: str) -> dict[str, Any] | None:
+        """Most recent NAV row by trade_date (health/certification source)."""
+
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(simulation_nav)
+                .where(simulation_nav.c.portfolio_id == portfolio_id)
+                .order_by(simulation_nav.c.trade_date.desc())
+                .limit(1)
+            ).first()
+        return row_dict(row) if row is not None else None
+
+    def performance_summary(self, portfolio_id: str) -> dict[str, Any]:
+        """Unitized TWR curve metrics plus the money-weighted XIRR companion.
+
+        The CNY NAV series stays the ledger reconciliation view; this report
+        is built on the unitized ``investment_wealth`` curve (design 4.4/8.3):
+        TWR, max drawdown and recovery time come from that curve, external
+        cash flows never manufacture return or drawdown (design 12.1). XIRR
+        uses the investor-perspective flows (initial deposit and recorded
+        external flows out of pocket, latest NAV as the terminal value) and
+        reports an explicit status on degenerate inputs.
+        """
+
+        with self.engine.connect() as connection:
+            portfolio = connection.execute(
+                select(simulation_portfolios).where(
+                    simulation_portfolios.c.id == portfolio_id
+                )
+            ).first()
+            if portfolio is None:
+                raise KeyError(portfolio_id)
+            nav_rows = [
+                row_dict(row)
+                for row in connection.execute(
+                    select(simulation_nav)
+                    .where(simulation_nav.c.portfolio_id == portfolio_id)
+                    .order_by(simulation_nav.c.trade_date)
+                )
+            ]
+            flow_rows = [
+                row_dict(row)
+                for row in connection.execute(
+                    select(simulation_external_flows)
+                    .where(simulation_external_flows.c.portfolio_id == portfolio_id)
+                    .order_by(simulation_external_flows.c.trade_date)
+                )
+            ]
+        chain_broken = any(row["investment_wealth"] is None for row in nav_rows)
+        points = [
+            (row["trade_date"], float(row["investment_wealth"]))
+            for row in nav_rows
+            if row["investment_wealth"] is not None
+        ]
+        unitized = unitized_drawdown_recovery(points)
+        if chain_broken:
+            unitized = {
+                **unitized,
+                "status": "unavailable_broken_chain",
+                "broken_from": next(
+                    row["trade_date"].isoformat()
+                    for row in nav_rows
+                    if row["investment_wealth"] is None
+                ),
+            }
+        money_flows = [
+            (portfolio.created_at.date(), -float(portfolio.initial_cash)),
+            *[
+                (row["trade_date"], -float(row["amount"]))
+                for row in flow_rows
+            ],
+        ]
+        money_weighted: dict[str, Any]
+        if nav_rows:
+            money_weighted = xirr(
+                money_flows,
+                terminal=(nav_rows[-1]["trade_date"], float(nav_rows[-1]["nav"])),
+            )
+        else:
+            money_weighted = {"status": "insufficient_evidence", "rate": None}
+        return {
+            "portfolio_id": str(portfolio_id),
+            "contract_version": UNITIZED_PERFORMANCE_VERSION,
+            "nav_days": len(nav_rows),
+            "external_flow_count": len(flow_rows),
+            "unitized": unitized,
+            "xirr": money_weighted,
+            "cny_nav_latest": (float(nav_rows[-1]["nav"]) if nav_rows else None),
+        }
+
     def execution_manifest(self, batch_id: str) -> dict[str, Any]:
         with self.engine.connect() as connection:
             batch = connection.execute(
@@ -2652,6 +3536,11 @@ class SimulationStore:
             ),
             "nav": (simulation_nav, simulation_nav, simulation_nav.c.trade_date),
             "events": (simulation_events, simulation_events, simulation_events.c.created_at),
+            "external_flows": (
+                simulation_external_flows,
+                simulation_external_flows,
+                simulation_external_flows.c.trade_date,
+            ),
         }
         if resource not in resources:
             raise ValueError("unknown simulation resource")

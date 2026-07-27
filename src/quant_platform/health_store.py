@@ -10,6 +10,7 @@ from quant_data.config import Settings
 from quant_data.database import jobs, open_database, row_dict, system_health_snapshots
 
 from .runtime_secret_store import RuntimeSecretStore
+from .safe_mode import SafeModeStore
 from .services import list_qlib_datasets
 
 
@@ -73,6 +74,7 @@ class OperationalHealthStore:
                 "message": f"Tushare credential storage failed: {exc}",
             }
         components["job_queue"] = self._job_queue_health(current)
+        components["safe_mode"] = self._safe_mode_health()
         components["broker_boundary"] = {
             "status": "not_applicable",
             "message": "broker execution is outside the research and recommendation system",
@@ -222,6 +224,30 @@ class OperationalHealthStore:
             "end_date": latest["end_date"],
             "age_days": age_days,
             "limit_days": self.settings.data_freshness_max_days,
+        }
+
+    def _safe_mode_health(self) -> dict[str, Any]:
+        try:
+            state = SafeModeStore(self.settings.database_url).status()
+        except Exception as exc:  # noqa: BLE001 - health collection never crashes
+            return {"status": "attention", "message": f"safe-mode state unreadable: {exc}"}
+        if state["active"]:
+            return {
+                "status": "degraded",
+                "message": (
+                    f"safe_mode active since {state['triggered_at']} "
+                    f"(source {state['source']}): {state['reason']}"
+                ),
+                "details": {
+                    "source": state["source"],
+                    "triggered_by": state["triggered_by"],
+                    "triggered_at": str(state["triggered_at"]),
+                    "recovery": "manual safe-mode release required (actor + reason)",
+                },
+            }
+        return {
+            "status": "ok",
+            "message": "safe mode off; recommendations and simulation orders flow",
         }
 
     def _job_queue_health(self, now: datetime) -> dict[str, Any]:

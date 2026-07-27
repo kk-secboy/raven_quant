@@ -936,6 +936,26 @@ def retry_failed() -> None:
     _run_phase(context, "retry", set(context.checkpoint.datasets()))
 
 
+def _trigger_safe_mode_on_quality_gate_failure(settings: Any, report: dict[str, Any]) -> None:
+    """Design 11.3: a failed data quality gate is a severe data anomaly.
+
+    Never masks the original verification failure when the control plane is
+    unreachable.
+    """
+
+    try:
+        from quant_platform.safe_mode import SafeModeStore
+
+        SafeModeStore(settings.database_url).activate(
+            reason=f"数据质量门校验失败（{len(report['errors'])} 项错误）",
+            source="data_quality_gate",
+            actor="system",
+            details={"errors": [str(item) for item in report["errors"]][:20]},
+        )
+    except Exception:  # noqa: BLE001 - the verification failure takes priority
+        console.print("[red]safe_mode trigger failed; verification error stands[/red]")
+
+
 @app.command()
 def verify(
     snapshot_end: Annotated[
@@ -961,6 +981,7 @@ def verify(
     write_report(report, path)
     console.print_json(json.dumps(report, ensure_ascii=False))
     if not report["ok"]:
+        _trigger_safe_mode_on_quality_gate_failure(context.settings, report)
         raise typer.Exit(3)
 
 
@@ -989,6 +1010,7 @@ def snapshot(
         console.print("[red]verification failed; snapshot records quality_gate.ok=false[/red]")
         for error in report["errors"][:20]:
             console.print(f"  - {error}")
+        _trigger_safe_mode_on_quality_gate_failure(context.settings, report)
     path = _build_snapshot(
         context, name, start_date, end_date, profile, quality_gate=quality_gate_payload(report)
     )

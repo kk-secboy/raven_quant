@@ -1,4 +1,4 @@
-"""Pure corporate-action ledger primitives (现金分红/送转四阶段入账).
+"""Pure corporate-action ledger primitives（现金分红/送转四阶段入账 + §5.6 类型扩展）.
 
 No database, no system clock, no side effects — the same discipline as the
 project ``ExecutionCore``: every function takes explicit state and returns
@@ -16,6 +16,11 @@ explicit deltas.  All rounding rules live here and are deterministic:
   未结算负债（``pending_dividend_tax_liability``），卖出结算时只确认实际
   税额与已提负债的差额（多提冲回），NAV 在除权日不虚高、卖出日不跳变
   （设计 §5.6 保守税费负债原则）。
+- 非分红类公司行动（公告/名称变更/拆并股/代码变更/ETF 折算/持有人选择/
+  unsupported）统一走 ``CorporateEvent`` 信封：公告只产生信息事件不改账；
+  拆并股只调整经济数量与单位成本（总成本不变、不产生现金）；代码变更只
+  迁移证券身份；unsupported 类型 fail-closed 记原因，永不自动入账。每类
+  事件携带唯一事件键，账户内只应用一次（详见文件尾部类型扩展区）。
 
 设计出处：个人量化投资与模拟盘系统设计稿 §5.6/§5.7。
 """
@@ -584,4 +589,564 @@ def apply_ex_dividend(
         "events": events,
         "new_shares": new_shares_total,
         "tax_liability": tax_liability,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Extended corporate-event types（设计 §5.6 类型扩展）
+#
+# 除现金分红/送转外的公司行动统一走 ``CorporateEvent`` 信封：每类事件携带
+# 唯一事件键与 ``effective_date``，公告类只产生信息事件不改账，拆并股/代码
+# 变更在经济生效日调整账本，unsupported 类型 fail-closed 记原因。数据可得性
+# 结论（Tushare 已下载数据集，见 docs/design-gap-analysis.md 阶段 4/9）：
+#
+# - 公告阶段：dividend 表预案行（无 ex_date）→ ``normalize_announcement_rows``。
+# - 拆并股 / ETF 份额折算：无专表，经济效应体现在 adj_factor / fund_adj 跳变
+#   → ``detect_split_events`` 推断；也接受显式录入行。
+# - 代码/名称变更：namechange 表 → ``normalize_namechange_rows``（含补充
+#   ``new_ts_code`` 字段时产生代码映射，否则仅名称信息事件）。
+# - 需持有人选择：anns_d 公告标题关键词 → ``detect_choice_required_events``；
+#   也接受显式录入。
+# - 配股/换股/基金清盘：已下载数据无可支撑数据源（配股无表、换股无表、
+#   清盘无回收金额），有据跳过 → ``UNSUPPORTED_EVENT_TYPES`` fail-closed。
+# ---------------------------------------------------------------------------
+
+EVENT_KIND_ANNOUNCEMENT = "announcement"
+EVENT_KIND_NAME_CHANGE = "name_change"
+EVENT_KIND_SPLIT = "split"
+EVENT_KIND_REVERSE_SPLIT = "reverse_split"
+EVENT_KIND_CODE_CHANGE = "code_change"
+EVENT_KIND_CHOICE_REQUIRED = "choice_required"
+EVENT_KIND_UNSUPPORTED = "unsupported"
+
+INFORMATIONAL_EVENT_KINDS = (
+    EVENT_KIND_ANNOUNCEMENT,
+    EVENT_KIND_NAME_CHANGE,
+    EVENT_KIND_CHOICE_REQUIRED,
+    EVENT_KIND_UNSUPPORTED,
+)
+ECONOMIC_EVENT_KINDS = (
+    EVENT_KIND_SPLIT,
+    EVENT_KIND_REVERSE_SPLIT,
+    EVENT_KIND_CODE_CHANGE,
+)
+
+UNSUPPORTED_EVENT_TYPES = ("rights_issue", "share_exchange", "fund_liquidation")
+"""已下载数据无可支撑数据源的公司行动类型（配股/换股/基金清盘）：
+
+- 配股（rights_issue）：Tushare 已下载数据集无配股发行表，无法确定配股
+  价格、比例与缴款期，按 goal 规则有据跳过；公告经 ``choice_required``
+  提醒人工处理，账本拒绝自动入账。
+- 换股（share_exchange）：无换股要约结构化工单数据，同上。
+- 基金清盘（fund_liquidation）：fund_basic 只有摘牌日期、无清算回收金额
+  与支付日，无法在不假设现金结算的前提下入账（设计 §5.6 禁止统一假设
+  现金结算），fail-closed 留待人工确认回收事件。
+"""
+
+CHOICE_REQUIRED_KEYWORDS = ("配股", "换股", "要约", "现金选择权", "吸收合并")
+"""anns_d 公告标题中提示需要持有人选择的关键词（仅提醒，永不代客选择）。"""
+
+LIQUIDATION_KEYWORDS = ("清盘", "终止上市", "基金合同终止")
+"""anns_d 公告标题中提示基金清盘的关键词（unsupported fail-closed 路径）。"""
+
+_SPLIT_JUMP_THRESHOLD = 1.3
+"""adj_factor/fund_adj 单日跳变超过该倍数视为拆并股/折算候选（送转由
+dividend 表行解释，不落入本检测）。"""
+
+
+@dataclass(frozen=True)
+class CorporateEvent:
+    """One normalized non-dividend corporate event with a unique event key.
+
+    ``effective_date`` 是各阶段各自的生效日（公告日/除权日/变更生效日），
+    与 ``CorporateAction.ex_date`` 同样参与幂等；``event_key`` 全局唯一，
+    账户侧只应用一次（数据库唯一约束兜底）。
+    """
+
+    kind: str
+    instrument: str
+    effective_date: date
+    event_key: str
+    payload_sha256: str
+    stage: str | None = None
+    split_ratio: float | None = None
+    new_instrument: str | None = None
+    title: str | None = None
+    unsupported_type: str | None = None
+    source: str = ""
+    details: Mapping[str, Any] | None = None
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any]) -> CorporateEvent:
+        source = dict(values)
+        kind = str(source.get("kind") or "").strip()
+        known = INFORMATIONAL_EVENT_KINDS + ECONOMIC_EVENT_KINDS
+        if kind not in known:
+            # fail-closed：无法识别的事件类型在入口拒绝，绝不静默忽略。
+            raise ValueError(f"unknown corporate event kind: {source!r}")
+        instrument = str(source.get("instrument") or "").strip().upper()
+        if not instrument:
+            raise ValueError(f"corporate event requires an instrument: {source!r}")
+        effective_date = _parse_date(
+            source.get("effective_date")
+            or source.get("ex_date")
+            or source.get("ann_date")
+        )
+        if effective_date is None:
+            raise ValueError(f"corporate event requires an effective date: {source!r}")
+        split_ratio = None
+        if kind in (EVENT_KIND_SPLIT, EVENT_KIND_REVERSE_SPLIT):
+            split_ratio = float(source.get("split_ratio") or 0.0)
+            if not (0.001 <= split_ratio <= 1000.0) or abs(split_ratio - 1.0) < 1e-9:
+                raise ValueError(f"split ratio out of range: {source!r}")
+            expected = EVENT_KIND_SPLIT if split_ratio > 1.0 else EVENT_KIND_REVERSE_SPLIT
+            if kind != expected:
+                raise ValueError(f"split kind does not match its ratio: {source!r}")
+        new_instrument = None
+        if kind == EVENT_KIND_CODE_CHANGE:
+            new_instrument = str(source.get("new_instrument") or "").strip().upper()
+            if not new_instrument or new_instrument == instrument:
+                raise ValueError(f"code change requires a distinct new code: {source!r}")
+        unsupported_type = None
+        if kind == EVENT_KIND_UNSUPPORTED:
+            unsupported_type = str(source.get("unsupported_type") or "").strip()
+            if unsupported_type not in UNSUPPORTED_EVENT_TYPES:
+                raise ValueError(f"unregistered unsupported event type: {source!r}")
+        payload = {
+            key: source.get(key)
+            for key in (
+                "kind",
+                "instrument",
+                "effective_date",
+                "stage",
+                "split_ratio",
+                "new_instrument",
+                "title",
+                "unsupported_type",
+                "source",
+            )
+        }
+        payload_sha256 = str(source.get("payload_sha256") or _action_payload(payload))
+        event_key = str(source.get("event_key") or "").strip() or _corporate_event_key(
+            kind=kind,
+            instrument=instrument,
+            effective_date=effective_date,
+            new_instrument=new_instrument,
+            unsupported_type=unsupported_type,
+            payload_sha256=payload_sha256,
+        )
+        return cls(
+            kind=kind,
+            instrument=instrument,
+            effective_date=effective_date,
+            event_key=event_key,
+            payload_sha256=payload_sha256,
+            stage=(str(source["stage"]) if source.get("stage") is not None else None),
+            split_ratio=split_ratio,
+            new_instrument=new_instrument,
+            title=(str(source["title"]) if source.get("title") is not None else None),
+            unsupported_type=unsupported_type,
+            source=str(source.get("source") or ""),
+            details=dict(source.get("details") or {}),
+        )
+
+
+def _corporate_event_key(
+    *,
+    kind: str,
+    instrument: str,
+    effective_date: date,
+    new_instrument: str | None,
+    unsupported_type: str | None,
+    payload_sha256: str,
+) -> str:
+    if kind == EVENT_KIND_CODE_CHANGE:
+        return (
+            f"corporate_action:code_change:{instrument}:{new_instrument}:{effective_date}"
+        )
+    if kind == EVENT_KIND_UNSUPPORTED:
+        return (
+            f"corporate_action:unsupported:{unsupported_type}:{instrument}:{effective_date}"
+        )
+    if kind == EVENT_KIND_CHOICE_REQUIRED:
+        # 同日可能有多次要约：带载荷短哈希区分，重放同一数据键不变。
+        return (
+            f"corporate_action:choice_required:{instrument}:{effective_date}:"
+            f"{payload_sha256[:8]}"
+        )
+    return f"corporate_action:{kind}:{instrument}:{effective_date}"
+
+
+def normalize_announcement_rows(rows: Iterable[Mapping[str, Any]]) -> list[CorporateEvent]:
+    """Dividend-plan rows → informational announcement events (公告阶段不改账).
+
+    无 ``ex_date`` 的预案行此前被直接丢弃；此处转为 ``plan`` 阶段信息事件。
+    已给出除权日的实施公告行同样产生 ``implementation`` 阶段事件，并在
+    details 中携带 ``linked_ex_event_key`` 与后续除权入账事件关联。
+    """
+
+    events: list[CorporateEvent] = []
+    for row in rows:
+        source = dict(row)
+        ann_date = _parse_date(source.get("ann_date"))
+        if ann_date is None:
+            continue
+        ts_code = str(source.get("ts_code") or "")
+        instrument = ts_code_to_instrument(ts_code)
+        ex_date = _parse_date(source.get("ex_date"))
+        stage = "implementation" if ex_date is not None else "plan"
+        details: dict[str, Any] = {
+            "ann_date": ann_date.isoformat(),
+            "stage": stage,
+            "cash_div_pretax": float(source.get("cash_div_tax") or 0.0),
+            "bonus_share_ratio": float(source.get("stk_bo_rate") or 0.0),
+            "conversion_ratio": float(source.get("stk_co_rate") or 0.0),
+            "progress": str(source.get("div_proc") or ""),
+            # 与后续除权事件的唯一键关联（除权事件键由引擎在除权日产生）。
+            "related_event_key_prefix": f"corporate_action:ex:{instrument}:",
+        }
+        if ex_date is not None:
+            details["linked_ex_event_key"] = f"corporate_action:ex:{instrument}:{ex_date}"
+        events.append(
+            CorporateEvent.from_mapping(
+                {
+                    "kind": EVENT_KIND_ANNOUNCEMENT,
+                    "instrument": instrument,
+                    "effective_date": ann_date,
+                    "stage": stage,
+                    "source": "tushare_dividend",
+                    "details": details,
+                }
+            )
+        )
+    return events
+
+
+def normalize_namechange_rows(rows: Iterable[Mapping[str, Any]]) -> list[CorporateEvent]:
+    """Tushare ``namechange`` 行 → 名称/代码变更事件。
+
+    行带补充字段 ``new_ts_code``（人工或外部源录入）时产生代码变更事件
+    （旧代码持仓映射到新代码）；否则仅产生名称变更信息事件，不动账本。
+    """
+
+    events: list[CorporateEvent] = []
+    for row in rows:
+        source = dict(row)
+        effective = _parse_date(source.get("start_date"))
+        if effective is None:
+            continue
+        ts_code = str(source.get("ts_code") or "")
+        instrument = ts_code_to_instrument(ts_code)
+        new_ts_code = str(source.get("new_ts_code") or "").strip()
+        ann_date = _parse_date(source.get("ann_date"))
+        details: dict[str, Any] = {
+            "ann_date": ann_date.isoformat() if ann_date else None,
+            "new_name": str(source.get("name") or ""),
+            "change_reason": str(source.get("change_reason") or ""),
+        }
+        if new_ts_code:
+            events.append(
+                CorporateEvent.from_mapping(
+                    {
+                        "kind": EVENT_KIND_CODE_CHANGE,
+                        "instrument": instrument,
+                        "new_instrument": ts_code_to_instrument(new_ts_code),
+                        "effective_date": effective,
+                        "source": "tushare_namechange",
+                        "details": details,
+                    }
+                )
+            )
+        else:
+            events.append(
+                CorporateEvent.from_mapping(
+                    {
+                        "kind": EVENT_KIND_NAME_CHANGE,
+                        "instrument": instrument,
+                        "effective_date": effective,
+                        "title": str(source.get("name") or ""),
+                        "source": "tushare_namechange",
+                        "details": details,
+                    }
+                )
+            )
+    return events
+
+
+def detect_split_events(
+    adj_rows: Iterable[Mapping[str, Any]],
+    *,
+    known_ex_dates: Mapping[str, Iterable[Any]] | None = None,
+) -> list[CorporateEvent]:
+    """adj_factor / fund_adj 跳变 → 拆并股 / ETF 份额折算候选事件。
+
+    单日复权因子比值 ≥ 阈值（或 ≤ 其倒数）且当日无 dividend 行解释（送转
+    已由除权路径入账）时判定为拆股（比值>1）或并股/折算（比值<1）。推断
+    比例在 details 中标注 ``detection=adj_factor_jump``；显式录入的行可
+    不经本函数直接构造 ``CorporateEvent``。
+    """
+
+    known: dict[str, set[date]] = {
+        str(instrument).upper(): {
+            parsed for value in values if (parsed := _parse_date(value)) is not None
+        }
+        for instrument, values in (known_ex_dates or {}).items()
+    }
+    by_instrument: dict[str, list[tuple[date, float]]] = {}
+    for row in adj_rows:
+        trade_date = _parse_date(row.get("trade_date"))
+        factor_raw = row.get("adj_factor")
+        if trade_date is None or factor_raw is None:
+            continue
+        factor = float(factor_raw)
+        if factor <= 0:
+            continue
+        instrument = ts_code_to_instrument(str(row.get("ts_code") or ""))
+        by_instrument.setdefault(instrument, []).append((trade_date, factor))
+    events: list[CorporateEvent] = []
+    for instrument, series in sorted(by_instrument.items()):
+        series.sort(key=lambda item: item[0])
+        for (prev_date, prev_factor), (trade_date, factor) in zip(
+            series, series[1:], strict=False
+        ):
+            ratio = factor / prev_factor
+            if ratio >= _SPLIT_JUMP_THRESHOLD:
+                kind = EVENT_KIND_SPLIT
+            elif ratio <= 1.0 / _SPLIT_JUMP_THRESHOLD:
+                kind = EVENT_KIND_REVERSE_SPLIT
+            else:
+                continue
+            if trade_date in known.get(instrument, set()):
+                continue  # 当日除权（送转/分红）已解释因子跳变。
+            snapped = round(ratio, 4)
+            if abs(snapped - 1.0) < 1e-9:
+                continue
+            events.append(
+                CorporateEvent.from_mapping(
+                    {
+                        "kind": kind,
+                        "instrument": instrument,
+                        "effective_date": trade_date,
+                        "split_ratio": snapped,
+                        "source": "adj_factor",
+                        "details": {
+                            "detection": "adj_factor_jump",
+                            "prev_trade_date": prev_date.isoformat(),
+                            "prev_factor": prev_factor,
+                            "factor": factor,
+                            "raw_ratio": ratio,
+                        },
+                    }
+                )
+            )
+    return events
+
+
+def detect_choice_required_events(
+    anns_rows: Iterable[Mapping[str, Any]],
+) -> list[CorporateEvent]:
+    """anns_d 公告标题关键词 → 需持有人选择的提醒事件（只提醒，不改账）。"""
+
+    events: list[CorporateEvent] = []
+    for row in anns_rows:
+        title = str(row.get("title") or "")
+        if not any(keyword in title for keyword in CHOICE_REQUIRED_KEYWORDS):
+            continue
+        ann_date = _parse_date(row.get("ann_date"))
+        if ann_date is None:
+            continue
+        matched = [keyword for keyword in CHOICE_REQUIRED_KEYWORDS if keyword in title]
+        events.append(
+            CorporateEvent.from_mapping(
+                {
+                    "kind": EVENT_KIND_CHOICE_REQUIRED,
+                    "instrument": ts_code_to_instrument(str(row.get("ts_code") or "")),
+                    "effective_date": ann_date,
+                    "title": title,
+                    "source": "tushare_anns_d",
+                    "details": {"matched_keywords": matched, "ann_date": ann_date.isoformat()},
+                }
+            )
+        )
+    return events
+
+
+def detect_liquidation_events(anns_rows: Iterable[Mapping[str, Any]]) -> list[CorporateEvent]:
+    """anns_d 公告标题关键词 → 基金清盘 unsupported 事件（fail-closed 留痕）。"""
+
+    events: list[CorporateEvent] = []
+    for row in anns_rows:
+        title = str(row.get("title") or "")
+        if not any(keyword in title for keyword in LIQUIDATION_KEYWORDS):
+            continue
+        ann_date = _parse_date(row.get("ann_date"))
+        if ann_date is None:
+            continue
+        events.append(
+            CorporateEvent.from_mapping(
+                {
+                    "kind": EVENT_KIND_UNSUPPORTED,
+                    "instrument": ts_code_to_instrument(str(row.get("ts_code") or "")),
+                    "effective_date": ann_date,
+                    "unsupported_type": "fund_liquidation",
+                    "title": title,
+                    "source": "tushare_anns_d",
+                    "details": {
+                        "skip_reason": "no_liquidation_proceeds_data",
+                        "ann_date": ann_date.isoformat(),
+                    },
+                }
+            )
+        )
+    return events
+
+
+def apply_share_split(
+    *,
+    position: dict[str, Any],
+    event: CorporateEvent,
+    trade_date: date,
+) -> dict[str, Any]:
+    """Apply a split / reverse-split / ETF share conversion on its effective date.
+
+    只调整经济数量与单位成本：总成本基础不变、不产生现金、不动 NAV 口径
+    （市值随除权价机械变化由估值层处理，单位成本同步摊薄避免虚假亏损）。
+    批次数量按比例 floor 分配、余数按取得时间从早到晚逐股补齐（与送转
+    同一确定性规则）；并股归零批次的成本并入最早存活批次，不确认损益。
+    """
+
+    if event.split_ratio is None:
+        raise ValueError("share split requires a split ratio")
+    quantity = int(position.get("quantity", 0))
+    if quantity <= 0:
+        return {"events": [], "quantity_before": 0, "quantity_after": 0}
+    ratio = float(event.split_ratio)
+    target_total = _round_half_up(quantity * ratio)
+    if target_total < 1:
+        # 并股后不足 1 股：不臆造份额、不假设现金结算（设计 §5.6），
+        # 持仓保持原样并标记估值不确定，留待人工处理。
+        return {
+            "events": [
+                {
+                    "severity": "critical",
+                    "event_type": "corporate_action_split_dust",
+                    "instrument": event.instrument,
+                    "reason": "reverse_split_below_one_share",
+                    "details": {
+                        "event_key": event.event_key,
+                        "quantity": quantity,
+                        "split_ratio": ratio,
+                        "valuation_uncertain": True,
+                    },
+                }
+            ],
+            "quantity_before": quantity,
+            "quantity_after": quantity,
+        }
+    lots = position_lots(position, trade_date=trade_date)
+    ordered = sorted(
+        lots,
+        key=lambda lot: (_parse_date(lot.get("acquired_at")) or date.min, str(lot.get("lot_key"))),
+    )
+    allocations: dict[int, int] = {}
+    allocated = 0
+    for index, lot in enumerate(ordered):
+        share = int(floor(int(lot.get("quantity", 0)) * ratio))
+        allocations[index] = share
+        allocated += share
+    leftover = max(0, target_total - allocated)
+    for index in range(len(ordered)):
+        if leftover <= 0:
+            break
+        allocations[index] += 1
+        leftover -= 1
+    merged_cost = 0.0
+    surviving: list[dict[str, Any]] = []
+    for index, lot in enumerate(ordered):
+        new_quantity = allocations[index]
+        if new_quantity <= 0:
+            merged_cost += float(lot.get("cost_basis_total", 0.0))
+            continue
+        lot["quantity"] = new_quantity
+        surviving.append(lot)
+    if merged_cost and surviving:
+        surviving[0]["cost_basis_total"] = float(surviving[0].get("cost_basis_total", 0.0)) + (
+            merged_cost
+        )
+    total_cost = sum(float(lot.get("cost_basis_total", 0.0)) for lot in surviving)
+    position["lots"] = surviving
+    position["quantity"] = target_total
+    position["available_quantity"] = min(
+        int(position.get("available_quantity", 0)), target_total
+    )
+    position["average_cost"] = total_cost / target_total if target_total else 0.0
+    return {
+        "events": [
+            {
+                "severity": "info",
+                "event_type": f"corporate_action_{event.kind}",
+                "instrument": event.instrument,
+                "reason": "share_split_applied",
+                "details": {
+                    "event_key": event.event_key,
+                    "effective_date": event.effective_date.isoformat(),
+                    "split_ratio": ratio,
+                    "quantity_before": quantity,
+                    "quantity_after": target_total,
+                    "cost_basis_total": _round_money(total_cost),
+                    "average_cost_after": position["average_cost"],
+                    **dict(event.details or {}),
+                },
+            }
+        ],
+        "quantity_before": quantity,
+        "quantity_after": target_total,
+    }
+
+
+def apply_code_change(
+    *,
+    positions: dict[str, dict[str, Any]],
+    event: CorporateEvent,
+    trade_date: date,
+) -> dict[str, Any]:
+    """Map a position from the old instrument code to the new one (证券身份变更).
+
+    数量、批次、成本基础原样迁移，不产生现金或经济损益；新旧代码同时有
+    持仓时 fail-closed 抛错（需要人工合并，不静默并账）。
+    """
+
+    if not event.new_instrument:
+        raise ValueError("code change requires a new instrument")
+    old = event.instrument
+    new = event.new_instrument
+    position = positions.get(old)
+    moved = False
+    if position is not None and int(position.get("quantity", 0)) > 0:
+        existing = positions.get(new)
+        if existing is not None and int(existing.get("quantity", 0)) > 0:
+            raise RuntimeError(
+                f"code change would merge two live positions: {old} and {new}"
+            )
+        positions[new] = position
+        del positions[old]
+        moved = True
+    return {
+        "moved": moved,
+        "events": [
+            {
+                "severity": "info",
+                "event_type": "corporate_action_code_change",
+                "instrument": new,
+                "reason": "instrument_code_mapped" if moved else "code_change_without_position",
+                "details": {
+                    "event_key": event.event_key,
+                    "effective_date": event.effective_date.isoformat(),
+                    "old_instrument": old,
+                    "new_instrument": new,
+                    "position_moved": moved,
+                    **dict(event.details or {}),
+                },
+            }
+        ],
     }

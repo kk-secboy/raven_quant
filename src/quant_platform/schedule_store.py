@@ -25,6 +25,9 @@ ACTIVE_SCHEDULE_KINDS = (
     "ashare_5m_sync",
     "rdagent_research",
     "recommendation_refresh",
+    "weekly_report",
+    "monthly_decision_day",
+    "preopen_check",
 )
 
 

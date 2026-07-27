@@ -82,12 +82,98 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "data_tasks",
         "platform_configs",
         "platform_config_revisions",
+        "market_permission_versions",
+        "shadow_account_snapshots",
+        "simulation_external_flows",
+        "simulation_corporate_events",
     }
     with engine.connect() as connection:
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0045_research_only_pair"
+    assert revision == "0050_corporate_event_types"
+    assert {
+        "portfolio_id",
+        "event_key",
+        "event_type",
+        "instrument",
+        "effective_date",
+        "payload_sha256",
+        "details_json",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "simulation_corporate_events", schema="quantlab"
+        )
+    }
+    assert {
+        "portfolio_id",
+        "flow_key",
+        "trade_date",
+        "timing",
+        "amount",
+        "created_by",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("simulation_external_flows", schema="quantlab")
+    }
+    assert {
+        "external_flow_open",
+        "external_flow_close",
+        "twr_daily_return",
+        "investment_wealth",
+        "twr_drawdown",
+        "twr_status",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("simulation_nav", schema="quantlab")
+    }
+    assert {
+        "scope_type",
+        "scope_key",
+        "permission",
+        "confirmation_source",
+        "as_of",
+        "valid_until",
+        "relaxation_confirmed",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("market_permission_versions", schema="quantlab")
+    }
+    assert {
+        "account_id",
+        "import_source",
+        "cash",
+        "holdings_json",
+        "open_orders_json",
+        "content_sha256",
+        "imported_by",
+        "imported_at",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("shadow_account_snapshots", schema="quantlab")
+    }
+    order_columns = {
+        column["name"]
+        for column in inspector.get_columns("simulation_orders", schema="quantlab")
+    }
+    assert {
+        "portfolio_id",
+        "limit_price",
+        "not_before",
+        "not_after",
+        "target_version",
+        "account_netting_plan_id",
+        "strategy_contributions_json",
+        "plan_op",
+        "cancel_reason",
+        "updated_at",
+    } <= order_columns
+    batch_columns = {
+        column["name"]
+        for column in inspector.get_columns("simulation_batches", schema="quantlab")
+    }
+    assert {"account_netting_plan_id"} <= batch_columns
     assert {"promotion_stage"} <= {
         column["name"]
         for column in inspector.get_columns("strategy_versions", schema="quantlab")
@@ -410,7 +496,10 @@ def test_0045_retires_legacy_approved_pair_versions(database_url: str) -> None:
 
     config = alembic_config(database_url)
     command.stamp(config, "0044_recommendation_actions")
-    command.upgrade(config, "head")
+    # Replay only 0045's data migration: later migrations are DDL and cannot
+    # re-run on the already-migrated schema; restore the head stamp after.
+    command.upgrade(config, "0045_research_only_pair")
+    command.stamp(config, "head")
 
     with engine.connect() as connection:
         retired = connection.execute(

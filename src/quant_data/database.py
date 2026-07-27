@@ -841,6 +841,9 @@ simulation_portfolios = Table(
     Column("execution_engine_version", String, nullable=False),
     Column("cost_schedule_version", String, nullable=False),
     Column("execution_policy_json", json_type, nullable=False),
+    # 单位化 TWR 链状态（设计 4.4）：与人民币 NAV 口径并存，NULL 表示链断裂。
+    Column("investment_wealth", Float, nullable=True),
+    Column("twr_high_water_mark", Float, nullable=True),
     Column("created_by", String, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
@@ -884,6 +887,11 @@ simulation_batches = Table(
     Column("execution_not_before", DateTime(timezone=True)),
     Column("status", String, nullable=False),
     Column("idempotency_key", String, nullable=False, unique=True),
+    Column(
+        "account_netting_plan_id",
+        String,
+        ForeignKey("quantlab.account_netting_plans.id", ondelete="SET NULL"),
+    ),
     Column("created_by", String, nullable=False, server_default="legacy-system"),
     Column("summary_json", json_type),
     Column("error", Text),
@@ -922,6 +930,11 @@ simulation_orders = Table(
         ForeignKey("quantlab.simulation_batches.id", ondelete="CASCADE"),
         nullable=False,
     ),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+    ),
     Column("instrument", String, nullable=False),
     Column("side", String, nullable=False),
     Column("atomic_group_id", String),
@@ -937,9 +950,32 @@ simulation_orders = Table(
     Column("filled_value", Numeric(20, 6), nullable=False),
     Column("capacity_fill_ratio", Float, nullable=False),
     Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("limit_price", Numeric(20, 8)),
+    Column("not_before", DateTime(timezone=True)),
+    Column("not_after", DateTime(timezone=True)),
+    Column("target_version", String),
+    Column(
+        "account_netting_plan_id",
+        String,
+        ForeignKey("quantlab.account_netting_plans.id", ondelete="SET NULL"),
+    ),
+    Column("strategy_contributions_json", json_type),
+    Column("plan_op", String),
+    Column("cancel_reason", String),
+    Column("updated_at", DateTime(timezone=True)),
     Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "status IN ('planned', 'open', 'filled', 'partial_filled_expired', "
+        "'rejected', 'expired', 'cancelled')",
+        name="ck_simulation_orders_status",
+    ),
 )
 Index("idx_simulation_orders_batch", simulation_orders.c.batch_id, simulation_orders.c.instrument)
+Index(
+    "idx_simulation_orders_portfolio_status",
+    simulation_orders.c.portfolio_id,
+    simulation_orders.c.status,
+)
 
 simulation_fills = Table(
     "simulation_fills",
@@ -1106,6 +1142,37 @@ Index(
     simulation_dividend_actions.c.status,
 )
 
+# 非分红类公司行动台账（设计 §5.6 类型扩展）：公告/名称变更/拆并股/代码
+# 变更/持有人选择/unsupported 事件共用一张 append-only 表；event_key 是
+# 唯一幂等键，任何事件在账户内只应用一次。
+simulation_corporate_events = Table(
+    "simulation_corporate_events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("event_key", String, nullable=False),
+    Column("event_type", String, nullable=False),
+    Column("instrument", String, nullable=False),
+    Column("effective_date", Date, nullable=False),
+    Column("payload_sha256", String, nullable=False),
+    Column("details_json", json_type, nullable=False),
+    Column("batch_id", String),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "portfolio_id", "event_key", name="uq_simulation_corporate_events_key"
+    ),
+)
+Index(
+    "idx_simulation_corporate_events_portfolio_date",
+    simulation_corporate_events.c.portfolio_id,
+    simulation_corporate_events.c.effective_date,
+)
+
 simulation_cash_flows = Table(
     "simulation_cash_flows",
     metadata,
@@ -1134,6 +1201,43 @@ Index(
     simulation_cash_flows.c.trade_date,
 )
 
+simulation_external_flows = Table(
+    "simulation_external_flows",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    # 调用方稳定幂等键；缺省由载荷哈希派生，重放同载荷不产生第二行。
+    Column("flow_key", String, nullable=False),
+    Column("trade_date", Date, nullable=False),
+    # open=开盘前确认可用于当日决策；close=盘后确认，次日才进入可投资现金。
+    Column("timing", String, nullable=False),
+    # 入金为正、出金为负（设计 4.4）；外部现金流不计损益。
+    Column("amount", Numeric(20, 6), nullable=False),
+    Column("note", Text, nullable=True),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "timing IN ('open', 'close')",
+        name="ck_simulation_external_flows_timing",
+    ),
+)
+Index(
+    "uq_simulation_external_flows_key",
+    simulation_external_flows.c.portfolio_id,
+    simulation_external_flows.c.flow_key,
+    unique=True,
+)
+Index(
+    "idx_simulation_external_flows_portfolio_date",
+    simulation_external_flows.c.portfolio_id,
+    simulation_external_flows.c.trade_date,
+)
+
 simulation_nav = Table(
     "simulation_nav",
     metadata,
@@ -1152,6 +1256,13 @@ simulation_nav = Table(
     Column("nav", Numeric(20, 6), nullable=False),
     Column("daily_return", Float, nullable=False),
     Column("drawdown", Float, nullable=False),
+    # 当日外部现金流（开盘前/盘后确认）；单位化 TWR 链状态与回撤（设计 4.4）。
+    Column("external_flow_open", Numeric(20, 6), nullable=False, server_default="0"),
+    Column("external_flow_close", Numeric(20, 6), nullable=False, server_default="0"),
+    Column("twr_daily_return", Float, nullable=True),
+    Column("investment_wealth", Float, nullable=True),
+    Column("twr_drawdown", Float, nullable=True),
+    Column("twr_status", String, nullable=False, server_default="unavailable_legacy"),
     Column("market_date", Date),
     Column("has_stale_prices", Boolean, nullable=False),
     Column("status", String, nullable=False),
@@ -1860,6 +1971,74 @@ system_health_snapshots = Table(
     Column("recorded_at", DateTime(timezone=True), nullable=False),
 )
 Index("idx_system_health_recorded", system_health_snapshots.c.recorded_at.desc())
+
+platform_safe_mode_state = Table(
+    "platform_safe_mode_state",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("active", Boolean, nullable=False, server_default="false"),
+    Column("reason", Text, nullable=False, server_default=""),
+    Column("source", String, nullable=False, server_default=""),
+    Column("triggered_by", String, nullable=False, server_default=""),
+    Column("triggered_at", DateTime(timezone=True)),
+    Column("details_json", json_type),
+    Column("cleared_by", String),
+    Column("cleared_at", DateTime(timezone=True)),
+    Column("clear_reason", Text),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+# Versioned personal market permissions (design draft 8.7). Each row is one
+# immutable policy version for a scope (exchange/board/risk_warning/
+# etf_subtype); the effective permission is the latest version with
+# as_of <= today. New versions may only tighten (buy_sell → sell_only →
+# disabled → unknown) unless the relaxation is explicitly confirmed.
+market_permission_versions = Table(
+    "market_permission_versions",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("scope_type", String, nullable=False),
+    Column("scope_key", String, nullable=False),
+    Column("permission", String, nullable=False),
+    Column("confirmation_source", Text, nullable=False),
+    Column("as_of", Date, nullable=False),
+    Column("valid_until", Date),
+    Column("supersedes_id", String),
+    Column("relaxation_confirmed", Boolean, nullable=False, server_default="false"),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_market_permission_scope",
+    market_permission_versions.c.scope_type,
+    market_permission_versions.c.scope_key,
+    market_permission_versions.c.as_of.desc(),
+)
+
+# Manual/CSV shadow account snapshots (design draft 8.6): user-imported real
+# holdings, cash, sellable quantities and open orders. Snapshots are immutable
+# full-state imports; freshness is judged from imported_at and stale state
+# degrades recommendations to simulation-only instead of silently falling
+# back to the simulation ledger.
+shadow_account_snapshots = Table(
+    "shadow_account_snapshots",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("account_id", String, nullable=False),
+    Column("import_source", String, nullable=False),
+    Column("cash", Numeric(20, 6), nullable=False),
+    Column("holdings_json", json_type, nullable=False),
+    Column("open_orders_json", json_type, nullable=False),
+    Column("content_sha256", String, nullable=False),
+    Column("notes", Text),
+    Column("imported_by", String, nullable=False),
+    Column("imported_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_shadow_account_snapshots_account",
+    shadow_account_snapshots.c.account_id,
+    shadow_account_snapshots.c.imported_at.desc(),
+)
 
 broker_destinations = Table(
     "broker_destinations",
