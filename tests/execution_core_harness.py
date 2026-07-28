@@ -73,16 +73,14 @@ def pinned_qlib_root() -> Path | None:
 _TOKEN = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
-def _boolify(value: Any) -> Any:
-    if isinstance(value, pd.Series):
-        return value.astype(bool)
-    return bool(value)
-
-
 _EXPRESSION_FUNCTIONS = {
-    "Or": lambda a, b: _boolify(a) | _boolify(b),
-    "And": lambda a, b: _boolify(a) & _boolify(b),
-    "Not": lambda a: ~_boolify(a),
+    # Match Qlib's NpPairOperator exactly. Do not silently coerce float
+    # channels to bool here: production Qlib uses numpy.bitwise_or/and and
+    # therefore rejects ``Or($paused, ...)`` when paused is encoded as 0.0/1.0.
+    # The adapter must express the conversion explicitly with Gt/Eq.
+    "Or": lambda a, b: a | b,
+    "And": lambda a, b: a & b,
+    "Not": lambda a: ~a,
     "Ge": lambda a, b: a >= b,
     "Gt": lambda a, b: a > b,
     "Le": lambda a, b: a <= b,
@@ -318,8 +316,8 @@ def run_pinned_exchange(
         codes=codes,
         deal_price=deal_price,
         limit_threshold=(
-            f"Or($paused, Ge(${limit_price}, $up_limit))",
-            f"Or($paused, Le(${limit_price}, $down_limit))",
+            f"Or(Gt($paused, 0), Ge(${limit_price}, $up_limit))",
+            f"Or(Gt($paused, 0), Le(${limit_price}, $down_limit))",
         ),
         quote_cls=HarnessQuote,
     )

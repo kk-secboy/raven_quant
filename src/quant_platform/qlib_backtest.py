@@ -82,9 +82,7 @@ def calculate_trade_metrics(fills: list[dict[str, Any]]) -> dict[str, Any]:
         if fill["side"] == "buy":
             new_amount = state["amount"] + amount
             if new_amount > 0:
-                state["basis"] = (
-                    state["amount"] * state["basis"] + value + cost
-                ) / new_amount
+                state["basis"] = (state["amount"] * state["basis"] + value + cost) / new_amount
                 state["amount"] = new_amount
             continue
         sold = min(amount, state["amount"])
@@ -179,13 +177,9 @@ def calculate_qlib_metrics(
         "annualized_return": _risk_value(net_geometric, "annualized_return"),
         "annualized_excess_return": _risk_value(excess_standard, "annualized_return"),
         "tracking_error": float(excess_std * np.sqrt(252)),
-        "information_ratio": _optional_risk_value(
-            excess_standard, "information_ratio"
-        ),
+        "information_ratio": _optional_risk_value(excess_standard, "information_ratio"),
         "sharpe_ratio": _optional_risk_value(net_standard, "information_ratio"),
-        "sortino_ratio": float(annualized_mar_excess / annualized_downside)
-        if sortino_ok
-        else None,
+        "sortino_ratio": float(annualized_mar_excess / annualized_downside) if sortino_ok else None,
         "sortino_status": "ok" if sortino_ok else "undefined_no_downside",
         "annual_minimum_acceptable_return": float(annual_minimum_acceptable_return),
         "annualized_downside_deviation": annualized_downside,
@@ -250,8 +244,8 @@ def run_formal_qlib_backtest(
         **({"codes": instruments} if instruments else {}),
         deal_price="$open",
         limit_threshold=(
-            "Or($paused, Ge($open, $up_limit))",
-            "Or($paused, Le($open, $down_limit))",
+            "Or(Gt($paused, 0), Ge($open, $up_limit))",
+            "Or(Gt($paused, 0), Le($open, $down_limit))",
         ),
     )
     report, positions = backtest_daily(
@@ -320,8 +314,8 @@ def _run_formal_minute_backtest(
         codes=instruments,
         deal_price="$vwap",
         limit_threshold=(
-            "Or($paused, Ge($vwap, $up_limit))",
-            "Or($paused, Le($vwap, $down_limit))",
+            "Or(Gt($paused, 0), Ge($vwap, $up_limit))",
+            "Or(Gt($paused, 0), Le($vwap, $down_limit))",
         ),
     )
     executor = NestedExecutor(
@@ -408,16 +402,13 @@ def run_qlib_validation_suites(
     capacity_runner: Callable[[float], QlibBacktestResult] | None = None,
     robustness_runner: Callable[[dict[str, Any], CostScheduleBook], QlibBacktestResult]
     | None = None,
-    robustness_artifact_writer: Callable[[str, QlibBacktestResult], dict[str, Any]]
-    | None = None,
+    robustness_artifact_writer: Callable[[str, QlibBacktestResult], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Repeat the same Qlib runner for cost, rolling and event validation."""
 
     schedule = _resolve_cost_schedule(cost_model, cost_schedule)
 
-    def scenario_result(
-        overrides: dict[str, Any], costs: CostScheduleBook
-    ) -> QlibBacktestResult:
+    def scenario_result(overrides: dict[str, Any], costs: CostScheduleBook) -> QlibBacktestResult:
         if robustness_runner is not None:
             return robustness_runner(overrides, costs)
         return runner(start_time, end_time, costs)
@@ -432,9 +423,7 @@ def run_qlib_validation_suites(
         "topk_80pct": (
             {
                 "topk": max(5, int(np.floor(topk * 0.80))),
-                "n_drop": min(
-                    int(config.get("n_drop", 0)), max(5, int(np.floor(topk * 0.80)))
-                ),
+                "n_drop": min(int(config.get("n_drop", 0)), max(5, int(np.floor(topk * 0.80)))),
             },
             schedule,
         ),
@@ -476,9 +465,9 @@ def run_qlib_validation_suites(
         name: scenario_entry(name, {}, schedule.scaled(**multipliers))
         for name, multipliers in COMPONENT_COST_STRESS_MULTIPLIERS.items()
     }
-    component_pass_rate = sum(
-        item["passed"] for item in component_cost_stress.values()
-    ) / len(component_cost_stress)
+    component_pass_rate = sum(item["passed"] for item in component_cost_stress.values()) / len(
+        component_cost_stress
+    )
     dates = pd.DatetimeIndex(full_result.report.index).tz_localize(None)
     window = int(config.get("rolling_window_days", 252))
     step = int(config.get("rolling_step_days", 63))
@@ -526,9 +515,7 @@ def run_qlib_validation_suites(
         cumulative_benchmark_return = float((1.0 + event_benchmark).prod() - 1.0)
         underperformance = cumulative_benchmark_return - cumulative_return
         passed = underperformance <= max_event_underperformance
-        start_holdings, state_fill_count = _holdings_before(
-            full_result.fills, start
-        )
+        start_holdings, state_fill_count = _holdings_before(full_result.fills, start)
         events.append(
             {
                 "start": start.date().isoformat(),
@@ -593,9 +580,8 @@ def run_qlib_validation_suites(
         "robustness": {
             "scenario_count": len(robustness),
             "pass_rate": robustness_pass_rate,
-            "passed": len(robustness) == 4 and robustness_pass_rate >= float(
-                config.get("min_robustness_pass_rate", 1.0)
-            ),
+            "passed": len(robustness) == 4
+            and robustness_pass_rate >= float(config.get("min_robustness_pass_rate", 1.0)),
             "minimum_pass_rate": float(config.get("min_robustness_pass_rate", 1.0)),
             "scenarios": robustness,
         },
@@ -604,8 +590,7 @@ def run_qlib_validation_suites(
             "scenario_count": len(component_cost_stress),
             "pass_rate": component_pass_rate,
             "passed": len(component_cost_stress) == len(COMPONENT_COST_STRESS_MULTIPLIERS)
-            and component_pass_rate
-            >= float(config.get("min_component_stress_pass_rate", 1.0)),
+            and component_pass_rate >= float(config.get("min_component_stress_pass_rate", 1.0)),
             "minimum_pass_rate": float(config.get("min_component_stress_pass_rate", 1.0)),
             "scenarios": component_cost_stress,
         },
