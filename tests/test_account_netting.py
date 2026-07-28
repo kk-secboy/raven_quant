@@ -146,6 +146,16 @@ def test_plan_validation_fails_closed() -> None:
         _plan(execution_policy="market_on_close")
     with pytest.raises(ValueError, match="member sleeve"):
         _plan(member_targets={"m1": {"SH600000": 0.6, "SH600001": 0.6}, "m2": {}})
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        _plan(member_budgets={"m1": float("nan"), "m2": 0.5})
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        _plan(member_targets={"m1": {"SH600000": float("nan")}, "m2": {}})
+    with pytest.raises(ValueError, match="current weights"):
+        _plan(member_current_weights={"m1": {"SH600000": float("inf")}})
+    with pytest.raises(ValueError, match="matching budget"):
+        _plan(member_targets={"m1": {}, "m2": {}, "unknown": {"SH600000": 1.0}})
+    with pytest.raises(ValueError, match="finite values"):
+        net_member_demands({"m1": {"SH600000": float("nan")}})
 
 
 @pytest.mark.no_database

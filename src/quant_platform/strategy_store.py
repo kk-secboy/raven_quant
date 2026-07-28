@@ -33,7 +33,10 @@ from quant_data.execution_contract import (
 )
 from quant_platform.cost_model import KNOWN_COST_SCHEDULE_VERSIONS, CostModelConfig
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
-from quant_platform.formal_validation import FORMAL_VALIDATION_CONTRACT_VERSION
+from quant_platform.formal_validation import (
+    FORMAL_VALIDATION_CONTRACT_VERSION,
+    SIGNAL_DECAY_FRONTIER_VERSION,
+)
 from quant_platform.pair_trading import PairTradingConfig
 from quant_platform.qlib_backtest import (
     COMPONENT_COST_STRESS_MULTIPLIERS,
@@ -45,6 +48,7 @@ from quant_platform.qlib_factor_baseline import (
     bind_factor_source_config,
 )
 from quant_platform.qlib_workflow import require_qlib_workflow_identity
+from quant_platform.statistical_validation import DEFLATED_SHARPE_METHOD_VERSION
 from quant_platform.strategy_catalog import require_capital_eligible_strategy_type
 from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
@@ -216,6 +220,7 @@ def _formal_validation_failures(
     if (
         not isinstance(decay, dict)
         or decay.get("status") != "completed"
+        or decay.get("frontier_version") != SIGNAL_DECAY_FRONTIER_VERSION
         or decay.get("maximum_supported_delay_bars") is None
         or not decay.get("runs")
     ):
@@ -1742,7 +1747,11 @@ class StrategyStore:
         if metrics.get("sortino_status") != "ok":
             failures.append("Sortino is undefined or non-finite")
         deflated = metrics.get("deflated_sharpe")
-        if not isinstance(deflated, dict) or deflated.get("status") != "ok":
+        if (
+            not isinstance(deflated, dict)
+            or deflated.get("status") != "ok"
+            or deflated.get("method_version") != DEFLATED_SHARPE_METHOD_VERSION
+        ):
             failures.append("Deflated Sharpe evidence is missing or invalid")
         failures.extend(_formal_validation_failures(version, metrics))
         if metrics.get("capacity_curve_passed") is not True:

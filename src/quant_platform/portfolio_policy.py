@@ -178,7 +178,33 @@ class PortfolioPolicy:
             else pd.Series(previous_weights or {}, dtype=float)
         )
         previous.index = previous.index.astype(str)
-        previous = previous.clip(lower=0.0)
+        if not previous.index.is_unique:
+            raise ValueError("previous weights must use a unique instrument index")
+        previous = pd.to_numeric(previous, errors="coerce").astype(float)
+        if (
+            previous.isna().any()
+            or not np.isfinite(previous.to_numpy(dtype=float)).all()
+            or (previous < 0).any()
+            or float(previous.sum()) > 1.0 + 1e-8
+        ):
+            raise ValueError(
+                "previous weights must be finite, non-negative and sum to at most one"
+            )
+        normalized_risk_exposure = float(risk_exposure)
+        normalized_drawdown = float(portfolio_drawdown)
+        normalized_daily_return = float(daily_return)
+        if (
+            not np.isfinite(normalized_risk_exposure)
+            or not 0.0 <= normalized_risk_exposure <= 1.0
+        ):
+            raise ValueError("risk exposure must be finite and within [0, 1]")
+        if (
+            not np.isfinite(normalized_drawdown)
+            or not -1.0 <= normalized_drawdown <= 0.0
+        ):
+            raise ValueError("portfolio drawdown must be finite and within [-1, 0]")
+        if not np.isfinite(normalized_daily_return) or normalized_daily_return < -1.0:
+            raise ValueError("daily return must be finite and at least -100%")
         basis = (
             cost_basis.copy()
             if isinstance(cost_basis, pd.Series)
@@ -289,27 +315,27 @@ class PortfolioPolicy:
         if cadence_hold:
             target = previous.reindex(target.index.union(previous.index), fill_value=0.0)
 
-        if portfolio_drawdown <= -self.config.max_drawdown_liquidate:
+        if normalized_drawdown <= -self.config.max_drawdown_liquidate:
             target *= 0.0
             risk_events.append(
                 self._risk_event(
                     "max_drawdown_liquidate",
-                    portfolio_drawdown,
+                    normalized_drawdown,
                     self.config.max_drawdown_liquidate,
                     "liquidate",
                 )
             )
-        elif portfolio_drawdown <= -self.config.max_drawdown_reduce:
+        elif normalized_drawdown <= -self.config.max_drawdown_reduce:
             target *= self.config.drawdown_reduction_exposure
             risk_events.append(
                 self._risk_event(
                     "max_drawdown_reduce",
-                    portfolio_drawdown,
+                    normalized_drawdown,
                     self.config.max_drawdown_reduce,
                     "reduce_exposure",
                 )
             )
-        target *= max(0.0, min(1.0, float(risk_exposure)))
+        target *= normalized_risk_exposure
         all_instruments = target.index.union(previous.index)
         target = target.reindex(all_instruments, fill_value=0.0)
         previous = previous.reindex(all_instruments, fill_value=0.0)
@@ -367,11 +393,14 @@ class PortfolioPolicy:
                         )
                     else:
                         target[instrument] = min(target[instrument], previous[instrument])
-        if daily_return <= -self.config.max_daily_loss:
+        if normalized_daily_return <= -self.config.max_daily_loss:
             target = pd.concat([target, previous], axis=1).min(axis=1)
             risk_events.append(
                 self._risk_event(
-                    "max_daily_loss", daily_return, self.config.max_daily_loss, "no_new_buys"
+                    "max_daily_loss",
+                    normalized_daily_return,
+                    self.config.max_daily_loss,
+                    "no_new_buys",
                 )
             )
         pending_target: pd.Series | None = None
@@ -564,7 +593,7 @@ class PortfolioPolicy:
             reasons.append(
                 f"{self.config.execution_method} execution over {self.config.execution_days} days"
             )
-        if risk_exposure < 1:
+        if normalized_risk_exposure < 1:
             reasons.append("risk exposure reduction")
         if target_volatility_evidence:
             reasons.append("target volatility exposure scaling")

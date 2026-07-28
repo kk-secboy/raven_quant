@@ -260,6 +260,7 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
             "status": "ok",
             "probability": 0.99,
             "trials": 1,
+            "method_version": "bailey-lopez-de-prado-cross-trial-v2",
         },
         "formal_validation_passed": True,
         "formal_validation": {
@@ -309,6 +310,7 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
             },
             "signal_decay": {
                 "status": "completed",
+                "frontier_version": "contiguous-zero-delay-frontier-v2",
                 "maximum_supported_delay_bars": 1,
                 "runs": [
                     {"delay_bars": 0, "passed": True},

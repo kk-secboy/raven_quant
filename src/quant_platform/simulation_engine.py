@@ -111,7 +111,14 @@ def execute_simulation_day(
     replaying the same input is a no-op.
     """
 
-    if not isfinite(cash) or cash < 0 or prior_nav <= 0 or high_water_mark <= 0:
+    if (
+        not isfinite(cash)
+        or cash < 0
+        or not isfinite(prior_nav)
+        or prior_nav <= 0
+        or not isfinite(high_water_mark)
+        or high_water_mark <= 0
+    ):
         raise ValueError("simulation account balances are invalid")
     available_cash = cash if tradable_cash is None else float(tradable_cash)
     if (
@@ -905,7 +912,14 @@ def execute_atomic_pair_day(
 ) -> dict[str, Any]:
     """Execute a governed pair target as one all-filled or all-rejected atomic group."""
 
-    if not isfinite(cash) or cash < 0 or prior_nav <= 0 or high_water_mark <= 0:
+    if (
+        not isfinite(cash)
+        or cash < 0
+        or not isfinite(prior_nav)
+        or prior_nav <= 0
+        or not isfinite(high_water_mark)
+        or high_water_mark <= 0
+    ):
         raise ValueError("simulation account balances are invalid")
     if external_flow_open or external_flow_close:
         # 配对账户是离线研究台账，不接受外部现金流（设计 6.4.3/12.1）。

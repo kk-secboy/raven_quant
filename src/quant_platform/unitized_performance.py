@@ -27,7 +27,7 @@ from datetime import date
 from math import isfinite
 from typing import Any
 
-UNITIZED_PERFORMANCE_VERSION = "unitized-twr-v1"
+UNITIZED_PERFORMANCE_VERSION = "unitized-twr-v2-finite-ordered"
 
 _XIRR_YEAR_DAYS = 365.2425
 
@@ -56,11 +56,32 @@ def chain_unitized_day(
     if prior_wealth is None or prior_high_water_mark is None:
         # 链已断裂：不得跳过当日继续连乘，必须从最后已验证状态重建。
         return _undefined_day("unavailable_broken_chain")
+    values = (
+        prior_nav,
+        nav,
+        flow_open,
+        flow_close,
+        prior_wealth,
+        prior_high_water_mark,
+    )
+    if any(not isfinite(float(value)) for value in values):
+        raise ValueError("unitized performance inputs must be finite")
+    if (
+        prior_nav < 0
+        or nav < 0
+        or prior_wealth < 0
+        or prior_high_water_mark <= 0
+        or prior_high_water_mark + 1e-12 < prior_wealth
+    ):
+        raise ValueError("unitized NAV and wealth state is invalid")
     base = prior_nav + flow_open
     if base <= 0:
         return _undefined_day("undefined_nonpositive_base")
     daily_return = (nav - flow_close) / base - 1.0
     wealth = prior_wealth * (1.0 + daily_return)
+    if not isfinite(daily_return) or not isfinite(wealth) or wealth < -1e-12:
+        raise ValueError("unitized performance would create invalid negative wealth")
+    wealth = max(0.0, wealth)
     high_water_mark = max(prior_high_water_mark, wealth)
     return {
         "status": "ok",
@@ -84,6 +105,27 @@ def unitized_drawdown_recovery(
 
     if not points:
         return {"status": "insufficient_evidence"}
+    normalized = [(day, float(wealth)) for day, wealth in points]
+    if (
+        any(not isfinite(wealth) or wealth < 0 for _, wealth in normalized)
+        or normalized[0][1] <= 0
+        or any(
+            previous_wealth == 0 and current_wealth > 0
+            for (_, previous_wealth), (_, current_wealth) in zip(
+                normalized, normalized[1:], strict=False
+            )
+        )
+        or any(
+            current_day <= previous_day
+            for (previous_day, _), (current_day, _) in zip(
+                normalized, normalized[1:], strict=False
+            )
+        )
+    ):
+        raise ValueError(
+            "unitized wealth points must be finite, non-negative and strictly ordered"
+        )
+    points = normalized
     peak_value = float("-inf")
     peak_date: date | None = None
     max_drawdown = 0.0
@@ -142,7 +184,12 @@ def xirr(
     """
 
     points = [(day, float(amount)) for day, amount in flows]
-    points.append((terminal[0], float(terminal[1])))
+    terminal_value = float(terminal[1])
+    if not isfinite(terminal_value) or terminal_value < 0:
+        raise ValueError("XIRR terminal value must be finite and non-negative")
+    if points and terminal[0] < max(day for day, _ in points):
+        raise ValueError("XIRR terminal date cannot precede a cash flow")
+    points.append((terminal[0], terminal_value))
     if any(not isfinite(amount) for _, amount in points):
         raise ValueError("XIRR cash flows must be finite")
     if len(points) < 2:

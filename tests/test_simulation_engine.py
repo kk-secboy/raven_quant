@@ -59,6 +59,19 @@ def _run(**overrides):
     return execute_simulation_day(**defaults)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cash", float("nan")),
+        ("prior_nav", float("nan")),
+        ("high_water_mark", float("inf")),
+    ],
+)
+def test_non_finite_account_balances_fail_closed(field: str, value: float) -> None:
+    with pytest.raises(ValueError, match="account balances"):
+        _run(**{field: value})
+
+
 def test_buy_is_round_lot_and_locked_until_next_day() -> None:
     result = _run()
     assert result["orders"][0]["requested_quantity"] == 5_000

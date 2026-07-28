@@ -64,6 +64,13 @@ def _ratio(name: str, value: float) -> float:
     return normalized
 
 
+def _non_negative(name: str, value: float) -> float:
+    normalized = float(value)
+    if not isfinite(normalized) or normalized < 0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return normalized
+
+
 def assess_account_risk(
     *,
     cash_shortfall: float = 0.0,
@@ -93,7 +100,7 @@ def assess_account_risk(
         "investment_wealth_drawdown": _ratio(
             "investment_wealth_drawdown", investment_wealth_drawdown
         ),
-        "annualized_volatility": _ratio(
+        "annualized_volatility": _non_negative(
             "annualized_volatility", annualized_volatility
         ),
         "illiquid_weight": _ratio("illiquid_weight", illiquid_weight),

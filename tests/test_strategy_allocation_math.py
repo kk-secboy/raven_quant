@@ -11,9 +11,17 @@ from qlib_test_doubles import (
 
 from quant_platform.allocation_store import AllocationStore
 from quant_platform.risk_math import COVARIANCE_MODEL_VERSION
-from quant_platform.strategy_allocation import analyze_strategy_allocation
+from quant_platform.strategy_allocation import _capped, analyze_strategy_allocation
 
 pytestmark = pytest.mark.no_database
+
+
+def test_capped_weight_projection_keeps_already_capped_members_fixed() -> None:
+    projected = _capped(np.array([0.60, 0.35, 0.05]), 0.40)
+
+    assert projected == pytest.approx([0.40, 0.40, 0.20])
+    assert projected.sum() == pytest.approx(1.0)
+    assert projected.max() <= 0.40 + 1e-12
 
 
 def test_hypothesis_group_members_share_one_cap_and_trial_count() -> None:

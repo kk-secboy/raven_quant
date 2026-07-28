@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 FORMAL_VALIDATION_CONTRACT_VERSION = "formal-validation-evidence-v1"
+SIGNAL_DECAY_FRONTIER_VERSION = "contiguous-zero-delay-frontier-v2"
 
 
 @dataclass(frozen=True)
@@ -207,12 +208,20 @@ def run_signal_decay_suite(
                 "passed": retention >= minimum_retention and value > 0,
             }
         )
-    valid = [item["delay_bars"] for item in runs if item["passed"]]
+    contiguous: list[int] = []
+    for item in runs:
+        if not item["passed"]:
+            break
+        contiguous.append(int(item["delay_bars"]))
     return {
         "status": "completed",
         "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
         "metric": metric,
         "minimum_retention": float(minimum_retention),
-        "maximum_supported_delay_bars": max(valid) if valid else None,
+        "frontier_version": SIGNAL_DECAY_FRONTIER_VERSION,
+        # Execution tolerance is a contiguous frontier from zero delay.  A
+        # noisy later pass after an earlier failure does not prove that the
+        # strategy can tolerate the skipped delay.
+        "maximum_supported_delay_bars": max(contiguous) if contiguous else None,
         "runs": runs,
     }

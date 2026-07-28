@@ -95,7 +95,22 @@ def test_signal_decay_derives_last_supported_delay() -> None:
         minimum_retention=0.60,
     )
     assert result["maximum_supported_delay_bars"] == 1
+    assert result["frontier_version"] == "contiguous-zero-delay-frontier-v2"
     assert [item["delay_bars"] for item in result["runs"]] == [0, 1, 2, 3]
+
+
+def test_signal_decay_requires_a_contiguous_supported_frontier() -> None:
+    values = {0: 1.0, 1: 0.40, 2: 0.80}
+
+    result = run_signal_decay_suite(
+        delays=[0, 1, 2],
+        runner=lambda delay: {"annualized_excess_return": values[delay]},
+        metric="annualized_excess_return",
+        minimum_retention=0.60,
+    )
+
+    assert [item["passed"] for item in result["runs"]] == [True, False, True]
+    assert result["maximum_supported_delay_bars"] == 0
 
 
 def test_holm_adjustment_preserves_original_order() -> None:

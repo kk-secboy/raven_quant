@@ -32,6 +32,49 @@ def test_policy_enforces_position_and_turnover_caps() -> None:
     assert decision.policy_version == policy.version
 
 
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"previous_weights": {"one": -0.10}}, "previous weights"),
+        ({"previous_weights": {"one": 0.70, "two": 0.40}}, "previous weights"),
+        ({"risk_exposure": float("nan")}, "risk exposure"),
+        ({"risk_exposure": 1.10}, "risk exposure"),
+        ({"portfolio_drawdown": float("nan")}, "portfolio drawdown"),
+        ({"portfolio_drawdown": 0.01}, "portfolio drawdown"),
+        ({"daily_return": float("nan")}, "daily return"),
+    ],
+)
+def test_policy_rejects_invalid_financial_state(
+    overrides: dict[str, object], message: str
+) -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(topk=2, n_drop=0, max_position_weight=0.60)
+    )
+
+    with pytest.raises(ValueError, match=message):
+        policy.decide(
+            pd.Series({"one": 1.0, "two": 0.5}),
+            **overrides,
+        )
+
+
+def test_policy_uses_normalized_numeric_financial_state() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(topk=2, n_drop=0, max_position_weight=0.60)
+    )
+
+    decision = policy.decide(
+        pd.Series({"one": 1.0, "two": 0.5}),
+        risk_exposure="0.5",  # type: ignore[arg-type]
+        portfolio_drawdown="-0.11",  # type: ignore[arg-type]
+        daily_return="-0.06",  # type: ignore[arg-type]
+    )
+
+    rules = {event["rule"] for event in decision.risk_events}
+    assert rules == {"max_drawdown_reduce", "max_daily_loss"}
+    assert "risk exposure reduction" in decision.reasons
+
+
 def test_cost_model_is_shared_and_doubles_every_variable_cost() -> None:
     costs = CostModelConfig()
     assert costs.buy_commission_rate == pytest.approx(0.0005)

@@ -157,6 +157,92 @@ def test_portfolio_risk_rejects_unknown_instruments() -> None:
     model = _estimate()
     with pytest.raises(ValueError, match="outside the risk model"):
         model.portfolio_risk(pd.Series({"UNKNOWN": 1.0}))
+    with pytest.raises(ValueError, match="positive periods"):
+        model.portfolio_risk(
+            pd.Series({"S001": 1.0}),
+            annualize=True,
+            periods_per_year=0,
+        )
+
+
+def test_final_risk_exposures_fail_closed_on_missing_style_or_industry() -> None:
+    dates, _, _, returns, styles, memberships, _ = _synthetic_world()
+    missing_style = styles[
+        ~(
+            (styles["instrument"] == "S000")
+            & (styles["datetime"] == dates[-1])
+        )
+    ]
+    with pytest.raises(ValueError, match="stale style"):
+        estimate_structured_risk_model(
+            returns,
+            missing_style,
+            memberships,
+            min_cross_section=10,
+            min_specific_observations=20,
+        )
+
+    missing_industry = memberships[memberships["instrument"] != "S000"]
+    with pytest.raises(ValueError, match="incomplete industry"):
+        estimate_structured_risk_model(
+            returns,
+            styles,
+            missing_industry,
+            min_cross_section=10,
+            min_specific_observations=20,
+        )
+
+
+def test_structured_risk_rejects_infinite_regression_weights() -> None:
+    dates, instruments, _, returns, styles, memberships, _ = _synthetic_world()
+    weights = pd.DataFrame(
+        [
+            {
+                "instrument": instrument,
+                "datetime": timestamp,
+                "weight": float("inf") if instrument == "S000" else 1.0,
+            }
+            for timestamp in dates
+            for instrument in instruments
+        ]
+    )
+
+    with pytest.raises(ValueError, match="regression weights must be finite"):
+        estimate_structured_risk_model(
+            returns,
+            styles,
+            memberships,
+            weights,
+            min_cross_section=10,
+            min_specific_observations=20,
+        )
+
+
+@pytest.mark.parametrize(
+    ("in_date", "out_date"),
+    [
+        ("not-a-date", None),
+        ("2026-01-03", "2026-01-02"),
+    ],
+)
+def test_structured_risk_rejects_invalid_membership_intervals(
+    in_date: str, out_date: str | None
+) -> None:
+    _, _, _, returns, styles, memberships, _ = _synthetic_world()
+    memberships = memberships.copy()
+    memberships["in_date"] = memberships["in_date"].astype(object)
+    memberships["out_date"] = memberships["out_date"].astype(object)
+    memberships.loc[0, "in_date"] = in_date
+    memberships.loc[0, "out_date"] = out_date
+
+    with pytest.raises(ValueError, match="industry membership"):
+        estimate_structured_risk_model(
+            returns,
+            styles,
+            memberships,
+            min_cross_section=10,
+            min_specific_observations=20,
+        )
 
 
 def test_industry_premium_visible_in_factor_covariance() -> None:

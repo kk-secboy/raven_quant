@@ -176,6 +176,37 @@ def test_allocation_uses_recommendation_ledgers_and_propagates_risk(
         ),
     ]
     store = AllocationStore(database_url)
+    with pytest.raises(ValueError, match="member cap exceeds"):
+        store.create(
+            name="zero cap must not fall back to a default",
+            strategy_version_ids=version_ids,
+            dataset="allocation-data",
+            total_capital=1_000_000,
+            allocation_method="risk_parity",
+            lookback_days=120,
+            target_volatility=0.20,
+            max_pairwise_correlation=0.80,
+            max_strategy_weight=0.70,
+            max_member_drawdown=0.08,
+            max_drawdown_reduce=0.10,
+            max_drawdown_liquidate=0.15,
+            fixed_weights=None,
+            actor="allocation-author",
+            member_specs=[
+                {
+                    "strategy_version_id": version_ids[0],
+                    "role": "core",
+                    "risk_budget": 0.50,
+                    "member_cap": 0.0,
+                },
+                {
+                    "strategy_version_id": version_ids[1],
+                    "role": "core",
+                    "risk_budget": 0.50,
+                    "member_cap": 0.50,
+                },
+            ],
+        )
     with pytest.raises(ValueError, match="core/satellite member cap"):
         store.create(
             name="invalid satellite allocation",

@@ -119,6 +119,59 @@ def _run_segment(
     return completed
 
 
+def _progress_payload(
+    trial_results: list[dict[str, Any]], *, trial_count: int
+) -> dict[str, Any]:
+    completed = [
+        {
+            "trial_index": trial["trial_index"],
+            "status": trial["status"],
+            "score": trial["score"],
+            "warnings": trial["warnings"],
+            "error": trial["error"],
+        }
+        for trial in trial_results
+    ]
+    return {
+        "completed_count": len(completed),
+        "trial_count": trial_count,
+        "succeeded_count": sum(item["status"] == "succeeded" for item in completed),
+        "failed_count": sum(item["status"] == "failed" for item in completed),
+        "trials": completed,
+    }
+
+
+def _finalize_cross_trial_dsr(
+    trial_results: list[dict[str, Any]],
+    out_of_sample_returns: dict[int, pd.Series],
+    *,
+    trial_count: int,
+) -> bool:
+    successful_trials = [
+        item for item in trial_results if item.get("status") == "succeeded"
+    ]
+    if len(successful_trials) != trial_count:
+        return False
+    trial_sharpes = [
+        float(item["metrics"]["out_of_sample"]["deflated_sharpe"]["daily_sharpe"])
+        for item in successful_trials
+    ]
+    for item in successful_trials:
+        trial_index = int(item["trial_index"])
+        out_of_sample = item["metrics"]["out_of_sample"]
+        dsr = deflated_sharpe_probability(
+            out_of_sample_returns[trial_index],
+            trials=trial_count,
+            trial_sharpes=trial_sharpes,
+        )
+        out_of_sample["deflated_sharpe"] = dsr
+        out_of_sample["deflated_sharpe_probability"] = dsr["probability"]
+        item["score"], item["warnings"] = evaluate_trial(
+            item["metrics"]["in_sample"], out_of_sample
+        )
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-uri", required=True)
@@ -140,6 +193,7 @@ def main() -> None:
     qlib.init(provider_uri=args.provider_uri, region="cn")
     backtest_script = Path(__file__).with_name("run_multifactor_backtest.py")
     trial_results: list[dict[str, Any]] = []
+    out_of_sample_returns: dict[int, pd.Series] = {}
     for trial in manifest["trials"]:
         trial_index = int(trial["trial_index"])
         trial_output = output / f"trial-{trial_index:03d}"
@@ -172,6 +226,7 @@ def main() -> None:
                     returns = pd.to_numeric(daily["return"], errors="coerce") - pd.to_numeric(
                         daily.get("cost", 0.0), errors="coerce"
                     )
+                    out_of_sample_returns[trial_index] = returns
                     dsr = deflated_sharpe_probability(
                         returns, trials=len(manifest["trials"])
                     )
@@ -191,33 +246,36 @@ def main() -> None:
         except Exception as exc:
             item["error"] = str(exc)[-4000:]
         trial_results.append(item)
-        completed = [
-            {
-                "trial_index": trial["trial_index"],
-                "status": trial["status"],
-                "score": trial["score"],
-                "warnings": trial["warnings"],
-                "error": trial["error"],
-            }
-            for trial in trial_results
-        ]
         (output / "progress.json").write_text(
             json.dumps(
-                {
-                    "completed_count": len(completed),
-                    "trial_count": len(manifest["trials"]),
-                    "succeeded_count": sum(item["status"] == "succeeded" for item in completed),
-                    "failed_count": sum(item["status"] == "failed" for item in completed),
-                    "trials": completed,
-                },
+                _progress_payload(
+                    trial_results, trial_count=len(manifest["trials"])
+                ),
                 ensure_ascii=False,
                 indent=2,
             ),
             encoding="utf-8",
         )
+    _finalize_cross_trial_dsr(
+        trial_results,
+        out_of_sample_returns,
+        trial_count=len(manifest["trials"]),
+    )
+    # The last in-loop progress snapshot predates the cross-trial DSR. Rewrite
+    # it so the live UI and the final result expose the same scores/warnings.
+    (output / "progress.json").write_text(
+        json.dumps(
+            _progress_payload(trial_results, trial_count=len(manifest["trials"])),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     summary = summarize_trials(trial_results, manifest["parameter_grid"])
     if not summary["succeeded_count"]:
-        raise RuntimeError("every parameter trial failed; inspect trial backtest logs")
+        raise RuntimeError(
+            "no parameter trial passed statistical acceptance; inspect the trial evidence"
+        )
     result = {
         "status": "ok",
         "experiment_id": manifest["experiment_id"],

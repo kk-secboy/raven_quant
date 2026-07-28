@@ -27,22 +27,33 @@ def _capped(weights: np.ndarray, maximum: float) -> np.ndarray:
     if not np.isfinite(values).all() or (values < 0).any() or float(values.sum()) <= 0:
         raise ValueError("Qlib allocation weights must be finite and non-negative")
     values /= values.sum()
-    for _ in range(count + 2):
-        over = values > maximum + 1e-12
-        if not over.any():
-            return values / values.sum()
-        values[over] = maximum
-        remaining = 1.0 - float(values[over].sum())
-        under = ~over
-        if remaining <= 0 or not under.any():
+    result = np.zeros(count, dtype=float)
+    active = np.ones(count, dtype=bool)
+    remaining = 1.0
+    for _ in range(count):
+        active_index = np.flatnonzero(active)
+        if len(active_index) == 0:
             break
-        basis = values[under]
+        basis = values[active_index]
         if float(basis.sum()) <= 0:
-            basis = np.ones(int(under.sum()), dtype=float)
-        values[under] = remaining * basis / basis.sum()
-    if (values > maximum + 1e-9).any():
+            basis = np.ones(len(active_index), dtype=float)
+        proposed = remaining * basis / basis.sum()
+        over = proposed > maximum + 1e-12
+        if not over.any():
+            result[active_index] = proposed
+            remaining = 0.0
+            break
+        capped_index = active_index[over]
+        result[capped_index] = maximum
+        active[capped_index] = False
+        remaining = 1.0 - float(result.sum())
+    if (
+        remaining > 1e-9
+        or abs(float(result.sum()) - 1.0) > 1e-9
+        or (result > maximum + 1e-9).any()
+    ):
         raise ValueError("unable to satisfy max strategy weight")
-    return values / values.sum()
+    return result / result.sum()
 
 
 def analyze_strategy_allocation(
@@ -116,7 +127,7 @@ def analyze_strategy_allocation(
         "engine": "qlib.contrib.strategy.optimizer.PortfolioOptimizer",
         "qlib_version": qlib_runtime["version"],
         "qlib_commit": qlib_runtime["commit"],
-        "constraint_wrapper": "project_max_member_weight_v1",
+        "constraint_wrapper": "project_max_member_weight_v2_waterfill",
         "maximum_risk_budget_error": None,
         "risk_budget_tolerance": None,
     }
@@ -160,7 +171,7 @@ def analyze_strategy_allocation(
         solver.update(
             {
                 "engine": "project_fixed_weight_constraint_wrapper",
-                "constraint_wrapper": "project_max_member_weight_v1",
+                "constraint_wrapper": "project_max_member_weight_v2_waterfill",
             }
         )
     portfolio_variance = float(base_weights @ covariance @ base_weights)

@@ -58,6 +58,37 @@ def test_deflated_sharpe_penalizes_trial_count() -> None:
     rng = np.random.default_rng(13)
     returns = 0.001 + rng.normal(0, 0.01, 500)
     one = deflated_sharpe_probability(returns, trials=1)
-    many = deflated_sharpe_probability(returns, trials=100)
+    many = deflated_sharpe_probability(
+        returns,
+        trials=100,
+        trial_sharpes=np.linspace(-0.10, 0.10, 100),
+    )
     assert one["probability"] > many["probability"]
     assert many["trials"] == 100
+    assert many["method_version"] == "bailey-lopez-de-prado-cross-trial-v2"
+    assert many["trial_sharpe_std"] == pytest.approx(
+        np.std(np.linspace(-0.10, 0.10, 100), ddof=1)
+    )
+
+
+def test_deflated_sharpe_blocks_multi_trial_without_candidate_distribution() -> None:
+    rng = np.random.default_rng(17)
+    returns = 0.001 + rng.normal(0, 0.01, 500)
+
+    result = deflated_sharpe_probability(returns, trials=20)
+
+    assert result["status"] == "blocked_missing_trial_sharpe_distribution"
+    assert result["probability"] is None
+    assert result["expected_maximum_daily_sharpe"] is None
+
+
+def test_deflated_sharpe_rejects_incomplete_candidate_distribution() -> None:
+    rng = np.random.default_rng(19)
+    returns = 0.001 + rng.normal(0, 0.01, 500)
+
+    with pytest.raises(ValueError, match="one finite daily Sharpe"):
+        deflated_sharpe_probability(
+            returns,
+            trials=3,
+            trial_sharpes=[0.10, 0.20],
+        )

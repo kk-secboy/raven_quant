@@ -30,6 +30,7 @@ import hashlib
 import json
 import uuid
 from datetime import UTC, date, datetime
+from math import isfinite
 from typing import Any
 
 from sqlalchemy import insert, select
@@ -44,7 +45,7 @@ from quant_data.database import (
     strategy_allocations,
 )
 
-NETTING_PLAN_VERSION = "account-netting-plan-v1"
+NETTING_PLAN_VERSION = "account-netting-plan-v2-finite-inputs"
 DEFAULT_EXECUTION_POLICY = "next_bar"
 EXECUTION_POLICIES = (DEFAULT_EXECUTION_POLICY, "twap", "vwap")
 
@@ -104,6 +105,8 @@ def net_member_demands(
     for member, demands in member_demands.items():
         for instrument, value in demands.items():
             delta = float(value)
+            if not isfinite(delta):
+                raise ValueError("member demands must contain only finite values")
             if not delta:
                 continue
             gross.setdefault(str(instrument), {})[str(member)] = (
@@ -169,32 +172,69 @@ def build_account_netting_plan(
         raise ValueError(f"execution policy must be one of {EXECUTION_POLICIES}")
     if tranche_index < 0:
         raise ValueError("tranche index must be non-negative")
-    if total_capital <= 0:
+    capital = float(total_capital)
+    if not isfinite(capital) or capital <= 0:
         raise ValueError("total capital must be positive")
     budgets = {str(member): float(weight) for member, weight in member_budgets.items()}
-    if any(weight < -_TOLERANCE for weight in budgets.values()):
-        raise ValueError("member budgets must be non-negative")
+    if len(budgets) != len(member_budgets):
+        raise ValueError("member budget identifiers must be unique after normalization")
+    if any(not isfinite(weight) or weight < -_TOLERANCE for weight in budgets.values()):
+        raise ValueError("member budgets must be finite and non-negative")
     if sum(budgets.values()) > 1.0 + _TOLERANCE:
         raise ValueError("member budgets exceed investable capital")
-    if max_instrument_weight is not None and not 0 < max_instrument_weight <= 1:
-        raise ValueError("max instrument weight must be in (0, 1]")
+    normalized_cap = (
+        None if max_instrument_weight is None else float(max_instrument_weight)
+    )
+    if normalized_cap is not None and (
+        not isfinite(normalized_cap) or not 0 < normalized_cap <= 1
+    ):
+        raise ValueError("max instrument weight must be finite and in (0, 1]")
+    target_books = {str(member): values for member, values in member_targets.items()}
+    current_books = {
+        str(member): values for member, values in (member_current_weights or {}).items()
+    }
+    if len(target_books) != len(member_targets) or len(current_books) != len(
+        member_current_weights or {}
+    ):
+        raise ValueError("member identifiers must be unique after normalization")
+    unknown_targets = set(target_books).difference(budgets)
+    unknown_currents = set(current_books).difference(budgets)
+    if unknown_targets or unknown_currents:
+        raise ValueError("member targets and current weights require a matching budget")
 
-    currents = member_current_weights or {}
     demands: dict[str, dict[str, float]] = {}
     account_current: dict[str, float] = {}
     net_targets: dict[str, float] = {}
     for member, budget in budgets.items():
+        raw_targets = target_books.get(member) or {}
         targets = {
             str(key): float(value)
-            for key, value in (member_targets.get(member) or {}).items()
+            for key, value in raw_targets.items()
         }
-        if any(value < -_TOLERANCE for value in targets.values()):
-            raise ValueError("long-only member targets must be non-negative")
+        if len(targets) != len(raw_targets):
+            raise ValueError("target instruments must be unique after normalization")
+        if any(
+            not isfinite(value) or value < -_TOLERANCE for value in targets.values()
+        ):
+            raise ValueError("long-only member targets must be finite and non-negative")
         if sum(targets.values()) > 1.0 + 1e-6:
             raise ValueError(f"member {member} targets exceed the member sleeve")
+        raw_current = current_books.get(member) or {}
         sleeve_current = {
-            str(key): float(value) for key, value in (currents.get(member) or {}).items()
+            str(key): float(value)
+            for key, value in raw_current.items()
         }
+        if len(sleeve_current) != len(raw_current):
+            raise ValueError("current instruments must be unique after normalization")
+        if any(
+            not isfinite(value) or value < -_TOLERANCE
+            for value in sleeve_current.values()
+        ):
+            raise ValueError(
+                "long-only member current weights must be finite and non-negative"
+            )
+        if sum(sleeve_current.values()) > 1.0 + 1e-6:
+            raise ValueError(f"member {member} current weights exceed the member sleeve")
         for instrument in sorted(set(targets) | set(sleeve_current)):
             target = targets.get(instrument, 0.0)
             current = sleeve_current.get(instrument, 0.0)
@@ -212,12 +252,12 @@ def build_account_netting_plan(
     clamped_targets: dict[str, float] = {}
     for instrument in sorted(net_targets):
         weight = net_targets[instrument]
-        if max_instrument_weight is not None and weight > max_instrument_weight:
+        if normalized_cap is not None and weight > normalized_cap:
             clamps[instrument] = {
                 "raw_weight": weight,
-                "clamped_weight": float(max_instrument_weight),
+                "clamped_weight": normalized_cap,
             }
-            weight = float(max_instrument_weight)
+            weight = normalized_cap
         if weight > _TOLERANCE:
             clamped_targets[instrument] = weight
 
@@ -255,12 +295,12 @@ def build_account_netting_plan(
         "policy_version": str(policy_version),
         "execution_policy": execution_policy,
         "tranche_index": int(tranche_index),
-        "total_capital": float(total_capital),
+        "total_capital": capital,
         "member_budgets": budgets,
         "net_targets": {
             instrument: {
                 "weight": weight,
-                "target_value": weight * float(total_capital),
+                "target_value": weight * capital,
             }
             for instrument, weight in clamped_targets.items()
         },
@@ -268,14 +308,14 @@ def build_account_netting_plan(
             instrument: {
                 "delta_weight": delta,
                 "side": "buy" if delta > 0 else "sell",
-                "trade_value": abs(delta) * float(total_capital),
+                "trade_value": abs(delta) * capital,
             }
             for instrument, delta in net_trades.items()
         },
         "cash_weight": cash_weight,
         "strategy_contributions": contributions,
         "constraint_clamps": clamps,
-        "max_instrument_weight": max_instrument_weight,
+        "max_instrument_weight": normalized_cap,
     }
     plan["plan_hash"] = _canonical_hash(
         {

@@ -72,6 +72,14 @@ def test_trusted_hard_breach_creates_exit_target() -> None:
     assert item["action"] == "EXIT"
 
 
+def test_extreme_annualized_volatility_triggers_risk_off_instead_of_error() -> None:
+    assessment = assess_account_risk(annualized_volatility=1.50)
+
+    assert assessment["risk_state"] == RISK_OFF
+    assert assessment["metrics"]["annualized_volatility"] == pytest.approx(1.50)
+    assert "annualized_volatility_risk_off" in assessment["hard_reasons"]
+
+
 def test_stale_data_preserves_buy_action_but_hard_blocks_new_risk() -> None:
     assessment = assess_account_risk(data_stale=True, market_data_trusted=False)
     assert assessment["risk_state"] == RISK_OFF

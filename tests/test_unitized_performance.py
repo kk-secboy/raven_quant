@@ -87,6 +87,41 @@ def test_nonpositive_base_marks_chain_unavailable_and_break_propagates() -> None
     assert propagated["daily_return"] is None
 
 
+def test_inconsistent_close_flow_cannot_create_negative_unitized_wealth() -> None:
+    with pytest.raises(ValueError, match="negative wealth"):
+        chain_unitized_day(
+            prior_nav=100.0,
+            nav=50.0,
+            flow_open=0.0,
+            flow_close=75.0,
+            prior_wealth=1.0,
+            prior_high_water_mark=1.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"prior_nav": -1.0, "flow_open": 101.0},
+        {"prior_wealth": 1.10, "prior_high_water_mark": 1.0},
+    ],
+)
+def test_inconsistent_unitized_account_state_fails_closed(
+    overrides: dict[str, float],
+) -> None:
+    inputs = {
+        "prior_nav": 100.0,
+        "nav": 101.0,
+        "flow_open": 0.0,
+        "flow_close": 0.0,
+        "prior_wealth": 1.0,
+        "prior_high_water_mark": 1.0,
+    }
+    inputs.update(overrides)
+    with pytest.raises(ValueError, match="account state|wealth state"):
+        chain_unitized_day(**inputs)
+
+
 def test_unitized_drawdown_and_recovery_hand_computed() -> None:
     start = date(2026, 1, 5)
     days = [start + timedelta(days=offset) for offset in range(6)]
@@ -123,6 +158,22 @@ def test_monotone_curve_has_zero_recovery() -> None:
     assert result["status"] == "ok"
     assert result["max_drawdown"] == pytest.approx(0.0)
     assert result["recovery_trading_days"] == 0
+
+
+@pytest.mark.parametrize(
+    "points",
+    [
+        [(date(2026, 1, 2), float("nan"))],
+        [(date(2026, 1, 2), 0.0)],
+        [(date(2026, 1, 3), 1.0), (date(2026, 1, 2), 1.1)],
+        [(date(2026, 1, 2), 1.0), (date(2026, 1, 3), 0.0), (date(2026, 1, 4), 0.1)],
+    ],
+)
+def test_invalid_unitized_curve_fails_closed(
+    points: list[tuple[date, float]],
+) -> None:
+    with pytest.raises(ValueError, match="strictly ordered"):
+        unitized_drawdown_recovery(points)
 
 
 def test_xirr_converges_on_simple_golden_case() -> None:
@@ -165,15 +216,21 @@ def test_xirr_single_sign_is_undefined() -> None:
     assert result["rate"] is None
 
 
-def test_xirr_no_root_reports_status_not_pseudo_precision() -> None:
-    # 交替投入/取出且终值无法使 NPV 过零（投入远小于流出终值）时如实标注。
-    result = xirr(
-        [(date(2025, 1, 2), -1.0), (date(2025, 6, 2), 2.0)],
-        terminal=(date(2026, 1, 2), -1.0),
-    )
-    assert result["status"] in {"undefined_no_root", "multiple_roots", "ok"}
-    if result["status"] == "undefined_no_root":
-        assert result["rate"] is None
+def test_xirr_rejects_negative_terminal_value() -> None:
+    # Negative terminal wealth is not a valid long-only account state.
+    with pytest.raises(ValueError, match="terminal value"):
+        xirr(
+            [(date(2025, 1, 2), -1.0), (date(2025, 6, 2), 2.0)],
+            terminal=(date(2026, 1, 2), -1.0),
+        )
+
+
+def test_xirr_rejects_terminal_value_before_the_last_cash_flow() -> None:
+    with pytest.raises(ValueError, match="terminal date"):
+        xirr(
+            [(date(2026, 2, 1), -100.0)],
+            terminal=(date(2026, 1, 31), 110.0),
+        )
 
 
 def test_xirr_rejects_non_finite_flows() -> None:

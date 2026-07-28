@@ -5596,18 +5596,35 @@ class SimulationStore:
                     if row["investment_wealth"] is None
                 ),
             }
-        money_flows = [
-            (portfolio.created_at.date(), -float(portfolio.initial_cash)),
-            *[
-                (row["trade_date"], -float(row["amount"]))
-                for row in flow_rows
-            ],
-        ]
         money_weighted: dict[str, Any]
+        xirr_flow_count = 0
+        xirr_inception_date: date | None = None
         if nav_rows:
+            terminal_date = nav_rows[-1]["trade_date"]
+            realized_flows = [
+                row for row in flow_rows if row["trade_date"] <= terminal_date
+            ]
+            # Wall-clock creation is not an economic inception date for a
+            # deterministic historical replay. Anchor initial capital no later
+            # than the first booked NAV/flow; forward simulations retain their
+            # actual creation date.
+            economic_dates = [
+                portfolio.created_at.date(),
+                nav_rows[0]["trade_date"],
+                *[row["trade_date"] for row in realized_flows],
+            ]
+            xirr_inception_date = min(economic_dates)
+            money_flows = [
+                (xirr_inception_date, -float(portfolio.initial_cash)),
+                *[
+                    (row["trade_date"], -float(row["amount"]))
+                    for row in realized_flows
+                ],
+            ]
+            xirr_flow_count = len(realized_flows)
             money_weighted = xirr(
                 money_flows,
-                terminal=(nav_rows[-1]["trade_date"], float(nav_rows[-1]["nav"])),
+                terminal=(terminal_date, float(nav_rows[-1]["nav"])),
             )
         else:
             money_weighted = {"status": "insufficient_evidence", "rate": None}
@@ -5616,6 +5633,10 @@ class SimulationStore:
             "contract_version": UNITIZED_PERFORMANCE_VERSION,
             "nav_days": len(nav_rows),
             "external_flow_count": len(flow_rows),
+            "xirr_external_flow_count": xirr_flow_count,
+            "xirr_inception_date": (
+                xirr_inception_date.isoformat() if xirr_inception_date else None
+            ),
             "unitized": unitized,
             "xirr": money_weighted,
             "cny_nav_latest": (float(nav_rows[-1]["nav"]) if nav_rows else None),

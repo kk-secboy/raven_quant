@@ -90,7 +90,7 @@ def estimate_covariance(
 # availability guard (effective date plus the conservative publication lag),
 # so no future membership can leak into an exposure.
 
-STRUCTURED_RISK_MODEL_VERSION = "barra-lite-cne6-v1"
+STRUCTURED_RISK_MODEL_VERSION = "barra-lite-cne6-v2-pit-complete"
 
 MARKET_FACTOR = "market"
 DEFAULT_FACTOR_HALF_LIFE_DAYS = 90.0
@@ -170,6 +170,8 @@ class StructuredRiskModel:
     ) -> PortfolioRiskReport:
         """Decompose portfolio variance into market/style/industry/specific."""
 
+        if annualize and periods_per_year <= 0:
+            raise ValueError("annualized portfolio risk requires positive periods per year")
         if not isinstance(weights, pd.Series) or weights.empty or not weights.index.is_unique:
             raise ValueError("portfolio weights must be a unique non-empty Series")
         normalized = pd.to_numeric(weights, errors="coerce").astype(float)
@@ -280,6 +282,15 @@ def estimate_structured_risk_model(
     (instrument, datetime, weight); without it every stock weighs equally.
     """
 
+    if (
+        min_cross_section < 2
+        or min_specific_observations < 2
+        or not np.isfinite(factor_half_life_days)
+        or factor_half_life_days <= 0
+        or not np.isfinite(specific_half_life_days)
+        or specific_half_life_days <= 0
+    ):
+        raise ValueError("structured risk model estimation parameters are invalid")
     panel = _normalize_returns(returns)
     styles = _normalize_style_panel(style_exposures)
     memberships = _normalize_membership_frame(industry_memberships)
@@ -393,6 +404,9 @@ def _normalize_style_panel(style_exposures: pd.DataFrame) -> pd.DataFrame:
     frame["instrument"] = frame["instrument"].astype(str)
     frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
     frame[style_columns] = frame[style_columns].apply(pd.to_numeric, errors="coerce")
+    style_values = frame[style_columns].to_numpy(dtype=float)
+    if not (np.isfinite(style_values) | pd.isna(style_values)).all():
+        raise ValueError("style exposure panel must not contain infinite values")
     frame = frame.dropna(subset=["instrument", "datetime"])
     frame = frame.sort_values("datetime").drop_duplicates(
         ["instrument", "datetime"], keep="last"
@@ -407,11 +421,28 @@ def _normalize_membership_frame(memberships: pd.DataFrame) -> pd.DataFrame:
     if not required.issubset(memberships.columns):
         raise ValueError("industry memberships are incomplete")
     frame = memberships.loc[:, ["instrument", "industry", "in_date", "out_date"]].copy()
+    frame = frame.dropna(subset=["instrument", "industry", "in_date"])
     frame["instrument"] = frame["instrument"].astype(str)
     frame["industry"] = frame["industry"].astype(str)
-    frame["in_date"] = pd.to_datetime(frame["in_date"], errors="coerce")
-    frame["out_date"] = pd.to_datetime(frame["out_date"], errors="coerce")
-    return frame.dropna(subset=["instrument", "industry", "in_date"])
+    frame["in_date"] = pd.to_datetime(
+        frame["in_date"], errors="coerce", format="mixed"
+    )
+    frame["out_date"] = pd.to_datetime(
+        frame["out_date"], errors="coerce", format="mixed"
+    )
+    if frame["in_date"].isna().any():
+        raise ValueError("industry memberships contain an invalid in_date")
+    if (
+        frame["out_date"].notna()
+        & (frame["out_date"] < frame["in_date"])
+    ).any():
+        raise ValueError("industry membership out_date cannot precede in_date")
+    frame = frame[
+        frame["instrument"].str.strip().ne("") & frame["industry"].str.strip().ne("")
+    ]
+    if frame.empty:
+        raise ValueError("industry memberships are empty")
+    return frame
 
 
 def _normalize_weight_panel(weights: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -425,6 +456,8 @@ def _normalize_weight_panel(weights: pd.DataFrame | None) -> pd.DataFrame | None
     frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
     frame["weight"] = pd.to_numeric(frame["weight"], errors="coerce")
     frame = frame.dropna()
+    if not np.isfinite(frame["weight"].to_numpy(dtype=float)).all():
+        raise ValueError("regression weights must be finite")
     frame = frame[frame["weight"] > 0]
     frame = frame.drop_duplicates(["datetime", "instrument"], keep="last")
     if frame.empty:
@@ -571,13 +604,24 @@ def _final_exposures(
         .drop_duplicates("instrument", keep="last")
         .set_index("instrument")
     )
-    style_frame = latest.reindex(universe)[styles.columns].astype(float).fillna(0.0)
+    latest_dates = pd.to_datetime(
+        latest.reindex(universe)["datetime"], errors="coerce"
+    )
+    if latest_dates.isna().any() or not latest_dates.eq(pd.Timestamp(as_of)).all():
+        raise ValueError("final risk exposures have stale style data")
+    style_frame = latest.reindex(universe)[styles.columns].astype(float)
+    if style_frame.isna().any().any() or not np.isfinite(
+        style_frame.to_numpy(dtype=float)
+    ).all():
+        raise ValueError("final risk exposures have incomplete style data")
     assigned = _industries_at(memberships, as_of).reindex(universe)
+    if assigned.isna().any():
+        raise ValueError("final risk exposures have incomplete industry data")
     exposures = pd.DataFrame(1.0, index=universe, columns=[MARKET_FACTOR])
     for column in style_frame.columns:
         exposures[column] = style_frame[column]
     for name in industries:
         exposures[f"industry:{name}"] = (assigned == name).astype(float)
-    # Instruments without a point-in-time industry keep zero industry
-    # exposure (degraded to style+specific risk only) rather than failing.
+    # Completeness was verified above; zero dummies identify only the
+    # explicitly selected reference industry.
     return exposures.reindex(columns=factor_names, fill_value=0.0)

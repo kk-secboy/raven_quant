@@ -12,6 +12,7 @@ from scipy.stats import norm
 # Holm, paired bootstrap and PBO are additive evidence blocks, so they do not
 # invalidate already frozen factor artifacts or require a schema migration.
 STATISTICAL_CONTRACT_VERSION = "research-statistics-v1-hac-bh-dsr"
+DEFLATED_SHARPE_METHOD_VERSION = "bailey-lopez-de-prado-cross-trial-v2"
 
 
 def newey_west_mean_test(values: pd.Series | list[float], *, max_lag: int) -> dict[str, Any]:
@@ -243,8 +244,21 @@ def purged_embargo_split(
 
 
 def deflated_sharpe_probability(
-    daily_returns: pd.Series | list[float], *, trials: int
+    daily_returns: pd.Series | list[float],
+    *,
+    trials: int,
+    trial_sharpes: pd.Series | list[float] | None = None,
 ) -> dict[str, Any]:
+    """Probability that a selected Sharpe exceeds the multiple-trial benchmark.
+
+    Bailey and Lopez de Prado's expected-maximum Sharpe uses the dispersion
+    *across the tried strategies*.  The sampling variance of this strategy's
+    own Sharpe belongs only in the probabilistic-Sharpe denominator and must
+    not be reused as a stand-in for cross-trial dispersion.  Consequently a
+    multi-trial result fails closed until the complete frozen candidate
+    family's daily Sharpe ratios are supplied.
+    """
+
     values = np.asarray(pd.Series(daily_returns).dropna(), dtype=float)
     if len(values) < 30 or trials < 1 or not np.isfinite(values).all():
         raise ValueError("Deflated Sharpe requires finite returns and at least 30 observations")
@@ -254,21 +268,46 @@ def deflated_sharpe_probability(
             "probability": 0.0,
             "status": "zero_return_variance",
             "trials": trials,
+            "method_version": DEFLATED_SHARPE_METHOD_VERSION,
             "contract_version": STATISTICAL_CONTRACT_VERSION,
         }
     daily_sharpe = float(values.mean() / standard_deviation)
     skewness = float(pd.Series(values).skew())
     kurtosis = float(pd.Series(values).kurt() + 3.0)
-    sharpe_variance = max(
-        1e-12,
-        (1.0 - skewness * daily_sharpe + (kurtosis - 1.0) * daily_sharpe**2 / 4.0)
-        / (len(values) - 1),
-    )
     if trials == 1:
+        if trial_sharpes is not None and len(pd.Series(trial_sharpes)) != 1:
+            raise ValueError("single-trial Deflated Sharpe accepts exactly one trial Sharpe")
         expected_maximum = 0.0
+        trial_sharpe_std = 0.0
     else:
+        if trial_sharpes is None:
+            return {
+                "probability": None,
+                "status": "blocked_missing_trial_sharpe_distribution",
+                "trials": trials,
+                "method_version": DEFLATED_SHARPE_METHOD_VERSION,
+                "daily_sharpe": daily_sharpe,
+                "annualized_sharpe": daily_sharpe * sqrt(252.0),
+                "expected_maximum_daily_sharpe": None,
+                "trial_sharpe_std": None,
+                "observations": len(values),
+                "skewness": skewness,
+                "kurtosis": kurtosis,
+                "contract_version": STATISTICAL_CONTRACT_VERSION,
+            }
+        family = np.asarray(pd.Series(trial_sharpes), dtype=float)
+        if (
+            len(family) != trials
+            or not np.isfinite(family).all()
+            or trials < 2
+        ):
+            raise ValueError(
+                "multi-trial Deflated Sharpe requires one finite daily Sharpe "
+                "for every frozen trial"
+            )
+        trial_sharpe_std = float(family.std(ddof=1))
         euler_gamma = 0.5772156649015329
-        expected_maximum = sqrt(sharpe_variance) * (
+        expected_maximum = trial_sharpe_std * (
             (1.0 - euler_gamma) * norm.ppf(1.0 - 1.0 / trials)
             + euler_gamma * norm.ppf(1.0 - 1.0 / (trials * e))
         )
@@ -289,9 +328,11 @@ def deflated_sharpe_probability(
         "probability": probability,
         "status": status,
         "trials": trials,
+        "method_version": DEFLATED_SHARPE_METHOD_VERSION,
         "daily_sharpe": daily_sharpe,
         "annualized_sharpe": daily_sharpe * sqrt(252.0),
         "expected_maximum_daily_sharpe": expected_maximum,
+        "trial_sharpe_std": trial_sharpe_std,
         "observations": len(values),
         "skewness": skewness,
         "kurtosis": kurtosis,

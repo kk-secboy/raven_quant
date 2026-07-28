@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from sqlalchemy import select
 from test_simulation_store import (
@@ -163,18 +165,27 @@ def test_performance_summary_reports_twr_recovery_and_xirr(
             simulation["execution_policy"]["simulation_semantics_sha256"],
         ),
     )
+    store.record_external_flow(
+        simulation["id"],
+        trade_date=TRADE_DATE + timedelta(days=1),
+        timing="open",
+        amount=10_000.0,
+        actor="future-flow-test",
+    )
     summary = store.performance_summary(simulation["id"])
     assert summary["nav_days"] == 1
-    assert summary["external_flow_count"] == 0
+    assert summary["external_flow_count"] == 1
+    assert summary["xirr_external_flow_count"] == 0
     unitized = summary["unitized"]
     assert unitized["status"] == "ok"
     assert unitized["observations"] == 1
     assert unitized["max_drawdown"] == pytest.approx(0.0)
     assert unitized["recovery_trading_days"] == 0
     xirr_result = summary["xirr"]
-    # 夹具的批次交易日早于账户创建时钟日，年化符号无意义；只要求有解。
-    assert xirr_result["status"] == "ok"
-    assert isinstance(xirr_result["rate"], float)
+    # One same-day NAV observation has no economically meaningful annualized root.
+    assert summary["xirr_inception_date"] == TRADE_DATE.isoformat()
+    assert xirr_result["status"] == "undefined_no_root"
+    assert xirr_result["rate"] is None
     assert summary["cny_nav_latest"] > 0.0
 
 

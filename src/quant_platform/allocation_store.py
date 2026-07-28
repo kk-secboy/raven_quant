@@ -165,7 +165,8 @@ class AllocationStore:
                 raise ValueError("allocation member role must be core or satellite")
             risk_budget = float(item.get("risk_budget", 1.0))
             default_cap = min(max_strategy_weight, 0.15 if role == "satellite" else 0.70)
-            member_cap = float(item.get("member_cap") or default_cap)
+            raw_member_cap = item.get("member_cap")
+            member_cap = float(default_cap if raw_member_cap is None else raw_member_cap)
             if not 0 < risk_budget <= 1:
                 raise ValueError("allocation member risk budget must be between zero and one")
             if not 0 < member_cap <= min(max_strategy_weight, 0.70):
