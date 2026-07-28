@@ -131,6 +131,37 @@ def test_unchanged_dataset_is_fully_linked(tmp_path: Path) -> None:
     assert _manifest_entry(successor, "daily") == _manifest_entry(base, "daily")
 
 
+def test_all_null_date_like_column_falls_back_to_non_partitioned_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = ParquetStore(tmp_path / "data")
+    unit = _write_unit(
+        store,
+        "sge_basic",
+        "sge-basic",
+        [
+            {
+                "ts_code": "AU9999.SGE",
+                "name": "Gold",
+                "trade_time": None,
+            }
+        ],
+    )
+
+    snapshot = store.build_snapshot(
+        name="sge-reference",
+        successful_units={"sge_basic": [unit]},
+        manifest_extra={},
+    )
+
+    frame = _dataset_frame(snapshot, "sge_basic")
+    entry = _manifest_entry(snapshot, "sge_basic")
+    assert len(frame) == 1
+    assert entry["rows"] == 1
+    assert entry["date_field"] is None
+    assert len(entry["files"]) == 1
+
+
 def test_dropped_unit_forces_full_dataset_rebuild_without_stale_rows(tmp_path: Path) -> None:
     store = ParquetStore(tmp_path / "data")
     old_unit = _write_unit(store, "daily", "daily_20240102", _daily_rows("20240102"))

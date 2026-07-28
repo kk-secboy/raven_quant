@@ -304,6 +304,23 @@ class ParquetStore:
             (field for field in _date_field_candidates(dataset) if field in columns),
             None,
         )
+        if date_field is not None:
+            # Wide provider schemas can contain a date-like column that is
+            # unrelated to this dataset and entirely NULL (for example
+            # sge_basic carrying an empty trade_time column). Treat that as a
+            # non-partitioned reference dataset. Otherwise the partition
+            # exporter creates no files while the manifest still reports the
+            # source row count, producing an unusable snapshot.
+            date_expression = _date_sql_expression(date_field)
+            has_valid_dates = bool(
+                connection.execute(
+                    f"SELECT count(*) > 0 FROM read_parquet("
+                    f"{quoted_paths}, union_by_name=true"
+                    f") WHERE {date_expression} IS NOT NULL"
+                ).fetchone()[0]
+            )
+            if not has_valid_dates:
+                date_field = None
         news_identity = {"datetime", "content", "title", "source"}
         legacy_news = dataset == "news" and news_identity.issubset(set(columns))
         if date_field is None or legacy_news:
