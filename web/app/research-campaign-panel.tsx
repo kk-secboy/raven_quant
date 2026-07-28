@@ -1,7 +1,8 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
+import { usePolling } from "./use-polling";
 
 type Dataset = { name: string; ready: boolean; reproducible: boolean; start_date?: string | null; end_date?: string | null };
 type Recipe = { id: string; name: string; rdagent_objective: string };
@@ -102,11 +103,7 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
     }
   }, [api, dataset, recipeId]);
 
-  useEffect(() => {
-    const initial = window.setTimeout(refresh, 0);
-    const timer = window.setInterval(refresh, 5000);
-    return () => { window.clearTimeout(initial); window.clearInterval(timer); };
-  }, [refresh]);
+  usePolling(refresh, 5000);
 
   const activeCount = useMemo(
     () => campaigns.filter((item) => ["queued", "running", "awaiting_approval"].includes(item.status)).length,

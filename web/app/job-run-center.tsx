@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
 import { DataJob, jobDisplayName, phaseLabel, targetText } from "./data-progress";
+import { usePolling } from "./use-polling";
 
 type Job = DataJob & {
   cancel_requested_at?: string | null;
@@ -58,11 +59,7 @@ export function JobRunCenter({ api, canControl, onChanged, onMessage }: Props) {
     setTotal(Number(response.headers.get("x-total-count") ?? 0));
   }, [api, kind, page, status]);
 
-  useEffect(() => {
-    const initial = window.setTimeout(load, 0);
-    const timer = window.setInterval(load, 5000);
-    return () => { window.clearTimeout(initial); window.clearInterval(timer); };
-  }, [load]);
+  usePolling(load, 5000);
 
   async function openJob(job: Job) {
     const [detailResponse, logResponse] = await Promise.all([

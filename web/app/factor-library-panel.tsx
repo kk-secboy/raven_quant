@@ -1,7 +1,8 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useState } from "react";
 import { apiFetch } from "./api-client";
+import { usePolling } from "./use-polling";
 
 type GatePolicy = {
   min_abs_ic: number; min_abs_icir: number; min_abs_rank_ic: number;
@@ -49,12 +50,7 @@ export function FactorLibraryPanel({ api }: { api: string }) {
     }
   }
 
-  useEffect(() => {
-    const initial = window.setTimeout(load, 0);
-    const timer = window.setInterval(load, 8000);
-    return () => { window.clearTimeout(initial); window.clearInterval(timer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  usePolling(load, 8000);
 
   async function promote(event: FormEvent) {
     event.preventDefault();

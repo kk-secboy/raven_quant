@@ -16,6 +16,7 @@ import { RDAgentPanel } from "./rdagent-panel";
 import { ResearchCampaignPanel } from "./research-campaign-panel";
 import { SettingsPanel } from "./settings-panel";
 import { StrategyAllocationPanel } from "./strategy-allocation-panel";
+import { usePolling } from "./use-polling";
 
 type Overview = {
   mode: string;
@@ -128,23 +129,38 @@ export default function Home() {
   }, []);
 
   const refresh = useCallback(async () => {
+    const [overviewResult, datasetsResult, dataTasksResult] = await Promise.allSettled([
+      apiFetch(`${API}/api/overview`, { cache: "no-store" }).then(async (response) => {
+        if (!response.ok) throw new Error("overview unavailable");
+        return response.json() as Promise<Overview>;
+      }),
+      apiFetch(`${API}/api/datasets`, { cache: "no-store" }).then(async (response) => {
+        if (!response.ok) throw new Error("datasets unavailable");
+        return response.json() as Promise<Dataset[]>;
+      }),
+      apiFetch(`${API}/api/data-tasks`, { cache: "no-store" }).then(async (response) => {
+        if (!response.ok) throw new Error("data tasks unavailable");
+        return response.json() as Promise<DataTask[]>;
+      }),
+    ]);
+    let loaded = 0;
+    if (overviewResult.status === "fulfilled") { setOverview(overviewResult.value); loaded += 1; }
+    if (datasetsResult.status === "fulfilled") { setDatasets(datasetsResult.value); loaded += 1; }
+    if (dataTasksResult.status === "fulfilled") { setDataTasks(dataTasksResult.value); loaded += 1; }
+    setMessage(loaded === 0 ? "暂时无法连接数据服务。" : loaded < 3 ? "部分数据正在恢复，已先展示可用内容。" : "");
+    setLoading(false);
+  }, []);
+
+  const loadRetention = useCallback(async () => {
     try {
-      const [overviewResponse, datasetsResponse, dataTasksResponse, retentionResponse] = await Promise.all([
-        apiFetch(`${API}/api/overview`, { cache: "no-store" }),
-        apiFetch(`${API}/api/datasets`, { cache: "no-store" }),
-        apiFetch(`${API}/api/data-tasks`, { cache: "no-store" }),
-        apiFetch(`${API}/api/data-retention`, { cache: "no-store" }),
-      ]);
-      if (!overviewResponse.ok || !datasetsResponse.ok || !dataTasksResponse.ok || !retentionResponse.ok) throw new Error("API unavailable");
-      setOverview(await overviewResponse.json());
-      setDatasets(await datasetsResponse.json());
-      setDataTasks(await dataTasksResponse.json());
-      setRetention(await retentionResponse.json());
-      setMessage("");
+      const response = await apiFetch(`${API}/api/data-retention`, {
+        cache: "no-store",
+        timeoutMs: 120_000,
+      });
+      if (!response.ok) throw new Error("retention unavailable");
+      setRetention(await response.json());
     } catch {
-      setMessage("后端尚未启动。启动 quant-web serve 后，本页会自动连接真实数据。 ");
-    } finally {
-      setLoading(false);
+      setMessage("存储容量统计暂时不可用；其他数据不受影响。");
     }
   }, []);
 
@@ -153,12 +169,18 @@ export default function Home() {
     return () => window.clearTimeout(initial);
   }, [checkAuth]);
 
-  useEffect(() => {
-    if (!auth || !["authenticated", "disabled"].includes(auth.status)) return;
-    const initial = window.setTimeout(refresh, 0);
-    const timer = window.setInterval(refresh, 5000);
-    return () => { window.clearTimeout(initial); window.clearInterval(timer); };
-  }, [auth, refresh]);
+  const dataPollingEnabled = Boolean(
+    auth && ["authenticated", "disabled"].includes(auth.status) && [0, 1].includes(activeNav),
+  );
+  usePolling(refresh, 5000, dataPollingEnabled);
+
+  const storageViewEnabled = dataPollingEnabled && activeNav === 1 && dataView === "storage";
+  usePolling(loadRetention, 60 * 60 * 1000, storageViewEnabled);
+
+  async function refreshVisible() {
+    await refresh();
+    if (activeNav === 1 && dataView === "storage") await loadRetention();
+  }
 
   async function logout() {
     await apiFetch(`${API}/api/auth/logout`, { method: "POST" });
@@ -231,6 +253,7 @@ export default function Home() {
     setRetentionConfirmation("");
     setMessage(`已清理 ${body.deleted.length} 个未引用数据集，释放 ${formatBytes(body.reclaimed_bytes)}。`);
     await refresh();
+    await loadRetention();
   }
 
   if (!auth) return <main className="auth-shell"><div className="auth-loading">正在检查安全会话…</div></main>;
@@ -263,7 +286,7 @@ export default function Home() {
       <section className="workspace">
         <header className="topbar">
           <div><p className="eyebrow">{headings[activeNav]?.[0]}</p><h1>{headings[activeNav]?.[1]}</h1></div>
-          <div className="top-actions"><span className="system-live"><i />数据每 5 秒更新</span><span className="account-chip"><b>{auth.user?.display_name}</b><small>{auth.user?.role}</small></span><button onClick={refresh}>刷新</button>{auth.status === "authenticated" && <button onClick={logout}>退出</button>}</div>
+          <div className="top-actions"><span className="system-live"><i />当前页面自动更新</span><span className="account-chip"><b>{auth.user?.display_name}</b><small>{auth.user?.role}</small></span><button onClick={() => void refreshVisible()}>刷新</button>{auth.status === "authenticated" && <button onClick={logout}>退出</button>}</div>
         </header>
 
         {message && <div className="notice">{message}</div>}

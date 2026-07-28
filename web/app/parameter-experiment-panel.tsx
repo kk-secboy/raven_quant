@@ -1,7 +1,8 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
+import { usePolling } from "./use-polling";
 
 type Dataset = { name: string; ready: boolean; reproducible: boolean; start_date: string; end_date: string };
 type StrategyVersion = { id: string; version: number; status: string };
@@ -80,11 +81,7 @@ export function ParameterExperimentPanel({ api }: { api: string }) {
     } catch { setMessage("无法读取参数实验中心，请确认数据库已升级且 Python 后端正在运行。"); }
   }
 
-  useEffect(() => {
-    const initial = window.setTimeout(load, 0); const timer = window.setInterval(load, 8000);
-    return () => { window.clearTimeout(initial); window.clearInterval(timer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedExperiment]);
+  usePolling(load, 8000);
 
   const versionOptions = strategies.filter((item) => item.strategy_type !== "pair").flatMap((strategy) => strategy.versions.map((version) => ({ strategy, version })));
   const parsedGrid = useMemo(() => {

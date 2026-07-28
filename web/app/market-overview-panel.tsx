@@ -1,7 +1,8 @@
 "use client";
 
-import { CSSProperties, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { CSSProperties, FormEvent, useCallback, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
+import { usePolling } from "./use-polling";
 
 type Quote = {
   ts_code: string;
@@ -117,11 +118,7 @@ export function MarketOverviewPanel({ api, onOpenData }: MarketOverviewPanelProp
     }
   }, [api, querySymbols]);
 
-  useEffect(() => {
-    const initial = window.setTimeout(refresh, 0);
-    const timer = window.setInterval(refresh, 30_000);
-    return () => { window.clearTimeout(initial); window.clearInterval(timer); };
-  }, [refresh]);
+  usePolling(refresh, 30_000);
 
   const breadthTotal = (market?.breadth.advances ?? 0) + (market?.breadth.declines ?? 0) + (market?.breadth.unchanged ?? 0);
   const advanceRatio = breadthTotal ? Math.round((market?.breadth.advances ?? 0) / breadthTotal * 100) : 0;

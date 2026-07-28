@@ -37,7 +37,15 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   const allSource = sources.map(([, source]) => source).join("\n");
 
   assert.match(sourceByName["api-client.ts"], /credentials:\s*"include"/);
+  assert.match(sourceByName["api-client.ts"], /inflightGets/);
+  assert.match(sourceByName["api-client.ts"], /AbortController/);
+  assert.match(sourceByName["use-polling.ts"], /finally[\s\S]*setTimeout/);
+  assert.doesNotMatch(allSource, /setInterval/);
   assert.match(sourceByName["page.tsx"], /\/api\/auth\/state/);
+  const coreBatchStart = sourceByName["page.tsx"].indexOf("Promise.allSettled([");
+  const coreBatchEnd = sourceByName["page.tsx"].indexOf("]);", coreBatchStart);
+  assert.ok(coreBatchStart >= 0 && coreBatchEnd > coreBatchStart);
+  assert.doesNotMatch(sourceByName["page.tsx"].slice(coreBatchStart, coreBatchEnd), /data-retention/);
   assert.match(sourceByName["auth-panel.tsx"], /bootstrap.*login|login.*bootstrap/s);
   assert.match(sourceByName["page.tsx"], /StrategyAllocationPanel/);
   assert.match(sourceByName["page.tsx"], /PairSatellitePanel/);

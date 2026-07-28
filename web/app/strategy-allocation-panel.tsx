@@ -1,7 +1,8 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
+import { usePolling } from "./use-polling";
 
 type Dataset = { name: string; ready: boolean; reproducible: boolean; end_date: string };
 type StrategyVersion = { id: string; version: number; status: string; strategy_type: string };
@@ -87,12 +88,7 @@ export function StrategyAllocationPanel({ api }: { api: string }) {
     if (!dataset && datasets.length) setDataset(datasets[0].name);
   }
 
-  useEffect(() => {
-    const initial = window.setTimeout(load, 0);
-    const timer = window.setInterval(load, 8000);
-    return () => { window.clearTimeout(initial); window.clearInterval(timer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [datasets.length]);
+  usePolling(load, 8000);
 
   async function create(event: FormEvent) {
     event.preventDefault();

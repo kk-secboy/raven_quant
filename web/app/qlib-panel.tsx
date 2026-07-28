@@ -1,7 +1,8 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
+import { usePolling } from "./use-polling";
 
 type Runtime = { status: string; qlib_version?: string; lightgbm_version?: string };
 type QlibDataset = { name: string; ready: boolean; trading_days: number; frequency: string; start_date?: string | null; end_date?: string | null };
@@ -61,12 +62,7 @@ export function QlibPanel({ api }: { api: string }) {
     }
   }
 
-  useEffect(() => {
-    const initial = window.setTimeout(load, 0);
-    const timer = window.setInterval(load, 7000);
-    return () => { window.clearTimeout(initial); window.clearInterval(timer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  usePolling(load, 7000);
 
   async function runBaseline(event: FormEvent) {
     event.preventDefault();
