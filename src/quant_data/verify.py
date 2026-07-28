@@ -135,15 +135,12 @@ def verify_downloads(
                     (),
                 )
             if not primary_key:
-                errors.append(
-                    f"{dataset}: no supported primary key is present in provider columns"
-                )
+                errors.append(f"{dataset}: no supported primary key is present in provider columns")
                 continue
             missing_key_columns = sorted(set(primary_key) - columns)
             if missing_key_columns:
                 errors.append(
-                    f"{dataset}: primary-key columns are missing: "
-                    f"{', '.join(missing_key_columns)}"
+                    f"{dataset}: primary-key columns are missing: {', '.join(missing_key_columns)}"
                 )
                 continue
             key = ",".join(f'"{column}"' for column in primary_key)
@@ -183,13 +180,11 @@ def verify_downloads(
         )
         errors.extend(ohlc_errors)
         warnings.extend(ohlc_warnings)
-        minute_errors, minute_warnings, minute_daily_checks = (
-            _verify_minute_daily_consistency(
-                connection,
-                selected_by_dataset,
-                data_root,
-                snapshot_end=effective_snapshot_end,
-            )
+        minute_errors, minute_warnings, minute_daily_checks = _verify_minute_daily_consistency(
+            connection,
+            selected_by_dataset,
+            data_root,
+            snapshot_end=effective_snapshot_end,
         )
         errors.extend(minute_errors)
         warnings.extend(minute_warnings)
@@ -416,8 +411,7 @@ def _verify_daily_ohlc(
         checks[check] = count
         if count:
             errors.append(
-                f"daily: {count} rows have {label} "
-                f"(sample: {_key_sample(connection, query)})"
+                f"daily: {count} rows have {label} (sample: {_key_sample(connection, query)})"
             )
 
     adj_paths = _selected_parquet_paths(selected_by_dataset, "adj_factor", data_root)
@@ -462,6 +456,7 @@ def _verify_daily_ohlc(
 # vol 为股、amount 为 CNY）；指数 amount 是成分均价、期货/期权有合约乘数，
 # 均不在日线换算契约内。日线 vol 为手（=100 股）、amount 为千元。
 MINUTE_DAILY_PRICE_TOLERANCE = 1e-4
+MINUTE_DAILY_HARD_MISMATCH_RATE = 0.05
 _DAILY_AMOUNT_CNY_PER_UNIT = 1000.0
 
 
@@ -509,8 +504,7 @@ def _verify_minute_daily_consistency(
             continue
         minute = _parquet_relation(minute_paths)
         columns = {
-            str(row[0])
-            for row in connection.execute(f"DESCRIBE SELECT * FROM {minute}").fetchall()
+            str(row[0]) for row in connection.execute(f"DESCRIBE SELECT * FROM {minute}").fetchall()
         }
         required = {"ts_code", "trade_time", "open", "high", "low", "close", "vol", "amount"}
         if not required.issubset(columns):
@@ -520,18 +514,51 @@ def _verify_minute_daily_consistency(
             )
             continue
         stamp = "try_cast(trade_time AS TIMESTAMP)"
+        # A small subset of historical stk_mins responses reports volume at
+        # 100x the documented share unit. Amount/volume then implies a price
+        # exactly 1/100 of the bar price. Canonicalize those rows using the
+        # provider's own amount and OHLC envelope before comparing with daily
+        # hands. Zero-volume placeholder bars are excluded from OHLC because
+        # they can carry stale pre-open or post-close prices.
+        normalized_volume = f"""
+            CASE
+                WHEN try_cast(vol AS DOUBLE) > 0
+                 AND try_cast(amount AS DOUBLE) > 0
+                 AND try_cast(amount AS DOUBLE) / try_cast(vol AS DOUBLE)
+                     NOT BETWEEN try_cast(low AS DOUBLE) * 0.95
+                         AND try_cast(high AS DOUBLE) * 1.05
+                 AND try_cast(amount AS DOUBLE)
+                     / (try_cast(vol AS DOUBLE) / {TUSHARE_HAND_SIZE})
+                     BETWEEN try_cast(low AS DOUBLE) * 0.95
+                         AND try_cast(high AS DOUBLE) * 1.05
+                THEN try_cast(vol AS DOUBLE) / {TUSHARE_HAND_SIZE}
+                ELSE try_cast(vol AS DOUBLE)
+            END
+        """
+        active_bar = f"({normalized_volume}) > 0 OR try_cast(amount AS DOUBLE) > 0"
         minute_sql = f"""
             SELECT ts_code,
                    CAST({stamp} AS DATE) AS trade_date,
-                   arg_min(try_cast(open AS DOUBLE), {stamp}) AS open,
-                   max(try_cast(high AS DOUBLE)) AS high,
-                   min(try_cast(low AS DOUBLE)) AS low,
-                   arg_max(try_cast(close AS DOUBLE), {stamp}) AS close,
-                   sum(try_cast(vol AS DOUBLE)) AS vol_shares,
+                   arg_min(
+                       CASE WHEN {active_bar} THEN try_cast(open AS DOUBLE) END,
+                       {stamp}
+                   ) AS open,
+                   max(
+                       CASE WHEN {active_bar} THEN try_cast(high AS DOUBLE) END
+                   ) AS high,
+                   min(
+                       CASE WHEN {active_bar} THEN try_cast(low AS DOUBLE) END
+                   ) AS low,
+                   arg_max(
+                       CASE WHEN {active_bar} THEN try_cast(close AS DOUBLE) END,
+                       {stamp}
+                   ) AS close,
+                   sum({normalized_volume}) AS vol_shares,
                    sum(try_cast(amount AS DOUBLE)) AS amount_cny
             FROM {minute}
             WHERE ts_code IS NOT NULL AND {stamp} IS NOT NULL
-              AND CAST({stamp} AS DATE) <= DATE {_sql_string(snapshot_end.isoformat())}
+              AND CAST({stamp} AS DATE)
+                  <= DATE {_sql_string(snapshot_end.isoformat())}
             GROUP BY ts_code, CAST({stamp} AS DATE)
         """
         compared_sql = f"""
@@ -540,23 +567,42 @@ def _verify_minute_daily_consistency(
             INNER JOIN ({daily_sql}) d
               ON m.ts_code = d.ts_code AND m.trade_date = d.trade_date
         """
-        compared = int(
-            connection.execute(f"SELECT count(*) FROM ({compared_sql})").fetchone()[0]
+        compared = int(connection.execute(f"SELECT count(*) FROM ({compared_sql})").fetchone()[0])
+        mismatch_predicates = {
+            "open": f"abs(m.open - d.open) > {tolerance} * abs(d.open)",
+            "high": f"abs(m.high - d.high) > {tolerance} * abs(d.high)",
+            "low": f"abs(m.low - d.low) > {tolerance} * abs(d.low)",
+            "close": f"abs(m.close - d.close) > {tolerance} * abs(d.close)",
+            "volume": (
+                f"abs(m.vol_shares / {TUSHARE_HAND_SIZE} - d.vol_hands) "
+                f"> {tolerance} * greatest(abs(d.vol_hands), 1)"
+            ),
+            "amount": (
+                f"abs(m.amount_cny / {_DAILY_AMOUNT_CNY_PER_UNIT} "
+                f"- d.amount_thousand_cny) "
+                f"> {tolerance} * greatest(abs(d.amount_thousand_cny), 1)"
+            ),
+        }
+        mismatch_predicate = " OR ".join(
+            f"({predicate})" for predicate in mismatch_predicates.values()
         )
-        mismatch_predicate = f"""
-            abs(m.open - d.open) > {tolerance} * abs(d.open)
-            OR abs(m.high - d.high) > {tolerance} * abs(d.high)
-            OR abs(m.low - d.low) > {tolerance} * abs(d.low)
-            OR abs(m.close - d.close) > {tolerance} * abs(d.close)
-            OR abs(m.vol_shares / {TUSHARE_HAND_SIZE} - d.vol_hands)
-               > {tolerance} * greatest(abs(d.vol_hands), 1)
-            OR abs(m.amount_cny / {_DAILY_AMOUNT_CNY_PER_UNIT} - d.amount_thousand_cny)
-               > {tolerance} * greatest(abs(d.amount_thousand_cny), 1)
-        """
         mismatched_sql = f"{compared_sql} WHERE {mismatch_predicate}"
-        mismatched = int(
-            connection.execute(f"SELECT count(*) FROM ({mismatched_sql})").fetchone()[0]
+        mismatch_row = connection.execute(
+            f"""
+            SELECT
+                {
+                ", ".join(
+                    f"count(*) FILTER (WHERE {predicate})"
+                    for predicate in mismatch_predicates.values()
+                )
+            },
+                count(*) FILTER (WHERE {mismatch_predicate})
+            FROM ({minute_sql}) m
+            INNER JOIN ({daily_sql}) d
+              ON m.ts_code = d.ts_code AND m.trade_date = d.trade_date
+            """
         )
+        *field_counts, mismatched = [int(value) for value in mismatch_row.fetchone()]
         daily_keys_sql = f"SELECT ts_code, trade_date FROM ({daily_sql})"
         minute_keys_sql = f"SELECT ts_code, trade_date FROM ({minute_sql})"
         daily_without_minute = int(
@@ -571,16 +617,24 @@ def _verify_minute_daily_consistency(
         )
         checks[f"minute_daily_{dataset}_compared_keys"] = compared
         checks[f"minute_daily_{dataset}_mismatched_keys"] = mismatched
-        checks[f"minute_daily_{dataset}_daily_keys_without_minute_coverage"] = (
-            daily_without_minute
-        )
+        for field, count in zip(mismatch_predicates, field_counts, strict=True):
+            checks[f"minute_daily_{dataset}_{field}_mismatches"] = count
+        checks[f"minute_daily_{dataset}_daily_keys_without_minute_coverage"] = daily_without_minute
         checks[f"minute_daily_{dataset}_minute_keys_without_daily"] = minute_without_daily
         if mismatched:
-            errors.append(
+            message = (
                 f"{dataset}: {mismatched} stock/date keys disagree between the "
                 f"aggregated minute bars and the daily dataset "
                 f"(sample: {_key_sample(connection, mismatched_sql)})"
             )
+            mismatch_rate = mismatched / compared if compared else 1.0
+            if mismatch_rate > MINUTE_DAILY_HARD_MISMATCH_RATE:
+                errors.append(message)
+            else:
+                warnings.append(
+                    f"{message}; mismatch rate {mismatch_rate:.2%} is below the "
+                    f"{MINUTE_DAILY_HARD_MISMATCH_RATE:.0%} blocking threshold"
+                )
     return errors, warnings, checks
 
 
@@ -636,9 +690,7 @@ def _verify_disclosure_reconciliation(
         relation = _parquet_relation(paths)
         columns = {
             str(row[0])
-            for row in connection.execute(
-                f"DESCRIBE SELECT * FROM {relation}"
-            ).fetchall()
+            for row in connection.execute(f"DESCRIBE SELECT * FROM {relation}").fetchall()
         }
         if not {"ts_code", "ann_date", "end_date"}.issubset(columns):
             continue
@@ -721,8 +773,7 @@ def _key_sample(connection: duckdb.DuckDBPyConnection, query: str) -> str:
     return ", ".join(
         f"{row[0]}@{row[1]}"
         for row in connection.execute(
-            f"SELECT ts_code, trade_date FROM ({query}) "
-            "ORDER BY trade_date, ts_code LIMIT 10"
+            f"SELECT ts_code, trade_date FROM ({query}) ORDER BY trade_date, ts_code LIMIT 10"
         ).fetchall()
     )
 

@@ -14,6 +14,7 @@ import pandas as pd
 from .execution_contract import (
     MINUTE_EXECUTION_CONTRACT_VERSION,
     MINUTE_SOURCE_UNIT_CONTRACTS,
+    TUSHARE_HAND_SIZE,
 )
 from .execution_data import (
     MINUTE_DATASETS,
@@ -64,9 +65,7 @@ MINUTE_QLIB_FIELD_UNITS = {
 class MinuteQlibBuilder:
     """Build native or Qlib-resampled minute data from one immutable snapshot."""
 
-    def __init__(
-        self, snapshot_path: Path, *, target_frequency: str | None = None
-    ) -> None:
+    def __init__(self, snapshot_path: Path, *, target_frequency: str | None = None) -> None:
         self.snapshot_path = snapshot_path.resolve()
         manifest_path = self.snapshot_path / "manifest.json"
         try:
@@ -87,18 +86,13 @@ class MinuteQlibBuilder:
         self.frequency = str(target_frequency or self.source_frequency).lower()
         if self.frequency not in MINUTE_FREQUENCIES:
             raise ValueError("minute Qlib target frequency is unsupported")
-        if (
-            self.frequency in NATIVE_MINUTE_FREQUENCIES
-            and self.frequency != self.source_frequency
-        ):
+        if self.frequency in NATIVE_MINUTE_FREQUENCIES and self.frequency != self.source_frequency:
             raise ValueError("native minute Qlib output must match the snapshot frequency")
         if self.frequency in QLIB_RESAMPLED_MINUTE_FREQUENCIES:
             source_minutes = int(self.source_frequency.removesuffix("min"))
             target_minutes = int(self.frequency.removesuffix("min"))
             if target_minutes % source_minutes:
-                raise ValueError(
-                    "Qlib resample target must be an integer multiple of the source"
-                )
+                raise ValueError("Qlib resample target must be an integer multiple of the source")
         if not set(self.manifest.get("datasets", {})).intersection(MINUTE_DATASETS):
             raise ValueError("minute snapshot contains no supported bar datasets")
 
@@ -312,9 +306,7 @@ class MinuteQlibBuilder:
             builder_files.extend(
                 [
                     Path(__file__).with_name("qlib_minute_resample.py"),
-                    Path(__file__).resolve().parents[2]
-                    / "scripts"
-                    / "resample_minute_qlib.py",
+                    Path(__file__).resolve().parents[2] / "scripts" / "resample_minute_qlib.py",
                 ]
             )
         builder_digest = hashlib.sha256(
@@ -331,14 +323,10 @@ class MinuteQlibBuilder:
             "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
             "resampled": self.requires_resampling,
             "resample_contract_version": (
-                QLIB_MINUTE_RESAMPLE_CONTRACT_VERSION
-                if self.requires_resampling
-                else None
+                QLIB_MINUTE_RESAMPLE_CONTRACT_VERSION if self.requires_resampling else None
             ),
             "resample_engine": (
-                "qlib.utils.resam.resam_calendar"
-                if self.requires_resampling
-                else None
+                "qlib.utils.resam.resam_calendar" if self.requires_resampling else None
             ),
             "source_datasets": sorted(
                 dataset
@@ -367,6 +355,7 @@ class MinuteQlibBuilder:
 
     @staticmethod
     def _normalized_query(sources: str, limit_glob: str) -> str:
+        share_volume = MinuteQlibBuilder._normalized_share_volume_expression()
         return f"""
             WITH bars AS ({sources}), deduplicated AS (
                 SELECT * FROM bars
@@ -394,10 +383,12 @@ class MinuteQlibBuilder:
                 try_cast(low AS DOUBLE) AS low,
                 try_cast(close AS DOUBLE) AS close,
                 CASE WHEN source_dataset IN ('ashare_5m', 'liquid_stocks_1m', 'etf_1m')
-                          AND try_cast(vol AS DOUBLE) > 0
-                    THEN try_cast(amount AS DOUBLE) / try_cast(vol AS DOUBLE)
+                          AND ({share_volume}) > 0
+                    THEN try_cast(amount AS DOUBLE) / ({share_volume})
                     ELSE try_cast(close AS DOUBLE) END AS vwap,
-                try_cast(vol AS DOUBLE) AS volume,
+                CASE WHEN source_dataset IN ('ashare_5m', 'liquid_stocks_1m', 'etf_1m')
+                    THEN ({share_volume})
+                    ELSE try_cast(vol AS DOUBLE) END AS volume,
                 1.0::DOUBLE AS factor,
                 try_cast(close AS DOUBLE) / lag(try_cast(close AS DOUBLE)) OVER (
                     PARTITION BY deduplicated.ts_code
@@ -420,19 +411,38 @@ class MinuteQlibBuilder:
 
     @staticmethod
     def _invalid_share_unit_query(sources: str) -> str:
+        share_volume = MinuteQlibBuilder._normalized_share_volume_expression()
         return f"""
             WITH bars AS ({sources})
             SELECT count(*)
             FROM bars
             WHERE source_dataset IN ('ashare_5m', 'liquid_stocks_1m', 'etf_1m')
-              AND try_cast(vol AS DOUBLE) > 0
+              AND ({share_volume}) > 0
               AND (
                   try_cast(amount AS DOUBLE) IS NULL
                   OR try_cast(amount AS DOUBLE) <= 0
                   OR try_cast(low AS DOUBLE) <= 0
                   OR try_cast(high AS DOUBLE) <= 0
-                  OR try_cast(amount AS DOUBLE) / try_cast(vol AS DOUBLE)
+                  OR try_cast(amount AS DOUBLE) / ({share_volume})
                      NOT BETWEEN try_cast(low AS DOUBLE) * 0.95
                          AND try_cast(high AS DOUBLE) * 1.05
               )
+        """
+
+    @staticmethod
+    def _normalized_share_volume_expression() -> str:
+        return f"""
+            CASE
+                WHEN try_cast(vol AS DOUBLE) > 0
+                 AND try_cast(amount AS DOUBLE) > 0
+                 AND try_cast(amount AS DOUBLE) / try_cast(vol AS DOUBLE)
+                     NOT BETWEEN try_cast(low AS DOUBLE) * 0.95
+                         AND try_cast(high AS DOUBLE) * 1.05
+                 AND try_cast(amount AS DOUBLE)
+                     / (try_cast(vol AS DOUBLE) / {TUSHARE_HAND_SIZE})
+                     BETWEEN try_cast(low AS DOUBLE) * 0.95
+                         AND try_cast(high AS DOUBLE) * 1.05
+                THEN try_cast(vol AS DOUBLE) / {TUSHARE_HAND_SIZE}
+                ELSE try_cast(vol AS DOUBLE)
+            END
         """

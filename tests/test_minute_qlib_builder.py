@@ -91,6 +91,20 @@ def test_builds_minute_qlib_staging_from_execution_snapshot(tmp_path: Path) -> N
     assert set(MINUTE_QLIB_FIELDS).issubset(frame.columns)
 
 
+def test_build_normalizes_hundredfold_provider_volume(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path)
+    source = next((snapshot / "parquet" / "etf_1m").rglob("*.parquet"))
+    frame = pd.read_parquet(source)
+    frame.loc[0, "vol"] = float(frame.loc[0, "vol"]) * 100.0
+    frame.to_parquet(source, index=False)
+
+    by_symbol = MinuteQlibBuilder(snapshot).build_staging(tmp_path / "normalized-volume-staging")
+    result = pd.read_parquet(by_symbol / "SH510300.parquet")
+
+    assert result["volume"].iloc[0] == 1000.0
+    assert result["vwap"].iloc[0] == pytest.approx(3.51)
+
+
 def test_builds_staging_from_minute_datasets_with_different_source_columns(
     tmp_path: Path,
 ) -> None:
@@ -191,9 +205,7 @@ def test_qllib_resamples_native_bars_with_ohlcv_semantics() -> None:
         ]
     )
 
-    def qlib_calendar(
-        _index: pd.DatetimeIndex, _source: str, _target: str
-    ) -> pd.DatetimeIndex:
+    def qlib_calendar(_index: pd.DatetimeIndex, _source: str, _target: str) -> pd.DatetimeIndex:
         return pd.DatetimeIndex(
             ["2024-01-02 09:30:00", "2024-01-02 09:45:00", "2024-01-02 10:00:00"]
         )
@@ -221,9 +233,7 @@ def test_qllib_resamples_native_bars_with_ohlcv_semantics() -> None:
 def test_resample_drops_windows_without_full_source_coverage() -> None:
     frame = pd.DataFrame(_minute_bars("09:30", 14, base=3.50, volume=1000))
 
-    def qlib_calendar(
-        _index: pd.DatetimeIndex, _source: str, _target: str
-    ) -> pd.DatetimeIndex:
+    def qlib_calendar(_index: pd.DatetimeIndex, _source: str, _target: str) -> pd.DatetimeIndex:
         return pd.DatetimeIndex(["2024-01-02 09:30:00"])
 
     with pytest.raises(ValueError, match="no complete bars"):
@@ -275,16 +285,11 @@ def test_resampled_builder_uses_pinned_qlib_runtime_and_records_provenance(
         lambda _self: "c" * 64,
     )
     builder._write_provenance(qlib_dir)
-    provenance = json.loads(
-        (qlib_dir / "metadata" / "provenance.json").read_text(encoding="utf-8")
-    )
+    provenance = json.loads((qlib_dir / "metadata" / "provenance.json").read_text(encoding="utf-8"))
     assert provenance["frequency"] == "30min"
     assert provenance["source_frequency"] == "1min"
     assert provenance["resampled"] is True
-    assert (
-        provenance["resample_contract_version"]
-        == QLIB_MINUTE_RESAMPLE_CONTRACT_VERSION
-    )
+    assert provenance["resample_contract_version"] == QLIB_MINUTE_RESAMPLE_CONTRACT_VERSION
     assert provenance["resample_engine"] == "qlib.utils.resam.resam_calendar"
 
 
@@ -320,24 +325,20 @@ def test_five_minute_snapshot_uses_native_qlib_frequency(
     )
 
     assert captured[captured.index("--freq") + 1] == "5min"
-    provenance = json.loads(
-        (qlib_dir / "metadata" / "provenance.json").read_text(encoding="utf-8")
-    )
+    provenance = json.loads((qlib_dir / "metadata" / "provenance.json").read_text(encoding="utf-8"))
     assert provenance["frequency"] == "5min"
     assert provenance["execution_contract_version"] == MINUTE_EXECUTION_CONTRACT_VERSION
     assert provenance["field_units"]["amount"] == "cny_yuan"
     assert provenance["field_units"]["vwap"] == "source_price_cny_amount_div_volume"
     assert provenance["source_datasets"] == ["etf_1m"]
-    assert provenance["source_unit_contracts"] == {
-        "etf_1m": MINUTE_SOURCE_UNIT_CONTRACTS["etf_1m"]
-    }
+    assert provenance["source_unit_contracts"] == {"etf_1m": MINUTE_SOURCE_UNIT_CONTRACTS["etf_1m"]}
 
 
 def test_rejects_stock_or_etf_amount_volume_unit_mismatch(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path)
     source = next((snapshot / "parquet" / "etf_1m").rglob("*.parquet"))
     frame = pd.read_parquet(source)
-    frame["vol"] *= 100
+    frame["vol"] *= 10
     frame.to_parquet(source, index=False)
 
     with pytest.raises(RuntimeError, match="share-volume/CNY-amount"):

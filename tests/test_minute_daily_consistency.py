@@ -98,6 +98,39 @@ def test_consistent_minute_aggregation_passes(tmp_path: Path) -> None:
     assert checks["minute_daily_ashare_5m_minute_keys_without_daily"] == 0
 
 
+def test_zero_volume_placeholder_does_not_override_traded_open(tmp_path: Path) -> None:
+    minute = [
+        {
+            **_minute_rows()[0],
+            "trade_time": "2024-01-02 09:30:00",
+            "open": 9.5,
+            "high": 9.5,
+            "low": 9.5,
+            "close": 9.5,
+            "vol": 0,
+            "amount": 0,
+        },
+        *_minute_rows(),
+    ]
+    errors, _, checks = _run(tmp_path, [_daily_row()], minute)
+
+    assert errors == []
+    assert checks["minute_daily_ashare_5m_mismatched_keys"] == 0
+
+
+def test_hundredfold_provider_volume_is_normalized_from_amount(
+    tmp_path: Path,
+) -> None:
+    minute = _minute_rows()
+    minute[1]["amount"] = 32_000.0
+    minute[2]["amount"] = 33_000.0
+    minute = [{**row, "vol": float(row["vol"]) * 100.0} for row in minute]
+    errors, _, checks = _run(tmp_path, [_daily_row()], minute)
+
+    assert errors == []
+    assert checks["minute_daily_ashare_5m_mismatched_keys"] == 0
+
+
 @pytest.mark.parametrize("dataset", sorted(SIMULATION_MINUTE_SOURCE_DATASETS))
 def test_all_share_volume_minute_datasets_are_checked(tmp_path: Path, dataset: str) -> None:
     errors, _, checks = _run(tmp_path, [_daily_row()], _minute_rows(), dataset=dataset)
@@ -109,6 +142,24 @@ def test_price_mismatch_is_an_error(tmp_path: Path) -> None:
     errors, _, checks = _run(tmp_path, [_daily_row()], _minute_rows(close=11.0))
     assert checks["minute_daily_ashare_5m_mismatched_keys"] == 1
     assert any("disagree" in error for error in errors)
+
+
+def test_isolated_cross_source_mismatch_is_an_audited_warning(
+    tmp_path: Path,
+) -> None:
+    daily = []
+    minute = []
+    for index in range(21):
+        symbol = f"{index:06d}.SZ"
+        daily.append(_daily_row(ts_code=symbol))
+        rows = _minute_rows(close=11.0 if index == 0 else 10.5)
+        minute.extend({**row, "ts_code": symbol} for row in rows)
+
+    errors, warnings, checks = _run(tmp_path, daily, minute)
+
+    assert errors == []
+    assert checks["minute_daily_ashare_5m_mismatched_keys"] == 1
+    assert any("below the 5% blocking threshold" in warning for warning in warnings)
 
 
 def test_price_tolerance_boundary(tmp_path: Path) -> None:
@@ -125,9 +176,7 @@ def test_price_tolerance_boundary(tmp_path: Path) -> None:
 def test_volume_amount_unit_conversion_and_mismatch(tmp_path: Path) -> None:
     # 量额按换算契约折算：分钟 10000 股=100 手、105000 CNY=105 千元（见一致案例）。
     # 量放大到 14000 股=140 手，相对偏差 40% 超容差。
-    errors, _, checks = _run(
-        tmp_path, [_daily_row()], _minute_rows(vols=(8000, 3000, 3000))
-    )
+    errors, _, checks = _run(tmp_path, [_daily_row()], _minute_rows(vols=(8000, 3000, 3000)))
     assert checks["minute_daily_ashare_5m_mismatched_keys"] == 1
     assert errors
 

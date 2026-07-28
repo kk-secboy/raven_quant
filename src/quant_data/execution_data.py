@@ -5,6 +5,10 @@ from collections.abc import Iterable, Mapping
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
+from .execution_contract import (
+    SIMULATION_MINUTE_SOURCE_DATASETS,
+    TUSHARE_HAND_SIZE,
+)
 from .models import FetchSpec, ProviderResult
 from .partitioning import partition_metadata
 from .provider import ProviderError
@@ -34,9 +38,7 @@ MINUTE_DATASETS: dict[str, str] = {
 }
 NATIVE_MINUTE_FREQUENCIES = frozenset({"1min", "5min"})
 QLIB_RESAMPLED_MINUTE_FREQUENCIES = frozenset({"15min", "30min", "60min"})
-MINUTE_FREQUENCIES = frozenset(
-    {*NATIVE_MINUTE_FREQUENCIES, *QLIB_RESAMPLED_MINUTE_FREQUENCIES}
-)
+MINUTE_FREQUENCIES = frozenset({*NATIVE_MINUTE_FREQUENCIES, *QLIB_RESAMPLED_MINUTE_FREQUENCIES})
 
 MARGIN_FIELDS = ("trade_date", "ts_code", "name", "exchange")
 MINUTE_FIELDS = ("ts_code", "trade_time", "open", "close", "high", "low", "vol", "amount")
@@ -153,13 +155,9 @@ def minute_specs(
     end: date,
     max_attempts: int,
     freq: str = "1min",
-    active_ranges_by_dataset: Mapping[
-        str, Mapping[str, tuple[date, date]]
-    ] | None = None,
+    active_ranges_by_dataset: Mapping[str, Mapping[str, tuple[date, date]]] | None = None,
     trading_dates: Iterable[str] | None = None,
-    windows_by_dataset: Mapping[
-        str, Mapping[str, Iterable[tuple[date, date]]]
-    ] | None = None,
+    windows_by_dataset: Mapping[str, Mapping[str, Iterable[tuple[date, date]]]] | None = None,
 ) -> list[FetchSpec]:
     if end < start:
         raise ValueError("end must not be before start")
@@ -173,9 +171,7 @@ def minute_specs(
     if unknown:
         raise ValueError(f"unsupported minute datasets: {', '.join(sorted(unknown))}")
 
-    session_dates = (
-        _normalize_trading_dates(trading_dates) if trading_dates is not None else None
-    )
+    session_dates = _normalize_trading_dates(trading_dates) if trading_dates is not None else None
     specs: list[FetchSpec] = []
     for dataset, raw_symbols in sorted(symbols_by_dataset.items()):
         symbols = sorted({_normalize_symbol(value) for value in raw_symbols if str(value).strip()})
@@ -346,6 +342,7 @@ def _validate_minute(spec: FetchSpec, result: ProviderResult) -> ProviderResult:
     expected_symbol = str(spec.params["ts_code"])
     seen: set[tuple[str, datetime]] = set()
     rows: list[dict[str, Any]] = []
+    normalized_volume_rows = 0
     for raw in result.rows:
         row = dict(raw)
         symbol = str(row.get("ts_code") or "").strip()
@@ -365,15 +362,39 @@ def _validate_minute(spec: FetchSpec, result: ProviderResult) -> ProviderResult:
             raise ProviderError(f"{spec.dataset} returned duplicate key {key}", retryable=False)
         seen.add(key)
         _validate_bar(spec.dataset, row)
+        if _normalize_share_volume(spec.dataset, row):
+            normalized_volume_rows += 1
         row["trade_time"] = stamp.isoformat(sep=" ")
         rows.append(row)
+    metadata = dict(result.metadata)
+    if normalized_volume_rows:
+        metadata["normalized_volume_rows"] = normalized_volume_rows
     return ProviderResult(
         result.api_name,
         list(result.columns),
         rows,
         result.raw_body,
-        dict(result.metadata),
+        metadata,
     )
+
+
+def _normalize_share_volume(dataset: str, row: dict[str, Any]) -> bool:
+    if dataset not in SIMULATION_MINUTE_SOURCE_DATASETS:
+        return False
+    volume = float(row["vol"])
+    amount = float(row["amount"])
+    low = float(row["low"])
+    high = float(row["high"])
+    if volume <= 0 or amount <= 0:
+        return False
+    direct_price = amount / volume
+    normalized_price = amount / (volume / TUSHARE_HAND_SIZE)
+    direct_valid = low * 0.95 <= direct_price <= high * 1.05
+    normalized_valid = low * 0.95 <= normalized_price <= high * 1.05
+    if direct_valid or not normalized_valid:
+        return False
+    row["vol"] = volume / TUSHARE_HAND_SIZE
+    return True
 
 
 def _validate_bar(dataset: str, row: Mapping[str, Any]) -> None:
@@ -467,8 +488,5 @@ def _trading_session_ranges(
 
 def _normalize_trading_dates(values: Iterable[str]) -> list[date]:
     return sorted(
-        {
-            datetime.strptime(str(value).replace("-", "")[:8], "%Y%m%d").date()
-            for value in values
-        }
+        {datetime.strptime(str(value).replace("-", "")[:8], "%Y%m%d").date() for value in values}
     )

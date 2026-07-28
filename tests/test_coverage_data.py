@@ -32,6 +32,24 @@ def test_coverage_inventory_matches_audited_default_and_optional_counts() -> Non
     assert all(coverage_primary_key_candidates(dataset) for dataset in default | optional)
 
 
+@pytest.mark.parametrize(
+    ("dataset", "expected"),
+    (
+        ("broker_recommend", ("month", "broker", "ts_code")),
+        ("ccass_hold_detail", ("ts_code", "trade_date", "col_participant_id")),
+        ("daily_info", ("trade_date", "ts_code")),
+        ("hm_detail", ("trade_date", "ts_code", "hm_name", "hm_orgs")),
+        ("idx_anns", ("url",)),
+        ("slb_len", ("trade_date",)),
+        ("us_adjfactor", ("trade_date", "exchange", "ts_code")),
+    ),
+)
+def test_coverage_primary_keys_match_provider_row_identity(
+    dataset: str, expected: tuple[str, ...]
+) -> None:
+    assert coverage_primary_key_candidates(dataset)[0] == expected
+
+
 @pytest.mark.parametrize("bundle", sorted(COVERAGE_BUNDLES))
 def test_every_coverage_bundle_has_a_stable_task_inventory(bundle: str) -> None:
     assert bundle_datasets(bundle) == coverage_bundle_datasets(bundle)
@@ -76,9 +94,7 @@ def test_default_rules_plan_full_market_cross_sections_without_stock_loops() -> 
             expected = expected - {"stk_rewards"}
         assert datasets == expected
         assert all(
-            "ts_code" not in spec.params
-            for spec in specs
-            if spec.dataset != "stock_company"
+            "ts_code" not in spec.params for spec in specs if spec.dataset != "stock_company"
         )
 
 

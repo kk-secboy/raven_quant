@@ -207,9 +207,10 @@ def test_market_calendar_helper_keeps_only_open_sessions() -> None:
         ]
     )
 
-    assert _open_market_dates(
-        calendar, start=date(2024, 1, 1), end=date(2024, 1, 4)
-    ) == ["20240102", "20240103"]
+    assert _open_market_dates(calendar, start=date(2024, 1, 1), end=date(2024, 1, 4)) == [
+        "20240102",
+        "20240103",
+    ]
 
 
 def test_runner_normalizes_shortability_and_minute_timestamp(
@@ -311,18 +312,16 @@ def test_execution_data_api_and_worker_commands(
     )
     (minute_dataset / "metadata" / "provenance.json").write_text(
         json.dumps(
-                {
-                    "frequency": "1min",
-                    "dataset_identity_sha256": "a" * 64,
-                    "snapshot_manifest_sha256": "b" * 64,
-                    "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
-                    "fields": ["vwap", "volume", "paused", "up_limit", "down_limit"],
-                    "lineage_verified": True,
-                    "source_datasets": ["etf_1m"],
-                    "source_unit_contracts": {
-                        "etf_1m": MINUTE_SOURCE_UNIT_CONTRACTS["etf_1m"]
-                    },
-                }
+            {
+                "frequency": "1min",
+                "dataset_identity_sha256": "a" * 64,
+                "snapshot_manifest_sha256": "b" * 64,
+                "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
+                "fields": ["vwap", "volume", "paused", "up_limit", "down_limit"],
+                "lineage_verified": True,
+                "source_datasets": ["etf_1m"],
+                "source_unit_contracts": {"etf_1m": MINUTE_SOURCE_UNIT_CONTRACTS["etf_1m"]},
+            }
         ),
         encoding="utf-8",
     )
@@ -431,13 +430,9 @@ def test_execution_data_api_and_worker_commands(
     )
     capital_flow_command, _, _ = worker._command(capital_flow.json())
     specialty_minutes_command, _, _ = worker._command(specialty_minutes.json())
-    ashare_5m_command, ashare_5m_result, ashare_5m_env = worker._command(
-        ashare_5m.json()
-    )
+    ashare_5m_command, ashare_5m_result, ashare_5m_env = worker._command(ashare_5m.json())
     market_command, market_result, market_env = worker._command(market.json())
-    minute_qlib_command, minute_qlib_result, minute_qlib_env = worker._command(
-        minute_qlib.json()
-    )
+    minute_qlib_command, minute_qlib_result, minute_qlib_env = worker._command(minute_qlib.json())
     minute_research_command, minute_research_result, minute_research_env = worker._command(
         minute_research.json()
     )
@@ -611,3 +606,29 @@ def test_invalid_ohlc_is_terminal() -> None:
 
     with pytest.raises(ProviderError, match="OHLC"):
         validate_and_normalize(spec, ProviderResult("etf_mins", list(row), [row], b"{}"))
+
+
+def test_hundredfold_minute_volume_is_normalized_before_storage() -> None:
+    spec = minute_specs(
+        {"ashare_5m": ["600827.SH"]},
+        start=date(2024, 5, 31),
+        end=date(2024, 5, 31),
+        max_attempts=2,
+        freq="5min",
+    )[0]
+    row = {
+        "ts_code": "600827.SH",
+        "trade_time": "2024-05-31 09:35:00",
+        "open": 8.44,
+        "close": 8.45,
+        "high": 8.5,
+        "low": 8.43,
+        "vol": 25_880_000.0,
+        "amount": 2_193_095.0,
+    }
+    from quant_data.execution_data import validate_and_normalize
+
+    result = validate_and_normalize(spec, ProviderResult("stk_mins", list(row), [row], b"{}"))
+
+    assert result.rows[0]["vol"] == 258_800.0
+    assert result.metadata["normalized_volume_rows"] == 1

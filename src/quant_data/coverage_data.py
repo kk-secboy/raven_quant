@@ -133,9 +133,7 @@ _RULES: dict[str, tuple[CoverageRule, ...]] = {
         CoverageRule("wc_cnt", "month_range", 3_000, 16, date_field="publish_time"),
     ),
     "strategy_specialty": (
-        CoverageRule(
-            "stk_nineturn", "daily", 10_000, 4, variants=_variants(freq=("D",))
-        ),
+        CoverageRule("stk_nineturn", "daily", 10_000, 4, variants=_variants(freq=("D",))),
         CoverageRule("stk_ah_comparison", "daily", 1_000, 4),
         CoverageRule("limit_list_ths", "daily", 4_000, 4),
         CoverageRule("limit_step", "daily", 2_000, 8),
@@ -172,8 +170,7 @@ COVERAGE_DATASETS = frozenset(
     dataset
     for bundle in COVERAGE_BUNDLES
     for dataset in (
-        {rule.dataset for rule in _RULES[bundle]}
-        | SECONDARY_DATASETS.get(bundle, set())
+        {rule.dataset for rule in _RULES[bundle]} | SECONDARY_DATASETS.get(bundle, set())
     )
 )
 
@@ -188,16 +185,21 @@ _PRIMARY_KEY_OVERRIDES: dict[str, tuple[tuple[str, ...], ...]] = {
     "ggt_daily": (("trade_date",),),
     "cyq_chips": (("ts_code", "trade_date", "price"),),
     "ccass_hold_detail": (
+        ("ts_code", "trade_date", "col_participant_id"),
         ("ts_code", "trade_date", "broker_id"),
         ("hk_code", "trade_date", "broker_id"),
     ),
-    "broker_recommend": (("month", "ts_code"), ("ann_date", "ts_code")),
+    "broker_recommend": (
+        ("month", "broker", "ts_code"),
+        ("month", "ts_code"),
+        ("ann_date", "ts_code"),
+    ),
     "margin": (("trade_date", "exchange_id"),),
     "moneyflow_hsgt": (("trade_date",),),
     "moneyflow_mkt_dc": (("trade_date",),),
-    "idx_anns": (("ann_date", "ts_code", "title"), ("ann_date", "title")),
+    "idx_anns": (("url",), ("ann_date", "ts_code", "title"), ("ann_date", "title")),
     "ci_index_member": (("l3_code", "ts_code", "in_date"), ("l3_code", "ts_code")),
-    "daily_info": (("trade_date", "exchange"),),
+    "daily_info": (("trade_date", "ts_code"), ("trade_date", "exchange")),
     "sz_daily_info": (("trade_date", "ts_code"), ("trade_date", "name")),
     "mkt_idx_bmk": (("ts_code", "bmk_type", "bmk_level"),),
     "fut_weekly_detail": (("week", "exchange", "prd"),),
@@ -210,7 +212,20 @@ _PRIMARY_KEY_OVERRIDES: dict[str, tuple[tuple[str, ...], ...]] = {
     "us_tltr": (("date",),),
     "us_trltr": (("date",),),
     "npr": (("pub_time", "title"), ("datetime", "title")),
-    "research_report": (("trade_date", "ts_code", "title"),),
+    "research_report": (
+        (
+            "url",
+            "trade_date",
+            "title",
+            "report_type",
+            "author",
+            "name",
+            "ts_code",
+            "inst_csname",
+            "ind_name",
+        ),
+        ("trade_date", "ts_code", "title"),
+    ),
     "monetary_policy": (("pub_date", "title"),),
     "cctv_news": (("date", "title"),),
     "irm_qa_sh": (("trade_date", "ts_code", "q"), ("trade_date", "ts_code", "question")),
@@ -222,9 +237,18 @@ _PRIMARY_KEY_OVERRIDES: dict[str, tuple[tuple[str, ...], ...]] = {
     "dc_index": (("ts_code", "trade_date"), ("ts_code",)),
     "dc_member": (("ts_code", "con_code", "trade_date"),),
     "hm_list": (("name",),),
-    "hm_detail": (("trade_date", "ts_code", "hm_name"),),
-    "ths_hot": (("trade_date", "ts_code", "market"),),
-    "dc_hot": (("trade_date", "ts_code", "market", "hot_type"),),
+    "hm_detail": (("trade_date", "ts_code", "hm_name", "hm_orgs"),),
+    "ths_hot": (
+        ("trade_date", "data_type", "rank_time", "rank", "ts_code"),
+        ("trade_date", "ts_code", "market"),
+    ),
+    "dc_hot": (
+        ("trade_date", "data_type", "rank_time", "rank", "ts_code"),
+        ("trade_date", "ts_code", "market", "hot_type"),
+    ),
+    "slb_len": (("trade_date",),),
+    "bond_blk_detail": (("trade_date", "ts_code", "price", "vol", "amount", "buy_dp", "sell_dp"),),
+    "us_adjfactor": (("trade_date", "exchange", "ts_code"),),
     "tdx_index": (("ts_code", "trade_date", "idx_type"),),
     "tdx_member": (("ts_code", "con_code", "trade_date"),),
     "kpl_list": (("trade_date", "ts_code", "tag"),),
@@ -461,10 +485,8 @@ def _paged(
         scope.update(
             {
                 "expected_date_field": rule.date_field,
-                "expected_date_start": str(partition["partition_start"])
-                .replace("-", "")[:8],
-                "expected_date_end": str(partition["partition_end"])
-                .replace("-", "")[:8],
+                "expected_date_start": str(partition["partition_start"]).replace("-", "")[:8],
+                "expected_date_end": str(partition["partition_end"]).replace("-", "")[:8],
             }
         )
     return [
