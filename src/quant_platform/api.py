@@ -3454,15 +3454,14 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.post("/api/jobs/finalize-data", status_code=202)
     def finalize_data_pipeline(payload: DataFinalizeRequest) -> dict:
-        counts = checkpoint.counts()
-        if not counts:
+        datasets = set(checkpoint.datasets())
+        if not datasets:
             raise HTTPException(409, "no downloaded work units are available to finalize")
+        progress = checkpoint.progress_summary(datasets)
         incomplete = {
-            str(row["status"]): sum(
-                int(item["units"]) for item in counts if str(item["status"]) == str(row["status"])
-            )
-            for row in counts
-            if str(row["status"]) != "succeeded"
+            key: int(progress[key])
+            for key in ("pending", "running", "retry_waiting")
+            if int(progress[key]) > 0
         }
         if incomplete:
             detail = ", ".join(f"{key}={value}" for key, value in sorted(incomplete.items()))

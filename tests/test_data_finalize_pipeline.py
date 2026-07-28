@@ -56,6 +56,23 @@ def test_finalize_api_requires_completed_downloads_and_queues_verify(
         pending.unit_key,
         UnitResult(output_path="units/daily/fixture.parquet", row_count=1, sha256="a" * 64),
     )
+    terminal = FetchSpec(
+        dataset="daily_basic",
+        api_name="daily_basic",
+        scope={"trade_date": "20240102"},
+        params={"trade_date": "20240102"},
+        fields=("ts_code", "trade_date", "close"),
+    )
+    superseded = FetchSpec(
+        dataset="adj_factor",
+        api_name="adj_factor",
+        scope={"trade_date": "20240102"},
+        params={"trade_date": "20240102"},
+        fields=("ts_code", "trade_date", "adj_factor"),
+    )
+    checkpoint.add([terminal, superseded])
+    checkpoint.fail(terminal.unit_key, "provider has no published row", terminal=True)
+    checkpoint.supersede_units([superseded.unit_key], "outside frozen snapshot")
     with TestClient(app) as client:
         queued = client.post(
             "/api/jobs/finalize-data",
