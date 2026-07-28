@@ -8,10 +8,12 @@ from typing import Any
 COST_SCHEDULE_VERSION = "cn-effective-cost-v1"
 
 # Effective-dated schedule versions recorded from the named announcements.
-COST_SCHEDULE_VERSION_2005 = "cn-effective-cost-2005-01-24"
-COST_SCHEDULE_VERSION_2007 = "cn-effective-cost-2007-05-30"
-COST_SCHEDULE_VERSION_2008_04 = "cn-effective-cost-2008-04-24"
-COST_SCHEDULE_VERSION_2008_09 = "cn-effective-cost-2008-09-19"
+#
+# The governed schedule intentionally starts on 2015-08-01.  Before that date
+# Shanghai charged transfer fees on face value while Shenzhen charged on
+# traded value, and the exact rules changed again in 2012.  This model does not
+# receive par value, so pretending one flat traded-value rate is exact would
+# corrupt per-fill cash and NAV.  Pre-2015 runs therefore fail closed.
 COST_SCHEDULE_VERSION_2015 = "cn-effective-cost-2015-08-01"
 COST_SCHEDULE_VERSION_2022 = "cn-effective-cost-2022-04-29"
 COST_SCHEDULE_VERSION_2023 = "cn-effective-cost-2023-08-28"
@@ -19,10 +21,6 @@ COST_SCHEDULE_VERSION_2023 = "cn-effective-cost-2023-08-28"
 KNOWN_COST_SCHEDULE_VERSIONS = frozenset(
     {
         COST_SCHEDULE_VERSION,
-        COST_SCHEDULE_VERSION_2005,
-        COST_SCHEDULE_VERSION_2007,
-        COST_SCHEDULE_VERSION_2008_04,
-        COST_SCHEDULE_VERSION_2008_09,
         COST_SCHEDULE_VERSION_2015,
         COST_SCHEDULE_VERSION_2022,
         COST_SCHEDULE_VERSION_2023,
@@ -291,59 +289,6 @@ _BROKER_ASSUMPTIONS: dict[str, Any] = {
 
 CN_COST_SCHEDULE_VERSIONS: tuple[CostModelConfig, ...] = (
     CostModelConfig(
-        version=COST_SCHEDULE_VERSION_2005,
-        effective_from="2005-01-24",
-        effective_to="2007-05-29",
-        stock_sell_stamp_duty_rate=0.002,
-        transfer_fee_rate=0.00002,
-        source=(
-            "财政部 2005-01：2005-01-24 起证券交易印花税税率由 2‰ 下调为 1‰，"
-            "立据双方分别缴纳；双边各 1‰ 按卖出侧合并等效为 0.002（回合成本等价）。"
-            "过户费实为沪市按成交面值 0.3‰、深市按成交金额 0.0255‰ 双边收取，"
-            "此处按成交金额 0.00002 双边近似"
-        ),
-        **_BROKER_ASSUMPTIONS,
-    ),
-    CostModelConfig(
-        version=COST_SCHEDULE_VERSION_2007,
-        effective_from="2007-05-30",
-        effective_to="2008-04-23",
-        stock_sell_stamp_duty_rate=0.006,
-        transfer_fee_rate=0.00002,
-        source=(
-            "财政部 2007-05-29 公告：2007-05-30 起证券交易印花税税率由 1‰ "
-            "调整为 3‰，立据双方分别缴纳；双边各 3‰ 按卖出侧合并等效为 0.006"
-            "（回合成本等价）。过户费同前近似"
-        ),
-        **_BROKER_ASSUMPTIONS,
-    ),
-    CostModelConfig(
-        version=COST_SCHEDULE_VERSION_2008_04,
-        effective_from="2008-04-24",
-        effective_to="2008-09-18",
-        stock_sell_stamp_duty_rate=0.002,
-        transfer_fee_rate=0.00002,
-        source=(
-            "财政部 国家税务总局 2008-04：2008-04-24 起证券交易印花税税率由 3‰ "
-            "调整为 1‰，仍双边征收；双边各 1‰ 按卖出侧合并等效为 0.002。"
-            "过户费同前近似"
-        ),
-        **_BROKER_ASSUMPTIONS,
-    ),
-    CostModelConfig(
-        version=COST_SCHEDULE_VERSION_2008_09,
-        effective_from="2008-09-19",
-        effective_to="2015-07-31",
-        stock_sell_stamp_duty_rate=0.001,
-        transfer_fee_rate=0.00002,
-        source=(
-            "财政部 国家税务总局 2008-09：2008-09-19 起证券交易印花税改由出让方"
-            "单边缴纳，税率 1‰ 不变。过户费实为沪市按成交面值 0.3‰、深市按成交"
-            "金额 0.0255‰ 双边收取，此处按成交金额 0.00002 双边近似"
-        ),
-        **_BROKER_ASSUMPTIONS,
-    ),
-    CostModelConfig(
         version=COST_SCHEDULE_VERSION_2015,
         effective_from="2015-08-01",
         effective_to="2022-04-28",
@@ -419,11 +364,63 @@ class CostScheduleBook:
         if not source:
             return cls(CN_COST_SCHEDULE_VERSIONS)
         raw_versions = source.get("versions")
-        if raw_versions is None:
-            return cls((CostModelConfig.from_mapping(source),))
-        if not isinstance(raw_versions, list) or not raw_versions:
-            raise ValueError("cost schedule versions must be a non-empty list")
-        return cls(tuple(CostModelConfig.from_mapping(item) for item in raw_versions))
+        if raw_versions is not None:
+            if not isinstance(raw_versions, list) or not raw_versions:
+                raise ValueError("cost schedule versions must be a non-empty list")
+            return cls(tuple(CostModelConfig.from_mapping(item) for item in raw_versions))
+
+        requested_version = str(
+            source.get("version")
+            or source.get("cost_schedule_version")
+            or COST_SCHEDULE_VERSION
+        )
+        if requested_version == COST_SCHEDULE_VERSION:
+            recorded = CN_COST_SCHEDULE_VERSIONS
+        else:
+            recorded = tuple(
+                item for item in CN_COST_SCHEDULE_VERSIONS if item.version == requested_version
+            )
+            if not recorded:
+                raise ValueError(f"unknown cost schedule version: {requested_version}")
+
+        # A flat strategy request freezes broker assumptions, not historical
+        # tax law.  Overlay only those assumptions on the authoritative
+        # effective-dated regulatory schedule.  Previously the flat request
+        # became one version effective from 2000, silently applying today's
+        # 0.5‰ sell stamp duty to 2018-2023 backtests.
+        template = CostModelConfig.from_mapping(source)
+        broker_fields = (
+            "buy_commission_rate",
+            "sell_commission_rate",
+            "annual_borrow_rate",
+            "min_commission",
+            "fixed_slippage_rate",
+            "max_volume_participation",
+            "impact_at_max_participation",
+            "lot_size",
+        )
+        regulatory_fields = (
+            "stock_sell_stamp_duty_rate",
+            "etf_sell_stamp_duty_rate",
+            "transfer_fee_rate",
+        )
+        current_defaults = CostModelConfig()
+        explicit_regulatory_overrides = tuple(
+            name
+            for name in regulatory_fields
+            if source.get(name) is not None
+            and float(source[name]) != float(getattr(current_defaults, name))
+        )
+        overlay_fields = (*broker_fields, *explicit_regulatory_overrides)
+        return cls(
+            tuple(
+                replace(
+                    version,
+                    **{name: getattr(template, name) for name in overlay_fields},
+                )
+                for version in recorded
+            )
+        )
 
     def as_of(self, trade_date: date) -> CostModelConfig:
         day = trade_date if isinstance(trade_date, date) else date.fromisoformat(str(trade_date))
@@ -441,6 +438,43 @@ class CostScheduleBook:
         """Per-component stress view applied to every recorded version."""
 
         return CostScheduleBook(tuple(version.scaled(**multipliers) for version in self.versions))
+
+    def factor_screening_rate(
+        self,
+        *,
+        reference_order_value: float,
+        start: date,
+        end: date,
+        participation: float | None = None,
+    ) -> float:
+        """Return the conservative effective round-trip rate for one period.
+
+        Factor screening uses one scalar cost for a diagnostic long/short
+        series.  Resolve every law version intersecting the validation period
+        and use the maximum rather than silently applying today's lower tax to
+        older observations.  Formal backtests still resolve every fill by its
+        own trade date.
+        """
+
+        if end < start:
+            raise ValueError("factor screening cost period is invalid")
+        self.as_of(start)
+        self.as_of(end)
+        candidates = [
+            version.factor_screening_rate(
+                reference_order_value=reference_order_value,
+                participation=participation,
+            )
+            for version in self.versions
+            if date.fromisoformat(version.effective_from) <= end
+            and (
+                version.effective_to is None
+                or date.fromisoformat(version.effective_to) >= start
+            )
+        ]
+        if not candidates:
+            raise ValueError("no effective cost schedule covers the factor screening period")
+        return max(candidates)
 
     def flat_view(self, *, as_of: date) -> dict[str, Any]:
         """Flat Qlib-style cost view resolved at one explicit date."""

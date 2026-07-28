@@ -243,6 +243,9 @@ def optimize_benchmark_relative_weights(
         str(column): abs(float(weights.dot(styles[column])) - float(benchmark_styles[column]))
         for column in styles.columns
     }
+    size_deviation = measured_style_deviations.get("size")
+    if size_deviation is None:
+        size_deviation = measured_style_deviations.get("log_market_cap")
     active = weights - benchmark
     full_active = active_risk_vector(weights.to_numpy(dtype=float))
     tracking_risk = float(np.sqrt(max(0.0, full_active @ annual_covariance @ full_active)))
@@ -260,8 +263,7 @@ def optimize_benchmark_relative_weights(
         active_share=0.5 * (float(active.abs().sum()) + omitted_benchmark_weight),
         expected_turnover=0.5 * (float((weights - previous).abs().sum()) + previous_cash),
         max_industry_deviation=measured_industry_deviation,
-        size_deviation=measured_style_deviations.get("size")
-        or measured_style_deviations.get("log_market_cap"),
+        size_deviation=size_deviation,
         style_deviations=measured_style_deviations,
         iterations=int(result.nit),
     )

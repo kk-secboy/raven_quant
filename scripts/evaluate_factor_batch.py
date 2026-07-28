@@ -14,7 +14,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from quant_platform.cost_model import CostModelConfig
+from quant_platform.cost_model import CostScheduleBook
 from quant_platform.factor_evaluator import evaluate_factor_values
 from quant_platform.factor_recompute import (
     compare_submitted_values,
@@ -118,7 +118,7 @@ def main() -> None:
                 test_start=pd.Timestamp(periods["test_start"]).date(),
                 test_end=pd.Timestamp(periods["test_end"]).date(),
                 comparison_values=comparisons,
-                cost_model=CostModelConfig.from_mapping(manifest.get("cost_model")),
+                cost_schedule=CostScheduleBook.from_mapping(manifest.get("cost_model")),
                 reference_order_value=float(manifest["cost_reference_order_value"]),
                 min_daily_instruments=int(manifest.get("min_daily_instruments", 50)),
                 label_horizon_days=label_horizon_days,

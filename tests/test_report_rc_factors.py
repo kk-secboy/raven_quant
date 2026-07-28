@@ -364,7 +364,9 @@ def _seed_full(data_root: Path) -> None:
     rows = []
     base = date(2024, 1, 2)
     instruments = [f"6000{i:02d}.SH" for i in range(12)]
-    for week in range(14):
+    # Leave enough independent event dates after the governed direction,
+    # final-test and label-horizon purges for the 10-observation HAC floor.
+    for week in range(24):
         report_day = base + timedelta(days=7 * week)
         for index, instrument in enumerate(instruments):
             rating = "买入" if (week + index) % 3 else "增持"
@@ -456,7 +458,7 @@ def test_produced_factor_fits_the_sparse_event_evaluation_shape(tmp_path: Path) 
     factor = factor.set_index(["datetime", "instrument"])[m.RATING_CHANGE_FACTOR_NAME]
 
     instruments = [f"6000{i:02d}.SH" for i in range(12)]
-    days = pd.bdate_range("2024-01-01", periods=100)
+    days = pd.bdate_range("2024-01-01", periods=120)
     rng = np.random.default_rng(7)
     label_rows = []
     for day in days:

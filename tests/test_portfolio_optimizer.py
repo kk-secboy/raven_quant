@@ -118,6 +118,27 @@ def test_benchmark_relative_optimizer_enforces_multiple_style_dimensions() -> No
     assert max(result.style_deviations.values()) <= 0.10 + 1e-6
 
 
+def test_optimizer_preserves_exactly_zero_size_deviation() -> None:
+    instruments = pd.Index([f"stock-{index:02d}" for index in range(10)])
+    result = optimize_benchmark_relative_weights(
+        pd.Series(range(10), index=instruments, dtype=float),
+        pd.Series(0.10, index=instruments),
+        pd.Series(0.10, index=instruments),
+        industries=pd.Series(["all"] * 10, index=instruments),
+        benchmark_industry_weights=pd.Series({"all": 1.0}),
+        style_exposures=pd.Series(0.0, index=instruments, name="size"),
+        benchmark_style_exposure=0.0,
+        return_covariance=_covariance(instruments),
+        max_position_weight=0.15,
+        max_industry_weight=1.0,
+        max_industry_deviation=0.0,
+        max_size_deviation=0.10,
+    )
+
+    assert result.style_deviations["size"] == pytest.approx(0.0)
+    assert result.size_deviation == pytest.approx(0.0)
+
+
 def test_benchmark_relative_optimizer_requires_point_in_time_membership() -> None:
     instruments = pd.Index([f"stock-{index}" for index in range(5)])
     with pytest.raises(ValueError, match="point-in-time"):

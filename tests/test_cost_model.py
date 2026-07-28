@@ -88,12 +88,12 @@ def test_zero_notional_has_zero_transaction_cost() -> None:
     assert result["commission"] == 0.0
 
 
-def test_transfer_fee_history_versions_are_recorded() -> None:
-    baseline = CN_COST_SCHEDULE_BOOK.as_of(date(2010, 1, 4))
-    unified = CN_COST_SCHEDULE_BOOK.as_of(date(2015, 8, 3))
-    assert baseline.transfer_fee_rate == pytest.approx(0.00002)
+def test_supported_transfer_fee_history_versions_are_recorded() -> None:
+    unified = CN_COST_SCHEDULE_BOOK.as_of(date(2018, 1, 2))
+    reduced = CN_COST_SCHEDULE_BOOK.as_of(date(2022, 4, 29))
     assert unified.transfer_fee_rate == pytest.approx(0.00002)
-    assert baseline.version != unified.version
+    assert reduced.transfer_fee_rate == pytest.approx(0.00001)
+    assert unified.version != reduced.version
     assert all(version.source for version in CN_COST_SCHEDULE_VERSIONS)
 
 
@@ -115,10 +115,53 @@ def test_from_mapping_keeps_legacy_aliases() -> None:
     book = CostScheduleBook.from_mapping(
         {"open_cost": 0.0004, "close_cost": 0.0006, "min_cost": 3.0}
     )
-    assert len(book.versions) == 1
+    assert len(book.versions) == len(CN_COST_SCHEDULE_VERSIONS)
+    assert book.as_of(date(2018, 1, 2)).buy_commission_rate == pytest.approx(0.0004)
     assert book.as_of(date(2024, 1, 2)).buy_commission_rate == pytest.approx(0.0004)
     explicit = CostScheduleBook.from_mapping(book.to_dict())
     assert explicit.versions == book.versions
+
+
+def test_flat_strategy_config_keeps_effective_dated_tax_law() -> None:
+    config = CostModelConfig().to_dict()
+    book = CostScheduleBook.from_mapping(config)
+
+    assert len(book.versions) == len(CN_COST_SCHEDULE_VERSIONS)
+    assert book.as_of(date(2018, 1, 2)).stock_sell_stamp_duty_rate == pytest.approx(
+        0.001
+    )
+    assert book.as_of(date(2024, 1, 2)).stock_sell_stamp_duty_rate == pytest.approx(
+        0.0005
+    )
+    assert all(
+        item.buy_commission_rate == pytest.approx(config["buy_commission_rate"])
+        for item in book.versions
+    )
+
+
+def test_explicit_regulatory_override_is_preserved_across_frozen_contract() -> None:
+    config = {
+        **CostModelConfig().to_dict(),
+        "stock_sell_stamp_duty_rate": 0.0,
+        "transfer_fee_rate": 0.0,
+    }
+    book = CostScheduleBook.from_mapping(config)
+
+    assert all(item.stock_sell_stamp_duty_rate == 0.0 for item in book.versions)
+    assert all(item.transfer_fee_rate == 0.0 for item in book.versions)
+
+
+def test_factor_screening_uses_worst_effective_rate_in_validation_period() -> None:
+    historical = CN_COST_SCHEDULE_BOOK.factor_screening_rate(
+        reference_order_value=100_000,
+        start=date(2018, 1, 2),
+        end=date(2024, 1, 2),
+    )
+    current = CN_COST_SCHEDULE_BOOK.as_of(date(2024, 1, 2)).factor_screening_rate(
+        reference_order_value=100_000
+    )
+
+    assert historical > current
 
 
 def test_from_mapping_defaults_to_recorded_schedule() -> None:

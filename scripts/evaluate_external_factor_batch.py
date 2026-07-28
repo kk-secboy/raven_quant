@@ -33,7 +33,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from quant_platform.cost_model import CostModelConfig
+from quant_platform.cost_model import CostScheduleBook
 from quant_platform.external_factor_evaluation import (
     POLICY_BY_SHAPE,
     SHAPE_MARKET_TIMESERIES,
@@ -135,7 +135,7 @@ def main() -> None:
         }
 
     comparisons = [_load_values(path) for path in manifest.get("comparison_values", [])]
-    cost_model = CostModelConfig.from_mapping(manifest.get("cost_model"))
+    cost_schedule = CostScheduleBook.from_mapping(manifest.get("cost_model"))
     reference_order_value = float(manifest.get("cost_reference_order_value", 100_000.0))
     config = ExternalEvaluationConfig()
     period_dates = {key: date.fromisoformat(value) for key, value in periods.items()}
@@ -161,7 +161,7 @@ def main() -> None:
                     valid_end=period_dates["valid_end"],
                     test_start=period_dates["test_start"],
                     test_end=period_dates["test_end"],
-                    cost_model=cost_model,
+                    cost_schedule=cost_schedule,
                     reference_order_value=reference_order_value,
                     label_horizon_days=horizon,
                     config=config,
@@ -175,7 +175,7 @@ def main() -> None:
                     test_start=period_dates["test_start"],
                     test_end=period_dates["test_end"],
                     comparison_values=comparisons,
-                    cost_model=cost_model,
+                    cost_schedule=cost_schedule,
                     reference_order_value=reference_order_value,
                     label_horizon_days=horizon,
                     config=config,

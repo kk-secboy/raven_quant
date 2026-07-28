@@ -266,7 +266,7 @@ def test_sparse_event_evaluation_passes_event_gate() -> None:
     metrics = outcome["metrics"]
     assert metrics["evaluation_shape"] == ext.SHAPE_SPARSE_EVENT
     assert metrics["event_days"] == 40
-    assert metrics["selection_days"] == 32
+    assert metrics["selection_days"] == 31
     assert metrics["ic"] > 0.3
     assert metrics["external_evaluator_version"] == EXTERNAL_EVALUATOR_VERSION
     entry = _event_entry("candidate-1", metrics)
@@ -328,11 +328,11 @@ def test_sparse_event_gate_reports_insufficient_below_event_floor() -> None:
         test_end=PERIODS["test_end"],
     )
     assert outcome["status"] == "ok"
-    assert outcome["metrics"]["selection_days"] == 16
+    assert outcome["metrics"]["selection_days"] == 15
     entry = _event_entry("candidate-1", outcome["metrics"])
     gate_status, reasons = ExternalEventGatePolicy().evaluate(entry["metrics"])
     assert gate_status == "insufficient_evidence"
-    assert any("event days=16" in reason for reason in reasons)
+    assert any("event days=15" in reason for reason in reasons)
 
 
 @pytest.mark.no_database
@@ -373,7 +373,7 @@ def test_market_timeseries_evaluation_passes_market_gate() -> None:
     metrics = outcome["metrics"]
     assert metrics["evaluation_shape"] == ext.SHAPE_MARKET_TIMESERIES
     assert metrics["benchmark_instrument"] == BENCHMARK
-    assert metrics["selection_days"] == 112
+    assert metrics["selection_days"] == 111
     assert metrics["ic"] > 0.3
     assert metrics["quantile_spread"] > 0
     entry = _event_entry("candidate-1", metrics)
@@ -409,11 +409,11 @@ def test_market_timeseries_gate_reports_insufficient_below_signal_floor() -> Non
         test_end=PERIODS["test_end"],
     )
     assert outcome["status"] == "ok"
-    assert outcome["metrics"]["selection_days"] == 48
+    assert outcome["metrics"]["selection_days"] == 47
     entry = _event_entry("candidate-1", outcome["metrics"])
     gate_status, reasons = MarketTimeseriesGatePolicy().evaluate(entry["metrics"])
     assert gate_status == "insufficient_evidence"
-    assert any("signal days=48" in reason for reason in reasons)
+    assert any("signal days=47" in reason for reason in reasons)
 
 
 @pytest.mark.no_database

@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .cost_model import CostModelConfig
+from .cost_model import CN_COST_SCHEDULE_BOOK, CostModelConfig, CostScheduleBook
 from .statistical_validation import STATISTICAL_CONTRACT_VERSION, newey_west_mean_test
 
 
@@ -54,6 +54,44 @@ def _daily_correlation(frame: pd.DataFrame, method: str) -> pd.Series:
         return float(group["factor"].corr(group["label"]))
 
     return frame.groupby(level="datetime", sort=True).apply(correlation).dropna()
+
+
+def purged_factor_evaluation_days(
+    dates: pd.DatetimeIndex | Iterable[Any], *, label_horizon_days: int
+) -> dict[str, pd.DatetimeIndex | int]:
+    """Split direction/selection days without overlapping forward labels.
+
+    Forward labels dated ``t`` consume observations after ``t``.  Therefore
+    the last ``h`` validation dates cannot be used next to the sealed test
+    boundary, and the last ``h`` direction dates cannot be used next to the
+    selection boundary.  Keeping those rows would let the direction choice or
+    validation score see returns belonging to the following partition.
+    """
+
+    if label_horizon_days < 1:
+        raise ValueError("label_horizon_days must be positive")
+    ordered = pd.DatetimeIndex(pd.to_datetime(list(dates)).unique()).sort_values()
+    if len(ordered) < 10:
+        raise ValueError("validation window must contain at least 10 trading days")
+    if len(ordered) <= label_horizon_days:
+        raise ValueError("label purge leaves no validation observations")
+    evaluable = ordered[:-label_horizon_days]
+    direction_count = max(1, int(np.ceil(len(evaluable) * 0.20)))
+    if direction_count >= len(evaluable):
+        raise ValueError("validation window cannot be split into direction and selection periods")
+    direction_candidates = evaluable[:direction_count]
+    if len(direction_candidates) <= label_horizon_days:
+        raise ValueError("label purge leaves no independent direction observations")
+    direction = direction_candidates[:-label_horizon_days]
+    selection = evaluable[direction_count:]
+    if len(direction) == 0 or len(selection) == 0:
+        raise ValueError("label purge leaves an empty direction or selection window")
+    return {
+        "direction": direction,
+        "selection": selection,
+        "direction_purge_days": int(label_horizon_days),
+        "final_test_purge_days": int(label_horizon_days),
+    }
 
 
 def _long_short_returns(
@@ -122,6 +160,7 @@ def evaluate_factor_values(
     test_end: date,
     comparison_values: Iterable[pd.Series | pd.DataFrame] = (),
     cost_model: CostModelConfig | None = None,
+    cost_schedule: CostScheduleBook | None = None,
     reference_order_value: float = 100_000.0,
     min_daily_instruments: int = 50,
     min_coverage_ratio: float = 0.80,
@@ -147,15 +186,20 @@ def evaluate_factor_values(
     if valid.empty:
         raise ValueError("factor and forward-return data must cover the validation window")
     valid_days = pd.DatetimeIndex(valid.index.get_level_values("datetime").unique()).sort_values()
-    if len(valid_days) < 10:
-        raise ValueError("validation window must contain at least 10 trading days")
-    direction_count = max(1, int(np.ceil(len(valid_days) * 0.20)))
-    if direction_count >= len(valid_days):
-        raise ValueError("validation window cannot be split into direction and selection periods")
-    direction_end = valid_days[direction_count - 1]
-    selection_start = valid_days[direction_count]
-    direction_frame = valid[valid.index.get_level_values("datetime") <= direction_end]
-    selection = valid[valid.index.get_level_values("datetime") >= selection_start]
+    windows = purged_factor_evaluation_days(
+        valid_days, label_horizon_days=label_horizon_days
+    )
+    direction_days = windows["direction"]
+    selection_days = windows["selection"]
+    assert isinstance(direction_days, pd.DatetimeIndex)
+    assert isinstance(selection_days, pd.DatetimeIndex)
+    direction_start = direction_days[0]
+    direction_end = direction_days[-1]
+    selection_start = selection_days[0]
+    selection_end = selection_days[-1]
+    valid_dates = valid.index.get_level_values("datetime")
+    direction_frame = valid[valid_dates.isin(direction_days)]
+    selection = valid[valid_dates.isin(selection_days)]
 
     direction_ic_daily = _daily_correlation(direction_frame, "pearson")
     raw_ic_daily = _daily_correlation(selection, "pearson")
@@ -176,8 +220,25 @@ def evaluate_factor_values(
     rank_std = rank_ic_daily.std(ddof=1)
     rank_icir = float(rank_ic / rank_std) if rank_std > 0 else None
     hac = newey_west_mean_test(ic_daily, max_lag=label_horizon_days)
-    costs = cost_model or CostModelConfig()
-    screening_cost_rate = costs.factor_screening_rate(reference_order_value=reference_order_value)
+    if cost_model is not None and cost_schedule is not None:
+        raise ValueError("factor evaluation accepts either cost_model or cost_schedule, not both")
+    costs = cost_model
+    schedule = cost_schedule or (None if costs is not None else CN_COST_SCHEDULE_BOOK)
+    if schedule is not None:
+        screening_cost_rate = schedule.factor_screening_rate(
+            reference_order_value=reference_order_value,
+            start=valid_start,
+            end=valid_end,
+        )
+        cost_evidence = schedule.to_dict()
+        cost_rate_resolution = "maximum_effective_rate_in_validation_period"
+    else:
+        assert costs is not None
+        screening_cost_rate = costs.factor_screening_rate(
+            reference_order_value=reference_order_value
+        )
+        cost_evidence = costs.to_dict()
+        cost_rate_resolution = "explicit_flat_model"
     turnover, gross_return, cost_adjusted_return = _long_short_returns(
         directed_selection,
         screening_cost_rate,
@@ -186,11 +247,11 @@ def evaluate_factor_values(
 
     selection_factor = factor[
         (factor.index.get_level_values("datetime") >= selection_start)
-        & (factor.index.get_level_values("datetime") <= valid_days[-1])
+        & (factor.index.get_level_values("datetime") <= selection_end)
     ]
     selection_label = label[
         (label.index.get_level_values("datetime") >= selection_start)
-        & (label.index.get_level_values("datetime") <= valid_days[-1])
+        & (label.index.get_level_values("datetime") <= selection_end)
     ]
     factor_counts = selection_factor.groupby(level="datetime").size()
     universe_counts = selection_label.groupby(level="datetime").size()
@@ -210,7 +271,7 @@ def evaluate_factor_values(
         )
         pair = pd.concat([directed_factor, other], axis=1, join="inner").dropna()
         pair_dates = pair.index.get_level_values("datetime")
-        pair = pair[(pair_dates >= selection_start) & (pair_dates <= valid_days[-1])]
+        pair = pair[(pair_dates >= selection_start) & (pair_dates <= selection_end)]
         if pair.empty:
             continue
         daily = pair.groupby(level="datetime").apply(
@@ -243,10 +304,12 @@ def evaluate_factor_values(
         "direction": "inverted" if direction < 0 else "original",
         "observations": int(len(selection)),
         "selection_days": int(selection.index.get_level_values("datetime").nunique()),
-        "direction_start": valid_days[0].date().isoformat(),
+        "direction_start": direction_start.date().isoformat(),
         "direction_end": direction_end.date().isoformat(),
         "selection_start": selection_start.date().isoformat(),
-        "selection_end": valid_days[-1].date().isoformat(),
+        "selection_end": selection_end.date().isoformat(),
+        "direction_purge_days": windows["direction_purge_days"],
+        "final_test_purge_days": windows["final_test_purge_days"],
         "coverage_pass_rate": coverage_pass_rate,
         "mean_coverage_ratio": float(coverage.mean()) if len(coverage) else 0.0,
         "min_daily_instruments_observed": int(factor_counts.min()) if len(factor_counts) else 0,
@@ -255,6 +318,7 @@ def evaluate_factor_values(
             coverage_pass_rate >= min_good_day_rate and constant_day_rate <= max_constant_day_rate
         ),
         "cost_rate": screening_cost_rate,
-        "cost_model": costs.to_dict(),
+        "cost_model": cost_evidence,
+        "cost_rate_resolution": cost_rate_resolution,
         "cost_reference_order_value": reference_order_value,
     }

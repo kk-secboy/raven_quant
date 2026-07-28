@@ -39,8 +39,12 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pandas as pd
 
-from .cost_model import CostModelConfig
-from .factor_evaluator import evaluate_factor_values, normalize_series
+from .cost_model import CN_COST_SCHEDULE_BOOK, CostModelConfig, CostScheduleBook
+from .factor_evaluator import (
+    evaluate_factor_values,
+    normalize_series,
+    purged_factor_evaluation_days,
+)
 from .research_store import (
     EXTERNAL_EVALUATOR_VERSION,
     ExternalEventGatePolicy,
@@ -430,6 +434,7 @@ def evaluate_sparse_event_factor(
     test_end: date,
     comparison_values: Iterable[pd.Series | pd.DataFrame] = (),
     cost_model: CostModelConfig | None = None,
+    cost_schedule: CostScheduleBook | None = None,
     reference_order_value: float = 100_000.0,
     label_horizon_days: int = 1,
     config: ExternalEvaluationConfig | None = None,
@@ -466,6 +471,7 @@ def evaluate_sparse_event_factor(
             test_end=test_end,
             comparison_values=comparison_values,
             cost_model=cost_model,
+            cost_schedule=cost_schedule,
             reference_order_value=reference_order_value,
             # The event set itself is the evaluation domain; the cross-sectional
             # coverage floor does not apply to event-driven factors. Coverage
@@ -500,6 +506,7 @@ def evaluate_market_timeseries_factor(
     test_start: date,
     test_end: date,
     cost_model: CostModelConfig | None = None,
+    cost_schedule: CostScheduleBook | None = None,
     reference_order_value: float = 100_000.0,
     label_horizon_days: int = 1,
     config: ExternalEvaluationConfig | None = None,
@@ -547,16 +554,25 @@ def evaluate_market_timeseries_factor(
                 "required for any statistical inference"
             ],
         )
-    direction_count = max(1, int(np.ceil(len(days) * 0.20)))
-    if direction_count >= len(days):
+    try:
+        windows = purged_factor_evaluation_days(
+            days, label_horizon_days=label_horizon_days
+        )
+    except ValueError as exc:
         return _insufficient(
             SHAPE_MARKET_TIMESERIES,
-            ["signal window cannot be split into direction and selection periods"],
+            [str(exc)],
         )
-    direction_end = days[direction_count - 1]
-    selection_start = days[direction_count]
-    direction_frame = joined[joined.index <= direction_end]
-    selection = joined[joined.index >= selection_start]
+    direction_days = windows["direction"]
+    selection_days = windows["selection"]
+    assert isinstance(direction_days, pd.DatetimeIndex)
+    assert isinstance(selection_days, pd.DatetimeIndex)
+    direction_start = direction_days[0]
+    direction_end = direction_days[-1]
+    selection_start = selection_days[0]
+    selection_end = selection_days[-1]
+    direction_frame = joined[joined.index.isin(direction_days)]
+    selection = joined[joined.index.isin(selection_days)]
     if (
         len(selection) < 10
         or direction_frame["factor"].nunique() < 2
@@ -585,8 +601,25 @@ def evaluate_market_timeseries_factor(
         directed_signal.to_numpy() * selection["label"].to_numpy(), index=selection.index
     )
     hac = newey_west_mean_test(hac_input, max_lag=label_horizon_days)
-    costs = cost_model or CostModelConfig()
-    screening_cost_rate = costs.factor_screening_rate(reference_order_value=reference_order_value)
+    if cost_model is not None and cost_schedule is not None:
+        raise ValueError("factor evaluation accepts either cost_model or cost_schedule, not both")
+    costs = cost_model
+    schedule = cost_schedule or (None if costs is not None else CN_COST_SCHEDULE_BOOK)
+    if schedule is not None:
+        screening_cost_rate = schedule.factor_screening_rate(
+            reference_order_value=reference_order_value,
+            start=valid_start,
+            end=valid_end,
+        )
+        cost_evidence = schedule.to_dict()
+        cost_rate_resolution = "maximum_effective_rate_in_validation_period"
+    else:
+        assert costs is not None
+        screening_cost_rate = costs.factor_screening_rate(
+            reference_order_value=reference_order_value
+        )
+        cost_evidence = costs.to_dict()
+        cost_rate_resolution = "explicit_flat_model"
     quantile_count = max(2, int(config.quantile_count))
     return_selection = selection.iloc[::label_horizon_days]
     return_signal = directed_signal.reindex(return_selection.index)
@@ -627,15 +660,18 @@ def evaluate_market_timeseries_factor(
         "observations": int(len(selection)),
         "selection_days": int(len(selection)),
         "signal_days": int(len(days)),
-        "direction_start": days[0].date().isoformat(),
+        "direction_start": direction_start.date().isoformat(),
         "direction_end": direction_end.date().isoformat(),
         "selection_start": selection_start.date().isoformat(),
-        "selection_end": days[-1].date().isoformat(),
+        "selection_end": selection_end.date().isoformat(),
+        "direction_purge_days": windows["direction_purge_days"],
+        "final_test_purge_days": windows["final_test_purge_days"],
         "benchmark_instrument": benchmark_instrument,
         "evaluation_shape": SHAPE_MARKET_TIMESERIES,
         "external_evaluator_version": config.version,
         "cost_rate": screening_cost_rate,
-        "cost_model": costs.to_dict(),
+        "cost_model": cost_evidence,
+        "cost_rate_resolution": cost_rate_resolution,
         "cost_reference_order_value": reference_order_value,
     }
     metrics["placebo_diagnostics"] = evaluate_placebo_leakage_diagnostics(

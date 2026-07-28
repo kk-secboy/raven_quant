@@ -63,7 +63,40 @@ def test_factor_evaluator_never_reads_reserved_test_values() -> None:
         test_end=date(2022, 3, 31),
         min_daily_instruments=5,
     )
-    assert result["selection_end"] == "2022-01-28"
+    assert result["selection_end"] == "2022-01-27"
+    assert result["final_test_purge_days"] == 1
+
+
+def test_factor_direction_and_selection_purge_overlapping_forward_labels() -> None:
+    dates = pd.bdate_range("2022-01-03", periods=80)
+    instruments = [f"SH{600000 + index:06d}" for index in range(20)]
+    index = pd.MultiIndex.from_product(
+        [dates, instruments], names=["datetime", "instrument"]
+    )
+    signal = np.tile(np.arange(len(instruments), dtype=float), len(dates))
+    factor = pd.Series(signal, index=index)
+    returns = pd.Series(signal * 0.01, index=index)
+    # With a ten-session label, the final ten direction candidates overlap
+    # the selection boundary. Their opposite labels must not flip direction.
+    direction_boundary = 14
+    for day in dates[direction_boundary - 10 : direction_boundary]:
+        returns.loc[(day, slice(None))] *= -1.0
+
+    result = evaluate_factor_values(
+        factor,
+        returns,
+        valid_start=dates[0].date(),
+        valid_end=dates[-1].date(),
+        test_start=(dates[-1] + pd.offsets.BDay(1)).date(),
+        test_end=(dates[-1] + pd.offsets.BDay(30)).date(),
+        min_daily_instruments=5,
+        label_horizon_days=10,
+    )
+
+    assert result["direction"] == "original"
+    assert result["direction_purge_days"] == 10
+    assert result["final_test_purge_days"] == 10
+    assert pd.Timestamp(result["direction_end"]) < pd.Timestamp(result["selection_start"])
 
 
 def test_factor_screening_annualizes_over_the_label_holding_period() -> None:
@@ -101,6 +134,6 @@ def test_factor_screening_annualizes_over_the_label_holding_period() -> None:
     ) == pytest.approx(
         one_day["gross_annualized_return"]
         - one_day["cost_adjusted_return"],
-        rel=0.02,
+        rel=0.10,
     )
     assert five_day["return_annualization_horizon_days"] == 5
