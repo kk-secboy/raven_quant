@@ -70,8 +70,10 @@ def test_factor_sandbox_is_seeded_offline_from_the_release_worker() -> None:
     builder = (root / "deploy" / "factor-sandbox" / "build.sh").read_text(
         encoding="utf-8"
     )
+    attributes = (root / ".gitattributes").read_text(encoding="utf-8")
 
     assert "image: quantlab-worker-runtime:v2" in compose
+    assert "*.sh text eol=lf" in attributes
     assert "/var/run/docker.sock:/var/run/docker.sock" in compose
     assert "FACTOR_SANDBOX_DOCKER_HOST: tcp://rdagent-docker:2375" in compose
     assert "FROM ${FACTOR_SANDBOX_BASE_IMAGE}" in dockerfile
