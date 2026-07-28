@@ -3433,7 +3433,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         serialized = {
             "profile": payload.profile,
             "start": payload.start.isoformat(),
-            "end": payload.end.isoformat() if isinstance(payload.end, date) else payload.end,
+            # Freeze "latest" at request time.  Re-resolving it inside a worker
+            # in the Shanghai timezone can cross midnight and plan an
+            # unfinished trading day outside the immutable snapshot contract.
+            "end": requested_end.isoformat(),
             "build_qlib": False,
             "finalize_after_download": payload.build_qlib,
             "pipeline_id": uuid.uuid4().hex,

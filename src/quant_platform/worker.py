@@ -634,7 +634,7 @@ class LocalJobWorker:
                 "--start",
                 payload["start"],
                 "--end",
-                payload["end"],
+                payload.get("snapshot_end") or payload["end"],
             ]
             command.append("--download-only")
             return (

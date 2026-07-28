@@ -121,6 +121,8 @@ def test_settings_api_validates_saves_and_enables_bootstrap(
     assert bootstrap.status_code == 202
     assert bootstrap.json()["payload"]["build_qlib"] is False
     assert bootstrap.json()["payload"]["finalize_after_download"] is True
+    assert bootstrap.json()["payload"]["end"] == bootstrap.json()["payload"]["snapshot_end"]
+    assert bootstrap.json()["payload"]["end"] != "latest"
 
 
 def test_worker_injects_latest_tushare_secret(database_url: str, tmp_path: Path) -> None:
@@ -146,6 +148,7 @@ def test_worker_injects_latest_tushare_secret(database_url: str, tmp_path: Path)
                 "profile": "full",
                 "start": "2024-01-01",
                 "end": "latest",
+                "snapshot_end": "2024-02-02",
                 "build_qlib": True,
             },
         }
@@ -156,6 +159,7 @@ def test_worker_injects_latest_tushare_secret(database_url: str, tmp_path: Path)
     }
     assert "--download-only" in command
     assert "--build-qlib" not in command
+    assert command[command.index("--end") + 1] == "2024-02-02"
 
 
 def test_scheduler_hot_loads_latest_encrypted_alert_webhook(
