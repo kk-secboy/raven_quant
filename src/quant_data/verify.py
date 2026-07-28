@@ -17,8 +17,8 @@ from .reference_data import select_current_reference_units
 # Interfaces whose provider pagination reorders rows between pages, or whose
 # intraday snapshots drift between polls, making overlapping pages (and
 # therefore duplicate primary keys) inherent.  Snapshot builds already
-# deduplicate rows with SELECT DISTINCT, so duplicates for these datasets are
-# reported as warnings instead of hard errors.
+# deduplicate identical provider fields while retaining the earliest ingestion
+# timestamp, so only semantic duplicates for these datasets can be warnings.
 UNSTABLE_PAGINATION_DATASETS = frozenset(
     {
         "share_float",
@@ -169,7 +169,7 @@ def verify_downloads(
             if duplicates and dataset in UNSTABLE_PAGINATION_DATASETS:
                 provider_columns = ", ".join(
                     f'materialized."{column.replace(chr(34), chr(34) * 2)}"'
-                    for column in sorted(columns)
+                    for column in sorted(columns - {"ingested_at"})
                 )
                 conflicting_duplicates = int(
                     connection.execute(
@@ -196,8 +196,8 @@ def verify_downloads(
                     warnings.append(
                         f"{dataset}: {duplicates} exact duplicate primary-key rows "
                         "(provider paginates this interface with an unstable sort order "
-                        "or drifts intraday snapshots between polls; snapshot SELECT "
-                        "DISTINCT removes the identical rows)"
+                        "or drifts intraday snapshots between polls; snapshot semantic-row "
+                        "deduplication removes the identical provider rows)"
                     )
             elif duplicates:
                 errors.append(f"{dataset}: {duplicates} duplicate primary-key rows")

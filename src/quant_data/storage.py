@@ -259,6 +259,7 @@ class ParquetStore:
         ]
         empty_entry = {
             "rows": 0,
+            "source_rows": 0,
             "unit_files": 0,
             "empty_units": len(rows),
             "date_field": None,
@@ -343,13 +344,24 @@ class ParquetStore:
                 rows,
                 paths,
                 date_field,
+                set(columns),
                 dataset_dir,
                 base_dir,
                 base_entry,
                 current_tuples,
             )
-        row_count = connection.execute(
+        source_row_count = connection.execute(
             f"SELECT count(*) FROM read_parquet({quoted_paths}, union_by_name=true)"
+        ).fetchone()[0]
+        snapshot_paths = [
+            str(path.resolve()) for path in sorted(dataset_dir.rglob("*.parquet"))
+        ]
+        snapshot_quoted_paths = (
+            "[" + ",".join(_sql_string(path) for path in snapshot_paths) + "]"
+        )
+        row_count = connection.execute(
+            f"SELECT count(*) FROM read_parquet({snapshot_quoted_paths}, "
+            "union_by_name=true)"
         ).fetchone()[0]
         date_min = date_max = None
         if date_field is not None:
@@ -387,6 +399,7 @@ class ParquetStore:
                 )
         return {
             "rows": int(row_count),
+            "source_rows": int(source_row_count),
             "unit_files": len(paths),
             "empty_units": len(rows) - len(paths),
             "date_field": date_field,
@@ -409,6 +422,7 @@ class ParquetStore:
         rows: list[dict[str, Any]],
         paths: list[str],
         date_field: str,
+        columns: set[str],
         dataset_dir: Path,
         base_dir: Path | None,
         base_entry: dict[str, Any] | None,
@@ -512,6 +526,7 @@ class ParquetStore:
             if not sources:
                 continue
             quoted = "[" + ",".join(_sql_string(path) for path in sources) + "]"
+            source_sql = _snapshot_source_query(dataset, quoted, columns)
             partition_dir = (
                 dataset_dir / f"partition_year={year}" / f"partition_month={month}"
             )
@@ -519,7 +534,7 @@ class ParquetStore:
             connection.execute(
                 f"COPY ("
                 f"SELECT * FROM ("
-                f"SELECT DISTINCT * FROM read_parquet({quoted}, union_by_name=true)"
+                f"{source_sql}"
                 f") "
                 f"WHERE {date_expression} IS NOT NULL "
                 f"AND year({date_expression}) = {year} AND month({date_expression}) = {month}"
@@ -625,7 +640,22 @@ def _date_sql_expression(field: str) -> str:
 
 
 def _snapshot_source_query(dataset: str, quoted_paths: str, columns: set[str]) -> str:
-    base = f"SELECT DISTINCT * FROM read_parquet({quoted_paths}, union_by_name=true)"
+    if "ingested_at" in columns:
+        # ``ingested_at`` is acquisition lineage, not provider row identity.
+        # Overlapping/resumed pages can return the exact same provider row at
+        # different fetch times. Collapse those semantic duplicates and keep
+        # the earliest observation, which is the conservative point-in-time
+        # timestamp. Conflicting rows sharing a business primary key are
+        # rejected by the verifier before snapshot publication.
+        provider_columns = sorted(columns - {"ingested_at"})
+        projected = ", ".join(_identifier(column) for column in provider_columns)
+        base = (
+            f"SELECT {projected}, min(ingested_at) AS ingested_at "
+            f"FROM read_parquet({quoted_paths}, union_by_name=true) "
+            f"GROUP BY {projected}"
+        )
+    else:
+        base = f"SELECT DISTINCT * FROM read_parquet({quoted_paths}, union_by_name=true)"
     news_identity = {"datetime", "content", "title", "source"}
     if dataset != "news" or not news_identity.issubset(columns):
         return base

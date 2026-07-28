@@ -166,13 +166,19 @@ def test_verifier_downgrades_only_exact_duplicates_for_unstable_pagination_datas
         params={"trade_date": "20240102"},
         scope={"page_group": "dc_hot:20240102", "offset": 0},
     )
+    unstable_next_page = FetchSpec(
+        dataset="dc_hot",
+        api_name="dc_hot",
+        params={"trade_date": "20240102", "offset": 1000},
+        scope={"page_group": "dc_hot:20240102", "offset": 1000},
+    )
     stable = FetchSpec(
         dataset="adj_factor",
         api_name="adj_factor",
         params={"trade_date": "20240102"},
         scope={"trade_date": "20240102"},
     )
-    checkpoint.add([unstable, stable])
+    checkpoint.add([unstable, unstable_next_page, stable])
     hot_row = {
         "trade_date": "20240102",
         "ts_code": "000001.SZ",
@@ -181,14 +187,18 @@ def test_verifier_downgrades_only_exact_duplicates_for_unstable_pagination_datas
         "rank": 1,
     }
     adj_row = {"ts_code": "000001.SZ", "trade_date": "20240102", "adj_factor": 1.0}
-    for spec, row in ((unstable, hot_row), (stable, adj_row)):
+    for spec, row, copies in (
+        (unstable, hot_row, 1),
+        (unstable_next_page, hot_row, 1),
+        (stable, adj_row, 2),
+    ):
         written = storage.write_unit(
             spec.dataset,
             spec.unit_key,
             ProviderResult(
                 api_name=spec.api_name,
                 columns=list(row),
-                rows=[row, dict(row)],
+                rows=[dict(row) for _ in range(copies)],
                 raw_body=b"{}",
             ),
         )

@@ -207,10 +207,13 @@ def test_overlapping_added_unit_does_not_duplicate_rows(tmp_path: Path) -> None:
         _dataset_frame(full, "daily"), _dataset_frame(incremental, "daily")
     )
     frame = _dataset_frame(incremental, "daily")
-    # Both builds retain both ingested_at versions exactly as the legacy full
-    # rebuild did: rows differ in ingested_at, so DISTINCT keeps them. The
-    # incremental path must not invent new dedup semantics — it must match.
-    assert len(frame) == len(_dataset_frame(full, "daily"))
+    # Full and incremental builds collapse the same provider row even when
+    # separate fetches carry different ingestion timestamps.
+    assert len(frame) == 4
+    assert frame.groupby(["ts_code", "trade_date"], observed=True).size().max() == 1
+    entry = _manifest_entry(incremental, "daily")
+    assert entry["rows"] == 4
+    assert entry["source_rows"] == 6
 
 
 def test_legacy_news_global_dedup_is_preserved_with_base(tmp_path: Path) -> None:
