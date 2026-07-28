@@ -41,6 +41,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from .account_risk_state import RISK_NORMAL, RISK_SCOPE, apply_risk_overlay
+
 ACTION_BUY = "BUY"
 ACTION_SELL = "SELL"
 ACTION_EXIT = "EXIT"
@@ -351,11 +353,26 @@ def plan_instrument_action(
 
 
 def plan_account_actions(
-    instruments: list[dict[str, Any]], *, now: datetime
+    instruments: list[dict[str, Any]],
+    *,
+    now: datetime,
+    risk_assessment: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Vector form of :func:`plan_instrument_action` for one account decision."""
 
-    return [
-        plan_instrument_action(now=now, **item)
-        for item in sorted(instruments, key=lambda entry: str(entry["instrument"]))
-    ]
+    assessment = risk_assessment or {
+        "risk_state": RISK_NORMAL,
+        "risk_scope": RISK_SCOPE,
+        "reasons": [],
+        "new_risk_multiplier": 1.0,
+        "exit_existing_risk": False,
+    }
+    planned: list[dict[str, Any]] = []
+    for source in sorted(instruments, key=lambda entry: str(entry["instrument"])):
+        overlaid = apply_risk_overlay(source, assessment)
+        metadata = overlaid.pop("_risk_metadata")
+        overlaid.pop("original_target_quantity", None)
+        action = plan_instrument_action(now=now, **overlaid)
+        action.update(metadata)
+        planned.append(action)
+    return planned

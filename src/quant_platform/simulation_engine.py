@@ -70,6 +70,7 @@ def execute_simulation_day(
     applied_event_keys: Iterable[str] = (),
     dividend_tax_book: DividendTaxRuleBook | None = None,
     order_specs_override: list[dict[str, Any]] | None = None,
+    tradable_cash: float | None = None,
     external_flow_open: float = 0.0,
     external_flow_close: float = 0.0,
     prior_investment_wealth: float | None = 1.0,
@@ -112,6 +113,13 @@ def execute_simulation_day(
 
     if not isfinite(cash) or cash < 0 or prior_nav <= 0 or high_water_mark <= 0:
         raise ValueError("simulation account balances are invalid")
+    available_cash = cash if tradable_cash is None else float(tradable_cash)
+    if (
+        not isfinite(available_cash)
+        or available_cash < 0
+        or available_cash > cash + 1e-6
+    ):
+        raise ValueError("simulation tradable cash view is invalid")
     if not (isfinite(external_flow_open) and isfinite(external_flow_close)):
         raise ValueError("external cash flows must be finite")
     cost_model = _resolve_cost_schedule(cost_model, cost_schedule).as_of(trade_date)
@@ -142,6 +150,9 @@ def execute_simulation_day(
         if cash + external_flow_open < -1e-6:
             raise RuntimeError("external withdrawal would create negative cash")
         cash += external_flow_open
+        available_cash += external_flow_open
+        if available_cash < -1e-6:
+            raise RuntimeError("external withdrawal exceeds tradable cash")
         cash_flows.append(
             {
                 "trade_date": trade_date,
@@ -184,6 +195,7 @@ def execute_simulation_day(
             continue
         amount = float(receivable["amount"])
         cash += amount
+        available_cash += amount
         cash_flows.append(
             {
                 "trade_date": trade_date,
@@ -499,6 +511,7 @@ def execute_simulation_day(
                     "limit_price": spec.get("limit_price"),
                     "not_before": spec.get("not_before"),
                     "not_after": spec.get("not_after"),
+                    "reserved_cash": spec.get("reserved_cash"),
                 }
             )
     else:
@@ -576,6 +589,13 @@ def execute_simulation_day(
         order_fills: list[dict[str, Any]] = []
         rejection_reasons: list[str] = []
         limit_price = spec.get("limit_price")
+        reserved_cash = (
+            float(spec["reserved_cash"])
+            if spec.get("reserved_cash") is not None
+            else None
+        )
+        if reserved_cash is not None and reserved_cash < 0:
+            raise ValueError("persistent order reserved cash must be non-negative")
         not_before = _window_bound(spec.get("not_before"))
         not_after = _window_bound(spec.get("not_after"))
         for execution_slice in slices:
@@ -616,9 +636,12 @@ def execute_simulation_day(
             fill_quantity = min(slice_request, capacity)
             if side == "buy":
                 fill_quantity = lot_floor(fill_quantity, lot_rules[instrument])
+                spendable = available_cash
+                if reserved_cash is not None:
+                    spendable = min(spendable, reserved_cash)
                 fill_quantity = _affordable_buy_quantity(
                     fill_quantity,
-                    cash=cash,
+                    cash=spendable,
                     price=price,
                     participation=(fill_quantity / minute_volume if minute_volume else 0.0),
                     asset_type=infer_cn_asset_type(instrument),
@@ -653,6 +676,9 @@ def execute_simulation_day(
             if cash + cash_delta < -1e-6:
                 raise RuntimeError("simulation execution would create negative cash")
             cash += cash_delta
+            available_cash += cash_delta
+            if side == "buy" and reserved_cash is not None:
+                reserved_cash += cash_delta
             fill = {
                 "instrument": instrument,
                 "side": side,
@@ -676,6 +702,8 @@ def execute_simulation_day(
                     "flow_type": "buy_settlement" if side == "buy" else "sell_settlement",
                     "amount": cash_delta,
                     "balance_after": cash,
+                    "fill_seq": int(fill["_seq"]),
+                    "order_ref": fill.get("order_ref"),
                 }
             )
             consumed_lots = _apply_fill(state, fill, trade_date)
@@ -709,12 +737,15 @@ def execute_simulation_day(
                     if cash - dividend_tax < -1e-6:
                         raise RuntimeError("dividend tax would create negative cash")
                     cash -= dividend_tax
+                    available_cash -= dividend_tax
                     cash_flows.append(
                         {
                             "trade_date": trade_date,
                             "flow_type": "dividend_tax",
                             "amount": -dividend_tax,
                             "balance_after": cash,
+                            "fill_seq": int(fill["_seq"]),
+                            "order_ref": fill.get("order_ref"),
                         }
                     )
                 if dividend_tax > 0 or dividend_tax_released > 0:
@@ -755,6 +786,10 @@ def execute_simulation_day(
         if cash + external_flow_close < -1e-6:
             raise RuntimeError("external withdrawal would create negative cash")
         cash += external_flow_close
+        if external_flow_close < 0:
+            available_cash += external_flow_close
+            if available_cash < -1e-6:
+                raise RuntimeError("external withdrawal exceeds tradable cash")
         cash_flows.append(
             {
                 "trade_date": trade_date,
@@ -794,6 +829,7 @@ def execute_simulation_day(
     nav_row = {
         "trade_date": trade_date,
         "cash": cash,
+        "tradable_cash": available_cash,
         "market_value": valuation["market_value"],
         "corporate_receivables": receivables_total,
         "corporate_tax_liabilities": tax_liabilities_total,

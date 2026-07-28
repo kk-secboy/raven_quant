@@ -26,7 +26,7 @@
 
 | # | 缺口 | 现状证据 | 工作量 | 关闭状态 |
 | --- | --- | --- | --- | --- |
-| P1 | 行级 `ingested_at` 不落数据文件，无法回答"这行数据平台何时取得"；原始响应体默认不保留（`storage.py:58` 的 `keep_raw=False`） | `storage.py:66-83`、`checkpoint.py:113-128` | S | 【已关闭】2026-07-18 |
+| P1 | 行级 `ingested_at` 与原始响应留存 | `storage.write_unit` 落行级 UTC 时间；`ParquetStore` 与 `Settings` 默认 `keep_raw=True`，仍可显式关闭 | S | 【已关闭并强化】2026-07-28 |
 | P2 | 无 `available_at` 抽象：财务用 `ann_date` 代替，但行情衍生字段（daily_basic）、指数权重、行业成员都默认"生效日即可知"，无可用滞后建模 | `qlib_builder.py:795-799`（`same_trade_date_after_close` 仅是约定）；`strategy_backtest.py:222-229` | M | 【已关闭】2026-07-18 |
 | P3 | 财务修订无处理路径：按 period 重拉 + `SELECT DISTINCT` 合并导致修订行共存，构建期去重对同 `(ann_date, end_date)` 冲突行无 tie-break | `supplemental_data.py:572-593`、`storage.py:329-333`、`qlib_builder.py:819-822` | M | 【已关闭】2026-07-18 |
 | P4 | reference 类数据（stock_basic、index_classify 等 29+ 个）实质 current_only：快照只取最新代，历史状态不可复原，且无字段级等级标注 | `reference_data.py:18-54,174-241` | M | 【已关闭】2026-07-18 |
@@ -35,7 +35,7 @@
 
 关闭证据（2026-07-18，测试文件均带 `pytestmark = pytest.mark.no_database`）：
 
-- **P1**：`storage.write_unit` 为每行写 tz-aware UTC `ingested_at`（`src/quant_data/storage.py:86-89`，可注入 clock）；`build_snapshot` 经 `union_by_name` 保留该列、旧单元填 NULL，manifest 记录 `ingested_at_min/max`（`storage.py:262-276`）。测试：`tests/test_pit_semantics.py::test_write_unit_records_tz_aware_row_level_ingested_at`、`test_snapshot_preserves_ingested_at_and_null_fills_legacy_units`。
+- **P1**：`storage.write_unit` 为每行写 tz-aware UTC `ingested_at`（可注入 clock）；`build_snapshot` 经 `union_by_name` 保留该列、旧单元填 NULL，manifest 记录 `ingested_at_min/max`。2026-07-28 再强化为 `Settings.keep_raw=True`、`ParquetStore(..., keep_raw=True)` 和 `.env.example KEEP_RAW_RESPONSES=true`，测试同时验证原始响应文件默认生成；只有操作者显式关闭时才不留存。
 - **P2**：政策注册表 `AVAILABILITY_POLICIES`（`src/quant_data/availability.py:71-103`）；政策写入 qlib `research_feature_contract.availability_policy` + `availability_policy_version`（`qlib_builder.py:924-941`）；消费侧 `_snapshot`/`_industries_at` 应用带版本保守滞后（`AVAILABILITY_LAG_CONFIG_VERSION=1`、默认 5 个自然日，`availability.py:47-48`；`strategy_backtest.py:57,102,143,243-274`；注释写明"真实公布滞后无源数据，属近似"）。测试：`tests/test_pit_semantics.py` 的 `test_availability_registry_declares_all_policy_families`、`test_index_weight_applies_the_conservative_publication_lag`、`test_snapshot_helper_applies_publication_lag`、`test_industries_at_helper_applies_publication_lag`；`tests/test_qlib_builder.py` 泄漏测试已更新为新契约。
 - **P3**：`_fundamental_revision_order`（`src/quant_data/qlib_builder.py:1108-1128`）：`end_date` 之后依次按 `f_ann_date`（列存在时）、`update_flag`（列存在时）、`ingested_at`（列存在时）取较新者，最终以投影列内容哈希 `md5(concat_ws(...))` 保证全序。测试：`tests/test_qlib_builder.py::test_fundamental_revision_conflict_prefers_newest_f_ann_date`、`test_fundamental_revision_conflict_uses_latest_ingested_at`、`test_fundamental_revision_dedup_is_deterministic_across_row_order`（换序+重跑逐帧相等）。
 - **P4**：`RECOVERABILITY_LEVELS`（`availability.py:105-164`）逐组标注并在注释说明依据；进 snapshot manifest（`storage.py:275`）与 qlib 契约/provenance（`qlib_builder.py:938-941`，经 `research_feature_contract` 进入 identity 哈希）。强制测试：`tests/test_qlib_builder.py::test_research_contract_admits_only_evidence_grade_recoverability`（契约内数据集只允许 `native_history`/`reconstructed`）、`tests/test_pit_semantics.py::test_recoverability_levels_cover_the_audited_groups`。

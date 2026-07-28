@@ -243,6 +243,11 @@ def run_formal_qlib_backtest(
         freq="day",
         start_time=start_time,
         end_time=end_time,
+        # Restrict the quote universe to the strategy instruments: the provider
+        # also carries index quotes (e.g. BJ899050) that have no price-limit
+        # channels, and Qlib's default codes=None would load them and crash
+        # evaluating the limit-threshold expressions.
+        **({"codes": instruments} if instruments else {}),
         deal_price="$open",
         limit_threshold=(
             "Or($paused, Ge($open, $up_limit))",

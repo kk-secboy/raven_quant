@@ -319,6 +319,21 @@ strategies = Table(
     Column("name", String, nullable=False, unique=True),
     Column("description", Text, nullable=False),
     Column("status", String, nullable=False),
+    # Immutable economic-hypothesis family. Renaming a strategy or creating a
+    # model/frequency wrapper must not reset the family-wide trial count or
+    # obtain another independent capital budget (design 6.8/6.10).
+    Column(
+        "economic_hypothesis_group",
+        String,
+        nullable=False,
+        server_default="legacy-unclassified",
+    ),
+    Column(
+        "hypothesis_group_cap",
+        Float,
+        nullable=False,
+        server_default="0.70",
+    ),
     Column("created_by", String, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
@@ -402,6 +417,59 @@ strategy_factors = Table(
     Column("weight", Float, nullable=False),
     Column("direction", Integer, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
+)
+
+model_artifacts = Table(
+    "model_artifacts",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "strategy_version_id",
+        String,
+        ForeignKey("quantlab.strategy_versions.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("artifact_key", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("strategy_spec_sha256", String, nullable=False),
+    Column("model_recipe_sha256", String, nullable=False),
+    Column("model_recipe_json", json_type, nullable=False),
+    Column("dataset", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("training_start", Date, nullable=False),
+    Column("training_end", Date, nullable=False),
+    Column("data_cutoff_at", DateTime(timezone=True), nullable=False),
+    Column("scheduled_refit_at", DateTime(timezone=True)),
+    Column("valid_until", DateTime(timezone=True), nullable=False),
+    Column("artifact_path", Text, nullable=False),
+    Column("artifact_sha256", String, nullable=False),
+    Column("predictions_sha256", String, nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("activated_by", String),
+    Column("activated_at", DateTime(timezone=True)),
+    Column("retired_at", DateTime(timezone=True)),
+    Column("failure_reason", Text),
+    UniqueConstraint(
+        "strategy_version_id",
+        "artifact_key",
+        name="uq_model_artifacts_key",
+    ),
+    CheckConstraint(
+        "status IN ('candidate', 'active', 'retired', 'failed', 'expired')",
+        name="ck_model_artifacts_status",
+    ),
+)
+Index(
+    "idx_model_artifacts_strategy_created",
+    model_artifacts.c.strategy_version_id,
+    model_artifacts.c.created_at.desc(),
+)
+Index(
+    "uq_model_artifacts_active",
+    model_artifacts.c.strategy_version_id,
+    unique=True,
+    postgresql_where=model_artifacts.c.status == "active",
 )
 
 strategy_pairs = Table(
@@ -1010,6 +1078,57 @@ simulation_fills = Table(
 )
 Index("idx_simulation_fills_batch", simulation_fills.c.batch_id, simulation_fills.c.executed_at)
 
+simulation_fee_adjustments = Table(
+    "simulation_fee_adjustments",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "fill_id",
+        String,
+        ForeignKey("quantlab.simulation_fills.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "batch_id",
+        String,
+        ForeignKey("quantlab.simulation_batches.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("adjustment_key", String, nullable=False),
+    Column("trade_date", Date, nullable=False),
+    Column("source", String, nullable=False),
+    Column("previously_confirmed_fee", Numeric(20, 6), nullable=False),
+    Column("final_fee", Numeric(20, 6), nullable=False),
+    Column("adjustment_amount", Numeric(20, 6), nullable=False),
+    Column("evidence_sha256", String, nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "portfolio_id",
+        "adjustment_key",
+        name="uq_simulation_fee_adjustments_key",
+    ),
+    CheckConstraint(
+        "source IN ('end_of_day', 'user_import')",
+        name="ck_simulation_fee_adjustments_source",
+    ),
+    CheckConstraint(
+        "final_fee >= 0",
+        name="ck_simulation_fee_adjustments_final_fee",
+    ),
+)
+Index(
+    "idx_simulation_fee_adjustments_fill",
+    simulation_fee_adjustments.c.fill_id,
+    simulation_fee_adjustments.c.created_at,
+)
+
 simulation_positions = Table(
     "simulation_positions",
     metadata,
@@ -1026,6 +1145,7 @@ simulation_positions = Table(
     Column("borrow_cost", Numeric(20, 6), nullable=False, server_default="0"),
     Column("quantity", Integer, nullable=False),
     Column("available_quantity", Integer, nullable=False),
+    Column("frozen_quantity", Integer, nullable=False, server_default="0"),
     Column("average_cost", Numeric(20, 8), nullable=False),
     Column("last_trade_date", Date),
     Column("market_price", Numeric(20, 8)),
@@ -1033,6 +1153,130 @@ simulation_positions = Table(
     Column("stale", Boolean, nullable=False),
     Column("market_value", Numeric(20, 6), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "frozen_quantity >= 0 AND frozen_quantity <= available_quantity",
+        name="ck_simulation_positions_frozen_quantity",
+    ),
+)
+
+simulation_position_reservations = Table(
+    "simulation_position_reservations",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "order_id",
+        String,
+        ForeignKey("quantlab.simulation_orders.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("instrument", String, nullable=False),
+    Column("reserved_quantity", Integer, nullable=False),
+    Column("remaining_quantity", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "reserved_quantity > 0 AND remaining_quantity >= 0 "
+        "AND remaining_quantity <= reserved_quantity",
+        name="ck_simulation_position_reservations_quantity",
+    ),
+)
+Index(
+    "idx_simulation_position_reservations_portfolio_instrument",
+    simulation_position_reservations.c.portfolio_id,
+    simulation_position_reservations.c.instrument,
+    simulation_position_reservations.c.remaining_quantity,
+)
+
+simulation_security_events = Table(
+    "simulation_security_events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "batch_id",
+        String,
+        ForeignKey("quantlab.simulation_batches.id", ondelete="CASCADE"),
+    ),
+    Column(
+        "order_id",
+        String,
+        ForeignKey("quantlab.simulation_orders.id", ondelete="CASCADE"),
+    ),
+    Column("event_key", String, nullable=False),
+    Column("event_type", String, nullable=False),
+    Column("instrument", String, nullable=False),
+    Column("quantity", Integer, nullable=False),
+    Column("details_json", json_type, nullable=False),
+    Column("occurred_at", DateTime(timezone=True), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "portfolio_id",
+        "event_key",
+        name="uq_simulation_security_events_key",
+    ),
+    CheckConstraint(
+        "event_type IN ('freeze', 'consume', 'release', 'reclassify')",
+        name="ck_simulation_security_events_type",
+    ),
+    CheckConstraint(
+        "quantity > 0",
+        name="ck_simulation_security_events_quantity",
+    ),
+)
+Index(
+    "idx_simulation_security_events_portfolio_time",
+    simulation_security_events.c.portfolio_id,
+    simulation_security_events.c.occurred_at,
+)
+
+simulation_day_attributions = Table(
+    "simulation_day_attributions",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "batch_id",
+        String,
+        ForeignKey("quantlab.simulation_batches.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("trade_date", Date, nullable=False),
+    Column("strategy_json", json_type, nullable=False),
+    Column("industry_json", json_type, nullable=False),
+    Column("asset_json", json_type, nullable=False),
+    Column("cost_json", json_type, nullable=False),
+    Column("execution_json", json_type, nullable=False),
+    Column("coverage_status", String, nullable=False),
+    Column("blocker_reasons_json", json_type, nullable=False),
+    Column("input_sha256", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("batch_id", name="uq_simulation_day_attributions_batch"),
+    CheckConstraint(
+        "coverage_status IN ('complete', 'partial')",
+        name="ck_simulation_day_attributions_coverage",
+    ),
+)
+Index(
+    "idx_simulation_day_attributions_portfolio_date",
+    simulation_day_attributions.c.portfolio_id,
+    simulation_day_attributions.c.trade_date,
 )
 
 simulation_position_lots = Table(
@@ -1199,6 +1443,171 @@ Index(
     "idx_simulation_cash_flows_portfolio_date",
     simulation_cash_flows.c.portfolio_id,
     simulation_cash_flows.c.trade_date,
+)
+
+simulation_cash_lots = Table(
+    "simulation_cash_lots",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("lot_key", String, nullable=False),
+    Column("source_type", String, nullable=False),
+    Column("source_reference_id", String),
+    # Free and frozen are mutually exclusive classifications of one economic
+    # cash asset. Availability timestamps are permissions on free cash, not
+    # additional assets.
+    Column("free_amount", Numeric(20, 6), nullable=False),
+    Column("frozen_amount", Numeric(20, 6), nullable=False),
+    Column("tradable_at", DateTime(timezone=True), nullable=False),
+    Column("withdrawable_at", DateTime(timezone=True), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "portfolio_id",
+        "lot_key",
+        name="uq_simulation_cash_lots_key",
+    ),
+    CheckConstraint(
+        "free_amount >= 0 AND frozen_amount >= 0",
+        name="ck_simulation_cash_lots_nonnegative",
+    ),
+)
+Index(
+    "idx_simulation_cash_lots_portfolio_availability",
+    simulation_cash_lots.c.portfolio_id,
+    simulation_cash_lots.c.tradable_at,
+    simulation_cash_lots.c.withdrawable_at,
+)
+
+simulation_cash_events = Table(
+    "simulation_cash_events",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "batch_id",
+        String,
+        ForeignKey("quantlab.simulation_batches.id", ondelete="CASCADE"),
+    ),
+    Column(
+        "order_id",
+        String,
+        ForeignKey("quantlab.simulation_orders.id", ondelete="CASCADE"),
+    ),
+    Column("event_key", String, nullable=False),
+    Column("event_type", String, nullable=False),
+    Column("amount", Numeric(20, 6), nullable=False),
+    Column("details_json", json_type, nullable=False),
+    Column("occurred_at", DateTime(timezone=True), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "portfolio_id",
+        "event_key",
+        name="uq_simulation_cash_events_key",
+    ),
+    CheckConstraint(
+        "event_type IN ('create', 'freeze', 'consume_free', "
+        "'consume_frozen', 'release', 'reclassify')",
+        name="ck_simulation_cash_events_type",
+    ),
+    CheckConstraint(
+        "amount >= 0",
+        name="ck_simulation_cash_events_amount",
+    ),
+)
+Index(
+    "idx_simulation_cash_events_portfolio_time",
+    simulation_cash_events.c.portfolio_id,
+    simulation_cash_events.c.occurred_at,
+)
+
+simulation_cash_event_allocations = Table(
+    "simulation_cash_event_allocations",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "event_id",
+        String,
+        ForeignKey("quantlab.simulation_cash_events.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "cash_lot_id",
+        String,
+        ForeignKey("quantlab.simulation_cash_lots.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("action", String, nullable=False),
+    Column("amount", Numeric(20, 6), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "event_id",
+        "cash_lot_id",
+        "action",
+        name="uq_simulation_cash_event_allocations",
+    ),
+    CheckConstraint(
+        "action IN ('create', 'freeze', 'consume_free', "
+        "'consume_frozen', 'release', 'reclassify')",
+        name="ck_simulation_cash_event_allocations_action",
+    ),
+    CheckConstraint(
+        "amount > 0",
+        name="ck_simulation_cash_event_allocations_amount",
+    ),
+)
+
+simulation_cash_reservations = Table(
+    "simulation_cash_reservations",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "portfolio_id",
+        String,
+        ForeignKey("quantlab.simulation_portfolios.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "order_id",
+        String,
+        ForeignKey("quantlab.simulation_orders.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "cash_lot_id",
+        String,
+        ForeignKey("quantlab.simulation_cash_lots.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("reserved_amount", Numeric(20, 6), nullable=False),
+    Column("remaining_amount", Numeric(20, 6), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "order_id",
+        "cash_lot_id",
+        name="uq_simulation_cash_reservations_order_lot",
+    ),
+    CheckConstraint(
+        "reserved_amount > 0 AND remaining_amount >= 0 "
+        "AND remaining_amount <= reserved_amount",
+        name="ck_simulation_cash_reservations_amounts",
+    ),
+)
+Index(
+    "idx_simulation_cash_reservations_order",
+    simulation_cash_reservations.c.order_id,
+    simulation_cash_reservations.c.remaining_amount,
 )
 
 simulation_external_flows = Table(
@@ -1892,6 +2301,14 @@ strategy_allocation_members = Table(
     Column("role", String, nullable=False, server_default="core"),
     Column("risk_budget", Float, nullable=False, server_default="1"),
     Column("member_cap", Float, nullable=False, server_default="0.70"),
+    Column(
+        "economic_hypothesis_group",
+        String,
+        nullable=False,
+        server_default="legacy-unclassified",
+    ),
+    Column("hypothesis_group_cap", Float, nullable=False, server_default="0.70"),
+    Column("shared_experiment_count", Integer, nullable=False, server_default="1"),
     Column("annualized_volatility", Float, nullable=False),
     Column("risk_contribution", Float, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),

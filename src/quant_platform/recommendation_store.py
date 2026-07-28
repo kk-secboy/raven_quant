@@ -18,6 +18,7 @@ from quant_data.database import (
     row_dict,
 )
 
+from .account_risk_state import assess_account_risk
 from .cost_model import CostModelConfig
 from .market_rules import lot_floor, order_unit_rules
 from .portfolio_policy import POLICY_VERSION
@@ -420,6 +421,7 @@ class RecommendationStore:
         now: datetime | None = None,
         permission_store: Any | None = None,
         account_context: dict[str, Any] | None = None,
+        risk_assessment: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Attach the two-dimension account action plan (design 8.4) to a snapshot.
 
@@ -501,13 +503,25 @@ class RecommendationStore:
                 }
             )
         computed_at = now or _now()
+        resolved_context = account_context or {
+            "account_type": "main_paper",
+            "degraded": False,
+        }
+        resolved_risk = risk_assessment or assess_account_risk(
+            account_state_stale=bool(resolved_context.get("degraded")),
+            market_data_trusted=not bool(resolved_context.get("degraded")),
+        )
         plan = {
             "model_version": RECOMMENDATION_ACTION_MODEL_VERSION,
             "computed_at": computed_at.isoformat(),
             "rule_date": rule_date.isoformat(),
-            "account_context": account_context
-            or {"account_type": "main_paper", "degraded": False},
-            "items": plan_account_actions(instruments, now=computed_at),
+            "account_context": resolved_context,
+            "risk_assessment": resolved_risk,
+            "items": plan_account_actions(
+                instruments,
+                now=computed_at,
+                risk_assessment=resolved_risk,
+            ),
         }
         with self.engine.begin() as connection:
             result = connection.execute(

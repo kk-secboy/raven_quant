@@ -144,7 +144,14 @@ def test_web_uses_only_the_single_mainline_routes() -> None:
     pair_source = (ROOT / "web" / "app" / "pair-satellite-panel.tsx").read_text(
         encoding="utf-8"
     )
-    assert "/pair-replays" in pair_source
-    assert "backtest_id" in pair_source
-    assert "target_payload" not in pair_source
-    assert "annual_borrow_rate" not in pair_source
+    assert "/pair-backtests" in pair_source
+    assert "RESEARCH ONLY / NO CAPITAL" in pair_source
+    for marker in (
+        "/pair-replays",
+        "/approve",
+        "/api/simulation-portfolios",
+        "backtest_id",
+        "target_payload",
+        "annual_borrow_rate",
+    ):
+        assert marker not in pair_source

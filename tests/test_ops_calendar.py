@@ -15,6 +15,7 @@ from quant_data.database import (
     open_database,
     simulation_batches,
     simulation_nav,
+    simulation_orders,
     simulation_portfolios,
     strategy_versions,
 )
@@ -29,7 +30,7 @@ from quant_platform.ops_calendar import (
 )
 from quant_platform.ops_tasks import run_task
 from quant_platform.recommendation_store import RecommendationStore
-from quant_platform.schedule_store import ScheduleStore
+from quant_platform.schedule_store import ScheduleStore, intraday_occurrence_after
 from quant_platform.scheduler import SchedulerEngine
 from quant_platform.worker import LocalJobWorker
 
@@ -95,6 +96,28 @@ def test_monthly_decision_day_is_the_first_trading_day() -> None:
     assert is_monthly_decision_day(date(2025, 2, 1), days) is False
     # Fail closed without calendar coverage.
     assert is_monthly_decision_day(date(2025, 3, 3), days) is False
+
+
+@pytest.mark.no_database
+def test_intraday_occurrence_respects_bar_interval_and_lunch_break() -> None:
+    assert intraday_occurrence_after(
+        datetime(2025, 2, 3, 3, 25, tzinfo=UTC),
+        "Asia/Shanghai",
+        time(9, 35),
+        5,
+    ) == datetime(2025, 2, 3, 3, 30, tzinfo=UTC)
+    assert intraday_occurrence_after(
+        datetime(2025, 2, 3, 3, 30, tzinfo=UTC),
+        "Asia/Shanghai",
+        time(9, 35),
+        5,
+    ) == datetime(2025, 2, 3, 5, 5, tzinfo=UTC)
+    assert intraday_occurrence_after(
+        datetime(2025, 2, 3, 7, 0, tzinfo=UTC),
+        "Asia/Shanghai",
+        time(9, 35),
+        5,
+    ) == datetime(2025, 2, 4, 1, 35, tzinfo=UTC)
 
 
 # --- reconciliation gate (pure logic, fake store) ------------------------------
@@ -617,6 +640,89 @@ def _create_gate_schedule(database_url: str, portfolio_id: str) -> None:
         actor="operator",
         now=datetime(2025, 2, 3, 8, 0, tzinfo=UTC),  # local 16:00, before slot
     )
+
+
+def test_intraday_check_projects_only_material_simulation_order_changes(
+    database_url: str, tmp_path: Path
+) -> None:
+    settings = _settings(database_url, tmp_path)
+    _seed_qlib_dataset(settings.data_root, "snap-ops", CALENDAR_DAYS)
+    portfolio = _create_portfolio(database_url, tmp_path)
+    _insert_simulation_account(
+        database_url,
+        portfolio["id"],
+        batch_status="succeeded",
+        nav_status="healthy",
+        nav_certified=True,
+        nav_stale=False,
+        trade_date=date(2025, 2, 3),
+    )
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(simulation_orders).values(
+                id="intraday-order-1",
+                batch_id="batch-gate-1",
+                portfolio_id="sim-gate-1",
+                instrument="SH600000",
+                side="buy",
+                target_weight=0.10,
+                requested_quantity=1000,
+                filled_quantity=0,
+                status="open",
+                requested_value=Decimal("10000"),
+                filled_value=Decimal("0"),
+                capacity_fill_ratio=1.0,
+                expires_at=datetime(2025, 2, 3, 7, 0, tzinfo=UTC),
+                not_before=datetime(2025, 2, 3, 1, 35, tzinfo=UTC),
+                not_after=datetime(2025, 2, 3, 7, 0, tzinfo=UTC),
+                created_at=datetime(2025, 2, 3, 1, 34, tzinfo=UTC),
+            )
+        )
+
+    first = run_task(
+        settings,
+        "intraday_execution_check",
+        date(2025, 2, 3),
+        dataset_anchor="snap-ops",
+        as_of=datetime(2025, 2, 3, 1, 35, tzinfo=UTC),
+    )
+    assert first["minute_alpha_generated"] is False
+    assert first["live_price_status"] == "blocked_by_data_or_permission"
+    assert first["events"][0]["execution_state"] == "READY"
+
+    with engine.begin() as connection:
+        connection.execute(
+            update(simulation_orders)
+            .where(simulation_orders.c.id == "intraday-order-1")
+            .values(filled_quantity=300, filled_value=Decimal("3000"))
+        )
+    second = run_task(
+        settings,
+        "intraday_execution_check",
+        date(2025, 2, 3),
+        dataset_anchor="snap-ops",
+        as_of=datetime(2025, 2, 3, 1, 40, tzinfo=UTC),
+    )
+    assert second["events"][0]["execution_state"] == "PARTIAL"
+    assert second["events"][0]["remaining_quantity"] == 700
+
+    # Repeating the same completed-bar facts is silent: the durable alert
+    # dedupe key includes order state and filled quantity.
+    run_task(
+        settings,
+        "intraday_execution_check",
+        date(2025, 2, 3),
+        dataset_anchor="snap-ops",
+        as_of=datetime(2025, 2, 3, 1, 45, tzinfo=UTC),
+    )
+    projected = [
+        item
+        for item in AlertStore(database_url).list()
+        if item["category"] == "intraday_execution_state"
+    ]
+    assert len(projected) == 2
+    assert all(item["details"]["account_source"] == "simulation" for item in projected)
 
 
 def test_recommendation_refresh_blocked_until_reconciled_then_recovers(

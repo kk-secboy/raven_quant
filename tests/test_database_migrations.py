@@ -25,12 +25,20 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "simulation_orders",
         "simulation_fills",
         "simulation_positions",
+        "simulation_position_reservations",
+        "simulation_security_events",
+        "simulation_day_attributions",
         "simulation_cash_flows",
+        "simulation_cash_lots",
+        "simulation_cash_events",
+        "simulation_cash_event_allocations",
+        "simulation_cash_reservations",
         "simulation_nav",
         "simulation_events",
         "research_events",
         "strategies",
         "strategy_versions",
+        "model_artifacts",
         "strategy_factors",
         "strategy_pairs",
         "pair_paper_portfolios",
@@ -86,12 +94,144 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "shadow_account_snapshots",
         "simulation_external_flows",
         "simulation_corporate_events",
+        "simulation_fee_adjustments",
     }
     with engine.connect() as connection:
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0050_corporate_event_types"
+    assert revision == "0056_day_attributions"
+    assert {
+        "economic_hypothesis_group",
+        "hypothesis_group_cap",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("strategies", schema="quantlab")
+    }
+    assert {
+        "economic_hypothesis_group",
+        "hypothesis_group_cap",
+        "shared_experiment_count",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "strategy_allocation_members", schema="quantlab"
+        )
+    }
+    assert {
+        "strategy_version_id",
+        "artifact_key",
+        "strategy_spec_sha256",
+        "model_recipe_sha256",
+        "dataset_identity_sha256",
+        "artifact_sha256",
+        "predictions_sha256",
+        "valid_until",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("model_artifacts", schema="quantlab")
+    }
+    assert {
+        "portfolio_id",
+        "fill_id",
+        "adjustment_key",
+        "previously_confirmed_fee",
+        "final_fee",
+        "adjustment_amount",
+        "evidence_sha256",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "simulation_fee_adjustments", schema="quantlab"
+        )
+    }
+    assert {
+        "portfolio_id",
+        "lot_key",
+        "source_type",
+        "free_amount",
+        "frozen_amount",
+        "tradable_at",
+        "withdrawable_at",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "simulation_cash_lots", schema="quantlab"
+        )
+    }
+    assert {
+        "portfolio_id",
+        "event_key",
+        "event_type",
+        "amount",
+        "occurred_at",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "simulation_cash_events", schema="quantlab"
+        )
+    }
+    assert {
+        "portfolio_id",
+        "order_id",
+        "cash_lot_id",
+        "reserved_amount",
+        "remaining_amount",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "simulation_cash_reservations", schema="quantlab"
+        )
+    }
+    assert {"frozen_quantity"} <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "simulation_positions", schema="quantlab"
+        )
+    }
+    assert {
+        "portfolio_id",
+        "order_id",
+        "instrument",
+        "reserved_quantity",
+        "remaining_quantity",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "simulation_position_reservations", schema="quantlab"
+        )
+    }
+    assert {
+        "portfolio_id",
+        "order_id",
+        "event_key",
+        "event_type",
+        "instrument",
+        "quantity",
+        "occurred_at",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "simulation_security_events", schema="quantlab"
+        )
+    }
+    assert {
+        "portfolio_id",
+        "batch_id",
+        "trade_date",
+        "strategy_json",
+        "industry_json",
+        "asset_json",
+        "cost_json",
+        "execution_json",
+        "coverage_status",
+        "input_sha256",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "simulation_day_attributions", schema="quantlab"
+        )
+    }
     assert {
         "portfolio_id",
         "event_key",

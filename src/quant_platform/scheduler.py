@@ -141,7 +141,12 @@ class SchedulerEngine:
                 job = self._enqueue_recommendation(run, scheduled_for)
                 if job is None:
                     return
-            elif run["kind"] in ("weekly_report", "monthly_decision_day", "preopen_check"):
+            elif run["kind"] in (
+                "weekly_report",
+                "monthly_decision_day",
+                "preopen_check",
+                "intraday_execution_check",
+            ):
                 job = self._enqueue_ops_task(run, scheduled_for)
                 if job is None:
                     return
@@ -402,6 +407,7 @@ class SchedulerEngine:
                 return None
         payload = {
             "local_date": local_date.isoformat(),
+            "as_of": scheduled_for.isoformat(),
             "schedule_run_id": run["id"],
             **{
                 key: value

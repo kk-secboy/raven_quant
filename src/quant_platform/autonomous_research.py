@@ -17,6 +17,7 @@ from .qlib_factor_baseline import (
 from .recommendation_store import RecommendationStore
 from .research_automation import rank_factor_candidates
 from .research_campaign_store import ResearchCampaignStore
+from .research_contracts import default_campaign_research_brief
 from .research_store import ResearchStore
 from .schedule_store import ScheduleStore
 from .services import list_qlib_datasets
@@ -67,6 +68,15 @@ class AutonomousResearchOrchestrator:
             "end_date": evidence.get("end_date"),
             "provenance": evidence.get("provenance"),
         }
+        pinned["research_mode"] = "template_extension"
+        pinned["research_brief"] = default_campaign_research_brief(
+            objective=objective,
+            dataset=dataset,
+            benchmark=benchmark,
+            universe=universe,
+            recipe_id=recipe_id,
+            config=pinned,
+        )
         return self.campaigns.create(
             name=name,
             objective=objective,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import UTC, date, datetime, time
 from zoneinfo import ZoneInfo
@@ -101,7 +103,14 @@ def test_apply_order_plan_maps_all_four_ops() -> None:
     assert replace["new_requested_quantity"] == 100
     assert replace["released_quantity"] == 100
     assert outcome["news"] == [
-        {"op": "new", "instrument": "SH600001", "side": "sell", "quantity": 100, "reason": ""}
+        {
+            "op": "new",
+            "instrument": "SH600001",
+            "side": "sell",
+            "quantity": 100,
+            "limit_price": None,
+            "reason": "",
+        }
     ]
 
 
@@ -281,7 +290,30 @@ def _process(
     price=10.0,
     day=TRADE_DATE,
     instruments: tuple[str, ...] = ("SH600000",),
+    industry_snapshot: dict[str, str] | None = None,
 ):
+    next_day = day + pd.offsets.BusinessDay(1)
+    evidence = _execution_evidence(
+        batch["id"],
+        simulation["execution_contract_hash"],
+    )
+    evidence["next_trade_date"] = next_day.date().isoformat()
+    if industry_snapshot is not None:
+        normalized = {
+            str(instrument).strip().upper(): str(industry).strip()
+            for instrument, industry in industry_snapshot.items()
+        }
+        evidence["industry_snapshot_sha256"] = hashlib.sha256(
+            json.dumps(
+                {
+                    "trade_date": day.isoformat(),
+                    "values": dict(sorted(normalized.items())),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
     return store.process_batch(
         batch["id"],
         minute_bars=_bars(price=price, day=day, instruments=instruments),
@@ -289,7 +321,8 @@ def _process(
             instrument: {"price": price, "market_date": day.isoformat()}
             for instrument in instruments
         },
-        execution_evidence=_execution_evidence(batch["id"], simulation["execution_contract_hash"]),
+        execution_evidence=evidence,
+        industry_snapshot=industry_snapshot,
     )
 
 
@@ -308,7 +341,13 @@ def _buy_action(instrument: str, quantity: int) -> dict:
         "instrument": instrument,
         "action": "BUY",
         "order_plan": [
-            {"op": "new", "instrument": instrument, "side": "buy", "quantity": quantity}
+            {
+                "op": "new",
+                "instrument": instrument,
+                "side": "buy",
+                "quantity": quantity,
+                "limit_price": 10.0,
+            }
         ],
     }
 
@@ -343,6 +382,317 @@ def test_order_plan_batch_persists_planned_then_executes(database_url: str, tmp_
     assert sum(int(fill["quantity"]) for fill in fills) == 1_000
     assert {fill["order_id"] for fill in fills} == {order["id"]}
     assert abs(completed["summary"]["conservation"]["cash_difference"]) < 1e-6
+    cash = store.cash_view(simulation["id"])
+    assert cash["total_cash"] == pytest.approx(float(completed["summary"]["cash"]))
+    assert cash["frozen_cash"] == pytest.approx(0.0)
+    cash_events = store.rows(simulation["id"], "cash_events")
+    assert [item["event_type"] for item in cash_events].count("freeze") == 1
+    assert [item["event_type"] for item in cash_events].count(
+        "consume_frozen"
+    ) == len(fills)
+    # Limit-price and per-slice fee headroom is released after the terminal
+    # fill instead of being charged or left frozen.
+    assert [item["event_type"] for item in cash_events].count("release") == 1
+    (attribution,) = store.rows(simulation["id"], "day_attributions")
+    assert attribution["coverage_status"] == "partial"
+    assert attribution["blocker_reasons_json"] == [
+        "blocked_missing_bound_industry_snapshot"
+    ]
+    assert attribution["industry_json"]["status"] == (
+        "blocked_missing_bound_industry_snapshot"
+    )
+    assert attribution["strategy_json"]["status"] == (
+        "source_level_fallback_no_frozen_member_contributions"
+    )
+    execution = attribution["execution_json"]["instruments"]["SH600000"]
+    assert int(execution["filled_quantity"]) == 1_000
+    assert execution["fill_ratio"] == pytest.approx(1.0)
+    assert attribution["cost_json"]["total_fee"] == pytest.approx(
+        sum(float(fill["fee"]) for fill in fills)
+    )
+
+
+def test_buy_order_freeze_and_cancel_only_reclassify_cash_once(
+    database_url: str, tmp_path
+) -> None:
+    store, simulation = _create_simulation(database_url, tmp_path)
+    initial = store.get(simulation["id"])
+    batch, _ = store.create_order_plan_batch(
+        simulation["id"],
+        trade_date=TRADE_DATE,
+        actions=[_buy_action("SH600000", 1_000)],
+        target_version="target-v1",
+        actor="test",
+    )
+    (order,) = _orders(store, simulation)
+    frozen = store.cash_view(simulation["id"])
+    assert frozen["total_cash"] == pytest.approx(float(initial["cash"]))
+    assert frozen["frozen_cash"] > 10_000
+    assert frozen["free_cash"] + frozen["frozen_cash"] == pytest.approx(
+        frozen["total_cash"]
+    )
+    # A reservation is a classification only: neither scalar cash nor NAV
+    # changes when the order is committed.
+    after_plan = store.get(simulation["id"])
+    assert float(after_plan["cash"]) == pytest.approx(float(initial["cash"]))
+    assert float(after_plan["nav"]) == pytest.approx(float(initial["nav"]))
+
+    cancel = {
+        "op": "cancel",
+        "order_id": order["id"],
+        "quantity": 1_000,
+        "reason": "target_already_filled",
+    }
+    store.create_order_plan_batch(
+        simulation["id"],
+        trade_date=TRADE_DATE,
+        actions=[
+            {
+                "instrument": "SH600000",
+                "action": "HOLD",
+                "order_plan": [cancel],
+            }
+        ],
+        target_version="target-v2",
+        actor="test",
+    )
+    released = store.cash_view(simulation["id"])
+    assert released["total_cash"] == pytest.approx(frozen["total_cash"])
+    assert released["frozen_cash"] == pytest.approx(0.0)
+    assert released["free_cash"] == pytest.approx(released["total_cash"])
+
+    # Replaying the cancellation against its terminal order creates no second
+    # release and cannot manufacture free cash.
+    store.create_order_plan_batch(
+        simulation["id"],
+        trade_date=TRADE_DATE,
+        actions=[
+            {
+                "instrument": "SH600000",
+                "action": "HOLD",
+                "order_plan": [cancel],
+            }
+        ],
+        target_version="target-v3",
+        actor="test",
+    )
+    replayed = store.cash_view(simulation["id"])
+    for field in (
+        "total_cash",
+        "free_cash",
+        "frozen_cash",
+        "tradable_cash",
+        "withdrawable_cash",
+    ):
+        assert replayed[field] == pytest.approx(released[field])
+    release_events = [
+        row
+        for row in store.rows(simulation["id"], "cash_events")
+        if row["event_type"] == "release"
+    ]
+    assert len(release_events) == 1
+    assert release_events[0]["order_id"] == order["id"]
+    assert batch["id"] != release_events[0]["batch_id"]
+
+
+def test_bound_industry_snapshot_completes_day_attribution(
+    database_url: str, tmp_path
+) -> None:
+    store, simulation = _create_simulation(database_url, tmp_path)
+    batch, _ = store.create_order_plan_batch(
+        simulation["id"],
+        trade_date=TRADE_DATE,
+        actions=[_buy_action("SH600000", 1_000)],
+        target_version="target-v1",
+        actor="test",
+    )
+    _process(
+        store,
+        simulation,
+        batch,
+        industry_snapshot={"SH600000": "银行"},
+    )
+    (attribution,) = store.rows(simulation["id"], "day_attributions")
+    assert attribution["coverage_status"] == "complete"
+    assert attribution["blocker_reasons_json"] == []
+    assert attribution["industry_json"]["status"] == "available"
+    assert attribution["industry_json"]["unclassified_instruments"] == []
+    assert attribution["industry_json"]["groups"]["银行"][
+        "closing_market_value"
+    ] == pytest.approx(10_000.0)
+
+
+def test_sell_proceeds_are_tradable_same_day_but_withdrawable_next_business_day(
+    database_url: str, tmp_path
+) -> None:
+    store, simulation = _create_simulation(database_url, tmp_path)
+    buy_batch, _ = store.create_order_plan_batch(
+        simulation["id"],
+        trade_date=TRADE_DATE,
+        actions=[_buy_action("SH600000", 1_000)],
+        target_version="target-v1",
+        actor="test",
+    )
+    _process(store, simulation, buy_batch)
+    sell_batch, _ = store.create_order_plan_batch(
+        simulation["id"],
+        trade_date=DAY2,
+        actions=[
+            {
+                "instrument": "SH600000",
+                "action": "SELL",
+                "order_plan": [
+                    {
+                        "op": "new",
+                        "instrument": "SH600000",
+                        "side": "sell",
+                        "quantity": 1_000,
+                        "limit_price": 9.0,
+                    }
+                ],
+            }
+        ],
+        target_version="target-v2",
+        actor="test",
+    )
+    (position_before_fill,) = store.rows(simulation["id"], "positions")
+    assert int(position_before_fill["frozen_quantity"]) == 1_000
+    assert int(position_before_fill["free_sellable_quantity"]) == 0
+    _process(store, simulation, sell_batch, day=DAY2)
+    assert store.rows(simulation["id"], "positions") == []
+    (sell_reservation,) = [
+        item
+        for item in store.rows(simulation["id"], "position_reservations")
+        if item["order_id"]
+        == next(
+            order["id"]
+            for order in _orders(store, simulation)
+            if order["side"] == "sell"
+        )
+    ]
+    assert int(sell_reservation["remaining_quantity"]) == 0
+    sell_lots = [
+        row
+        for row in store.rows(simulation["id"], "cash_lots")
+        if row["source_type"] == "sell_settlement"
+    ]
+    assert len(sell_lots) == len(
+        [
+            fill
+            for fill in store.rows(simulation["id"], "fills")
+            if fill["side"] == "sell"
+        ]
+    )
+    for proceeds in sell_lots:
+        tradable_at = datetime.fromisoformat(str(proceeds["tradable_at"]))
+        withdrawable_at = datetime.fromisoformat(str(proceeds["withdrawable_at"]))
+        assert tradable_at.astimezone(SHANGHAI).date() == DAY2
+        assert withdrawable_at.astimezone(SHANGHAI).date() == date(2026, 7, 15)
+        assert withdrawable_at > tradable_at
+
+
+def test_sell_orders_cannot_double_reserve_and_cancel_releases_once(
+    database_url: str, tmp_path
+) -> None:
+    store, simulation = _create_simulation(database_url, tmp_path)
+    buy_batch, _ = store.create_order_plan_batch(
+        simulation["id"],
+        trade_date=TRADE_DATE,
+        actions=[_buy_action("SH600000", 1_000)],
+        target_version="target-v1",
+        actor="test",
+    )
+    _process(store, simulation, buy_batch)
+    sell_batch, _ = store.create_order_plan_batch(
+        simulation["id"],
+        trade_date=DAY2,
+        actions=[
+            {
+                "instrument": "SH600000",
+                "action": "SELL",
+                "order_plan": [
+                    {
+                        "op": "new",
+                        "instrument": "SH600000",
+                        "side": "sell",
+                        "quantity": 600,
+                        "limit_price": 9.0,
+                    }
+                ],
+            }
+        ],
+        target_version="target-v2",
+        actor="test",
+    )
+    sell_order = next(
+        order for order in _orders(store, simulation) if order["side"] == "sell"
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="exceeds free sellable quantity after existing freezes",
+    ):
+        store.create_order_plan_batch(
+            simulation["id"],
+            trade_date=DAY2,
+            actions=[
+                {
+                    "instrument": "SH600000",
+                    "action": "SELL",
+                    "order_plan": [
+                        {
+                            "op": "new",
+                            "instrument": "SH600000",
+                            "side": "sell",
+                            "quantity": 500,
+                            "limit_price": 9.0,
+                        }
+                    ],
+                }
+            ],
+            target_version="target-v3",
+            actor="test",
+        )
+    cancel_kwargs = {
+        "trade_date": DAY2,
+        "actions": [
+            {
+                "instrument": "SH600000",
+                "action": "HOLD",
+                "order_plan": [
+                    {
+                        "op": "cancel",
+                        "order_id": sell_order["id"],
+                        "quantity": 600,
+                        "reason": "target_already_filled",
+                    }
+                ],
+            }
+        ],
+        "target_version": "target-v4",
+        "actor": "test",
+    }
+    _, created = store.create_order_plan_batch(simulation["id"], **cancel_kwargs)
+    _, replay_created = store.create_order_plan_batch(
+        simulation["id"], **cancel_kwargs
+    )
+    assert created is True
+    assert replay_created is False
+    (position,) = store.rows(simulation["id"], "positions")
+    assert int(position["frozen_quantity"]) == 0
+    reservation = next(
+        item
+        for item in store.rows(simulation["id"], "position_reservations")
+        if item["order_id"] == sell_order["id"]
+    )
+    assert int(reservation["remaining_quantity"]) == 0
+    release_events = [
+        event
+        for event in store.rows(simulation["id"], "security_events")
+        if event["event_type"] == "release"
+        and event["order_id"] == sell_order["id"]
+    ]
+    assert len(release_events) == 1
+    assert sell_batch["id"] != release_events[0]["batch_id"]
 
 
 def test_plan_consumption_cancel_replace_new_end_to_end(database_url: str, tmp_path) -> None:
@@ -375,6 +725,7 @@ def test_plan_consumption_cancel_replace_new_end_to_end(database_url: str, tmp_p
                         "instrument": "SH600002",
                         "side": "buy",
                         "quantity": 100,
+                        "limit_price": 10.0,
                     },
                 ],
             },

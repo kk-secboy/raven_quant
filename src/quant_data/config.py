@@ -40,7 +40,7 @@ class Settings:
     timeout_seconds: float = 60.0
     max_request_attempts: int = 5
     cooldown_seconds: float = 180.0
-    keep_raw: bool = False
+    keep_raw: bool = True
     qlib_repo: Path = Path("E:/projects/qlib")
     qlib_python: str = "/mnt/e/venvs/qlib/bin/python"
     qlib_wsl_distro: str = "Ubuntu-22.04"
@@ -100,7 +100,7 @@ class Settings:
             timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "60")),
             max_request_attempts=max(1, int(os.getenv("MAX_REQUEST_ATTEMPTS", "5"))),
             cooldown_seconds=float(os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "180")),
-            keep_raw=_bool("KEEP_RAW_RESPONSES", False),
+            keep_raw=_bool("KEEP_RAW_RESPONSES", True),
             qlib_repo=Path(os.getenv("QLIB_REPO", "E:/projects/qlib")).expanduser().resolve(),
             qlib_python=os.getenv("QLIB_PYTHON", "/mnt/e/venvs/qlib/bin/python"),
             qlib_wsl_distro=os.getenv("QLIB_WSL_DISTRO", "Ubuntu-22.04"),

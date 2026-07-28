@@ -87,6 +87,7 @@ def _execution_evidence(batch_id: str, contract_hash: str) -> dict:
         "dataset_lineage_id": EXECUTION_LINEAGE,
         "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
         "execution_contract_hash": contract_hash,
+        "next_trade_date": "2026-07-14",
     }
 
 

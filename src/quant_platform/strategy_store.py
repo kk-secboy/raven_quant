@@ -33,6 +33,7 @@ from quant_data.execution_contract import (
 )
 from quant_platform.cost_model import KNOWN_COST_SCHEDULE_VERSIONS, CostModelConfig
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
+from quant_platform.formal_validation import FORMAL_VALIDATION_CONTRACT_VERSION
 from quant_platform.pair_trading import PairTradingConfig
 from quant_platform.qlib_backtest import (
     COMPONENT_COST_STRESS_MULTIPLIERS,
@@ -162,6 +163,102 @@ def _scenario_artifact_failures(
             failures.append(
                 f"robustness scenario {scenario_name} has no complete immutable artifacts"
             )
+    return failures
+
+
+def _formal_validation_failures(
+    version: dict[str, Any], metrics: dict[str, Any]
+) -> list[str]:
+    evidence = metrics.get("formal_validation")
+    if not isinstance(evidence, dict):
+        return ["formal validation evidence is required"]
+    failures: list[str] = []
+    if evidence.get("contract_version") != FORMAL_VALIDATION_CONTRACT_VERSION:
+        failures.append("formal validation contract version is missing or obsolete")
+    if evidence.get("status") != "passed" or metrics.get(
+        "formal_validation_passed"
+    ) is not True:
+        failures.append("formal validation suite did not pass")
+
+    outer = evidence.get("outer_walk_forward")
+    coverage = outer.get("candidate_coverage") if isinstance(outer, dict) else {}
+    trials = int((metrics.get("deflated_sharpe") or {}).get("trials") or 1)
+    if (
+        not isinstance(outer, dict)
+        or outer.get("status") != "completed"
+        or int(outer.get("fold_count") or 0) < 3
+        or int((coverage or {}).get("required_group_trials") or 0) != trials
+        or int((coverage or {}).get("provided_candidates") or 0) != trials
+    ):
+        failures.append(
+            "outer walk-forward must rerun the complete hypothesis-group candidate set"
+        )
+
+    baseline = version.get("config", {}).get("baseline_definition")
+    expected_components = len(version.get("factors") or []) + len(
+        (baseline or {}).get("factors") or []
+    )
+    ablation = evidence.get("ablation")
+    if (
+        not isinstance(ablation, dict)
+        or ablation.get("status") != "passed"
+        or len(ablation.get("runs") or []) != expected_components
+        or any(
+            not isinstance(item, dict)
+            or item.get("passed") is not True
+            or not isinstance(item.get("metrics"), dict)
+            for item in ablation.get("runs") or []
+        )
+    ):
+        failures.append("complete passing component ablation evidence is required")
+
+    decay = evidence.get("signal_decay")
+    if (
+        not isinstance(decay, dict)
+        or decay.get("status") != "completed"
+        or decay.get("maximum_supported_delay_bars") is None
+        or not decay.get("runs")
+    ):
+        failures.append("signal-decay evidence did not establish a supported response delay")
+
+    bootstrap = evidence.get("paired_block_bootstrap")
+    interval = (
+        bootstrap.get("confidence_interval_95")
+        if isinstance(bootstrap, dict)
+        else None
+    )
+    if (
+        not isinstance(bootstrap, dict)
+        or bootstrap.get("status") != "ok"
+        or not isinstance(interval, list)
+        or len(interval) != 2
+        or float(interval[0]) <= 0
+    ):
+        failures.append(
+            "paired moving-block bootstrap did not show positive baseline increment"
+        )
+
+    multiple = evidence.get("multiple_testing")
+    if trials == 1:
+        valid_multiple = (
+            isinstance(multiple, dict)
+            and multiple.get("status") == "not_applicable_single_trial"
+            and len(multiple.get("holm_adjusted_p_values") or []) == 1
+        )
+    else:
+        pbo = multiple.get("pbo") if isinstance(multiple, dict) else None
+        valid_multiple = (
+            isinstance(multiple, dict)
+            and multiple.get("status") == "ok"
+            and len(multiple.get("holm_adjusted_p_values") or []) == trials
+            and isinstance(pbo, dict)
+            and pbo.get("status") == "ok"
+            and pbo.get("pbo") is not None
+        )
+    if not valid_multiple:
+        failures.append(
+            "Holm/PBO evidence must cover the shared hypothesis-group trial count"
+        )
     return failures
 
 
@@ -447,6 +544,8 @@ class StrategyStore:
         factors: list[dict[str, Any]],
         config: dict[str, Any],
         actor: str,
+        economic_hypothesis_group: str | None = None,
+        hypothesis_group_cap: float = 0.70,
     ) -> dict[str, Any]:
         config = _normalize_multifactor_contract(
             config, factor_count=len(factors), creating_family=True
@@ -457,6 +556,11 @@ class StrategyStore:
         if factors and total_weight <= 0:
             raise ValueError("factor weights must not all be zero")
         strategy_id = uuid.uuid4().hex
+        group = str(economic_hypothesis_group or strategy_id).strip()
+        if not group or len(group) > 200:
+            raise ValueError("economic hypothesis group must contain 1 to 200 characters")
+        if not 0 < float(hypothesis_group_cap) <= 0.70:
+            raise ValueError("hypothesis group capital cap must be in (0, 0.70]")
         version_id = uuid.uuid4().hex
         now = _now()
         try:
@@ -468,6 +572,8 @@ class StrategyStore:
                         name=name,
                         description=description,
                         status="draft",
+                        economic_hypothesis_group=group,
+                        hypothesis_group_cap=float(hypothesis_group_cap),
                         created_by=actor,
                         created_at=now,
                         updated_at=now,
@@ -821,10 +927,35 @@ class StrategyStore:
             ids = [str(row.id) for row in connection.execute(statement)]
         return [self.get(strategy_id) for strategy_id in ids]
 
+    def list_pairs(self, limit: int = 100) -> list[dict[str, Any]]:
+        statement = (
+            select(strategies.c.id)
+            .join(
+                strategy_versions,
+                strategy_versions.c.strategy_id == strategies.c.id,
+            )
+            .join(
+                strategy_pairs,
+                strategy_pairs.c.strategy_version_id == strategy_versions.c.id,
+            )
+            .group_by(strategies.c.id)
+            .order_by(strategies.c.updated_at.desc())
+            .limit(limit)
+        )
+        with self.engine.connect() as connection:
+            ids = [str(row.id) for row in connection.execute(statement)]
+        return [self.get(strategy_id) for strategy_id in ids]
+
     def get_version(self, version_id: str) -> dict[str, Any]:
         with self.engine.connect() as connection:
             row = connection.execute(
-                select(strategy_versions).where(strategy_versions.c.id == version_id)
+                select(
+                    strategy_versions,
+                    strategies.c.economic_hypothesis_group,
+                    strategies.c.hypothesis_group_cap,
+                )
+                .join(strategies, strategies.c.id == strategy_versions.c.strategy_id)
+                .where(strategy_versions.c.id == version_id)
             ).first()
             if row is None:
                 raise KeyError(version_id)
@@ -859,6 +990,62 @@ class StrategyStore:
             "baseline_definition_sha256"
         )
         return result
+
+    def hypothesis_group_evidence(self, version_id: str) -> dict[str, Any]:
+        """Return the immutable family-wide trial count used by formal gates.
+
+        Factor experiment families carry their declared count (including
+        non-winning variants); multiple versions/model wrappers also count as
+        trials.  Renaming or versioning therefore cannot reset DSR/PBO inputs.
+        """
+
+        version = self.get_version(version_id)
+        group = str(version["economic_hypothesis_group"])
+        with self.engine.connect() as connection:
+            version_rows = connection.execute(
+                select(strategy_versions.c.id)
+                .join(strategies, strategies.c.id == strategy_versions.c.strategy_id)
+                .where(
+                    strategies.c.economic_hypothesis_group == group,
+                    strategy_versions.c.is_legacy.is_(False),
+                )
+            ).all()
+            factor_rows = connection.execute(
+                select(
+                    factor_candidates.c.experiment_family_id,
+                    factor_candidates.c.id,
+                    factor_candidates.c.experiment_count,
+                )
+                .join(
+                    strategy_factors,
+                    strategy_factors.c.factor_candidate_id == factor_candidates.c.id,
+                )
+                .join(
+                    strategy_versions,
+                    strategy_versions.c.id == strategy_factors.c.strategy_version_id,
+                )
+                .join(strategies, strategies.c.id == strategy_versions.c.strategy_id)
+                .where(
+                    strategies.c.economic_hypothesis_group == group,
+                    strategy_versions.c.is_legacy.is_(False),
+                )
+            ).all()
+        family_counts: dict[str, int] = {}
+        for row in factor_rows:
+            family = str(row.experiment_family_id or row.id)
+            family_counts[family] = max(
+                family_counts.get(family, 0),
+                int(row.experiment_count or 1),
+            )
+        version_ids = sorted(str(row.id) for row in version_rows)
+        shared_count = max(1, len(version_ids), sum(family_counts.values()))
+        return {
+            "economic_hypothesis_group": group,
+            "hypothesis_group_cap": float(version["hypothesis_group_cap"]),
+            "shared_experiment_count": shared_count,
+            "strategy_version_ids": version_ids,
+            "experiment_family_counts": dict(sorted(family_counts.items())),
+        }
 
     def create_backtest(
         self,
@@ -1557,6 +1744,7 @@ class StrategyStore:
         deflated = metrics.get("deflated_sharpe")
         if not isinstance(deflated, dict) or deflated.get("status") != "ok":
             failures.append("Deflated Sharpe evidence is missing or invalid")
+        failures.extend(_formal_validation_failures(version, metrics))
         if metrics.get("capacity_curve_passed") is not True:
             failures.append("capacity curve did not satisfy the configured result gate")
         eligibility = metrics.get("eligibility")

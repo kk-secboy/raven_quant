@@ -34,7 +34,8 @@ Docker 镜像分别位于 `deploy/Dockerfile.api`、`deploy/Dockerfile.worker`�
 
 ## 本地安装
 
-需要 Python 3.11+、PostgreSQL，以及运行 RD-Agent 沙箱时所需的 Docker。
+需要 Python 3.11+、PostgreSQL、Node.js 22.15+，以及运行 RD-Agent 沙箱时
+所需的 Docker。
 
 ```powershell
 cd E:\projects\rdagent-python
@@ -58,8 +59,9 @@ Copy-Item .env.example .env
 
 ```powershell
 cd E:\projects\rdagent-python\web
-npm install
-npm run dev
+corepack enable
+pnpm install --frozen-lockfile
+pnpm run dev
 ```
 
 ## 数据与研究起点
@@ -93,6 +95,8 @@ docker compose --env-file deploy\.env -f deploy\compose.yaml ps
 ```powershell
 .\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe -m ruff check src tests
+pnpm --dir web run lint
+pnpm --dir web run test
 ```
 
 产品语义变更必须直接更新根目录权威 Markdown，并通过文档治理测试。

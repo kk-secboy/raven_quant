@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from math import e, isfinite, sqrt
+from itertools import combinations
+from math import e, isfinite, log, sqrt
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
+# The existing HAC/BH/DSR factor-evaluation payload remains wire compatible.
+# Holm, paired bootstrap and PBO are additive evidence blocks, so they do not
+# invalidate already frozen factor artifacts or require a schema migration.
 STATISTICAL_CONTRACT_VERSION = "research-statistics-v1-hac-bh-dsr"
 
 
@@ -66,6 +70,151 @@ def benjamini_hochberg(p_values: list[float]) -> list[float]:
     result = np.empty_like(adjusted)
     result[order] = np.clip(adjusted, 0.0, 1.0)
     return result.tolist()
+
+
+def holm_bonferroni(p_values: list[float]) -> list[float]:
+    """Family-wise adjusted p-values for a frozen small candidate family."""
+
+    values = np.asarray(p_values, dtype=float)
+    if len(values) == 0:
+        return []
+    if not np.isfinite(values).all() or ((values < 0) | (values > 1)).any():
+        raise ValueError("Holm p-values must be finite and in [0, 1]")
+    order = np.argsort(values)
+    ranked = values[order]
+    adjusted = np.maximum.accumulate(
+        ranked * np.arange(len(values), 0, -1, dtype=float)
+    )
+    result = np.empty_like(adjusted)
+    result[order] = np.clip(adjusted, 0.0, 1.0)
+    return result.tolist()
+
+
+def paired_moving_block_bootstrap(
+    candidate_returns: pd.Series | list[float],
+    baseline_returns: pd.Series | list[float],
+    *,
+    block_size: int,
+    samples: int = 2000,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Paired circular moving-block bootstrap for mean return improvement."""
+
+    candidate = np.asarray(pd.Series(candidate_returns), dtype=float)
+    baseline = np.asarray(pd.Series(baseline_returns), dtype=float)
+    if (
+        len(candidate) != len(baseline)
+        or len(candidate) < 30
+        or not np.isfinite(candidate).all()
+        or not np.isfinite(baseline).all()
+    ):
+        raise ValueError("paired bootstrap requires equal finite samples of at least 30")
+    if not 1 <= block_size <= len(candidate) or samples < 100:
+        raise ValueError("paired bootstrap block size or sample count is invalid")
+    difference = candidate - baseline
+    rng = np.random.default_rng(seed)
+    block_count = int(np.ceil(len(difference) / block_size))
+    estimates = np.empty(samples, dtype=float)
+    offsets = np.arange(block_size)
+    for sample_no in range(samples):
+        starts = rng.integers(0, len(difference), size=block_count)
+        indices = ((starts[:, None] + offsets) % len(difference)).ravel()[
+            : len(difference)
+        ]
+        estimates[sample_no] = float(difference[indices].mean())
+    observed = float(difference.mean())
+    lower, upper = np.quantile(estimates, [0.025, 0.975])
+    return {
+        "status": "ok",
+        "observed_mean_difference": observed,
+        "confidence_interval_95": [float(lower), float(upper)],
+        "probability_positive": float(np.mean(estimates > 0.0)),
+        "one_sided_p_value": float((np.sum(estimates <= 0.0) + 1) / (samples + 1)),
+        "block_size": int(block_size),
+        "samples": int(samples),
+        "seed": int(seed),
+        "observations": len(difference),
+        "contract_version": STATISTICAL_CONTRACT_VERSION,
+    }
+
+
+def probability_of_backtest_overfitting(
+    trial_returns: pd.DataFrame,
+    *,
+    blocks: int = 8,
+) -> dict[str, Any]:
+    """Combinatorially symmetric cross-validation PBO diagnostic.
+
+    Each column is a frozen candidate/trial and each row an aligned return.
+    PBO is the fraction of splits where the in-sample winner ranks below the
+    test-set median.  It is diagnostic evidence, not a universal approval
+    certificate.
+    """
+
+    if (
+        not isinstance(trial_returns, pd.DataFrame)
+        or trial_returns.shape[0] < 40
+        or trial_returns.shape[1] < 2
+        or blocks < 4
+        or blocks % 2
+        or trial_returns.shape[0] < blocks * 5
+    ):
+        raise ValueError("PBO requires at least two trials and even non-trivial blocks")
+    values = trial_returns.apply(pd.to_numeric, errors="coerce")
+    if values.isna().any().any() or not np.isfinite(values.to_numpy(dtype=float)).all():
+        raise ValueError("PBO return matrix must be complete and finite")
+    partitions = np.array_split(np.arange(len(values)), blocks)
+    train_size = blocks // 2
+    logits: list[float] = []
+    winners: list[str] = []
+    # Complementary splits carry the same information; keep one canonical
+    # member of each pair to avoid double weighting.
+    for selected in combinations(range(blocks), train_size):
+        complement = tuple(index for index in range(blocks) if index not in selected)
+        if selected > complement:
+            continue
+        train_index = np.concatenate([partitions[index] for index in selected])
+        test_index = np.concatenate([partitions[index] for index in complement])
+        train = values.iloc[train_index]
+        test = values.iloc[test_index]
+        train_std = train.std(ddof=1).replace(0.0, np.nan)
+        train_scores = (train.mean() / train_std).replace(
+            [np.inf, -np.inf], np.nan
+        )
+        if train_scores.notna().sum() < 2:
+            continue
+        winner = str(train_scores.idxmax())
+        test_std = test.std(ddof=1).replace(0.0, np.nan)
+        test_scores = (test.mean() / test_std).replace(
+            [np.inf, -np.inf], np.nan
+        ).dropna()
+        if winner not in test_scores or len(test_scores) < 2:
+            continue
+        # Rank 1 is worst, N is best. Map to (0,1) without endpoints.
+        rank = float(test_scores.rank(method="average")[winner])
+        relative_rank = (rank - 0.5) / len(test_scores)
+        logits.append(log(relative_rank / (1.0 - relative_rank)))
+        winners.append(winner)
+    if not logits:
+        return {
+            "status": "undefined_degenerate_trials",
+            "pbo": None,
+            "split_count": 0,
+            "contract_version": STATISTICAL_CONTRACT_VERSION,
+        }
+    return {
+        "status": "ok",
+        "pbo": float(np.mean(np.asarray(logits) <= 0.0)),
+        "split_count": len(logits),
+        "median_logit_rank": float(np.median(logits)),
+        "winner_counts": {
+            candidate: winners.count(candidate) for candidate in sorted(set(winners))
+        },
+        "blocks": int(blocks),
+        "trials": int(values.shape[1]),
+        "observations": int(values.shape[0]),
+        "contract_version": STATISTICAL_CONTRACT_VERSION,
+    }
 
 
 def purged_embargo_split(

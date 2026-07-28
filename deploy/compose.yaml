@@ -215,6 +215,12 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   gateway:
     image: caddy:2.10-alpine
@@ -225,9 +231,12 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
     depends_on:
-      - web
-      - api
-      - scheduler
+      web:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+      scheduler:
+        condition: service_healthy
 
 volumes:
   quantlab_postgres:

@@ -161,6 +161,7 @@ def apply_order_plan(
                     "instrument": str(entry.get("instrument") or "").upper(),
                     "side": side,
                     "quantity": quantity,
+                    "limit_price": entry.get("limit_price"),
                     "reason": str(entry.get("reason") or ""),
                 }
             )

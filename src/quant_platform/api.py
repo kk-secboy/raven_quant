@@ -52,6 +52,7 @@ from .deployment_readiness import DeploymentReadinessStore
 from .health_store import OperationalHealthStore
 from .job_store import JobStore
 from .market_overview import MarketOverviewService
+from .model_artifact_store import ModelArtifactStore
 from .parameter_experiment_store import ParameterExperimentStore
 from .parameter_experiments import normalize_parameter_grid, split_research_period
 from .platform_config_store import PlatformConfigStore
@@ -399,6 +400,8 @@ class StrategyConfigRequest(BaseModel):
     liquidity_lookback_days: int = Field(default=20, ge=5, le=252)
     require_regulatory_events: bool = False
     max_tracking_error: float = Field(default=0.12, gt=0, le=1.0)
+    min_cash_weight: float = Field(default=0.0, ge=0, lt=1.0)
+    max_asset_class_weights: dict[str, float] | None = None
     target_volatility: float = Field(default=0.15, gt=0, le=0.50)
     max_drawdown: float = Field(default=0.25, gt=0, le=1.0)
     max_turnover: float = Field(default=0.60, gt=0, le=2.0)
@@ -407,6 +410,11 @@ class StrategyConfigRequest(BaseModel):
     min_sortino_ratio: float = Field(default=0.0, ge=-5, le=20)
     min_robustness_pass_rate: float = Field(default=1.0, ge=0, le=1)
     annual_minimum_acceptable_return: float = Field(default=0.0, gt=-1.0, le=1.0)
+    # The first release does not hold a separate cash instrument, therefore
+    # idle cash earns exactly zero. A non-zero research risk-free rate must
+    # never leak into account P&L as obtainable cash yield.
+    annual_cash_yield_rate: float = Field(default=0.0, ge=0.0, le=0.0)
+    cash_yield_source: Literal["none_zero_yield"] = "none_zero_yield"
     rolling_window_days: int = Field(default=252, ge=60, le=1260)
     rolling_step_days: int = Field(default=63, ge=20, le=504)
     min_rolling_windows: int = Field(default=3, ge=2, le=20)
@@ -459,6 +467,11 @@ class StrategyConfigRequest(BaseModel):
             raise ValueError("n_drop must not exceed topk")
         if self.max_industry_weight < self.max_position_weight:
             raise ValueError("max_industry_weight must not be below max_position_weight")
+        if self.max_asset_class_weights is not None and any(
+            not 0 <= float(limit) <= 1
+            for limit in self.max_asset_class_weights.values()
+        ):
+            raise ValueError("asset class limits must be between zero and one")
         if (
             self.portfolio_construction in {"benchmark_relative_qp", "industry_neutral_qp"}
             and self.topk * self.max_position_weight < 1.0
@@ -506,6 +519,10 @@ def _rebind_strategy_execution_contract(values: dict[str, Any]) -> StrategyConfi
 class StrategyCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=150)
     description: str = Field(min_length=10, max_length=2000)
+    economic_hypothesis_group: str | None = Field(
+        default=None, min_length=1, max_length=200
+    )
+    hypothesis_group_cap: float = Field(default=0.70, gt=0, le=0.70)
     benchmark: str = "SH000300"
     universe: str = "cn_all"
     factors: list[StrategyFactorRequest] = Field(default_factory=list, max_length=20)
@@ -624,6 +641,42 @@ class StrategyBacktestRequest(BaseModel):
         if self.end <= self.start:
             raise ValueError("backtest end must be after start")
         return self
+
+
+class ModelArtifactCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_key: str = Field(min_length=1, max_length=200)
+    model_recipe: dict[str, Any]
+    dataset: str = Field(min_length=1, max_length=300)
+    dataset_identity_sha256: str = Field(min_length=64, max_length=64)
+    training_start: date
+    training_end: date
+    data_cutoff_at: datetime
+    scheduled_refit_at: datetime | None = None
+    valid_until: datetime
+    artifact_path: str = Field(min_length=1, max_length=2000)
+    predictions_sha256: str = Field(min_length=64, max_length=64)
+    actor: str = Field(default="model-operator", min_length=2, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_model_artifact(self) -> ModelArtifactCreateRequest:
+        if self.training_end < self.training_start:
+            raise ValueError("model training window is invalid")
+        for value, label in (
+            (self.data_cutoff_at, "data_cutoff_at"),
+            (self.valid_until, "valid_until"),
+            (self.scheduled_refit_at, "scheduled_refit_at"),
+        ):
+            if value is not None and (
+                value.tzinfo is None or value.utcoffset() is None
+            ):
+                raise ValueError(f"{label} must include a timezone")
+        return self
+
+
+class ModelArtifactActivateRequest(BaseModel):
+    actor: str = Field(default="model-reviewer", min_length=2, max_length=100)
 
 
 class ParameterExperimentRequest(BaseModel):
@@ -890,6 +943,16 @@ class SimulationNavReviewRequest(BaseModel):
     note: str = Field(min_length=10, max_length=2000)
 
 
+class SimulationFinalFeeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    final_fee: float = Field(ge=0)
+    evidence_sha256: str = Field(min_length=64, max_length=64)
+    source: Literal["end_of_day", "user_import"] = "user_import"
+    adjustment_key: str | None = Field(default=None, min_length=1, max_length=200)
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+
 class ScheduleCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=150)
     kind: Literal[
@@ -901,6 +964,7 @@ class ScheduleCreateRequest(BaseModel):
         "weekly_report",
         "monthly_decision_day",
         "preopen_check",
+        "intraday_execution_check",
     ]
     timezone: str = "Asia/Shanghai"
     run_time: time = time(15, 30)
@@ -938,6 +1002,22 @@ class ScheduleCreateRequest(BaseModel):
             unknown = set(self.payload) - {"dataset"}
             if unknown:
                 raise ValueError(f"unsupported {self.kind} payload keys: {sorted(unknown)}")
+        elif self.kind == "intraday_execution_check":
+            unknown = set(self.payload) - {"dataset", "interval_minutes"}
+            if unknown:
+                raise ValueError(
+                    f"unsupported {self.kind} payload keys: {sorted(unknown)}"
+                )
+            interval = int(self.payload.get("interval_minutes", 5))
+            if interval not in {1, 5}:
+                raise ValueError("intraday interval must be 1 or 5 minutes")
+            first_close = time(9, 30 + interval)
+            in_morning = first_close <= self.run_time <= time(11, 30)
+            in_afternoon = time(13, interval) <= self.run_time <= time(15, 0)
+            if not (in_morning or in_afternoon):
+                raise ValueError(
+                    "intraday run_time must be a completed bar inside A-share sessions"
+                )
         else:
             profile = self.payload.get("profile", "full")
             if profile not in {"core", "research", "full"}:
@@ -1087,6 +1167,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     strategies = StrategyStore(settings.database_url)
     recommendations = RecommendationStore(settings.database_url)
     simulations = SimulationStore(settings.database_url)
+    model_artifacts = ModelArtifactStore(settings.database_url)
     parameter_experiments = ParameterExperimentStore(settings.database_url)
     autonomous_research = AutonomousResearchOrchestrator(settings)
     continuous_research = ContinuousResearchController(settings)
@@ -2143,6 +2224,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     else strategy_defaults_state()["config"]
                 ),
                 actor=authenticated_actor(request, payload.actor),
+                economic_hypothesis_group=payload.economic_hypothesis_group,
+                hypothesis_group_cap=payload.hypothesis_group_cap,
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -2184,6 +2267,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/pair-strategies")
+    def list_pair_strategies(
+        limit: int = Query(100, ge=1, le=500),
+    ) -> list[dict]:
+        return strategies.list_pairs(limit)
 
     @app.post("/api/pair-strategies/{strategy_id}/versions", status_code=201)
     def create_pair_strategy_version(
@@ -2385,6 +2474,59 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         strategies.attach_job(backtest["id"], job["id"])
         worker.notify()
         return strategies.get_backtest(backtest["id"])
+
+    @app.get("/api/strategy-versions/{version_id}/model-artifacts")
+    def list_model_artifacts(version_id: str) -> list[dict[str, Any]]:
+        try:
+            return model_artifacts.list_for_strategy(version_id)
+        except KeyError as exc:
+            raise HTTPException(404, "strategy version not found") from exc
+
+    @app.post(
+        "/api/strategy-versions/{version_id}/model-artifacts",
+        status_code=201,
+    )
+    def create_model_artifact(
+        version_id: str,
+        payload: ModelArtifactCreateRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        try:
+            return model_artifacts.create(
+                strategy_version_id=version_id,
+                artifact_key=payload.artifact_key,
+                model_recipe=payload.model_recipe,
+                dataset=payload.dataset,
+                dataset_identity_sha256=payload.dataset_identity_sha256,
+                training_start=payload.training_start,
+                training_end=payload.training_end,
+                data_cutoff_at=payload.data_cutoff_at,
+                scheduled_refit_at=payload.scheduled_refit_at,
+                valid_until=payload.valid_until,
+                artifact_path=payload.artifact_path,
+                predictions_sha256=payload.predictions_sha256,
+                actor=authenticated_actor(request, payload.actor),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "strategy version not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/model-artifacts/{artifact_id}/activate")
+    def activate_model_artifact(
+        artifact_id: str,
+        payload: ModelArtifactActivateRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        try:
+            return model_artifacts.activate(
+                artifact_id,
+                actor=authenticated_actor(request, payload.actor),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "model artifact not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/strategy-versions/{version_id}/pair-backtests", status_code=202)
     def create_pair_strategy_backtest(
@@ -3017,10 +3159,50 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    @app.post(
+        "/api/simulation-portfolios/{portfolio_id}/fills/{fill_id}/final-fee",
+        status_code=201,
+    )
+    def record_simulation_final_fee(
+        portfolio_id: str,
+        fill_id: str,
+        payload: SimulationFinalFeeRequest,
+        request: Request,
+    ) -> dict:
+        try:
+            return simulations.record_final_fee(
+                portfolio_id,
+                fill_id=fill_id,
+                final_fee=payload.final_fee,
+                evidence_sha256=payload.evidence_sha256,
+                source=payload.source,
+                adjustment_key=payload.adjustment_key,
+                actor=authenticated_actor(request, payload.actor),
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                404, "simulation portfolio or fill not found"
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.get("/api/simulation-portfolios/{portfolio_id}/{resource}")
     def get_simulation_resource(
         portfolio_id: str,
-        resource: Literal["orders", "fills", "positions", "nav", "events"],
+        resource: Literal[
+            "orders",
+            "fills",
+            "positions",
+            "nav",
+            "events",
+            "fee_adjustments",
+            "cash_lots",
+            "cash_events",
+            "cash_reservations",
+            "position_reservations",
+            "security_events",
+            "day_attributions",
+        ],
     ) -> list[dict]:
         try:
             simulations.get(portfolio_id)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from logging.config import fileConfig
 
@@ -10,7 +11,19 @@ from quant_data.database import metadata
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Alembic is also invoked in-process by the API/tests.  ``fileConfig``'s
+    # defaults disable every already-created application logger and replace
+    # the host process' root handlers; that made later warnings disappear and
+    # broke any embedding application's logging/capture pipeline.  Preserve an
+    # existing host configuration, while still installing alembic.ini logging
+    # for the standalone CLI where no handlers exist yet.
+    root_logger = logging.getLogger()
+    host_handlers = list(root_logger.handlers)
+    host_level = root_logger.level
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
+    if host_handlers:
+        root_logger.handlers[:] = host_handlers
+        root_logger.setLevel(host_level)
 
 database_url = os.environ.get("DATABASE_URL") or config.get_main_option("sqlalchemy.url")
 if not database_url:

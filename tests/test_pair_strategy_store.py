@@ -69,6 +69,7 @@ def test_pair_strategy_versions_stay_research_only_at_the_approval_gate(
 ) -> None:
     store = StrategyStore(database_url)
     strategy = _pair(store)
+    assert [item["id"] for item in store.list_pairs()] == [strategy["id"]]
     version = strategy["versions"][0]
     assert version["strategy_type"] == "pair"
     assert version["factors"] == []

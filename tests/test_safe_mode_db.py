@@ -18,6 +18,7 @@ from quant_data.database import (
     open_database,
     recommendation_portfolios,
     simulation_batches,
+    simulation_cash_lots,
     simulation_nav,
     simulation_portfolios,
 )
@@ -80,6 +81,21 @@ def _seed_simulation_portfolio(database_url: str, *, name: str = "safe-mode-sim"
                 cost_schedule_version="cost-schedule-test",
                 execution_policy_json={"execution_algorithm": "twap"},
                 created_by="safe-mode-test",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        connection.execute(
+            insert(simulation_cash_lots).values(
+                id=uuid.uuid4().hex,
+                portfolio_id=portfolio_id,
+                lot_key="opening-balance",
+                source_type="opening_balance",
+                source_reference_id=None,
+                free_amount=Decimal("1000000"),
+                frozen_amount=Decimal("0"),
+                tradable_at=datetime(1970, 1, 1, tzinfo=UTC),
+                withdrawable_at=datetime(1970, 1, 1, tzinfo=UTC),
                 created_at=now,
                 updated_at=now,
             )

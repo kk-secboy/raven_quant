@@ -305,6 +305,28 @@ def main() -> None:
     from qlib.data import D
 
     qlib.init(provider_uri=str(provider), region=REG_CN)
+    calendar_end = (
+        pd.Timestamp(trade_date) + pd.Timedelta(days=31)
+    ).strftime("%Y-%m-%d")
+    daily_calendar = pd.to_datetime(
+        D.calendar(
+            start_time=trade_date,
+            end_time=calendar_end,
+            freq="day",
+        )
+    )
+    later_sessions = sorted(
+        {
+            value.date()
+            for value in daily_calendar
+            if value.date() > pd.Timestamp(trade_date).date()
+        }
+    )
+    if not later_sessions:
+        raise ValueError(
+            "bound Qlib calendar has no next trading session for cash settlement"
+        )
+    next_trade_date = later_sessions[0].isoformat()
     execution_policy = dict(manifest.get("execution_policy") or {})
     normalized_policy = normalize_execution_policy(execution_policy)
     normalized_policy.update(
@@ -386,6 +408,7 @@ def main() -> None:
         "dataset_lineage_id": provenance["dataset_lineage_id"],
         "execution_contract_version": provenance["execution_contract_version"],
         "execution_contract_hash": manifest["execution_contract_hash"],
+        "next_trade_date": next_trade_date,
         "minute_bars_file": bars_path.name,
         "closing_prices": closing_prices,
     }

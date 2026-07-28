@@ -25,6 +25,13 @@ def test_docx_risk_template_is_the_strategy_default() -> None:
     assert config.max_drawdown_reduce == pytest.approx(0.10)
     assert config.max_volume_participation == pytest.approx(0.01)
     assert config.max_industry_weight == pytest.approx(0.30)
+    assert config.annual_cash_yield_rate == pytest.approx(0.0)
+    assert config.cash_yield_source == "none_zero_yield"
+
+
+def test_cash_yield_cannot_substitute_a_research_risk_free_rate() -> None:
+    with pytest.raises(ValidationError, match="less than or equal to 0"):
+        StrategyConfigRequest(annual_cash_yield_rate=0.02)
 
 
 @pytest.mark.parametrize(

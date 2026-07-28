@@ -48,6 +48,16 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
                 ],
             }
 
+        @staticmethod
+        def hypothesis_group_evidence(_version_id: str) -> dict:
+            return {
+                "economic_hypothesis_group": "hypothesis-1",
+                "hypothesis_group_cap": 0.70,
+                "shared_experiment_count": 1,
+                "strategy_version_ids": ["version-1"],
+                "experiment_family_counts": {"factor-1": 1},
+            }
+
     worker = object.__new__(LocalJobWorker)
     worker.project_root = tmp_path
     worker.settings = SimpleNamespace(
@@ -95,6 +105,8 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
     assert manifest["execution_dataset"] == "ashare-5m"
     assert manifest["execution_frequency"] == "5min"
     assert manifest["execution_contract_version"] == MINUTE_EXECUTION_CONTRACT_VERSION
+    assert manifest["economic_hypothesis_group"] == "hypothesis-1"
+    assert manifest["strategy_trial_count"] == 1
 
 
 def test_worker_builds_production_qlib_order_plan_job(

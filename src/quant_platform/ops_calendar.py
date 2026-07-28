@@ -22,6 +22,10 @@ parallel channel:
 - ``build_preopen_check`` — trading-day preopen check: calendar confirmation,
   data readiness, account status, open orders and suspension/risk summary;
   anomalies raise deduped critical alerts.
+- ``build_intraday_execution_check`` — completed-bar polling of the existing
+  low-frequency execution ledger. It never selects securities or creates a
+  target; it reports only material order-state/fill changes, with account
+  source and immutable per-state dedupe keys.
 
 All three task builders are deterministic in their dedupe keys (per ISO week
 / per date), so reruns of the same schedule slot are idempotent.
@@ -34,6 +38,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
@@ -46,6 +51,7 @@ from quant_data.database import (
     simulation_fills,
     simulation_nav,
     simulation_orders,
+    simulation_portfolios,
     strategy_allocation_events,
 )
 
@@ -60,7 +66,12 @@ from .simulation_store import SimulationStore
 # does not apply to it: Saturday is never a trading day.
 WEEKLY_REPORT_WEEKDAY = 5
 
-OPS_TASK_KINDS = ("weekly_report", "monthly_decision_day", "preopen_check")
+OPS_TASK_KINDS = (
+    "weekly_report",
+    "monthly_decision_day",
+    "preopen_check",
+    "intraday_execution_check",
+)
 
 
 def is_weekly_report_day(local_date: date) -> bool:
@@ -598,4 +609,146 @@ def build_preopen_check(
         dedupe_key=f"preopen-check:{day_key}",
         details={"artifact_path": artifact_path, "report": report},
     )
+    return report
+
+
+def build_intraday_execution_check(
+    settings: Settings,
+    stores: OpsStores,
+    local_date: date,
+    *,
+    as_of: datetime,
+    dataset: dict[str, Any],
+) -> dict[str, Any]:
+    """Project material simulation-ledger changes for approved low-frequency targets.
+
+    This is intentionally not a minute-alpha engine.  It reads only accounts
+    sourced from a recommendation portfolio and orders already created by the
+    governed account target/execution chain.  Price-driven READY/WAIT changes
+    require a separately approved real-time feed; without one, this task still
+    reports durable order/fill/cancel/expiry transitions and never pretends a
+    historical minute dataset is live.
+    """
+
+    calendar_days = load_calendar_days(dataset["path"])
+    if local_date not in calendar_days:
+        raise ValueError(f"{local_date} is not a trading day in {dataset['name']}")
+    local_as_of = as_of.astimezone(ZoneInfo("Asia/Shanghai"))
+    if local_as_of.date() != local_date:
+        raise ValueError("intraday check timestamp does not match the local task date")
+
+    engine = open_database(settings.database_url)
+    with engine.connect() as connection:
+        rows = connection.execute(
+            select(
+                simulation_orders,
+                simulation_batches.c.trade_date,
+                simulation_batches.c.recommendation_snapshot_id,
+                simulation_portfolios.c.name.label("portfolio_name"),
+                simulation_portfolios.c.source_type,
+                simulation_portfolios.c.source_id,
+                simulation_portfolios.c.execution_frequency,
+            )
+            .join(
+                simulation_batches,
+                simulation_batches.c.id == simulation_orders.c.batch_id,
+            )
+            .join(
+                simulation_portfolios,
+                simulation_portfolios.c.id == simulation_orders.c.portfolio_id,
+            )
+            .where(
+                simulation_batches.c.trade_date == local_date,
+                simulation_portfolios.c.status == "active",
+                simulation_portfolios.c.source_type == "recommendation",
+                simulation_orders.c.created_at <= as_of,
+            )
+            .order_by(simulation_orders.c.created_at, simulation_orders.c.id)
+        ).all()
+
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        item = row_dict(row)
+        status = str(item["status"])
+        filled = int(item["filled_quantity"])
+        requested = int(item["requested_quantity"])
+        if status == "planned":
+            execution_state = "WAIT"
+        elif status == "open" and filled:
+            execution_state = "PARTIAL"
+        elif status == "open":
+            execution_state = "READY"
+        elif status == "filled":
+            execution_state = "FILLED"
+        elif status in {"expired", "partial_filled_expired"}:
+            execution_state = "EXPIRED"
+        elif status == "cancelled":
+            execution_state = "CANCELLED"
+        else:
+            execution_state = "FAILED"
+        action = "BUY" if str(item["side"]).lower() == "buy" else "SELL"
+        fingerprint = f"{status}:{filled}:{item.get('reject_reason') or ''}"
+        event = {
+            "order_id": str(item["id"]),
+            "portfolio_id": str(item["portfolio_id"]),
+            "portfolio_name": str(item["portfolio_name"]),
+            "account_source": "simulation",
+            "recommendation_portfolio_id": str(item["source_id"]),
+            "recommendation_snapshot_id": item.get("recommendation_snapshot_id"),
+            "instrument": str(item["instrument"]),
+            "action": action,
+            "execution_state": execution_state,
+            "requested_quantity": requested,
+            "filled_quantity": filled,
+            "remaining_quantity": max(0, requested - filled),
+            "target_weight": float(item["target_weight"]),
+            "execution_window": {
+                "not_before": str(item.get("not_before") or ""),
+                "not_after": str(item.get("not_after") or item["expires_at"]),
+            },
+            "reason": str(
+                item.get("reject_reason")
+                or item.get("cancel_reason")
+                or status
+            ),
+            "fingerprint": fingerprint,
+        }
+        events.append(event)
+        # One alert per immutable state/fill transition. Repeated completed-bar
+        # polls with the same ledger facts are silent.
+        stores.alerts.create(
+            source_type="simulation_order",
+            source_id=event["order_id"],
+            severity="critical" if execution_state == "FAILED" else "info",
+            category="intraday_execution_state",
+            title=(
+                f"{event['portfolio_name']} {event['instrument']} "
+                f"{action}/{execution_state}"
+            ),
+            message=(
+                f"{event['instrument']} {action} {filled}/{requested}，"
+                f"剩余 {event['remaining_quantity']}，状态 {execution_state}；"
+                f"账户来源 simulation。"
+            ),
+            dedupe_key=f"intraday-order:{event['order_id']}:{fingerprint}",
+            details=event,
+        )
+
+    report: dict[str, Any] = {
+        "kind": "intraday_execution_check",
+        "date": local_date.isoformat(),
+        "as_of": as_of.isoformat(),
+        "dataset": {"name": dataset["name"], "calendar_only": True},
+        "scope": "approved_low_frequency_targets_only",
+        "minute_alpha_generated": False,
+        "live_price_readiness_evaluated": False,
+        "live_price_status": "blocked_by_data_or_permission",
+        "events": events,
+    }
+    artifact_path = _write_report_artifact(
+        settings.data_root,
+        f"intraday-{local_as_of:%Y-%m-%dT%H%M%S%z}",
+        report,
+    )
+    report["artifact_path"] = artifact_path
     return report

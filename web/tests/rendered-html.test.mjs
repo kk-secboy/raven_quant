@@ -41,6 +41,7 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(sourceByName["auth-panel.tsx"], /bootstrap.*login|login.*bootstrap/s);
   assert.match(sourceByName["page.tsx"], /StrategyAllocationPanel/);
   assert.match(sourceByName["page.tsx"], /PairSatellitePanel/);
+  assert.doesNotMatch(sourceByName["page.tsx"], /<section hidden>/);
   assert.match(sourceByName["page.tsx"], /数据快照/);
   assert.match(sourceByName["page.tsx"], /因子准入/);
   assert.match(sourceByName["page.tsx"], /Qlib 回测与审批/);
@@ -63,11 +64,11 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   const pair = sourceByName["pair-satellite-panel.tsx"];
   assert.match(pair, /\/api\/pair-strategies/);
   assert.match(pair, /\/pair-backtests/);
-  assert.match(pair, /\/api\/strategy-versions\/\$\{selectedVersion\}\/approve/);
-  assert.match(pair, /\/api\/simulation-portfolios/);
-  assert.match(pair, /execution_adapter:\s*"pair"/);
-  assert.match(pair, /source_type:\s*"strategy_version"/);
-  assert.doesNotMatch(pair, /\/api\/pair-portfolios|pair_paper|paper[_ -]trading/i);
+  assert.match(pair, /不得批准、创建持久模拟账户/);
+  assert.doesNotMatch(
+    pair,
+    /\/approve|\/api\/simulation-portfolios|\/api\/pair-portfolios|pair_paper|paper[_ -]trading/i,
+  );
 
   const allocation = sourceByName["strategy-allocation-panel.tsx"];
   assert.match(allocation, /\/api\/strategy-allocations/);

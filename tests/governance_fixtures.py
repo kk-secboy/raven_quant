@@ -158,6 +158,8 @@ def create_strategy_version(
         "event_count": 5,
         "min_backtest_days": 504,
         "capacity_notional": 5_000_000,
+        "annual_cash_yield_rate": 0.0,
+        "cash_yield_source": "none_zero_yield",
         "max_volume_participation": 0.01,
         "min_commission": 5.0,
     }
@@ -251,7 +253,76 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
         "deflated_sharpe": {
             "status": "ok",
             "probability": 0.99,
-            "trial_count": 1,
+            "trials": 1,
+        },
+        "formal_validation_passed": True,
+        "formal_validation": {
+            "contract_version": "formal-validation-evidence-v1",
+            "status": "passed",
+            "outer_walk_forward": {
+                "status": "completed",
+                "fold_count": 3,
+                "candidate_coverage": {
+                    "required_group_trials": 1,
+                    "provided_candidates": 1,
+                    "scope": "frozen_strategy_no_search",
+                },
+                "folds": [{}, {}, {}],
+            },
+            "ablation": {
+                "status": "passed",
+                "runs": [
+                    {
+                        "removed_component_id": str(
+                            item.get("factor_candidate_id") or item.get("id")
+                        ),
+                        "passed": True,
+                        "metrics": {"annualized_excess_return": 0.01},
+                    }
+                    for item in version.get("factors", [])
+                ]
+                + [
+                    {
+                        "removed_component_id": str(item["id"]),
+                        "passed": True,
+                        "metrics": {"annualized_excess_return": 0.01},
+                    }
+                    for item in (
+                        (
+                            version.get("config", {})
+                            .get("baseline_definition", {})
+                            .get("factors", [])
+                        )
+                        if isinstance(
+                            version.get("config", {}).get("baseline_definition"),
+                            dict,
+                        )
+                        else []
+                    )
+                ],
+            },
+            "signal_decay": {
+                "status": "completed",
+                "maximum_supported_delay_bars": 1,
+                "runs": [
+                    {"delay_bars": 0, "passed": True},
+                    {"delay_bars": 1, "passed": True},
+                ],
+            },
+            "paired_block_bootstrap": {
+                "status": "ok",
+                "confidence_interval_95": [0.0001, 0.001],
+                "one_sided_p_value": 0.01,
+            },
+            "multiple_testing": {
+                "status": "not_applicable_single_trial",
+                "trial_count": 1,
+                "holm_adjusted_p_values": [0.01],
+                "pbo": {
+                    "status": "not_applicable_single_trial",
+                    "pbo": None,
+                },
+            },
         },
         "robustness_pass_rate": 1.0,
         "robustness": {

@@ -27,6 +27,7 @@ from quant_data.database import (
     open_database,
     paper_portfolios,
     recommendation_portfolios,
+    simulation_cash_lots,
     simulation_nav,
     simulation_portfolios,
 )
@@ -262,6 +263,21 @@ def test_allocation_uses_recommendation_ledgers_and_propagates_risk(
                     cost_schedule_version=COST_SCHEDULE_VERSION,
                     execution_policy_json={"execution_algorithm": "twap"},
                     created_by="test",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            connection.execute(
+                insert(simulation_cash_lots).values(
+                    id=uuid.uuid4().hex,
+                    portfolio_id=simulation_id,
+                    lot_key="opening-balance",
+                    source_type="opening_balance",
+                    source_reference_id=None,
+                    free_amount=simulation_value,
+                    frozen_amount=Decimal("0"),
+                    tradable_at=datetime(1970, 1, 1, tzinfo=UTC),
+                    withdrawable_at=datetime(1970, 1, 1, tzinfo=UTC),
                     created_at=now,
                     updated_at=now,
                 )

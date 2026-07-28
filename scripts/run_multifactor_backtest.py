@@ -24,6 +24,12 @@ from quant_data.execution_contract import (
 from quant_platform.cost_model import CostScheduleBook
 from quant_platform.eligibility import eligibility_statistics
 from quant_platform.execution_algorithms import execution_time_slots
+from quant_platform.formal_validation import (
+    FORMAL_VALIDATION_CONTRACT_VERSION,
+    run_ablation_suite,
+    run_outer_walk_forward,
+    run_signal_decay_suite,
+)
 from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
 from quant_platform.qlib_backtest import (
     QLIB_ENGINE_VERSION,
@@ -38,7 +44,11 @@ from quant_platform.qlib_factor_baseline import (
 from quant_platform.qlib_policy_strategy import create_qlib_policy_strategy
 from quant_platform.qlib_workflow import qlib_workflow_run
 from quant_platform.risk_math import estimate_covariance
-from quant_platform.statistical_validation import deflated_sharpe_probability
+from quant_platform.statistical_validation import (
+    deflated_sharpe_probability,
+    holm_bonferroni,
+    paired_moving_block_bootstrap,
+)
 from quant_platform.strategy_backtest import build_governed_signal, compose_factor_scores
 from quant_platform.upstream_versions import upstream_runtime_identity
 
@@ -350,9 +360,18 @@ def main() -> None:
         str(item["candidate_id"]): item.get("code_sha256") for item in manifest["factors"]
     }
 
-    challenger_factors = [
-        (_load(item["values_path"]), float(item["weight"]), int(item["direction"]))
+    challenger_entries = [
+        (
+            str(item["candidate_id"]),
+            _load(item["values_path"]),
+            float(item["weight"]),
+            int(item["direction"]),
+        )
         for item in manifest["factors"]
+    ]
+    challenger_factors = [
+        (values, weight, direction)
+        for _candidate_id, values, weight, direction in challenger_entries
     ]
     config = manifest["config"]
     strategy_contract = require_strategy_execution_contract(config)
@@ -407,6 +426,8 @@ def main() -> None:
     )
     baseline_artifacts: dict[str, Any] | None = None
     baseline_definition = config.get("baseline_definition")
+    baseline_raw: pd.DataFrame | None = None
+    baseline_normalized: pd.DataFrame | None = None
     baseline_scores: pd.Series | None = None
     if isinstance(baseline_definition, dict):
         baseline_raw, baseline_normalized, baseline_scores = _recompute_qlib_baseline(
@@ -514,7 +535,10 @@ def main() -> None:
     style_fields = {
         "Log($total_mv)": "size",
         "1/$pb": "value",
-        "($fund_quarter_revenue_yoy+$fund_quarter_profit_yoy)/2": "growth",
+        # fund_quarter_profit_yoy is declared but never populated (Tushare
+        # q_profit_yoy is a non-default downloader column); use the populated
+        # quarterly operating-profit YoY field instead.
+        "($fund_quarter_revenue_yoy+$fund_op_profit_yoy)/2": "growth",
         "Std($close/Ref($close, 1)-1, 60)": "volatility",
     }
     style_exposures = D.features(
@@ -538,9 +562,12 @@ def main() -> None:
     ]:
         raise ValueError("strategy requires regulatory events but no reliable source is available")
 
-    def governed_for(scenario_config: dict[str, Any]) -> pd.Series:
+    def governed_for(
+        scenario_config: dict[str, Any],
+        signal_scores: pd.Series | None = None,
+    ) -> pd.Series:
         return build_governed_signal(
-            scores,
+            scores if signal_scores is None else signal_scores,
             topk=int(scenario_config["topk"]),
             liquidity_amount=liquidity_amount,
             industry_memberships=industry_memberships,
@@ -616,6 +643,7 @@ def main() -> None:
         costs: CostScheduleBook,
         account: float | None = None,
         scenario_config: dict[str, Any] | None = None,
+        signal_scores: pd.Series | None = None,
     ):
         effective_config = {**config, **(scenario_config or {})}
         scenario_policy = PortfolioPolicy(
@@ -623,7 +651,11 @@ def main() -> None:
             costs.as_of(pd.Timestamp(start).date()),
         )
         strategy = create_qlib_policy_strategy(
-            signal=governed_for(effective_config) if scenario_config else governed_signal,
+            signal=(
+                governed_for(effective_config, signal_scores)
+                if scenario_config or signal_scores is not None
+                else governed_signal
+            ),
             policy=scenario_policy,
             metadata_provider=metadata,
         )
@@ -704,17 +736,270 @@ def main() -> None:
     net_daily_returns = pd.to_numeric(qlib_report["return"], errors="coerce") - pd.to_numeric(
         qlib_report.get("cost", 0.0), errors="coerce"
     )
+    strategy_trial_count = int(manifest.get("strategy_trial_count") or 1)
+
+    def write_formal_run_artifacts(
+        category: str, name: str, result: Any
+    ) -> dict[str, Any]:
+        target = output / "formal-validation" / category / name
+        target.mkdir(parents=True, exist_ok=True)
+        report_path = target / "daily_report.parquet"
+        fills_path = target / "fills.parquet"
+        metrics_path = target / "metrics.json"
+        result.report.to_parquet(report_path, compression="zstd")
+        pd.DataFrame(result.fills).to_parquet(
+            fills_path, index=False, compression="zstd"
+        )
+        metrics_path.write_text(
+            json.dumps(result.metrics, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return {
+            key: {
+                "path": str(path.relative_to(output)).replace("\\", "/"),
+                "sha256": _sha256_file(path),
+            }
+            for key, path in {
+                "daily_report": report_path,
+                "fills": fills_path,
+                "metrics": metrics_path,
+            }.items()
+        }
+
+    baseline_weights = {
+        str(item["id"]): float(item["weight"])
+        for item in (
+            baseline_definition.get("factors") or []
+            if isinstance(baseline_definition, dict)
+            else []
+        )
+    }
+    ablation_components = [
+        *(f"baseline:{factor_id}" for factor_id in sorted(baseline_weights)),
+        *(
+            f"challenger:{candidate_id}"
+            for candidate_id, _values, _weight, _direction in challenger_entries
+        ),
+    ]
+
+    def ablated_scores(component: str) -> pd.Series | None:
+        baseline_variant = baseline_scores
+        challenger_variant = challenger_scores
+        if component.startswith("baseline:"):
+            removed = component.split(":", 1)[1]
+            remaining = {
+                factor_id: weight
+                for factor_id, weight in baseline_weights.items()
+                if factor_id != removed
+            }
+            baseline_variant = (
+                baseline_normalized.mul(pd.Series(remaining), axis=1)
+                .sum(axis=1)
+                .rename("score")
+                if remaining and baseline_normalized is not None
+                else None
+            )
+        elif component.startswith("challenger:"):
+            removed = component.split(":", 1)[1]
+            remaining = [
+                (values, weight, direction)
+                for candidate_id, values, weight, direction in challenger_entries
+                if candidate_id != removed
+            ]
+            challenger_variant = (
+                compose_factor_scores(remaining) if remaining else None
+            )
+        else:
+            raise ValueError(f"unknown ablation component: {component}")
+        if factor_source_mode == FACTOR_SOURCE_PROMOTED_ONLY:
+            return challenger_variant
+        if baseline_variant is None:
+            return None
+        if challenger_variant is None:
+            return baseline_variant
+        return combine_factor_sources(
+            mode=factor_source_mode,
+            baseline=baseline_variant,
+            challenger=challenger_variant,
+            challenger_weight=float(config.get("challenger_weight") or 0.0),
+        )
+
+    def run_ablation(component: str) -> dict[str, Any]:
+        signal = ablated_scores(component)
+        if signal is None:
+            # Removing the final alpha component leaves the declared simple
+            # benchmark/no-alpha baseline, not an arbitrary Top-K tie break.
+            return {
+                "annualized_excess_return": 0.0,
+                "baseline_state": "no_alpha_component",
+                "artifacts": {},
+            }
+        result = run(
+            periods["start"],
+            periods["end"],
+            cost_schedule,
+            signal_scores=signal,
+        )
+        return {
+            **result.metrics,
+            "artifacts": write_formal_run_artifacts(
+                "ablation", component.replace(":", "-"), result
+            ),
+        }
+
+    ablation = run_ablation_suite(
+        component_ids=ablation_components,
+        full_metrics=formal.metrics,
+        runner=run_ablation,
+        metric="annualized_excess_return",
+        minimum_increment=float(config.get("min_component_increment", 0.0)),
+    )
+
+    def delayed_scores(delay: int) -> pd.Series:
+        if delay == 0:
+            return scores
+        shifted = (
+            scores.groupby(level="instrument", group_keys=False)
+            .shift(delay)
+            .dropna()
+            .rename("score")
+        )
+        if shifted.empty:
+            raise ValueError("signal decay delay leaves no executable observations")
+        return shifted
+
+    def run_delay(delay: int) -> dict[str, Any]:
+        if delay == 0:
+            return {**formal.metrics, "artifacts": {}}
+        result = run(
+            periods["start"],
+            periods["end"],
+            cost_schedule,
+            signal_scores=delayed_scores(delay),
+        )
+        return {
+            **result.metrics,
+            "artifacts": write_formal_run_artifacts(
+                "signal-decay", f"delay-{delay}", result
+            ),
+        }
+
+    signal_decay = run_signal_decay_suite(
+        delays=config.get("signal_decay_delays", [0, 1, 2, 3]),
+        runner=run_delay,
+        metric="annualized_excess_return",
+        minimum_retention=float(config.get("minimum_signal_retention", 0.60)),
+    )
+
+    if strategy_trial_count == 1:
+        outer_walk_forward = run_outer_walk_forward(
+            dates=pd.DatetimeIndex(qlib_report.index).tz_localize(None),
+            candidate_ids=["frozen-strategy"],
+            inner_runner=lambda _candidate, fold: run(
+                fold.validation_start,
+                fold.validation_end,
+                cost_schedule,
+            ).metrics,
+            test_runner=lambda _candidate, fold: run(
+                fold.test_start,
+                fold.test_end,
+                cost_schedule,
+            ).metrics,
+            selection_metric="annualized_excess_return",
+            train_days=int(config.get("outer_train_days", 252)),
+            validation_days=int(config.get("outer_validation_days", 42)),
+            test_days=int(config.get("outer_test_days", 42)),
+            purge_days=int(config.get("outer_purge_days", 5)),
+            embargo_days=int(config.get("outer_embargo_days", 5)),
+        )
+        outer_walk_forward["candidate_coverage"] = {
+            "required_group_trials": 1,
+            "provided_candidates": 1,
+            "scope": "frozen_strategy_no_search",
+        }
+    else:
+        outer_walk_forward = {
+            "status": "blocked_missing_group_candidate_artifacts",
+            "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
+            "candidate_coverage": {
+                "required_group_trials": strategy_trial_count,
+                "provided_candidates": 1,
+                "scope": "economic_hypothesis_group",
+            },
+        }
+
+    paired = pd.concat(
+        [
+            net_daily_returns.rename("candidate"),
+            pd.to_numeric(qlib_report["bench"], errors="coerce").rename("baseline"),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna()
+    paired_bootstrap = paired_moving_block_bootstrap(
+        paired["candidate"],
+        paired["baseline"],
+        block_size=int(config.get("bootstrap_block_days", 20)),
+        samples=int(config.get("bootstrap_samples", 2000)),
+        seed=int(config.get("validation_seed", 0)),
+    )
+    if strategy_trial_count == 1:
+        multiple_testing = {
+            "status": "not_applicable_single_trial",
+            "trial_count": 1,
+            "holm_adjusted_p_values": holm_bonferroni(
+                [paired_bootstrap["one_sided_p_value"]]
+            ),
+            "pbo": {
+                "status": "not_applicable_single_trial",
+                "pbo": None,
+            },
+        }
+    else:
+        multiple_testing = {
+            "status": "blocked_missing_group_candidate_artifacts",
+            "trial_count": strategy_trial_count,
+            "holm_adjusted_p_values": None,
+            "pbo": {
+                "status": "blocked_missing_group_candidate_artifacts",
+                "pbo": None,
+            },
+        }
+    formal_validation = {
+        "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
+        "status": (
+            "passed"
+            if outer_walk_forward.get("status") == "completed"
+            and ablation["status"] == "passed"
+            and signal_decay["maximum_supported_delay_bars"] is not None
+            and paired_bootstrap["confidence_interval_95"][0] > 0
+            and multiple_testing["status"] == "not_applicable_single_trial"
+            else "failed"
+        ),
+        "outer_walk_forward": outer_walk_forward,
+        "ablation": ablation,
+        "signal_decay": signal_decay,
+        "paired_block_bootstrap": paired_bootstrap,
+        "multiple_testing": multiple_testing,
+    }
     deflated_sharpe = deflated_sharpe_probability(
         net_daily_returns,
-        trials=int(manifest.get("strategy_trial_count") or 1),
+        trials=strategy_trial_count,
     )
     metrics = {
         **formal.metrics,
         "policy_version": policy.version,
         "cost_model": cost_schedule.to_dict(),
+        "cash_yield": {
+            "annual_rate": float(config.get("annual_cash_yield_rate", 0.0)),
+            "source": str(config.get("cash_yield_source") or "none_zero_yield"),
+            "accounting": "idle cash earns zero without a governed cash instrument",
+        },
         "eligibility": eligibility_evidence,
         "deflated_sharpe": deflated_sharpe,
         "deflated_sharpe_probability": deflated_sharpe["probability"],
+        "formal_validation": formal_validation,
+        "formal_validation_passed": formal_validation["status"] == "passed",
         "execution_model": {
             "method": execution_method,
             "days": int(config.get("execution_days", 1)),
@@ -865,6 +1150,10 @@ def main() -> None:
     (output / "capacity_curve.json").write_text(
         json.dumps(metrics["capacity"], ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    (output / "formal_validation.json").write_text(
+        json.dumps(metrics["formal_validation"], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     # Dataset descriptors consumed by the promotion chain: after the formal
     # hard gate approves the version, the isolated paper simulation account is
     # created from these verbatim dataset provenance records (design 6.11).
@@ -903,6 +1192,7 @@ def main() -> None:
             "rolling": str(output / "rolling.json"),
             "event_stress": str(output / "event_stress.json"),
             "capacity_curve": str(output / "capacity_curve.json"),
+            "formal_validation": str(output / "formal_validation.json"),
         },
     }
     workflow_run_id = str(

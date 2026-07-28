@@ -7,18 +7,23 @@ RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-07-16-v3"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},
-    {"id": "reversal", "weight": 0.10, "qlib_expression": "-(Ref($close,1)/Ref($close,21)-1)"},
+    # Qlib expressions have no unary-minus operator; rewrite negations as
+    # explicit binary subtractions (design: 1-month reversal = 1 - r_21).
+    {"id": "reversal", "weight": 0.10, "qlib_expression": "1-Ref($close,1)/Ref($close,21)"},
     {"id": "value", "weight": 0.20, "qlib_expression": "(1/$pe_ttm+1/$pb)/2"},
     {"id": "quality", "weight": 0.20, "qlib_expression": "($fund_roe+$fund_roa)/2"},
     {
         "id": "growth",
         "weight": 0.10,
-        "qlib_expression": "($fund_quarter_revenue_yoy+$fund_quarter_profit_yoy)/2",
+        # fund_quarter_profit_yoy is declared but never populated (Tushare
+        # q_profit_yoy is a non-default column the downloader never receives);
+        # fund_op_profit_yoy is the populated quarterly profit-growth field.
+        "qlib_expression": "($fund_quarter_revenue_yoy+$fund_op_profit_yoy)/2",
     },
     {
         "id": "low_volatility",
         "weight": 0.20,
-        "qlib_expression": "-Std($close/Ref($close,1)-1,60)",
+        "qlib_expression": "0-Std($close/Ref($close,1)-1,60)",
     },
 )
 
@@ -267,17 +272,17 @@ _RECIPES: tuple[dict[str, Any], ...] = (
             {
                 "id": "oversold_60m",
                 "weight": 0.50,
-                "qlib_expression": "-($close/Mean($close,12)-1)",
+                "qlib_expression": "1-$close/Mean($close,12)",
             },
             {
                 "id": "intraday_vwap_discount",
                 "weight": 0.30,
-                "qlib_expression": "-($close/$vwap-1)",
+                "qlib_expression": "1-$close/$vwap",
             },
             {
                 "id": "lower_band_120m",
                 "weight": 0.20,
-                "qlib_expression": "-(($close-Mean($close,24))/(Std($close,24)+1e-12))",
+                "qlib_expression": "0-($close-Mean($close,24))/(Std($close,24)+1e-12)",
             },
         ),
         "preprocessing": ["PIT可交易过滤", "缩尾", "截面z-score"],

@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from quant_data.config import Settings
 
 from .ops_calendar import (
     OPS_TASK_KINDS,
+    build_intraday_execution_check,
     build_monthly_decision_day,
     build_preopen_check,
     build_weekly_report,
@@ -33,6 +34,7 @@ def run_task(
     local_date: date,
     *,
     dataset_anchor: str | None = None,
+    as_of: datetime | None = None,
 ) -> dict:
     stores = ops_stores(settings)
     if kind == "weekly_report":
@@ -42,6 +44,17 @@ def run_task(
     if kind == "preopen_check":
         dataset = select_ops_dataset(settings.data_root, dataset_anchor)
         return build_preopen_check(settings, stores, local_date, dataset=dataset)
+    if kind == "intraday_execution_check":
+        if as_of is None or as_of.tzinfo is None:
+            raise ValueError("intraday_execution_check requires a timezone-aware as_of")
+        dataset = select_ops_dataset(settings.data_root, dataset_anchor)
+        return build_intraday_execution_check(
+            settings,
+            stores,
+            local_date,
+            as_of=as_of,
+            dataset=dataset,
+        )
     raise ValueError(f"unsupported ops task kind: {kind}")
 
 
@@ -51,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--date", required=True, help="local task date, YYYY-MM-DD")
     parser.add_argument("--result", required=True, help="result JSON output path")
     parser.add_argument("--dataset", default=None, help="Qlib dataset anchor name")
+    parser.add_argument("--as-of", default=None, help="timezone-aware scheduled timestamp")
     args = parser.parse_args(argv)
 
     settings = Settings.from_env(Path(".env"))
@@ -59,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         args.kind,
         date.fromisoformat(args.date),
         dataset_anchor=args.dataset or None,
+        as_of=datetime.fromisoformat(args.as_of) if args.as_of else None,
     )
     result_path = Path(args.result)
     result_path.parent.mkdir(parents=True, exist_ok=True)

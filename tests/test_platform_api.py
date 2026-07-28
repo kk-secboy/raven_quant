@@ -36,6 +36,7 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
         readiness = client.get("/api/operations/readiness")
         datasets = client.get("/api/datasets")
         market = client.get("/api/market/overview")
+        pair_strategies = client.get("/api/pair-strategies")
         bootstrap = client.post(
             "/api/jobs/bootstrap",
             json={"profile": "core", "start": "2024-01-01", "end": "latest"},
@@ -57,6 +58,8 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
     assert market.status_code == 200
     assert market.json()["status"] == "not_ready"
     assert market.json()["source"]["is_realtime"] is False
+    assert pair_strategies.status_code == 200
+    assert pair_strategies.json() == []
     assert bootstrap.status_code == 409
     assert bootstrap.json()["detail"] == (
         "missing deployment secret: TUSHARE_API_URL, TUSHARE_TOKEN"

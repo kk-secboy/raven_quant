@@ -14,6 +14,38 @@ from quant_data.execution_contract import (
 from quant_platform.strategy_store import StrategyStore
 
 
+def test_strategy_versions_share_hypothesis_trial_count_and_cap(
+    tmp_path: Path, database_url: str
+) -> None:
+    first_id = create_strategy_version(database_url, tmp_path)
+    store = StrategyStore(database_url)
+    first = store.get_version(first_id)
+    factor = first["factors"][0]
+    second = store.create_version(
+        first["strategy_id"],
+        benchmark=first["benchmark"],
+        universe=first["universe"],
+        factors=[
+            {
+                "candidate_id": factor["factor_candidate_id"],
+                "weight": 1.0,
+            }
+        ],
+        config=first["config"],
+        actor="researcher",
+    )
+
+    first_evidence = store.hypothesis_group_evidence(first_id)
+    second_evidence = store.hypothesis_group_evidence(second["id"])
+    assert first_evidence == second_evidence
+    assert first_evidence["economic_hypothesis_group"] == first["strategy_id"]
+    assert first_evidence["hypothesis_group_cap"] == 0.70
+    assert first_evidence["shared_experiment_count"] == 2
+    assert first_evidence["strategy_version_ids"] == sorted(
+        [first_id, second["id"]]
+    )
+
+
 def test_only_v2_qlib_policy_backtest_can_be_approved(tmp_path: Path, database_url: str) -> None:
     version_id = create_strategy_version(database_url, tmp_path)
     store = StrategyStore(database_url)

@@ -190,6 +190,20 @@ class AllocationStore:
                 # not even as satellites.
                 if version.get("strategy_type") == "pair":
                     require_capital_eligible_strategy_type("pair", action="分配")
+                hypothesis = self.strategies.hypothesis_group_evidence(version_id)
+                governance[version_id].update(
+                    {
+                        "economic_hypothesis_group": hypothesis[
+                            "economic_hypothesis_group"
+                        ],
+                        "hypothesis_group_cap": hypothesis[
+                            "hypothesis_group_cap"
+                        ],
+                        "shared_experiment_count": hypothesis[
+                            "shared_experiment_count"
+                        ],
+                    }
+                )
                 backtest_row = connection.execute(
                     select(backtest_runs)
                     .where(
@@ -285,6 +299,15 @@ class AllocationStore:
                             member_cap=governance[member["strategy_version_id"]][
                                 "member_cap"
                             ],
+                            economic_hypothesis_group=governance[
+                                member["strategy_version_id"]
+                            ]["economic_hypothesis_group"],
+                            hypothesis_group_cap=governance[
+                                member["strategy_version_id"]
+                            ]["hypothesis_group_cap"],
+                            shared_experiment_count=governance[
+                                member["strategy_version_id"]
+                            ]["shared_experiment_count"],
                             annualized_volatility=evidence["annualized_volatility"],
                             risk_contribution=evidence["risk_contribution"],
                             created_at=now,
@@ -349,6 +372,53 @@ class AllocationStore:
             "project_core_satellite_caps_v1"
         )
         analysis["solver"]["governed_max_strategy_weight"] = max_strategy_weight
+        return AllocationStore._apply_hypothesis_group_governance(
+            analysis, governance
+        )
+
+    @staticmethod
+    def _apply_hypothesis_group_governance(
+        analysis: dict[str, Any],
+        governance: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Freeze family-wide trial evidence and enforce one shared capital cap."""
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for version_id, member in governance.items():
+            group = str(member["economic_hypothesis_group"])
+            cap = float(member["hypothesis_group_cap"])
+            shared_count = int(member["shared_experiment_count"])
+            entry = grouped.setdefault(
+                group,
+                {
+                    "member_strategy_version_ids": [],
+                    "capital_cap_weight": cap,
+                    "shared_experiment_count": shared_count,
+                    "target_weight": 0.0,
+                },
+            )
+            if abs(float(entry["capital_cap_weight"]) - cap) > 1e-12:
+                raise ValueError(
+                    f"economic hypothesis group {group!r} has conflicting capital caps"
+                )
+            if int(entry["shared_experiment_count"]) != shared_count:
+                raise ValueError(
+                    f"economic hypothesis group {group!r} has conflicting trial counts"
+                )
+            entry["member_strategy_version_ids"].append(version_id)
+            target = (analysis.get("members") or {}).get(version_id, {})
+            entry["target_weight"] += float(target.get("target_weight") or 0.0)
+        for group, entry in grouped.items():
+            entry["member_strategy_version_ids"].sort()
+            if float(entry["target_weight"]) > float(entry["capital_cap_weight"]) + 1e-9:
+                raise ValueError(
+                    f"economic hypothesis group {group!r} target weight exceeds "
+                    "its shared capital cap"
+                )
+        analysis["economic_hypothesis_groups"] = dict(sorted(grouped.items()))
+        analysis["solver"]["hypothesis_group_governance"] = (
+            "shared_trial_count_and_cap_v1"
+        )
         return analysis
 
     @staticmethod
@@ -458,6 +528,11 @@ class AllocationStore:
                 "role": str(member.role),
                 "risk_budget": float(member.risk_budget),
                 "member_cap": float(member.member_cap),
+                "economic_hypothesis_group": str(
+                    member.economic_hypothesis_group
+                ),
+                "hypothesis_group_cap": float(member.hypothesis_group_cap),
+                "shared_experiment_count": int(member.shared_experiment_count),
             }
         # A fixed-budget policy re-applies the frozen user weights instead of
         # fabricating a new optimization input (design 6.10 fallback semantics).
@@ -551,9 +626,20 @@ class AllocationStore:
                     }
                 )
             analysis = fallback
-        return renormalize_budgets_for_suspended(
+        resolved = renormalize_budgets_for_suspended(
             analysis, previous_weights=previous_weights, suspended=suspended
         )
+        governance = {
+            str(member.strategy_version_id): {
+                "economic_hypothesis_group": str(
+                    member.economic_hypothesis_group
+                ),
+                "hypothesis_group_cap": float(member.hypothesis_group_cap),
+                "shared_experiment_count": int(member.shared_experiment_count),
+            }
+            for member in members
+        }
+        return self._apply_hypothesis_group_governance(resolved, governance)
 
     def _resolve_artifact(
         self, connection: Any, allocation: Any, decision_date: date

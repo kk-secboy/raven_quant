@@ -350,6 +350,7 @@ class LocalJobWorker:
                     execution_evidence=result,
                     corporate_actions=result.get("corporate_actions"),
                     corporate_events=result.get("corporate_events"),
+                    industry_snapshot=result.get("industry_snapshot"),
                 )
                 manifest = self.simulations.execution_manifest(simulation_batch_id)
                 self.allocations.refresh_for_simulation_source(
@@ -498,7 +499,12 @@ class LocalJobWorker:
                 if payload.get("symbols"):
                     command.extend(["--symbols", ",".join(payload["symbols"])])
             return command, result_path, {"TUSHARE_API_URL": api_url, "TUSHARE_TOKEN": token}
-        if job["kind"] in {"weekly_report", "monthly_decision_day", "preopen_check"}:
+        if job["kind"] in {
+            "weekly_report",
+            "monthly_decision_day",
+            "preopen_check",
+            "intraday_execution_check",
+        }:
             output = (
                 self.settings.data_root / "artifacts" / "ops-reports" / job["kind"] / job["id"]
             )
@@ -516,6 +522,8 @@ class LocalJobWorker:
             ]
             if payload.get("dataset"):
                 command.extend(["--dataset", str(payload["dataset"])])
+            if job["kind"] == "intraday_execution_check":
+                command.extend(["--as-of", str(payload["as_of"])])
             return command, result_path, {}
         if job["kind"] == "data_verify":
             return (
@@ -894,12 +902,9 @@ class LocalJobWorker:
                 return _to_wsl_path(Path(value)) if is_wsl else str(value)
 
             execution_dataset = payload.get("execution_dataset")
-            family_trials: dict[str, int] = {}
-            for factor in version["factors"]:
-                family = str(factor.get("experiment_family_id") or factor["factor_candidate_id"])
-                family_trials[family] = max(
-                    family_trials.get(family, 0), int(factor.get("experiment_count") or 1)
-                )
+            hypothesis_evidence = self.strategies.hypothesis_group_evidence(
+                version["id"]
+            )
             manifest = {
                 "backtest_id": payload["backtest_id"],
                 "strategy_version_id": version["id"],
@@ -933,7 +938,13 @@ class LocalJobWorker:
                     if version["config"].get("baseline_definition")
                     else None
                 ),
-                "strategy_trial_count": max(1, sum(family_trials.values())),
+                "strategy_trial_count": hypothesis_evidence[
+                    "shared_experiment_count"
+                ],
+                "economic_hypothesis_group": hypothesis_evidence[
+                    "economic_hypothesis_group"
+                ],
+                "hypothesis_group_evidence": hypothesis_evidence,
                 "periods": payload["periods"],
                 "config": version["config"],
                 "factors": [

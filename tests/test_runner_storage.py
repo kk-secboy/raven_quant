@@ -71,6 +71,8 @@ def test_runner_writes_atomic_parquet_and_snapshot(tmp_path: Path, database_url:
     assert summary.succeeded == 4
     assert summary.failed == 0
     assert not list((tmp_path / "units").rglob("*.tmp"))
+    raw_files = list((tmp_path / "raw").rglob("*.json.gz"))
+    assert len(raw_files) == 4
 
     report = verify_downloads(checkpoint, tmp_path)
     assert report["ok"] is True

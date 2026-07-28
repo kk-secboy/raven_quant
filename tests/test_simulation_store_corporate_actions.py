@@ -87,13 +87,21 @@ def _execution_dataset() -> dict:
     }
 
 
-def _evidence(batch_id: str, contract_hash: str, actions: list[dict] | None) -> dict:
+def _evidence(
+    batch_id: str,
+    contract_hash: str,
+    actions: list[dict] | None,
+    trade_date: date,
+) -> dict:
     evidence = {
         "batch_id": batch_id,
         "dataset_identity_sha256": EXECUTION_IDENTITY,
         "dataset_lineage_id": EXECUTION_LINEAGE,
         "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
         "execution_contract_hash": contract_hash,
+        "next_trade_date": (
+            pd.Timestamp(trade_date) + pd.offsets.BusinessDay(1)
+        ).date().isoformat(),
     }
     if actions is not None:
         evidence["corporate_actions_sha256"] = corporate_actions_sha256(actions)
@@ -244,7 +252,7 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
         batch["id"],
         minute_bars=_bars(DAY_BUY),
         closing_prices={"SH600000": {"price": 10.0, "market_date": DAY_BUY.isoformat()}},
-        execution_evidence=_evidence(batch["id"], contract_hash, []),
+        execution_evidence=_evidence(batch["id"], contract_hash, [], DAY_BUY),
         corporate_actions=[],
     )
     assert completed["status"] == "succeeded"
@@ -266,7 +274,9 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
         batch_ex["id"],
         minute_bars=_no_trade_bars(DAY_EX),
         closing_prices={"SH600000": {"price": 10.0, "market_date": DAY_EX.isoformat()}},
-        execution_evidence=_evidence(batch_ex["id"], contract_hash, actions),
+        execution_evidence=_evidence(
+            batch_ex["id"], contract_hash, actions, DAY_EX
+        ),
         corporate_actions=actions,
     )
     assert completed["status"] == "succeeded"
@@ -333,7 +343,9 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
         batch_sell["id"],
         minute_bars=_bars(DAY_SELL),
         closing_prices={"SH600000": {"price": 10.0, "market_date": DAY_SELL.isoformat()}},
-        execution_evidence=_evidence(batch_sell["id"], contract_hash, []),
+        execution_evidence=_evidence(
+            batch_sell["id"], contract_hash, [], DAY_SELL
+        ),
         corporate_actions=[],
     )
     assert completed["status"] == "succeeded"
@@ -366,7 +378,9 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
         batch_pay["id"],
         minute_bars=_no_trade_bars(DAY_PAY),
         closing_prices={"SH600000": {"price": 10.0, "market_date": DAY_PAY.isoformat()}},
-        execution_evidence=_evidence(batch_pay["id"], contract_hash, actions),
+        execution_evidence=_evidence(
+            batch_pay["id"], contract_hash, actions, DAY_PAY
+        ),
         corporate_actions=actions,
     )
     assert completed["status"] == "succeeded"
@@ -409,6 +423,11 @@ def test_corporate_actions_evidence_mismatch_fails_closed(database_url: str, tmp
             batch["id"],
             minute_bars=_bars(DAY_BUY),
             closing_prices={"SH600000": {"price": 10.0, "market_date": DAY_BUY.isoformat()}},
-            execution_evidence=_evidence(batch["id"], simulation["execution_contract_hash"], []),
+            execution_evidence=_evidence(
+                batch["id"],
+                simulation["execution_contract_hash"],
+                [],
+                DAY_BUY,
+            ),
             corporate_actions=[dict(ACTION)],  # 与证据哈希（空列表）不一致
         )

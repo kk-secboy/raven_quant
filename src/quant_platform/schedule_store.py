@@ -28,6 +28,7 @@ ACTIVE_SCHEDULE_KINDS = (
     "weekly_report",
     "monthly_decision_day",
     "preopen_check",
+    "intraday_execution_check",
 )
 
 
@@ -50,6 +51,40 @@ def next_occurrence(now: datetime, timezone: str, run_time: time) -> datetime:
 def occurrence_after(scheduled_for: datetime, timezone: str, run_time: time) -> datetime:
     zone = ZoneInfo(timezone)
     next_date = scheduled_for.astimezone(zone).date() + timedelta(days=1)
+    return datetime.combine(next_date, run_time, tzinfo=zone).astimezone(UTC)
+
+
+def intraday_occurrence_after(
+    scheduled_for: datetime,
+    timezone: str,
+    run_time: time,
+    interval_minutes: int,
+) -> datetime:
+    """Return the next completed A-share minute-bar check slot.
+
+    The schedule itself does not guess trading days; the scheduler's persisted
+    Qlib calendar gate skips non-trading dates.  Within a date we only advance
+    through the two continuous-auction sessions and resume at the configured
+    first completed-bar time on the next calendar day.
+    """
+
+    if interval_minutes not in {1, 5}:
+        raise ValueError("intraday interval must be 1 or 5 minutes")
+    zone = ZoneInfo(timezone)
+    local = scheduled_for.astimezone(zone)
+    candidate = local + timedelta(minutes=interval_minutes)
+    morning_end = datetime.combine(local.date(), time(11, 30), tzinfo=zone)
+    afternoon_start = datetime.combine(
+        local.date(), time(13, interval_minutes), tzinfo=zone
+    )
+    afternoon_end = datetime.combine(local.date(), time(15, 0), tzinfo=zone)
+    if candidate <= morning_end:
+        return candidate.astimezone(UTC)
+    if local <= morning_end:
+        return afternoon_start.astimezone(UTC)
+    if candidate <= afternoon_end:
+        return candidate.astimezone(UTC)
+    next_date = local.date() + timedelta(days=1)
     return datetime.combine(next_date, run_time, tzinfo=zone).astimezone(UTC)
 
 
@@ -353,10 +388,19 @@ class ScheduleStore:
                     .where(schedules.c.id == row.id)
                     .values(
                         last_run_at=scheduled_for,
-                        next_run_at=occurrence_after(
-                            scheduled_for,
-                            row.timezone,
-                            row.run_time,
+                        next_run_at=(
+                            intraday_occurrence_after(
+                                scheduled_for,
+                                row.timezone,
+                                row.run_time,
+                                int((row.payload_json or {}).get("interval_minutes", 5)),
+                            )
+                            if row.kind == "intraday_execution_check"
+                            else occurrence_after(
+                                scheduled_for,
+                                row.timezone,
+                                row.run_time,
+                            )
                         ),
                         updated_at=current,
                     )

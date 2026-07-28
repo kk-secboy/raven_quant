@@ -9,10 +9,42 @@ from qlib_test_doubles import (
     qlib_runtime_identity,
 )
 
+from quant_platform.allocation_store import AllocationStore
 from quant_platform.risk_math import COVARIANCE_MODEL_VERSION
 from quant_platform.strategy_allocation import analyze_strategy_allocation
 
 pytestmark = pytest.mark.no_database
+
+
+def test_hypothesis_group_members_share_one_cap_and_trial_count() -> None:
+    analysis = {
+        "members": {
+            "version-a": {"target_weight": 0.30},
+            "version-b": {"target_weight": 0.25},
+        },
+        "solver": {},
+    }
+    governance = {
+        version_id: {
+            "economic_hypothesis_group": "same-idea",
+            "hypothesis_group_cap": 0.50,
+            "shared_experiment_count": 7,
+        }
+        for version_id in analysis["members"]
+    }
+    with pytest.raises(ValueError, match="shared capital cap"):
+        AllocationStore._apply_hypothesis_group_governance(
+            analysis, governance
+        )
+
+    analysis["members"]["version-b"]["target_weight"] = 0.20
+    governed = AllocationStore._apply_hypothesis_group_governance(
+        analysis, governance
+    )
+    group = governed["economic_hypothesis_groups"]["same-idea"]
+    assert group["target_weight"] == pytest.approx(0.50)
+    assert group["shared_experiment_count"] == 7
+    assert group["member_strategy_version_ids"] == ["version-a", "version-b"]
 
 
 def test_risk_parity_fails_closed_on_pathological_negative_risk_contributions() -> None:

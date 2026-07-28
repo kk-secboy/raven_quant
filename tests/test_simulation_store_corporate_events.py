@@ -100,13 +100,21 @@ def _execution_dataset() -> dict:
     }
 
 
-def _evidence(batch_id: str, contract_hash: str, events: list[dict] | None) -> dict:
+def _evidence(
+    batch_id: str,
+    contract_hash: str,
+    events: list[dict] | None,
+    trade_date: date,
+) -> dict:
     evidence = {
         "batch_id": batch_id,
         "dataset_identity_sha256": EXECUTION_IDENTITY,
         "dataset_lineage_id": EXECUTION_LINEAGE,
         "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
         "execution_contract_hash": contract_hash,
+        "next_trade_date": (
+            pd.Timestamp(trade_date) + pd.offsets.BusinessDay(1)
+        ).date().isoformat(),
     }
     if events is not None:
         evidence["corporate_events_sha256"] = corporate_actions_sha256(events)
@@ -250,7 +258,9 @@ def test_corporate_event_types_lifecycle(database_url: str, tmp_path) -> None:
         batch["id"],
         minute_bars=_instrument_bars("SH600000", DAY_BUY),
         closing_prices={"SH600000": {"price": 10.0, "market_date": DAY_BUY.isoformat()}},
-        execution_evidence=_evidence(batch["id"], contract_hash, None),
+        execution_evidence=_evidence(
+            batch["id"], contract_hash, None, DAY_BUY
+        ),
     )
     assert completed["status"] == "succeeded"
     bought = store.rows(simulation["id"], "positions")[0]
@@ -272,7 +282,9 @@ def test_corporate_event_types_lifecycle(database_url: str, tmp_path) -> None:
         batch_event["id"],
         minute_bars=_no_trade_bars(DAY_EVENT),
         closing_prices={"SH600000": {"price": 5.0, "market_date": DAY_EVENT.isoformat()}},
-        execution_evidence=_evidence(batch_event["id"], contract_hash, events),
+        execution_evidence=_evidence(
+            batch_event["id"], contract_hash, events, DAY_EVENT
+        ),
         corporate_events=events,
     )
     assert completed["status"] == "succeeded"
@@ -318,7 +330,9 @@ def test_corporate_event_types_lifecycle(database_url: str, tmp_path) -> None:
         batch_sell["id"],
         minute_bars=_instrument_bars("SH600000", DAY_SELL, price=5.0),
         closing_prices={"SH600000": {"price": 5.0, "market_date": DAY_SELL.isoformat()}},
-        execution_evidence=_evidence(batch_sell["id"], contract_hash, replayed),
+        execution_evidence=_evidence(
+            batch_sell["id"], contract_hash, replayed, DAY_SELL
+        ),
         corporate_events=replayed,
     )
     assert completed["status"] == "succeeded"
@@ -356,7 +370,10 @@ def test_corporate_events_evidence_mismatch_fails_closed(
                 "SH600000": {"price": 10.0, "market_date": DAY_BUY.isoformat()}
             },
             execution_evidence=_evidence(
-                batch["id"], simulation["execution_contract_hash"], []
+                batch["id"],
+                simulation["execution_contract_hash"],
+                [],
+                DAY_BUY,
             ),
             corporate_events=[dict(EVENTS[1])],  # 与证据哈希（空列表）不一致
         )

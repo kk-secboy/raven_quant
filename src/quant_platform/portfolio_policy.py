@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from .cost_model import CostModelConfig
+from .discrete_constraints import validate_discrete_constraints
 from .portfolio_optimizer import optimize_benchmark_relative_weights
 
 POLICY_VERSION = "portfolio-policy-v2"
@@ -48,6 +49,8 @@ class PortfolioPolicyConfig:
     max_industry_weight: float = 0.30
     max_industry_deviation: float = 0.03
     max_tracking_error: float = 0.12
+    min_cash_weight: float = 0.0
+    max_asset_class_weights: dict[str, float] | None = None
     max_size_deviation: float = 0.30
     max_value_deviation: float = 0.30
     max_growth_deviation: float = 0.30
@@ -100,6 +103,13 @@ class PortfolioPolicyConfig:
             raise ValueError("unsupported portfolio construction method")
         if not 0 < self.max_tracking_error <= 1:
             raise ValueError("tracking-error limit must be between zero and one")
+        if not 0 <= self.min_cash_weight < 1:
+            raise ValueError("minimum cash weight must be between zero and one")
+        if self.max_asset_class_weights is not None and any(
+            not 0 <= float(limit) <= 1
+            for limit in self.max_asset_class_weights.values()
+        ):
+            raise ValueError("asset class limits must be between zero and one")
         if self.target_volatility is not None and not 0 < self.target_volatility <= 0.50:
             raise ValueError("target volatility must be between zero and 0.50")
         rebalance_period_key("2026-01-01", self.rebalance_frequency)
@@ -139,6 +149,7 @@ class PortfolioPolicy:
         previous_weights: pd.Series | dict[str, float] | None = None,
         *,
         industries: pd.Series | None = None,
+        asset_classes: pd.Series | None = None,
         benchmark_weights: pd.Series | None = None,
         benchmark_industry_weights: pd.Series | None = None,
         style_exposures: pd.Series | pd.DataFrame | None = None,
@@ -432,6 +443,94 @@ class PortfolioPolicy:
             raw_changes = target - previous
             turnover = self._turnover(target, previous)
         target[target.abs() < 1e-10] = 0.0
+        constrained_policy = self.config.portfolio_construction in {
+            "benchmark_relative_qp",
+            "industry_neutral_qp",
+        }
+        constraint_scale = float(target_volatility_evidence.get("exposure_scale", 1.0))
+        constraint_benchmark_weights = (
+            benchmark_weights * constraint_scale
+            if constrained_policy and benchmark_weights is not None
+            else None
+        )
+        constraint_benchmark_industries = (
+            benchmark_industry_weights * constraint_scale
+            if constrained_policy and benchmark_industry_weights is not None
+            else None
+        )
+        if constrained_policy and benchmark_style_exposure is not None:
+            if isinstance(benchmark_style_exposure, pd.Series):
+                constraint_benchmark_styles: float | pd.Series | dict[str, float] = (
+                    benchmark_style_exposure * constraint_scale
+                )
+            elif isinstance(benchmark_style_exposure, dict):
+                constraint_benchmark_styles = {
+                    key: float(value) * constraint_scale
+                    for key, value in benchmark_style_exposure.items()
+                }
+            else:
+                constraint_benchmark_styles = (
+                    float(benchmark_style_exposure) * constraint_scale
+                )
+        else:
+            constraint_benchmark_styles = {}
+        discrete_validation = validate_discrete_constraints(
+            target,
+            previous,
+            max_position_weight=self.config.max_position_weight,
+            max_daily_turnover=self.config.max_daily_turnover,
+            min_cash_weight=self.config.min_cash_weight,
+            industries=industries,
+            max_industry_weight=(
+                self.config.max_industry_weight if industries is not None else None
+            ),
+            benchmark_industry_weights=(
+                constraint_benchmark_industries
+            ),
+            max_industry_deviation=(
+                self.config.max_industry_deviation if constrained_policy else None
+            ),
+            asset_classes=asset_classes,
+            max_asset_class_weights=self.config.max_asset_class_weights,
+            benchmark_weights=constraint_benchmark_weights,
+            return_covariance=return_covariance if constrained_policy else None,
+            max_tracking_error=(
+                self.config.max_tracking_error if constrained_policy else None
+            ),
+            style_exposures=style_exposures if constrained_policy else None,
+            benchmark_style_exposure=(
+                constraint_benchmark_styles if constrained_policy else None
+            ),
+            max_style_deviations=(
+                {
+                    "size": self.config.max_size_deviation,
+                    "value": self.config.max_value_deviation,
+                    "growth": self.config.max_growth_deviation,
+                    "volatility": self.config.max_volatility_deviation,
+                    "log_market_cap": self.config.max_size_deviation,
+                }
+                if constrained_policy
+                else None
+            ),
+            average_daily_values=average_daily_values,
+            portfolio_value=portfolio_value,
+            max_volume_participation=(
+                self.cost_model.max_volume_participation
+                if average_daily_values is not None
+                else None
+            ),
+            prices=prices,
+            lot_size=self.cost_model.lot_size if prices is not None else None,
+            risk_ceiling=risk_ceiling,
+        )
+        if discrete_validation["status"] != "passed":
+            failures = ", ".join(
+                f"{item['name']}[{item['scope']}]"
+                for item in discrete_validation["violations"]
+            )
+            raise ValueError(
+                "post-discretization hard constraint violation: " + failures
+            )
         next_execution_state: dict[str, Any] = {}
         if pending_target is not None:
             pending_target = pending_target.reindex(target.index, fill_value=0.0)
@@ -483,6 +582,7 @@ class PortfolioPolicy:
             position_state={
                 "take_profit_stages": stages,
                 "execution": next_execution_state,
+                "discrete_constraint_validation": discrete_validation,
                 **(
                     {"target_volatility": target_volatility_evidence}
                     if target_volatility_evidence

@@ -61,7 +61,7 @@ class ParquetStore:
         self,
         root: Path,
         *,
-        keep_raw: bool = False,
+        keep_raw: bool = True,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.root = root

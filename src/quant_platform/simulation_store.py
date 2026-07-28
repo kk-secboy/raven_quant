@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from math import isfinite
 from pathlib import Path
@@ -24,18 +24,26 @@ from quant_data.database import (
     recommendation_snapshots,
     row_dict,
     simulation_batches,
+    simulation_cash_event_allocations,
+    simulation_cash_events,
     simulation_cash_flows,
+    simulation_cash_lots,
+    simulation_cash_reservations,
     simulation_corporate_events,
+    simulation_day_attributions,
     simulation_dividend_actions,
     simulation_dividend_entitlements,
     simulation_events,
     simulation_external_flows,
+    simulation_fee_adjustments,
     simulation_fills,
     simulation_nav,
     simulation_orders,
     simulation_portfolios,
     simulation_position_lots,
+    simulation_position_reservations,
     simulation_positions,
+    simulation_security_events,
     strategy_allocations,
     strategy_pairs,
     strategy_versions,
@@ -52,6 +60,7 @@ from .cost_model import (
     KNOWN_COST_SCHEDULE_VERSIONS,
     CostModelConfig,
     CostScheduleBook,
+    infer_cn_asset_type,
 )
 from .execution_algorithms import execution_time_slots, normalize_execution_policy
 from .member_risk_gate import (
@@ -77,6 +86,7 @@ from .simulation_order_state import (
 from .strategy_catalog import require_capital_eligible_strategy_type
 from .unitized_performance import (
     UNITIZED_PERFORMANCE_VERSION,
+    chain_unitized_day,
     unitized_drawdown_recovery,
     xirr,
 )
@@ -101,6 +111,7 @@ SIMULATION_EXECUTION_SEMANTICS_VERSION = "simulation-execution-semantics-v1"
 QLIB_ORDER_PLAN_FORMAT_VERSION = "qlib-order-plan-v1"
 VWAP_PROFILE_METHOD = "qlib-historical-average-volume-v1"
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
+CASH_OPENING_BALANCE_AT = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _canonical_hash(payload: dict[str, Any]) -> str:
@@ -191,6 +202,769 @@ class SimulationStore:
         self.database_url = database_url
         self.engine = open_database(database_url)
         self.safe_mode = SafeModeStore(database_url)
+
+    @staticmethod
+    def _cash_amount(value: Any) -> Decimal:
+        amount = Decimal(str(value)).quantize(Decimal("0.000001"))
+        if not amount.is_finite():
+            raise ValueError("cash ledger amount must be finite")
+        return amount
+
+    @staticmethod
+    def _session_time(day: date, hour: int, minute: int = 0) -> datetime:
+        return datetime.combine(
+            day,
+            time(hour, minute),
+            SHANGHAI_TIMEZONE,
+        )
+
+    def _insert_cash_event(
+        self,
+        connection: Any,
+        *,
+        portfolio_id: str,
+        event_key: str,
+        event_type: str,
+        amount: Decimal,
+        occurred_at: datetime,
+        details: dict[str, Any],
+        allocations: list[tuple[str, str, Decimal]],
+        batch_id: str | None = None,
+        order_id: str | None = None,
+        now: datetime,
+    ) -> str:
+        normalized_amount = self._cash_amount(amount)
+        if normalized_amount < 0:
+            raise ValueError("cash event amount must be non-negative")
+        existing = connection.execute(
+            select(simulation_cash_events).where(
+                simulation_cash_events.c.portfolio_id == portfolio_id,
+                simulation_cash_events.c.event_key == event_key,
+            )
+        ).first()
+        if existing is not None:
+            identity = {
+                "event_type": str(existing.event_type),
+                "amount": self._cash_amount(existing.amount),
+                "batch_id": str(existing.batch_id) if existing.batch_id else None,
+                "order_id": str(existing.order_id) if existing.order_id else None,
+            }
+            expected = {
+                "event_type": event_type,
+                "amount": normalized_amount,
+                "batch_id": str(batch_id) if batch_id else None,
+                "order_id": str(order_id) if order_id else None,
+            }
+            if identity != expected:
+                raise ValueError("cash event key was reused with a different payload")
+            return str(existing.id)
+        event_id = uuid.uuid4().hex
+        connection.execute(
+            insert(simulation_cash_events).values(
+                id=event_id,
+                portfolio_id=portfolio_id,
+                batch_id=batch_id,
+                order_id=order_id,
+                event_key=event_key,
+                event_type=event_type,
+                amount=normalized_amount,
+                details_json=details,
+                occurred_at=occurred_at,
+                created_at=now,
+            )
+        )
+        for lot_id, action, allocated in allocations:
+            value = self._cash_amount(allocated)
+            if value <= 0:
+                continue
+            connection.execute(
+                insert(simulation_cash_event_allocations).values(
+                    id=uuid.uuid4().hex,
+                    event_id=event_id,
+                    cash_lot_id=lot_id,
+                    action=action,
+                    amount=value,
+                    created_at=now,
+                )
+            )
+        return event_id
+
+    def _create_cash_lot(
+        self,
+        connection: Any,
+        *,
+        portfolio_id: str,
+        event_key: str,
+        source_type: str,
+        amount: Decimal,
+        tradable_at: datetime,
+        withdrawable_at: datetime,
+        occurred_at: datetime,
+        now: datetime,
+        source_reference_id: str | None = None,
+        batch_id: str | None = None,
+        order_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> str:
+        value = self._cash_amount(amount)
+        if value <= 0:
+            raise ValueError("cash lot amount must be positive")
+        existing = connection.execute(
+            select(simulation_cash_lots).where(
+                simulation_cash_lots.c.portfolio_id == portfolio_id,
+                simulation_cash_lots.c.lot_key == event_key,
+            )
+        ).first()
+        if existing is not None:
+            if (
+                str(existing.source_type) != source_type
+                or self._cash_amount(existing.free_amount)
+                + self._cash_amount(existing.frozen_amount)
+                != value
+            ):
+                raise ValueError("cash lot key was reused with a different payload")
+            return str(existing.id)
+        lot_id = uuid.uuid4().hex
+        connection.execute(
+            insert(simulation_cash_lots).values(
+                id=lot_id,
+                portfolio_id=portfolio_id,
+                lot_key=event_key,
+                source_type=source_type,
+                source_reference_id=source_reference_id,
+                free_amount=value,
+                frozen_amount=Decimal("0"),
+                tradable_at=tradable_at,
+                withdrawable_at=withdrawable_at,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        self._insert_cash_event(
+            connection,
+            portfolio_id=portfolio_id,
+            event_key=event_key,
+            event_type="create",
+            amount=value,
+            occurred_at=occurred_at,
+            details={"source_type": source_type, **(details or {})},
+            allocations=[(lot_id, "create", value)],
+            batch_id=batch_id,
+            order_id=order_id,
+            now=now,
+        )
+        return lot_id
+
+    def _allocate_free_cash(
+        self,
+        connection: Any,
+        *,
+        portfolio_id: str,
+        event_key: str,
+        event_type: str,
+        amount: Decimal,
+        as_of: datetime,
+        now: datetime,
+        require_withdrawable: bool = False,
+        batch_id: str | None = None,
+        order_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> list[tuple[str, Decimal]]:
+        value = self._cash_amount(amount)
+        if value <= 0:
+            raise ValueError("cash allocation amount must be positive")
+        if event_type not in {"freeze", "consume_free"}:
+            raise ValueError("cash allocation event type is invalid")
+        existing = connection.execute(
+            select(simulation_cash_events).where(
+                simulation_cash_events.c.portfolio_id == portfolio_id,
+                simulation_cash_events.c.event_key == event_key,
+            )
+        ).first()
+        if existing is not None:
+            if (
+                str(existing.event_type) != event_type
+                or self._cash_amount(existing.amount) != value
+            ):
+                raise ValueError("cash event key was reused with a different payload")
+            return []
+        availability = (
+            simulation_cash_lots.c.withdrawable_at
+            if require_withdrawable
+            else simulation_cash_lots.c.tradable_at
+        )
+        rows = connection.execute(
+            select(simulation_cash_lots)
+            .where(
+                simulation_cash_lots.c.portfolio_id == portfolio_id,
+                simulation_cash_lots.c.free_amount > 0,
+                availability <= as_of,
+            )
+            .order_by(
+                availability,
+                simulation_cash_lots.c.created_at,
+                simulation_cash_lots.c.id,
+            )
+            .with_for_update()
+        ).all()
+        remaining = value
+        allocations: list[tuple[str, Decimal]] = []
+        for row in rows:
+            if remaining <= 0:
+                break
+            available = self._cash_amount(row.free_amount)
+            used = min(available, remaining)
+            if used <= 0:
+                continue
+            updates: dict[str, Any] = {
+                "free_amount": available - used,
+                "updated_at": now,
+            }
+            if event_type == "freeze":
+                updates["frozen_amount"] = self._cash_amount(row.frozen_amount) + used
+            connection.execute(
+                update(simulation_cash_lots)
+                .where(simulation_cash_lots.c.id == row.id)
+                .values(**updates)
+            )
+            allocations.append((str(row.id), used))
+            remaining -= used
+        if remaining > Decimal("0.000001"):
+            permission = "withdrawable" if require_withdrawable else "tradable"
+            raise RuntimeError(
+                f"simulation cash ledger has insufficient {permission} free cash"
+            )
+        self._insert_cash_event(
+            connection,
+            portfolio_id=portfolio_id,
+            event_key=event_key,
+            event_type=event_type,
+            amount=value,
+            occurred_at=as_of,
+            details=details or {},
+            allocations=[
+                (lot_id, event_type, allocated)
+                for lot_id, allocated in allocations
+            ],
+            batch_id=batch_id,
+            order_id=order_id,
+            now=now,
+        )
+        return allocations
+
+    def _freeze_order_cash(
+        self,
+        connection: Any,
+        *,
+        portfolio_id: str,
+        order_id: str,
+        event_key: str,
+        amount: Decimal,
+        as_of: datetime,
+        now: datetime,
+        batch_id: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        allocations = self._allocate_free_cash(
+            connection,
+            portfolio_id=portfolio_id,
+            event_key=event_key,
+            event_type="freeze",
+            amount=amount,
+            as_of=as_of,
+            now=now,
+            batch_id=batch_id,
+            order_id=order_id,
+            details=details,
+        )
+        for lot_id, allocated in allocations:
+            connection.execute(
+                insert(simulation_cash_reservations).values(
+                    id=uuid.uuid4().hex,
+                    portfolio_id=portfolio_id,
+                    order_id=order_id,
+                    cash_lot_id=lot_id,
+                    reserved_amount=allocated,
+                    remaining_amount=allocated,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    def _reservation_total(
+        self,
+        connection: Any,
+        order_id: str,
+    ) -> Decimal:
+        value = connection.scalar(
+            select(
+                func.coalesce(
+                    func.sum(simulation_cash_reservations.c.remaining_amount),
+                    0,
+                )
+            ).where(simulation_cash_reservations.c.order_id == order_id)
+        )
+        return self._cash_amount(value or 0)
+
+    def _move_order_reservation(
+        self,
+        connection: Any,
+        *,
+        portfolio_id: str,
+        order_id: str,
+        event_key: str,
+        event_type: str,
+        amount: Decimal | None,
+        occurred_at: datetime,
+        now: datetime,
+        batch_id: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> Decimal:
+        if event_type not in {"consume_frozen", "release"}:
+            raise ValueError("reservation movement type is invalid")
+        existing = connection.execute(
+            select(simulation_cash_events).where(
+                simulation_cash_events.c.portfolio_id == portfolio_id,
+                simulation_cash_events.c.event_key == event_key,
+            )
+        ).first()
+        if existing is not None:
+            if str(existing.event_type) != event_type:
+                raise ValueError("cash event key was reused with a different payload")
+            return self._cash_amount(existing.amount)
+        reservations = connection.execute(
+            select(simulation_cash_reservations)
+            .where(
+                simulation_cash_reservations.c.order_id == order_id,
+                simulation_cash_reservations.c.remaining_amount > 0,
+            )
+            .order_by(
+                simulation_cash_reservations.c.created_at,
+                simulation_cash_reservations.c.id,
+            )
+            .with_for_update()
+        ).all()
+        available = sum(
+            (self._cash_amount(row.remaining_amount) for row in reservations),
+            Decimal("0"),
+        )
+        requested = available if amount is None else self._cash_amount(amount)
+        if requested < 0 or requested - available > Decimal("0.000001"):
+            raise RuntimeError("simulation order cash reservation is insufficient")
+        if requested == 0:
+            return Decimal("0")
+        remaining = requested
+        allocations: list[tuple[str, str, Decimal]] = []
+        for reservation in reservations:
+            if remaining <= 0:
+                break
+            reserved = self._cash_amount(reservation.remaining_amount)
+            used = min(reserved, remaining)
+            if used <= 0:
+                continue
+            lot = connection.execute(
+                select(simulation_cash_lots)
+                .where(simulation_cash_lots.c.id == reservation.cash_lot_id)
+                .with_for_update()
+            ).one()
+            frozen = self._cash_amount(lot.frozen_amount)
+            if used - frozen > Decimal("0.000001"):
+                raise RuntimeError("simulation frozen cash lot is inconsistent")
+            lot_updates: dict[str, Any] = {
+                "frozen_amount": frozen - used,
+                "updated_at": now,
+            }
+            if event_type == "release":
+                lot_updates["free_amount"] = self._cash_amount(lot.free_amount) + used
+            connection.execute(
+                update(simulation_cash_lots)
+                .where(simulation_cash_lots.c.id == lot.id)
+                .values(**lot_updates)
+            )
+            connection.execute(
+                update(simulation_cash_reservations)
+                .where(simulation_cash_reservations.c.id == reservation.id)
+                .values(remaining_amount=reserved - used, updated_at=now)
+            )
+            allocations.append((str(lot.id), event_type, used))
+            remaining -= used
+        if remaining > Decimal("0.000001"):
+            raise RuntimeError("simulation order reservation movement did not reconcile")
+        self._insert_cash_event(
+            connection,
+            portfolio_id=portfolio_id,
+            event_key=event_key,
+            event_type=event_type,
+            amount=requested,
+            occurred_at=occurred_at,
+            details=details or {},
+            allocations=allocations,
+            batch_id=batch_id,
+            order_id=order_id,
+            now=now,
+        )
+        return requested
+
+    def _cash_view_in_connection(
+        self,
+        connection: Any,
+        portfolio_id: str,
+        *,
+        as_of: datetime,
+    ) -> dict[str, Any]:
+        rows = connection.execute(
+            select(simulation_cash_lots)
+            .where(simulation_cash_lots.c.portfolio_id == portfolio_id)
+            .order_by(simulation_cash_lots.c.created_at, simulation_cash_lots.c.id)
+        ).all()
+        free = sum(
+            (self._cash_amount(row.free_amount) for row in rows),
+            Decimal("0"),
+        )
+        frozen = sum(
+            (self._cash_amount(row.frozen_amount) for row in rows),
+            Decimal("0"),
+        )
+        tradable = sum(
+            (
+                self._cash_amount(row.free_amount)
+                for row in rows
+                if row.tradable_at <= as_of
+            ),
+            Decimal("0"),
+        )
+        withdrawable = sum(
+            (
+                self._cash_amount(row.free_amount)
+                for row in rows
+                if row.withdrawable_at <= as_of
+            ),
+            Decimal("0"),
+        )
+        return {
+            "as_of": as_of,
+            "total_cash": free + frozen,
+            "free_cash": free,
+            "frozen_cash": frozen,
+            "tradable_cash": tradable,
+            "withdrawable_cash": withdrawable,
+            "unsettled_cash": free - tradable,
+            "tradable_not_withdrawable_cash": tradable - withdrawable,
+            "lot_count": len(rows),
+        }
+
+    def _assert_cash_lots_reconcile(
+        self,
+        connection: Any,
+        portfolio_id: str,
+        *,
+        expected_cash: Any,
+        as_of: datetime,
+    ) -> dict[str, Any]:
+        view = self._cash_view_in_connection(
+            connection,
+            portfolio_id,
+            as_of=as_of,
+        )
+        difference = view["total_cash"] - self._cash_amount(expected_cash)
+        if abs(difference) > Decimal("0.000001"):
+            raise RuntimeError("simulation cash lots do not reconcile with portfolio cash")
+        return view
+
+    def cash_view(
+        self,
+        portfolio_id: str,
+        *,
+        as_of: datetime | None = None,
+    ) -> dict[str, Any]:
+        observed_at = as_of or _now()
+        if observed_at.tzinfo is None:
+            raise ValueError("cash view as_of must be timezone-aware")
+        with self.engine.connect() as connection:
+            portfolio = connection.execute(
+                select(simulation_portfolios).where(
+                    simulation_portfolios.c.id == portfolio_id
+                )
+            ).first()
+            if portfolio is None:
+                raise KeyError(portfolio_id)
+            view = self._assert_cash_lots_reconcile(
+                connection,
+                portfolio_id,
+                expected_cash=portfolio.cash,
+                as_of=observed_at,
+            )
+            return {
+                key: float(value) if isinstance(value, Decimal) else value
+                for key, value in view.items()
+            }
+
+    def _insert_security_event(
+        self,
+        connection: Any,
+        *,
+        portfolio_id: str,
+        event_key: str,
+        event_type: str,
+        instrument: str,
+        quantity: int,
+        occurred_at: datetime,
+        now: datetime,
+        batch_id: str | None = None,
+        order_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if quantity <= 0:
+            raise ValueError("security event quantity must be positive")
+        existing = connection.execute(
+            select(simulation_security_events).where(
+                simulation_security_events.c.portfolio_id == portfolio_id,
+                simulation_security_events.c.event_key == event_key,
+            )
+        ).first()
+        if existing is not None:
+            identity = (
+                str(existing.event_type),
+                str(existing.instrument),
+                int(existing.quantity),
+                str(existing.order_id) if existing.order_id else None,
+            )
+            expected = (
+                event_type,
+                instrument,
+                quantity,
+                str(order_id) if order_id else None,
+            )
+            if identity != expected:
+                raise ValueError(
+                    "security event key was reused with a different payload"
+                )
+            return
+        connection.execute(
+            insert(simulation_security_events).values(
+                id=uuid.uuid4().hex,
+                portfolio_id=portfolio_id,
+                batch_id=batch_id,
+                order_id=order_id,
+                event_key=event_key,
+                event_type=event_type,
+                instrument=instrument,
+                quantity=quantity,
+                details_json=details or {},
+                occurred_at=occurred_at,
+                created_at=now,
+            )
+        )
+
+    def _freeze_sell_quantity(
+        self,
+        connection: Any,
+        *,
+        portfolio_id: str,
+        order_id: str,
+        instrument: str,
+        quantity: int,
+        trade_date: date,
+        event_key: str,
+        occurred_at: datetime,
+        now: datetime,
+        batch_id: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if quantity <= 0:
+            raise ValueError("sell reservation quantity must be positive")
+        existing = connection.execute(
+            select(simulation_position_reservations).where(
+                simulation_position_reservations.c.order_id == order_id
+            )
+        ).first()
+        if existing is not None:
+            if (
+                str(existing.instrument) != instrument
+                or int(existing.reserved_quantity) != quantity
+            ):
+                raise ValueError(
+                    "sell order reservation is already bound to another payload"
+                )
+            return
+        position = connection.execute(
+            select(simulation_positions)
+            .where(
+                simulation_positions.c.portfolio_id == portfolio_id,
+                simulation_positions.c.instrument == instrument,
+            )
+            .with_for_update()
+        ).first()
+        if position is None:
+            raise RuntimeError("sell order has no economic position to freeze")
+        available = int(position.available_quantity)
+        if position.last_trade_date is None or position.last_trade_date < trade_date:
+            settled = int(position.quantity)
+            if settled > available:
+                delta = settled - available
+                available = settled
+                connection.execute(
+                    update(simulation_positions)
+                    .where(
+                        simulation_positions.c.portfolio_id == portfolio_id,
+                        simulation_positions.c.instrument == instrument,
+                    )
+                    .values(available_quantity=available, updated_at=now)
+                )
+                self._insert_security_event(
+                    connection,
+                    portfolio_id=portfolio_id,
+                    event_key=(
+                        f"position:{portfolio_id}:{instrument}:"
+                        f"reclassify:{trade_date.isoformat()}"
+                    ),
+                    event_type="reclassify",
+                    instrument=instrument,
+                    quantity=delta,
+                    occurred_at=occurred_at,
+                    now=now,
+                    batch_id=batch_id,
+                    details={"reason": "t_plus_one_sellable"},
+                )
+        frozen = int(position.frozen_quantity)
+        if quantity > available - frozen:
+            raise RuntimeError(
+                "sell order exceeds free sellable quantity after existing freezes"
+            )
+        connection.execute(
+            update(simulation_positions)
+            .where(
+                simulation_positions.c.portfolio_id == portfolio_id,
+                simulation_positions.c.instrument == instrument,
+            )
+            .values(frozen_quantity=frozen + quantity, updated_at=now)
+        )
+        connection.execute(
+            insert(simulation_position_reservations).values(
+                id=uuid.uuid4().hex,
+                portfolio_id=portfolio_id,
+                order_id=order_id,
+                instrument=instrument,
+                reserved_quantity=quantity,
+                remaining_quantity=quantity,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        self._insert_security_event(
+            connection,
+            portfolio_id=portfolio_id,
+            event_key=event_key,
+            event_type="freeze",
+            instrument=instrument,
+            quantity=quantity,
+            occurred_at=occurred_at,
+            now=now,
+            batch_id=batch_id,
+            order_id=order_id,
+            details=details,
+        )
+
+    def _security_reservation_total(
+        self,
+        connection: Any,
+        order_id: str,
+    ) -> int:
+        return int(
+            connection.scalar(
+                select(
+                    func.coalesce(
+                        func.sum(
+                            simulation_position_reservations.c.remaining_quantity
+                        ),
+                        0,
+                    )
+                ).where(simulation_position_reservations.c.order_id == order_id)
+            )
+            or 0
+        )
+
+    def _move_sell_reservation(
+        self,
+        connection: Any,
+        *,
+        portfolio_id: str,
+        order_id: str,
+        event_key: str,
+        event_type: str,
+        quantity: int | None,
+        occurred_at: datetime,
+        now: datetime,
+        batch_id: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        if event_type not in {"consume", "release"}:
+            raise ValueError("sell reservation movement type is invalid")
+        existing_event = connection.execute(
+            select(simulation_security_events).where(
+                simulation_security_events.c.portfolio_id == portfolio_id,
+                simulation_security_events.c.event_key == event_key,
+            )
+        ).first()
+        if existing_event is not None:
+            if str(existing_event.event_type) != event_type:
+                raise ValueError(
+                    "security event key was reused with a different payload"
+                )
+            return int(existing_event.quantity)
+        reservation = connection.execute(
+            select(simulation_position_reservations)
+            .where(simulation_position_reservations.c.order_id == order_id)
+            .with_for_update()
+        ).first()
+        if reservation is None:
+            if quantity in {None, 0}:
+                return 0
+            raise RuntimeError("sell order has no frozen security reservation")
+        available = int(reservation.remaining_quantity)
+        moved = available if quantity is None else int(quantity)
+        if moved < 0 or moved > available:
+            raise RuntimeError("sell order frozen quantity is insufficient")
+        if moved == 0:
+            return 0
+        position = connection.execute(
+            select(simulation_positions)
+            .where(
+                simulation_positions.c.portfolio_id == portfolio_id,
+                simulation_positions.c.instrument == reservation.instrument,
+            )
+            .with_for_update()
+        ).one()
+        frozen = int(position.frozen_quantity)
+        if moved > frozen:
+            raise RuntimeError("simulation frozen security position is inconsistent")
+        connection.execute(
+            update(simulation_positions)
+            .where(
+                simulation_positions.c.portfolio_id == portfolio_id,
+                simulation_positions.c.instrument == reservation.instrument,
+            )
+            .values(frozen_quantity=frozen - moved, updated_at=now)
+        )
+        connection.execute(
+            update(simulation_position_reservations)
+            .where(simulation_position_reservations.c.id == reservation.id)
+            .values(remaining_quantity=available - moved, updated_at=now)
+        )
+        self._insert_security_event(
+            connection,
+            portfolio_id=portfolio_id,
+            event_key=event_key,
+            event_type=event_type,
+            instrument=str(reservation.instrument),
+            quantity=moved,
+            occurred_at=occurred_at,
+            now=now,
+            batch_id=batch_id,
+            order_id=order_id,
+            details=details,
+        )
+        return moved
 
     @staticmethod
     def _governed_execution_policy(
@@ -459,6 +1233,19 @@ class SimulationStore:
                         created_at=now,
                     )
                 )
+                self._create_cash_lot(
+                    connection,
+                    portfolio_id=portfolio_id,
+                    event_key=f"initial-deposit:{portfolio_id}",
+                    source_type="initial_deposit",
+                    source_reference_id=portfolio_id,
+                    amount=Decimal(str(initial_cash)),
+                    tradable_at=CASH_OPENING_BALANCE_AT,
+                    withdrawable_at=CASH_OPENING_BALANCE_AT,
+                    occurred_at=now,
+                    now=now,
+                    details={"account_created_by": actor.strip()},
+                )
         except IntegrityError as exc:
             raise ValueError(
                 "simulation name or source/execution dataset is already in use"
@@ -602,6 +1389,360 @@ class SimulationStore:
             "timing": normalized_timing,
             "amount": value,
             "created": created,
+        }
+
+    def record_final_fee(
+        self,
+        portfolio_id: str,
+        *,
+        fill_id: str,
+        final_fee: float,
+        evidence_sha256: str,
+        actor: str,
+        source: str = "user_import",
+        adjustment_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Append a final fee confirmation and apply only its economic delta.
+
+        The original fill is immutable.  A confirmation applies
+        ``final_fee - (fill fee + prior adjustments)`` once, updates the
+        latest unreviewed day-end NAV, and writes an explicit cash-flow and
+        event trail.  Older or independently reviewed NAV cannot be silently
+        restated; those cases require rebuilding from the last verified
+        ledger state.
+        """
+
+        self.safe_mode.assert_inactive(action="simulation final fee confirmation")
+        normalized_source = str(source).strip().lower()
+        if normalized_source not in {"end_of_day", "user_import"}:
+            raise ValueError("final fee source must be end_of_day or user_import")
+        creator = str(actor).strip()
+        if len(creator) < 2:
+            raise ValueError("a responsible final fee actor is required")
+        evidence = str(evidence_sha256).strip().lower()
+        if not _is_sha256(evidence):
+            raise ValueError("final fee evidence must be a SHA-256 digest")
+        try:
+            confirmed_final = Decimal(str(final_fee)).quantize(Decimal("0.000001"))
+        except Exception as exc:
+            raise ValueError("final fee must be a finite non-negative amount") from exc
+        if not confirmed_final.is_finite() or confirmed_final < 0:
+            raise ValueError("final fee must be a finite non-negative amount")
+        payload = {
+            "portfolio_id": str(portfolio_id),
+            "fill_id": str(fill_id),
+            "final_fee": format(confirmed_final, "f"),
+            "evidence_sha256": evidence,
+            "source": normalized_source,
+        }
+        key = (
+            str(adjustment_key).strip()
+            if adjustment_key
+            else _canonical_hash(payload)
+        )
+        if not key:
+            raise ValueError("final fee adjustment key is required")
+        now = _now()
+
+        with self.engine.begin() as connection:
+            portfolio = connection.execute(
+                select(simulation_portfolios)
+                .where(simulation_portfolios.c.id == portfolio_id)
+                .with_for_update()
+            ).first()
+            if portfolio is None:
+                raise KeyError(portfolio_id)
+            fill = connection.execute(
+                select(
+                    simulation_fills,
+                    simulation_batches.c.portfolio_id.label("fill_portfolio_id"),
+                    simulation_batches.c.trade_date.label("fill_trade_date"),
+                    simulation_batches.c.status.label("batch_status"),
+                )
+                .join(
+                    simulation_batches,
+                    simulation_batches.c.id == simulation_fills.c.batch_id,
+                )
+                .where(simulation_fills.c.id == fill_id)
+            ).first()
+            if fill is None or str(fill.fill_portfolio_id) != str(portfolio_id):
+                raise KeyError(fill_id)
+            if str(fill.batch_status) != "succeeded":
+                raise ValueError("final fee confirmation requires a succeeded fill batch")
+
+            existing = connection.execute(
+                select(simulation_fee_adjustments).where(
+                    simulation_fee_adjustments.c.portfolio_id == portfolio_id,
+                    simulation_fee_adjustments.c.adjustment_key == key,
+                )
+            ).first()
+            if existing is not None:
+                stored = {
+                    "portfolio_id": str(existing.portfolio_id),
+                    "fill_id": str(existing.fill_id),
+                    "final_fee": format(Decimal(existing.final_fee), "f"),
+                    "evidence_sha256": str(existing.evidence_sha256),
+                    "source": str(existing.source),
+                }
+                if stored != payload:
+                    raise ValueError(
+                        "final fee adjustment key was reused with a different payload"
+                    )
+                result = row_dict(existing)
+                result["created"] = False
+                return result
+
+            latest_nav = connection.execute(
+                select(simulation_nav)
+                .where(simulation_nav.c.portfolio_id == portfolio_id)
+                .order_by(simulation_nav.c.trade_date.desc())
+                .limit(1)
+                .with_for_update()
+            ).first()
+            trade_date = fill.fill_trade_date
+            if latest_nav is None or latest_nav.trade_date != trade_date:
+                raise ValueError(
+                    "final fee can only adjust the latest settled trade date; "
+                    "rebuild older ledger state"
+                )
+            if latest_nav.reviewed_at is not None:
+                raise ValueError(
+                    "independently reviewed NAV is immutable; rebuild from the "
+                    "last verified state"
+                )
+
+            previous_adjustments = connection.scalar(
+                select(func.coalesce(func.sum(simulation_fee_adjustments.c.adjustment_amount), 0))
+                .where(simulation_fee_adjustments.c.fill_id == fill_id)
+            )
+            previously_confirmed = (
+                Decimal(fill.fee) + Decimal(previous_adjustments or 0)
+            ).quantize(Decimal("0.000001"))
+            delta = (confirmed_final - previously_confirmed).quantize(
+                Decimal("0.000001")
+            )
+            new_cash = (Decimal(latest_nav.cash) - delta).quantize(
+                Decimal("0.000001")
+            )
+            new_nav = (Decimal(latest_nav.nav) - delta).quantize(
+                Decimal("0.000001")
+            )
+            if new_cash < 0:
+                raise RuntimeError("final fee adjustment would create negative cash")
+
+            prior_rows = connection.execute(
+                select(simulation_nav)
+                .where(
+                    simulation_nav.c.portfolio_id == portfolio_id,
+                    simulation_nav.c.trade_date < trade_date,
+                )
+                .order_by(simulation_nav.c.trade_date)
+            ).all()
+            if prior_rows:
+                prior_nav = float(prior_rows[-1].nav)
+                prior_wealth = (
+                    float(prior_rows[-1].investment_wealth)
+                    if prior_rows[-1].investment_wealth is not None
+                    else None
+                )
+                previous_cny_peak = max(float(item.nav) for item in prior_rows)
+                wealth_points = [
+                    float(item.investment_wealth)
+                    for item in prior_rows
+                    if item.investment_wealth is not None
+                ]
+                previous_twr_peak = max(wealth_points) if wealth_points else None
+            else:
+                initial_deposit = connection.scalar(
+                    select(simulation_cash_flows.c.amount)
+                    .where(
+                        simulation_cash_flows.c.portfolio_id == portfolio_id,
+                        simulation_cash_flows.c.flow_type == "initial_deposit",
+                    )
+                    .order_by(simulation_cash_flows.c.created_at)
+                    .limit(1)
+                )
+                if initial_deposit is None:
+                    raise RuntimeError("simulation initial deposit is missing")
+                prior_nav = float(initial_deposit)
+                prior_wealth = 1.0
+                previous_cny_peak = prior_nav
+                previous_twr_peak = 1.0
+            cny_peak = max(previous_cny_peak, float(new_nav))
+            unitized = chain_unitized_day(
+                prior_nav=prior_nav,
+                nav=float(new_nav),
+                flow_open=float(latest_nav.external_flow_open),
+                flow_close=float(latest_nav.external_flow_close),
+                prior_wealth=prior_wealth,
+                prior_high_water_mark=previous_twr_peak,
+            )
+
+            adjustment_id = uuid.uuid4().hex
+            connection.execute(
+                insert(simulation_fee_adjustments).values(
+                    id=adjustment_id,
+                    portfolio_id=portfolio_id,
+                    fill_id=fill_id,
+                    batch_id=fill.batch_id,
+                    adjustment_key=key,
+                    trade_date=trade_date,
+                    source=normalized_source,
+                    previously_confirmed_fee=previously_confirmed,
+                    final_fee=confirmed_final,
+                    adjustment_amount=delta,
+                    evidence_sha256=evidence,
+                    created_by=creator,
+                    created_at=now,
+                )
+            )
+            if delta:
+                connection.execute(
+                    insert(simulation_cash_flows).values(
+                        id=uuid.uuid4().hex,
+                        portfolio_id=portfolio_id,
+                        batch_id=fill.batch_id,
+                        trade_date=trade_date,
+                        flow_type="fee_adjustment",
+                        amount=-delta,
+                        balance_after=new_cash,
+                        reference_id=adjustment_id,
+                        created_at=now,
+                    )
+                )
+                cash_event_key = f"final-fee:{adjustment_id}"
+                if delta > 0:
+                    self._allocate_free_cash(
+                        connection,
+                        portfolio_id=str(portfolio_id),
+                        event_key=cash_event_key,
+                        event_type="consume_free",
+                        amount=delta,
+                        as_of=now,
+                        now=now,
+                        batch_id=str(fill.batch_id),
+                        order_id=str(fill.order_id),
+                        details={
+                            "adjustment_id": adjustment_id,
+                            "fill_id": str(fill_id),
+                        },
+                    )
+                else:
+                    self._create_cash_lot(
+                        connection,
+                        portfolio_id=str(portfolio_id),
+                        event_key=cash_event_key,
+                        source_type="fee_adjustment_refund",
+                        source_reference_id=adjustment_id,
+                        amount=-delta,
+                        tradable_at=now,
+                        withdrawable_at=now,
+                        occurred_at=now,
+                        now=now,
+                        batch_id=str(fill.batch_id),
+                        order_id=str(fill.order_id),
+                        details={"fill_id": str(fill_id)},
+                    )
+                self._assert_cash_lots_reconcile(
+                    connection,
+                    str(portfolio_id),
+                    expected_cash=new_cash,
+                    as_of=now,
+                )
+            connection.execute(
+                update(simulation_nav)
+                .where(
+                    simulation_nav.c.portfolio_id == portfolio_id,
+                    simulation_nav.c.trade_date == trade_date,
+                )
+                .values(
+                    cash=new_cash,
+                    nav=new_nav,
+                    daily_return=float(new_nav) / prior_nav - 1.0,
+                    drawdown=float(new_nav) / cny_peak - 1.0,
+                    twr_daily_return=unitized["daily_return"],
+                    investment_wealth=unitized["investment_wealth"],
+                    twr_drawdown=unitized["drawdown"],
+                    twr_status=unitized["status"],
+                )
+            )
+            twr_peak = unitized["high_water_mark"]
+            connection.execute(
+                update(simulation_portfolios)
+                .where(simulation_portfolios.c.id == portfolio_id)
+                .values(
+                    cash=new_cash,
+                    nav=new_nav,
+                    high_water_mark=Decimal(str(cny_peak)),
+                    investment_wealth=unitized["investment_wealth"],
+                    twr_high_water_mark=twr_peak,
+                    updated_at=now,
+                )
+            )
+            all_adjustments = connection.execute(
+                select(
+                    func.count(simulation_fee_adjustments.c.id),
+                    func.coalesce(
+                        func.sum(simulation_fee_adjustments.c.adjustment_amount), 0
+                    ),
+                ).where(simulation_fee_adjustments.c.batch_id == fill.batch_id)
+            ).one()
+            batch_summary = connection.scalar(
+                select(simulation_batches.c.summary_json).where(
+                    simulation_batches.c.id == fill.batch_id
+                )
+            )
+            summary = dict(batch_summary or {})
+            summary.update(
+                {
+                    "cash": float(new_cash),
+                    "nav": float(new_nav),
+                    "fee_adjustments": {
+                        "count": int(all_adjustments[0]),
+                        "net_amount": float(all_adjustments[1]),
+                        "latest_adjustment_id": adjustment_id,
+                    },
+                }
+            )
+            connection.execute(
+                update(simulation_batches)
+                .where(simulation_batches.c.id == fill.batch_id)
+                .values(summary_json=summary)
+            )
+            connection.execute(
+                insert(simulation_events).values(
+                    id=uuid.uuid4().hex,
+                    portfolio_id=portfolio_id,
+                    batch_id=fill.batch_id,
+                    trade_date=trade_date,
+                    severity="info",
+                    event_type="final_fee_adjustment",
+                    instrument=str(fill.instrument),
+                    reason="final_fee_minus_previously_confirmed_fee",
+                    details_json={
+                        "adjustment_id": adjustment_id,
+                        "adjustment_key": key,
+                        "fill_id": str(fill_id),
+                        "source": normalized_source,
+                        "previously_confirmed_fee": float(previously_confirmed),
+                        "final_fee": float(confirmed_final),
+                        "adjustment_amount": float(delta),
+                        "evidence_sha256": evidence,
+                    },
+                    created_at=now,
+                )
+            )
+
+        return {
+            "id": adjustment_id,
+            **payload,
+            "adjustment_key": key,
+            "trade_date": trade_date,
+            "previously_confirmed_fee": previously_confirmed,
+            "adjustment_amount": delta,
+            "created_by": creator,
+            "created_at": now,
+            "created": True,
         }
 
     @staticmethod
@@ -1304,6 +2445,9 @@ class SimulationStore:
                 open_orders=[dict(row_dict(row)) for row in order_rows],
                 plan_entries=plan_entries,
             )
+            cost_model = CostScheduleBook.from_mapping(
+                dict(portfolio.execution_policy_json or {}).get("cost_model")
+            ).as_of(trade_date)
             batch_id = uuid.uuid4().hex
             connection.execute(
                 insert(simulation_batches).values(
@@ -1369,6 +2513,32 @@ class SimulationStore:
                     raise ValueError(
                         f"order {cancel['order_id']} changed state while the plan committed"
                     )
+                if str(row.side) == "buy":
+                    self._move_order_reservation(
+                        connection,
+                        portfolio_id=str(portfolio.id),
+                        order_id=str(row.id),
+                        event_key=f"order:{row.id}:release:{batch_id}:cancel",
+                        event_type="release",
+                        amount=None,
+                        occurred_at=now,
+                        now=now,
+                        batch_id=batch_id,
+                        details={"reason": cancel["reason"]},
+                    )
+                else:
+                    self._move_sell_reservation(
+                        connection,
+                        portfolio_id=str(portfolio.id),
+                        order_id=str(row.id),
+                        event_key=f"order:{row.id}:security-release:{batch_id}:cancel",
+                        event_type="release",
+                        quantity=None,
+                        occurred_at=now,
+                        now=now,
+                        batch_id=batch_id,
+                        details={"reason": cancel["reason"]},
+                    )
                 _order_event(
                     event_type="order_cancelled",
                     instrument=str(row.instrument),
@@ -1380,6 +2550,55 @@ class SimulationStore:
                 )
             for replace in outcome["replaces"]:
                 row = book[replace["order_id"]]
+                if str(row.side) == "buy":
+                    open_quantity = int(row.requested_quantity) - int(
+                        row.filled_quantity
+                    )
+                    reservation = self._reservation_total(connection, str(row.id))
+                    release_amount = (
+                        reservation
+                        * Decimal(str(replace["released_quantity"]))
+                        / Decimal(str(open_quantity))
+                    ).quantize(Decimal("0.000001"))
+                    self._move_order_reservation(
+                        connection,
+                        portfolio_id=str(portfolio.id),
+                        order_id=str(row.id),
+                        event_key=f"order:{row.id}:release:{batch_id}:replace",
+                        event_type="release",
+                        amount=release_amount,
+                        occurred_at=now,
+                        now=now,
+                        batch_id=batch_id,
+                        details={
+                            "previous_requested_quantity": int(
+                                row.requested_quantity
+                            ),
+                            "new_requested_quantity": replace[
+                                "new_requested_quantity"
+                            ],
+                        },
+                    )
+                else:
+                    self._move_sell_reservation(
+                        connection,
+                        portfolio_id=str(portfolio.id),
+                        order_id=str(row.id),
+                        event_key=f"order:{row.id}:security-release:{batch_id}:replace",
+                        event_type="release",
+                        quantity=int(replace["released_quantity"]),
+                        occurred_at=now,
+                        now=now,
+                        batch_id=batch_id,
+                        details={
+                            "previous_requested_quantity": int(
+                                row.requested_quantity
+                            ),
+                            "new_requested_quantity": replace[
+                                "new_requested_quantity"
+                            ],
+                        },
+                    )
                 updated = connection.execute(
                     update(simulation_orders)
                     .where(
@@ -1409,10 +2628,22 @@ class SimulationStore:
                 )
             for new in outcome["news"]:
                 instrument = new["instrument"]
-                limit_price = prices.get(instrument)
+                supplied_price = new.get("limit_price")
+                limit_price = prices.get(
+                    instrument,
+                    float(supplied_price) if supplied_price is not None else None,
+                )
+                if new["side"] == "buy" and limit_price is None:
+                    raise ValueError(
+                        "persistent buy orders require a frozen positive limit price "
+                        "so their maximum cash and fee reservation is deterministic"
+                    )
+                if limit_price is not None and limit_price <= 0:
+                    raise ValueError("persistent order limit price must be positive")
+                order_id = uuid.uuid4().hex
                 connection.execute(
                     insert(simulation_orders).values(
-                        id=uuid.uuid4().hex,
+                        id=order_id,
                         batch_id=batch_id,
                         portfolio_id=portfolio.id,
                         instrument=instrument,
@@ -1443,6 +2674,62 @@ class SimulationStore:
                         created_at=now,
                     )
                 )
+                if new["side"] == "buy":
+                    gross = Decimal(
+                        str(int(new["quantity"]) * float(limit_price))
+                    ).quantize(Decimal("0.000001"))
+                    # Fees are confirmed per fill slice; minimum commission can
+                    # therefore be charged more than once. Reserve a
+                    # conservative all-slices upper bound, not one aggregate
+                    # order commission.
+                    maximum_slices = int(
+                        dict(portfolio.execution_policy_json or {}).get(
+                            "max_slices",
+                            24,
+                        )
+                        or 24
+                    )
+                    slice_gross = float(gross) / maximum_slices
+                    estimated_fee = self._cash_amount(
+                        maximum_slices
+                        * cost_model.estimate(
+                            side="buy",
+                            gross_value=slice_gross,
+                            participation=cost_model.max_volume_participation,
+                            asset_type=infer_cn_asset_type(instrument),
+                            trade_date=trade_date,
+                        )
+                    )
+                    self._freeze_order_cash(
+                        connection,
+                        portfolio_id=str(portfolio.id),
+                        order_id=order_id,
+                        event_key=f"order:{order_id}:freeze",
+                        amount=gross + estimated_fee,
+                        as_of=now,
+                        now=now,
+                        batch_id=batch_id,
+                        details={
+                            "instrument": instrument,
+                            "quantity": int(new["quantity"]),
+                            "limit_price": float(limit_price),
+                            "estimated_fee": float(estimated_fee),
+                        },
+                    )
+                else:
+                    self._freeze_sell_quantity(
+                        connection,
+                        portfolio_id=str(portfolio.id),
+                        order_id=order_id,
+                        instrument=instrument,
+                        quantity=int(new["quantity"]),
+                        trade_date=trade_date,
+                        event_key=f"order:{order_id}:security-freeze",
+                        occurred_at=now,
+                        now=now,
+                        batch_id=batch_id,
+                        details={"target_version": normalized_target_version},
+                    )
         return self.get_batch(batch_id), True
 
     @staticmethod
@@ -2206,6 +3493,32 @@ class SimulationStore:
             )
         ).all()
         for row in stale:
+            if str(row.side) == "buy":
+                self._move_order_reservation(
+                    connection,
+                    portfolio_id=str(portfolio.id),
+                    order_id=str(row.id),
+                    event_key=f"order:{row.id}:release:{batch.id}:expired",
+                    event_type="release",
+                    amount=None,
+                    occurred_at=now,
+                    now=now,
+                    batch_id=str(batch.id),
+                    details={"reason": "execution_window_elapsed"},
+                )
+            else:
+                self._move_sell_reservation(
+                    connection,
+                    portfolio_id=str(portfolio.id),
+                    order_id=str(row.id),
+                    event_key=f"order:{row.id}:security-release:{batch.id}:expired",
+                    event_type="release",
+                    quantity=None,
+                    occurred_at=now,
+                    now=now,
+                    batch_id=str(batch.id),
+                    details={"reason": "execution_window_elapsed"},
+                )
             connection.execute(
                 update(simulation_orders)
                 .where(simulation_orders.c.id == row.id)
@@ -2239,6 +3552,22 @@ class SimulationStore:
                 continue
             if row.not_after is not None and row.not_after < day_start:
                 continue
+            if (
+                str(row.side) == "buy"
+                and self._reservation_total(connection, str(row.id)) <= 0
+            ):
+                raise RuntimeError(
+                    f"working buy order {row.id} has no frozen cash reservation"
+                )
+            if (
+                str(row.side) == "sell"
+                and self._security_reservation_total(connection, str(row.id))
+                != int(row.requested_quantity) - int(row.filled_quantity)
+            ):
+                raise RuntimeError(
+                    f"working sell order {row.id} does not match its frozen "
+                    "security reservation"
+                )
             working[str(row.id)] = row
         return working
 
@@ -2251,6 +3580,7 @@ class SimulationStore:
         execution_evidence: dict[str, Any],
         corporate_actions: list[dict[str, Any]] | None = None,
         corporate_events: list[dict[str, Any]] | None = None,
+        industry_snapshot: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Compute, book and value a simulation day in one database transaction."""
 
@@ -2303,6 +3633,23 @@ class SimulationStore:
                 )
             if str(execution_evidence.get("batch_id") or "") != str(batch.id):
                 raise ValueError("simulation execution evidence does not match the batch")
+            try:
+                next_trade_date = date.fromisoformat(
+                    str(execution_evidence["next_trade_date"])
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "simulation execution evidence requires the bound Qlib "
+                    "next trading session"
+                ) from exc
+            if not (
+                batch.trade_date < next_trade_date
+                <= batch.trade_date + timedelta(days=31)
+            ):
+                raise ValueError(
+                    "simulation next trading session evidence is outside its "
+                    "settlement horizon"
+                )
             normalized_actions = [dict(item) for item in (corporate_actions or [])]
             if corporate_actions is not None:
                 # 公司行动与行情一样属于不可变执行输入：必须与证据哈希绑定。
@@ -2324,6 +3671,35 @@ class SimulationStore:
                 ):
                     raise ValueError(
                         "simulation corporate events do not match the execution evidence"
+                    )
+            normalized_industries: dict[str, str] = {}
+            if industry_snapshot is None:
+                if execution_evidence.get("industry_snapshot_sha256") is not None:
+                    raise ValueError(
+                        "simulation industry snapshot evidence has no payload"
+                    )
+            else:
+                normalized_industries = {
+                    str(instrument).strip().upper(): str(industry).strip()
+                    for instrument, industry in industry_snapshot.items()
+                }
+                if any(
+                    not instrument or not industry
+                    for instrument, industry in normalized_industries.items()
+                ):
+                    raise ValueError(
+                        "simulation industry snapshot contains an empty key or value"
+                    )
+                industry_identity = {
+                    "trade_date": batch.trade_date.isoformat(),
+                    "values": dict(sorted(normalized_industries.items())),
+                }
+                if str(
+                    execution_evidence.get("industry_snapshot_sha256") or ""
+                ) != _canonical_hash(industry_identity):
+                    raise ValueError(
+                        "simulation industry snapshot does not match its "
+                        "immutable execution evidence"
                     )
             for field in ("signal_at", "execution_not_before"):
                 expected_timestamp = getattr(batch, field)
@@ -2534,6 +3910,29 @@ class SimulationStore:
                     flow_open += float(flow_row.amount)
                 else:
                     flow_close += float(flow_row.amount)
+            cash_as_of = self._session_time(batch.trade_date, 9, 30)
+            cash_view = self._assert_cash_lots_reconcile(
+                connection,
+                str(portfolio.id),
+                expected_cash=portfolio.cash,
+                as_of=cash_as_of,
+            )
+            if (
+                flow_open < 0
+                and abs(Decimal(str(flow_open)))
+                > cash_view["withdrawable_cash"] + Decimal("0.000001")
+            ):
+                raise RuntimeError(
+                    "external open withdrawal exceeds withdrawable cash"
+                )
+            if (
+                flow_close < 0
+                and abs(Decimal(str(flow_close)))
+                > cash_view["withdrawable_cash"] + Decimal("0.000001")
+            ):
+                raise RuntimeError(
+                    "external close withdrawal exceeds withdrawable cash"
+                )
             prior_investment_wealth = (
                 float(portfolio.investment_wealth)
                 if portfolio.investment_wealth is not None
@@ -2557,12 +3956,19 @@ class SimulationStore:
             if order_plan_mode:
                 blocked_buys: list[str] = []
                 specs: list[dict[str, Any]] = []
+                working_reserved_cash = Decimal("0")
                 for row in working_orders.values():
                     side = str(row.side)
                     if side == "buy" and not strategy_risk_state["allow_new_risk"]:
                         # 风险硬门：只阻断新增风险，工作买单保留待风险解除。
                         blocked_buys.append(str(row.id))
                         continue
+                    reserved_cash = (
+                        self._reservation_total(connection, str(row.id))
+                        if side == "buy"
+                        else Decimal("0")
+                    )
+                    working_reserved_cash += reserved_cash
                     specs.append(
                         {
                             "instrument": str(row.instrument),
@@ -2576,6 +3982,7 @@ class SimulationStore:
                             ),
                             "not_before": row.not_before,
                             "not_after": row.not_after,
+                            "reserved_cash": float(reserved_cash),
                         }
                     )
                 result = execute_simulation_day(
@@ -2595,6 +4002,9 @@ class SimulationStore:
                     corporate_events=normalized_events,
                     applied_event_keys=applied_event_keys,
                     order_specs_override=specs,
+                    tradable_cash=float(
+                        cash_view["tradable_cash"] + working_reserved_cash
+                    ),
                     external_flow_open=flow_open,
                     external_flow_close=flow_close,
                     prior_investment_wealth=prior_investment_wealth,
@@ -2711,6 +4121,7 @@ class SimulationStore:
                     dividend_receivables=open_receivables,
                     corporate_events=normalized_events,
                     applied_event_keys=applied_event_keys,
+                    tradable_cash=float(cash_view["tradable_cash"]),
                     external_flow_open=flow_open,
                     external_flow_close=flow_close,
                     prior_investment_wealth=prior_investment_wealth,
@@ -2718,6 +4129,7 @@ class SimulationStore:
                 )
                 result.setdefault("dividend_receivables", list(open_receivables))
                 result.setdefault("corporate_actions_applied", [])
+            result["next_trade_date"] = next_trade_date
             if str(portfolio.execution_adapter) == "pair":
                 # 配对账户按设计只作离线研究：公司行动不入账，但必须留痕。
                 pair_relevant = [
@@ -2758,6 +4170,12 @@ class SimulationStore:
                     }
                 )
                 result["strategy_risk_state"] = strategy_risk_state
+            result["industry_snapshot"] = normalized_industries
+            result["industry_snapshot_sha256"] = (
+                str(execution_evidence["industry_snapshot_sha256"])
+                if industry_snapshot is not None
+                else None
+            )
             self._persist_result(connection, batch, portfolio, result, now)
         return self.get_batch(batch_id)
 
@@ -2789,6 +4207,320 @@ class SimulationStore:
                 actor="system",
                 details={"batch_id": batch_id, "error": error[:2000]},
             )
+
+    @staticmethod
+    def _build_day_attribution(
+        connection: Any,
+        *,
+        batch: Any,
+        portfolio: Any,
+        result: dict[str, Any],
+        fill_order_ids_by_seq: dict[int, str],
+    ) -> dict[str, Any]:
+        """Build the immutable §9.4 activity attribution without inventing P&L."""
+
+        order_ids = sorted(set(fill_order_ids_by_seq.values()))
+        order_rows = {
+            str(row.id): row
+            for row in (
+                connection.execute(
+                    select(simulation_orders).where(
+                        simulation_orders.c.id.in_(order_ids)
+                    )
+                ).all()
+                if order_ids
+                else []
+            )
+        }
+        strategy_groups: dict[str, dict[str, Any]] = {}
+        strategy_exact = True
+        cost_components: dict[str, float] = {}
+        asset_groups: dict[str, dict[str, Any]] = {}
+        execution_groups: dict[str, dict[str, Any]] = {}
+
+        for instrument, position in result["positions"].items():
+            instrument = str(instrument)
+            asset_type = infer_cn_asset_type(instrument)
+            asset = asset_groups.setdefault(
+                asset_type,
+                {
+                    "closing_market_value": 0.0,
+                    "gross_turnover": 0.0,
+                    "fees": 0.0,
+                    "position_count": 0,
+                },
+            )
+            asset["closing_market_value"] += float(
+                position.get("market_value") or 0.0
+            )
+            asset["position_count"] += 1
+
+        for fill_seq, fill in enumerate(result["fills"]):
+            instrument = str(fill["instrument"])
+            quantity = int(fill["quantity"])
+            gross = float(fill["gross_value"])
+            fee = float(fill["fee"])
+            side = str(fill["side"])
+            asset_type = infer_cn_asset_type(instrument)
+            asset = asset_groups.setdefault(
+                asset_type,
+                {
+                    "closing_market_value": 0.0,
+                    "gross_turnover": 0.0,
+                    "fees": 0.0,
+                    "position_count": 0,
+                },
+            )
+            asset["gross_turnover"] += gross
+            asset["fees"] += fee
+            for name, value in dict(fill.get("cost_breakdown") or {}).items():
+                if isinstance(value, (int, float)) and isfinite(float(value)):
+                    cost_components[str(name)] = (
+                        cost_components.get(str(name), 0.0) + float(value)
+                    )
+
+            execution = execution_groups.setdefault(
+                instrument,
+                {
+                    "side": side,
+                    "filled_quantity": 0,
+                    "gross_value": 0.0,
+                    "fees": 0.0,
+                    "capacity_quantity": 0,
+                    "minute_volume": 0,
+                },
+            )
+            execution["filled_quantity"] += quantity
+            execution["gross_value"] += gross
+            execution["fees"] += fee
+            execution["capacity_quantity"] += int(fill["capacity_quantity"])
+            execution["minute_volume"] += int(fill["minute_volume"])
+
+            order_id = fill_order_ids_by_seq[fill_seq]
+            order = order_rows[order_id]
+            contribution = dict(order.strategy_contributions_json or {})
+            members = dict(contribution.get("members") or {})
+            same_side = {
+                str(member): abs(float(values.get("net_contribution") or 0.0))
+                for member, values in members.items()
+                if (
+                    float(values.get("net_contribution") or 0.0) > 0
+                    if side == "buy"
+                    else float(values.get("net_contribution") or 0.0) < 0
+                )
+            }
+            denominator = sum(same_side.values())
+            if denominator <= 0:
+                strategy_exact = False
+                same_side = {str(portfolio.source_id): 1.0}
+                denominator = 1.0
+            for strategy_id, weight in same_side.items():
+                share = weight / denominator
+                strategy = strategy_groups.setdefault(
+                    strategy_id,
+                    {
+                        "filled_quantity": 0.0,
+                        "gross_value": 0.0,
+                        "fees": 0.0,
+                        "instruments": {},
+                    },
+                )
+                strategy["filled_quantity"] += quantity * share
+                strategy["gross_value"] += gross * share
+                strategy["fees"] += fee * share
+                instrument_row = strategy["instruments"].setdefault(
+                    instrument,
+                    {
+                        "side": side,
+                        "filled_quantity": 0.0,
+                        "gross_value": 0.0,
+                        "fees": 0.0,
+                    },
+                )
+                instrument_row["filled_quantity"] += quantity * share
+                instrument_row["gross_value"] += gross * share
+                instrument_row["fees"] += fee * share
+
+        requested_by_instrument: dict[str, int] = {}
+        cumulative_filled_by_instrument: dict[str, int] = {}
+        rejected_by_instrument: dict[str, list[str]] = {}
+        for order in result["orders"]:
+            instrument = str(order["instrument"])
+            requested_by_instrument[instrument] = (
+                requested_by_instrument.get(instrument, 0)
+                + int(order["requested_quantity"])
+            )
+            cumulative_filled_by_instrument[instrument] = (
+                cumulative_filled_by_instrument.get(instrument, 0)
+                + int(order["filled_quantity"])
+            )
+            if order.get("reject_reason"):
+                rejected_by_instrument.setdefault(instrument, []).append(
+                    str(order["reject_reason"])
+                )
+        for instrument in sorted(
+            set(requested_by_instrument) | set(execution_groups)
+        ):
+            execution = execution_groups.setdefault(
+                instrument,
+                {
+                    "side": None,
+                    "filled_quantity": 0,
+                    "gross_value": 0.0,
+                    "fees": 0.0,
+                    "capacity_quantity": 0,
+                    "minute_volume": 0,
+                },
+            )
+            requested = requested_by_instrument.get(instrument, 0)
+            day_filled = int(execution["filled_quantity"])
+            cumulative_filled = cumulative_filled_by_instrument.get(
+                instrument, day_filled
+            )
+            execution["requested_quantity"] = requested
+            execution["day_filled_quantity"] = day_filled
+            execution["cumulative_filled_quantity"] = cumulative_filled
+            execution["unfilled_quantity"] = max(
+                requested - cumulative_filled, 0
+            )
+            execution["fill_ratio"] = (
+                cumulative_filled / requested if requested else None
+            )
+            execution["average_fill_price"] = (
+                execution["gross_value"] / day_filled if day_filled else None
+            )
+            position = result["positions"].get(instrument) or {}
+            closing_price = position.get("market_price")
+            execution["closing_reference_price"] = (
+                float(closing_price) if closing_price is not None else None
+            )
+            if (
+                day_filled
+                and closing_price is not None
+                and float(closing_price) > 0
+            ):
+                average_price = float(execution["average_fill_price"])
+                close = float(closing_price)
+                execution["adverse_price_deviation_bps"] = (
+                    (average_price / close - 1.0) * 10_000
+                    if execution["side"] == "buy"
+                    else (close / average_price - 1.0) * 10_000
+                )
+                execution["price_deviation_status"] = "available"
+            else:
+                execution["adverse_price_deviation_bps"] = None
+                execution["price_deviation_status"] = (
+                    "no_fill"
+                    if not day_filled
+                    else "blocked_missing_closing_reference"
+                )
+            execution["rejection_reasons"] = sorted(
+                set(rejected_by_instrument.get(instrument, []))
+            )
+
+        instruments = sorted(
+            set(result["positions"])
+            | {str(fill["instrument"]) for fill in result["fills"]}
+        )
+        industry_snapshot = {
+            str(instrument).upper(): str(industry)
+            for instrument, industry in dict(
+                result.get("industry_snapshot") or {}
+            ).items()
+        }
+        missing_industries = [
+            instrument
+            for instrument in instruments
+            if instrument.upper() not in industry_snapshot
+        ]
+        industry_groups: dict[str, dict[str, Any]] = {}
+        for instrument in instruments:
+            industry_name = industry_snapshot.get(instrument.upper())
+            if industry_name is None:
+                continue
+            group = industry_groups.setdefault(
+                industry_name,
+                {
+                    "closing_market_value": 0.0,
+                    "gross_turnover": 0.0,
+                    "fees": 0.0,
+                    "instruments": [],
+                },
+            )
+            position = result["positions"].get(instrument) or {}
+            group["closing_market_value"] += float(
+                position.get("market_value") or 0.0
+            )
+            for fill in result["fills"]:
+                if str(fill["instrument"]) != instrument:
+                    continue
+                group["gross_turnover"] += float(fill["gross_value"])
+                group["fees"] += float(fill["fee"])
+            group["instruments"].append(instrument)
+        blocker_reasons = []
+        if missing_industries:
+            blocker_reasons.append(
+                "blocked_missing_bound_industry_snapshot"
+                if not industry_snapshot
+                else "blocked_incomplete_bound_industry_snapshot"
+            )
+        strategy = {
+            "status": (
+                "exact_frozen_same_side_pro_rata"
+                if strategy_exact
+                else "source_level_fallback_no_frozen_member_contributions"
+            ),
+            "groups": strategy_groups,
+        }
+        industry = {
+            "status": (
+                (
+                    "blocked_missing_bound_industry_snapshot"
+                    if not industry_snapshot
+                    else "blocked_incomplete_bound_industry_snapshot"
+                )
+                if missing_industries
+                else (
+                    "available"
+                    if instruments
+                    else "not_applicable_no_instruments"
+                )
+            ),
+            "snapshot_sha256": result.get("industry_snapshot_sha256"),
+            "groups": industry_groups,
+            "unclassified_instruments": missing_industries,
+        }
+        asset = {
+            "status": "available",
+            "scope": "closing_exposure_and_trading_activity",
+            "groups": asset_groups,
+        }
+        cost = {
+            "status": "available",
+            "total_fee": sum(float(fill["fee"]) for fill in result["fills"]),
+            "components": cost_components,
+        }
+        execution = {
+            "status": "available",
+            "reference": "same_day_closing_price_when_position_remains",
+            "instruments": execution_groups,
+        }
+        payload = {
+            "batch_id": str(batch.id),
+            "portfolio_id": str(portfolio.id),
+            "trade_date": batch.trade_date.isoformat(),
+            "strategy": strategy,
+            "industry": industry,
+            "asset": asset,
+            "cost": cost,
+            "execution": execution,
+        }
+        return {
+            **payload,
+            "coverage_status": "partial" if blocker_reasons else "complete",
+            "blocker_reasons": blocker_reasons,
+            "input_sha256": _canonical_hash(payload),
+        }
 
     def _persist_result(
         self, connection: Any, batch: Any, portfolio: Any, result: dict[str, Any], now: datetime
@@ -2843,13 +4575,17 @@ class SimulationStore:
                 )
             )
         fill_ids: list[str] = []
-        for fill in result["fills"]:
+        fill_ids_by_seq: dict[int, str] = {}
+        fill_order_ids_by_seq: dict[int, str] = {}
+        for fill_seq, fill in enumerate(result["fills"]):
             fill_id = uuid.uuid4().hex
             fill_ids.append(fill_id)
+            fill_ids_by_seq[fill_seq] = fill_id
             fill_key = fill.get("order_ref") or (
                 str(fill["instrument"]),
                 str(fill["side"]),
             )
+            fill_order_ids_by_seq[fill_seq] = order_ids[fill_key]
             connection.execute(
                 insert(simulation_fills).values(
                     id=fill_id,
@@ -2871,7 +4607,65 @@ class SimulationStore:
                     capacity_quantity=int(fill["capacity_quantity"]),
                 )
             )
+        immediate_sell_orders: dict[str, dict[str, Any]] = {}
+        for fill_seq, fill in enumerate(result["fills"]):
+            if (
+                str(batch.execution_adapter) != "long_only"
+                or str(fill["side"]) != "sell"
+            ):
+                continue
+            order_id = fill_order_ids_by_seq[fill_seq]
+            entry = immediate_sell_orders.setdefault(
+                order_id,
+                {
+                    "instrument": str(fill["instrument"]),
+                    "quantity": 0,
+                    "occurred_at": fill["executed_at"],
+                },
+            )
+            entry["quantity"] += int(fill["quantity"])
+            entry["occurred_at"] = min(entry["occurred_at"], fill["executed_at"])
+        for order_id, entry in immediate_sell_orders.items():
+            if self._security_reservation_total(connection, order_id) > 0:
+                continue
+            self._freeze_sell_quantity(
+                connection,
+                portfolio_id=str(portfolio.id),
+                order_id=order_id,
+                instrument=str(entry["instrument"]),
+                quantity=int(entry["quantity"]),
+                trade_date=batch.trade_date,
+                event_key=f"order:{order_id}:security-freeze:immediate",
+                occurred_at=entry["occurred_at"],
+                now=now,
+                batch_id=str(batch.id),
+                details={"reason": "immediate_order_fill"},
+            )
         for index, flow in enumerate(result["cash_flows"]):
+            raw_fill_seq = flow.get("fill_seq")
+            fill_seq = int(raw_fill_seq) if raw_fill_seq is not None else None
+            if fill_seq is None and str(flow["flow_type"]).startswith("pair_"):
+                fill_seq = index if index in fill_ids_by_seq else None
+            reference_id = (
+                fill_ids_by_seq.get(fill_seq) if fill_seq is not None else None
+            )
+            order_id = (
+                fill_order_ids_by_seq.get(fill_seq)
+                if fill_seq is not None
+                else None
+            )
+            occurred_at = (
+                result["fills"][fill_seq]["executed_at"]
+                if fill_seq is not None
+                else self._session_time(
+                    batch.trade_date,
+                    15
+                    if str(flow["flow_type"]).endswith("_close")
+                    else 9,
+                    30,
+                )
+            )
+            amount = self._cash_amount(flow["amount"])
             connection.execute(
                 insert(simulation_cash_flows).values(
                     id=uuid.uuid4().hex,
@@ -2879,12 +4673,186 @@ class SimulationStore:
                     batch_id=batch.id,
                     trade_date=batch.trade_date,
                     flow_type=flow["flow_type"],
-                    amount=Decimal(str(flow["amount"])),
+                    amount=amount,
                     balance_after=Decimal(str(flow["balance_after"])),
-                    reference_id=fill_ids[index] if index < len(fill_ids) else None,
+                    reference_id=reference_id,
                     created_at=now,
                 )
             )
+            event_key = (
+                f"batch:{batch.id}:cash-flow:{index}:{flow['flow_type']}"
+            )
+            if amount > 0:
+                flow_type = str(flow["flow_type"])
+                if flow_type == "sell_settlement":
+                    if order_id is None or fill_seq is None:
+                        raise RuntimeError(
+                            "sell settlement is missing its order/fill identity"
+                        )
+                    self._move_sell_reservation(
+                        connection,
+                        portfolio_id=str(portfolio.id),
+                        order_id=order_id,
+                        event_key=f"order:{order_id}:security-consume:{reference_id}",
+                        event_type="consume",
+                        quantity=int(result["fills"][fill_seq]["quantity"]),
+                        occurred_at=occurred_at,
+                        now=now,
+                        batch_id=str(batch.id),
+                        details={"fill_id": reference_id},
+                    )
+                    tradable_at = occurred_at
+                    withdrawable_at = self._session_time(
+                        result["next_trade_date"],
+                        9,
+                    )
+                elif flow_type == "external_deposit_close":
+                    tradable_at = self._session_time(
+                        result["next_trade_date"],
+                        9,
+                    )
+                    withdrawable_at = tradable_at
+                else:
+                    tradable_at = occurred_at
+                    withdrawable_at = occurred_at
+                self._create_cash_lot(
+                    connection,
+                    portfolio_id=str(portfolio.id),
+                    event_key=event_key,
+                    source_type=flow_type,
+                    source_reference_id=reference_id,
+                    amount=amount,
+                    tradable_at=tradable_at,
+                    withdrawable_at=withdrawable_at,
+                    occurred_at=occurred_at,
+                    now=now,
+                    batch_id=str(batch.id),
+                    order_id=order_id,
+                    details={"cash_flow_index": index},
+                )
+            elif amount < 0:
+                debit = -amount
+                if str(flow["flow_type"]) == "buy_settlement" and order_id:
+                    if self._reservation_total(connection, order_id) <= 0:
+                        # Immediate target-weight orders have no pre-existing
+                        # working window. Freeze the exact confirmed fill
+                        # amount in the same atomic booking transaction before
+                        # consuming it.
+                        self._freeze_order_cash(
+                            connection,
+                            portfolio_id=str(portfolio.id),
+                            order_id=order_id,
+                            event_key=f"{event_key}:freeze",
+                            amount=debit,
+                            as_of=occurred_at,
+                            now=now,
+                            batch_id=str(batch.id),
+                            details={
+                                "reason": "immediate_order_fill",
+                                "cash_flow_index": index,
+                            },
+                        )
+                    self._move_order_reservation(
+                        connection,
+                        portfolio_id=str(portfolio.id),
+                        order_id=order_id,
+                        event_key=event_key,
+                        event_type="consume_frozen",
+                        amount=debit,
+                        occurred_at=occurred_at,
+                        now=now,
+                        batch_id=str(batch.id),
+                        details={
+                            "fill_id": reference_id,
+                            "cash_flow_index": index,
+                        },
+                    )
+                else:
+                    self._allocate_free_cash(
+                        connection,
+                        portfolio_id=str(portfolio.id),
+                        event_key=event_key,
+                        event_type="consume_free",
+                        amount=debit,
+                        as_of=occurred_at,
+                        now=now,
+                        require_withdrawable=str(flow["flow_type"]).startswith(
+                            "external_withdrawal"
+                        ),
+                        batch_id=str(batch.id),
+                        order_id=order_id,
+                        details={
+                            "flow_type": str(flow["flow_type"]),
+                            "reference_id": reference_id,
+                            "cash_flow_index": index,
+                        },
+                    )
+            self._assert_cash_lots_reconcile(
+                connection,
+                str(portfolio.id),
+                expected_cash=flow["balance_after"],
+                as_of=occurred_at,
+            )
+        for order in result["orders"]:
+            ref = order.get("order_ref")
+            if ref is None:
+                continue
+            if str(order.get("status")) in OPEN_STATUSES:
+                continue
+            if str(order.get("side")) == "buy":
+                if self._reservation_total(connection, str(ref)) <= 0:
+                    continue
+                self._move_order_reservation(
+                    connection,
+                    portfolio_id=str(portfolio.id),
+                    order_id=str(ref),
+                    event_key=f"order:{ref}:release:{batch.id}:terminal",
+                    event_type="release",
+                    amount=None,
+                    occurred_at=now,
+                    now=now,
+                    batch_id=str(batch.id),
+                    details={"terminal_status": str(order.get("status"))},
+                )
+            else:
+                if self._security_reservation_total(connection, str(ref)) <= 0:
+                    continue
+                self._move_sell_reservation(
+                    connection,
+                    portfolio_id=str(portfolio.id),
+                    order_id=str(ref),
+                    event_key=(
+                        f"order:{ref}:security-release:{batch.id}:terminal"
+                    ),
+                    event_type="release",
+                    quantity=None,
+                    occurred_at=now,
+                    now=now,
+                    batch_id=str(batch.id),
+                    details={"terminal_status": str(order.get("status"))},
+                )
+        cash_view = self._assert_cash_lots_reconcile(
+            connection,
+            str(portfolio.id),
+            expected_cash=result["cash"],
+            as_of=now,
+        )
+        frozen_by_instrument = {
+            str(row.instrument): int(row.quantity)
+            for row in connection.execute(
+                select(
+                    simulation_position_reservations.c.instrument,
+                    func.sum(
+                        simulation_position_reservations.c.remaining_quantity
+                    ).label("quantity"),
+                )
+                .where(
+                    simulation_position_reservations.c.portfolio_id == portfolio.id,
+                    simulation_position_reservations.c.remaining_quantity > 0,
+                )
+                .group_by(simulation_position_reservations.c.instrument)
+            )
+        }
         connection.execute(
             delete(simulation_positions).where(
                 simulation_positions.c.portfolio_id == portfolio.id
@@ -2901,6 +4869,7 @@ class SimulationStore:
                     borrow_cost=Decimal(str(position.get("borrow_cost", 0.0))),
                     quantity=int(position["quantity"]),
                     available_quantity=int(position["available_quantity"]),
+                    frozen_quantity=frozen_by_instrument.get(instrument, 0),
                     average_cost=Decimal(str(position["average_cost"])),
                     last_trade_date=position.get("last_trade_date"),
                     market_price=(
@@ -3097,6 +5066,30 @@ class SimulationStore:
                     created_at=now,
                 )
             )
+        attribution = self._build_day_attribution(
+            connection,
+            batch=batch,
+            portfolio=portfolio,
+            result=result,
+            fill_order_ids_by_seq=fill_order_ids_by_seq,
+        )
+        connection.execute(
+            insert(simulation_day_attributions).values(
+                id=uuid.uuid4().hex,
+                portfolio_id=portfolio.id,
+                batch_id=batch.id,
+                trade_date=batch.trade_date,
+                strategy_json=attribution["strategy"],
+                industry_json=attribution["industry"],
+                asset_json=attribution["asset"],
+                cost_json=attribution["cost"],
+                execution_json=attribution["execution"],
+                coverage_status=attribution["coverage_status"],
+                blocker_reasons_json=attribution["blocker_reasons"],
+                input_sha256=attribution["input_sha256"],
+                created_at=now,
+            )
+        )
         summary = {
             "engine_version": result["engine_version"],
             "execution_adapter": str(batch.execution_adapter),
@@ -3105,10 +5098,20 @@ class SimulationStore:
             "fills": len(result["fills"]),
             "rejections": sum(order["status"] != "filled" for order in result["orders"]),
             "cash": result["cash"],
+            "cash_classification": {
+                key: float(value)
+                for key, value in cash_view.items()
+                if isinstance(value, Decimal)
+            },
             "nav": result["nav"],
             "conservation": result["conservation"],
             "corporate_actions": len(result.get("corporate_actions_applied") or []),
             "corporate_events": len(result.get("corporate_events_applied") or []),
+            "day_attribution": {
+                "coverage_status": attribution["coverage_status"],
+                "blocker_reasons": attribution["blocker_reasons"],
+                "input_sha256": attribution["input_sha256"],
+            },
         }
         if result.get("shortability_evidence_sha256"):
             summary["shortability_evidence_sha256"] = result[
@@ -3306,6 +5309,16 @@ class SimulationStore:
                     else None
                 ),
                 "reviews": review_evidence,
+            }
+            current_cash = self._assert_cash_lots_reconcile(
+                connection,
+                portfolio_id,
+                expected_cash=row.cash,
+                as_of=_now(),
+            )
+            result["cash_view"] = {
+                key: float(value) if isinstance(value, Decimal) else value
+                for key, value in current_cash.items()
             }
         return result
 
@@ -3541,6 +5554,41 @@ class SimulationStore:
                 simulation_external_flows,
                 simulation_external_flows.c.trade_date,
             ),
+            "fee_adjustments": (
+                simulation_fee_adjustments,
+                simulation_fee_adjustments,
+                simulation_fee_adjustments.c.created_at,
+            ),
+            "cash_lots": (
+                simulation_cash_lots,
+                simulation_cash_lots,
+                simulation_cash_lots.c.created_at,
+            ),
+            "cash_events": (
+                simulation_cash_events,
+                simulation_cash_events,
+                simulation_cash_events.c.occurred_at,
+            ),
+            "cash_reservations": (
+                simulation_cash_reservations,
+                simulation_cash_reservations,
+                simulation_cash_reservations.c.created_at,
+            ),
+            "position_reservations": (
+                simulation_position_reservations,
+                simulation_position_reservations,
+                simulation_position_reservations.c.created_at,
+            ),
+            "security_events": (
+                simulation_security_events,
+                simulation_security_events,
+                simulation_security_events.c.occurred_at,
+            ),
+            "day_attributions": (
+                simulation_day_attributions,
+                simulation_day_attributions,
+                simulation_day_attributions.c.trade_date,
+            ),
         }
         if resource not in resources:
             raise ValueError("unknown simulation resource")
@@ -3551,7 +5599,7 @@ class SimulationStore:
             else table.c.portfolio_id
         )
         with self.engine.connect() as connection:
-            return [
+            rows = [
                 row_dict(row)
                 for row in connection.execute(
                     select(table)
@@ -3560,6 +5608,12 @@ class SimulationStore:
                     .order_by(ordering)
                 )
             ]
+        if resource == "positions":
+            for row in rows:
+                row["free_sellable_quantity"] = int(
+                    row["available_quantity"]
+                ) - int(row["frozen_quantity"])
+        return rows
 
     @staticmethod
     def _portfolio_dict(row: Any) -> dict[str, Any]:
