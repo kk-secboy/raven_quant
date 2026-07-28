@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,8 @@ from .regulatory_events import (
 )
 from .style_exposure_panel import build_adjusted_close, build_raw_style_panel
 
+logger = logging.getLogger(__name__)
+
 _BASE_QLIB_FIELDS = (
     "open",
     "high",
@@ -76,6 +79,15 @@ _DAILY_RESEARCH_FIELDS = (
 # on the report period (end_date), so no field here can leak an unpublished
 # report. Fundamentals are never price-normalized: absolute amounts stay in
 # CNY yuan and per-share values in yuan per share.
+#
+# q_profit_yoy, inv_turn, ocf_to_or, ocf_to_profit and salescash_to_or are
+# documented Tushare fina_indicator output columns (doc_id=79) but flagged
+# non-default there, so the downloader (which requests no explicit field
+# list) currently never receives them. They stay declared on purpose: the
+# build-time coverage diagnostics in _research_feature_contract warn about
+# the missing source columns instead of silently dropping the fields, and a
+# future downloader change that requests them explicitly lights the fields
+# up without another contract change.
 _FUNDAMENTAL_RESEARCH_FIELDS = {
     "fina_indicator": {
         "roe": "fund_roe",
@@ -99,7 +111,7 @@ _FUNDAMENTAL_RESEARCH_FIELDS = {
         "ar_turn": "fund_receivables_turnover",
         "quick_ratio": "fund_quick_ratio",
         "debt_to_eqt": "fund_debt_to_equity",
-        "saleexp_of_gr": "fund_sales_expense_ratio",
+        "saleexp_to_gr": "fund_sales_expense_ratio",
         "adminexp_of_gr": "fund_admin_expense_ratio",
         "finaexp_of_gr": "fund_finance_expense_ratio",
         "op_yoy": "fund_op_profit_yoy",
@@ -1084,6 +1096,9 @@ class QlibBuilder:
             for dataset in _FUNDAMENTAL_RESEARCH_FIELDS
         }
         daily_fields = [field for field in _DAILY_RESEARCH_FIELDS if field in daily_columns]
+        missing_daily_fields = [
+            field for field in _DAILY_RESEARCH_FIELDS if field not in daily_columns
+        ]
         fundamental_fields = {
             dataset: {
                 source: target
@@ -1092,16 +1107,65 @@ class QlibBuilder:
             }
             for dataset, mapping in _FUNDAMENTAL_RESEARCH_FIELDS.items()
         }
+        missing_fundamental_fields = {
+            dataset: {
+                source: target
+                for source, target in mapping.items()
+                if source not in fundamental_columns[dataset]
+            }
+            for dataset, mapping in _FUNDAMENTAL_RESEARCH_FIELDS.items()
+        }
         fundamental_fields = {
             dataset: fields
             for dataset, fields in fundamental_fields.items()
             if fields
         }
+        missing_fundamental_fields = {
+            dataset: fields
+            for dataset, fields in missing_fundamental_fields.items()
+            if fields
+        }
+        # Distinguish "source column does not exist" from "source column
+        # exists but holds no non-null value": both keep a field out of the
+        # dumped binaries (an all-null channel carries no signal), but only
+        # the latter proves the pipeline received the column.
+        all_null_daily_fields = sorted(self._all_null_columns("daily_basic", daily_fields))
+        all_null_fundamental_fields = {
+            dataset: {
+                source: target
+                for source, target in fields.items()
+                if source in self._all_null_columns(dataset, set(fields))
+            }
+            for dataset, fields in fundamental_fields.items()
+        }
+        all_null_fundamental_fields = {
+            dataset: fields
+            for dataset, fields in all_null_fundamental_fields.items()
+            if fields
+        }
+        if missing_daily_fields or missing_fundamental_fields:
+            logger.warning(
+                "research field contract drift: declared source columns absent "
+                "from snapshot parquets (fields skipped, not injected): "
+                "daily_basic=%s fundamentals=%s",
+                missing_daily_fields,
+                missing_fundamental_fields,
+            )
+        if all_null_daily_fields or all_null_fundamental_fields:
+            logger.warning(
+                "research field sources contain only null values (fields "
+                "injected as all-NaN channels): daily_basic=%s fundamentals=%s",
+                all_null_daily_fields,
+                all_null_fundamental_fields,
+            )
         # Version 2: availability policies and recoverability levels come from
         # the shared registry in quant_data.availability and now also cover the
         # index/industry metadata consumed next to the feature fields.
         # Version 3: fundamental fields are grouped by source statement table
         # (fina_indicator plus the income/balancesheet/cashflow line items).
+        # Version 4: declared-vs-available coverage diagnostics distinguish
+        # source columns missing from the snapshot parquets from columns that
+        # exist but are entirely null.
         availability_datasets = (
             "daily_basic",
             "fina_indicator",
@@ -1112,13 +1176,17 @@ class QlibBuilder:
             "index_member_all",
         )
         return {
-            "version": 3,
+            "version": 4,
             "daily_fields": daily_fields,
             "fundamental_fields": fundamental_fields,
             "fields": [
                 *daily_fields,
                 *(target for fields in fundamental_fields.values() for target in fields.values()),
             ],
+            "missing_daily_fields": missing_daily_fields,
+            "missing_fundamental_fields": missing_fundamental_fields,
+            "all_null_daily_fields": all_null_daily_fields,
+            "all_null_fundamental_fields": all_null_fundamental_fields,
             "availability_policy_version": AVAILABILITY_POLICY_VERSION,
             "availability_policy": {
                 dataset: availability_contract_label(dataset)
@@ -1128,6 +1196,36 @@ class QlibBuilder:
                 dataset: recoverability_level(dataset)
                 for dataset in availability_datasets
             },
+        }
+
+    def _all_null_columns(self, dataset: str, columns: Collection[str]) -> set[str]:
+        """Source columns present in the dataset schema with zero non-null rows."""
+
+        if not columns:
+            return set()
+        root = self.snapshot_path / "parquet" / dataset
+        if not root.exists() or not any(root.rglob("*.parquet")):
+            return set()
+        glob = _sql_string(str((root / "**" / "*.parquet").resolve()))
+        ordered = sorted(columns)
+        projection = ", ".join(
+            f'count("{column.replace(chr(34), chr(34) * 2)}") AS "c{index}"'
+            for index, column in enumerate(ordered)
+        )
+        connection = duckdb.connect()
+        try:
+            row = connection.execute(
+                f"SELECT {projection} FROM read_parquet({glob}, "
+                "hive_partitioning=true, union_by_name=true)"
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return set()
+        return {
+            column
+            for index, column in enumerate(ordered)
+            if int(row[index] or 0) == 0
         }
 
     def _validate_research_sources(self) -> None:

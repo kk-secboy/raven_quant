@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
@@ -1390,14 +1391,17 @@ def announcement_nlp_command(
     )
     settings = context.settings
     secret_store = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
-    summary = process_announcements(
-        settings.data_root,
-        ts_codes=set(_split_codes(ts_code)) or None,
-        start=start_date,
-        end=end_date,
-        categories=categories or None,
-        limit=limit or None,
-        secret_store=secret_store,
+    summary = _produce_factors(
+        "announcement-nlp",
+        lambda: process_announcements(
+            settings.data_root,
+            ts_codes=set(_split_codes(ts_code)) or None,
+            start=start_date,
+            end=end_date,
+            categories=categories or None,
+            limit=limit or None,
+            secret_store=secret_store,
+        ),
     )
     result = {
         "dataset": "announcement_nlp",
@@ -1453,14 +1457,17 @@ def corpus_nlp_command(
     )
     settings = context.settings
     secret_store = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
-    summary = process_corpus(
-        settings.data_root,
-        datasets=datasets or None,
-        ts_codes=set(_split_codes(ts_code)) or None,
-        start=start_date,
-        end=end_date,
-        limit=limit or None,
-        secret_store=secret_store,
+    summary = _produce_factors(
+        "corpus-nlp",
+        lambda: process_corpus(
+            settings.data_root,
+            datasets=datasets or None,
+            ts_codes=set(_split_codes(ts_code)) or None,
+            start=start_date,
+            end=end_date,
+            limit=limit or None,
+            secret_store=secret_store,
+        ),
     )
     result = {
         "dataset": "corpus_nlp",
@@ -1500,11 +1507,14 @@ def report_rc_factors_command(
     context.report_progress(
         "processing", "report_rc structured factor production", {"report_rc"}, force=True
     )
-    summary = process_report_rc(
-        context.settings.data_root,
-        ts_codes=set(_split_codes(ts_code)) or None,
-        start=start_date,
-        end=end_date,
+    summary = _produce_factors(
+        "report-rc-factors",
+        lambda: process_report_rc(
+            context.settings.data_root,
+            ts_codes=set(_split_codes(ts_code)) or None,
+            start=start_date,
+            end=end_date,
+        ),
     )
     result = {
         "dataset": "report_rc",
@@ -1543,11 +1553,14 @@ def major_news_mentions_command(
     context.report_progress(
         "processing", "major_news mention mapping", {"major_news"}, force=True
     )
-    summary = process_major_news_mentions(
-        context.settings.data_root,
-        ts_codes=set(_split_codes(ts_code)) or None,
-        start=start_date,
-        end=end_date,
+    summary = _produce_factors(
+        "major-news-mentions",
+        lambda: process_major_news_mentions(
+            context.settings.data_root,
+            ts_codes=set(_split_codes(ts_code)) or None,
+            start=start_date,
+            end=end_date,
+        ),
     )
     result = {
         "dataset": "major_news",
@@ -1573,7 +1586,10 @@ def news_flash_factors_command(
     context.report_progress(
         "processing", "news flash intensity factor production", {"news"}, force=True
     )
-    summary = process_news_flash(context.settings.data_root)
+    summary = _produce_factors(
+        "news-flash-factors",
+        lambda: process_news_flash(context.settings.data_root),
+    )
     result = {"dataset": "news", **summary.as_dict()}
     _write_optional_result(result_path, result)
     console.print_json(json.dumps(result, ensure_ascii=False))
@@ -2163,6 +2179,26 @@ def _write_optional_result(path: Path | None, payload: dict) -> None:
     temporary = path.with_suffix(f"{path.suffix}.tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def _produce_factors(label: str, produce: Callable[[], Any]) -> Any:
+    """Run a factor-production processor with a guaranteed non-zero failure exit.
+
+    Fail-closed builders raise RuntimeError/ValueError on incomplete inputs
+    (short trade calendar, missing parquets). Letting that propagate as an
+    unhandled exception relies on the interpreter's excepthook for a non-zero
+    exit code, which invocation wrappers (docker exec pipelines, shell
+    capture) have flattened to 0 in production — schedulers then misread a
+    failed run as success. Convert expected data errors to typer.Exit(2),
+    matching the operational-failure convention used by bootstrap; usage
+    errors stay BadParameter, and unexpected exceptions still propagate.
+    """
+
+    try:
+        return produce()
+    except (RuntimeError, ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]{label} failed (fail-closed)[/red]: {exc}")
+        raise typer.Exit(2) from exc
 
 
 def _build_execution_snapshot(

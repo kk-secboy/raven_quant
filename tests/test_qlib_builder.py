@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -908,7 +909,7 @@ _EXTENDED_FINA_ROW = {
     "ar_turn": 7.6,
     "quick_ratio": 1.3,
     "debt_to_eqt": 80.0,
-    "saleexp_of_gr": 4.5,
+    "saleexp_to_gr": 4.5,
     "adminexp_of_gr": 6.5,
     "finaexp_of_gr": 1.2,
     "op_yoy": 15.0,
@@ -972,6 +973,54 @@ def test_extended_fina_indicator_fields_enter_bin_point_in_time(tmp_path: Path) 
     assert units["fund_assets_turnover"] == "turnover_times"
     assert units["fund_quick_ratio"] == "ratio_unitless"
     assert units["fund_interest_debt"] == "cny_yuan"
+
+
+def test_contract_distinguishes_missing_from_all_null_source_columns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-03",
+                "end_date": "2023-12-31",
+                "roe": 12.5,
+                # Declared and present in the schema, but entirely null.
+                "ocf_to_or": None,
+            }
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="quant_data.qlib_builder"):
+        builder = QlibBuilder(snapshot)
+
+    contract = builder.research_feature_contract
+    assert contract["version"] == 4
+    # The Tushare non-default columns the downloader never receives are
+    # reported as missing source columns instead of being silently skipped.
+    missing = contract["missing_fundamental_fields"]["fina_indicator"]
+    assert missing["q_profit_yoy"] == "fund_quarter_profit_yoy"
+    assert "ocf_to_or" not in missing
+    # A column that exists but holds no non-null value is a distinct class.
+    assert contract["all_null_fundamental_fields"]["fina_indicator"] == {
+        "ocf_to_or": "fund_ocf_to_revenue"
+    }
+    # Missing sources stay out of the injected fields; all-null sources keep
+    # their (all-NaN) channel, matching the accepted NaN-channel semantics
+    # for values an issuer never discloses.
+    assert "fund_quarter_profit_yoy" not in contract["fields"]
+    assert "fund_ocf_to_revenue" in contract["fields"]
+    # Both drift classes surface as build-time warnings without blocking.
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("absent" in message for message in messages)
+    assert any("only null" in message for message in messages)
+
+    by_symbol = builder.build_staging(tmp_path / "staging")
+    frame = pd.read_parquet(by_symbol / "SZ000001.parquet")
+    assert "fund_quarter_profit_yoy" not in frame.columns
+    assert frame["fund_ocf_to_revenue"].isna().all()
 
 
 def _write_statement_fixture(
