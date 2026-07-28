@@ -13,6 +13,7 @@ from .checkpoint import CheckpointStore
 from .coverage_data import COVERAGE_DATASETS, coverage_primary_key_candidates
 from .execution_contract import SIMULATION_MINUTE_SOURCE_DATASETS, TUSHARE_HAND_SIZE
 from .reference_data import select_current_reference_units
+from .row_identity import SNAPSHOT_QUARANTINE_KEYS, semantic_provider_columns
 
 # Interfaces whose provider pagination reorders rows between pages, or whose
 # intraday snapshots drift between polls, making overlapping pages (and
@@ -103,6 +104,7 @@ def verify_downloads(
 
     duplicate_checks: dict[str, int] = {}
     conflicting_duplicate_checks: dict[str, int] = {}
+    quarantined_conflict_checks: dict[str, int] = {}
     completeness_checks: dict[str, int] = {}
     connection = duckdb.connect()
     try:
@@ -169,29 +171,52 @@ def verify_downloads(
             if duplicates and dataset in UNSTABLE_PAGINATION_DATASETS:
                 provider_columns = ", ".join(
                     f'materialized."{column.replace(chr(34), chr(34) * 2)}"'
-                    for column in sorted(columns - {"ingested_at"})
+                    for column in sorted(semantic_provider_columns(dataset, columns))
                 )
+                deduplicated_sql = f"""
+                    SELECT DISTINCT {provider_columns}
+                    FROM read_parquet(
+                        '{glob}', union_by_name=true, filename=true
+                    ) AS materialized
+                    INNER JOIN selected_unit_files AS selected
+                        ON materialized.filename = selected.path
+                """
                 conflicting_duplicates = int(
                     connection.execute(
                         f"""
                         SELECT count(*) - count(DISTINCT ({key}))
-                        FROM (
-                            SELECT DISTINCT {provider_columns}
-                            FROM read_parquet(
-                                '{glob}', union_by_name=true, filename=true
-                            ) AS materialized
-                            INNER JOIN selected_unit_files AS selected
-                                ON materialized.filename = selected.path
-                        ) AS deduplicated
+                        FROM ({deduplicated_sql}) AS deduplicated
                         """
                     ).fetchone()[0]
                 )
                 conflicting_duplicate_checks[dataset] = conflicting_duplicates
                 if conflicting_duplicates:
-                    errors.append(
-                        f"{dataset}: {conflicting_duplicates} conflicting "
-                        "primary-key rows remain after exact-row deduplication"
+                    conflicting_keys = int(
+                        connection.execute(
+                            f"""
+                            SELECT count(*)
+                            FROM (
+                                SELECT {key}
+                                FROM ({deduplicated_sql}) AS deduplicated
+                                GROUP BY {key}
+                                HAVING count(*) > 1
+                            )
+                            """
+                        ).fetchone()[0]
                     )
+                    if dataset in SNAPSHOT_QUARANTINE_KEYS:
+                        quarantined_conflict_checks[dataset] = conflicting_keys
+                        warnings.append(
+                            f"{dataset}: {conflicting_keys} conflicting business keys "
+                            f"({conflicting_duplicates} extra semantic variants) are "
+                            "quarantined from successor snapshots"
+                        )
+                    else:
+                        errors.append(
+                            f"{dataset}: {conflicting_keys} conflicting business keys "
+                            f"({conflicting_duplicates} extra semantic variants) remain "
+                            "after exact-row deduplication"
+                        )
                 else:
                     warnings.append(
                         f"{dataset}: {duplicates} exact duplicate primary-key rows "
@@ -243,6 +268,7 @@ def verify_downloads(
         "datasets": datasets,
         "duplicate_checks": duplicate_checks,
         "conflicting_duplicate_checks": conflicting_duplicate_checks,
+        "quarantined_conflict_checks": quarantined_conflict_checks,
         "completeness_checks": completeness_checks,
         "ohlc_checks": ohlc_checks,
         "minute_daily_checks": minute_daily_checks,
@@ -357,17 +383,14 @@ def _verify_daily_completeness(
             f"{_sql_string(DAILY_BASIC_BSE_COMPLETE_FROM.isoformat())}"
         )
         daily_keys = (
-            f"SELECT ts_code, trade_date FROM ({daily_all_keys}) "
-            f"WHERE {supported_history_filter}"
+            f"SELECT ts_code, trade_date FROM ({daily_all_keys}) WHERE {supported_history_filter}"
         )
         basic_keys = (
-            f"SELECT ts_code, trade_date FROM ({basic_all_keys}) "
-            f"WHERE {supported_history_filter}"
+            f"SELECT ts_code, trade_date FROM ({basic_all_keys}) WHERE {supported_history_filter}"
         )
         checks["daily_rows_outside_daily_basic_history"] = int(
             connection.execute(
-                f"SELECT count(*) FROM ({daily_all_keys}) "
-                f"WHERE NOT ({supported_history_filter})"
+                f"SELECT count(*) FROM ({daily_all_keys}) WHERE NOT ({supported_history_filter})"
             ).fetchone()[0]
         )
         checks["daily_rows"] = int(

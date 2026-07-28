@@ -16,6 +16,12 @@ import pandas as pd
 from .availability import availability_contract_label, recoverability_level
 from .models import ProviderResult, UnitResult
 from .reference_data import reference_manifest_metadata
+from .row_identity import (
+    NULL_ON_AMBIGUITY_COLUMNS,
+    SEMANTIC_METADATA_COLUMNS,
+    SNAPSHOT_QUARANTINE_KEYS,
+    semantic_provider_columns,
+)
 
 DATE_COLUMNS = {
     "trade_date",
@@ -353,15 +359,10 @@ class ParquetStore:
         source_row_count = connection.execute(
             f"SELECT count(*) FROM read_parquet({quoted_paths}, union_by_name=true)"
         ).fetchone()[0]
-        snapshot_paths = [
-            str(path.resolve()) for path in sorted(dataset_dir.rglob("*.parquet"))
-        ]
-        snapshot_quoted_paths = (
-            "[" + ",".join(_sql_string(path) for path in snapshot_paths) + "]"
-        )
+        snapshot_paths = [str(path.resolve()) for path in sorted(dataset_dir.rglob("*.parquet"))]
+        snapshot_quoted_paths = "[" + ",".join(_sql_string(path) for path in snapshot_paths) + "]"
         row_count = connection.execute(
-            f"SELECT count(*) FROM read_parquet({snapshot_quoted_paths}, "
-            "union_by_name=true)"
+            f"SELECT count(*) FROM read_parquet({snapshot_quoted_paths}, union_by_name=true)"
         ).fetchone()[0]
         date_min = date_max = None
         if date_field is not None:
@@ -380,9 +381,7 @@ class ParquetStore:
             ).fetchone()
         base_files = {}
         if base_entry is not None:
-            base_files = {
-                str(item["path"]): item for item in base_entry.get("files") or []
-            }
+            base_files = {str(item["path"]): item for item in base_entry.get("files") or []}
         files = []
         for path in sorted(dataset_dir.rglob("*.parquet")):
             relative = path.relative_to(temporary).as_posix()
@@ -499,9 +498,7 @@ class ParquetStore:
             link = base_partitions - rebuild
 
         for year, month in sorted(link):
-            source_dir = (
-                base_dir / f"partition_year={year}" / f"partition_month={month}"
-            )
+            source_dir = base_dir / f"partition_year={year}" / f"partition_month={month}"
             if base_dir is not None and source_dir.exists():
                 _link_tree(
                     source_dir,
@@ -512,13 +509,10 @@ class ParquetStore:
             sources = [
                 path
                 for path, unit_range in unit_ranges.items()
-                if unit_range is not None
-                and unit_range[0] <= (year, month) <= unit_range[1]
+                if unit_range is not None and unit_range[0] <= (year, month) <= unit_range[1]
             ]
             if use_base_partitions and base_dir is not None:
-                parent_dir = (
-                    base_dir / f"partition_year={year}" / f"partition_month={month}"
-                )
+                parent_dir = base_dir / f"partition_year={year}" / f"partition_month={month}"
                 if parent_dir.exists():
                     sources = [
                         str(path) for path in sorted(parent_dir.rglob("*.parquet"))
@@ -527,9 +521,7 @@ class ParquetStore:
                 continue
             quoted = "[" + ",".join(_sql_string(path) for path in sources) + "]"
             source_sql = _snapshot_source_query(dataset, quoted, columns)
-            partition_dir = (
-                dataset_dir / f"partition_year={year}" / f"partition_month={month}"
-            )
+            partition_dir = dataset_dir / f"partition_year={year}" / f"partition_month={month}"
             partition_dir.mkdir(parents=True, exist_ok=True)
             connection.execute(
                 f"COPY ("
@@ -559,9 +551,7 @@ def _year_month(value: Any) -> tuple[int, int]:
     return (int(timestamp.year), int(timestamp.month))
 
 
-def _months_between(
-    lo: tuple[int, int], hi: tuple[int, int]
-) -> list[tuple[int, int]]:
+def _months_between(lo: tuple[int, int], hi: tuple[int, int]) -> list[tuple[int, int]]:
     if hi < lo:
         return []
     months: list[tuple[int, int]] = []
@@ -645,15 +635,38 @@ def _snapshot_source_query(dataset: str, quoted_paths: str, columns: set[str]) -
         # Overlapping/resumed pages can return the exact same provider row at
         # different fetch times. Collapse those semantic duplicates and keep
         # the earliest observation, which is the conservative point-in-time
-        # timestamp. Conflicting rows sharing a business primary key are
-        # rejected by the verifier before snapshot publication.
-        provider_columns = sorted(columns - {"ingested_at"})
+        # timestamp. Unsafe conflicts are either blocked by verification or
+        # removed under an explicit dataset-specific quarantine rule below.
+        provider_columns = sorted(semantic_provider_columns(dataset, columns))
         projected = ", ".join(_identifier(column) for column in provider_columns)
-        base = (
-            f"SELECT {projected}, min(ingested_at) AS ingested_at "
+        metadata_columns = sorted(set(columns) & set(SEMANTIC_METADATA_COLUMNS.get(dataset, ())))
+        null_on_ambiguity = NULL_ON_AMBIGUITY_COLUMNS.get(dataset, ())
+        metadata_projections = []
+        for column in metadata_columns:
+            identifier = _identifier(column)
+            if column in null_on_ambiguity:
+                metadata_projections.append(
+                    f"CASE WHEN count(DISTINCT {identifier}) <= 1 "
+                    f"THEN min({identifier}) END AS {identifier}"
+                )
+            else:
+                metadata_projections.append(f"min({identifier}) AS {identifier}")
+        selected = ", ".join([projected, *metadata_projections, "min(ingested_at) AS ingested_at"])
+        semantic_rows = (
+            f"SELECT {selected} "
             f"FROM read_parquet({quoted_paths}, union_by_name=true) "
             f"GROUP BY {projected}"
         )
+        quarantine_key = SNAPSHOT_QUARANTINE_KEYS.get(dataset)
+        if quarantine_key:
+            quarantine_columns = ", ".join(_identifier(column) for column in quarantine_key)
+            base = (
+                f"WITH semantic_rows AS ({semantic_rows}) "
+                "SELECT * FROM semantic_rows "
+                f"QUALIFY count(*) OVER (PARTITION BY {quarantine_columns}) = 1"
+            )
+        else:
+            base = semantic_rows
     else:
         base = f"SELECT DISTINCT * FROM read_parquet({quoted_paths}, union_by_name=true)"
     news_identity = {"datetime", "content", "title", "source"}

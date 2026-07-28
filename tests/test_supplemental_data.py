@@ -65,15 +65,12 @@ def test_institutional_bundle_matches_its_declared_interface_contract() -> None:
     }
     assert len([spec for spec in specs if spec.dataset == "major_news"]) == 9
     assert all("ts_code" not in spec.params for spec in specs)
-    assert next(spec for spec in specs if spec.dataset == "report_rc").scope[
-        "page_size"
-    ] == 3_000
-    assert next(spec for spec in specs if spec.dataset == "ci_daily").params[
-        "trade_date"
-    ] == "20240102"
-    assert next(spec for spec in specs if spec.dataset == "major_news").scope[
-        "page_size"
-    ] == 400
+    assert next(spec for spec in specs if spec.dataset == "report_rc").scope["page_size"] == 3_000
+    assert (
+        next(spec for spec in specs if spec.dataset == "ci_daily").params["trade_date"]
+        == "20240102"
+    )
+    assert next(spec for spec in specs if spec.dataset == "major_news").scope["page_size"] == 400
     assert next(spec for spec in specs if spec.dataset == "major_news").fields == (
         "title",
         "content",
@@ -198,11 +195,7 @@ def test_a_share_financial_history_includes_four_quarters_before_start() -> None
         end=date(2024, 1, 2),
         max_attempts=3,
     )
-    periods = {
-        spec.params["period"]
-        for spec in specs
-        if spec.dataset == "fina_indicator"
-    }
+    periods = {spec.params["period"] for spec in specs if spec.dataset == "fina_indicator"}
     assert periods == {"20230331", "20230630", "20230930", "20231231"}
 
 
@@ -245,8 +238,7 @@ def test_option_contract_master_can_continue_beyond_old_64_page_ceiling() -> Non
     specs = [spec for spec in specs if spec.dataset == "opt_basic"]
     while len(specs) < 65:
         rows = [
-            {"unit_key": spec.unit_key, "row_count": int(spec.scope["page_size"])}
-            for spec in specs
+            {"unit_key": spec.unit_key, "row_count": int(spec.scope["page_size"])} for spec in specs
         ]
         specs.extend(next_pagination_specs(specs, rows))
     assert len(specs) == 65
@@ -283,18 +275,12 @@ def test_fund_bundle_covers_research_master_and_time_series() -> None:
     assert {spec.params["status"] for spec in masters} == {"L", "I", "D"}
     assert len(masters) == 6
     paged_master = next(
-        spec
-        for spec in masters
-        if spec.params["market"] == "O" and spec.params["status"] == "L"
+        spec for spec in masters if spec.params["market"] == "O" and spec.params["status"] == "L"
     )
     assert paged_master.params["limit"] == 5_000
     assert paged_master.params["offset"] == 0
     assert paged_master.scope["page_size"] == 5_000
-    assert all(
-        spec.scope["row_limit"] == 15_000
-        for spec in masters
-        if spec is not paged_master
-    )
+    assert all(spec.scope["row_limit"] == 15_000 for spec in masters if spec is not paged_master)
     etf_masters = [spec for spec in specs if spec.dataset == "etf_basic"]
     assert {spec.params["list_status"] for spec in etf_masters} == {"L", "D", "P"}
     assert next(spec for spec in specs if spec.dataset == "etf_index").scope["page_size"] == 5_000
@@ -333,9 +319,7 @@ def test_dense_fund_portfolio_can_continue_beyond_the_old_256_page_ceiling() -> 
     rows = []
     for _ in range(256):
         current = specs[-1]
-        rows.append(
-            {"unit_key": current.unit_key, "row_count": int(current.scope["page_size"])}
-        )
+        rows.append({"unit_key": current.unit_key, "row_count": int(current.scope["page_size"])})
         specs.extend(next_pagination_specs(specs, rows))
     assert len(specs) == 257
     assert specs[-1].params["offset"] == 512_000
@@ -656,10 +640,7 @@ def test_share_float_offset_cap_repartitions_the_whole_month_by_day() -> None:
         "offset": 0,
     }
     assert daily[-1].params["start_date"] == "20240131"
-    assert all(
-        item.scope["supersedes_page_group"] == parent.scope["page_group"]
-        for item in daily
-    )
+    assert all(item.scope["supersedes_page_group"] == parent.scope["page_group"] for item in daily)
     assert all(item.scope["expected_date"] == item.params["start_date"] for item in daily)
 
     following = next_pagination_specs(
@@ -667,10 +648,7 @@ def test_share_float_offset_cap_repartitions_the_whole_month_by_day() -> None:
         [
             {"unit_key": parent.unit_key, "row_count": 1_000},
             {"unit_key": daily[0].unit_key, "row_count": 6_000},
-            *[
-                {"unit_key": item.unit_key, "row_count": 0}
-                for item in daily[1:]
-            ],
+            *[{"unit_key": item.unit_key, "row_count": 0} for item in daily[1:]],
         ],
     )
     assert len(following) == 1
@@ -681,10 +659,7 @@ def test_share_float_offset_cap_repartitions_the_whole_month_by_day() -> None:
         [parent, *daily],
         [
             {"unit_key": parent.unit_key, "row_count": 1_000},
-            *[
-                {"unit_key": item.unit_key, "row_count": 0}
-                for item in daily
-            ],
+            *[{"unit_key": item.unit_key, "row_count": 0} for item in daily],
         ],
     )
 
@@ -712,9 +687,7 @@ def test_etf_constituent_history_starts_one_partition_per_active_symbol_range() 
 
 
 def test_market_daily_specs_use_only_calendar_open_dates() -> None:
-    specs = market_daily_specs(
-        "hk", ["20240102", "20240104"], max_attempts=3
-    )
+    specs = market_daily_specs("hk", ["20240102", "20240104"], max_attempts=3)
 
     assert {spec.dataset for spec in specs} == {"hk_daily", "hk_daily_adj"}
     assert {spec.params["trade_date"] for spec in specs} == {
@@ -740,9 +713,11 @@ def test_hk_and_us_initial_market_plans_contain_only_master_and_calendar() -> No
     )
 
     assert {spec.dataset for spec in hk} == {"hk_basic", "hk_tradecal"}
-    assert {
-        spec.params["list_status"] for spec in hk if spec.dataset == "hk_basic"
-    } == {"L", "D", "P"}
+    assert {spec.params["list_status"] for spec in hk if spec.dataset == "hk_basic"} == {
+        "L",
+        "D",
+        "P",
+    }
     assert {spec.dataset for spec in us} == {"us_basic", "us_tradecal"}
 
 
@@ -787,8 +762,7 @@ def test_etf_symbol_window_offset_cap_bisects_the_date_range() -> None:
     assert children[-1].params["end_date"] == "20260715"
     assert children[0].params["end_date"] < children[1].params["start_date"]
     assert all(
-        child.scope["supersedes_page_group"] == failed.scope["page_group"]
-        for child in children
+        child.scope["supersedes_page_group"] == failed.scope["page_group"] for child in children
     )
 
 
@@ -801,4 +775,5 @@ def test_share_float_has_a_natural_date_and_duplicate_gate() -> None:
         "float_date",
         "holder_name",
         "share_type",
+        "float_share",
     )

@@ -37,9 +37,27 @@ def test_coverage_inventory_matches_audited_default_and_optional_counts() -> Non
     (
         ("broker_recommend", ("month", "broker", "ts_code")),
         ("ccass_hold_detail", ("ts_code", "trade_date", "col_participant_id")),
+        (
+            "dc_hot",
+            ("trade_date", "data_type", "rank_time", "rank", "ts_code", "ts_name"),
+        ),
         ("daily_info", ("trade_date", "ts_code")),
+        (
+            "eco_cal",
+            (
+                "date",
+                "time",
+                "currency",
+                "country",
+                "event",
+                "value",
+                "pre_value",
+                "fore_value",
+            ),
+        ),
         ("hm_detail", ("trade_date", "ts_code", "hm_name", "hm_orgs")),
         ("idx_anns", ("url",)),
+        ("moneyflow_ind_dc", ("trade_date", "content_type", "ts_code")),
         ("slb_len", ("trade_date",)),
         ("us_adjfactor", ("trade_date", "exchange", "ts_code")),
     ),

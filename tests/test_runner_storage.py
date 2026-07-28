@@ -129,6 +129,8 @@ def test_verifier_uses_successor_generation_and_can_ignore_dormant_plans(
         "ts_code": "000001.SZ",
         "ann_date": "20240101",
         "float_date": "20240101",
+        "float_share": 100.0,
+        "float_ratio": 0.01,
         "holder_name": "holder",
         "share_type": "A",
     }
@@ -181,7 +183,10 @@ def test_verifier_downgrades_only_exact_duplicates_for_unstable_pagination_datas
     checkpoint.add([unstable, unstable_next_page, stable])
     hot_row = {
         "trade_date": "20240102",
+        "data_type": "A股市场",
+        "rank_time": "2024-01-02 15:00:00",
         "ts_code": "000001.SZ",
+        "ts_name": "平安银行",
         "market": "concept",
         "hot_type": "popularity",
         "rank": 1,
@@ -208,12 +213,8 @@ def test_verifier_downgrades_only_exact_duplicates_for_unstable_pagination_datas
 
     assert result["duplicate_checks"] == {"adj_factor": 1, "dc_hot": 1}
     assert result["conflicting_duplicate_checks"] == {"dc_hot": 0}
-    assert any(
-        "dc_hot: 1 exact duplicate primary-key rows" in item for item in result["warnings"]
-    )
-    assert any(
-        "adj_factor: 1 duplicate primary-key rows" in item for item in result["errors"]
-    )
+    assert any("dc_hot: 1 exact duplicate primary-key rows" in item for item in result["warnings"])
+    assert any("adj_factor: 1 duplicate primary-key rows" in item for item in result["errors"])
 
 
 def test_verifier_rejects_conflicting_duplicates_from_unstable_pagination(
@@ -222,20 +223,19 @@ def test_verifier_rejects_conflicting_duplicates_from_unstable_pagination(
     checkpoint = CheckpointStore(database_url)
     storage = ParquetStore(tmp_path)
     spec = FetchSpec(
-        dataset="dc_hot",
-        api_name="dc_hot",
+        dataset="dc_member",
+        api_name="dc_member",
         params={"trade_date": "20240102"},
-        scope={"page_group": "dc_hot:20240102", "offset": 0},
+        scope={"page_group": "dc_member:20240102", "offset": 0},
     )
     checkpoint.add([spec])
     first = {
         "trade_date": "20240102",
-        "ts_code": "000001.SZ",
-        "market": "concept",
-        "hot_type": "popularity",
-        "rank": 1,
+        "ts_code": "BK0001.DC",
+        "con_code": "000001.SZ",
+        "name": "first",
     }
-    second = {**first, "rank": 2}
+    second = {**first, "name": "second"}
     written = storage.write_unit(
         spec.dataset,
         spec.unit_key,
@@ -250,10 +250,57 @@ def test_verifier_rejects_conflicting_duplicates_from_unstable_pagination(
 
     result = verify_downloads(checkpoint, tmp_path)
 
-    assert result["duplicate_checks"] == {"dc_hot": 1}
-    assert result["conflicting_duplicate_checks"] == {"dc_hot": 1}
+    assert result["duplicate_checks"] == {"dc_member": 1}
+    assert result["conflicting_duplicate_checks"] == {"dc_member": 1}
+    assert any("dc_member: 1 conflicting business keys" in item for item in result["errors"])
+
+
+def test_verifier_audits_snapshot_quarantine_for_unsafe_provider_conflicts(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    spec = FetchSpec(
+        dataset="ccass_hold",
+        api_name="ccass_hold",
+        params={"trade_date": "20250930"},
+        scope={"page_group": "ccass_hold:20250930", "offset": 0},
+    )
+    checkpoint.add([spec])
+    first = {
+        "trade_date": "20250930",
+        "ts_code": "300300.SZ",
+        "name": "海峡创新",
+        "shareholding": "354",
+        "hold_nums": "7",
+        "hold_ratio": "0.00",
+    }
+    second = {
+        **first,
+        "name": "食品饮料ETF天弘",
+        "shareholding": "225631",
+        "hold_nums": "4",
+    }
+    written = storage.write_unit(
+        spec.dataset,
+        spec.unit_key,
+        ProviderResult(
+            api_name=spec.api_name,
+            columns=list(first),
+            rows=[first, second],
+            raw_body=b"{}",
+        ),
+    )
+    checkpoint.succeed(spec.unit_key, written)
+
+    result = verify_downloads(checkpoint, tmp_path)
+
+    assert result["ok"] is True
+    assert result["conflicting_duplicate_checks"] == {"ccass_hold": 1}
+    assert result["quarantined_conflict_checks"] == {"ccass_hold": 1}
     assert any(
-        "dc_hot: 1 conflicting primary-key rows" in item for item in result["errors"]
+        "ccass_hold: 1 conflicting business keys" in item and "quarantined" in item
+        for item in result["warnings"]
     )
 
 
@@ -338,9 +385,7 @@ def test_verifier_scopes_daily_basic_to_complete_bse_history(
                 "vol": 100.0,
             },
         ],
-        "daily_basic": [
-            {"ts_code": "000001.SZ", "trade_date": "20221230", "total_mv": 100.0}
-        ],
+        "daily_basic": [{"ts_code": "000001.SZ", "trade_date": "20221230", "total_mv": 100.0}],
         "adj_factor": [
             {"ts_code": "000001.SZ", "trade_date": "20221230", "adj_factor": 1.0},
             {"ts_code": "920001.BJ", "trade_date": "20221230", "adj_factor": 1.0},
@@ -391,16 +436,14 @@ def test_verifier_warns_for_isolated_daily_basic_provider_hole(
         for index in range(10_001)
     ]
     basic_rows = [
-        {"ts_code": row["ts_code"], "trade_date": day, "total_mv": 100.0}
-        for row in daily_rows[1:]
+        {"ts_code": row["ts_code"], "trade_date": day, "total_mv": 100.0} for row in daily_rows[1:]
     ]
     fixtures = {
         "trade_cal": [{"exchange": "SSE", "cal_date": day, "is_open": "1"}],
         "daily": daily_rows,
         "daily_basic": basic_rows,
         "adj_factor": [
-            {"ts_code": row["ts_code"], "trade_date": day, "adj_factor": 1.0}
-            for row in daily_rows
+            {"ts_code": row["ts_code"], "trade_date": day, "adj_factor": 1.0} for row in daily_rows
         ],
     }
     specs = [
@@ -427,8 +470,7 @@ def test_verifier_warns_for_isolated_daily_basic_provider_hole(
     assert report["ok"] is True, report["errors"]
     assert report["completeness_checks"]["stocks_missing_daily_basic"] == 1
     assert any(
-        "daily_basic: 1 stock/date rows" in item
-        and "below the 0.01% blocking threshold" in item
+        "daily_basic: 1 stock/date rows" in item and "below the 0.01% blocking threshold" in item
         for item in report["warnings"]
     )
 
