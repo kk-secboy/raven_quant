@@ -82,7 +82,7 @@ from .worker import LocalJobWorker
 
 class BootstrapRequest(BaseModel):
     profile: Literal["core", "research", "full"] = "core"
-    start: date = Field(default=date(2024, 1, 1))
+    start: date = Field(default=date(2018, 1, 1))
     end: date | Literal["latest"] = "latest"
     build_qlib: bool = False
 
@@ -95,7 +95,7 @@ class BootstrapRequest(BaseModel):
 
 class DataFinalizeRequest(BaseModel):
     profile: Literal["core", "research", "full"] = "full"
-    start: date = Field(default=date(2024, 1, 1))
+    start: date = Field(default=date(2018, 1, 1))
     end: date | Literal["latest"] = "latest"
     snapshot_name: str | None = Field(default=None, min_length=3, max_length=120)
 
@@ -856,6 +856,7 @@ class RecommendationPortfolioCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=150)
     strategy_version_id: str
     dataset: str
+    dataset_roll_policy: Literal["pinned", "latest_compatible"] = "latest_compatible"
     construction_notional: float = Field(
         default=5_000_000,
         ge=100_000,
@@ -881,6 +882,8 @@ class SimulationPortfolioCreateRequest(BaseModel):
     execution_frequency: Literal["1min", "5min"] = "5min"
     execution_adapter: Literal["long_only", "pair"] | None = None
     execution_contract_hash: str | None = Field(default=None, min_length=64, max_length=64)
+    daily_roll_policy: Literal["pinned", "latest_compatible"] = "latest_compatible"
+    execution_roll_policy: Literal["pinned", "latest_compatible"] = "latest_compatible"
     initial_cash: float = Field(ge=100_000)
     execution_algorithm: Literal["twap", "vwap", "next_bar"] | None = None
     slice_minutes: int | None = Field(default=None, ge=5, le=30, multiple_of=5)
@@ -2822,7 +2825,15 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def create_recommendation_portfolio(
         payload: RecommendationPortfolioCreateRequest, request: Request
     ) -> dict:
-        require_qlib_dataset(payload.dataset, purpose="recommendation portfolio", frequency="day")
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="recommendation portfolio", frequency="day"
+        )
+        lineage_id = str(dataset.get("lineage_id") or "")
+        if payload.dataset_roll_policy == "latest_compatible" and len(lineage_id) != 64:
+            raise HTTPException(
+                409,
+                "latest-compatible recommendation requires a verified dataset lineage",
+            )
         try:
             return recommendations.create(
                 name=payload.name,
@@ -2830,6 +2841,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 dataset=payload.dataset,
                 hypothetical_initial_value=payload.construction_notional,
                 actor=authenticated_actor(request, payload.actor),
+                dataset_roll_policy=payload.dataset_roll_policy,
+                dataset_lineage_id=lineage_id or None,
             )
         except KeyError as exc:
             raise HTTPException(404, "strategy version not found") from exc
@@ -2882,8 +2895,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             dataset = select_qlib_dataset(
                 settings.data_root,
                 anchor_name=portfolio["dataset"],
-                roll_policy="pinned",
-                lineage_id=None,
+                roll_policy=str(portfolio.get("dataset_roll_policy") or "pinned"),
+                lineage_id=portfolio.get("dataset_lineage_id"),
                 required_date=payload.as_of_date,
             )
             snapshot, created = recommendations.create_snapshot(
@@ -2891,6 +2904,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 as_of_date=payload.as_of_date,
                 dataset=dataset["name"],
                 dataset_identity_sha256=dataset["provenance"]["dataset_identity_sha256"],
+                dataset_lineage_id=dataset.get("lineage_id"),
             )
         except KeyError as exc:
             raise HTTPException(404, "recommendation portfolio not found") from exc
@@ -2988,6 +3002,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 actor=authenticated_actor(request, payload.actor),
                 execution_adapter=payload.execution_adapter,
                 execution_contract_hash=payload.execution_contract_hash,
+                daily_roll_policy=payload.daily_roll_policy,
+                execution_roll_policy=payload.execution_roll_policy,
             )
         except KeyError as exc:
             raise HTTPException(404, "simulation source not found") from exc

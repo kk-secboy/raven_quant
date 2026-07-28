@@ -105,6 +105,7 @@ def _evidence(
     contract_hash: str,
     events: list[dict] | None,
     trade_date: date,
+    simulation_semantics_sha256: str,
 ) -> dict:
     evidence = {
         "batch_id": batch_id,
@@ -112,6 +113,7 @@ def _evidence(
         "dataset_lineage_id": EXECUTION_LINEAGE,
         "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
         "execution_contract_hash": contract_hash,
+        "simulation_semantics_sha256": simulation_semantics_sha256,
         "next_trade_date": (
             pd.Timestamp(trade_date) + pd.offsets.BusinessDay(1)
         ).date().isoformat(),
@@ -259,7 +261,11 @@ def test_corporate_event_types_lifecycle(database_url: str, tmp_path) -> None:
         minute_bars=_instrument_bars("SH600000", DAY_BUY),
         closing_prices={"SH600000": {"price": 10.0, "market_date": DAY_BUY.isoformat()}},
         execution_evidence=_evidence(
-            batch["id"], contract_hash, None, DAY_BUY
+            batch["id"],
+            contract_hash,
+            None,
+            DAY_BUY,
+            batch["simulation_semantics_sha256"],
         ),
     )
     assert completed["status"] == "succeeded"
@@ -283,7 +289,11 @@ def test_corporate_event_types_lifecycle(database_url: str, tmp_path) -> None:
         minute_bars=_no_trade_bars(DAY_EVENT),
         closing_prices={"SH600000": {"price": 5.0, "market_date": DAY_EVENT.isoformat()}},
         execution_evidence=_evidence(
-            batch_event["id"], contract_hash, events, DAY_EVENT
+            batch_event["id"],
+            contract_hash,
+            events,
+            DAY_EVENT,
+            batch_event["simulation_semantics_sha256"],
         ),
         corporate_events=events,
     )
@@ -331,7 +341,11 @@ def test_corporate_event_types_lifecycle(database_url: str, tmp_path) -> None:
         minute_bars=_instrument_bars("SH600000", DAY_SELL, price=5.0),
         closing_prices={"SH600000": {"price": 5.0, "market_date": DAY_SELL.isoformat()}},
         execution_evidence=_evidence(
-            batch_sell["id"], contract_hash, replayed, DAY_SELL
+            batch_sell["id"],
+            contract_hash,
+            replayed,
+            DAY_SELL,
+            batch_sell["simulation_semantics_sha256"],
         ),
         corporate_events=replayed,
     )
@@ -374,6 +388,7 @@ def test_corporate_events_evidence_mismatch_fails_closed(
                 simulation["execution_contract_hash"],
                 [],
                 DAY_BUY,
+                batch["simulation_semantics_sha256"],
             ),
             corporate_events=[dict(EVENTS[1])],  # 与证据哈希（空列表）不一致
         )

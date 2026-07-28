@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -9,7 +9,13 @@ from sqlalchemy import select
 
 from quant_data.config import Settings
 from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES
-from quant_data.database import jobs, strategy_allocation_events
+from quant_data.database import (
+    jobs,
+    recommendation_snapshots,
+    simulation_batches,
+    simulation_portfolios,
+    strategy_allocation_events,
+)
 
 from .alert_store import AlertStore
 from .autonomous_research import AutonomousResearchOrchestrator
@@ -78,6 +84,7 @@ class SchedulerEngine:
             processed += 1
         program_result = self.continuous_research.tick(limit=5, now=current)
         campaign_result = self.autonomous_research.tick(limit=10)
+        simulation_replays_enqueued = self._enqueue_due_simulation_replays(current)
         projected = self.project_alerts()
         health_recorded = 0
         if self.health.due(current):
@@ -98,7 +105,95 @@ class SchedulerEngine:
             "alerts_projected": projected,
             "alerts_delivered": delivered,
             "health_recorded": health_recorded,
+            "simulation_replays_enqueued": simulation_replays_enqueued,
         }
+
+    def _enqueue_due_simulation_replays(self, now: datetime) -> int:
+        """Bind due forward batches only after immutable execution data exists."""
+
+        local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        with self.jobs.engine.connect() as connection:
+            snapshot_ids = connection.scalars(
+                select(recommendation_snapshots.c.id)
+                .join(
+                    simulation_portfolios,
+                    (
+                        simulation_portfolios.c.source_type == "recommendation"
+                    )
+                    & (
+                        simulation_portfolios.c.source_id
+                        == recommendation_snapshots.c.portfolio_id
+                    ),
+                )
+                .outerjoin(
+                    simulation_batches,
+                    (
+                        simulation_batches.c.portfolio_id
+                        == simulation_portfolios.c.id
+                    )
+                    & (
+                        simulation_batches.c.recommendation_snapshot_id
+                        == recommendation_snapshots.c.id
+                    ),
+                )
+                .where(
+                    recommendation_snapshots.c.status == "succeeded",
+                    recommendation_snapshots.c.effective_date <= local_date,
+                    simulation_portfolios.c.status == "active",
+                    simulation_batches.c.id.is_(None),
+                )
+                .order_by(recommendation_snapshots.c.effective_date)
+                .limit(100)
+            ).all()
+        for snapshot_id in snapshot_ids:
+            try:
+                self.simulations.create_batches_for_snapshot(
+                    str(snapshot_id),
+                    actor="forward-simulation-scheduler",
+                    data_root=self.settings.data_root,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                waiting_markers = (
+                    "not available yet",
+                    "not ready",
+                    "does not cover",
+                    "no verified latest-compatible",
+                    "unavailable",
+                )
+                if any(marker in message for marker in waiting_markers):
+                    continue
+                raise
+        with self.jobs.engine.connect() as connection:
+            due_batches = connection.scalars(
+                select(simulation_batches.c.id)
+                .join(
+                    simulation_portfolios,
+                    simulation_portfolios.c.id == simulation_batches.c.portfolio_id,
+                )
+                .where(
+                    simulation_batches.c.status == "queued",
+                    simulation_batches.c.trade_date <= local_date,
+                    simulation_portfolios.c.status == "active",
+                )
+                .order_by(simulation_batches.c.trade_date, simulation_batches.c.created_at)
+                .limit(100)
+            ).all()
+        enqueued = 0
+        for batch_id in due_batches:
+            job = self.jobs.create(
+                "simulation_replay",
+                {"simulation_batch_id": str(batch_id)},
+                self.settings.data_root
+                / "platform"
+                / "logs"
+                / f"simulation-replay-{batch_id}.log",
+                dedupe_active_kind=False,
+                idempotency_key=f"simulation-replay:{batch_id}",
+            )
+            if job["status"] in {"queued", "running"}:
+                enqueued += 1
+        return enqueued
 
     def _alert_webhook_url(self) -> str:
         try:
@@ -178,7 +273,7 @@ class SchedulerEngine:
         payload = run["payload"]
         local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
         lookback_days = max(1, min(30, int(payload.get("lookback_days", 7))))
-        snapshot_start = str(payload.get("snapshot_start", "2024-01-01"))
+        snapshot_start = str(payload.get("snapshot_start", "2018-01-01"))
         finalize = bool(payload.get("build_qlib", True))
         snapshot_name = f"cn-{snapshot_start.replace('-', '')}-{local_date:%Y%m%d}"
         log_path = self.settings.data_root / "platform" / "logs" / f"scheduled-sync-{run['id']}.log"
@@ -210,7 +305,7 @@ class SchedulerEngine:
         payload = run["payload"]
         local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
         lookback_days = max(1, min(90, int(payload.get("lookback_days", 7))))
-        snapshot_start = str(payload.get("snapshot_start", "2024-01-01"))
+        snapshot_start = str(payload.get("snapshot_start", "2018-01-01"))
         bundles = payload.get("bundles") or list(AUTOMATED_DATA_BUNDLES)
         unknown = sorted(set(bundles) - set(AUTOMATED_DATA_BUNDLES))
         if unknown:
@@ -266,18 +361,61 @@ class SchedulerEngine:
             raise ValueError("Tushare credentials are not configured")
         payload = run["payload"]
         local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
-        lookback_days = max(1, min(30, int(payload.get("lookback_days", 3))))
-        start = local_date - timedelta(days=lookback_days - 1)
+        history_start = date.fromisoformat(
+            str(payload.get("history_start") or "2024-01-01")
+        )
+        if history_start > local_date:
+            raise ValueError("A-share five-minute history start is after the run date")
+        daily_datasets = [
+            item
+            for item in list_qlib_datasets(self.settings.data_root)
+            if item.get("ready")
+            and item.get("reproducible")
+            and item.get("frequency") == "day"
+        ]
+        requested_daily = str(payload.get("daily_dataset") or "")
+        if requested_daily:
+            daily_datasets = [
+                item for item in daily_datasets if item["name"] == requested_daily
+            ]
+        if not daily_datasets:
+            raise ValueError(
+                "a reproducible daily Qlib dataset is required before five-minute sync"
+            )
+        daily_dataset = max(
+            daily_datasets,
+            key=lambda item: (str(item.get("end_date") or ""), str(item["name"])),
+        )
+        source_lineage_id = str(
+            (daily_dataset.get("provenance") or {}).get("source_lineage_id") or ""
+        )
+        if len(source_lineage_id) != 64:
+            raise ValueError("daily Qlib dataset has no verified source lineage")
         snapshot_name = f"ashare-5m-incremental-{local_date:%Y%m%d}"
+        output_name = f"{snapshot_name}-5min"
         log_path = (
             self.settings.data_root / "platform" / "logs" / f"scheduled-ashare-5m-{run['id']}.log"
         )
         return self.jobs.create(
             "ashare_5m_download",
             {
-                "start": start.isoformat(),
+                "start": history_start.isoformat(),
                 "end": local_date.isoformat(),
                 "snapshot_name": snapshot_name,
+                "source_lineage_id": source_lineage_id,
+                "daily_dataset": daily_dataset["name"],
+                "pipeline_steps": [
+                    {
+                        "kind": "minute_qlib",
+                        "payload": {
+                            "output_name": output_name,
+                            "target_frequency": "5min",
+                        },
+                    }
+                ],
+                "pipeline_next_index": 0,
+                "pipeline_id": f"schedule-run:{run['id']}",
+                "profile": "ashare_intraday",
             },
             log_path,
             idempotency_key=f"schedule-run:{run['id']}",
@@ -474,8 +612,8 @@ class SchedulerEngine:
         dataset = select_qlib_dataset(
             self.settings.data_root,
             anchor_name=portfolio["dataset"],
-            roll_policy="pinned",
-            lineage_id=None,
+            roll_policy=str(portfolio.get("dataset_roll_policy") or "pinned"),
+            lineage_id=portfolio.get("dataset_lineage_id"),
             required_date=signal_date,
         )
         calendar_days = load_calendar_days(dataset["path"])
@@ -533,6 +671,7 @@ class SchedulerEngine:
             as_of_date=signal_date,
             dataset=dataset["name"],
             dataset_identity_sha256=dataset["provenance"]["dataset_identity_sha256"],
+            dataset_lineage_id=dataset.get("lineage_id"),
         )
         if not created:
             self.schedules.finish_run(

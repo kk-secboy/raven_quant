@@ -203,7 +203,7 @@ export function PairSatellitePanel({ api }: { api: string }) {
             不得批准、创建持久模拟账户，也不会生成真实交易指令。
           </p>
         </div>
-        <span className="boundary-chip">RESEARCH ONLY</span>
+        <span className="boundary-chip">RESEARCH ONLY / NO CAPITAL · 仅研究，不分配资金</span>
       </div>
 
       <div className="pair-metric-strip">

@@ -190,3 +190,25 @@ def test_formal_runner_calls_qlib_d_features_with_the_frozen_expressions(
             "freq": "day",
         }
     ]
+
+
+def test_formal_runner_restricts_exchange_universe_to_eligible_assets() -> None:
+    from scripts.run_multifactor_backtest import _eligible_strategy_instruments
+
+    index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2025-01-02"), "SH600000"),
+            (pd.Timestamp("2025-01-02"), "SZ000001"),
+            (pd.Timestamp("2025-01-02"), "BJ899050"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    scores = pd.Series([1.0, 0.5, 0.1], index=index)
+    eligibility = pd.DataFrame(
+        [
+            {"datetime": "2025-01-02", "instrument": "SH600000", "eligible": True},
+            {"datetime": "2025-01-02", "instrument": "SZ000001", "eligible": False},
+        ]
+    )
+
+    assert _eligible_strategy_instruments(scores, eligibility) == ["SH600000"]

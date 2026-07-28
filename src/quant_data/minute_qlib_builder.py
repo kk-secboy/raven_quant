@@ -338,13 +338,48 @@ class MinuteQlibBuilder:
             dataset: MINUTE_SOURCE_UNIT_CONTRACTS[dataset]
             for dataset in identity["source_datasets"]
         }
+        snapshot_lineage_id = str(self.manifest.get("lineage_id") or "")
+        source_lineage_id = str(
+            self.manifest.get("source_lineage_id") or snapshot_lineage_id
+        )
+        lineage_verified = all(
+            len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+            for value in (snapshot_lineage_id, source_lineage_id)
+        )
+        dataset_lineage_id = (
+            hashlib.sha256(
+                json.dumps(
+                    {
+                        "snapshot_lineage_id": snapshot_lineage_id,
+                        "qlib_builder_sha256": builder_digest,
+                        "frequency": self.frequency,
+                        "source_frequency": self.source_frequency,
+                        "fields": list(MINUTE_QLIB_FIELDS),
+                        "field_units": MINUTE_QLIB_FIELD_UNITS,
+                        "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
+                        "resample_contract_version": (
+                            QLIB_MINUTE_RESAMPLE_CONTRACT_VERSION
+                            if self.requires_resampling
+                            else None
+                        ),
+                        "source_unit_contracts": identity["source_unit_contracts"],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if lineage_verified
+            else None
+        )
         canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
         provenance = {
             **identity,
             "dataset_identity_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
-            "dataset_lineage_id": self.manifest.get("lineage_id"),
-            "source_lineage_id": self.manifest.get("lineage_id"),
-            "lineage_verified": bool(self.manifest.get("lineage_id")),
+            "dataset_lineage_id": dataset_lineage_id,
+            "source_snapshot_lineage_id": snapshot_lineage_id or None,
+            "source_lineage_id": source_lineage_id or None,
+            "lineage_verified": lineage_verified,
             "source_start_date": self.manifest.get("start_date"),
             "source_end_date": self.manifest.get("end_date"),
             "created_at": datetime.now(UTC).isoformat(),

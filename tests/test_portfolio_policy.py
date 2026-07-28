@@ -69,7 +69,9 @@ def test_cost_schedule_is_asset_and_effective_date_specific() -> None:
     )
     assert stock["stamp_duty"] == pytest.approx(50.0)
     assert etf["stamp_duty"] == pytest.approx(0.0)
-    assert stock["total"] - etf["total"] == pytest.approx(50.0)
+    assert stock["transfer_fee"] == pytest.approx(1.0)
+    assert etf["transfer_fee"] == pytest.approx(0.0)
+    assert stock["total"] - etf["total"] == pytest.approx(51.0)
     with pytest.raises(ValueError, match="no effective cost schedule"):
         costs.estimate(
             side="buy",

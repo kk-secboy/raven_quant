@@ -238,6 +238,59 @@ def test_pair_capacity_uses_one_common_partial_fill_ratio() -> None:
     )
 
 
+def test_pair_partial_exit_keeps_position_open_until_both_legs_are_flat() -> None:
+    daily, minute = _markets()
+    config = _config(min_capacity_fill_ratio=0.80)
+    baseline = run_pair_backtest(
+        daily,
+        minute,
+        leg_y="SH510300",
+        leg_x="SZ159919",
+        config=config,
+    )
+    first_exit = next(item for item in baseline["trades"] if item["action"] == "exit")
+    exit_date = pd.Timestamp(first_exit["trade_date"]).tz_localize(None)
+    constrained = minute.copy()
+    for order in first_exit["orders"]:
+        instrument = order["instrument"]
+        mask = (
+            constrained.index.get_level_values("datetime").normalize() == exit_date
+        ) & (constrained.index.get_level_values("instrument") == instrument)
+        bar_count = int(mask.sum())
+        constrained.loc[mask, "volume"] = (
+            abs(order["requested_delta"])
+            * 0.90
+            / config.max_volume_participation
+            / bar_count
+        )
+        constrained.loc[mask, "amount"] = (
+            constrained.loc[mask, "close"] * constrained.loc[mask, "volume"]
+        )
+
+    result = run_pair_backtest(
+        daily,
+        constrained,
+        leg_y="SH510300",
+        leg_x="SZ159919",
+        config=config,
+    )
+    partial_exit = next(
+        item
+        for item in result["trades"]
+        if item["action"] == "exit"
+        and pd.Timestamp(item["trade_date"]).tz_localize(None) == exit_date
+    )
+    exit_state = result["daily"].loc[exit_date]
+
+    assert any(
+        abs(item["delta"]) < abs(item["requested_delta"])
+        for item in partial_exit["orders"]
+    )
+    assert exit_state["position"] != 0
+    assert exit_state["quantity_y"] != 0
+    assert exit_state["quantity_x"] != 0
+
+
 def test_pair_config_fails_closed_on_inverted_thresholds() -> None:
     with pytest.raises(ValueError, match="exit < entry < stop"):
         PairTradingConfig(exit_zscore=2.0, entry_zscore=1.5, stop_zscore=3.0)

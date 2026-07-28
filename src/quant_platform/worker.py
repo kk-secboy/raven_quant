@@ -296,21 +296,6 @@ class LocalJobWorker:
             if recommendation_snapshot_id:
                 if exit_code == 0 and result:
                     snapshot = self.recommendations.apply_result(recommendation_snapshot_id, result)
-                    batches = self.simulations.create_batches_for_snapshot(
-                        recommendation_snapshot_id
-                    )
-                    for batch, created in batches:
-                        if created:
-                            self.store.create(
-                                "simulation_replay",
-                                {"simulation_batch_id": batch["id"]},
-                                self.settings.data_root
-                                / "platform"
-                                / "logs"
-                                / f"simulation-replay-{batch['id']}.log",
-                                dedupe_active_kind=False,
-                                idempotency_key=f"simulation-replay:{batch['id']}",
-                            )
                     self.allocations.refresh_for_portfolio(str(snapshot["portfolio_id"]))
                 else:
                     self.recommendations.mark_failed(
@@ -482,6 +467,10 @@ class LocalJobWorker:
                         str(result_path),
                     ]
                 )
+                if payload.get("source_lineage_id"):
+                    command.extend(
+                        ["--source-lineage-id", str(payload["source_lineage_id"])]
+                    )
             else:
                 command.extend(
                     [
@@ -1571,6 +1560,7 @@ class LocalJobWorker:
                 "data_verify",
                 "data_snapshot",
                 "data_qlib",
+                "minute_qlib",
                 "qlib_baseline",
                 *(
                     f"supplemental_{bundle}"

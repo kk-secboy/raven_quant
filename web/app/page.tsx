@@ -113,7 +113,7 @@ export default function Home() {
   const [retentionSelection, setRetentionSelection] = useState<Record<string, boolean>>({});
   const [retentionConfirmation, setRetentionConfirmation] = useState("");
   const [profile, setProfile] = useState("core");
-  const [start, setStart] = useState("2024-01-01");
+  const [start, setStart] = useState("2018-01-01");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
 
@@ -295,7 +295,7 @@ export default function Home() {
         {activeNav === 0 ? (
           <div className="overview-page">
             <section className="overview-kpis">
-              <article><span>数据就绪度</span><strong>{overview?.readiness_percent ?? 0}%</strong><small>{overview?.ready_tasks ?? 0} / {overview?.actionable_tasks ?? 0} 项已可用</small></article>
+              <article><span>平均目录覆盖度</span><strong>{overview?.readiness_percent ?? 0}%</strong><small>{overview?.ready_tasks ?? 0} / {overview?.actionable_tasks ?? 0} 项已完全可用</small></article>
               <article><span>运行中的任务</span><strong>{overview?.active_jobs ?? 0}</strong><small>{overview?.active_jobs ? "后台正在处理" : "当前队列空闲"}</small></article>
               <article><span>研究数据</span><strong>{overview?.qlib_datasets ?? 0}</strong><small>Qlib 数据集 · {overview?.snapshots ?? 0} 份快照</small></article>
               <article><span>已存数据</span><strong>{formatNumber(overview?.rows ?? 0)}</strong><small>数据行</small></article>
@@ -325,8 +325,8 @@ export default function Home() {
 
             {dataView === "overview" ? <>
               <section className="readiness-hero">
-                <div className="readiness-copy"><span className="status-chip">{loading ? "正在连接" : overview?.active_jobs ? "下载器正在工作" : (overview?.partial_tasks || overview?.waiting_tasks) ? "仍有数据能力待准备" : "数据能力已就绪"}</span><h2>{overview?.ready_tasks ?? 0} / {overview?.actionable_tasks ?? 0} 项数据能力已可用</h2><p>这里表示目录能力是否可用于研究，不代表某个下载任务的执行百分比。当前执行阶段、checkpoint 和恢复状态在下方单独展示。</p></div>
-                <div className="readiness-ring" style={{ "--progress": `${overview?.readiness_percent ?? 0}%` } as CSSProperties}><strong>{overview?.readiness_percent ?? 0}%</strong><span>目录就绪度</span></div>
+                <div className="readiness-copy"><span className="status-chip">{loading ? "正在连接" : overview?.active_jobs ? "下载器正在工作" : (overview?.partial_tasks || overview?.waiting_tasks) ? "仍有数据能力待准备" : "数据能力已就绪"}</span><h2>{overview?.ready_tasks ?? 0} / {overview?.actionable_tasks ?? 0} 项数据能力已完全可用</h2><p>圆环是全部目录覆盖率的平均值，部分完成的目录也会计入；分数是完全可用的目录数量。它们都不代表单个下载任务的执行进度，当前阶段与 checkpoint 在下方单独展示。</p></div>
+                <div className="readiness-ring" style={{ "--progress": `${overview?.readiness_percent ?? 0}%` } as CSSProperties}><strong>{overview?.readiness_percent ?? 0}%</strong><span>平均目录覆盖度</span></div>
               </section>
               <section className="status-strip">
                 <article><span>正在运行</span><strong>{overview?.running_tasks ?? 0}</strong></article>

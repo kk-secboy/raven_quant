@@ -48,6 +48,21 @@ def _load(path: str) -> pd.DataFrame:
     raise ValueError(f"unsupported factor artifact: {source}")
 
 
+def _next_known_trading_date(provider_uri: str | Path, as_of: pd.Timestamp) -> str:
+    source = Path(provider_uri) / "metadata" / "known_trading_calendar.parquet"
+    if not source.is_file():
+        raise ValueError(
+            "Qlib dataset has no immutable known trading calendar for next-session execution"
+        )
+    calendar = pd.to_datetime(
+        pd.read_parquet(source)["date"], errors="coerce"
+    ).dropna()
+    future = calendar[calendar.dt.date > as_of.date()].sort_values()
+    if future.empty:
+        raise ValueError("known trading calendar has no effective trading date")
+    return future.iloc[0].date().isoformat()
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -353,7 +368,7 @@ def main() -> None:
     style_fields = {
         "Log($total_mv)": "size",
         "1/$pb": "value",
-        "($fund_quarter_revenue_yoy+$fund_quarter_profit_yoy)/2": "growth",
+        "($fund_quarter_revenue_yoy+$fund_op_profit_yoy)/2": "growth",
         "Std($close/Ref($close, 1)-1, 60)": "volatility",
     }
     styles_frame = D.features(
@@ -369,6 +384,10 @@ def main() -> None:
         "regulatory_data_available"
     ]:
         raise ValueError("strategy requires regulatory events but no reliable source is available")
+    neutralize_baseline = config.get("portfolio_construction") in {
+        "benchmark_relative_qp",
+        "industry_neutral_qp",
+    }
     governed = build_governed_signal(
         scores.loc[(slice(lookback, as_of), slice(None))],
         topk=int(config["topk"]),
@@ -381,6 +400,8 @@ def main() -> None:
         max_industry_deviation=float(config.get("max_industry_deviation", 1.0)),
         min_average_daily_amount=float(config.get("min_average_daily_amount", 0.0)),
         liquidity_lookback_days=int(config.get("liquidity_lookback_days", 20)),
+        neutralize_industry=neutralize_baseline,
+        neutralize_style_columns=("size",) if neutralize_baseline else (),
     )
     signal = governed.xs(as_of, level="datetime")
     # Read-side availability guard (design draft 3.3): industry membership and
@@ -443,17 +464,7 @@ def main() -> None:
         rebalance_due=rebalance_due,
     )
     if signal_frequency == "day":
-        calendar = pd.DatetimeIndex(
-            D.calendar(
-                start_time=as_of.date().isoformat(),
-                end_time=(as_of + pd.Timedelta(days=14)).date().isoformat(),
-                freq="day",
-            )
-        ).tz_localize(None)
-        future = calendar[calendar > market_as_of]
-        if not len(future):
-            raise ValueError("Qlib calendar has no effective trading date")
-        effective_date = future[0].date().isoformat()
+        effective_date = _next_known_trading_date(args.provider_uri, market_as_of)
     else:
         if manifest.get("signal_at") is None:
             raise ValueError("minute Qlib order-plan generation requires signal_at")

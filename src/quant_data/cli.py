@@ -781,7 +781,7 @@ def probe() -> None:
 @app.command()
 def bootstrap(
     profile: Annotated[str, typer.Option(help="core, research, or full")] = "core",
-    start: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2024-01-01",
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2018-01-01",
     end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
     snapshot_name: Annotated[str | None, typer.Option("--snapshot-name")] = None,
     build_qlib: Annotated[
@@ -989,7 +989,7 @@ def verify(
 @app.command()
 def snapshot(
     name: Annotated[str | None, typer.Option()] = None,
-    start: Annotated[str, typer.Option()] = "2024-01-01",
+    start: Annotated[str, typer.Option()] = "2018-01-01",
     end: Annotated[str, typer.Option()] = "latest",
     profile: Annotated[str, typer.Option()] = "core",
 ) -> None:
@@ -1221,6 +1221,13 @@ def ashare_5m(
     start: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2024-01-01",
     end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
     snapshot_name: Annotated[str | None, typer.Option("--snapshot-name")] = None,
+    source_lineage_id: Annotated[
+        str | None,
+        typer.Option(
+            "--source-lineage-id",
+            help="Verified daily-source lineage paired with this execution snapshot",
+        ),
+    ] = None,
     result_path: Annotated[Path | None, typer.Option("--result")] = None,
 ) -> None:
     """Download resumable 5-minute bars for every A-share active in the range."""
@@ -1263,6 +1270,16 @@ def ashare_5m(
         context, "full A-share 5-minute bars", specs
     )
     _require_symbol_coverage(specs, rows)
+    report = verify_downloads(
+        context.checkpoint,
+        context.settings.data_root,
+        snapshot_end=end_date,
+        require_all_planned=False,
+    )
+    write_report(report, context.settings.data_root / "verification" / "latest.json")
+    if not report["ok"]:
+        _trigger_safe_mode_on_quality_gate_failure(context.settings, report)
+        raise typer.Exit(3)
     name = snapshot_name or (
         f"ashare-5m-{start_date:%Y%m%d}-{end_date:%Y%m%d}-"
         f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
@@ -1284,7 +1301,10 @@ def ashare_5m(
         },
         frequency="5min",
         profile="ashare_intraday",
+        source_lineage_id=source_lineage_id,
+        quality_gate=quality_gate_payload(report),
     )
+    write_report(report, snapshot_path / "verification.json")
     result = {
         "status": "succeeded",
         "dataset": "ashare_5m",
@@ -2212,6 +2232,8 @@ def _build_execution_snapshot(
     universe_evidence: dict | None = None,
     frequency: str = "1min",
     profile: str = "pair_execution",
+    source_lineage_id: str | None = None,
+    quality_gate: dict[str, Any] | None = None,
 ) -> Path:
     module_root = Path(__file__).resolve().parent
     lineage_id = make_lineage_id(
@@ -2220,7 +2242,6 @@ def _build_execution_snapshot(
             "start_date": start_date.isoformat(),
             "frequency": frequency,
             "provider": "tushare-compatible",
-            "symbols": symbols_by_dataset,
             "ingestion_contract_sha256": file_contract_sha256(
                 {
                     "execution_data": module_root / "execution_data.py",
@@ -2230,6 +2251,12 @@ def _build_execution_snapshot(
             ),
         },
     )
+    paired_source_lineage_id = str(source_lineage_id or lineage_id)
+    if len(paired_source_lineage_id) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in paired_source_lineage_id
+    ):
+        raise ValueError("execution snapshot source lineage must be a SHA-256 digest")
     expected = {
         "profile": profile,
         "start_date": start_date.isoformat(),
@@ -2238,6 +2265,7 @@ def _build_execution_snapshot(
         "symbols": symbols_by_dataset,
         "universe": universe_evidence or {"mode": "manual"},
         "lineage_id": lineage_id,
+        "source_lineage_id": paired_source_lineage_id,
     }
     existing = context.storage.snapshots_root / name
     if existing.exists():
@@ -2259,7 +2287,12 @@ def _build_execution_snapshot(
     return context.storage.build_snapshot(
         name=name,
         successful_units=selected,
-        manifest_extra={**expected, **lineage, "provider": "tushare-compatible"},
+        manifest_extra={
+            **expected,
+            **lineage,
+            "provider": "tushare-compatible",
+            **({"quality_gate": quality_gate} if quality_gate else {}),
+        },
     )
 
 

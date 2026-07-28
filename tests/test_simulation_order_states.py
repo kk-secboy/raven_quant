@@ -296,6 +296,7 @@ def _process(
     evidence = _execution_evidence(
         batch["id"],
         simulation["execution_contract_hash"],
+        simulation["execution_policy"]["simulation_semantics_sha256"],
     )
     evidence["next_trade_date"] = next_day.date().isoformat()
     if industry_snapshot is not None:

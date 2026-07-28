@@ -190,7 +190,11 @@ class CostModelConfig:
         commission_rate = (
             self.buy_commission_rate if normalized_side == "buy" else self.sell_commission_rate
         )
-        commission = max(self.min_commission, gross_value * commission_rate)
+        commission = (
+            max(self.min_commission, gross_value * commission_rate)
+            if gross_value > 0
+            else 0.0
+        )
         stamp_rate = 0.0
         if normalized_side == "sell":
             stamp_rate = (
@@ -199,7 +203,14 @@ class CostModelConfig:
                 else self.etf_sell_stamp_duty_rate
             )
         stamp_duty = gross_value * stamp_rate
-        transfer_fee = gross_value * self.transfer_fee_rate
+        # ChinaClear's secondary-market transaction transfer fee is an A-share
+        # charge. ETF creation/redemption can have separate basket transfer
+        # fees, but those are not incurred by this secondary-market simulator.
+        transfer_fee = (
+            gross_value * self.transfer_fee_rate
+            if normalized_asset == "stock"
+            else 0.0
+        )
         slippage = gross_value * self.fixed_slippage_rate
         impact = gross_value * self.market_impact_rate(participation)
         borrow = gross_value * self.annual_borrow_rate * borrow_days / 252.0

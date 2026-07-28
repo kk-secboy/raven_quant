@@ -14,6 +14,7 @@ import pandas as pd
 
 ALLOWED_IMPORT_ROOTS = {"math", "numpy", "pandas"}
 FORBIDDEN_CALLS = {"breakpoint", "compile", "eval", "exec", "input", "open", "__import__"}
+FACTOR_RECOMPUTE_EXECUTOR_VERSION = "factor-recompute-v2-container"
 
 
 def sha256_file(path: Path) -> str:
@@ -86,21 +87,35 @@ def execute_factor_code(
     runtime_input = workspace / "daily_pv.h5"
     shutil.copy2(code_path, runtime_code)
     shutil.copy2(input_path, runtime_input)
-    env = {
-        "HOME": str(workspace),
-        "PATH": os.environ.get("PATH", ""),
-        "PYTHONHASHSEED": "0",
-        "PYTHONNOUSERSITE": "1",
-    }
-    completed = subprocess.run(
-        [python_executable or sys.executable, "-I", str(runtime_code)],
-        cwd=workspace,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-        check=False,
-    )
+    sandbox_image = str(os.environ.get("FACTOR_SANDBOX_IMAGE") or "").strip()
+    if sandbox_image:
+        completed, sandbox_evidence = _run_container_sandbox(
+            workspace=workspace,
+            runtime_code=runtime_code,
+            image=sandbox_image,
+            timeout_seconds=timeout_seconds,
+        )
+    elif os.environ.get("FACTOR_RECOMPUTE_ALLOW_LOCAL_UNSAFE") == "1":
+        env = {
+            "HOME": str(workspace),
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONHASHSEED": "0",
+            "PYTHONNOUSERSITE": "1",
+        }
+        completed = subprocess.run(
+            [python_executable or sys.executable, "-I", str(runtime_code)],
+            cwd=workspace,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        sandbox_evidence = {"sandbox_mode": "local-test-override"}
+    else:
+        raise ValueError(
+            "factor recomputation requires the isolated container sandbox"
+        )
     if completed.returncode != 0:
         message = (completed.stderr or completed.stdout or "factor execution failed").strip()
         raise ValueError(f"independent factor recomputation failed: {message[-2000:]}")
@@ -109,7 +124,7 @@ def execute_factor_code(
         raise ValueError("independent factor recomputation did not create result.h5")
     values = normalize_factor_values(pd.read_hdf(output))
     evidence = {
-        "executor_version": "factor-recompute-v1",
+        "executor_version": FACTOR_RECOMPUTE_EXECUTOR_VERSION,
         "code_sha256": sha256_file(code_path),
         "input_sha256": sha256_file(input_path),
         "output_sha256": sha256_file(output),
@@ -117,8 +132,101 @@ def execute_factor_code(
         "timeout_seconds": timeout_seconds,
         "stdout_sha256": hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest(),
         "stderr_sha256": hashlib.sha256(completed.stderr.encode("utf-8")).hexdigest(),
+        **sandbox_evidence,
     }
     return values, evidence
+
+
+def _run_container_sandbox(
+    *,
+    workspace: Path,
+    runtime_code: Path,
+    image: str,
+    timeout_seconds: int,
+) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
+    if not shutil.which("docker"):
+        raise ValueError("factor container sandbox requires the Docker CLI")
+    if not runtime_code.is_relative_to(workspace):
+        raise ValueError("factor runtime code is outside its isolated workspace")
+    workspace.chmod(0o777)
+    runtime_code.chmod(0o444)
+    (workspace / "daily_pv.h5").chmod(0o444)
+    image_result = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if image_result.returncode != 0:
+        raise ValueError("factor sandbox image is unavailable")
+    image_id = image_result.stdout.strip()
+    if not image_id.startswith("sha256:") or len(image_id) != 71:
+        raise ValueError("factor sandbox image identity is invalid")
+    cidfile = workspace / "container.cid"
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--cidfile",
+        str(cidfile),
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        "128",
+        "--memory",
+        "2g",
+        "--cpus",
+        "1",
+        "--user",
+        "65534:65534",
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,nodev,size=256m",
+        "--mount",
+        f"type=bind,src={workspace.resolve()},dst=/work",
+        "--workdir",
+        "/work",
+        image,
+        "python",
+        "-I",
+        "factor.py",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        if cidfile.is_file():
+            container_id = cidfile.read_text(encoding="utf-8").strip()
+            if container_id:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_id],
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+        raise
+    return completed, {
+        "sandbox_mode": "docker-isolated",
+        "sandbox_image": image,
+        "sandbox_image_id": image_id,
+        "network_mode": "none",
+        "root_filesystem_read_only": True,
+        "capabilities_dropped": "ALL",
+        "no_new_privileges": True,
+        "pids_limit": 128,
+        "memory_limit_bytes": 2 * 1024**3,
+        "cpu_limit": 1,
+    }
 
 
 def compare_submitted_values(

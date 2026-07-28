@@ -15,7 +15,8 @@ def test_factor_evaluator_uses_validation_direction_and_costs() -> None:
     dates = pd.bdate_range("2022-01-03", periods=140)
     instruments = [f"SH{600000 + index:06d}" for index in range(80)]
     index = pd.MultiIndex.from_product([dates, instruments], names=["datetime", "instrument"])
-    signal = random.normal(size=len(index))
+    daily_signal = random.normal(size=len(instruments))
+    signal = np.tile(daily_signal, len(dates))
     factor = pd.Series(-signal, index=index, name="factor")
     returns = pd.Series(signal * 0.02 + random.normal(scale=0.01, size=len(index)), index=index)
     result = evaluate_factor_values(
@@ -63,3 +64,43 @@ def test_factor_evaluator_never_reads_reserved_test_values() -> None:
         min_daily_instruments=5,
     )
     assert result["selection_end"] == "2022-01-28"
+
+
+def test_factor_screening_annualizes_over_the_label_holding_period() -> None:
+    random = np.random.default_rng(19)
+    dates = pd.bdate_range("2022-01-03", periods=80)
+    instruments = [f"SH{600000 + index:06d}" for index in range(20)]
+    index = pd.MultiIndex.from_product(
+        [dates, instruments], names=["datetime", "instrument"]
+    )
+    daily_signal = random.normal(size=len(instruments))
+    signal = np.tile(daily_signal, len(dates))
+    factor = pd.Series(signal, index=index)
+    returns = pd.Series(signal * 0.01, index=index)
+    common = {
+        "valid_start": date(2022, 1, 3),
+        "valid_end": date(2022, 4, 22),
+        "test_start": date(2022, 4, 25),
+        "test_end": date(2022, 7, 29),
+        "min_daily_instruments": 5,
+    }
+
+    one_day = evaluate_factor_values(
+        factor, returns, label_horizon_days=1, **common
+    )
+    five_day = evaluate_factor_values(
+        factor, returns, label_horizon_days=5, **common
+    )
+
+    assert five_day["gross_annualized_return"] == pytest.approx(
+        one_day["gross_annualized_return"] / 5.0
+    )
+    assert (
+        five_day["gross_annualized_return"]
+        - five_day["cost_adjusted_return"]
+    ) == pytest.approx(
+        one_day["gross_annualized_return"]
+        - one_day["cost_adjusted_return"],
+        rel=0.02,
+    )
+    assert five_day["return_annualization_horizon_days"] == 5

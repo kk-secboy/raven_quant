@@ -19,6 +19,7 @@ from quant_data.database import (
     research_runs,
     row_dict,
 )
+from quant_platform.factor_recompute import FACTOR_RECOMPUTE_EXECUTOR_VERSION
 from quant_platform.qlib_workflow import require_qlib_workflow_identity
 from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
@@ -221,7 +222,7 @@ class FactorGatePolicy:
 
 
 # Executor version bound into external factor evaluation evidence. Mirrors the
-# hardcoded "factor-recompute-v1" check in record_evaluation: the version lives
+# hardcoded factor-recompute check in record_evaluation: the version lives
 # here because this module validates the evidence chain.
 EXTERNAL_EVALUATOR_VERSION = "external-factor-eval-v2"
 
@@ -728,7 +729,19 @@ class ResearchStore:
             raise ValueError("factor recomputation evidence is not bound to the Qlib dataset")
         if recompute_evidence.get("authoritative_values_sha256") != actual_recomputed_sha256:
             raise ValueError("factor recomputation evidence is not bound to authoritative values")
-        if recompute_evidence.get("executor_version") != "factor-recompute-v1":
+        if (
+            recompute_evidence.get("executor_version")
+            != FACTOR_RECOMPUTE_EXECUTOR_VERSION
+            or recompute_evidence.get("sandbox_mode") != "docker-isolated"
+            or not str(recompute_evidence.get("sandbox_image_id") or "").startswith(
+                "sha256:"
+            )
+            or len(str(recompute_evidence.get("sandbox_image_id") or "")) != 71
+            or recompute_evidence.get("network_mode") != "none"
+            or recompute_evidence.get("root_filesystem_read_only") is not True
+            or recompute_evidence.get("capabilities_dropped") != "ALL"
+            or recompute_evidence.get("no_new_privileges") is not True
+        ):
             raise ValueError("factor recomputation evidence has an unsupported executor version")
         if int(recompute_evidence.get("label_horizon_days") or 0) != int(
             candidate["label_horizon_days"]

@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -40,6 +41,68 @@ TRADE_DATE = date(2026, 7, 13)
 SOURCE_LINEAGE = "9" * 64
 EXECUTION_IDENTITY = "d" * 64
 EXECUTION_LINEAGE = "e" * 64
+
+
+def test_forward_batch_binds_immutable_daily_and_execution_descendants(
+    tmp_path, monkeypatch
+) -> None:
+    daily_lineage = "b" * 64
+    execution_lineage = "d" * 64
+    source_lineage = "9" * 64
+    daily = {
+        "name": "daily-descendant",
+        "ready": True,
+        "provenance": {
+            "dataset_identity_sha256": "a" * 64,
+            "dataset_lineage_id": daily_lineage,
+            "source_lineage_id": source_lineage,
+        },
+    }
+    execution = {
+        "name": "minute-descendant",
+        "ready": True,
+        "provenance": {
+            "dataset_identity_sha256": "c" * 64,
+            "dataset_lineage_id": execution_lineage,
+            "source_lineage_id": source_lineage,
+        },
+    }
+    monkeypatch.setattr(
+        "quant_platform.services.list_qlib_datasets", lambda _: [daily]
+    )
+    monkeypatch.setattr(
+        "quant_platform.data_rollover.select_qlib_dataset",
+        lambda *args, **kwargs: execution,
+    )
+    portfolio = SimpleNamespace(
+        daily_dataset="daily-anchor",
+        daily_dataset_identity_sha256="e" * 64,
+        daily_dataset_lineage_id=daily_lineage,
+        daily_roll_policy="latest_compatible",
+        execution_dataset="minute-anchor",
+        execution_dataset_identity_sha256="f" * 64,
+        execution_dataset_lineage_id=execution_lineage,
+        execution_roll_policy="latest_compatible",
+    )
+    snapshot = SimpleNamespace(
+        dataset="daily-descendant",
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id=daily_lineage,
+    )
+
+    bindings = SimulationStore.__new__(
+        SimulationStore
+    )._snapshot_batch_dataset_bindings(
+        portfolio=portfolio,
+        snapshot=snapshot,
+        trade_date=date(2026, 7, 28),
+        data_root=tmp_path,
+    )
+
+    assert bindings["daily_dataset"] == "daily-descendant"
+    assert bindings["execution_dataset"] == "minute-descendant"
+    assert bindings["daily_dataset_identity_sha256"] == "a" * 64
+    assert bindings["execution_dataset_identity_sha256"] == "c" * 64
 
 
 def _daily_dataset() -> dict:
@@ -80,13 +143,18 @@ def _execution_dataset(frequency: str = "5min") -> dict:
     }
 
 
-def _execution_evidence(batch_id: str, contract_hash: str) -> dict:
+def _execution_evidence(
+    batch_id: str,
+    contract_hash: str,
+    simulation_semantics_sha256: str,
+) -> dict:
     return {
         "batch_id": batch_id,
         "dataset_identity_sha256": EXECUTION_IDENTITY,
         "dataset_lineage_id": EXECUTION_LINEAGE,
         "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
         "execution_contract_hash": contract_hash,
+        "simulation_semantics_sha256": simulation_semantics_sha256,
         "next_trade_date": "2026-07-14",
     }
 
@@ -313,7 +381,11 @@ def test_simulation_batch_is_idempotent_and_books_auditable_nav(
         batch["id"],
         minute_bars=_bars(),
         closing_prices={"SH600000": {"price": 10.0, "market_date": TRADE_DATE.isoformat()}},
-        execution_evidence=_execution_evidence(batch["id"], simulation["execution_contract_hash"]),
+        execution_evidence=_execution_evidence(
+            batch["id"],
+            simulation["execution_contract_hash"],
+            simulation["execution_policy"]["simulation_semantics_sha256"],
+        ),
     )
     assert completed["status"] == "succeeded"
     assert completed["summary"]["conservation"] == {
@@ -343,7 +415,11 @@ def test_certified_nav_review_is_four_eyes_and_database_immutable(
         batch["id"],
         minute_bars=_bars(),
         closing_prices={"SH600000": {"price": 10.0, "market_date": TRADE_DATE.isoformat()}},
-        execution_evidence=_execution_evidence(batch["id"], simulation["execution_contract_hash"]),
+        execution_evidence=_execution_evidence(
+            batch["id"],
+            simulation["execution_contract_hash"],
+            simulation["execution_policy"]["simulation_semantics_sha256"],
+        ),
     )
     nav = store.rows(simulation["id"], "nav")[0]
     assert nav["nav_scope"] == "member_ledger"
@@ -456,7 +532,11 @@ def test_simulation_rejects_mismatched_execution_lineage_before_booking(
     database_url: str, tmp_path
 ) -> None:
     store, simulation, batch = _create_batch(database_url, tmp_path)
-    evidence = _execution_evidence(batch["id"], simulation["execution_contract_hash"])
+    evidence = _execution_evidence(
+        batch["id"],
+        simulation["execution_contract_hash"],
+        simulation["execution_policy"]["simulation_semantics_sha256"],
+    )
     evidence["dataset_identity_sha256"] = "f" * 64
     with pytest.raises(ValueError, match="bound dataset"):
         store.process_batch(
@@ -496,7 +576,9 @@ def test_simulation_booking_rolls_back_all_ledger_writes_on_nav_conflict(
             minute_bars=_bars(),
             closing_prices={"SH600000": {"price": 10.0, "market_date": TRADE_DATE.isoformat()}},
             execution_evidence=_execution_evidence(
-                batch["id"], simulation["execution_contract_hash"]
+                batch["id"],
+                simulation["execution_contract_hash"],
+                simulation["execution_policy"]["simulation_semantics_sha256"],
             ),
         )
     assert store.get_batch(batch["id"])["status"] == "queued"
@@ -579,7 +661,11 @@ def test_approved_strategy_source_accepts_only_immutable_qlib_order_plans(
         batch["id"],
         minute_bars=_bars(),
         closing_prices={"SH600000": {"price": 10.0, "market_date": TRADE_DATE.isoformat()}},
-        execution_evidence=_execution_evidence(batch["id"], simulation["execution_contract_hash"]),
+        execution_evidence=_execution_evidence(
+            batch["id"],
+            simulation["execution_contract_hash"],
+            simulation["execution_policy"]["simulation_semantics_sha256"],
+        ),
     )
     assert completed["status"] == "succeeded"
 
@@ -662,7 +748,9 @@ def test_minute_order_plan_persists_and_executes_the_strict_next_bar(
     bars = _bars().copy()
     bars["datetime"] = "2026-07-13 10:10:00"
     evidence = _execution_evidence(
-        batch["id"], simulation["execution_contract_hash"]
+        batch["id"],
+        simulation["execution_contract_hash"],
+        simulation["execution_policy"]["simulation_semantics_sha256"],
     )
     evidence.update(
         {
@@ -734,7 +822,9 @@ def test_long_only_order_plan_and_execution_semantics_fail_closed_on_tampering(
             minute_bars=_bars(),
             closing_prices={},
             execution_evidence=_execution_evidence(
-                batch["id"], simulation["execution_contract_hash"]
+                batch["id"],
+                simulation["execution_contract_hash"],
+                simulation["execution_policy"]["simulation_semantics_sha256"],
             ),
         )
     assert store.get_batch(batch["id"])["status"] == "queued"
@@ -807,7 +897,9 @@ def test_process_batch_uses_full_cost_parameters_from_approved_source_contract(
             "SH600000": {"price": 10.0, "market_date": TRADE_DATE.isoformat()}
         },
         execution_evidence=_execution_evidence(
-            batch["id"], simulation["execution_contract_hash"]
+            batch["id"],
+            simulation["execution_contract_hash"],
+            simulation["execution_policy"]["simulation_semantics_sha256"],
         ),
     )
     fill = store.rows(simulation["id"], "fills")[0]
@@ -984,7 +1076,11 @@ def test_simulation_api_exposes_ledger_and_retires_hypothetical_performance(
         batch["id"],
         minute_bars=_bars(),
         closing_prices={"SH600000": {"price": 10.0, "market_date": TRADE_DATE.isoformat()}},
-        execution_evidence=_execution_evidence(batch["id"], simulation["execution_contract_hash"]),
+        execution_evidence=_execution_evidence(
+            batch["id"],
+            simulation["execution_contract_hash"],
+            simulation["execution_policy"]["simulation_semantics_sha256"],
+        ),
     )
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))

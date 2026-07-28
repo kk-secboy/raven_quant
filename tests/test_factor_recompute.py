@@ -10,8 +10,11 @@ from quant_platform.factor_recompute import execute_factor_code, validate_factor
 pytestmark = pytest.mark.no_database
 
 
-def test_factor_code_is_reexecuted_against_supplied_snapshot(tmp_path: Path) -> None:
+def test_factor_code_is_reexecuted_against_supplied_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pytest.importorskip("tables")
+    monkeypatch.setenv("FACTOR_RECOMPUTE_ALLOW_LOCAL_UNSAFE", "1")
     index = pd.MultiIndex.from_product(
         [[pd.Timestamp("2026-07-01")], ["SH600000", "SH600001"]],
         names=["datetime", "instrument"],
@@ -36,8 +39,27 @@ def test_factor_code_is_reexecuted_against_supplied_snapshot(tmp_path: Path) -> 
     assert evidence["code_sha256"]
     assert evidence["input_sha256"]
     assert evidence["output_sha256"]
+    assert evidence["sandbox_mode"] == "local-test-override"
 
 
 def test_factor_code_rejects_filesystem_and_process_capabilities() -> None:
     with pytest.raises(ValueError, match="forbidden"):
         validate_factor_code("import os\nos.system('whoami')\n")
+
+
+def test_factor_recompute_fails_closed_without_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("FACTOR_SANDBOX_IMAGE", raising=False)
+    monkeypatch.delenv("FACTOR_RECOMPUTE_ALLOW_LOCAL_UNSAFE", raising=False)
+    code = tmp_path / "factor.py"
+    source = tmp_path / "input.h5"
+    code.write_text("result = 1\n", encoding="utf-8")
+    source.write_bytes(b"fixture")
+
+    with pytest.raises(ValueError, match="isolated container sandbox"):
+        execute_factor_code(
+            code_path=code,
+            input_path=source,
+            workspace=tmp_path / "sandbox",
+        )

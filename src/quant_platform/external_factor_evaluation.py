@@ -3,7 +3,7 @@
 External NLP factor artifacts (announcement_tone, irm_qa_sentiment_daily,
 news_sentiment_daily) land in ``factor_candidates`` via the announcement/corpus
 registries with values that derive from text fields, not market data, so the
-standard RD-Agent recompute path (``factor-recompute-v1``) does not apply.
+standard container-isolated RD-Agent recompute path does not apply.
 Their shapes also differ from dense cross-sectional factors, so the
 cross-sectional coverage gates of ``FactorGatePolicy`` cannot apply either
 (design draft 4.3: independent samples are effective decisions, not covered
@@ -588,18 +588,21 @@ def evaluate_market_timeseries_factor(
     costs = cost_model or CostModelConfig()
     screening_cost_rate = costs.factor_screening_rate(reference_order_value=reference_order_value)
     quantile_count = max(2, int(config.quantile_count))
-    ranks = directed_signal.rank(method="average", pct=True)
+    return_selection = selection.iloc[::label_horizon_days]
+    return_signal = directed_signal.reindex(return_selection.index)
+    ranks = return_signal.rank(method="average", pct=True)
     top_bucket = ranks >= 1.0 - 1.0 / quantile_count
     bottom_bucket = ranks <= 1.0 / quantile_count
-    position = pd.Series(0.0, index=selection.index)
+    position = pd.Series(0.0, index=return_selection.index)
     position[top_bucket] = 1.0
     position[bottom_bucket] = -1.0
-    daily_long_short = position * selection["label"]
+    daily_long_short = position * return_selection["label"]
     turnover_daily = position.diff().abs()
     turnover_daily.iloc[0] = abs(float(position.iloc[0]))
     daily_net = daily_long_short - turnover_daily * screening_cost_rate
-    top_return = float(selection["label"][top_bucket].mean())
-    bottom_return = float(selection["label"][bottom_bucket].mean())
+    annualization = 252.0 / label_horizon_days
+    top_return = float(return_selection["label"][top_bucket].mean())
+    bottom_return = float(return_selection["label"][bottom_bucket].mean())
     metrics: dict[str, Any] = {
         "ic": ic,
         "icir": None,
@@ -610,8 +613,9 @@ def evaluate_market_timeseries_factor(
         "statistical_contract_version": hac["contract_version"],
         "turnover": float(turnover_daily.mean()),
         "max_correlation": None,
-        "cost_adjusted_return": float(daily_net.mean() * 252),
-        "gross_annualized_return": float(daily_long_short.mean() * 252),
+        "cost_adjusted_return": float(daily_net.mean() * annualization),
+        "gross_annualized_return": float(daily_long_short.mean() * annualization),
+        "return_annualization_horizon_days": label_horizon_days,
         "quantile_count": quantile_count,
         "quantile_top_return": top_return,
         "quantile_bottom_return": bottom_return,

@@ -17,7 +17,12 @@ from quant_data.qlib_minute_resample import (
 pytestmark = pytest.mark.no_database
 
 
-def _snapshot(tmp_path: Path, *, frequency: str = "1min") -> Path:
+def _snapshot(
+    tmp_path: Path,
+    *,
+    frequency: str = "1min",
+    source_lineage_id: str | None = None,
+) -> Path:
     snapshot = tmp_path / "minute-snapshot"
     target = snapshot / "parquet" / "etf_1m" / "partition_year=2024"
     target.mkdir(parents=True)
@@ -62,6 +67,11 @@ def _snapshot(tmp_path: Path, *, frequency: str = "1min") -> Path:
             {
                 "frequency": frequency,
                 "lineage_id": "a" * 64,
+                **(
+                    {"source_lineage_id": source_lineage_id}
+                    if source_lineage_id
+                    else {}
+                ),
                 "start_date": "2024-01-02",
                 "end_date": "2024-01-02",
                 "datasets": {
@@ -296,7 +306,13 @@ def test_resampled_builder_uses_pinned_qlib_runtime_and_records_provenance(
 def test_five_minute_snapshot_uses_native_qlib_frequency(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    builder = MinuteQlibBuilder(_snapshot(tmp_path, frequency="5min"))
+    builder = MinuteQlibBuilder(
+        _snapshot(
+            tmp_path,
+            frequency="5min",
+            source_lineage_id="d" * 64,
+        )
+    )
     qlib_repo = tmp_path / "qlib"
     script = qlib_repo / "scripts" / "dump_bin.py"
     script.parent.mkdir(parents=True)
@@ -332,6 +348,9 @@ def test_five_minute_snapshot_uses_native_qlib_frequency(
     assert provenance["field_units"]["vwap"] == "source_price_cny_amount_div_volume"
     assert provenance["source_datasets"] == ["etf_1m"]
     assert provenance["source_unit_contracts"] == {"etf_1m": MINUTE_SOURCE_UNIT_CONTRACTS["etf_1m"]}
+    assert len(provenance["dataset_lineage_id"]) == 64
+    assert provenance["source_snapshot_lineage_id"] == "a" * 64
+    assert provenance["source_lineage_id"] == "d" * 64
 
 
 def test_rejects_stock_or_etf_amount_volume_unit_mismatch(tmp_path: Path) -> None:

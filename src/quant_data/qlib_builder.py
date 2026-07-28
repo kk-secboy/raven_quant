@@ -551,6 +551,43 @@ class QlibBuilder:
         target = qlib_dir / "metadata"
         wrote_metadata = False
 
+        calendar_source = self.snapshot_path / "parquet" / "trade_cal"
+        calendar_files = (
+            sorted(calendar_source.rglob("*.parquet"))
+            if calendar_source.exists()
+            else []
+        )
+        if calendar_files:
+            frame = pd.concat(
+                [pd.read_parquet(path) for path in calendar_files],
+                ignore_index=True,
+            )
+            if {"cal_date", "is_open"}.issubset(frame.columns):
+                calendar = pd.DataFrame(
+                    {
+                        "date": pd.to_datetime(frame["cal_date"], errors="coerce"),
+                        "is_open": pd.to_numeric(
+                            frame["is_open"], errors="coerce"
+                        ),
+                    }
+                )
+                calendar = calendar[calendar["is_open"] == 1].dropna(
+                    subset=["date"]
+                )
+                calendar = (
+                    calendar[["date"]]
+                    .drop_duplicates()
+                    .sort_values("date")
+                )
+                if not calendar.empty:
+                    target.mkdir(parents=True, exist_ok=True)
+                    calendar.to_parquet(
+                        target / "known_trading_calendar.parquet",
+                        index=False,
+                        compression="zstd",
+                    )
+                    wrote_metadata = True
+
         industry_source = self.snapshot_path / "parquet" / "index_member_all"
         industry_files = (
             sorted(industry_source.rglob("*.parquet")) if industry_source.exists() else []

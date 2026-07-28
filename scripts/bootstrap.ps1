@@ -1,7 +1,7 @@
 param(
     [ValidateSet("core", "research", "full")]
     [string]$Profile = "core",
-    [string]$Start = "2024-01-01",
+    [string]$Start = "2018-01-01",
     [string]$End = "latest"
 )
 

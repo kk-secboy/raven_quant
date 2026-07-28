@@ -58,6 +58,31 @@ def test_compose_bounds_every_service_log_file() -> None:
     ) == 4
 
 
+def test_factor_sandbox_is_seeded_offline_from_the_release_worker() -> None:
+    root = Path(__file__).resolve().parents[1]
+    compose = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+    dockerfile = (root / "deploy" / "factor-sandbox" / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    worker_dockerfile = (root / "deploy" / "Dockerfile.worker").read_text(
+        encoding="utf-8"
+    )
+    builder = (root / "deploy" / "factor-sandbox" / "build.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "image: quantlab-worker-runtime:v2" in compose
+    assert "/var/run/docker.sock:/var/run/docker.sock" in compose
+    assert "FACTOR_SANDBOX_DOCKER_HOST: tcp://rdagent-docker:2375" in compose
+    assert "FROM ${FACTOR_SANDBOX_BASE_IMAGE}" in dockerfile
+    assert "FROM python:" not in dockerfile
+    assert "FROM docker:27-dind AS docker_cli" in worker_dockerfile
+    assert "COPY --from=docker_cli /usr/local/bin/docker" in worker_dockerfile
+    assert 'docker save "$base_image"' in builder
+    assert 'docker --host "$sandbox_host" load' in builder
+    assert 'docker --host "$sandbox_host" build' in builder
+
+
 def test_systemd_backup_timer_is_persistent_and_fail_closed() -> None:
     root = Path(__file__).resolve().parents[1]
     service = (root / "deploy" / "systemd" / "quantlab-backup.service").read_text(encoding="utf-8")

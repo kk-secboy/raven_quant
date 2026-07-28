@@ -50,6 +50,44 @@ def test_transfer_fee_2022_04_29_applies_to_both_sides() -> None:
     assert sell["transfer_fee"] == pytest.approx(1.0)
 
 
+def test_secondary_market_etf_does_not_pay_a_share_transfer_fee() -> None:
+    costs = CN_COST_SCHEDULE_BOOK.as_of(date(2024, 1, 2))
+
+    buy = costs.estimate_breakdown(
+        side="buy",
+        gross_value=100_000,
+        participation=0,
+        asset_type="etf",
+        trade_date=date(2024, 1, 2),
+    )
+    sell = costs.estimate_breakdown(
+        side="sell",
+        gross_value=100_000,
+        participation=0,
+        asset_type="etf",
+        trade_date=date(2024, 1, 2),
+    )
+
+    assert buy["transfer_fee"] == 0.0
+    assert sell["transfer_fee"] == 0.0
+    assert sell["stamp_duty"] == 0.0
+
+
+def test_zero_notional_has_zero_transaction_cost() -> None:
+    costs = CN_COST_SCHEDULE_BOOK.as_of(date(2024, 1, 2))
+
+    result = costs.estimate_breakdown(
+        side="buy",
+        gross_value=0,
+        participation=0,
+        asset_type="stock",
+        trade_date=date(2024, 1, 2),
+    )
+
+    assert result["total"] == 0.0
+    assert result["commission"] == 0.0
+
+
 def test_transfer_fee_history_versions_are_recorded() -> None:
     baseline = CN_COST_SCHEDULE_BOOK.as_of(date(2010, 1, 4))
     unified = CN_COST_SCHEDULE_BOOK.as_of(date(2015, 8, 3))

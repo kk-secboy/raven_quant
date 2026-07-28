@@ -224,6 +224,10 @@ def run_release_upgrade(
         result["backup_directory"] = str(backup_directory)
         state_mutated = True
 
+        # The sandbox builder is intentionally one-shot.  Remove any completed
+        # container from an older release so Compose must seed the freshly built
+        # worker image into the isolated RD-Agent daemon again.
+        context.run("rm", "-s", "-f", "factor-sandbox-builder", check=False)
         context.run(
             "up",
             "-d",

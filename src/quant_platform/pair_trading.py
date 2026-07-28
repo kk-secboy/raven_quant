@@ -407,6 +407,8 @@ def run_pair_backtest(
         if pending:
             action = str(pending["action"])
             signal_date = pd.Timestamp(pending["signal_date"]).tz_localize(None)
+            pending_reason = str(pending["reason"])
+            retry_pending: dict[str, Any] | None = None
             target_quantities = {leg_y: 0, leg_x: 0}
             hedge_ratio = float(
                 pending.get("hedge_ratio") or kalman.loc[signal_date, "hedge_ratio"]
@@ -505,6 +507,12 @@ def run_pair_backtest(
                         "reason": rejection_reason,
                     }
                 )
+                if action == "exit":
+                    retry_pending = {
+                        "action": "exit",
+                        "reason": pending_reason,
+                        "signal_date": trade_date,
+                    }
             else:
                 total_cost = 0.0
                 total_notional = 0.0
@@ -531,27 +539,37 @@ def run_pair_backtest(
                     holding_days = 0
                     entry_nav = nav_before - total_cost
                     filled_entry_notional += total_notional
+                    position_closed = False
                 else:
-                    exit_nav = cash
-                    if entry_nav and entry_nav > 0:
-                        closed_returns.append(float(exit_nav / entry_nav - 1.0))
-                    position_direction = 0
-                    holding_days = 0
-                    entry_nav = None
+                    position_closed = all(quantity == 0 for quantity in quantities.values())
+                    if position_closed:
+                        exit_nav = cash
+                        if entry_nav and entry_nav > 0:
+                            closed_returns.append(float(exit_nav / entry_nav - 1.0))
+                        position_direction = 0
+                        holding_days = 0
+                        entry_nav = None
+                    else:
+                        retry_pending = {
+                            "action": "exit",
+                            "reason": pending_reason,
+                            "signal_date": trade_date,
+                        }
                 trades.append(
                     {
                         "trade_date": trade_date.isoformat(),
                         "signal_date": pd.Timestamp(pending["signal_date"]).isoformat(),
                         "action": action,
-                        "reason": pending["reason"],
+                        "reason": pending_reason,
                         "direction": direction,
                         "hedge_ratio": hedge_ratio,
+                        "position_closed": position_closed,
                         "orders": orders,
                         "gross_notional": total_notional,
                         "cost": total_cost,
                     }
                 )
-            pending = None
+            pending = retry_pending
 
         nav = mark_nav(trade_date)
         if position_direction:
@@ -625,7 +643,11 @@ def run_pair_backtest(
         initial_window[leg_x],
         min_observations=config.formation_window,
     )
-    exits = [item for item in trades if item["action"] == "exit"]
+    exits = [
+        item
+        for item in trades
+        if item["action"] == "exit" and item.get("position_closed") is True
+    ]
     metrics: dict[str, Any] = {
         **_performance(daily_frame),
         "backtest_engine": "quantlab_pair",

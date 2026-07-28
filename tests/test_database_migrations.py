@@ -100,7 +100,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0056_day_attributions"
+    assert revision == "0057_forward_rollover"
     assert {
         "economic_hypothesis_group",
         "hypothesis_group_cap",
@@ -435,6 +435,12 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
     assert {"dataset_roll_policy", "dataset_lineage_id"} <= {
         column["name"] for column in inspector.get_columns("paper_portfolios", schema="quantlab")
     }
+    assert {"dataset_roll_policy", "dataset_lineage_id"} <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "recommendation_portfolios", schema="quantlab"
+        )
+    }
     assert {"dataset", "dataset_identity_sha256", "dataset_lineage_id"} <= {
         column["name"] for column in inspector.get_columns("portfolio_batches", schema="quantlab")
     }
@@ -537,6 +543,8 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "execution_adapter",
         "execution_frequency",
         "execution_contract_hash",
+        "daily_roll_policy",
+        "execution_roll_policy",
     } <= {
         column["name"]
         for column in inspector.get_columns("simulation_portfolios", schema="quantlab")
@@ -549,6 +557,13 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "created_by",
         "signal_at",
         "execution_not_before",
+        "daily_dataset",
+        "daily_dataset_identity_sha256",
+        "daily_dataset_lineage_id",
+        "execution_dataset",
+        "execution_dataset_identity_sha256",
+        "execution_dataset_lineage_id",
+        "simulation_semantics_sha256",
     } <= {
         column["name"]
         for column in inspector.get_columns("simulation_batches", schema="quantlab")

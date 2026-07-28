@@ -83,6 +83,8 @@ class RecommendationStore:
         hypothetical_initial_value: float,
         actor: str,
         recommendation_scope: str = "standalone",
+        dataset_roll_policy: str = "pinned",
+        dataset_lineage_id: str | None = None,
     ) -> dict[str, Any]:
         version = self.strategies.get_version(strategy_version_id)
         self._assert_v2_strategy(version)
@@ -92,6 +94,14 @@ class RecommendationStore:
             raise ValueError("name, dataset and actor are required")
         if recommendation_scope not in {"standalone", "allocation_member"}:
             raise ValueError("recommendation_scope must be standalone or allocation_member")
+        if dataset_roll_policy not in {"pinned", "latest_compatible"}:
+            raise ValueError("recommendation dataset roll policy is invalid")
+        if dataset_roll_policy == "latest_compatible" and len(
+            str(dataset_lineage_id or "")
+        ) != 64:
+            raise ValueError(
+                "latest-compatible recommendations require a verified dataset lineage"
+            )
         portfolio_id = uuid.uuid4().hex
         now = _now()
         try:
@@ -118,6 +128,8 @@ class RecommendationStore:
                         name=name.strip(),
                         strategy_version_id=strategy_version_id,
                         dataset=dataset.strip(),
+                        dataset_roll_policy=dataset_roll_policy,
+                        dataset_lineage_id=dataset_lineage_id,
                         status="active",
                         base_currency="CNY",
                         hypothetical_initial_value=Decimal(str(hypothetical_initial_value)),
@@ -223,14 +235,23 @@ class RecommendationStore:
         as_of_date: date,
         dataset: str,
         dataset_identity_sha256: str,
+        dataset_lineage_id: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         # Design 11.3: new recommendations stop while safe mode is active.
         self.safe_mode.assert_inactive(action="recommendation snapshot creation")
         portfolio = self.get(portfolio_id)
         if portfolio["status"] != "active":
             raise ValueError("only active recommendation portfolios may refresh")
-        if dataset != portfolio["dataset"]:
-            raise ValueError("recommendation snapshot dataset must match its portfolio")
+        roll_policy = str(portfolio.get("dataset_roll_policy") or "pinned")
+        if roll_policy == "pinned" and dataset != portfolio["dataset"]:
+            raise ValueError("pinned recommendation snapshot dataset must match its portfolio")
+        if roll_policy == "latest_compatible" and (
+            len(str(dataset_lineage_id or "")) != 64
+            or dataset_lineage_id != portfolio.get("dataset_lineage_id")
+        ):
+            raise ValueError(
+                "recommendation snapshot must use a verified compatible dataset lineage"
+            )
         if len(dataset_identity_sha256) != 64:
             raise ValueError("recommendation snapshot requires immutable dataset identity")
         version = self.strategies.get_version(portfolio["strategy_version_id"])
@@ -251,6 +272,7 @@ class RecommendationStore:
                         backtest_engine_version=QLIB_ENGINE_VERSION,
                         dataset=dataset,
                         dataset_identity_sha256=dataset_identity_sha256,
+                        dataset_lineage_id=dataset_lineage_id,
                         strategy_version_id=portfolio["strategy_version_id"],
                         created_at=now,
                     )

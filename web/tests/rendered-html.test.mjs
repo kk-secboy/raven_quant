@@ -103,7 +103,7 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(sourceByName["research-campaign-panel.tsx"], /\/api\/research-programs/);
   assert.match(sourceByName["market-overview-panel.tsx"], /\/api\/market\/overview/);
   assert.match(sourceByName["job-run-center.tsx"], /\/api\/jobs\/\$\{job\.id\}\/log/);
-  assert.match(sourceByName["page.tsx"], /目录就绪度/);
+  assert.match(sourceByName["page.tsx"], /平均目录覆盖度/);
   assert.match(sourceByName["page.tsx"], /成功 checkpoint/);
   assert.match(sourceByName["data-task-center.tsx"], /请求策略/);
   assert.match(sourceByName["job-run-center.tsx"], /job-progress-card/);

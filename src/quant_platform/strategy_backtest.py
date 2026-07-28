@@ -55,6 +55,8 @@ def build_governed_signal(
     min_average_daily_amount: float = 0.0,
     liquidity_lookback_days: int = 20,
     metadata_availability_lag_days: int = METADATA_AVAILABILITY_LAG_DAYS,
+    neutralize_industry: bool = True,
+    neutralize_style_columns: Sequence[str] = (),
 ) -> pd.Series:
     """Apply eligibility gates before the shared PortfolioPolicy assigns weights.
 
@@ -84,6 +86,17 @@ def build_governed_signal(
     )
     memberships = _normalize_memberships(industry_memberships)
     styles = _normalize_style_snapshots(style_exposures)
+    requested_styles = tuple(dict.fromkeys(str(item) for item in neutralize_style_columns))
+    if styles is None and requested_styles:
+        raise ValueError("requested style neutralization has no point-in-time exposures")
+    if styles is not None:
+        missing_styles = set(requested_styles).difference(
+            set(styles.columns) - {"datetime", "instrument"}
+        )
+        if missing_styles:
+            raise ValueError(
+                f"point-in-time style metadata is missing neutralizers: {sorted(missing_styles)}"
+            )
     benchmark = _normalize_snapshots(benchmark_weights, "weight")
     eligibility = _normalize_eligibility(eligibility_matrix)
     rows: list[pd.Series] = []
@@ -106,21 +119,35 @@ def build_governed_signal(
             assigned = daily_industries.reindex(ranking.index)
             ranking = ranking[assigned.notna()]
             assigned = assigned.reindex(ranking.index)
-            industry_design = pd.get_dummies(
-                assigned.astype(str), prefix="industry", drop_first=True, dtype=float
-            )
-        daily_styles = _style_snapshot(styles, timestamp).reindex(ranking.index)
+            if neutralize_industry:
+                industry_design = pd.get_dummies(
+                    assigned.astype(str), prefix="industry", drop_first=True, dtype=float
+                )
+        daily_styles = (
+            _style_snapshot(styles, timestamp)
+            .reindex(ranking.index)
+            .reindex(columns=list(requested_styles))
+            if requested_styles
+            else pd.DataFrame(index=ranking.index)
+        )
         design = pd.concat(
             [ranking.rename("score"), daily_styles, industry_design], axis=1
         ).dropna()
         style_columns = [column for column in design.columns if column != "score"]
-        if style_columns and len(design) >= max(5, min(topk, len(ranking))):
+        if style_columns:
+            minimum_design_rows = max(5, len(style_columns) + 2, min(topk, len(ranking)))
+            if len(design) < minimum_design_rows:
+                continue
             matrix = design[style_columns].to_numpy(dtype=float)
             matrix = np.column_stack([np.ones(len(matrix)), matrix])
             coefficients, *_ = np.linalg.lstsq(
                 matrix, design["score"].to_numpy(dtype=float), rcond=None
             )
-            ranking.loc[design.index] = design["score"] - matrix @ coefficients
+            ranking = pd.Series(
+                design["score"].to_numpy(dtype=float) - matrix @ coefficients,
+                index=design.index,
+                name=ranking.name,
+            )
         if min_average_daily_amount > 0:
             eligible_liquidity = (
                 rolling_liquidity.index[rolling_liquidity.index <= timestamp]
@@ -216,7 +243,7 @@ def _normalize_style_snapshots(values: pd.DataFrame | None) -> pd.DataFrame | No
     result[style_columns] = result[style_columns].apply(pd.to_numeric, errors="coerce").replace(
         [np.inf, -np.inf], np.nan
     )
-    return result.dropna()
+    return result.dropna(subset=["datetime", "instrument"])
 
 
 def _normalize_eligibility(values: pd.DataFrame | None) -> pd.DataFrame | None:

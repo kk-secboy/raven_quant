@@ -4,6 +4,7 @@ import json
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
 from governance_fixtures import (
     DATASET_IDENTITY,
     PERIODS,
@@ -19,6 +20,7 @@ from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.recommendation_store import RecommendationStore
 from quant_platform.strategy_store import StrategyStore
+from scripts.run_recommendation_refresh import _next_known_trading_date
 
 
 def test_v2_research_to_final_test_and_recommendation_snapshot(
@@ -177,3 +179,17 @@ def test_v2_research_to_final_test_and_recommendation_snapshot(
     )
     assert completed["status"] == "succeeded"
     assert completed["holdings"][0]["instrument"] == "SH600000"
+
+
+def test_recommendation_uses_snapshot_known_calendar_for_next_session(
+    tmp_path: Path,
+) -> None:
+    metadata = tmp_path / "qlib" / "metadata"
+    metadata.mkdir(parents=True)
+    pd.DataFrame(
+        {"date": pd.to_datetime(["2026-07-24", "2026-07-27", "2026-07-28"])}
+    ).to_parquet(metadata / "known_trading_calendar.parquet", index=False)
+
+    assert _next_known_trading_date(
+        tmp_path / "qlib", pd.Timestamp("2026-07-24")
+    ) == "2026-07-27"

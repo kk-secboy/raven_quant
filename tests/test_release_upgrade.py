@@ -94,6 +94,7 @@ def test_release_upgrade_builds_backs_up_and_accepts_current_schema(
     assert result["status"] == "succeeded"
     assert result["backup_directory"] == str(backup)
     assert ("build", *release_upgrade.BUILT_SERVICES) in context.calls
+    assert ("rm", "-s", "-f", "factor-sandbox-builder") in context.calls
     assert any(call[:3] == ("up", "-d", "--remove-orphans") for call in context.calls)
 
 

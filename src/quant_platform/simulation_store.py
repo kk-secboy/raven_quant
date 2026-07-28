@@ -1090,6 +1090,8 @@ class SimulationStore:
         actor: str,
         execution_adapter: str | None = None,
         execution_contract_hash: str | None = None,
+        daily_roll_policy: str = "pinned",
+        execution_roll_policy: str = "pinned",
     ) -> dict[str, Any]:
         self.safe_mode.assert_inactive(action="simulation account creation")
         if initial_cash < 100_000:
@@ -1119,6 +1121,10 @@ class SimulationStore:
         }
         if any(len(str(value or "")) != 64 for value in required_hashes.values()):
             raise ValueError("simulation datasets require immutable identities and lineages")
+        if daily_roll_policy not in {"pinned", "latest_compatible"}:
+            raise ValueError("simulation daily roll policy is invalid")
+        if execution_roll_policy not in {"pinned", "latest_compatible"}:
+            raise ValueError("simulation execution roll policy is invalid")
         normalized_source_type = str(
             source_type or ("recommendation" if recommendation_portfolio_id else "")
         )
@@ -1199,6 +1205,8 @@ class SimulationStore:
                         execution_contract_hash=contract_hash,
                         execution_dataset=str(execution_dataset["name"]),
                         daily_dataset=str(daily_dataset["name"]),
+                        daily_roll_policy=daily_roll_policy,
+                        execution_roll_policy=execution_roll_policy,
                         daily_dataset_identity_sha256=daily_provenance[
                             "dataset_identity_sha256"
                         ],
@@ -1996,15 +2004,155 @@ class SimulationStore:
         snapshot_id: str,
         *,
         actor: str = "recommendation-worker",
+        data_root: Path | None = None,
     ) -> tuple[dict[str, Any] | None, bool]:
-        batches = self.create_batches_for_snapshot(snapshot_id, actor=actor)
+        batches = self.create_batches_for_snapshot(
+            snapshot_id, actor=actor, data_root=data_root
+        )
         return batches[0] if batches else (None, False)
+
+    @staticmethod
+    def _portfolio_batch_dataset_bindings(portfolio: Any) -> dict[str, str]:
+        return {
+            "daily_dataset": str(portfolio.daily_dataset),
+            "daily_dataset_identity_sha256": str(
+                portfolio.daily_dataset_identity_sha256
+            ),
+            "daily_dataset_lineage_id": str(portfolio.daily_dataset_lineage_id),
+            "execution_dataset": str(portfolio.execution_dataset),
+            "execution_dataset_identity_sha256": str(
+                portfolio.execution_dataset_identity_sha256
+            ),
+            "execution_dataset_lineage_id": str(
+                portfolio.execution_dataset_lineage_id
+            ),
+        }
+
+    @staticmethod
+    def _batch_simulation_semantics_sha256(
+        portfolio: Any,
+        bindings: dict[str, str],
+    ) -> str:
+        return _canonical_hash(
+            _simulation_semantics_payload(
+                source_type=str(portfolio.source_type),
+                source_id=str(portfolio.source_id),
+                source_execution_contract_hash=str(
+                    portfolio.execution_contract_hash
+                ),
+                execution_adapter=str(portfolio.execution_adapter),
+                execution_frequency=str(portfolio.execution_frequency),
+                daily_dataset=bindings["daily_dataset"],
+                daily_dataset_identity_sha256=bindings[
+                    "daily_dataset_identity_sha256"
+                ],
+                daily_dataset_lineage_id=bindings["daily_dataset_lineage_id"],
+                execution_dataset=bindings["execution_dataset"],
+                execution_dataset_identity_sha256=bindings[
+                    "execution_dataset_identity_sha256"
+                ],
+                execution_dataset_lineage_id=bindings[
+                    "execution_dataset_lineage_id"
+                ],
+                execution_field_contract_version=str(
+                    portfolio.execution_field_contract_version
+                ),
+                execution_engine_version=str(portfolio.execution_engine_version),
+                execution_policy=dict(portfolio.execution_policy_json or {}),
+            )
+        )
+
+    def _snapshot_batch_dataset_bindings(
+        self,
+        *,
+        portfolio: Any,
+        snapshot: Any,
+        trade_date: date,
+        data_root: Path | None,
+    ) -> dict[str, str]:
+        bindings = self._portfolio_batch_dataset_bindings(portfolio)
+        daily_roll = str(portfolio.daily_roll_policy or "pinned")
+        execution_roll = str(portfolio.execution_roll_policy or "pinned")
+        if daily_roll == "pinned":
+            if (
+                str(snapshot.dataset) != bindings["daily_dataset"]
+                or str(snapshot.dataset_identity_sha256)
+                != bindings["daily_dataset_identity_sha256"]
+            ):
+                raise ValueError(
+                    "pinned simulation daily dataset does not match the recommendation"
+                )
+        elif daily_roll != "latest_compatible":
+            raise ValueError("simulation daily roll policy is invalid")
+        if execution_roll not in {"pinned", "latest_compatible"}:
+            raise ValueError("simulation execution roll policy is invalid")
+        if daily_roll == "latest_compatible" or execution_roll == "latest_compatible":
+            if data_root is None:
+                raise ValueError(
+                    "compatible forward simulation datasets are not available yet"
+                )
+            from .data_rollover import select_qlib_dataset
+            from .services import list_qlib_datasets
+
+            datasets = {
+                str(item["name"]): item for item in list_qlib_datasets(data_root)
+            }
+            daily = datasets.get(str(snapshot.dataset))
+            if daily is None or not daily.get("ready"):
+                raise ValueError(
+                    "recommendation daily dataset is not ready for forward simulation"
+                )
+            daily_provenance = dict(daily.get("provenance") or {})
+            if (
+                str(daily_provenance.get("dataset_identity_sha256") or "")
+                != str(snapshot.dataset_identity_sha256)
+                or str(daily_provenance.get("dataset_lineage_id") or "")
+                != str(portfolio.daily_dataset_lineage_id)
+                or str(snapshot.dataset_lineage_id or "")
+                != str(portfolio.daily_dataset_lineage_id)
+            ):
+                raise ValueError(
+                    "recommendation daily dataset is outside the simulation lineage"
+                )
+            execution = select_qlib_dataset(
+                data_root,
+                anchor_name=str(portfolio.execution_dataset),
+                roll_policy=execution_roll,
+                lineage_id=str(portfolio.execution_dataset_lineage_id),
+                required_date=trade_date,
+            )
+            execution_provenance = dict(execution.get("provenance") or {})
+            if (
+                str(daily_provenance.get("source_lineage_id") or "")
+                != str(execution_provenance.get("source_lineage_id") or "")
+            ):
+                raise ValueError(
+                    "forward daily and execution datasets do not share source lineage"
+                )
+            bindings = {
+                "daily_dataset": str(daily["name"]),
+                "daily_dataset_identity_sha256": str(
+                    daily_provenance["dataset_identity_sha256"]
+                ),
+                "daily_dataset_lineage_id": str(
+                    daily_provenance["dataset_lineage_id"]
+                ),
+                "execution_dataset": str(execution["name"]),
+                "execution_dataset_identity_sha256": str(
+                    execution_provenance["dataset_identity_sha256"]
+                ),
+                "execution_dataset_lineage_id": str(
+                    execution_provenance["dataset_lineage_id"]
+                ),
+            }
+        return bindings
 
     def create_batches_for_snapshot(
         self,
         snapshot_id: str,
         *,
         actor: str = "recommendation-worker",
+        data_root: Path | None = None,
     ) -> list[tuple[dict[str, Any], bool]]:
         self.safe_mode.assert_inactive(action="simulation batch creation")
         producer = actor.strip()
@@ -2032,12 +2180,17 @@ class SimulationStore:
             ).all()
             for portfolio in portfolios:
                 self._require_current_source_contract(connection, portfolio)
-                if (
-                    str(snapshot.dataset) != str(portfolio.daily_dataset)
-                    or str(snapshot.dataset_identity_sha256)
-                    != str(portfolio.daily_dataset_identity_sha256)
-                ):
-                    raise ValueError("recommendation snapshot lineage does not match simulation")
+                dataset_bindings = self._snapshot_batch_dataset_bindings(
+                    portfolio=portfolio,
+                    snapshot=snapshot,
+                    trade_date=snapshot.effective_date,
+                    data_root=data_root,
+                )
+                simulation_semantics_sha256 = (
+                    self._batch_simulation_semantics_sha256(
+                        portfolio, dataset_bindings
+                    )
+                )
                 batch_id = uuid.uuid4().hex
                 inserted_id = connection.scalar(
                     pg_insert(simulation_batches)
@@ -2049,6 +2202,8 @@ class SimulationStore:
                         target_payload_json=None,
                         execution_adapter=portfolio.execution_adapter,
                         execution_contract_hash=portfolio.execution_contract_hash,
+                        **dataset_bindings,
+                        simulation_semantics_sha256=simulation_semantics_sha256,
                         signal_date=snapshot.as_of_date,
                         trade_date=snapshot.effective_date,
                         status="queued",
@@ -2271,6 +2426,7 @@ class SimulationStore:
             idempotency_key = (
                 f"qlib-order-plan:{portfolio.id}:{manifest_sha256}"
             )
+            dataset_bindings = self._portfolio_batch_dataset_bindings(portfolio)
             inserted_id = connection.scalar(
                 pg_insert(simulation_batches)
                 .values(
@@ -2281,6 +2437,10 @@ class SimulationStore:
                     target_payload_json=payload,
                     execution_adapter="long_only",
                     execution_contract_hash=portfolio.execution_contract_hash,
+                    **dataset_bindings,
+                    simulation_semantics_sha256=self._batch_simulation_semantics_sha256(
+                        portfolio, dataset_bindings
+                    ),
                     signal_date=signal_date,
                     trade_date=trade_date,
                     signal_at=signal_at,
@@ -2448,6 +2608,7 @@ class SimulationStore:
             cost_model = CostScheduleBook.from_mapping(
                 dict(portfolio.execution_policy_json or {}).get("cost_model")
             ).as_of(trade_date)
+            dataset_bindings = self._portfolio_batch_dataset_bindings(portfolio)
             batch_id = uuid.uuid4().hex
             connection.execute(
                 insert(simulation_batches).values(
@@ -2465,6 +2626,10 @@ class SimulationStore:
                     },
                     execution_adapter=str(portfolio.execution_adapter),
                     execution_contract_hash=portfolio.execution_contract_hash,
+                    **dataset_bindings,
+                    simulation_semantics_sha256=self._batch_simulation_semantics_sha256(
+                        portfolio, dataset_bindings
+                    ),
                     signal_date=normalized_signal_date,
                     trade_date=trade_date,
                     signal_at=None,
@@ -2885,6 +3050,7 @@ class SimulationStore:
                 f"pair-replay:{portfolio.id}:{backtest.id}:{trade_date.isoformat()}:"
                 f"{plan['pair_plan_sha256']}"
             )
+            dataset_bindings = self._portfolio_batch_dataset_bindings(portfolio)
             inserted_id = connection.scalar(
                 pg_insert(simulation_batches)
                 .values(
@@ -2898,6 +3064,10 @@ class SimulationStore:
                     },
                     execution_adapter="pair",
                     execution_contract_hash=portfolio.execution_contract_hash,
+                    **dataset_bindings,
+                    simulation_semantics_sha256=self._batch_simulation_semantics_sha256(
+                        portfolio, dataset_bindings
+                    ),
                     signal_date=signal_date,
                     trade_date=trade_date,
                     status="queued",
@@ -3338,11 +3508,11 @@ class SimulationStore:
             ),
             (
                 source_snapshot.get("dataset_identity_sha256"),
-                str(portfolio.daily_dataset_identity_sha256),
+                str(batch.daily_dataset_identity_sha256),
             ),
             (
                 source_snapshot.get("dataset_lineage_id"),
-                str(portfolio.daily_dataset_lineage_id),
+                str(batch.daily_dataset_lineage_id),
             ),
         )
         if any(observed != expected for observed, expected in required_matches):
@@ -3393,6 +3563,9 @@ class SimulationStore:
         execution_evidence: dict[str, Any],
     ) -> dict[str, Any]:
         stored = dict(portfolio.execution_policy_json or {})
+        stored["simulation_semantics_sha256"] = str(
+            batch.simulation_semantics_sha256
+        )
         if str(portfolio.execution_adapter) == "pair":
             return stored
         algorithm = str(stored.get("execution_algorithm") or "")
@@ -3424,9 +3597,9 @@ class SimulationStore:
             "end": profile_end.isoformat(),
             "trade_date": batch.trade_date.isoformat(),
             "dataset_identity_sha256": str(
-                portfolio.execution_dataset_identity_sha256
+                batch.execution_dataset_identity_sha256
             ),
-            "dataset_lineage_id": str(portfolio.execution_dataset_lineage_id),
+            "dataset_lineage_id": str(batch.execution_dataset_lineage_id),
             "simulation_semantics_sha256": stored.get(
                 "simulation_semantics_sha256"
             ),
@@ -3438,9 +3611,9 @@ class SimulationStore:
             or evidence.get("future_data_used") is not False
             or profile_end >= batch.trade_date
             or str(evidence.get("dataset_identity_sha256") or "")
-            != str(portfolio.execution_dataset_identity_sha256)
+            != str(batch.execution_dataset_identity_sha256)
             or str(evidence.get("dataset_lineage_id") or "")
-            != str(portfolio.execution_dataset_lineage_id)
+            != str(batch.execution_dataset_lineage_id)
             or str(evidence.get("simulation_semantics_sha256") or "")
             != str(stored.get("simulation_semantics_sha256") or "")
             or execution_evidence.get("execution_volume_profile_sha256")
@@ -3613,13 +3786,16 @@ class SimulationStore:
                 raise ValueError("simulation batch contract no longer matches its portfolio")
             expected_execution = {
                 "dataset_identity_sha256": str(
-                    portfolio.execution_dataset_identity_sha256
+                    batch.execution_dataset_identity_sha256
                 ),
-                "dataset_lineage_id": str(portfolio.execution_dataset_lineage_id),
+                "dataset_lineage_id": str(batch.execution_dataset_lineage_id),
                 "execution_contract_version": str(
                     portfolio.execution_field_contract_version
                 ),
                 "execution_contract_hash": str(portfolio.execution_contract_hash),
+                "simulation_semantics_sha256": str(
+                    batch.simulation_semantics_sha256
+                ),
             }
             mismatches = [
                 field
@@ -5513,10 +5689,15 @@ class SimulationStore:
                 if batch.execution_not_before is not None
                 else None
             ),
-            "daily_dataset": str(portfolio.daily_dataset),
-            "execution_dataset": str(portfolio.execution_dataset),
+            "daily_dataset": str(batch.daily_dataset),
+            "execution_dataset": str(batch.execution_dataset),
             "execution_algorithm": str(portfolio.execution_algorithm),
-            "execution_policy": dict(portfolio.execution_policy_json or {}),
+            "execution_policy": {
+                **dict(portfolio.execution_policy_json or {}),
+                "simulation_semantics_sha256": str(
+                    batch.simulation_semantics_sha256
+                ),
+            },
             "execution_adapter": str(portfolio.execution_adapter),
             "execution_frequency": str(portfolio.execution_frequency),
             "execution_contract_hash": str(portfolio.execution_contract_hash),

@@ -26,6 +26,43 @@ def _settings(database_url: str, tmp_path: Path) -> Settings:
     )
 
 
+def _write_qlib_dataset(
+    data_root: Path,
+    *,
+    name: str,
+    frequency: str,
+    start: str,
+    end: str,
+    source_lineage_id: str,
+) -> None:
+    root = data_root / "qlib" / name
+    (root / "calendars").mkdir(parents=True)
+    (root / "instruments").mkdir()
+    (root / "features").mkdir()
+    (root / "calendars" / f"{frequency}.txt").write_text(
+        f"{start}\n{end}\n",
+        encoding="utf-8",
+    )
+    (root / "instruments" / "cn_all.txt").write_text(
+        "SH600000\t2024-01-01\t2025-01-02\n",
+        encoding="utf-8",
+    )
+    (root / "metadata").mkdir()
+    (root / "metadata" / "provenance.json").write_text(
+        json.dumps(
+            {
+                "frequency": frequency,
+                "dataset_identity_sha256": "b" * 64,
+                "dataset_lineage_id": "c" * 64,
+                "source_lineage_id": source_lineage_id,
+                "snapshot_manifest_sha256": "d" * 64,
+                "lineage_verified": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_scheduler_materializes_once_and_enqueues_incremental_job(
     database_url: str, tmp_path: Path
 ) -> None:
@@ -58,7 +95,7 @@ def test_scheduler_materializes_once_and_enqueues_incremental_job(
     assert job["payload"]["end"] == "latest"
     assert job["payload"]["build_qlib"] is False
     assert job["payload"]["finalize_after_download"] is False
-    assert job["payload"]["snapshot_start"] == "2024-01-01"
+    assert job["payload"]["snapshot_start"] == "2018-01-01"
 
 
 def test_scheduler_creates_recoverable_full_data_pipeline(
@@ -113,13 +150,22 @@ def test_scheduler_creates_daily_full_a_share_five_minute_increment(
         timezone="Asia/Shanghai",
         run_time=time(21, 0),
         trading_days_only=True,
-        payload={"lookback_days": 3},
+        payload={"history_start": "2024-01-01", "daily_dataset": "daily-fixture"},
         misfire_grace_seconds=1800,
         actor="operator",
         now=current,
     )
 
-    result = SchedulerEngine(_settings(database_url, tmp_path)).tick(
+    settings = _settings(database_url, tmp_path)
+    _write_qlib_dataset(
+        settings.data_root,
+        name="daily-fixture",
+        frequency="day",
+        start="2024-01-01",
+        end="2025-01-02",
+        source_lineage_id="a" * 64,
+    )
+    result = SchedulerEngine(settings).tick(
         datetime(2025, 1, 2, 13, 1, tzinfo=UTC)
     )
 
@@ -127,9 +173,19 @@ def test_scheduler_creates_daily_full_a_share_five_minute_increment(
     run = store.list_runs()[0]
     job = JobStore(database_url).get(run["job_id"])
     assert job["kind"] == "ashare_5m_download"
-    assert job["payload"]["start"] == "2024-12-31"
+    assert job["payload"]["start"] == "2024-01-01"
     assert job["payload"]["end"] == "2025-01-02"
     assert job["payload"]["snapshot_name"] == "ashare-5m-incremental-20250102"
+    assert job["payload"]["source_lineage_id"] == "a" * 64
+    assert job["payload"]["pipeline_steps"] == [
+        {
+            "kind": "minute_qlib",
+            "payload": {
+                "output_name": "ashare-5m-incremental-20250102-5min",
+                "target_frequency": "5min",
+            },
+        }
+    ]
 
 
 def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(

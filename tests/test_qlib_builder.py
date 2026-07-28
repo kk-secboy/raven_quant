@@ -514,6 +514,35 @@ def test_writes_point_in_time_industry_metadata(tmp_path: Path) -> None:
     assert eligibility.loc[0, "instrument"] == "SZ000001"
 
 
+def test_writes_future_known_trading_calendar_without_future_market_bars(
+    tmp_path: Path, monkeypatch
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    source = snapshot / "parquet" / "trade_cal" / "partition_year=2024"
+    source.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {"cal_date": "2024-01-02", "is_open": 1},
+            {"cal_date": "2024-01-03", "is_open": 1},
+            {"cal_date": "2024-01-04", "is_open": 0},
+        ]
+    ).to_parquet(source / "calendar.parquet", index=False)
+    builder = QlibBuilder(snapshot)
+    monkeypatch.setattr(builder, "_write_market_context_metadata", lambda _: False)
+    monkeypatch.setattr(builder, "_write_eligibility_metadata", lambda _: True)
+
+    qlib_dir = tmp_path / "qlib"
+    builder._write_portfolio_metadata(qlib_dir)
+
+    calendar = pd.read_parquet(
+        qlib_dir / "metadata" / "known_trading_calendar.parquet"
+    )
+    assert calendar["date"].dt.date.astype(str).tolist() == [
+        "2024-01-02",
+        "2024-01-03",
+    ]
+
+
 def test_writes_normalized_market_context_without_stock_level_duplication(
     tmp_path: Path,
 ) -> None:

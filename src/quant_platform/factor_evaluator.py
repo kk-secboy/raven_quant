@@ -56,12 +56,26 @@ def _daily_correlation(frame: pd.DataFrame, method: str) -> pd.Series:
     return frame.groupby(level="datetime", sort=True).apply(correlation).dropna()
 
 
-def _long_short_returns(frame: pd.DataFrame, cost_rate: float) -> tuple[float, float, float]:
+def _long_short_returns(
+    frame: pd.DataFrame,
+    cost_rate: float,
+    *,
+    holding_period_days: int,
+) -> tuple[float, float, float]:
+    if holding_period_days < 1:
+        raise ValueError("holding_period_days must be positive")
     previous: pd.Series | None = None
     turnovers: list[float] = []
     gross_returns: list[float] = []
     net_returns: list[float] = []
-    for _, group in frame.groupby(level="datetime", sort=True):
+    # h-day forward labels overlap when sampled every day. Evaluate one
+    # non-overlapping cohort every h trading sessions so return annualization,
+    # turnover and transaction costs describe the same investable sequence.
+    for period_index, (_, group) in enumerate(
+        frame.groupby(level="datetime", sort=True)
+    ):
+        if period_index % holding_period_days:
+            continue
         if len(group) < 10:
             continue
         ranks = group["factor"].rank(method="average", pct=True)
@@ -90,10 +104,11 @@ def _long_short_returns(frame: pd.DataFrame, cost_rate: float) -> tuple[float, f
         net_returns.append(gross - turnover * cost_rate)
     if not net_returns:
         return float("nan"), float("nan"), float("nan")
+    annualization = 252.0 / holding_period_days
     return (
         float(pd.Series(turnovers).mean()),
-        float(pd.Series(gross_returns).mean() * 252),
-        float(pd.Series(net_returns).mean() * 252),
+        float(pd.Series(gross_returns).mean() * annualization),
+        float(pd.Series(net_returns).mean() * annualization),
     )
 
 
@@ -164,7 +179,9 @@ def evaluate_factor_values(
     costs = cost_model or CostModelConfig()
     screening_cost_rate = costs.factor_screening_rate(reference_order_value=reference_order_value)
     turnover, gross_return, cost_adjusted_return = _long_short_returns(
-        directed_selection, screening_cost_rate
+        directed_selection,
+        screening_cost_rate,
+        holding_period_days=label_horizon_days,
     )
 
     selection_factor = factor[
@@ -218,6 +235,7 @@ def evaluate_factor_values(
         "max_correlation": max(correlations, default=0.0),
         "cost_adjusted_return": cost_adjusted_return,
         "gross_annualized_return": gross_return,
+        "return_annualization_horizon_days": label_horizon_days,
         "valid_ic": float(raw_valid_ic * direction),
         "raw_valid_ic": raw_valid_ic,
         "raw_selection_ic": float(raw_ic_daily.mean()),

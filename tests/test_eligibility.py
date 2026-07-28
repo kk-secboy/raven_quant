@@ -1,5 +1,6 @@
 import json
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -193,3 +194,34 @@ def test_governed_signal_neutralizes_point_in_time_industry_bias() -> None:
     by_industry = memberships.set_index("instrument")["industry"]
 
     assert governed.groupby(by_industry).mean().abs().max() < 1e-10
+
+
+def test_governed_signal_drops_missing_required_style_exposures() -> None:
+    timestamp = pd.Timestamp("2026-07-10")
+    instruments = [f"SH{600000 + index:06d}" for index in range(6)]
+    scores = pd.Series(
+        np.arange(6, dtype=float),
+        index=pd.MultiIndex.from_product(
+            [[timestamp], instruments], names=["datetime", "instrument"]
+        ),
+    )
+    styles = pd.DataFrame(
+        {
+            "datetime": [timestamp] * 6,
+            "instrument": instruments,
+            "size": [1.0, 2.0, 3.0, 4.0, 5.0, np.nan],
+            # An unused, unavailable style must not erase valid size evidence.
+            "growth": [np.nan] * 6,
+        }
+    )
+
+    governed = build_governed_signal(
+        scores,
+        topk=5,
+        style_exposures=styles,
+        neutralize_industry=False,
+        neutralize_style_columns=("size",),
+    )
+
+    assert "SH600005" not in set(governed.index.get_level_values("instrument"))
+    assert len(governed) == 5

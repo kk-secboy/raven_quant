@@ -188,6 +188,45 @@ def test_chained_data_pipeline_keeps_each_download_and_build_as_separate_job(
     assert worker._has_data_pipeline_successor(current) is False
 
 
+def test_five_minute_download_chains_to_minute_qlib_build(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
+    settings = Settings.from_env(tmp_path / ".env")
+    jobs = JobStore(database_url)
+    worker = LocalJobWorker(jobs, tmp_path, settings)
+    download = {
+        "kind": "ashare_5m_download",
+        "payload": {
+            "pipeline_id": "ashare-5m-fixture",
+            "profile": "ashare_intraday",
+            "start": "2024-01-01",
+            "end": "2025-01-02",
+            "snapshot_name": "ashare-5m-20250102",
+            "pipeline_steps": [
+                {
+                    "kind": "minute_qlib",
+                    "payload": {
+                        "output_name": "ashare-5m-20250102-5min",
+                        "target_frequency": "5min",
+                    },
+                }
+            ],
+            "pipeline_next_index": 0,
+        },
+    }
+
+    successor = worker._queue_data_pipeline_successor(download)
+
+    assert successor["kind"] == "minute_qlib"
+    assert successor["payload"]["snapshot_name"] == "ashare-5m-20250102"
+    assert successor["payload"]["output_name"] == "ashare-5m-20250102-5min"
+    assert successor["payload"]["target_frequency"] == "5min"
+    assert worker._has_data_pipeline_successor(successor) is False
+
+
 def test_full_snapshot_contract_keeps_execution_frequency_separate() -> None:
     assert "daily" in _profile_datasets("full")
     assert {"stk_premarket", "stk_auction_o", "stk_auction_c"} <= _profile_datasets("full")

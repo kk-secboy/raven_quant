@@ -27,7 +27,9 @@ def _settled_fill(database_url: str, tmp_path):
             }
         },
         execution_evidence=_execution_evidence(
-            batch["id"], simulation["execution_contract_hash"]
+            batch["id"],
+            simulation["execution_contract_hash"],
+            simulation["execution_policy"]["simulation_semantics_sha256"],
         ),
     )
     fill = store.rows(simulation["id"], "fills")[0]

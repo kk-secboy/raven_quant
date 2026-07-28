@@ -86,7 +86,11 @@ def test_settled_trade_date_rejects_new_flows(database_url: str, tmp_path) -> No
         batch["id"],
         minute_bars=_bars(),
         closing_prices={"SH600000": {"price": 10.0, "market_date": TRADE_DATE.isoformat()}},
-        execution_evidence=_execution_evidence(batch["id"], simulation["execution_contract_hash"]),
+        execution_evidence=_execution_evidence(
+            batch["id"],
+            simulation["execution_contract_hash"],
+            simulation["execution_policy"]["simulation_semantics_sha256"],
+        ),
     )
     with pytest.raises(ValueError, match="settled trade date"):
         store.record_external_flow(
@@ -113,7 +117,11 @@ def test_process_batch_applies_open_deposit_without_manufacturing_return(
         batch["id"],
         minute_bars=_bars(),
         closing_prices={"SH600000": {"price": 10.0, "market_date": TRADE_DATE.isoformat()}},
-        execution_evidence=_execution_evidence(batch["id"], simulation["execution_contract_hash"]),
+        execution_evidence=_execution_evidence(
+            batch["id"],
+            simulation["execution_contract_hash"],
+            simulation["execution_policy"]["simulation_semantics_sha256"],
+        ),
     )
     assert completed["status"] == "succeeded"
     nav = store.rows(simulation["id"], "nav")[0]
@@ -149,7 +157,11 @@ def test_performance_summary_reports_twr_recovery_and_xirr(
         batch["id"],
         minute_bars=_bars(),
         closing_prices={"SH600000": {"price": 10.0, "market_date": TRADE_DATE.isoformat()}},
-        execution_evidence=_execution_evidence(batch["id"], simulation["execution_contract_hash"]),
+        execution_evidence=_execution_evidence(
+            batch["id"],
+            simulation["execution_contract_hash"],
+            simulation["execution_policy"]["simulation_semantics_sha256"],
+        ),
     )
     summary = store.performance_summary(simulation["id"])
     assert summary["nav_days"] == 1

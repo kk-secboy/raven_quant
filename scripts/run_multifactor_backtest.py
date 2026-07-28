@@ -141,6 +141,26 @@ def _qlib_instruments(provider_uri: str | Path) -> set[str]:
     }
 
 
+def _eligible_strategy_instruments(
+    scores: pd.Series, eligibility_matrix: pd.DataFrame
+) -> list[str]:
+    required = {"instrument", "eligible"}
+    if not required.issubset(eligibility_matrix.columns):
+        raise ValueError("point-in-time eligibility metadata is incomplete")
+    score_instruments = set(
+        scores.index.get_level_values("instrument").astype(str)
+    )
+    eligible_instruments = set(
+        eligibility_matrix.loc[
+            eligibility_matrix["eligible"].fillna(False).astype(bool), "instrument"
+        ].astype(str)
+    )
+    instruments = sorted(score_instruments & eligible_instruments)
+    if not instruments:
+        raise ValueError("factor scores have no point-in-time eligible instruments")
+    return instruments
+
+
 def _minute_warmup_window(
     provider_uri: str | Path, frequency: str, start_time: str, lookback_days: int
 ) -> tuple[str, str]:
@@ -462,7 +482,11 @@ def main() -> None:
             challenger=challenger_scores,
             challenger_weight=float(config.get("challenger_weight") or 0.0),
         )
-    instruments = sorted(set(scores.index.get_level_values("instrument")))
+    eligibility_path = Path(args.provider_uri) / "metadata" / "eligibility_matrix.parquet"
+    if not eligibility_path.is_file():
+        raise ValueError("Qlib daily dataset has no point-in-time eligibility matrix")
+    eligibility_matrix = pd.read_parquet(eligibility_path)
+    instruments = _eligible_strategy_instruments(scores, eligibility_matrix)
     if minute_execution:
         available_instruments = _qlib_instruments(args.execution_provider_uri)
         missing_instruments = sorted(set(instruments) - available_instruments)
@@ -552,10 +576,6 @@ def main() -> None:
         raise ValueError(f"constrained backtest requires historical {target_weight_label} weights")
     if style_exposures.empty:
         raise ValueError("index-enhancement backtest requires point-in-time style exposures")
-    eligibility_path = Path(args.provider_uri) / "metadata" / "eligibility_matrix.parquet"
-    if not eligibility_path.is_file():
-        raise ValueError("Qlib daily dataset has no point-in-time eligibility matrix")
-    eligibility_matrix = pd.read_parquet(eligibility_path)
     eligibility_evidence = eligibility_statistics(eligibility_matrix)
     if config.get("require_regulatory_events") and not eligibility_evidence[
         "regulatory_data_available"
@@ -566,6 +586,10 @@ def main() -> None:
         scenario_config: dict[str, Any],
         signal_scores: pd.Series | None = None,
     ) -> pd.Series:
+        neutralize_baseline = scenario_config.get("portfolio_construction") in {
+            "benchmark_relative_qp",
+            "industry_neutral_qp",
+        }
         return build_governed_signal(
             scores if signal_scores is None else signal_scores,
             topk=int(scenario_config["topk"]),
@@ -582,6 +606,8 @@ def main() -> None:
             liquidity_lookback_days=int(
                 scenario_config.get("liquidity_lookback_days", 20)
             ),
+            neutralize_industry=neutralize_baseline,
+            neutralize_style_columns=("size",) if neutralize_baseline else (),
         )
 
     governed_signal = governed_for(config)
