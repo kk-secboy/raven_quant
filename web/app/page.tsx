@@ -128,17 +128,17 @@ export default function Home() {
     }
   }, []);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (forceRefresh = false) => {
     const [overviewResult, datasetsResult, dataTasksResult] = await Promise.allSettled([
-      apiFetch(`${API}/api/overview`, { cache: "no-store" }).then(async (response) => {
+      apiFetch(`${API}/api/overview`, { cache: "no-store", forceRefresh }).then(async (response) => {
         if (!response.ok) throw new Error("overview unavailable");
         return response.json() as Promise<Overview>;
       }),
-      apiFetch(`${API}/api/datasets`, { cache: "no-store" }).then(async (response) => {
+      apiFetch(`${API}/api/datasets`, { cache: "no-store", forceRefresh }).then(async (response) => {
         if (!response.ok) throw new Error("datasets unavailable");
         return response.json() as Promise<Dataset[]>;
       }),
-      apiFetch(`${API}/api/data-tasks`, { cache: "no-store" }).then(async (response) => {
+      apiFetch(`${API}/api/data-tasks`, { cache: "no-store", forceRefresh }).then(async (response) => {
         if (!response.ok) throw new Error("data tasks unavailable");
         return response.json() as Promise<DataTask[]>;
       }),
@@ -151,10 +151,11 @@ export default function Home() {
     setLoading(false);
   }, []);
 
-  const loadRetention = useCallback(async () => {
+  const loadRetention = useCallback(async (forceRefresh = false) => {
     try {
       const response = await apiFetch(`${API}/api/data-retention`, {
         cache: "no-store",
+        forceRefresh,
         timeoutMs: 120_000,
       });
       if (!response.ok) throw new Error("retention unavailable");
@@ -178,8 +179,8 @@ export default function Home() {
   usePolling(loadRetention, 60 * 60 * 1000, storageViewEnabled);
 
   async function refreshVisible() {
-    await refresh();
-    if (activeNav === 1 && dataView === "storage") await loadRetention();
+    await refresh(true);
+    if (activeNav === 1 && dataView === "storage") await loadRetention(true);
   }
 
   async function logout() {

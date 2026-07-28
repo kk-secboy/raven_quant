@@ -39,6 +39,9 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(sourceByName["api-client.ts"], /credentials:\s*"include"/);
   assert.match(sourceByName["api-client.ts"], /inflightGets/);
   assert.match(sourceByName["api-client.ts"], /AbortController/);
+  assert.match(sourceByName["api-client.ts"], /sessionStorage/);
+  assert.match(sourceByName["api-client.ts"], /staleMs/);
+  assert.match(sourceByName["api-client.ts"], /clearApiCache/);
   assert.match(sourceByName["use-polling.ts"], /finally[\s\S]*setTimeout/);
   assert.doesNotMatch(allSource, /setInterval/);
   assert.match(sourceByName["page.tsx"], /\/api\/auth\/state/);

@@ -105,9 +105,12 @@ export function MarketOverviewPanel({ api, onOpenData }: MarketOverviewPanelProp
   const [watchlistText, setWatchlistText] = useState(defaultWatchlist);
   const [querySymbols, setQuerySymbols] = useState(defaultWatchlist);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (forceRefresh = false) => {
     try {
-      const response = await apiFetch(`${api}/api/market/overview?symbols=${encodeURIComponent(querySymbols)}`, { cache: "no-store" });
+      const response = await apiFetch(`${api}/api/market/overview?symbols=${encodeURIComponent(querySymbols)}`, {
+        cache: "no-store",
+        forceRefresh,
+      });
       if (!response.ok) throw new Error("行情聚合接口暂不可用");
       setMarket(await response.json());
       setError("");
@@ -149,7 +152,7 @@ export function MarketOverviewPanel({ api, onOpenData }: MarketOverviewPanelProp
       <div><span>行情日期</span><strong>{market.source.as_of ?? "—"}</strong></div>
       <div><span>数据状态</span><strong>{freshnessLabel}</strong></div>
       <div className="market-source-name"><span>数据版本</span><strong>{market.source.snapshot_name}</strong></div>
-      <button onClick={refresh}>刷新行情</button>
+      <button onClick={() => void refresh(true)}>刷新行情</button>
     </section>
 
     {error ? <div className="notice">{error}，当前仍展示上一次成功结果。</div> : null}
