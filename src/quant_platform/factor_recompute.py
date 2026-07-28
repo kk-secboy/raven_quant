@@ -14,7 +14,7 @@ import pandas as pd
 
 ALLOWED_IMPORT_ROOTS = {"math", "numpy", "pandas"}
 FORBIDDEN_CALLS = {"breakpoint", "compile", "eval", "exec", "input", "open", "__import__"}
-FACTOR_RECOMPUTE_EXECUTOR_VERSION = "factor-recompute-v2-container"
+FACTOR_RECOMPUTE_EXECUTOR_VERSION = "factor-recompute-v3-container-index-exact"
 
 
 def sha256_file(path: Path) -> str:
@@ -235,12 +235,12 @@ def compare_submitted_values(
     if submitted_path is None or not submitted_path.is_file():
         return {"available": False, "exact_match": False}
     submitted = normalize_factor_values(pd.read_hdf(submitted_path))
-    left, right = submitted.align(recomputed, join="outer")
+    same_index = submitted.index.equals(recomputed.index)
     equal = bool(
-        left.index.equals(right.index)
+        same_index
         and np.allclose(
-            left.iloc[:, 0].to_numpy(dtype=float),
-            right.iloc[:, 0].to_numpy(dtype=float),
+            submitted.iloc[:, 0].to_numpy(dtype=float),
+            recomputed.iloc[:, 0].to_numpy(dtype=float),
             equal_nan=True,
             rtol=1e-10,
             atol=1e-12,
@@ -250,6 +250,7 @@ def compare_submitted_values(
         "available": True,
         "submitted_sha256": sha256_file(submitted_path),
         "exact_match": equal,
+        "index_exact_match": same_index,
         "submitted_rows": len(submitted),
         "recomputed_rows": len(recomputed),
     }

@@ -5,7 +5,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from quant_platform.factor_recompute import execute_factor_code, validate_factor_code
+from quant_platform.factor_recompute import (
+    compare_submitted_values,
+    execute_factor_code,
+    validate_factor_code,
+)
 
 pytestmark = pytest.mark.no_database
 
@@ -63,3 +67,30 @@ def test_factor_recompute_fails_closed_without_container(
             input_path=source,
             workspace=tmp_path / "sandbox",
         )
+
+
+def test_submitted_values_require_the_exact_recomputed_index(tmp_path: Path) -> None:
+    pytest.importorskip("tables")
+    submitted_index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2026-07-01"), "SH600000"),
+            (pd.Timestamp("2026-07-01"), "SH600001"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    recomputed_index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2026-07-01"), "SH600000"),
+            (pd.Timestamp("2026-07-01"), "SH600002"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    submitted = pd.DataFrame({"factor": [1.0, float("nan")]}, index=submitted_index)
+    recomputed = pd.DataFrame({"factor": [1.0, float("nan")]}, index=recomputed_index)
+    submitted_path = tmp_path / "submitted.h5"
+    submitted.to_hdf(submitted_path, key="data", mode="w")
+
+    comparison = compare_submitted_values(submitted_path, recomputed)
+
+    assert comparison["index_exact_match"] is False
+    assert comparison["exact_match"] is False

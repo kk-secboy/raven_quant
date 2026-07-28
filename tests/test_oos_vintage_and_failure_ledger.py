@@ -103,7 +103,7 @@ def _record_passing_evaluation(store: ResearchStore, tmp_path: Path, candidate: 
         recomputed_values_path=str(recomputed_path),
         recomputed_values_sha256=recomputed_sha256,
         recompute_evidence={
-            "executor_version": "factor-recompute-v2-container",
+            "executor_version": "factor-recompute-v3-container-index-exact",
             "sandbox_mode": "docker-isolated",
             "sandbox_image_id": "sha256:" + "a" * 64,
             "network_mode": "none",
@@ -118,6 +118,7 @@ def _record_passing_evaluation(store: ResearchStore, tmp_path: Path, candidate: 
             "submitted_comparison": {
                 "available": True,
                 "exact_match": True,
+                "index_exact_match": True,
                 "submitted_sha256": hashlib.sha256(
                     Path(candidate["values_path"]).read_bytes()
                 ).hexdigest(),

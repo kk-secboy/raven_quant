@@ -97,7 +97,7 @@ def _recompute_args(store: ResearchStore, candidate_id: str, tmp_path: Path) -> 
         "recomputed_values_path": str(recomputed_path),
         "recomputed_values_sha256": recomputed_sha256,
         "recompute_evidence": {
-            "executor_version": "factor-recompute-v2-container",
+            "executor_version": "factor-recompute-v3-container-index-exact",
             "sandbox_mode": "docker-isolated",
             "sandbox_image_id": "sha256:" + "a" * 64,
             "network_mode": "none",
@@ -112,6 +112,7 @@ def _recompute_args(store: ResearchStore, candidate_id: str, tmp_path: Path) -> 
             "submitted_comparison": {
                 "available": True,
                 "exact_match": True,
+                "index_exact_match": True,
                 "submitted_sha256": candidate["values_sha256"],
             },
             "authoritative_values_sha256": recomputed_sha256,
@@ -249,6 +250,32 @@ def test_factor_evaluation_rejects_submitted_values_that_do_not_match_recompute(
             artifact_path=str(
                 _write_evaluation_artifact(
                     tmp_path / "mismatched-evaluation.json",
+                    candidate["id"],
+                    _passing_metrics(),
+                )
+            ),
+            **recompute,
+        )
+
+
+def test_factor_evaluation_rejects_legacy_index_ambiguous_recompute_evidence(
+    tmp_path: Path, database_url: str
+) -> None:
+    store = ResearchStore(database_url)
+    candidate = _candidate(store, tmp_path)
+    recompute = _recompute_args(store, candidate["id"], tmp_path)
+    del recompute["recompute_evidence"]["submitted_comparison"]["index_exact_match"]
+
+    with pytest.raises(ValueError, match="do not match independent recomputation"):
+        store.record_evaluation(
+            candidate["id"],
+            dataset="snapshot-20260710",
+            dataset_identity_sha256=DATASET_IDENTITY,
+            **PERIODS,
+            metrics=_passing_metrics(),
+            artifact_path=str(
+                _write_evaluation_artifact(
+                    tmp_path / "legacy-index-evidence.json",
                     candidate["id"],
                     _passing_metrics(),
                 )

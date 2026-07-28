@@ -763,6 +763,7 @@ class ResearchStore:
         if not isinstance(submitted_comparison, dict) or not (
             submitted_comparison.get("available") is True
             and submitted_comparison.get("exact_match") is True
+            and submitted_comparison.get("index_exact_match") is True
             and submitted_comparison.get("submitted_sha256") == submitted_values_sha256
         ):
             raise ValueError("submitted factor values do not match independent recomputation")
