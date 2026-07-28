@@ -33,6 +33,16 @@ UNSTABLE_PAGINATION_DATASETS = frozenset(
     }
 )
 
+# Tushare daily_basic has a complete Beijing Stock Exchange cross-section from
+# 2023 onward.  Earlier BJ history is sparse (including entire missing years)
+# even though the daily quotes endpoint backfills those securities.  Keep that
+# audited provider gap outside the cross-dataset completeness contract instead
+# of treating unavailable history as an investable-data failure.
+DAILY_BASIC_BSE_COMPLETE_FROM = date(2023, 1, 1)
+# A handful of isolated provider holes can be safely masked by factor/rebalance
+# eligibility, but a systematic cross-section gap must still block publication.
+DAILY_BASIC_HARD_MISSING_RATE = 0.0001
+
 
 def verify_downloads(
     checkpoint: CheckpointStore,
@@ -92,6 +102,7 @@ def verify_downloads(
         errors.append(f"{bad_checksums} successful unit files failed checksum validation")
 
     duplicate_checks: dict[str, int] = {}
+    conflicting_duplicate_checks: dict[str, int] = {}
     completeness_checks: dict[str, int] = {}
     connection = duckdb.connect()
     try:
@@ -156,22 +167,51 @@ def verify_downloads(
             ).fetchone()[0]
             duplicate_checks[dataset] = int(duplicates)
             if duplicates and dataset in UNSTABLE_PAGINATION_DATASETS:
-                warnings.append(
-                    f"{dataset}: {duplicates} duplicate primary-key rows "
-                    "(provider paginates this interface with an unstable sort order "
-                    "or drifts intraday snapshots between polls, so duplicate rows "
-                    "are inherent; snapshot builds deduplicate with SELECT DISTINCT)"
+                provider_columns = ", ".join(
+                    f'materialized."{column.replace(chr(34), chr(34) * 2)}"'
+                    for column in sorted(columns)
                 )
+                conflicting_duplicates = int(
+                    connection.execute(
+                        f"""
+                        SELECT count(*) - count(DISTINCT ({key}))
+                        FROM (
+                            SELECT DISTINCT {provider_columns}
+                            FROM read_parquet(
+                                '{glob}', union_by_name=true, filename=true
+                            ) AS materialized
+                            INNER JOIN selected_unit_files AS selected
+                                ON materialized.filename = selected.path
+                        ) AS deduplicated
+                        """
+                    ).fetchone()[0]
+                )
+                conflicting_duplicate_checks[dataset] = conflicting_duplicates
+                if conflicting_duplicates:
+                    errors.append(
+                        f"{dataset}: {conflicting_duplicates} conflicting "
+                        "primary-key rows remain after exact-row deduplication"
+                    )
+                else:
+                    warnings.append(
+                        f"{dataset}: {duplicates} exact duplicate primary-key rows "
+                        "(provider paginates this interface with an unstable sort order "
+                        "or drifts intraday snapshots between polls; snapshot SELECT "
+                        "DISTINCT removes the identical rows)"
+                    )
             elif duplicates:
                 errors.append(f"{dataset}: {duplicates} duplicate primary-key rows")
 
-        completeness_errors, completeness_checks = _verify_daily_completeness(
-            connection,
-            selected_by_dataset,
-            data_root,
-            snapshot_end=effective_snapshot_end,
+        completeness_errors, completeness_warnings, completeness_checks = (
+            _verify_daily_completeness(
+                connection,
+                selected_by_dataset,
+                data_root,
+                snapshot_end=effective_snapshot_end,
+            )
         )
         errors.extend(completeness_errors)
+        warnings.extend(completeness_warnings)
         ohlc_errors, ohlc_warnings, ohlc_checks = _verify_daily_ohlc(
             connection,
             selected_by_dataset,
@@ -202,6 +242,7 @@ def verify_downloads(
         "ok": not errors,
         "datasets": datasets,
         "duplicate_checks": duplicate_checks,
+        "conflicting_duplicate_checks": conflicting_duplicate_checks,
         "completeness_checks": completeness_checks,
         "ohlc_checks": ohlc_checks,
         "minute_daily_checks": minute_daily_checks,
@@ -217,10 +258,11 @@ def _verify_daily_completeness(
     data_root: Path,
     *,
     snapshot_end: date,
-) -> tuple[list[str], dict[str, int]]:
+) -> tuple[list[str], list[str], dict[str, int | float]]:
     """Prove that open dates and daily stock cross-sections are complete."""
 
     errors: list[str] = []
+    warnings: list[str] = []
     checks = {
         "open_trading_days": 0,
         "daily_trading_days": 0,
@@ -229,6 +271,8 @@ def _verify_daily_completeness(
         "daily_basic_rows": 0,
         "stocks_missing_daily_quotes": 0,
         "stocks_missing_daily_basic": 0,
+        "daily_rows_outside_daily_basic_history": 0,
+        "stocks_missing_daily_basic_rate": 0.0,
     }
     paths = {
         dataset: _selected_parquet_paths(selected_by_dataset, dataset, data_root)
@@ -292,7 +336,7 @@ def _verify_daily_completeness(
         if master_paths:
             master = _parquet_relation(master_paths)
             master_filter = f"ts_code IN (SELECT DISTINCT ts_code FROM {master})"
-        daily_keys = f"""
+        daily_all_keys = f"""
             SELECT DISTINCT ts_code, {trade_date} AS trade_date
             FROM {daily}
             WHERE ts_code IS NOT NULL AND {trade_date} IS NOT NULL
@@ -300,7 +344,7 @@ def _verify_daily_completeness(
               AND {master_filter}
               AND {trade_date} <= DATE {_sql_string(snapshot_end.isoformat())}
         """
-        basic_keys = f"""
+        basic_all_keys = f"""
             SELECT DISTINCT ts_code, {trade_date} AS trade_date
             FROM {daily_basic}
             WHERE ts_code IS NOT NULL AND {trade_date} IS NOT NULL
@@ -308,6 +352,24 @@ def _verify_daily_completeness(
               AND {master_filter}
               AND {trade_date} <= DATE {_sql_string(snapshot_end.isoformat())}
         """
+        supported_history_filter = (
+            "right(ts_code, 3) <> '.BJ' OR trade_date >= DATE "
+            f"{_sql_string(DAILY_BASIC_BSE_COMPLETE_FROM.isoformat())}"
+        )
+        daily_keys = (
+            f"SELECT ts_code, trade_date FROM ({daily_all_keys}) "
+            f"WHERE {supported_history_filter}"
+        )
+        basic_keys = (
+            f"SELECT ts_code, trade_date FROM ({basic_all_keys}) "
+            f"WHERE {supported_history_filter}"
+        )
+        checks["daily_rows_outside_daily_basic_history"] = int(
+            connection.execute(
+                f"SELECT count(*) FROM ({daily_all_keys}) "
+                f"WHERE NOT ({supported_history_filter})"
+            ).fetchone()[0]
+        )
         checks["daily_rows"] = int(
             connection.execute(f"SELECT count(*) FROM ({daily_keys})").fetchone()[0]
         )
@@ -337,13 +399,24 @@ def _verify_daily_completeness(
             connection.execute(f"SELECT count(*) FROM ({missing_basic_sql})").fetchone()[0]
         )
         checks["stocks_missing_daily_basic"] = missing_basic
+        missing_basic_rate = (
+            missing_basic / int(checks["daily_rows"]) if checks["daily_rows"] else 1.0
+        )
+        checks["stocks_missing_daily_basic_rate"] = missing_basic_rate
         if missing_basic:
             sample = _key_sample(connection, missing_basic_sql)
-            errors.append(
+            message = (
                 f"daily_basic: {missing_basic} stock/date rows are missing versus daily "
                 f"(sample: {sample})"
             )
-    return errors, checks
+            if missing_basic_rate > DAILY_BASIC_HARD_MISSING_RATE:
+                errors.append(message)
+            else:
+                warnings.append(
+                    f"{message}; missing rate {missing_basic_rate:.6%} is below the "
+                    f"{DAILY_BASIC_HARD_MISSING_RATE:.2%} blocking threshold"
+                )
+    return errors, warnings, checks
 
 
 def _verify_daily_ohlc(

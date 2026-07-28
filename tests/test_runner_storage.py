@@ -155,7 +155,7 @@ def test_verifier_uses_successor_generation_and_can_ignore_dormant_plans(
     assert any("daily: 0/1 units succeeded" in item for item in relaxed["warnings"])
 
 
-def test_verifier_downgrades_duplicates_only_for_unstable_pagination_datasets(
+def test_verifier_downgrades_only_exact_duplicates_for_unstable_pagination_datasets(
     tmp_path: Path, database_url: str
 ) -> None:
     checkpoint = CheckpointStore(database_url)
@@ -197,11 +197,53 @@ def test_verifier_downgrades_duplicates_only_for_unstable_pagination_datasets(
     result = verify_downloads(checkpoint, tmp_path)
 
     assert result["duplicate_checks"] == {"adj_factor": 1, "dc_hot": 1}
+    assert result["conflicting_duplicate_checks"] == {"dc_hot": 0}
     assert any(
-        "dc_hot: 1 duplicate primary-key rows" in item for item in result["warnings"]
+        "dc_hot: 1 exact duplicate primary-key rows" in item for item in result["warnings"]
     )
     assert any(
         "adj_factor: 1 duplicate primary-key rows" in item for item in result["errors"]
+    )
+
+
+def test_verifier_rejects_conflicting_duplicates_from_unstable_pagination(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    spec = FetchSpec(
+        dataset="dc_hot",
+        api_name="dc_hot",
+        params={"trade_date": "20240102"},
+        scope={"page_group": "dc_hot:20240102", "offset": 0},
+    )
+    checkpoint.add([spec])
+    first = {
+        "trade_date": "20240102",
+        "ts_code": "000001.SZ",
+        "market": "concept",
+        "hot_type": "popularity",
+        "rank": 1,
+    }
+    second = {**first, "rank": 2}
+    written = storage.write_unit(
+        spec.dataset,
+        spec.unit_key,
+        ProviderResult(
+            api_name=spec.api_name,
+            columns=list(first),
+            rows=[first, second],
+            raw_body=b"{}",
+        ),
+    )
+    checkpoint.succeed(spec.unit_key, written)
+
+    result = verify_downloads(checkpoint, tmp_path)
+
+    assert result["duplicate_checks"] == {"dc_hot": 1}
+    assert result["conflicting_duplicate_checks"] == {"dc_hot": 1}
+    assert any(
+        "dc_hot: 1 conflicting primary-key rows" in item for item in result["errors"]
     )
 
 
@@ -257,6 +299,130 @@ def test_verifier_rejects_missing_trading_day_and_stock_quote(
     assert report["completeness_checks"]["stocks_missing_daily_quotes"] == 1
     assert any("open trading days have no quotes" in item for item in report["errors"])
     assert any("stock/date quotes are missing" in item for item in report["errors"])
+
+
+def test_verifier_scopes_daily_basic_to_complete_bse_history(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    fixtures = {
+        "trade_cal": [{"exchange": "SSE", "cal_date": "20221230", "is_open": "1"}],
+        "daily": [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": "20221230",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.0,
+                "vol": 100.0,
+            },
+            {
+                "ts_code": "920001.BJ",
+                "trade_date": "20221230",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.0,
+                "vol": 100.0,
+            },
+        ],
+        "daily_basic": [
+            {"ts_code": "000001.SZ", "trade_date": "20221230", "total_mv": 100.0}
+        ],
+        "adj_factor": [
+            {"ts_code": "000001.SZ", "trade_date": "20221230", "adj_factor": 1.0},
+            {"ts_code": "920001.BJ", "trade_date": "20221230", "adj_factor": 1.0},
+        ],
+    }
+    specs = [
+        FetchSpec(
+            dataset=dataset,
+            api_name=dataset,
+            scope={"fixture": dataset},
+            params={"fixture": dataset},
+        )
+        for dataset in fixtures
+    ]
+    checkpoint.add(specs)
+    for spec in specs:
+        rows = fixtures[spec.dataset]
+        written = storage.write_unit(
+            spec.dataset,
+            spec.unit_key,
+            ProviderResult(spec.api_name, list(rows[0]), rows, b"{}"),
+        )
+        checkpoint.succeed(spec.unit_key, written)
+
+    report = verify_downloads(checkpoint, tmp_path)
+
+    assert report["ok"] is True, report["errors"]
+    assert report["completeness_checks"]["daily_rows_outside_daily_basic_history"] == 1
+    assert report["completeness_checks"]["stocks_missing_daily_basic"] == 0
+
+
+def test_verifier_warns_for_isolated_daily_basic_provider_hole(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    day = "20240102"
+    daily_rows = [
+        {
+            "ts_code": f"{index:06d}.SZ",
+            "trade_date": day,
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.0,
+            "vol": 100.0,
+        }
+        for index in range(10_001)
+    ]
+    basic_rows = [
+        {"ts_code": row["ts_code"], "trade_date": day, "total_mv": 100.0}
+        for row in daily_rows[1:]
+    ]
+    fixtures = {
+        "trade_cal": [{"exchange": "SSE", "cal_date": day, "is_open": "1"}],
+        "daily": daily_rows,
+        "daily_basic": basic_rows,
+        "adj_factor": [
+            {"ts_code": row["ts_code"], "trade_date": day, "adj_factor": 1.0}
+            for row in daily_rows
+        ],
+    }
+    specs = [
+        FetchSpec(
+            dataset=dataset,
+            api_name=dataset,
+            scope={"fixture": dataset},
+            params={"fixture": dataset},
+        )
+        for dataset in fixtures
+    ]
+    checkpoint.add(specs)
+    for spec in specs:
+        rows = fixtures[spec.dataset]
+        written = storage.write_unit(
+            spec.dataset,
+            spec.unit_key,
+            ProviderResult(spec.api_name, list(rows[0]), rows, b"{}"),
+        )
+        checkpoint.succeed(spec.unit_key, written)
+
+    report = verify_downloads(checkpoint, tmp_path)
+
+    assert report["ok"] is True, report["errors"]
+    assert report["completeness_checks"]["stocks_missing_daily_basic"] == 1
+    assert any(
+        "daily_basic: 1 stock/date rows" in item
+        and "below the 0.01% blocking threshold" in item
+        for item in report["warnings"]
+    )
+
+
 def test_verifier_ignores_b_share_codes_outside_market_scope(
     tmp_path: Path, database_url: str
 ) -> None:
