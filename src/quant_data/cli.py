@@ -512,11 +512,13 @@ def _share_float_overflow_recovery(
                 recovered_keys.add(failed_spec.unit_key)
                 continue
         error = str(row.get("last_error") or "")
-        normalized_error = error.replace("-", " ")
         offset = int(failed_spec.params.get("offset") or 0)
-        if offset < 100_000 or (
-            "code=50101" not in error and "offset cap" not in normalized_error
-        ):
+        # Once a share_float cursor reaches the provider's documented offset
+        # ceiling it is structurally unrecoverable, even if a later retry
+        # overwrites the original 50101 with a transient cooldown/rate-limit
+        # error.  Partition from the cursor itself instead of depending on the
+        # mutable last_error string.
+        if offset < 100_000:
             continue
 
         start_text = str(failed_spec.params.get("start_date") or "")

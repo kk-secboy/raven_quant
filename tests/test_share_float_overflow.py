@@ -146,7 +146,16 @@ def test_restart_rehydrates_existing_daily_share_float_replacement() -> None:
 
 
 @pytest.mark.no_database
-def test_single_day_recovery_loads_historically_active_stock_symbols() -> None:
+@pytest.mark.parametrize(
+    "last_error",
+    [
+        "provider error code=50101: offset cap",
+        "provider error code=503: temporarily cooling down after invalid requests",
+    ],
+)
+def test_single_day_recovery_loads_historically_active_stock_symbols(
+    last_error: str,
+) -> None:
     failed = FetchSpec(
         dataset="share_float",
         api_name="share_float",
@@ -176,7 +185,7 @@ def test_single_day_recovery_loads_historically_active_stock_symbols() -> None:
                 {
                     "unit_key": failed.unit_key,
                     "status": "failed",
-                    "last_error": "provider error code=50101: offset cap",
+                    "last_error": last_error,
                 }
             ] if failed.unit_key in set(unit_keys) else []
 
