@@ -65,6 +65,7 @@ _STAGE_AWAITING = "awaiting_simulation"
 _STAGE_FROZEN = "frozen"
 
 _REFERENCE_ORDER_VALUE = 100_000.0
+_DEFAULT_PAPER_INITIAL_CASH = 100_000.0
 _RECONCILIATION_TOLERANCE = 1e-6
 
 
@@ -267,7 +268,11 @@ class PromotionStore:
                 select(strategy_versions).where(strategy_versions.c.id == version_id)
             ).one()
         config = dict(version.config_json or {})
-        cash = float(initial_cash or config.get("capacity_notional") or 1_000_000.0)
+        cash = float(
+            initial_cash
+            if initial_cash is not None
+            else config.get("paper_initial_cash", _DEFAULT_PAPER_INITIAL_CASH)
+        )
         simulation = SimulationStore(self.database_url)
         portfolio = simulation.create(
             name=(
@@ -687,6 +692,7 @@ class PromotionStore:
             "source_contract_hash": (
                 str(row.source_contract_hash) if row.source_contract_hash else None
             ),
+            "initial_cash": float(row.initial_cash) if row.initial_cash is not None else None,
             "opened_at": row.opened_at.isoformat(),
             "frozen_at": row.frozen_at.isoformat() if row.frozen_at else None,
             "freeze_reason": str(row.freeze_reason) if row.freeze_reason else None,

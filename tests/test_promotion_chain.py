@@ -393,7 +393,9 @@ def test_attach_creates_isolated_paper_account(
     # 独立隔离账户：自己的账本/资本/合同，绑定该版本的冻结来源
     assert str(portfolio.source_type) == "strategy_version"
     assert str(portfolio.source_id) == version_id
-    assert float(portfolio.initial_cash) >= 100_000
+    assert float(portfolio.initial_cash) == 100_000
+    assert float(portfolio.initial_cash) != 5_000_000
+    assert stage["initial_cash"] == 100_000
     assert stage["source_contract_hash"] == str(portfolio.execution_contract_hash)
 
 

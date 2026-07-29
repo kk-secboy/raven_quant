@@ -433,6 +433,12 @@ class StrategyConfigRequest(BaseModel):
     max_event_underperformance: float = Field(default=0.05, ge=0, le=0.50)
     min_event_stress_pass_rate: float = Field(default=0.60, ge=0, le=1)
     min_backtest_days: int = Field(default=504, ge=252, le=2520)
+    # Account capital and capacity stress notionals are different contracts.
+    # The personal deployment starts paper evidence with the user's 100k
+    # account while retaining larger capacity curves for scalability tests.
+    paper_initial_cash: float = Field(
+        default=100_000, ge=100_000, le=10_000_000_000
+    )
     capacity_notional: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
     capacity_curve_notionals: list[float] = Field(
         default_factory=lambda: [5_000_000, 20_000_000, 100_000_000],
