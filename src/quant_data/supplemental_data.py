@@ -7,6 +7,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from .coverage_data import COVERAGE_BUNDLES, coverage_bundle_datasets, coverage_specs
+from .history_bounds import clip_history_range
 from .models import FetchSpec, ProviderResult
 from .partitioning import is_adaptive_partition, partition_metadata, split_partition_spec
 from .planner import compact_date
@@ -1133,6 +1134,12 @@ def _cn_institutional_specs(
                 max_attempts=max_attempts,
             )
         )
+    news_range = clip_history_range("major_news", start, end)
+    for window_start, window_end in (
+        _month_ranges(*news_range) if news_range is not None else ()
+    ):
+        compact_start = compact_date(window_start)
+        compact_end = compact_date(window_end)
         start_text = f"{window_start.isoformat()} 00:00:00"
         end_text = f"{window_end.isoformat()} 23:59:59"
         for source in _MAJOR_NEWS_SOURCES:

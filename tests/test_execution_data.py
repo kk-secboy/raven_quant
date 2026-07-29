@@ -21,7 +21,7 @@ from quant_data.execution_contract import (
     MINUTE_EXECUTION_CONTRACT_VERSION,
     MINUTE_SOURCE_UNIT_CONTRACTS,
 )
-from quant_data.execution_data import margin_specs, minute_specs
+from quant_data.execution_data import margin_specs, minute_specs, news_specs
 from quant_data.models import ProviderResult
 from quant_data.provider import ProviderError
 from quant_data.runner import DownloadRunner
@@ -81,6 +81,28 @@ def test_plans_daily_market_margin_and_monthly_symbol_windows() -> None:
     assert len(futures) == 2
     assert {spec.params["ts_code"] for spec in etf} == {"510300.SH", "159919.SZ"}
     assert all(spec.params["freq"] == "1min" for spec in minutes)
+
+
+@pytest.mark.no_database
+def test_news_history_is_clipped_to_documented_provider_start() -> None:
+    assert (
+        news_specs(
+            date(2008, 1, 1),
+            date(2018, 11, 19),
+            max_attempts=3,
+        )
+        == []
+    )
+
+    specs = news_specs(
+        date(2008, 1, 1),
+        date(2018, 11, 21),
+        max_attempts=3,
+    )
+
+    assert len(specs) == 18
+    assert specs[0].params["start_date"] == "2018-11-20 00:00:00"
+    assert specs[-1].params["end_date"] == "2018-11-21 23:59:59"
 
 
 @pytest.mark.no_database

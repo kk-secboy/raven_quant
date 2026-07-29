@@ -119,6 +119,25 @@ def test_major_news_uses_monthly_source_windows_instead_of_daily_churn() -> None
     assert news[-1].params["end_date"] == "2024-03-02 23:59:59"
 
 
+def test_major_news_history_is_clipped_without_shortening_other_research_data() -> None:
+    specs = supplemental_specs(
+        "cn_institutional",
+        start=date(2008, 1, 1),
+        end=date(2018, 11, 21),
+        trading_dates=[],
+        max_attempts=3,
+    )
+    news = [spec for spec in specs if spec.dataset == "major_news"]
+    reports = [spec for spec in specs if spec.dataset == "report_rc"]
+
+    assert len(news) == 9
+    assert all(
+        spec.params["start_date"] == "2018-11-20 00:00:00" for spec in news
+    )
+    assert all(spec.params["end_date"] == "2018-11-21 23:59:59" for spec in news)
+    assert reports[0].params["start_date"] == "20080101"
+
+
 def test_extended_bundle_adds_point_in_time_st_and_sw_industry_bars() -> None:
     specs = supplemental_specs(
         "cn_extended_daily",

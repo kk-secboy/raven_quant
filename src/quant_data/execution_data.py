@@ -9,6 +9,7 @@ from .execution_contract import (
     SIMULATION_MINUTE_SOURCE_DATASETS,
     TUSHARE_HAND_SIZE,
 )
+from .history_bounds import clip_history_range
 from .models import FetchSpec, ProviderResult
 from .partitioning import partition_metadata
 from .provider import ProviderError
@@ -84,6 +85,11 @@ def news_specs(
         raise ValueError(f"unsupported news sources: {', '.join(sorted(unknown))}")
     if not normalized_sources:
         raise ValueError("at least one news source is required")
+
+    clipped = clip_history_range(NEWS_DATASET, start, end)
+    if clipped is None:
+        return []
+    start, end = clipped
 
     specs: list[FetchSpec] = []
     cursor = start
