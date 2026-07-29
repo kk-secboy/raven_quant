@@ -1191,6 +1191,9 @@ class LocalJobWorker:
             strategy_risk_state = self.allocations.strategy_risk_state(
                 str(version["id"])
             )
+            account_risk_state = self.simulations.policy_risk_inputs(
+                str(portfolio["id"])
+            )
             output = (
                 self.settings.data_root
                 / "artifacts"
@@ -1231,8 +1234,12 @@ class LocalJobWorker:
                 "risk_exposure_override": float(
                     strategy_risk_state["risk_exposure_override"]
                 ),
-                "allow_new_risk": bool(strategy_risk_state["allow_new_risk"]),
+                "allow_new_risk": bool(strategy_risk_state["allow_new_risk"])
+                and bool(account_risk_state["allow_new_risk"]),
                 "member_risk_state": strategy_risk_state,
+                "account_risk_state": account_risk_state,
+                "portfolio_drawdown": account_risk_state["portfolio_drawdown"],
+                "daily_return": account_risk_state["daily_return"],
                 "previous_holdings": previous_holdings,
                 "previous_snapshot": None,
                 "signal_dataset": (
@@ -1323,6 +1330,9 @@ class LocalJobWorker:
             if version["status"] != "approved":
                 raise ValueError("recommendation refresh requires an approved strategy version")
             member_risk_state = self.allocations.strategy_risk_state(str(version["id"]))
+            account_risk_state = self.simulations.recommendation_policy_risk_inputs(
+                str(portfolio["id"])
+            )
             risk_exposure = min(
                 float(portfolio.get("risk_exposure_override", 1.0)),
                 float(member_risk_state["risk_exposure_override"]),
@@ -1345,8 +1355,12 @@ class LocalJobWorker:
                 "construction_notional": float(portfolio["construction_notional"]),
                 "risk_exposure": risk_exposure,
                 "risk_exposure_override": risk_exposure,
-                "allow_new_risk": bool(member_risk_state["allow_new_risk"]),
+                "allow_new_risk": bool(member_risk_state["allow_new_risk"])
+                and bool(account_risk_state["allow_new_risk"]),
                 "member_risk_state": member_risk_state,
+                "account_risk_state": account_risk_state,
+                "portfolio_drawdown": account_risk_state["portfolio_drawdown"],
+                "daily_return": account_risk_state["daily_return"],
                 "previous_holdings": latest_snapshot.get("holdings") or [],
                 "previous_snapshot": (
                     {

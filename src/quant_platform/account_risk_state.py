@@ -25,6 +25,7 @@ RISK_OFF = "risk_off"
 RISK_STATES = (RISK_NORMAL, RISK_CAUTION, RISK_OFF)
 RISK_SCOPE = "selected_account_only"
 RISK_MODEL_VERSION = "selected-account-risk-v1"
+LEDGER_POLICY_RISK_VERSION = "ledger-policy-risk-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +70,92 @@ def _non_negative(name: str, value: float) -> float:
     if not isfinite(normalized) or normalized < 0:
         raise ValueError(f"{name} must be finite and non-negative")
     return normalized
+
+
+def ledger_policy_risk_inputs(
+    *,
+    portfolio_id: str,
+    portfolio_status: str,
+    latest_nav: dict[str, Any] | None,
+    position_count: int,
+) -> dict[str, Any]:
+    """Translate certified account-ledger facts into PortfolioPolicy inputs.
+
+    A brand-new empty account may create its first target. Once positions
+    exist, missing, stale or uncertified evidence blocks new risk and supplies
+    neutral return inputs so untrusted prices cannot manufacture a liquidation.
+    """
+
+    count = int(position_count)
+    if count < 0:
+        raise ValueError("position_count must be non-negative")
+    base = {
+        "contract_version": LEDGER_POLICY_RISK_VERSION,
+        "risk_scope": RISK_SCOPE,
+        "portfolio_id": str(portfolio_id),
+        "portfolio_drawdown": 0.0,
+        "daily_return": 0.0,
+        "allow_new_risk": False,
+    }
+    if str(portfolio_status) != "active":
+        return {
+            **base,
+            "status": "blocked_inactive_account",
+            "reasons": ["simulation_account_not_active"],
+        }
+    if latest_nav is None:
+        if count == 0:
+            return {
+                **base,
+                "status": "initial_empty_account",
+                "allow_new_risk": True,
+                "reasons": [],
+            }
+        return {
+            **base,
+            "status": "blocked_missing_nav",
+            "reasons": ["positions_or_orders_exist_without_nav"],
+        }
+    reasons: list[str] = []
+    if not bool(latest_nav.get("performance_certified")):
+        reasons.append("performance_not_certified")
+    if bool(latest_nav.get("has_stale_prices")):
+        reasons.append("stale_prices")
+    if str(latest_nav.get("status") or "") != "healthy":
+        reasons.append("nav_not_healthy")
+    if str(latest_nav.get("twr_status") or "") != "ok":
+        reasons.append("twr_chain_not_ok")
+    try:
+        drawdown = float(latest_nav["twr_drawdown"])
+        daily_return = float(latest_nav["twr_daily_return"])
+    except (KeyError, TypeError, ValueError):
+        reasons.append("unitized_risk_values_missing")
+        drawdown = 0.0
+        daily_return = 0.0
+    if (
+        not isfinite(drawdown)
+        or not -1.0 <= drawdown <= 0.0
+        or not isfinite(daily_return)
+        or daily_return < -1.0
+    ):
+        reasons.append("unitized_risk_values_invalid")
+        drawdown = 0.0
+        daily_return = 0.0
+    if reasons:
+        return {
+            **base,
+            "status": "blocked_untrusted_ledger",
+            "reasons": sorted(set(reasons)),
+        }
+    return {
+        **base,
+        "status": "certified",
+        "portfolio_drawdown": drawdown,
+        "daily_return": daily_return,
+        "allow_new_risk": True,
+        "reasons": [],
+        "nav_trade_date": str(latest_nav.get("trade_date") or ""),
+    }
 
 
 def assess_account_risk(

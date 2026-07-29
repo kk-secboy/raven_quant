@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -10,6 +10,7 @@ from quant_platform.account_risk_state import (
     RISK_OFF,
     RISK_SCOPE,
     assess_account_risk,
+    ledger_policy_risk_inputs,
 )
 from quant_platform.recommendation_actions import plan_account_actions
 
@@ -120,3 +121,71 @@ def test_stale_data_keeps_reduction_target_but_waits() -> None:
 def test_invalid_metrics_fail_closed(field: str, value: float) -> None:
     with pytest.raises(ValueError):
         assess_account_risk(**{field: value})
+
+
+def test_certified_ledger_risk_values_feed_the_portfolio_policy() -> None:
+    result = ledger_policy_risk_inputs(
+        portfolio_id="paper-1",
+        portfolio_status="active",
+        latest_nav={
+            "trade_date": date(2026, 7, 28),
+            "performance_certified": True,
+            "has_stale_prices": False,
+            "status": "healthy",
+            "twr_status": "ok",
+            "twr_drawdown": -0.12,
+            "twr_daily_return": -0.03,
+        },
+        position_count=3,
+    )
+    assert result["status"] == "certified"
+    assert result["portfolio_drawdown"] == pytest.approx(-0.12)
+    assert result["daily_return"] == pytest.approx(-0.03)
+    assert result["allow_new_risk"] is True
+    assert result["risk_scope"] == "selected_account_only"
+
+
+def test_untrusted_ledger_blocks_buys_without_manufacturing_an_exit() -> None:
+    result = ledger_policy_risk_inputs(
+        portfolio_id="paper-1",
+        portfolio_status="active",
+        latest_nav={
+            "performance_certified": False,
+            "has_stale_prices": True,
+            "status": "degraded",
+            "twr_status": "ok",
+            "twr_drawdown": -0.25,
+            "twr_daily_return": -0.08,
+        },
+        position_count=3,
+    )
+    assert result["status"] == "blocked_untrusted_ledger"
+    assert result["allow_new_risk"] is False
+    assert result["portfolio_drawdown"] == pytest.approx(0.0)
+    assert result["daily_return"] == pytest.approx(0.0)
+    assert "stale_prices" in result["reasons"]
+
+
+def test_only_a_truly_empty_new_account_gets_cold_start_permission() -> None:
+    empty = ledger_policy_risk_inputs(
+        portfolio_id="paper-1",
+        portfolio_status="active",
+        latest_nav=None,
+        position_count=0,
+    )
+    inconsistent = ledger_policy_risk_inputs(
+        portfolio_id="paper-2",
+        portfolio_status="active",
+        latest_nav=None,
+        position_count=1,
+    )
+    paused = ledger_policy_risk_inputs(
+        portfolio_id="paper-3",
+        portfolio_status="paused",
+        latest_nav=None,
+        position_count=0,
+    )
+    assert empty["status"] == "initial_empty_account"
+    assert empty["allow_new_risk"] is True
+    assert inconsistent["allow_new_risk"] is False
+    assert paused["allow_new_risk"] is False

@@ -114,6 +114,19 @@ def test_worker_builds_production_qlib_order_plan_job(
 ) -> None:
     class Simulations:
         @staticmethod
+        def policy_risk_inputs(_portfolio_id: str) -> dict:
+            return {
+                "contract_version": "ledger-policy-risk-v1",
+                "risk_scope": "selected_account_only",
+                "portfolio_id": "simulation-1",
+                "status": "certified",
+                "portfolio_drawdown": -0.12,
+                "daily_return": -0.03,
+                "allow_new_risk": True,
+                "reasons": [],
+            }
+
+        @staticmethod
         def get(_portfolio_id: str) -> dict:
             return {
                 "id": "simulation-1",
@@ -253,6 +266,10 @@ def test_worker_builds_production_qlib_order_plan_job(
         "frequency": "5min",
     }
     assert manifest["dataset_identity_sha256"] == "a" * 64
+    assert manifest["account_risk_state"]["status"] == "certified"
+    assert manifest["portfolio_drawdown"] == pytest.approx(-0.12)
+    assert manifest["daily_return"] == pytest.approx(-0.03)
+    assert manifest["allow_new_risk"] is True
     assert "--signal-provider-uri" in command
     assert environment == {
         "_MLFLOW_SERVER_ARTIFACT_ROOT": str(tmp_path / "artifacts" / "mlflow")

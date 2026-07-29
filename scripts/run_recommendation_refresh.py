@@ -452,8 +452,8 @@ def main() -> None:
         return_covariance=estimate_covariance(risk_returns),
         prices=pd.to_numeric(point_metadata["$open"], errors="coerce"),
         current_prices=pd.to_numeric(point_metadata["$close"], errors="coerce"),
-        portfolio_drawdown=0.0,
-        daily_return=0.0,
+        portfolio_drawdown=float(manifest["portfolio_drawdown"]),
+        daily_return=float(manifest["daily_return"]),
         # $amount is CNY yuan under the v3 daily field contract.
         average_daily_values=(
             pd.to_numeric(point_metadata["Ref(Mean($amount, 20), 1)"], errors="coerce")
@@ -494,6 +494,7 @@ def main() -> None:
             "rebalance_frequency": config.get("rebalance_frequency", "day"),
             "rebalance_due": rebalance_due,
             "member_risk_state": dict(manifest.get("member_risk_state") or {}),
+            "account_risk_state": dict(manifest.get("account_risk_state") or {}),
             "eligibility": eligibility_evidence,
         },
         "reasons": decision.reasons,

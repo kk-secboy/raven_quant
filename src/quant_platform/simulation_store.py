@@ -55,6 +55,11 @@ from quant_data.execution_contract import (
     require_strategy_execution_contract,
 )
 
+from .account_risk_state import (
+    LEDGER_POLICY_RISK_VERSION,
+    RISK_SCOPE,
+    ledger_policy_risk_inputs,
+)
 from .corporate_actions import corporate_actions_sha256
 from .cost_model import (
     KNOWN_COST_SCHEDULE_VERSIONS,
@@ -3402,6 +3407,97 @@ class SimulationStore:
                     "allocation_ids": [],
                 }
             return load_strategy_risk_state(connection, str(strategy_version_id))
+
+    def policy_risk_inputs(self, portfolio_id: str) -> dict[str, Any]:
+        """Read the selected simulation ledger facts consumed by PortfolioPolicy."""
+
+        with self.engine.connect() as connection:
+            portfolio = connection.execute(
+                select(simulation_portfolios).where(
+                    simulation_portfolios.c.id == portfolio_id
+                )
+            ).first()
+            if portfolio is None:
+                raise KeyError(portfolio_id)
+            latest_nav = connection.execute(
+                select(simulation_nav)
+                .where(simulation_nav.c.portfolio_id == portfolio_id)
+                .order_by(simulation_nav.c.trade_date.desc())
+                .limit(1)
+            ).first()
+            position_count = int(
+                connection.scalar(
+                    select(func.count())
+                    .select_from(simulation_positions)
+                    .where(
+                        simulation_positions.c.portfolio_id == portfolio_id,
+                        simulation_positions.c.quantity != 0,
+                    )
+                )
+                or 0
+            )
+            open_order_count = int(
+                connection.scalar(
+                    select(func.count())
+                    .select_from(simulation_orders)
+                    .where(
+                        simulation_orders.c.portfolio_id == portfolio_id,
+                        simulation_orders.c.status.in_(OPEN_STATUSES),
+                    )
+                )
+                or 0
+            )
+        return ledger_policy_risk_inputs(
+            portfolio_id=str(portfolio.id),
+            portfolio_status=str(portfolio.status),
+            latest_nav=row_dict(latest_nav) if latest_nav is not None else None,
+            position_count=position_count + open_order_count,
+        )
+
+    def recommendation_policy_risk_inputs(
+        self, recommendation_portfolio_id: str
+    ) -> dict[str, Any]:
+        """Resolve the sole selected account for a recommendation, fail-closed."""
+
+        with self.engine.connect() as connection:
+            account_ids = list(
+                connection.scalars(
+                    select(simulation_portfolios.c.id)
+                    .where(
+                        simulation_portfolios.c.source_type == "recommendation",
+                        simulation_portfolios.c.source_id
+                        == recommendation_portfolio_id,
+                        simulation_portfolios.c.status.in_(("active", "paused")),
+                    )
+                    .order_by(simulation_portfolios.c.created_at)
+                )
+            )
+        if not account_ids:
+            # Cold start is needed to create the first recommendation before
+            # its paper account exists. The status remains explicit.
+            return {
+                "contract_version": LEDGER_POLICY_RISK_VERSION,
+                "risk_scope": RISK_SCOPE,
+                "portfolio_id": None,
+                "status": "initial_unbound_recommendation",
+                "portfolio_drawdown": 0.0,
+                "daily_return": 0.0,
+                "allow_new_risk": True,
+                "reasons": [],
+            }
+        if len(account_ids) > 1:
+            return {
+                "contract_version": LEDGER_POLICY_RISK_VERSION,
+                "risk_scope": RISK_SCOPE,
+                "portfolio_id": None,
+                "status": "blocked_ambiguous_selected_account",
+                "portfolio_drawdown": 0.0,
+                "daily_return": 0.0,
+                "allow_new_risk": False,
+                "reasons": ["multiple_simulation_accounts_require_selection"],
+                "candidate_portfolio_ids": [str(value) for value in account_ids],
+            }
+        return self.policy_risk_inputs(str(account_ids[0]))
 
     @staticmethod
     def _apply_risk_exposure_override(
