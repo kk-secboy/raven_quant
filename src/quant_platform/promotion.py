@@ -498,8 +498,6 @@ class PromotionStore:
                 raise KeyError(version_id)
             if str(version.status) != "approved" or version.promotion_stage != STAGE_PAPER:
                 raise ValueError("only a paper-stage approved version can be promoted")
-            if actor.strip() == str(version.approved_by or ""):
-                raise ValueError("promotion to recommendation_enabled requires a second operator")
             now = _now()
             connection.execute(
                 update(strategy_versions)

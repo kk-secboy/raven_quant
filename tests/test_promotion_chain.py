@@ -493,15 +493,13 @@ def test_gate_subitems_and_promotion_with_human_approval(
     assert evaluation["passed"] is True
     assert evaluation["checks"]["cost_deviation"]["observed"] >= 0.0
 
-    # 人工点是四人眼：批准人不能自批晋升
-    with pytest.raises(ValueError, match="second operator"):
-        promotion.promote(
-            version_id,
-            actor="allocation-risk-owner",
-            reason="Promote after the forward gate passed.",
-        )
+    # Personal deployments have one authenticated human operator. The second
+    # explicit promotion action remains mandatory after the frozen forward
+    # gate passes, but it must not require a fabricated second login.
     result = promotion.promote(
-        version_id, actor="second-operator", reason="Promote after the forward gate passed."
+        version_id,
+        actor="allocation-risk-owner",
+        reason="Promote after the forward gate passed.",
     )
     assert result["promotion_stage"] == "recommendation_enabled"
     version = StrategyStore(database_url).get_version(version_id)
@@ -595,7 +593,9 @@ def test_paper_version_cannot_create_standalone_recommendation(
         gross=1000.0,
     )
     promotion.promote(
-        version_id, actor="second-operator", reason="Promote after the forward gate passed."
+        version_id,
+        actor="allocation-risk-owner",
+        reason="Promote after the forward gate passed.",
     )
     portfolio = recommendations.create(
         name="enabled recommendation",
