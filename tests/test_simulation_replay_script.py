@@ -126,3 +126,40 @@ def test_vwap_profile_uses_only_prior_bound_qlib_volume_rows() -> None:
     assert evidence["end"] == "2026-07-10"
     assert evidence["future_data_used"] is False
     assert len(digest) == 64
+
+
+def test_benchmark_evidence_uses_exact_signal_and_trade_date_closes() -> None:
+    script = _script_module()
+
+    class DataApi:
+        @staticmethod
+        def features(*_args, **_kwargs):
+            return pd.DataFrame(
+                {
+                    "datetime": pd.to_datetime(
+                        [
+                            "2026-07-10 14:55:00",
+                            "2026-07-10 15:00:00",
+                            "2026-07-13 15:00:00",
+                        ]
+                    ),
+                    "instrument": ["SH000300"] * 3,
+                    "$close": [4_000.0, 4_010.0, 4_050.0],
+                }
+            ).set_index(["datetime", "instrument"])
+
+    evidence = script._benchmark_evidence(
+        DataApi,
+        benchmark="SH000300",
+        signal_date="2026-07-10",
+        trade_date="2026-07-13",
+        frequency="5min",
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+    )
+
+    assert evidence["baseline_close"] == pytest.approx(4_010.0)
+    assert evidence["close"] == pytest.approx(4_050.0)
+    assert evidence["baseline_date"] == "2026-07-10"
+    assert evidence["trade_date"] == "2026-07-13"
+    assert len(evidence["evidence_sha256"]) == 64

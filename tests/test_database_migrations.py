@@ -114,7 +114,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0057_forward_rollover"
+    assert revision == "0058_simulation_benchmark"
     assert {
         "economic_hypothesis_group",
         "hypothesis_group_cap",
@@ -557,6 +557,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "execution_adapter",
         "execution_frequency",
         "execution_contract_hash",
+        "benchmark",
         "daily_roll_policy",
         "execution_roll_policy",
     } <= {
@@ -613,6 +614,9 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "reviewed_at",
         "review_evidence_sha256",
         "review_note",
+        "benchmark_close",
+        "benchmark_return",
+        "benchmark_wealth",
     } <= {
         column["name"]
         for column in inspector.get_columns("simulation_nav", schema="quantlab")

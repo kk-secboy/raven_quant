@@ -893,6 +893,7 @@ simulation_portfolios = Table(
     Column("source_id", String, nullable=False),
     Column("status", String, nullable=False),
     Column("base_currency", String, nullable=False),
+    Column("benchmark", String),
     Column("initial_cash", Numeric(20, 6), nullable=False),
     Column("cash", Numeric(20, 6), nullable=False),
     Column("nav", Numeric(20, 6), nullable=False),
@@ -1676,6 +1677,9 @@ simulation_nav = Table(
     Column("corporate_tax_liabilities", Numeric(20, 6), nullable=False, server_default="0"),
     Column("nav", Numeric(20, 6), nullable=False),
     Column("daily_return", Float, nullable=False),
+    Column("benchmark_close", Numeric(20, 8)),
+    Column("benchmark_return", Float),
+    Column("benchmark_wealth", Float),
     Column("drawdown", Float, nullable=False),
     # 当日外部现金流（开盘前/盘后确认）；单位化 TWR 链状态与回撤（设计 4.4）。
     Column("external_flow_open", Numeric(20, 6), nullable=False, server_default="0"),

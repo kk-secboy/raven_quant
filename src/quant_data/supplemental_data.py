@@ -290,14 +290,19 @@ def next_pagination_specs(
     return result
 
 
-def share_float_overflow_repartition_specs(failed_spec: FetchSpec) -> list[FetchSpec]:
-    """Replace an offset-capped share-float window with daily partitions.
+def share_float_overflow_repartition_specs(
+    failed_spec: FetchSpec,
+    symbols: Iterable[str] = (),
+) -> list[FetchSpec]:
+    """Replace an offset-capped share-float window with disjoint partitions.
 
     Provider probes proved that an exact-day query does not preserve the row
     order of the enclosing monthly query, so a cursor cannot safely resume at
-    the monthly boundary.  Successful monthly units remain immutable, while
-    the daily generation explicitly supersedes that page group in successor
-    snapshots.
+    the monthly boundary. A multi-day window is therefore replaced by daily
+    groups. If one exact day itself exceeds the provider offset cap, the
+    documented ``ts_code`` filter becomes the final disjoint partition axis.
+    Successful parent units remain immutable while the replacement generation
+    explicitly supersedes that page group in successor snapshots.
     """
 
     if failed_spec.dataset != "share_float":
@@ -312,13 +317,50 @@ def share_float_overflow_repartition_specs(failed_spec: FetchSpec) -> list[Fetch
     window_end = date.fromisoformat(
         f"{end_text[:4]}-{end_text[4:6]}-{end_text[6:8]}"
     )
-    if window_start == window_end:
-        raise RuntimeError(
-            f"single-day share_float partition {start_text} exceeded the provider offset cap"
-        )
-
     parent_group = str(failed_spec.scope["page_group"])
     page_size = 6_000
+    if window_start == window_end:
+        normalized_symbols = sorted(
+            {
+                str(symbol).strip().upper()
+                for symbol in symbols
+                if str(symbol).strip().upper().endswith((".SH", ".SZ", ".BJ"))
+            }
+        )
+        if not normalized_symbols:
+            raise RuntimeError(
+                f"single-day share_float partition {start_text} exceeded the "
+                "provider offset cap and stock_basic supplied no active symbols"
+            )
+        return [
+            _spec(
+                "share_float",
+                "share_float",
+                {
+                    "ts_code": symbol,
+                    "start_date": start_text,
+                    "end_date": end_text,
+                    "limit": page_size,
+                    "offset": 0,
+                },
+                scope={
+                    "ts_code": symbol,
+                    "start_date": start_text,
+                    "end_date": end_text,
+                    "page_group": f"{parent_group}:symbol:{symbol}",
+                    "offset": 0,
+                    "page_size": page_size,
+                    "max_pages": _PAGINATION_MAX_PAGES["share_float"],
+                    "expected_date_field": "float_date",
+                    "expected_date": start_text,
+                    "supersedes_page_group": parent_group,
+                },
+                allow_empty=True,
+                max_attempts=failed_spec.max_attempts,
+            )
+            for symbol in normalized_symbols
+        ]
+
     result: list[FetchSpec] = []
     current = window_start
     while current <= window_end:

@@ -473,7 +473,7 @@ def _share_float_overflow_recovery(
     specs: list[FetchSpec],
     ignored_keys: set[str],
 ) -> tuple[list[FetchSpec], set[str]]:
-    """Replace provider-capped monthly pages with disjoint tail continuations."""
+    """Replace provider-capped pages with disjoint date/symbol continuations."""
 
     rows_by_key = {
         str(row["unit_key"]): row
@@ -493,6 +493,7 @@ def _share_float_overflow_recovery(
             )
     recovery_specs: list[FetchSpec] = []
     recovered_keys: set[str] = set()
+    stock_master: pd.DataFrame | None = None
     for failed_spec in specs:
         if failed_spec.unit_key in ignored_keys or failed_spec.dataset != "share_float":
             continue
@@ -518,7 +519,23 @@ def _share_float_overflow_recovery(
         ):
             continue
 
-        recovery_specs.extend(share_float_overflow_repartition_specs(failed_spec))
+        start_text = str(failed_spec.params.get("start_date") or "")
+        end_text = str(failed_spec.params.get("end_date") or "")
+        symbols: list[str] = []
+        if start_text == end_text and len(start_text) == 8:
+            if stock_master is None:
+                stock_master = context.storage.read_units(
+                    context.checkpoint.successful("stock_basic")
+                )
+            partition_date = datetime.strptime(start_text, "%Y%m%d").date()
+            symbols = _historical_a_share_symbols(
+                stock_master,
+                start=partition_date,
+                end=partition_date,
+            )
+        recovery_specs.extend(
+            share_float_overflow_repartition_specs(failed_spec, symbols)
+        )
         recovered_keys.add(failed_spec.unit_key)
         context.checkpoint.supersede_units(
             [failed_spec.unit_key],

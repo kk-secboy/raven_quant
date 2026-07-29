@@ -177,10 +177,15 @@ def test_performance_summary_reports_twr_recovery_and_xirr(
     assert summary["external_flow_count"] == 1
     assert summary["xirr_external_flow_count"] == 0
     unitized = summary["unitized"]
-    assert unitized["status"] == "ok"
+    latest_nav = store.latest_nav(simulation["id"])
+    assert latest_nav is not None
+    assert unitized["status"] == "ongoing"
     assert unitized["observations"] == 1
-    assert unitized["max_drawdown"] == pytest.approx(0.0)
-    assert unitized["recovery_trading_days"] == 0
+    assert unitized["max_drawdown"] == pytest.approx(
+        float(latest_nav["investment_wealth"]) - 1.0
+    )
+    assert unitized["max_drawdown"] < 0.0
+    assert unitized["recovery_trading_days"] is None
     assert summary["statistics"]["inception_date"] == (
         TRADE_DATE - timedelta(days=3)
     ).isoformat()

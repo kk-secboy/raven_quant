@@ -147,8 +147,10 @@ def _execution_evidence(
     batch_id: str,
     contract_hash: str,
     simulation_semantics_sha256: str,
+    *,
+    benchmark_evidence: dict | None = None,
 ) -> dict:
-    return {
+    result = {
         "batch_id": batch_id,
         "dataset_identity_sha256": EXECUTION_IDENTITY,
         "dataset_lineage_id": EXECUTION_LINEAGE,
@@ -157,6 +159,36 @@ def _execution_evidence(
         "simulation_semantics_sha256": simulation_semantics_sha256,
         "next_trade_date": "2026-07-14",
     }
+    if benchmark_evidence is not None:
+        result["benchmark_evidence"] = benchmark_evidence
+    return result
+
+
+def _benchmark_evidence(
+    *,
+    baseline_close: float = 4_000.0,
+    close: float = 4_040.0,
+) -> dict:
+    payload = {
+        "contract_version": "simulation-benchmark-evidence-v1",
+        "instrument": "SH000300",
+        "baseline_date": "2026-07-10",
+        "baseline_close": baseline_close,
+        "trade_date": TRADE_DATE.isoformat(),
+        "close": close,
+        "dataset_identity_sha256": EXECUTION_IDENTITY,
+        "dataset_lineage_id": EXECUTION_LINEAGE,
+        "frequency": "5min",
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return {**payload, "evidence_sha256": digest}
 
 
 def _bars() -> pd.DataFrame:
@@ -406,6 +438,71 @@ def test_simulation_batch_is_idempotent_and_books_auditable_nav(
     assert len(nav) == 1
     assert nav[0]["performance_certified"] is True
     assert len(store.rows(simulation["id"], "fills")) == 1
+
+
+def test_simulation_persists_bound_benchmark_return_evidence(
+    database_url: str, tmp_path
+) -> None:
+    store, simulation, batch = _create_batch(database_url, tmp_path)
+    completed = store.process_batch(
+        batch["id"],
+        minute_bars=_bars(),
+        closing_prices={
+            "SH600000": {
+                "price": 10.0,
+                "market_date": TRADE_DATE.isoformat(),
+            }
+        },
+        execution_evidence=_execution_evidence(
+            batch["id"],
+            simulation["execution_contract_hash"],
+            simulation["execution_policy"]["simulation_semantics_sha256"],
+            benchmark_evidence=_benchmark_evidence(),
+        ),
+    )
+
+    nav = store.latest_nav(simulation["id"])
+    assert nav is not None
+    assert float(nav["benchmark_close"]) == pytest.approx(4_040.0)
+    assert nav["benchmark_return"] == pytest.approx(0.01)
+    assert nav["benchmark_wealth"] == pytest.approx(1.01)
+    assert completed["summary"]["benchmark"]["instrument"] == "SH000300"
+    assert completed["summary"]["benchmark"]["status"] == "ok"
+    relative = store.performance_summary(simulation["id"])[
+        "relative_performance"
+    ]
+    assert relative["benchmark"] == "SH000300"
+    assert relative["status"] == "insufficient_evidence"
+    assert relative["cumulative_benchmark_return"] == pytest.approx(0.01)
+
+
+def test_simulation_rejects_tampered_benchmark_evidence_before_booking(
+    database_url: str, tmp_path
+) -> None:
+    store, simulation, batch = _create_batch(database_url, tmp_path)
+    tampered = _benchmark_evidence()
+    tampered["close"] = 9_999.0
+
+    with pytest.raises(ValueError, match="benchmark evidence hash"):
+        store.process_batch(
+            batch["id"],
+            minute_bars=_bars(),
+            closing_prices={
+                "SH600000": {
+                    "price": 10.0,
+                    "market_date": TRADE_DATE.isoformat(),
+                }
+            },
+            execution_evidence=_execution_evidence(
+                batch["id"],
+                simulation["execution_contract_hash"],
+                simulation["execution_policy"]["simulation_semantics_sha256"],
+                benchmark_evidence=tampered,
+            ),
+        )
+
+    assert store.latest_nav(simulation["id"]) is None
+    assert store.get_batch(batch["id"])["status"] == "queued"
 
 
 def test_certified_nav_review_is_four_eyes_and_database_immutable(

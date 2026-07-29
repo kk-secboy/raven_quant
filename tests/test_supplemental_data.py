@@ -3,7 +3,7 @@ from datetime import date
 import pytest
 
 from quant_data.catalog import ALL_DEFINITIONS
-from quant_data.models import ProviderResult
+from quant_data.models import FetchSpec, ProviderResult
 from quant_data.provider import ProviderError
 from quant_data.supplemental_data import (
     a_share_bulk_history_specs,
@@ -661,6 +661,49 @@ def test_share_float_offset_cap_repartitions_the_whole_month_by_day() -> None:
             {"unit_key": parent.unit_key, "row_count": 1_000},
             *[{"unit_key": item.unit_key, "row_count": 0} for item in daily],
         ],
+    )
+
+
+def test_single_day_share_float_offset_cap_repartitions_by_active_symbol() -> None:
+    failed = FetchSpec(
+        dataset="share_float",
+        api_name="share_float",
+        params={
+            "start_date": "20240219",
+            "end_date": "20240219",
+            "limit": 6_000,
+            "offset": 102_000,
+        },
+        scope={
+            "start_date": "20240219",
+            "end_date": "20240219",
+            "page_group": "share_float:20240201:20240229:daily:20240219",
+            "page_size": 6_000,
+            "max_pages": 512,
+            "offset": 102_000,
+        },
+        allow_empty=True,
+        max_attempts=5,
+    )
+
+    children = share_float_overflow_repartition_specs(
+        failed,
+        ["600000.SH", "000001.SZ", "600000.SH", "00700.HK"],
+    )
+
+    assert [item.params["ts_code"] for item in children] == [
+        "000001.SZ",
+        "600000.SH",
+    ]
+    assert all(item.params["offset"] == 0 for item in children)
+    assert all(item.params["start_date"] == "20240219" for item in children)
+    assert all(
+        item.scope["supersedes_page_group"] == failed.scope["page_group"]
+        for item in children
+    )
+    assert all(
+        item.scope["page_group"].endswith(item.params["ts_code"])
+        for item in children
     )
 
 

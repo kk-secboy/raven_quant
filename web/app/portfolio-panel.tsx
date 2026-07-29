@@ -37,7 +37,7 @@ type SimulationPortfolio = {
   execution_adapter: "long_only" | "pair"; execution_frequency: "1min" | "5min";
   execution_contract_hash: string; status: string; cash: number;
   nav: number; execution_algorithm: string; execution_dataset: string; daily_dataset: string;
-  cost_schedule_version: string; latest_nav?: SimulationNav | null;
+  cost_schedule_version: string; benchmark?: string | null; latest_nav?: SimulationNav | null;
 };
 type SimulationPerformance = {
   nav_days: number;
@@ -53,6 +53,7 @@ type SimulationPerformance = {
   relative_performance: {
     status: string; annualized_excess_return?: number | null;
     information_ratio?: number | null; tracking_error?: number | null;
+    benchmark?: string | null; broken_from?: string | null;
   };
   xirr: { status: string; rate?: number | null };
 };
@@ -312,11 +313,12 @@ export function PortfolioPanel({ api }: { api: string }) {
           <div><span>XIRR · 资金体验</span><strong>{pct(simulationPerformance?.xirr.rate)}</strong></div>
           <div><span>恢复交易日</span><strong>{simulationPerformance?.unitized.recovery_trading_days ?? "—"}</strong></div>
           <div><span>净值天数</span><strong>{simulationPerformance?.nav_days ?? 0}</strong></div>
-          <div><span>年化超额</span><strong>{pct(simulationPerformance?.relative_performance.annualized_excess_return)}</strong></div>
+          <div><span>年化超额 · {simulationPerformance?.relative_performance.benchmark ?? selectedSimulation.benchmark ?? "未绑定基准"}</span><strong>{pct(simulationPerformance?.relative_performance.annualized_excess_return)}</strong></div>
           <div><span>Information Ratio</span><strong>{decimal(simulationPerformance?.relative_performance.information_ratio)}</strong></div>
           <div><span>Tracking Error</span><strong>{pct(simulationPerformance?.relative_performance.tracking_error)}</strong></div>
         </div>
         {simulationPerformance?.relative_performance.status === "benchmark_not_configured" && <div className="notice">账户政策基准尚未配置：相对收益、IR 和 Tracking Error 明确保持未定义，不以 0 冒充。</div>}
+        {simulationPerformance?.relative_performance.status === "unavailable_broken_benchmark_chain" && <div className="notice">基准证据链在 {simulationPerformance.relative_performance.broken_from ?? "未知日期"} 缺失或中断：相对收益、IR 和 Tracking Error 暂不发布，补齐逐日基准行情后才会恢复。</div>}
       </section>}
       <div className="table-wrap"><table><thead><tr><th>证券</th><th>持仓</th><th>可卖</th><th>成本</th><th>行情日</th><th>市值</th><th>估值状态</th></tr></thead><tbody>{simulationPositions.map((position) => <tr key={position.instrument}><td><code>{position.instrument}</code></td><td>{position.quantity}</td><td>{position.available_quantity}</td><td>{Number(position.average_cost).toFixed(4)}</td><td>{position.market_date ?? "—"}</td><td>¥{Number(position.market_value).toFixed(2)}</td><td><span className={`state ${position.stale ? "failed" : "ready"}`}>{position.stale ? "stale" : "current"}</span></td></tr>)}</tbody></table>{selectedSimulation && !simulationPositions.length && <div className="empty">账户尚无持仓；等待下一次成功的推荐快照进入 T+1 撮合。</div>}</div>
     </section>

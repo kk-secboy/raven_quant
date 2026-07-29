@@ -44,6 +44,7 @@ from quant_data.database import (
     simulation_position_reservations,
     simulation_positions,
     simulation_security_events,
+    strategy_allocation_members,
     strategy_allocations,
     strategy_pairs,
     strategy_versions,
@@ -91,6 +92,7 @@ from .simulation_order_state import (
 from .strategy_catalog import require_capital_eligible_strategy_type
 from .unitized_performance import (
     UNITIZED_PERFORMANCE_VERSION,
+    benchmark_relative_statistics,
     chain_unitized_day,
     unitized_drawdown_recovery,
     unitized_return_statistics,
@@ -110,10 +112,112 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _benchmark_chain_day(
+    evidence: dict[str, Any] | None,
+    *,
+    benchmark: str,
+    signal_date: date,
+    trade_date: date,
+    execution_frequency: str,
+    dataset_identity_sha256: str,
+    dataset_lineage_id: str,
+    prior_nav: Any | None,
+) -> dict[str, Any]:
+    if evidence is None:
+        return {
+            "status": "benchmark_evidence_missing",
+            "benchmark_close": None,
+            "benchmark_return": None,
+            "benchmark_wealth": None,
+            "evidence_sha256": None,
+        }
+    payload = {
+        key: evidence.get(key)
+        for key in (
+            "contract_version",
+            "instrument",
+            "baseline_date",
+            "baseline_close",
+            "trade_date",
+            "close",
+            "dataset_identity_sha256",
+            "dataset_lineage_id",
+            "frequency",
+        )
+    }
+    expected = {
+        "contract_version": SIMULATION_BENCHMARK_EVIDENCE_VERSION,
+        "instrument": benchmark,
+        "baseline_date": signal_date.isoformat(),
+        "trade_date": trade_date.isoformat(),
+        "dataset_identity_sha256": dataset_identity_sha256,
+        "dataset_lineage_id": dataset_lineage_id,
+        "frequency": execution_frequency,
+    }
+    mismatches = [
+        key for key, value in expected.items() if str(payload.get(key) or "") != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "simulation benchmark evidence does not match the bound contract: "
+            + ", ".join(mismatches)
+        )
+    baseline_close = float(payload["baseline_close"])
+    current_close = float(payload["close"])
+    if (
+        not isfinite(baseline_close)
+        or baseline_close <= 0
+        or not isfinite(current_close)
+        or current_close <= 0
+    ):
+        raise ValueError("simulation benchmark evidence requires positive finite closes")
+    observed_hash = str(evidence.get("evidence_sha256") or "")
+    if not _is_sha256(observed_hash) or observed_hash != _canonical_hash(payload):
+        raise ValueError("simulation benchmark evidence hash is invalid")
+
+    if prior_nav is not None:
+        if (
+            prior_nav.benchmark_close is None
+            or prior_nav.benchmark_wealth is None
+            or prior_nav.trade_date >= trade_date
+        ):
+            return {
+                "status": "unavailable_broken_benchmark_chain",
+                "benchmark_close": current_close,
+                "benchmark_return": None,
+                "benchmark_wealth": None,
+                "evidence_sha256": observed_hash,
+            }
+        prior_close = float(prior_nav.benchmark_close)
+        prior_wealth = float(prior_nav.benchmark_wealth)
+        if (
+            not isfinite(prior_close)
+            or prior_close <= 0
+            or not isfinite(prior_wealth)
+            or prior_wealth < 0
+        ):
+            raise ValueError("persisted simulation benchmark chain is invalid")
+    else:
+        prior_close = baseline_close
+        prior_wealth = 1.0
+    daily_return = current_close / prior_close - 1.0
+    wealth = prior_wealth * (1.0 + daily_return)
+    if not isfinite(daily_return) or daily_return < -1.0 or not isfinite(wealth):
+        raise ValueError("simulation benchmark return chain is invalid")
+    return {
+        "status": "ok",
+        "benchmark_close": current_close,
+        "benchmark_return": daily_return,
+        "benchmark_wealth": wealth,
+        "evidence_sha256": observed_hash,
+    }
+
+
 SIMULATION_SOURCE_TYPES = frozenset({"recommendation", "strategy_version", "allocation"})
 SIMULATION_EXECUTION_ADAPTERS = frozenset({"long_only", "pair"})
 SIMULATION_EXECUTION_FREQUENCIES = frozenset({"1min", "5min"})
 SIMULATION_EXECUTION_SEMANTICS_VERSION = "simulation-execution-semantics-v1"
+SIMULATION_BENCHMARK_EVIDENCE_VERSION = "simulation-benchmark-evidence-v1"
 QLIB_ORDER_PLAN_FORMAT_VERSION = "qlib-order-plan-v1"
 VWAP_PROFILE_METHOD = "qlib-historical-average-volume-v1"
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -1153,6 +1257,11 @@ class SimulationStore:
         # The pair adapter string doubles as the strategy type here.
         if normalized_adapter == "pair":
             require_capital_eligible_strategy_type("pair", action="持久模拟")
+        benchmark = str(source.get("benchmark") or "").strip().upper()
+        if not benchmark or benchmark == "CASH":
+            raise ValueError(
+                "simulation source must bind one non-cash performance benchmark"
+            )
         governed_frequency = str(source.get("execution_frequency") or "")
         if governed_frequency and governed_frequency != execution_frequency:
             raise ValueError("simulation frequency does not match the governed strategy source")
@@ -1201,6 +1310,7 @@ class SimulationStore:
                         source_id=normalized_source_id,
                         status="paused",
                         base_currency="CNY",
+                        benchmark=benchmark,
                         initial_cash=Decimal(str(initial_cash)),
                         cash=Decimal(str(initial_cash)),
                         nav=Decimal(str(initial_cash)),
@@ -1801,6 +1911,7 @@ class SimulationStore:
                     or ""
                 ),
                 "execution_method": str(version_config.get("execution_method") or ""),
+                "benchmark": str(version.benchmark or ""),
                 "config": version_config,
             }
         if source_type == "strategy_version":
@@ -1847,6 +1958,7 @@ class SimulationStore:
                     or ""
                 ),
                 "execution_method": str(version_config.get("execution_method") or ""),
+                "benchmark": str(row.benchmark or ""),
                 "config": version_config,
                 "formal_backtest_id": str(backtest.id),
             }
@@ -1858,6 +1970,23 @@ class SimulationStore:
                 raise KeyError(source_id)
             if row.status != "active" or row.is_legacy:
                 raise ValueError("simulation requires an approved active allocation")
+            member_benchmarks = {
+                str(value).strip().upper()
+                for value in connection.scalars(
+                    select(strategy_versions.c.benchmark)
+                    .select_from(
+                        strategy_allocation_members.join(
+                            strategy_versions,
+                            strategy_allocation_members.c.strategy_version_id
+                            == strategy_versions.c.id,
+                        )
+                    )
+                    .where(
+                        strategy_allocation_members.c.allocation_id == source_id
+                    )
+                )
+                if str(value or "").strip()
+            }
             return {
                 "dataset": str(row.dataset),
                 "execution_adapter": "long_only",
@@ -1875,6 +2004,11 @@ class SimulationStore:
                 "signal_horizon": "1d",
                 "execution_frequency": "",
                 "execution_method": "",
+                "benchmark": (
+                    next(iter(member_benchmarks))
+                    if len(member_benchmarks) == 1
+                    else ""
+                ),
                 "config": CostModelConfig().to_dict(),
                 "policy_mode": "self_contained",
             }
@@ -4461,6 +4595,47 @@ class SimulationStore:
                 if industry_snapshot is not None
                 else None
             )
+            benchmark = str(portfolio.benchmark or "").strip().upper()
+            prior_benchmark_nav = connection.execute(
+                select(simulation_nav)
+                .where(
+                    simulation_nav.c.portfolio_id == portfolio.id,
+                    simulation_nav.c.trade_date < batch.trade_date,
+                )
+                .order_by(simulation_nav.c.trade_date.desc())
+                .limit(1)
+            ).first()
+            benchmark_day = (
+                _benchmark_chain_day(
+                    execution_evidence.get("benchmark_evidence"),
+                    benchmark=benchmark,
+                    signal_date=batch.signal_date,
+                    trade_date=batch.trade_date,
+                    execution_frequency=str(portfolio.execution_frequency),
+                    dataset_identity_sha256=str(
+                        batch.execution_dataset_identity_sha256
+                    ),
+                    dataset_lineage_id=str(batch.execution_dataset_lineage_id),
+                    prior_nav=prior_benchmark_nav,
+                )
+                if benchmark
+                else {
+                    "status": "benchmark_not_bound_legacy",
+                    "benchmark_close": None,
+                    "benchmark_return": None,
+                    "benchmark_wealth": None,
+                    "evidence_sha256": None,
+                }
+            )
+            result["benchmark"] = benchmark or None
+            result["benchmark_day"] = benchmark_day
+            result["nav_row"].update(
+                {
+                    "benchmark_close": benchmark_day["benchmark_close"],
+                    "benchmark_return": benchmark_day["benchmark_return"],
+                    "benchmark_wealth": benchmark_day["benchmark_wealth"],
+                }
+            )
             self._persist_result(connection, batch, portfolio, result, now)
         return self.get_batch(batch_id)
 
@@ -5304,6 +5479,21 @@ class SimulationStore:
                 ),
                 nav=Decimal(str(nav["nav"])),
                 daily_return=float(nav["daily_return"]),
+                benchmark_close=(
+                    Decimal(str(nav["benchmark_close"]))
+                    if nav.get("benchmark_close") is not None
+                    else None
+                ),
+                benchmark_return=(
+                    float(nav["benchmark_return"])
+                    if nav.get("benchmark_return") is not None
+                    else None
+                ),
+                benchmark_wealth=(
+                    float(nav["benchmark_wealth"])
+                    if nav.get("benchmark_wealth") is not None
+                    else None
+                ),
                 drawdown=float(nav["drawdown"]),
                 external_flow_open=Decimal(str(nav.get("external_flow_open", 0.0))),
                 external_flow_close=Decimal(str(nav.get("external_flow_close", 0.0))),
@@ -5389,6 +5579,10 @@ class SimulationStore:
                 if isinstance(value, Decimal)
             },
             "nav": result["nav"],
+            "benchmark": {
+                "instrument": result.get("benchmark"),
+                **dict(result.get("benchmark_day") or {}),
+            },
             "conservation": result["conservation"],
             "corporate_actions": len(result.get("corporate_actions_applied") or []),
             "corporate_events": len(result.get("corporate_events_applied") or []),
@@ -5746,6 +5940,50 @@ class SimulationStore:
                     or row["twr_daily_return"] is None
                 ),
             }
+        benchmark = str(portfolio.benchmark or "").strip().upper()
+        if not benchmark:
+            relative_performance = {
+                "status": "benchmark_not_configured",
+                "benchmark": None,
+                "information_ratio": None,
+                "tracking_error": None,
+                "annualized_excess_return": None,
+            }
+        else:
+            benchmark_chain_broken = any(
+                row["twr_daily_return"] is None
+                or row["benchmark_return"] is None
+                or row["benchmark_wealth"] is None
+                for row in nav_rows
+            )
+            relative_points = [
+                (
+                    row["trade_date"],
+                    float(row["twr_daily_return"]),
+                    float(row["benchmark_return"]),
+                    float(row["benchmark_wealth"]),
+                )
+                for row in nav_rows
+                if row["twr_daily_return"] is not None
+                and row["benchmark_return"] is not None
+                and row["benchmark_wealth"] is not None
+            ]
+            relative_performance = {
+                **benchmark_relative_statistics(relative_points),
+                "benchmark": benchmark,
+            }
+            if benchmark_chain_broken:
+                relative_performance = {
+                    **relative_performance,
+                    "status": "unavailable_broken_benchmark_chain",
+                    "broken_from": next(
+                        row["trade_date"].isoformat()
+                        for row in nav_rows
+                        if row["twr_daily_return"] is None
+                        or row["benchmark_return"] is None
+                        or row["benchmark_wealth"] is None
+                    ),
+                }
         money_weighted: dict[str, Any]
         xirr_flow_count = 0
         xirr_inception_date: date | None = None
@@ -5790,12 +6028,7 @@ class SimulationStore:
             ),
             "unitized": unitized,
             "statistics": statistics,
-            "relative_performance": {
-                "status": "benchmark_not_configured",
-                "information_ratio": None,
-                "tracking_error": None,
-                "annualized_excess_return": None,
-            },
+            "relative_performance": relative_performance,
             "xirr": money_weighted,
             "cny_nav_latest": (float(nav_rows[-1]["nav"]) if nav_rows else None),
         }
@@ -5851,6 +6084,7 @@ class SimulationStore:
             "portfolio_id": str(portfolio.id),
             "source_type": str(portfolio.source_type),
             "source_id": str(portfolio.source_id),
+            "benchmark": str(portfolio.benchmark or ""),
             "source_snapshot_id": str(batch.source_snapshot_id),
             "recommendation_portfolio_id": (
                 str(portfolio.recommendation_portfolio_id)

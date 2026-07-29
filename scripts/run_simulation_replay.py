@@ -24,7 +24,10 @@ from quant_platform.execution_algorithms import (
     execution_time_slots,
     normalize_execution_policy,
 )
-from quant_platform.simulation_store import VWAP_PROFILE_METHOD
+from quant_platform.simulation_store import (
+    SIMULATION_BENCHMARK_EVIDENCE_VERSION,
+    VWAP_PROFILE_METHOD,
+)
 
 
 def _canonical_sha256(value: Any) -> str:
@@ -150,6 +153,60 @@ def _historical_volume_profile(
         "profile": profile,
     }
     return profile, evidence, _canonical_sha256(identity)
+
+
+def _benchmark_evidence(
+    data_api: Any,
+    *,
+    benchmark: str,
+    signal_date: str,
+    trade_date: str,
+    frequency: str,
+    dataset_identity_sha256: str,
+    dataset_lineage_id: str,
+) -> dict[str, Any]:
+    values = data_api.features(
+        [benchmark],
+        ["$close"],
+        start_time=f"{signal_date} 00:00:00",
+        end_time=f"{trade_date} 23:59:59",
+        freq=frequency,
+    ).reset_index()
+    if values.empty or not {"datetime", "instrument", "$close"}.issubset(values):
+        raise ValueError("simulation benchmark has no bound minute close evidence")
+    values["datetime"] = pd.to_datetime(values["datetime"], errors="coerce")
+    values["close"] = pd.to_numeric(values["$close"], errors="coerce")
+    values["instrument"] = values["instrument"].map(_qlib_symbol)
+    values = values.dropna(subset=["datetime", "close"])
+    values = values[
+        (values["instrument"] == benchmark)
+        & (values["close"] > 0)
+    ].sort_values("datetime")
+    baseline = values[
+        values["datetime"].dt.date == pd.Timestamp(signal_date).date()
+    ]
+    current = values[
+        values["datetime"].dt.date == pd.Timestamp(trade_date).date()
+    ]
+    if baseline.empty or current.empty:
+        raise ValueError(
+            "simulation benchmark requires exact signal-date and trade-date closes"
+        )
+    payload = {
+        "contract_version": SIMULATION_BENCHMARK_EVIDENCE_VERSION,
+        "instrument": benchmark,
+        "baseline_date": signal_date,
+        "baseline_close": float(baseline.iloc[-1]["close"]),
+        "trade_date": trade_date,
+        "close": float(current.iloc[-1]["close"]),
+        "dataset_identity_sha256": dataset_identity_sha256,
+        "dataset_lineage_id": dataset_lineage_id,
+        "frequency": frequency,
+    }
+    return {
+        **payload,
+        "evidence_sha256": _canonical_sha256(payload),
+    }
 
 
 def _load_shortability(
@@ -357,6 +414,18 @@ def main() -> None:
             dataset_identity_sha256=str(provenance["dataset_identity_sha256"]),
             dataset_lineage_id=str(provenance["dataset_lineage_id"]),
         )
+    benchmark = str(manifest.get("benchmark") or "").strip().upper()
+    if not benchmark:
+        raise ValueError("simulation manifest has no governed benchmark")
+    benchmark_evidence = _benchmark_evidence(
+        D,
+        benchmark=benchmark,
+        signal_date=str(manifest["signal_date"]),
+        trade_date=trade_date,
+        frequency=execution_frequency,
+        dataset_identity_sha256=str(provenance["dataset_identity_sha256"]),
+        dataset_lineage_id=str(provenance["dataset_lineage_id"]),
+    )
     fields = ["$close", "$vwap", "$volume", "$paused", "$up_limit", "$down_limit"]
     values = D.features(
         instruments,
@@ -409,6 +478,7 @@ def main() -> None:
         "execution_contract_version": provenance["execution_contract_version"],
         "execution_contract_hash": manifest["execution_contract_hash"],
         "next_trade_date": next_trade_date,
+        "benchmark_evidence": benchmark_evidence,
         "minute_bars_file": bars_path.name,
         "closing_prices": closing_prices,
     }

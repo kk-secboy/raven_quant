@@ -7,6 +7,8 @@ from datetime import date, timedelta
 import pytest
 
 from quant_platform.unitized_performance import (
+    BENCHMARK_RELATIVE_PERFORMANCE_VERSION,
+    benchmark_relative_statistics,
     chain_unitized_day,
     unitized_drawdown_recovery,
     unitized_return_statistics,
@@ -235,6 +237,52 @@ def test_unitized_return_statistics_rejects_a_non_reconciling_curve() -> None:
                 (date(2026, 1, 6), 1.20, 0.01),
             ],
             inception_date=date(2026, 1, 4),
+        )
+
+
+def test_benchmark_relative_statistics_match_hand_computed_active_returns() -> None:
+    result = benchmark_relative_statistics(
+        [
+            (date(2026, 1, 5), 0.02, 0.01, 1.01),
+            (date(2026, 1, 6), -0.01, 0.0, 1.01),
+        ]
+    )
+
+    assert result["status"] == "ok"
+    assert result["contract_version"] == BENCHMARK_RELATIVE_PERFORMANCE_VERSION
+    assert result["cumulative_account_return"] == pytest.approx(1.02 * 0.99 - 1.0)
+    assert result["cumulative_benchmark_return"] == pytest.approx(0.01)
+    assert result["cumulative_excess_return"] == pytest.approx(1.02 * 0.99 - 1.01)
+    assert result["annualized_excess_return"] == pytest.approx(0.0)
+    assert result["tracking_error"] == pytest.approx(
+        (0.0002**0.5) * (252**0.5)
+    )
+    assert result["information_ratio"] == pytest.approx(0.0)
+
+
+def test_benchmark_relative_statistics_keeps_zero_tracking_error_undefined() -> None:
+    result = benchmark_relative_statistics(
+        [
+            (date(2026, 1, 5), 0.01, 0.01, 1.01),
+            (date(2026, 1, 6), 0.0, 0.0, 1.01),
+        ]
+    )
+
+    assert result["tracking_error"] == pytest.approx(0.0)
+    assert result["information_ratio"] is None
+    assert (
+        result["metric_status"]["information_ratio"]
+        == "undefined_zero_tracking_error"
+    )
+
+
+def test_benchmark_relative_statistics_rejects_a_broken_benchmark_chain() -> None:
+    with pytest.raises(ValueError, match="does not reconcile"):
+        benchmark_relative_statistics(
+            [
+                (date(2026, 1, 5), 0.01, 0.01, 1.01),
+                (date(2026, 1, 6), 0.01, 0.01, 1.50),
+            ]
         )
 
 

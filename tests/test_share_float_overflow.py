@@ -145,6 +145,100 @@ def test_restart_rehydrates_existing_daily_share_float_replacement() -> None:
     )
 
 
+@pytest.mark.no_database
+def test_single_day_recovery_loads_historically_active_stock_symbols() -> None:
+    failed = FetchSpec(
+        dataset="share_float",
+        api_name="share_float",
+        params={
+            "start_date": "20240219",
+            "end_date": "20240219",
+            "limit": 6_000,
+            "offset": 102_000,
+        },
+        scope={
+            "start_date": "20240219",
+            "end_date": "20240219",
+            "page_group": "share_float:20240201:20240229:daily:20240219",
+            "page_size": 6_000,
+            "max_pages": 512,
+            "offset": 102_000,
+        },
+        allow_empty=True,
+        max_attempts=5,
+    )
+    superseded: list[str] = []
+
+    class Checkpoint:
+        @staticmethod
+        def unit_rows(unit_keys) -> list[dict]:
+            return [
+                {
+                    "unit_key": failed.unit_key,
+                    "status": "failed",
+                    "last_error": "provider error code=50101: offset cap",
+                }
+            ] if failed.unit_key in set(unit_keys) else []
+
+        @staticmethod
+        def dataset_units(dataset: str) -> list[dict]:
+            assert dataset == "share_float"
+            return []
+
+        @staticmethod
+        def successful(dataset: str) -> list[dict]:
+            assert dataset == "stock_basic"
+            return [{"unit_key": "stock-master"}]
+
+        @staticmethod
+        def supersede_units(unit_keys, _reason: str) -> None:
+            superseded.extend(unit_keys)
+
+    master = pd.DataFrame.from_records(
+        [
+            {
+                "ts_code": "600000.SH",
+                "list_date": "19991110",
+                "delist_date": None,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "list_date": "19910403",
+                "delist_date": None,
+            },
+            {
+                "ts_code": "430047.BJ",
+                "list_date": "20101001",
+                "delist_date": "20231231",
+            },
+            {
+                "ts_code": "600001.SH",
+                "list_date": "20250101",
+                "delist_date": None,
+            },
+        ]
+    )
+    storage = SimpleNamespace(read_units=lambda _rows: master)
+    context = SimpleNamespace(checkpoint=Checkpoint(), storage=storage)
+
+    replacements, recovered = _share_float_overflow_recovery(
+        context,
+        [failed],
+        set(),
+    )
+
+    assert recovered == {failed.unit_key}
+    assert superseded == [failed.unit_key]
+    assert [item.params["ts_code"] for item in replacements] == [
+        "000001.SZ",
+        "600000.SH",
+    ]
+    assert all(
+        item.scope["supersedes_page_group"] == failed.scope["page_group"]
+        for item in replacements
+    )
+
+
 def test_etf_overflow_recovery_uses_listed_exchange_symbols(
     database_url: str,
 ) -> None:

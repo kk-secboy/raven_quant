@@ -29,6 +29,9 @@ from statistics import fmean, stdev
 from typing import Any
 
 UNITIZED_PERFORMANCE_VERSION = "unitized-twr-v3-inception-baseline"
+BENCHMARK_RELATIVE_PERFORMANCE_VERSION = (
+    "benchmark-relative-v1-arithmetic-active-return"
+)
 
 _XIRR_YEAR_DAYS = 365.2425
 _TRADING_DAYS_PER_YEAR = 252
@@ -334,6 +337,126 @@ def unitized_return_statistics(
         },
         "contract_version": UNITIZED_PERFORMANCE_VERSION,
     }
+
+
+def benchmark_relative_statistics(
+    points: list[tuple[date, float, float, float]],
+    *,
+    annualization_factor: int = _TRADING_DAYS_PER_YEAR,
+) -> dict[str, Any]:
+    """Compute benchmark-relative statistics from one aligned daily chain.
+
+    Each point is ``(trade_date, account_return, benchmark_return,
+    benchmark_wealth)``.  The persisted benchmark wealth must independently
+    reconcile from the 1.0 inception baseline.  Active return uses the
+    standard arithmetic daily difference used by the governed Qlib report;
+    tracking error is its sample standard deviation annualized by square root
+    of time, and information ratio is annualized mean active return divided by
+    tracking error.  A zero denominator remains undefined.
+    """
+
+    if not points:
+        return {
+            "status": "benchmark_evidence_missing",
+            "observations": 0,
+            "annualized_excess_return": None,
+            "tracking_error": None,
+            "information_ratio": None,
+            "contract_version": BENCHMARK_RELATIVE_PERFORMANCE_VERSION,
+        }
+    if annualization_factor <= 1:
+        raise ValueError("annualization_factor must be greater than one")
+    normalized = [
+        (
+            day,
+            float(account_return),
+            float(benchmark_return),
+            float(benchmark_wealth),
+        )
+        for day, account_return, benchmark_return, benchmark_wealth in points
+    ]
+    if any(
+        not isfinite(account_return)
+        or not isfinite(benchmark_return)
+        or account_return < -1.0
+        or benchmark_return < -1.0
+        or not isfinite(benchmark_wealth)
+        or benchmark_wealth < 0.0
+        for _, account_return, benchmark_return, benchmark_wealth in normalized
+    ) or any(
+        current_day <= previous_day
+        for (previous_day, _, _, _), (current_day, _, _, _) in zip(
+            normalized, normalized[1:], strict=False
+        )
+    ):
+        raise ValueError(
+            "benchmark-relative points must be finite, valid and strictly ordered"
+        )
+    prior_benchmark_wealth = 1.0
+    account_wealth = 1.0
+    active_returns: list[float] = []
+    for day, account_return, benchmark_return, benchmark_wealth in normalized:
+        expected_benchmark_wealth = prior_benchmark_wealth * (
+            1.0 + benchmark_return
+        )
+        tolerance = 1e-8 * max(
+            1.0,
+            abs(expected_benchmark_wealth),
+            abs(benchmark_wealth),
+        )
+        if abs(benchmark_wealth - expected_benchmark_wealth) > tolerance:
+            raise ValueError(
+                f"benchmark return chain does not reconcile on {day.isoformat()}"
+            )
+        prior_benchmark_wealth = benchmark_wealth
+        account_wealth *= 1.0 + account_return
+        active_returns.append(account_return - benchmark_return)
+
+    observations = len(normalized)
+    result: dict[str, Any] = {
+        "status": "ok" if observations >= 2 else "insufficient_evidence",
+        "observations": observations,
+        "start_date": normalized[0][0].isoformat(),
+        "end_date": normalized[-1][0].isoformat(),
+        "cumulative_account_return": account_wealth - 1.0,
+        "cumulative_benchmark_return": prior_benchmark_wealth - 1.0,
+        "cumulative_excess_return": account_wealth - prior_benchmark_wealth,
+        "annualized_excess_return": None,
+        "tracking_error": None,
+        "information_ratio": None,
+        "metric_status": {},
+        "assumptions": {
+            "annualization_factor": annualization_factor,
+            "active_return_method": "account_simple_return_minus_benchmark_simple_return",
+            "annualized_excess_method": "arithmetic_mean_times_periods",
+            "tracking_error_method": "sample_std_times_sqrt_periods",
+        },
+        "contract_version": BENCHMARK_RELATIVE_PERFORMANCE_VERSION,
+    }
+    if observations < 2:
+        result["metric_status"] = {
+            "annualized_excess_return": "insufficient_evidence",
+            "tracking_error": "insufficient_evidence",
+            "information_ratio": "insufficient_evidence",
+        }
+        return result
+
+    mean_active = fmean(active_returns)
+    active_std = stdev(active_returns)
+    result["annualized_excess_return"] = mean_active * annualization_factor
+    result["tracking_error"] = active_std * sqrt(float(annualization_factor))
+    result["metric_status"] = {
+        "annualized_excess_return": "ok",
+        "tracking_error": "ok",
+        "information_ratio": (
+            "ok" if active_std > 1e-15 else "undefined_zero_tracking_error"
+        ),
+    }
+    if active_std > 1e-15:
+        result["information_ratio"] = (
+            mean_active / active_std * sqrt(float(annualization_factor))
+        )
+    return result
 
 
 def xirr(

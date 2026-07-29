@@ -24,6 +24,7 @@ from quant_data.database import (
     open_database,
     simulation_batches,
     strategy_allocation_artifacts,
+    strategy_allocation_members,
     strategy_allocations,
     strategy_versions,
 )
@@ -41,6 +42,7 @@ from quant_platform.simulation_order_state import (
     assert_transition,
 )
 from quant_platform.simulation_store import SimulationStore
+from quant_platform.strategy_store import StrategyStore
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DAY2 = date(2026, 7, 14)
@@ -963,7 +965,19 @@ def test_order_without_window_expires_end_of_day(database_url: str, tmp_path) ->
 # ---------------------------------------------------------------------------
 
 
-def _seed_active_allocation(database_url: str) -> tuple[str, str]:
+def _seed_active_allocation(database_url: str, tmp_path) -> tuple[str, str]:
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        config_overrides={"execution_frequency": "5min", "execution_method": "twap"},
+    )
+    backtest = StrategyStore(database_url).create_backtest(
+        version_id=version_id,
+        dataset="snapshot",
+        execution_dataset="execution-snapshot/liquid_stocks_5m",
+        periods={"start": "2024-01-08", "end": "2026-07-10"},
+        artifact_path=tmp_path / "allocation-backtest",
+    )
     engine = open_database(database_url)
     allocation_id = uuid.uuid4().hex
     artifact_id = uuid.uuid4().hex
@@ -993,6 +1007,20 @@ def _seed_active_allocation(database_url: str) -> tuple[str, str]:
                 created_by="test",
                 created_at=now,
                 updated_at=now,
+            )
+        )
+        connection.execute(
+            insert(strategy_allocation_members).values(
+                allocation_id=allocation_id,
+                strategy_version_id=version_id,
+                backtest_id=backtest["id"],
+                target_weight=0.7,
+                role="core",
+                risk_budget=0.7,
+                member_cap=0.7,
+                annualized_volatility=0.10,
+                risk_contribution=0.7,
+                created_at=now,
             )
         )
         connection.execute(
@@ -1046,7 +1074,7 @@ def _create_allocation_simulation(
 
 
 def test_netting_plan_binding_records_contributions(database_url: str, tmp_path) -> None:
-    allocation_id, artifact_id = _seed_active_allocation(database_url)
+    allocation_id, artifact_id = _seed_active_allocation(database_url, tmp_path)
     plan = _netting_plan(database_url, allocation_id, artifact_id)
     store, simulation = _create_allocation_simulation(database_url, allocation_id)
 
@@ -1075,7 +1103,7 @@ def test_netting_plan_binding_records_contributions(database_url: str, tmp_path)
 
 
 def test_netting_plan_binding_requires_matching_account(database_url: str, tmp_path) -> None:
-    allocation_id, artifact_id = _seed_active_allocation(database_url)
+    allocation_id, artifact_id = _seed_active_allocation(database_url, tmp_path)
     plan = _netting_plan(database_url, allocation_id, artifact_id)
     # 非 allocation 来源的账户不得绑定净额计划（fail closed）。
     store, simulation = _create_simulation(database_url, tmp_path)
