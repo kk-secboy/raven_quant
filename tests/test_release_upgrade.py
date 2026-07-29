@@ -76,6 +76,11 @@ def test_release_upgrade_builds_backs_up_and_accepts_current_schema(
         "_capture_rollback_images",
         lambda *_args: {"api": "quantlab-rollback:test-api"},
     )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_assess_backup_capacity",
+        lambda *_args, **_kwargs: {"status": "pass"},
+    )
 
     def create(*_args, **kwargs) -> Path:
         assert kwargs["restart_services"] is False
@@ -112,6 +117,11 @@ def test_release_upgrade_restores_backup_and_old_images_on_failed_acceptance(
         lambda *_args, **_kwargs: next(gates),
     )
     monkeypatch.setattr(release_upgrade, "_capture_rollback_images", lambda *_args: tags)
+    monkeypatch.setattr(
+        release_upgrade,
+        "_assess_backup_capacity",
+        lambda *_args, **_kwargs: {"status": "pass"},
+    )
     monkeypatch.setattr(release_upgrade, "create_backup", lambda *_args, **_kwargs: backup)
     rollbacks: list[Path] = []
 
@@ -163,3 +173,59 @@ def test_rollback_image_pruning_keeps_newest_release_sets() -> None:
         "quantlab-rollback:20260713t010000z-web",
     ]
     assert ("docker", "image", "rm", "-f", *removed) in context.calls
+
+
+def test_backup_capacity_requires_full_data_copy_plus_headroom(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class CapacityContext(FakeContext):
+        @staticmethod
+        def data_volume() -> str:
+            return "/data/quantlab"
+
+        def docker(self, *args: str, **_kwargs) -> str:
+            self.calls.append(("docker", *args))
+            return f"{100 * 1024**2}\t/source"
+
+    disk_usage = type("Usage", (), {"free": 110 * 1024**3})()
+    monkeypatch.setattr(release_upgrade.shutil, "disk_usage", lambda _path: disk_usage)
+    backup_root = tmp_path / "backups"
+
+    result = release_upgrade._assess_backup_capacity(
+        CapacityContext(),  # type: ignore[arg-type]
+        backup_root,
+        minimum_free_gb=20.0,
+    )
+
+    assert result["status"] == "block"
+    assert "data upper bound 100.0 GiB" in result["evidence"]
+    assert "required 120.0 GiB" in result["evidence"]
+
+
+def test_release_upgrade_blocks_before_image_capture_when_backup_target_is_small(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context = FakeContext()
+    monkeypatch.setattr(
+        release_upgrade,
+        "assess_release",
+        lambda *_args, **_kwargs: _gate(),
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_assess_backup_capacity",
+        lambda *_args, **_kwargs: {"status": "block", "evidence": "too small"},
+    )
+
+    result = release_upgrade.run_release_upgrade(
+        context,  # type: ignore[arg-type]
+        tmp_path,
+        tmp_path / "backups",
+        confirmed=True,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["checks"]["backup_capacity"]["evidence"] == "too small"
+    assert context.calls == []

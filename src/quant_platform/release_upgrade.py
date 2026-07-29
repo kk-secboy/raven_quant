@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,10 +22,77 @@ ROLLBACK_TAG = re.compile(
     r"^quantlab-rollback:(?P<release>[0-9]{8}t[0-9]{6}z)-"
     r"(?P<service>api|scheduler|worker|rdagent-worker|web)$"
 )
+_GIB = 1024**3
 
 
 def _stamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _existing_storage_anchor(path: Path) -> Path:
+    candidate = path.resolve()
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            raise FileNotFoundError(path)
+        candidate = parent
+    return candidate
+
+
+def _assess_backup_capacity(
+    context: ComposeContext,
+    backup_root: Path,
+    *,
+    minimum_free_gb: float,
+) -> dict[str, Any]:
+    """Fail closed unless the target can hold a worst-case full data copy.
+
+    The backup writer creates the new archive before retention removes an old
+    generation. Gzip ratios are data dependent, so planning from a nominal
+    fixed headroom can fill the filesystem. Use the uncompressed /data size as
+    the conservative upper bound and retain the requested operational
+    headroom in addition to it.
+    """
+
+    try:
+        source = context.data_volume()
+        raw = context.docker(
+            "run",
+            "--rm",
+            "--volume",
+            f"{source}:/source:ro",
+            "postgres:16-alpine",
+            "du",
+            "-sk",
+            "/source",
+            capture=True,
+        )
+        source_kib = int(raw.splitlines()[-1].split()[0])
+        source_bytes = source_kib * 1024
+        anchor = _existing_storage_anchor(backup_root)
+        free_bytes = shutil.disk_usage(anchor).free
+        required_bytes = source_bytes + int(minimum_free_gb * _GIB)
+        passed = free_bytes >= required_bytes
+        evidence = (
+            f"target {backup_root.resolve()}; free {free_bytes / _GIB:.1f} GiB; "
+            f"data upper bound {source_bytes / _GIB:.1f} GiB; retained headroom "
+            f"{minimum_free_gb:.1f} GiB; required {required_bytes / _GIB:.1f} GiB"
+        )
+    except Exception as exc:
+        passed = False
+        evidence = f"backup capacity could not be measured: {type(exc).__name__}: {exc}"
+    return {
+        "id": "backup_capacity",
+        "title": "Coordinated backup target capacity",
+        "status": "pass" if passed else "block",
+        "evidence": evidence,
+        "remediation": (
+            None
+            if passed
+            else "Choose a backup root with space for one full uncompressed data "
+            "generation plus release headroom."
+        ),
+    }
 
 
 def _capture_rollback_images(
@@ -196,6 +264,16 @@ def run_release_upgrade(
             result["status"] = "blocked"
             result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")
             return result
+        backup_capacity = _assess_backup_capacity(
+            context,
+            backup_root,
+            minimum_free_gb=minimum_free_gb,
+        )
+        result["checks"]["backup_capacity"] = backup_capacity
+        if backup_capacity["status"] != "pass":
+            result["status"] = "blocked"
+            result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+            return result
 
         rollback_tags = _capture_rollback_images(context, release_id)
         result["rollback_images"] = rollback_tags
@@ -211,6 +289,18 @@ def run_release_upgrade(
         )
         result["checks"]["post_build_preflight"] = final_gate
         if final_gate["status"] != "ready":
+            result["status"] = "blocked"
+            result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+            return result
+        post_build_backup_capacity = _assess_backup_capacity(
+            context,
+            backup_root,
+            minimum_free_gb=minimum_free_gb,
+        )
+        result["checks"]["post_build_backup_capacity"] = (
+            post_build_backup_capacity
+        )
+        if post_build_backup_capacity["status"] != "pass":
             result["status"] = "blocked"
             result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")
             return result
