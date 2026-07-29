@@ -5,6 +5,7 @@ import json
 import uuid
 from dataclasses import asdict
 from datetime import UTC, date, datetime
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -187,15 +188,65 @@ def _formal_validation_failures(
     outer = evidence.get("outer_walk_forward")
     coverage = outer.get("candidate_coverage") if isinstance(outer, dict) else {}
     trials = int((metrics.get("deflated_sharpe") or {}).get("trials") or 1)
+    config = version.get("config", {})
+    minimum_outer_test_metric = float(
+        config.get("minimum_outer_test_excess_return", 0.0)
+    )
+    minimum_outer_test_pass_rate = float(
+        config.get("minimum_outer_test_pass_rate", 0.60)
+    )
+    outer_folds = outer.get("folds") if isinstance(outer, dict) else None
+
+    def valid_outer_fold(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        try:
+            test_metric = float(item.get("test_metric"))
+        except (TypeError, ValueError):
+            return False
+        recorded_passed = item.get("test_passed")
+        return isinstance(recorded_passed, bool) and isfinite(test_metric) and recorded_passed == (
+            test_metric > minimum_outer_test_metric
+        )
+
+    valid_outer_folds = (
+        isinstance(outer_folds, list)
+        and bool(outer_folds)
+        and all(valid_outer_fold(item) for item in outer_folds)
+    )
+    if valid_outer_folds:
+        outer_test_metrics = [float(item["test_metric"]) for item in outer_folds]
+        calculated_test_pass_rate = sum(
+            bool(item["test_passed"]) for item in outer_folds
+        ) / len(outer_folds)
+        calculated_mean_test_metric = sum(outer_test_metrics) / len(outer_test_metrics)
+    else:
+        calculated_test_pass_rate = float("-inf")
+        calculated_mean_test_metric = float("-inf")
+    try:
+        recorded_test_pass_rate = float(outer.get("test_pass_rate"))
+        recorded_mean_test_metric = float(outer.get("mean_test_metric"))
+    except (AttributeError, TypeError, ValueError):
+        recorded_test_pass_rate = float("-inf")
+        recorded_mean_test_metric = float("-inf")
+
     if (
         not isinstance(outer, dict)
         or outer.get("status") != "completed"
+        or outer.get("passed") is not True
         or int(outer.get("fold_count") or 0) < 3
         or int((coverage or {}).get("required_group_trials") or 0) != trials
         or int((coverage or {}).get("provided_candidates") or 0) != trials
+        or recorded_test_pass_rate < minimum_outer_test_pass_rate
+        or recorded_mean_test_metric <= minimum_outer_test_metric
+        or not isinstance(outer_folds, list)
+        or len(outer_folds) != int(outer.get("fold_count") or 0)
+        or not valid_outer_folds
+        or abs(recorded_test_pass_rate - calculated_test_pass_rate) > 1e-12
+        or abs(recorded_mean_test_metric - calculated_mean_test_metric) > 1e-12
     ):
         failures.append(
-            "outer walk-forward must rerun the complete hypothesis-group candidate set"
+            "outer walk-forward must cover the complete candidate set and pass OOS gates"
         )
 
     baseline = version.get("config", {}).get("baseline_definition")

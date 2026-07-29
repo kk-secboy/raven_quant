@@ -265,17 +265,26 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
         },
         "formal_validation_passed": True,
         "formal_validation": {
-            "contract_version": "formal-validation-evidence-v1",
+            "contract_version": "formal-validation-evidence-v2-oos-gate",
             "status": "passed",
             "outer_walk_forward": {
                 "status": "completed",
+                "passed": True,
                 "fold_count": 3,
+                "minimum_test_metric": 0.0,
+                "minimum_test_pass_rate": 0.60,
+                "test_pass_rate": 1.0,
+                "mean_test_metric": 0.01,
                 "candidate_coverage": {
                     "required_group_trials": 1,
                     "provided_candidates": 1,
                     "scope": "frozen_strategy_no_search",
                 },
-                "folds": [{}, {}, {}],
+                "folds": [
+                    {"test_metric": 0.01, "test_passed": True},
+                    {"test_metric": 0.01, "test_passed": True},
+                    {"test_metric": 0.01, "test_passed": True},
+                ],
             },
             "ablation": {
                 "status": "passed",

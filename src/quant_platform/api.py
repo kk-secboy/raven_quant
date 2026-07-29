@@ -419,6 +419,13 @@ class StrategyConfigRequest(BaseModel):
     rolling_step_days: int = Field(default=63, ge=20, le=504)
     min_rolling_windows: int = Field(default=3, ge=2, le=20)
     min_rolling_pass_rate: float = Field(default=0.60, ge=0, le=1)
+    outer_train_days: int = Field(default=252, ge=60, le=2520)
+    outer_validation_days: int = Field(default=42, ge=10, le=504)
+    outer_test_days: int = Field(default=42, ge=10, le=504)
+    outer_purge_days: int = Field(default=5, ge=1, le=126)
+    outer_embargo_days: int = Field(default=5, ge=1, le=126)
+    minimum_outer_test_excess_return: float = Field(default=0.0, ge=-1.0, le=5.0)
+    minimum_outer_test_pass_rate: float = Field(default=0.60, ge=0.50, le=1.0)
     event_window_days: int = Field(default=20, ge=20, le=126)
     event_count: int = Field(default=5, ge=1, le=20)
     max_event_underperformance: float = Field(default=0.05, ge=0, le=0.50)
@@ -495,6 +502,17 @@ class StrategyConfigRequest(BaseModel):
             raise ValueError("capacity curve requires at least three distinct positive notionals")
         if self.rolling_step_days > self.rolling_window_days:
             raise ValueError("rolling_step_days must not exceed rolling_window_days")
+        required_outer_days = (
+            self.outer_train_days
+            + self.outer_purge_days
+            + self.outer_validation_days
+            + self.outer_embargo_days
+            + 3 * self.outer_test_days
+        )
+        if self.min_backtest_days < required_outer_days:
+            raise ValueError(
+                "min_backtest_days must leave at least three complete outer test folds"
+            )
         if self.execution_slice_minutes % 5:
             raise ValueError("execution_slice_minutes must be a multiple of five")
         CostModelConfig.from_mapping(self.model_dump())

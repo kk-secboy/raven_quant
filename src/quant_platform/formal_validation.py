@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-FORMAL_VALIDATION_CONTRACT_VERSION = "formal-validation-evidence-v1"
+FORMAL_VALIDATION_CONTRACT_VERSION = "formal-validation-evidence-v2-oos-gate"
 SIGNAL_DECAY_FRONTIER_VERSION = "contiguous-zero-delay-frontier-v2"
 
 
@@ -83,12 +83,18 @@ def run_outer_walk_forward(
     test_days: int,
     purge_days: int,
     embargo_days: int,
+    minimum_test_metric: float = 0.0,
+    minimum_test_pass_rate: float = 0.60,
 ) -> dict[str, Any]:
     """Rerun candidate selection inside every outer fold, then open its test."""
 
     candidates = [str(item) for item in candidate_ids]
     if not candidates or len(candidates) != len(set(candidates)):
         raise ValueError("outer walk-forward candidates must be non-empty and unique")
+    if not np.isfinite(float(minimum_test_metric)):
+        raise ValueError("outer walk-forward test floor must be finite")
+    if not 0.0 <= float(minimum_test_pass_rate) <= 1.0:
+        raise ValueError("outer walk-forward test pass rate must be in [0, 1]")
     folds = build_outer_walk_forward_folds(
         dates,
         train_days=train_days,
@@ -112,22 +118,42 @@ def run_outer_walk_forward(
             scored.append((float(score), candidate))
         selected = max(scored, key=lambda item: (item[0], item[1]))[1]
         test_result = dict(test_runner(selected, fold))
+        test_score = test_result.get(selection_metric)
+        if test_score is None or not np.isfinite(float(test_score)):
+            raise ValueError(
+                f"outer test metric {selection_metric} is missing or non-finite"
+            )
+        test_passed = float(test_score) > float(minimum_test_metric)
         evidence.append(
             {
                 "fold": fold.__dict__,
                 "inner_selection": inner_results,
                 "selected_candidate_id": selected,
                 "test_result": test_result,
+                "test_metric": float(test_score),
+                "test_passed": test_passed,
             }
         )
+    test_values = np.asarray([item["test_metric"] for item in evidence], dtype=float)
+    test_pass_rate = float(np.mean([item["test_passed"] for item in evidence]))
+    mean_test_metric = float(test_values.mean())
+    passed = (
+        test_pass_rate >= float(minimum_test_pass_rate)
+        and mean_test_metric > float(minimum_test_metric)
+    )
     return {
         "status": "completed",
+        "passed": passed,
         "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
         "selection_metric": selection_metric,
         "candidate_ids": candidates,
         "fold_count": len(evidence),
         "purge_days": int(purge_days),
         "embargo_days": int(embargo_days),
+        "minimum_test_metric": float(minimum_test_metric),
+        "minimum_test_pass_rate": float(minimum_test_pass_rate),
+        "test_pass_rate": test_pass_rate,
+        "mean_test_metric": mean_test_metric,
         "folds": evidence,
     }
 

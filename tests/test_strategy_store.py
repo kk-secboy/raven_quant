@@ -92,6 +92,23 @@ def test_only_v2_qlib_policy_backtest_can_be_approved(tmp_path: Path, database_u
     )
     metrics = formal_backtest_metrics(version, manifest)
     store.validate_backtest_artifacts(backtest["id"], metrics)
+    failed_oos = deepcopy(metrics)
+    failed_oos["formal_validation_passed"] = False
+    failed_oos["formal_validation"]["status"] = "failed"
+    failed_oos["formal_validation"]["outer_walk_forward"].update(
+        {
+            "passed": False,
+            "test_pass_rate": 1.0 / 3.0,
+            "mean_test_metric": -0.10,
+        }
+    )
+    store.mark_backtest(backtest["id"], "succeeded", metrics=failed_oos)
+    with pytest.raises(ValueError, match="outer walk-forward"):
+        store.approve(
+            version_id,
+            actor="risk-owner",
+            reason="Out-of-sample walk-forward windows failed the configured gate.",
+        )
     failed_stress = deepcopy(metrics)
     failed_stress["event_stress_pass_rate"] = 0.0
     failed_stress["event_stress_passed"] = False

@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from quant_platform.formal_validation import (
+    FORMAL_VALIDATION_CONTRACT_VERSION,
     build_outer_walk_forward_folds,
     run_ablation_suite,
     run_outer_walk_forward,
@@ -15,6 +16,7 @@ from quant_platform.statistical_validation import (
     paired_moving_block_bootstrap,
     probability_of_backtest_overfitting,
 )
+from quant_platform.strategy_store import _formal_validation_failures
 
 pytestmark = pytest.mark.no_database
 
@@ -35,6 +37,7 @@ def test_outer_walk_forward_reruns_inner_selection_for_every_fold() -> None:
         test_runner=lambda candidate, fold: {
             "candidate": candidate,
             "test_start": fold.test_start,
+            "information_ratio": 0.5,
         },
         selection_metric="information_ratio",
         train_days=60,
@@ -54,6 +57,105 @@ def test_outer_walk_forward_reruns_inner_selection_for_every_fold() -> None:
         for item in result["folds"]
     ]
     assert len(test_ranges) == len(set(test_ranges))
+    assert result["passed"] is True
+    assert result["test_pass_rate"] == 1.0
+
+
+def test_outer_walk_forward_fails_when_oos_windows_do_not_hold_up() -> None:
+    dates = pd.bdate_range("2020-01-02", periods=160)
+    test_values = iter([0.02, -0.40, -0.10])
+
+    result = run_outer_walk_forward(
+        dates=dates,
+        candidate_ids=["frozen"],
+        inner_runner=lambda _candidate, _fold: {"annualized_excess_return": 0.20},
+        test_runner=lambda _candidate, _fold: {
+            "annualized_excess_return": next(test_values)
+        },
+        selection_metric="annualized_excess_return",
+        train_days=60,
+        validation_days=20,
+        test_days=20,
+        purge_days=5,
+        embargo_days=5,
+        minimum_test_metric=0.0,
+        minimum_test_pass_rate=0.60,
+    )
+
+    assert result["passed"] is False
+    assert result["test_pass_rate"] == pytest.approx(1.0 / 3.0)
+    assert result["mean_test_metric"] < 0
+
+
+def test_strategy_formal_gate_rejects_completed_but_failing_oos_evidence() -> None:
+    version = {
+        "config": {
+            "minimum_outer_test_excess_return": 0.0,
+            "minimum_outer_test_pass_rate": 0.60,
+            "baseline_definition": None,
+        },
+        "factors": [],
+    }
+    outer = {
+        "status": "completed",
+        "passed": True,
+        "fold_count": 3,
+        "test_pass_rate": 2.0 / 3.0,
+        "mean_test_metric": 0.01,
+        "candidate_coverage": {
+            "required_group_trials": 1,
+            "provided_candidates": 1,
+        },
+        "folds": [
+            {"test_metric": 0.02, "test_passed": True},
+            {"test_metric": 0.02, "test_passed": True},
+            {"test_metric": -0.01, "test_passed": False},
+        ],
+    }
+    metrics = {
+        "deflated_sharpe": {"trials": 1},
+        "formal_validation_passed": True,
+        "formal_validation": {
+            "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
+            "status": "passed",
+            "outer_walk_forward": outer,
+            "ablation": {"status": "passed", "runs": []},
+            "signal_decay": {
+                "status": "completed",
+                "frontier_version": "contiguous-zero-delay-frontier-v2",
+                "maximum_supported_delay_bars": 0,
+                "runs": [{"delay_bars": 0, "passed": True}],
+            },
+            "paired_block_bootstrap": {
+                "status": "ok",
+                "confidence_interval_95": [0.0001, 0.01],
+            },
+            "multiple_testing": {
+                "status": "not_applicable_single_trial",
+                "holm_adjusted_p_values": [0.01],
+            },
+        },
+    }
+
+    assert _formal_validation_failures(version, metrics) == []
+
+    outer.update(
+        {
+            "passed": False,
+            "test_pass_rate": 1.0 / 3.0,
+            "mean_test_metric": -0.10,
+        }
+    )
+    outer["folds"] = [
+        {"test_metric": 0.02, "test_passed": True},
+        {"test_metric": -0.20, "test_passed": False},
+        {"test_metric": -0.12, "test_passed": False},
+    ]
+
+    assert any(
+        "outer walk-forward" in failure
+        for failure in _formal_validation_failures(version, metrics)
+    )
 
 
 def test_outer_fold_builder_keeps_purge_and_embargo_gaps() -> None:

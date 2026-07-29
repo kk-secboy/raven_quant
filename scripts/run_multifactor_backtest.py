@@ -940,6 +940,12 @@ def main() -> None:
             test_days=int(config.get("outer_test_days", 42)),
             purge_days=int(config.get("outer_purge_days", 5)),
             embargo_days=int(config.get("outer_embargo_days", 5)),
+            minimum_test_metric=float(
+                config.get("minimum_outer_test_excess_return", 0.0)
+            ),
+            minimum_test_pass_rate=float(
+                config.get("minimum_outer_test_pass_rate", 0.60)
+            ),
         )
         outer_walk_forward["candidate_coverage"] = {
             "required_group_trials": 1,
@@ -997,6 +1003,7 @@ def main() -> None:
         "status": (
             "passed"
             if outer_walk_forward.get("status") == "completed"
+            and outer_walk_forward.get("passed") is True
             and ablation["status"] == "passed"
             and signal_decay["maximum_supported_delay_bars"] is not None
             and paired_bootstrap["confidence_interval_95"][0] > 0
