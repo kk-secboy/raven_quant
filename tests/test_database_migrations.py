@@ -3,6 +3,20 @@ from sqlalchemy import inspect, text
 from quant_data.database import open_database
 
 
+def test_explicit_migration_url_overrides_host_database_environment(
+    database_url: str, monkeypatch
+) -> None:
+    from alembic import command
+
+    from quant_platform.db_cli import alembic_config
+
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+psycopg://invalid:invalid@127.0.0.1:1/must_not_be_used",
+    )
+    command.current(alembic_config(database_url))
+
+
 def test_database_is_at_versioned_control_plane_schema(database_url: str) -> None:
     engine = open_database(database_url)
     inspector = inspect(engine)

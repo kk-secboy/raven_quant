@@ -143,6 +143,7 @@ def test_console_password_recovery_revokes_sessions_and_is_audited(
     assert any(item["action"] == "auth.password_recovered" for item in store.list_audit())
 
 
+@pytest.mark.no_database
 def test_role_permission_matrix_is_closed_by_default() -> None:
     assert has_permission("admin", permission_for("POST", "/api/auth/users"))
     assert has_permission("researcher", permission_for("POST", "/api/rdagent/runs"))
@@ -165,6 +166,9 @@ def test_role_permission_matrix_is_closed_by_default() -> None:
     assert has_permission("operator", permission_for("POST", "/api/schedules"))
     assert has_permission(
         "operator", permission_for("POST", "/api/recommendation-portfolios")
+    )
+    assert has_permission(
+        "operator", permission_for("PUT", "/api/recommendation-accounts/active")
     )
     nav_review_permission = permission_for(
         "POST",

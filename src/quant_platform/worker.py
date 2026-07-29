@@ -21,8 +21,10 @@ from .cost_model import CostModelConfig
 from .data_rollover import qlib_trading_date_on_or_before
 from .execution_algorithms import execution_time_slots
 from .job_store import JobStore
+from .market_permission import MarketPermissionStore
 from .parameter_experiment_store import ParameterExperimentStore
 from .rdagent_runtime import rdagent_command, require_rdagent_runtime_identity
+from .recommendation_account_store import RecommendationAccountStore
 from .recommendation_store import RecommendationStore
 from .research_store import ResearchStore
 from .runtime_secret_store import RuntimeSecretStore
@@ -51,6 +53,11 @@ class LocalJobWorker:
         self.strategies = StrategyStore(settings.database_url)
         self.recommendations = RecommendationStore(settings.database_url)
         self.simulations = SimulationStore(settings.database_url)
+        self.recommendation_accounts = RecommendationAccountStore(
+            settings.database_url,
+            simulations=self.simulations,
+        )
+        self.market_permissions = MarketPermissionStore(settings.database_url)
         self.allocations = AllocationStore(settings.database_url)
         self.parameter_experiments = ParameterExperimentStore(settings.database_url)
         self.runtime_secrets = RuntimeSecretStore(
@@ -296,7 +303,26 @@ class LocalJobWorker:
                 )
             if recommendation_snapshot_id:
                 if exit_code == 0 and result:
-                    snapshot = self.recommendations.apply_result(recommendation_snapshot_id, result)
+                    account_risk_state = dict(
+                        dict(result.get("risk_summary") or {}).get(
+                            "account_risk_state"
+                        )
+                        or {}
+                    )
+                    action_state = self.recommendation_accounts.account_state_for_actions(
+                        str(result["portfolio_id"]),
+                        reference_prices=dict(result.get("reference_prices") or {}),
+                        account_risk_state=account_risk_state,
+                    )
+                    snapshot = self.recommendations.apply_result(
+                        recommendation_snapshot_id,
+                        result,
+                        account_state=action_state["account_state"],
+                        permission_store=self.market_permissions,
+                        account_context=action_state["account_context"],
+                        risk_assessment=action_state["risk_assessment"],
+                        account_value=action_state["account_value"],
+                    )
                     self.allocations.refresh_for_portfolio(str(snapshot["portfolio_id"]))
                 else:
                     self.recommendations.mark_failed(
@@ -1340,7 +1366,7 @@ class LocalJobWorker:
                 {"path": payload["dataset_path"]},
                 date.fromisoformat(str(payload["as_of_date"])),
             )
-            account_risk_state = self.simulations.recommendation_policy_risk_inputs(
+            account_risk_state = self.recommendation_accounts.policy_risk_inputs(
                 str(portfolio["id"]),
                 required_nav_date=required_nav_date,
             )

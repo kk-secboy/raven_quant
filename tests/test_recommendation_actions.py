@@ -339,7 +339,7 @@ def test_plan_account_actions_sorts_and_vectors() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_succeeded_snapshot(database_url: str, tmp_path):
+def _make_pending_snapshot(database_url: str, tmp_path):
     version_id = create_strategy_version(database_url, tmp_path)
     recommendations = RecommendationStore(database_url)
     with recommendations.engine.begin() as connection:
@@ -362,33 +362,37 @@ def _make_succeeded_snapshot(database_url: str, tmp_path):
         dataset_identity_sha256=DATASET_IDENTITY,
     )
     assert created is True
-    recommendations.apply_result(
-        snapshot["id"],
-        {
-            "status": "ok",
-            "portfolio_id": portfolio["id"],
-            "strategy_version_id": version_id,
-            "dataset": "snapshot",
-            "dataset_identity_sha256": DATASET_IDENTITY,
-            "as_of_date": "2026-07-10",
-            "effective_date": "2026-07-13",
-            "policy_version": POLICY_VERSION,
-            "backtest_engine_version": QLIB_ENGINE_VERSION,
-            "cost_model": snapshot["cost_model"],
-            "cash_weight": 0.999,
-            "holdings": [
-                {
-                    "instrument": "SH600000",
-                    "weight": 0.001,
-                    "previous_weight": 0.0,
-                    "weight_change": 0.001,
-                    "action": "increase",
-                    "reason": "governed target",
-                }
-            ],
-        },
-    )
-    return recommendations, snapshot["id"]
+    result = {
+        "status": "ok",
+        "portfolio_id": portfolio["id"],
+        "strategy_version_id": version_id,
+        "dataset": "snapshot",
+        "dataset_identity_sha256": DATASET_IDENTITY,
+        "as_of_date": "2026-07-10",
+        "effective_date": "2026-07-13",
+        "policy_version": POLICY_VERSION,
+        "backtest_engine_version": QLIB_ENGINE_VERSION,
+        "cost_model": snapshot["cost_model"],
+        "cash_weight": 0.999,
+        "reference_prices": {"SH600000": 10.0},
+        "holdings": [
+            {
+                "instrument": "SH600000",
+                "weight": 0.001,
+                "previous_weight": 0.0,
+                "weight_change": 0.001,
+                "action": "increase",
+                "reason": "governed target",
+            }
+        ],
+    }
+    return recommendations, snapshot["id"], result
+
+
+def _make_succeeded_snapshot(database_url: str, tmp_path):
+    recommendations, snapshot_id, result = _make_pending_snapshot(database_url, tmp_path)
+    recommendations.apply_result(snapshot_id, result)
+    return recommendations, snapshot_id
 
 
 def test_attach_account_actions_end_to_end(database_url: str, tmp_path) -> None:
@@ -427,6 +431,71 @@ def test_attach_account_actions_end_to_end(database_url: str, tmp_path) -> None:
     assert items["SZ000001"]["order_plan"][-1]["quantity"] == 200
     # 既有 increase/decrease 导出保持兼容，不被两维模型改写。
     assert updated["holdings"][0]["action"] == "increase"
+
+
+def test_attach_account_actions_uses_selected_account_value(
+    database_url: str, tmp_path
+) -> None:
+    recommendations, snapshot_id = _make_succeeded_snapshot(database_url, tmp_path)
+    updated = recommendations.attach_account_actions(
+        snapshot_id,
+        account_state={
+            "SH600000": {
+                "reference_price": 10.0,
+                "filled_position": 0,
+                "sellable_quantity": 0,
+            }
+        },
+        account_value=2_000_000,
+        now=datetime(2026, 7, 15, 10, 0, tzinfo=UTC),
+    )
+
+    plan = updated["account_actions"]
+    assert plan["account_value"] == 2_000_000
+    assert plan["account_value_source"] == "selected_account"
+    assert plan["items"][0]["target_quantity"] == 200
+
+
+def test_apply_result_commits_recommendation_and_account_actions_atomically(
+    database_url: str, tmp_path
+) -> None:
+    recommendations, snapshot_id, result = _make_pending_snapshot(database_url, tmp_path)
+
+    updated = recommendations.apply_result(
+        snapshot_id,
+        result,
+        account_state={
+            "SH600000": {
+                "reference_price": 10.0,
+                "filled_position": 0,
+                "sellable_quantity": 0,
+            }
+        },
+        account_value=2_000_000,
+    )
+
+    assert updated["status"] == "succeeded"
+    assert updated["account_actions"]["account_value_source"] == "selected_account"
+    assert updated["account_actions"]["items"][0]["target_quantity"] == 200
+
+
+def test_apply_result_does_not_publish_when_account_action_planning_fails(
+    database_url: str, tmp_path
+) -> None:
+    recommendations, snapshot_id, result = _make_pending_snapshot(database_url, tmp_path)
+
+    with pytest.raises(ValueError, match="reference price"):
+        recommendations.apply_result(
+            snapshot_id,
+            result,
+            account_state={"SH600000": {"filled_position": 0}},
+        )
+
+    unchanged = recommendations.get_snapshot(snapshot_id)
+    assert unchanged["status"] == "queued"
+    assert unchanged["snapshot"] is None
+    assert unchanged["account_actions"] is None
+    assert unchanged["holdings"] == []
 
 
 def test_attach_account_actions_requires_succeeded_snapshot(

@@ -204,6 +204,9 @@ def _make_batch(
             "backtest_engine_version": QLIB_ENGINE_VERSION,
             "cost_model": snapshot["cost_model"],
             "cash_weight": 1.0 - sum(item["weight"] for item in holdings),
+            "reference_prices": {
+                item["instrument"]: 10.0 for item in holdings
+            },
             "holdings": holdings,
         },
     )

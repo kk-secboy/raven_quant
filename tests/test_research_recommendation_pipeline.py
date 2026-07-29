@@ -157,6 +157,7 @@ def test_v2_research_to_final_test_and_recommendation_snapshot(
             "effective_date": "2026-07-13",
             "cost_model": CostModelConfig().to_dict(),
             "cash_weight": 0.98,
+            "reference_prices": {"SH600000": 10.0},
             "holdings": [
                 {
                     "instrument": "SH600000",

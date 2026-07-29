@@ -470,6 +470,11 @@ def main() -> None:
             raise ValueError("minute Qlib order-plan generation requires signal_at")
         effective_date = as_of.date().isoformat()
     changes = {item["instrument"]: item for item in decision.changes}
+    reference_prices = pd.to_numeric(
+        point_metadata["$close"], errors="coerce"
+    ).reindex(decision.target_weights)
+    if reference_prices.isna().any() or (reference_prices <= 0).any():
+        raise ValueError("recommendation target holdings require positive reference prices")
 
     result = {
         "status": "ok",
@@ -499,6 +504,10 @@ def main() -> None:
         },
         "reasons": decision.reasons,
         "cash_weight": max(0.0, 1.0 - sum(decision.target_weights.values())),
+        "reference_prices": {
+            str(instrument): float(price)
+            for instrument, price in reference_prices.items()
+        },
         "holdings": [
             {
                 "instrument": instrument,

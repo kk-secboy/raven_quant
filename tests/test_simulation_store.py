@@ -231,6 +231,7 @@ def _create_batch(database_url: str, tmp_path) -> tuple[SimulationStore, dict, d
             "backtest_engine_version": QLIB_ENGINE_VERSION,
             "cost_model": snapshot["cost_model"],
             "cash_weight": 0.999,
+            "reference_prices": {"SH600000": 10.0},
             "holdings": [
                 {
                     "instrument": "SH600000",

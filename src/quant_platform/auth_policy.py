@@ -75,7 +75,9 @@ def permission_for(method: str, path: str) -> str:
         return "portfolio:write"
     if path.startswith("/api/strategy-allocations"):
         return "strategy:write"
-    if path.startswith("/api/recommendation-portfolios"):
+    if path.startswith(
+        ("/api/recommendation-portfolios", "/api/recommendation-accounts")
+    ):
         return "portfolio:write"
     if path.startswith("/api/simulation-portfolios/") and path.endswith("/review"):
         return "strategy:approve"

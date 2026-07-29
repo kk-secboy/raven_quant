@@ -58,6 +58,7 @@ from .parameter_experiment_store import ParameterExperimentStore
 from .parameter_experiments import normalize_parameter_grid, split_research_period
 from .platform_config_store import PlatformConfigStore
 from .rdagent_runtime import probe_rdagent, validate_duration
+from .recommendation_account_store import RecommendationAccountStore
 from .recommendation_store import RecommendationStore
 from .research_automation import normalize_research_schedule_payload
 from .research_store import ResearchStore
@@ -890,6 +891,15 @@ class RecommendationRefreshRequest(BaseModel):
     as_of_date: date
 
 
+class ActiveRecommendationAccountRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    recommendation_portfolio_id: str = Field(min_length=1, max_length=200)
+    account_type: Literal["main_paper", "manual_shadow"]
+    account_id: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=10, max_length=2000)
+
+
 class SimulationPortfolioCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1193,6 +1203,11 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     auth = AuthStore(settings.database_url)
     runtime_secrets = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
     platform_configs = PlatformConfigStore(settings.database_url)
+    recommendation_accounts = RecommendationAccountStore(
+        settings.database_url,
+        configs=platform_configs,
+        simulations=simulations,
+    )
     retention = DataRetentionManager(settings.data_root, settings.database_url)
     market_dashboard = MarketOverviewService(settings.data_root)
     deployment_readiness = DeploymentReadinessStore(settings, project_root)
@@ -2866,6 +2881,35 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             return recommendations.get(portfolio_id)
         except KeyError as exc:
             raise HTTPException(404, "recommendation portfolio not found") from exc
+
+    @app.get("/api/recommendation-accounts/active")
+    def get_active_recommendation_account(
+        recommendation_portfolio_id: str = Query(min_length=1, max_length=200),
+    ) -> dict:
+        try:
+            recommendations.get(recommendation_portfolio_id)
+            return recommendation_accounts.resolve(recommendation_portfolio_id)
+        except KeyError as exc:
+            raise HTTPException(404, "recommendation portfolio not found") from exc
+
+    @app.put("/api/recommendation-accounts/active")
+    def select_active_recommendation_account(
+        payload: ActiveRecommendationAccountRequest,
+        request: Request,
+    ) -> dict:
+        try:
+            recommendations.get(payload.recommendation_portfolio_id)
+            return recommendation_accounts.select(
+                recommendation_portfolio_id=payload.recommendation_portfolio_id,
+                account_type=payload.account_type,
+                account_id=payload.account_id,
+                actor=authenticated_actor(request, "local-admin"),
+                reason=payload.reason,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "recommendation portfolio or account not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/recommendation-portfolios/{portfolio_id}/snapshots/{snapshot_id}")
     def get_recommendation_snapshot(portfolio_id: str, snapshot_id: str) -> dict:

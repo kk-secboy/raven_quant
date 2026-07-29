@@ -35,6 +35,98 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _build_account_action_plan(
+    *,
+    weights: dict[str, float],
+    rule_date: date,
+    construction_notional: float,
+    account_state: dict[str, dict[str, Any]],
+    now: datetime | None,
+    permission_store: Any | None,
+    account_context: dict[str, Any] | None,
+    risk_assessment: dict[str, Any] | None,
+    account_value: float | None,
+) -> dict[str, Any]:
+    initial_value = (
+        float(account_value)
+        if account_value is not None
+        else float(construction_notional)
+    )
+    if not isfinite(initial_value) or initial_value <= 0:
+        raise ValueError("account action planning requires a positive finite account value")
+    instruments: list[dict[str, Any]] = []
+    for instrument in sorted(set(weights) | set(account_state)):
+        state = dict(account_state.get(instrument) or {})
+        target_quantity = state.pop("target_quantity", None)
+        if instrument in weights and target_quantity is None:
+            reference_price = state.pop("reference_price", None)
+            if reference_price is None or float(reference_price) <= 0:
+                raise ValueError(
+                    f"account state for {instrument} needs a reference price or "
+                    "an explicit target quantity"
+                )
+            rules = order_unit_rules(instrument, rule_date)
+            target_quantity = lot_floor(
+                int(weights[instrument] * initial_value / float(reference_price)),
+                rules,
+            )
+        elif instrument not in weights:
+            target_quantity = 0
+        lot_rules = order_unit_rules(instrument, rule_date)
+        filled_position = int(state.pop("filled_position", 0))
+        hard_blocked_reason = state.pop("hard_blocked_reason", None)
+        not_executable_reason = state.pop("not_executable_reason", None)
+        if permission_store is not None and target_quantity is not None:
+            gate = permission_store.gate_for_instrument(
+                instrument,
+                on_date=rule_date,
+                is_buy_action=int(target_quantity) > filled_position,
+            )
+            if gate is not None:
+                if gate["kind"] == "hard" and not hard_blocked_reason:
+                    hard_blocked_reason = gate["reason"]
+                elif gate["kind"] == "soft" and not not_executable_reason:
+                    not_executable_reason = gate["reason"]
+        instruments.append(
+            {
+                "instrument": instrument,
+                "target_quantity": target_quantity,
+                "filled_position": filled_position,
+                "sellable_quantity": state.pop("sellable_quantity", None),
+                "open_orders": state.pop("open_orders", []),
+                "lot_increment": lot_rules.lot_increment,
+                "min_lot": lot_rules.min_lot,
+                "hard_blocked_reason": hard_blocked_reason,
+                "not_executable_reason": not_executable_reason,
+            }
+        )
+    computed_at = now or _now()
+    resolved_context = account_context or {
+        "account_type": "main_paper",
+        "degraded": False,
+    }
+    resolved_risk = risk_assessment or assess_account_risk(
+        account_state_stale=bool(resolved_context.get("degraded")),
+        market_data_trusted=not bool(resolved_context.get("degraded")),
+    )
+    return {
+        "model_version": RECOMMENDATION_ACTION_MODEL_VERSION,
+        "computed_at": computed_at.isoformat(),
+        "rule_date": rule_date.isoformat(),
+        "account_context": resolved_context,
+        "account_value": initial_value,
+        "account_value_source": (
+            "selected_account" if account_value is not None else "construction_notional"
+        ),
+        "risk_assessment": resolved_risk,
+        "items": plan_account_actions(
+            instruments,
+            now=computed_at,
+            risk_assessment=resolved_risk,
+        ),
+    }
+
+
 class RecommendationStore:
     """Durable recommendation snapshots; this store has no order or fill concepts."""
 
@@ -301,7 +393,17 @@ class RecommendationStore:
             if not result.rowcount:
                 raise KeyError(snapshot_id)
 
-    def apply_result(self, snapshot_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    def apply_result(
+        self,
+        snapshot_id: str,
+        result: dict[str, Any],
+        *,
+        account_state: dict[str, dict[str, Any]] | None = None,
+        permission_store: Any | None = None,
+        account_context: dict[str, Any] | None = None,
+        risk_assessment: dict[str, Any] | None = None,
+        account_value: float | None = None,
+    ) -> dict[str, Any]:
         if (
             result.get("status") != "ok"
             or result.get("policy_version") != POLICY_VERSION
@@ -318,6 +420,7 @@ class RecommendationStore:
             raise ValueError("recommendation holdings must contain objects")
         instruments = [str(item.get("instrument") or "") for item in holdings]
         weights = [float(item.get("weight", float("nan"))) for item in holdings]
+        reference_prices = result.get("reference_prices")
         if (
             any(not instrument for instrument in instruments)
             or len(instruments) != len(set(instruments))
@@ -326,7 +429,35 @@ class RecommendationStore:
             or abs(sum(weights) + float(cash_weight) - 1.0) > 1e-6
         ):
             raise ValueError("recommendation holdings and cash weight are inconsistent")
+        if (
+            not isinstance(reference_prices, dict)
+            or any(instrument not in reference_prices for instrument in instruments)
+            or any(
+                not isfinite(float(reference_prices[instrument]))
+                or float(reference_prices[instrument]) <= 0
+                for instrument in instruments
+            )
+        ):
+            raise ValueError(
+                "recommendation holdings require positive finite reference prices"
+            )
         now = _now()
+        effective_date = date.fromisoformat(result["effective_date"])
+        planned_account_actions = None
+        if account_state is not None:
+            preview = self.get_snapshot(snapshot_id)
+            portfolio = self.get(str(preview["portfolio_id"]))
+            planned_account_actions = _build_account_action_plan(
+                weights=dict(zip(instruments, weights, strict=True)),
+                rule_date=effective_date,
+                construction_notional=float(portfolio["construction_notional"]),
+                account_state=account_state,
+                now=now,
+                permission_store=permission_store,
+                account_context=account_context,
+                risk_assessment=risk_assessment,
+                account_value=account_value,
+            )
         with self.engine.begin() as connection:
             snapshot = connection.execute(
                 select(recommendation_snapshots)
@@ -357,7 +488,6 @@ class RecommendationStore:
             result_cost_model = CostModelConfig.from_mapping(result["cost_model"]).to_dict()
             if result_cost_model != dict(snapshot.cost_model_json):
                 raise ValueError("recommendation result cost model does not match snapshot")
-            effective_date = date.fromisoformat(result["effective_date"])
             if effective_date <= snapshot.as_of_date:
                 raise ValueError("recommendation effective date must follow its signal date")
             connection.execute(
@@ -367,6 +497,7 @@ class RecommendationStore:
                     effective_date=effective_date,
                     status="succeeded",
                     snapshot_json=result,
+                    account_actions_json=planned_account_actions,
                     cost_model_json=result_cost_model,
                     error=None,
                     finished_at=now,
@@ -444,6 +575,7 @@ class RecommendationStore:
         permission_store: Any | None = None,
         account_context: dict[str, Any] | None = None,
         risk_assessment: dict[str, Any] | None = None,
+        account_value: float | None = None,
     ) -> dict[str, Any]:
         """Attach the two-dimension account action plan (design 8.4) to a snapshot.
 
@@ -473,78 +605,21 @@ class RecommendationStore:
         if snapshot["status"] != "succeeded":
             raise ValueError("account actions require a succeeded recommendation snapshot")
         portfolio = self.get(str(snapshot["portfolio_id"]))
-        initial_value = float(portfolio["construction_notional"])
         rule_date = snapshot["effective_date"] or snapshot["as_of_date"]
         weights = {
             str(item["instrument"]): float(item["weight"]) for item in snapshot["holdings"]
         }
-        instruments: list[dict[str, Any]] = []
-        for instrument in sorted(set(weights) | set(account_state)):
-            state = dict(account_state.get(instrument) or {})
-            target_quantity = state.pop("target_quantity", None)
-            if instrument in weights and target_quantity is None:
-                reference_price = state.pop("reference_price", None)
-                if reference_price is None or float(reference_price) <= 0:
-                    raise ValueError(
-                        f"account state for {instrument} needs a reference price or "
-                        "an explicit target quantity"
-                    )
-                rules = order_unit_rules(instrument, rule_date)
-                target_quantity = lot_floor(
-                    int(weights[instrument] * initial_value / float(reference_price)),
-                    rules,
-                )
-            elif instrument not in weights:
-                target_quantity = 0
-            lot_rules = order_unit_rules(instrument, rule_date)
-            filled_position = int(state.pop("filled_position", 0))
-            hard_blocked_reason = state.pop("hard_blocked_reason", None)
-            not_executable_reason = state.pop("not_executable_reason", None)
-            if permission_store is not None and target_quantity is not None:
-                gate = permission_store.gate_for_instrument(
-                    instrument,
-                    on_date=rule_date,
-                    is_buy_action=int(target_quantity) > filled_position,
-                )
-                if gate is not None:
-                    if gate["kind"] == "hard" and not hard_blocked_reason:
-                        hard_blocked_reason = gate["reason"]
-                    elif gate["kind"] == "soft" and not not_executable_reason:
-                        not_executable_reason = gate["reason"]
-            instruments.append(
-                {
-                    "instrument": instrument,
-                    "target_quantity": target_quantity,
-                    "filled_position": filled_position,
-                    "sellable_quantity": state.pop("sellable_quantity", None),
-                    "open_orders": state.pop("open_orders", []),
-                    "lot_increment": lot_rules.lot_increment,
-                    "min_lot": lot_rules.min_lot,
-                    "hard_blocked_reason": hard_blocked_reason,
-                    "not_executable_reason": not_executable_reason,
-                }
-            )
-        computed_at = now or _now()
-        resolved_context = account_context or {
-            "account_type": "main_paper",
-            "degraded": False,
-        }
-        resolved_risk = risk_assessment or assess_account_risk(
-            account_state_stale=bool(resolved_context.get("degraded")),
-            market_data_trusted=not bool(resolved_context.get("degraded")),
+        plan = _build_account_action_plan(
+            weights=weights,
+            rule_date=rule_date,
+            construction_notional=float(portfolio["construction_notional"]),
+            account_state=account_state,
+            now=now,
+            permission_store=permission_store,
+            account_context=account_context,
+            risk_assessment=risk_assessment,
+            account_value=account_value,
         )
-        plan = {
-            "model_version": RECOMMENDATION_ACTION_MODEL_VERSION,
-            "computed_at": computed_at.isoformat(),
-            "rule_date": rule_date.isoformat(),
-            "account_context": resolved_context,
-            "risk_assessment": resolved_risk,
-            "items": plan_account_actions(
-                instruments,
-                now=computed_at,
-                risk_assessment=resolved_risk,
-            ),
-        }
         with self.engine.begin() as connection:
             result = connection.execute(
                 update(recommendation_snapshots)

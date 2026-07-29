@@ -54,6 +54,7 @@ def test_recommendation_snapshot_is_independent_of_paper_orders_and_fills(
         "effective_date": "2026-07-13",
         "cost_model": snapshot["cost_model"],
         "cash_weight": 0.98,
+        "reference_prices": {"SH600000": 10.0},
         "holdings": [
             {
                 "instrument": "SH600000",
@@ -125,6 +126,7 @@ def test_recommendation_result_identity_is_bound_and_cash_only_is_valid(
         "backtest_engine_version": QLIB_ENGINE_VERSION,
         "cost_model": snapshot["cost_model"],
         "cash_weight": 1.0,
+        "reference_prices": {},
         "holdings": [],
         "changes": [{"instrument": "SH600000", "action": "sell", "target_weight": 0.0}],
     }

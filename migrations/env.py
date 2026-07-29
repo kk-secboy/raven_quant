@@ -25,7 +25,13 @@ if config.config_file_name is not None:
         root_logger.handlers[:] = host_handlers
         root_logger.setLevel(host_level)
 
-database_url = os.environ.get("DATABASE_URL") or config.get_main_option("sqlalchemy.url")
+# Programmatic callers (tests, restore validation and release preflight) pass an
+# explicit database URL through the Alembic Config.  It must win over the host
+# process environment; otherwise an isolated migration can silently target the
+# production database named by DATABASE_URL.
+database_url = config.get_main_option("sqlalchemy.url") or os.environ.get(
+    "DATABASE_URL"
+)
 if not database_url:
     raise RuntimeError("DATABASE_URL is required for database migrations")
 config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))

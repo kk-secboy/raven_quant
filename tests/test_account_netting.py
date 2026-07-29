@@ -324,6 +324,9 @@ def test_build_plan_for_allocation(database_url: str, tmp_path: Path, monkeypatc
                 "backtest_engine_version": QLIB_ENGINE_VERSION,
                 "cost_model": snapshot["cost_model"],
                 "cash_weight": 1.0 - sum(holdings.values()),
+                "reference_prices": {
+                    instrument: 10.0 for instrument in holdings
+                },
                 "holdings": [
                     {
                         "instrument": instrument,
