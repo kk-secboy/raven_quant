@@ -105,6 +105,8 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(sourceByName["job-run-center.tsx"], /\/api\/jobs\/\$\{job\.id\}\/log/);
   assert.match(sourceByName["page.tsx"], /平均目录覆盖度/);
   assert.match(sourceByName["page.tsx"], /成功 checkpoint/);
+  assert.match(sourceByName["page.tsx"], /running_work_units/);
+  assert.match(sourceByName["page.tsx"], /liveExecutionPhase/);
   assert.match(sourceByName["data-task-center.tsx"], /请求策略/);
   assert.match(sourceByName["job-run-center.tsx"], /job-progress-card/);
   assert.match(sourceByName["data-progress.ts"], /adaptive_recovery:\s*"自适应拆分恢复"/);

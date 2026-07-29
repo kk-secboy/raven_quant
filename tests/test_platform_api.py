@@ -6,7 +6,9 @@ import pandas as pd
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
+from quant_data.checkpoint import CheckpointStore
 from quant_data.config import Settings
+from quant_data.models import FetchSpec
 from quant_platform.alert_store import AlertStore
 from quant_platform.api import create_app
 from quant_platform.job_store import JobStore
@@ -21,6 +23,30 @@ def _trading_calendar(start: date, end: date) -> str:
             days.append(current.isoformat())
         current += timedelta(days=1)
     return "\n".join(days) + "\n"
+
+
+def test_api_reports_live_work_unit_activity(
+    tmp_path: Path, monkeypatch, database_url: str
+) -> None:
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("PLATFORM_SECRET_KEY", Fernet.generate_key().decode("ascii"))
+    checkpoint = CheckpointStore(database_url)
+    spec = FetchSpec(
+        dataset="daily",
+        api_name="daily",
+        scope={"trade_date": "20240102"},
+        params={"trade_date": "20240102"},
+    )
+    checkpoint.add([spec])
+    assert checkpoint.claim({"daily"}) is not None
+
+    app = create_app(tmp_path)
+    with TestClient(app) as client:
+        overview = client.get("/api/overview")
+
+    assert overview.status_code == 200
+    assert overview.json()["running_work_units"] == 1
 
 
 def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url: str) -> None:
@@ -52,6 +78,7 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
     assert overview.json()["readiness_percent"] < 100
     assert overview.json()["actionable_tasks"] > overview.json()["ready_tasks"]
     assert overview.json()["legacy_download_coverage"] == overview.json()["coverage"]
+    assert overview.json()["running_work_units"] == 0
     assert readiness.status_code == 200
     assert readiness.json()["profiles"][0]["status"] == "blocked"
     assert any(item["name"] == "daily" for item in datasets.json())

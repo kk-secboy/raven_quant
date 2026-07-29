@@ -29,6 +29,7 @@ type Overview = {
   snapshots: number;
   qlib_datasets: number;
   active_jobs: number;
+  running_work_units: number;
   legacy_download_coverage: number;
   readiness_percent: number;
   ready_tasks: number;
@@ -206,6 +207,21 @@ export default function Home() {
     [dataTasks],
   );
 
+  function liveRunningUnits(task: DataTask) {
+    const scoped = Number(
+      task.progress?.checkpoint?.running ?? task.unit_stats.running,
+    );
+    return activeDataTasks.length === 1 && task.status === "running"
+      ? Math.max(scoped, overview?.running_work_units ?? 0)
+      : scoped;
+  }
+
+  function liveExecutionPhase(task: DataTask) {
+    return task.status === "running" && liveRunningUnits(task) > 0
+      ? "downloading"
+      : task.execution_phase;
+  }
+
   async function startBootstrap(event: FormEvent) {
     event.preventDefault();
     setMessage("正在创建初始化任务…");
@@ -339,11 +355,11 @@ export default function Home() {
                 <article className="workspace-card live-downloads">
                   <div className="section-heading"><div><h2>当前下载执行</h2><p>展示真实阶段与 checkpoint 状态；工作单元会随自适应拆分动态变化。</p></div><button onClick={() => setDataView("runs")}>运行记录</button></div>
                   {activeDataTasks.slice(0, 3).map((task) => <div className="live-download" key={task.job_id ?? task.task_key}>
-                    <div className="live-download-head"><div><span className={`task-status ${task.status}`}>{phaseLabel(task.execution_phase)}</span><strong>{task.title}</strong><small>{targetText(task.job?.payload, task.progress)}</small></div><span className="live-updated">{task.progress?.updated_at ? `更新于 ${new Date(task.progress.updated_at).toLocaleTimeString("zh-CN")}` : statusLabel(task.status)}</span></div>
+                    <div className="live-download-head"><div><span className={`task-status ${task.status}`}>{phaseLabel(liveExecutionPhase(task))}</span><strong>{task.title}</strong><small>{targetText(task.job?.payload, task.progress)}</small></div><span className="live-updated">{task.progress?.updated_at ? `更新于 ${new Date(task.progress.updated_at).toLocaleTimeString("zh-CN")}` : statusLabel(task.status)}</span></div>
                     <p>{task.config.request_strategy}</p>
                     <div className="checkpoint-metrics">
                       <div><span>成功 checkpoint</span><strong>{formatNumber(Number(task.progress?.checkpoint?.succeeded ?? task.unit_stats.succeeded))}</strong></div>
-                      <div><span>正在请求</span><strong>{formatNumber(Number(task.progress?.checkpoint?.running ?? task.unit_stats.running))}</strong></div>
+                      <div><span>正在请求</span><strong>{formatNumber(liveRunningUnits(task))}</strong></div>
                       <div><span>等待重试</span><strong>{formatNumber(Number(task.progress?.checkpoint?.retry_waiting ?? task.unit_stats.retry_waiting))}</strong></div>
                       <div><span>终止失败</span><strong className={Number(task.progress?.checkpoint?.terminal_failed ?? task.unit_stats.terminal_failed) ? "danger" : ""}>{formatNumber(Number(task.progress?.checkpoint?.terminal_failed ?? task.unit_stats.terminal_failed))}</strong></div>
                       <div><span>替代审计</span><strong>{formatNumber(Number(task.progress?.checkpoint?.superseded ?? task.unit_stats.superseded))}</strong></div>

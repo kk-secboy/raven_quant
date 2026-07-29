@@ -295,6 +295,7 @@ def system_summary(
     total_rows = sum(item["rows"] for item in catalog)
     planned = sum(item["planned"] for item in catalog)
     succeeded = sum(item["succeeded"] for item in catalog)
+    running_work_units = sum(item["running"] for item in catalog)
     snapshots = list_snapshots(settings.data_root)
     qlib_datasets = len(list_qlib_datasets(settings.data_root))
     active_jobs = sum(job["status"] in {"queued", "running"} for job in jobs)
@@ -365,6 +366,11 @@ def system_summary(
         "snapshots": len(snapshots),
         "qlib_datasets": qlib_datasets,
         "active_jobs": active_jobs,
+        # This is the live checkpoint activity across datasets, independent of
+        # whether a long-running CLI job has emitted a structured progress
+        # artifact yet. It prevents the UI from claiming "0 requests" while
+        # the downloader has leased work units.
+        "running_work_units": running_work_units,
         "components": [
             {"name": "PostgreSQL", "state": "ready"},
             {"name": "Data Center", "state": "ready"},
