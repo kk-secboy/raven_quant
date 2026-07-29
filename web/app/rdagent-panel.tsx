@@ -78,7 +78,7 @@ export function RDAgentPanel({ api }: { api: string }) {
   const [periods, setPeriods] = useState({
     train_start: "2008-01-01", train_end: "2017-12-31",
     valid_start: "2018-01-01", valid_end: "2020-12-31",
-    test_start: "2021-01-01", test_end: new Date().toISOString().slice(0, 10),
+    test_start: "2021-01-11", test_end: new Date().toISOString().slice(0, 10),
   });
   const [message, setMessage] = useState("正在核对 RD-Agent、Docker、LLM 与 Qlib 数据…");
   const recipeApplied = useRef(false);

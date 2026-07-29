@@ -21,7 +21,11 @@ type StrategyRecipe = {
 };
 type Backtest = {
   id: string; strategy_version_id: string; dataset: string; status: string;
-  periods: { start: string; end: string }; metrics?: Record<string, unknown> | null;
+  periods: {
+    start: string; end: string;
+    historical_start?: string; historical_end?: string;
+  };
+  metrics?: Record<string, unknown> | null;
   error?: string | null;
 };
 type RobustnessScenario = {
@@ -463,6 +467,6 @@ export function BacktestPanel({ api }: { api: string }) {
     {!currentBacktest || currentBacktest.status !== "succeeded" ? <div className="workspace-card empty-state-card"><h2>还没有可查看的回测结果</h2><p>请先在“新建回测”中选择策略版本和 Qlib 数据集运行回测。</p></div> : null}
     </>}
 
-    {view === "history" && <section className="data-panel panel-without-top-margin"><div className="panel-heading"><div><p className="eyebrow">GOVERNED BACKTESTS</p><h2>策略回测记录</h2></div><span>{backtests.length} 条记录</span></div><div className="table-wrap"><table><thead><tr><th>回测</th><th>策略版本</th><th>区间</th><th>状态</th><th>年化超额</th><th>Sharpe</th><th>稳健通过率</th><th>容量成交率</th></tr></thead><tbody>{backtests.map((item) => <tr key={item.id}><td><code>{item.id.slice(0, 10)}</code></td><td><code>{item.strategy_version_id.slice(0, 10)}</code></td><td>{item.periods.start} → {item.periods.end}</td><td><span className={`state ${item.status === "succeeded" ? "ready" : item.status === "failed" ? "failed" : "partial"}`}>{item.status}</span></td><td>{pct(item.metrics?.annualized_excess_return)}</td><td>{decimal(item.metrics?.sharpe_ratio)}</td><td>{pct(item.metrics?.robustness_pass_rate)}</td><td>{pct(item.metrics?.capacity_fill_ratio)}</td></tr>)}</tbody></table>{!backtests.length && <div className="empty">尚无策略回测。先用已晋级因子创建不可变策略版本。</div>}</div></section>}
+    {view === "history" && <section className="data-panel panel-without-top-margin"><div className="panel-heading"><div><p className="eyebrow">GOVERNED BACKTESTS</p><h2>策略回测记录</h2></div><span>{backtests.length} 条记录</span></div><div className="table-wrap"><table><thead><tr><th>回测</th><th>策略版本</th><th>预最终历史 / 最终 OOS</th><th>状态</th><th>年化超额</th><th>Sharpe</th><th>稳健通过率</th><th>容量成交率</th></tr></thead><tbody>{backtests.map((item) => <tr key={item.id}><td><code>{item.id.slice(0, 10)}</code></td><td><code>{item.strategy_version_id.slice(0, 10)}</code></td><td><span>{item.periods.historical_start && item.periods.historical_end ? `${item.periods.historical_start} → ${item.periods.historical_end}` : "未提供长期历史证据"}</span><small>最终：{item.periods.start} → {item.periods.end}</small></td><td><span className={`state ${item.status === "succeeded" ? "ready" : item.status === "failed" ? "failed" : "partial"}`}>{item.status}</span></td><td>{pct(item.metrics?.annualized_excess_return)}</td><td>{decimal(item.metrics?.sharpe_ratio)}</td><td>{pct(item.metrics?.robustness_pass_rate)}</td><td>{pct(item.metrics?.capacity_fill_ratio)}</td></tr>)}</tbody></table>{!backtests.length && <div className="empty">尚无策略回测。先用已晋级因子创建不可变策略版本。</div>}</div></section>}
   </>;
 }

@@ -31,6 +31,38 @@ function timeText(value?: string | null) {
   return value ? new Date(value).toLocaleString("zh-CN") : "—";
 }
 
+function pipelineIdentity(job: Job) {
+  const pipelineId = job.payload?.pipeline_id;
+  if (typeof pipelineId === "string" && pipelineId) return `${job.kind}:pipeline:${pipelineId}`;
+  const snapshotName = job.payload?.snapshot_name;
+  if (typeof snapshotName === "string" && snapshotName) {
+    return `${job.kind}:snapshot:${snapshotName}`;
+  }
+  return "";
+}
+
+function laterAttemptStatus(job: Job, jobs: Job[]) {
+  if (job.status !== "failed") return "";
+  if (job.retry_successor?.status === "succeeded") return "后续已成功";
+  if (["queued", "running"].includes(job.retry_successor?.status ?? "")) {
+    return "已重试，后续运行中";
+  }
+  const identity = pipelineIdentity(job);
+  if (!identity) return "";
+  const laterAttempts = jobs.filter((candidate) =>
+    candidate.id !== job.id
+    && pipelineIdentity(candidate) === identity
+    && new Date(candidate.created_at).getTime() > new Date(job.created_at).getTime()
+  );
+  if (laterAttempts.some((candidate) => candidate.status === "succeeded")) {
+    return "后续已成功";
+  }
+  if (laterAttempts.some((candidate) => ["queued", "running"].includes(candidate.status))) {
+    return "已重试，后续运行中";
+  }
+  return "";
+}
+
 type Props = {
   api: string;
   canControl: boolean;
@@ -88,10 +120,11 @@ export function JobRunCenter({ api, canControl, onChanged, onMessage }: Props) {
 
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const kindsOnPage = useMemo(() => [...new Set(jobs.map((item) => item.kind))].sort(), [jobs]);
+  const selectedLaterStatus = selected ? laterAttemptStatus(selected, jobs) : "";
 
   return <section className="job-run-center">
     <div className="job-run-toolbar">
-      <div><h2>运行记录</h2><p>筛选、分页、查看错误与日志；下载和 Qlib 构建可单独重试。</p></div>
+      <div><h2>运行记录</h2><p>完整保留历史审计；同一流水线的旧失败会标明已重试或后续已成功。</p></div>
       <div className="job-run-filters">
         <select aria-label="任务状态" value={status} onChange={(event) => { setStatus(event.target.value); setPage(0); }}>{statusOptions.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select>
         <input aria-label="任务类型" list="job-kinds" value={kind} onChange={(event) => { setKind(event.target.value); setPage(0); }} placeholder="全部任务类型" />
@@ -101,18 +134,21 @@ export function JobRunCenter({ api, canControl, onChanged, onMessage }: Props) {
     </div>
     <div className={`job-run-layout ${selected ? "with-detail" : ""}`}>
       <div className="job-run-list">
-        {jobs.map((job) => <button type="button" className={selected?.id === job.id ? "selected" : ""} onClick={() => openJob(job)} key={job.id}>
+        {jobs.map((job) => {
+          const laterStatus = laterAttemptStatus(job, jobs);
+          return <button type="button" className={selected?.id === job.id ? "selected" : ""} onClick={() => openJob(job)} key={job.id}>
           <span className={`job-state ${job.status}`} />
           <div><strong>{jobDisplayName(job)}</strong><small>{phaseLabel(job.progress?.execution_phase ?? (job.status === "running" ? "planning" : job.status === "queued" ? "queued" : null))} · {targetText(job.payload, job.progress)} · {timeText(job.created_at)}</small>{job.error ? <em>{job.error}</em> : null}</div>
           <code>{job.id.slice(0, 10)}</code>
-          <span className={`task-status ${job.status}`}>{statusText[job.status] ?? job.status}</span>
-        </button>)}
+          <span className={`task-status ${laterStatus ? "succeeded" : job.status}`}>{laterStatus || statusText[job.status] || job.status}</span>
+        </button>;
+        })}
         {!jobs.length ? <div className="empty compact">当前筛选条件下没有任务。</div> : null}
         <footer><span>共 {total} 条 · 第 {page + 1}/{pageCount} 页</span><div><button type="button" disabled={page === 0} onClick={() => setPage(page - 1)}>上一页</button><button type="button" disabled={page + 1 >= pageCount} onClick={() => setPage(page + 1)}>下一页</button></div></footer>
       </div>
       {selected ? <aside className="job-run-detail">
         <header><div><span>{selected.kind}</span><h3>{jobDisplayName(selected)}</h3></div><button type="button" onClick={() => setSelected(null)}>关闭</button></header>
-        <dl><div><dt>任务 ID</dt><dd><code>{selected.id}</code></dd></div><div><dt>状态</dt><dd>{statusText[selected.status] ?? selected.status}{selected.cancel_requested_at && selected.status === "running" ? " · 正在安全停止" : ""}</dd></div><div><dt>开始 / 结束</dt><dd>{timeText(selected.started_at)} / {timeText(selected.finished_at)}</dd></div><div><dt>退出码</dt><dd>{selected.exit_code ?? "—"}</dd></div></dl>
+        <dl><div><dt>任务 ID</dt><dd><code>{selected.id}</code></dd></div><div><dt>状态</dt><dd>{selectedLaterStatus || statusText[selected.status] || selected.status}{selected.cancel_requested_at && selected.status === "running" ? " · 正在安全停止" : ""}</dd></div><div><dt>开始 / 结束</dt><dd>{timeText(selected.started_at)} / {timeText(selected.finished_at)}</dd></div><div><dt>退出码</dt><dd>{selected.exit_code ?? "—"}</dd></div></dl>
         {selected.progress ? <section className="job-progress-card">
           <div><span>当前阶段</span><strong>{phaseLabel(selected.progress.execution_phase ?? (selected.progress.status === "succeeded" ? "verified" : null))}</strong><small>{selected.progress.phase_label ?? targetText(selected.payload, selected.progress)}</small></div>
           {selected.progress.checkpoint ? <div className="job-progress-metrics">

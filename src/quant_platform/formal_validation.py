@@ -7,7 +7,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-FORMAL_VALIDATION_CONTRACT_VERSION = "formal-validation-evidence-v2-oos-gate"
+FORMAL_VALIDATION_CONTRACT_VERSION = (
+    "formal-validation-evidence-v3-pre-final-history"
+)
+PRE_FINAL_HISTORY_CONTRACT_VERSION = "pre-final-history-calendar-v1"
 SIGNAL_DECAY_FRONTIER_VERSION = "contiguous-zero-delay-frontier-v2"
 
 
@@ -20,6 +23,79 @@ class OuterFold:
     validation_end: str
     test_start: str
     test_end: str
+
+
+def build_pre_final_history_evidence(
+    dates: pd.DatetimeIndex | Sequence[Any],
+    *,
+    requested_start: str,
+    requested_end: str,
+    final_test_start: str,
+    final_test_end: str,
+    minimum_trading_days: int,
+    minimum_embargo_trading_days: int,
+) -> dict[str, Any]:
+    """Prove that long-history evidence is isolated from the final test.
+
+    This is deliberately a calendar contract, not a performance claim.  It
+    prevents a short final-test report from being reused as supposed
+    long-history walk-forward evidence and records the exact trading-day
+    coverage consumed by the pre-final stability suite.
+    """
+
+    history_start = pd.Timestamp(requested_start).normalize()
+    history_end = pd.Timestamp(requested_end).normalize()
+    test_start = pd.Timestamp(final_test_start).normalize()
+    test_end = pd.Timestamp(final_test_end).normalize()
+    if history_end < history_start:
+        raise ValueError("pre-final history end must not be before its start")
+    if test_end < test_start:
+        raise ValueError("final test end must not be before its start")
+    if history_end >= test_start:
+        raise ValueError("pre-final history must end before the final test starts")
+    if minimum_trading_days < 252:
+        raise ValueError("pre-final history minimum must be at least 252 trading days")
+    if minimum_embargo_trading_days < 1:
+        raise ValueError("final-test embargo must be at least one trading day")
+
+    ordered = pd.DatetimeIndex(pd.to_datetime(dates).unique()).sort_values().tz_localize(None)
+    covered = ordered[(ordered >= history_start) & (ordered <= history_end)]
+    embargo = ordered[(ordered > history_end) & (ordered < test_start)]
+    if covered.empty:
+        raise ValueError("pre-final history has no trading calendar coverage")
+    if len(covered) < int(minimum_trading_days):
+        raise ValueError(
+            "pre-final history has "
+            f"{len(covered)} trading days; {minimum_trading_days} are required"
+        )
+    if len(embargo) < int(minimum_embargo_trading_days):
+        raise ValueError(
+            "pre-final history leaves "
+            f"{len(embargo)} embargo trading days; "
+            f"{minimum_embargo_trading_days} are required"
+        )
+    return {
+        "status": "completed",
+        "contract_version": PRE_FINAL_HISTORY_CONTRACT_VERSION,
+        "requested_periods": {
+            "start": history_start.date().isoformat(),
+            "end": history_end.date().isoformat(),
+        },
+        "observed_periods": {
+            "start": covered[0].date().isoformat(),
+            "end": covered[-1].date().isoformat(),
+        },
+        "final_test_periods": {
+            "start": test_start.date().isoformat(),
+            "end": test_end.date().isoformat(),
+        },
+        "trading_days": int(len(covered)),
+        "minimum_trading_days": int(minimum_trading_days),
+        "embargo_trading_days": int(len(embargo)),
+        "minimum_embargo_trading_days": int(minimum_embargo_trading_days),
+        "overlaps_final_test": False,
+        "uses_final_test_data": False,
+    }
 
 
 def build_outer_walk_forward_folds(

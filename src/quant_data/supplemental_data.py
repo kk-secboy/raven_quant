@@ -7,7 +7,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from .coverage_data import COVERAGE_BUNDLES, coverage_bundle_datasets, coverage_specs
-from .history_bounds import clip_history_range
+from .history_bounds import clip_history_range, history_start_date
 from .models import FetchSpec, ProviderResult
 from .partitioning import is_adaptive_partition, partition_metadata, split_partition_spec
 from .planner import compact_date
@@ -645,11 +645,14 @@ def a_share_bulk_history_specs(*, start: date, end: date, max_attempts: int) -> 
                 )
             )
 
-    for window_start, window_end in _month_ranges(start, end):
-        compact_start = compact_date(window_start)
-        compact_end = compact_date(window_end)
-        params = {"start_date": compact_start, "end_date": compact_end}
-        for dataset in ("namechange", "repurchase", "share_float", "stk_holdertrade"):
+    for dataset in ("namechange", "repurchase", "share_float", "stk_holdertrade"):
+        history_range = clip_history_range(dataset, start, end)
+        for window_start, window_end in (
+            _month_ranges(*history_range) if history_range is not None else ()
+        ):
+            compact_start = compact_date(window_start)
+            compact_end = compact_date(window_end)
+            params = {"start_date": compact_start, "end_date": compact_end}
             specs.extend(
                 _paged_specs(
                     dataset,
@@ -669,11 +672,17 @@ def a_share_bulk_history_specs(*, start: date, end: date, max_attempts: int) -> 
         ("pledge_detail", "ann_date", "ann_date", 16),
         ("anns_d", "ann_date", "ann_date", 64),
     ):
+        lower_bound = history_start_date(dataset)
+        dataset_dates = (
+            [value for value in dates if value >= compact_date(lower_bound)]
+            if lower_bound is not None
+            else dates
+        )
         specs.extend(
             _daily_paged_specs(
                 dataset,
                 dataset,
-                dates,
+                dataset_dates,
                 date_param=date_param,
                 date_field=date_field,
                 page_size=1_000,
@@ -811,11 +820,17 @@ def _cn_extended_specs(
         ("stock_st", 1_000, 4),
         ("sw_daily", 4_000, 4),
     ):
+        lower_bound = history_start_date(dataset)
+        dataset_dates = (
+            [value for value in dates if value >= compact_date(lower_bound)]
+            if lower_bound is not None
+            else dates
+        )
         specs.extend(
             _daily_paged_specs(
                 dataset,
                 dataset,
-                dates,
+                dataset_dates,
                 page_size=page_size,
                 max_pages=max_pages,
                 max_attempts=max_attempts,
@@ -1062,11 +1077,15 @@ def _cn_macro_specs(start: date, end: date, max_attempts: int) -> list[FetchSpec
             for name in ("cn_cpi", "cn_ppi", "cn_pmi", "cn_m", "sf_month")
         ],
     ]
-    daily = {"start_date": compact_date(start), "end_date": compact_date(end)}
-    specs.extend(
-        _spec(name, name, dict(daily), max_attempts=max_attempts)
-        for name in ("shibor", "shibor_lpr")
-    )
+    for name in ("shibor", "shibor_lpr"):
+        history_range = clip_history_range(name, start, end)
+        if history_range is None:
+            continue
+        daily = {
+            "start_date": compact_date(history_range[0]),
+            "end_date": compact_date(history_range[1]),
+        }
+        specs.append(_spec(name, name, daily, max_attempts=max_attempts))
     for month_start, _month_end in _month_ranges(start, end):
         month = month_start.strftime("%Y%m")
         specs.append(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from math import isfinite
@@ -36,6 +37,7 @@ from quant_platform.cost_model import KNOWN_COST_SCHEDULE_VERSIONS, CostModelCon
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
 from quant_platform.formal_validation import (
     FORMAL_VALIDATION_CONTRACT_VERSION,
+    PRE_FINAL_HISTORY_CONTRACT_VERSION,
     SIGNAL_DECAY_FRONTIER_VERSION,
 )
 from quant_platform.pair_trading import PairTradingConfig
@@ -185,10 +187,61 @@ def _formal_validation_failures(
     ) is not True:
         failures.append("formal validation suite did not pass")
 
+    config = version.get("config", {})
+    history = evidence.get("pre_final_history")
+    minimum_history_days = int(config.get("min_pre_final_history_days") or 2520)
+    valid_history = False
+    if isinstance(history, dict):
+        requested_history = history.get("requested_periods")
+        observed_history = history.get("observed_periods")
+        final_test = history.get("final_test_periods")
+        try:
+            requested_start = date.fromisoformat(str(requested_history["start"]))
+            requested_end = date.fromisoformat(str(requested_history["end"]))
+            observed_start = date.fromisoformat(str(observed_history["start"]))
+            observed_end = date.fromisoformat(str(observed_history["end"]))
+            final_start = date.fromisoformat(str(final_test["start"]))
+            final_end = date.fromisoformat(str(final_test["end"]))
+            trading_days = int(history["trading_days"])
+            recorded_minimum = int(history["minimum_trading_days"])
+            embargo_days = int(history["embargo_trading_days"])
+            recorded_embargo_minimum = int(
+                history["minimum_embargo_trading_days"]
+            )
+            history_execution = history["execution_model"]
+            valid_history = (
+                history.get("status") == "completed"
+                and history.get("contract_version")
+                == PRE_FINAL_HISTORY_CONTRACT_VERSION
+                and requested_start <= observed_start <= observed_end <= requested_end
+                and requested_end < final_start <= final_end
+                and trading_days >= minimum_history_days
+                and trading_days
+                <= (observed_end - observed_start).days + 1
+                and (observed_end - observed_start).days + 1
+                >= int(minimum_history_days * 7 / 5)
+                and recorded_minimum == minimum_history_days
+                and embargo_days >= int(config.get("outer_embargo_days") or 5)
+                and recorded_embargo_minimum
+                == int(config.get("outer_embargo_days") or 5)
+                and history.get("overlaps_final_test") is False
+                and history.get("uses_final_test_data") is False
+                and isinstance(history_execution, dict)
+                and history_execution.get("method") == "open"
+                and history_execution.get("frequency") == "day"
+                and history_execution.get("minute_execution_claimed") is False
+            )
+        except (KeyError, TypeError, ValueError):
+            valid_history = False
+    if not valid_history:
+        failures.append(
+            "pre-final history must provide at least "
+            f"{minimum_history_days} isolated trading days"
+        )
+
     outer = evidence.get("outer_walk_forward")
     coverage = outer.get("candidate_coverage") if isinstance(outer, dict) else {}
     trials = int((metrics.get("deflated_sharpe") or {}).get("trials") or 1)
-    config = version.get("config", {})
     minimum_outer_test_metric = float(
         config.get("minimum_outer_test_excess_return", 0.0)
     )
@@ -357,8 +410,34 @@ def _multifactor_manifest_failures(
     ):
         if manifest.get(field) != expected:
             failures.append(f"strategy backtest manifest {field} does not match the run")
-    if manifest.get("periods") != backtest.get("periods"):
-        failures.append("strategy backtest manifest periods do not match the run")
+    recorded_periods = backtest.get("periods") or {}
+    expected_final_periods = {
+        "start": recorded_periods.get("start"),
+        "end": recorded_periods.get("end"),
+    }
+    expected_history_periods = {
+        "start": recorded_periods.get("historical_start"),
+        "end": recorded_periods.get("historical_end"),
+    }
+    if manifest.get("periods") != expected_final_periods:
+        failures.append("strategy backtest manifest final-test periods do not match the run")
+    if manifest.get("historical_validation_periods") != expected_history_periods:
+        failures.append(
+            "strategy backtest manifest pre-final history periods do not match the run"
+        )
+    history_evidence = (
+        (metrics.get("formal_validation") or {}).get("pre_final_history")
+        if isinstance(metrics.get("formal_validation"), dict)
+        else None
+    )
+    if (
+        not isinstance(history_evidence, dict)
+        or history_evidence.get("requested_periods") != expected_history_periods
+        or history_evidence.get("final_test_periods") != expected_final_periods
+    ):
+        failures.append(
+            "pre-final history evidence periods do not match the immutable run"
+        )
 
     expected_factors = {
         str(item["factor_candidate_id"]): {
@@ -1111,8 +1190,20 @@ class StrategyStore:
         periods: dict[str, str],
         artifact_path: Path,
         execution_dataset: str | None = None,
+        trading_dates: Sequence[date | str] | None = None,
     ) -> dict[str, Any]:
         version = self.get_version(version_id)
+        try:
+            requested_start = date.fromisoformat(str(periods["start"]))
+            requested_end = date.fromisoformat(str(periods["end"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("backtest final-test periods are invalid") from exc
+        if requested_end < requested_start:
+            raise ValueError("backtest final-test end must not be before its start")
+        recorded_periods = {
+            "start": requested_start.isoformat(),
+            "end": requested_end.isoformat(),
+        }
         backtest_id = uuid.uuid4().hex
         artifact_directory = (
             artifact_path / backtest_id
@@ -1139,6 +1230,8 @@ class StrategyStore:
                         factor_evaluations.c.factor_candidate_id,
                         factor_evaluations.c.dataset,
                         factor_evaluations.c.dataset_identity_sha256,
+                        factor_evaluations.c.train_start,
+                        factor_evaluations.c.valid_end,
                         factor_evaluations.c.test_start,
                         factor_evaluations.c.test_end,
                         factor_evaluations.c.evaluator_version,
@@ -1150,8 +1243,6 @@ class StrategyStore:
                     )
                     .where(strategy_factors.c.strategy_version_id == version_id)
                 ).all()
-                requested_start = date.fromisoformat(periods["start"])
-                requested_end = date.fromisoformat(periods["end"])
                 if not baseline_only and (not factor_windows or any(
                     item.dataset != dataset
                     or str(item.evaluator_version) != "factor-gate-v3-hac-bh"
@@ -1164,6 +1255,113 @@ class StrategyStore:
                     )
                 if any(item.final_test_consumed_at is not None for item in factor_windows):
                     raise ValueError("reserved final test has already been consumed")
+                if factor_windows:
+                    # Every selected factor must have observed the same
+                    # pre-final history.  The intersection is authoritative:
+                    # a factor with shorter lineage may not borrow another
+                    # factor's earlier dates to manufacture ten-year evidence.
+                    history_start = max(item.train_start for item in factor_windows)
+                    history_end = min(item.valid_end for item in factor_windows)
+                    supplied_start = periods.get("historical_start")
+                    supplied_end = periods.get("historical_end")
+                    if (
+                        supplied_start is not None
+                        and date.fromisoformat(str(supplied_start)) != history_start
+                    ) or (
+                        supplied_end is not None
+                        and date.fromisoformat(str(supplied_end)) != history_end
+                    ):
+                        raise ValueError(
+                            "pre-final history must match the selected factors' "
+                            "immutable evaluation window"
+                        )
+                else:
+                    # A pure immutable Qlib baseline has no factor-evaluation
+                    # rows from which to derive its development history.
+                    # Callers therefore have to pin the dataset-backed window.
+                    try:
+                        history_start = date.fromisoformat(
+                            str(periods["historical_start"])
+                        )
+                        history_end = date.fromisoformat(
+                            str(periods["historical_end"])
+                        )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ValueError(
+                            "baseline final tests require explicit pre-final "
+                            "history periods"
+                        ) from exc
+                if history_end < history_start:
+                    raise ValueError(
+                        "pre-final history end must not be before its start"
+                    )
+                if history_end >= requested_start:
+                    raise ValueError(
+                        "pre-final history must end before the final test starts"
+                    )
+                minimum_embargo_days = int(
+                    version["config"].get("outer_embargo_days") or 5
+                )
+                minimum_history_days = int(
+                    version["config"].get("min_pre_final_history_days") or 2520
+                )
+                if trading_dates is not None:
+                    try:
+                        calendar = sorted(
+                            {
+                                value
+                                if isinstance(value, date)
+                                else date.fromisoformat(str(value))
+                                for value in trading_dates
+                            }
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            "Qlib trading calendar contains invalid dates"
+                        ) from exc
+                    history_trading_days = sum(
+                        history_start <= value <= history_end for value in calendar
+                    )
+                    embargo_trading_days = sum(
+                        history_end < value < requested_start for value in calendar
+                    )
+                    if history_trading_days < minimum_history_days:
+                        raise ValueError(
+                            "pre-final history has "
+                            f"{history_trading_days} trading days; "
+                            f"{minimum_history_days} are required"
+                        )
+                    if embargo_trading_days < minimum_embargo_days:
+                        raise ValueError(
+                            "pre-final history leaves "
+                            f"{embargo_trading_days} trading days for the configured "
+                            f"{minimum_embargo_days}-trading-day embargo"
+                        )
+                else:
+                    # Compatibility callers without a bound dataset calendar
+                    # still receive a conservative coarse guard. Production
+                    # API/orchestrator callers always supply the exact Qlib
+                    # calendar before the once-only final sample is consumed.
+                    available_calendar_gap = (
+                        requested_start - history_end
+                    ).days - 1
+                    if available_calendar_gap < minimum_embargo_days:
+                        raise ValueError(
+                            "pre-final history leaves too little calendar space for "
+                            f"the configured {minimum_embargo_days}-trading-day embargo"
+                        )
+                    minimum_calendar_days = int(minimum_history_days * 7 / 5)
+                    if (history_end - history_start).days + 1 < minimum_calendar_days:
+                        raise ValueError(
+                            "pre-final history is too short for the configured "
+                            f"{minimum_history_days}-trading-day gate"
+                        )
+                recorded_periods.update(
+                    {
+                        "historical_start": history_start.isoformat(),
+                        "historical_end": history_end.isoformat(),
+                    }
+                )
                 consumed_at = _now()
                 if factor_windows:
                     # Cross-campaign seal (design draft 4.1/12.1): the reserved
@@ -1185,7 +1383,10 @@ class StrategyStore:
                     )
                 for item in factor_windows:
                     key = hashlib.sha256(
-                        f"{version_id}:{item.id}:{dataset}:{periods['start']}:{periods['end']}".encode()
+                        (
+                            f"{version_id}:{item.id}:{dataset}:"
+                            f"{recorded_periods['start']}:{recorded_periods['end']}"
+                        ).encode()
                     ).hexdigest()
                     connection.execute(
                         update(factor_evaluations)
@@ -1209,7 +1410,7 @@ class StrategyStore:
                     rdagent_version=version["rdagent_version"],
                     rdagent_commit=version["rdagent_commit"],
                     status="queued",
-                    periods_json=periods,
+                    periods_json=recorded_periods,
                     artifact_path=str(artifact_directory),
                     created_at=_now(),
                 )

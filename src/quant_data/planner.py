@@ -26,6 +26,7 @@ from .execution_data import (
     news_specs,
     news_window_spec,
 )
+from .history_bounds import history_start_date
 from .models import FetchSpec, canonical_json
 from .reference_data import apply_reference_refresh
 from .storage import ParquetStore
@@ -127,8 +128,15 @@ class BootstrapPlanner:
         max_attempts: int,
     ) -> int:
         specs = []
+        lower_bounds = {
+            definition.name: history_start_date(definition.name)
+            for definition in definitions
+        }
         for trade_date in dates:
             for definition in definitions:
+                lower_bound = lower_bounds[definition.name]
+                if lower_bound is not None and trade_date < compact_date(lower_bound):
+                    continue
                 scope: dict[str, object] = {"trade_date": trade_date}
                 if definition.row_limit is not None:
                     scope.update(

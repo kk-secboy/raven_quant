@@ -152,6 +152,23 @@ def test_extended_bundle_adds_point_in_time_st_and_sw_industry_bars() -> None:
     assert {spec.scope["page_size"] for spec in institutional} == {1_000, 4_000}
 
 
+def test_extended_history_respects_documented_st_source_start() -> None:
+    specs = supplemental_specs(
+        "cn_extended_daily",
+        start=date(2008, 1, 2),
+        end=date(2016, 1, 4),
+        trading_dates=["20080102", "20160104"],
+        max_attempts=3,
+    )
+
+    assert [
+        spec.params["trade_date"] for spec in specs if spec.dataset == "stock_st"
+    ] == ["20160104"]
+    assert [
+        spec.params["trade_date"] for spec in specs if spec.dataset == "sw_daily"
+    ] == ["20080102", "20160104"]
+
+
 def test_a_share_financial_specs_use_cross_sectional_vip_batches() -> None:
     specs = supplemental_specs(
         "cn_extended_daily",
@@ -216,6 +233,37 @@ def test_a_share_financial_history_includes_four_quarters_before_start() -> None
     )
     periods = {spec.params["period"] for spec in specs if spec.dataset == "fina_indicator"}
     assert periods == {"20230331", "20230630", "20230930", "20231231"}
+
+
+def test_a_share_event_history_clips_only_datasets_with_documented_bounds() -> None:
+    specs = a_share_bulk_history_specs(
+        start=date(2008, 1, 1),
+        end=date(2014, 1, 2),
+        max_attempts=3,
+    )
+
+    repurchases = [spec for spec in specs if spec.dataset == "repurchase"]
+    pledge_stats = [spec for spec in specs if spec.dataset == "pledge_stat"]
+    name_changes = [spec for spec in specs if spec.dataset == "namechange"]
+
+    assert repurchases[0].params["start_date"] == "20110101"
+    assert pledge_stats[0].params["end_date"] == "20140101"
+    assert name_changes[0].params["start_date"] == "20080101"
+
+
+def test_macro_history_clips_lpr_without_shortening_older_shibor() -> None:
+    specs = supplemental_specs(
+        "cn_macro",
+        start=date(2008, 1, 1),
+        end=date(2013, 1, 2),
+        trading_dates=[],
+        max_attempts=3,
+    )
+    shibor = next(spec for spec in specs if spec.dataset == "shibor")
+    lpr = next(spec for spec in specs if spec.dataset == "shibor_lpr")
+
+    assert shibor.params["start_date"] == "20080101"
+    assert lpr.params["start_date"] == "20130101"
 
 
 def test_options_bundle_starts_one_page_per_partition_and_advances_full_pages() -> None:

@@ -20,8 +20,8 @@ def test_parameter_experiment_store_persists_trials_progress_and_result(
         strategy_version_id=version_id,
         dataset="qlib-snapshot",
         periods={
-            "in_sample": {"start": "2022-05-27", "end": "2023-02-28"},
-            "out_of_sample": {"start": "2023-03-01", "end": "2023-12-31"},
+            "in_sample": {"start": "2018-05-28", "end": "2019-06-28"},
+            "out_of_sample": {"start": "2019-07-01", "end": "2020-12-31"},
         },
         parameter_grid={"topk": [30, 50]},
         baseline_config={"topk": 50, "max_daily_turnover": 0.2},
@@ -87,8 +87,8 @@ def test_parameter_experiment_result_must_cover_every_trial(
         strategy_version_id=version_id,
         dataset="qlib-snapshot",
         periods={
-            "in_sample": {"start": "2022-05-27", "end": "2023-02-28"},
-            "out_of_sample": {"start": "2023-03-01", "end": "2023-12-31"},
+            "in_sample": {"start": "2018-05-28", "end": "2019-06-28"},
+            "out_of_sample": {"start": "2019-07-01", "end": "2020-12-31"},
         },
         parameter_grid={"topk": [50]},
         baseline_config={"topk": 50},
@@ -110,9 +110,9 @@ def test_api_creates_a_bounded_parameter_experiment_job(
     (dataset / "instruments").mkdir()
     (dataset / "features").mkdir()
     (dataset / "metadata").mkdir()
-    (dataset / "calendars" / "day.txt").write_text("2022-01-01\n2023-12-31\n", encoding="utf-8")
+    (dataset / "calendars" / "day.txt").write_text("2018-01-01\n2020-12-31\n", encoding="utf-8")
     (dataset / "instruments" / "cn_all.txt").write_text(
-        "SH600000\t2022-01-01\t2023-12-31\n", encoding="utf-8"
+        "SH600000\t2018-01-01\t2020-12-31\n", encoding="utf-8"
     )
     (dataset / "metadata" / "provenance.json").write_text(
         json.dumps(
@@ -141,8 +141,8 @@ def test_api_creates_a_bounded_parameter_experiment_job(
             f"/api/strategy-versions/{version_id}/parameter-experiments",
             json={
                 "dataset": "experiment-snapshot",
-                "start": "2022-05-27",
-                "end": "2023-12-31",
+                "start": "2018-05-28",
+                "end": "2020-12-31",
                 "parameter_grid": {"topk": [30, 50]},
                 "max_trials": 2,
             },

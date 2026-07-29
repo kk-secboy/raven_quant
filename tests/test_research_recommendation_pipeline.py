@@ -33,8 +33,8 @@ def test_v2_research_to_final_test_and_recommendation_snapshot(
         strategy_version_id=version_id,
         dataset="synthetic-qlib",
         periods={
-            "in_sample": {"start": "2022-05-27", "end": "2023-02-28"},
-            "out_of_sample": {"start": "2023-03-01", "end": "2023-12-31"},
+            "in_sample": {"start": "2018-05-28", "end": "2019-06-28"},
+            "out_of_sample": {"start": "2019-07-01", "end": "2020-12-31"},
         },
         parameter_grid={"topk": [30, 50]},
         baseline_config={"topk": 50},

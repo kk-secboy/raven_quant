@@ -1,7 +1,7 @@
 from datetime import date
 from pathlib import Path
 
-from quant_data.catalog import CORE_DAILY, INDEX_CATALOG_MARKETS
+from quant_data.catalog import CORE_DAILY, INDEX_CATALOG_MARKETS, RESEARCH_DAILY
 from quant_data.checkpoint import CheckpointStore
 from quant_data.models import FetchSpec, ProviderResult
 from quant_data.planner import BootstrapPlanner, _month_ranges, _quarter_ranges, _report_periods
@@ -99,6 +99,37 @@ def test_plans_full_market_calls_by_trade_date(tmp_path: Path, database_url: str
         {"trade_date": "20240102"},
         {"trade_date": "20240103"},
     ]
+
+
+def test_daily_planning_skips_dates_before_documented_provider_history(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    planner = BootstrapPlanner(checkpoint, ParquetStore(tmp_path))
+    definitions = (
+        next(item for item in RESEARCH_DAILY if item.name == "moneyflow"),
+        next(item for item in RESEARCH_DAILY if item.name == "margin_detail"),
+        next(item for item in CORE_DAILY if item.name == "limit_list_d"),
+    )
+
+    assert planner.plan_daily(
+        ["20091231", "20100104", "20191231", "20200102"],
+        definitions,
+        3,
+    ) == 10
+
+    planned: dict[str, list[str]] = {}
+    for dataset in ("moneyflow", "margin_detail", "limit_list_d"):
+        planned[dataset] = []
+        while unit := checkpoint.claim({dataset}):
+            planned[dataset].append(str(unit.spec.params["trade_date"]))
+            checkpoint.fail(unit.unit_key, "test inspection", terminal=True)
+
+    assert {dataset: sorted(values) for dataset, values in planned.items()} == {
+        "moneyflow": ["20100104", "20191231", "20200102"],
+        "margin_detail": ["20100104", "20191231", "20200102"],
+        "limit_list_d": ["20091231", "20100104", "20191231", "20200102"],
+    }
 
 
 def test_complete_index_catalog_starts_one_paginated_partition_per_market(

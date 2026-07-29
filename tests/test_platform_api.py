@@ -162,6 +162,38 @@ def test_job_store_filters_pages_and_cancels_without_deleting_history(
     assert page[0]["id"] == queued["id"]
 
 
+def test_failed_job_exposes_later_attempt_even_when_filtered(
+    tmp_path: Path, database_url: str
+) -> None:
+    store = JobStore(database_url)
+    payload = {
+        "pipeline_id": "pipeline-retry-audit",
+        "snapshot_name": "snapshot-retry-audit",
+    }
+    failed = store.create("bootstrap", payload, tmp_path / "failed.log")
+    claimed = store.claim_next()
+    assert claimed and claimed["id"] == failed["id"]
+    store.finish(failed["id"], exit_code=1, error="old attempt failed")
+
+    successor = store.create("bootstrap", payload, tmp_path / "successor.log")
+    claimed_successor = store.claim_next()
+    assert claimed_successor and claimed_successor["id"] == successor["id"]
+
+    filtered = store.list(statuses=("failed",))
+    old_attempt = next(item for item in filtered if item["id"] == failed["id"])
+    assert old_attempt["retry_successor"] == {
+        "id": successor["id"],
+        "status": "running",
+    }
+    assert store.get(failed["id"])["retry_successor"]["id"] == successor["id"]
+
+    store.finish(successor["id"], exit_code=0)
+    assert store.get(failed["id"])["retry_successor"] == {
+        "id": successor["id"],
+        "status": "succeeded",
+    }
+
+
 def test_jobs_api_exposes_filters_total_and_cancel(
     tmp_path: Path, monkeypatch, database_url: str
 ) -> None:

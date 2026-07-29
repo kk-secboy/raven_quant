@@ -7,6 +7,7 @@ from quant_data.config import Settings
 
 from .cost_model import CostModelConfig
 from .job_store import JobStore
+from .ops_calendar import load_calendar_days
 from .parameter_experiment_store import ParameterExperimentStore
 from .qlib_factor_baseline import (
     FACTOR_SOURCE_QLIB_BASELINE,
@@ -551,6 +552,9 @@ class AutonomousResearchOrchestrator:
                 dataset=campaign["dataset"],
                 periods=campaign["config"]["backtest_periods"],
                 artifact_path=self.settings.data_root / "artifacts" / "backtests",
+                trading_dates=load_calendar_days(
+                    campaign["config"]["dataset_evidence"]["path"]
+                ),
             )
         if backtest.get("job_id"):
             return backtest, self.jobs.get(str(backtest["job_id"]))

@@ -181,6 +181,8 @@ def test_baseline_approval_validates_expression_artifacts_hashes_and_recorder(
     periods = {
         "start": PERIODS["test_start"].isoformat(),
         "end": PERIODS["test_end"].isoformat(),
+        "historical_start": PERIODS["train_start"].isoformat(),
+        "historical_end": PERIODS["valid_end"].isoformat(),
     }
     backtest = store.create_backtest(
         version_id=version["id"],
@@ -215,7 +217,14 @@ def test_baseline_approval_validates_expression_artifacts_hashes_and_recorder(
                 "execution_dataset": None,
                 "benchmark": version["benchmark"],
                 "universe": version["universe"],
-                "periods": periods,
+                "periods": {
+                    "start": periods["start"],
+                    "end": periods["end"],
+                },
+                "historical_validation_periods": {
+                    "start": periods["historical_start"],
+                    "end": periods["historical_end"],
+                },
                 "config": version["config"],
                 "factors": [],
                 "factor_source_mode": FACTOR_SOURCE_QLIB_BASELINE,

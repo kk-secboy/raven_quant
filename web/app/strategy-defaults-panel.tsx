@@ -74,6 +74,7 @@ const groups: FieldGroup[] = [
       { key: "rolling_step_days", label: "滚动步长交易日", min: 20, max: 504, step: 1 },
       { key: "min_rolling_windows", label: "最少滚动窗口数", min: 2, max: 20, step: 1 },
       { key: "min_rolling_pass_rate", label: "滚动窗口通过率（%）", min: 0, max: 100, step: 1, scale: 100 },
+      { key: "min_pre_final_history_days", label: "预最终历史交易日", min: 2520, max: 7560, step: 1 },
       { key: "event_window_days", label: "事件压力窗口交易日", min: 20, max: 126, step: 1 },
       { key: "event_count", label: "历史压力事件数量", min: 1, max: 20, step: 1 },
       { key: "max_event_underperformance", label: "事件最大落后（%）", min: 0, max: 50, step: 0.5, scale: 100 },

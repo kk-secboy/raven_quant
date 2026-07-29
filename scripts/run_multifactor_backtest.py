@@ -26,6 +26,7 @@ from quant_platform.eligibility import eligibility_statistics
 from quant_platform.execution_algorithms import execution_time_slots
 from quant_platform.formal_validation import (
     FORMAL_VALIDATION_CONTRACT_VERSION,
+    build_pre_final_history_evidence,
     run_ablation_suite,
     run_outer_walk_forward,
     run_signal_decay_suite,
@@ -473,6 +474,18 @@ def main() -> None:
         }
     qlib.init(provider_uri=provider_uri, region="cn")
     periods = manifest["periods"]
+    historical_periods = manifest.get("historical_validation_periods")
+    if not isinstance(historical_periods, dict) or set(historical_periods) != {
+        "start",
+        "end",
+    }:
+        raise ValueError(
+            "formal backtest manifest requires isolated pre-final history periods"
+        )
+    data_periods = {
+        "start": historical_periods["start"],
+        "end": periods["end"],
+    }
     challenger_scores = compose_factor_scores(challenger_factors) if challenger_factors else None
     baseline_artifacts: dict[str, Any] | None = None
     baseline_definition = config.get("baseline_definition")
@@ -484,8 +497,8 @@ def main() -> None:
             D,
             universe=str(manifest.get("universe") or "cn_all"),
             definition=baseline_definition,
-            start_time=periods["start"],
-            end_time=periods["end"],
+            start_time=data_periods["start"],
+            end_time=data_periods["end"],
         )
         baseline_artifacts = _write_baseline_artifacts(
             output,
@@ -530,8 +543,8 @@ def main() -> None:
     liquidity_amount = D.features(
         instruments,
         ["$amount"],
-        start_time=periods["start"],
-        end_time=periods["end"],
+        start_time=data_periods["start"],
+        end_time=data_periods["end"],
         freq="day",
     )
     open_field = "$open/$factor" if minute_execution else "$open"
@@ -539,16 +552,18 @@ def main() -> None:
     execution_metadata = D.features(
         instruments,
         [open_field, close_field, "Ref(Mean($amount, 20), 1)"],
-        start_time=periods["start"],
-        end_time=periods["end"],
+        start_time=data_periods["start"],
+        end_time=data_periods["end"],
         freq="day",
     )
-    covariance_start = (pd.Timestamp(periods["start"]) - pd.Timedelta(days=120)).date().isoformat()
+    covariance_start = (
+        pd.Timestamp(data_periods["start"]) - pd.Timedelta(days=120)
+    ).date().isoformat()
     close_history = D.features(
         instruments,
         ["$close"],
         start_time=covariance_start,
-        end_time=periods["end"],
+        end_time=data_periods["end"],
         freq="day",
     )
     intraday_prices = (
@@ -679,7 +694,13 @@ def main() -> None:
         account: float | None = None,
         scenario_config: dict[str, Any] | None = None,
         signal_scores: pd.Series | None = None,
+        historical_proxy: bool = False,
     ):
+        if historical_proxy and signal_frequency != "day":
+            raise ValueError(
+                "pre-final long-history validation supports daily signals only; "
+                "minute signals require separately bounded recent evidence"
+            )
         effective_config = {**config, **(scenario_config or {})}
         scenario_policy = PortfolioPolicy(
             PortfolioPolicyConfig.from_mapping(effective_config),
@@ -701,10 +722,14 @@ def main() -> None:
             account=float(account if account is not None else config["capacity_notional"]),
             benchmark=manifest["benchmark"],
             cost_schedule=costs,
-            execution_method=execution_method,
+            execution_method=("open" if historical_proxy else execution_method),
             signal_frequency=signal_frequency,
-            execution_frequency=args.execution_frequency if minute_execution else None,
-            execution_policy=execution_policy,
+            execution_frequency=(
+                None
+                if historical_proxy
+                else (args.execution_frequency if minute_execution else None)
+            ),
+            execution_policy=None if historical_proxy else execution_policy,
             instruments=instruments,
             annual_minimum_acceptable_return=float(
                 effective_config.get("annual_minimum_acceptable_return", 0.0)
@@ -712,6 +737,33 @@ def main() -> None:
         )
 
     formal = run(periods["start"], periods["end"], cost_schedule)
+    pre_final_calendar = pd.DatetimeIndex(
+        D.calendar(
+            start_time=historical_periods["start"],
+            end_time=periods["start"],
+            freq="day",
+        )
+    )
+    history_calendar = pre_final_calendar[
+        pre_final_calendar <= pd.Timestamp(historical_periods["end"])
+    ]
+    pre_final_history = build_pre_final_history_evidence(
+        pre_final_calendar,
+        requested_start=historical_periods["start"],
+        requested_end=historical_periods["end"],
+        final_test_start=periods["start"],
+        final_test_end=periods["end"],
+        minimum_trading_days=int(
+            config.get("min_pre_final_history_days", 2520)
+        ),
+        minimum_embargo_trading_days=int(config.get("outer_embargo_days", 5)),
+    )
+    pre_final_history["execution_model"] = {
+        "method": "open",
+        "frequency": "day",
+        "scope": "pre_final_signal_and_portfolio_stability_proxy",
+        "minute_execution_claimed": False,
+    }
 
     def write_robustness_artifacts(name: str, result: Any) -> dict[str, Any]:
         target = output / "robustness" / name
@@ -918,13 +970,14 @@ def main() -> None:
 
     if strategy_trial_count == 1:
         outer_walk_forward = run_outer_walk_forward(
-            dates=pd.DatetimeIndex(qlib_report.index).tz_localize(None),
+            dates=history_calendar,
             candidate_ids=["frozen-strategy"],
             inner_runner=lambda _candidate, fold: (
                 run(
                     fold.validation_start,
                     fold.validation_end,
                     cost_schedule,
+                    historical_proxy=True,
                 ).metrics
             ),
             test_runner=lambda _candidate, fold: (
@@ -932,6 +985,7 @@ def main() -> None:
                     fold.test_start,
                     fold.test_end,
                     cost_schedule,
+                    historical_proxy=True,
                 ).metrics
             ),
             selection_metric="annualized_excess_return",
@@ -950,7 +1004,7 @@ def main() -> None:
         outer_walk_forward["candidate_coverage"] = {
             "required_group_trials": 1,
             "provided_candidates": 1,
-            "scope": "frozen_strategy_no_search",
+            "scope": "pre_final_history_fixed_specification",
         }
     else:
         outer_walk_forward = {
@@ -1000,6 +1054,7 @@ def main() -> None:
         }
     formal_validation = {
         "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
+        "pre_final_history": pre_final_history,
         "status": (
             "passed"
             if outer_walk_forward.get("status") == "completed"

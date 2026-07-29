@@ -921,6 +921,14 @@ class LocalJobWorker:
             hypothesis_evidence = self.strategies.hypothesis_group_evidence(
                 version["id"]
             )
+            final_periods = {
+                "start": payload["periods"]["start"],
+                "end": payload["periods"]["end"],
+            }
+            historical_validation_periods = {
+                "start": payload["periods"]["historical_start"],
+                "end": payload["periods"]["historical_end"],
+            }
             manifest = {
                 "backtest_id": payload["backtest_id"],
                 "strategy_version_id": version["id"],
@@ -961,7 +969,8 @@ class LocalJobWorker:
                     "economic_hypothesis_group"
                 ],
                 "hypothesis_group_evidence": hypothesis_evidence,
-                "periods": payload["periods"],
+                "periods": final_periods,
+                "historical_validation_periods": historical_validation_periods,
                 "config": version["config"],
                 "factors": [
                     {

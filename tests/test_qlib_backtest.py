@@ -367,6 +367,42 @@ def test_trade_metrics_report_win_rate_and_profit_loss_ratio() -> None:
     assert metrics["profit_loss_ratio"] == pytest.approx(2.0)
 
 
+def test_trade_metrics_count_a_sliced_exit_as_one_closed_trade() -> None:
+    fills = [
+        {
+            "instrument": "SH600000",
+            "side": "buy",
+            "amount": 200.0,
+            "trade_value": 2_000.0,
+            "trade_price": 10.0,
+            "cost": 2.0,
+        },
+        {
+            "instrument": "SH600000",
+            "side": "sell",
+            "amount": 100.0,
+            "trade_value": 1_100.0,
+            "trade_price": 11.0,
+            "cost": 1.0,
+        },
+        {
+            "instrument": "SH600000",
+            "side": "sell",
+            "amount": 100.0,
+            "trade_value": 1_200.0,
+            "trade_price": 12.0,
+            "cost": 1.0,
+        },
+    ]
+
+    metrics = calculate_trade_metrics(fills)
+
+    assert metrics["closed_trade_count"] == 1
+    assert metrics["gross_realized_pnl"] == pytest.approx(300.0)
+    assert metrics["net_realized_pnl"] == pytest.approx(296.0)
+    assert metrics["average_win"] == pytest.approx(296.0)
+
+
 def test_capacity_fill_ratio_is_weighted_by_requested_notional() -> None:
     fills = [
         {

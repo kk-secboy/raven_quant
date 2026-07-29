@@ -100,9 +100,20 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(sourceByName["backtest-panel.tsx"], /industry_neutral_qp/);
   assert.match(sourceByName["backtest-panel.tsx"], /execution_dataset/);
   assert.match(sourceByName["backtest-panel.tsx"], /执行契约哈希/);
+  assert.match(sourceByName["backtest-panel.tsx"], /预最终历史 \/ 最终 OOS/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /2021-01-11/);
+  assert.match(sourceByName["research-campaign-panel.tsx"], /2021-01-11/);
+  assert.match(
+    sourceByName["strategy-defaults-panel.tsx"],
+    /min_pre_final_history_days/,
+  );
   assert.match(sourceByName["research-campaign-panel.tsx"], /\/api\/research-programs/);
   assert.match(sourceByName["market-overview-panel.tsx"], /\/api\/market\/overview/);
   assert.match(sourceByName["job-run-center.tsx"], /\/api\/jobs\/\$\{job\.id\}\/log/);
+  assert.match(sourceByName["job-run-center.tsx"], /同一流水线的旧失败/);
+  assert.match(sourceByName["job-run-center.tsx"], /后续已成功/);
+  assert.match(sourceByName["job-run-center.tsx"], /已重试，后续运行中/);
+  assert.match(sourceByName["job-run-center.tsx"], /pipeline_id/);
   assert.match(sourceByName["page.tsx"], /平均目录覆盖度/);
   assert.match(sourceByName["page.tsx"], /成功 checkpoint/);
   assert.match(sourceByName["page.tsx"], /running_work_units/);

@@ -116,7 +116,25 @@ class ContinuousResearchController:
 
         template = program["config"]
         windows = template["window_days"]
-        required_days = int(windows["train"]) + int(windows["validation"]) + int(windows["test"])
+        embargo_days = int(
+            template["strategy_config"].get("outer_embargo_days") or 5
+        )
+        if int(windows["train"]) + int(windows["validation"]) < 2520:
+            self.programs.checked(
+                program["id"],
+                message=(
+                    "研究计划的预最终历史少于 2520 个交易日；"
+                    "必须创建符合十年历史门槛的新计划"
+                ),
+                delay_seconds=3600,
+            )
+            return "deferred"
+        required_days = (
+            int(windows["train"])
+            + int(windows["validation"])
+            + embargo_days
+            + int(windows["test"])
+        )
         if len(calendar) < required_days:
             self.programs.checked(
                 program["id"],
@@ -132,6 +150,7 @@ class ContinuousResearchController:
             train_days=int(windows["train"]),
             validation_days=int(windows["validation"]),
             test_days=int(windows["test"]),
+            embargo_days=embargo_days,
         )
         research = normalize_research_schedule_payload(
             {

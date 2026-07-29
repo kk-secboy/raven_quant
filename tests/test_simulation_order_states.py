@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
-from governance_fixtures import create_strategy_version
+from governance_fixtures import PERIODS, create_strategy_version
 from sqlalchemy import insert, select, update
 from test_simulation_store import (
     COST_SCHEDULE_VERSION,
@@ -975,7 +975,10 @@ def _seed_active_allocation(database_url: str, tmp_path) -> tuple[str, str]:
         version_id=version_id,
         dataset="snapshot",
         execution_dataset="execution-snapshot/liquid_stocks_5m",
-        periods={"start": "2024-01-08", "end": "2026-07-10"},
+        periods={
+            "start": PERIODS["test_start"].isoformat(),
+            "end": PERIODS["test_end"].isoformat(),
+        },
         artifact_path=tmp_path / "allocation-backtest",
     )
     engine = open_database(database_url)

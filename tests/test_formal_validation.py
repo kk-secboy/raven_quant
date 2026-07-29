@@ -6,7 +6,9 @@ import pytest
 
 from quant_platform.formal_validation import (
     FORMAL_VALIDATION_CONTRACT_VERSION,
+    PRE_FINAL_HISTORY_CONTRACT_VERSION,
     build_outer_walk_forward_folds,
+    build_pre_final_history_evidence,
     run_ablation_suite,
     run_outer_walk_forward,
     run_signal_decay_suite,
@@ -92,6 +94,8 @@ def test_strategy_formal_gate_rejects_completed_but_failing_oos_evidence() -> No
         "config": {
             "minimum_outer_test_excess_return": 0.0,
             "minimum_outer_test_pass_rate": 0.60,
+            "min_pre_final_history_days": 2520,
+            "outer_embargo_days": 5,
             "baseline_definition": None,
         },
         "factors": [],
@@ -118,6 +122,33 @@ def test_strategy_formal_gate_rejects_completed_but_failing_oos_evidence() -> No
         "formal_validation": {
             "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
             "status": "passed",
+            "pre_final_history": {
+                "status": "completed",
+                "contract_version": PRE_FINAL_HISTORY_CONTRACT_VERSION,
+                "requested_periods": {
+                    "start": "2008-01-01",
+                    "end": "2020-12-31",
+                },
+                "observed_periods": {
+                    "start": "2008-01-02",
+                    "end": "2020-12-31",
+                },
+                "final_test_periods": {
+                    "start": "2021-01-11",
+                    "end": "2026-07-28",
+                },
+                "trading_days": 3150,
+                "minimum_trading_days": 2520,
+                "embargo_trading_days": 5,
+                "minimum_embargo_trading_days": 5,
+                "overlaps_final_test": False,
+                "uses_final_test_data": False,
+                "execution_model": {
+                    "method": "open",
+                    "frequency": "day",
+                    "minute_execution_claimed": False,
+                },
+            },
             "outer_walk_forward": outer,
             "ablation": {"status": "passed", "runs": []},
             "signal_decay": {
@@ -156,6 +187,57 @@ def test_strategy_formal_gate_rejects_completed_but_failing_oos_evidence() -> No
         "outer walk-forward" in failure
         for failure in _formal_validation_failures(version, metrics)
     )
+
+
+def test_pre_final_history_is_long_and_strictly_before_final_test() -> None:
+    dates = pd.bdate_range("2008-01-01", "2021-01-11")
+    evidence = build_pre_final_history_evidence(
+        dates,
+        requested_start="2008-01-01",
+        requested_end="2020-12-31",
+        final_test_start="2021-01-11",
+        final_test_end="2026-07-28",
+        minimum_trading_days=2520,
+        minimum_embargo_trading_days=5,
+    )
+
+    assert evidence["trading_days"] >= 2520
+    assert evidence["uses_final_test_data"] is False
+    assert evidence["final_test_periods"]["start"] == "2021-01-11"
+    assert evidence["embargo_trading_days"] >= 5
+
+    with pytest.raises(ValueError, match="must end before"):
+        build_pre_final_history_evidence(
+            dates,
+            requested_start="2008-01-01",
+            requested_end="2021-01-01",
+            final_test_start="2021-01-01",
+            final_test_end="2026-07-28",
+            minimum_trading_days=2520,
+            minimum_embargo_trading_days=5,
+        )
+
+    with pytest.raises(ValueError, match="trading days"):
+        build_pre_final_history_evidence(
+            pd.bdate_range("2019-01-01", "2020-12-31"),
+            requested_start="2019-01-01",
+            requested_end="2020-12-31",
+            final_test_start="2021-01-01",
+            final_test_end="2026-07-28",
+            minimum_trading_days=2520,
+            minimum_embargo_trading_days=5,
+        )
+
+    with pytest.raises(ValueError, match="embargo trading days"):
+        build_pre_final_history_evidence(
+            pd.bdate_range("2008-01-01", "2021-01-04"),
+            requested_start="2008-01-01",
+            requested_end="2020-12-31",
+            final_test_start="2021-01-04",
+            final_test_end="2026-07-28",
+            minimum_trading_days=2520,
+            minimum_embargo_trading_days=5,
+        )
 
 
 def test_outer_fold_builder_keeps_purge_and_embargo_gaps() -> None:

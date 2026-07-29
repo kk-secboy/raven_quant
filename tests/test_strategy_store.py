@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import pytest
 from governance_fixtures import PERIODS, create_strategy_version, formal_backtest_metrics
+from sqlalchemy import select
 
+from quant_data.database import factor_evaluations, open_database
 from quant_data.execution_contract import (
     MINUTE_EXECUTION_CONTRACT_VERSION,
     MINUTE_SOURCE_UNIT_CONTRACTS,
@@ -148,6 +152,85 @@ def test_final_test_can_only_be_created_once(tmp_path: Path, database_url: str) 
     store.mark_backtest(created["id"], "failed", error="final test gate failed")
     with pytest.raises(ValueError, match="cannot be rerun"):
         store.requeue_backtest(created["id"])
+
+
+def test_final_test_is_not_opened_when_pre_final_history_is_too_short(
+    tmp_path: Path, database_url: str
+) -> None:
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        config_overrides={"min_pre_final_history_days": 7560},
+    )
+    store = StrategyStore(database_url)
+    periods = {
+        "start": PERIODS["test_start"].isoformat(),
+        "end": PERIODS["test_end"].isoformat(),
+    }
+
+    with pytest.raises(ValueError, match="pre-final history is too short"):
+        store.create_backtest(
+            version_id=version_id,
+            dataset="snapshot",
+            periods=periods,
+            artifact_path=tmp_path,
+        )
+
+    version = store.get_version(version_id)
+    evaluation_id = version["factors"][0]["factor_evaluation_id"]
+    with open_database(database_url).connect() as connection:
+        consumed_at = connection.scalar(
+            select(factor_evaluations.c.final_test_consumed_at).where(
+                factor_evaluations.c.id == evaluation_id
+            )
+        )
+    assert consumed_at is None
+
+
+def test_final_test_is_not_opened_without_pre_final_embargo(
+    tmp_path: Path, database_url: str
+) -> None:
+    tight_periods = {
+        **PERIODS,
+        # Six calendar days look sufficient to the coarse guard, but the
+        # bound Qlib calendar contains only four trading days (Jan 4-7).
+        "valid_end": date(2021, 1, 1),
+        "test_start": date(2021, 1, 8),
+    }
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        periods=tight_periods,
+    )
+    store = StrategyStore(database_url)
+
+    trading_dates = list(
+        pd.bdate_range(
+            tight_periods["train_start"],
+            tight_periods["test_end"],
+        ).date
+    )
+    with pytest.raises(ValueError, match="leaves 4 trading days"):
+        store.create_backtest(
+            version_id=version_id,
+            dataset="snapshot",
+            periods={
+                "start": tight_periods["test_start"].isoformat(),
+                "end": tight_periods["test_end"].isoformat(),
+            },
+            artifact_path=tmp_path,
+            trading_dates=trading_dates,
+        )
+
+    version = store.get_version(version_id)
+    evaluation_id = version["factors"][0]["factor_evaluation_id"]
+    with open_database(database_url).connect() as connection:
+        consumed_at = connection.scalar(
+            select(factor_evaluations.c.final_test_consumed_at).where(
+                factor_evaluations.c.id == evaluation_id
+            )
+        )
+    assert consumed_at is None
 
 
 def test_twap_approval_requires_minute_native_execution_evidence(

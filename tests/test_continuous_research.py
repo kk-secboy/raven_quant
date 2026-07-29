@@ -11,8 +11,8 @@ def _dataset(root: Path) -> dict:
     path = root / "qlib" / "cn-research"
     calendar = path / "calendars" / "day.txt"
     calendar.parent.mkdir(parents=True)
-    start = date(2020, 1, 1)
-    days = [(start + timedelta(days=offset)).isoformat() for offset in range(1600)]
+    start = date(2008, 1, 1)
+    days = [(start + timedelta(days=offset)).isoformat() for offset in range(4000)]
     calendar.write_text("\n".join(days), encoding="utf-8")
     return {
         "name": "cn-research",
@@ -59,7 +59,7 @@ def test_controller_creates_one_campaign_per_dataset_identity(
         universe="cn_all",
         dataset_lineage_id="lineage-a",
         config={
-            "window_days": {"train": 756, "validation": 252, "test": 504},
+            "window_days": {"train": 2520, "validation": 252, "test": 504},
             "loop_n": 1,
             "duration": "30m",
             "max_factors": 3,
@@ -86,7 +86,14 @@ def test_controller_creates_one_campaign_per_dataset_identity(
     assert len(campaigns) == 1
     assert campaigns[0]["research_program_id"] == program["id"]
     assert campaigns[0]["dataset_identity_sha256"] == "a" * 64
-    assert campaigns[0]["config"]["research"]["periods"]["test_end"] == dataset["end_date"]
+    periods = campaigns[0]["config"]["research"]["periods"]
+    assert periods["test_end"] == dataset["end_date"]
+    calendar = controller._calendar(dataset)
+    assert (
+        calendar.index(periods["test_start"])
+        - calendar.index(periods["valid_end"])
+        - 1
+    ) == 5
 
     controller.programs.check_now(program["id"], actor="research-admin")
     second = controller.tick(limit=1)

@@ -111,7 +111,12 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
     }
     backtest = {
         "dataset": "snapshot-1",
-        "periods": {"start": "2024-01-01", "end": "2026-07-10"},
+        "periods": {
+            "start": "2024-01-01",
+            "end": "2026-07-10",
+            "historical_start": "2008-01-01",
+            "historical_end": "2023-12-31",
+        },
         "artifact_path": str(tmp_path),
     }
     manifest = {
@@ -119,7 +124,14 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
         "dataset": backtest["dataset"],
         "benchmark": version["benchmark"],
         "universe": version["universe"],
-        "periods": backtest["periods"],
+        "periods": {
+            "start": backtest["periods"]["start"],
+            "end": backtest["periods"]["end"],
+        },
+        "historical_validation_periods": {
+            "start": backtest["periods"]["historical_start"],
+            "end": backtest["periods"]["historical_end"],
+        },
         "config": config,
         "factors": [
             {
@@ -134,6 +146,12 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     metrics = {
+        "formal_validation": {
+            "pre_final_history": {
+                "requested_periods": manifest["historical_validation_periods"],
+                "final_test_periods": manifest["periods"],
+            }
+        },
         "provenance": {
             "execution_manifest_sha256": _sha256_file(manifest_path),
             "strategy_config_sha256": _canonical_sha256(config),

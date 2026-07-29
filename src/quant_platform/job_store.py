@@ -316,7 +316,8 @@ class JobStore:
             statement = statement.where(jobs.c.kind.in_(kinds))
         statement = statement.order_by(jobs.c.created_at.desc()).offset(offset).limit(limit)
         with self.engine.connect() as connection:
-            return [self._decode(row_dict(row)) for row in connection.execute(statement)]
+            rows = [self._decode(row_dict(row)) for row in connection.execute(statement)]
+            return self._annotate_retry_successors(connection, rows)
 
     def count(
         self,
@@ -335,9 +336,78 @@ class JobStore:
     def get(self, job_id: str) -> dict[str, Any]:
         with self.engine.connect() as connection:
             row = connection.execute(select(jobs).where(jobs.c.id == job_id)).first()
-        if row is None:
-            raise KeyError(job_id)
-        return self._decode(row_dict(row))
+            if row is None:
+                raise KeyError(job_id)
+            decoded = self._decode(row_dict(row))
+            return self._annotate_retry_successors(connection, [decoded])[0]
+
+    @staticmethod
+    def _lineage_identity(job: dict[str, Any]) -> tuple[str, str, str] | None:
+        payload = job.get("payload") or {}
+        pipeline_id = payload.get("pipeline_id")
+        if isinstance(pipeline_id, str) and pipeline_id:
+            return str(job["kind"]), "pipeline", pipeline_id
+        snapshot_name = payload.get("snapshot_name")
+        if isinstance(snapshot_name, str) and snapshot_name:
+            return str(job["kind"]), "snapshot", snapshot_name
+        return None
+
+    @classmethod
+    def _annotate_retry_successors(
+        cls,
+        connection,
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        failed = [
+            row
+            for row in rows
+            if row.get("status") == "failed" and cls._lineage_identity(row) is not None
+        ]
+        if not failed:
+            return rows
+        # row_dict intentionally serializes datetimes for API responses and
+        # truncates them to seconds. Retry attempts can be created within the
+        # same second, so ordering must use the database timestamps rather
+        # than those serialized display values.
+        failed_created_at = {
+            str(row.id): row.created_at
+            for row in connection.execute(
+                select(jobs.c.id, jobs.c.created_at).where(
+                    jobs.c.id.in_([str(item["id"]) for item in failed])
+                )
+            )
+        }
+        earliest = min(failed_created_at.values())
+        failed_kinds = sorted({str(row["kind"]) for row in failed})
+        candidates = [
+            (raw.created_at, cls._decode(row_dict(raw)))
+            for raw in connection.execute(
+                select(jobs)
+                .where(
+                    jobs.c.created_at > earliest,
+                    jobs.c.kind.in_(failed_kinds),
+                    jobs.c.status.in_(("queued", "running", "succeeded")),
+                )
+                .order_by(jobs.c.created_at.desc())
+            )
+        ]
+        for row in failed:
+            identity = cls._lineage_identity(row)
+            successor = next(
+                (
+                    candidate
+                    for candidate_created_at, candidate in candidates
+                    if candidate_created_at > failed_created_at[str(row["id"])]
+                    and cls._lineage_identity(candidate) == identity
+                ),
+                None,
+            )
+            if successor is not None:
+                row["retry_successor"] = {
+                    "id": successor["id"],
+                    "status": successor["status"],
+                }
+        return rows
 
     @staticmethod
     def _decode(row: dict[str, Any]) -> dict[str, Any]:

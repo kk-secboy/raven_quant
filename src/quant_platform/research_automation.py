@@ -82,13 +82,14 @@ def derive_rolling_research_periods(
     train_days: int,
     validation_days: int,
     test_days: int,
+    embargo_days: int,
 ) -> dict[str, str]:
     """Build non-overlapping rolling windows from an actual Qlib trading calendar."""
 
-    if min(train_days, validation_days, test_days) < 1:
+    if min(train_days, validation_days, test_days, embargo_days) < 1:
         raise ValueError("research window lengths must be positive")
     ordered = sorted(dict.fromkeys(calendar_days))
-    total = train_days + validation_days + test_days
+    total = train_days + validation_days + embargo_days + test_days
     if len(ordered) < total:
         raise ValueError(
             f"Qlib calendar has {len(ordered)} trading days; continuous research requires {total}"
@@ -97,7 +98,7 @@ def derive_rolling_research_periods(
     train_end = train_days - 1
     valid_start = train_days
     valid_end = train_days + validation_days - 1
-    test_start = train_days + validation_days
+    test_start = train_days + validation_days + embargo_days
     return {
         "train_start": selected[0],
         "train_end": selected[train_end],

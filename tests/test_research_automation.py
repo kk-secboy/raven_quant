@@ -19,7 +19,7 @@ def test_default_research_periods_cover_the_2008_multiregime_history() -> None:
     assert periods.train_end.isoformat() == "2017-12-31"
     assert periods.valid_start.isoformat() == "2018-01-01"
     assert periods.valid_end.isoformat() == "2020-12-31"
-    assert periods.test_start.isoformat() == "2021-01-01"
+    assert periods.test_start.isoformat() == "2021-01-11"
     assert (periods.test_end - periods.train_start).days >= 3652
 
 
@@ -110,22 +110,46 @@ def test_continuous_research_windows_use_actual_trading_days() -> None:
         train_days=3,
         validation_days=2,
         test_days=2,
+        embargo_days=1,
     )
     assert periods == {
-        "train_start": "2024-01-03",
-        "train_end": "2024-01-05",
-        "valid_start": "2024-01-06",
-        "valid_end": "2024-01-07",
+        "train_start": "2024-01-02",
+        "train_end": "2024-01-04",
+        "valid_start": "2024-01-05",
+        "valid_end": "2024-01-06",
         "test_start": "2024-01-08",
         "test_end": "2024-01-09",
     }
-    with pytest.raises(ValueError, match="requires 10"):
+    assert calendar.index(periods["test_start"]) - calendar.index(periods["valid_end"]) == 2
+    with pytest.raises(ValueError, match="requires 11"):
         derive_rolling_research_periods(
             calendar,
             train_days=5,
             validation_days=3,
             test_days=2,
+            embargo_days=1,
         )
+
+
+@pytest.mark.no_database
+def test_continuous_research_reserves_configured_trading_day_embargo() -> None:
+    calendar = [f"2024-01-{day:02d}" for day in range(1, 13)]
+    periods = derive_rolling_research_periods(
+        calendar,
+        train_days=3,
+        validation_days=2,
+        test_days=2,
+        embargo_days=5,
+    )
+
+    assert periods == {
+        "train_start": "2024-01-01",
+        "train_end": "2024-01-03",
+        "valid_start": "2024-01-04",
+        "valid_end": "2024-01-05",
+        "test_start": "2024-01-11",
+        "test_end": "2024-01-12",
+    }
 
 
 @pytest.mark.no_database

@@ -11,6 +11,10 @@ from qlib_test_doubles import qlib_workflow_identity
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_platform.api import StrategyConfigRequest
 from quant_platform.cost_model import CostModelConfig
+from quant_platform.formal_validation import (
+    FORMAL_VALIDATION_CONTRACT_VERSION,
+    PRE_FINAL_HISTORY_CONTRACT_VERSION,
+)
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import (
     COMPONENT_COST_STRESS_MULTIPLIERS,
@@ -21,11 +25,11 @@ from quant_platform.strategy_store import StrategyStore
 
 DATASET_IDENTITY = "a" * 64
 PERIODS = {
-    "train_start": date(2018, 1, 1),
-    "train_end": date(2021, 12, 31),
-    "valid_start": date(2022, 1, 1),
-    "valid_end": date(2023, 12, 31),
-    "test_start": date(2024, 1, 8),
+    "train_start": date(2008, 1, 1),
+    "train_end": date(2017, 12, 31),
+    "valid_start": date(2018, 1, 1),
+    "valid_end": date(2020, 12, 31),
+    "test_start": date(2021, 1, 11),
     "test_end": date(2026, 7, 10),
 }
 
@@ -42,7 +46,7 @@ def passing_factor_metrics() -> dict:
         "raw_valid_ic": -0.031,
         "raw_selection_ic": -0.035,
         "selection_days": 400,
-        "selection_start": "2022-05-27",
+        "selection_start": "2018-05-28",
         "coverage_pass_rate": 0.99,
         "mean_coverage_ratio": 0.95,
         "constant_day_rate": 0.0,
@@ -188,6 +192,19 @@ def create_strategy_version(
 
 
 def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
+    manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    history_periods = manifest_payload.setdefault(
+        "historical_validation_periods",
+        {
+            "start": PERIODS["train_start"].isoformat(),
+            "end": PERIODS["valid_end"].isoformat(),
+        },
+    )
+    final_periods = manifest_payload["periods"]
+    manifest.write_text(
+        json.dumps(manifest_payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
     factor = version["factors"][0] if version["factors"] else None
     config_hash = hashlib.sha256(
         json.dumps(
@@ -265,8 +282,31 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
         },
         "formal_validation_passed": True,
         "formal_validation": {
-            "contract_version": "formal-validation-evidence-v2-oos-gate",
+            "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
             "status": "passed",
+            "pre_final_history": {
+                "status": "completed",
+                "contract_version": PRE_FINAL_HISTORY_CONTRACT_VERSION,
+                "requested_periods": history_periods,
+                "observed_periods": history_periods,
+                "final_test_periods": final_periods,
+                "trading_days": 3150,
+                "minimum_trading_days": int(
+                    version["config"].get("min_pre_final_history_days", 2520)
+                ),
+                "embargo_trading_days": 5,
+                "minimum_embargo_trading_days": int(
+                    version["config"].get("outer_embargo_days", 5)
+                ),
+                "overlaps_final_test": False,
+                "uses_final_test_data": False,
+                "execution_model": {
+                    "method": "open",
+                    "frequency": "day",
+                    "scope": "pre_final_signal_and_portfolio_stability_proxy",
+                    "minute_execution_claimed": False,
+                },
+            },
             "outer_walk_forward": {
                 "status": "completed",
                 "passed": True,

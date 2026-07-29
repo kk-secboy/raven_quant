@@ -72,41 +72,70 @@ class QlibBacktestResult:
 
 def calculate_trade_metrics(fills: list[dict[str, Any]]) -> dict[str, Any]:
     positions: dict[str, dict[str, float]] = {}
-    closed_pnl: list[float] = []
+    closed_net_pnl: list[float] = []
+    closed_gross_pnl: list[float] = []
     for fill in fills:
         instrument = str(fill["instrument"])
         amount = max(0.0, float(fill["amount"]))
         value = max(0.0, float(fill["trade_value"]))
         cost = max(0.0, float(fill["cost"]))
-        state = positions.setdefault(instrument, {"amount": 0.0, "basis": 0.0})
+        state = positions.setdefault(
+            instrument,
+            {
+                "amount": 0.0,
+                "gross_basis": 0.0,
+                "net_basis": 0.0,
+                "cycle_gross_pnl": 0.0,
+                "cycle_net_pnl": 0.0,
+            },
+        )
         if fill["side"] == "buy":
             new_amount = state["amount"] + amount
             if new_amount > 0:
-                state["basis"] = (state["amount"] * state["basis"] + value + cost) / new_amount
+                state["gross_basis"] = (
+                    state["amount"] * state["gross_basis"] + value
+                ) / new_amount
+                state["net_basis"] = (
+                    state["amount"] * state["net_basis"] + value + cost
+                ) / new_amount
                 state["amount"] = new_amount
             continue
         sold = min(amount, state["amount"])
         if sold <= 0:
             continue
-        net_proceeds = sold * float(fill["trade_price"]) - cost * (sold / amount if amount else 0.0)
-        closed_pnl.append(net_proceeds - sold * state["basis"])
+        gross_proceeds = sold * float(fill["trade_price"])
+        allocated_cost = cost * (sold / amount if amount else 0.0)
+        state["cycle_gross_pnl"] += gross_proceeds - sold * state["gross_basis"]
+        state["cycle_net_pnl"] += (
+            gross_proceeds - allocated_cost - sold * state["net_basis"]
+        )
         state["amount"] -= sold
         if state["amount"] <= 1e-10:
+            closed_gross_pnl.append(state["cycle_gross_pnl"])
+            closed_net_pnl.append(state["cycle_net_pnl"])
             state["amount"] = 0.0
-            state["basis"] = 0.0
-    wins = [value for value in closed_pnl if value > 0]
-    losses = [value for value in closed_pnl if value < 0]
+            state["gross_basis"] = 0.0
+            state["net_basis"] = 0.0
+            state["cycle_gross_pnl"] = 0.0
+            state["cycle_net_pnl"] = 0.0
+    wins = [value for value in closed_net_pnl if value > 0]
+    losses = [value for value in closed_net_pnl if value < 0]
     average_win = float(np.mean(wins)) if wins else 0.0
     average_loss = float(np.mean(losses)) if losses else 0.0
     return {
-        "closed_trade_count": len(closed_pnl),
-        "win_rate": float(len(wins) / len(closed_pnl)) if closed_pnl else None,
+        "closed_trade_count": len(closed_net_pnl),
+        "win_rate": (
+            float(len(wins) / len(closed_net_pnl))
+            if closed_net_pnl
+            else None
+        ),
         "average_win": average_win,
         "average_loss": average_loss,
         "profit_loss_ratio": (
             float(average_win / abs(average_loss)) if wins and losses and average_loss else None
         ),
-        "gross_realized_pnl": float(sum(closed_pnl)),
+        "gross_realized_pnl": float(sum(closed_gross_pnl)),
+        "net_realized_pnl": float(sum(closed_net_pnl)),
     }
 
 

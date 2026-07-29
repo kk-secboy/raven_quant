@@ -276,6 +276,64 @@ def test_industry_neutral_policy_scales_the_stock_sleeve_to_target_volatility() 
     assert "target volatility exposure scaling" in decision.reasons
 
 
+def test_constrained_policy_can_ramp_from_cash_under_turnover_cap() -> None:
+    instruments = pd.Index([f"S{index:02d}" for index in range(10)])
+    scores = pd.Series(range(10), index=instruments, dtype=float)
+    benchmark = pd.Series(0.10, index=instruments)
+    industries = pd.Series(["bank"] * 5 + ["technology"] * 5, index=instruments)
+    styles = pd.DataFrame(
+        {
+            "size": 0.0,
+            "value": 0.0,
+            "growth": 0.0,
+            "volatility": 0.0,
+        },
+        index=instruments,
+    )
+    covariance = pd.DataFrame(
+        np.eye(len(instruments)) * 0.001,
+        index=instruments,
+        columns=instruments,
+    )
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=10,
+            n_drop=0,
+            max_position_weight=0.15,
+            max_daily_turnover=0.15,
+            max_industry_weight=0.60,
+            max_industry_deviation=0.10,
+            max_size_deviation=0.10,
+            max_value_deviation=0.10,
+            max_growth_deviation=0.10,
+            max_volatility_deviation=0.10,
+            max_tracking_error=1.0,
+            portfolio_construction="benchmark_relative_qp",
+        )
+    )
+
+    decision = policy.decide(
+        scores,
+        {},
+        industries=industries,
+        benchmark_weights=benchmark,
+        benchmark_industry_weights=pd.Series(
+            {"bank": 0.50, "technology": 0.50}
+        ),
+        style_exposures=styles,
+        benchmark_style_exposure={column: 0.0 for column in styles.columns},
+        return_covariance=covariance,
+    )
+
+    assert decision.expected_turnover == pytest.approx(0.15)
+    assert sum(decision.target_weights.values()) == pytest.approx(0.15)
+    evidence = decision.position_state["discrete_constraint_validation"]
+    assert evidence["status"] == "passed"
+    assert decision.position_state["constraint_benchmark_scale"] == pytest.approx(
+        0.15
+    )
+
+
 def test_policy_applies_position_and_portfolio_risk_rules() -> None:
     scores = pd.Series({"winner": 2.0, "loser": 1.0})
     policy = PortfolioPolicy(

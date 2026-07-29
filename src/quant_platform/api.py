@@ -33,6 +33,7 @@ from quant_data.execution_data import (
     MINUTE_FREQUENCIES,
     NATIVE_MINUTE_FREQUENCIES,
 )
+from quant_platform.qlib_factor_baseline import FACTOR_SOURCE_QLIB_BASELINE
 
 from .alert_store import AlertStore
 from .allocation_store import AllocationStore
@@ -267,7 +268,10 @@ class ResearchPeriods(BaseModel):
     train_end: date = date(2017, 12, 31)
     valid_start: date = date(2018, 1, 1)
     valid_end: date = date(2020, 12, 31)
-    test_start: date = date(2021, 1, 1)
+    # Keep the configured five-trading-day embargo between validation and the
+    # once-only final test.  2021-01-04 through 2021-01-08 are deliberately
+    # unused by the default fixed research window.
+    test_start: date = date(2021, 1, 11)
     test_end: date = Field(default_factory=date.today)
 
     @model_validator(mode="after")
@@ -428,6 +432,10 @@ class StrategyConfigRequest(BaseModel):
     outer_embargo_days: int = Field(default=5, ge=1, le=126)
     minimum_outer_test_excess_return: float = Field(default=0.0, ge=-1.0, le=5.0)
     minimum_outer_test_pass_rate: float = Field(default=0.60, ge=0.50, le=1.0)
+    # A production recommendation must be supported by a full pre-final
+    # market-history regime sample.  Ten trading years is intentionally
+    # separate from the once-only final OOS window below.
+    min_pre_final_history_days: int = Field(default=2520, ge=2520, le=7560)
     event_window_days: int = Field(default=20, ge=20, le=126)
     event_count: int = Field(default=5, ge=1, le=20)
     max_event_underperformance: float = Field(default=0.05, ge=0, le=0.50)
@@ -777,7 +785,7 @@ class ResearchProgramCreateRequest(BaseModel):
     objective: str | None = Field(default=None, min_length=10, max_length=2000)
     benchmark: str | None = None
     universe: str | None = None
-    train_trading_days: int = Field(default=756, ge=252, le=2520)
+    train_trading_days: int = Field(default=2520, ge=252, le=2520)
     validation_trading_days: int = Field(default=252, ge=63, le=756)
     test_trading_days: int = Field(default=504, ge=252, le=1260)
     min_new_trading_days: int = Field(default=20, ge=1, le=252)
@@ -805,6 +813,10 @@ class ResearchProgramCreateRequest(BaseModel):
     @model_validator(mode="after")
     def validate_program(self) -> ResearchProgramCreateRequest:
         validate_duration(self.duration)
+        if self.train_trading_days + self.validation_trading_days < 2520:
+            raise ValueError(
+                "continuous research requires at least 2520 pre-final trading days"
+            )
         if self.recommendation_run_time < time(15, 10):
             raise ValueError("recommendation refresh must run after the A-share close")
         try:
@@ -2480,12 +2492,47 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 raise ValueError(
                     "open execution backtests must not specify a minute execution dataset"
                 )
+            backtest_periods = {
+                "start": payload.start.isoformat(),
+                "end": payload.end.isoformat(),
+            }
+            trading_dates = load_calendar_days(dataset["path"])
+            if (
+                version["config"].get("factor_source_mode")
+                == FACTOR_SOURCE_QLIB_BASELINE
+                and not version["factors"]
+            ):
+                dataset_start = str(dataset.get("start_date") or "")[:10]
+                if not dataset_start:
+                    raise ValueError(
+                        "baseline final tests require a dated daily dataset"
+                    )
+                embargo_days = int(
+                    version["config"].get("outer_embargo_days", 5)
+                )
+                dates_before_final = sorted(
+                    value for value in trading_dates if value < payload.start
+                )
+                if len(dates_before_final) <= embargo_days:
+                    raise ValueError(
+                        "baseline dataset has too little history before the "
+                        "final-test embargo"
+                    )
+                backtest_periods.update(
+                    {
+                        "historical_start": dataset_start,
+                        "historical_end": dates_before_final[
+                            -(embargo_days + 1)
+                        ].isoformat(),
+                    }
+                )
             backtest = strategies.create_backtest(
                 version_id=version_id,
                 dataset=payload.dataset,
                 execution_dataset=payload.execution_dataset,
-                periods={"start": payload.start.isoformat(), "end": payload.end.isoformat()},
+                periods=backtest_periods,
                 artifact_path=artifact_root,
+                trading_dates=trading_dates,
             )
         except KeyError as exc:
             raise HTTPException(404, "strategy version not found") from exc

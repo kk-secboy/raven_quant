@@ -476,7 +476,13 @@ class PortfolioPolicy:
             "benchmark_relative_qp",
             "industry_neutral_qp",
         }
-        constraint_scale = float(target_volatility_evidence.get("exposure_scale", 1.0))
+        # Relative constraints apply to the invested stock sleeve.  A fresh
+        # account is intentionally ramped from cash by the turnover/execution
+        # caps, and volatility or risk gates can also retain cash. Comparing
+        # that partial sleeve with a 100%-invested benchmark would make the
+        # first rebalance mathematically infeasible even when its composition
+        # is perfectly benchmark-relative.
+        constraint_scale = float(target.sum())
         constraint_benchmark_weights = (
             benchmark_weights * constraint_scale
             if constrained_policy and benchmark_weights is not None
@@ -611,6 +617,7 @@ class PortfolioPolicy:
             position_state={
                 "take_profit_stages": stages,
                 "execution": next_execution_state,
+                "constraint_benchmark_scale": constraint_scale,
                 "discrete_constraint_validation": discrete_validation,
                 **(
                     {"target_volatility": target_volatility_evidence}

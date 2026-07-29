@@ -35,6 +35,10 @@ export type DataJob = {
   next_attempt_at?: string | null;
   attempts?: number;
   max_attempts?: number;
+  retry_successor?: {
+    id: string;
+    status: string;
+  } | null;
 };
 
 export const phaseText: Record<string, string> = {

@@ -84,7 +84,12 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
                     "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION
                 },
             },
-            "periods": {"start": "2024-01-01", "end": "2025-01-01"},
+            "periods": {
+                "start": "2024-01-01",
+                "end": "2025-01-01",
+                "historical_start": "2010-01-01",
+                "historical_end": "2023-12-31",
+            },
         },
     }
 
@@ -107,6 +112,11 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
     assert manifest["execution_contract_version"] == MINUTE_EXECUTION_CONTRACT_VERSION
     assert manifest["economic_hypothesis_group"] == "hypothesis-1"
     assert manifest["strategy_trial_count"] == 1
+    assert manifest["periods"] == {"start": "2024-01-01", "end": "2025-01-01"}
+    assert manifest["historical_validation_periods"] == {
+        "start": "2010-01-01",
+        "end": "2023-12-31",
+    }
 
 
 def test_worker_builds_production_qlib_order_plan_job(
