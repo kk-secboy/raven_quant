@@ -24,12 +24,14 @@ pseudo-precise numbers when the equation is degenerate.
 from __future__ import annotations
 
 from datetime import date
-from math import isfinite
+from math import isfinite, sqrt
+from statistics import fmean, stdev
 from typing import Any
 
-UNITIZED_PERFORMANCE_VERSION = "unitized-twr-v2-finite-ordered"
+UNITIZED_PERFORMANCE_VERSION = "unitized-twr-v3-inception-baseline"
 
 _XIRR_YEAR_DAYS = 365.2425
+_TRADING_DAYS_PER_YEAR = 252
 
 
 def _undefined_day(status: str) -> dict[str, Any]:
@@ -97,10 +99,12 @@ def unitized_drawdown_recovery(
 ) -> dict[str, Any]:
     """Max drawdown and recovery time on the unitized wealth curve.
 
-    ``points`` are ``(trade_date, investment_wealth)`` in date order. Recovery
-    time counts trading days from the max-drawdown trough until the curve
-    reaches its prior high again; ``None`` with status ``ongoing`` when the
-    curve has not recovered.
+    ``points`` are end-of-day ``(trade_date, investment_wealth)`` observations
+    in date order.  The unitized account is defined to start at 1.0 immediately
+    before the first observation, so total return and first-day drawdown must
+    retain that inception baseline.  Recovery time counts trading days from
+    the max-drawdown trough until the curve reaches its prior high again;
+    ``None`` with status ``ongoing`` when the curve has not recovered.
     """
 
     if not points:
@@ -108,7 +112,6 @@ def unitized_drawdown_recovery(
     normalized = [(day, float(wealth)) for day, wealth in points]
     if (
         any(not isfinite(wealth) or wealth < 0 for _, wealth in normalized)
-        or normalized[0][1] <= 0
         or any(
             previous_wealth == 0 and current_wealth > 0
             for (_, previous_wealth), (_, current_wealth) in zip(
@@ -126,9 +129,13 @@ def unitized_drawdown_recovery(
             "unitized wealth points must be finite, non-negative and strictly ordered"
         )
     points = normalized
-    peak_value = float("-inf")
+    # Every persisted investment_wealth value is chained from the 1.0
+    # inception unit.  Omitting that point would drop the first day's return
+    # from TWR and hide a first-day loss from max drawdown.
+    peak_value = 1.0
     peak_date: date | None = None
     max_drawdown = 0.0
+    drawdown_peak_date: date | None = None
     trough_date: date | None = None
     trough_index: int | None = None
     trough_prior_peak: float | None = None
@@ -139,6 +146,7 @@ def unitized_drawdown_recovery(
         drawdown = wealth / peak_value - 1.0
         if drawdown < max_drawdown:
             max_drawdown = drawdown
+            drawdown_peak_date = peak_date
             trough_date = day
             trough_index = index
             trough_prior_peak = peak_value
@@ -146,9 +154,13 @@ def unitized_drawdown_recovery(
         "observations": len(points),
         "start_date": points[0][0].isoformat(),
         "end_date": points[-1][0].isoformat(),
-        "twr": points[-1][1] / points[0][1] - 1.0 if len(points) > 1 else 0.0,
+        "twr": points[-1][1] - 1.0,
         "max_drawdown": max_drawdown,
-        "peak_date": peak_date.isoformat() if peak_date else None,
+        "peak_date": (
+            drawdown_peak_date.isoformat()
+            if drawdown_peak_date
+            else (peak_date.isoformat() if trough_index is None and peak_date else None)
+        ),
         "trough_date": trough_date.isoformat() if trough_date else None,
         "recovery_date": None,
         "recovery_trading_days": None,
@@ -167,6 +179,148 @@ def unitized_drawdown_recovery(
             return result
     result["status"] = "ongoing"
     return result
+
+
+def unitized_return_statistics(
+    points: list[tuple[date, float, float]],
+    *,
+    cash_return_annual: float = 0.0,
+    minimum_acceptable_return_annual: float = 0.0,
+    annualization_factor: int = _TRADING_DAYS_PER_YEAR,
+) -> dict[str, Any]:
+    """Compute account return/risk statistics from the certified TWR chain.
+
+    Each point is ``(trade_date, investment_wealth, twr_daily_return)``.  The
+    chain is independently reconciled from the 1.0 inception unit before any
+    statistic is reported.  Undefined denominators remain ``None`` with an
+    explicit per-metric status; they are never rendered as zero or infinity.
+    """
+
+    if not points:
+        return {
+            "status": "insufficient_evidence",
+            "observations": 0,
+            "contract_version": UNITIZED_PERFORMANCE_VERSION,
+        }
+    if annualization_factor <= 1:
+        raise ValueError("annualization_factor must be greater than one")
+    if (
+        not isfinite(float(cash_return_annual))
+        or float(cash_return_annual) <= -1.0
+        or not isfinite(float(minimum_acceptable_return_annual))
+        or float(minimum_acceptable_return_annual) <= -1.0
+    ):
+        raise ValueError("annual return assumptions must be finite and greater than -1")
+    normalized = [
+        (day, float(wealth), float(daily_return))
+        for day, wealth, daily_return in points
+    ]
+    if any(
+        not isfinite(wealth)
+        or wealth < 0
+        or not isfinite(daily_return)
+        or daily_return < -1.0
+        for _, wealth, daily_return in normalized
+    ) or any(
+        current_day <= previous_day
+        for (previous_day, _, _), (current_day, _, _) in zip(
+            normalized, normalized[1:], strict=False
+        )
+    ):
+        raise ValueError(
+            "unitized return points must be finite, valid and strictly ordered"
+        )
+    prior_wealth = 1.0
+    for day, wealth, daily_return in normalized:
+        expected = prior_wealth * (1.0 + daily_return)
+        tolerance = 1e-8 * max(1.0, abs(expected), abs(wealth))
+        if abs(wealth - expected) > tolerance:
+            raise ValueError(
+                f"unitized return chain does not reconcile on {day.isoformat()}"
+            )
+        prior_wealth = wealth
+
+    observations = len(normalized)
+    daily_returns = [daily_return for _, _, daily_return in normalized]
+    elapsed_days = (normalized[-1][0] - normalized[0][0]).days
+    total_return = normalized[-1][1] - 1.0
+    metric_status: dict[str, str] = {"twr": "ok"}
+    cagr: float | None
+    if observations < 2 or elapsed_days <= 0:
+        cagr = None
+        metric_status["cagr"] = "insufficient_evidence"
+    elif normalized[-1][1] == 0.0:
+        cagr = -1.0
+        metric_status["cagr"] = "ok"
+    else:
+        cagr = normalized[-1][1] ** (_XIRR_YEAR_DAYS / elapsed_days) - 1.0
+        metric_status["cagr"] = "ok"
+
+    annualized_volatility: float | None = None
+    sharpe_ratio: float | None = None
+    sortino_ratio: float | None = None
+    if observations < 2:
+        metric_status.update(
+            {
+                "annualized_volatility": "insufficient_evidence",
+                "sharpe_ratio": "insufficient_evidence",
+                "sortino_ratio": "insufficient_evidence",
+            }
+        )
+    else:
+        daily_std = stdev(daily_returns)
+        annualized_volatility = daily_std * sqrt(float(annualization_factor))
+        metric_status["annualized_volatility"] = "ok"
+        cash_daily = (1.0 + float(cash_return_annual)) ** (
+            1.0 / annualization_factor
+        ) - 1.0
+        excess = [value - cash_daily for value in daily_returns]
+        if daily_std <= 1e-15:
+            metric_status["sharpe_ratio"] = "undefined_zero_variance"
+        else:
+            sharpe_ratio = (
+                fmean(excess) / daily_std * sqrt(float(annualization_factor))
+            )
+            metric_status["sharpe_ratio"] = "ok"
+        minimum_daily = (1.0 + float(minimum_acceptable_return_annual)) ** (
+            1.0 / annualization_factor
+        ) - 1.0
+        differences = [value - minimum_daily for value in daily_returns]
+        downside_deviation = sqrt(
+            fmean(min(value, 0.0) ** 2 for value in differences)
+        )
+        if downside_deviation <= 1e-15:
+            metric_status["sortino_ratio"] = "undefined_zero_downside_deviation"
+        else:
+            sortino_ratio = (
+                fmean(differences)
+                / downside_deviation
+                * sqrt(float(annualization_factor))
+            )
+            metric_status["sortino_ratio"] = "ok"
+
+    return {
+        "status": "ok" if observations >= 2 else "insufficient_evidence",
+        "observations": observations,
+        "start_date": normalized[0][0].isoformat(),
+        "end_date": normalized[-1][0].isoformat(),
+        "elapsed_calendar_days": elapsed_days,
+        "twr": total_return,
+        "cagr": cagr,
+        "annualized_volatility": annualized_volatility,
+        "sharpe_ratio": sharpe_ratio,
+        "sortino_ratio": sortino_ratio,
+        "metric_status": metric_status,
+        "assumptions": {
+            "annualization_factor": annualization_factor,
+            "cash_return_annual": float(cash_return_annual),
+            "minimum_acceptable_return_annual": float(
+                minimum_acceptable_return_annual
+            ),
+            "benchmark_status": "not_configured",
+        },
+        "contract_version": UNITIZED_PERFORMANCE_VERSION,
+    }
 
 
 def xirr(
@@ -203,32 +357,54 @@ def xirr(
     terms = [
         ((day - origin).days / _XIRR_YEAR_DAYS, amount) for day, amount in ordered
     ]
+    if all(t == 0.0 for t, _ in terms):
+        # With no elapsed time the equation is rate-independent. Even when
+        # amounts net to zero there are infinitely many roots, not a meaningful
+        # annualized return.
+        return {
+            "status": "undefined_no_elapsed_time",
+            "rate": None,
+            "observations": len(points),
+            "contract_version": UNITIZED_PERFORMANCE_VERSION,
+        }
 
     def npv(rate: float) -> float:
         base = 1.0 + rate
         return sum(amount / base**t for t, amount in terms)
 
-    # log-spaced grid over (-1, 1000%]: finds every sign change bracket.
+    # Exact grid roots must be retained: zero-return cash flows have r=0
+    # exactly, and a strict sign-change-only search would incorrectly report
+    # that ordinary case as having no solution.
     grid = [-0.9999] + [
         -1.0 + 10 ** (-4 + i * 0.05) for i in range(0, 141)
     ]
+    scale = max(1.0, sum(abs(amount) for _, amount in points))
+    zero_tolerance = 1e-12 * scale
     brackets: list[tuple[float, float]] = []
-    previous_rate = grid[0]
-    previous_value = npv(previous_rate)
-    for rate in grid[1:]:
+    roots: list[float] = []
+    finite_grid: list[tuple[float, float]] = []
+    for rate in grid:
         value = npv(rate)
-        if isfinite(value) and previous_value * value < 0:
-            brackets.append((previous_rate, rate))
         if isfinite(value):
-            previous_rate, previous_value = rate, value
-    if not brackets:
+            finite_grid.append((rate, value))
+            if abs(value) <= zero_tolerance:
+                roots.append(rate)
+    for (previous_rate, previous_value), (rate, value) in zip(
+        finite_grid, finite_grid[1:], strict=False
+    ):
+        if (
+            abs(previous_value) > zero_tolerance
+            and abs(value) > zero_tolerance
+            and previous_value * value < 0
+        ):
+            brackets.append((previous_rate, rate))
+    if not brackets and not roots:
         return {
             "status": "undefined_no_root",
             "rate": None,
             "observations": len(points),
             "contract_version": UNITIZED_PERFORMANCE_VERSION,
         }
-    roots: list[float] = []
     for low, high in brackets:
         for _ in range(200):
             middle = (low + high) / 2.0
@@ -240,12 +416,17 @@ def xirr(
             else:
                 low = middle
         roots.append((low + high) / 2.0)
+    roots = sorted(roots)
+    unique_roots: list[float] = []
+    for root in roots:
+        if not unique_roots or abs(root - unique_roots[-1]) > 1e-9:
+            unique_roots.append(root)
     # 多解退化：取经济上最相关（最接近零）的根并如实标注。
-    rate = min(roots, key=abs)
+    rate = min(unique_roots, key=abs)
     return {
-        "status": "ok" if len(roots) == 1 else "multiple_roots",
+        "status": "ok" if len(unique_roots) == 1 else "multiple_roots",
         "rate": rate,
-        "root_count": len(roots),
+        "root_count": len(unique_roots),
         "observations": len(points),
         "contract_version": UNITIZED_PERFORMANCE_VERSION,
     }

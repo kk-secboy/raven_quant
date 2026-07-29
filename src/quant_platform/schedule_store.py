@@ -54,6 +54,70 @@ def occurrence_after(scheduled_for: datetime, timezone: str, run_time: time) -> 
     return datetime.combine(next_date, run_time, tzinfo=zone).astimezone(UTC)
 
 
+def validate_intraday_run_time(run_time: time, interval_minutes: int) -> None:
+    """Validate that a run time is the close of a complete A-share bar."""
+
+    if interval_minutes not in {1, 5}:
+        raise ValueError("intraday interval must be 1 or 5 minutes")
+    minute_of_day = run_time.hour * 60 + run_time.minute
+    morning_open = 9 * 60 + 30
+    morning_end = 11 * 60 + 30
+    afternoon_open = 13 * 60
+    afternoon_end = 15 * 60
+    morning_complete = (
+        morning_open < minute_of_day <= morning_end
+        and (minute_of_day - morning_open) % interval_minutes == 0
+    )
+    afternoon_complete = (
+        afternoon_open < minute_of_day <= afternoon_end
+        and (minute_of_day - afternoon_open) % interval_minutes == 0
+    )
+    if run_time.second or run_time.microsecond or not (
+        morning_complete or afternoon_complete
+    ):
+        raise ValueError(
+            "intraday run_time must align to a completed bar inside A-share sessions"
+        )
+
+
+def next_intraday_occurrence(
+    now: datetime,
+    timezone: str,
+    run_time: time,
+    interval_minutes: int,
+) -> datetime:
+    """Return the next intraday slot, including the remaining session today."""
+
+    validate_intraday_run_time(run_time, interval_minutes)
+    zone = ZoneInfo(timezone)
+    local = now.astimezone(zone)
+    local_date = local.date()
+    start = datetime.combine(local_date, run_time, tzinfo=zone)
+    morning_end = datetime.combine(local_date, time(11, 30), tzinfo=zone)
+    afternoon_start = datetime.combine(
+        local_date, time(13, interval_minutes), tzinfo=zone
+    )
+    afternoon_end = datetime.combine(local_date, time(15, 0), tzinfo=zone)
+
+    candidates: list[datetime] = []
+    if start <= morning_end:
+        candidate = start
+        while candidate <= morning_end:
+            candidates.append(candidate)
+            candidate += timedelta(minutes=interval_minutes)
+        candidate = afternoon_start
+    else:
+        candidate = start
+    while candidate <= afternoon_end:
+        candidates.append(candidate)
+        candidate += timedelta(minutes=interval_minutes)
+    for candidate in candidates:
+        if candidate > local:
+            return candidate.astimezone(UTC)
+    next_date = local_date + timedelta(days=1)
+    return datetime.combine(next_date, run_time, tzinfo=zone).astimezone(UTC)
+
+
 def intraday_occurrence_after(
     scheduled_for: datetime,
     timezone: str,
@@ -68,8 +132,7 @@ def intraday_occurrence_after(
     first completed-bar time on the next calendar day.
     """
 
-    if interval_minutes not in {1, 5}:
-        raise ValueError("intraday interval must be 1 or 5 minutes")
+    validate_intraday_run_time(run_time, interval_minutes)
     zone = ZoneInfo(timezone)
     local = scheduled_for.astimezone(zone)
     candidate = local + timedelta(minutes=interval_minutes)
@@ -121,6 +184,10 @@ class ScheduleStore:
         if kind == "recommendation_refresh" and not recommendation_portfolio_id:
             raise ValueError("recommendation_refresh requires recommendation_portfolio_id")
         current = now or _now()
+        interval_minutes = 5
+        if kind == "intraday_execution_check":
+            interval_minutes = int(payload.get("interval_minutes", 5))
+            validate_intraday_run_time(run_time, interval_minutes)
         schedule_id = uuid.uuid4().hex
         try:
             with self.engine.begin() as connection:
@@ -137,7 +204,16 @@ class ScheduleStore:
                         trading_days_only=trading_days_only,
                         payload_json=payload,
                         misfire_grace_seconds=misfire_grace_seconds,
-                        next_run_at=next_occurrence(current, timezone, run_time),
+                        next_run_at=(
+                            next_intraday_occurrence(
+                                current,
+                                timezone,
+                                run_time,
+                                interval_minutes,
+                            )
+                            if kind == "intraday_execution_check"
+                            else next_occurrence(current, timezone, run_time)
+                        ),
                         created_by=actor.strip(),
                         created_at=current,
                         updated_at=current,
@@ -193,10 +269,19 @@ class ScheduleStore:
                 "updated_at": current,
             }
             if effective == "active":
-                values["next_run_at"] = next_occurrence(
-                    current,
-                    row.timezone,
-                    row.run_time,
+                values["next_run_at"] = (
+                    next_intraday_occurrence(
+                        current,
+                        row.timezone,
+                        row.run_time,
+                        int((row.payload_json or {}).get("interval_minutes", 5)),
+                    )
+                    if row.kind == "intraday_execution_check"
+                    else next_occurrence(
+                        current,
+                        row.timezone,
+                        row.run_time,
+                    )
                 )
             connection.execute(
                 update(schedules).where(schedules.c.id == schedule_id).values(**values)

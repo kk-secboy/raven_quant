@@ -39,8 +39,26 @@ type SimulationPortfolio = {
   nav: number; execution_algorithm: string; execution_dataset: string; daily_dataset: string;
   cost_schedule_version: string; latest_nav?: SimulationNav | null;
 };
+type SimulationPerformance = {
+  nav_days: number;
+  unitized: {
+    status: string; twr?: number | null; max_drawdown?: number | null;
+    recovery_trading_days?: number | null;
+  };
+  statistics: {
+    status: string; twr?: number | null; cagr?: number | null;
+    annualized_volatility?: number | null; sharpe_ratio?: number | null;
+    sortino_ratio?: number | null; metric_status?: Record<string, string>;
+  };
+  relative_performance: {
+    status: string; annualized_excess_return?: number | null;
+    information_ratio?: number | null; tracking_error?: number | null;
+  };
+  xirr: { status: string; rate?: number | null };
+};
 
 const pct = (value?: number | null) => value == null ? "—" : `${(value * 100).toFixed(2)}%`;
+const decimal = (value?: number | null) => value == null ? "—" : value.toFixed(2);
 
 export function PortfolioPanel({ api }: { api: string }) {
   const [portfolios, setPortfolios] = useState<RecommendationPortfolio[]>([]);
@@ -63,6 +81,7 @@ export function PortfolioPanel({ api }: { api: string }) {
   const [initialCash, setInitialCash] = useState(5_000_000);
   const [simulationNav, setSimulationNav] = useState<SimulationNav[]>([]);
   const [simulationPositions, setSimulationPositions] = useState<SimulationPosition[]>([]);
+  const [simulationPerformance, setSimulationPerformance] = useState<SimulationPerformance | null>(null);
 
   const load = useCallback(async () => {
     const [portfolioResponse, strategyResponse, datasetResponse, simulationResponse, allocationResponse] = await Promise.all([
@@ -124,13 +143,19 @@ export function PortfolioPanel({ api }: { api: string }) {
       apiFetch(`${api}/api/simulation-portfolios/${selectedSimulationId}`, { cache: "no-store" }),
       apiFetch(`${api}/api/simulation-portfolios/${selectedSimulationId}/nav`, { cache: "no-store" }),
       apiFetch(`${api}/api/simulation-portfolios/${selectedSimulationId}/positions`, { cache: "no-store" }),
-    ]).then(async ([detailResponse, navResponse, positionResponse]) => {
+      apiFetch(`${api}/api/simulation-portfolios/${selectedSimulationId}/performance`, { cache: "no-store" }),
+    ]).then(async ([detailResponse, navResponse, positionResponse, performanceResponse]) => {
       if (detailResponse.ok) {
         const detail = await detailResponse.json() as SimulationPortfolio;
         setSimulations((current) => current.map((item) => item.id === detail.id ? detail : item));
       }
       setSimulationNav(navResponse.ok ? await navResponse.json() as SimulationNav[] : []);
       setSimulationPositions(positionResponse.ok ? await positionResponse.json() as SimulationPosition[] : []);
+      setSimulationPerformance(
+        performanceResponse.ok
+          ? await performanceResponse.json() as SimulationPerformance
+          : null,
+      );
     }).catch(() => setMessage("无法读取模拟账户账本。"));
   }, [api, selectedSimulationId]);
   const selected = portfolios.find((item) => item.id === selectedId) ?? portfolios[0];
@@ -273,6 +298,26 @@ export function PortfolioPanel({ api }: { api: string }) {
           <small>净值只来自 T+1 分钟撮合、成交、费用、现金和持仓账本；页面和任务不会向 QMT 或券商网关发单。</small>
         </article>
       </div>
+      {selectedSimulation && <section className="workspace-card">
+        <div className="panel-heading"><div><p className="eyebrow">CERTIFIED ACCOUNT PERFORMANCE</p><h2>账户单位净值绩效</h2><p>收益、回撤和风险指标来自扣除费用后的单位化 TWR；入金和出金不会制造收益。</p></div><span className={`state ${simulationPerformance?.statistics.status === "ok" ? "ready" : "partial"}`}>{simulationPerformance?.statistics.status ?? "证据不足"}</span></div>
+        <div className="metric-strip portfolio-metrics">
+          <div><span>累计 TWR</span><strong>{pct(simulationPerformance?.statistics.twr)}</strong></div>
+          <div><span>CAGR</span><strong>{pct(simulationPerformance?.statistics.cagr)}</strong></div>
+          <div><span>年化波动</span><strong>{pct(simulationPerformance?.statistics.annualized_volatility)}</strong></div>
+          <div><span>Sharpe</span><strong>{decimal(simulationPerformance?.statistics.sharpe_ratio)}</strong></div>
+          <div><span>Sortino</span><strong>{decimal(simulationPerformance?.statistics.sortino_ratio)}</strong></div>
+          <div><span>最大回撤</span><strong>{pct(simulationPerformance?.unitized.max_drawdown)}</strong></div>
+        </div>
+        <div className="metric-strip portfolio-metrics">
+          <div><span>XIRR · 资金体验</span><strong>{pct(simulationPerformance?.xirr.rate)}</strong></div>
+          <div><span>恢复交易日</span><strong>{simulationPerformance?.unitized.recovery_trading_days ?? "—"}</strong></div>
+          <div><span>净值天数</span><strong>{simulationPerformance?.nav_days ?? 0}</strong></div>
+          <div><span>年化超额</span><strong>{pct(simulationPerformance?.relative_performance.annualized_excess_return)}</strong></div>
+          <div><span>Information Ratio</span><strong>{decimal(simulationPerformance?.relative_performance.information_ratio)}</strong></div>
+          <div><span>Tracking Error</span><strong>{pct(simulationPerformance?.relative_performance.tracking_error)}</strong></div>
+        </div>
+        {simulationPerformance?.relative_performance.status === "benchmark_not_configured" && <div className="notice">账户政策基准尚未配置：相对收益、IR 和 Tracking Error 明确保持未定义，不以 0 冒充。</div>}
+      </section>}
       <div className="table-wrap"><table><thead><tr><th>证券</th><th>持仓</th><th>可卖</th><th>成本</th><th>行情日</th><th>市值</th><th>估值状态</th></tr></thead><tbody>{simulationPositions.map((position) => <tr key={position.instrument}><td><code>{position.instrument}</code></td><td>{position.quantity}</td><td>{position.available_quantity}</td><td>{Number(position.average_cost).toFixed(4)}</td><td>{position.market_date ?? "—"}</td><td>¥{Number(position.market_value).toFixed(2)}</td><td><span className={`state ${position.stale ? "failed" : "ready"}`}>{position.stale ? "stale" : "current"}</span></td></tr>)}</tbody></table>{selectedSimulation && !simulationPositions.length && <div className="empty">账户尚无持仓；等待下一次成功的推荐快照进入 T+1 撮合。</div>}</div>
     </section>
     {snapshot && <section className="data-panel"><div className="panel-heading"><div><p className="eyebrow">COST ASSUMPTIONS</p><h2>统一成本假设</h2></div></div><div className="metric-strip portfolio-metrics"><div><span>买入费率</span><strong>{pct(snapshot.cost_model.buy_commission_rate)}</strong></div><div><span>卖出费率</span><strong>{pct(snapshot.cost_model.sell_commission_rate)}</strong></div><div><span>固定滑点</span><strong>{pct(snapshot.cost_model.fixed_slippage_rate)}</strong></div><div><span>参与率上限</span><strong>{pct(snapshot.cost_model.max_volume_participation)}</strong></div><div><span>最低佣金</span><strong>¥{snapshot.cost_model.min_commission}</strong></div></div></section>}

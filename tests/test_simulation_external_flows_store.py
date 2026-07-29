@@ -182,9 +182,9 @@ def test_performance_summary_reports_twr_recovery_and_xirr(
     assert unitized["max_drawdown"] == pytest.approx(0.0)
     assert unitized["recovery_trading_days"] == 0
     xirr_result = summary["xirr"]
-    # One same-day NAV observation has no economically meaningful annualized root.
+    # One same-day NAV observation has no economically meaningful annualized horizon.
     assert summary["xirr_inception_date"] == TRADE_DATE.isoformat()
-    assert xirr_result["status"] == "undefined_no_root"
+    assert xirr_result["status"] == "undefined_no_elapsed_time"
     assert xirr_result["rate"] is None
     assert summary["cny_nav_latest"] > 0.0
 

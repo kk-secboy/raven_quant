@@ -63,7 +63,7 @@ from .research_store import ResearchStore
 from .retention import DataRetentionManager
 from .runtime_secret_store import RuntimeSecretStore
 from .safe_mode import SafeModeStore
-from .schedule_store import ScheduleStore
+from .schedule_store import ScheduleStore, validate_intraday_run_time
 from .services import (
     dataset_catalog,
     list_qlib_datasets,
@@ -1030,15 +1030,7 @@ class ScheduleCreateRequest(BaseModel):
                     f"unsupported {self.kind} payload keys: {sorted(unknown)}"
                 )
             interval = int(self.payload.get("interval_minutes", 5))
-            if interval not in {1, 5}:
-                raise ValueError("intraday interval must be 1 or 5 minutes")
-            first_close = time(9, 30 + interval)
-            in_morning = first_close <= self.run_time <= time(11, 30)
-            in_afternoon = time(13, interval) <= self.run_time <= time(15, 0)
-            if not (in_morning or in_afternoon):
-                raise ValueError(
-                    "intraday run_time must be a completed bar inside A-share sessions"
-                )
+            validate_intraday_run_time(self.run_time, interval)
         else:
             profile = self.payload.get("profile", "full")
             if profile not in {"core", "research", "full"}:
@@ -3217,6 +3209,15 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(
                 404, "simulation portfolio or fill not found"
             ) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/simulation-portfolios/{portfolio_id}/performance")
+    def get_simulation_performance(portfolio_id: str) -> dict:
+        try:
+            return simulations.performance_summary(portfolio_id)
+        except KeyError as exc:
+            raise HTTPException(404, "simulation portfolio not found") from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 

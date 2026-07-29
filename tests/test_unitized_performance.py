@@ -9,6 +9,7 @@ import pytest
 from quant_platform.unitized_performance import (
     chain_unitized_day,
     unitized_drawdown_recovery,
+    unitized_return_statistics,
     xirr,
 )
 
@@ -149,6 +150,77 @@ def test_unrecovered_drawdown_is_ongoing() -> None:
     assert result["recovery_date"] is None
 
 
+def test_first_observed_day_return_and_drawdown_keep_inception_baseline() -> None:
+    start = date(2026, 1, 5)
+    days = [start + timedelta(days=offset) for offset in range(3)]
+    result = unitized_drawdown_recovery(
+        list(zip(days, [0.90, 0.95, 1.00], strict=True))
+    )
+    assert result["twr"] == pytest.approx(0.0)
+    assert result["max_drawdown"] == pytest.approx(-0.10)
+    assert result["peak_date"] is None
+    assert result["trough_date"] == days[0].isoformat()
+    assert result["recovery_date"] == days[2].isoformat()
+    assert result["recovery_trading_days"] == 2
+
+
+def test_single_first_day_gain_is_reported_as_total_twr() -> None:
+    result = unitized_drawdown_recovery([(date(2026, 1, 5), 1.04)])
+    assert result["twr"] == pytest.approx(0.04)
+    assert result["max_drawdown"] == pytest.approx(0.0)
+
+
+def test_total_loss_is_a_valid_minus_one_hundred_percent_drawdown() -> None:
+    result = unitized_drawdown_recovery([(date(2026, 1, 5), 0.0)])
+    assert result["twr"] == pytest.approx(-1.0)
+    assert result["max_drawdown"] == pytest.approx(-1.0)
+    assert result["status"] == "ongoing"
+
+
+def test_unitized_return_statistics_match_hand_computed_two_day_path() -> None:
+    result = unitized_return_statistics(
+        [
+            (date(2026, 1, 5), 1.10, 0.10),
+            (date(2026, 1, 6), 0.99, -0.10),
+        ]
+    )
+    assert result["twr"] == pytest.approx(-0.01)
+    assert result["cagr"] == pytest.approx(0.99**365.2425 - 1.0)
+    assert result["annualized_volatility"] == pytest.approx(
+        0.14142135623730953 * (252**0.5)
+    )
+    assert result["metric_status"]["sharpe_ratio"] == "ok"
+    assert result["metric_status"]["sortino_ratio"] == "ok"
+    assert result["assumptions"]["benchmark_status"] == "not_configured"
+
+
+def test_unitized_return_statistics_never_invents_zero_ratio() -> None:
+    result = unitized_return_statistics(
+        [
+            (date(2026, 1, 5), 1.0, 0.0),
+            (date(2026, 1, 6), 1.0, 0.0),
+        ]
+    )
+    assert result["annualized_volatility"] == pytest.approx(0.0)
+    assert result["sharpe_ratio"] is None
+    assert result["sortino_ratio"] is None
+    assert result["metric_status"]["sharpe_ratio"] == "undefined_zero_variance"
+    assert (
+        result["metric_status"]["sortino_ratio"]
+        == "undefined_zero_downside_deviation"
+    )
+
+
+def test_unitized_return_statistics_rejects_a_non_reconciling_curve() -> None:
+    with pytest.raises(ValueError, match="does not reconcile"):
+        unitized_return_statistics(
+            [
+                (date(2026, 1, 5), 1.05, 0.05),
+                (date(2026, 1, 6), 1.20, 0.01),
+            ]
+        )
+
+
 def test_monotone_curve_has_zero_recovery() -> None:
     start = date(2026, 1, 5)
     days = [start + timedelta(days=offset) for offset in range(3)]
@@ -164,7 +236,6 @@ def test_monotone_curve_has_zero_recovery() -> None:
     "points",
     [
         [(date(2026, 1, 2), float("nan"))],
-        [(date(2026, 1, 2), 0.0)],
         [(date(2026, 1, 3), 1.0), (date(2026, 1, 2), 1.1)],
         [(date(2026, 1, 2), 1.0), (date(2026, 1, 3), 0.0), (date(2026, 1, 4), 0.1)],
     ],
@@ -205,6 +276,25 @@ def test_xirr_with_intermediate_flows() -> None:
         + 160_000.0 / (1.0 + rate) ** t_end
     )
     assert npv == pytest.approx(0.0, abs=1e-6)
+
+
+def test_xirr_zero_return_exact_grid_root_is_not_lost() -> None:
+    result = xirr(
+        [(date(2025, 1, 2), -100_000.0)],
+        terminal=(date(2026, 1, 2), 100_000.0),
+    )
+    assert result["status"] == "ok"
+    assert result["rate"] == pytest.approx(0.0, abs=1e-12)
+    assert result["root_count"] == 1
+
+
+def test_xirr_same_day_cash_flows_have_no_annualized_time_basis() -> None:
+    result = xirr(
+        [(date(2025, 1, 2), -100_000.0)],
+        terminal=(date(2025, 1, 2), 100_000.0),
+    )
+    assert result["status"] == "undefined_no_elapsed_time"
+    assert result["rate"] is None
 
 
 def test_xirr_single_sign_is_undefined() -> None:

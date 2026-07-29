@@ -88,6 +88,7 @@ from .unitized_performance import (
     UNITIZED_PERFORMANCE_VERSION,
     chain_unitized_day,
     unitized_drawdown_recovery,
+    unitized_return_statistics,
     xirr,
 )
 
@@ -5580,12 +5581,27 @@ class SimulationStore:
                 )
             ]
         chain_broken = any(row["investment_wealth"] is None for row in nav_rows)
+        statistics_chain_broken = any(
+            row["investment_wealth"] is None or row["twr_daily_return"] is None
+            for row in nav_rows
+        )
         points = [
             (row["trade_date"], float(row["investment_wealth"]))
             for row in nav_rows
             if row["investment_wealth"] is not None
         ]
         unitized = unitized_drawdown_recovery(points)
+        statistics_points = [
+            (
+                row["trade_date"],
+                float(row["investment_wealth"]),
+                float(row["twr_daily_return"]),
+            )
+            for row in nav_rows
+            if row["investment_wealth"] is not None
+            and row["twr_daily_return"] is not None
+        ]
+        statistics = unitized_return_statistics(statistics_points)
         if chain_broken:
             unitized = {
                 **unitized,
@@ -5594,6 +5610,17 @@ class SimulationStore:
                     row["trade_date"].isoformat()
                     for row in nav_rows
                     if row["investment_wealth"] is None
+                ),
+            }
+        if statistics_chain_broken:
+            statistics = {
+                **statistics,
+                "status": "unavailable_broken_chain",
+                "broken_from": next(
+                    row["trade_date"].isoformat()
+                    for row in nav_rows
+                    if row["investment_wealth"] is None
+                    or row["twr_daily_return"] is None
                 ),
             }
         money_weighted: dict[str, Any]
@@ -5638,6 +5665,13 @@ class SimulationStore:
                 xirr_inception_date.isoformat() if xirr_inception_date else None
             ),
             "unitized": unitized,
+            "statistics": statistics,
+            "relative_performance": {
+                "status": "benchmark_not_configured",
+                "information_ratio": None,
+                "tracking_error": None,
+                "annualized_excess_return": None,
+            },
             "xirr": money_weighted,
             "cny_nav_latest": (float(nav_rows[-1]["nav"]) if nav_rows else None),
         }
