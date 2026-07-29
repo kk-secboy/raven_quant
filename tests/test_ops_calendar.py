@@ -248,6 +248,23 @@ def test_gate_blocks_lagging_nav_and_uncovered_calendar() -> None:
 
 
 @pytest.mark.no_database
+def test_gate_blocks_future_nav_when_refreshing_a_historical_date() -> None:
+    result = evaluate_recommendation_gate(
+        FakeSimulations(
+            [_linked("p1")],
+            batch=_batch("succeeded", trade_date=date(2025, 2, 4)),
+            nav=_nav(trade_date=date(2025, 2, 4)),
+        ),
+        {"id": "p1"},
+        date(2025, 2, 3),
+        set(CALENDAR_DAYS),
+    )
+
+    assert result["passed"] is False
+    assert any("historical look-ahead" in reason for reason in result["reasons"])
+
+
+@pytest.mark.no_database
 def test_gate_passes_when_reconciled_healthy_and_fresh() -> None:
     result = evaluate_recommendation_gate(
         FakeSimulations([_linked("p1")], batch=_batch("succeeded"), nav=_nav()),

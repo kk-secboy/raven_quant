@@ -114,7 +114,12 @@ def test_worker_builds_production_qlib_order_plan_job(
 ) -> None:
     class Simulations:
         @staticmethod
-        def policy_risk_inputs(_portfolio_id: str) -> dict:
+        def policy_risk_inputs(
+            _portfolio_id: str,
+            *,
+            required_nav_date: date | None = None,
+        ) -> dict:
+            assert required_nav_date == date(2026, 7, 13)
             return {
                 "contract_version": "ledger-policy-risk-v1",
                 "risk_scope": "selected_account_only",
@@ -188,6 +193,12 @@ def test_worker_builds_production_qlib_order_plan_job(
                 "allow_new_risk": True,
             }
 
+    calendar_path = tmp_path / "qlib" / "daily" / "calendars"
+    calendar_path.mkdir(parents=True)
+    (calendar_path / "day.txt").write_text(
+        "2026-07-10\n2026-07-13\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         "quant_platform.worker.list_qlib_datasets",
         lambda _root: [

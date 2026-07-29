@@ -18,6 +18,7 @@ from quant_data.path_utils import to_wsl_path as _to_wsl_path
 
 from .allocation_store import AllocationStore
 from .cost_model import CostModelConfig
+from .data_rollover import qlib_trading_date_on_or_before
 from .execution_algorithms import execution_time_slots
 from .job_store import JobStore
 from .parameter_experiment_store import ParameterExperimentStore
@@ -1191,8 +1192,13 @@ class LocalJobWorker:
             strategy_risk_state = self.allocations.strategy_risk_state(
                 str(version["id"])
             )
+            required_nav_date = qlib_trading_date_on_or_before(
+                dataset,
+                date.fromisoformat(str(payload["signal_date"])),
+            )
             account_risk_state = self.simulations.policy_risk_inputs(
-                str(portfolio["id"])
+                str(portfolio["id"]),
+                required_nav_date=required_nav_date,
             )
             output = (
                 self.settings.data_root
@@ -1330,8 +1336,13 @@ class LocalJobWorker:
             if version["status"] != "approved":
                 raise ValueError("recommendation refresh requires an approved strategy version")
             member_risk_state = self.allocations.strategy_risk_state(str(version["id"]))
+            required_nav_date = qlib_trading_date_on_or_before(
+                {"path": payload["dataset_path"]},
+                date.fromisoformat(str(payload["as_of_date"])),
+            )
             account_risk_state = self.simulations.recommendation_policy_risk_inputs(
-                str(portfolio["id"])
+                str(portfolio["id"]),
+                required_nav_date=required_nav_date,
             )
             risk_exposure = min(
                 float(portfolio.get("risk_exposure_override", 1.0)),

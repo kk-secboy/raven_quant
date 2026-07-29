@@ -46,6 +46,7 @@ MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
 IGNORED_ARTIFACT_PARTS = {
     ".git",
+    ".codex_tmp",
     ".venv",
     ".pytest-tmp",
     ".worktrees",

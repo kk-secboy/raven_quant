@@ -12,12 +12,37 @@ from .services import list_qlib_datasets, list_snapshots, resolve_snapshot_datas
 ROLL_POLICIES = {"pinned", "latest_compatible"}
 
 
-def next_qlib_trading_date(dataset: dict[str, Any], signal_date: date) -> date:
+def _qlib_calendar(dataset: dict[str, Any]) -> list[date]:
     calendar_path = Path(str(dataset["path"])) / "calendars" / "day.txt"
     try:
-        calendar = [date.fromisoformat(value) for value in calendar_path.read_text().splitlines()]
+        calendar = sorted(
+            {
+                date.fromisoformat(value)
+                for value in calendar_path.read_text(encoding="utf-8").splitlines()
+                if value.strip()
+            }
+        )
     except (FileNotFoundError, ValueError) as exc:
         raise ValueError("Qlib dataset calendar is unavailable or invalid") from exc
+    if not calendar:
+        raise ValueError("Qlib dataset calendar is empty")
+    return calendar
+
+
+def qlib_trading_date_on_or_before(
+    dataset: dict[str, Any],
+    as_of_date: date,
+) -> date:
+    """Return the latest persisted trading day no later than ``as_of_date``."""
+
+    eligible = [value for value in _qlib_calendar(dataset) if value <= as_of_date]
+    if not eligible:
+        raise ValueError("Qlib dataset has no trading day on or before the requested date")
+    return eligible[-1]
+
+
+def next_qlib_trading_date(dataset: dict[str, Any], signal_date: date) -> date:
+    calendar = _qlib_calendar(dataset)
     next_dates = [value for value in calendar if value > signal_date]
     if not next_dates:
         raise ValueError("Qlib dataset has no later trading day")

@@ -137,12 +137,46 @@ def test_certified_ledger_risk_values_feed_the_portfolio_policy() -> None:
             "twr_daily_return": -0.03,
         },
         position_count=3,
+        required_nav_date=date(2026, 7, 28),
     )
     assert result["status"] == "certified"
     assert result["portfolio_drawdown"] == pytest.approx(-0.12)
     assert result["daily_return"] == pytest.approx(-0.03)
     assert result["allow_new_risk"] is True
     assert result["risk_scope"] == "selected_account_only"
+    assert result["required_nav_date"] == "2026-07-28"
+
+
+@pytest.mark.parametrize(
+    ("nav_date", "reason"),
+    [
+        (date(2026, 7, 25), "nav_lags_required_trade_date"),
+        (date(2026, 7, 29), "nav_is_after_required_trade_date"),
+    ],
+)
+def test_ledger_risk_rejects_stale_or_future_account_state(
+    nav_date: date,
+    reason: str,
+) -> None:
+    result = ledger_policy_risk_inputs(
+        portfolio_id="paper-1",
+        portfolio_status="active",
+        latest_nav={
+            "trade_date": nav_date,
+            "performance_certified": True,
+            "has_stale_prices": False,
+            "status": "healthy",
+            "twr_status": "ok",
+            "twr_drawdown": -0.01,
+            "twr_daily_return": 0.01,
+        },
+        position_count=3,
+        required_nav_date=date(2026, 7, 28),
+    )
+
+    assert result["status"] == "blocked_untrusted_ledger"
+    assert result["allow_new_risk"] is False
+    assert reason in result["reasons"]
 
 
 def test_untrusted_ledger_blocks_buys_without_manufacturing_an_exit() -> None:

@@ -16,6 +16,7 @@ Two risk-off modes are kept distinct:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import date
 from math import isfinite
 from typing import Any
 
@@ -78,6 +79,7 @@ def ledger_policy_risk_inputs(
     portfolio_status: str,
     latest_nav: dict[str, Any] | None,
     position_count: int,
+    required_nav_date: date | None = None,
 ) -> dict[str, Any]:
     """Translate certified account-ledger facts into PortfolioPolicy inputs.
 
@@ -117,6 +119,24 @@ def ledger_policy_risk_inputs(
             "reasons": ["positions_or_orders_exist_without_nav"],
         }
     reasons: list[str] = []
+    nav_trade_date: date | None = None
+    raw_nav_trade_date = latest_nav.get("trade_date")
+    try:
+        nav_trade_date = (
+            raw_nav_trade_date
+            if isinstance(raw_nav_trade_date, date)
+            else date.fromisoformat(str(raw_nav_trade_date))
+        )
+    except (TypeError, ValueError):
+        reasons.append("nav_trade_date_invalid")
+    if required_nav_date is not None:
+        base["required_nav_date"] = required_nav_date.isoformat()
+        if nav_trade_date is None:
+            reasons.append("nav_trade_date_missing")
+        elif nav_trade_date < required_nav_date:
+            reasons.append("nav_lags_required_trade_date")
+        elif nav_trade_date > required_nav_date:
+            reasons.append("nav_is_after_required_trade_date")
     if not bool(latest_nav.get("performance_certified")):
         reasons.append("performance_not_certified")
     if bool(latest_nav.get("has_stale_prices")):
@@ -154,7 +174,7 @@ def ledger_policy_risk_inputs(
         "daily_return": daily_return,
         "allow_new_risk": True,
         "reasons": [],
-        "nav_trade_date": str(latest_nav.get("trade_date") or ""),
+        "nav_trade_date": nav_trade_date.isoformat() if nav_trade_date else "",
     }
 
 

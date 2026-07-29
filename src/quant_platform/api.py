@@ -53,6 +53,7 @@ from .health_store import OperationalHealthStore
 from .job_store import JobStore
 from .market_overview import MarketOverviewService
 from .model_artifact_store import ModelArtifactStore
+from .ops_calendar import evaluate_recommendation_gate, load_calendar_days
 from .parameter_experiment_store import ParameterExperimentStore
 from .parameter_experiments import normalize_parameter_grid, split_research_period
 from .platform_config_store import PlatformConfigStore
@@ -2909,6 +2910,17 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 lineage_id=portfolio.get("dataset_lineage_id"),
                 required_date=payload.as_of_date,
             )
+            gate = evaluate_recommendation_gate(
+                simulations,
+                portfolio,
+                payload.as_of_date,
+                load_calendar_days(dataset["path"]),
+            )
+            if not gate["passed"]:
+                raise ValueError(
+                    "recommendation reconciliation gate blocked: "
+                    + "; ".join(gate["reasons"])
+                )
             snapshot, created = recommendations.create_snapshot(
                 portfolio_id=portfolio_id,
                 as_of_date=payload.as_of_date,

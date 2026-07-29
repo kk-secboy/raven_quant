@@ -3408,7 +3408,12 @@ class SimulationStore:
                 }
             return load_strategy_risk_state(connection, str(strategy_version_id))
 
-    def policy_risk_inputs(self, portfolio_id: str) -> dict[str, Any]:
+    def policy_risk_inputs(
+        self,
+        portfolio_id: str,
+        *,
+        required_nav_date: date | None = None,
+    ) -> dict[str, Any]:
         """Read the selected simulation ledger facts consumed by PortfolioPolicy."""
 
         with self.engine.connect() as connection:
@@ -3452,10 +3457,14 @@ class SimulationStore:
             portfolio_status=str(portfolio.status),
             latest_nav=row_dict(latest_nav) if latest_nav is not None else None,
             position_count=position_count + open_order_count,
+            required_nav_date=required_nav_date,
         )
 
     def recommendation_policy_risk_inputs(
-        self, recommendation_portfolio_id: str
+        self,
+        recommendation_portfolio_id: str,
+        *,
+        required_nav_date: date | None = None,
     ) -> dict[str, Any]:
         """Resolve the sole selected account for a recommendation, fail-closed."""
 
@@ -3497,7 +3506,10 @@ class SimulationStore:
                 "reasons": ["multiple_simulation_accounts_require_selection"],
                 "candidate_portfolio_ids": [str(value) for value in account_ids],
             }
-        return self.policy_risk_inputs(str(account_ids[0]))
+        return self.policy_risk_inputs(
+            str(account_ids[0]),
+            required_nav_date=required_nav_date,
+        )
 
     @staticmethod
     def _apply_risk_exposure_override(

@@ -7,9 +7,12 @@ import pytest
 
 from quant_platform.data_rollover import (
     next_qlib_trading_date,
+    qlib_trading_date_on_or_before,
     select_execution_snapshot,
     select_qlib_dataset,
 )
+
+pytestmark = pytest.mark.no_database
 
 
 def _units(*keys: str, changed: bool = False) -> list[dict[str, object]]:
@@ -148,6 +151,12 @@ def test_selects_latest_verified_qlib_descendant(tmp_path: Path) -> None:
 
     assert selected["name"] == "qlib-v2"
     assert next_qlib_trading_date(selected, date(2024, 1, 3)) == date(2024, 1, 4)
+    assert qlib_trading_date_on_or_before(
+        selected, date(2024, 1, 3)
+    ) == date(2024, 1, 3)
+    assert qlib_trading_date_on_or_before(
+        selected, date(2024, 1, 6)
+    ) == date(2024, 1, 4)
 
 
 def test_rejects_unverified_qlib_anchor_for_latest_policy(tmp_path: Path) -> None:

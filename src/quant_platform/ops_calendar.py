@@ -224,6 +224,11 @@ def evaluate_recommendation_gate(
                         f"latest simulation NAV is {nav['trade_date']}, lagging the "
                         f"required {required_date} (data freshness)"
                     )
+                elif nav["trade_date"] > required_date:
+                    reasons.append(
+                        f"latest simulation NAV is {nav['trade_date']}, after the "
+                        f"required {required_date} (historical look-ahead)"
+                    )
         if str(nav["status"]) == "degraded":
             reasons.append("latest simulation NAV is degraded")
         if not bool(nav["performance_certified"]):
