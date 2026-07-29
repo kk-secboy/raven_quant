@@ -52,6 +52,10 @@ from quant_platform.statistical_validation import (
 from quant_platform.strategy_backtest import build_governed_signal, compose_factor_scores
 from quant_platform.upstream_versions import upstream_runtime_identity
 
+GOVERNED_STYLE_COLUMNS = ("size", "value", "growth", "volatility")
+MAX_STYLE_CROSS_SECTION_MISSING_RATE = 0.05
+STYLE_EXPOSURE_CONTRACT_VERSION = "standardized-neutral-imputation-v1"
+
 
 def _load(path: str) -> pd.DataFrame:
     source = Path(path)
@@ -83,9 +87,7 @@ def _recompute_qlib_baseline(
     start_time: str,
     end_time: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
-    expressions = [
-        str(item["qlib_expression"]) for item in definition.get("factors") or []
-    ]
+    expressions = [str(item["qlib_expression"]) for item in definition.get("factors") or []]
     values = data_api.features(
         data_api.instruments(universe),
         expressions,
@@ -109,18 +111,14 @@ def _write_baseline_artifacts(
         root.mkdir(parents=True, exist_ok=True)
         for factor_id in frame.columns:
             path = root / f"{factor_id}.parquet"
-            frame[factor_id].rename("value").to_frame().to_parquet(
-                path, compression="zstd"
-            )
+            frame[factor_id].rename("value").to_frame().to_parquet(path, compression="zstd")
             artifacts[artifact_kind][str(factor_id)] = {
                 "path": str(path.relative_to(output)).replace("\\", "/"),
                 "sha256": _sha256_file(path),
             }
     composite_path = output / "baseline" / "composite.parquet"
     composite_path.parent.mkdir(parents=True, exist_ok=True)
-    composite.rename("score").to_frame().to_parquet(
-        composite_path, compression="zstd"
-    )
+    composite.rename("score").to_frame().to_parquet(composite_path, compression="zstd")
     artifacts["composite"] = {
         "path": str(composite_path.relative_to(output)).replace("\\", "/"),
         "sha256": _sha256_file(composite_path),
@@ -147,9 +145,7 @@ def _eligible_strategy_instruments(
     required = {"instrument", "eligible"}
     if not required.issubset(eligibility_matrix.columns):
         raise ValueError("point-in-time eligibility metadata is incomplete")
-    score_instruments = set(
-        scores.index.get_level_values("instrument").astype(str)
-    )
+    score_instruments = set(scores.index.get_level_values("instrument").astype(str))
     eligible_instruments = set(
         eligibility_matrix.loc[
             eligibility_matrix["eligible"].fillna(False).astype(bool), "instrument"
@@ -250,14 +246,62 @@ def _latest_style_cross_section(frame: pd.DataFrame, when: pd.Timestamp) -> pd.D
     result = values.set_index(values["instrument"].astype(str)).drop(
         columns=["datetime", "instrument"]
     )
-    result = result.apply(pd.to_numeric, errors="coerce")
-    if (
-        result.index.has_duplicates
-        or result.isna().any().any()
-        or not np.isfinite(result.to_numpy(dtype=float)).all()
-    ):
-        raise ValueError("point-in-time style exposures are duplicated or incomplete")
+    if result.index.has_duplicates:
+        raise ValueError("point-in-time style exposures are duplicated")
+    result = result.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    missing_rates = result.isna().mean()
+    systemic = missing_rates[missing_rates > MAX_STYLE_CROSS_SECTION_MISSING_RATE]
+    if not systemic.empty:
+        details = ", ".join(f"{column}={rate:.2%}" for column, rate in systemic.items())
+        raise ValueError(
+            "point-in-time standardized style exposure missing rate exceeds "
+            f"{MAX_STYLE_CROSS_SECTION_MISSING_RATE:.0%}: {details}"
+        )
+    # The builder writes cross-sectionally standardized exposures. Zero is the
+    # neutral exposure, so sparse missing descriptors are conservatively
+    # imputed to neutral only after the per-date systemic-missing gate above.
+    result = result.fillna(0.0)
+    if not np.isfinite(result.to_numpy(dtype=float)).all():
+        raise ValueError("point-in-time style exposures are not finite")
     return result.astype(float)
+
+
+def _load_governed_style_exposures(
+    provider_uri: str | Path,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    path = Path(provider_uri) / "metadata" / "style_exposures.parquet"
+    if not path.is_file():
+        raise ValueError("constrained backtest requires standardized point-in-time style metadata")
+    required = ["instrument", "datetime", *GOVERNED_STYLE_COLUMNS]
+    try:
+        frame = pd.read_parquet(path, columns=required)
+    except (KeyError, ValueError) as exc:
+        raise ValueError(
+            "standardized style metadata is missing governed exposure columns"
+        ) from exc
+    frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
+    if frame[["instrument", "datetime"]].isna().any().any():
+        raise ValueError("standardized style metadata contains invalid identity fields")
+    frame["instrument"] = frame["instrument"].astype(str)
+    if frame.duplicated(["datetime", "instrument"]).any():
+        raise ValueError("standardized style metadata contains duplicate instrument dates")
+    frame[list(GOVERNED_STYLE_COLUMNS)] = (
+        frame[list(GOVERNED_STYLE_COLUMNS)]
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+    )
+    missing_counts = {column: int(frame[column].isna().sum()) for column in GOVERNED_STYLE_COLUMNS}
+    return frame, {
+        "contract_version": STYLE_EXPOSURE_CONTRACT_VERSION,
+        "source": "qlib_builder_standardized_style_exposures",
+        "path": str(path),
+        "sha256": _sha256_file(path),
+        "columns": list(GOVERNED_STYLE_COLUMNS),
+        "rows": int(len(frame)),
+        "missing_counts": missing_counts,
+        "max_cross_section_missing_rate": MAX_STYLE_CROSS_SECTION_MISSING_RATE,
+        "missing_imputation": "zero_standardized_neutral_exposure",
+    }
 
 
 def _qlib_cross_section(frame: pd.DataFrame, when: pd.Timestamp, column: str) -> pd.Series:
@@ -318,9 +362,7 @@ def _metadata_provider(
         if benchmark_industries.isna().any():
             raise ValueError("benchmark constituents are missing point-in-time industries")
         risk_instruments = instruments.astype(str).union(benchmark.index.astype(str))
-        history = close_matrix.loc[:market_timestamp].reindex(
-            columns=risk_instruments
-        ).tail(61)
+        history = close_matrix.loc[:market_timestamp].reindex(columns=risk_instruments).tail(61)
         returns = history.pct_change(fill_method=None).dropna(how="any")
         if len(returns) < 60:
             raise ValueError("optimizer requires 60 complete point-in-time return observations")
@@ -329,9 +371,7 @@ def _metadata_provider(
             "benchmark_weights": benchmark,
             "benchmark_industry_weights": benchmark.groupby(benchmark_industries).sum(),
             "style_exposures": style,
-            "benchmark_style_exposure": style.reindex(benchmark.index).mul(
-                benchmark, axis=0
-            ).sum(),
+            "benchmark_style_exposure": style.reindex(benchmark.index).mul(benchmark, axis=0).sum(),
             "return_covariance": estimate_covariance(returns),
             "prices": _qlib_cross_section(
                 intraday_prices if intraday_prices is not None else execution_metadata,
@@ -395,17 +435,13 @@ def main() -> None:
     ]
     config = manifest["config"]
     strategy_contract = require_strategy_execution_contract(config)
-    factor_source_mode = str(
-        config.get("factor_source_mode") or FACTOR_SOURCE_PROMOTED_ONLY
-    )
+    factor_source_mode = str(config.get("factor_source_mode") or FACTOR_SOURCE_PROMOTED_ONLY)
     signal_frequency = str(config.get("signal_frequency") or "day")
     execution_method = str(config.get("execution_method", "open"))
     minute_execution = execution_method in {"twap", "vwap", "next_bar"}
     minute_signal = signal_frequency != "day"
     if minute_signal and execution_method != "next_bar":
-        raise ValueError(
-            "minute signals currently require the Qlib next_bar execution adapter"
-        )
+        raise ValueError("minute signals currently require the Qlib next_bar execution adapter")
     configured_execution_frequency = str(config.get("execution_frequency") or "day")
     if minute_execution and args.execution_frequency != configured_execution_frequency:
         raise ValueError(
@@ -422,12 +458,8 @@ def main() -> None:
         )
         if not execution_provenance_path.exists():
             raise ValueError("minute execution Qlib dataset requires provenance metadata")
-        execution_provenance = json.loads(
-            execution_provenance_path.read_text(encoding="utf-8")
-        )
-        require_minute_execution_contract(
-            execution_provenance, frequency=args.execution_frequency
-        )
+        execution_provenance = json.loads(execution_provenance_path.read_text(encoding="utf-8"))
+        require_minute_execution_contract(execution_provenance, frequency=args.execution_frequency)
     import qlib
     from qlib.data import D
 
@@ -441,9 +473,7 @@ def main() -> None:
         }
     qlib.init(provider_uri=provider_uri, region="cn")
     periods = manifest["periods"]
-    challenger_scores = (
-        compose_factor_scores(challenger_factors) if challenger_factors else None
-    )
+    challenger_scores = compose_factor_scores(challenger_factors) if challenger_factors else None
     baseline_artifacts: dict[str, Any] | None = None
     baseline_definition = config.get("baseline_definition")
     baseline_raw: pd.DataFrame | None = None
@@ -494,8 +524,7 @@ def main() -> None:
             preview = ", ".join(missing_instruments[:10])
             raise ValueError(
                 "minute execution dataset is missing "
-                f"{len(missing_instruments)} strategy instruments: "
-                + preview
+                f"{len(missing_instruments)} strategy instruments: " + preview
             )
     # $amount is CNY yuan under the v3 daily field contract.
     liquidity_amount = D.features(
@@ -539,9 +568,7 @@ def main() -> None:
     if industry_cap_enabled and industry_memberships is None:
         raise ValueError("industry-constrained backtest requires point-in-time industry metadata")
     if config.get("portfolio_construction") == "industry_neutral_qp":
-        target_weight_path = (
-            Path(args.provider_uri) / "metadata" / "full_market_weights.parquet"
-        )
+        target_weight_path = Path(args.provider_uri) / "metadata" / "full_market_weights.parquet"
         benchmark_weights = (
             pd.read_parquet(target_weight_path) if target_weight_path.exists() else None
         )
@@ -556,30 +583,16 @@ def main() -> None:
                 benchmark_weights["benchmark"] == manifest["benchmark"]
             ].drop(columns=["benchmark"])
         target_weight_label = "index benchmark"
-    style_fields = {
-        "Log($total_mv)": "size",
-        "1/$pb": "value",
-        # fund_quarter_profit_yoy is declared but never populated (Tushare
-        # q_profit_yoy is a non-default downloader column); use the populated
-        # quarterly operating-profit YoY field instead.
-        "($fund_quarter_revenue_yoy+$fund_op_profit_yoy)/2": "growth",
-        "Std($close/Ref($close, 1)-1, 60)": "volatility",
-    }
-    style_exposures = D.features(
-        instruments,
-        list(style_fields),
-        start_time=periods["start"],
-        end_time=periods["end"],
-        freq="day",
-    ).rename(columns=style_fields).reset_index()
+    style_exposures, style_exposure_evidence = _load_governed_style_exposures(args.provider_uri)
     if benchmark_weights is None or benchmark_weights.empty:
         raise ValueError(f"constrained backtest requires historical {target_weight_label} weights")
     if style_exposures.empty:
         raise ValueError("index-enhancement backtest requires point-in-time style exposures")
     eligibility_evidence = eligibility_statistics(eligibility_matrix)
-    if config.get("require_regulatory_events") and not eligibility_evidence[
-        "regulatory_data_available"
-    ]:
+    if (
+        config.get("require_regulatory_events")
+        and not eligibility_evidence["regulatory_data_available"]
+    ):
         raise ValueError("strategy requires regulatory events but no reliable source is available")
 
     def governed_for(
@@ -600,12 +613,8 @@ def main() -> None:
             eligibility_matrix=eligibility_matrix,
             max_industry_weight=float(scenario_config.get("max_industry_weight", 1.0)),
             max_industry_deviation=float(scenario_config.get("max_industry_deviation", 1.0)),
-            min_average_daily_amount=float(
-                scenario_config.get("min_average_daily_amount", 0.0)
-            ),
-            liquidity_lookback_days=int(
-                scenario_config.get("liquidity_lookback_days", 20)
-            ),
+            min_average_daily_amount=float(scenario_config.get("min_average_daily_amount", 0.0)),
+            liquidity_lookback_days=int(scenario_config.get("liquidity_lookback_days", 20)),
             neutralize_industry=neutralize_baseline,
             neutralize_style_columns=("size",) if neutralize_baseline else (),
         )
@@ -764,18 +773,14 @@ def main() -> None:
     )
     strategy_trial_count = int(manifest.get("strategy_trial_count") or 1)
 
-    def write_formal_run_artifacts(
-        category: str, name: str, result: Any
-    ) -> dict[str, Any]:
+    def write_formal_run_artifacts(category: str, name: str, result: Any) -> dict[str, Any]:
         target = output / "formal-validation" / category / name
         target.mkdir(parents=True, exist_ok=True)
         report_path = target / "daily_report.parquet"
         fills_path = target / "fills.parquet"
         metrics_path = target / "metrics.json"
         result.report.to_parquet(report_path, compression="zstd")
-        pd.DataFrame(result.fills).to_parquet(
-            fills_path, index=False, compression="zstd"
-        )
+        pd.DataFrame(result.fills).to_parquet(fills_path, index=False, compression="zstd")
         metrics_path.write_text(
             json.dumps(result.metrics, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -819,9 +824,7 @@ def main() -> None:
                 if factor_id != removed
             }
             baseline_variant = (
-                baseline_normalized.mul(pd.Series(remaining), axis=1)
-                .sum(axis=1)
-                .rename("score")
+                baseline_normalized.mul(pd.Series(remaining), axis=1).sum(axis=1).rename("score")
                 if remaining and baseline_normalized is not None
                 else None
             )
@@ -832,9 +835,7 @@ def main() -> None:
                 for candidate_id, values, weight, direction in challenger_entries
                 if candidate_id != removed
             ]
-            challenger_variant = (
-                compose_factor_scores(remaining) if remaining else None
-            )
+            challenger_variant = compose_factor_scores(remaining) if remaining else None
         else:
             raise ValueError(f"unknown ablation component: {component}")
         if factor_source_mode == FACTOR_SOURCE_PROMOTED_ONLY:
@@ -905,9 +906,7 @@ def main() -> None:
         )
         return {
             **result.metrics,
-            "artifacts": write_formal_run_artifacts(
-                "signal-decay", f"delay-{delay}", result
-            ),
+            "artifacts": write_formal_run_artifacts("signal-decay", f"delay-{delay}", result),
         }
 
     signal_decay = run_signal_decay_suite(
@@ -921,16 +920,20 @@ def main() -> None:
         outer_walk_forward = run_outer_walk_forward(
             dates=pd.DatetimeIndex(qlib_report.index).tz_localize(None),
             candidate_ids=["frozen-strategy"],
-            inner_runner=lambda _candidate, fold: run(
-                fold.validation_start,
-                fold.validation_end,
-                cost_schedule,
-            ).metrics,
-            test_runner=lambda _candidate, fold: run(
-                fold.test_start,
-                fold.test_end,
-                cost_schedule,
-            ).metrics,
+            inner_runner=lambda _candidate, fold: (
+                run(
+                    fold.validation_start,
+                    fold.validation_end,
+                    cost_schedule,
+                ).metrics
+            ),
+            test_runner=lambda _candidate, fold: (
+                run(
+                    fold.test_start,
+                    fold.test_end,
+                    cost_schedule,
+                ).metrics
+            ),
             selection_metric="annualized_excess_return",
             train_days=int(config.get("outer_train_days", 252)),
             validation_days=int(config.get("outer_validation_days", 42)),
@@ -973,9 +976,7 @@ def main() -> None:
         multiple_testing = {
             "status": "not_applicable_single_trial",
             "trial_count": 1,
-            "holm_adjusted_p_values": holm_bonferroni(
-                [paired_bootstrap["one_sided_p_value"]]
-            ),
+            "holm_adjusted_p_values": holm_bonferroni([paired_bootstrap["one_sided_p_value"]]),
             "pbo": {
                 "status": "not_applicable_single_trial",
                 "pbo": None,
@@ -1040,9 +1041,7 @@ def main() -> None:
                 manifest.get("execution_dataset") if minute_execution else manifest["dataset"]
             ),
             "contract_version": (
-                execution_provenance.get("execution_contract_version")
-                if minute_execution
-                else None
+                execution_provenance.get("execution_contract_version") if minute_execution else None
             ),
             "slice_minutes": execution_policy.get("slice_minutes") if execution_policy else None,
             "max_slices": execution_policy.get("max_slices") if execution_policy else None,
@@ -1077,6 +1076,7 @@ def main() -> None:
             "source_hand_size": provider_provenance.get("source_hand_size"),
             "lineage_verified": provider_provenance.get("lineage_verified"),
             "source_lineage_id": provider_provenance.get("source_lineage_id"),
+            "style_exposure_contract": style_exposure_evidence,
             "execution_dataset_identity_sha256": execution_provenance.get(
                 "dataset_identity_sha256"
             ),
@@ -1084,14 +1084,10 @@ def main() -> None:
                 "snapshot_manifest_sha256"
             ),
             "execution_qlib_builder_sha256": execution_provenance.get("qlib_builder_sha256"),
-            "execution_contract_version": execution_provenance.get(
-                "execution_contract_version"
-            ),
+            "execution_contract_version": execution_provenance.get("execution_contract_version"),
             "execution_fields": execution_provenance.get("fields"),
             "execution_source_datasets": execution_provenance.get("source_datasets"),
-            "execution_source_unit_contracts": execution_provenance.get(
-                "source_unit_contracts"
-            ),
+            "execution_source_unit_contracts": execution_provenance.get("source_unit_contracts"),
             "execution_source_lineage_id": execution_provenance.get("source_lineage_id"),
             "execution_lineage_verified": execution_provenance.get("lineage_verified"),
             "strategy_config_sha256": _canonical_sha256(config),
@@ -1100,9 +1096,7 @@ def main() -> None:
             "factor_code_sha256": factor_code_hashes,
             "factor_source_mode": factor_source_mode,
             "challenger_weight": float(config.get("challenger_weight") or 0.0),
-            "baseline_definition_sha256": config.get(
-                "baseline_definition_sha256"
-            ),
+            "baseline_definition_sha256": config.get("baseline_definition_sha256"),
             "baseline_qlib_expressions": (
                 {
                     str(item["id"]): str(item["qlib_expression"])
@@ -1133,9 +1127,7 @@ def main() -> None:
                 else None
             ),
             "baseline_composite_values_sha256": (
-                baseline_artifacts["composite"]["sha256"]
-                if baseline_artifacts
-                else None
+                baseline_artifacts["composite"]["sha256"] if baseline_artifacts else None
             ),
             "qlib_version": qlib_runtime["version"],
             "qlib_commit": qlib_runtime["commit"],
@@ -1244,9 +1236,7 @@ def main() -> None:
                 "start": periods["start"],
                 "end": periods["end"],
                 "execution_method": execution_method,
-                "execution_frequency": (
-                    args.execution_frequency if minute_execution else "day"
-                ),
+                "execution_frequency": (args.execution_frequency if minute_execution else "day"),
                 "strategy_config_sha256": metrics["provenance"]["strategy_config_sha256"],
             }
         )
@@ -1254,15 +1244,11 @@ def main() -> None:
         recorder_identity = workflow.identity_dict()
         manifest["qlib_workflow"] = recorder_identity
         manifest["factor_source_mode"] = factor_source_mode
-        manifest["challenger_weight"] = float(
-            config.get("challenger_weight") or 0.0
-        )
+        manifest["challenger_weight"] = float(config.get("challenger_weight") or 0.0)
         Path(args.manifest).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        metrics["provenance"]["execution_manifest_sha256"] = _sha256_file(
-            args.manifest
-        )
+        metrics["provenance"]["execution_manifest_sha256"] = _sha256_file(args.manifest)
         metrics["provenance"]["qlib_workflow"] = recorder_identity
         result["qlib_workflow"] = recorder_identity
         (output / "result.json").write_text(

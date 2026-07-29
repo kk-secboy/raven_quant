@@ -22,9 +22,7 @@ pytestmark = pytest.mark.no_database
 def _qlib_feature_frame() -> pd.DataFrame:
     instruments = ["SH600000", "SZ000001", "SZ000002", "SH600001"]
     datetimes = pd.to_datetime(["2025-01-02", "2025-01-03"])
-    index = pd.MultiIndex.from_product(
-        [instruments, datetimes], names=["instrument", "datetime"]
-    )
+    index = pd.MultiIndex.from_product([instruments, datetimes], names=["instrument", "datetime"])
     values = np.arange(1, len(index) * 6 + 1, dtype=float).reshape(len(index), 6)
     return pd.DataFrame(values, index=index)
 
@@ -76,9 +74,7 @@ def test_swing_recipe_is_a_governed_daily_qlib_baseline_family() -> None:
 
 def test_qlib_baseline_values_are_winsorized_zscored_and_composed() -> None:
     definition = core_baseline_definition("index_enhancement")
-    raw, normalized, score = normalize_qlib_baseline_values(
-        _qlib_feature_frame(), definition
-    )
+    raw, normalized, score = normalize_qlib_baseline_values(_qlib_feature_frame(), definition)
 
     assert list(raw.columns) == [
         "momentum",
@@ -182,9 +178,7 @@ def test_formal_runner_calls_qlib_d_features_with_the_frozen_expressions(
     assert FakeDataApi.calls == [
         {
             "instruments": "cn_all",
-            "expressions": [
-                item["qlib_expression"] for item in definition["factors"]
-            ],
+            "expressions": [item["qlib_expression"] for item in definition["factors"]],
             "start_time": "2025-01-01",
             "end_time": "2025-12-31",
             "freq": "day",
@@ -212,3 +206,82 @@ def test_formal_runner_restricts_exchange_universe_to_eligible_assets() -> None:
     )
 
     assert _eligible_strategy_instruments(scores, eligibility) == ["SH600000"]
+
+
+def test_standardized_style_snapshot_neutral_imputes_only_sparse_missing() -> None:
+    from scripts.run_multifactor_backtest import _latest_style_cross_section
+
+    instruments = [f"S{index:04d}" for index in range(100)]
+    frame = pd.DataFrame(
+        {
+            "datetime": pd.Timestamp("2025-01-02"),
+            "instrument": instruments,
+            "size": np.linspace(-2.0, 2.0, len(instruments)),
+            "value": 0.5,
+            "growth": 0.25,
+            "volatility": -0.1,
+        }
+    )
+    frame.loc[0, "growth"] = np.nan
+
+    result = _latest_style_cross_section(frame, pd.Timestamp("2025-01-03"))
+
+    assert result.loc["S0000", "growth"] == pytest.approx(0.0)
+    assert result.loc["S0001", "growth"] == pytest.approx(0.25)
+    assert np.isfinite(result.to_numpy()).all()
+
+
+def test_standardized_style_snapshot_rejects_systemic_missing() -> None:
+    from scripts.run_multifactor_backtest import _latest_style_cross_section
+
+    frame = pd.DataFrame(
+        {
+            "datetime": pd.Timestamp("2025-01-02"),
+            "instrument": [f"S{index:04d}" for index in range(20)],
+            "size": 0.0,
+            "value": 0.0,
+            "growth": [np.nan, np.nan, *([0.0] * 18)],
+            "volatility": 0.0,
+        }
+    )
+
+    with pytest.raises(ValueError, match=r"growth=10.00%"):
+        _latest_style_cross_section(frame, pd.Timestamp("2025-01-02"))
+
+
+def test_formal_runner_loads_versioned_builder_style_contract(tmp_path: Path) -> None:
+    from scripts.run_multifactor_backtest import _load_governed_style_exposures
+
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    source = pd.DataFrame(
+        {
+            "instrument": ["SH600000", "SZ000001"],
+            "datetime": pd.to_datetime(["2025-01-02", "2025-01-02"]),
+            "size": [-0.5, 0.5],
+            "value": [0.2, np.nan],
+            "growth": [0.1, -0.1],
+            "volatility": [-0.2, 0.2],
+            "unused_descriptor": [1.0, 2.0],
+        }
+    )
+    source.to_parquet(metadata / "style_exposures.parquet", index=False)
+
+    frame, evidence = _load_governed_style_exposures(tmp_path)
+
+    assert list(frame.columns) == [
+        "instrument",
+        "datetime",
+        "size",
+        "value",
+        "growth",
+        "volatility",
+    ]
+    assert evidence["contract_version"] == "standardized-neutral-imputation-v1"
+    assert evidence["missing_counts"] == {
+        "size": 0,
+        "value": 1,
+        "growth": 0,
+        "volatility": 0,
+    }
+    assert len(evidence["sha256"]) == 64
