@@ -110,6 +110,41 @@ def calculate_trade_metrics(fills: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def calculate_capacity_fill_ratio(fills: list[dict[str, Any]]) -> float:
+    """Return requested-notional-weighted execution completion.
+
+    Share counts cannot be added across instruments with different prices.
+    Weighting each order by ``requested_amount * trade_price`` makes the
+    capacity statistic an economic fraction of requested notional.  Missing
+    prices on a non-empty request fail closed because its notional cannot be
+    established.
+    """
+
+    if not fills:
+        return 1.0
+    requested_value = 0.0
+    filled_value = 0.0
+    for fill in fills:
+        requested_amount = float(fill.get("requested_amount") or 0.0)
+        amount = float(fill.get("amount") or 0.0)
+        price = float(fill.get("trade_price") or 0.0)
+        trade_value = float(fill.get("trade_value") or 0.0)
+        values = (requested_amount, amount, price, trade_value)
+        if not all(np.isfinite(value) and value >= 0 for value in values):
+            raise ValueError("formal fill ledger contains invalid capacity evidence")
+        if amount > requested_amount + 1e-8:
+            raise ValueError("formal fill ledger executes more than the requested amount")
+        if requested_amount <= 0:
+            continue
+        if price <= 0:
+            return 0.0
+        requested_value += requested_amount * price
+        filled_value += min(trade_value, requested_amount * price)
+    if requested_value <= 0:
+        return 1.0
+    return float(min(1.0, filled_value / requested_value))
+
+
 def _max_drawdown_recovery(nav: pd.Series) -> tuple[int | None, str]:
     """Trading days from the max-drawdown trough back to the prior peak.
 
@@ -267,7 +302,7 @@ def run_formal_qlib_backtest(
         {
             "minute_execution_enforced": False,
             "execution_frequency": "day",
-            "capacity_fill_ratio": 1.0,
+            "capacity_fill_ratio": calculate_capacity_fill_ratio(exchange.fill_log),
         }
     )
     return QlibBacktestResult(metrics, report, positions, exchange.fill_log)
@@ -373,15 +408,38 @@ def aggregate_intraday_report(report: pd.DataFrame) -> pd.DataFrame:
     if values.index.tz is not None:
         values.index = values.index.tz_localize(None)
     dates = values.index.normalize()
-    result: dict[str, pd.Series] = {}
+    numeric_values: dict[str, pd.Series] = {}
     for column in values.columns:
         numeric = pd.to_numeric(values[column], errors="coerce")
-        if numeric.isna().any():
+        if numeric.isna().any() or not np.isfinite(numeric.to_numpy(dtype=float)).all():
             raise ValueError("intraday Qlib portfolio report contains non-numeric values")
+        numeric_values[column] = numeric
+
+    gross_factors = 1.0 + numeric_values["return"]
+    net_factors = 1.0 + numeric_values["return"] - numeric_values["cost"]
+    benchmark_factors = 1.0 + numeric_values["bench"]
+    invalid_factor = (
+        (gross_factors <= 0).any()
+        or (net_factors <= 0).any()
+        or (benchmark_factors <= 0).any()
+    )
+    if bool(invalid_factor):
+        raise ValueError("intraday Qlib report contains a return at or below -100%")
+    gross_daily = gross_factors.groupby(dates).prod() - 1.0
+    net_daily = net_factors.groupby(dates).prod() - 1.0
+    result: dict[str, pd.Series] = {
+        "return": gross_daily,
+        # Preserve Qlib's report contract (net = return - cost) while making
+        # the daily net return exactly equal to the compounded intraday net
+        # path.  A plain sum of intraday costs drops return/cost cross terms.
+        "cost": gross_daily - net_daily,
+        "bench": benchmark_factors.groupby(dates).prod() - 1.0,
+    }
+    for column, numeric in numeric_values.items():
+        if column in {"return", "cost", "bench"}:
+            continue
         grouped = numeric.groupby(dates)
-        if column in {"return", "bench"}:
-            result[column] = grouped.apply(lambda item: float((1.0 + item).prod() - 1.0))
-        elif column in {"cost", "turnover"}:
+        if column == "turnover":
             result[column] = grouped.sum()
         else:
             result[column] = grouped.last()

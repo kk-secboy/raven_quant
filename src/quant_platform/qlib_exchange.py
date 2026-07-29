@@ -62,6 +62,36 @@ class SquareRootImpactExchange(Exchange):
             **kwargs,
         )
 
+    def deal_order(self, order: Order, *args: Any, **kwargs: Any) -> tuple[float, float, float]:
+        evidence_start = len(self.fill_log)
+        trade_value, trade_cost, trade_price = super().deal_order(order, *args, **kwargs)
+        if len(self.fill_log) == evidence_start:
+            # Qlib rejects suspension/limit-lock/no-quote orders before calling
+            # _calc_trade_info_by_order.  Record those attempts here so the
+            # capacity denominator includes every submitted order.
+            evidence_price = trade_price
+            try:
+                usable_price = np.isfinite(float(evidence_price)) and float(evidence_price) > 0
+            except (TypeError, ValueError):
+                usable_price = False
+            if not usable_price:
+                try:
+                    evidence_price = self.get_deal_price(
+                        order.stock_id,
+                        order.start_time,
+                        order.end_time,
+                        order.direction,
+                    )
+                except (TypeError, ValueError):
+                    evidence_price = 0.0
+            self._record_fill(
+                order,
+                trade_price=evidence_price,
+                trade_value=trade_value,
+                cost=trade_cost,
+            )
+        return trade_value, trade_cost, trade_price
+
     def _calc_trade_info_by_order(
         self,
         order: Order,
@@ -99,8 +129,14 @@ class SquareRootImpactExchange(Exchange):
             # Below the board minimum declaration (for example fewer than 200
             # shares on STAR): the exchange would reject the order outright.
             order.deal_amount = 0.0
+            self._record_fill(order, trade_price=trade_price, trade_value=0.0, cost=0.0)
             return trade_price, 0.0, 0.0
         if trade_value <= 1e-5:
+            # A rejected/suspended/limit-locked order is still capacity
+            # evidence.  Omitting zero fills would make the aggregate fill
+            # ratio condition on successful orders and systematically
+            # overstate executable capacity.
+            self._record_fill(order, trade_price=trade_price, trade_value=0.0, cost=0.0)
             return trade_price, trade_value, 0.0
         trade_date = order.start_time.date()
         cost_model = self.cost_schedule.as_of(trade_date)
@@ -120,24 +156,47 @@ class SquareRootImpactExchange(Exchange):
             asset_type=infer_cn_asset_type(str(order.stock_id)),
             trade_date=trade_date,
         )
+        self._record_fill(
+            order,
+            trade_price=trade_price,
+            trade_value=trade_value,
+            cost=actual_cost,
+        )
+        return trade_price, trade_value, actual_cost
+
+    def _record_fill(
+        self,
+        order: Order,
+        *,
+        trade_price: float,
+        trade_value: float,
+        cost: float,
+    ) -> None:
+        requested_amount = max(0.0, float(order.amount))
+        try:
+            raw_price = float(trade_price)
+        except (TypeError, ValueError):
+            raw_price = 0.0
+        price = raw_price if np.isfinite(raw_price) and raw_price > 0 else 0.0
+        value = max(0.0, float(trade_value))
+        executed_amount = value / price if price > 0 else 0.0
         self.fill_log.append(
             {
                 "instrument": str(order.stock_id),
                 "date": str(order.start_time),
-                "side": side,
-                "requested_amount": float(order.amount),
-                "amount": float(trade_value / trade_price) if trade_price else 0.0,
+                "side": "buy" if order.direction == Order.BUY else "sell",
+                "requested_amount": requested_amount,
+                "amount": executed_amount,
                 "capacity_fill_ratio": (
-                    min(1.0, float(trade_value / trade_price) / float(order.amount))
-                    if trade_price and float(order.amount) > 0
+                    min(1.0, executed_amount / requested_amount)
+                    if requested_amount > 0
                     else 0.0
                 ),
-                "trade_price": float(trade_price),
-                "trade_value": float(trade_value),
-                "cost": float(actual_cost),
+                "trade_price": price,
+                "trade_value": value,
+                "cost": max(0.0, float(cost)),
             }
         )
-        return trade_price, trade_value, actual_cost
 
 
 def _as_date(value: Any) -> date:

@@ -9,6 +9,7 @@ from quant_platform.qlib_backtest import (
     COMPONENT_COST_STRESS_MULTIPLIERS,
     QlibBacktestResult,
     aggregate_intraday_report,
+    calculate_capacity_fill_ratio,
     calculate_qlib_metrics,
     calculate_trade_metrics,
     run_qlib_validation_suites,
@@ -150,7 +151,13 @@ def test_intraday_report_is_geometrically_aggregated_to_daily_metrics() -> None:
     assert daily.loc["2026-07-10", "bench"] == pytest.approx(
         (1.002 * 1.003) - 1.0
     )
-    assert daily.loc["2026-07-10", "cost"] == pytest.approx(0.003)
+    expected_net = (1.01 - 0.001) * (0.995 - 0.002) - 1.0
+    assert daily.loc["2026-07-10", "cost"] == pytest.approx(
+        daily.loc["2026-07-10", "return"] - expected_net
+    )
+    assert (
+        daily.loc["2026-07-10", "return"] - daily.loc["2026-07-10", "cost"]
+    ) == pytest.approx(expected_net)
     assert daily.loc["2026-07-10", "turnover"] == pytest.approx(0.3)
     assert daily.loc["2026-07-10", "account"] == pytest.approx(100.495)
 
@@ -358,6 +365,47 @@ def test_trade_metrics_report_win_rate_and_profit_loss_ratio() -> None:
     assert metrics["average_win"] == pytest.approx(200.0)
     assert metrics["average_loss"] == pytest.approx(-100.0)
     assert metrics["profit_loss_ratio"] == pytest.approx(2.0)
+
+
+def test_capacity_fill_ratio_is_weighted_by_requested_notional() -> None:
+    fills = [
+        {
+            "requested_amount": 100.0,
+            "amount": 50.0,
+            "trade_price": 10.0,
+            "trade_value": 500.0,
+        },
+        {
+            "requested_amount": 100.0,
+            "amount": 100.0,
+            "trade_price": 20.0,
+            "trade_value": 2_000.0,
+        },
+    ]
+
+    assert calculate_capacity_fill_ratio(fills) == pytest.approx(2_500.0 / 3_000.0)
+
+
+def test_capacity_fill_ratio_includes_zero_fills_and_fails_closed_without_price() -> None:
+    zero_fill = [
+        {
+            "requested_amount": 100.0,
+            "amount": 0.0,
+            "trade_price": 10.0,
+            "trade_value": 0.0,
+        }
+    ]
+    unknown_notional = [
+        {
+            "requested_amount": 100.0,
+            "amount": 0.0,
+            "trade_price": 0.0,
+            "trade_value": 0.0,
+        }
+    ]
+
+    assert calculate_capacity_fill_ratio(zero_fill) == 0.0
+    assert calculate_capacity_fill_ratio(unknown_notional) == 0.0
 
 
 def test_capacity_curve_repeats_formal_runner_at_three_notionals() -> None:

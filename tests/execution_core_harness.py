@@ -331,10 +331,16 @@ def run_pinned_exchange(
             start_time=pd.Timestamp(spec["start_time"]),
             end_time=pd.Timestamp(spec["end_time"]),
         )
+        evidence_start = len(exchange.fill_log)
         trade_value, trade_cost, trade_price = exchange.deal_order(
             order,
             position=spec.get("position"),
             dealt_order_amount=defaultdict(float),
+        )
+        fill_evidence = (
+            exchange.fill_log[evidence_start]
+            if len(exchange.fill_log) == evidence_start + 1
+            else None
         )
         results.append(
             {
@@ -346,6 +352,7 @@ def run_pinned_exchange(
                 "trade_value": float(trade_value),
                 "cost": float(trade_cost),
                 "factor": order.factor,
+                "fill_evidence": fill_evidence,
             }
         )
     return results

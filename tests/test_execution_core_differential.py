@@ -225,6 +225,9 @@ def test_suspension_blocks_both_chains() -> None:
 
     assert qlib["filled_quantity"] == 0
     assert qlib["cost"] == 0
+    assert qlib["fill_evidence"]["requested_amount"] == 5_000
+    assert qlib["fill_evidence"]["amount"] == 0
+    assert qlib["fill_evidence"]["capacity_fill_ratio"] == 0
     assert _sim_order(sim)["status"] == "rejected"
     assert _sim_order(sim)["reject_reason"] == "suspended"
     assert sim["fills"] == []
