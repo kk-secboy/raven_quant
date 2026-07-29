@@ -335,7 +335,7 @@ def test_allocation_uses_recommendation_ledgers_and_propagates_risk(
     with pytest.raises(ValueError, match="independently reviewed"):
         store.approve(
             allocation["id"],
-            actor="allocation-approver",
+            actor="allocation-author",
             reason="Review evidence is intentionally missing for this attempt.",
         )
     simulations = SimulationStore(database_url)
@@ -354,9 +354,11 @@ def test_allocation_uses_recommendation_ledgers_and_propagates_risk(
     )
     approved = store.approve(
         allocation["id"],
-        actor="allocation-approver",
+        actor="allocation-author",
         reason="Approved low-correlation recommendation allocation.",
     )
+    assert approved["created_by"] == "allocation-author"
+    assert approved["approved_by"] == "allocation-author"
     portfolio_ids = [item["recommendation_portfolio_id"] for item in approved["members"]]
     assert all(portfolio_ids)
     assert {item["role"] for item in approved["members"]} == {"core"}

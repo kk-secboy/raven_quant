@@ -722,8 +722,6 @@ class AllocationStore:
                 raise ValueError("legacy paper-backed allocations are read-only")
             if allocation.status != "draft":
                 raise ValueError("only draft strategy allocations may be approved")
-            if actor.strip() == allocation.created_by:
-                raise ValueError("strategy allocation approval requires a second operator")
             self._assert_single_active_allocation(connection, allocation_id)
             analysis = dict(allocation.analysis_json or {})
             if analysis.get("covariance_model_version") != COVARIANCE_MODEL_VERSION:
@@ -850,7 +848,7 @@ class AllocationStore:
                 allocation_id,
                 event_type="allocation.approved",
                 severity="info",
-                rule="four_eyes_approval",
+                rule="explicit_human_approval",
                 details={"actor": actor.strip(), "reason": reason.strip()},
             )
         return self.get(allocation_id)
