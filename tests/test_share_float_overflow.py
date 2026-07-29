@@ -1,10 +1,12 @@
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from quant_data.checkpoint import CheckpointStore
 from quant_data.cli import _pagination_overflow_recovery, _share_float_overflow_recovery
 from quant_data.models import FetchSpec
+from quant_data.supplemental_data import share_float_overflow_repartition_specs
 
 
 def test_overflow_recovery_preserves_prefix_and_supersedes_bad_cursor(
@@ -68,6 +70,69 @@ def test_overflow_recovery_preserves_prefix_and_supersedes_bad_cursor(
     failed_row = checkpoint.unit_rows([failed.unit_key])[0]
     assert failed_row["status"] == "superseded"
     assert "pagination offset cap" in failed_row["last_error"]
+
+
+@pytest.mark.no_database
+def test_restart_rehydrates_existing_daily_share_float_replacement() -> None:
+    parent = FetchSpec(
+        dataset="share_float",
+        api_name="share_float",
+        params={
+            "start_date": "20240101",
+            "end_date": "20240131",
+            "limit": 1_000,
+            "offset": 0,
+        },
+        scope={
+            "start_date": "20240101",
+            "end_date": "20240131",
+            "page_group": "share_float:20240101:20240131",
+            "page_size": 1_000,
+            "max_pages": 512,
+            "offset": 0,
+        },
+        allow_empty=True,
+        max_attempts=5,
+    )
+    daily = share_float_overflow_repartition_specs(parent)
+
+    class Checkpoint:
+        @staticmethod
+        def unit_rows(unit_keys) -> list[dict]:
+            keys = set(unit_keys)
+            rows = []
+            if parent.unit_key in keys:
+                rows.append(
+                    {
+                        "unit_key": parent.unit_key,
+                        "status": "superseded",
+                        "last_error": "monthly pagination replaced by daily partitions",
+                    }
+                )
+            rows.extend(
+                {
+                    "unit_key": item.unit_key,
+                    "status": "pending",
+                    "scope_json": item.scope,
+                }
+                for item in daily
+                if item.unit_key in keys
+            )
+            return rows
+
+    context = SimpleNamespace(checkpoint=Checkpoint())
+    replacements, recovered = _share_float_overflow_recovery(
+        context, [parent], set()
+    )
+
+    assert recovered == {parent.unit_key}
+    assert {item.unit_key for item in replacements} == {
+        item.unit_key for item in daily
+    }
+    assert all(
+        item.scope["supersedes_page_group"] == parent.scope["page_group"]
+        for item in replacements
+    )
 
 
 def test_etf_overflow_recovery_uses_listed_exchange_symbols(

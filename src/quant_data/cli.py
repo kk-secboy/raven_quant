@@ -487,6 +487,30 @@ def _share_float_overflow_recovery(
         row = rows_by_key.get(failed_spec.unit_key)
         if not row or str(row.get("status")) not in {"failed", "superseded"}:
             continue
+        if str(row.get("status")) == "superseded":
+            # A previous run may already have replaced the unstable monthly
+            # page group with immutable daily children.  Rehydrate that
+            # replacement plan on restart instead of requiring the deliberately
+            # superseded parent to become "succeeded".
+            replacements = share_float_overflow_repartition_specs(failed_spec)
+            replacement_rows = context.checkpoint.unit_rows(
+                item.unit_key for item in replacements
+            )
+            parent_group = str(failed_spec.scope.get("page_group") or "")
+            has_linked_replacement = any(
+                str(
+                    dict(child.get("scope_json") or {}).get(
+                        "supersedes_page_group"
+                    )
+                    or ""
+                )
+                == parent_group
+                for child in replacement_rows
+            )
+            if has_linked_replacement:
+                recovery_specs.extend(replacements)
+                recovered_keys.add(failed_spec.unit_key)
+                continue
         error = str(row.get("last_error") or "")
         normalized_error = error.replace("-", " ")
         offset = int(failed_spec.params.get("offset") or 0)
