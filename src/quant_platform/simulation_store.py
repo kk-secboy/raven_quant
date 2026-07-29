@@ -5676,6 +5676,18 @@ class SimulationStore:
                     .order_by(simulation_external_flows.c.trade_date)
                 )
             ]
+            first_batch_signal_date = connection.scalar(
+                select(simulation_batches.c.signal_date)
+                .where(
+                    simulation_batches.c.portfolio_id == portfolio_id,
+                    simulation_batches.c.status == "succeeded",
+                )
+                .order_by(
+                    simulation_batches.c.trade_date,
+                    simulation_batches.c.signal_date,
+                )
+                .limit(1)
+            )
         chain_broken = any(row["investment_wealth"] is None for row in nav_rows)
         statistics_chain_broken = any(
             row["investment_wealth"] is None or row["twr_daily_return"] is None
@@ -5697,7 +5709,10 @@ class SimulationStore:
             if row["investment_wealth"] is not None
             and row["twr_daily_return"] is not None
         ]
-        statistics = unitized_return_statistics(statistics_points)
+        statistics = unitized_return_statistics(
+            statistics_points,
+            inception_date=first_batch_signal_date,
+        )
         if chain_broken:
             unitized = {
                 **unitized,
@@ -5733,6 +5748,7 @@ class SimulationStore:
             # actual creation date.
             economic_dates = [
                 portfolio.created_at.date(),
+                *([first_batch_signal_date] if first_batch_signal_date else []),
                 nav_rows[0]["trade_date"],
                 *[row["trade_date"] for row in realized_flows],
             ]

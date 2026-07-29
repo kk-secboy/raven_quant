@@ -181,11 +181,17 @@ def test_performance_summary_reports_twr_recovery_and_xirr(
     assert unitized["observations"] == 1
     assert unitized["max_drawdown"] == pytest.approx(0.0)
     assert unitized["recovery_trading_days"] == 0
+    assert summary["statistics"]["inception_date"] == (
+        TRADE_DATE - timedelta(days=3)
+    ).isoformat()
     xirr_result = summary["xirr"]
-    # One same-day NAV observation has no economically meaningful annualized horizon.
-    assert summary["xirr_inception_date"] == TRADE_DATE.isoformat()
-    assert xirr_result["status"] == "undefined_no_elapsed_time"
-    assert xirr_result["rate"] is None
+    # The first signal date is the persisted economic baseline before the
+    # first trade-date return; starting at the NAV date would drop that period.
+    assert summary["xirr_inception_date"] == (
+        TRADE_DATE - timedelta(days=3)
+    ).isoformat()
+    assert xirr_result["status"] == "ok"
+    assert xirr_result["rate"] < 0.0
     assert summary["cny_nav_latest"] > 0.0
 
 

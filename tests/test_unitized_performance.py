@@ -182,10 +182,12 @@ def test_unitized_return_statistics_match_hand_computed_two_day_path() -> None:
         [
             (date(2026, 1, 5), 1.10, 0.10),
             (date(2026, 1, 6), 0.99, -0.10),
-        ]
+        ],
+        inception_date=date(2026, 1, 4),
     )
     assert result["twr"] == pytest.approx(-0.01)
-    assert result["cagr"] == pytest.approx(0.99**365.2425 - 1.0)
+    assert result["elapsed_calendar_days"] == 2
+    assert result["cagr"] == pytest.approx(0.99 ** (365.2425 / 2) - 1.0)
     assert result["annualized_volatility"] == pytest.approx(
         0.14142135623730953 * (252**0.5)
     )
@@ -199,7 +201,8 @@ def test_unitized_return_statistics_never_invents_zero_ratio() -> None:
         [
             (date(2026, 1, 5), 1.0, 0.0),
             (date(2026, 1, 6), 1.0, 0.0),
-        ]
+        ],
+        inception_date=date(2026, 1, 4),
     )
     assert result["annualized_volatility"] == pytest.approx(0.0)
     assert result["sharpe_ratio"] is None
@@ -211,13 +214,27 @@ def test_unitized_return_statistics_never_invents_zero_ratio() -> None:
     )
 
 
+def test_cagr_requires_the_wealth_baseline_date() -> None:
+    result = unitized_return_statistics(
+        [
+            (date(2026, 1, 5), 1.01, 0.01),
+            (date(2026, 1, 6), 1.02, 1.02 / 1.01 - 1.0),
+        ],
+        inception_date=None,
+    )
+    assert result["cagr"] is None
+    assert result["elapsed_calendar_days"] is None
+    assert result["metric_status"]["cagr"] == "missing_inception_date"
+
+
 def test_unitized_return_statistics_rejects_a_non_reconciling_curve() -> None:
     with pytest.raises(ValueError, match="does not reconcile"):
         unitized_return_statistics(
             [
                 (date(2026, 1, 5), 1.05, 0.05),
                 (date(2026, 1, 6), 1.20, 0.01),
-            ]
+            ],
+            inception_date=date(2026, 1, 4),
         )
 
 

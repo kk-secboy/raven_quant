@@ -184,16 +184,19 @@ def unitized_drawdown_recovery(
 def unitized_return_statistics(
     points: list[tuple[date, float, float]],
     *,
+    inception_date: date | None,
     cash_return_annual: float = 0.0,
     minimum_acceptable_return_annual: float = 0.0,
     annualization_factor: int = _TRADING_DAYS_PER_YEAR,
 ) -> dict[str, Any]:
     """Compute account return/risk statistics from the certified TWR chain.
 
-    Each point is ``(trade_date, investment_wealth, twr_daily_return)``.  The
-    chain is independently reconciled from the 1.0 inception unit before any
-    statistic is reported.  Undefined denominators remain ``None`` with an
-    explicit per-metric status; they are never rendered as zero or infinity.
+    Each point is ``(trade_date, investment_wealth, twr_daily_return)``.
+    ``inception_date`` is the date of the 1.0 wealth baseline immediately
+    before the first reported return (normally the first batch signal date).
+    The chain is independently reconciled before any statistic is reported.
+    Undefined denominators remain ``None`` with an explicit per-metric status;
+    they are never rendered as zero or infinity.
     """
 
     if not points:
@@ -230,6 +233,8 @@ def unitized_return_statistics(
         raise ValueError(
             "unitized return points must be finite, valid and strictly ordered"
         )
+    if inception_date is not None and inception_date > normalized[0][0]:
+        raise ValueError("unitized performance inception cannot follow the first return")
     prior_wealth = 1.0
     for day, wealth, daily_return in normalized:
         expected = prior_wealth * (1.0 + daily_return)
@@ -242,11 +247,18 @@ def unitized_return_statistics(
 
     observations = len(normalized)
     daily_returns = [daily_return for _, _, daily_return in normalized]
-    elapsed_days = (normalized[-1][0] - normalized[0][0]).days
+    elapsed_days = (
+        (normalized[-1][0] - inception_date).days
+        if inception_date is not None
+        else None
+    )
     total_return = normalized[-1][1] - 1.0
     metric_status: dict[str, str] = {"twr": "ok"}
     cagr: float | None
-    if observations < 2 or elapsed_days <= 0:
+    if inception_date is None:
+        cagr = None
+        metric_status["cagr"] = "missing_inception_date"
+    elif observations < 2 or elapsed_days is None or elapsed_days <= 0:
         cagr = None
         metric_status["cagr"] = "insufficient_evidence"
     elif normalized[-1][1] == 0.0:
@@ -302,6 +314,7 @@ def unitized_return_statistics(
     return {
         "status": "ok" if observations >= 2 else "insufficient_evidence",
         "observations": observations,
+        "inception_date": inception_date.isoformat() if inception_date else None,
         "start_date": normalized[0][0].isoformat(),
         "end_date": normalized[-1][0].isoformat(),
         "elapsed_calendar_days": elapsed_days,
