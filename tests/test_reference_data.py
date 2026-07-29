@@ -150,6 +150,31 @@ def test_snapshot_selection_replaces_a_provider_capped_page_group() -> None:
     assert [item["unit_key"] for item in selected] == ["daily-20240101"]
 
 
+def test_snapshot_selection_retires_ignored_index_member_request_shape() -> None:
+    rows = [
+        {
+            "dataset": "index_member_all",
+            "unit_key": "legacy-ignored-index-code",
+            "params_json": {"index_code": "850111.SI"},
+            "scope_json": {"index_code": "850111.SI"},
+        },
+        {
+            "dataset": "index_member_all",
+            "unit_key": "current-l3",
+            "params_json": {"l3_code": "850111.SI", "is_new": "Y"},
+            "scope_json": {
+                "l3_code": "850111.SI",
+                "is_new": "Y",
+                "row_limit": 2_000,
+            },
+        },
+    ]
+
+    selected = select_current_reference_units(rows, snapshot_end=date(2026, 7, 29))
+
+    assert [item["unit_key"] for item in selected] == ["current-l3"]
+
+
 def test_snapshot_manifest_records_historical_bounds_and_reference_version(tmp_path) -> None:
     store = ParquetStore(tmp_path)
     cpi_result = store.write_unit(

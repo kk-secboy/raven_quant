@@ -250,6 +250,8 @@ class BootstrapPlanner:
         if frame.empty:
             return []
         column = "index_code" if "index_code" in frame.columns else "ts_code"
+        if "level" in frame.columns:
+            frame = frame[frame["level"].astype(str).str.upper() == "L3"]
         return sorted(frame[column].dropna().astype(str).unique().tolist())
 
     def plan_industry_members(self, max_attempts: int, *, as_of: date | None = None) -> int:
@@ -257,16 +259,19 @@ class BootstrapPlanner:
             FetchSpec(
                 dataset="index_member_all",
                 api_name="index_member_all",
-                scope={"index_code": index_code},
-                params={"index_code": index_code},
-                allow_empty=False,
+                scope={
+                    "l3_code": index_code,
+                    "is_new": membership_status,
+                    "row_limit": 2_000,
+                },
+                params={"l3_code": index_code, "is_new": membership_status},
+                allow_empty=True,
                 max_attempts=max_attempts,
             )
             for index_code in self.industry_codes()
+            for membership_status in ("Y", "N")
         ]
-        return self.checkpoint.add(
-            apply_reference_refresh(specs, as_of=as_of) if as_of else specs
-        )
+        return self.checkpoint.add(apply_reference_refresh(specs, as_of=as_of) if as_of else specs)
 
     def plan_etf_daily(self, dates: Iterable[str], max_attempts: int) -> int:
         return self.plan_daily(dates, ETF_DAILY, max_attempts)
@@ -290,9 +295,9 @@ class BootstrapPlanner:
             source = str(candidate.params.get("src") or "")
             if candidate_start.date() != candidate_end.date() or not source:
                 continue
-            successful_by_source_day.setdefault(
-                (source, candidate_start.date()), []
-            ).append((candidate_start, candidate_end, candidate))
+            successful_by_source_day.setdefault((source, candidate_start.date()), []).append(
+                (candidate_start, candidate_end, candidate)
+            )
         reusable: dict[str, FetchSpec] = {}
         missing: list[FetchSpec] = []
         for target in desired:
@@ -388,9 +393,7 @@ class ExecutionDataPlanner:
         max_attempts: int,
         *,
         freq: str = "1min",
-        active_ranges_by_dataset: dict[
-            str, dict[str, tuple[date, date]]
-        ] | None = None,
+        active_ranges_by_dataset: dict[str, dict[str, tuple[date, date]]] | None = None,
         trading_dates: Iterable[str] | None = None,
     ) -> list[FetchSpec]:
         specs = minute_specs(
@@ -497,12 +500,8 @@ class ExecutionDataPlanner:
             if str(candidate.params.get("freq") or "") != "5min":
                 continue
             try:
-                window_start = datetime.fromisoformat(
-                    str(candidate.params["start_date"])
-                ).date()
-                window_end = datetime.fromisoformat(
-                    str(candidate.params["end_date"])
-                ).date()
+                window_start = datetime.fromisoformat(str(candidate.params["start_date"])).date()
+                window_end = datetime.fromisoformat(str(candidate.params["end_date"])).date()
             except (KeyError, ValueError):
                 continue
             symbol = str(candidate.params.get("ts_code") or "").upper()

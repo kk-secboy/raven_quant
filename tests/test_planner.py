@@ -112,6 +112,46 @@ def test_complete_index_catalog_starts_one_paginated_partition_per_market(
     assert all(spec.allow_empty for spec in specs)
 
 
+def test_industry_members_use_supported_l3_current_and_historical_partitions(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    classify = FetchSpec(
+        dataset="index_classify",
+        api_name="index_classify",
+        scope={"src": "SW2021"},
+        params={"src": "SW2021"},
+    )
+    persist_reference(
+        checkpoint,
+        storage,
+        classify,
+        ["index_code", "level"],
+        [
+            {"index_code": "801010.SI", "level": "L1"},
+            {"index_code": "850111.SI", "level": "L3"},
+            {"index_code": "850112.SI", "level": "L3"},
+        ],
+    )
+    planner = BootstrapPlanner(checkpoint, storage)
+
+    assert planner.plan_industry_members(4, as_of=date(2026, 7, 29)) == 4
+    specs = []
+    while unit := checkpoint.claim({"index_member_all"}):
+        specs.append(unit.spec)
+        checkpoint.fail(unit.unit_key, "test inspection", terminal=True)
+
+    assert {tuple(sorted(spec.params.items())) for spec in specs} == {
+        (("is_new", "N"), ("l3_code", "850111.SI")),
+        (("is_new", "Y"), ("l3_code", "850111.SI")),
+        (("is_new", "N"), ("l3_code", "850112.SI")),
+        (("is_new", "Y"), ("l3_code", "850112.SI")),
+    }
+    assert all(spec.scope["row_limit"] == 2_000 for spec in specs)
+    assert all(spec.allow_empty for spec in specs)
+
+
 def test_quarter_ranges_clip_to_requested_window() -> None:
     assert _quarter_ranges(date(2024, 2, 10), date(2024, 8, 5)) == [
         (date(2024, 2, 10), date(2024, 3, 31)),

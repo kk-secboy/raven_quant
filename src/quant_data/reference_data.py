@@ -181,13 +181,11 @@ def select_current_reference_units(
     generations so changed master rows cannot appear twice.
     """
 
-    materialized = list(rows)
+    materialized = [row for row in rows if not _retired_provider_request_contract(row)]
     superseded_page_groups = {
         str(parent)
         for row in materialized
-        if (
-            parent := dict(row.get("scope_json") or {}).get("supersedes_page_group")
-        )
+        if (parent := dict(row.get("scope_json") or {}).get("supersedes_page_group"))
     }
     materialized = [
         row
@@ -271,3 +269,18 @@ def _stable_identity(scope: dict[str, Any]) -> str:
     from .models import canonical_json
 
     return canonical_json(scope)
+
+
+def _retired_provider_request_contract(row: dict[str, Any]) -> bool:
+    """Exclude proven-invalid completed requests from successor snapshots.
+
+    The Tushare ``index_member_all`` interface accepts l1/l2/l3_code, not
+    index_code. Legacy requests used the ignored index_code parameter, so each
+    partition stored the same provider-capped unfiltered rows. Immutable old
+    snapshots retain their manifests; successor selection retires only that
+    invalid request shape after the corrected L3 Y/N partitions were added.
+    """
+
+    return str(row.get("dataset")) == "index_member_all" and "index_code" in dict(
+        row.get("params_json") or {}
+    )
