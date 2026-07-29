@@ -342,6 +342,47 @@ def test_rejects_qlib_build_without_financial_industry_and_weights(
     assert "missing index_weight" in message
 
 
+def test_rejects_incomplete_historical_benchmark_industry_coverage(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    weight_path = (
+        snapshot
+        / "parquet"
+        / "index_weight"
+        / "partition_year=2024"
+        / "research.parquet"
+    )
+    pd.DataFrame(
+        [
+            {
+                "index_code": "000300.SH",
+                "con_code": instrument,
+                "trade_date": "2024-01-02",
+                "weight": weight,
+            }
+            for instrument, weight in (
+                ("000001.SZ", 4.5),
+                ("600000.SH", 3.5),
+            )
+        ]
+    ).to_parquet(weight_path)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "no active point-in-time industry for 1/2 "
+            "000300.SH constituent-date rows"
+        ),
+    ):
+        QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+
 def test_adds_normalized_index_staging(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshot"
     daily_dir = snapshot / "parquet" / "daily" / "partition_year=2024"

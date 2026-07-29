@@ -61,6 +61,8 @@ _BASE_QLIB_FIELDS = (
     "down_limit",
 )
 
+_GOVERNED_BENCHMARK = "000300.SH"
+
 _DAILY_RESEARCH_FIELDS = (
     "turnover_rate",
     "turnover_rate_f",
@@ -1349,8 +1351,132 @@ class QlibBuilder:
                 if not self._has_usable_row(dataset, predicate):
                     issues.append(f"{dataset} has no usable rows")
 
+        if not issues:
+            coverage_issue = self._benchmark_industry_coverage_issue(
+                industry_columns
+            )
+            if coverage_issue:
+                issues.append(coverage_issue)
+
         if issues:
             raise RuntimeError("Qlib research inputs are incomplete: " + "; ".join(issues))
+
+    def _benchmark_industry_coverage_issue(
+        self, industry_columns: set[str]
+    ) -> str | None:
+        """Require point-in-time industry coverage for the governed benchmark.
+
+        The benchmark-relative optimizer rejects constituents without an
+        industry. Catch an incomplete/capped ``index_member_all`` snapshot here
+        instead of allowing Qlib generation to succeed and failing much later
+        during the formal backtest.
+        """
+
+        instrument_column = next(
+            name for name in ("ts_code", "con_code") if name in industry_columns
+        )
+        industry_column = next(
+            name
+            for name in ("l1_code", "index_code", "l2_code")
+            if name in industry_columns
+        )
+        out_date = (
+            _as_date_sql("out_date")
+            if "out_date" in industry_columns
+            else "NULL::DATE"
+        )
+        weight_root = self.snapshot_path / "parquet" / "index_weight"
+        industry_root = self.snapshot_path / "parquet" / "index_member_all"
+        weight_glob = _sql_string(
+            str((weight_root / "**" / "*.parquet").resolve())
+        )
+        industry_glob = _sql_string(
+            str((industry_root / "**" / "*.parquet").resolve())
+        )
+        benchmark = _sql_string(_GOVERNED_BENCHMARK)
+        query = f"""
+            WITH weight_rows AS (
+                SELECT
+                    upper(trim(CAST(index_code AS VARCHAR))) AS benchmark,
+                    upper(trim(CAST(con_code AS VARCHAR))) AS instrument,
+                    {_as_date_sql("trade_date")} AS weight_date,
+                    try_cast(weight AS DOUBLE) AS weight
+                FROM read_parquet(
+                    {weight_glob}, hive_partitioning=true, union_by_name=true
+                )
+            ),
+            constituents AS (
+                SELECT DISTINCT w.weight_date, w.instrument
+                FROM weight_rows w
+                WHERE w.benchmark = {benchmark}
+                  AND w.instrument IS NOT NULL
+                  AND w.weight_date IS NOT NULL
+                  AND w.weight > 0
+            ),
+            industry_rows AS (
+                SELECT
+                    upper(trim(CAST("{instrument_column}" AS VARCHAR))) AS instrument,
+                    {_as_date_sql("in_date")} AS in_date,
+                    {out_date} AS out_date
+                FROM read_parquet(
+                    {industry_glob}, hive_partitioning=true, union_by_name=true
+                )
+                WHERE "{instrument_column}" IS NOT NULL
+                  AND "{industry_column}" IS NOT NULL
+                  AND {_as_date_sql("in_date")} IS NOT NULL
+            ),
+            coverage AS (
+                SELECT
+                    c.weight_date,
+                    c.instrument,
+                    count(i.instrument) > 0 AS covered
+                FROM constituents c
+                LEFT JOIN industry_rows i
+                  ON i.instrument = c.instrument
+                 AND i.in_date <= c.weight_date
+                 AND (i.out_date IS NULL OR i.out_date >= c.weight_date)
+                GROUP BY c.weight_date, c.instrument
+            )
+            SELECT
+                count(*) AS total_rows,
+                count(DISTINCT weight_date) AS benchmark_dates,
+                count(*) FILTER (WHERE NOT covered) AS missing_rows,
+                min(weight_date) FILTER (WHERE NOT covered) AS first_missing_date,
+                (
+                    SELECT string_agg(instrument, ', ')
+                    FROM (
+                        SELECT instrument
+                        FROM coverage
+                        WHERE NOT covered
+                        ORDER BY weight_date, instrument
+                        LIMIT 10
+                    ) examples
+                ) AS examples
+            FROM coverage
+        """
+        connection = duckdb.connect()
+        try:
+            row = connection.execute(query).fetchone()
+        finally:
+            connection.close()
+        total_rows = int(row[0] or 0) if row is not None else 0
+        if total_rows == 0:
+            return (
+                "index_weight has no positive constituents for governed "
+                f"benchmark {_GOVERNED_BENCHMARK}"
+            )
+        missing_rows = int(row[2] or 0)
+        if missing_rows == 0:
+            return None
+        benchmark_dates = int(row[1] or 0)
+        first_missing_date = row[3]
+        examples = str(row[4] or "")
+        return (
+            f"index_member_all has no active point-in-time industry for "
+            f"{missing_rows}/{total_rows} {_GOVERNED_BENCHMARK} constituent-date "
+            f"rows across {benchmark_dates} benchmark dates; first affected date "
+            f"{first_missing_date}: {examples}"
+        )
 
     @staticmethod
     def _industry_usable_predicate(columns: set[str]) -> str:
