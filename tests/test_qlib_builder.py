@@ -358,14 +358,41 @@ def test_rejects_incomplete_historical_benchmark_industry_coverage(
         / "partition_year=2024"
         / "research.parquet"
     )
+    membership_path = (
+        snapshot
+        / "parquet"
+        / "index_member_all"
+        / "partition_year=2024"
+        / "research.parquet"
+    )
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "l1_code": "801780.SI",
+                "in_date": "2021-01-01",
+                "out_date": None,
+            },
+            {
+                # This constituent is classified by the latest weight date,
+                # but not by the earlier date. A latest-only gate would miss
+                # the historical hole.
+                "ts_code": "600000.SH",
+                "l1_code": "801780.SI",
+                "in_date": "2024-02-01",
+                "out_date": None,
+            },
+        ]
+    ).to_parquet(membership_path)
     pd.DataFrame(
         [
             {
                 "index_code": "000300.SH",
                 "con_code": instrument,
-                "trade_date": "2024-01-02",
+                "trade_date": trade_date,
                 "weight": weight,
             }
+            for trade_date in ("2024-01-02", "2024-03-01")
             for instrument, weight in (
                 ("000001.SZ", 4.5),
                 ("600000.SH", 3.5),
@@ -376,8 +403,8 @@ def test_rejects_incomplete_historical_benchmark_industry_coverage(
     with pytest.raises(
         RuntimeError,
         match=(
-            "no active point-in-time industry for 1/2 "
-            "000300.SH constituent-date rows"
+            "no active point-in-time industry for 1/4 "
+            "000300.SH constituent-date rows across 2 benchmark dates"
         ),
     ):
         QlibBuilder(snapshot).build_staging(tmp_path / "staging")
