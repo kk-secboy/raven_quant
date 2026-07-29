@@ -2,12 +2,25 @@ from __future__ import annotations
 
 import pytest
 
+from quant_platform.api import ResearchPeriods
 from quant_platform.research_automation import (
     derive_rolling_research_periods,
     normalize_research_schedule_payload,
     rank_factor_candidates,
     select_latest_program_dataset,
 )
+
+
+@pytest.mark.no_database
+def test_default_research_periods_cover_the_2008_multiregime_history() -> None:
+    periods = ResearchPeriods()
+
+    assert periods.train_start.isoformat() == "2008-01-01"
+    assert periods.train_end.isoformat() == "2017-12-31"
+    assert periods.valid_start.isoformat() == "2018-01-01"
+    assert periods.valid_end.isoformat() == "2020-12-31"
+    assert periods.test_start.isoformat() == "2021-01-01"
+    assert (periods.test_end - periods.train_start).days >= 3652
 
 
 def _payload() -> dict:

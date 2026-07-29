@@ -263,11 +263,11 @@ class MinuteResearchRequest(BaseModel):
 
 
 class ResearchPeriods(BaseModel):
-    train_start: date = date(2018, 1, 1)
-    train_end: date = date(2021, 12, 31)
-    valid_start: date = date(2022, 1, 1)
-    valid_end: date = date(2023, 12, 31)
-    test_start: date = date(2024, 1, 8)
+    train_start: date = date(2008, 1, 1)
+    train_end: date = date(2017, 12, 31)
+    valid_start: date = date(2018, 1, 1)
+    valid_end: date = date(2020, 12, 31)
+    test_start: date = date(2021, 1, 1)
     test_end: date = Field(default_factory=date.today)
 
     @model_validator(mode="after")
