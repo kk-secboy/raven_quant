@@ -52,6 +52,7 @@ from .runner import DownloadRunner
 from .snapshot_lineage import file_contract_sha256, make_lineage_id, prepare_lineage_metadata
 from .storage import ParquetStore
 from .supplemental_data import (
+    SHARE_FLOAT_PROVIDER_OFFSET_CAP,
     SUPPORTED_BUNDLES,
     a_share_bulk_history_specs,
     bond_reference_specs,
@@ -661,15 +662,43 @@ def _full_page_partition_recovery(
         if group in continued:
             continue
         current = max(pages, key=lambda item: int(item.scope.get("offset") or 0))
-        if not is_adaptive_partition(current):
-            continue
         page_size = int(current.scope["page_size"])
-        max_pages = int(current.scope["max_pages"])
         page_index = int(
             current.scope.get(
                 "page_index", int(current.scope.get("offset") or 0) // page_size
             )
         )
+        share_float_cap = (
+            current.dataset == "share_float"
+            and (page_index + 1) * page_size >= SHARE_FLOAT_PROVIDER_OFFSET_CAP
+            and row_counts.get(current.unit_key, -1) >= page_size
+        )
+        if share_float_cap:
+            start_text = str(current.params.get("start_date") or "")
+            end_text = str(current.params.get("end_date") or "")
+            symbols: list[str] = []
+            if start_text == end_text and len(start_text) == 8:
+                stock_master = context.storage.read_units(
+                    context.checkpoint.successful("stock_basic")
+                )
+                partition_date = datetime.strptime(start_text, "%Y%m%d").date()
+                symbols = _historical_a_share_symbols(
+                    stock_master,
+                    start=partition_date,
+                    end=partition_date,
+                )
+            children.extend(
+                share_float_overflow_repartition_specs(current, symbols)
+            )
+            recovered.add(current.unit_key)
+            context.checkpoint.supersede_units(
+                [page.unit_key for page in pages],
+                "provider offset cap avoided by disjoint share_float partitions",
+            )
+            continue
+        if not is_adaptive_partition(current):
+            continue
+        max_pages = int(current.scope["max_pages"])
         if page_index + 1 < max_pages or row_counts.get(current.unit_key, -1) < page_size:
             continue
         children.extend(split_partition_spec(current))

@@ -4,9 +4,17 @@ import pandas as pd
 import pytest
 
 from quant_data.checkpoint import CheckpointStore
-from quant_data.cli import _pagination_overflow_recovery, _share_float_overflow_recovery
+from quant_data.cli import (
+    _full_page_partition_recovery,
+    _pagination_overflow_recovery,
+    _share_float_overflow_recovery,
+)
 from quant_data.models import FetchSpec
-from quant_data.supplemental_data import share_float_overflow_repartition_specs
+from quant_data.supplemental_data import (
+    a_share_bulk_history_specs,
+    next_pagination_specs,
+    share_float_overflow_repartition_specs,
+)
 
 
 def test_overflow_recovery_preserves_prefix_and_supersedes_bad_cursor(
@@ -246,6 +254,133 @@ def test_single_day_recovery_loads_historically_active_stock_symbols(
         item.scope["supersedes_page_group"] == failed.scope["page_group"]
         for item in replacements
     )
+
+
+@pytest.mark.no_database
+def test_full_month_is_repartitioned_before_requesting_the_provider_cap() -> None:
+    parent = next(
+        spec
+        for spec in a_share_bulk_history_specs(
+            start=pd.Timestamp("2024-01-01").date(),
+            end=pd.Timestamp("2024-01-31").date(),
+            max_attempts=3,
+        )
+        if spec.dataset == "share_float"
+    )
+    current = parent
+    for _ in range(99):
+        current = next_pagination_specs(
+            [current],
+            [{"unit_key": current.unit_key, "row_count": 1_000}],
+        )[0]
+    superseded: list[str] = []
+
+    class Checkpoint:
+        @staticmethod
+        def supersede_units(unit_keys, _reason: str) -> None:
+            superseded.extend(unit_keys)
+
+    children, recovered = _full_page_partition_recovery(
+        SimpleNamespace(checkpoint=Checkpoint()),
+        [parent, current],
+        [
+            {"unit_key": parent.unit_key, "row_count": 1_000},
+            {"unit_key": current.unit_key, "row_count": 1_000},
+        ],
+        set(),
+    )
+
+    assert recovered == {current.unit_key}
+    assert len(children) == 31
+    assert {item.params["offset"] for item in children} == {0}
+    assert superseded == [parent.unit_key, current.unit_key]
+
+
+@pytest.mark.no_database
+def test_full_day_is_partitioned_by_active_symbol_before_provider_cap() -> None:
+    monthly = next(
+        spec
+        for spec in a_share_bulk_history_specs(
+            start=pd.Timestamp("2024-02-01").date(),
+            end=pd.Timestamp("2024-02-29").date(),
+            max_attempts=3,
+        )
+        if spec.dataset == "share_float"
+    )
+    daily = next(
+        spec
+        for spec in share_float_overflow_repartition_specs(monthly)
+        if spec.params["start_date"] == "20240219"
+    )
+    current = daily
+    for _ in range(16):
+        current = next_pagination_specs(
+            [current],
+            [{"unit_key": current.unit_key, "row_count": 6_000}],
+        )[0]
+    assert current.params["offset"] == 96_000
+    assert next_pagination_specs(
+        [current],
+        [{"unit_key": current.unit_key, "row_count": 6_000}],
+    ) == []
+
+    superseded: list[str] = []
+
+    class Checkpoint:
+        @staticmethod
+        def successful(dataset: str) -> list[dict]:
+            assert dataset == "stock_basic"
+            return [{"unit_key": "stock-master"}]
+
+        @staticmethod
+        def supersede_units(unit_keys, _reason: str) -> None:
+            superseded.extend(unit_keys)
+
+    master = pd.DataFrame.from_records(
+        [
+            {
+                "ts_code": "600000.SH",
+                "list_date": "19991110",
+                "delist_date": None,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "list_date": "19910403",
+                "delist_date": None,
+            },
+            {
+                "ts_code": "430047.BJ",
+                "list_date": "20101001",
+                "delist_date": "20231231",
+            },
+            {
+                "ts_code": "600001.SH",
+                "list_date": "20250101",
+                "delist_date": None,
+            },
+        ]
+    )
+    context = SimpleNamespace(
+        checkpoint=Checkpoint(),
+        storage=SimpleNamespace(read_units=lambda _rows: master),
+    )
+
+    children, recovered = _full_page_partition_recovery(
+        context,
+        [daily, current],
+        [
+            {"unit_key": daily.unit_key, "row_count": 6_000},
+            {"unit_key": current.unit_key, "row_count": 6_000},
+        ],
+        set(),
+    )
+
+    assert recovered == {current.unit_key}
+    assert [item.params["ts_code"] for item in children] == [
+        "000001.SZ",
+        "600000.SH",
+    ]
+    assert superseded == [daily.unit_key, current.unit_key]
 
 
 def test_etf_overflow_recovery_uses_listed_exchange_symbols(

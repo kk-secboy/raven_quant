@@ -613,7 +613,7 @@ def test_share_float_continues_after_the_old_64_page_ceiling() -> None:
     assert int(specs[-1].scope["offset"]) == 64_000
 
 
-def test_share_float_offset_cap_repartitions_the_whole_month_by_day() -> None:
+def test_share_float_stops_before_offset_cap_and_repartitions_the_whole_month() -> None:
     parent = next(
         spec
         for spec in a_share_bulk_history_specs(
@@ -623,15 +623,19 @@ def test_share_float_offset_cap_repartitions_the_whole_month_by_day() -> None:
         )
         if spec.dataset == "share_float"
     )
-    failed = parent
-    for _ in range(101):
-        failed = next_pagination_specs(
-            [failed],
-            [{"unit_key": failed.unit_key, "row_count": 1_000}],
+    current = parent
+    for _ in range(99):
+        current = next_pagination_specs(
+            [current],
+            [{"unit_key": current.unit_key, "row_count": 1_000}],
         )[0]
-    assert failed.params["offset"] == 101_000
+    assert current.params["offset"] == 99_000
+    assert next_pagination_specs(
+        [current],
+        [{"unit_key": current.unit_key, "row_count": 1_000}],
+    ) == []
 
-    daily = share_float_overflow_repartition_specs(failed)
+    daily = share_float_overflow_repartition_specs(current)
     assert len(daily) == 31
     assert daily[0].params == {
         "start_date": "20240101",

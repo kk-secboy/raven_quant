@@ -27,6 +27,7 @@ SUPPORTED_BUNDLES = {
 
 _CN_EXCHANGES = ("CFFEX", "DCE", "CZCE", "SHFE", "INE", "GFEX")
 ETF_CONSTITUENT_DATASETS = {"etf_sh_cons", "etf_sz_cons"}
+SHARE_FLOAT_PROVIDER_OFFSET_CAP = 100_000
 _PAGINATION_MAX_PAGES = {
     "index_basic": 16,
     # These are safety ceilings, not pre-planned page counts.  The CLI starts
@@ -278,6 +279,15 @@ def next_pagination_specs(
             current.scope.get("page_index", int(current.scope["offset"]) // page_size)
         )
         next_page = current_page + 1
+        if (
+            current.dataset == "share_float"
+            and next_page * page_size >= SHARE_FLOAT_PROVIDER_OFFSET_CAP
+        ):
+            # Tushare rejects this cursor deterministically.  Let the caller
+            # replace the full page group with disjoint date/symbol
+            # partitions instead of sending an invalid request and triggering
+            # the provider's multi-minute cooldown.
+            continue
         max_pages = int(
             current.scope.get("max_pages")
             or _PAGINATION_MAX_PAGES[current.dataset]
