@@ -242,6 +242,17 @@ class CheckpointStore:
         with self.engine.connect() as connection:
             return [row_dict(row) for row in connection.execute(statement)]
 
+    def dataset_units(self, dataset: str) -> list[dict[str, Any]]:
+        """Return one dataset's durable plan rows in deterministic key order."""
+
+        statement = (
+            select(work_units)
+            .where(work_units.c.dataset == dataset)
+            .order_by(work_units.c.unit_key)
+        )
+        with self.engine.connect() as connection:
+            return [row_dict(row) for row in connection.execute(statement)]
+
     def unfinished_units(
         self, dataset: str | set[str] | None = None
     ) -> list[dict[str, Any]]:

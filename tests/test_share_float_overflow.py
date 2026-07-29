@@ -95,6 +95,7 @@ def test_restart_rehydrates_existing_daily_share_float_replacement() -> None:
         max_attempts=5,
     )
     daily = share_float_overflow_repartition_specs(parent)
+    durable = daily[::2]
 
     class Checkpoint:
         @staticmethod
@@ -109,16 +110,25 @@ def test_restart_rehydrates_existing_daily_share_float_replacement() -> None:
                         "last_error": "monthly pagination replaced by daily partitions",
                     }
                 )
-            rows.extend(
+            return rows
+
+        @staticmethod
+        def dataset_units(dataset: str) -> list[dict]:
+            assert dataset == "share_float"
+            return [
                 {
                     "unit_key": item.unit_key,
                     "status": "pending",
+                    "dataset": item.dataset,
+                    "api_name": item.api_name,
                     "scope_json": item.scope,
+                    "params_json": item.params,
+                    "fields_json": list(item.fields),
+                    "allow_empty": item.allow_empty,
+                    "max_attempts": item.max_attempts,
                 }
-                for item in daily
-                if item.unit_key in keys
-            )
-            return rows
+                for item in durable
+            ]
 
     context = SimpleNamespace(checkpoint=Checkpoint())
     replacements, recovered = _share_float_overflow_recovery(
@@ -127,7 +137,7 @@ def test_restart_rehydrates_existing_daily_share_float_replacement() -> None:
 
     assert recovered == {parent.unit_key}
     assert {item.unit_key for item in replacements} == {
-        item.unit_key for item in daily
+        item.unit_key for item in durable
     }
     assert all(
         item.scope["supersedes_page_group"] == parent.scope["page_group"]

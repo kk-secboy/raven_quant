@@ -479,6 +479,18 @@ def _share_float_overflow_recovery(
         str(row["unit_key"]): row
         for row in context.checkpoint.unit_rows(spec.unit_key for spec in specs)
     }
+    replacements_by_parent: dict[str, list[FetchSpec]] = {}
+    for child in context.checkpoint.dataset_units("share_float"):
+        if str(child.get("status")) == "superseded":
+            continue
+        parent_group = str(
+            dict(child.get("scope_json") or {}).get("supersedes_page_group")
+            or ""
+        )
+        if parent_group:
+            replacements_by_parent.setdefault(parent_group, []).append(
+                _checkpoint_row_spec(child)
+            )
     recovery_specs: list[FetchSpec] = []
     recovered_keys: set[str] = set()
     for failed_spec in specs:
@@ -489,25 +501,12 @@ def _share_float_overflow_recovery(
             continue
         if str(row.get("status")) == "superseded":
             # A previous run may already have replaced the unstable monthly
-            # page group with immutable daily children.  Rehydrate that
-            # replacement plan on restart instead of requiring the deliberately
-            # superseded parent to become "succeeded".
-            replacements = share_float_overflow_repartition_specs(failed_spec)
-            replacement_rows = context.checkpoint.unit_rows(
-                item.unit_key for item in replacements
-            )
+            # page group with immutable child partitions. Rehydrate the exact
+            # durable plan (which may contain trading days only) instead of
+            # inventing extra calendar-day requests on restart.
             parent_group = str(failed_spec.scope.get("page_group") or "")
-            has_linked_replacement = any(
-                str(
-                    dict(child.get("scope_json") or {}).get(
-                        "supersedes_page_group"
-                    )
-                    or ""
-                )
-                == parent_group
-                for child in replacement_rows
-            )
-            if has_linked_replacement:
+            replacements = replacements_by_parent.get(parent_group, [])
+            if replacements:
                 recovery_specs.extend(replacements)
                 recovered_keys.add(failed_spec.unit_key)
                 continue
