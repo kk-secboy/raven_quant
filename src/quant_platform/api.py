@@ -34,6 +34,7 @@ from quant_data.execution_data import (
     MINUTE_FREQUENCIES,
     NATIVE_MINUTE_FREQUENCIES,
 )
+from quant_data.legacy_market import BAOSTOCK_OVERLAP_POLICY_VERSION
 from quant_platform.qlib_factor_baseline import FACTOR_SOURCE_QLIB_BASELINE
 
 from .alert_store import AlertStore
@@ -3628,7 +3629,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 serialized,
                 log_path,
                 idempotency_key=(
-                    f"baostock-overlap:{payload.start}:{payload.end}:"
+                    f"baostock-overlap:{BAOSTOCK_OVERLAP_POLICY_VERSION}:"
+                    f"{payload.start}:{payload.end}:"
                     f"{','.join(sorted(payload.symbols)) or 'audited-default'}"
                 ),
             )
@@ -3658,6 +3660,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             not isinstance(validation, dict)
             or validation.get("ok") is not True
             or validation.get("source") != "baostock-0.9.3"
+            or validation.get("policy_version") != BAOSTOCK_OVERLAP_POLICY_VERSION
             or str(validation.get("start_date") or "") > "2016-01-01"
             or str(validation.get("end_date") or "") < "2016-12-31"
         ):

@@ -324,6 +324,65 @@ def test_overlap_gate_rejects_volume_unit_mismatch() -> None:
     assert any("volume_relative_error_p99" in item for item in report["errors"])
 
 
+def test_overlap_gate_accepts_long_suspension_when_both_sources_cover_same_days() -> None:
+    dates = pd.bdate_range("2016-01-04", periods=94).strftime("%Y-%m-%d")
+    daily = pd.DataFrame(
+        [
+            {
+                "ts_code": "000651.SZ",
+                "trade_date": item,
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "pre_close": 10.0,
+                "pct_chg": 5.0,
+                "vol": 1_000.0,
+                "amount": 2_000.0,
+            }
+            for item in dates
+        ]
+    )
+    adj = pd.DataFrame(
+        [
+            {
+                "ts_code": "000651.SZ",
+                "trade_date": item,
+                "adj_factor": 2.0,
+            }
+            for item in dates
+        ]
+    )
+
+    report = compare_baostock_overlap(
+        daily,
+        daily.copy(),
+        adj,
+        adj.copy(),
+        symbols=["000651.SZ"],
+    )
+
+    assert report["ok"] is True
+    assert report["checks"][0]["daily_overlap_coverage"] == 1.0
+    assert report["threshold_policy"]["min_days_per_symbol"] == 60
+
+
+def test_overlap_gate_rejects_incomplete_source_coverage() -> None:
+    tushare_daily, baostock_daily, tushare_adj, baostock_adj = _overlap_frames()
+
+    report = compare_baostock_overlap(
+        tushare_daily,
+        baostock_daily.iloc[:2],
+        tushare_adj,
+        baostock_adj.iloc[:2],
+        symbols=["600000.SH"],
+        min_days_per_symbol=2,
+    )
+
+    assert report["ok"] is False
+    assert any("overlap coverage" in item for item in report["errors"])
+
+
 def test_legacy_cli_refuses_import_without_overlap_report() -> None:
     result = CliRunner().invoke(
         app,

@@ -13,6 +13,9 @@ from .models import FetchSpec
 from .storage import ParquetStore
 
 LEGACY_MARKET_DATASETS = {"trade_cal", "daily", "daily_basic", "adj_factor"}
+BAOSTOCK_OVERLAP_POLICY_VERSION = "coverage-v2"
+MIN_OVERLAP_DAYS = 60
+MIN_OVERLAP_COVERAGE = 0.98
 DEFAULT_OVERLAP_SYMBOLS = (
     "000001.SZ",
     "000002.SZ",
@@ -174,7 +177,8 @@ def compare_baostock_overlap(
     baostock_adj: pd.DataFrame,
     *,
     symbols: Iterable[str],
-    min_days_per_symbol: int = 180,
+    min_days_per_symbol: int = MIN_OVERLAP_DAYS,
+    min_overlap_coverage: float = MIN_OVERLAP_COVERAGE,
 ) -> dict[str, Any]:
     """Compare source contracts on an overlap year before admitting legacy data."""
 
@@ -187,19 +191,40 @@ def compare_baostock_overlap(
     price_columns = ("open", "high", "low", "close", "pre_close")
 
     for symbol in sorted(set(symbols)):
-        daily = left_daily[left_daily["ts_code"] == symbol].merge(
-            right_daily[right_daily["ts_code"] == symbol],
+        left_symbol_daily = left_daily[left_daily["ts_code"] == symbol]
+        right_symbol_daily = right_daily[right_daily["ts_code"] == symbol]
+        daily = left_symbol_daily.merge(
+            right_symbol_daily,
             on=["ts_code", "trade_date"],
             suffixes=("_tushare", "_baostock"),
         )
-        item: dict[str, Any] = {"symbol": symbol, "common_days": len(daily)}
-        if len(daily) < min_days_per_symbol:
+        primary_days = int(left_symbol_daily["trade_date"].nunique())
+        baostock_days = int(right_symbol_daily["trade_date"].nunique())
+        common_days = int(daily["trade_date"].nunique())
+        daily_coverage = (
+            common_days / max(primary_days, baostock_days)
+            if max(primary_days, baostock_days)
+            else 0.0
+        )
+        item: dict[str, Any] = {
+            "symbol": symbol,
+            "primary_days": primary_days,
+            "baostock_days": baostock_days,
+            "common_days": common_days,
+            "daily_overlap_coverage": daily_coverage,
+        }
+        if common_days < min_days_per_symbol:
             errors.append(
-                f"{symbol} has only {len(daily)} common daily rows; "
+                f"{symbol} has only {common_days} common daily rows; "
                 f"requires {min_days_per_symbol}"
             )
             checks.append(item)
             continue
+        if daily_coverage < min_overlap_coverage:
+            errors.append(
+                f"{symbol} daily overlap coverage={daily_coverage:.6f} "
+                f"is below {min_overlap_coverage:.6f}"
+            )
 
         price_errors = pd.concat(
             [
@@ -231,13 +256,35 @@ def compare_baostock_overlap(
             }
         )
 
-        adj = left_adj[left_adj["ts_code"] == symbol].merge(
-            right_adj[right_adj["ts_code"] == symbol],
+        left_symbol_adj = left_adj[left_adj["ts_code"] == symbol]
+        right_symbol_adj = right_adj[right_adj["ts_code"] == symbol]
+        adj = left_symbol_adj.merge(
+            right_symbol_adj,
             on=["ts_code", "trade_date"],
             suffixes=("_tushare", "_baostock"),
         )
-        item["common_adj_days"] = len(adj)
-        if len(adj) >= min_days_per_symbol:
+        primary_adj_days = int(left_symbol_adj["trade_date"].nunique())
+        baostock_adj_days = int(right_symbol_adj["trade_date"].nunique())
+        common_adj_days = int(adj["trade_date"].nunique())
+        adj_coverage = (
+            common_adj_days / max(primary_adj_days, baostock_adj_days)
+            if max(primary_adj_days, baostock_adj_days)
+            else 0.0
+        )
+        item.update(
+            {
+                "primary_adj_days": primary_adj_days,
+                "baostock_adj_days": baostock_adj_days,
+                "common_adj_days": common_adj_days,
+                "adj_overlap_coverage": adj_coverage,
+            }
+        )
+        if adj_coverage < min_overlap_coverage:
+            errors.append(
+                f"{symbol} adjustment overlap coverage={adj_coverage:.6f} "
+                f"is below {min_overlap_coverage:.6f}"
+            )
+        if common_adj_days >= min_days_per_symbol:
             tushare_factor = pd.to_numeric(
                 adj["adj_factor_tushare"], errors="coerce"
             )
@@ -291,6 +338,7 @@ def compare_baostock_overlap(
             "adj_factor_relative_error_p99": 0.005,
             "adj_factor_relative_error_max": 0.02,
             "min_days_per_symbol": min_days_per_symbol,
+            "min_overlap_coverage": min_overlap_coverage,
         },
     }
 
@@ -303,7 +351,8 @@ def validate_baostock_overlap(
     start: date,
     end: date,
     symbols: Iterable[str] = DEFAULT_OVERLAP_SYMBOLS,
-    min_days_per_symbol: int = 180,
+    min_days_per_symbol: int = MIN_OVERLAP_DAYS,
+    min_overlap_coverage: float = MIN_OVERLAP_COVERAGE,
 ) -> dict[str, Any]:
     selected_symbols = sorted(set(symbols))
     tushare_daily = storage.read_units(
@@ -327,6 +376,7 @@ def validate_baostock_overlap(
     return {
         "source": BAOSTOCK_SOURCE_VERSION,
         "reference_source": "configured-tushare-gateway",
+        "policy_version": BAOSTOCK_OVERLAP_POLICY_VERSION,
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
         **compare_baostock_overlap(
@@ -336,5 +386,6 @@ def validate_baostock_overlap(
             baostock_adj,
             symbols=selected_symbols,
             min_days_per_symbol=min_days_per_symbol,
+            min_overlap_coverage=min_overlap_coverage,
         ),
     }
