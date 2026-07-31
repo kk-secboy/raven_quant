@@ -15,6 +15,9 @@ TUSHARE_HISTORY_STARTS: dict[str, date] = {
     "margin_detail": date(2010, 1, 1),
     "repurchase": date(2011, 1, 1),
     "pledge_stat": date(2014, 1, 1),
+    # The configured production gateway rejects report periods before 2016,
+    # including prior-year periods whose actual disclosure happened later.
+    "disclosure_date": date(2016, 1, 1),
     "stock_st": date(2016, 1, 1),
     "shibor": date(2006, 1, 1),
     "shibor_quote": date(2006, 1, 1),

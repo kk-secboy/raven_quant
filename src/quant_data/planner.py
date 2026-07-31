@@ -161,26 +161,30 @@ class BootstrapPlanner:
 
     def plan_index_context(self, start: date, end: date, max_attempts: int) -> int:
         specs: list[FetchSpec] = []
+        index_starts = self.index_history_starts()
         for index_code in INDEX_CODES:
+            available_start = max(start, index_starts.get(index_code, start))
+            if available_start > end:
+                continue
             specs.append(
                 FetchSpec(
                     dataset="index_daily",
                     api_name="index_daily",
                     scope={
                         "index_code": index_code,
-                        "start": compact_date(start),
+                        "start": compact_date(available_start),
                         "end": compact_date(end),
                     },
                     params={
                         "ts_code": index_code,
-                        "start_date": compact_date(start),
+                        "start_date": compact_date(available_start),
                         "end_date": compact_date(end),
                     },
                     allow_empty=False,
                     max_attempts=max_attempts,
                 )
             )
-            for chunk_start, chunk_end in _month_ranges(start, end):
+            for chunk_start, chunk_end in _month_ranges(available_start, end):
                 specs.append(
                     FetchSpec(
                         dataset="index_weight",
@@ -217,6 +221,22 @@ class BootstrapPlanner:
             )
         return self.checkpoint.add(apply_reference_refresh(specs, as_of=end))
 
+    def index_history_starts(self) -> dict[str, date]:
+        """Read index inception dates from the downloaded index master."""
+
+        frame = self.storage.read_units(self.checkpoint.successful("index_basic"))
+        if frame.empty or "ts_code" not in frame.columns or "list_date" not in frame.columns:
+            return {}
+        normalized = frame[["ts_code", "list_date"]].copy()
+        normalized["list_date"] = pd.to_datetime(
+            normalized["list_date"], errors="coerce"
+        )
+        normalized = normalized.dropna(subset=["ts_code", "list_date"])
+        starts: dict[str, date] = {}
+        for symbol, values in normalized.groupby("ts_code")["list_date"]:
+            starts[str(symbol)] = values.min().date()
+        return starts
+
     def plan_research_reference(self, start: date, end: date, max_attempts: int) -> int:
         specs: list[FetchSpec] = [
             FetchSpec(
@@ -239,7 +259,13 @@ class BootstrapPlanner:
                     max_attempts=max_attempts,
                 )
             )
+        disclosure_start = history_start_date("disclosure_date")
         for period in _report_periods(start, end):
+            if (
+                disclosure_start is not None
+                and period < compact_date(disclosure_start)
+            ):
+                continue
             specs.append(
                 FetchSpec(
                     dataset="disclosure_date",

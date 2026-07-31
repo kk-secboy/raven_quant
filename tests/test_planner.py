@@ -143,6 +143,81 @@ def test_complete_index_catalog_starts_one_paginated_partition_per_market(
     assert all(spec.allow_empty for spec in specs)
 
 
+def test_index_context_respects_downloaded_index_inception_dates(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    index_basic = FetchSpec(
+        dataset="index_basic",
+        api_name="index_basic",
+        scope={"market": "SSE"},
+        params={"market": "SSE"},
+    )
+    persist_reference(
+        checkpoint,
+        storage,
+        index_basic,
+        ["ts_code", "list_date"],
+        [
+            {"ts_code": "000300.SH", "list_date": "20050408"},
+            {"ts_code": "000688.SH", "list_date": "20200123"},
+            {"ts_code": "899050.BJ", "list_date": "20221121"},
+        ],
+    )
+    trade_cal = FetchSpec(
+        dataset="trade_cal",
+        api_name="trade_cal",
+        scope={"range": "test"},
+        params={},
+    )
+    persist_reference(
+        checkpoint,
+        storage,
+        trade_cal,
+        ["exchange", "cal_date", "is_open"],
+        [{"exchange": "SSE", "cal_date": "20160104", "is_open": 1}],
+    )
+    planner = BootstrapPlanner(checkpoint, storage)
+
+    planner.plan_index_context(date(2016, 1, 1), date(2017, 12, 31), 5)
+    planned: dict[str, tuple[str, str]] = {}
+    while unit := checkpoint.claim({"index_daily"}):
+        planned[str(unit.spec.params["ts_code"])] = (
+            str(unit.spec.params["start_date"]),
+            str(unit.spec.params["end_date"]),
+        )
+        checkpoint.fail(unit.unit_key, "test inspection", terminal=True)
+
+    assert "000688.SH" not in planned
+    assert "899050.BJ" not in planned
+    assert planned["000300.SH"] == ("20160101", "20171231")
+
+
+def test_research_reference_skips_unsupported_pre_2016_disclosure_periods(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    planner = BootstrapPlanner(checkpoint, ParquetStore(tmp_path))
+
+    planner.plan_research_reference(date(2016, 1, 1), date(2017, 12, 31), 5)
+    periods: list[str] = []
+    while unit := checkpoint.claim({"disclosure_date"}):
+        periods.append(str(unit.spec.params["end_date"]))
+        checkpoint.fail(unit.unit_key, "test inspection", terminal=True)
+
+    assert sorted(periods) == [
+        "20160331",
+        "20160630",
+        "20160930",
+        "20161231",
+        "20170331",
+        "20170630",
+        "20170930",
+        "20171231",
+    ]
+
+
 def test_industry_members_use_supported_l3_current_and_historical_partitions(
     tmp_path: Path, database_url: str
 ) -> None:

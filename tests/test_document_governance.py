@@ -23,6 +23,7 @@ CONTROLLED_DOCUMENTS = {
     Path("README.md"),
     Path("docs/DEPLOYMENT.md"),
     Path("docs/design-gap-analysis.md"),
+    Path("docs/legacy-market-backfill.md"),
     Path("docs/pit-nlp-gap-report.md"),
     Path(MARKDOWN_NAME),
     Path(DOCX_NAME),
