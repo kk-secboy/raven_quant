@@ -29,6 +29,18 @@ from quant_platform.worker import LocalJobWorker
 pytestmark = pytest.mark.no_database
 
 
+def test_primary_worker_accepts_legacy_market_jobs() -> None:
+    compose = (Path(__file__).parents[1] / "deploy" / "compose.yaml").read_text(
+        encoding="utf-8"
+    )
+    worker_block = compose.split("\n  worker:\n", maxsplit=1)[1].split(
+        "\n  scheduler:\n", maxsplit=1
+    )[0]
+
+    assert "baostock_overlap_validation" in worker_block
+    assert "legacy_market_backfill" in worker_block
+
+
 def test_security_code_conversion_is_explicit_and_reversible() -> None:
     assert tushare_code("sh.600000") == "600000.SH"
     assert tushare_code("sz.000001") == "000001.SZ"
