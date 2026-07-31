@@ -367,6 +367,62 @@ def test_overlap_gate_accepts_long_suspension_when_both_sources_cover_same_days(
     assert report["threshold_policy"]["min_days_per_symbol"] == 60
 
 
+def test_overlap_gate_ignores_primary_adjustment_rows_on_suspended_days() -> None:
+    tushare_daily, baostock_daily, tushare_adj, baostock_adj = _overlap_frames()
+    tushare_adj = pd.concat(
+        [
+            tushare_adj,
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": "2016-01-07",
+                        "adj_factor": 2.2,
+                    },
+                    {
+                        "ts_code": "600000.SH",
+                        "trade_date": "2016-01-08",
+                        "adj_factor": 2.2,
+                    },
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    report = compare_baostock_overlap(
+        tushare_daily,
+        baostock_daily,
+        tushare_adj,
+        baostock_adj,
+        symbols=["600000.SH"],
+        min_days_per_symbol=3,
+    )
+
+    assert report["ok"] is True
+    check = report["checks"][0]
+    assert check["primary_adj_days"] == 5
+    assert check["expected_adj_days"] == 3
+    assert check["common_adj_days"] == 3
+    assert check["adj_overlap_coverage"] == 1.0
+
+
+def test_overlap_gate_rejects_adjustment_gap_on_common_daily_date() -> None:
+    tushare_daily, baostock_daily, tushare_adj, baostock_adj = _overlap_frames()
+
+    report = compare_baostock_overlap(
+        tushare_daily,
+        baostock_daily,
+        tushare_adj,
+        baostock_adj.iloc[:2],
+        symbols=["600000.SH"],
+        min_days_per_symbol=2,
+    )
+
+    assert report["ok"] is False
+    assert any("adjustment overlap coverage" in item for item in report["errors"])
+
+
 def test_overlap_gate_rejects_incomplete_source_coverage() -> None:
     tushare_daily, baostock_daily, tushare_adj, baostock_adj = _overlap_frames()
 

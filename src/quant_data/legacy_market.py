@@ -13,7 +13,7 @@ from .models import FetchSpec
 from .storage import ParquetStore
 
 LEGACY_MARKET_DATASETS = {"trade_cal", "daily", "daily_basic", "adj_factor"}
-BAOSTOCK_OVERLAP_POLICY_VERSION = "coverage-v2"
+BAOSTOCK_OVERLAP_POLICY_VERSION = "daily-aligned-v3"
 MIN_OVERLAP_DAYS = 60
 MIN_OVERLAP_COVERAGE = 0.98
 DEFAULT_OVERLAP_SYMBOLS = (
@@ -258,23 +258,37 @@ def compare_baostock_overlap(
 
         left_symbol_adj = left_adj[left_adj["ts_code"] == symbol]
         right_symbol_adj = right_adj[right_adj["ts_code"] == symbol]
-        adj = left_symbol_adj.merge(
-            right_symbol_adj,
+        common_daily_dates = set(daily["trade_date"].dropna().astype(str))
+        left_symbol_adj_on_daily = left_symbol_adj[
+            left_symbol_adj["trade_date"].astype(str).isin(common_daily_dates)
+        ]
+        right_symbol_adj_on_daily = right_symbol_adj[
+            right_symbol_adj["trade_date"].astype(str).isin(common_daily_dates)
+        ]
+        adj = left_symbol_adj_on_daily.merge(
+            right_symbol_adj_on_daily,
             on=["ts_code", "trade_date"],
             suffixes=("_tushare", "_baostock"),
-        )
+        ).sort_values("trade_date")
         primary_adj_days = int(left_symbol_adj["trade_date"].nunique())
         baostock_adj_days = int(right_symbol_adj["trade_date"].nunique())
+        primary_adj_on_daily_days = int(
+            left_symbol_adj_on_daily["trade_date"].nunique()
+        )
+        baostock_adj_on_daily_days = int(
+            right_symbol_adj_on_daily["trade_date"].nunique()
+        )
         common_adj_days = int(adj["trade_date"].nunique())
         adj_coverage = (
-            common_adj_days / max(primary_adj_days, baostock_adj_days)
-            if max(primary_adj_days, baostock_adj_days)
-            else 0.0
+            common_adj_days / common_days if common_days else 0.0
         )
         item.update(
             {
                 "primary_adj_days": primary_adj_days,
                 "baostock_adj_days": baostock_adj_days,
+                "expected_adj_days": common_days,
+                "primary_adj_on_common_daily_days": primary_adj_on_daily_days,
+                "baostock_adj_on_common_daily_days": baostock_adj_on_daily_days,
                 "common_adj_days": common_adj_days,
                 "adj_overlap_coverage": adj_coverage,
             }
