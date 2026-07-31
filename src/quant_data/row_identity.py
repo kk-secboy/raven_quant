@@ -11,6 +11,10 @@ SEMANTIC_METADATA_COLUMNS: dict[str, frozenset[str]] = {
     "ccass_hold_detail": frozenset({"name", "col_participant_name"}),
     "irm_qa_sh": frozenset({"name", "pub_time"}),
     "irm_qa_sz": frozenset({"name", "pub_time"}),
+    # Snapshot-only presentation fields. They are recomputed from the immutable
+    # provider title/content on every snapshot build and must never become part
+    # of the provider-row identity when an older snapshot is used as a base.
+    "news": frozenset({"display_title", "title_source"}),
     "share_float": frozenset({"float_ratio"}),
 }
 

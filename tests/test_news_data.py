@@ -145,6 +145,62 @@ def test_news_snapshot_replaces_legacy_duplicates_without_deleting_units(
     assert len(frame) == 3
     tagged = frame[frame["content"] == "market update"]
     assert set(tagged["source"]) == {"sina", "cls"}
+    assert set(tagged["display_title"]) == {"headline"}
+    assert set(tagged["title_source"]) == {"original"}
     legacy = frame[frame["content"] == "legacy only"]
     assert len(legacy) == 1
     assert pd.isna(legacy.iloc[0]["source"])
+    assert legacy.iloc[0]["display_title"] == "older headline"
+    assert legacy.iloc[0]["title_source"] == "original"
+
+
+def test_news_snapshot_derives_auditable_display_title_without_mutating_units(
+    tmp_path: Path,
+) -> None:
+    storage = ParquetStore(tmp_path)
+    content = "content-only flash " * 10
+    result = storage.write_unit(
+        "news",
+        "content-only",
+        ProviderResult(
+            "news",
+            [*NEWS_FIELDS, "source"],
+            [
+                {
+                    "datetime": "2024-01-02 10:30:00",
+                    "content": content,
+                    "title": None,
+                    "channels": "finance",
+                    "source": "sina",
+                }
+            ],
+            b"{}",
+        ),
+    )
+    snapshot = storage.build_snapshot(
+        name="news-display-title",
+        successful_units={
+            "news": [
+                {
+                    "unit_key": "content-only",
+                    "output_path": result.output_path,
+                    "row_count": result.row_count,
+                    "sha256": result.sha256,
+                }
+            ]
+        },
+        manifest_extra={"profile": "test"},
+    )
+
+    raw = pd.read_parquet(tmp_path / result.output_path)
+    assert pd.isna(raw.iloc[0]["title"])
+    assert "display_title" not in raw.columns
+    frame = pd.concat(
+        [
+            pd.read_parquet(path)
+            for path in (snapshot / "parquet" / "news").rglob("*.parquet")
+        ],
+        ignore_index=True,
+    )
+    assert frame.iloc[0]["display_title"] == content.strip()[:80]
+    assert frame.iloc[0]["title_source"] == "content_fallback"

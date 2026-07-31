@@ -676,9 +676,26 @@ def _snapshot_source_query(dataset: str, quoted_paths: str, columns: set[str]) -
     # persist the source; retain those only when no new source-aware window has
     # supplied the same timestamp/title/content. This lets immutable old units
     # remain on disk without duplicating repaired snapshots.
+    candidate_projection = "candidate.*"
+    derived_columns = {"display_title", "title_source"} & columns
+    if derived_columns:
+        excluded = ", ".join(_identifier(column) for column in sorted(derived_columns))
+        candidate_projection = f"candidate.* EXCLUDE ({excluded})"
     return f"""
         WITH source_rows AS ({base})
-        SELECT candidate.*
+        SELECT
+            {candidate_projection},
+            coalesce(
+                nullif(trim(CAST(candidate.title AS VARCHAR)), ''),
+                nullif(substr(trim(CAST(candidate.content AS VARCHAR)), 1, 80), '')
+            ) AS display_title,
+            CASE
+                WHEN nullif(trim(CAST(candidate.title AS VARCHAR)), '') IS NOT NULL
+                    THEN 'original'
+                WHEN nullif(trim(CAST(candidate.content AS VARCHAR)), '') IS NOT NULL
+                    THEN 'content_fallback'
+                ELSE 'missing'
+            END AS title_source
         FROM source_rows AS candidate
         WHERE candidate.source IS NOT NULL
            OR NOT EXISTS (
