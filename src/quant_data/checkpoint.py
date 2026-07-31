@@ -73,8 +73,11 @@ class CheckpointStore:
         lease_seconds: int = 300,
         *,
         unit_keys: set[str] | None = None,
+        api_names: set[str] | None = None,
     ) -> WorkUnit | None:
         if unit_keys is not None and not unit_keys:
+            return None
+        if api_names is not None and not api_names:
             return None
         now = _utc_now()
         conditions = [
@@ -86,6 +89,8 @@ class CheckpointStore:
             conditions.append(work_units.c.dataset.in_(sorted(datasets)))
         if unit_keys is not None:
             conditions.append(work_units.c.unit_key.in_(sorted(unit_keys)))
+        if api_names is not None:
+            conditions.append(work_units.c.api_name.in_(sorted(api_names)))
         statement = (
             select(work_units)
             .where(*conditions)

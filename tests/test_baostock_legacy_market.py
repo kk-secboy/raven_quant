@@ -212,7 +212,9 @@ def test_adjustment_factor_uses_back_adjusted_to_raw_close_ratio() -> None:
 def test_runner_can_claim_only_explicit_legacy_unit_keys() -> None:
     class Checkpoint:
         def __init__(self) -> None:
-            self.claimed: list[tuple[set[str] | None, set[str] | None]] = []
+            self.claimed: list[
+                tuple[set[str] | None, set[str] | None, set[str] | None]
+            ] = []
 
         def reset_stale(self) -> int:
             return 0
@@ -222,8 +224,9 @@ def test_runner_can_claim_only_explicit_legacy_unit_keys() -> None:
             datasets: set[str] | None = None,
             *,
             unit_keys: set[str] | None = None,
+            api_names: set[str] | None = None,
         ) -> None:
-            self.claimed.append((datasets, unit_keys))
+            self.claimed.append((datasets, unit_keys, api_names))
             return None
 
     checkpoint = Checkpoint()
@@ -237,7 +240,11 @@ def test_runner_can_claim_only_explicit_legacy_unit_keys() -> None:
     summary = runner.run(unit_keys={"legacy-a", "legacy-b"})
 
     assert summary.succeeded == 0
-    assert checkpoint.claimed == [(None, {"legacy-a", "legacy-b"})]
+    assert checkpoint.claimed == [(None, {"legacy-a", "legacy-b"}, None)]
+
+    checkpoint.claimed.clear()
+    runner.run({"daily"}, api_names={"baostock_daily"})
+    assert checkpoint.claimed == [({"daily"}, None, {"baostock_daily"})]
 
 
 def _overlap_frames() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:

@@ -48,12 +48,13 @@ class DownloadRunner:
         datasets: set[str] | None = None,
         *,
         unit_keys: set[str] | None = None,
+        api_names: set[str] | None = None,
     ) -> RunSummary:
         self.checkpoint.reset_stale()
         summary = RunSummary()
         with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="fetch") as pool:
             futures = [
-                pool.submit(self._worker, summary, datasets, unit_keys)
+                pool.submit(self._worker, summary, datasets, unit_keys, api_names)
                 for _ in range(self.workers)
             ]
             for future in futures:
@@ -65,12 +66,17 @@ class DownloadRunner:
         summary: RunSummary,
         datasets: set[str] | None,
         unit_keys: set[str] | None,
+        api_names: set[str] | None,
     ) -> None:
         while True:
             unit = (
                 self.checkpoint.claim(datasets=datasets)
-                if unit_keys is None
-                else self.checkpoint.claim(datasets=datasets, unit_keys=unit_keys)
+                if unit_keys is None and api_names is None
+                else self.checkpoint.claim(
+                    datasets=datasets,
+                    unit_keys=unit_keys,
+                    api_names=api_names,
+                )
             )
             if unit is None:
                 return

@@ -999,9 +999,11 @@ def _run_legacy_market_specs(
     label: str,
 ) -> tuple[int, int]:
     keys = {spec.unit_key for spec in specs}
+    datasets = {spec.dataset for spec in specs}
+    api_names = {spec.api_name for spec in specs}
     inserted = context.checkpoint.add(specs)
     context.checkpoint.retry_failed_units(keys)
-    summary = context.runner.run(unit_keys=keys)
+    summary = context.runner.run(datasets, api_names=api_names)
     rows = _require_specs_complete(context, specs)
     console.print(
         f"{label}: planned={len(specs)} inserted={inserted} "

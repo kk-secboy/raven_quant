@@ -48,8 +48,8 @@ The API exposes two sequential background jobs:
 
 The second endpoint remains unavailable until the first report passes. Both
 jobs are PostgreSQL-backed and visible in the normal job history. The legacy
-runner claims only the exact work-unit keys it planned, preventing it from
-executing dormant Tushare units with the BaoStock adapter.
+runner claims only BaoStock API contracts for the planned datasets, preventing
+it from executing dormant Tushare units with the BaoStock adapter.
 
 After the legacy job completes, the ordinary full quality gate, immutable
 snapshot, Qlib build, and long-horizon formal validation must still run. Passing
