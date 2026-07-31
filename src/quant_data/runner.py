@@ -43,18 +43,35 @@ class DownloadRunner:
         self.on_result = on_result
         self._lock = threading.Lock()
 
-    def run(self, datasets: set[str] | None = None) -> RunSummary:
+    def run(
+        self,
+        datasets: set[str] | None = None,
+        *,
+        unit_keys: set[str] | None = None,
+    ) -> RunSummary:
         self.checkpoint.reset_stale()
         summary = RunSummary()
         with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="fetch") as pool:
-            futures = [pool.submit(self._worker, summary, datasets) for _ in range(self.workers)]
+            futures = [
+                pool.submit(self._worker, summary, datasets, unit_keys)
+                for _ in range(self.workers)
+            ]
             for future in futures:
                 future.result()
         return summary
 
-    def _worker(self, summary: RunSummary, datasets: set[str] | None) -> None:
+    def _worker(
+        self,
+        summary: RunSummary,
+        datasets: set[str] | None,
+        unit_keys: set[str] | None,
+    ) -> None:
         while True:
-            unit = self.checkpoint.claim(datasets=datasets)
+            unit = (
+                self.checkpoint.claim(datasets=datasets)
+                if unit_keys is None
+                else self.checkpoint.claim(datasets=datasets, unit_keys=unit_keys)
+            )
             if unit is None:
                 return
             self._execute(unit, summary)

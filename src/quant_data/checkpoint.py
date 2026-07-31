@@ -67,7 +67,15 @@ class CheckpointStore:
         with self.engine.begin() as connection:
             return int(connection.execute(statement).rowcount or 0)
 
-    def claim(self, datasets: set[str] | None = None, lease_seconds: int = 300) -> WorkUnit | None:
+    def claim(
+        self,
+        datasets: set[str] | None = None,
+        lease_seconds: int = 300,
+        *,
+        unit_keys: set[str] | None = None,
+    ) -> WorkUnit | None:
+        if unit_keys is not None and not unit_keys:
+            return None
         now = _utc_now()
         conditions = [
             work_units.c.status.in_(("pending", "failed")),
@@ -76,6 +84,8 @@ class CheckpointStore:
         ]
         if datasets:
             conditions.append(work_units.c.dataset.in_(sorted(datasets)))
+        if unit_keys is not None:
+            conditions.append(work_units.c.unit_key.in_(sorted(unit_keys)))
         statement = (
             select(work_units)
             .where(*conditions)

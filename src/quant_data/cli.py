@@ -21,6 +21,7 @@ from quant_platform.news_flash_factors import process_news_flash
 from quant_platform.report_rc_factors import process_report_rc
 from quant_platform.runtime_secret_store import RuntimeSecretStore
 
+from .baostock_provider import BaoStockProvider
 from .catalog import (
     CORE_DAILY,
     CORPORATE_EVENTS,
@@ -34,6 +35,14 @@ from .cninfo_announcements import download_cninfo_announcements
 from .config import Settings
 from .coverage_data import coverage_secondary_specs
 from .execution_data import MARGIN_DATASET, MINUTE_DATASETS, margin_specs
+from .legacy_market import (
+    DEFAULT_OVERLAP_SYMBOLS,
+    LEGACY_MARKET_DATASETS,
+    baostock_history_specs,
+    baostock_reference_specs,
+    planned_baostock_universe,
+    validate_baostock_overlap,
+)
 from .minute_qlib_builder import MinuteQlibBuilder
 from .models import FetchSpec
 from .partitioning import (
@@ -982,6 +991,180 @@ def bootstrap(
         qlib_path = _build_qlib(context, snapshot_path, staging_only=False)
         console.print(f"[green]Qlib dataset built[/green]: {qlib_path}")
     console.print(f"[bold green]bootstrap complete[/bold green]: {snapshot_path}")
+
+
+def _run_legacy_market_specs(
+    context: Context,
+    specs: list[FetchSpec],
+    label: str,
+) -> tuple[int, int]:
+    keys = {spec.unit_key for spec in specs}
+    inserted = context.checkpoint.add(specs)
+    context.checkpoint.retry_failed_units(keys)
+    summary = context.runner.run(unit_keys=keys)
+    rows = _require_specs_complete(context, specs)
+    console.print(
+        f"{label}: planned={len(specs)} inserted={inserted} "
+        f"succeeded={summary.succeeded} "
+        f"rows={sum(int(row.get('row_count') or 0) for row in rows)}"
+    )
+    return inserted, summary.succeeded
+
+
+@app.command("bootstrap-legacy-market")
+def bootstrap_legacy_market(
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2008-01-01",
+    end: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2015-12-31",
+    validation_report: Annotated[
+        Path | None,
+        typer.Option(
+            "--validation-report",
+            help="Successful 2016 BaoStock/Tushare overlap report",
+        ),
+    ] = None,
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Backfill audited pre-2016 A-share market data from BaoStock.
+
+    Only the calendar, unadjusted daily bars, BaoStock's published valuation
+    fields, and a derived adjustment factor are imported.  Fundamentals, news,
+    and other datasets are not fabricated for dates their sources cannot cover.
+    """
+
+    start_date = parse_date(start)
+    end_date = parse_date(end)
+    if end_date < start_date:
+        raise typer.BadParameter("end must not be before start")
+    if end_date >= date(2016, 1, 1):
+        raise typer.BadParameter(
+            "legacy production import must end before 2016-01-01; "
+            "use the overlap validator for cross-source comparison"
+        )
+    if validation_report is None or not validation_report.is_file():
+        raise typer.BadParameter(
+            "a successful --validation-report is required before legacy import"
+        )
+    try:
+        validation = json.loads(validation_report.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise typer.BadParameter("validation report is unreadable") from exc
+    if (
+        not isinstance(validation, dict)
+        or validation.get("ok") is not True
+        or validation.get("source") != "baostock-0.9.3"
+        or str(validation.get("start_date") or "") > "2016-01-01"
+        or str(validation.get("end_date") or "") < "2016-12-31"
+    ):
+        raise typer.BadParameter(
+            "validation report did not pass the required 2016 overlap gate"
+        )
+
+    context = load_context(
+        require_credentials=False,
+        progress_path=result_path,
+        progress_target={
+            "kind": "legacy_market_backfill",
+            "source": "baostock",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+    )
+    reference_specs = baostock_reference_specs(
+        start_date,
+        end_date,
+        max_attempts=context.settings.max_request_attempts,
+    )
+    with BaoStockProvider() as provider:
+        context.provider = provider
+        context.runner = DownloadRunner(
+            checkpoint=context.checkpoint,
+            storage=context.storage,
+            provider=provider,
+            # BaoStock's Python client owns one process-global socket.
+            workers=1,
+        )
+        context.report_progress(
+            "prerequisites",
+            "BaoStock calendar and historical stock master",
+            {"trade_cal", "baostock_stock_basic"},
+            force=True,
+        )
+        _run_legacy_market_specs(
+            context,
+            reference_specs,
+            "BaoStock calendar and historical stock master",
+        )
+        codes = planned_baostock_universe(
+            context.checkpoint,
+            context.storage,
+            start=start_date,
+            end=end_date,
+        )
+        if not codes:
+            raise RuntimeError("BaoStock historical A-share universe is empty")
+        history_specs = baostock_history_specs(
+            codes,
+            start_date,
+            end_date,
+            max_attempts=context.settings.max_request_attempts,
+        )
+        context.report_progress(
+            "downloading",
+            "BaoStock pre-2016 market history",
+            LEGACY_MARKET_DATASETS,
+            force=True,
+        )
+        inserted, succeeded = _run_legacy_market_specs(
+            context,
+            history_specs,
+            "BaoStock pre-2016 market history",
+        )
+
+    result = {
+        "status": "succeeded",
+        "source": "baostock",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "symbols": len(codes),
+        "planned_units": len(history_specs),
+        "inserted_units": inserted,
+        "succeeded_this_run": succeeded,
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+@app.command("validate-baostock-overlap")
+def validate_baostock_overlap_command(
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2016-01-01",
+    end: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2016-12-31",
+    symbols: Annotated[
+        str,
+        typer.Option(help="Comma-separated Tushare codes; empty uses the audited sample"),
+    ] = "",
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Gate legacy imports by comparing BaoStock with the primary source."""
+
+    start_date = parse_date(start)
+    end_date = parse_date(end)
+    if end_date < start_date:
+        raise typer.BadParameter("end must not be before start")
+    selected_symbols = tuple(_split_codes(symbols)) or DEFAULT_OVERLAP_SYMBOLS
+    context = load_context(require_credentials=False)
+    with BaoStockProvider() as provider:
+        report = validate_baostock_overlap(
+            context.checkpoint,
+            context.storage,
+            provider,
+            start=start_date,
+            end=end_date,
+            symbols=selected_symbols,
+        )
+    _write_optional_result(result_path, report)
+    console.print_json(json.dumps(report, ensure_ascii=False))
+    if not report["ok"]:
+        raise typer.Exit(3)
 
 
 @app.command()

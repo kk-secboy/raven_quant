@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -93,6 +94,31 @@ class BootstrapRequest(BaseModel):
     def validate_range(self) -> BootstrapRequest:
         if isinstance(self.end, date) and self.end < self.start:
             raise ValueError("end must not be before start")
+        return self
+
+
+class BaoStockOverlapRequest(BaseModel):
+    start: date = Field(default=date(2016, 1, 1))
+    end: date = Field(default=date(2016, 12, 31))
+    symbols: list[str] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> BaoStockOverlapRequest:
+        if self.end < self.start:
+            raise ValueError("end must not be before start")
+        return self
+
+
+class LegacyMarketBackfillRequest(BaseModel):
+    start: date = Field(default=date(2008, 1, 1))
+    end: date = Field(default=date(2015, 12, 31))
+
+    @model_validator(mode="after")
+    def validate_range(self) -> LegacyMarketBackfillRequest:
+        if self.end < self.start:
+            raise ValueError("end must not be before start")
+        if self.end >= date(2016, 1, 1):
+            raise ValueError("legacy backfill must end before 2016-01-01")
         return self
 
 
@@ -3575,6 +3601,90 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         log_path = platform_root / "logs" / f"bootstrap-{payload.profile}-{date.today():%Y%m%d}.log"
         try:
             job = jobs.create("bootstrap", serialized, log_path)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return job
+
+    @app.post("/api/jobs/baostock-overlap-validation", status_code=202)
+    def create_baostock_overlap_validation(payload: BaoStockOverlapRequest) -> dict:
+        if jobs.count(
+            statuses=("queued", "running"),
+            kinds=("bootstrap", "legacy_market_backfill"),
+        ):
+            raise HTTPException(409, "market-data download is already active")
+        output = settings.data_root / "artifacts" / "data-quality"
+        result_path = output / "baostock-overlap-2016.json"
+        serialized = {
+            "start": payload.start.isoformat(),
+            "end": payload.end.isoformat(),
+            "symbols": payload.symbols,
+            "result_path": str(result_path),
+        }
+        log_path = platform_root / "logs" / "baostock-overlap-validation.log"
+        try:
+            job = jobs.create(
+                "baostock_overlap_validation",
+                serialized,
+                log_path,
+                idempotency_key=(
+                    f"baostock-overlap:{payload.start}:{payload.end}:"
+                    f"{','.join(sorted(payload.symbols)) or 'audited-default'}"
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return job
+
+    @app.post("/api/jobs/legacy-market-backfill", status_code=202)
+    def create_legacy_market_backfill(payload: LegacyMarketBackfillRequest) -> dict:
+        if jobs.count(
+            statuses=("queued", "running"),
+            kinds=("bootstrap", "baostock_overlap_validation"),
+        ):
+            raise HTTPException(409, "market-data download or validation is already active")
+        validation_path = (
+            settings.data_root
+            / "artifacts"
+            / "data-quality"
+            / "baostock-overlap-2016.json"
+        )
+        try:
+            validation = json.loads(validation_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(409, "BaoStock overlap validation is unavailable") from exc
+        if (
+            not isinstance(validation, dict)
+            or validation.get("ok") is not True
+            or validation.get("source") != "baostock-0.9.3"
+            or str(validation.get("start_date") or "") > "2016-01-01"
+            or str(validation.get("end_date") or "") < "2016-12-31"
+        ):
+            raise HTTPException(409, "BaoStock overlap validation did not pass")
+        result_path = (
+            settings.data_root
+            / "artifacts"
+            / "execution-data"
+            / f"legacy-market-{payload.start:%Y%m%d}-{payload.end:%Y%m%d}"
+            / "result.json"
+        )
+        serialized = {
+            "start": payload.start.isoformat(),
+            "end": payload.end.isoformat(),
+            "validation_report": str(validation_path),
+            "result_path": str(result_path),
+        }
+        log_path = platform_root / "logs" / (
+            f"legacy-market-{payload.start:%Y%m%d}-{payload.end:%Y%m%d}.log"
+        )
+        try:
+            job = jobs.create(
+                "legacy_market_backfill",
+                serialized,
+                log_path,
+                idempotency_key=f"legacy-market:{payload.start}:{payload.end}:baostock-0.9.3",
+            )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         worker.notify()

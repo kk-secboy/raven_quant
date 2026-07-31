@@ -416,6 +416,40 @@ class LocalJobWorker:
 
     def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
         payload = job["payload"]
+        if job["kind"] == "baostock_overlap_validation":
+            result_path = Path(payload["result_path"])
+            command = [
+                sys.executable,
+                "-m",
+                "quant_data.cli",
+                "validate-baostock-overlap",
+                "--start",
+                payload["start"],
+                "--end",
+                payload["end"],
+                "--result",
+                str(result_path),
+            ]
+            if payload.get("symbols"):
+                command.extend(["--symbols", ",".join(payload["symbols"])])
+            return command, result_path, {}
+        if job["kind"] == "legacy_market_backfill":
+            result_path = Path(payload["result_path"])
+            command = [
+                sys.executable,
+                "-m",
+                "quant_data.cli",
+                "bootstrap-legacy-market",
+                "--start",
+                payload["start"],
+                "--end",
+                payload["end"],
+                "--validation-report",
+                payload["validation_report"],
+                "--result",
+                str(result_path),
+            ]
+            return command, result_path, {}
         if job["kind"] in {
             "margin_eligibility_download",
             "core_intraday_download",
