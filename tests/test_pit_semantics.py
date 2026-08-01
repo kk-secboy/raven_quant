@@ -79,7 +79,7 @@ def test_snapshot_preserves_ingested_at_and_null_fills_legacy_units(tmp_path: Pa
     legacy_dir = tmp_path / "units" / "daily"
     legacy_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
-        [{"ts_code": "000001.SZ", "trade_date": "2024-01-03", "close": 11.0}]
+        [{"ts_code": "000001.SZ", "trade_date": "2024-02-03", "close": 11.0}]
     ).to_parquet(legacy_dir / "legacy.parquet", index=False)
 
     snapshot = storage.build_snapshot(
@@ -96,7 +96,9 @@ def test_snapshot_preserves_ingested_at_and_null_fills_legacy_units(tmp_path: Pa
     frame = pd.concat(
         [pd.read_parquet(path) for path in (snapshot / "parquet" / "daily").rglob("*.parquet")],
         ignore_index=True,
-    ).sort_values("trade_date")
+    )
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+    frame = frame.sort_values("trade_date")
     assert frame["ingested_at"].iloc[0] == pd.Timestamp(clock_time)
     assert pd.isna(frame["ingested_at"].iloc[1])
 

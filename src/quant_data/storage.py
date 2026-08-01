@@ -520,7 +520,13 @@ class ParquetStore:
             if not sources:
                 continue
             quoted = "[" + ",".join(_sql_string(path) for path in sources) + "]"
-            source_sql = _snapshot_source_query(dataset, quoted, columns)
+            partition_columns = {
+                str(row[0])
+                for row in connection.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet({quoted}, union_by_name=true)"
+                ).fetchall()
+            }
+            source_sql = _snapshot_source_query(dataset, quoted, partition_columns)
             partition_dir = dataset_dir / f"partition_year={year}" / f"partition_month={month}"
             partition_dir.mkdir(parents=True, exist_ok=True)
             connection.execute(
