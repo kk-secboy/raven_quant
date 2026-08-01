@@ -72,11 +72,14 @@ def verify_downloads(
         if item["succeeded"] != item["planned"]:
             message = f"{item['dataset']}: {item['succeeded']}/{item['planned']} units succeeded"
             (errors if require_all_planned else warnings).append(message)
-        definition = ALL_DEFINITIONS.get(item["dataset"])
-        if item["empty"] and definition and not definition.allow_empty:
-            errors.append(f"{item['dataset']}: {item['empty']} unexpected empty units")
-        elif item["empty"]:
-            warnings.append(f"{item['dataset']}: {item['empty']} allowed empty units")
+        unexpected_empty = int(item.get("unexpected_empty") or 0)
+        allowed_empty = int(item.get("allowed_empty") or 0)
+        if unexpected_empty:
+            errors.append(
+                f"{item['dataset']}: {unexpected_empty} unexpected empty units"
+            )
+        if allowed_empty:
+            warnings.append(f"{item['dataset']}: {allowed_empty} allowed empty units")
         datasets.append(item)
 
     successful_rows = checkpoint.successful()

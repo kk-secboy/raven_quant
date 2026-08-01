@@ -442,6 +442,28 @@ class CheckpointStore:
                         else_=0,
                     )
                 ).label("empty"),
+                func.sum(
+                    case(
+                        (
+                            (work_units.c.status == "succeeded")
+                            & (work_units.c.row_count == 0)
+                            & work_units.c.allow_empty,
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("allowed_empty"),
+                func.sum(
+                    case(
+                        (
+                            (work_units.c.status == "succeeded")
+                            & (work_units.c.row_count == 0)
+                            & ~work_units.c.allow_empty,
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("unexpected_empty"),
                 func.coalesce(
                     func.sum(
                         case(

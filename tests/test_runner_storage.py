@@ -157,6 +157,50 @@ def test_verifier_uses_successor_generation_and_can_ignore_dormant_plans(
     assert any("daily: 0/1 units succeeded" in item for item in relaxed["warnings"])
 
 
+def test_verifier_respects_unit_level_empty_contracts(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    allowed = FetchSpec(
+        dataset="daily",
+        api_name="baostock_daily",
+        params={"code": "sh.600000"},
+        scope={"source": "baostock-0.9.3", "code": "sh.600000"},
+        allow_empty=True,
+    )
+    unexpected = FetchSpec(
+        dataset="daily",
+        api_name="daily",
+        params={"trade_date": "20240102"},
+        scope={"trade_date": "20240102"},
+        allow_empty=False,
+    )
+    checkpoint.add([allowed, unexpected])
+    for spec in (allowed, unexpected):
+        written = storage.write_unit(
+            "daily",
+            spec.unit_key,
+            ProviderResult(
+                api_name=spec.api_name,
+                columns=[],
+                rows=[],
+                raw_body=b"{}",
+            ),
+        )
+        checkpoint.succeed(spec.unit_key, written)
+
+    report = verify_downloads(checkpoint, tmp_path)
+
+    assert report["ok"] is False
+    assert any("daily: 1 unexpected empty units" in item for item in report["errors"])
+    assert any("daily: 1 allowed empty units" in item for item in report["warnings"])
+    daily = next(item for item in report["datasets"] if item["dataset"] == "daily")
+    assert daily["empty"] == 2
+    assert daily["allowed_empty"] == 1
+    assert daily["unexpected_empty"] == 1
+
+
 def test_verifier_downgrades_only_exact_duplicates_for_unstable_pagination_datasets(
     tmp_path: Path, database_url: str
 ) -> None:
