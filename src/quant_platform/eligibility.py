@@ -76,16 +76,21 @@ def build_point_in_time_eligibility(
         raise ValueError("listing metadata is duplicated or missing list dates")
     base = base.merge(listing, on="instrument", how="left", validate="many_to_one")
     calendar = pd.DatetimeIndex(base["datetime"].unique()).sort_values()
-    base["listing_trading_days"] = base["list_date"].map(
-        lambda listed: int((calendar >= listed).sum()) if pd.notna(listed) else 0
+    # Count calendar positions with vectorized binary searches.  Expanding a
+    # calendar mask per market row is O(rows * trading_days), which becomes
+    # tens of billions of comparisons for a full A-share history.
+    current_positions = calendar.searchsorted(
+        pd.DatetimeIndex(base["datetime"]), side="right"
     )
-    # Correct the count to each row's point in time, not the full calendar end.
-    base["listing_trading_days"] = [
-        int(((calendar >= listed) & (calendar <= current)).sum())
-        if pd.notna(listed)
-        else 0
-        for listed, current in zip(base["list_date"], base["datetime"], strict=True)
-    ]
+    listed = pd.to_datetime(base["list_date"], errors="coerce")
+    listed_positions = calendar.searchsorted(
+        pd.DatetimeIndex(listed.fillna(pd.Timestamp.max.normalize())), side="left"
+    )
+    base["listing_trading_days"] = np.where(
+        listed.notna(),
+        np.maximum(current_positions - listed_positions, 0),
+        0,
+    )
     base["normal_listing_status"] = base["list_date"].notna() & (
         base["delist_date"].isna() | (base["datetime"] < base["delist_date"])
     )
