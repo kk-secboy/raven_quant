@@ -138,7 +138,12 @@ def derive_regulatory_events(
     frame["ts_code"] = frame["ts_code"].astype("string").str.upper()
     frame["ann_date"] = _normalize_ann_date(frame["ann_date"])
     frame = frame.dropna(subset=["ts_code", "ann_date"])
-    frame["event_type"] = frame["title"].map(classify_title)
+    titles = frame["title"].astype("string")
+    event_types = pd.Series(pd.NA, index=frame.index, dtype="string")
+    for event_type, pattern in EVENT_TYPE_RULES:
+        matches = event_types.isna() & titles.str.contains(pattern, na=False)
+        event_types.loc[matches] = event_type
+    frame["event_type"] = event_types
     matched = frame.dropna(subset=["event_type"])
     if matched.empty:
         return _empty_events_frame()
