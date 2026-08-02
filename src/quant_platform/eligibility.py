@@ -156,12 +156,12 @@ def build_point_in_time_eligibility(
         normalized_major = events["major"].map(_strict_boolean)
         if normalized_major.isna().any():
             raise ValueError("regulatory event major flags must be boolean")
-        major = events[normalized_major]
-        for row in major.itertuples(index=False):
-            mask = (base["instrument"] == row.instrument) & (
-                base["datetime"] >= row.known_date
-            )
-            base.loc[mask, "major_violation"] = True
+        major = events.loc[normalized_major.astype(bool)]
+        first_known_date = major.groupby("instrument", sort=False)["known_date"].min()
+        instrument_known_date = base["instrument"].map(first_known_date)
+        base["major_violation"] = instrument_known_date.notna() & base["datetime"].ge(
+            instrument_known_date
+        )
 
     checks = {
         "new_listing": base["listing_trading_days"] < rules.min_listing_trading_days,
