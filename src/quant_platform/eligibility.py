@@ -180,11 +180,21 @@ def build_point_in_time_eligibility(
             else pd.Series(False, index=base.index)
         ),
     }
-    base["eligible"] = ~pd.DataFrame(checks).any(axis=1)
-    base["reasons"] = [
-        json.dumps([name for name, values in checks.items() if bool(values.loc[index])])
-        for index in base.index
-    ]
+    check_names = list(checks)
+    reason_mask = np.zeros(len(base), dtype=np.uint16)
+    for bit, name in enumerate(check_names):
+        reason_mask |= checks[name].to_numpy(dtype=np.uint16) * np.uint16(1 << bit)
+    reason_lookup = np.asarray(
+        [
+            json.dumps(
+                [name for bit, name in enumerate(check_names) if mask & (1 << bit)]
+            )
+            for mask in range(1 << len(check_names))
+        ],
+        dtype=object,
+    )
+    base["eligible"] = reason_mask == 0
+    base["reasons"] = reason_lookup[reason_mask]
     base["contract_version"] = ELIGIBILITY_CONTRACT_VERSION
     columns = [
         "datetime",
@@ -264,11 +274,21 @@ def _interval_flags(
     base: pd.DataFrame, intervals: pd.DataFrame, *, value_column: str
 ) -> pd.Series:
     flags = pd.Series(False, index=base.index)
-    for row in intervals.itertuples(index=False):
-        mask = (base["instrument"] == row.instrument) & (base["datetime"] >= row.start_date)
-        if pd.notna(row.end_date):
-            mask &= base["datetime"] <= row.end_date
-        flags.loc[mask] = bool(getattr(row, value_column))
+    base_groups = base.groupby("instrument", sort=False).groups
+    for instrument, source in intervals.groupby("instrument", sort=False):
+        index = base_groups.get(instrument)
+        if index is None:
+            continue
+        target = base.loc[index, ["datetime"]].sort_values("datetime")
+        dates = pd.DatetimeIndex(target["datetime"])
+        for row in source.itertuples(index=False):
+            left = dates.searchsorted(row.start_date, side="left")
+            right = (
+                dates.searchsorted(row.end_date, side="right")
+                if pd.notna(row.end_date)
+                else len(dates)
+            )
+            flags.loc[target.index[left:right]] = bool(getattr(row, value_column))
     return flags
 
 
