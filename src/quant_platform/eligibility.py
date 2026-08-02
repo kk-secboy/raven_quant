@@ -311,14 +311,18 @@ def _asof_disclosure(
     for column in value_columns:
         result[column] = np.nan if column != "audit_opinion" else None
     result[f"{label}_announcement_date"] = pd.NaT
+    disclosure_groups = {
+        instrument: source[["announcement_date", *value_columns]]
+        for instrument, source in disclosure.groupby("instrument", sort=False)
+    }
     for instrument, index in result.groupby("instrument").groups.items():
-        source = disclosure[disclosure["instrument"] == instrument]
-        if source.empty:
+        source = disclosure_groups.get(instrument)
+        if source is None:
             continue
         target = result.loc[index, ["datetime"]].sort_values("datetime")
         joined = pd.merge_asof(
             target,
-            source[["announcement_date", *value_columns]],
+            source,
             left_on="datetime",
             right_on="announcement_date",
             direction="backward",
