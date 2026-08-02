@@ -13,6 +13,7 @@ from quant_data.availability import (
     recoverability_level,
 )
 from quant_data.qlib_builder import (
+    _MAX_EXCLUDED_DAILY_UNIT_RATIO,
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
     QlibBuilder,
     _to_wsl_path,
@@ -831,6 +832,43 @@ def test_rejects_daily_amount_and_hand_volume_with_impossible_vwap(tmp_path: Pat
 
     with pytest.raises(RuntimeError, match="hand/amount price contract"):
         QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+
+def test_bounded_daily_unit_outliers_are_excluded_without_fabricating_vwap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    daily = next((snapshot / "parquet" / "daily").rglob("*.parquet"))
+    invalid = pd.read_parquet(daily).assign(ts_code="000002.SZ", amount=1_000.0)
+    pd.concat([pd.read_parquet(daily), invalid], ignore_index=True).to_parquet(daily, index=False)
+    for dataset in ("adj_factor", "stk_limit"):
+        path = next((snapshot / "parquet" / dataset).rglob("*.parquet"))
+        original = pd.read_parquet(path)
+        pd.concat(
+            [original, original.assign(ts_code="000002.SZ")], ignore_index=True
+        ).to_parquet(path, index=False)
+    builder = QlibBuilder(snapshot)
+    monkeypatch.setattr(
+        builder,
+        "_daily_unit_quality_coverage",
+        lambda: {
+            "policy": "exclude_internally_inconsistent_rows_from_research_history",
+            "excluded_rows": 1,
+            "total_rows": 100_001,
+            "excluded_ratio": 1 / 100_001,
+            "max_excluded_ratio": _MAX_EXCLUDED_DAILY_UNIT_RATIO,
+        },
+    )
+
+    by_symbol = builder.build_staging(tmp_path / "staging")
+
+    assert (by_symbol / "SZ000001.parquet").exists()
+    assert not (by_symbol / "SZ000002.parquet").exists()
 
 
 def test_rejects_tampered_snapshot_content(tmp_path: Path) -> None:

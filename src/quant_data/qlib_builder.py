@@ -65,6 +65,7 @@ _GOVERNED_BENCHMARK = "000300.SH"
 _UNKNOWN_INDUSTRY = "__UNKNOWN__"
 _MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO = 0.01
 _UNRESTRICTED_UP_LIMIT = 99999.99
+_MAX_EXCLUDED_DAILY_UNIT_RATIO = 0.00001
 
 _DAILY_RESEARCH_FIELDS = (
     "turnover_rate",
@@ -208,6 +209,7 @@ class QlibBuilder:
     def __init__(self, snapshot_path: Path) -> None:
         self.snapshot_path = snapshot_path.resolve()
         self.research_feature_contract = self._research_feature_contract()
+        self._daily_unit_quality_cache: dict[str, Any] | None = None
 
     @property
     def qlib_fields(self) -> tuple[str, ...]:
@@ -245,12 +247,20 @@ class QlibBuilder:
                     f"{invalid} daily rows have an invalid adjustment factor or "
                     "partial/malformed price limits"
                 )
-            invalid_units = connection.execute(
-                self._invalid_daily_units_query(daily_glob)
-            ).fetchone()[0]
-            if invalid_units:
+            daily_unit_quality = self._daily_unit_quality_coverage()
+            invalid_units = int(daily_unit_quality["excluded_rows"])
+            if invalid_units and float(daily_unit_quality["excluded_ratio"]) > float(
+                daily_unit_quality["max_excluded_ratio"]
+            ):
                 raise RuntimeError(
                     f"{invalid_units} daily rows violate the Tushare hand/amount price contract"
+                )
+            if invalid_units:
+                logger.warning(
+                    "excluding %s/%s daily rows with internally inconsistent price/volume/amount "
+                    "units from research history",
+                    invalid_units,
+                    daily_unit_quality["total_rows"],
                 )
             connection.execute(
                 f"COPY ({query}) TO {_sql_string(str(partitions))} "
@@ -383,6 +393,7 @@ class QlibBuilder:
         fields = list(self.qlib_fields)
         field_units = self._field_units()
         execution_controls = self._execution_control_coverage()
+        daily_unit_quality = self._daily_unit_quality_coverage()
         contract = {
             "version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
             "frequency": "day",
@@ -402,6 +413,7 @@ class QlibBuilder:
                 "method": "bounded_source_gap_intervals_without_future_fill",
             },
             "execution_controls": execution_controls,
+            "daily_unit_quality": daily_unit_quality,
         }
         contract_sha256 = hashlib.sha256(
             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -447,6 +459,7 @@ class QlibBuilder:
                 "method": "bounded_source_gap_intervals_without_future_fill",
             },
             "execution_controls": execution_controls,
+            "daily_unit_quality": daily_unit_quality,
         }
         canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         provenance = {
@@ -570,6 +583,46 @@ class QlibBuilder:
             "missing_row_policy": "research_only_unrestricted_sentinel",
             "formal_execution_requires_native_controls": True,
         }
+
+    def _daily_unit_quality_coverage(self) -> dict[str, Any]:
+        if self._daily_unit_quality_cache is not None:
+            return dict(self._daily_unit_quality_cache)
+        daily_files = list((self.snapshot_path / "parquet" / "daily").rglob("*.parquet"))
+        if not daily_files:
+            result = {
+                "policy": "exclude_internally_inconsistent_rows_from_research_history",
+                "excluded_rows": 0,
+                "total_rows": 0,
+                "excluded_ratio": 0.0,
+                "max_excluded_ratio": _MAX_EXCLUDED_DAILY_UNIT_RATIO,
+            }
+            self._daily_unit_quality_cache = result
+            return dict(result)
+        daily = _sql_string(
+            str((self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet").resolve())
+        )
+        predicate = self._invalid_daily_units_predicate("")
+        connection = duckdb.connect()
+        try:
+            row = connection.execute(
+                f"""
+                SELECT count(*) FILTER (WHERE {predicate}), count(*)
+                FROM read_parquet({daily}, hive_partitioning=true)
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+        excluded_rows = int(row[0] or 0) if row is not None else 0
+        total_rows = int(row[1] or 0) if row is not None else 0
+        result = {
+            "policy": "exclude_internally_inconsistent_rows_from_research_history",
+            "excluded_rows": excluded_rows,
+            "total_rows": total_rows,
+            "excluded_ratio": excluded_rows / total_rows if total_rows else 0.0,
+            "max_excluded_ratio": _MAX_EXCLUDED_DAILY_UNIT_RATIO,
+        }
+        self._daily_unit_quality_cache = result
+        return dict(result)
 
     def _write_index_staging(self, by_symbol: Path) -> None:
         index_root = self.snapshot_path / "parquet" / "index_daily"
@@ -1299,27 +1352,27 @@ class QlibBuilder:
                 )}
             FROM joined
             WHERE adj_factor IS NOT NULL AND adj_factor > 0 AND base_price > 0
+              AND NOT ({self._invalid_daily_units_predicate("")})
         """
 
     @staticmethod
-    def _invalid_daily_units_query(daily_glob: Path) -> str:
-        """Reject daily rows whose Tushare amount/hand units imply an impossible VWAP."""
+    def _invalid_daily_units_predicate(alias: str) -> str:
+        """Identify rows whose amount/hand units imply an impossible traded price."""
 
-        daily = _sql_string(str(daily_glob.resolve()))
+        prefix = f"{alias}." if alias else ""
+        vol = f"try_cast({prefix}vol AS DOUBLE)"
+        amount = f"try_cast({prefix}amount AS DOUBLE)"
+        low = f"try_cast({prefix}low AS DOUBLE)"
+        high = f"try_cast({prefix}high AS DOUBLE)"
         return f"""
-            SELECT count(*)
-            FROM read_parquet({daily}, hive_partitioning=true)
-            WHERE try_cast(vol AS DOUBLE) > 0
-              AND (
-                try_cast(amount AS DOUBLE) IS NULL
-                OR try_cast(amount AS DOUBLE) <= 0
-                OR try_cast(low AS DOUBLE) <= 0
-                OR try_cast(high AS DOUBLE) < try_cast(low AS DOUBLE)
-                OR try_cast(amount AS DOUBLE) * 10.0 / try_cast(vol AS DOUBLE)
-                    < try_cast(low AS DOUBLE) * 0.95
-                OR try_cast(amount AS DOUBLE) * 10.0 / try_cast(vol AS DOUBLE)
-                    > try_cast(high AS DOUBLE) * 1.05
-              )
+            {vol} > 0 AND (
+                {amount} IS NULL
+                OR {amount} <= 0
+                OR {low} <= 0
+                OR {high} < {low}
+                OR {amount} * 10.0 / {vol} < {low} * 0.95
+                OR {amount} * 10.0 / {vol} > {high} * 1.05
+            )
         """
 
     def _research_feature_contract(self) -> dict[str, object]:
