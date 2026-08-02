@@ -543,8 +543,12 @@ class QlibBuilder:
                         try_cast(d.trade_date AS DATE) AS trade_date,
                         l.up_limit,
                         l.down_limit
-                    FROM read_parquet({daily}, hive_partitioning=true) d
-                    LEFT JOIN read_parquet({limits}, hive_partitioning=true) l
+                    FROM read_parquet(
+                        {daily}, hive_partitioning=true, union_by_name=true
+                    ) d
+                    LEFT JOIN read_parquet(
+                        {limits}, hive_partitioning=true, union_by_name=true
+                    ) l
                       ON d.ts_code = l.ts_code AND d.trade_date = l.trade_date
                     WHERE d.ts_code IS NOT NULL AND d.close IS NOT NULL
                 )
@@ -607,7 +611,7 @@ class QlibBuilder:
             row = connection.execute(
                 f"""
                 SELECT count(*) FILTER (WHERE {predicate}), count(*)
-                FROM read_parquet({daily}, hive_partitioning=true)
+                FROM read_parquet({daily}, hive_partitioning=true, union_by_name=true)
                 """
             ).fetchone()
         finally:
@@ -675,7 +679,11 @@ class QlibBuilder:
             rows = connection.execute(
                 f"""
                 SELECT ts_code, min(trade_date), max(trade_date)
-                FROM read_parquet({_sql_string(str(daily_glob.resolve()))}, hive_partitioning=true)
+                FROM read_parquet(
+                    {_sql_string(str(daily_glob.resolve()))},
+                    hive_partitioning=true,
+                    union_by_name=true
+                )
                 WHERE ts_code IS NOT NULL AND trade_date IS NOT NULL
                 GROUP BY ts_code ORDER BY ts_code
                 """
@@ -1260,7 +1268,9 @@ class QlibBuilder:
                 for field in daily_features
             )
             daily_join = f"""
-                LEFT JOIN read_parquet({daily_basic}, hive_partitioning=true) db
+                LEFT JOIN read_parquet(
+                    {daily_basic}, hive_partitioning=true, union_by_name=true
+                ) db
                   ON d.ts_code = db.ts_code
                  AND try_cast(d.trade_date AS DATE) = try_cast(db.trade_date AS DATE)
             """
@@ -1285,7 +1295,9 @@ class QlibBuilder:
             fundamental_join += f"""
                 ASOF LEFT JOIN (
                     SELECT {projected}
-                    FROM read_parquet({statement}, hive_partitioning=true)
+                    FROM read_parquet(
+                        {statement}, hive_partitioning=true, union_by_name=true
+                    )
                     WHERE ts_code IS NOT NULL AND try_cast(ann_date AS DATE) IS NOT NULL
                     QUALIFY row_number() OVER (
                         PARTITION BY ts_code, try_cast(ann_date AS DATE)
@@ -1315,10 +1327,10 @@ class QlibBuilder:
                     , first_value(d.close * a.adj_factor) OVER (
                         PARTITION BY d.ts_code ORDER BY d.trade_date
                     ) AS base_price
-                FROM read_parquet({daily}, hive_partitioning=true) d
-                LEFT JOIN read_parquet({adj}, hive_partitioning=true) a
+                FROM read_parquet({daily}, hive_partitioning=true, union_by_name=true) d
+                LEFT JOIN read_parquet({adj}, hive_partitioning=true, union_by_name=true) a
                   ON d.ts_code = a.ts_code AND d.trade_date = a.trade_date
-                LEFT JOIN read_parquet({limits}, hive_partitioning=true) l
+                LEFT JOIN read_parquet({limits}, hive_partitioning=true, union_by_name=true) l
                   ON d.ts_code = l.ts_code AND d.trade_date = l.trade_date
                 {daily_join}
                 {fundamental_join}
@@ -1802,10 +1814,10 @@ class QlibBuilder:
         limits = _sql_string(str(limit_glob.resolve()))
         return f"""
             SELECT count(*)
-            FROM read_parquet({daily}, hive_partitioning=true) d
-            LEFT JOIN read_parquet({adj}, hive_partitioning=true) a
+            FROM read_parquet({daily}, hive_partitioning=true, union_by_name=true) d
+            LEFT JOIN read_parquet({adj}, hive_partitioning=true, union_by_name=true) a
               ON d.ts_code = a.ts_code AND d.trade_date = a.trade_date
-            LEFT JOIN read_parquet({limits}, hive_partitioning=true) l
+            LEFT JOIN read_parquet({limits}, hive_partitioning=true, union_by_name=true) l
               ON d.ts_code = l.ts_code AND d.trade_date = l.trade_date
             WHERE d.ts_code IS NOT NULL AND d.close IS NOT NULL
               AND (

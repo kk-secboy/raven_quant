@@ -871,6 +871,37 @@ def test_bounded_daily_unit_outliers_are_excluded_without_fabricating_vwap(
     assert not (by_symbol / "SZ000002.parquet").exists()
 
 
+def test_fundamental_partitions_allow_optional_ingestion_metadata(tmp_path: Path) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    cashflow = snapshot / "parquet" / "cashflow"
+    first = cashflow / "partition_year=2023"
+    second = cashflow / "partition_year=2024"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    common = {
+        "ts_code": "000001.SZ",
+        "end_date": "2023-09-30",
+        "n_cashflow_act": 100.0,
+        "c_pay_acq_const_fiolta": 20.0,
+    }
+    pd.DataFrame(
+        [{**common, "ann_date": "2023-12-31", "ingested_at": "2024-01-01T00:00:00Z"}]
+    ).to_parquet(first / "data.parquet")
+    pd.DataFrame([{**common, "ann_date": "2024-01-01"}]).to_parquet(
+        second / "data.parquet"
+    )
+
+    by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+    frame = pd.read_parquet(by_symbol / "SZ000001.parquet")
+
+    assert "fund_ocf_net" in frame.columns
+
+
 def test_rejects_tampered_snapshot_content(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshot"
     source = snapshot / "parquet" / "daily" / "data.parquet"
