@@ -62,6 +62,8 @@ _BASE_QLIB_FIELDS = (
 )
 
 _GOVERNED_BENCHMARK = "000300.SH"
+_UNKNOWN_INDUSTRY = "__UNKNOWN__"
+_MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO = 0.01
 
 _DAILY_RESEARCH_FIELDS = (
     "turnover_rate",
@@ -391,6 +393,11 @@ class QlibBuilder:
             "field_units": field_units,
             "research_features": self.research_feature_contract,
             "eligibility_contract_version": ELIGIBILITY_CONTRACT_VERSION,
+            "industry_missing_value_policy": {
+                "label": _UNKNOWN_INDUSTRY,
+                "max_benchmark_weight_ratio": _MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO,
+                "method": "bounded_source_gap_intervals_without_future_fill",
+            },
         }
         contract_sha256 = hashlib.sha256(
             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -430,6 +437,11 @@ class QlibBuilder:
             "field_units": field_units,
             "research_features": self.research_feature_contract,
             "eligibility_contract_version": ELIGIBILITY_CONTRACT_VERSION,
+            "industry_missing_value_policy": {
+                "label": _UNKNOWN_INDUSTRY,
+                "max_benchmark_weight_ratio": _MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO,
+                "method": "bounded_source_gap_intervals_without_future_fill",
+            },
         }
         canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         provenance = {
@@ -619,6 +631,14 @@ class QlibBuilder:
                 metadata.drop_duplicates(
                     ["instrument", "industry", "in_date", "out_date"], inplace=True
                 )
+                unknown = self._unknown_benchmark_industry_memberships(metadata)
+                if not unknown.empty:
+                    metadata = pd.concat([metadata, unknown], ignore_index=True)
+                    logger.warning(
+                        "assigned %s source-gap intervals to explicit industry %s",
+                        len(unknown),
+                        _UNKNOWN_INDUSTRY,
+                    )
                 metadata.sort_values(["instrument", "in_date", "industry"], inplace=True)
                 if not metadata.empty:
                     target.mkdir(parents=True, exist_ok=True)
@@ -701,6 +721,103 @@ class QlibBuilder:
 
         if not wrote_metadata and target.exists() and not any(target.iterdir()):
             target.rmdir()
+
+    def _unknown_benchmark_industry_memberships(
+        self, metadata: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Represent small provider gaps without future-filling classifications.
+
+        Tushare occasionally leaves an interval between two historical Shenwan
+        classifications.  Forward/back-filling an adjacent industry would
+        introduce look-ahead or stale-classification bias.  For constituents
+        affected on governed-benchmark weight dates, emit an explicit unknown
+        interval bounded by the surrounding source intervals instead.
+        """
+
+        weight_source = self.snapshot_path / "parquet" / "index_weight"
+        weight_files = (
+            sorted(weight_source.rglob("*.parquet"))
+            if weight_source.exists()
+            else []
+        )
+        if not weight_files or metadata.empty:
+            return pd.DataFrame(columns=metadata.columns)
+        weights = pd.concat(
+            [pd.read_parquet(path) for path in weight_files], ignore_index=True
+        )
+        required = {"index_code", "con_code", "trade_date", "weight"}
+        if not required.issubset(weights.columns):
+            return pd.DataFrame(columns=metadata.columns)
+        weights = pd.DataFrame(
+            {
+                "benchmark": weights["index_code"].astype("string").str.upper().str.strip(),
+                "instrument": weights["con_code"].map(_qlib_symbol),
+                "datetime": pd.to_datetime(weights["trade_date"], errors="coerce"),
+                "weight": pd.to_numeric(weights["weight"], errors="coerce"),
+            }
+        ).dropna()
+        weights = weights[
+            (weights["benchmark"] == _GOVERNED_BENCHMARK)
+            & (weights["weight"] > 0)
+        ]
+        weights.drop_duplicates(["instrument", "datetime"], keep="last", inplace=True)
+        if weights.empty:
+            return pd.DataFrame(columns=metadata.columns)
+
+        normalized = metadata.copy()
+        normalized["in_date"] = pd.to_datetime(normalized["in_date"], errors="coerce")
+        normalized["out_date"] = pd.to_datetime(normalized["out_date"], errors="coerce")
+        rows: list[dict[str, Any]] = []
+        for instrument, observations in weights.groupby("instrument", sort=True):
+            known = normalized[normalized["instrument"] == instrument].sort_values(
+                "in_date"
+            )
+            dates = sorted(pd.Timestamp(value).normalize() for value in observations["datetime"])
+            missing = [
+                value
+                for value in dates
+                if known[
+                    (known["in_date"] <= value)
+                    & (known["out_date"].isna() | (known["out_date"] >= value))
+                ].empty
+            ]
+            if not missing:
+                continue
+            first_missing = min(missing)
+            intervals: set[tuple[pd.Timestamp, pd.Timestamp | None]] = set()
+            for value in missing:
+                previous = known.loc[known["out_date"].notna() & (known["out_date"] < value)]
+                following = known.loc[known["in_date"] > value]
+                start = (
+                    pd.Timestamp(previous["out_date"].max()).normalize()
+                    + pd.Timedelta(days=1)
+                    if not previous.empty
+                    else first_missing
+                )
+                end = (
+                    pd.Timestamp(following["in_date"].min()).normalize()
+                    - pd.Timedelta(days=1)
+                    if not following.empty
+                    else None
+                )
+                intervals.add((start, end))
+            rows.extend(
+                {
+                    "instrument": instrument,
+                    "industry": _UNKNOWN_INDUSTRY,
+                    "in_date": start,
+                    "out_date": end,
+                }
+                for start, end in sorted(
+                    intervals,
+                    key=lambda item: (item[0], item[1] or pd.Timestamp.max),
+                )
+            )
+        result = pd.DataFrame(rows, columns=metadata.columns)
+        if not result.empty:
+            result["in_date"] = pd.to_datetime(result["in_date"])
+            result["out_date"] = pd.to_datetime(result["out_date"])
+        return result
 
     def _build_style_exposures(self, daily_basic: pd.DataFrame) -> pd.DataFrame:
         """Extended Barra-style exposure panel with a backward-compatible schema.
@@ -1406,12 +1523,13 @@ class QlibBuilder:
                 )
             ),
             constituents AS (
-                SELECT DISTINCT w.weight_date, w.instrument
+                SELECT w.weight_date, w.instrument, max(w.weight) AS weight
                 FROM weight_rows w
                 WHERE w.benchmark = {benchmark}
                   AND w.instrument IS NOT NULL
                   AND w.weight_date IS NOT NULL
                   AND w.weight > 0
+                GROUP BY w.weight_date, w.instrument
             ),
             industry_rows AS (
                 SELECT
@@ -1429,13 +1547,22 @@ class QlibBuilder:
                 SELECT
                     c.weight_date,
                     c.instrument,
+                    c.weight,
                     count(i.instrument) > 0 AS covered
                 FROM constituents c
                 LEFT JOIN industry_rows i
                   ON i.instrument = c.instrument
                  AND i.in_date <= c.weight_date
                  AND (i.out_date IS NULL OR i.out_date >= c.weight_date)
-                GROUP BY c.weight_date, c.instrument
+                GROUP BY c.weight_date, c.instrument, c.weight
+            ),
+            date_coverage AS (
+                SELECT
+                    weight_date,
+                    sum(weight) AS total_weight,
+                    coalesce(sum(weight) FILTER (WHERE NOT covered), 0) AS missing_weight
+                FROM coverage
+                GROUP BY weight_date
             )
             SELECT
                 count(*) AS total_rows,
@@ -1451,7 +1578,11 @@ class QlibBuilder:
                         ORDER BY weight_date, instrument
                         LIMIT 10
                     ) examples
-                ) AS examples
+                ) AS examples,
+                (
+                    SELECT max(missing_weight / nullif(total_weight, 0))
+                    FROM date_coverage
+                ) AS max_missing_weight_ratio
             FROM coverage
         """
         connection = duckdb.connect()
@@ -1471,11 +1602,26 @@ class QlibBuilder:
         benchmark_dates = int(row[1] or 0)
         first_missing_date = row[3]
         examples = str(row[4] or "")
+        max_missing_weight_ratio = float(row[5] or 0.0)
+        if max_missing_weight_ratio <= _MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO:
+            logger.warning(
+                "index_member_all has %s/%s uncovered %s constituent-date rows; "
+                "maximum missing benchmark weight %.4f%% is within the %.2f%% "
+                "explicit-unknown limit",
+                missing_rows,
+                total_rows,
+                _GOVERNED_BENCHMARK,
+                max_missing_weight_ratio * 100.0,
+                _MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO * 100.0,
+            )
+            return None
         return (
             f"index_member_all has no active point-in-time industry for "
             f"{missing_rows}/{total_rows} {_GOVERNED_BENCHMARK} constituent-date "
             f"rows across {benchmark_dates} benchmark dates; first affected date "
-            f"{first_missing_date}: {examples}"
+            f"{first_missing_date}; maximum missing benchmark weight "
+            f"{max_missing_weight_ratio:.4%} exceeds "
+            f"{_MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO:.2%}: {examples}"
         )
 
     @staticmethod

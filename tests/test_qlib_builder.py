@@ -410,6 +410,64 @@ def test_rejects_incomplete_historical_benchmark_industry_coverage(
         QlibBuilder(snapshot).build_staging(tmp_path / "staging")
 
 
+def test_accepts_bounded_unknown_benchmark_industry_weight(tmp_path: Path) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    weight_path = (
+        snapshot
+        / "parquet"
+        / "index_weight"
+        / "partition_year=2024"
+        / "research.parquet"
+    )
+    membership_path = (
+        snapshot
+        / "parquet"
+        / "index_member_all"
+        / "partition_year=2024"
+        / "research.parquet"
+    )
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "l1_code": "801780.SI",
+                "in_date": "2021-01-01",
+                "out_date": None,
+            },
+            {
+                "ts_code": "600000.SH",
+                "l1_code": "801780.SI",
+                "in_date": "2024-02-01",
+                "out_date": None,
+            },
+        ]
+    ).to_parquet(membership_path)
+    pd.DataFrame(
+        [
+            {
+                "index_code": "000300.SH",
+                "con_code": instrument,
+                "trade_date": trade_date,
+                "weight": weight,
+            }
+            for trade_date in ("2024-01-02", "2024-03-01")
+            for instrument, weight in (
+                ("000001.SZ", 99.5),
+                ("600000.SH", 0.5),
+            )
+        ]
+    ).to_parquet(weight_path)
+
+    by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+    assert (by_symbol / "SZ000001.parquet").exists()
+
+
 def test_adds_normalized_index_staging(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshot"
     daily_dir = snapshot / "parquet" / "daily" / "partition_year=2024"
@@ -507,8 +565,14 @@ def test_writes_point_in_time_industry_metadata(tmp_path: Path) -> None:
                 "index_code": "000300.SH",
                 "con_code": "000001.SZ",
                 "trade_date": "20240131",
-                "weight": 4.5,
-            }
+                "weight": 99.5,
+            },
+            {
+                "index_code": "000300.SH",
+                "con_code": "600001.SH",
+                "trade_date": "20240131",
+                "weight": 0.5,
+            },
         ]
     ).to_parquet(weights_source / "weights.parquet")
     style_source = snapshot / "parquet" / "daily_basic"
@@ -541,13 +605,16 @@ def test_writes_point_in_time_industry_metadata(tmp_path: Path) -> None:
     QlibBuilder(snapshot)._write_portfolio_metadata(qlib_dir)
 
     metadata = pd.read_parquet(qlib_dir / "metadata" / "industry_memberships.parquet")
-    assert metadata["instrument"].tolist() == ["SH600000", "SZ000001"]
-    assert metadata["industry"].tolist() == ["801780.SI", "801780.SI"]
+    assert metadata["instrument"].tolist() == ["SH600000", "SH600001", "SZ000001"]
+    assert metadata.loc[
+        metadata["instrument"] == "SH600001", "industry"
+    ].tolist() == ["__UNKNOWN__"]
     assert metadata.loc[metadata["instrument"] == "SH600000", "out_date"].notna().all()
     weights = pd.read_parquet(qlib_dir / "metadata" / "benchmark_weights.parquet")
-    assert weights.loc[0, "benchmark"] == "SH000300"
-    assert weights.loc[0, "instrument"] == "SZ000001"
-    assert weights.loc[0, "weight"] == pytest.approx(0.045)
+    assert set(weights["benchmark"]) == {"SH000300"}
+    assert weights.loc[weights["instrument"] == "SZ000001", "weight"].iloc[0] == pytest.approx(
+        0.995
+    )
     styles = pd.read_parquet(qlib_dir / "metadata" / "style_exposures.parquet")
     assert styles.loc[0, "instrument"] == "SZ000001"
     assert styles.loc[0, "log_market_cap"] == pytest.approx(11.736069, rel=1e-6)
