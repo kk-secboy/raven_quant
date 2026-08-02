@@ -1363,6 +1363,25 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(409, f"{purpose}: {exc}") from exc
         return dataset
 
+    def require_native_execution_controls(
+        dataset: dict[str, Any], *, start: date, purpose: str
+    ) -> None:
+        controls = (dataset.get("provenance") or {}).get("execution_controls") or {}
+        if not controls.get("formal_execution_requires_native_controls"):
+            return
+        native_complete_from = str(controls.get("native_complete_from") or "")[:10]
+        if not native_complete_from:
+            raise HTTPException(
+                409,
+                f"{purpose} requires a dated native execution-control boundary",
+            )
+        if start.isoformat() < native_complete_from:
+            raise HTTPException(
+                409,
+                f"{purpose} starts before native execution controls are complete "
+                f"({native_complete_from})",
+            )
+
     def require_research_calendar(dataset: dict, periods: dict[str, str]) -> None:
         calendar_path = Path(dataset["path"]) / "calendars" / "day.txt"
         try:
@@ -2394,6 +2413,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         dataset = require_qlib_dataset(
             payload.dataset, purpose="parameter experiment", frequency="day"
         )
+        require_native_execution_controls(
+            dataset, start=payload.start, purpose="parameter experiment"
+        )
         if dataset.get("start_date") and payload.start.isoformat() < dataset["start_date"]:
             raise HTTPException(409, "experiment starts before the selected dataset")
         if dataset.get("end_date") and payload.end.isoformat() > dataset["end_date"]:
@@ -2475,6 +2497,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def create_strategy_backtest(version_id: str, payload: StrategyBacktestRequest) -> dict:
         dataset = require_qlib_dataset(
             payload.dataset, purpose="strategy backtest", frequency="day"
+        )
+        require_native_execution_controls(
+            dataset, start=payload.start, purpose="strategy backtest"
         )
         if dataset.get("start_date") and payload.start.isoformat() < dataset["start_date"]:
             raise HTTPException(409, "backtest starts before the selected dataset")
@@ -2643,6 +2668,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     ) -> dict:
         dataset = require_qlib_dataset(
             payload.dataset, purpose="pair strategy backtest", frequency="day"
+        )
+        require_native_execution_controls(
+            dataset, start=payload.start, purpose="pair strategy backtest"
         )
         if dataset.get("start_date") and payload.start.isoformat() < dataset["start_date"]:
             raise HTTPException(409, "backtest starts before the selected daily dataset")

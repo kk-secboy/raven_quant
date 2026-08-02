@@ -104,6 +104,21 @@ def main() -> None:
         "valid": (calendar[train_end], calendar[valid_end - 1]),
         "test": (calendar[valid_end], calendar[-1]),
     }
+    execution_controls = dataset_provenance.get("execution_controls") or {}
+    native_complete_from = execution_controls.get("native_complete_from")
+    if execution_controls.get("formal_execution_requires_native_controls"):
+        if not native_complete_from:
+            raise RuntimeError(
+                "Qlib baseline requires a dated native execution-control boundary"
+            )
+        native_start = pd.Timestamp(native_complete_from)
+    else:
+        native_start = pd.Timestamp(segments["test"][0])
+    backtest_start = max(pd.Timestamp(segments["test"][0]), native_start)
+    if sum(value >= backtest_start for value in calendar) < 30:
+        raise RuntimeError(
+            "Qlib dataset has fewer than 30 trading days with native execution controls"
+        )
     handler = Alpha158(
         start_time=calendar[0],
         end_time=calendar[-1],
@@ -163,7 +178,7 @@ def main() -> None:
     strategy = TopkDropoutStrategy(signal=predictions, topk=args.topk, n_drop=args.n_drop)
     backtest_end = calendar[-2]
     report, positions = backtest_daily(
-        start_time=segments["test"][0],
+        start_time=backtest_start,
         end_time=backtest_end,
         strategy=strategy,
         account=args.account,
@@ -210,6 +225,7 @@ def main() -> None:
             for name, bounds in segments.items()
         },
         "backtest_end": str(pd.Timestamp(backtest_end).date()),
+        "backtest_start": str(backtest_start.date()),
         "metrics": metrics,
         "training_metrics": {key: finite(value) for key, value in training_metrics.items()},
         "provenance": {
@@ -218,6 +234,7 @@ def main() -> None:
             "qlib_builder_sha256": dataset_provenance.get("qlib_builder_sha256"),
             "qlib_version": workflow.identity_dict()["qlib_version"],
             "qlib_commit": workflow.identity_dict()["qlib_commit"],
+            "execution_controls_complete_from": native_complete_from,
             "baseline_config_sha256": hashlib.sha256(
                 json.dumps(
                     {

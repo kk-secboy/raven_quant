@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 from collections.abc import Callable, Collection
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +64,7 @@ _BASE_QLIB_FIELDS = (
 _GOVERNED_BENCHMARK = "000300.SH"
 _UNKNOWN_INDUSTRY = "__UNKNOWN__"
 _MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO = 0.01
+_UNRESTRICTED_UP_LIMIT = 99999.99
 
 _DAILY_RESEARCH_FIELDS = (
     "turnover_rate",
@@ -236,12 +237,13 @@ class QlibBuilder:
         connection = duckdb.connect()
         try:
             query = self._normalized_query(daily_glob, adj_glob, limit_glob)
-            missing = connection.execute(
+            invalid = connection.execute(
                 self._missing_market_controls_query(daily_glob, adj_glob, limit_glob)
             ).fetchone()[0]
-            if missing:
+            if invalid:
                 raise RuntimeError(
-                    f"{missing} daily rows have no valid adjustment factor or price limits"
+                    f"{invalid} daily rows have an invalid adjustment factor or "
+                    "partial/malformed price limits"
                 )
             invalid_units = connection.execute(
                 self._invalid_daily_units_query(daily_glob)
@@ -380,6 +382,7 @@ class QlibBuilder:
         builder_digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         fields = list(self.qlib_fields)
         field_units = self._field_units()
+        execution_controls = self._execution_control_coverage()
         contract = {
             "version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
             "frequency": "day",
@@ -398,6 +401,7 @@ class QlibBuilder:
                 "max_benchmark_weight_ratio": _MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO,
                 "method": "bounded_source_gap_intervals_without_future_fill",
             },
+            "execution_controls": execution_controls,
         }
         contract_sha256 = hashlib.sha256(
             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -442,6 +446,7 @@ class QlibBuilder:
                 "max_benchmark_weight_ratio": _MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO,
                 "method": "bounded_source_gap_intervals_without_future_fill",
             },
+            "execution_controls": execution_controls,
         }
         canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         provenance = {
@@ -493,6 +498,78 @@ class QlibBuilder:
                 if _sha256_file(target) != item.get("sha256"):
                     raise ValueError(f"snapshot file digest mismatch: {relative.as_posix()}")
         return hashlib.sha256(snapshot_manifest.read_bytes()).hexdigest()
+
+    def _execution_control_coverage(self) -> dict[str, Any]:
+        daily_files = list((self.snapshot_path / "parquet" / "daily").rglob("*.parquet"))
+        limit_files = list((self.snapshot_path / "parquet" / "stk_limit").rglob("*.parquet"))
+        if not daily_files or not limit_files:
+            return {
+                "source": "native_stk_limit",
+                "missing_rows": 0,
+                "total_rows": 0,
+                "first_missing_date": None,
+                "last_missing_date": None,
+                "native_complete_from": None,
+                "missing_row_policy": "research_only_unrestricted_sentinel",
+                "formal_execution_requires_native_controls": True,
+            }
+        daily = _sql_string(
+            str((self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet").resolve())
+        )
+        limits = _sql_string(
+            str(
+                (self.snapshot_path / "parquet" / "stk_limit" / "**" / "*.parquet").resolve()
+            )
+        )
+        connection = duckdb.connect()
+        try:
+            row = connection.execute(
+                f"""
+                WITH coverage AS (
+                    SELECT
+                        try_cast(d.trade_date AS DATE) AS trade_date,
+                        l.up_limit,
+                        l.down_limit
+                    FROM read_parquet({daily}, hive_partitioning=true) d
+                    LEFT JOIN read_parquet({limits}, hive_partitioning=true) l
+                      ON d.ts_code = l.ts_code AND d.trade_date = l.trade_date
+                    WHERE d.ts_code IS NOT NULL AND d.close IS NOT NULL
+                )
+                SELECT
+                    count(*) FILTER (
+                        WHERE up_limit IS NULL AND down_limit IS NULL
+                    ) AS missing_rows,
+                    min(trade_date) FILTER (
+                        WHERE up_limit IS NULL AND down_limit IS NULL
+                    ) AS first_missing_date,
+                    max(trade_date) FILTER (
+                        WHERE up_limit IS NULL AND down_limit IS NULL
+                    ) AS last_missing_date,
+                    count(*) AS total_rows
+                FROM coverage
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+        missing_rows = int(row[0] or 0) if row is not None else 0
+        first_missing = row[1] if row is not None else None
+        last_missing = row[2] if row is not None else None
+        total_rows = int(row[3] or 0) if row is not None else 0
+        native_complete_from = (
+            (last_missing + timedelta(days=1)).isoformat()
+            if last_missing is not None
+            else None
+        )
+        return {
+            "source": "native_stk_limit",
+            "missing_rows": missing_rows,
+            "total_rows": total_rows,
+            "first_missing_date": str(first_missing) if first_missing is not None else None,
+            "last_missing_date": str(last_missing) if last_missing is not None else None,
+            "native_complete_from": native_complete_from,
+            "missing_row_policy": "research_only_unrestricted_sentinel",
+            "formal_execution_requires_native_controls": True,
+        }
 
     def _write_index_staging(self, by_symbol: Path) -> None:
         index_root = self.snapshot_path / "parquet" / "index_daily"
@@ -1178,8 +1255,8 @@ class QlibBuilder:
                     d.amount,
                     d.pct_chg,
                     a.adj_factor,
-                    l.up_limit,
-                    l.down_limit
+                    coalesce(l.up_limit, {_UNRESTRICTED_UP_LIMIT}) AS up_limit,
+                    coalesce(l.down_limit, 0.0) AS down_limit
                     {joined_daily_select}
                     {joined_fundamental_select}
                     , first_value(d.close * a.adj_factor) OVER (
@@ -1680,8 +1757,10 @@ class QlibBuilder:
             WHERE d.ts_code IS NOT NULL AND d.close IS NOT NULL
               AND (
                 a.adj_factor IS NULL OR a.adj_factor <= 0
-                OR l.up_limit IS NULL OR l.down_limit IS NULL
+                OR ((l.up_limit IS NULL) <> (l.down_limit IS NULL))
                 OR (
+                  l.up_limit IS NOT NULL AND l.down_limit IS NOT NULL
+                  AND
                   (l.up_limit <= 0 OR l.down_limit <= 0)
                   AND NOT (l.up_limit >= 99999.0 AND l.down_limit = 0)
                 )

@@ -154,3 +154,65 @@ def test_api_creates_a_bounded_parameter_experiment_job(
     assert created["trial_count"] == 2
     assert created["periods"]["out_of_sample"]["start"] > created["periods"]["in_sample"]["end"]
     assert detail.status_code == 200
+
+
+def test_parameter_experiment_rejects_research_only_execution_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, database_url: str
+) -> None:
+    version_id = create_strategy_version(database_url, tmp_path, dataset="bounded-snapshot")
+    data_root = tmp_path / "data"
+    dataset = data_root / "qlib" / "bounded-snapshot"
+    (dataset / "calendars").mkdir(parents=True)
+    (dataset / "instruments").mkdir()
+    (dataset / "features").mkdir()
+    (dataset / "metadata").mkdir()
+    (dataset / "calendars" / "day.txt").write_text(
+        "2018-01-01\n2020-12-31\n", encoding="utf-8"
+    )
+    (dataset / "instruments" / "cn_all.txt").write_text(
+        "SH600000\t2018-01-01\t2020-12-31\n", encoding="utf-8"
+    )
+    (dataset / "metadata" / "provenance.json").write_text(
+        json.dumps(
+            {
+                "frequency": "day",
+                "dataset_identity_sha256": "a" * 64,
+                "snapshot_manifest_sha256": "b" * 64,
+                "qlib_builder_sha256": "c" * 64,
+                "field_contract_version": "daily-qlib-field-v3-cny-amount",
+                "source_volume_unit": "hand",
+                "qlib_volume_unit": "share",
+                "source_amount_unit": "thousand_cny",
+                "qlib_amount_unit": "cny",
+                "source_hand_size": 100,
+                "index_volume_policy": "excluded_non_tradable_benchmark",
+                "lineage_verified": True,
+                "execution_controls": {
+                    "native_complete_from": "2020-01-01",
+                    "formal_execution_requires_native_controls": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DATA_ROOT", str(data_root))
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
+
+    with TestClient(create_app(tmp_path)) as client:
+        response = client.post(
+            f"/api/strategy-versions/{version_id}/parameter-experiments",
+            json={
+                "dataset": "bounded-snapshot",
+                "start": "2019-01-01",
+                "end": "2020-12-31",
+                "parameter_grid": {"topk": [30]},
+                "max_trials": 1,
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "parameter experiment starts before native execution controls are complete "
+        "(2020-01-01)"
+    )

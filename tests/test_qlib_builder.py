@@ -309,6 +309,46 @@ def test_accepts_tushare_unrestricted_price_limit_sentinel(tmp_path: Path) -> No
     assert frame["down_limit"].iloc[0] == 0.0
 
 
+def test_missing_native_price_limits_are_research_only_unrestricted_rows(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    limit_path = snapshot / "parquet" / "stk_limit" / "partition_year=2024" / "data.parquet"
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "000002.SZ",
+                "trade_date": "2024-01-02",
+                "up_limit": 11.0,
+                "down_limit": 9.0,
+            }
+        ]
+    ).to_parquet(limit_path)
+
+    builder = QlibBuilder(snapshot)
+    by_symbol = builder.build_staging(tmp_path / "staging")
+    frame = pd.read_parquet(by_symbol / "SZ000001.parquet")
+    coverage = builder._execution_control_coverage()
+
+    assert frame["up_limit"].iloc[0] == pytest.approx(9999.999)
+    assert frame["down_limit"].iloc[0] == 0.0
+    assert coverage == {
+        "source": "native_stk_limit",
+        "missing_rows": 1,
+        "total_rows": 1,
+        "first_missing_date": "2024-01-02",
+        "last_missing_date": "2024-01-02",
+        "native_complete_from": "2024-01-03",
+        "missing_row_policy": "research_only_unrestricted_sentinel",
+        "formal_execution_requires_native_controls": True,
+    }
+
+
 def test_rejects_non_sentinel_zero_price_limit(tmp_path: Path) -> None:
     snapshot = _write_market_control_snapshot(
         tmp_path,
