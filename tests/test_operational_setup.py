@@ -58,6 +58,33 @@ def test_compose_bounds_every_service_log_file() -> None:
     ) == 4
 
 
+def test_worker_accepts_every_supplemental_download_bundle() -> None:
+    root = Path(__file__).resolve().parents[1]
+    compose = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+    bundles = {
+        "cn_extended_daily",
+        "cn_funds",
+        "cn_macro",
+        "cn_institutional",
+        "cn_futures",
+        "cn_options_bonds",
+        "hk_market",
+        "us_market",
+        "global_markets",
+        "cn_governance_risk",
+        "cn_capital_flow",
+        "cn_fund_index_enhanced",
+        "cn_derivatives_enhanced",
+        "global_rates_enhanced",
+        "research_corpus",
+        "strategy_specialty",
+        "strategy_specialty_minutes",
+    }
+
+    for bundle in bundles:
+        assert f"supplemental_{bundle}" in compose
+
+
 def test_factor_sandbox_is_seeded_offline_from_the_release_worker() -> None:
     root = Path(__file__).resolve().parents[1]
     compose = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
