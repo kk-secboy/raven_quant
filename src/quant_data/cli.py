@@ -245,9 +245,7 @@ def _run_paginated_specs(
     inserted = context.checkpoint.add(specs)
     datasets = {spec.dataset for spec in specs}
     ignored_keys: set[str] = set()
-    recovery_specs, recovered_keys = _pagination_overflow_recovery(
-        context, specs, ignored_keys
-    )
+    recovery_specs, recovered_keys = _pagination_overflow_recovery(context, specs, ignored_keys)
     if recovered_keys:
         ignored_keys.update(recovered_keys)
         known = {spec.unit_key for spec in specs}
@@ -257,9 +255,7 @@ def _run_paginated_specs(
     _run_phase(context, label, datasets)
 
     while True:
-        recovery_specs, recovered_keys = _pagination_overflow_recovery(
-            context, specs, ignored_keys
-        )
+        recovery_specs, recovered_keys = _pagination_overflow_recovery(context, specs, ignored_keys)
         if recovered_keys:
             ignored_keys.update(recovered_keys)
             known = {spec.unit_key for spec in specs}
@@ -290,9 +286,7 @@ def _run_paginated_specs(
             return specs, rows, inserted
 
         specs.extend(next_specs)
-        recovery_specs, recovered_keys = _pagination_overflow_recovery(
-            context, specs, ignored_keys
-        )
+        recovery_specs, recovered_keys = _pagination_overflow_recovery(context, specs, ignored_keys)
         if recovered_keys:
             ignored_keys.update(recovered_keys)
             known = {spec.unit_key for spec in specs}
@@ -315,6 +309,8 @@ _RANGE_REUSE_DATASETS = {
     "moneyflow_mkt_dc",
     "etf_sh_cons",
     "etf_sz_cons",
+    "cyq_perf",
+    "cyq_chips",
 }
 
 
@@ -333,9 +329,7 @@ def _reconcile_range_plan(context: Context, specs: list[FetchSpec]) -> list[Fetc
         dataset: context.checkpoint.successful(dataset)
         for dataset in {spec.dataset for spec in targets}
     }
-    success_index: dict[
-        str, dict[tuple[tuple[str, object], ...], list[FetchSpec]]
-    ] = {}
+    success_index: dict[str, dict[tuple[tuple[str, object], ...], list[FetchSpec]]] = {}
     for dataset, rows in rows_by_dataset.items():
         by_identity: dict[tuple[tuple[str, object], ...], list[FetchSpec]] = {}
         for candidate in _complete_success_specs(rows):
@@ -381,16 +375,12 @@ def _reconcile_range_plan(context: Context, specs: list[FetchSpec]) -> list[Fetc
                 target_start,
                 target_end,
             )
-            covered.update(
-                value for value in values if candidate_start <= value <= candidate_end
-            )
+            covered.update(value for value in values if candidate_start <= value <= candidate_end)
         segment: list[date] = []
         for value in values:
             if value in covered:
                 if segment:
-                    replacements.append(
-                        resize_partition_spec(target, segment[0], segment[-1])
-                    )
+                    replacements.append(resize_partition_spec(target, segment[0], segment[-1]))
                     segment = []
             else:
                 segment.append(value)
@@ -412,6 +402,22 @@ def _reconcile_range_plan(context: Context, specs: list[FetchSpec]) -> list[Fetc
     return planned
 
 
+def _supersede_unsupported_governance_units(context: Context) -> int:
+    stale: list[str] = []
+    for dataset in ("ccass_hold", "ccass_hold_detail"):
+        for row in context.checkpoint.unfinished_units(dataset):
+            params = dict(row.get("params_json") or {})
+            requested_date = str(
+                params.get("trade_date") or params.get("start_date") or params.get("end_date") or ""
+            ).replace("-", "")[:8]
+            if requested_date and requested_date < "20160101":
+                stale.append(str(row["unit_key"]))
+    return context.checkpoint.supersede_units(
+        stale,
+        "provider does not support CCASS history before 2016",
+    )
+
+
 def _complete_success_specs(rows: list[dict]) -> list[FetchSpec]:
     specs_by_group: dict[str, list[tuple[FetchSpec, int]]] = {}
     result: list[FetchSpec] = []
@@ -421,9 +427,7 @@ def _complete_success_specs(rows: list[dict]) -> list[FetchSpec]:
         if not group:
             result.append(spec)
             continue
-        specs_by_group.setdefault(str(group), []).append(
-            (spec, int(row.get("row_count") or 0))
-        )
+        specs_by_group.setdefault(str(group), []).append((spec, int(row.get("row_count") or 0)))
     for pages in specs_by_group.values():
         ordered = sorted(pages, key=lambda item: int(item[0].scope.get("offset") or 0))
         if ordered[-1][1] < int(ordered[-1][0].scope["page_size"]):
@@ -493,14 +497,9 @@ def _share_float_overflow_recovery(
     for child in context.checkpoint.dataset_units("share_float"):
         if str(child.get("status")) == "superseded":
             continue
-        parent_group = str(
-            dict(child.get("scope_json") or {}).get("supersedes_page_group")
-            or ""
-        )
+        parent_group = str(dict(child.get("scope_json") or {}).get("supersedes_page_group") or "")
         if parent_group:
-            replacements_by_parent.setdefault(parent_group, []).append(
-                _checkpoint_row_spec(child)
-            )
+            replacements_by_parent.setdefault(parent_group, []).append(_checkpoint_row_spec(child))
     recovery_specs: list[FetchSpec] = []
     recovered_keys: set[str] = set()
     stock_master: pd.DataFrame | None = None
@@ -545,9 +544,7 @@ def _share_float_overflow_recovery(
                 start=partition_date,
                 end=partition_date,
             )
-        recovery_specs.extend(
-            share_float_overflow_repartition_specs(failed_spec, symbols)
-        )
+        recovery_specs.extend(share_float_overflow_repartition_specs(failed_spec, symbols))
         recovered_keys.add(failed_spec.unit_key)
         context.checkpoint.supersede_units(
             [failed_spec.unit_key],
@@ -563,9 +560,7 @@ def _pagination_overflow_recovery(
 ) -> tuple[list[FetchSpec], set[str]]:
     """Recover every provider offset cap using a smaller documented partition."""
 
-    recovery_specs, recovered_keys = _share_float_overflow_recovery(
-        context, specs, ignored_keys
-    )
+    recovery_specs, recovered_keys = _share_float_overflow_recovery(context, specs, ignored_keys)
     rows_by_key = {
         str(row["unit_key"]): row
         for row in context.checkpoint.unit_rows(spec.unit_key for spec in specs)
@@ -604,9 +599,7 @@ def _pagination_overflow_recovery(
         error = str(row.get("last_error") or "")
         offset = int(failed_spec.params.get("offset") or 0)
         normalized_error = error.replace("-", " ")
-        if offset < 100_000 or (
-            "code=50101" not in error and "offset cap" not in normalized_error
-        ):
+        if offset < 100_000 or ("code=50101" not in error and "offset cap" not in normalized_error):
             continue
 
         if (
@@ -614,14 +607,10 @@ def _pagination_overflow_recovery(
             and failed_spec.params.get("start_date")
             and failed_spec.params.get("end_date")
         ):
-            recovery_specs.extend(
-                etf_constituent_overflow_repartition_specs(failed_spec)
-            )
+            recovery_specs.extend(etf_constituent_overflow_repartition_specs(failed_spec))
         else:
             if etf_master is None:
-                etf_master = context.storage.read_units(
-                    context.checkpoint.successful("etf_basic")
-                )
+                etf_master = context.storage.read_units(context.checkpoint.successful("etf_basic"))
                 if "ts_code" not in etf_master.columns:
                     raise RuntimeError(
                         "etf_basic did not provide ts_code for constituent overflow recovery"
@@ -631,9 +620,7 @@ def _pagination_overflow_recovery(
                 dataset=failed_spec.dataset,
                 trade_date=str(failed_spec.params["trade_date"]),
             )
-            recovery_specs.extend(
-                etf_constituent_overflow_repartition_specs(failed_spec, symbols)
-            )
+            recovery_specs.extend(etf_constituent_overflow_repartition_specs(failed_spec, symbols))
         recovered_keys.add(failed_spec.unit_key)
         context.checkpoint.supersede_units(
             [failed_spec.unit_key],
@@ -673,9 +660,7 @@ def _full_page_partition_recovery(
         current = max(pages, key=lambda item: int(item.scope.get("offset") or 0))
         page_size = int(current.scope["page_size"])
         page_index = int(
-            current.scope.get(
-                "page_index", int(current.scope.get("offset") or 0) // page_size
-            )
+            current.scope.get("page_index", int(current.scope.get("offset") or 0) // page_size)
         )
         share_float_cap = (
             current.dataset == "share_float"
@@ -696,9 +681,7 @@ def _full_page_partition_recovery(
                     start=partition_date,
                     end=partition_date,
                 )
-            children.extend(
-                share_float_overflow_repartition_specs(current, symbols)
-            )
+            children.extend(share_float_overflow_repartition_specs(current, symbols))
             recovered.add(current.unit_key)
             context.checkpoint.supersede_units(
                 [page.unit_key for page in pages],
@@ -719,9 +702,7 @@ def _full_page_partition_recovery(
     return children, recovered
 
 
-def _eligible_etf_symbols(
-    master: pd.DataFrame, *, dataset: str, trade_date: str
-) -> list[str]:
+def _eligible_etf_symbols(master: pd.DataFrame, *, dataset: str, trade_date: str) -> list[str]:
     suffix = ".SH" if dataset == "etf_sh_cons" else ".SZ"
     frame = master.copy()
     if "list_status" in frame.columns:
@@ -767,9 +748,7 @@ def _historical_etf_active_ranges(
             continue
         previous = ranges.get(symbol)
         ranges[symbol] = (
-            (min(previous[0], clipped[0]), max(previous[1], clipped[1]))
-            if previous
-            else clipped
+            (min(previous[0], clipped[0]), max(previous[1], clipped[1])) if previous else clipped
         )
     return ranges
 
@@ -816,9 +795,7 @@ def _institutional_history_specs(
     start_text = compact_date(start)
     end_text = compact_date(end)
     legacy_keys = []
-    for row in context.checkpoint.unfinished_units(
-        {"etf_sh_cons", "etf_sz_cons"}
-    ):
+    for row in context.checkpoint.unfinished_units({"etf_sh_cons", "etf_sz_cons"}):
         scope = dict(row.get("scope_json") or {})
         trade_date = str(scope.get("trade_date") or "")
         if (
@@ -832,14 +809,10 @@ def _institutional_history_specs(
         "replaced by ETF symbol/date-range pagination",
     )
     if superseded:
-        console.print(
-            f"retired legacy per-ETF/per-day constituent units: {superseded}"
-        )
+        console.print(f"retired legacy per-ETF/per-day constituent units: {superseded}")
 
     return [
-        spec
-        for spec in base_specs
-        if spec.dataset not in {"etf_sh_cons", "etf_sz_cons"}
+        spec for spec in base_specs if spec.dataset not in {"etf_sh_cons", "etf_sz_cons"}
     ] + constituent_specs
 
 
@@ -922,9 +895,7 @@ def bootstrap(
                 "disclosure_date",
             },
         )
-        planned_members = context.planner.plan_industry_members(
-            max_attempts, as_of=end_date
-        )
+        planned_members = context.planner.plan_industry_members(max_attempts, as_of=end_date)
         console.print(f"planned historical industry membership units: +{planned_members}")
         _run_phase(context, "historical industry members", {"index_member_all"})
     if profile == "full":
@@ -1057,9 +1028,7 @@ def bootstrap_legacy_market(
         or str(validation.get("start_date") or "") > "2016-01-01"
         or str(validation.get("end_date") or "") < "2016-12-31"
     ):
-        raise typer.BadParameter(
-            "validation report did not pass the required 2016 overlap gate"
-        )
+        raise typer.BadParameter("validation report did not pass the required 2016 overlap gate")
 
     context = load_context(
         require_credentials=False,
@@ -1502,17 +1471,13 @@ def ashare_5m(
         },
     )
     master = context.storage.read_units(context.checkpoint.successful("stock_basic"))
-    active_ranges = _historical_a_share_active_ranges(
-        master, start=start_date, end=end_date
-    )
+    active_ranges = _historical_a_share_active_ranges(master, start=start_date, end=end_date)
     symbols = sorted(active_ranges)
 
     if not symbols:
         raise RuntimeError("stock_basic produced an empty historical A-share universe")
     context.progress.set_target(symbols=len(symbols))
-    context.report_progress(
-        "planning", "full A-share 5-minute planning", {"ashare_5m"}, force=True
-    )
+    context.report_progress("planning", "full A-share 5-minute planning", {"ashare_5m"}, force=True)
     specs = context.execution_planner.plan_minutes(
         {"ashare_5m": symbols},
         start_date,
@@ -1522,9 +1487,7 @@ def ashare_5m(
         active_ranges_by_dataset={"ashare_5m": active_ranges},
         trading_dates=context.planner.trading_dates(start_date, end_date),
     )
-    specs, rows, _ = _run_paginated_specs(
-        context, "full A-share 5-minute bars", specs
-    )
+    specs, rows, _ = _run_paginated_specs(context, "full A-share 5-minute bars", specs)
     _require_symbol_coverage(specs, rows)
     report = verify_downloads(
         context.checkpoint,
@@ -1537,8 +1500,7 @@ def ashare_5m(
         _trigger_safe_mode_on_quality_gate_failure(context.settings, report)
         raise typer.Exit(3)
     name = snapshot_name or (
-        f"ashare-5m-{start_date:%Y%m%d}-{end_date:%Y%m%d}-"
-        f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+        f"ashare-5m-{start_date:%Y%m%d}-{end_date:%Y%m%d}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
     )
     context.report_progress(
         "snapshot", "building immutable 5-minute snapshot", {"ashare_5m"}, force=True
@@ -1579,9 +1541,7 @@ def ashare_5m(
 
 @app.command("cninfo-announcements")
 def cninfo_announcements_command(
-    ts_code: Annotated[
-        str, typer.Option(help="Comma-separated Tushare codes to include")
-    ] = "",
+    ts_code: Annotated[str, typer.Option(help="Comma-separated Tushare codes to include")] = "",
     start: Annotated[str, typer.Option(help="YYYY-MM-DD announcement date")] = "2024-01-01",
     end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
     limit: Annotated[
@@ -1630,9 +1590,7 @@ def cninfo_announcements_command(
 
 @app.command("announcement-nlp")
 def announcement_nlp_command(
-    ts_code: Annotated[
-        str, typer.Option(help="Comma-separated Tushare codes to include")
-    ] = "",
+    ts_code: Annotated[str, typer.Option(help="Comma-separated Tushare codes to include")] = "",
     start: Annotated[str, typer.Option(help="YYYY-MM-DD announcement date")] = "2024-01-01",
     end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
     category: Annotated[
@@ -1696,13 +1654,10 @@ def corpus_nlp_command(
     dataset: Annotated[
         str,
         typer.Option(
-            help="Comma-separated major_news,npr,cctv_news,irm_qa_sh,irm_qa_sz; "
-            "empty = all"
+            help="Comma-separated major_news,npr,cctv_news,irm_qa_sh,irm_qa_sz; empty = all"
         ),
     ] = "",
-    ts_code: Annotated[
-        str, typer.Option(help="Comma-separated Tushare codes to include")
-    ] = "",
+    ts_code: Annotated[str, typer.Option(help="Comma-separated Tushare codes to include")] = "",
     start: Annotated[str, typer.Option(help="YYYY-MM-DD publication date")] = "2024-01-01",
     end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
     limit: Annotated[
@@ -1728,9 +1683,7 @@ def corpus_nlp_command(
             "end_date": end_date.isoformat(),
         },
     )
-    context.report_progress(
-        "processing", "corpus NLP extraction", {"corpus_nlp"}, force=True
-    )
+    context.report_progress("processing", "corpus NLP extraction", {"corpus_nlp"}, force=True)
     settings = context.settings
     secret_store = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
     summary = _produce_factors(
@@ -1759,9 +1712,7 @@ def corpus_nlp_command(
 
 @app.command("report-rc-factors")
 def report_rc_factors_command(
-    ts_code: Annotated[
-        str, typer.Option(help="Comma-separated Tushare codes to include")
-    ] = "",
+    ts_code: Annotated[str, typer.Option(help="Comma-separated Tushare codes to include")] = "",
     start: Annotated[str, typer.Option(help="YYYY-MM-DD report date")] = "2010-01-01",
     end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
     result_path: Annotated[Path | None, typer.Option("--result")] = None,
@@ -1805,9 +1756,7 @@ def report_rc_factors_command(
 
 @app.command("major-news-mentions")
 def major_news_mentions_command(
-    ts_code: Annotated[
-        str, typer.Option(help="Comma-separated Tushare codes to include")
-    ] = "",
+    ts_code: Annotated[str, typer.Option(help="Comma-separated Tushare codes to include")] = "",
     start: Annotated[str, typer.Option(help="YYYY-MM-DD publication date")] = "2024-01-01",
     end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
     result_path: Annotated[Path | None, typer.Option("--result")] = None,
@@ -1826,9 +1775,7 @@ def major_news_mentions_command(
             "end_date": end_date.isoformat(),
         },
     )
-    context.report_progress(
-        "processing", "major_news mention mapping", {"major_news"}, force=True
-    )
+    context.report_progress("processing", "major_news mention mapping", {"major_news"}, force=True)
     summary = _produce_factors(
         "major-news-mentions",
         lambda: process_major_news_mentions(
@@ -1871,9 +1818,7 @@ def news_flash_factors_command(
     console.print_json(json.dumps(result, ensure_ascii=False))
 
 
-def _historical_a_share_symbols(
-    master: pd.DataFrame, *, start: date, end: date
-) -> list[str]:
+def _historical_a_share_symbols(master: pd.DataFrame, *, start: date, end: date) -> list[str]:
     return sorted(_historical_a_share_active_ranges(master, start=start, end=end))
 
 
@@ -1890,11 +1835,7 @@ def _historical_a_share_active_ranges(
     active = master.loc[
         list_dates.le(pd.Timestamp(end))
         & (delist_dates.isna() | delist_dates.ge(pd.Timestamp(start)))
-        & master["ts_code"]
-        .fillna("")
-        .astype(str)
-        .str.upper()
-        .str.endswith((".SH", ".SZ", ".BJ"))
+        & master["ts_code"].fillna("").astype(str).str.upper().str.endswith((".SH", ".SZ", ".BJ"))
     ]
     ranges: dict[str, tuple[date, date]] = {}
     for index, row in active.iterrows():
@@ -1907,9 +1848,13 @@ def _historical_a_share_active_ranges(
             continue
         previous = ranges.get(symbol)
         ranges[symbol] = (
-            min(previous[0], clipped[0]),
-            max(previous[1], clipped[1]),
-        ) if previous else clipped
+            (
+                min(previous[0], clipped[0]),
+                max(previous[1], clipped[1]),
+            )
+            if previous
+            else clipped
+        )
     return ranges
 
 
@@ -1938,9 +1883,7 @@ def _historically_active_symbols(
     return sorted(set(symbols.loc[mask].tolist()))
 
 
-def _open_market_dates(
-    calendar: pd.DataFrame, *, start: date, end: date
-) -> list[str]:
+def _open_market_dates(calendar: pd.DataFrame, *, start: date, end: date) -> list[str]:
     if calendar.empty or "is_open" not in calendar.columns:
         raise RuntimeError("market trade calendar is unavailable or missing is_open")
     date_field = "cal_date" if "cal_date" in calendar.columns else "date"
@@ -2005,6 +1948,8 @@ def supplemental_download(
     context.report_progress("planning", f"{bundle} planning", datasets, force=True)
     rows: list[dict] = []
     inserted = 0
+    if bundle == "cn_governance_risk":
+        _supersede_unsupported_governance_units(context)
     if specs:
         specs, rows, inserted = _run_paginated_specs(context, bundle, specs)
     console.print(
@@ -2012,30 +1957,34 @@ def supplemental_download(
     )
     if bundle == "cn_governance_risk":
         master = context.storage.read_units(context.checkpoint.successful("stock_basic"))
-        if "ts_code" not in master.columns:
-            raise RuntimeError(
-                "stock_basic did not provide ts_code for management-reward planning"
-            )
+        active_ranges = _historical_a_share_active_ranges(
+            master,
+            start=start_date,
+            end=end_date,
+        )
+        cyq_ranges = {
+            symbol: active_range
+            for symbol, active_range in active_ranges.items()
+            if active_range[1] >= date(2018, 1, 1)
+        }
         secondary_specs = coverage_secondary_specs(
             bundle,
             {
-                "stk_rewards": sorted(
-                    {
-                        str(value).strip()
-                        for value in master["ts_code"].dropna().tolist()
-                        if str(value).strip()
-                    }
-                )
+                "stk_rewards": active_ranges,
+                "cyq_perf": cyq_ranges,
+                "cyq_chips": cyq_ranges,
             },
             start=start_date,
             end=end_date,
             max_attempts=context.settings.max_request_attempts,
         )
-        inserted += context.checkpoint.add(secondary_specs)
-        context.checkpoint.retry_failed_units(spec.unit_key for spec in secondary_specs)
+        secondary_specs, secondary_rows, secondary_inserted = _run_paginated_specs(
+            context,
+            f"{bundle} symbol data",
+            secondary_specs,
+        )
+        inserted += secondary_inserted
         secondary_datasets = {spec.dataset for spec in secondary_specs}
-        _run_phase(context, f"{bundle} symbol batches", secondary_datasets)
-        secondary_rows = _require_specs_complete(context, secondary_specs)
         specs.extend(secondary_specs)
         rows.extend(secondary_rows)
         datasets.update(secondary_datasets)
@@ -2094,9 +2043,7 @@ def supplemental_download(
         market = bundle.split("_", 1)[0]
         basic_dataset = f"{market}_basic"
         calendar_dataset = f"{market}_tradecal"
-        calendar = context.storage.read_units(
-            context.checkpoint.successful(calendar_dataset)
-        )
+        calendar = context.storage.read_units(context.checkpoint.successful(calendar_dataset))
         open_dates = _open_market_dates(calendar, start=start_date, end=end_date)
         daily_specs = market_daily_specs(
             market,
@@ -2199,9 +2146,7 @@ def build_qlib_command(
 def build_minute_qlib_command(
     snapshot_name: Annotated[str, typer.Option("--snapshot")],
     output_name: Annotated[str | None, typer.Option("--output-name")] = None,
-    target_frequency: Annotated[
-        str | None, typer.Option("--target-frequency")
-    ] = None,
+    target_frequency: Annotated[str | None, typer.Option("--target-frequency")] = None,
     staging_only: Annotated[bool, typer.Option("--staging-only")] = False,
     skip_quality_gate: Annotated[
         bool,
@@ -2391,9 +2336,7 @@ def _build_minute_qlib(
             f"existing minute Qlib output is incomplete and requires operator review: {output}"
         )
     native_staging = (
-        staging.with_name(f"{staging.name}.native")
-        if builder.requires_resampling
-        else staging
+        staging.with_name(f"{staging.name}.native") if builder.requires_resampling else staging
     )
     by_symbol = builder.build_staging(native_staging)
     if builder.requires_resampling:
@@ -2509,8 +2452,7 @@ def _build_execution_snapshot(
     )
     paired_source_lineage_id = str(source_lineage_id or lineage_id)
     if len(paired_source_lineage_id) != 64 or any(
-        character not in "0123456789abcdef"
-        for character in paired_source_lineage_id
+        character not in "0123456789abcdef" for character in paired_source_lineage_id
     ):
         raise ValueError("execution snapshot source lineage must be a SHA-256 digest")
     expected = {

@@ -1,7 +1,12 @@
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
+from quant_data.cli import (
+    _reconcile_range_plan,
+    _supersede_unsupported_governance_units,
+)
 from quant_data.coverage_data import (
     COVERAGE_BUNDLES,
     DEFAULT_COVERAGE_BUNDLES,
@@ -9,7 +14,9 @@ from quant_data.coverage_data import (
     coverage_bundle_datasets,
     coverage_primary_key_candidates,
     coverage_secondary_specs,
+    coverage_specs,
 )
+from quant_data.models import FetchSpec
 from quant_data.supplemental_data import (
     bundle_datasets,
     next_pagination_specs,
@@ -17,6 +24,23 @@ from quant_data.supplemental_data import (
 )
 
 pytestmark = pytest.mark.no_database
+
+
+class _CheckpointStub:
+    def __init__(self, rows: dict[str, list[dict]]) -> None:
+        self.rows = rows
+        self.superseded: list[str] = []
+
+    def successful(self, dataset: str) -> list[dict]:
+        return []
+
+    def unfinished_units(self, dataset: str) -> list[dict]:
+        return list(self.rows.get(dataset, []))
+
+    def supersede_units(self, unit_keys, reason: str) -> int:
+        keys = list(unit_keys)
+        self.superseded.extend(keys)
+        return len(keys)
 
 
 def test_coverage_inventory_matches_audited_default_and_optional_counts() -> None:
@@ -109,7 +133,7 @@ def test_default_rules_plan_full_market_cross_sections_without_stock_loops() -> 
         datasets = {spec.dataset for spec in specs}
         expected = coverage_bundle_datasets(bundle)
         if bundle == "cn_governance_risk":
-            expected = expected - {"stk_rewards"}
+            expected = expected - {"stk_rewards", "cyq_perf", "cyq_chips"}
         assert datasets == expected
         assert all(
             "ts_code" not in spec.params for spec in specs if spec.dataset != "stock_company"
@@ -165,16 +189,30 @@ def test_capital_flow_uses_year_month_and_daily_grains_by_density() -> None:
 def test_only_provider_mandated_symbol_paths_expand_by_symbol() -> None:
     governance = coverage_secondary_specs(
         "cn_governance_risk",
-        {"stk_rewards": ["000001.SZ", "600000.SH"]},
+        {
+            "stk_rewards": ["000001.SZ", "600000.SH"],
+            "cyq_perf": ["000001.SZ", "600000.SH"],
+            "cyq_chips": ["000001.SZ", "600000.SH"],
+        },
         start=date(2024, 1, 1),
         end=date(2024, 1, 31),
         max_attempts=3,
     )
-    assert len(governance) == 1
-    assert governance[0].params["ts_code"] == "000001.SZ,600000.SH"
-    assert governance[0].allow_empty is True
-    assert governance[0].max_attempts == 3
-    assert governance[0].scope["row_limit"] == 10_000
+    rewards = [spec for spec in governance if spec.dataset == "stk_rewards"]
+    cyq = [spec for spec in governance if spec.dataset.startswith("cyq_")]
+    assert len(rewards) == 1
+    assert rewards[0].params["ts_code"] == "000001.SZ,600000.SH"
+    assert rewards[0].scope["row_limit"] == 10_000
+    assert len(cyq) == 4
+    assert {spec.params["ts_code"] for spec in cyq} == {
+        "000001.SZ",
+        "600000.SH",
+    }
+    assert all(spec.params["start_date"] >= "20180101" for spec in cyq)
+    assert all(spec.scope["partition_axis"] == "date" for spec in cyq)
+    assert all(spec.scope["page_size"] == 6_000 for spec in cyq)
+    assert all(spec.allow_empty is True for spec in governance)
+    assert all(spec.max_attempts == 3 for spec in governance)
 
     minutes = coverage_secondary_specs(
         "strategy_specialty_minutes",
@@ -189,3 +227,92 @@ def test_only_provider_mandated_symbol_paths_expand_by_symbol() -> None:
     assert all(spec.allow_empty is True for spec in minutes)
     assert all(spec.max_attempts == 3 for spec in minutes)
     assert all(int(spec.scope["row_limit"]) > 0 for spec in minutes)
+
+
+def test_governance_planning_respects_provider_history_and_required_symbols() -> None:
+    primary = coverage_specs(
+        "cn_governance_risk",
+        start=date(2008, 1, 1),
+        end=date(2018, 1, 2),
+        trading_dates=["20080102", "20150105", "20160104", "20180102"],
+        max_attempts=3,
+    )
+    assert not {"cyq_perf", "cyq_chips"} & {spec.dataset for spec in primary}
+    ccass = [spec for spec in primary if spec.dataset.startswith("ccass_hold")]
+    assert ccass
+    assert all(spec.params["trade_date"] >= "20160101" for spec in ccass)
+
+    secondary = coverage_secondary_specs(
+        "cn_governance_risk",
+        {
+            "stk_rewards": ["000001.SZ"],
+            "cyq_perf": {"000001.SZ": (date(2008, 1, 1), date(2018, 1, 2))},
+            "cyq_chips": {"000001.SZ": (date(2008, 1, 1), date(2018, 1, 2))},
+        },
+        start=date(2008, 1, 1),
+        end=date(2018, 1, 2),
+        max_attempts=3,
+    )
+    cyq = [spec for spec in secondary if spec.dataset.startswith("cyq_")]
+    assert len(cyq) == 2
+    assert all(spec.params["ts_code"] == "000001.SZ" for spec in cyq)
+    assert all(spec.params["start_date"] == "20180101" for spec in cyq)
+
+
+def test_governance_symbol_plan_supersedes_invalid_legacy_units() -> None:
+    legacy_spec = FetchSpec(
+        dataset="cyq_chips",
+        api_name="cyq_chips",
+        scope={"trade_date": "20240102"},
+        params={"trade_date": "20240102", "limit": 6_000, "offset": 0},
+        allow_empty=True,
+        max_attempts=3,
+    )
+    legacy = {
+        "unit_key": legacy_spec.unit_key,
+        "dataset": legacy_spec.dataset,
+        "api_name": legacy_spec.api_name,
+        "scope_json": legacy_spec.scope,
+        "params_json": legacy_spec.params,
+        "allow_empty": True,
+        "max_attempts": 3,
+    }
+    checkpoint = _CheckpointStub({"cyq_chips": [legacy]})
+    target = next(
+        spec
+        for spec in coverage_secondary_specs(
+            "cn_governance_risk",
+            {"cyq_chips": ["000001.SZ"]},
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 31),
+            max_attempts=3,
+        )
+        if spec.dataset == "cyq_chips"
+    )
+
+    reconciled = _reconcile_range_plan(SimpleNamespace(checkpoint=checkpoint), [target])
+
+    assert reconciled == [target]
+    assert checkpoint.superseded == [legacy_spec.unit_key]
+
+
+def test_governance_supersedes_only_pre_2016_ccass_units() -> None:
+    checkpoint = _CheckpointStub(
+        {
+            "ccass_hold": [
+                {
+                    "unit_key": "unsupported",
+                    "params_json": {"trade_date": "20151231"},
+                },
+                {
+                    "unit_key": "supported",
+                    "params_json": {"trade_date": "20160104"},
+                },
+            ]
+        }
+    )
+
+    count = _supersede_unsupported_governance_units(SimpleNamespace(checkpoint=checkpoint))
+
+    assert count == 1
+    assert checkpoint.superseded == ["unsupported"]

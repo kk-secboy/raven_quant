@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
@@ -73,8 +73,6 @@ _RULES: dict[str, tuple[CoverageRule, ...]] = {
         # stk_alert rows carry start_date/end_date (alert effective period), not
         # trade_date; validate against start_date or every row fails the date check.
         CoverageRule("stk_alert", "daily", 1_000, 8, "trade_date", "start_date"),
-        CoverageRule("cyq_perf", "daily", 6_000, 4),
-        CoverageRule("cyq_chips", "daily", 6_000, 4),
         CoverageRule("ccass_hold", "daily", 5_000, 8),
         CoverageRule("ccass_hold_detail", "daily", 6_000, 8),
         CoverageRule("broker_recommend", "month", 1_000, 8, "month", "ann_date"),
@@ -163,8 +161,15 @@ _RULES: dict[str, tuple[CoverageRule, ...]] = {
 
 
 SECONDARY_DATASETS = {
-    "cn_governance_risk": {"stk_rewards"},
+    "cn_governance_risk": {"stk_rewards", "cyq_perf", "cyq_chips"},
     "strategy_specialty_minutes": {"sw_mins", "hk_mins"},
+}
+
+_DATASET_START_DATES = {
+    # The provider rejects CCASS history before 2016 instead of returning an
+    # empty result, so unsupported dates must never enter the checkpoint plan.
+    "ccass_hold": date(2016, 1, 1),
+    "ccass_hold_detail": date(2016, 1, 1),
 }
 COVERAGE_DATASETS = frozenset(
     dataset
@@ -312,15 +317,19 @@ def coverage_specs(
     if bundle not in COVERAGE_BUNDLES:
         raise ValueError(f"unsupported coverage bundle: {bundle}")
     dates = sorted(set(trading_dates)) or _weekdays(start, end)
-    calendar_dates = _calendar_dates(start, end)
     specs: list[FetchSpec] = []
     for rule in _RULES[bundle]:
+        rule_start = max(start, _DATASET_START_DATES.get(rule.dataset, start))
+        if rule_start > end:
+            continue
+        rule_dates = [value for value in dates if value >= compact_date(rule_start)]
+        rule_calendar_dates = _calendar_dates(rule_start, end)
         variants = [dict(items) for items in rule.variants]
         if rule.mode == "once":
             for variant in variants:
                 specs.extend(_paged(rule, variant, f"{rule.dataset}:{_tag(variant)}", max_attempts))
         elif rule.mode in {"daily", "calendar_daily"}:
-            source_dates = dates if rule.mode == "daily" else calendar_dates
+            source_dates = rule_dates if rule.mode == "daily" else rule_calendar_dates
             for value in source_dates:
                 for variant in variants:
                     params = {rule.date_param: value, **variant}
@@ -334,11 +343,11 @@ def coverage_specs(
                         )
                     )
         elif rule.mode == "calendar_daily_range":
-            for value in calendar_dates:
+            for value in rule_calendar_dates:
                 params = {"start_date": value, "end_date": value}
                 specs.extend(_paged(rule, params, f"{rule.dataset}:{value}", max_attempts))
         elif rule.mode == "month":
-            for month_start, _ in _month_ranges(start, end):
+            for month_start, _ in _month_ranges(rule_start, end):
                 value = month_start.strftime("%Y%m")
                 specs.extend(
                     _paged(
@@ -349,7 +358,7 @@ def coverage_specs(
                     )
                 )
         elif rule.mode == "month_range":
-            for window_start, window_end in _month_ranges(start, end):
+            for window_start, window_end in _month_ranges(rule_start, end):
                 params = {
                     "start_date": compact_date(window_start),
                     "end_date": compact_date(window_end),
@@ -377,7 +386,7 @@ def coverage_specs(
                     )
                 )
         elif rule.mode in {"year", "year_week"}:
-            for window_start, window_end in _year_ranges(start, end):
+            for window_start, window_end in _year_ranges(rule_start, end):
                 if rule.mode == "year_week":
                     params = {
                         "start_week": compact_date(window_start),
@@ -420,16 +429,16 @@ def coverage_specs(
 
 def coverage_secondary_specs(
     bundle: str,
-    symbols_by_dataset: dict[str, Iterable[str]],
+    symbols_by_dataset: dict[str, Iterable[str] | Mapping[str, tuple[date, date]]],
     *,
     start: date,
     end: date,
     max_attempts: int,
 ) -> list[FetchSpec]:
     if bundle == "cn_governance_risk":
-        symbols = _codes(symbols_by_dataset.get("stk_rewards", ()))
+        reward_symbols = _codes(symbols_by_dataset.get("stk_rewards", ()))
         specs: list[FetchSpec] = []
-        for batch in _batched(symbols, 100):
+        for batch in _batched(reward_symbols, 100):
             params = {"ts_code": ",".join(batch)}
             specs.append(
                 FetchSpec(
@@ -441,6 +450,40 @@ def coverage_secondary_specs(
                     max_attempts=max_attempts,
                 )
             )
+        cyq_start = max(start, date(2018, 1, 1))
+        if cyq_start <= end:
+            cyq_rules = (
+                ("cyq_perf", "year", CoverageRule("cyq_perf", "year", 6_000, 4)),
+                (
+                    "cyq_chips",
+                    "month",
+                    CoverageRule("cyq_chips", "month_range", 6_000, 4),
+                ),
+            )
+            for dataset, grain, rule in cyq_rules:
+                for symbol, (symbol_start, symbol_end) in _symbol_ranges(
+                    symbols_by_dataset.get(dataset, ()), start=cyq_start, end=end
+                ).items():
+                    ranges = (
+                        _year_ranges(symbol_start, symbol_end)
+                        if grain == "year"
+                        else _month_ranges(symbol_start, symbol_end)
+                    )
+                    for window_start, window_end in ranges:
+                        params = {
+                            "ts_code": symbol,
+                            "start_date": compact_date(window_start),
+                            "end_date": compact_date(window_end),
+                        }
+                        specs.extend(
+                            _paged(
+                                rule,
+                                params,
+                                (f"{dataset}:{symbol}:{params['start_date']}:{params['end_date']}"),
+                                max_attempts,
+                                partition=partition_metadata("date", window_start, window_end),
+                            )
+                        )
         return apply_reference_refresh(specs, as_of=end)
     if bundle == "strategy_specialty_minutes":
         specs = []
@@ -468,6 +511,26 @@ def coverage_secondary_specs(
                     )
         return specs
     return []
+
+
+def _symbol_ranges(
+    values: Iterable[str] | Mapping[str, tuple[date, date]],
+    *,
+    start: date,
+    end: date,
+) -> dict[str, tuple[date, date]]:
+    if isinstance(values, Mapping):
+        result: dict[str, tuple[date, date]] = {}
+        for raw_symbol, raw_range in values.items():
+            symbol = str(raw_symbol).strip().upper()
+            if not symbol:
+                continue
+            symbol_start = max(start, raw_range[0])
+            symbol_end = min(end, raw_range[1])
+            if symbol_start <= symbol_end:
+                result[symbol] = (symbol_start, symbol_end)
+        return dict(sorted(result.items()))
+    return {symbol: (start, end) for symbol in _codes(values)}
 
 
 def _paged(
