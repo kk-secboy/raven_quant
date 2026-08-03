@@ -917,7 +917,12 @@ class DataTaskStore:
             ]
             if str(row["task_key"]) in SUPPLEMENTAL_TASK_KEYS:
                 progress = row.get("progress") or {}
-                completed_datasets = set((progress.get("datasets") or {}).keys())
+                progress_datasets = progress.get("datasets") or {}
+                completed_datasets = (
+                    set(progress_datasets.keys())
+                    if isinstance(progress_datasets, dict)
+                    else set()
+                )
                 expected_datasets = set(row["config"]["datasets"])
                 authoritative_success = (
                     row["status"] == "succeeded"

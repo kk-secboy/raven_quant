@@ -326,6 +326,35 @@ def test_verified_current_plan_ignores_superseded_failed_units(
     assert task["coverage"] == 100.0
 
 
+def test_running_supplemental_progress_accepts_dataset_name_list(
+    database_url: str, tmp_path: Path
+) -> None:
+    jobs = JobStore(database_url)
+    job = jobs.create(
+        "supplemental_cn_funds",
+        {"bundle": "cn_funds", "start": "2024-01-01", "end": "2024-01-31"},
+        tmp_path / "funds.log",
+    )
+    claimed = jobs.claim_next(("supplemental_cn_funds",))
+    assert claimed is not None
+    assert claimed["id"] == job["id"]
+    jobs.update_progress(
+        job["id"],
+        {
+            "status": "running",
+            "datasets": sorted(bundle_datasets("cn_funds")),
+            "execution_phase": "downloading",
+        },
+    )
+
+    store = DataTaskStore(database_url)
+    store.sync_catalog()
+    task = next(item for item in store.list() if item["task_key"] == "cn_funds")
+
+    assert task["status"] == "running"
+    assert task["progress"]["datasets"] == sorted(bundle_datasets("cn_funds"))
+
+
 def test_task_card_exposes_adaptive_checkpoint_and_cooldown_state(
     database_url: str, tmp_path: Path
 ) -> None:

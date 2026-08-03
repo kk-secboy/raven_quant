@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from quant_platform.worker import _failure_message
 from scripts.configure_tushare import update_env, validate_token
 
@@ -58,6 +60,7 @@ def test_compose_bounds_every_service_log_file() -> None:
     ) == 4
 
 
+@pytest.mark.no_database
 def test_worker_accepts_every_supplemental_download_bundle() -> None:
     root = Path(__file__).resolve().parents[1]
     compose = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
