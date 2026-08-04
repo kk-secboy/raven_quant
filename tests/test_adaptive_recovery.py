@@ -80,6 +80,47 @@ def test_full_last_page_splits_range_without_discarding_success(database_url: st
     assert store.unit_rows([parent.unit_key])[0]["status"] == "succeeded"
 
 
+def test_full_non_adaptive_page_group_continues_without_rekeying_completed_pages(
+    database_url: str,
+) -> None:
+    store = CheckpointStore(database_url)
+    parent = FetchSpec(
+        dataset="ccass_hold_detail",
+        api_name="ccass_hold_detail",
+        scope={
+            "page_group": "ccass_hold_detail:20200910",
+            "page_size": 6_000,
+            "max_pages": 8,
+            "offset": 42_000,
+        },
+        params={"trade_date": "20200910", "limit": 6_000, "offset": 42_000},
+        allow_empty=True,
+        max_attempts=3,
+    )
+    store.add([parent])
+    store.succeed(
+        parent.unit_key,
+        UnitResult(output_path="units/ccass.parquet", row_count=6_000, sha256="abc"),
+    )
+
+    children, recovered = _full_page_partition_recovery(
+        SimpleNamespace(checkpoint=store),
+        [parent],
+        [{"unit_key": parent.unit_key, "row_count": 6_000}],
+        set(),
+    )
+
+    assert recovered == {parent.unit_key}
+    assert len(children) == 1
+    continuation = children[0]
+    assert continuation.params["offset"] == 48_000
+    assert continuation.scope["offset_origin"] == 48_000
+    assert continuation.scope["page_index"] == 0
+    assert continuation.scope["max_pages"] == 128
+    assert continuation.scope["continues_page_group"] == parent.scope["page_group"]
+    assert store.unit_rows([parent.unit_key])[0]["status"] == "succeeded"
+
+
 def test_adaptive_offset_cap_splits_the_whole_date_range(database_url: str) -> None:
     store = CheckpointStore(database_url)
     failed = FetchSpec(

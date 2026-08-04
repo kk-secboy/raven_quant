@@ -70,6 +70,7 @@ from .supplemental_data import (
     market_daily_specs,
     market_financial_specs,
     next_pagination_specs,
+    pagination_extension_spec,
     require_pagination_terminated,
     share_float_overflow_repartition_specs,
     supplemental_specs,
@@ -79,6 +80,17 @@ from .verify import quality_gate_payload, verify_downloads, write_report
 
 app = typer.Typer(no_args_is_help=True, help="Resumable Tushare-to-Parquet bootstrap pipeline")
 console = Console()
+
+
+# Provider probes on 2026-08-04 proved that these non-adaptive interfaces can
+# legitimately exceed their original page ceilings.  Extend only capped page
+# groups so their already-completed checkpoint unit keys remain reusable.
+_PAGINATION_EXTENSION_MAX_PAGES = {
+    "ccass_hold_detail": 128,
+    "dc_member": 32,
+    "tdx_member": 48,
+    "ths_member": 96,
+}
 
 
 class ExecutionProgressReporter:
@@ -688,6 +700,18 @@ def _full_page_partition_recovery(
                 "provider offset cap avoided by disjoint share_float partitions",
             )
             continue
+        extension_max_pages = _PAGINATION_EXTENSION_MAX_PAGES.get(current.dataset)
+        max_pages = int(current.scope.get("max_pages") or 0)
+        final_page_is_full = (
+            page_index + 1 >= max_pages
+            and row_counts.get(current.unit_key, -1) >= page_size
+        )
+        if extension_max_pages and final_page_is_full:
+            children.append(
+                pagination_extension_spec(current, max_pages=extension_max_pages)
+            )
+            recovered.add(current.unit_key)
+            continue
         if not is_adaptive_partition(current):
             continue
         max_pages = int(current.scope["max_pages"])
@@ -942,6 +966,14 @@ def bootstrap(
         context.settings.data_root,
         snapshot_end=end_date,
         require_all_planned=False,
+        dataset_filter={
+            "ashare_5m",
+            "daily",
+            "trade_cal",
+            "daily_basic",
+            "stock_basic",
+            "adj_factor",
+        },
     )
     report_path = context.settings.data_root / "verification" / "latest.json"
     write_report(report, report_path)
@@ -1895,6 +1927,39 @@ def _open_market_dates(calendar: pd.DataFrame, *, start: date, end: date) -> lis
     return sorted(values.loc[selected].dt.strftime("%Y%m%d").dropna().unique().tolist())
 
 
+def _index_active_ranges(
+    master: pd.DataFrame, *, suffix: str, start: date, end: date
+) -> dict[str, tuple[date, date]]:
+    if master.empty or "ts_code" not in master.columns:
+        raise RuntimeError("index_basic is unavailable; run the reference bootstrap first")
+    symbols = master["ts_code"].fillna("").astype(str).str.strip().str.upper()
+    selected = master.loc[symbols.str.endswith(suffix.upper())].copy()
+    selected["_symbol"] = symbols.loc[selected.index]
+    listed = pd.to_datetime(selected.get("list_date"), errors="coerce")
+    expired = pd.to_datetime(selected.get("exp_date"), errors="coerce")
+    ranges: dict[str, tuple[date, date]] = {}
+    for index, row in selected.iterrows():
+        listed_value = listed.loc[index]
+        expired_value = expired.loc[index]
+        symbol_start = start if pd.isna(listed_value) else max(start, listed_value.date())
+        symbol_end = end if pd.isna(expired_value) else min(end, expired_value.date())
+        if symbol_start <= symbol_end:
+            ranges[str(row["_symbol"])] = (symbol_start, symbol_end)
+    return dict(sorted(ranges.items()))
+
+
+def _supersede_obsolete_derivative_units(context: Context) -> None:
+    obsolete = context.checkpoint.unfinished_units({"fut_index_daily", "bc_bestotcqt"})
+    if obsolete:
+        context.checkpoint.supersede_units(
+            [str(row["unit_key"]) for row in obsolete],
+            (
+                "obsolete derivative plan: NH indices require per-symbol index_daily requests; "
+                "bc_bestotcqt returns anonymous prices without an auditable instrument key"
+            ),
+        )
+
+
 @app.command("supplemental-download")
 def supplemental_download(
     bundle: Annotated[str, typer.Option(help="Independent supplemental data bundle")],
@@ -1950,6 +2015,8 @@ def supplemental_download(
     inserted = 0
     if bundle == "cn_governance_risk":
         _supersede_unsupported_governance_units(context)
+    if bundle == "cn_derivatives_enhanced":
+        _supersede_obsolete_derivative_units(context)
     if specs:
         specs, rows, inserted = _run_paginated_specs(context, bundle, specs)
     console.print(
@@ -1981,6 +2048,39 @@ def supplemental_download(
         secondary_specs, secondary_rows, secondary_inserted = _run_paginated_specs(
             context,
             f"{bundle} symbol data",
+            secondary_specs,
+        )
+        inserted += secondary_inserted
+        secondary_datasets = {spec.dataset for spec in secondary_specs}
+        specs.extend(secondary_specs)
+        rows.extend(secondary_rows)
+        datasets.update(secondary_datasets)
+    if bundle == "cn_derivatives_enhanced":
+        current_index_units = select_current_reference_units(
+            context.checkpoint.successful("index_basic"),
+            snapshot_end=end_date,
+        )
+        index_master = context.storage.read_units(current_index_units)
+        index_ranges = _index_active_ranges(
+            index_master,
+            suffix=".NH",
+            start=start_date,
+            end=end_date,
+        )
+        if not index_ranges:
+            raise RuntimeError(
+                "index_basic has no .NH contracts; rerun the core reference bootstrap"
+            )
+        secondary_specs = coverage_secondary_specs(
+            bundle,
+            {"fut_index_daily": index_ranges},
+            start=start_date,
+            end=end_date,
+            max_attempts=context.settings.max_request_attempts,
+        )
+        secondary_specs, secondary_rows, secondary_inserted = _run_paginated_specs(
+            context,
+            f"{bundle} NH index history",
             secondary_specs,
         )
         inserted += secondary_inserted

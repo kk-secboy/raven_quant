@@ -157,6 +157,70 @@ def test_verifier_uses_successor_generation_and_can_ignore_dormant_plans(
     assert any("daily: 0/1 units succeeded" in item for item in relaxed["warnings"])
 
 
+def test_verifier_dataset_filter_ignores_unrelated_failed_plan(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    daily = FetchSpec(
+        dataset="daily",
+        api_name="daily",
+        params={"trade_date": "20240102"},
+        scope={"trade_date": "20240102"},
+    )
+    adj_factor = FetchSpec(
+        dataset="adj_factor",
+        api_name="adj_factor",
+        params={"trade_date": "20240102"},
+        scope={"trade_date": "20240102"},
+    )
+    unrelated = FetchSpec(
+        dataset="ccass_hold_detail",
+        api_name="ccass_hold_detail",
+        params={"trade_date": "20240102"},
+        scope={"trade_date": "20240102"},
+    )
+    checkpoint.add([daily, adj_factor, unrelated])
+    row = {
+        "ts_code": "000001.SZ",
+        "trade_date": "20240102",
+        "open": 10.0,
+        "high": 11.0,
+        "low": 9.0,
+        "close": 10.5,
+        "vol": 100.0,
+    }
+    written = storage.write_unit(
+        daily.dataset,
+        daily.unit_key,
+        ProviderResult(daily.api_name, list(row), [row], b"{}"),
+    )
+    checkpoint.succeed(daily.unit_key, written)
+    adj_row = {
+        "ts_code": "000001.SZ",
+        "trade_date": "20240102",
+        "adj_factor": 1.0,
+    }
+    adj_written = storage.write_unit(
+        adj_factor.dataset,
+        adj_factor.unit_key,
+        ProviderResult(adj_factor.api_name, list(adj_row), [adj_row], b"{}"),
+    )
+    checkpoint.succeed(adj_factor.unit_key, adj_written)
+    checkpoint.fail(unrelated.unit_key, "unrelated failure", terminal=True)
+
+    report = verify_downloads(
+        checkpoint,
+        tmp_path,
+        dataset_filter={"daily", "adj_factor"},
+    )
+
+    assert report["errors"] == []
+    assert report["ok"] is True
+    assert {item["dataset"] for item in report["datasets"]} == {"daily", "adj_factor"}
+    assert not any("ccass_hold_detail" in item for item in report["errors"])
+
+
 def test_verifier_respects_unit_level_empty_contracts(
     tmp_path: Path, database_url: str
 ) -> None:

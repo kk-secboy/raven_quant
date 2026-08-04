@@ -99,13 +99,11 @@ _RULES: dict[str, tuple[CoverageRule, ...]] = {
         CoverageRule("fund_factor_pro", "daily", 8_000, 4),
     ),
     "cn_derivatives_enhanced": (
-        CoverageRule("fut_index_daily", "daily", 8_000, 4),
         CoverageRule("fut_weekly_detail", "year_week", 4_000, 8, "week", "week"),
         CoverageRule("sge_basic", "once", 100, 2),
         CoverageRule("sge_daily", "daily", 4_000, 4),
         CoverageRule("cb_factor_pro", "daily", 10_000, 4),
         CoverageRule("bc_otcqt", "daily", 2_000, 8),
-        CoverageRule("bc_bestotcqt", "daily", 2_000, 8),
         CoverageRule("bond_blk", "daily", 1_000, 8),
         CoverageRule("bond_blk_detail", "daily", 1_000, 8),
         CoverageRule("eco_cal", "calendar_daily", 100, 8, "date", "date"),
@@ -162,6 +160,7 @@ _RULES: dict[str, tuple[CoverageRule, ...]] = {
 
 SECONDARY_DATASETS = {
     "cn_governance_risk": {"stk_rewards", "cyq_perf", "cyq_chips"},
+    "cn_derivatives_enhanced": {"fut_index_daily"},
     "strategy_specialty_minutes": {"sw_mins", "hk_mins"},
 }
 
@@ -435,6 +434,43 @@ def coverage_secondary_specs(
     end: date,
     max_attempts: int,
 ) -> list[FetchSpec]:
+    if bundle == "cn_derivatives_enhanced":
+        specs: list[FetchSpec] = []
+        rule = CoverageRule("fut_index_daily", "year", 8_000, 4)
+        for symbol, (symbol_start, symbol_end) in _symbol_ranges(
+            symbols_by_dataset.get("fut_index_daily", ()), start=start, end=end
+        ).items():
+            for window_start, window_end in _year_ranges(symbol_start, symbol_end):
+                params = {
+                    "ts_code": symbol,
+                    "start_date": compact_date(window_start),
+                    "end_date": compact_date(window_end),
+                }
+                page_group = (
+                    f"fut_index_daily:{symbol}:{params['start_date']}:{params['end_date']}"
+                )
+                scope = {
+                    **params,
+                    "page_group": page_group,
+                    "page_size": rule.page_size,
+                    "max_pages": rule.max_pages,
+                    "offset": 0,
+                    "expected_date_field": "trade_date",
+                    "expected_date_start": params["start_date"],
+                    "expected_date_end": params["end_date"],
+                    **partition_metadata("date", window_start, window_end),
+                }
+                specs.append(
+                    FetchSpec(
+                        dataset="fut_index_daily",
+                        api_name="index_daily",
+                        params={**params, "limit": rule.page_size, "offset": 0},
+                        scope=scope,
+                        allow_empty=True,
+                        max_attempts=max_attempts,
+                    )
+                )
+        return specs
     if bundle == "cn_governance_risk":
         reward_symbols = _codes(symbols_by_dataset.get("stk_rewards", ()))
         specs: list[FetchSpec] = []

@@ -209,7 +209,17 @@ DISCLOSURE_FIELDS = (
 # even though it is not listed in the current market-code table.  Every market
 # is paginated because CSI currently contains more than the provider's legacy
 # 8,000-row default response ceiling.
-INDEX_CATALOG_MARKETS = ("MSCI", "CSI", "SSE", "SZSE", "CICC", "SW", "OTH", "BSE")
+INDEX_CATALOG_MARKETS = (
+    "MSCI",
+    "CSI",
+    "SSE",
+    "SZSE",
+    "CICC",
+    "SW",
+    "OTH",
+    "BSE",
+    "NH",
+)
 INDEX_CATALOG_PAGE_SIZE = 1_000
 
 # Broad-market benchmarks required by the Web market view, Qlib benchmark

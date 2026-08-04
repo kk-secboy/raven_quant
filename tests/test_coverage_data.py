@@ -16,11 +16,12 @@ from quant_data.coverage_data import (
     coverage_secondary_specs,
     coverage_specs,
 )
-from quant_data.models import FetchSpec
+from quant_data.models import FetchSpec, ProviderResult
 from quant_data.supplemental_data import (
     bundle_datasets,
     next_pagination_specs,
     supplemental_specs,
+    validate_supplemental,
 )
 
 pytestmark = pytest.mark.no_database
@@ -50,7 +51,7 @@ def test_coverage_inventory_matches_audited_default_and_optional_counts() -> Non
     optional = set().union(
         *(coverage_bundle_datasets(bundle) for bundle in OPTIONAL_COVERAGE_BUNDLES)
     )
-    assert len(default) == 59
+    assert len(default) == 58
     assert len(optional) == 26
     assert default.isdisjoint(optional)
     assert all(coverage_primary_key_candidates(dataset) for dataset in default | optional)
@@ -134,6 +135,8 @@ def test_default_rules_plan_full_market_cross_sections_without_stock_loops() -> 
         expected = coverage_bundle_datasets(bundle)
         if bundle == "cn_governance_risk":
             expected = expected - {"stk_rewards", "cyq_perf", "cyq_chips"}
+        if bundle == "cn_derivatives_enhanced":
+            expected = expected - {"fut_index_daily"}
         assert datasets == expected
         assert all(
             "ts_code" not in spec.params for spec in specs if spec.dataset != "stock_company"
@@ -162,6 +165,51 @@ def test_coverage_pagination_uses_rule_owned_page_ceiling() -> None:
     page = next(spec for spec in following if spec.dataset == "moneyflow_dc")
     assert page.params["offset"] == 6_000
     assert page.scope["max_pages"] == 4
+
+
+def test_derivative_index_history_is_planned_per_nh_symbol() -> None:
+    specs = coverage_secondary_specs(
+        "cn_derivatives_enhanced",
+        {"fut_index_daily": {"NHCI.NH": (date(2024, 1, 2), date(2025, 2, 2))}},
+        start=date(2024, 1, 2),
+        end=date(2025, 2, 2),
+        max_attempts=3,
+    )
+
+    assert len(specs) == 2
+    assert {spec.api_name for spec in specs} == {"index_daily"}
+    assert {spec.params["ts_code"] for spec in specs} == {"NHCI.NH"}
+    assert all(spec.scope["expected_date_field"] == "trade_date" for spec in specs)
+
+
+def test_bc_otc_quote_fields_are_normalized_before_date_validation() -> None:
+    spec = FetchSpec(
+        dataset="bc_otcqt",
+        api_name="bc_otcqt",
+        params={"trade_date": "20260603"},
+        scope={
+            "expected_date_field": "trade_date",
+            "expected_date": "20260603",
+        },
+    )
+    result = validate_supplemental(
+        spec,
+        ProviderResult(
+            api_name="bc_otcqt",
+            columns=["TRADE_DATE", "TS_CODE", "BUY_PRICE"],
+            rows=[
+                {
+                    "TRADE_DATE": "20260603",
+                    "TS_CODE": "160017.BC",
+                    "BUY_PRICE": 101.25,
+                }
+            ],
+            raw_body=b"{}",
+        ),
+    )
+
+    assert result.columns == ["trade_date", "ts_code", "buy_price"]
+    assert result.rows[0]["trade_date"] == "20260603"
 
 
 def test_capital_flow_uses_year_month_and_daily_grains_by_density() -> None:

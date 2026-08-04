@@ -178,6 +178,17 @@ def supplemental_specs(
 
 
 def validate_supplemental(spec: FetchSpec, result: ProviderResult) -> ProviderResult:
+    if spec.dataset == "bc_otcqt":
+        # This endpoint uniquely returns upper-case provider fields, unlike the
+        # rest of Tushare.  Normalize at the adapter boundary so date contracts,
+        # primary keys, and downstream factor code use one canonical schema.
+        result = ProviderResult(
+            api_name=result.api_name,
+            columns=[str(column).lower() for column in result.columns],
+            rows=[{str(key).lower(): value for key, value in row.items()} for row in result.rows],
+            raw_body=result.raw_body,
+            metadata=result.metadata,
+        )
     page_size = spec.scope.get("page_size")
     if page_size is not None and len(result.rows) > int(page_size):
         raise ProviderError(
@@ -299,6 +310,46 @@ def next_pagination_specs(
         for page in range(next_page, min(max_pages, next_page + prefetch)):
             result.append(_next_page_spec(current, page))
     return result
+
+
+def pagination_extension_spec(current: FetchSpec, *, max_pages: int) -> FetchSpec:
+    """Continue a capped page group without changing its completed unit keys.
+
+    ``max_pages`` is the safety ceiling for the continuation itself.  The new
+    group starts at the first offset after ``current`` and records the parent
+    group so pagination verification treats the original full page as safely
+    continued rather than truncated.
+    """
+
+    if max_pages < 1:
+        raise ValueError("pagination continuation max_pages must be positive")
+    page_size = int(current.scope["page_size"])
+    next_offset = int(current.scope.get("offset") or 0) + page_size
+    parent_group = str(current.scope["page_group"])
+    continuation_group = f"{parent_group}:continuation:{next_offset}"
+    params = {
+        **current.params,
+        "limit": page_size,
+        "offset": next_offset,
+    }
+    scope = {
+        **current.scope,
+        "page_group": continuation_group,
+        "continues_page_group": parent_group,
+        "offset_origin": next_offset,
+        "offset": next_offset,
+        "page_index": 0,
+        "max_pages": max_pages,
+    }
+    return _spec(
+        current.dataset,
+        current.api_name,
+        params,
+        scope=scope,
+        fields=current.fields,
+        allow_empty=current.allow_empty,
+        max_attempts=current.max_attempts,
+    )
 
 
 def share_float_overflow_repartition_specs(

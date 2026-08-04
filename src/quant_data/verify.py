@@ -51,6 +51,7 @@ def verify_downloads(
     *,
     snapshot_end: date | None = None,
     require_all_planned: bool = True,
+    dataset_filter: set[str] | frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Verify durable files and the exact generation a successor snapshot will use.
 
@@ -68,6 +69,8 @@ def verify_downloads(
     errors: list[str] = []
     warnings: list[str] = []
     for row in checkpoint.verification_rows():
+        if dataset_filter is not None and str(row["dataset"]) not in dataset_filter:
+            continue
         item = dict(row)
         if item["succeeded"] != item["planned"]:
             message = f"{item['dataset']}: {item['succeeded']}/{item['planned']} units succeeded"
@@ -82,7 +85,11 @@ def verify_downloads(
             warnings.append(f"{item['dataset']}: {allowed_empty} allowed empty units")
         datasets.append(item)
 
-    successful_rows = checkpoint.successful()
+    successful_rows = [
+        row
+        for row in checkpoint.successful()
+        if dataset_filter is None or str(row["dataset"]) in dataset_filter
+    ]
     selected_rows = select_current_reference_units(
         successful_rows, snapshot_end=effective_snapshot_end
     )
