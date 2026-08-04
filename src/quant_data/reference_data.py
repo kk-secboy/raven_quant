@@ -182,11 +182,15 @@ def select_current_reference_units(
     """
 
     materialized = [row for row in rows if not _retired_provider_request_contract(row)]
-    superseded_page_groups = {
-        str(parent)
-        for row in materialized
-        if (parent := dict(row.get("scope_json") or {}).get("supersedes_page_group"))
-    }
+    superseded_page_groups: set[str] = set()
+    for row in materialized:
+        scope = dict(row.get("scope_json") or {})
+        parent = scope.get("supersedes_page_group")
+        if parent:
+            superseded_page_groups.add(str(parent))
+        parents = scope.get("supersedes_page_groups")
+        if isinstance(parents, (list, tuple, set, frozenset)):
+            superseded_page_groups.update(str(value) for value in parents if value)
     materialized = [
         row
         for row in materialized

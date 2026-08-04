@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date, datetime
 from types import SimpleNamespace
 
+import pandas as pd
+
 from quant_data.checkpoint import CheckpointStore
 from quant_data.cli import _full_page_partition_recovery, _pagination_overflow_recovery
 from quant_data.execution_data import minute_specs
@@ -153,6 +155,56 @@ def test_adaptive_offset_cap_splits_the_whole_date_range(database_url: str) -> N
     assert [child.params["offset"] for child in children] == [0, 0]
     assert children[0].params["end_date"] == "20240116"
     assert children[1].params["start_date"] == "20240117"
+
+
+def test_tdx_member_offset_cap_repartitions_by_index_symbol(database_url: str) -> None:
+    class Storage:
+        def read_units(self, _rows):
+            return pd.DataFrame(
+                [
+                    {"trade_date": "20260720", "ts_code": "880904.TDX"},
+                    {"trade_date": "20260720", "ts_code": "880735.TDX"},
+                    {"trade_date": "20260721", "ts_code": "880001.TDX"},
+                ]
+            )
+
+    store = CheckpointStore(database_url)
+    root_group = "tdx_member:20260720"
+    continuation_group = f"{root_group}:continuation:24000"
+    failed = FetchSpec(
+        dataset="tdx_member",
+        api_name="tdx_member",
+        scope={
+            "trade_date": "20260720",
+            "page_group": continuation_group,
+            "continues_page_group": root_group,
+            "page_size": 3_000,
+            "max_pages": 48,
+            "offset": 102_000,
+            "page_index": 26,
+        },
+        params={"trade_date": "20260720", "limit": 3_000, "offset": 102_000},
+        allow_empty=True,
+        max_attempts=5,
+    )
+    store.add([failed])
+    store.fail(failed.unit_key, "provider error code=503: cooldown", terminal=True)
+
+    children, recovered = _pagination_overflow_recovery(
+        SimpleNamespace(checkpoint=store, storage=Storage()), [failed], set()
+    )
+
+    assert recovered == {failed.unit_key}
+    assert [child.params["ts_code"] for child in children] == [
+        "880735.TDX",
+        "880904.TDX",
+    ]
+    assert all(child.params["offset"] == 0 for child in children)
+    assert all(
+        child.scope["supersedes_page_groups"] == [root_group, continuation_group]
+        for child in children
+    )
+    assert store.unit_rows([failed.unit_key])[0]["status"] == "superseded"
 
 
 def test_rate_limit_failure_is_handed_back_to_checkpoint_with_cooldown(

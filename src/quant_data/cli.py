@@ -74,6 +74,7 @@ from .supplemental_data import (
     require_pagination_terminated,
     share_float_overflow_repartition_specs,
     supplemental_specs,
+    tdx_member_overflow_repartition_specs,
 )
 from .universe import select_intraday_universe_from_store
 from .verify import quality_gate_payload, verify_downloads, write_report
@@ -573,6 +574,11 @@ def _pagination_overflow_recovery(
     """Recover every provider offset cap using a smaller documented partition."""
 
     recovery_specs, recovered_keys = _share_float_overflow_recovery(context, specs, ignored_keys)
+    tdx_specs, tdx_recovered = _tdx_member_overflow_recovery(
+        context, specs, ignored_keys | recovered_keys
+    )
+    recovery_specs.extend(tdx_specs)
+    recovered_keys.update(tdx_recovered)
     rows_by_key = {
         str(row["unit_key"]): row
         for row in context.checkpoint.unit_rows(spec.unit_key for spec in specs)
@@ -641,6 +647,55 @@ def _pagination_overflow_recovery(
     return recovery_specs, recovered_keys
 
 
+def _tdx_member_overflow_recovery(
+    context: Context,
+    specs: list[FetchSpec],
+    ignored_keys: set[str],
+) -> tuple[list[FetchSpec], set[str]]:
+    """Replace TDX member cursors at the provider cap with index partitions."""
+
+    candidates = [
+        spec
+        for spec in specs
+        if spec.unit_key not in ignored_keys
+        and spec.dataset == "tdx_member"
+        and int(spec.params.get("offset") or 0) >= 100_000
+    ]
+    if not candidates:
+        return [], set()
+    rows_by_key = {
+        str(row["unit_key"]): row
+        for row in context.checkpoint.unit_rows(spec.unit_key for spec in candidates)
+    }
+    failed = [
+        spec
+        for spec in candidates
+        if str((rows_by_key.get(spec.unit_key) or {}).get("status")) in {"failed", "superseded"}
+    ]
+    if not failed:
+        return [], set()
+
+    index_frame = context.storage.read_units(context.checkpoint.successful("tdx_index"))
+    if "ts_code" not in index_frame.columns or "trade_date" not in index_frame.columns:
+        raise RuntimeError("tdx_index did not provide ts_code and trade_date for recovery")
+    normalized_dates = pd.to_datetime(index_frame["trade_date"], errors="coerce").dt.strftime(
+        "%Y%m%d"
+    )
+    recovery_specs: list[FetchSpec] = []
+    recovered_keys: set[str] = set()
+    for failed_spec in failed:
+        trade_date = str(failed_spec.params.get("trade_date") or "")
+        symbols = index_frame.loc[normalized_dates == trade_date, "ts_code"].dropna().tolist()
+        recovery_specs.extend(tdx_member_overflow_repartition_specs(failed_spec, symbols))
+        recovered_keys.add(failed_spec.unit_key)
+        error = str((rows_by_key.get(failed_spec.unit_key) or {}).get("last_error") or "")
+        context.checkpoint.supersede_units(
+            [failed_spec.unit_key],
+            f"{error}; pagination offset cap superseded by per-index TDX partitions",
+        )
+    return recovery_specs, recovered_keys
+
+
 def _full_page_partition_recovery(
     context: Context,
     specs: list[FetchSpec],
@@ -650,14 +705,14 @@ def _full_page_partition_recovery(
     """Split a bisectable page group whose final allowed page is still full."""
 
     row_counts = {str(row["unit_key"]): int(row.get("row_count") or 0) for row in rows}
-    continued = {
-        str(parent)
-        for spec in specs
-        if (
-            parent := spec.scope.get("continues_page_group")
-            or spec.scope.get("supersedes_page_group")
-        )
-    }
+    continued: set[str] = set()
+    for spec in specs:
+        parent = spec.scope.get("continues_page_group") or spec.scope.get("supersedes_page_group")
+        if parent:
+            continued.add(str(parent))
+        parents = spec.scope.get("supersedes_page_groups")
+        if isinstance(parents, (list, tuple, set, frozenset)):
+            continued.update(str(value) for value in parents if value)
     groups: dict[str, list[FetchSpec]] = {}
     for spec in specs:
         group = spec.scope.get("page_group")

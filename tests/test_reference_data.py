@@ -150,6 +150,36 @@ def test_snapshot_selection_replaces_a_provider_capped_page_group() -> None:
     assert [item["unit_key"] for item in selected] == ["daily-20240101"]
 
 
+def test_snapshot_selection_replaces_root_and_continuation_page_groups() -> None:
+    root = "tdx_member:20260720"
+    continuation = f"{root}:continuation:24000"
+    rows = [
+        {
+            "dataset": "tdx_member",
+            "unit_key": "root-page",
+            "scope_json": {"page_group": root, "offset": 0},
+        },
+        {
+            "dataset": "tdx_member",
+            "unit_key": "continuation-page",
+            "scope_json": {"page_group": continuation, "offset": 24_000},
+        },
+        {
+            "dataset": "tdx_member",
+            "unit_key": "symbol-page",
+            "scope_json": {
+                "page_group": f"{root}:symbol:880904.TDX",
+                "offset": 0,
+                "supersedes_page_groups": [root, continuation],
+            },
+        },
+    ]
+
+    selected = select_current_reference_units(rows, snapshot_end=date(2026, 7, 20))
+
+    assert [item["unit_key"] for item in selected] == ["symbol-page"]
+
+
 def test_snapshot_selection_retires_ignored_index_member_request_shape() -> None:
     rows = [
         {

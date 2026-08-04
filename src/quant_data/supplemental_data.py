@@ -237,14 +237,7 @@ def require_pagination_terminated(
         group = spec.scope.get("page_group")
         if group:
             groups[str(group)].append(spec)
-    continued_groups = {
-        str(parent)
-        for spec in specs
-        if (
-            parent := spec.scope.get("continues_page_group")
-            or spec.scope.get("supersedes_page_group")
-        )
-    }
+    continued_groups = {parent for spec in specs for parent in _linked_page_groups(spec.scope)}
     unterminated: list[str] = []
     for group, pages in groups.items():
         if group in continued_groups:
@@ -271,14 +264,7 @@ def next_pagination_specs(
         group = spec.scope.get("page_group")
         if group:
             groups[str(group)].append(spec)
-    continued_groups = {
-        str(parent)
-        for spec in specs
-        if (
-            parent := spec.scope.get("continues_page_group")
-            or spec.scope.get("supersedes_page_group")
-        )
-    }
+    continued_groups = {parent for spec in specs for parent in _linked_page_groups(spec.scope)}
     result: list[FetchSpec] = []
     for group, pages in groups.items():
         if group in continued_groups:
@@ -350,6 +336,71 @@ def pagination_extension_spec(current: FetchSpec, *, max_pages: int) -> FetchSpe
         allow_empty=current.allow_empty,
         max_attempts=current.max_attempts,
     )
+
+
+def _linked_page_groups(scope: Mapping[str, Any]) -> set[str]:
+    groups = {
+        str(value)
+        for key in ("continues_page_group", "supersedes_page_group")
+        if (value := scope.get(key))
+    }
+    plural = scope.get("supersedes_page_groups")
+    if isinstance(plural, (list, tuple, set, frozenset)):
+        groups.update(str(value) for value in plural if value)
+    return groups
+
+
+def tdx_member_overflow_repartition_specs(
+    failed_spec: FetchSpec,
+    symbols: Iterable[str],
+) -> list[FetchSpec]:
+    """Replace an offset-capped TDX member day with per-index partitions."""
+
+    if failed_spec.dataset != "tdx_member":
+        raise ValueError("overflow repartition is only supported for tdx_member")
+    trade_date = str(failed_spec.params.get("trade_date") or "")
+    if len(trade_date) != 8:
+        raise ValueError("tdx_member overflow requires a compact trade_date")
+    normalized_symbols = sorted(
+        {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+    )
+    if not normalized_symbols:
+        raise RuntimeError(
+            f"tdx_member partition {trade_date} exceeded the provider offset cap "
+            "and tdx_index supplied no index symbols"
+        )
+
+    current_group = str(failed_spec.scope["page_group"])
+    root_group = str(failed_spec.scope.get("continues_page_group") or current_group)
+    superseded_groups = sorted({current_group, root_group})
+    page_size = int(failed_spec.scope.get("page_size") or 3_000)
+    max_pages = int(failed_spec.scope.get("max_pages") or 8)
+    return [
+        _spec(
+            "tdx_member",
+            "tdx_member",
+            {
+                "trade_date": trade_date,
+                "ts_code": symbol,
+                "limit": page_size,
+                "offset": 0,
+            },
+            scope={
+                "trade_date": trade_date,
+                "ts_code": symbol,
+                "page_group": f"{root_group}:symbol:{symbol}",
+                "offset": 0,
+                "page_size": page_size,
+                "max_pages": max_pages,
+                "expected_date_field": "trade_date",
+                "expected_date": trade_date,
+                "supersedes_page_groups": superseded_groups,
+            },
+            allow_empty=True,
+            max_attempts=failed_spec.max_attempts,
+        )
+        for symbol in normalized_symbols
+    ]
 
 
 def share_float_overflow_repartition_specs(
