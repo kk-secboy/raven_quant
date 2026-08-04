@@ -966,14 +966,6 @@ def bootstrap(
         context.settings.data_root,
         snapshot_end=end_date,
         require_all_planned=False,
-        dataset_filter={
-            "ashare_5m",
-            "daily",
-            "trade_cal",
-            "daily_basic",
-            "stock_basic",
-            "adj_factor",
-        },
     )
     report_path = context.settings.data_root / "verification" / "latest.json"
     write_report(report, report_path)
@@ -1526,6 +1518,14 @@ def ashare_5m(
         context.settings.data_root,
         snapshot_end=end_date,
         require_all_planned=False,
+        dataset_filter={
+            "ashare_5m",
+            "daily",
+            "trade_cal",
+            "daily_basic",
+            "stock_basic",
+            "adj_factor",
+        },
     )
     write_report(report, context.settings.data_root / "verification" / "latest.json")
     if not report["ok"]:

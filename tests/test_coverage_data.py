@@ -1,3 +1,4 @@
+import inspect
 from datetime import date
 from types import SimpleNamespace
 
@@ -6,6 +7,9 @@ import pytest
 from quant_data.cli import (
     _reconcile_range_plan,
     _supersede_unsupported_governance_units,
+    ashare_5m,
+    bootstrap,
+    snapshot,
 )
 from quant_data.coverage_data import (
     COVERAGE_BUNDLES,
@@ -42,6 +46,12 @@ class _CheckpointStub:
         keys = list(unit_keys)
         self.superseded.extend(keys)
         return len(keys)
+
+
+def test_scoped_quality_gate_is_applied_only_to_ashare_5m_command() -> None:
+    assert "dataset_filter=" in inspect.getsource(ashare_5m)
+    assert "dataset_filter=" not in inspect.getsource(bootstrap)
+    assert "dataset_filter=" not in inspect.getsource(snapshot)
 
 
 def test_coverage_inventory_matches_audited_default_and_optional_counts() -> None:
