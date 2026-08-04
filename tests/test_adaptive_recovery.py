@@ -123,6 +123,47 @@ def test_full_non_adaptive_page_group_continues_without_rekeying_completed_pages
     assert store.unit_rows([parent.unit_key])[0]["status"] == "succeeded"
 
 
+def test_full_economic_calendar_day_extends_past_original_page_ceiling(
+    database_url: str,
+) -> None:
+    store = CheckpointStore(database_url)
+    parent = FetchSpec(
+        dataset="eco_cal",
+        api_name="eco_cal",
+        scope={
+            "page_group": "eco_cal:20251030",
+            "page_size": 100,
+            "max_pages": 8,
+            "offset": 700,
+            "page_index": 7,
+            "expected_date_field": "date",
+            "expected_date": "20251030",
+        },
+        params={"date": "20251030", "limit": 100, "offset": 700},
+        allow_empty=True,
+        max_attempts=5,
+    )
+    store.add([parent])
+    store.succeed(
+        parent.unit_key,
+        UnitResult(output_path="units/eco-cal.parquet", row_count=100, sha256="abc"),
+    )
+
+    children, recovered = _full_page_partition_recovery(
+        SimpleNamespace(checkpoint=store),
+        [parent],
+        [{"unit_key": parent.unit_key, "row_count": 100}],
+        set(),
+    )
+
+    assert recovered == {parent.unit_key}
+    assert len(children) == 1
+    continuation = children[0]
+    assert continuation.params["offset"] == 800
+    assert continuation.scope["max_pages"] == 32
+    assert continuation.scope["continues_page_group"] == parent.scope["page_group"]
+
+
 def test_adaptive_offset_cap_splits_the_whole_date_range(database_url: str) -> None:
     store = CheckpointStore(database_url)
     failed = FetchSpec(

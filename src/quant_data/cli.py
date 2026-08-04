@@ -89,6 +89,10 @@ console = Console()
 _PAGINATION_EXTENSION_MAX_PAGES = {
     "ccass_hold_detail": 128,
     "dc_member": 32,
+    # Production dates can exceed the original eight 100-row pages. Continue
+    # from the existing offset so completed calendar pages stay reusable while
+    # a short page still proves that the date is complete.
+    "eco_cal": 32,
     "tdx_member": 48,
     "ths_member": 96,
 }
