@@ -492,8 +492,8 @@ def coverage_secondary_specs(
                 ("cyq_perf", "year", CoverageRule("cyq_perf", "year", 6_000, 4)),
                 (
                     "cyq_chips",
-                    "month",
-                    CoverageRule("cyq_chips", "month_range", 6_000, 4),
+                    "quarter",
+                    CoverageRule("cyq_chips", "quarter_range", 6_000, 4),
                 ),
             )
             for dataset, grain, rule in cyq_rules:
@@ -503,7 +503,7 @@ def coverage_secondary_specs(
                     ranges = (
                         _year_ranges(symbol_start, symbol_end)
                         if grain == "year"
-                        else _month_ranges(symbol_start, symbol_end)
+                        else _quarter_ranges(symbol_start, symbol_end)
                     )
                     for window_start, window_end in ranges:
                         params = {
@@ -655,6 +655,30 @@ def _month_ranges(start: date, end: date) -> list[tuple[date, date]]:
             else date(current.year, current.month + 1, 1)
         )
         window_end = min(end, next_month - timedelta(days=1))
+        values.append((current, window_end))
+        current = window_end + timedelta(days=1)
+    return values
+
+
+def _quarter_ranges(start: date, end: date) -> list[tuple[date, date]]:
+    """Split a range on calendar-quarter boundaries.
+
+    A quarterly cyq_chips request is normally below the provider's 6,000-row
+    page size.  Dense symbols remain protected by pagination and the existing
+    adaptive partition recovery, while the common case uses one request
+    instead of three monthly requests.
+    """
+
+    values = []
+    current = start
+    while current <= end:
+        next_quarter_month = ((current.month - 1) // 3 + 1) * 3 + 1
+        next_quarter = (
+            date(current.year + 1, 1, 1)
+            if next_quarter_month > 12
+            else date(current.year, next_quarter_month, 1)
+        )
+        window_end = min(end, next_quarter - timedelta(days=1))
         values.append((current, window_end))
         current = window_end + timedelta(days=1)
     return values

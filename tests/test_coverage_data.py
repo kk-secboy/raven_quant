@@ -389,6 +389,60 @@ def test_governance_symbol_plan_supersedes_invalid_legacy_units() -> None:
     assert checkpoint.superseded == [legacy_spec.unit_key]
 
 
+def test_range_plan_supersedes_unfinished_adaptive_children_not_in_current_plan() -> None:
+    current, stale_child = [
+        next(
+            spec
+            for spec in coverage_secondary_specs(
+                "cn_governance_risk",
+                {"cyq_perf": [symbol]},
+                start=date(2024, 1, 1),
+                end=date(2024, 12, 31),
+                max_attempts=3,
+            )
+            if spec.dataset == "cyq_perf"
+        )
+        for symbol in ("000001.SZ", "000002.SZ")
+    ]
+    stale = {
+        "unit_key": stale_child.unit_key,
+        "dataset": stale_child.dataset,
+        "api_name": stale_child.api_name,
+        "scope_json": stale_child.scope,
+        "params_json": stale_child.params,
+        "allow_empty": True,
+        "max_attempts": 3,
+    }
+    checkpoint = _CheckpointStub({"cyq_perf": [stale]})
+
+    reconciled = _reconcile_range_plan(SimpleNamespace(checkpoint=checkpoint), [current])
+
+    assert reconciled == [current]
+    assert checkpoint.superseded == [stale_child.unit_key]
+
+
+def test_cyq_chips_uses_quarterly_windows_with_adaptive_overflow_protection() -> None:
+    specs = coverage_secondary_specs(
+        "cn_governance_risk",
+        {"cyq_chips": ["000001.SZ"], "cyq_perf": ["000001.SZ"]},
+        start=date(2024, 1, 1),
+        end=date(2024, 12, 31),
+        max_attempts=3,
+    )
+
+    chips = [spec for spec in specs if spec.dataset == "cyq_chips"]
+    perf = [spec for spec in specs if spec.dataset == "cyq_perf"]
+    assert [(spec.params["start_date"], spec.params["end_date"]) for spec in chips] == [
+        ("20240101", "20240331"),
+        ("20240401", "20240630"),
+        ("20240701", "20240930"),
+        ("20241001", "20241231"),
+    ]
+    assert len(perf) == 1
+    assert all(spec.scope["max_pages"] == 4 for spec in chips)
+    assert all(spec.scope["partition_axis"] == "date" for spec in chips)
+
+
 def test_governance_supersedes_only_pre_2016_ccass_units() -> None:
     checkpoint = _CheckpointStub(
         {

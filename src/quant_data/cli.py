@@ -411,7 +411,7 @@ def _reconcile_range_plan(context: Context, specs: list[FetchSpec]) -> list[Fetc
     for dataset in {spec.dataset for spec in targets}:
         for row in context.checkpoint.unfinished_units(dataset):
             spec = _checkpoint_row_spec(row)
-            if spec.unit_key not in planned_keys and not is_adaptive_partition(spec):
+            if spec.unit_key not in planned_keys:
                 stale.append(spec.unit_key)
     context.checkpoint.supersede_units(
         stale,
