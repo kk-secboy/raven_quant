@@ -48,6 +48,41 @@ class _CheckpointStub:
         return len(keys)
 
 
+class _CountingRangeSpec:
+    comparisons = 0
+
+    def __init__(self, index: int) -> None:
+        self.dataset = "cyq_chips"
+        self.api_name = "cyq_chips"
+        self.scope = {}
+        self.params = {"ts_code": f"{index:06d}.SZ"}
+        self.unit_key = str(index)
+
+    def __eq__(self, other: object) -> bool:
+        type(self).comparisons += 1
+        return self is other
+
+
+def test_range_plan_classifies_specs_without_quadratic_equality_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specs = [_CountingRangeSpec(index) for index in range(100)]
+    checkpoint = _CheckpointStub({})
+    _CountingRangeSpec.comparisons = 0
+    monkeypatch.setattr("quant_data.cli.is_adaptive_partition", lambda spec: True)
+    monkeypatch.setattr(
+        "quant_data.cli.partition_bounds",
+        lambda spec: ("date", date(2024, 1, 1), date(2024, 1, 31)),
+    )
+
+    reconciled = _reconcile_range_plan(  # type: ignore[arg-type]
+        SimpleNamespace(checkpoint=checkpoint), specs
+    )
+
+    assert [spec.unit_key for spec in reconciled] == [spec.unit_key for spec in specs]
+    assert _CountingRangeSpec.comparisons == 0
+
+
 def test_scoped_quality_gate_is_applied_only_to_ashare_5m_command() -> None:
     assert "dataset_filter=" in inspect.getsource(ashare_5m)
     assert "dataset_filter=" not in inspect.getsource(bootstrap)

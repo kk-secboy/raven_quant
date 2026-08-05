@@ -334,14 +334,15 @@ _RANGE_REUSE_DATASETS = {
 def _reconcile_range_plan(context: Context, specs: list[FetchSpec]) -> list[FetchSpec]:
     """Reuse complete legacy partitions and plan only uncovered session gaps."""
 
-    targets = [
-        spec
-        for spec in specs
-        if spec.dataset in _RANGE_REUSE_DATASETS and is_adaptive_partition(spec)
-    ]
+    targets: list[FetchSpec] = []
+    untouched: list[FetchSpec] = []
+    for spec in specs:
+        if spec.dataset in _RANGE_REUSE_DATASETS and is_adaptive_partition(spec):
+            targets.append(spec)
+        else:
+            untouched.append(spec)
     if not targets:
         return specs
-    untouched = [spec for spec in specs if spec not in targets]
     rows_by_dataset = {
         dataset: context.checkpoint.successful(dataset)
         for dataset in {spec.dataset for spec in targets}
