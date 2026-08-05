@@ -269,6 +269,7 @@ def _run_paginated_specs(
         recovery_specs = [spec for spec in recovery_specs if spec.unit_key not in known]
         specs.extend(recovery_specs)
         inserted += context.checkpoint.add(recovery_specs)
+    _supersede_unplanned_range_units(context, specs)
     _run_phase(context, label, datasets)
 
     while True:
@@ -418,6 +419,33 @@ def _reconcile_range_plan(context: Context, specs: list[FetchSpec]) -> list[Fetc
         "legacy unfinished unit superseded by adaptive range planning",
     )
     return planned
+
+
+def _supersede_unplanned_range_units(context: Context, specs: list[FetchSpec]) -> int:
+    """Retire unfinished range rows that are absent from the executable plan.
+
+    Run this after overflow recovery has rehydrated every child that still
+    belongs to the plan so obsolete adaptive children cannot remain runnable.
+    """
+
+    range_specs = [
+        spec
+        for spec in specs
+        if spec.dataset in _RANGE_REUSE_DATASETS and is_adaptive_partition(spec)
+    ]
+    if not range_specs:
+        return 0
+    planned_keys = {spec.unit_key for spec in range_specs}
+    stale = [
+        str(row["unit_key"])
+        for dataset in {spec.dataset for spec in range_specs}
+        for row in context.checkpoint.unfinished_units(dataset)
+        if str(row["unit_key"]) not in planned_keys
+    ]
+    return context.checkpoint.supersede_units(
+        stale,
+        "unfinished adaptive unit superseded by the executable range plan",
+    )
 
 
 def _supersede_unsupported_governance_units(context: Context) -> int:

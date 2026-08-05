@@ -6,6 +6,7 @@ import pytest
 
 from quant_data.cli import (
     _reconcile_range_plan,
+    _supersede_unplanned_range_units,
     _supersede_unsupported_governance_units,
     ashare_5m,
     bootstrap,
@@ -418,6 +419,37 @@ def test_range_plan_supersedes_unfinished_adaptive_children_not_in_current_plan(
     reconciled = _reconcile_range_plan(SimpleNamespace(checkpoint=checkpoint), [current])
 
     assert reconciled == [current]
+    assert checkpoint.superseded == [stale_child.unit_key]
+
+
+def test_executable_range_plan_guard_retires_only_absent_units() -> None:
+    current, stale_child = [
+        next(
+            spec
+            for spec in coverage_secondary_specs(
+                "cn_governance_risk",
+                {"cyq_perf": [symbol]},
+                start=date(2024, 1, 1),
+                end=date(2024, 12, 31),
+                max_attempts=3,
+            )
+            if spec.dataset == "cyq_perf"
+        )
+        for symbol in ("000001.SZ", "000002.SZ")
+    ]
+    rows = {
+        "cyq_perf": [
+            {"unit_key": current.unit_key},
+            {"unit_key": stale_child.unit_key},
+        ]
+    }
+    checkpoint = _CheckpointStub(rows)
+
+    superseded = _supersede_unplanned_range_units(
+        SimpleNamespace(checkpoint=checkpoint), [current]
+    )
+
+    assert superseded == 1
     assert checkpoint.superseded == [stale_child.unit_key]
 
 
