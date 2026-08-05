@@ -88,6 +88,28 @@ def decode_response(api_name: str, body: bytes, status_code: int = 200) -> Provi
         )
     )
     rate_limited = status_code == 429 or explicit_rate_limit
+    no_data = status_code == 200 and any(
+        token in message_lower
+        for token in (
+            "指定数据不存在",
+            "data does not exist",
+            "no data exists",
+        )
+    )
+    if no_data:
+        # Some Tushare endpoints report an empty but otherwise valid slice as
+        # code 50101 instead of returning code=0 with an empty items array.
+        # Preserve this as a successful empty response so the work unit's
+        # allow_empty policy decides whether it is acceptable.  Do not treat
+        # every 50101 this way: the same code is also used for pagination and
+        # parameter errors that must remain visible to recovery logic.
+        return ProviderResult(
+            api_name=api_name,
+            columns=[],
+            rows=[],
+            raw_body=body,
+            metadata={"provider_code": code, "provider_message": message},
+        )
     if status_code < 200 or status_code >= 300 or str(code) not in {"0", "", "None"}:
         permission_error = any(
             token in message_lower

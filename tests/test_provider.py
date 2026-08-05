@@ -45,6 +45,28 @@ def test_rate_limit_error_is_retryable() -> None:
     assert raised.value.rate_limited is True
 
 
+def test_provider_no_data_code_decodes_as_empty_success() -> None:
+    body = json.dumps(
+        {"code": 50101, "msg": "指定数据不存在，请确认参数！"},
+        ensure_ascii=False,
+    ).encode()
+
+    result = decode_response("cyq_chips", body)
+
+    assert result.rows == []
+    assert result.columns == []
+    assert result.metadata["provider_code"] == 50101
+
+
+def test_provider_50101_offset_error_remains_retryable() -> None:
+    body = json.dumps({"code": 50101, "msg": "pagination offset cap"}).encode()
+
+    with pytest.raises(ProviderError) as raised:
+        decode_response("share_float", body)
+
+    assert raised.value.retryable is True
+
+
 @pytest.mark.parametrize(
     "message,status_code",
     [
