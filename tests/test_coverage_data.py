@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from quant_data.cli import (
+    _exclude_superseded_specs,
     _reconcile_range_plan,
     _supersede_unplanned_range_units,
     _supersede_unsupported_governance_units,
@@ -33,9 +34,15 @@ pytestmark = pytest.mark.no_database
 
 
 class _CheckpointStub:
-    def __init__(self, rows: dict[str, list[dict]]) -> None:
+    def __init__(
+        self,
+        rows: dict[str, list[dict]],
+        *,
+        superseded_keys: set[str] | None = None,
+    ) -> None:
         self.rows = rows
         self.superseded: list[str] = []
+        self.superseded_keys = superseded_keys or set()
 
     def successful(self, dataset: str) -> list[dict]:
         return []
@@ -47,6 +54,9 @@ class _CheckpointStub:
         keys = list(unit_keys)
         self.superseded.extend(keys)
         return len(keys)
+
+    def superseded_unit_keys(self, unit_keys) -> set[str]:
+        return set(unit_keys) & self.superseded_keys
 
 
 class _CountingRangeSpec:
@@ -451,6 +461,30 @@ def test_executable_range_plan_guard_retires_only_absent_units() -> None:
 
     assert superseded == 1
     assert checkpoint.superseded == [stale_child.unit_key]
+
+
+def test_pagination_completeness_excludes_superseded_audit_rows() -> None:
+    current, obsolete = [
+        next(
+            spec
+            for spec in coverage_secondary_specs(
+                "cn_governance_risk",
+                {"cyq_perf": [symbol]},
+                start=date(2024, 1, 1),
+                end=date(2024, 12, 31),
+                max_attempts=3,
+            )
+            if spec.dataset == "cyq_perf"
+        )
+        for symbol in ("000001.SZ", "000002.SZ")
+    ]
+    checkpoint = _CheckpointStub({}, superseded_keys={obsolete.unit_key})
+
+    executable = _exclude_superseded_specs(
+        SimpleNamespace(checkpoint=checkpoint), [current, obsolete]
+    )
+
+    assert executable == [current]
 
 
 def test_cyq_chips_uses_quarterly_windows_with_adaptive_overflow_protection() -> None:

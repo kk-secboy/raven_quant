@@ -374,6 +374,23 @@ class CheckpointStore:
                 rows.extend(row_dict(row) for row in connection.execute(statement))
         return sorted(rows, key=lambda row: (str(row["dataset"]), str(row["unit_key"])))
 
+    def superseded_unit_keys(self, unit_keys: Iterable[str]) -> set[str]:
+        """Return audit-only keys that must not re-enter an executable plan."""
+
+        keys = sorted(set(unit_keys))
+        if not keys:
+            return set()
+        superseded: set[str] = set()
+        with self.engine.connect() as connection:
+            for offset in range(0, len(keys), _SELECT_BATCH_SIZE):
+                batch = keys[offset : offset + _SELECT_BATCH_SIZE]
+                statement = select(work_units.c.unit_key).where(
+                    work_units.c.status == "superseded",
+                    work_units.c.unit_key.in_(batch),
+                )
+                superseded.update(str(row.unit_key) for row in connection.execute(statement))
+        return superseded
+
     def unit_rows(self, unit_keys: Iterable[str]) -> list[dict[str, Any]]:
         """Return checkpoint rows for an explicit plan, regardless of status."""
 

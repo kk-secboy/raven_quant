@@ -283,7 +283,10 @@ def _run_paginated_specs(
             _run_phase(context, f"{label} overflow continuation", datasets)
             continue
 
-        active_specs = [spec for spec in specs if spec.unit_key not in ignored_keys]
+        active_specs = _exclude_superseded_specs(
+            context,
+            [spec for spec in specs if spec.unit_key not in ignored_keys],
+        )
         rows = _require_specs_complete(context, active_specs)
         next_specs = next_pagination_specs(active_specs, rows)
         if not next_specs:
@@ -446,6 +449,15 @@ def _supersede_unplanned_range_units(context: Context, specs: list[FetchSpec]) -
         stale,
         "unfinished adaptive unit superseded by the executable range plan",
     )
+
+
+def _exclude_superseded_specs(context: Context, specs: list[FetchSpec]) -> list[FetchSpec]:
+    """Keep audit-only checkpoint rows out of pagination completeness checks."""
+
+    superseded = context.checkpoint.superseded_unit_keys(spec.unit_key for spec in specs)
+    if not superseded:
+        return specs
+    return [spec for spec in specs if spec.unit_key not in superseded]
 
 
 def _supersede_unsupported_governance_units(context: Context) -> int:

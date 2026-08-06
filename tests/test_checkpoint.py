@@ -86,6 +86,29 @@ def test_successful_units_reads_only_the_requested_plan(database_url: str) -> No
     assert [row["unit_key"] for row in rows] == [first.unit_key]
 
 
+def test_superseded_unit_keys_are_scoped_to_the_requested_plan(database_url: str) -> None:
+    store = CheckpointStore(database_url)
+    current = spec()
+    obsolete = FetchSpec(
+        dataset="daily",
+        api_name="daily",
+        scope={"trade_date": "20240103"},
+        params={"trade_date": "20240103"},
+    )
+    unrelated = FetchSpec(
+        dataset="daily",
+        api_name="daily",
+        scope={"trade_date": "20240104"},
+        params={"trade_date": "20240104"},
+    )
+    store.add([current, obsolete, unrelated])
+    store.supersede_units([obsolete.unit_key, unrelated.unit_key], "obsolete plan")
+
+    assert store.superseded_unit_keys([current.unit_key, obsolete.unit_key]) == {
+        obsolete.unit_key
+    }
+
+
 def test_superseded_units_are_retained_but_not_runnable_or_planned(
     database_url: str,
 ) -> None:
