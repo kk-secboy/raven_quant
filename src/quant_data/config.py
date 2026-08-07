@@ -7,10 +7,10 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
-# The relay operator confirmed a 120-start window. Keep one request of headroom
-# and clamp operator overrides so a stale environment cannot silently trade
-# useful throughput for upstream throttling and retries.
-TUSHARE_RELAY_MAX_REQUESTS_PER_MINUTE = 119.0
+# The relay operator recommends keeping each client's aggregate start rate at
+# or below 118 while the relay dynamically shares capacity among its users.
+# Clamp stale operator overrides so retries do not reduce useful throughput.
+TUSHARE_RELAY_MAX_REQUESTS_PER_MINUTE = 118.0
 
 
 def normalize_api_url(value: str) -> str:

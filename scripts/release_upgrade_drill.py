@@ -33,7 +33,7 @@ def _write_env(path: Path) -> None:
                 "AUTH_COOKIE_SECURE=false",
                 f"PLATFORM_SECRET_KEY={secret}",
                 "BROKER_MODE=disabled",
-                "REQUESTS_PER_MINUTE=119",
+                "REQUESTS_PER_MINUTE=118",
                 "DOWNLOAD_WORKERS=2",
                 "LOG_MAX_SIZE=5m",
                 "LOG_MAX_FILES=2",
