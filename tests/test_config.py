@@ -14,7 +14,7 @@ def test_tushare_relay_rate_is_capped_below_provider_limit(
 
     settings = Settings.from_env(tmp_path / ".env.missing")
 
-    assert settings.requests_per_minute == TUSHARE_RELAY_MAX_REQUESTS_PER_MINUTE == 99.0
+    assert settings.requests_per_minute == TUSHARE_RELAY_MAX_REQUESTS_PER_MINUTE == 119.0
 
 
 def test_tushare_relay_rate_preserves_stricter_operator_limit(

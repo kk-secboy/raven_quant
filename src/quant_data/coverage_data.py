@@ -159,7 +159,10 @@ _RULES: dict[str, tuple[CoverageRule, ...]] = {
 
 
 SECONDARY_DATASETS = {
-    "cn_governance_risk": {"stk_rewards", "cyq_perf", "cyq_chips"},
+    # cyq_perf is the canonical compact daily chip-cost/winner-rate dataset.
+    # cyq_chips expands every stock/day into many price-bucket rows, is not
+    # consumed by the platform, and is retained only as historical audit data.
+    "cn_governance_risk": {"stk_rewards", "cyq_perf"},
     "cn_derivatives_enhanced": {"fut_index_daily"},
     "strategy_specialty_minutes": {"sw_mins", "hk_mins"},
 }
@@ -488,38 +491,25 @@ def coverage_secondary_specs(
             )
         cyq_start = max(start, date(2018, 1, 1))
         if cyq_start <= end:
-            cyq_rules = (
-                ("cyq_perf", "year", CoverageRule("cyq_perf", "year", 6_000, 4)),
-                (
-                    "cyq_chips",
-                    "quarter",
-                    CoverageRule("cyq_chips", "quarter_range", 6_000, 4),
-                ),
-            )
-            for dataset, grain, rule in cyq_rules:
-                for symbol, (symbol_start, symbol_end) in _symbol_ranges(
-                    symbols_by_dataset.get(dataset, ()), start=cyq_start, end=end
-                ).items():
-                    ranges = (
-                        _year_ranges(symbol_start, symbol_end)
-                        if grain == "year"
-                        else _quarter_ranges(symbol_start, symbol_end)
-                    )
-                    for window_start, window_end in ranges:
-                        params = {
-                            "ts_code": symbol,
-                            "start_date": compact_date(window_start),
-                            "end_date": compact_date(window_end),
-                        }
-                        specs.extend(
-                            _paged(
-                                rule,
-                                params,
-                                (f"{dataset}:{symbol}:{params['start_date']}:{params['end_date']}"),
-                                max_attempts,
-                                partition=partition_metadata("date", window_start, window_end),
-                            )
+            rule = CoverageRule("cyq_perf", "year", 6_000, 4)
+            for symbol, (symbol_start, symbol_end) in _symbol_ranges(
+                symbols_by_dataset.get("cyq_perf", ()), start=cyq_start, end=end
+            ).items():
+                for window_start, window_end in _year_ranges(symbol_start, symbol_end):
+                    params = {
+                        "ts_code": symbol,
+                        "start_date": compact_date(window_start),
+                        "end_date": compact_date(window_end),
+                    }
+                    specs.extend(
+                        _paged(
+                            rule,
+                            params,
+                            (f"cyq_perf:{symbol}:{params['start_date']}:{params['end_date']}"),
+                            max_attempts,
+                            partition=partition_metadata("date", window_start, window_end),
                         )
+                    )
         return apply_reference_refresh(specs, as_of=end)
     if bundle == "strategy_specialty_minutes":
         specs = []
@@ -655,30 +645,6 @@ def _month_ranges(start: date, end: date) -> list[tuple[date, date]]:
             else date(current.year, current.month + 1, 1)
         )
         window_end = min(end, next_month - timedelta(days=1))
-        values.append((current, window_end))
-        current = window_end + timedelta(days=1)
-    return values
-
-
-def _quarter_ranges(start: date, end: date) -> list[tuple[date, date]]:
-    """Split a range on calendar-quarter boundaries.
-
-    A quarterly cyq_chips request is normally below the provider's 6,000-row
-    page size.  Dense symbols remain protected by pagination and the existing
-    adaptive partition recovery, while the common case uses one request
-    instead of three monthly requests.
-    """
-
-    values = []
-    current = start
-    while current <= end:
-        next_quarter_month = ((current.month - 1) // 3 + 1) * 3 + 1
-        next_quarter = (
-            date(current.year + 1, 1, 1)
-            if next_quarter_month > 12
-            else date(current.year, next_quarter_month, 1)
-        )
-        window_end = min(end, next_quarter - timedelta(days=1))
         values.append((current, window_end))
         current = window_end + timedelta(days=1)
     return values

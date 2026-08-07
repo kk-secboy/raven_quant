@@ -461,6 +461,14 @@ def _exclude_superseded_specs(context: Context, specs: list[FetchSpec]) -> list[
 
 
 def _supersede_unsupported_governance_units(context: Context) -> int:
+    retired_chips = [
+        str(row["unit_key"]) for row in context.checkpoint.unfinished_units("cyq_chips")
+    ]
+    superseded = context.checkpoint.supersede_units(
+        retired_chips,
+        "cyq_chips raw price distribution retired from the required governance plan; "
+        "cyq_perf is the canonical compact dataset",
+    )
     stale: list[str] = []
     for dataset in ("ccass_hold", "ccass_hold_detail"):
         for row in context.checkpoint.unfinished_units(dataset):
@@ -470,10 +478,11 @@ def _supersede_unsupported_governance_units(context: Context) -> int:
             ).replace("-", "")[:8]
             if requested_date and requested_date < "20160101":
                 stale.append(str(row["unit_key"]))
-    return context.checkpoint.supersede_units(
+    superseded += context.checkpoint.supersede_units(
         stale,
         "provider does not support CCASS history before 2016",
     )
+    return superseded
 
 
 def _complete_success_specs(rows: list[dict]) -> list[FetchSpec]:
@@ -2139,7 +2148,6 @@ def supplemental_download(
             {
                 "stk_rewards": active_ranges,
                 "cyq_perf": cyq_ranges,
-                "cyq_chips": cyq_ranges,
             },
             start=start_date,
             end=end_date,

@@ -107,7 +107,7 @@ def test_coverage_inventory_matches_audited_default_and_optional_counts() -> Non
     optional = set().union(
         *(coverage_bundle_datasets(bundle) for bundle in OPTIONAL_COVERAGE_BUNDLES)
     )
-    assert len(default) == 58
+    assert len(default) == 57
     assert len(optional) == 26
     assert default.isdisjoint(optional)
     assert all(coverage_primary_key_candidates(dataset) for dataset in default | optional)
@@ -190,7 +190,7 @@ def test_default_rules_plan_full_market_cross_sections_without_stock_loops() -> 
         datasets = {spec.dataset for spec in specs}
         expected = coverage_bundle_datasets(bundle)
         if bundle == "cn_governance_risk":
-            expected = expected - {"stk_rewards", "cyq_perf", "cyq_chips"}
+            expected = expected - {"stk_rewards", "cyq_perf"}
         if bundle == "cn_derivatives_enhanced":
             expected = expected - {"fut_index_daily"}
         assert datasets == expected
@@ -307,7 +307,8 @@ def test_only_provider_mandated_symbol_paths_expand_by_symbol() -> None:
     assert len(rewards) == 1
     assert rewards[0].params["ts_code"] == "000001.SZ,600000.SH"
     assert rewards[0].scope["row_limit"] == 10_000
-    assert len(cyq) == 4
+    assert len(cyq) == 2
+    assert {spec.dataset for spec in cyq} == {"cyq_perf"}
     assert {spec.params["ts_code"] for spec in cyq} == {
         "000001.SZ",
         "600000.SH",
@@ -358,12 +359,13 @@ def test_governance_planning_respects_provider_history_and_required_symbols() ->
         max_attempts=3,
     )
     cyq = [spec for spec in secondary if spec.dataset.startswith("cyq_")]
-    assert len(cyq) == 2
+    assert len(cyq) == 1
+    assert {spec.dataset for spec in cyq} == {"cyq_perf"}
     assert all(spec.params["ts_code"] == "000001.SZ" for spec in cyq)
     assert all(spec.params["start_date"] == "20180101" for spec in cyq)
 
 
-def test_governance_symbol_plan_supersedes_invalid_legacy_units() -> None:
+def test_governance_cleanup_supersedes_retired_cyq_chips_units() -> None:
     legacy_spec = FetchSpec(
         dataset="cyq_chips",
         api_name="cyq_chips",
@@ -382,21 +384,10 @@ def test_governance_symbol_plan_supersedes_invalid_legacy_units() -> None:
         "max_attempts": 3,
     }
     checkpoint = _CheckpointStub({"cyq_chips": [legacy]})
-    target = next(
-        spec
-        for spec in coverage_secondary_specs(
-            "cn_governance_risk",
-            {"cyq_chips": ["000001.SZ"]},
-            start=date(2024, 1, 1),
-            end=date(2024, 1, 31),
-            max_attempts=3,
-        )
-        if spec.dataset == "cyq_chips"
-    )
 
-    reconciled = _reconcile_range_plan(SimpleNamespace(checkpoint=checkpoint), [target])
+    count = _supersede_unsupported_governance_units(SimpleNamespace(checkpoint=checkpoint))
 
-    assert reconciled == [target]
+    assert count == 1
     assert checkpoint.superseded == [legacy_spec.unit_key]
 
 
@@ -487,7 +478,7 @@ def test_pagination_completeness_excludes_superseded_audit_rows() -> None:
     assert executable == [current]
 
 
-def test_cyq_chips_uses_quarterly_windows_with_adaptive_overflow_protection() -> None:
+def test_cyq_chips_is_not_planned_as_required_governance_data() -> None:
     specs = coverage_secondary_specs(
         "cn_governance_risk",
         {"cyq_chips": ["000001.SZ"], "cyq_perf": ["000001.SZ"]},
@@ -496,17 +487,8 @@ def test_cyq_chips_uses_quarterly_windows_with_adaptive_overflow_protection() ->
         max_attempts=3,
     )
 
-    chips = [spec for spec in specs if spec.dataset == "cyq_chips"]
-    perf = [spec for spec in specs if spec.dataset == "cyq_perf"]
-    assert [(spec.params["start_date"], spec.params["end_date"]) for spec in chips] == [
-        ("20240101", "20240331"),
-        ("20240401", "20240630"),
-        ("20240701", "20240930"),
-        ("20241001", "20241231"),
-    ]
-    assert len(perf) == 1
-    assert all(spec.scope["max_pages"] == 4 for spec in chips)
-    assert all(spec.scope["partition_axis"] == "date" for spec in chips)
+    assert {spec.dataset for spec in specs} == {"cyq_perf"}
+    assert len(specs) == 1
 
 
 def test_governance_supersedes_only_pre_2016_ccass_units() -> None:

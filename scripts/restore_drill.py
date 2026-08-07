@@ -60,7 +60,7 @@ def _write_env(path: Path, password: str, secret_key: str) -> None:
                 f"PLATFORM_SECRET_KEY={secret_key}",
                 "BROKER_MODE=disabled",
                 "RDAGENT_ENABLED=true",
-                "REQUESTS_PER_MINUTE=99",
+                "REQUESTS_PER_MINUTE=119",
                 "DOWNLOAD_WORKERS=2",
             )
         )
