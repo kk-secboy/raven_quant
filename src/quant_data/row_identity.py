@@ -30,6 +30,7 @@ NULL_ON_AMBIGUITY_COLUMNS: dict[str, frozenset[str]] = {
 # the verification report records the quarantined-key count.
 SNAPSHOT_QUARANTINE_KEYS: dict[str, tuple[str, ...]] = {
     "ccass_hold": ("ts_code", "trade_date"),
+    "ccass_hold_detail": ("ts_code", "trade_date", "col_participant_id"),
     "irm_qa_sh": ("trade_date", "ts_code", "q"),
     "irm_qa_sz": ("trade_date", "ts_code", "q"),
 }

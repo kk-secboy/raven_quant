@@ -363,6 +363,41 @@ def test_verifier_rejects_conflicting_duplicates_from_unstable_pagination(
     assert any("dc_member: 1 conflicting business keys" in item for item in result["errors"])
 
 
+def test_verifier_accepts_exact_duplicates_from_overlapping_date_partitions(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    specs = [
+        FetchSpec(
+            dataset="us_trycr",
+            api_name="us_trycr",
+            params={"start_date": start, "end_date": end},
+            scope={"start_date": start, "end_date": end},
+        )
+        for start, end in (("20250101", "20260101"), ("20260101", "20261231"))
+    ]
+    checkpoint.add(specs)
+    row = {"date": "20260101", "y5": 3.5, "y10": 4.0, "y30": 4.5}
+    for spec in specs:
+        written = storage.write_unit(
+            spec.dataset,
+            spec.unit_key,
+            ProviderResult(spec.api_name, list(row), [row], b"{}"),
+        )
+        checkpoint.succeed(spec.unit_key, written)
+
+    result = verify_downloads(checkpoint, tmp_path)
+
+    assert result["ok"] is True
+    assert result["duplicate_checks"] == {"us_trycr": 1}
+    assert result["conflicting_duplicate_checks"] == {"us_trycr": 0}
+    assert any(
+        "us_trycr: 1 exact duplicate primary-key rows" in item
+        for item in result["warnings"]
+    )
+
+
 def test_verifier_audits_snapshot_quarantine_for_unsafe_provider_conflicts(
     tmp_path: Path, database_url: str
 ) -> None:
@@ -408,6 +443,51 @@ def test_verifier_audits_snapshot_quarantine_for_unsafe_provider_conflicts(
     assert result["quarantined_conflict_checks"] == {"ccass_hold": 1}
     assert any(
         "ccass_hold: 1 conflicting business keys" in item and "quarantined" in item
+        for item in result["warnings"]
+    )
+
+
+def test_verifier_quarantines_conflicting_ccass_detail_business_key(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+    storage = ParquetStore(tmp_path)
+    spec = FetchSpec(
+        dataset="ccass_hold_detail",
+        api_name="ccass_hold_detail",
+        params={"trade_date": "20250930"},
+        scope={"page_group": "ccass_hold_detail:20250930", "offset": 0},
+    )
+    checkpoint.add([spec])
+    first = {
+        "trade_date": "20250930",
+        "ts_code": "00001.HK",
+        "name": "CK Hutchison",
+        "col_participant_id": "B01231",
+        "col_participant_name": "Broker A",
+        "col_shareholding": "2368",
+        "col_shareholding_percent": "0.00",
+    }
+    second = {
+        **first,
+        "col_participant_name": "Broker B",
+        "col_shareholding": "2400",
+    }
+    written = storage.write_unit(
+        spec.dataset,
+        spec.unit_key,
+        ProviderResult(spec.api_name, list(first), [first, second], b"{}"),
+    )
+    checkpoint.succeed(spec.unit_key, written)
+
+    result = verify_downloads(checkpoint, tmp_path)
+
+    assert result["ok"] is True
+    assert result["conflicting_duplicate_checks"] == {"ccass_hold_detail": 1}
+    assert result["quarantined_conflict_checks"] == {"ccass_hold_detail": 1}
+    assert any(
+        "ccass_hold_detail: 1 conflicting business keys" in item
+        and "quarantined" in item
         for item in result["warnings"]
     )
 

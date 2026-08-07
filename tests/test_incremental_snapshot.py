@@ -267,6 +267,24 @@ def test_snapshot_resolves_metadata_drift_and_quarantines_unsafe_keys(
             "col_shareholding": "2368",
             "col_shareholding_percent": "0.00",
         },
+        {
+            "trade_date": "20250808",
+            "ts_code": "00019.HK",
+            "name": "Swire Pacific",
+            "col_participant_id": "B09999",
+            "col_participant_name": "Broker C",
+            "col_shareholding": "100",
+            "col_shareholding_percent": "0.01",
+        },
+        {
+            "trade_date": "20250808",
+            "ts_code": "00019.HK",
+            "name": "Swire Pacific",
+            "col_participant_id": "B09999",
+            "col_participant_name": "Broker C",
+            "col_shareholding": "200",
+            "col_shareholding_percent": "0.02",
+        },
     ]
     share_float_rows = [
         {
@@ -332,6 +350,7 @@ def test_snapshot_resolves_metadata_drift_and_quarantines_unsafe_keys(
     assert len(ccass) == 2
     detail = _dataset_frame(snapshot, "ccass_hold_detail")
     assert len(detail) == 1
+    assert detail.iloc[0]["col_participant_id"] == "B01231"
     assert detail.iloc[0]["col_shareholding"] == "2368"
     share_float = _dataset_frame(snapshot, "share_float")
     assert len(share_float) == 1

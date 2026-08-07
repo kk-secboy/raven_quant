@@ -15,11 +15,11 @@ from .execution_contract import SIMULATION_MINUTE_SOURCE_DATASETS, TUSHARE_HAND_
 from .reference_data import select_current_reference_units
 from .row_identity import SNAPSHOT_QUARANTINE_KEYS, semantic_provider_columns
 
-# Interfaces whose provider pagination reorders rows between pages, or whose
-# intraday snapshots drift between polls, making overlapping pages (and
-# therefore duplicate primary keys) inherent.  Snapshot builds already
-# deduplicate identical provider fields while retaining the earliest ingestion
-# timestamp, so only semantic duplicates for these datasets can be warnings.
+# Interfaces whose provider pagination reorders rows between pages, whose
+# intraday snapshots drift between polls, or whose requested date partitions
+# overlap at their boundaries. Snapshot builds already deduplicate identical
+# provider fields while retaining the earliest ingestion timestamp, so only
+# semantic duplicates for these datasets can be warnings.
 UNSTABLE_PAGINATION_DATASETS = frozenset(
     {
         "share_float",
@@ -31,6 +31,10 @@ UNSTABLE_PAGINATION_DATASETS = frozenset(
         "moneyflow_ind_dc",
         "irm_qa_sh",
         "irm_qa_sz",
+        "us_tbr",
+        "us_tltr",
+        "us_trltr",
+        "us_trycr",
     }
 )
 
@@ -231,7 +235,8 @@ def verify_downloads(
                     warnings.append(
                         f"{dataset}: {duplicates} exact duplicate primary-key rows "
                         "(provider paginates this interface with an unstable sort order "
-                        "or drifts intraday snapshots between polls; snapshot semantic-row "
+                        "or drifts intraday snapshots between polls, or requested windows "
+                        "overlap at their boundaries; snapshot semantic-row "
                         "deduplication removes the identical provider rows)"
                     )
             elif duplicates:

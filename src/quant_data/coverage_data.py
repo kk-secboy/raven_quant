@@ -201,6 +201,10 @@ _PRIMARY_KEY_OVERRIDES: dict[str, tuple[tuple[str, ...], ...]] = {
         ("month", "ts_code"),
         ("ann_date", "ts_code"),
     ),
+    # The OTC quote feed contains many time/bank observations for the same
+    # bond and trade date. ``id`` is the provider record identity and is
+    # populated uniquely across the audited history.
+    "bc_otcqt": (("id",),),
     "margin": (("trade_date", "exchange_id"),),
     "moneyflow_hsgt": (("trade_date",),),
     "moneyflow_mkt_dc": (("trade_date",),),

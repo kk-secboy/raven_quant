@@ -117,6 +117,7 @@ def test_coverage_inventory_matches_audited_default_and_optional_counts() -> Non
     ("dataset", "expected"),
     (
         ("broker_recommend", ("month", "broker", "ts_code")),
+        ("bc_otcqt", ("id",)),
         ("ccass_hold_detail", ("ts_code", "trade_date", "col_participant_id")),
         (
             "dc_hot",
