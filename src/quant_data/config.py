@@ -7,6 +7,11 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
+# The deployed relay enforces a hard 100-start window. Keep one request of
+# headroom and clamp operator overrides so a stale environment cannot silently
+# trade half of its useful throughput for upstream throttling and retries.
+TUSHARE_RELAY_MAX_REQUESTS_PER_MINUTE = 99.0
+
 
 def normalize_api_url(value: str) -> str:
     value = value.strip().rstrip("/")
@@ -35,7 +40,7 @@ class Settings:
         "postgresql+psycopg://quantlab:quantlab@127.0.0.1:55432/quantlab"
         "?options=-csearch_path%3Dpublic"
     )
-    requests_per_minute: float = 90.0
+    requests_per_minute: float = TUSHARE_RELAY_MAX_REQUESTS_PER_MINUTE
     workers: int = 4
     timeout_seconds: float = 60.0
     max_request_attempts: int = 5
@@ -95,7 +100,15 @@ class Settings:
                 "postgresql+psycopg://quantlab:quantlab@127.0.0.1:55432/quantlab"
                 "?options=-csearch_path%3Dpublic",
             ),
-            requests_per_minute=float(os.getenv("REQUESTS_PER_MINUTE", "90")),
+            requests_per_minute=min(
+                float(
+                    os.getenv(
+                        "REQUESTS_PER_MINUTE",
+                        str(TUSHARE_RELAY_MAX_REQUESTS_PER_MINUTE),
+                    )
+                ),
+                TUSHARE_RELAY_MAX_REQUESTS_PER_MINUTE,
+            ),
             workers=max(1, int(os.getenv("DOWNLOAD_WORKERS", "4"))),
             timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "60")),
             max_request_attempts=max(1, int(os.getenv("MAX_REQUEST_ATTEMPTS", "5"))),
