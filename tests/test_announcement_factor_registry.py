@@ -228,6 +228,10 @@ def test_register_success(database_url: str, tmp_path: Path) -> None:
     assert candidate["status"] == "awaiting_evaluation"
     assert candidate["values_path"] == str(artifact["artifact_path"])
     assert candidate["values_sha256"] == artifact["manifest"]["sha256"]
+    assert candidate["experiment_family_id"] == (
+        f"external:{registry.SOURCE_DATASET}:{nlp.FACTOR_NAME}"
+    )
+    assert candidate["experiment_count"] == 1
     code_path = Path(candidate["code_path"])
     assert code_path.is_file()
     assert candidate["code_sha256"] == hashlib.sha256(code_path.read_bytes()).hexdigest()
@@ -282,6 +286,12 @@ def test_register_new_artifact_version_creates_new_candidate(
     assert second["candidate_id"] != first["candidate_id"]
     assert second["run_id"] != first["run_id"]
     assert second["values_sha256"] != first["values_sha256"]
+    first_candidate = store.get_candidate(first["candidate_id"])
+    second_candidate = store.get_candidate(second["candidate_id"])
+    assert second_candidate["experiment_family_id"] == first_candidate[
+        "experiment_family_id"
+    ]
+    assert second_candidate["experiment_count"] == 2
     assert len(_candidates(store)) == 2
     assert len(_import_runs(store)) == 2
 

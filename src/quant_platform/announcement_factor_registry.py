@@ -265,6 +265,8 @@ def register_external_factor(
         }
 
     metadata = build_metadata(manifest, values_sha256)
+    experiment_family_id = f"external:{source_dataset}:{factor_name}"
+    experiment_count = store.count_candidates(name=factor_name) + 1
     code_path = factors_dir / f"{factor_name}_factor.py"
     _write_code_artifact(code_path, metadata.code_source)
 
@@ -299,6 +301,8 @@ def register_external_factor(
             code_sha256=None,
             rdagent_decision=None,
             rdagent_feedback=metadata.rdagent_feedback,
+            experiment_family_id=experiment_family_id,
+            experiment_count=experiment_count,
             actor=actor,
         )
     except Exception as exc:

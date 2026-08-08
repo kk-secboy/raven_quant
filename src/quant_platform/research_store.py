@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import and_, insert, select, update
+from sqlalchemy import and_, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
@@ -677,6 +677,15 @@ class ResearchStore:
         candidate = self._decode_candidate(row_dict(row))
         candidate["latest_evaluation"] = self.latest_evaluation(candidate["id"])
         return candidate
+
+    def count_candidates(self, *, name: str) -> int:
+        """Count immutable trials for a named factor across research runs."""
+
+        statement = select(func.count()).select_from(factor_candidates).where(
+            factor_candidates.c.name == name
+        )
+        with self.engine.connect() as connection:
+            return int(connection.scalar(statement) or 0)
 
     def list_candidates(
         self, *, run_id: str | None = None, status: str | None = None, limit: int = 100

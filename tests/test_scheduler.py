@@ -159,6 +159,14 @@ def test_scheduler_creates_bounded_recoverable_information_pipeline(
         json.dumps({"ok": True, "errors": []}), encoding="utf-8"
     )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "quant_platform.scheduler.resolve_information_evaluation_dataset",
+        lambda _root, _evaluation: {
+            "name": "qlib-frozen",
+            "path": str(tmp_path / "data" / "qlib" / "qlib-frozen"),
+            "provenance": {"dataset_identity_sha256": "a" * 64},
+        },
+    )
     store = ScheduleStore(database_url)
     store.create(
         name="daily governed information pipeline",
@@ -172,6 +180,20 @@ def test_scheduler_creates_bounded_recoverable_information_pipeline(
             "announcement_nlp_limit": 125,
             "corpus_nlp_limit": 175,
             "corpus_datasets": ["major_news", "irm_qa_sh", "irm_qa_sz"],
+            "include_factor_evaluation": True,
+            "factor_evaluation": {
+                "dataset": "qlib-frozen",
+                "periods": {
+                    "train_start": "2020-01-01",
+                    "train_end": "2021-12-31",
+                    "valid_start": "2022-01-01",
+                    "valid_end": "2023-12-31",
+                    "test_start": "2024-01-08",
+                    "test_end": "2025-01-02",
+                },
+                "universe": "cn_all",
+                "benchmark": "SH000300",
+            },
         },
         misfire_grace_seconds=1800,
         actor="operator",
@@ -195,10 +217,19 @@ def test_scheduler_creates_bounded_recoverable_information_pipeline(
         "corpus_nlp",
         "corpus_factor_register",
         "event_market_response",
+        "information_factor_evaluate",
     ]
     assert steps[0]["payload"]["limit"] == 125
     assert steps[2]["payload"]["limit"] == 175
     assert steps[4]["payload"]["snapshot_name"] == "cn-verified"
+    assert steps[5]["payload"]["dataset"] == "qlib-frozen"
+    assert steps[5]["payload"]["dataset_identity_sha256"] == "a" * 64
+    assert steps[5]["payload"]["factor_names"] == [
+        "announcement_logic_score",
+        "announcement_tone",
+        "irm_qa_sentiment_daily",
+        "news_sentiment_daily",
+    ]
 
 
 def test_information_schedule_skips_when_a_conflicting_job_is_active(

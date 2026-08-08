@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from quant_platform import information_schedule as schedule_module
+from quant_platform.announcement_nlp import FACTOR_NAME
 from quant_platform.information_schedule import (
     latest_verified_snapshot,
     normalize_information_schedule_payload,
@@ -42,6 +44,8 @@ def test_information_schedule_is_raw_only_and_bounded_by_default() -> None:
     assert payload["enable_nlp"] is False
     assert payload["include_corpus_nlp"] is False
     assert payload["include_event_labels"] is False
+    assert payload["include_factor_evaluation"] is False
+    assert payload["factor_evaluation"] is None
     assert payload["announcement_nlp_limit"] == 500
     assert payload["corpus_nlp_limit"] == 500
 
@@ -65,6 +69,63 @@ def test_information_schedule_requires_explicit_nlp_and_finite_limits() -> None:
     assert payload["corpus_datasets"] == ["irm_qa_sz", "major_news"]
 
 
+def test_information_schedule_requires_explicit_frozen_factor_evaluation() -> None:
+    with pytest.raises(ValueError, match="include_factor_evaluation=true"):
+        normalize_information_schedule_payload(
+            {"enable_nlp": True, "factor_evaluation": {"dataset": "qlib"}}
+        )
+    with pytest.raises(ValueError, match="periods must contain exactly"):
+        normalize_information_schedule_payload(
+            {
+                "enable_nlp": True,
+                "include_factor_evaluation": True,
+                "factor_evaluation": {"dataset": "qlib-fixture", "periods": {}},
+            }
+        )
+    with pytest.raises(ValueError, match="purge/embargo"):
+        normalize_information_schedule_payload(
+            {
+                "enable_nlp": True,
+                "include_factor_evaluation": True,
+                "factor_evaluation": {
+                    "dataset": "qlib-fixture",
+                    "periods": {
+                        "train_start": "2020-01-01",
+                        "train_end": "2021-12-31",
+                        "valid_start": "2022-01-01",
+                        "valid_end": "2023-12-31",
+                        "test_start": "2024-01-05",
+                        "test_end": "2025-12-31",
+                    },
+                },
+            }
+        )
+
+    payload = normalize_information_schedule_payload(
+        {
+            "enable_nlp": True,
+            "include_factor_evaluation": True,
+            "factor_evaluation": {
+                "dataset": "qlib-fixture",
+                "periods": {
+                    "train_start": "2020-01-01",
+                    "train_end": "2021-12-31",
+                    "valid_start": "2022-01-01",
+                    "valid_end": "2023-12-31",
+                    "test_start": "2024-01-08",
+                    "test_end": "2025-12-31",
+                },
+                "universe": "cn_all",
+                "benchmark": "sh000300",
+            },
+        }
+    )
+
+    assert payload["include_factor_evaluation"] is True
+    assert payload["factor_evaluation"]["dataset"] == "qlib-fixture"
+    assert payload["factor_evaluation"]["benchmark"] == "SH000300"
+
+
 def test_latest_verified_snapshot_ignores_failed_invalid_and_future_candidates(
     tmp_path: Path,
 ) -> None:
@@ -79,6 +140,57 @@ def test_latest_verified_snapshot_ignores_failed_invalid_and_future_candidates(
     (invalid / "manifest.json").write_text("not json", encoding="utf-8")
 
     assert latest_verified_snapshot(data_root, as_of=date(2025, 1, 3)) == "verified-current"
+
+
+def test_information_evaluation_resolves_only_pinned_reproducible_daily_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset_path = tmp_path / "data" / "qlib" / "qlib-frozen"
+    calendar_path = dataset_path / "calendars" / "day.txt"
+    calendar_path.parent.mkdir(parents=True)
+    start = date(2020, 1, 1)
+    calendar_path.write_text(
+        "\n".join((start + timedelta(days=offset)).isoformat() for offset in range(2200)),
+        encoding="utf-8",
+    )
+    dataset = {
+        "name": "qlib-frozen",
+        "path": str(dataset_path),
+        "ready": True,
+        "reproducible": True,
+        "frequency": "day",
+        "start_date": "2020-01-01",
+        "end_date": "2026-01-01",
+        "provenance": {"dataset_identity_sha256": "a" * 64},
+    }
+    monkeypatch.setattr(schedule_module, "list_qlib_datasets", lambda _root: [dataset])
+    monkeypatch.setattr(
+        schedule_module, "require_daily_qlib_contract", lambda _provenance: None
+    )
+    evaluation = normalize_information_schedule_payload(
+        {
+            "enable_nlp": True,
+            "include_factor_evaluation": True,
+            "factor_evaluation": {
+                "dataset": "qlib-frozen",
+                "periods": {
+                    "train_start": "2020-01-01",
+                    "train_end": "2021-12-31",
+                    "valid_start": "2022-01-01",
+                    "valid_end": "2023-12-31",
+                    "test_start": "2024-01-08",
+                    "test_end": "2025-12-31",
+                },
+            },
+        }
+    )["factor_evaluation"]
+
+    assert (
+        schedule_module.resolve_information_evaluation_dataset(
+            tmp_path / "data", evaluation
+        )["name"]
+        == "qlib-frozen"
+    )
 
 
 def test_information_steps_form_a_durable_idempotent_successor_chain(
@@ -136,6 +248,25 @@ def test_information_steps_form_a_durable_idempotent_successor_chain(
                 "benchmark_code": "000300.SH",
             },
         },
+        {
+            "kind": "information_factor_evaluate",
+            "payload": {
+                "dataset": "qlib-fixture",
+                "dataset_path": str(tmp_path / "data" / "qlib" / "qlib-fixture"),
+                "dataset_identity_sha256": "a" * 64,
+                "periods": {
+                    "train_start": "2020-01-01",
+                    "train_end": "2021-12-31",
+                    "valid_start": "2022-01-01",
+                    "valid_end": "2023-12-31",
+                    "test_start": "2024-01-08",
+                    "test_end": "2025-01-02",
+                },
+                "universe": "cn_all",
+                "benchmark": "SH000300",
+                "factor_names": [FACTOR_NAME],
+            },
+        },
     ]
     current = {
         "kind": "cninfo_announcements_download",
@@ -157,6 +288,7 @@ def test_information_steps_form_a_durable_idempotent_successor_chain(
         "corpus_nlp",
         "corpus_factor_register",
         "event_market_response",
+        "information_factor_evaluate",
     )
     steps.insert(
         1,
@@ -179,7 +311,8 @@ def test_information_steps_form_a_durable_idempotent_successor_chain(
         created.append(successor)
         current = successor
 
-    assert created[-1]["payload"]["snapshot_name"] == "cn-verified"
+    assert created[-2]["payload"]["snapshot_name"] == "cn-verified"
+    assert created[-1]["payload"]["dataset_identity_sha256"] == "a" * 64
     assert worker._has_data_pipeline_successor(created[-1]) is False
 
     announcement_command, result_path, environment = worker._command(created[1])

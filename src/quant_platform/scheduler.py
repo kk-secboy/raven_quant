@@ -25,6 +25,7 @@ from .health_store import OperationalHealthStore
 from .information_schedule import (
     latest_verified_snapshot,
     normalize_information_schedule_payload,
+    resolve_information_evaluation_dataset,
 )
 from .job_store import JobStore
 from .ops_calendar import (
@@ -68,6 +69,7 @@ INFORMATION_CONFLICTING_JOB_KINDS = (
     "corpus_nlp",
     "corpus_factor_register",
     "event_market_response",
+    "information_factor_evaluate",
     "data_verify",
     "data_snapshot",
     "data_qlib",
@@ -410,8 +412,21 @@ class SchedulerEngine:
         pipeline_name = f"information-{local_date:%Y%m%d}"
         pipeline_id = f"schedule-run:{run['id']}"
         steps: list[dict[str, Any]] = []
+        evaluation_dataset: dict[str, Any] | None = None
+        if payload["include_factor_evaluation"]:
+            evaluation_dataset = resolve_information_evaluation_dataset(
+                self.settings.data_root, payload["factor_evaluation"]
+            )
         if payload["enable_nlp"]:
+            from .announcement_nlp import (
+                FACTOR_NAME as announcement_tone_factor,
+            )
+            from .announcement_nlp import (
+                LOGIC_FACTOR_NAME as announcement_logic_factor,
+            )
             from .announcement_nlp import PROMPT_VERSION as announcement_prompt_version
+
+            factor_names = [announcement_tone_factor, announcement_logic_factor]
 
             steps.append(
                 {
@@ -433,7 +448,26 @@ class SchedulerEngine:
                 }
             )
             if payload["include_corpus_nlp"]:
+                from .corpus_nlp import (
+                    DATASET_MAJOR_NEWS,
+                    DEFAULT_CORPUS_DATASETS,
+                    IRM_QA_DATASETS,
+                    IRM_QA_FACTOR_NAME,
+                    NEWS_FACTOR_NAME,
+                    POLICY_DATASETS,
+                    POLICY_FACTOR_NAME,
+                )
                 from .corpus_nlp import PROMPT_VERSION as corpus_prompt_version
+
+                selected_corpus = set(
+                    payload["corpus_datasets"] or DEFAULT_CORPUS_DATASETS
+                )
+                if DATASET_MAJOR_NEWS in selected_corpus:
+                    factor_names.append(NEWS_FACTOR_NAME)
+                if selected_corpus.intersection(IRM_QA_DATASETS):
+                    factor_names.append(IRM_QA_FACTOR_NAME)
+                if selected_corpus.intersection(POLICY_DATASETS):
+                    factor_names.append(POLICY_FACTOR_NAME)
 
                 steps.append(
                     {
@@ -471,6 +505,24 @@ class SchedulerEngine:
                             "horizons": payload["horizons"],
                             "benchmark_code": payload["benchmark_code"],
                             "schema_version": LABEL_SCHEMA_VERSION,
+                        },
+                    }
+                )
+            if evaluation_dataset is not None:
+                evaluation = payload["factor_evaluation"]
+                steps.append(
+                    {
+                        "kind": "information_factor_evaluate",
+                        "payload": {
+                            "dataset": evaluation["dataset"],
+                            "dataset_path": evaluation_dataset["path"],
+                            "dataset_identity_sha256": evaluation_dataset["provenance"][
+                                "dataset_identity_sha256"
+                            ],
+                            "periods": evaluation["periods"],
+                            "universe": evaluation["universe"],
+                            "benchmark": evaluation["benchmark"],
+                            "factor_names": sorted(set(factor_names)),
                         },
                     }
                 )

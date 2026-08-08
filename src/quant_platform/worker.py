@@ -17,6 +17,12 @@ from quant_data.config import Settings
 from quant_data.path_utils import to_wsl_path as _to_wsl_path
 
 from .allocation_store import AllocationStore
+from .announcement_factor_registry import default_factors_dir as announcement_factors_dir
+from .announcement_nlp import FACTOR_NAME as ANNOUNCEMENT_FACTOR_NAME
+from .announcement_nlp import LOGIC_FACTOR_NAME as ANNOUNCEMENT_LOGIC_FACTOR_NAME
+from .corpus_nlp import (
+    CORPUS_FACTOR_NAMES,
+)
 from .corpus_nlp import (
     DEFAULT_BATCH_SIZE as CORPUS_DEFAULT_BATCH_SIZE,
 )
@@ -26,6 +32,7 @@ from .corpus_nlp import (
 from .corpus_nlp import (
     DEFAULT_MAJOR_NEWS_PER_DAY as CORPUS_DEFAULT_MAJOR_NEWS_PER_DAY,
 )
+from .corpus_nlp import default_factors_dir as corpus_factors_dir
 from .cost_model import CostModelConfig
 from .data_rollover import qlib_trading_date_on_or_before
 from .execution_algorithms import execution_time_slots
@@ -208,7 +215,10 @@ class LocalJobWorker:
                         for item in failures
                     )
                     exit_code = 3
-            if exit_code == 0 and job["kind"] == "external_factor_evaluate":
+            if exit_code == 0 and job["kind"] in {
+                "external_factor_evaluate",
+                "information_factor_evaluate",
+            }:
                 try:
                     if not isinstance(result, dict):
                         raise ValueError("external factor evaluation result is missing")
@@ -998,7 +1008,7 @@ class LocalJobWorker:
                 result_path,
                 _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
             )
-        if job["kind"] == "external_factor_evaluate":
+        if job["kind"] in {"external_factor_evaluate", "information_factor_evaluate"}:
             output = (
                 self.settings.data_root
                 / "artifacts"
@@ -1014,6 +1024,11 @@ class LocalJobWorker:
                 path = Path(value)
                 return _to_wsl_path(path) if is_wsl else str(path)
 
+            candidates = (
+                self._resolve_information_factor_candidates(payload)
+                if job["kind"] == "information_factor_evaluate"
+                else payload["candidates"]
+            )
             manifest = {
                 "research_run_id": job["id"],
                 "dataset": payload["dataset"],
@@ -1026,7 +1041,7 @@ class LocalJobWorker:
                         **item,
                         "values_path": runtime_path(item["values_path"]),
                     }
-                    for item in payload["candidates"]
+                    for item in candidates
                 ],
                 "comparison_values": [],
                 "cost_model": CostModelConfig.from_mapping(
@@ -1039,6 +1054,22 @@ class LocalJobWorker:
             manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+            if job["kind"] == "information_factor_evaluate" and not candidates:
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "status": "ok",
+                            "evaluations": [],
+                            "skipped": (
+                                "all registered artifacts already have an evaluation outcome"
+                            ),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                return [sys.executable, "-c", "pass"], result_path, {}
             script = self.project_root / "scripts" / "evaluate_external_factor_batch.py"
             command = (
                 [
@@ -1878,6 +1909,7 @@ class LocalJobWorker:
                 "corpus_nlp",
                 "corpus_factor_register",
                 "event_market_response",
+                "information_factor_evaluate",
                 *(
                     f"supplemental_{bundle}"
                     for bundle in (
@@ -2093,6 +2125,97 @@ class LocalJobWorker:
             periods=periods,
             artifact_path=artifact_path,
         )
+
+    def _resolve_information_factor_candidates(
+        self, payload: dict[str, object]
+    ) -> list[dict[str, object]]:
+        """Bind scheduled evaluation to the exact factor artifacts just registered."""
+
+        names = payload.get("factor_names")
+        if not isinstance(names, list) or not names or not all(
+            isinstance(name, str) for name in names
+        ):
+            raise ValueError("information factor evaluation requires factor_names")
+        if len(set(names)) != len(names):
+            raise ValueError("information factor evaluation factor_names contain duplicates")
+        known = {
+            ANNOUNCEMENT_FACTOR_NAME,
+            ANNOUNCEMENT_LOGIC_FACTOR_NAME,
+            *CORPUS_FACTOR_NAMES,
+        }
+        unknown = sorted(set(names) - known)
+        if unknown:
+            raise ValueError(f"unsupported information factors: {unknown}")
+        period_values = payload.get("periods")
+        if not isinstance(period_values, dict):
+            raise ValueError("information factor evaluation periods are missing")
+        try:
+            valid_end = date.fromisoformat(str(period_values["valid_end"]))
+            test_start = date.fromisoformat(str(period_values["test_start"]))
+        except (KeyError, ValueError) as exc:
+            raise ValueError("information factor evaluation periods are invalid") from exc
+
+        candidates: list[dict[str, object]] = []
+        for name in names:
+            factor_dir = (
+                announcement_factors_dir(self.settings.data_root)
+                if name in {ANNOUNCEMENT_FACTOR_NAME, ANNOUNCEMENT_LOGIC_FACTOR_NAME}
+                else corpus_factors_dir(self.settings.data_root)
+            )
+            manifest_path = factor_dir / f"{name}.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"information factor manifest is unavailable: {manifest_path}"
+                ) from exc
+            values_sha256 = manifest.get("sha256") if isinstance(manifest, dict) else None
+            if not isinstance(values_sha256, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", values_sha256
+            ):
+                raise ValueError(f"information factor manifest sha256 is invalid: {name}")
+            candidate = self.research.find_candidate(
+                name=name, values_sha256=values_sha256
+            )
+            if candidate is None:
+                raise ValueError(
+                    f"registered information factor candidate is missing: {name}"
+                )
+            if candidate.get("status") not in {
+                "awaiting_evaluation",
+                "evaluation_failed",
+            }:
+                continue
+            variables = candidate.get("variables")
+            source = variables.get("source") if isinstance(variables, dict) else None
+            if not isinstance(source, dict) or not str(source.get("dataset") or "").strip():
+                raise ValueError(f"information factor {name} has no governed source")
+            required = ("code_path", "values_path", "code_sha256", "values_sha256")
+            if any(not candidate.get(key) for key in required):
+                raise ValueError(f"information factor {name} misses immutable artifacts")
+            if not Path(str(candidate["code_path"])).is_file() or not Path(
+                str(candidate["values_path"])
+            ).is_file():
+                raise ValueError(f"information factor {name} artifacts are unavailable")
+            horizon = int(candidate.get("label_horizon_days") or 1)
+            embargo_days = max(5, horizon)
+            if (test_start - valid_end).days <= embargo_days:
+                raise ValueError(
+                    f"information factor {name} requires a purge/embargo gap greater "
+                    f"than {embargo_days} days"
+                )
+            candidates.append(
+                {
+                    "id": candidate["id"],
+                    "values_path": candidate["values_path"],
+                    "code_sha256": candidate["code_sha256"],
+                    "values_sha256": candidate["values_sha256"],
+                    "experiment_family_id": candidate.get("experiment_family_id"),
+                    "experiment_count": int(candidate.get("experiment_count") or 1),
+                    "label_horizon_days": horizon,
+                }
+            )
+        return candidates
 
 
 def _failure_message(log_path: Path, fallback: str) -> str:

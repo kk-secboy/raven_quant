@@ -2342,7 +2342,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def create_external_factor_evaluation(
         payload: ExternalFactorEvaluationRequest,
     ) -> dict:
-        if jobs.count(statuses=("queued", "running"), kinds=("external_factor_evaluate",)):
+        if jobs.count(
+            statuses=("queued", "running"),
+            kinds=("external_factor_evaluate", "information_factor_evaluate"),
+        ):
             raise HTTPException(409, "an external factor evaluation is already active")
         dataset = require_qlib_dataset(
             payload.dataset, purpose="external factor evaluation", frequency="day"

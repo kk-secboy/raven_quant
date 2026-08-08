@@ -5,11 +5,14 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from quant_data.execution_contract import require_daily_qlib_contract
+
 from .corpus_nlp import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_IRM_PER_INSTRUMENT_DAY,
     DEFAULT_MAJOR_NEWS_PER_DAY,
 )
+from .services import list_qlib_datasets
 
 INFORMATION_CORPUS_DATASETS = {
     "major_news",
@@ -33,10 +36,22 @@ INFORMATION_SCHEDULE_KEYS = {
     "major_news_per_day",
     "irm_per_instrument_day",
     "include_event_labels",
+    "include_factor_evaluation",
+    "factor_evaluation",
     "snapshot_name",
     "horizons",
     "benchmark_code",
 }
+
+INFORMATION_EVALUATION_KEYS = {"dataset", "periods", "universe", "benchmark"}
+RESEARCH_PERIOD_KEYS = (
+    "train_start",
+    "train_end",
+    "valid_start",
+    "valid_end",
+    "test_start",
+    "test_end",
+)
 
 
 def _integer(
@@ -100,8 +115,13 @@ def normalize_information_schedule_payload(payload: dict[str, Any]) -> dict[str,
     enable_nlp = _boolean(payload, "enable_nlp", False)
     include_corpus_nlp = _boolean(payload, "include_corpus_nlp", enable_nlp)
     include_event_labels = _boolean(payload, "include_event_labels", enable_nlp)
-    if (include_corpus_nlp or include_event_labels) and not enable_nlp:
+    include_factor_evaluation = _boolean(payload, "include_factor_evaluation", False)
+    if (include_corpus_nlp or include_event_labels or include_factor_evaluation) and not enable_nlp:
         raise ValueError("information_pipeline NLP consumers require enable_nlp=true")
+
+    evaluation = _normalize_factor_evaluation(
+        payload.get("factor_evaluation"), enabled=include_factor_evaluation
+    )
 
     categories = _string_list(
         payload,
@@ -171,10 +191,117 @@ def normalize_information_schedule_payload(payload: dict[str, Any]) -> dict[str,
             maximum=100,
         ),
         "include_event_labels": include_event_labels,
+        "include_factor_evaluation": include_factor_evaluation,
+        "factor_evaluation": evaluation,
         "snapshot_name": snapshot_name,
         "horizons": horizons,
         "benchmark_code": benchmark_code,
     }
+
+
+def _normalize_factor_evaluation(value: Any, *, enabled: bool) -> dict[str, Any] | None:
+    if not enabled:
+        if value not in (None, {}):
+            raise ValueError(
+                "information_pipeline factor_evaluation requires "
+                "include_factor_evaluation=true"
+            )
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("information_pipeline factor_evaluation must be an object")
+    unknown = sorted(set(value) - INFORMATION_EVALUATION_KEYS)
+    if unknown:
+        raise ValueError(
+            f"information_pipeline factor_evaluation contains unsupported keys: {unknown}"
+        )
+    dataset = str(value.get("dataset") or "").strip()
+    if len(dataset) < 3 or len(dataset) > 120:
+        raise ValueError("information_pipeline factor_evaluation dataset is required")
+    periods = value.get("periods")
+    if not isinstance(periods, dict) or set(periods) != set(RESEARCH_PERIOD_KEYS):
+        raise ValueError(
+            "information_pipeline factor_evaluation periods must contain exactly "
+            + ", ".join(RESEARCH_PERIOD_KEYS)
+        )
+    try:
+        parsed = {key: date.fromisoformat(str(periods[key])) for key in RESEARCH_PERIOD_KEYS}
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "information_pipeline factor_evaluation periods must be ISO dates"
+        ) from exc
+    if not (
+        parsed["train_start"]
+        <= parsed["train_end"]
+        < parsed["valid_start"]
+        <= parsed["valid_end"]
+        < parsed["test_start"]
+        <= parsed["test_end"]
+    ):
+        raise ValueError(
+            "information_pipeline factor_evaluation train, validation, and test "
+            "periods must be ordered and non-overlapping"
+        )
+    if (parsed["test_start"] - parsed["valid_end"]).days <= 5:
+        raise ValueError(
+            "information_pipeline factor_evaluation requires a purge/embargo gap "
+            "greater than 5 days"
+        )
+    universe = str(value.get("universe") or "cn_all").strip()
+    benchmark = str(value.get("benchmark") or "SH000300").strip().upper()
+    if len(universe) < 2 or len(universe) > 100:
+        raise ValueError("information_pipeline factor_evaluation universe is invalid")
+    if len(benchmark) < 4 or len(benchmark) > 32:
+        raise ValueError("information_pipeline factor_evaluation benchmark is invalid")
+    return {
+        "dataset": dataset,
+        "periods": {key: parsed[key].isoformat() for key in RESEARCH_PERIOD_KEYS},
+        "universe": universe,
+        "benchmark": benchmark,
+    }
+
+
+def resolve_information_evaluation_dataset(
+    data_root: Path, evaluation: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve one pinned, reproducible daily Qlib dataset for scheduled evaluation."""
+
+    available = {item["name"]: item for item in list_qlib_datasets(data_root)}
+    dataset = available.get(str(evaluation["dataset"]))
+    if not dataset or not dataset.get("ready"):
+        raise ValueError("information factor evaluation Qlib dataset is not ready")
+    if not dataset.get("reproducible"):
+        raise ValueError(
+            "information factor evaluation requires immutable Qlib provenance"
+        )
+    if dataset.get("frequency") != "day":
+        raise ValueError("information factor evaluation requires a daily Qlib dataset")
+    require_daily_qlib_contract(dataset.get("provenance") or {})
+    periods = evaluation["periods"]
+    if dataset.get("start_date") and periods["train_start"] < dataset["start_date"]:
+        raise ValueError("information factor evaluation starts before the Qlib dataset")
+    if dataset.get("end_date") and periods["test_end"] > dataset["end_date"]:
+        raise ValueError("information factor evaluation ends after the Qlib dataset")
+    calendar_path = Path(str(dataset["path"])) / "calendars" / "day.txt"
+    try:
+        calendar = [
+            date.fromisoformat(line.strip())
+            for line in calendar_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, ValueError) as exc:
+        raise ValueError("information factor evaluation Qlib calendar is invalid") from exc
+    valid_start = date.fromisoformat(periods["valid_start"])
+    valid_end = date.fromisoformat(periods["valid_end"])
+    test_start = date.fromisoformat(periods["test_start"])
+    test_end = date.fromisoformat(periods["test_end"])
+    valid_days = sum(valid_start <= day <= valid_end for day in calendar)
+    test_days = sum(test_start <= day <= test_end for day in calendar)
+    if valid_days < 126 or test_days < 252:
+        raise ValueError(
+            "information factor evaluation requires at least 126 validation and "
+            f"252 final-test trading days; got {valid_days} and {test_days}"
+        )
+    return dataset
 
 
 def latest_verified_snapshot(data_root: Path, *, as_of: date) -> str:

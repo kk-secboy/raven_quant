@@ -76,12 +76,31 @@ purge/embargo 和最终一次性 OOS，调度器不会直接发布策略或推�
     "irm_per_instrument_day": 2,
     "include_event_labels": true,
     "horizons": [1, 3, 5, 20],
-    "benchmark_code": "000300.SH"
+    "benchmark_code": "000300.SH",
+    "include_factor_evaluation": true,
+    "factor_evaluation": {
+      "dataset": "cn-full-20260803",
+      "periods": {
+        "train_start": "2008-01-01",
+        "train_end": "2018-12-31",
+        "valid_start": "2019-01-01",
+        "valid_end": "2021-12-31",
+        "test_start": "2022-01-10",
+        "test_end": "2026-08-03"
+      },
+      "universe": "cn_all",
+      "benchmark": "SH000300"
+    }
   },
   "misfire_grace_seconds": 1800,
   "actor": "quantlab-operator"
 }
 ```
+
+`include_factor_evaluation` 默认关闭。开启时必须显式钉住一个具有不可变 provenance 的
+日频 Qlib 数据集，并固定训练、验证、最终测试区间。注册阶段产生的每个因子会按
+`(factor_name, values_sha256)` 精确解析，因此不会误评同名旧版本。评估使用 purge/embargo、
+扩展窗口滚动样本外证据和一次性最终测试；结果只更新因子候选账本，不自动发布策略或推荐。
 
 配置校验会拒绝未知字段、无界 NLP、未开启 NLP 却请求下游消费者、非法收益期限以及
 未通过质量门的自动快照选择。生产启用仍须等当前长下载任务结束，在安全发布窗口部署

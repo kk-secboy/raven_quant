@@ -274,6 +274,161 @@ def test_worker_builds_external_factor_evaluation_command(tmp_path: Path) -> Non
     assert manifest["comparison_values"] == []
 
 
+def test_worker_binds_information_evaluation_to_registered_artifact_sha(
+    tmp_path: Path,
+) -> None:
+    worker = _worker(tmp_path)
+    factors_dir = worker.settings.data_root / "announcements" / "nlp" / "factors"
+    factors_dir.mkdir(parents=True)
+    values_path = factors_dir / "announcement_tone.parquet"
+    code_path = factors_dir / "announcement_tone_factor.py"
+    values_path.write_bytes(b"governed-values")
+    code_path.write_text("FACTOR_NAME = 'announcement_tone'\n", encoding="utf-8")
+    values_sha256 = "c" * 64
+    (factors_dir / "announcement_tone.json").write_text(
+        json.dumps({"factor": "announcement_tone", "sha256": values_sha256}),
+        encoding="utf-8",
+    )
+    candidate = {
+        "id": "registered-candidate",
+        "name": "announcement_tone",
+        "status": "awaiting_evaluation",
+        "variables": {"source": {"dataset": "announcement_nlp_fields"}},
+        "code_path": str(code_path),
+        "values_path": str(values_path),
+        "code_sha256": "b" * 64,
+        "values_sha256": values_sha256,
+        "experiment_family_id": "announcement_tone",
+        "experiment_count": 1,
+        "label_horizon_days": 1,
+    }
+
+    class FakeResearch:
+        def find_candidate(self, *, name: str, values_sha256: str):
+            assert name == "announcement_tone"
+            assert values_sha256 == "c" * 64
+            return candidate
+
+    worker.research = FakeResearch()
+    command, result_path, _environment = worker._command(
+        {
+            "id": "information-eval-job",
+            "kind": "information_factor_evaluate",
+            "payload": {
+                "dataset": "qlib-frozen",
+                "dataset_path": str(tmp_path / "qlib"),
+                "dataset_identity_sha256": "a" * 64,
+                "periods": {
+                    "train_start": "2020-01-01",
+                    "train_end": "2021-12-31",
+                    "valid_start": "2022-01-01",
+                    "valid_end": "2023-12-31",
+                    "test_start": "2024-01-08",
+                    "test_end": "2025-12-31",
+                },
+                "universe": "cn_all",
+                "benchmark": "SH000300",
+                "factor_names": ["announcement_tone"],
+            },
+        }
+    )
+
+    assert "evaluate_external_factor_batch.py" in " ".join(command)
+    manifest = json.loads((result_path.parent / "manifest.json").read_text(encoding="utf-8"))
+    assert len(manifest["candidates"]) == 1
+    bound = manifest["candidates"][0]
+    assert bound["id"] == "registered-candidate"
+    assert bound["values_path"].endswith("/announcement_tone.parquet")
+    assert bound["code_sha256"] == "b" * 64
+    assert bound["values_sha256"] == "c" * 64
+    assert bound["experiment_family_id"] == "announcement_tone"
+    assert bound["experiment_count"] == 1
+    assert bound["label_horizon_days"] == 1
+
+
+def test_worker_rejects_information_evaluation_when_registered_sha_is_missing(
+    tmp_path: Path,
+) -> None:
+    worker = _worker(tmp_path)
+    factors_dir = worker.settings.data_root / "announcements" / "nlp" / "factors"
+    factors_dir.mkdir(parents=True)
+    (factors_dir / "announcement_tone.json").write_text(
+        json.dumps({"factor": "announcement_tone", "sha256": "c" * 64}),
+        encoding="utf-8",
+    )
+
+    class EmptyResearch:
+        def find_candidate(self, *, name: str, values_sha256: str):
+            return None
+
+    worker.research = EmptyResearch()
+    with pytest.raises(ValueError, match="registered information factor candidate is missing"):
+        worker._command(
+            {
+                "id": "information-eval-job",
+                "kind": "information_factor_evaluate",
+                "payload": {
+                    "dataset": "qlib-frozen",
+                    "dataset_path": str(tmp_path / "qlib"),
+                    "dataset_identity_sha256": "a" * 64,
+                    "periods": {
+                        "valid_end": "2023-12-31",
+                        "test_start": "2024-01-08",
+                    },
+                    "factor_names": ["announcement_tone"],
+                },
+            }
+        )
+
+
+def test_worker_skips_unchanged_information_factor_with_existing_outcome(
+    tmp_path: Path,
+) -> None:
+    worker = _worker(tmp_path)
+    factors_dir = worker.settings.data_root / "announcements" / "nlp" / "factors"
+    factors_dir.mkdir(parents=True)
+    (factors_dir / "announcement_tone.json").write_text(
+        json.dumps({"factor": "announcement_tone", "sha256": "c" * 64}),
+        encoding="utf-8",
+    )
+
+    class EvaluatedResearch:
+        def find_candidate(self, *, name: str, values_sha256: str):
+            return {
+                "id": "evaluated",
+                "status": "gate_passed",
+                "values_sha256": values_sha256,
+            }
+
+    worker.research = EvaluatedResearch()
+    command, result_path, environment = worker._command(
+        {
+            "id": "information-eval-job",
+            "kind": "information_factor_evaluate",
+            "payload": {
+                "dataset": "qlib-frozen",
+                "dataset_path": str(tmp_path / "qlib"),
+                "dataset_identity_sha256": "a" * 64,
+                "periods": {
+                    "train_start": "2020-01-01",
+                    "train_end": "2021-12-31",
+                    "valid_start": "2022-01-01",
+                    "valid_end": "2023-12-31",
+                    "test_start": "2024-01-08",
+                    "test_end": "2025-12-31",
+                },
+                "factor_names": ["announcement_tone"],
+            },
+        }
+    )
+
+    assert command[-1] == "pass"
+    assert environment == {}
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["evaluations"] == []
+    assert "already have an evaluation" in result["skipped"]
+
+
 def test_worker_imports_external_evaluation_with_bound_periods(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

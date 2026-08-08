@@ -115,9 +115,15 @@ def test_register_success(database_url: str, tmp_path: Path) -> None:
     assert candidate["name"] == corpus.POLICY_FACTOR_NAME
     assert candidate["status"] == "awaiting_evaluation"
     assert candidate["values_sha256"] == result["values_sha256"]
+    assert candidate["experiment_family_id"] == (
+        f"external:{corpus.SOURCE_DATASET}:{corpus.POLICY_FACTOR_NAME}"
+    )
+    assert candidate["experiment_count"] == 1
     variables = candidate["variables"]
     assert variables["source"]["dataset"] == "corpus_nlp_fields"
-    assert variables["source"]["source_datasets"] == ["npr", "cctv_news"]
+    # The production default intentionally excludes NPR until a persisted
+    # native source exists; explicit NPR runs remain supported separately.
+    assert variables["source"]["source_datasets"] == ["cctv_news"]
     assert variables["source"]["prompt_version"] == corpus.PROMPT_VERSION
     assert "pubtime" in candidate["description"]
     run = store.get_run(result["run_id"])
