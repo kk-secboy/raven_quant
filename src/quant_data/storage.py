@@ -183,6 +183,8 @@ class ParquetStore:
             "datasets": {},
             **manifest_extra,
         }
+        snapshot_start = str(manifest_extra.get("start_date") or "")[:10] or None
+        snapshot_end = str(manifest_extra.get("end_date") or "")[:10] or None
         connection = duckdb.connect()
         try:
             connection.execute(f"SET memory_limit='{duckdb_memory_limit}'")
@@ -203,6 +205,8 @@ class ParquetStore:
                     temporary,
                     base_root,
                     base_entry,
+                    snapshot_start,
+                    snapshot_end,
                 )
             historical = {
                 dataset: {
@@ -240,6 +244,8 @@ class ParquetStore:
         temporary: Path,
         base_root: Path | None,
         base_entry: dict[str, Any] | None,
+        snapshot_start: str | None,
+        snapshot_end: str | None,
     ) -> dict[str, Any]:
         refresh_metadata = reference_manifest_metadata(rows)
         source_identity = [
@@ -288,17 +294,6 @@ class ParquetStore:
         }
         base_dir = base_root / dataset if base_root is not None else None
         dataset_dir = temporary / "parquet" / dataset
-        if (
-            base_entry is not None
-            and base_dir is not None
-            and base_dir.exists()
-            and current_tuples == _source_unit_tuples(base_entry)
-        ):
-            # Dataset untouched by this build: hard-link the parent's files and
-            # reuse its manifest entry verbatim (linked bytes are identical).
-            _link_tree(base_dir, dataset_dir)
-            return dict(base_entry)
-
         quoted_paths = "[" + ",".join(_sql_string(path) for path in paths) + "]"
         columns = (
             connection.execute(
@@ -328,6 +323,28 @@ class ParquetStore:
             )
             if not has_valid_dates:
                 date_field = None
+        if date_field is not None and base_entry is not None:
+            base_min = str(base_entry.get("date_min") or "")[:10] or None
+            base_max = str(base_entry.get("date_max") or "")[:10] or None
+            if (
+                (snapshot_start is not None and base_min is not None and base_min < snapshot_start)
+                or (snapshot_end is not None and base_max is not None and base_max > snapshot_end)
+            ):
+                # A parent created for a wider range (or by an older builder
+                # that leaked the rest of an overlapping month) cannot be
+                # hard-linked safely into this bounded snapshot.
+                base_entry = None
+                base_dir = None
+        if (
+            base_entry is not None
+            and base_dir is not None
+            and base_dir.exists()
+            and current_tuples == _source_unit_tuples(base_entry)
+        ):
+            # Dataset untouched by this build: hard-link the parent's files and
+            # reuse its manifest entry verbatim (linked bytes are identical).
+            _link_tree(base_dir, dataset_dir)
+            return dict(base_entry)
         news_identity = {"datetime", "content", "title", "source"}
         legacy_news = dataset == "news" and news_identity.issubset(set(columns))
         if date_field is None or legacy_news:
@@ -336,6 +353,12 @@ class ParquetStore:
             # export; the memory budget and spill directory still apply.
             dataset_dir.mkdir(parents=True, exist_ok=True)
             source_sql = _snapshot_source_query(dataset, quoted_paths, set(columns))
+            source_sql = _bounded_snapshot_query(
+                source_sql,
+                date_field,
+                snapshot_start,
+                snapshot_end,
+            )
             connection.execute(
                 "COPY ({query}) TO {target} "
                 "(FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)".format(
@@ -355,11 +378,28 @@ class ParquetStore:
                 base_dir,
                 base_entry,
                 current_tuples,
+                snapshot_start,
+                snapshot_end,
             )
+        raw_source_sql = f"SELECT * FROM read_parquet({quoted_paths}, union_by_name=true)"
+        raw_source_sql = _bounded_snapshot_query(
+            raw_source_sql,
+            date_field,
+            snapshot_start,
+            snapshot_end,
+        )
         source_row_count = connection.execute(
-            f"SELECT count(*) FROM read_parquet({quoted_paths}, union_by_name=true)"
+            f"SELECT count(*) FROM ({raw_source_sql})"
         ).fetchone()[0]
         snapshot_paths = [str(path.resolve()) for path in sorted(dataset_dir.rglob("*.parquet"))]
+        if not snapshot_paths:
+            return {
+                **empty_entry,
+                "source_rows": int(source_row_count),
+                "unit_files": len(paths),
+                "empty_units": len(rows) - len(paths),
+                "date_field": date_field,
+            }
         snapshot_quoted_paths = "[" + ",".join(_sql_string(path) for path in snapshot_paths) + "]"
         row_count = connection.execute(
             f"SELECT count(*) FROM read_parquet({snapshot_quoted_paths}, union_by_name=true)"
@@ -432,6 +472,8 @@ class ParquetStore:
         base_dir: Path | None,
         base_entry: dict[str, Any] | None,
         current_tuples: set[tuple[str, str, int]],
+        snapshot_start: str | None,
+        snapshot_end: str | None,
     ) -> None:
         date_expression = _date_sql_expression(date_field)
         # Metadata pass: one single-column min/max scan per unit file, so the
@@ -503,6 +545,21 @@ class ParquetStore:
             rebuild = set(dirty)
             link = base_partitions - rebuild
 
+        lower_month = _year_month(snapshot_start) if snapshot_start is not None else None
+        upper_month = _year_month(snapshot_end) if snapshot_end is not None else None
+        rebuild = {
+            item
+            for item in rebuild
+            if (lower_month is None or item >= lower_month)
+            and (upper_month is None or item <= upper_month)
+        }
+        link = {
+            item
+            for item in link
+            if (lower_month is None or item >= lower_month)
+            and (upper_month is None or item <= upper_month)
+        }
+
         for year, month in sorted(link):
             source_dir = base_dir / f"partition_year={year}" / f"partition_month={month}"
             if base_dir is not None and source_dir.exists():
@@ -533,6 +590,12 @@ class ParquetStore:
                 ).fetchall()
             }
             source_sql = _snapshot_source_query(dataset, quoted, partition_columns)
+            source_sql = _bounded_snapshot_query(
+                source_sql,
+                date_field,
+                snapshot_start,
+                snapshot_end,
+            )
             partition_dir = dataset_dir / f"partition_year={year}" / f"partition_month={month}"
             partition_dir.mkdir(parents=True, exist_ok=True)
             connection.execute(
@@ -639,6 +702,23 @@ def _date_sql_expression(field: str) -> str:
         f"try_strptime({value}, '%Y%m%d')::DATE, "
         f"try_strptime({value}, '%Y-%m-%d %H:%M:%S')::DATE)"
     )
+
+
+def _bounded_snapshot_query(
+    source_sql: str,
+    date_field: str | None,
+    snapshot_start: str | None,
+    snapshot_end: str | None,
+) -> str:
+    if date_field is None or (snapshot_start is None and snapshot_end is None):
+        return source_sql
+    expression = _date_sql_expression(date_field)
+    predicates = [f"{expression} IS NOT NULL"]
+    if snapshot_start is not None:
+        predicates.append(f"{expression} >= DATE {_sql_string(snapshot_start)}")
+    if snapshot_end is not None:
+        predicates.append(f"{expression} <= DATE {_sql_string(snapshot_end)}")
+    return f"SELECT * FROM ({source_sql}) WHERE {' AND '.join(predicates)}"
 
 
 def _snapshot_source_query(dataset: str, quoted_paths: str, columns: set[str]) -> str:

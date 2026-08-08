@@ -119,6 +119,60 @@ def test_unchanged_dataset_is_fully_linked(tmp_path: Path) -> None:
     assert _manifest_entry(successor, "daily") == _manifest_entry(base, "daily")
 
 
+def test_snapshot_clips_rows_to_exact_requested_range_within_month(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path / "data")
+    unit = _write_unit(
+        store,
+        "daily",
+        "daily_202408",
+        _daily_rows("20240802") + _daily_rows("20240805"),
+    )
+
+    snapshot = store.build_snapshot(
+        name="bounded",
+        successful_units={"daily": [unit]},
+        manifest_extra={"start_date": "2024-08-02", "end_date": "2024-08-02"},
+    )
+
+    frame = _dataset_frame(snapshot, "daily")
+    entry = _manifest_entry(snapshot, "daily")
+    assert set(frame["trade_date"].dt.strftime("%Y%m%d")) == {"20240802"}
+    assert entry["rows"] == 2
+    assert entry["source_rows"] == 2
+    assert entry["date_min"] == "2024-08-02"
+    assert entry["date_max"] == "2024-08-02"
+
+
+def test_bounded_snapshot_rebuilds_parent_that_contains_out_of_range_rows(
+    tmp_path: Path,
+) -> None:
+    store = ParquetStore(tmp_path / "data")
+    unit = _write_unit(
+        store,
+        "daily",
+        "daily_202408",
+        _daily_rows("20240802") + _daily_rows("20240805"),
+    )
+    base = store.build_snapshot(
+        name="unbounded-parent",
+        successful_units={"daily": [unit]},
+        manifest_extra={},
+    )
+
+    successor = store.build_snapshot(
+        name="bounded-successor",
+        successful_units={"daily": [unit]},
+        manifest_extra={"start_date": "2024-08-02", "end_date": "2024-08-02"},
+        base_snapshot=base,
+    )
+
+    frame = _dataset_frame(successor, "daily")
+    assert set(frame["trade_date"].dt.strftime("%Y%m%d")) == {"20240802"}
+    assert _manifest_entry(successor, "daily")["date_max"] == "2024-08-02"
+    relative = Path("parquet/daily/partition_year=2024/partition_month=8/data.parquet")
+    assert not (successor / relative).samefile(base / relative)
+
+
 def test_all_null_date_like_column_falls_back_to_non_partitioned_snapshot(
     tmp_path: Path,
 ) -> None:
