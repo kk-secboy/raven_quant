@@ -14,6 +14,7 @@ from quant_platform.api import (
     EventMarketResponseRequest,
     ExternalFactorEvaluationRequest,
 )
+from quant_platform.data_task_store import DATA_TASK_CATALOG
 from quant_platform.worker import LocalJobWorker
 
 pytestmark = pytest.mark.no_database
@@ -48,6 +49,15 @@ def test_information_request_models_fail_closed() -> None:
                 "test_end": "2026-08-03",
             },
         )
+
+
+def test_announcement_catalog_records_real_source_boundary() -> None:
+    tasks = {definition.task_key: definition for definition in DATA_TASK_CATALOG}
+
+    assert tasks["cn_cninfo_announcements"].range_start == "2016-01-01"
+    assert tasks["cn_cninfo_announcements"].estimated_storage_gb == 320
+    assert tasks["cn_announcement_nlp"].range_start == "2016-01-01"
+    assert tasks["cn_event_market_response"].range_start == "2016-01-01"
 
 
 def test_worker_builds_announcement_and_corpus_nlp_commands(tmp_path: Path) -> None:

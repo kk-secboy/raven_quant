@@ -376,6 +376,8 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         ("cn_ashare_daily_full",),
         ("cninfo_announcements",),
         "daily",
+        range_start="2016-01-01",
+        estimated_storage_gb=320,
     ),
     DataTaskDefinition(
         "cn_announcement_nlp",
@@ -391,6 +393,7 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         ("cn_cninfo_announcements",),
         ("announcement_nlp_fields",),
         "daily",
+        range_start="2016-01-01",
     ),
     DataTaskDefinition(
         "cn_corpus_nlp",
@@ -422,6 +425,7 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         ("cn_announcement_nlp", "cn_snapshot_build"),
         ("event_market_response_labels",),
         "daily",
+        range_start="2016-01-01",
     ),
     DataTaskDefinition(
         "strategy_specialty",
