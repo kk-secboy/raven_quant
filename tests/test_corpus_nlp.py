@@ -506,6 +506,12 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     assert summary.processed == 7
     assert summary.failed == 0
     assert summary.skipped == 0
+    assert summary.selection_audit["eligible_unique_items"] == 7
+    assert summary.selection_audit["selected_after_policy_before_limit"] == 7
+    assert summary.selection_audit["selected_after_limit"] == 7
+    assert summary.as_dict()["selection_audit"]["sources"]["major_news"][
+        "date_min"
+    ] == "2024-01-02"
     assert len(chat.calls) == 7
     assert chat.calls[0][1] == "test-model"
     assert corpus.PROMPT_VERSION in chat.calls[0][0][0]["content"]
@@ -960,6 +966,32 @@ def test_load_corpus_items_applies_deterministic_production_caps(tmp_path: Path)
     )
     assert len([item for item in irm if item.ts_code == "000001.SH"]) == 2
     assert len([item for item in irm if item.ts_code == "000002.SH"]) == 1
+
+    selected = corpus.load_corpus_items(
+        tmp_path,
+        datasets={"major_news", "irm_qa_sh"},
+        max_major_news_per_day=2,
+        max_irm_per_instrument_day=2,
+    )
+    audit = corpus.build_corpus_selection_audit(
+        tmp_path,
+        selected_datasets={"major_news", "irm_qa_sh"},
+        selected_before_limit=selected,
+        selected_after_limit=selected,
+        ts_codes=None,
+        start=None,
+        end=None,
+        limit=None,
+        max_major_news_per_day=2,
+        max_irm_per_instrument_day=2,
+    )
+    assert audit["eligible_unique_items"] == 10
+    assert audit["selected_after_policy_before_limit"] == 5
+    assert audit["sources"]["major_news"]["eligible_unique_items"] == 5
+    assert audit["sources"]["major_news"]["selected_after_limit"] == 2
+    assert audit["sources"]["major_news"]["final_selection_ratio"] == 0.4
+    assert audit["sources"]["irm_qa_sh"]["eligible_unique_items"] == 5
+    assert audit["sources"]["irm_qa_sh"]["selected_after_limit"] == 3
 
 
 def test_process_honors_limit(tmp_path: Path) -> None:

@@ -46,6 +46,7 @@ import hashlib
 import json
 import uuid
 from bisect import bisect_left
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
@@ -582,6 +583,250 @@ def load_corpus_items(
     return sorted(result, key=lambda item: (item.pub_time, item.source_dataset, item.item_id))
 
 
+def _eligible_corpus_stats(
+    paths: list[str],
+    dataset: str,
+    *,
+    start: date | None,
+    end: date | None,
+    ts_codes: set[str] | None,
+) -> dict[str, Any]:
+    """Count normalized unique source items without materializing corpus text.
+
+    The query mirrors each loader's validity and de-duplication contract.  It
+    lets a production run disclose its denominator and sampling ratio without
+    loading the uncapped multi-million-row corpus into Python memory.
+    """
+
+    columns = _available_columns(paths)
+    codes = {code.strip().upper() for code in (ts_codes or set()) if code.strip()}
+    if codes and dataset not in IRM_QA_DATASETS:
+        return {
+            "eligible_unique_items": 0,
+            "date_min": None,
+            "date_max": None,
+        }
+
+    if dataset == DATASET_MAJOR_NEWS:
+        missing = sorted({"title", "content", "pub_time"} - columns)
+        if missing:
+            raise RuntimeError(f"major_news parquet misses required columns: {missing}")
+        moment_expr = "try_cast(CAST(pub_time AS VARCHAR) AS TIMESTAMP)"
+        where, parameters = _date_bounds_sql(moment_expr, start=start, end=end)
+        query = f"""
+            WITH source AS (
+                SELECT DISTINCT
+                    CAST(title AS VARCHAR) AS title,
+                    CAST(content AS VARCHAR) AS content,
+                    CAST(pub_time AS VARCHAR) AS pub_time,
+                    {moment_expr} AS moment
+                FROM read_parquet(?, union_by_name=true)
+                {where}
+            ), eligible AS (
+                SELECT * FROM source
+                WHERE moment IS NOT NULL
+                  AND (trim(coalesce(title, '')) <> '' OR trim(coalesce(content, '')) <> '')
+            )
+            SELECT count(*) AS eligible_unique_items,
+                   min(CAST(moment AS DATE)) AS date_min,
+                   max(CAST(moment AS DATE)) AS date_max
+            FROM eligible
+        """
+    elif dataset in IRM_QA_DATASETS:
+        question_col = next((name for name in ("q", "question") if name in columns), None)
+        answer_col = next((name for name in ("a", "answer") if name in columns), None)
+        missing = sorted({"trade_date", "ts_code"} - columns)
+        if question_col is None:
+            missing.append("q|question")
+        if missing:
+            raise RuntimeError(f"{dataset} parquet misses required columns: {missing}")
+        trade_date_expr = (
+            "coalesce(try_cast(trade_date AS DATE), "
+            "try_strptime(CAST(trade_date AS VARCHAR), '%Y%m%d')::DATE)"
+        )
+        where, parameters = _date_bounds_sql(trade_date_expr, start=start, end=end)
+        answer_select = (
+            f', CAST("{answer_col}" AS VARCHAR) AS answer' if answer_col else ""
+        )
+        query = f"""
+            WITH source AS (
+                SELECT DISTINCT
+                    upper(trim(CAST(ts_code AS VARCHAR))) AS ts_code,
+                    {trade_date_expr} AS trade_date,
+                    CAST("{question_col}" AS VARCHAR) AS question
+                    {answer_select}
+                FROM read_parquet(?, union_by_name=true)
+                {where}
+            ), eligible AS (
+                SELECT * FROM source
+                WHERE trade_date IS NOT NULL
+                  AND ts_code <> ''
+                  AND trim(coalesce(question, '')) <> ''
+            )
+            SELECT ts_code, count(*) AS eligible_unique_items,
+                   min(trade_date) AS date_min, max(trade_date) AS date_max
+            FROM eligible
+            GROUP BY ts_code
+        """
+        grouped = _read_parquet_union(paths, query, parameters)
+        if codes:
+            grouped = grouped[grouped["ts_code"].astype(str).isin(codes)]
+        if grouped.empty:
+            return {
+                "eligible_unique_items": 0,
+                "date_min": None,
+                "date_max": None,
+            }
+        return {
+            "eligible_unique_items": int(grouped["eligible_unique_items"].sum()),
+            "date_min": pd.to_datetime(grouped["date_min"]).min().date().isoformat(),
+            "date_max": pd.to_datetime(grouped["date_max"]).max().date().isoformat(),
+        }
+    elif dataset == DATASET_NPR:
+        time_cols = [name for name in ("pubtime", "pub_time") if name in columns]
+        content_cols = [name for name in ("content_html", "content") if name in columns]
+        missing = sorted({"title"} - columns)
+        if not time_cols:
+            missing.append("pubtime|pub_time")
+        if missing:
+            raise RuntimeError(f"npr parquet misses required columns: {missing}")
+        time_expr = "coalesce(" + ", ".join(
+            f'CAST("{name}" AS VARCHAR)' for name in time_cols
+        ) + ")"
+        content_expr = (
+            "coalesce(" + ", ".join(
+                f'CAST("{name}" AS VARCHAR)' for name in content_cols
+            ) + ")"
+            if content_cols
+            else "NULL::VARCHAR"
+        )
+        moment_expr = f"try_cast({time_expr} AS TIMESTAMP)"
+        where, parameters = _date_bounds_sql(moment_expr, start=start, end=end)
+        query = f"""
+            WITH source AS (
+                SELECT DISTINCT CAST(title AS VARCHAR) AS title,
+                       {time_expr} AS pub_time, {content_expr} AS content,
+                       {moment_expr} AS moment
+                FROM read_parquet(?, union_by_name=true)
+                {where}
+            ), eligible AS (
+                SELECT * FROM source
+                WHERE moment IS NOT NULL AND trim(coalesce(title, '')) <> ''
+            )
+            SELECT count(*) AS eligible_unique_items,
+                   min(CAST(moment AS DATE)) AS date_min,
+                   max(CAST(moment AS DATE)) AS date_max
+            FROM eligible
+        """
+    elif dataset == DATASET_CCTV_NEWS:
+        missing = sorted({"date", "title", "content"} - columns)
+        if missing:
+            raise RuntimeError(f"cctv_news parquet misses required columns: {missing}")
+        date_expr = (
+            "coalesce(try_cast(date AS DATE), "
+            "try_strptime(CAST(date AS VARCHAR), '%Y%m%d')::DATE)"
+        )
+        where, parameters = _date_bounds_sql(date_expr, start=start, end=end)
+        query = f"""
+            WITH source AS (
+                SELECT DISTINCT {date_expr} AS broadcast_date,
+                       CAST(title AS VARCHAR) AS title,
+                       CAST(content AS VARCHAR) AS content
+                FROM read_parquet(?, union_by_name=true)
+                {where}
+            ), eligible AS (
+                SELECT * FROM source
+                WHERE broadcast_date IS NOT NULL
+                  AND (trim(coalesce(title, '')) <> '' OR trim(coalesce(content, '')) <> '')
+            )
+            SELECT count(*) AS eligible_unique_items,
+                   min(broadcast_date) AS date_min,
+                   max(broadcast_date) AS date_max
+            FROM eligible
+        """
+    else:  # guarded by SUPPORTED_CORPUS_DATASETS at the public boundary
+        raise ValueError(f"unsupported corpus dataset: {dataset}")
+
+    frame = _read_parquet_union(paths, query, parameters)
+    row = frame.iloc[0]
+    return {
+        "eligible_unique_items": int(row["eligible_unique_items"]),
+        "date_min": (
+            pd.Timestamp(row["date_min"]).date().isoformat()
+            if not pd.isna(row["date_min"])
+            else None
+        ),
+        "date_max": (
+            pd.Timestamp(row["date_max"]).date().isoformat()
+            if not pd.isna(row["date_max"])
+            else None
+        ),
+    }
+
+
+def build_corpus_selection_audit(
+    data_root: Path,
+    *,
+    selected_datasets: set[str],
+    selected_before_limit: Sequence[CorpusItem],
+    selected_after_limit: Sequence[CorpusItem],
+    ts_codes: set[str] | None,
+    start: date | None,
+    end: date | None,
+    limit: int | None,
+    max_major_news_per_day: int | None,
+    max_irm_per_instrument_day: int | None,
+) -> dict[str, Any]:
+    """Describe raw eligible denominators and governed sampling outcomes."""
+
+    ordered = [name for name in SUPPORTED_CORPUS_DATASETS if name in selected_datasets]
+    paths_by_dataset = _corpus_parquet_paths(data_root, ordered)
+    before_counts = Counter(item.source_dataset for item in selected_before_limit)
+    after_counts = Counter(item.source_dataset for item in selected_after_limit)
+    sources: dict[str, dict[str, Any]] = {}
+    for dataset in ordered:
+        stats = _eligible_corpus_stats(
+            paths_by_dataset[dataset],
+            dataset,
+            start=start,
+            end=end,
+            ts_codes=ts_codes,
+        )
+        eligible = int(stats["eligible_unique_items"])
+        selected_before = int(before_counts[dataset])
+        selected_after = int(after_counts[dataset])
+        sources[dataset] = {
+            **stats,
+            "selected_after_policy_before_limit": selected_before,
+            "selected_after_limit": selected_after,
+            "policy_selection_ratio": (
+                selected_before / eligible if eligible else 1.0 if selected_before == 0 else 0.0
+            ),
+            "final_selection_ratio": (
+                selected_after / eligible if eligible else 1.0 if selected_after == 0 else 0.0
+            ),
+        }
+    return {
+        "scope": {
+            "start_date": start.isoformat() if start else None,
+            "end_date": end.isoformat() if end else None,
+            "ts_codes": sorted(ts_codes or set()),
+            "limit": int(limit or 0),
+        },
+        "policy": {
+            "major_news_max_items_per_publication_day": max_major_news_per_day,
+            "irm_max_items_per_instrument_publication_day": max_irm_per_instrument_day,
+            "selection": "stable DuckDB hash rank; no post-event performance input",
+        },
+        "eligible_unique_items": sum(
+            int(value["eligible_unique_items"]) for value in sources.values()
+        ),
+        "selected_after_policy_before_limit": len(selected_before_limit),
+        "selected_after_limit": len(selected_after_limit),
+        "sources": sources,
+    }
+
+
 def available_at_for(item: CorpusItem, open_days: Sequence[date]) -> datetime:
     """Field-level visibility timestamp (design draft 3.3).
 
@@ -889,6 +1134,7 @@ def _write_factor_artifact(
     name: str,
     source_datasets: tuple[str, ...],
     selection_policy: Mapping[str, int | None],
+    selection_audit: Mapping[str, Any],
     source_scope: Mapping[str, Any],
     model: str,
     now: datetime,
@@ -909,6 +1155,7 @@ def _write_factor_artifact(
             "prompt_version": PROMPT_VERSION,
             "model": model,
             "selection_policy": dict(selection_policy),
+            "selection_audit": dict(selection_audit),
             "scope": dict(source_scope),
         },
         "generated_at": now.isoformat(),
@@ -935,6 +1182,7 @@ class CorpusNlpSummary:
     failed: int
     llm_calls: int
     selection_policy: dict[str, int | None]
+    selection_audit: dict[str, Any]
     fields_path: Path | None
     state_path: Path | None
     unit_path: Path | None
@@ -949,6 +1197,7 @@ class CorpusNlpSummary:
             "failed": self.failed,
             "llm_calls": self.llm_calls,
             "selection_policy": self.selection_policy,
+            "selection_audit": self.selection_audit,
             "fields_path": str(self.fields_path) if self.fields_path else None,
             "state_path": str(self.state_path) if self.state_path else None,
             "unit_path": str(self.unit_path) if self.unit_path else None,
@@ -1020,8 +1269,21 @@ def process_corpus(
         max_major_news_per_day=max_major_news_per_day,
         max_irm_per_instrument_day=max_irm_per_instrument_day,
     )
+    selected_before_limit = list(items)
     if limit is not None and limit > 0:
         items = items[:limit]
+    selection_audit = build_corpus_selection_audit(
+        data_root,
+        selected_datasets=selected_datasets,
+        selected_before_limit=selected_before_limit,
+        selected_after_limit=items,
+        ts_codes=ts_codes,
+        start=start,
+        end=end,
+        limit=limit,
+        max_major_news_per_day=max_major_news_per_day,
+        max_irm_per_instrument_day=max_irm_per_instrument_day,
+    )
     # The trading calendar drives both irm_qa availability and every factor
     # date; without it the run must not guess (fail closed).
     open_days = load_trade_calendar_open_days(data_root)
@@ -1246,6 +1508,7 @@ def process_corpus(
             if dataset in selected_datasets
         ),
         selection_policy=selection_policy,
+        selection_audit=selection_audit,
         source_scope=source_scope,
         model=model,
         now=clock(),
@@ -1258,6 +1521,7 @@ def process_corpus(
             dataset for dataset in IRM_QA_DATASETS if dataset in selected_datasets
         ),
         selection_policy=selection_policy,
+        selection_audit=selection_audit,
         source_scope=source_scope,
         model=model,
         now=clock(),
@@ -1270,6 +1534,7 @@ def process_corpus(
             dataset for dataset in POLICY_DATASETS if dataset in selected_datasets
         ),
         selection_policy=selection_policy,
+        selection_audit=selection_audit,
         source_scope=source_scope,
         model=model,
         now=clock(),
@@ -1281,6 +1546,7 @@ def process_corpus(
         failed=failed,
         llm_calls=llm_calls,
         selection_policy=selection_policy,
+        selection_audit=selection_audit,
         fields_path=fields_path,
         state_path=state_path,
         unit_path=unit_path,
