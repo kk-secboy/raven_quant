@@ -580,6 +580,22 @@ class LocalJobWorker:
                     ]
                 )
             return command, result_path, {}
+        if job["kind"] in {"announcement_factor_register", "corpus_factor_register"}:
+            command = [sys.executable, "-m", "quant_platform.db_cli"]
+            command.append(
+                "register-announcement-factor"
+                if job["kind"] == "announcement_factor_register"
+                else "register-corpus-factor"
+            )
+            command.extend(
+                [
+                    "--factor-name",
+                    str(payload.get("factor_name") or "all"),
+                    "--actor",
+                    str(payload.get("actor") or "information-pipeline-worker"),
+                ]
+            )
+            return command, None, {}
         if job["kind"] in {
             "margin_eligibility_download",
             "core_intraday_download",
@@ -1858,7 +1874,9 @@ class LocalJobWorker:
                 "minute_qlib",
                 "qlib_baseline",
                 "announcement_nlp",
+                "announcement_factor_register",
                 "corpus_nlp",
+                "corpus_factor_register",
                 "event_market_response",
                 *(
                     f"supplemental_{bundle}"

@@ -9,14 +9,19 @@
    监管类高信号公告。
 2. `announcement_nlp`：在正文下载成功后才创建，按正文 SHA-256、提示词版本和模型
    幂等恢复。
-3. `corpus_nlp`：消费已经落盘的新闻和互动问答语料；是否启用及来源范围由调度配置
+3. `announcement_factor_register`：校验公告因子 manifest 和文件 SHA-256 后，幂等注册
+   为 `awaiting_evaluation` 候选；不自动晋级。
+4. `corpus_nlp`：消费已经落盘的新闻和互动问答语料；是否启用及来源范围由调度配置
    固定。
-4. `event_market_response`：只读取已经通过阻断质量门的不可变快照，产出
+5. `corpus_factor_register`：以同一治理通道注册本轮语料因子候选。
+6. `event_market_response`：只读取已经通过阻断质量门的不可变快照，产出
    `training_label_only` 事后标签。
 
 每个阶段都是单独的 durable job。后继任务只在前一阶段退出码为零时创建；同一调度
 运行使用固定的 `pipeline_id` 和幂等键。已有行情下载、公告下载、NLP、快照或 Qlib
 构建任务时，本次运行记为 `skipped`，不重复排队，也不争抢正在运行的 I/O。
+因子注册只把不可变 artifact 接入研究候选账本；候选仍必须通过滚动样本外评估、
+purge/embargo 和最终一次性 OOS，调度器不会直接发布策略或推荐。
 
 ## 安全默认值
 

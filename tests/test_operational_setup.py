@@ -95,7 +95,9 @@ def test_worker_accepts_governed_information_jobs() -> None:
 
     for kind in (
         "announcement_nlp",
+        "announcement_factor_register",
         "corpus_nlp",
+        "corpus_factor_register",
         "event_market_response",
         "external_factor_evaluate",
     ):

@@ -191,12 +191,14 @@ def test_scheduler_creates_bounded_recoverable_information_pipeline(
     steps = job["payload"]["pipeline_steps"]
     assert [step["kind"] for step in steps] == [
         "announcement_nlp",
+        "announcement_factor_register",
         "corpus_nlp",
+        "corpus_factor_register",
         "event_market_response",
     ]
     assert steps[0]["payload"]["limit"] == 125
-    assert steps[1]["payload"]["limit"] == 175
-    assert steps[2]["payload"]["snapshot_name"] == "cn-verified"
+    assert steps[2]["payload"]["limit"] == 175
+    assert steps[4]["payload"]["snapshot_name"] == "cn-verified"
 
 
 def test_information_schedule_skips_when_a_conflicting_job_is_active(

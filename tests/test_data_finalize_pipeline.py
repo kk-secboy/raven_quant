@@ -264,6 +264,10 @@ def test_information_pipeline_keeps_download_nlp_and_labels_as_durable_jobs(
             },
         },
         {
+            "kind": "announcement_factor_register",
+            "payload": {"factor_name": "all", "actor": "information-scheduler"},
+        },
+        {
             "kind": "corpus_nlp",
             "payload": {
                 "start": "2025-01-01",
@@ -271,6 +275,10 @@ def test_information_pipeline_keeps_download_nlp_and_labels_as_durable_jobs(
                 "datasets": ["major_news"],
                 "limit": 100,
             },
+        },
+        {
+            "kind": "corpus_factor_register",
+            "payload": {"factor_name": "all", "actor": "information-scheduler"},
         },
         {
             "kind": "event_market_response",
@@ -295,16 +303,22 @@ def test_information_pipeline_keeps_download_nlp_and_labels_as_durable_jobs(
     }
 
     created = []
-    for expected in ("announcement_nlp", "corpus_nlp", "event_market_response"):
+    for expected in (
+        "announcement_nlp",
+        "announcement_factor_register",
+        "corpus_nlp",
+        "corpus_factor_register",
+        "event_market_response",
+    ):
         successor = worker._queue_data_pipeline_successor(current)
         assert successor["kind"] == expected
         created.append(successor)
         current = successor
 
     assert created[0]["payload"]["limit"] == 100
-    assert created[1]["payload"]["datasets"] == ["major_news"]
-    assert created[2]["payload"]["snapshot_name"] == "cn-verified"
-    assert worker._has_data_pipeline_successor(created[2]) is False
+    assert created[2]["payload"]["datasets"] == ["major_news"]
+    assert created[4]["payload"]["snapshot_name"] == "cn-verified"
+    assert worker._has_data_pipeline_successor(created[4]) is False
 
 
 def test_full_snapshot_contract_keeps_execution_frequency_separate() -> None:

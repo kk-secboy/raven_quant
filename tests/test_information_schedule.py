@@ -151,12 +151,43 @@ def test_information_steps_form_a_durable_idempotent_successor_chain(
     }
 
     created = []
-    for expected in ("announcement_nlp", "corpus_nlp", "event_market_response"):
+    expected_kinds = (
+        "announcement_nlp",
+        "announcement_factor_register",
+        "corpus_nlp",
+        "corpus_factor_register",
+        "event_market_response",
+    )
+    steps.insert(
+        1,
+        {
+            "kind": "announcement_factor_register",
+            "payload": {"factor_name": "all", "actor": "information-scheduler"},
+        },
+    )
+    steps.insert(
+        3,
+        {
+            "kind": "corpus_factor_register",
+            "payload": {"factor_name": "all", "actor": "information-scheduler"},
+        },
+    )
+    for expected in expected_kinds:
         successor = worker._queue_data_pipeline_successor(current)
         assert successor["kind"] == expected
         assert worker._queue_data_pipeline_successor(current)["id"] == successor["id"]
         created.append(successor)
         current = successor
 
-    assert created[2]["payload"]["snapshot_name"] == "cn-verified"
-    assert worker._has_data_pipeline_successor(created[2]) is False
+    assert created[-1]["payload"]["snapshot_name"] == "cn-verified"
+    assert worker._has_data_pipeline_successor(created[-1]) is False
+
+    announcement_command, result_path, environment = worker._command(created[1])
+    assert announcement_command[-5:] == [
+        "register-announcement-factor",
+        "--factor-name",
+        "all",
+        "--actor",
+        "information-scheduler",
+    ]
+    assert result_path is None and environment == {}

@@ -64,7 +64,9 @@ INFORMATION_CONFLICTING_JOB_KINDS = (
     "ashare_5m_download",
     "cninfo_announcements_download",
     "announcement_nlp",
+    "announcement_factor_register",
     "corpus_nlp",
+    "corpus_factor_register",
     "event_market_response",
     "data_verify",
     "data_snapshot",
@@ -424,6 +426,12 @@ class SchedulerEngine:
                     },
                 }
             )
+            steps.append(
+                {
+                    "kind": "announcement_factor_register",
+                    "payload": {"factor_name": "all", "actor": "information-scheduler"},
+                }
+            )
             if payload["include_corpus_nlp"]:
                 from .corpus_nlp import PROMPT_VERSION as corpus_prompt_version
 
@@ -441,6 +449,12 @@ class SchedulerEngine:
                             "irm_per_instrument_day": payload["irm_per_instrument_day"],
                             "prompt_version": corpus_prompt_version,
                         },
+                    }
+                )
+                steps.append(
+                    {
+                        "kind": "corpus_factor_register",
+                        "payload": {"factor_name": "all", "actor": "information-scheduler"},
                     }
                 )
             if payload["include_event_labels"]:
