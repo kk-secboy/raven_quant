@@ -418,6 +418,34 @@ def test_changed_content_creates_new_file_and_never_overwrites(tmp_path: Path) -
     assert index.set_index("url").loc[row["url"], "sha256"] == digest_b
 
 
+def test_same_size_corruption_is_not_skipped(tmp_path: Path) -> None:
+    row = _ann_row(
+        "000001.SZ", "20240102", "年度报告", "https://static.cninfo.com.cn/a.pdf"
+    )
+    _seed_data(tmp_path, [row])
+    original = _pdf("version-a")
+    first = _run(
+        tmp_path,
+        _client(FakeSession({row["url"]: [FakeResponse(200, original)]})),
+    )
+    index = pd.read_parquet(first.index_path).set_index("url")
+    stored = tmp_path / index.loc[row["url"], "file_path"]
+    stored.write_bytes(b"X" * len(original))
+    replacement = _pdf("version-b")
+    assert len(replacement) == len(original)
+    session = FakeSession({row["url"]: [FakeResponse(200, replacement)]})
+
+    second = _run(tmp_path, _client(session))
+
+    assert session.calls == [row["url"]]
+    assert second.skipped == 0
+    assert second.downloaded == 1
+    digest = hashlib.sha256(replacement).hexdigest()
+    assert (
+        tmp_path / "announcements" / "files" / digest[:2] / f"{digest}.pdf"
+    ).read_bytes() == replacement
+
+
 def test_retryable_failures_back_off_then_succeed(tmp_path: Path) -> None:
     row = _ann_row("000001.SZ", "20240102", "年度报告", "https://static.cninfo.com.cn/a.pdf")
     _seed_data(tmp_path, [row])

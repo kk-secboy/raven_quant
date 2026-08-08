@@ -107,6 +107,14 @@ def _validate_body(url: str, body: bytes) -> None:
         )
 
 
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _normalize_body(url: str, body: bytes) -> bytes:
     """Extract a PDF embedded in cninfo's occasional multipart response.
 
@@ -669,7 +677,11 @@ def download_cninfo_announcements(
         existing = records.get(ref.url)
         if existing is not None:
             target = data_root / existing["file_path"]
-            if target.is_file() and target.stat().st_size == existing["bytes"]:
+            if (
+                target.is_file()
+                and target.stat().st_size == existing["bytes"]
+                and _sha256_path(target) == existing["sha256"]
+            ):
                 unavailable_records.pop(ref.url, None)
                 skipped += 1
                 log_row.update(
