@@ -62,6 +62,15 @@ def test_announcement_catalog_records_real_source_boundary() -> None:
     assert tasks["cn_corpus_nlp"].range_start == "2018-11-20"
     assert "cn_ashare_daily_full" in tasks["cn_corpus_nlp"].depends_on
     assert tasks["cn_event_market_response"].range_start == "2016-01-01"
+    structured = tasks["cn_structured_information_factors"]
+    assert structured.range_start == "2010-01-01"
+    assert structured.frequency == "weekly"
+    assert structured.depends_on == ("research_corpus", "cn_qlib_baseline")
+    assert structured.datasets == (
+        "report_rc_factors",
+        "major_news_mentions",
+        "news_flash_factors",
+    )
 
 
 def test_pilot_jobs_cannot_certify_full_information_catalog_scope() -> None:

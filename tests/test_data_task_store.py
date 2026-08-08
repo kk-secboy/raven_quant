@@ -86,7 +86,7 @@ def test_catalog_tracks_each_finalize_pipeline_stage(database_url: str, tmp_path
 def test_catalog_binds_cninfo_announcement_download(database_url: str, tmp_path: Path) -> None:
     job = JobStore(database_url).create(
         "cninfo_announcements_download",
-        {"start": "2024-01-01", "end": "2026-08-03"},
+        {"start": "2016-01-01", "end": "2026-08-03"},
         tmp_path / "announcements.log",
     )
 
@@ -96,6 +96,69 @@ def test_catalog_binds_cninfo_announcement_download(database_url: str, tmp_path:
 
     assert task["job_id"] == job["id"]
     assert task["status"] == "queued"
+
+
+def test_structured_information_card_tracks_latest_refresh_stage(
+    database_url: str, tmp_path: Path
+) -> None:
+    jobs = JobStore(database_url)
+    producer = jobs.create(
+        "report_rc_factors",
+        {
+            "profile": "information_factor_refresh",
+            "start": "2010-01-01",
+            "end": "2026-08-08",
+        },
+        tmp_path / "report-rc-factors.log",
+    )
+    jobs.finish(producer["id"], exit_code=0)
+    register = jobs.create(
+        "report_rc_factor_register",
+        {
+            "profile": "information_factor_refresh",
+            "start": "2010-01-01",
+            "end": "2026-08-08",
+        },
+        tmp_path / "report-rc-register.log",
+    )
+
+    store = DataTaskStore(database_url)
+    store.sync_catalog()
+    task = next(
+        item
+        for item in store.list()
+        if item["task_key"] == "cn_structured_information_factors"
+    )
+
+    assert task["job_id"] == register["id"]
+    assert task["status"] == "queued"
+    assert task["coverage"] == 0.0
+
+
+def test_unrelated_information_evaluation_does_not_bind_refresh_card(
+    database_url: str, tmp_path: Path
+) -> None:
+    job = JobStore(database_url).create(
+        "information_factor_evaluate",
+        {
+            "profile": "manual_research",
+            "start": "2010-01-01",
+            "end": "2026-08-08",
+        },
+        tmp_path / "manual-evaluation.log",
+    )
+
+    store = DataTaskStore(database_url)
+    store.sync_catalog()
+    task = next(
+        item
+        for item in store.list()
+        if item["task_key"] == "cn_structured_information_factors"
+    )
+
+    assert task["job_id"] is None
+    assert task["status"] == "planned"
+    assert job["status"] == "queued"
 
 
 def test_newer_pipeline_stage_supersedes_legacy_bootstrap_failure(

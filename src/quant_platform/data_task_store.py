@@ -52,6 +52,10 @@ REQUEST_STRATEGIES = {
         "以已校验不可变日线快照计算公告后1/3/5/20交易日超额收益和方向一致性；"
         "结果只作为训练标签，禁止注册为因子或进入实时推理特征。"
     ),
+    "cn_structured_information_factors": (
+        "按真实数据边界全量重建研报评级、新闻提及和快讯因子；先生成内容寻址的不可变产物并注册，"
+        "再在固定 Qlib 数据集和冻结时间区间上执行滚动样本外评估。"
+    ),
 }
 
 
@@ -429,6 +433,21 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         range_start="2016-01-01",
     ),
     DataTaskDefinition(
+        "cn_structured_information_factors",
+        5,
+        91,
+        "结构化信息因子周更与样本外评估",
+        "将研报评级、长篇新闻个股提及和新闻快讯转换为带来源、真实可用时间和内容哈希的 PIT 因子；"
+        "注册后只在固定 Qlib 数据集与冻结训练、验证、测试区间上做严格滚动样本外评估。",
+        "研究语料",
+        "QuantLab",
+        "ready",
+        ("research_corpus", "cn_qlib_baseline"),
+        ("report_rc_factors", "major_news_mentions", "news_flash_factors"),
+        "weekly",
+        range_start="2010-01-01",
+    ),
+    DataTaskDefinition(
         "strategy_specialty",
         7,
         108,
@@ -772,6 +791,15 @@ class DataTaskStore:
 
     @staticmethod
     def _bind_pipeline_jobs(connection, now: datetime) -> None:
+        structured_information_kinds = (
+            "report_rc_factors",
+            "report_rc_factor_register",
+            "major_news_mentions",
+            "major_news_mentions_factor_register",
+            "news_flash_factors",
+            "news_flash_factor_register",
+            "information_factor_evaluate",
+        )
         task_by_kind = {
             "bootstrap": "cn_ashare_daily_full",
             "data_verify": "cn_data_verify",
@@ -794,7 +822,11 @@ class DataTaskStore:
                 jobs.c.payload_json,
                 jobs.c.created_at,
             )
-            .where(jobs.c.kind.in_((*tuple(task_by_kind), "minute_qlib")))
+            .where(
+                jobs.c.kind.in_(
+                    (*tuple(task_by_kind), "minute_qlib", *structured_information_kinds)
+                )
+            )
             .order_by(jobs.c.created_at.desc())
         ).all()
         latest: dict[str, Any] = {}
@@ -814,6 +846,26 @@ class DataTaskStore:
                 update(data_tasks)
                 .where(data_tasks.c.task_key == task_key)
                 .values(job_id=current.id, status=current.status, updated_at=now)
+            )
+        structured_information = next(
+            (
+                row
+                for row in rows
+                if str(row.kind) in structured_information_kinds
+                and str((row.payload_json or {}).get("profile") or "")
+                == "information_factor_refresh"
+            ),
+            None,
+        )
+        if structured_information is not None:
+            connection.execute(
+                update(data_tasks)
+                .where(data_tasks.c.task_key == "cn_structured_information_factors")
+                .values(
+                    job_id=structured_information.id,
+                    status=structured_information.status,
+                    updated_at=now,
+                )
             )
         minute_task_by_frequency = {
             "1min": "liquid_intraday_qlib",
