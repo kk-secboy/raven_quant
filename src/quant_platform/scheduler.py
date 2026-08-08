@@ -78,6 +78,7 @@ INFORMATION_CONFLICTING_JOB_KINDS = (
     "major_news_mentions_factor_register",
     "news_flash_factors",
     "news_flash_factor_register",
+    "multiface_audit",
     "data_verify",
     "data_snapshot",
     "data_qlib",
@@ -538,6 +539,18 @@ class SchedulerEngine:
                         },
                     }
                 )
+                steps.append(
+                    {
+                        "kind": "multiface_audit",
+                        "payload": {
+                            "dataset": evaluation["dataset"],
+                            "snapshot_name": (
+                                snapshot_name if payload["include_event_labels"] else None
+                            ),
+                            "require_ready": True,
+                        },
+                    }
+                )
 
         log_path = (
             self.settings.data_root / "platform" / "logs" / f"scheduled-information-{run['id']}.log"
@@ -683,6 +696,16 @@ class SchedulerEngine:
                     "universe": evaluation["universe"],
                     "benchmark": evaluation["benchmark"],
                     "factor_names": sorted(set(factor_names)),
+                },
+            }
+        )
+        stages.append(
+            {
+                "kind": "multiface_audit",
+                "payload": {
+                    "dataset": evaluation["dataset"],
+                    "snapshot_name": None,
+                    "require_ready": True,
                 },
             }
         )

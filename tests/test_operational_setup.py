@@ -107,6 +107,7 @@ def test_worker_accepts_governed_information_jobs() -> None:
         "major_news_mentions_factor_register",
         "news_flash_factors",
         "news_flash_factor_register",
+        "multiface_audit",
     ):
         assert kind in compose
     assert "REQUESTS_PER_MINUTE: ${REQUESTS_PER_MINUTE:-99}" in compose

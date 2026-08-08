@@ -208,6 +208,12 @@ class EventMarketResponseRequest(BaseModel):
         return self
 
 
+class MultifaceAuditRequest(BaseModel):
+    dataset: str = Field(min_length=3, max_length=300)
+    snapshot_name: str | None = Field(default=None, min_length=3, max_length=120)
+    require_ready: bool = True
+
+
 class MarginEligibilityRequest(BaseModel):
     start: date = Field(default=date(2024, 1, 1))
     end: date | Literal["latest"] = "latest"
@@ -4024,6 +4030,34 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     f"{','.join(str(value) for value in horizons)}:"
                     f"{serialized['benchmark_code']}"
                 ),
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return job
+
+    @app.post("/api/jobs/multiface-audit", status_code=202)
+    def create_multiface_audit(payload: MultifaceAuditRequest) -> dict:
+        dataset = require_qlib_dataset(payload.dataset, purpose="multi-face readiness audit")
+        if dataset.get("frequency") != "day":
+            raise HTTPException(409, "multi-face readiness audit requires a daily Qlib dataset")
+        if jobs.count(statuses=("queued", "running"), kinds=("multiface_audit",)):
+            raise HTTPException(409, "a multi-face readiness audit is already active")
+        serialized = {
+            "dataset": payload.dataset,
+            "dataset_identity_sha256": dataset["provenance"][
+                "dataset_identity_sha256"
+            ],
+            "snapshot_name": payload.snapshot_name,
+            "require_ready": payload.require_ready,
+        }
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        log_path = platform_root / "logs" / f"multiface-audit-{stamp}.log"
+        try:
+            job = jobs.create(
+                "multiface_audit",
+                serialized,
+                log_path,
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc

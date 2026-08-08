@@ -37,6 +37,10 @@ from quant_platform.major_news_mentions import (
 from quant_platform.major_news_mentions import (
     register_major_news_mentions_factor,
 )
+from quant_platform.multiface_audit import (
+    audit_multiface_readiness,
+    write_multiface_report,
+)
 from quant_platform.news_flash_factors import (
     IMPORT_ACTOR as NEWS_FLASH_IMPORT_ACTOR,
 )
@@ -221,6 +225,45 @@ def register_news_flash_factor_command(
         actor=actor,
     )
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@app.command("audit-multiface")
+def audit_multiface_command(
+    dataset: Annotated[
+        str, typer.Option(help="Immutable Qlib dataset directory name")
+    ],
+    snapshot_name: Annotated[
+        str | None,
+        typer.Option("--snapshot", help="Snapshot name; defaults to Qlib provenance"),
+    ] = None,
+    result: Annotated[
+        Path | None,
+        typer.Option(help="Optional job result JSON path"),
+    ] = None,
+    require_ready: Annotated[
+        bool,
+        typer.Option(help="Exit non-zero when any governed face is not ready"),
+    ] = False,
+) -> None:
+    """Audit Qlib fields, information factors, OOS evidence and label isolation."""
+
+    settings = Settings.from_env(project_root() / ".env")
+    report = audit_multiface_readiness(
+        settings.data_root,
+        dataset=dataset,
+        snapshot_name=snapshot_name,
+        ledger=ResearchStore(settings.database_url),
+    )
+    report_path = write_multiface_report(settings.data_root, report)
+    output = {**report, "report_path": str(report_path)}
+    if result is not None:
+        result.parent.mkdir(parents=True, exist_ok=True)
+        result.write_text(
+            json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    typer.echo(json.dumps(output, ensure_ascii=False, indent=2))
+    if require_ready and not report["ok"]:
+        raise typer.Exit(code=2)
 
 
 if __name__ == "__main__":

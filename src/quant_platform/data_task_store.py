@@ -799,6 +799,7 @@ class DataTaskStore:
             "news_flash_factors",
             "news_flash_factor_register",
             "information_factor_evaluate",
+            "multiface_audit",
         )
         task_by_kind = {
             "bootstrap": "cn_ashare_daily_full",

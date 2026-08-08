@@ -123,6 +123,7 @@ def test_structured_information_steps_are_allowed_in_durable_chain(
         "news_flash_factors",
         "news_flash_factor_register",
         "information_factor_evaluate",
+        "multiface_audit",
     ]
     current = {
         "kind": "report_rc_factors",

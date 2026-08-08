@@ -13,6 +13,7 @@ from quant_platform.api import (
     CorpusNlpRequest,
     EventMarketResponseRequest,
     ExternalFactorEvaluationRequest,
+    MultifaceAuditRequest,
 )
 from quant_platform.data_task_store import DATA_TASK_CATALOG, job_covers_catalog_scope
 from quant_platform.worker import LocalJobWorker
@@ -51,6 +52,7 @@ def test_information_request_models_fail_closed() -> None:
         )
     with pytest.raises(ValidationError, match="less than or equal to 100"):
         CorpusNlpRequest(batch_size=101)
+    assert MultifaceAuditRequest(dataset="cn-fixture").require_ready is True
 
 
 def test_announcement_catalog_records_real_source_boundary() -> None:
@@ -233,6 +235,30 @@ def test_worker_builds_market_response_label_command(tmp_path: Path) -> None:
     assert "cn-fixture" in command
     assert "1,3,5,20" in command
     assert "000300.SH" in command
+    assert result_path.name == "result.json"
+    assert environment == {}
+
+
+def test_worker_builds_multiface_readiness_audit_command(tmp_path: Path) -> None:
+    worker = _worker(tmp_path)
+    command, result_path, environment = worker._command(
+        {
+            "id": "multiface-job",
+            "kind": "multiface_audit",
+            "payload": {
+                "dataset": "qlib-fixture",
+                "snapshot_name": "snapshot-fixture",
+                "require_ready": True,
+            },
+        }
+    )
+
+    assert "audit-multiface" in command
+    assert command[command.index("--dataset") + 1] == "qlib-fixture"
+    assert command[command.index("--snapshot") + 1] == "snapshot-fixture"
+    # Worker imports the result first, then applies require_ready as a logical
+    # gate so a failed audit remains visible in the durable job result.
+    assert "--require-ready" not in command
     assert result_path.name == "result.json"
     assert environment == {}
 

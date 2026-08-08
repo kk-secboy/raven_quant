@@ -245,6 +245,13 @@ class LocalJobWorker:
                 except (KeyError, TypeError, ValueError) as exc:
                     logical_error = str(exc)
                     exit_code = 3
+            if exit_code == 0 and job["kind"] == "multiface_audit":
+                if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+                    logical_error = "multi-face readiness audit result is missing"
+                    exit_code = 3
+                elif job["payload"].get("require_ready", True) and not result["ok"]:
+                    logical_error = "one or more governed data faces are not ready"
+                    exit_code = 3
             if exit_code == 0 and job["kind"] in {
                 "strategy_backtest",
                 "pair_backtest",
@@ -672,6 +679,22 @@ class LocalJobWorker:
                 ]
             )
             return command, None, {}
+        if job["kind"] == "multiface_audit":
+            output = self.settings.data_root / "artifacts" / "execution-data" / job["id"]
+            result_path = output / "result.json"
+            command = [
+                sys.executable,
+                "-m",
+                "quant_platform.db_cli",
+                "audit-multiface",
+                "--dataset",
+                str(payload["dataset"]),
+                "--result",
+                str(result_path),
+            ]
+            if payload.get("snapshot_name"):
+                command.extend(["--snapshot", str(payload["snapshot_name"])])
+            return command, result_path, {}
         if job["kind"] in {
             "margin_eligibility_download",
             "core_intraday_download",
@@ -1982,6 +2005,7 @@ class LocalJobWorker:
                 "major_news_mentions_factor_register",
                 "news_flash_factors",
                 "news_flash_factor_register",
+                "multiface_audit",
                 *(
                     f"supplemental_{bundle}"
                     for bundle in (

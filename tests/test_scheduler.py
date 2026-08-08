@@ -218,6 +218,7 @@ def test_scheduler_creates_bounded_recoverable_information_pipeline(
         "corpus_factor_register",
         "event_market_response",
         "information_factor_evaluate",
+        "multiface_audit",
     ]
     assert steps[0]["payload"]["limit"] == 125
     assert steps[2]["payload"]["limit"] == 175
@@ -230,6 +231,11 @@ def test_scheduler_creates_bounded_recoverable_information_pipeline(
         "irm_qa_sentiment_daily",
         "news_sentiment_daily",
     ]
+    assert steps[6]["payload"] == {
+        "dataset": "qlib-frozen",
+        "snapshot_name": "cn-verified",
+        "require_ready": True,
+    }
 
 
 def test_information_schedule_skips_when_a_conflicting_job_is_active(
@@ -324,10 +330,11 @@ def test_scheduler_creates_weekly_structured_information_factor_refresh(
         "news_flash_factors",
         "news_flash_factor_register",
         "information_factor_evaluate",
+        "multiface_audit",
     ]
     assert steps[1]["payload"]["start"] == "2018-11-20"
     assert steps[3]["payload"]["start"] == "2018-11-20"
-    assert steps[-1]["payload"]["factor_names"] == [
+    assert steps[-2]["payload"]["factor_names"] == [
         "major_news_mention_count_daily",
         "major_news_mention_sentiment_daily",
         "news_flash_intensity_daily",
@@ -335,6 +342,11 @@ def test_scheduler_creates_weekly_structured_information_factor_refresh(
         "report_rc_eps_revision",
         "report_rc_rating_change",
     ]
+    assert steps[-1]["payload"] == {
+        "dataset": "qlib-frozen",
+        "snapshot_name": None,
+        "require_ready": True,
+    }
 
 
 def test_structured_information_refresh_skips_nonmatching_weekday(
