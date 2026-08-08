@@ -9,6 +9,7 @@ from quant_data.cli import (
     _reconcile_range_plan,
     _supersede_unplanned_range_units,
     _supersede_unsupported_governance_units,
+    _supersede_unsupported_research_units,
     ashare_5m,
     bootstrap,
     snapshot,
@@ -107,7 +108,7 @@ def test_coverage_inventory_matches_audited_default_and_optional_counts() -> Non
     optional = set().union(
         *(coverage_bundle_datasets(bundle) for bundle in OPTIONAL_COVERAGE_BUNDLES)
     )
-    assert len(default) == 57
+    assert len(default) == 55
     assert len(optional) == 26
     assert default.isdisjoint(optional)
     assert all(coverage_primary_key_candidates(dataset) for dataset in default | optional)
@@ -390,6 +391,31 @@ def test_governance_cleanup_supersedes_retired_cyq_chips_units() -> None:
 
     assert count == 1
     assert checkpoint.superseded == [legacy_spec.unit_key]
+
+
+def test_research_corpus_excludes_unavailable_wechat_contracts() -> None:
+    assert coverage_bundle_datasets("research_corpus") == {
+        "cctv_news",
+        "irm_qa_sh",
+        "irm_qa_sz",
+        "monetary_policy",
+        "npr",
+        "research_report",
+    }
+
+
+def test_research_cleanup_supersedes_unavailable_wechat_units() -> None:
+    checkpoint = _CheckpointStub(
+        {
+            "wc_list": [{"unit_key": "wc-list"}],
+            "wc_cnt": [{"unit_key": "wc-count"}],
+        }
+    )
+
+    count = _supersede_unsupported_research_units(SimpleNamespace(checkpoint=checkpoint))
+
+    assert count == 2
+    assert checkpoint.superseded == ["wc-list", "wc-count"]
 
 
 def test_range_plan_supersedes_unfinished_adaptive_children_not_in_current_plan() -> None:

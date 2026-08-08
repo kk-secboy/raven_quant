@@ -125,8 +125,6 @@ _RULES: dict[str, tuple[CoverageRule, ...]] = {
         CoverageRule("cctv_news", "calendar_daily", 1_000, 2, "date", "date"),
         CoverageRule("irm_qa_sh", "daily", 3_000, 8),
         CoverageRule("irm_qa_sz", "daily", 3_000, 8),
-        CoverageRule("wc_list", "once", 3_000, 2, date_field="pub_time"),
-        CoverageRule("wc_cnt", "month_range", 3_000, 16, date_field="publish_time"),
     ),
     "strategy_specialty": (
         CoverageRule("stk_nineturn", "daily", 10_000, 4, variants=_variants(freq=("D",))),

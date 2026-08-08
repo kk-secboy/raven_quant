@@ -485,6 +485,21 @@ def _supersede_unsupported_governance_units(context: Context) -> int:
     return superseded
 
 
+def _supersede_unsupported_research_units(context: Context) -> int:
+    """Retire provider contracts that are unavailable and unused by research."""
+
+    stale = [
+        str(row["unit_key"])
+        for dataset in ("wc_list", "wc_cnt")
+        for row in context.checkpoint.unfinished_units(dataset)
+    ]
+    return context.checkpoint.supersede_units(
+        stale,
+        "wc_list/wc_cnt are absent from the current provider catalog and rejected by "
+        "the production gateway; retained as unavailable audit rows",
+    )
+
+
 def _complete_success_specs(rows: list[dict]) -> list[FetchSpec]:
     specs_by_group: dict[str, list[tuple[FetchSpec, int]]] = {}
     result: list[FetchSpec] = []
@@ -2126,6 +2141,8 @@ def supplemental_download(
         _supersede_unsupported_governance_units(context)
     if bundle == "cn_derivatives_enhanced":
         _supersede_obsolete_derivative_units(context)
+    if bundle == "research_corpus":
+        _supersede_unsupported_research_units(context)
     if specs:
         specs, rows, inserted = _run_paginated_specs(context, bundle, specs)
     console.print(

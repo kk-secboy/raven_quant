@@ -204,6 +204,12 @@ RECOVERABILITY_LEVELS: dict[str, str] = {
     "irm_qa_sh": NATIVE_HISTORY,
     "irm_qa_sz": NATIVE_HISTORY,
     "research_report": NATIVE_HISTORY,
+    # The current official provider catalog exposes neither endpoint and the
+    # production relay rejects both contracts as upstream parameter errors.
+    # Keep the names explicit so historical audit rows cannot be mistaken for
+    # evidence-grade source coverage.
+    "wc_list": UNAVAILABLE,
+    "wc_cnt": UNAVAILABLE,
     # As-of masters: the provider exposes only the latest revision. Pulls are
     # versioned going forward, but history before the first pull is
     # unrecoverable (the 2026-07-15 audit in reference_data.py covers the

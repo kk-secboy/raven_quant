@@ -76,7 +76,6 @@ REFERENCE_REFRESH_POLICIES: dict[str, ReferenceRefreshPolicy] = {
             "us_tradecal",
             "us_tycr",
             "monetary_policy",
-            "wc_list",
         ),
         "weekly": (
             "cb_rate",
