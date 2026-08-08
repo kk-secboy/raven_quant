@@ -73,6 +73,30 @@ def test_pilot_jobs_cannot_certify_full_information_catalog_scope() -> None:
     assert job_covers_catalog_scope(
         "cn_announcement_nlp", {"start": "2016-01-01", "limit": 0}
     )
+    assert not job_covers_catalog_scope(
+        "cn_announcement_nlp",
+        {
+            "start": "2016-01-01",
+            "limit": 0,
+            "ts_codes": ["000001.SZ"],
+        },
+    )
+    assert not job_covers_catalog_scope(
+        "cn_announcement_nlp",
+        {
+            "start": "2016-01-01",
+            "limit": 0,
+            "categories": ["announcement"],
+        },
+    )
+    assert job_covers_catalog_scope(
+        "cn_announcement_nlp",
+        {
+            "start": "2016-01-01",
+            "limit": 0,
+            "categories": ["regulatory_letter"],
+        },
+    )
     assert job_covers_catalog_scope(
         "cn_announcement_nlp", {"start": "2015-12-31", "limit": 0}
     )
@@ -84,6 +108,31 @@ def test_pilot_jobs_cannot_certify_full_information_catalog_scope() -> None:
     )
     assert job_covers_catalog_scope(
         "cn_corpus_nlp", {"start": "2018-11-20", "limit": 0}
+    )
+    assert not job_covers_catalog_scope(
+        "cn_corpus_nlp",
+        {
+            "start": "2018-11-20",
+            "limit": 0,
+            "datasets": ["major_news"],
+        },
+    )
+    assert not job_covers_catalog_scope(
+        "cn_corpus_nlp",
+        {
+            "start": "2018-11-20",
+            "limit": 0,
+            "datasets": ["major_news", "cctv_news", "irm_qa_sh", "irm_qa_sz"],
+            "ts_codes": ["000001.SZ"],
+        },
+    )
+    assert job_covers_catalog_scope(
+        "cn_corpus_nlp",
+        {
+            "start": "2018-11-20",
+            "limit": 0,
+            "datasets": ["major_news", "cctv_news", "irm_qa_sh", "irm_qa_sz"],
+        },
     )
     assert job_covers_catalog_scope("cn_snapshot_build", {"limit": 100})
 

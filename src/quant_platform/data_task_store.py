@@ -634,6 +634,22 @@ _FULL_SCOPE_JOB_TASKS = frozenset(
     }
 )
 _DATA_TASK_BY_KEY = {definition.task_key: definition for definition in DATA_TASK_CATALOG}
+_CORPUS_CATALOG_DATASETS = frozenset(
+    {"major_news", "cctv_news", "irm_qa_sh", "irm_qa_sz"}
+)
+
+
+def _payload_values(payload: dict[str, Any], key: str) -> set[str]:
+    """Normalize list-like job filters without treating malformed values as full scope."""
+
+    raw = payload.get(key)
+    if raw is None or raw == "":
+        return set()
+    if isinstance(raw, str):
+        return {part.strip() for part in raw.split(",") if part.strip()}
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return {"__invalid__"}
+    return {str(part).strip() for part in raw if str(part).strip()}
 
 
 def job_covers_catalog_scope(task_key: str, payload: dict[str, Any] | None) -> bool:
@@ -655,6 +671,21 @@ def job_covers_catalog_scope(task_key: str, payload: dict[str, Any] | None) -> b
         return False
     if limit > 0:
         return False
+    if _payload_values(job_payload, "ts_codes"):
+        return False
+    if task_key == "cn_announcement_nlp":
+        categories = _payload_values(job_payload, "categories")
+        # The production announcement catalog is the governed regulatory
+        # subset. An empty filter means all downloaded categories (a superset),
+        # otherwise the regulatory category must be present explicitly.
+        if categories and "regulatory_letter" not in categories:
+            return False
+    if task_key == "cn_corpus_nlp":
+        datasets = _payload_values(job_payload, "datasets")
+        # npr has no persisted production rows and is an audited source gap,
+        # not a required fake dataset. The four real corpora are mandatory.
+        if datasets and not _CORPUS_CATALOG_DATASETS <= datasets:
+            return False
     definition = _DATA_TASK_BY_KEY[task_key]
     if definition.range_start is None:
         return True
