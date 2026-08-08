@@ -415,6 +415,7 @@ def download_cninfo_announcements(
     start: date | None = None,
     end: date | None = None,
     limit: int | None = None,
+    regulatory_only: bool = False,
     rate_gate: GlobalRateGate | None = None,
     client: CninfoHttpClient | None = None,
     requests_per_minute: float = 30.0,
@@ -433,6 +434,8 @@ def download_cninfo_announcements(
 
     clock = now or (lambda: datetime.now(UTC))
     refs = load_announcement_manifest(data_root, ts_codes=ts_codes, start=start, end=end)
+    if regulatory_only:
+        refs = [ref for ref in refs if categorize_title(ref.title) == REGULATORY_CATEGORY]
     if limit is not None and limit > 0:
         refs = refs[:limit]
 

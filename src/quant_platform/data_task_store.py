@@ -37,8 +37,8 @@ REQUEST_STRATEGIES = {
         "每只股票最多 150 个实际交易日一个初始窗口；达到 8000 行时无重叠二分。"
     ),
     "cn_cninfo_announcements": (
-        "以已落盘 anns_d 为清单按 URL 下载巨潮 PDF；内容寻址文件已存在且校验一致时跳过，"
-        "每次运行落独立下载日志 parquet。"
+        "以已落盘 anns_d 为清单，仅下载标题命中问询函、关注函、监管函、警示函或纪律处分的"
+        "高信号巨潮 PDF；全量公告正文因规模超出生产存储边界而不伪装为已覆盖。"
     ),
     "cn_announcement_nlp": (
         "对公告 PDF 做文本抽取后调用 OpenAI 兼容端点做严格 JSON 抽取；"
@@ -365,7 +365,7 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         87,
         "巨潮公告正文与监管函件",
         "以 anns_d 公告索引为清单下载巨潮 PDF 正文，按标题识别问询函、关注函、监管函、"
-        "警示函和纪律处分，落内容寻址不可变文件与含 available_at/ingested_at 的元数据索引。",
+        "警示函和纪律处分；生产任务只落上述高信号监管类正文，并记录全量公告的存储边界。",
         "研究语料",
         "QuantLab",
         "ready",

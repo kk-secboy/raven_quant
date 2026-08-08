@@ -42,6 +42,7 @@ def test_worker_builds_resumable_cninfo_download_command(tmp_path: Path) -> None
     assert "cninfo-announcements" in command
     assert "000001.SZ,600519.SH" in command
     assert "25" in command
+    assert "--regulatory-only" in command
     assert result_path == tmp_path / "artifacts/execution-data/announcement-job/result.json"
     assert environment == {}
 
@@ -199,6 +200,30 @@ def test_categorize_title_marks_regulatory_letters() -> None:
     assert cninfo.categorize_title("2023年年度报告") == "announcement"
     assert cninfo.categorize_title(None) == "announcement"
     assert cninfo.categorize_title("") == "announcement"
+
+
+def test_regulatory_only_download_filters_manifest_before_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    refs = [
+        cninfo.AnnouncementRef("000001.SZ", date(2024, 1, 2), "年度报告", "https://a"),
+        cninfo.AnnouncementRef("000002.SZ", date(2024, 1, 3), "关注函", "https://b"),
+    ]
+    monkeypatch.setattr(cninfo, "load_announcement_manifest", lambda *args, **kwargs: refs)
+    monkeypatch.setattr(cninfo, "load_trade_calendar_open_days", lambda *args: OPEN_DAYS)
+    session = FakeSession({"https://b": [FakeResponse(200, _pdf("regulatory"))]})
+
+    summary = cninfo.download_cninfo_announcements(
+        tmp_path,
+        regulatory_only=True,
+        limit=1,
+        client=_client(session),
+        now=lambda: NOW,
+    )
+
+    assert summary.planned == 1
+    assert summary.downloaded == 1
+    assert session.calls == ["https://b"]
 
 
 def test_next_trading_day_is_strictly_after_ann_date() -> None:

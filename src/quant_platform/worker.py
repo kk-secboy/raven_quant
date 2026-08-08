@@ -469,6 +469,8 @@ class LocalJobWorker:
                 command.extend(["--ts-code", ",".join(payload["ts_codes"])])
             if int(payload.get("limit") or 0) > 0:
                 command.extend(["--limit", str(payload["limit"])])
+            if payload.get("regulatory_only", True):
+                command.append("--regulatory-only")
             return command, result_path, {}
         if job["kind"] in {
             "margin_eligibility_download",

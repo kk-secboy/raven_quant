@@ -46,7 +46,7 @@
 
 | 环节 | 评级 | 关键证据 |
 | --- | --- | --- |
-| 公告全文下载 | 已实现（2026-07-18） | `src/quant_data/cninfo_announcements.py`：以 `anns_d` 为发现源抓 PDF 正文，内容寻址不可变文件 + 每轮下载日志 + 限速 + 幂等跳过；元数据索引行级 `available_at`（公告次一交易日，fail-closed 依赖 trade_cal）与 `ingested_at`（`cninfo_announcements.py:213-552`） |
+| 公告全文下载 | 已实现；生产范围收敛（2026-08-08） | `src/quant_data/cninfo_announcements.py`：以 `anns_d` 为发现源抓 PDF 正文，内容寻址不可变文件 + 每轮下载日志 + 限速 + 幂等跳过；元数据索引行级 `available_at`（公告次一交易日，fail-closed 依赖 trade_cal）与 `ingested_at`。生产清单复核为 2,526,585 篇，按首批 1,470 份约 1.05GB 的实测均值推算全量超过 1TB，而生产卷当时仅余约 303GB；故生产任务显式限定为监管类高信号正文，不伪装全量公告已覆盖。通用 CLI 仍保留 `--all-announcements` 供具备独立大容量存储的环境使用。 |
 | 问询函/监管函 | 已实现（2026-07-18） | 标题关键词分类 `REGULATORY_TITLE_PATTERN`/`categorize_title`（问询函/关注函/监管函/警示函/纪律处分 → `regulatory_letter`，`cninfo_announcements.py:20-81`） |
 | LLM/NLP 抽取 | 已实现（2026-07-18） | `src/quant_platform/announcement_nlp.py`：PDF 文本抽取 → LLM 抽取（事件类型、语气分数、关键数值）→ 结构化字段索引，行级 `available_at`/`ingested_at`，原子写、按 sha256+prompt_version+model 幂等、fail-closed |
 | 信号字段落地 | 已实现（2026-07-18） | 因子库机制完整（`factor_candidates`/`factor_evaluations`，`database.py:143-256`）；announcement_nlp 因子值 artifact 按 datetime/instrument 单值序列 parquet + sha256 落盘（`announcement_nlp.py:513-549`）；入库通道已接：`announcement_factor_registry.register_announcement_factor`（`announcement_factor_registry.py:181`）校验 manifest sha256 后经 `ResearchStore.add_candidate` 落库，幂等键 (name, values_sha256)（`research_store.py:437`），CLI `quant-db register-announcement-factor`（`db_cli.py:58`） |
@@ -56,7 +56,7 @@
 
 ## 四、可复用机制清单（开发约束，禁止另起炉灶）
 
-- **待抓取清单**：`anns_d` 已按日全量落盘且含 PDF URL，直接作为公告正文下载的发现源，不另建公告发现机制。
+- **待抓取清单**：`anns_d` 已按日全量落盘且含 PDF URL，直接作为公告正文下载的发现源，不另建公告发现机制。生产下载仅选择标题命中问询函、关注函、监管函、警示函或纪律处分的记录；全量 2,526,585 篇是明确记录的存储边界，不计为已下载覆盖。
 - **密钥配置**：复用 `RuntimeSecretStore` 的 `"llm"` 记录（api_key/api_base/chat_model 三元组，`runtime_secret_store.py:13-135`、`api.py:1584-1602`），不新建密钥体系。
 - **下载纪律**：不可变快照 + parquet/zstd 单元（`storage.py:66-74,124-216`）、下载日志（接口/参数/时间/行数/错误）、限速（`rate_limit.py`）、幂等重跑（`checkpoint.py`）。
 - **PIT 契约写法**：参照 `qlib_builder.py:903-921` 的 `research_feature_contract` + `availability_policy`。

@@ -1703,6 +1703,13 @@ def cninfo_announcements_command(
     limit: Annotated[
         int, typer.Option(min=0, help="Maximum announcements to download (0 = all)")
     ] = 0,
+    regulatory_only: Annotated[
+        bool,
+        typer.Option(
+            "--regulatory-only/--all-announcements",
+            help="Download only regulatory letters identified by the governed title filter",
+        ),
+    ] = False,
     result_path: Annotated[Path | None, typer.Option("--result")] = None,
 ) -> None:
     """Download cninfo announcement PDFs discovered through the anns_d index."""
@@ -1728,6 +1735,7 @@ def cninfo_announcements_command(
         start=start_date,
         end=end_date,
         limit=limit or None,
+        regulatory_only=regulatory_only,
         rate_gate=context.rate_gate,
         timeout_seconds=context.settings.timeout_seconds,
         max_attempts=context.settings.max_request_attempts,
@@ -1738,6 +1746,7 @@ def cninfo_announcements_command(
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "ts_codes": _split_codes(ts_code),
+        "regulatory_only": regulatory_only,
         **summary.as_dict(),
     }
     _write_optional_result(result_path, result)
