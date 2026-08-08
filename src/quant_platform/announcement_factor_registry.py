@@ -11,16 +11,17 @@ ResearchStore invariants instead of inventing new governance:
   is marked ``succeeded`` once the candidate lands (``failed`` otherwise) so it
   never holds the unique active-kind slot.
 - Non-rejected candidates require a code artifact, so a deterministic
-  provenance code file is generated next to the values parquet; both artifact
+  provenance code file is archived with the values parquet; both artifact
   hashes are computed and recorded by :meth:`ResearchStore.add_candidate`.
 - The manifest sha256 is verified against the values parquet before anything
   is written (fail closed).
 
 Idempotency: a candidate is keyed by (name, values_sha256). Re-registering the
 same artifact returns the existing candidate without creating a new run; a
-changed artifact (new sha256) creates a new candidate in a new run — candidate
-rows are immutable once imported, so a new row is the existing versioning
-mechanism.
+changed artifact (new sha256) creates a new candidate in a new run. Every new
+candidate points at a content-addressed archive containing the exact values,
+manifest and provenance code used at import time. The producer's ``current``
+files may therefore advance without invalidating older candidate evidence.
 
 :func:`register_external_factor` is the generic form of this channel, reused
 by other external producers (e.g. the structured report_rc factors in
@@ -39,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -197,11 +199,91 @@ def compute_factor(fields: pd.DataFrame) -> pd.Series:
 '''
 
 
-def _write_code_artifact(path: Path, source: str) -> None:
+def _write_immutable_bytes(path: Path, content: bytes, *, label: str) -> None:
+    """Create one archived file, accepting an identical retry only."""
+
+    expected = hashlib.sha256(content).hexdigest()
+    if path.exists():
+        if not path.is_file() or _sha256_file(path) != expected:
+            raise ValueError(f"immutable factor {label} archive collision: {path}")
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp")
-    temporary.write_text(source, encoding="utf-8")
-    os.replace(temporary, path)
+    temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    try:
+        temporary.write_bytes(content)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if _sha256_file(path) != expected:
+        raise ValueError(f"immutable factor {label} archive verification failed: {path}")
+
+
+def _copy_immutable_file(
+    source: Path,
+    target: Path,
+    *,
+    expected_sha256: str,
+    label: str,
+) -> None:
+    """Stream a verified producer artifact into its content-addressed archive."""
+
+    if target.exists():
+        if not target.is_file() or _sha256_file(target) != expected_sha256:
+            raise ValueError(f"immutable factor {label} archive collision: {target}")
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{target.name}.tmp-{os.getpid()}")
+    try:
+        with source.open("rb") as input_stream, temporary.open("wb") as output_stream:
+            shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
+        if _sha256_file(temporary) != expected_sha256:
+            raise ValueError(f"factor values changed while being archived: {source}")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if _sha256_file(target) != expected_sha256:
+        raise ValueError(f"immutable factor {label} archive verification failed: {target}")
+
+
+def _archive_factor_version(
+    factors_dir: Path,
+    *,
+    factor_name: str,
+    manifest: dict[str, Any],
+    artifact_path: Path,
+    values_sha256: str,
+    code_source: str,
+) -> tuple[Path, Path, Path]:
+    """Archive exact candidate inputs below ``versions/name/values_sha256``."""
+
+    version_dir = factors_dir / "versions" / factor_name / values_sha256
+    archived_values = version_dir / artifact_path.name
+    archived_manifest = version_dir / f"{factor_name}.json"
+    archived_code = version_dir / f"{factor_name}_factor.py"
+    manifest_content = (factors_dir / f"{factor_name}.json").read_bytes()
+    try:
+        current_manifest = json.loads(manifest_content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("factor manifest changed while being archived") from exc
+    if current_manifest != manifest:
+        raise ValueError("factor manifest changed while being archived")
+    _copy_immutable_file(
+        artifact_path,
+        archived_values,
+        expected_sha256=values_sha256,
+        label="values",
+    )
+    _write_immutable_bytes(
+        archived_manifest,
+        manifest_content,
+        label="manifest",
+    )
+    _write_immutable_bytes(
+        archived_code,
+        code_source.encode("utf-8"),
+        label="code",
+    )
+    return archived_values, archived_manifest, archived_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,10 +349,15 @@ def register_external_factor(
     metadata = build_metadata(manifest, values_sha256)
     experiment_family_id = f"external:{source_dataset}:{factor_name}"
     experiment_count = store.count_candidates(name=factor_name) + 1
-    code_path = factors_dir / f"{factor_name}_factor.py"
-    _write_code_artifact(code_path, metadata.code_source)
-
-    manifest_path = factors_dir / f"{factor_name}.json"
+    archived_values, manifest_path, code_path = _archive_factor_version(
+        factors_dir,
+        factor_name=factor_name,
+        manifest=manifest,
+        artifact_path=artifact_path,
+        values_sha256=values_sha256,
+        code_source=metadata.code_source,
+    )
+    variables = {**metadata.variables, "manifest": str(manifest_path)}
     run = store.create_run(
         kind=run_kind,
         objective=(
@@ -281,12 +368,12 @@ def register_external_factor(
         requested_by=actor,
         budget={"loop_n": 0},
         config={
+            **metadata.run_config,
             "factor_name": factor_name,
             "values_sha256": values_sha256,
             "manifest": str(manifest_path),
-            **metadata.run_config,
         },
-        artifact_path=factors_dir,
+        artifact_path=manifest_path.parent,
     )
     try:
         candidate = store.add_candidate(
@@ -294,10 +381,10 @@ def register_external_factor(
             name=factor_name,
             description=metadata.description,
             formulation=metadata.formulation,
-            variables=metadata.variables,
+            variables=variables,
             source_iteration=None,
             code_path=str(code_path),
-            values_path=str(artifact_path),
+            values_path=str(archived_values),
             code_sha256=None,
             rdagent_decision=None,
             rdagent_feedback=metadata.rdagent_feedback,

@@ -89,6 +89,25 @@ def test_verified_artifact_round_trips_manifest(tmp_path: Path) -> None:
 
 
 @pytest.mark.no_database
+def test_archive_rejects_manifest_changed_after_verification(tmp_path: Path) -> None:
+    factors_dir = tmp_path / "factors"
+    artifact = _write_artifact(factors_dir)
+    verified_manifest = dict(artifact["manifest"])
+    changed = {**verified_manifest, "rows": verified_manifest["rows"] + 1}
+    artifact["manifest_path"].write_text(json.dumps(changed), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest changed while being archived"):
+        registry._archive_factor_version(
+            factors_dir,
+            factor_name=nlp.FACTOR_NAME,
+            manifest=verified_manifest,
+            artifact_path=artifact["artifact_path"],
+            values_sha256=verified_manifest["sha256"],
+            code_source="FACTOR_NAME = 'fixture'\n",
+        )
+
+
+@pytest.mark.no_database
 def test_code_artifact_source_is_deterministic_and_recomputes_values(
     tmp_path: Path,
 ) -> None:
@@ -226,7 +245,15 @@ def test_register_success(database_url: str, tmp_path: Path) -> None:
     candidate = store.get_candidate(result["candidate_id"])
     assert candidate["name"] == nlp.FACTOR_NAME
     assert candidate["status"] == "awaiting_evaluation"
-    assert candidate["values_path"] == str(artifact["artifact_path"])
+    values_path = Path(candidate["values_path"])
+    expected_version_dir = (
+        factors_dir
+        / "versions"
+        / nlp.FACTOR_NAME
+        / artifact["manifest"]["sha256"]
+    )
+    assert values_path == expected_version_dir / f"{nlp.FACTOR_NAME}.parquet"
+    assert values_path.read_bytes() == artifact["artifact_path"].read_bytes()
     assert candidate["values_sha256"] == artifact["manifest"]["sha256"]
     assert candidate["experiment_family_id"] == (
         f"external:{registry.SOURCE_DATASET}:{nlp.FACTOR_NAME}"
@@ -243,6 +270,8 @@ def test_register_success(database_url: str, tmp_path: Path) -> None:
     assert variables["source"]["prompt_version"] == nlp.PROMPT_VERSION
     assert variables["source"]["model"] == "test-model"
     assert variables["rows"] == artifact["manifest"]["rows"]
+    assert Path(variables["manifest"]) == expected_version_dir / f"{nlp.FACTOR_NAME}.json"
+    assert Path(variables["manifest"]).read_bytes() == artifact["manifest_path"].read_bytes()
     policy_text = nlp.AVAILABILITY_POLICY[nlp.FACTOR_NAME]
     assert policy_text in candidate["description"]
     assert "available_at" in candidate["description"]
@@ -278,6 +307,13 @@ def test_register_new_artifact_version_creates_new_candidate(
     _write_artifact(factors_dir)
     store = ResearchStore(database_url)
     first = registry.register_announcement_factor(store, factors_dir)
+    first_candidate_before = store.get_candidate(first["candidate_id"])
+    first_values_path = Path(first_candidate_before["values_path"])
+    first_values = first_values_path.read_bytes()
+    first_manifest_path = Path(first_candidate_before["variables"]["manifest"])
+    first_manifest = first_manifest_path.read_bytes()
+    first_code_path = Path(first_candidate_before["code_path"])
+    first_code = first_code_path.read_bytes()
 
     _write_artifact(factors_dir, tone_override=-0.9)
     second = registry.register_announcement_factor(store, factors_dir)
@@ -292,6 +328,15 @@ def test_register_new_artifact_version_creates_new_candidate(
         "experiment_family_id"
     ]
     assert second_candidate["experiment_count"] == 2
+    assert Path(first_candidate["values_path"]) == first_values_path
+    assert first_values_path.read_bytes() == first_values
+    assert Path(first_candidate["variables"]["manifest"]) == first_manifest_path
+    assert first_manifest_path.read_bytes() == first_manifest
+    assert Path(first_candidate["code_path"]) == first_code_path
+    assert first_code_path.read_bytes() == first_code
+    assert Path(second_candidate["values_path"]) != first_values_path
+    assert Path(second_candidate["variables"]["manifest"]) != first_manifest_path
+    assert Path(second_candidate["code_path"]) != first_code_path
     assert len(_candidates(store)) == 2
     assert len(_import_runs(store)) == 2
 

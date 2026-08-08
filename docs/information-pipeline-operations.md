@@ -22,6 +22,9 @@
 构建任务时，本次运行记为 `skipped`，不重复排队，也不争抢正在运行的 I/O。
 因子注册只把不可变 artifact 接入研究候选账本；候选仍必须通过滚动样本外评估、
 purge/embargo 和最终一次性 OOS，调度器不会直接发布策略或推荐。
+注册时会把 values、manifest 和 provenance code 原样归档到
+`factors/versions/<factor_name>/<values_sha256>/`，数据库候选只指向该内容寻址目录。
+后续增量运行可以原子更新生产者的“当前版”文件，但不能覆盖或改变旧候选的审计证据。
 
 ## 安全默认值
 
