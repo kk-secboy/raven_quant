@@ -173,6 +173,98 @@ def test_bounded_snapshot_rebuilds_parent_that_contains_out_of_range_rows(
     assert not (successor / relative).samefile(base / relative)
 
 
+def test_bounded_snapshot_keeps_memberships_overlapping_requested_range(
+    tmp_path: Path,
+) -> None:
+    store = ParquetStore(tmp_path / "data")
+    unit = _write_unit(
+        store,
+        "index_member_all",
+        "industry-members",
+        [
+            {
+                "ts_code": "000001.SZ",
+                "l1_code": "801780.SI",
+                "in_date": "19910403",
+                "out_date": None,
+            },
+            {
+                "ts_code": "000002.SZ",
+                "l1_code": "801180.SI",
+                "in_date": "20060101",
+                "out_date": "20091231",
+            },
+            {
+                "ts_code": "000003.SZ",
+                "l1_code": "801230.SI",
+                "in_date": "20000101",
+                "out_date": "20071231",
+            },
+            {
+                "ts_code": "000004.SZ",
+                "l1_code": "801750.SI",
+                "in_date": "20250101",
+                "out_date": None,
+            },
+        ],
+    )
+
+    snapshot = store.build_snapshot(
+        name="bounded-memberships",
+        successful_units={"index_member_all": [unit]},
+        manifest_extra={"start_date": "2008-01-01", "end_date": "2024-12-31"},
+    )
+
+    frame = _dataset_frame(snapshot, "index_member_all")
+    entry = _manifest_entry(snapshot, "index_member_all")
+    assert set(frame["ts_code"]) == {"000001.SZ", "000002.SZ"}
+    assert entry["rows"] == 2
+    assert entry["source_rows"] == 2
+    assert entry["date_field"] is None
+    assert entry["date_filter_mode"] == "interval_overlap"
+
+
+def test_bounded_memberships_do_not_reuse_incompatible_parent(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path / "data")
+    unit = _write_unit(
+        store,
+        "index_member_all",
+        "industry-members",
+        [
+            {
+                "ts_code": "000001.SZ",
+                "l1_code": "801780.SI",
+                "in_date": "19910403",
+                "out_date": None,
+            },
+            {
+                "ts_code": "000004.SZ",
+                "l1_code": "801750.SI",
+                "in_date": "20250101",
+                "out_date": None,
+            },
+        ],
+    )
+    parent = store.build_snapshot(
+        name="unbounded-memberships",
+        successful_units={"index_member_all": [unit]},
+        manifest_extra={},
+    )
+
+    successor = store.build_snapshot(
+        name="bounded-memberships-successor",
+        successful_units={"index_member_all": [unit]},
+        manifest_extra={"start_date": "2008-01-01", "end_date": "2024-12-31"},
+        base_snapshot=parent,
+    )
+
+    frame = _dataset_frame(successor, "index_member_all")
+    assert set(frame["ts_code"]) == {"000001.SZ"}
+    assert not (
+        successor / "parquet" / "index_member_all" / "data.parquet"
+    ).samefile(parent / "parquet" / "index_member_all" / "data.parquet")
+
+
 def test_all_null_date_like_column_falls_back_to_non_partitioned_snapshot(
     tmp_path: Path,
 ) -> None:

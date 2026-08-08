@@ -277,6 +277,9 @@ class ParquetStore:
             "date_field": None,
             "date_min": None,
             "date_max": None,
+            "date_filter_mode": (
+                "interval_overlap" if dataset == "index_member_all" else None
+            ),
             "ingested_at_min": None,
             "ingested_at_max": None,
             "recoverability": recoverability_level(dataset),
@@ -323,6 +326,20 @@ class ParquetStore:
             )
             if not has_valid_dates:
                 date_field = None
+        date_filter_mode = (
+            "interval_overlap"
+            if dataset == "index_member_all"
+            else ("point_date" if date_field is not None else None)
+        )
+        if dataset == "index_member_all" and base_entry is not None:
+            # Interval membership output depends on both requested bounds.
+            # Rebuild this small reference dataset rather than linking a
+            # parent that may have been built for another range. Older
+            # snapshots also bounded memberships by in_date alone, dropping
+            # companies that entered before the requested start but remained
+            # active inside the requested range.
+            base_entry = None
+            base_dir = None
         if date_field is not None and base_entry is not None:
             base_min = str(base_entry.get("date_min") or "")[:10] or None
             base_max = str(base_entry.get("date_max") or "")[:10] or None
@@ -355,9 +372,11 @@ class ParquetStore:
             source_sql = _snapshot_source_query(dataset, quoted_paths, set(columns))
             source_sql = _bounded_snapshot_query(
                 source_sql,
+                dataset,
                 date_field,
                 snapshot_start,
                 snapshot_end,
+                set(columns),
             )
             connection.execute(
                 "COPY ({query}) TO {target} "
@@ -384,9 +403,11 @@ class ParquetStore:
         raw_source_sql = f"SELECT * FROM read_parquet({quoted_paths}, union_by_name=true)"
         raw_source_sql = _bounded_snapshot_query(
             raw_source_sql,
+            dataset,
             date_field,
             snapshot_start,
             snapshot_end,
+            set(columns),
         )
         source_row_count = connection.execute(
             f"SELECT count(*) FROM ({raw_source_sql})"
@@ -399,6 +420,7 @@ class ParquetStore:
                 "unit_files": len(paths),
                 "empty_units": len(rows) - len(paths),
                 "date_field": date_field,
+                "date_filter_mode": date_filter_mode,
             }
         snapshot_quoted_paths = "[" + ",".join(_sql_string(path) for path in snapshot_paths) + "]"
         row_count = connection.execute(
@@ -450,6 +472,7 @@ class ParquetStore:
             "date_field": date_field,
             "date_min": date_min,
             "date_max": date_max,
+            "date_filter_mode": date_filter_mode,
             "ingested_at_min": ingested_min,
             "ingested_at_max": ingested_max,
             "recoverability": recoverability_level(dataset),
@@ -592,9 +615,11 @@ class ParquetStore:
             source_sql = _snapshot_source_query(dataset, quoted, partition_columns)
             source_sql = _bounded_snapshot_query(
                 source_sql,
+                dataset,
                 date_field,
                 snapshot_start,
                 snapshot_end,
+                partition_columns,
             )
             partition_dir = dataset_dir / f"partition_year={year}" / f"partition_month={month}"
             partition_dir.mkdir(parents=True, exist_ok=True)
@@ -657,6 +682,10 @@ def _date_field_candidates(dataset: str) -> tuple[str, ...]:
         return ("cal_date",)
     if dataset == "stock_basic":
         return ()
+    if dataset == "index_member_all":
+        # Membership rows describe [in_date, out_date] intervals. They must
+        # not be partitioned or clipped as point observations by in_date.
+        return ()
     if dataset in {"income", "balancesheet", "cashflow", "fina_indicator", "forecast", "express"}:
         return ("ann_date", "f_ann_date", "end_date")
     return (
@@ -706,11 +735,27 @@ def _date_sql_expression(field: str) -> str:
 
 def _bounded_snapshot_query(
     source_sql: str,
+    dataset: str,
     date_field: str | None,
     snapshot_start: str | None,
     snapshot_end: str | None,
+    columns: set[str],
 ) -> str:
-    if date_field is None or (snapshot_start is None and snapshot_end is None):
+    if snapshot_start is None and snapshot_end is None:
+        return source_sql
+    if dataset == "index_member_all" and "in_date" in columns:
+        in_date = _date_sql_expression("in_date")
+        predicates = [f"{in_date} IS NOT NULL"]
+        if snapshot_end is not None:
+            predicates.append(f"{in_date} <= DATE {_sql_string(snapshot_end)}")
+        if snapshot_start is not None and "out_date" in columns:
+            out_date = _date_sql_expression("out_date")
+            predicates.append(
+                f"({out_date} IS NULL OR "
+                f"{out_date} >= DATE {_sql_string(snapshot_start)})"
+            )
+        return f"SELECT * FROM ({source_sql}) WHERE {' AND '.join(predicates)}"
+    if date_field is None:
         return source_sql
     expression = _date_sql_expression(date_field)
     predicates = [f"{expression} IS NOT NULL"]
