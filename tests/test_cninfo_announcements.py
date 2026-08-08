@@ -539,6 +539,94 @@ def test_missing_source_is_tombstoned_and_excluded_from_index(tmp_path: Path) ->
     assert len(pd.read_parquet(recovered.unavailable_path)) == 0
 
 
+def test_quality_audit_certifies_files_pit_and_explicit_source_gaps(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        _ann_row(
+            "000001.SZ",
+            "20240102",
+            "年度报告",
+            "https://static.cninfo.com.cn/a.pdf",
+        ),
+        _ann_row(
+            "000002.SZ",
+            "20240103",
+            "关注函",
+            "https://static.cninfo.com.cn/gone.pdf",
+        ),
+    ]
+    _seed_data(tmp_path, rows)
+    session = FakeSession(
+        {
+            rows[0]["url"]: [FakeResponse(200, _pdf("audited"))],
+            rows[1]["url"]: [FakeResponse(404, b"not found")],
+        }
+    )
+    summary = _run(tmp_path, _client(session))
+
+    report = cninfo.audit_cninfo_announcements(
+        tmp_path,
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 31),
+        now=lambda: NOW,
+    )
+
+    assert summary.failed == 0
+    assert report["ok"] is True
+    assert report["coverage"] == {
+        "planned": 2,
+        "indexed": 1,
+        "source_unavailable": 1,
+        "missing": 0,
+        "ratio": 1.0,
+        "missing_samples": [],
+        "source_unavailable_samples": [rows[1]["url"]],
+    }
+    assert report["governance"]["pit_mismatches"] == 0
+    assert report["integrity"]["verified_files"] == 1
+    assert report["artifacts"]["index_sha256"]
+    assert report["report_sha256"]
+    report_path = Path(report["report_path"])
+    assert report_path.is_file()
+    assert (report_path.parent / "latest.json").read_bytes() == report_path.read_bytes()
+
+
+def test_quality_audit_fails_closed_on_same_size_file_tamper_and_pit_drift(
+    tmp_path: Path,
+) -> None:
+    row = _ann_row(
+        "000001.SZ",
+        "20240102",
+        "年度报告",
+        "https://static.cninfo.com.cn/a.pdf",
+    )
+    _seed_data(tmp_path, [row])
+    summary = _run(
+        tmp_path,
+        _client(FakeSession({row["url"]: [FakeResponse(200, _pdf("original"))]})),
+    )
+    index = pd.read_parquet(summary.index_path)
+    target = tmp_path / index.iloc[0]["file_path"]
+    original = target.read_bytes()
+    target.write_bytes(original[:-1] + (b"X" if original[-1:] != b"X" else b"Y"))
+    index.loc[0, "available_at"] = pd.Timestamp("2024-01-05")
+    index.to_parquet(summary.index_path, index=False, compression="zstd", engine="pyarrow")
+
+    report = cninfo.audit_cninfo_announcements(
+        tmp_path,
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 31),
+        now=lambda: NOW,
+    )
+
+    assert report["ok"] is False
+    assert report["governance"]["pit_mismatches"] == 1
+    assert report["integrity"]["sha256_mismatches"] == 1
+    assert any("PIT metadata" in error for error in report["errors"])
+    assert any("checksum" in error for error in report["errors"])
+
+
 def test_non_pdf_body_for_pdf_url_is_terminal(tmp_path: Path) -> None:
     row = _ann_row("000001.SZ", "20240102", "异常响应", "https://static.cninfo.com.cn/a.pdf")
     _seed_data(tmp_path, [row])
@@ -616,6 +704,8 @@ def test_cli_downloads_with_filters_and_limit(tmp_path: Path, monkeypatch) -> No
     assert payload["status"] == "succeeded"
     assert payload["planned"] == 1
     assert payload["downloaded"] == 1
+    assert payload["quality_gate"]["ok"] is True
+    assert Path(payload["quality_report_path"]).is_file()
     index = pd.read_parquet(tmp_path / "announcements" / "index.parquet")
     assert index["url"].tolist() == [rows[0]["url"]]
     assert index.iloc[0]["category"] == "regulatory_letter"

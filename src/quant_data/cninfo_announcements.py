@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import random
 import re
@@ -64,6 +65,8 @@ UNAVAILABLE_COLUMNS = (
 )
 SOURCE_UNAVAILABLE_STATUS_CODES = frozenset({404, 410})
 DEFAULT_UNAVAILABLE_RECHECK_DAYS = 30
+QUALITY_SCHEMA_VERSION = "cninfo-announcement-quality.v1"
+QUALITY_SAMPLE_LIMIT = 20
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -243,6 +246,284 @@ class DownloadSummary:
                 str(self.unavailable_path) if self.unavailable_path else None
             ),
         }
+
+
+def _sample(values: Sequence[object]) -> list[str]:
+    return [str(value) for value in list(values)[:QUALITY_SAMPLE_LIMIT]]
+
+
+def _artifact_sha256(path: Path | None) -> str | None:
+    return _sha256_path(path) if path is not None and path.is_file() else None
+
+
+def _write_quality_report(data_root: Path, report: dict, generated_at: datetime) -> Path:
+    quality_root = data_root / ANNOUNCEMENTS_DIR / "quality"
+    quality_root.mkdir(parents=True, exist_ok=True)
+    report_path = quality_root / f"quality_{generated_at:%Y%m%dT%H%M%S%fZ}.json"
+    payload = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    temporary = report_path.with_suffix(".json.tmp")
+    temporary.write_text(payload, encoding="utf-8")
+    os.replace(temporary, report_path)
+    latest = quality_root / "latest.json"
+    temporary_latest = latest.with_suffix(".json.tmp")
+    temporary_latest.write_text(payload, encoding="utf-8")
+    os.replace(temporary_latest, latest)
+    return report_path
+
+
+def audit_cninfo_announcements(
+    data_root: Path,
+    *,
+    ts_codes: set[str] | None = None,
+    start: date | None = None,
+    end: date | None = None,
+    limit: int | None = None,
+    regulatory_only: bool = False,
+    verify_hashes: bool = True,
+    now: Callable[[], datetime] | None = None,
+) -> dict:
+    """Audit announcement coverage, PIT metadata, tombstones, and file integrity.
+
+    The audit reuses the exact governed discovery scope used by the downloader.
+    A source 404/410 is an explicit, non-fabricated gap and therefore a warning;
+    a URL absent from both the immutable index and the tombstone ledger is a
+    blocking error.  Full checksum verification is the production default so a
+    successful durable download cannot be certified by metadata alone.
+    """
+
+    clock = now or (lambda: datetime.now(UTC))
+    generated_at = clock()
+    refs = load_announcement_manifest(data_root, ts_codes=ts_codes, start=start, end=end)
+    if regulatory_only:
+        refs = [ref for ref in refs if categorize_title(ref.title) == REGULATORY_CATEGORY]
+    if limit is not None and limit > 0:
+        refs = refs[:limit]
+    refs_by_url = {ref.url: ref for ref in refs}
+    planned_urls = set(refs_by_url)
+
+    base = data_root / ANNOUNCEMENTS_DIR
+    index_path = base / "index.parquet"
+    unavailable_path = base / "source_unavailable.parquet"
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if index_path.is_file():
+        index = pd.read_parquet(index_path)
+    else:
+        index = _empty_index_frame()
+        if planned_urls:
+            errors.append(f"announcement index is missing: {index_path}")
+    missing_index_columns = sorted(set(INDEX_COLUMNS) - set(index.columns))
+    if missing_index_columns:
+        errors.append(f"announcement index is missing columns: {missing_index_columns}")
+        index = _empty_index_frame()
+
+    if unavailable_path.is_file():
+        unavailable_frame = pd.read_parquet(unavailable_path)
+    else:
+        unavailable_frame = _unavailable_frame({})
+    missing_unavailable_columns = sorted(
+        set(UNAVAILABLE_COLUMNS) - set(unavailable_frame.columns)
+    )
+    if missing_unavailable_columns:
+        errors.append(
+            "source-unavailable ledger is missing columns: "
+            f"{missing_unavailable_columns}"
+        )
+        unavailable_frame = _unavailable_frame({})
+
+    duplicate_index_urls = int(index["url"].duplicated(keep=False).sum())
+    duplicate_unavailable_urls = int(
+        unavailable_frame["url"].duplicated(keep=False).sum()
+    )
+    if duplicate_index_urls:
+        errors.append(f"announcement index has {duplicate_index_urls} duplicate URL rows")
+    if duplicate_unavailable_urls:
+        errors.append(
+            "source-unavailable ledger has "
+            f"{duplicate_unavailable_urls} duplicate URL rows"
+        )
+
+    index_scope = index[index["url"].astype(str).isin(planned_urls)].copy()
+    unavailable_scope = unavailable_frame[
+        unavailable_frame["url"].astype(str).isin(planned_urls)
+    ].copy()
+    indexed_urls = set(index_scope["url"].astype(str))
+    unavailable_urls = set(unavailable_scope["url"].astype(str))
+    overlap_urls = indexed_urls & unavailable_urls
+    missing_urls = planned_urls - indexed_urls - unavailable_urls
+    if overlap_urls:
+        errors.append(
+            f"{len(overlap_urls)} URLs exist in both index and source-unavailable ledger"
+        )
+    if missing_urls:
+        errors.append(
+            f"{len(missing_urls)} discovered URLs have neither an indexed file nor a "
+            "source-unavailable tombstone"
+        )
+    if unavailable_urls:
+        warnings.append(
+            f"{len(unavailable_urls)} discovered URLs are unavailable at source (HTTP 404/410)"
+        )
+
+    invalid_tombstone_status = unavailable_scope[
+        ~pd.to_numeric(unavailable_scope["status_code"], errors="coerce").isin(
+            SOURCE_UNAVAILABLE_STATUS_CODES
+        )
+    ]
+    if not invalid_tombstone_status.empty:
+        errors.append(
+            f"{len(invalid_tombstone_status)} source tombstones are not HTTP 404/410"
+        )
+
+    open_days = load_trade_calendar_open_days(data_root) if planned_urls else []
+    pit_mismatches: list[str] = []
+    metadata_mismatches: list[str] = []
+    invalid_paths: list[str] = []
+    missing_files: list[str] = []
+    size_mismatches: list[str] = []
+    sha_mismatches: list[str] = []
+    pdf_magic_mismatches: list[str] = []
+    verified_files = 0
+    root_resolved = data_root.resolve()
+
+    for row in index_scope.itertuples(index=False):
+        url = str(row.url)
+        ref = refs_by_url[url]
+        try:
+            expected_available_at = next_trading_day(ref.ann_date, open_days)
+        except LookupError as exc:
+            pit_mismatches.append(f"{url}: {exc}")
+            expected_available_at = None
+        actual_ann_date = pd.Timestamp(row.ann_date).date()
+        actual_available_at = pd.Timestamp(row.available_at).date()
+        if actual_ann_date != ref.ann_date or (
+            expected_available_at is not None
+            and actual_available_at != expected_available_at
+        ):
+            pit_mismatches.append(
+                f"{url}: ann_date={actual_ann_date}, available_at={actual_available_at}, "
+                f"expected={ref.ann_date}/{expected_available_at}"
+            )
+        expected_category = categorize_title(ref.title)
+        if (
+            str(row.ts_code) != ref.ts_code
+            or str(row.category) != expected_category
+            or str(row.title) != ref.title
+        ):
+            metadata_mismatches.append(url)
+
+        digest = str(row.sha256)
+        expected_relative = (
+            f"{ANNOUNCEMENTS_DIR}/files/{digest[:2]}/{digest}.pdf"
+            if re.fullmatch(r"[0-9a-f]{64}", digest)
+            else ""
+        )
+        relative = str(row.file_path)
+        target = data_root / relative
+        try:
+            safe_path = target.resolve().is_relative_to(root_resolved)
+        except (OSError, ValueError):
+            safe_path = False
+        if not safe_path or not expected_relative or relative != expected_relative:
+            invalid_paths.append(url)
+            continue
+        if not target.is_file():
+            missing_files.append(url)
+            continue
+        expected_bytes = int(row.bytes)
+        if expected_bytes <= 0 or target.stat().st_size != expected_bytes:
+            size_mismatches.append(url)
+            continue
+        with target.open("rb") as handle:
+            if handle.read(5) != b"%PDF-":
+                pdf_magic_mismatches.append(url)
+                continue
+        if verify_hashes and _sha256_path(target) != digest:
+            sha_mismatches.append(url)
+            continue
+        verified_files += 1
+
+    for label, values in (
+        ("PIT metadata mismatches", pit_mismatches),
+        ("source metadata mismatches", metadata_mismatches),
+        ("invalid content-addressed paths", invalid_paths),
+        ("missing files", missing_files),
+        ("file-size mismatches", size_mismatches),
+        ("file checksum mismatches", sha_mismatches),
+        ("non-PDF file bodies", pdf_magic_mismatches),
+    ):
+        if values:
+            errors.append(f"{len(values)} {label}")
+
+    planned = len(planned_urls)
+    covered = len(indexed_urls | unavailable_urls)
+    discovered_dates = sorted(ref.ann_date for ref in refs)
+    report = {
+        "schema_version": QUALITY_SCHEMA_VERSION,
+        "generated_at": generated_at.astimezone(UTC).isoformat(),
+        "scope": {
+            "start_date": start.isoformat() if start else None,
+            "end_date": end.isoformat() if end else None,
+            "ts_codes": sorted(ts_codes or set()),
+            "regulatory_only": bool(regulatory_only),
+            "limit": int(limit or 0),
+            "verify_hashes": bool(verify_hashes),
+        },
+        "source_boundary": {
+            "discovered_min": discovered_dates[0].isoformat() if discovered_dates else None,
+            "discovered_max": discovered_dates[-1].isoformat() if discovered_dates else None,
+            "note": (
+                "cninfo discovery is limited to the earliest trustworthy rows persisted "
+                "by anns_d; absent older rows are not fabricated"
+            ),
+        },
+        "coverage": {
+            "planned": planned,
+            "indexed": len(indexed_urls),
+            "source_unavailable": len(unavailable_urls),
+            "missing": len(missing_urls),
+            "ratio": (covered / planned) if planned else 1.0,
+            "missing_samples": _sample(sorted(missing_urls)),
+            "source_unavailable_samples": _sample(sorted(unavailable_urls)),
+        },
+        "governance": {
+            "duplicate_index_url_rows": duplicate_index_urls,
+            "duplicate_unavailable_url_rows": duplicate_unavailable_urls,
+            "index_tombstone_overlap": len(overlap_urls),
+            "pit_mismatches": len(pit_mismatches),
+            "metadata_mismatches": len(metadata_mismatches),
+            "pit_mismatch_samples": _sample(pit_mismatches),
+            "metadata_mismatch_samples": _sample(metadata_mismatches),
+        },
+        "integrity": {
+            "indexed_files_in_scope": len(index_scope),
+            "verified_files": verified_files,
+            "invalid_paths": len(invalid_paths),
+            "missing_files": len(missing_files),
+            "size_mismatches": len(size_mismatches),
+            "sha256_mismatches": len(sha_mismatches),
+            "pdf_magic_mismatches": len(pdf_magic_mismatches),
+            "invalid_path_samples": _sample(invalid_paths),
+            "missing_file_samples": _sample(missing_files),
+            "size_mismatch_samples": _sample(size_mismatches),
+            "sha256_mismatch_samples": _sample(sha_mismatches),
+            "pdf_magic_mismatch_samples": _sample(pdf_magic_mismatches),
+        },
+        "artifacts": {
+            "index_path": str(index_path),
+            "index_sha256": _artifact_sha256(index_path),
+            "source_unavailable_path": str(unavailable_path),
+            "source_unavailable_sha256": _artifact_sha256(unavailable_path),
+        },
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    report_path = _write_quality_report(data_root, report, generated_at)
+    report["report_path"] = str(report_path)
+    report["report_sha256"] = _sha256_path(report_path)
+    return report
 
 
 def _parquet_files(data_root: Path, dataset: str) -> list[str]:

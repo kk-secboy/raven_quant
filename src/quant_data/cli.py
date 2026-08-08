@@ -43,7 +43,7 @@ from .catalog import (
     RESEARCH_DAILY,
 )
 from .checkpoint import CheckpointStore
-from .cninfo_announcements import download_cninfo_announcements
+from .cninfo_announcements import audit_cninfo_announcements, download_cninfo_announcements
 from .config import Settings
 from .coverage_data import coverage_secondary_specs
 from .execution_data import MARGIN_DATASET, MINUTE_DATASETS, margin_specs
@@ -1763,6 +1763,18 @@ def cninfo_announcements_command(
         cooldown_seconds=context.settings.cooldown_seconds,
         progress_callback=report_announcement_progress,
     )
+    context.report_progress(
+        "verifying", "cninfo announcement quality audit", {"cninfo_announcements"}, force=True
+    )
+    quality_report = audit_cninfo_announcements(
+        context.settings.data_root,
+        ts_codes=set(_split_codes(ts_code)) or None,
+        start=start_date,
+        end=end_date,
+        limit=limit or None,
+        regulatory_only=regulatory_only,
+        verify_hashes=True,
+    )
     result = {
         "dataset": "cninfo_announcements",
         "start_date": start_date.isoformat(),
@@ -1770,11 +1782,21 @@ def cninfo_announcements_command(
         "ts_codes": _split_codes(ts_code),
         "regulatory_only": regulatory_only,
         **summary.as_dict(),
+        "quality_gate": {
+            "ok": quality_report["ok"],
+            "errors": quality_report["errors"],
+            "warnings": quality_report["warnings"],
+            "verified_at": quality_report["generated_at"],
+        },
+        "quality_report_path": quality_report["report_path"],
+        "quality_report_sha256": quality_report["report_sha256"],
     }
     _write_optional_result(result_path, result)
     console.print_json(json.dumps(result, ensure_ascii=False))
     if summary.failed:
         raise typer.Exit(3)
+    if not quality_report["ok"]:
+        raise typer.Exit(4)
 
 
 @app.command("announcement-nlp")
