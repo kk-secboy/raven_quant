@@ -734,6 +734,31 @@ def test_process_filters_ts_code_dates_and_category(tmp_path: Path) -> None:
     assert limited.processed == 1
 
 
+def test_factor_publication_is_restricted_to_the_requested_scope(tmp_path: Path) -> None:
+    _seed_two_announcements(tmp_path)
+    _run(tmp_path, FakeChatClient([_payload(), _payload(tone_score=-0.5)]))
+
+    scoped = _run(
+        tmp_path,
+        FakeChatClient([]),
+        categories={"regulatory_letter"},
+    )
+
+    assert scoped.planned == 1
+    assert scoped.skipped == 1
+    factor = pd.read_parquet(
+        tmp_path / "announcements/nlp/factors/announcement_tone.parquet"
+    )
+    assert factor["instrument"].tolist() == ["000002.SZ"]
+    manifest = json.loads(
+        (tmp_path / "announcements/nlp/factors/announcement_tone.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["source"]["scope"]["categories"] == ["regulatory_letter"]
+    assert manifest["source"]["scope_process_key_count"] == 1
+
+
 def test_factor_artifact_averages_same_day_instruments(tmp_path: Path) -> None:
     rows = [
         _seed_announcement(

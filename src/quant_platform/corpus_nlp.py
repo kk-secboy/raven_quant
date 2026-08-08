@@ -889,6 +889,7 @@ def _write_factor_artifact(
     name: str,
     source_datasets: tuple[str, ...],
     selection_policy: Mapping[str, int | None],
+    source_scope: Mapping[str, Any],
     model: str,
     now: datetime,
 ) -> dict[str, Any]:
@@ -908,6 +909,7 @@ def _write_factor_artifact(
             "prompt_version": PROMPT_VERSION,
             "model": model,
             "selection_policy": dict(selection_policy),
+            "scope": dict(source_scope),
         },
         "generated_at": now.isoformat(),
     }
@@ -1207,13 +1209,32 @@ def process_corpus(
     persist_checkpoint(force=True)
 
     fields = _fields_frame(list(fields_records.values()))
+    scope_process_keys = {
+        f"{item.item_id}:{PROMPT_VERSION}:{model}" for item in items
+    }
+    scoped_fields = fields[
+        (fields["prompt_version"].astype(str) == PROMPT_VERSION)
+        & (fields["model"].astype(str) == model)
+        & (fields["process_key"].astype(str).isin(scope_process_keys))
+    ]
     selection_policy: dict[str, int | None] = {
         "major_news_max_items_per_publication_day": max_major_news_per_day,
         "irm_max_items_per_instrument_publication_day": max_irm_per_instrument_day,
     }
-    news_series = build_news_sentiment_series(fields, open_days)
-    irm_qa_series = build_irm_qa_sentiment_series(fields, open_days)
-    policy_series = build_policy_sentiment_series(fields, open_days)
+    source_scope = {
+        "start_date": start.isoformat() if start else None,
+        "end_date": end.isoformat() if end else None,
+        "ts_codes": sorted(ts_codes or set()),
+        "limit": int(limit or 0),
+        "planned": len(items),
+        "process_keys_sha256": hashlib.sha256(
+            "\n".join(sorted(scope_process_keys)).encode("utf-8")
+        ).hexdigest(),
+        "process_key_count": len(scope_process_keys),
+    }
+    news_series = build_news_sentiment_series(scoped_fields, open_days)
+    irm_qa_series = build_irm_qa_sentiment_series(scoped_fields, open_days)
+    policy_series = build_policy_sentiment_series(scoped_fields, open_days)
 
     news_artifact = _write_factor_artifact(
         news_series,
@@ -1225,6 +1246,7 @@ def process_corpus(
             if dataset in selected_datasets
         ),
         selection_policy=selection_policy,
+        source_scope=source_scope,
         model=model,
         now=clock(),
     )
@@ -1236,6 +1258,7 @@ def process_corpus(
             dataset for dataset in IRM_QA_DATASETS if dataset in selected_datasets
         ),
         selection_policy=selection_policy,
+        source_scope=source_scope,
         model=model,
         now=clock(),
     )
@@ -1247,6 +1270,7 @@ def process_corpus(
             dataset for dataset in POLICY_DATASETS if dataset in selected_datasets
         ),
         selection_policy=selection_policy,
+        source_scope=source_scope,
         model=model,
         now=clock(),
     )

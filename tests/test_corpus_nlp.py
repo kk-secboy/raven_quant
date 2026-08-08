@@ -659,8 +659,13 @@ def test_process_reprocesses_when_prompt_version_changes(tmp_path: Path, monkeyp
     fields = pd.read_parquet(summary.fields_path)
     assert len(fields) == 14  # v1 and v2 rows coexist under distinct processing keys
     assert set(fields["prompt_version"]) == {"corpus-nlp.v2", "corpus-nlp.v3"}
-    # Duplicate (datetime, instrument) observations are averaged for the factor.
+    # Historical prompt generations remain auditable in fields, but only the
+    # current prompt/model generation can enter the published factor.
     assert summary.factors["news_sentiment_daily"]["manifest"]["rows"] == 3
+    news = pd.read_parquet(
+        tmp_path / "corpus_nlp/factors/news_sentiment_daily.parquet"
+    )
+    assert news["news_sentiment_daily"].tolist() == [0.1, 0.1, 0.1]
 
 
 def test_process_records_llm_failures_without_signals(tmp_path: Path) -> None:
@@ -965,6 +970,24 @@ def test_process_honors_limit(tmp_path: Path) -> None:
 
     assert limited.planned == 1
     assert limited.processed == 1
+
+
+def test_factor_publication_is_restricted_to_current_corpus_scope(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    _run(tmp_path, FakeChatClient([_payload()] * 7))
+
+    scoped = _run(tmp_path, FakeChatClient([]), limit=1)
+
+    assert scoped.planned == 1
+    assert scoped.skipped == 1
+    assert sum(
+        entry["manifest"]["rows"] for entry in scoped.factors.values()
+    ) == 1
+    for entry in scoped.factors.values():
+        source = entry["manifest"]["source"]
+        assert source["scope"]["planned"] == 1
+        assert source["scope"]["process_key_count"] == 1
 
 
 # --- CLI -----------------------------------------------------------------------

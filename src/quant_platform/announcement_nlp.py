@@ -649,6 +649,8 @@ def write_factor_artifact(
     name: str = FACTOR_NAME,
     model: str,
     now: datetime,
+    process_keys: set[str] | None = None,
+    source_scope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the normalized factor-values parquet plus its sha256 manifest.
 
@@ -661,6 +663,8 @@ def write_factor_artifact(
         (fields["prompt_version"].astype(str) == PROMPT_VERSION)
         & (fields["model"].astype(str) == model)
     ]
+    if process_keys is not None:
+        current = current[current["process_key"].astype(str).isin(process_keys)]
     if name == FACTOR_NAME:
         series = build_tone_factor_series(current, name)
     elif name == LOGIC_FACTOR_NAME:
@@ -679,6 +683,11 @@ def write_factor_artifact(
             "dataset": "announcement_nlp_fields",
             "prompt_version": PROMPT_VERSION,
             "model": model,
+            "scope": dict(source_scope or {}),
+            "scope_process_keys_sha256": hashlib.sha256(
+                "\n".join(sorted(process_keys or set())).encode("utf-8")
+            ).hexdigest(),
+            "scope_process_key_count": len(process_keys or set()),
         },
         "generated_at": now.isoformat(),
     }
@@ -925,12 +934,35 @@ def process_announcements(
 
     persist_checkpoint(force=True)
     fields = _fields_frame(list(fields_records.values()))
+    scope_process_keys = {
+        f"{row.sha256}:{PROMPT_VERSION}:{model}" for row in frame.itertuples()
+    }
+    source_scope = {
+        "start_date": start.isoformat() if start else None,
+        "end_date": end.isoformat() if end else None,
+        "ts_codes": sorted(ts_codes or set()),
+        "categories": sorted(categories or set()),
+        "limit": int(limit or 0),
+        "planned": len(frame),
+    }
 
     artifact = write_factor_artifact(
-        fields, factors_dir, name=factor_name, model=model, now=clock()
+        fields,
+        factors_dir,
+        name=factor_name,
+        model=model,
+        now=clock(),
+        process_keys=scope_process_keys,
+        source_scope=source_scope,
     )
     logic_artifact = write_factor_artifact(
-        fields, factors_dir, name=LOGIC_FACTOR_NAME, model=model, now=clock()
+        fields,
+        factors_dir,
+        name=LOGIC_FACTOR_NAME,
+        model=model,
+        now=clock(),
+        process_keys=scope_process_keys,
+        source_scope=source_scope,
     )
     return NlpSummary(
         planned=len(frame),
