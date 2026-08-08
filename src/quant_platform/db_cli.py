@@ -14,7 +14,7 @@ from quant_platform.announcement_factor_registry import (
     default_factors_dir,
     register_announcement_factor,
 )
-from quant_platform.announcement_nlp import FACTOR_NAME
+from quant_platform.announcement_nlp import FACTOR_NAME, LOGIC_FACTOR_NAME
 from quant_platform.corpus_nlp import (
     CORPUS_FACTOR_NAMES,
     register_corpus_factor,
@@ -102,20 +102,25 @@ def current() -> None:
 def register_announcement_factor_command(
     factor_name: Annotated[
         str, typer.Option(help="Announcement NLP factor artifact name")
-    ] = FACTOR_NAME,
+    ] = "all",
     actor: Annotated[
         str, typer.Option(help="Actor recorded on the research run and events")
     ] = IMPORT_ACTOR,
 ) -> None:
     """Register the announcement NLP factor artifact into factor_candidates (idempotent)."""
     settings = Settings.from_env(project_root() / ".env")
-    result = register_announcement_factor(
-        ResearchStore(settings.database_url),
-        default_factors_dir(settings.data_root),
-        factor_name=factor_name,
-        actor=actor,
+    names = (
+        [FACTOR_NAME, LOGIC_FACTOR_NAME]
+        if factor_name == "all"
+        else [part.strip() for part in factor_name.split(",") if part.strip()]
     )
-    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    store = ResearchStore(settings.database_url)
+    factors_dir = default_factors_dir(settings.data_root)
+    results = [
+        register_announcement_factor(store, factors_dir, factor_name=name, actor=actor)
+        for name in names
+    ]
+    typer.echo(json.dumps({"factors": results}, ensure_ascii=False, indent=2))
 
 
 @app.command("register-report-rc-factor")

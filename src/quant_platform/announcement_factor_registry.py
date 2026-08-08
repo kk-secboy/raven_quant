@@ -44,7 +44,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .announcement_nlp import ANNOUNCEMENTS_DIR, FACTOR_NAME, NLP_SUBDIR
+from .announcement_nlp import (
+    ANNOUNCEMENTS_DIR,
+    FACTOR_NAME,
+    LOGIC_FACTOR_NAME,
+    NLP_SUBDIR,
+)
 from .research_store import ResearchStore
 
 IMPORT_RUN_KIND = "announcement_nlp_factor_import"
@@ -147,15 +152,27 @@ def _code_artifact_source(
     registered values can be rebuilt from the announcement NLP fields index.
     """
 
+    if factor_name == FACTOR_NAME:
+        builder = "build_tone_factor_series"
+        explanation = "mean LLM tone score grouped by (available_at, ts_code)"
+    elif factor_name == LOGIC_FACTOR_NAME:
+        builder = "build_logic_factor_series"
+        explanation = (
+            "mean governed direction * horizon weight * confidence grouped by "
+            "(available_at, ts_code)"
+        )
+    else:
+        raise ValueError(f"unsupported announcement factor: {factor_name}")
     source = manifest["source"]
     policy = manifest["availability_policy"][factor_name]
     return f'''"""Provenance code artifact for the externally produced {factor_name} factor.
 
 Generated at factor-registration time by
 quant_platform.announcement_factor_registry. The registered factor values are
-the mean LLM tone score grouped by (available_at, ts_code), normalized with
-the factor_evaluator.normalize_series contract; available_at is the first
+{explanation}, normalized with the factor_evaluator.normalize_series contract;
+available_at is the first
 trading day strictly after the announcement date.
+Post-event returns and market-response labels are excluded from this feature.
 
 source dataset: {source["dataset"]}
 prompt_version: {source["prompt_version"]}
@@ -168,7 +185,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from quant_platform.factor_evaluator import normalize_series
+from quant_platform.announcement_nlp import {builder}
 
 FACTOR_NAME = {factor_name!r}
 
@@ -176,12 +193,7 @@ FACTOR_NAME = {factor_name!r}
 def compute_factor(fields: pd.DataFrame) -> pd.Series:
     """Rebuild the factor values from the announcement NLP fields index."""
 
-    frame = fields[["available_at", "ts_code", "tone_score"]].copy()
-    frame["tone_score"] = pd.to_numeric(frame["tone_score"], errors="coerce")
-    series = frame.groupby(["available_at", "ts_code"], sort=True)["tone_score"].mean()
-    series = series.rename(FACTOR_NAME)
-    series.index = series.index.set_names(["datetime", "instrument"])
-    return normalize_series(series, FACTOR_NAME)
+    return {builder}(fields, FACTOR_NAME)
 '''
 
 
@@ -317,23 +329,32 @@ def register_external_factor(
 
 
 def _announcement_metadata(manifest: dict[str, Any], values_sha256: str) -> ExternalFactorMetadata:
-    """Announcement NLP registration metadata (tone factor family)."""
+    """Announcement NLP registration metadata (tone and governed logic factors)."""
 
     factor_name = str(manifest["factor"])
     source = manifest["source"]
     policy = manifest["availability_policy"]
+    if factor_name == FACTOR_NAME:
+        family = "tone"
+        formulation = "mean(tone_score) over announcements"
+    elif factor_name == LOGIC_FACTOR_NAME:
+        family = "governed logic"
+        formulation = (
+            "mean(direction_enum_score * horizon_enum_weight * confidence) over announcements"
+        )
+    else:
+        raise ValueError(f"unsupported announcement factor: {factor_name}")
     return ExternalFactorMetadata(
         description=(
-            "Announcement NLP tone factor: mean LLM tone score per "
-            "(available_at, instrument). Availability: "
+            f"Announcement NLP {family} factor per (available_at, instrument). Availability: "
             f"{policy[factor_name]} — values become visible at available_at, the first "
             "trading day strictly after the announcement date; source fields carry "
             "available_at/ingested_at. Externally produced by announcement_nlp "
             f"(prompt_version={source['prompt_version']}, model={source['model']})."
         ),
         formulation=(
-            "mean(tone_score) over announcements grouped by (available_at, ts_code); "
-            "available_at = first trading day strictly after the announcement date"
+            f"{formulation} grouped by (available_at, ts_code); available_at = first "
+            "trading day strictly after the announcement date; post-event returns are excluded"
         ),
         variables={
             "availability_policy": policy,

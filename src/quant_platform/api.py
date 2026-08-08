@@ -35,6 +35,16 @@ from quant_data.execution_data import (
     NATIVE_MINUTE_FREQUENCIES,
 )
 from quant_data.legacy_market import BAOSTOCK_OVERLAP_POLICY_VERSION
+from quant_platform.announcement_nlp import (
+    ANNOUNCEMENTS_DIR,
+    LOGIC_FACTOR_NAME,
+    NLP_SUBDIR,
+)
+from quant_platform.announcement_nlp import (
+    PROMPT_VERSION as ANNOUNCEMENT_PROMPT_VERSION,
+)
+from quant_platform.corpus_nlp import PROMPT_VERSION as CORPUS_PROMPT_VERSION
+from quant_platform.event_market_response import LABEL_SCHEMA_VERSION
 from quant_platform.qlib_factor_baseline import FACTOR_SOURCE_QLIB_BASELINE
 
 from .alert_store import AlertStore
@@ -133,6 +143,52 @@ class DataFinalizeRequest(BaseModel):
     def validate_range(self) -> DataFinalizeRequest:
         if isinstance(self.end, date) and self.end < self.start:
             raise ValueError("end must not be before start")
+        return self
+
+
+class AnnouncementNlpRequest(BaseModel):
+    start: date = Field(default=date(2024, 1, 1))
+    end: date | Literal["latest"] = "latest"
+    ts_codes: list[str] = Field(default_factory=list, max_length=2000)
+    categories: list[Literal["announcement", "regulatory_letter"]] = Field(
+        default_factory=lambda: ["regulatory_letter"]
+    )
+    limit: int = Field(default=0, ge=0, le=1_000_000)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> AnnouncementNlpRequest:
+        if isinstance(self.end, date) and self.end < self.start:
+            raise ValueError("end must not be before start")
+        return self
+
+
+class CorpusNlpRequest(BaseModel):
+    start: date = Field(default=date(2024, 1, 1))
+    end: date | Literal["latest"] = "latest"
+    datasets: list[
+        Literal["major_news", "npr", "cctv_news", "irm_qa_sh", "irm_qa_sz"]
+    ] = Field(default_factory=list)
+    ts_codes: list[str] = Field(default_factory=list, max_length=2000)
+    limit: int = Field(default=0, ge=0, le=1_000_000)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> CorpusNlpRequest:
+        if isinstance(self.end, date) and self.end < self.start:
+            raise ValueError("end must not be before start")
+        return self
+
+
+class EventMarketResponseRequest(BaseModel):
+    snapshot_name: str = Field(min_length=3, max_length=120)
+    horizons: list[int] = Field(default_factory=lambda: [1, 3, 5, 20], min_length=1)
+    benchmark_code: str = Field(default="000300.SH", min_length=9, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_horizons(self) -> EventMarketResponseRequest:
+        if any(value <= 0 or value > 252 for value in self.horizons):
+            raise ValueError("horizons must be between 1 and 252 trading sessions")
+        if len(set(self.horizons)) != len(self.horizons):
+            raise ValueError("horizons must not contain duplicates")
         return self
 
 
@@ -3715,6 +3771,123 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 serialized,
                 log_path,
                 idempotency_key=f"legacy-market:{payload.start}:{payload.end}:baostock-0.9.3",
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return job
+
+    @app.post("/api/jobs/announcement-nlp", status_code=202)
+    def create_announcement_nlp(payload: AnnouncementNlpRequest) -> dict:
+        if jobs.count(
+            statuses=("queued", "running"),
+            kinds=("cninfo_announcements_download", "announcement_nlp"),
+        ):
+            raise HTTPException(409, "announcement download or NLP processing is already active")
+        end_date = payload.end if isinstance(payload.end, date) else date.today()
+        serialized = {
+            "start": payload.start.isoformat(),
+            "end": end_date.isoformat(),
+            "ts_codes": sorted(set(payload.ts_codes)),
+            "categories": sorted(set(payload.categories)),
+            "limit": payload.limit,
+            "prompt_version": ANNOUNCEMENT_PROMPT_VERSION,
+        }
+        log_path = platform_root / "logs" / (
+            f"announcement-nlp-{payload.start:%Y%m%d}-{end_date:%Y%m%d}.log"
+        )
+        try:
+            job = jobs.create(
+                "announcement_nlp",
+                serialized,
+                log_path,
+                idempotency_key=(
+                    f"announcement-nlp:{ANNOUNCEMENT_PROMPT_VERSION}:{payload.start}:"
+                    f"{end_date}:{','.join(serialized['categories'])}:"
+                    f"{','.join(serialized['ts_codes']) or 'all'}:{payload.limit}"
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return job
+
+    @app.post("/api/jobs/corpus-nlp", status_code=202)
+    def create_corpus_nlp(payload: CorpusNlpRequest) -> dict:
+        if jobs.count(statuses=("queued", "running"), kinds=("corpus_nlp",)):
+            raise HTTPException(409, "corpus NLP processing is already active")
+        end_date = payload.end if isinstance(payload.end, date) else date.today()
+        serialized = {
+            "start": payload.start.isoformat(),
+            "end": end_date.isoformat(),
+            "datasets": sorted(set(payload.datasets)),
+            "ts_codes": sorted(set(payload.ts_codes)),
+            "limit": payload.limit,
+            "prompt_version": CORPUS_PROMPT_VERSION,
+        }
+        log_path = platform_root / "logs" / (
+            f"corpus-nlp-{payload.start:%Y%m%d}-{end_date:%Y%m%d}.log"
+        )
+        try:
+            job = jobs.create(
+                "corpus_nlp",
+                serialized,
+                log_path,
+                idempotency_key=(
+                    f"corpus-nlp:{CORPUS_PROMPT_VERSION}:{payload.start}:{end_date}:"
+                    f"{','.join(serialized['datasets']) or 'all'}:"
+                    f"{','.join(serialized['ts_codes']) or 'all'}:{payload.limit}"
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return job
+
+    @app.post("/api/jobs/event-market-response", status_code=202)
+    def create_event_market_response(payload: EventMarketResponseRequest) -> dict:
+        if jobs.count(
+            statuses=("queued", "running"),
+            kinds=("announcement_nlp", "event_market_response"),
+        ):
+            raise HTTPException(
+                409, "announcement NLP or event market-response labeling is already active"
+            )
+        snapshot = settings.data_root / "snapshots" / payload.snapshot_name
+        verification_path = snapshot / "verification.json"
+        nlp_root = settings.data_root / ANNOUNCEMENTS_DIR / NLP_SUBDIR
+        fields_path = nlp_root / "fields.parquet"
+        logic_manifest_path = nlp_root / "factors" / f"{LOGIC_FACTOR_NAME}.json"
+        try:
+            verification = json.loads(verification_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(409, "verified snapshot evidence is unavailable") from exc
+        if verification.get("ok") is not True or verification.get("errors"):
+            raise HTTPException(409, "snapshot did not pass the blocking quality gate")
+        if not fields_path.is_file():
+            raise HTTPException(409, "announcement NLP fields are unavailable")
+        if not logic_manifest_path.is_file():
+            raise HTTPException(409, "governed logic factor manifest is unavailable")
+        horizons = sorted(set(payload.horizons))
+        serialized = {
+            "snapshot_name": payload.snapshot_name,
+            "horizons": horizons,
+            "benchmark_code": payload.benchmark_code.upper(),
+            "schema_version": LABEL_SCHEMA_VERSION,
+        }
+        log_path = platform_root / "logs" / (
+            f"event-market-response-{payload.snapshot_name}.log"
+        )
+        try:
+            job = jobs.create(
+                "event_market_response",
+                serialized,
+                log_path,
+                idempotency_key=(
+                    f"event-market-response:{LABEL_SCHEMA_VERSION}:{payload.snapshot_name}:"
+                    f"{','.join(str(value) for value in horizons)}:"
+                    f"{serialized['benchmark_code']}"
+                ),
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc

@@ -7,10 +7,12 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
-# The relay operator recommends keeping each client's aggregate start rate at
-# or below 118 while the relay dynamically shares capacity among its users.
-# Clamp stale operator overrides so retries do not reduce useful throughput.
-TUSHARE_RELAY_MAX_REQUESTS_PER_MINUTE = 118.0
+# The relay operator confirmed on 2026-08-07 that this account is capped at
+# 100 starts/minute. Keep one request/minute of headroom: exceeding the cap
+# creates slow error responses and lowers effective throughput below 99.
+# Clamp stale deployment overrides so aggregate workers cannot reintroduce the
+# 118/minute setting used before the operator clarified the actual limit.
+TUSHARE_RELAY_MAX_REQUESTS_PER_MINUTE = 99.0
 
 
 def normalize_api_url(value: str) -> str:

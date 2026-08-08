@@ -408,6 +408,29 @@ def _log_frame(rows: list[dict]) -> pd.DataFrame:
     return frame
 
 
+def _persist_download_state(
+    records: dict[str, dict],
+    log_rows: list[dict],
+    *,
+    index_path: Path,
+    log_path: Path | None,
+) -> None:
+    """Atomically persist resumable metadata during a long body download."""
+
+    index_frame = _index_frame(records)
+    temporary_index = index_path.with_suffix(".parquet.tmp")
+    index_frame.to_parquet(
+        temporary_index, index=False, compression="zstd", engine="pyarrow"
+    )
+    os.replace(temporary_index, index_path)
+    if log_path is not None and log_rows:
+        temporary_log = log_path.with_suffix(".parquet.tmp")
+        _log_frame(log_rows).to_parquet(
+            temporary_log, index=False, compression="zstd", engine="pyarrow"
+        )
+        os.replace(temporary_log, log_path)
+
+
 def download_cninfo_announcements(
     data_root: Path,
     *,
@@ -422,6 +445,8 @@ def download_cninfo_announcements(
     timeout_seconds: float = 60.0,
     max_attempts: int = 5,
     cooldown_seconds: float = 180.0,
+    checkpoint_every: int = 100,
+    progress_callback: Callable[[dict[str, int]], None] | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> DownloadSummary:
     """Download announcement bodies discovered through the persisted anns_d index.
@@ -464,9 +489,40 @@ def download_cninfo_announcements(
             cooldown_seconds=cooldown_seconds,
         )
 
+    if checkpoint_every <= 0:
+        raise ValueError("checkpoint_every must be positive")
     log_rows: list[dict] = []
+    log_path = (
+        logs_root / f"download_log_{clock():%Y%m%dT%H%M%SZ}.parquet" if refs else None
+    )
     downloaded = skipped = failed = bytes_written = 0
-    for ref in refs:
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "planned": len(refs),
+                "completed": 0,
+                "downloaded": 0,
+                "skipped": 0,
+                "failed": 0,
+                "bytes_written": 0,
+            }
+        )
+    for position, ref in enumerate(refs):
+        if position and position % checkpoint_every == 0:
+            _persist_download_state(
+                records, log_rows, index_path=index_path, log_path=log_path
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "planned": len(refs),
+                        "completed": downloaded + skipped + failed,
+                        "downloaded": downloaded,
+                        "skipped": skipped,
+                        "failed": failed,
+                        "bytes_written": bytes_written,
+                    }
+                )
         log_row: dict = {
             "api_name": LOG_API_NAME,
             "url": ref.url,
@@ -559,19 +615,18 @@ def download_cninfo_announcements(
             file_path=relative,
         )
 
-    index_frame = _index_frame(records)
-    temporary_index = index_path.with_suffix(".parquet.tmp")
-    index_frame.to_parquet(temporary_index, index=False, compression="zstd", engine="pyarrow")
-    os.replace(temporary_index, index_path)
-
-    log_path: Path | None = None
-    if log_rows:
-        log_path = logs_root / f"download_log_{clock():%Y%m%dT%H%M%SZ}.parquet"
-        temporary_log = log_path.with_suffix(".parquet.tmp")
-        _log_frame(log_rows).to_parquet(
-            temporary_log, index=False, compression="zstd", engine="pyarrow"
+    _persist_download_state(records, log_rows, index_path=index_path, log_path=log_path)
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "planned": len(refs),
+                "completed": downloaded + skipped + failed,
+                "downloaded": downloaded,
+                "skipped": skipped,
+                "failed": failed,
+                "bytes_written": bytes_written,
+            }
         )
-        os.replace(temporary_log, log_path)
 
     return DownloadSummary(
         planned=len(refs),

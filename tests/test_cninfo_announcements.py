@@ -291,6 +291,32 @@ def test_download_writes_content_addressed_files_and_index(tmp_path: Path) -> No
     assert log["bytes"].sum() == summary.bytes_written
 
 
+def test_download_checkpoints_index_and_reports_live_progress(tmp_path: Path) -> None:
+    rows = [
+        _ann_row("000001.SZ", "20240102", "公告A", "https://static.cninfo.com.cn/a.pdf"),
+        _ann_row("000002.SZ", "20240103", "公告B", "https://static.cninfo.com.cn/b.pdf"),
+    ]
+    _seed_data(tmp_path, rows)
+    session = FakeSession(
+        {row["url"]: [FakeResponse(200, _pdf(row["ts_code"]))] for row in rows}
+    )
+    progress: list[dict[str, int]] = []
+
+    summary = cninfo.download_cninfo_announcements(
+        tmp_path,
+        client=_client(session),
+        now=lambda: NOW,
+        checkpoint_every=1,
+        progress_callback=lambda value: progress.append(dict(value)),
+    )
+
+    assert [item["completed"] for item in progress] == [0, 1, 2]
+    assert progress[-1]["downloaded"] == 2
+    assert progress[-1]["failed"] == 0
+    assert len(pd.read_parquet(summary.index_path)) == 2
+    assert len(pd.read_parquet(summary.log_path)) == 2
+
+
 def test_download_skips_existing_checksum_on_rerun(tmp_path: Path) -> None:
     rows = [
         _ann_row("000001.SZ", "20240102", "年度报告", "https://static.cninfo.com.cn/a.pdf"),

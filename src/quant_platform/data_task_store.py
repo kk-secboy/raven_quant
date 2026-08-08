@@ -48,6 +48,10 @@ REQUEST_STRATEGIES = {
         "对 major_news 长篇新闻与沪深互动易问答调用 OpenAI 兼容端点做严格 JSON 抽取；"
         "以内容 sha256+prompt_version+model 为处理键幂等，失败行记录后可重跑。"
     ),
+    "cn_event_market_response": (
+        "以已校验不可变日线快照计算公告后1/3/5/20交易日超额收益和方向一致性；"
+        "结果只作为训练标签，禁止注册为因子或进入实时推理特征。"
+    ),
 }
 
 
@@ -406,6 +410,20 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         "daily",
     ),
     DataTaskDefinition(
+        "cn_event_market_response",
+        5,
+        90,
+        "公告后市场认可度训练标签",
+        "用沪深300基准计算公告可用日后的1/3/5/20交易日超额收益、成交额异常和方向一致性；"
+        "每个标签记录结果观察截止日与最早可用日，仅供训练/评估，禁止进入实时特征。",
+        "研究语料",
+        "QuantLab",
+        "ready",
+        ("cn_announcement_nlp", "cn_snapshot_build"),
+        ("event_market_response_labels",),
+        "daily",
+    ),
+    DataTaskDefinition(
         "strategy_specialty",
         7,
         108,
@@ -678,6 +696,9 @@ class DataTaskStore:
             "core_intraday_download": "pair_execution_1m",
             "ashare_5m_download": "cn_ashare_5m",
             "cninfo_announcements_download": "cn_cninfo_announcements",
+            "announcement_nlp": "cn_announcement_nlp",
+            "corpus_nlp": "cn_corpus_nlp",
+            "event_market_response": "cn_event_market_response",
         }
         rows = connection.execute(
             select(

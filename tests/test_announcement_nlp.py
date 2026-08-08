@@ -72,6 +72,10 @@ def _payload(**overrides) -> str:
         "event_type": "periodic_report",
         "tone_score": 0.6,
         "key_numbers": {"net_profit_yoy": "+30%"},
+        "impact_direction": "positive",
+        "impact_horizon": "short_term",
+        "impact_channels": ["earnings"],
+        "logic_summary": "Profit growth may improve near-term earnings expectations.",
         "confidence": 0.9,
     }
     body.update(overrides)
@@ -182,6 +186,9 @@ def test_parse_extraction_payload_accepts_valid_and_fenced() -> None:
     assert result.event_type == "periodic_report"
     assert result.tone_score == 0.6
     assert result.key_numbers == {"net_profit_yoy": "+30%"}
+    assert result.impact_direction == "positive"
+    assert result.impact_horizon == "short_term"
+    assert result.impact_channels == ("earnings",)
     assert result.confidence == 0.9
 
     fenced = f"```json\n{_payload(event_type='dividend', tone_score=-0.25)}\n```"
@@ -210,6 +217,13 @@ def test_parse_extraction_payload_allows_integer_scores() -> None:
         _payload(tone_score=True),
         _payload(key_numbers=["net", "profit"]),
         _payload(key_numbers="n/a"),
+        _payload(impact_direction="up"),
+        _payload(impact_horizon="forever"),
+        _payload(impact_channels="earnings"),
+        _payload(impact_channels=["earnings", "earnings"]),
+        _payload(impact_channels=["unsupported"]),
+        _payload(logic_summary=42),
+        _payload(logic_summary="x" * (nlp.MAX_LOGIC_SUMMARY_CHARS + 1)),
         _payload(confidence=1.5),
         _payload(confidence=-0.1),
     ],
@@ -221,7 +235,16 @@ def test_parse_extraction_payload_fail_closed(raw: str) -> None:
 
 
 def test_parse_extraction_payload_requires_all_keys() -> None:
-    for missing in ("event_type", "tone_score", "key_numbers", "confidence"):
+    for missing in (
+        "event_type",
+        "tone_score",
+        "key_numbers",
+        "impact_direction",
+        "impact_horizon",
+        "impact_channels",
+        "logic_summary",
+        "confidence",
+    ):
         body = json.loads(_payload())
         del body[missing]
         with pytest.raises(nlp.LlmExtractionError, match="misses keys"):
@@ -431,6 +454,9 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     assert first["processed_at"] == pd.Timestamp(NOW)
     assert first["available_at"] == pd.Timestamp(date(2024, 1, 3))
     assert json.loads(first["key_numbers"]) == {"net_profit_yoy": "+30%"}
+    assert first["impact_direction"] == "positive"
+    assert first["impact_horizon"] == "short_term"
+    assert json.loads(first["impact_channels"]) == ["earnings"]
     assert json.loads(fields.iloc[1]["key_numbers"]) == {}
 
     state = pd.read_parquet(summary.state_path)
@@ -466,6 +492,17 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     assert manifest["source"]["prompt_version"] == nlp.PROMPT_VERSION
     assert manifest["source"]["model"] == "test-model"
 
+    logic_path = (
+        tmp_path / "announcements/nlp/factors/announcement_logic_score.parquet"
+    )
+    logic = pd.read_parquet(logic_path)
+    assert logic["announcement_logic_score"].tolist() == [
+        pytest.approx(0.765),
+        pytest.approx(0.68),
+    ]
+    assert summary.logic_factor_rows == 2
+    assert summary.logic_factor_sha256 == hashlib.sha256(logic_path.read_bytes()).hexdigest()
+
 
 def test_process_is_idempotent_on_processing_key(tmp_path: Path) -> None:
     _seed_two_announcements(tmp_path)
@@ -491,7 +528,7 @@ def test_process_reprocesses_when_prompt_version_changes(
     _seed_two_announcements(tmp_path)
     _run(tmp_path, FakeChatClient([_payload(), _payload()]))
 
-    monkeypatch.setattr(nlp, "PROMPT_VERSION", "announcement-nlp.v2")
+    monkeypatch.setattr(nlp, "PROMPT_VERSION", "announcement-nlp.v3")
     chat = FakeChatClient([_payload(tone_score=0.1), _payload(tone_score=0.2)])
     summary = _run(tmp_path, chat)
 
@@ -499,8 +536,8 @@ def test_process_reprocesses_when_prompt_version_changes(
     assert summary.skipped == 0
     fields = pd.read_parquet(summary.fields_path)
     assert len(fields) == 4  # v1 and v2 rows coexist under distinct processing keys
-    assert set(fields["prompt_version"]) == {"announcement-nlp.v1", "announcement-nlp.v2"}
-    # Duplicate (datetime, instrument) observations are averaged for the factor.
+    assert set(fields["prompt_version"]) == {"announcement-nlp.v2", "announcement-nlp.v3"}
+    # Only the current prompt/model generation is published into the factor.
     assert summary.factor_rows == 2
 
 

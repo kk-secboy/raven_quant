@@ -176,3 +176,13 @@ Tushare `report_rc`（券商研报盈利预测与评级，cn_institutional 任�
 - **与 ShrinkCov 路径的关系**：`estimate_covariance`（qlib `ShrinkCovEstimator`，alpha=0.10/const_var，钉住 qlib commit 校验）原样保留，作为样本协方差对照与回退；结构化模型是并行新增路径，两者接口（输入收益率帧 → 协方差 DataFrame）对齐，可互换。
 - **测试**：`tests/test_style_exposure_panel.py`、`tests/test_style_exposures.py`、`tests/test_structured_risk_model.py` 共 29 个全部通过（小手算数据集验证暴露值、PIT 未来数据不进暴露/行业成员区间正反例、z-score 加权均值方差与 size 正交性、因子协方差正定性、组合风险端到端、ShrinkCov 回退共存、artifact 往返）。回归 `test_qlib_builder.py`/`test_portfolio_policy.py`/`test_portfolio_optimizer.py`/`test_strategy_allocation_math.py` 45 个通过；`ruff check src tests` 通过。`test_strategy_allocation_recommendations.py` 的唯一用例需真实 PG（127.0.0.1:55432），本次运行环境 PG 不可达（连接超时），与本次改动无关。
 - **已知局限**：① 新股/长期停牌股特质风险历史不足时收缩到截面中位数（不区分行业/风格特征，粗糙但保守）；② 行业因子用静态 L1 dummy，未做行业因子收益的多重共线性处理（参照类 + 满秩检查跳过退化日）；③ EWMA 半衰期 90 日为固定参数，未按因子类型分层；④ 组合风险接口当前不做交易成本/约束优化，优化器为后续独立开发项；⑤ 本机未对全量真实数据跑过结构化模型构建，真实覆盖率/因子收益平稳性待数据就位后验证。
+
+## 十一、逻辑面与市场认可度闭环（2026-08-08 追加）
+
+- **逻辑面不是自由文本猜测**：`announcement_nlp` 升级为 `announcement-nlp.v2`，在原有事件类型、语气、关键数值之外，增加固定枚举的 `impact_direction`、`impact_horizon`、`impact_channels` 与最长 240 字的证据约束摘要。未知、混合或材料不支持时必须输出 `uncertain`/空渠道/空摘要，不允许补写公告没有的事实。
+- **可解释逻辑因子**：新增 `announcement_logic_score`，公式固定为 `direction_enum_score × horizon_enum_weight × confidence`，再按 `(available_at, ts_code)` 求均值。方向与期限权重是代码内冻结映射，不直接采用 LLM 自报的任意数值；因子严格只读公告当时可见字段，完全不读事件后的价格。
+- **市场认可度只作标签**：新增 `event_market_response.py`，基于已通过阻断质量门的不可变日线快照，计算公告首个可用交易日起 1/3/5/20 日的个股收益、沪深300收益、超额收益、成交额异常和“公告方向 × 超额收益”的一致性。每个期限均记录 `outcome_end` 与 `label_available_at`；停牌、缺价或样本尾部不足时保持 NULL，不顺延猜测。
+- **防泄漏硬隔离**：标签 manifest 固定 `role=training_label_only`，并明确禁止 `factor_candidates`、Qlib 实时推理特征和 live signal 消费。标签生产器没有因子注册入口；只有公告逻辑因子可通过现有 sha256 治理通道注册。
+- **可运行任务**：新增 `announcement_nlp`、`corpus_nlp`、`event_market_response` 三类 durable worker 命令、API 入队端点和数据目录任务映射。事件标签任务要求指定快照且 `verification.json.ok=true`，公告 NLP 在公告下载仍运行时拒绝重复启动。
+- **限流与恢复**：Tushare 中转站按运营方最新确认改为 99 次/分钟上限（100 次限制保留 1 次余量）；巨潮正文长任务每 100 条原子刷新 index/download-log 并更新 job progress，避免只在任务结束时才出现 checkpoint。
+- **覆盖边界**：逻辑与市场认可度只能覆盖真实落盘且有文本层的公告；当前生产正文任务收敛为 2024 年以来监管类高信号 PDF。不能追溯或未下载的公告不计覆盖，扫描件无文本层时 fail-closed，不用模型虚构字段。

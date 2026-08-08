@@ -16,6 +16,11 @@ from rich.table import Table
 
 from quant_platform.announcement_nlp import process_announcements
 from quant_platform.corpus_nlp import SUPPORTED_CORPUS_DATASETS, process_corpus
+from quant_platform.event_market_response import (
+    DEFAULT_BENCHMARK,
+    DEFAULT_HORIZONS,
+    process_event_market_response,
+)
 from quant_platform.major_news_mentions import process_major_news_mentions
 from quant_platform.news_flash_factors import process_news_flash
 from quant_platform.report_rc_factors import process_report_rc
@@ -1729,6 +1734,15 @@ def cninfo_announcements_command(
     context.report_progress(
         "downloading", "cninfo announcement bodies", {"cninfo_announcements"}, force=True
     )
+    def report_announcement_progress(progress: dict[str, int]) -> None:
+        context.progress.set_target(**progress)
+        context.report_progress(
+            "downloading",
+            "cninfo announcement bodies",
+            {"cninfo_announcements"},
+            force=True,
+        )
+
     summary = download_cninfo_announcements(
         context.settings.data_root,
         ts_codes=set(_split_codes(ts_code)) or None,
@@ -1740,6 +1754,7 @@ def cninfo_announcements_command(
         timeout_seconds=context.settings.timeout_seconds,
         max_attempts=context.settings.max_request_attempts,
         cooldown_seconds=context.settings.cooldown_seconds,
+        progress_callback=report_announcement_progress,
     )
     result = {
         "dataset": "cninfo_announcements",
@@ -1869,6 +1884,57 @@ def corpus_nlp_command(
         "end_date": end_date.isoformat(),
         "datasets": sorted(datasets) or list(SUPPORTED_CORPUS_DATASETS),
         "ts_codes": _split_codes(ts_code),
+        **summary.as_dict(),
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+@app.command("event-market-response")
+def event_market_response_command(
+    snapshot_name: Annotated[
+        str, typer.Option(help="Verified immutable snapshot name")
+    ],
+    horizons: Annotated[
+        str, typer.Option(help="Comma-separated positive trading-session horizons")
+    ] = ",".join(str(value) for value in DEFAULT_HORIZONS),
+    benchmark_code: Annotated[
+        str, typer.Option(help="Benchmark index ts_code")
+    ] = DEFAULT_BENCHMARK,
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Build post-event training labels; never publishes them as live factors."""
+
+    try:
+        horizon_values = tuple(
+            sorted({int(part.strip()) for part in horizons.split(",") if part.strip()})
+        )
+    except ValueError as exc:
+        raise typer.BadParameter("horizons must be comma-separated integers") from exc
+    if not horizon_values or any(value <= 0 for value in horizon_values):
+        raise typer.BadParameter("horizons must contain positive integers")
+    context = load_context(
+        require_credentials=False,
+        progress_path=result_path,
+        progress_target={"kind": "event_market_response", "snapshot_name": snapshot_name},
+    )
+    context.report_progress(
+        "processing", "post-event market-response labels", {"event_market_response"}, force=True
+    )
+    summary = _produce_factors(
+        "event-market-response",
+        lambda: process_event_market_response(
+            context.settings.data_root,
+            snapshot_name=snapshot_name,
+            horizons=horizon_values,
+            benchmark_code=benchmark_code,
+        ),
+    )
+    result = {
+        "dataset": "event_market_response_labels",
+        "snapshot_name": snapshot_name,
+        "horizons": list(horizon_values),
+        "benchmark_code": benchmark_code,
         **summary.as_dict(),
     }
     _write_optional_result(result_path, result)

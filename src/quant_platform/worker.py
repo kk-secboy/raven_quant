@@ -472,6 +472,61 @@ class LocalJobWorker:
             if payload.get("regulatory_only", True):
                 command.append("--regulatory-only")
             return command, result_path, {}
+        if job["kind"] in {"announcement_nlp", "corpus_nlp", "event_market_response"}:
+            output = self.settings.data_root / "artifacts" / "execution-data" / job["id"]
+            result_path = output / "result.json"
+            command = [sys.executable, "-m", "quant_data.cli"]
+            if job["kind"] == "announcement_nlp":
+                command.extend(
+                    [
+                        "announcement-nlp",
+                        "--start",
+                        str(payload["start"]),
+                        "--end",
+                        str(payload["end"]),
+                        "--result",
+                        str(result_path),
+                    ]
+                )
+                if payload.get("ts_codes"):
+                    command.extend(["--ts-code", ",".join(payload["ts_codes"])])
+                if payload.get("categories"):
+                    command.extend(["--category", ",".join(payload["categories"])])
+                if int(payload.get("limit") or 0) > 0:
+                    command.extend(["--limit", str(payload["limit"])])
+            elif job["kind"] == "corpus_nlp":
+                command.extend(
+                    [
+                        "corpus-nlp",
+                        "--start",
+                        str(payload["start"]),
+                        "--end",
+                        str(payload["end"]),
+                        "--result",
+                        str(result_path),
+                    ]
+                )
+                if payload.get("datasets"):
+                    command.extend(["--dataset", ",".join(payload["datasets"])])
+                if payload.get("ts_codes"):
+                    command.extend(["--ts-code", ",".join(payload["ts_codes"])])
+                if int(payload.get("limit") or 0) > 0:
+                    command.extend(["--limit", str(payload["limit"])])
+            else:
+                command.extend(
+                    [
+                        "event-market-response",
+                        "--snapshot-name",
+                        str(payload["snapshot_name"]),
+                        "--horizons",
+                        ",".join(str(value) for value in payload.get("horizons", [1, 3, 5, 20])),
+                        "--benchmark-code",
+                        str(payload.get("benchmark_code") or "000300.SH"),
+                        "--result",
+                        str(result_path),
+                    ]
+                )
+            return command, result_path, {}
         if job["kind"] in {
             "margin_eligibility_download",
             "core_intraday_download",

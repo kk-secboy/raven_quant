@@ -3,7 +3,8 @@
 Reads the cninfo announcement index (``data/announcements/index.parquet``) produced by
 ``quant_data.cninfo_announcements``, extracts the PDF text layer, and calls an
 OpenAI-compatible chat endpoint for structured extraction (event type, tone score,
-key numbers, confidence). Outputs land under ``data/announcements/nlp/``:
+key numbers, causal impact channels, horizon, direction, and confidence). Outputs
+land under ``data/announcements/nlp/``:
 
 - ``units/fields_<timestamp>_<uuid>.parquet`` — immutable per-run field units
 - ``fields.parquet`` — derived structured-fields index (PIT: available_at is the
@@ -41,7 +42,7 @@ from quant_data.rate_limit import GlobalRateGate
 
 from .factor_evaluator import normalize_series
 
-PROMPT_VERSION = "announcement-nlp.v1"
+PROMPT_VERSION = "announcement-nlp.v2"
 
 EVENT_TYPES = (
     "earnings_forecast",
@@ -54,6 +55,31 @@ EVENT_TYPES = (
     "equity_change",
     "other",
 )
+
+IMPACT_DIRECTIONS = ("positive", "negative", "neutral", "mixed", "uncertain")
+IMPACT_HORIZONS = (
+    "immediate",
+    "short_term",
+    "medium_term",
+    "long_term",
+    "uncertain",
+)
+IMPACT_CHANNELS = (
+    "earnings",
+    "cash_flow",
+    "balance_sheet",
+    "governance",
+    "regulatory",
+    "industry_demand",
+    "capacity",
+    "pricing",
+    "cost",
+    "capital_allocation",
+    "share_supply",
+    "litigation",
+    "other",
+)
+MAX_LOGIC_SUMMARY_CHARS = 240
 
 ANNOUNCEMENTS_DIR = "announcements"
 NLP_SUBDIR = "nlp"
@@ -72,6 +98,10 @@ FIELDS_COLUMNS = (
     "event_type",
     "tone_score",
     "key_numbers",
+    "impact_direction",
+    "impact_horizon",
+    "impact_channels",
+    "logic_summary",
     "confidence",
     "source_sha256",
     "model",
@@ -92,11 +122,13 @@ STATE_COLUMNS = (
 )
 
 FACTOR_NAME = "announcement_tone"
+LOGIC_FACTOR_NAME = "announcement_logic_score"
 # Same availability_policy style as qlib_builder._research_feature_contract:
 # the field becomes visible at available_at, the first trading day strictly
 # after the announcement date (derived by the cninfo downloader).
 AVAILABILITY_POLICY = {
     FACTOR_NAME: "available_at_first_trading_day_after_announcement",
+    LOGIC_FACTOR_NAME: "available_at_first_trading_day_after_announcement",
 }
 
 
@@ -283,13 +315,21 @@ def build_extraction_messages(
     system = (
         f"You are an A-share announcement analysis engine (prompt_version={PROMPT_VERSION}). "
         "Respond with exactly one JSON object and nothing else, with keys "
-        '"event_type", "tone_score", "key_numbers", "confidence". '
+        '"event_type", "tone_score", "key_numbers", "impact_direction", '
+        '"impact_horizon", "impact_channels", "logic_summary", "confidence". '
         f'"event_type" must be one of: {", ".join(EVENT_TYPES)}. '
         '"tone_score" is a float in [-1.0, 1.0]: for periodic reports it rates the '
         "management tone (negative = pessimistic, positive = optimistic); for regulatory "
         "letters it rates issue severity (negative = severe). "
         '"key_numbers" is a JSON object with the key figures mentioned (e.g. forecast net '
         'profit bounds, year-over-year change ranges); use {} when none can be extracted. '
+        f'"impact_direction" must be one of: {", ".join(IMPACT_DIRECTIONS)}. '
+        f'"impact_horizon" must be one of: {", ".join(IMPACT_HORIZONS)}. '
+        f'"impact_channels" is a JSON array containing only: {", ".join(IMPACT_CHANNELS)}; '
+        'use [] when the document does not support a causal channel. '
+        f'"logic_summary" is an evidence-grounded causal summary of at most '
+        f'{MAX_LOGIC_SUMMARY_CHARS} characters; use an empty string when unsupported. '
+        'Do not infer facts not present in the announcement. '
         '"confidence" is a float in [0.0, 1.0].'
     )
     user = (
@@ -310,6 +350,10 @@ class ExtractionResult:
     event_type: str
     tone_score: float
     key_numbers: dict[str, Any]
+    impact_direction: str
+    impact_horizon: str
+    impact_channels: tuple[str, ...]
+    logic_summary: str
     confidence: float
 
 
@@ -328,8 +372,9 @@ def parse_extraction_payload(raw: str) -> ExtractionResult:
     """Validate the LLM JSON payload against the strict schema; fail closed.
 
     Required keys: event_type (fixed enum), tone_score ([-1, 1]), key_numbers
-    (JSON object), confidence ([0, 1]). Unknown extra keys are tolerated but
-    ignored; any missing key or type/range violation is a failure.
+    (JSON object), constrained impact direction/horizon/channels, a bounded
+    evidence-grounded summary, and confidence ([0, 1]). Unknown extra keys are
+    tolerated but ignored; any missing key or type/range violation is a failure.
     """
 
     text = raw.strip()
@@ -344,7 +389,16 @@ def parse_extraction_payload(raw: str) -> ExtractionResult:
         ) from exc
     if not isinstance(payload, dict):
         raise LlmExtractionError("LLM response must be a JSON object", stage="llm_parse")
-    required = {"event_type", "tone_score", "key_numbers", "confidence"}
+    required = {
+        "event_type",
+        "tone_score",
+        "key_numbers",
+        "impact_direction",
+        "impact_horizon",
+        "impact_channels",
+        "logic_summary",
+        "confidence",
+    }
     missing = sorted(required - set(payload))
     if missing:
         raise LlmExtractionError(f"LLM response misses keys: {missing}", stage="llm_parse")
@@ -358,11 +412,45 @@ def parse_extraction_payload(raw: str) -> ExtractionResult:
     key_numbers = payload.get("key_numbers")
     if not isinstance(key_numbers, dict):
         raise LlmExtractionError("key_numbers must be a JSON object", stage="llm_parse")
+    impact_direction = payload.get("impact_direction")
+    if impact_direction not in IMPACT_DIRECTIONS:
+        raise LlmExtractionError(
+            f"impact_direction must be one of {list(IMPACT_DIRECTIONS)}; "
+            f"got {impact_direction!r}",
+            stage="llm_parse",
+        )
+    impact_horizon = payload.get("impact_horizon")
+    if impact_horizon not in IMPACT_HORIZONS:
+        raise LlmExtractionError(
+            f"impact_horizon must be one of {list(IMPACT_HORIZONS)}; got {impact_horizon!r}",
+            stage="llm_parse",
+        )
+    impact_channels = payload.get("impact_channels")
+    if (
+        not isinstance(impact_channels, list)
+        or any(not isinstance(channel, str) for channel in impact_channels)
+        or any(channel not in IMPACT_CHANNELS for channel in impact_channels)
+        or len(set(impact_channels)) != len(impact_channels)
+    ):
+        raise LlmExtractionError(
+            "impact_channels must be a duplicate-free JSON array of governed channels",
+            stage="llm_parse",
+        )
+    logic_summary = payload.get("logic_summary")
+    if not isinstance(logic_summary, str) or len(logic_summary) > MAX_LOGIC_SUMMARY_CHARS:
+        raise LlmExtractionError(
+            f"logic_summary must be a string of at most {MAX_LOGIC_SUMMARY_CHARS} characters",
+            stage="llm_parse",
+        )
     confidence = _bounded_float(payload.get("confidence"), "confidence", 0.0, 1.0)
     return ExtractionResult(
         event_type=str(event_type),
         tone_score=tone_score,
         key_numbers=key_numbers,
+        impact_direction=str(impact_direction),
+        impact_horizon=str(impact_horizon),
+        impact_channels=tuple(impact_channels),
+        logic_summary=logic_summary.strip(),
         confidence=confidence,
     )
 
@@ -400,6 +488,10 @@ def _empty_fields_frame() -> pd.DataFrame:
             "event_type": pd.Series(dtype="string"),
             "tone_score": pd.Series(dtype="float64"),
             "key_numbers": pd.Series(dtype="string"),
+            "impact_direction": pd.Series(dtype="string"),
+            "impact_horizon": pd.Series(dtype="string"),
+            "impact_channels": pd.Series(dtype="string"),
+            "logic_summary": pd.Series(dtype="string"),
             "confidence": pd.Series(dtype="float64"),
             "source_sha256": pd.Series(dtype="string"),
             "model": pd.Series(dtype="string"),
@@ -510,6 +602,46 @@ def build_tone_factor_series(fields: pd.DataFrame, name: str = FACTOR_NAME) -> p
     return normalize_series(series, name)
 
 
+_DIRECTION_SCORE = {
+    "positive": 1.0,
+    "negative": -1.0,
+    "neutral": 0.0,
+    "mixed": 0.0,
+    "uncertain": 0.0,
+}
+_HORIZON_WEIGHT = {
+    "immediate": 1.0,
+    "short_term": 0.85,
+    "medium_term": 0.65,
+    "long_term": 0.45,
+    "uncertain": 0.0,
+}
+
+
+def build_logic_factor_series(
+    fields: pd.DataFrame, name: str = LOGIC_FACTOR_NAME
+) -> pd.Series:
+    """Build an explainable directional logic signal from governed NLP enums.
+
+    This is deliberately not a free-form LLM score.  Direction and horizon are
+    mapped through frozen tables and multiplied by the extraction confidence;
+    mixed/neutral/uncertain cases emit zero.  Post-event price response is never
+    consumed here and is produced separately as a training label.
+    """
+
+    frame = fields[
+        ["available_at", "ts_code", "impact_direction", "impact_horizon", "confidence"]
+    ].copy()
+    frame["direction_score"] = frame["impact_direction"].map(_DIRECTION_SCORE)
+    frame["horizon_weight"] = frame["impact_horizon"].map(_HORIZON_WEIGHT)
+    frame["confidence"] = pd.to_numeric(frame["confidence"], errors="coerce")
+    frame[name] = frame["direction_score"] * frame["horizon_weight"] * frame["confidence"]
+    grouped = frame.groupby(["available_at", "ts_code"], sort=True)[name].mean()
+    series = grouped.rename(name)
+    series.index = series.index.set_names(["datetime", "instrument"])
+    return normalize_series(series, name)
+
+
 def write_factor_artifact(
     fields: pd.DataFrame,
     factors_dir: Path,
@@ -525,7 +657,16 @@ def write_factor_artifact(
     research-run context instead of being faked here.
     """
 
-    series = build_tone_factor_series(fields, name)
+    current = fields[
+        (fields["prompt_version"].astype(str) == PROMPT_VERSION)
+        & (fields["model"].astype(str) == model)
+    ]
+    if name == FACTOR_NAME:
+        series = build_tone_factor_series(current, name)
+    elif name == LOGIC_FACTOR_NAME:
+        series = build_logic_factor_series(current, name)
+    else:
+        raise ValueError(f"unsupported announcement factor: {name}")
     artifact_path = factors_dir / f"{name}.parquet"
     _write_parquet_atomic(series.rename(name).reset_index(), artifact_path)
     manifest = {
@@ -533,7 +674,7 @@ def write_factor_artifact(
         "artifact": artifact_path.name,
         "sha256": _sha256_file(artifact_path),
         "rows": int(len(series)),
-        "availability_policy": dict(AVAILABILITY_POLICY),
+        "availability_policy": {name: AVAILABILITY_POLICY[name]},
         "source": {
             "dataset": "announcement_nlp_fields",
             "prompt_version": PROMPT_VERSION,
@@ -562,6 +703,9 @@ class NlpSummary:
     factor_manifest_path: Path | None
     factor_sha256: str | None
     factor_rows: int
+    logic_factor_manifest_path: Path | None
+    logic_factor_sha256: str | None
+    logic_factor_rows: int
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -578,6 +722,13 @@ class NlpSummary:
             ),
             "factor_sha256": self.factor_sha256,
             "factor_rows": self.factor_rows,
+            "logic_factor_manifest_path": (
+                str(self.logic_factor_manifest_path)
+                if self.logic_factor_manifest_path
+                else None
+            ),
+            "logic_factor_sha256": self.logic_factor_sha256,
+            "logic_factor_rows": self.logic_factor_rows,
         }
 
 
@@ -687,6 +838,12 @@ def process_announcements(
             "key_numbers": json.dumps(
                 result.key_numbers, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             ),
+            "impact_direction": result.impact_direction,
+            "impact_horizon": result.impact_horizon,
+            "impact_channels": json.dumps(
+                result.impact_channels, ensure_ascii=False, separators=(",", ":")
+            ),
+            "logic_summary": result.logic_summary,
             "confidence": result.confidence,
             "source_sha256": str(row.sha256),
             "model": model,
@@ -712,6 +869,9 @@ def process_announcements(
     artifact = write_factor_artifact(
         fields, factors_dir, name=factor_name, model=model, now=clock()
     )
+    logic_artifact = write_factor_artifact(
+        fields, factors_dir, name=LOGIC_FACTOR_NAME, model=model, now=clock()
+    )
     return NlpSummary(
         planned=len(frame),
         processed=processed,
@@ -723,4 +883,7 @@ def process_announcements(
         factor_manifest_path=artifact["manifest_path"],
         factor_sha256=artifact["manifest"]["sha256"],
         factor_rows=artifact["manifest"]["rows"],
+        logic_factor_manifest_path=logic_artifact["manifest_path"],
+        logic_factor_sha256=logic_artifact["manifest"]["sha256"],
+        logic_factor_rows=logic_artifact["manifest"]["rows"],
     )

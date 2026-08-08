@@ -28,15 +28,25 @@ def _fields_frame(*, tone_override: float | None = None) -> pd.DataFrame:
             "available_at": pd.to_datetime(["2026-07-20", "2026-07-20", "2026-07-21"]),
             "ts_code": ["600519.SH", "600519.SH", "000001.SZ"],
             "tone_score": scores,
+            "impact_direction": ["positive", "positive", "negative"],
+            "impact_horizon": ["short_term", "medium_term", "immediate"],
+            "confidence": [0.9, 0.8, 0.7],
+            "prompt_version": nlp.PROMPT_VERSION,
+            "model": "test-model",
         }
     )
 
 
-def _write_artifact(factors_dir: Path, *, tone_override: float | None = None) -> dict:
+def _write_artifact(
+    factors_dir: Path,
+    *,
+    tone_override: float | None = None,
+    factor_name: str = nlp.FACTOR_NAME,
+) -> dict:
     return nlp.write_factor_artifact(
         _fields_frame(tone_override=tone_override),
         factors_dir,
-        name=nlp.FACTOR_NAME,
+        name=factor_name,
         model="test-model",
         now=NOW,
     )
@@ -102,6 +112,27 @@ def test_code_artifact_source_is_deterministic_and_recomputes_values(
     recomputed = namespace["compute_factor"](_fields_frame())
     expected = nlp.build_tone_factor_series(_fields_frame(), nlp.FACTOR_NAME)
     assert recomputed.equals(expected)
+
+
+@pytest.mark.no_database
+def test_logic_code_artifact_recomputes_governed_logic_values(tmp_path: Path) -> None:
+    factors_dir = tmp_path / "factors"
+    artifact = _write_artifact(factors_dir, factor_name=nlp.LOGIC_FACTOR_NAME)
+    manifest = artifact["manifest"]
+    source = registry._code_artifact_source(
+        factor_name=nlp.LOGIC_FACTOR_NAME,
+        manifest=manifest,
+        values_sha256=manifest["sha256"],
+    )
+    namespace: dict = {}
+    exec(compile(source, "<logic-code-artifact>", "exec"), namespace)
+
+    recomputed = namespace["compute_factor"](_fields_frame())
+    expected = nlp.build_logic_factor_series(
+        _fields_frame(), nlp.LOGIC_FACTOR_NAME
+    )
+    assert recomputed.equals(expected)
+    assert "post-event returns" in source.lower()
 
 
 @pytest.mark.no_database
@@ -202,7 +233,9 @@ def test_register_success(database_url: str, tmp_path: Path) -> None:
     assert candidate["code_sha256"] == hashlib.sha256(code_path.read_bytes()).hexdigest()
     assert result["code_sha256"] == candidate["code_sha256"]
     variables = candidate["variables"]
-    assert variables["availability_policy"] == dict(nlp.AVAILABILITY_POLICY)
+    assert variables["availability_policy"] == {
+        nlp.FACTOR_NAME: nlp.AVAILABILITY_POLICY[nlp.FACTOR_NAME]
+    }
     assert variables["source"]["prompt_version"] == nlp.PROMPT_VERSION
     assert variables["source"]["model"] == "test-model"
     assert variables["rows"] == artifact["manifest"]["rows"]
@@ -272,17 +305,23 @@ def test_cli_registers_factor_idempotently(
     data_root = tmp_path / "data"
     factors_dir = registry.default_factors_dir(data_root)
     _write_artifact(factors_dir)
+    _write_artifact(factors_dir, factor_name=nlp.LOGIC_FACTOR_NAME)
     monkeypatch.setenv("DATA_ROOT", str(data_root))
 
     runner = CliRunner()
     first = runner.invoke(db_cli.app, ["register-announcement-factor"])
     assert first.exit_code == 0, first.output
     payload = json.loads(first.output)
-    assert payload["created"] is True
-    assert payload["factor_name"] == nlp.FACTOR_NAME
+    assert [item["factor_name"] for item in payload["factors"]] == [
+        nlp.FACTOR_NAME,
+        nlp.LOGIC_FACTOR_NAME,
+    ]
+    assert all(item["created"] is True for item in payload["factors"])
 
     second = runner.invoke(db_cli.app, ["register-announcement-factor"])
     assert second.exit_code == 0, second.output
     repeated = json.loads(second.output)
-    assert repeated["created"] is False
-    assert repeated["candidate_id"] == payload["candidate_id"]
+    assert all(item["created"] is False for item in repeated["factors"])
+    assert [item["candidate_id"] for item in repeated["factors"]] == [
+        item["candidate_id"] for item in payload["factors"]
+    ]
