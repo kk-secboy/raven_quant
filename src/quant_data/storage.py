@@ -367,10 +367,16 @@ class ParquetStore:
         date_min = date_max = None
         if date_field is not None:
             date_expression = _date_sql_expression(date_field)
-            source_sql = _snapshot_source_query(dataset, quoted_paths, set(columns))
+            # The compacted files are the published dataset and already carry
+            # exact-row deduplication plus any explicit conflict quarantine.
+            # Derive their coverage directly instead of re-running the full
+            # semantic GROUP BY over every source unit. On very large sources
+            # (for example ccass_hold_detail) that redundant global aggregate
+            # can exhaust DuckDB's bounded memory after partition export.
             date_min, date_max = connection.execute(
                 f"SELECT min({date_expression})::VARCHAR, max({date_expression})::VARCHAR "
-                f"FROM ({source_sql}) WHERE {date_expression} IS NOT NULL"
+                f"FROM read_parquet({snapshot_quoted_paths}, union_by_name=true) "
+                f"WHERE {date_expression} IS NOT NULL"
             ).fetchone()
         ingested_min = ingested_max = None
         if "ingested_at" in columns:

@@ -352,6 +352,11 @@ def test_snapshot_resolves_metadata_drift_and_quarantines_unsafe_keys(
     assert len(detail) == 1
     assert detail.iloc[0]["col_participant_id"] == "B01231"
     assert detail.iloc[0]["col_shareholding"] == "2368"
+    detail_manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))[
+        "datasets"
+    ]["ccass_hold_detail"]
+    assert detail_manifest["date_min"] == "2025-08-08"
+    assert detail_manifest["date_max"] == "2025-08-08"
     share_float = _dataset_frame(snapshot, "share_float")
     assert len(share_float) == 1
     assert pd.isna(share_float.iloc[0]["float_ratio"])
