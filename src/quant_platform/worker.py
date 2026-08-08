@@ -17,6 +17,7 @@ from quant_data.config import Settings
 from quant_data.path_utils import to_wsl_path as _to_wsl_path
 
 from .allocation_store import AllocationStore
+from .corpus_nlp import DEFAULT_BATCH_SIZE as CORPUS_DEFAULT_BATCH_SIZE
 from .cost_model import CostModelConfig
 from .data_rollover import qlib_trading_date_on_or_before
 from .execution_algorithms import execution_time_slots
@@ -534,6 +535,12 @@ class LocalJobWorker:
                     command.extend(["--ts-code", ",".join(payload["ts_codes"])])
                 if int(payload.get("limit") or 0) > 0:
                     command.extend(["--limit", str(payload["limit"])])
+                command.extend(
+                    [
+                        "--batch-size",
+                        str(int(payload.get("batch_size") or CORPUS_DEFAULT_BATCH_SIZE)),
+                    ]
+                )
             else:
                 command.extend(
                     [

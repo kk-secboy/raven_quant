@@ -16,6 +16,7 @@ from rich.table import Table
 
 from quant_platform.announcement_nlp import process_announcements
 from quant_platform.corpus_nlp import (
+    DEFAULT_BATCH_SIZE,
     DEFAULT_CORPUS_DATASETS,
     SUPPORTED_CORPUS_DATASETS,
     process_corpus,
@@ -1865,6 +1866,14 @@ def corpus_nlp_command(
     limit: Annotated[
         int, typer.Option(min=0, help="Maximum corpus items to process (0 = all)")
     ] = 0,
+    batch_size: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=100,
+            help="Corpus items per LLM request (strict item-id matching)",
+        ),
+    ] = DEFAULT_BATCH_SIZE,
     result_path: Annotated[Path | None, typer.Option("--result")] = None,
 ) -> None:
     """Extract structured NLP signal fields from downloaded Tushare text corpora."""
@@ -1904,6 +1913,7 @@ def corpus_nlp_command(
             start=start_date,
             end=end_date,
             limit=limit or None,
+            batch_size=batch_size,
             secret_store=secret_store,
             progress_callback=report_corpus_nlp_progress,
         ),

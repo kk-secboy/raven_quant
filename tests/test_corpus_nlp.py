@@ -49,6 +49,23 @@ def _payload(**overrides) -> str:
     return json.dumps(body, ensure_ascii=False)
 
 
+def _batch_payload(items, **overrides) -> str:
+    return json.dumps(
+        {
+            "items": [
+                {
+                    "item_id": item.item_id,
+                    "sentiment": overrides.get("sentiment", 0.6),
+                    "topic": overrides.get("topic", "company"),
+                    "confidence": overrides.get("confidence", 0.9),
+                }
+                for item in items
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
 class FakeChatClient:
     """Scripted ChatCompleter stand-in; fails the test on unscripted calls."""
 
@@ -397,6 +414,74 @@ def test_parse_extraction_payload_requires_all_keys() -> None:
             corpus.parse_extraction_payload(json.dumps(body))
 
 
+def test_batch_messages_and_parser_are_exact_on_item_ids(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    items = corpus.load_corpus_items(tmp_path, datasets={"major_news"})[:2]
+
+    messages = corpus.build_batch_extraction_messages(items, max_chars=4)
+    request = json.loads(messages[1]["content"])
+    assert [row["item_id"] for row in request["items"]] == [
+        item.item_id for item in items
+    ]
+    assert all(len(row["text"]) <= 4 for row in request["items"])
+
+    parsed = corpus.parse_batch_extraction_payload(
+        _batch_payload(items), expected_item_ids=[item.item_id for item in items]
+    )
+    assert set(parsed) == {item.item_id for item in items}
+    assert all(value.sentiment == 0.6 for value in parsed.values())
+
+    missing = json.loads(_batch_payload(items))
+    missing["items"].pop()
+    with pytest.raises(LlmExtractionError, match="item_id mismatch"):
+        corpus.parse_batch_extraction_payload(
+            json.dumps(missing), expected_item_ids=[item.item_id for item in items]
+        )
+
+
+def test_process_batches_multiple_items_per_llm_call(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    items = corpus.load_corpus_items(tmp_path)
+    batches = [items[index : index + 3] for index in range(0, len(items), 3)]
+    chat = FakeChatClient([_batch_payload(batch) for batch in batches])
+
+    summary = _run(tmp_path, chat, batch_size=3)
+
+    assert summary.processed == 7
+    assert summary.failed == 0
+    assert summary.llm_calls == 3
+    assert len(chat.calls) == 3
+    assert [len(json.loads(call[0][1]["content"])["items"]) for call in chat.calls] == [
+        3,
+        3,
+        1,
+    ]
+
+
+def test_batch_parse_failure_fails_closed_for_every_item(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    items = corpus.load_corpus_items(tmp_path)[:2]
+    incomplete = json.loads(_batch_payload(items))
+    incomplete["items"].pop()
+
+    summary = _run(
+        tmp_path,
+        FakeChatClient([json.dumps(incomplete)]),
+        limit=2,
+        batch_size=2,
+    )
+
+    assert summary.processed == 0
+    assert summary.failed == 2
+    assert summary.llm_calls == 1
+    assert pd.read_parquet(summary.fields_path).empty
+    state = pd.read_parquet(summary.state_path)
+    assert set(state["status"]) == {"failed"}
+    assert set(state["stage"]) == {"llm_parse"}
+
+
 # --- end-to-end processing -----------------------------------------------------
 
 
@@ -565,7 +650,7 @@ def test_process_reprocesses_when_prompt_version_changes(tmp_path: Path, monkeyp
     _seed_trade_cal(tmp_path)
     _run(tmp_path, FakeChatClient([_payload()] * 7))
 
-    monkeypatch.setattr(corpus, "PROMPT_VERSION", "corpus-nlp.v2")
+    monkeypatch.setattr(corpus, "PROMPT_VERSION", "corpus-nlp.v3")
     chat = FakeChatClient([_payload(sentiment=0.1)] * 7)
     summary = _run(tmp_path, chat)
 
@@ -573,7 +658,7 @@ def test_process_reprocesses_when_prompt_version_changes(tmp_path: Path, monkeyp
     assert summary.skipped == 0
     fields = pd.read_parquet(summary.fields_path)
     assert len(fields) == 14  # v1 and v2 rows coexist under distinct processing keys
-    assert set(fields["prompt_version"]) == {"corpus-nlp.v1", "corpus-nlp.v2"}
+    assert set(fields["prompt_version"]) == {"corpus-nlp.v2", "corpus-nlp.v3"}
     # Duplicate (datetime, instrument) observations are averaged for the factor.
     assert summary.factors["news_sentiment_daily"]["manifest"]["rows"] == 3
 
@@ -644,6 +729,7 @@ def test_process_checkpoints_and_resumes_after_interruption(tmp_path: Path) -> N
         "processed": 1,
         "skipped": 1,
         "failed": 0,
+        "llm_calls": 1,
     }
 
 
@@ -843,7 +929,10 @@ def test_process_honors_limit(tmp_path: Path) -> None:
 def test_cli_runs_with_injected_fakes(tmp_path: Path, monkeypatch) -> None:
     _seed_corpus(tmp_path)
     _seed_trade_cal(tmp_path)
-    chat = FakeChatClient([_payload()] * 7)
+    production_items = corpus.load_corpus_items(
+        tmp_path, datasets=set(corpus.DEFAULT_CORPUS_DATASETS)
+    )
+    chat = FakeChatClient([_batch_payload(production_items)])
     monkeypatch.setattr(
         cli_module, "RuntimeSecretStore", lambda *args, **kwargs: FakeSecretStore(STORE_RECORD)
     )
@@ -876,10 +965,11 @@ def test_cli_runs_with_injected_fakes(tmp_path: Path, monkeypatch) -> None:
     assert payload["planned"] == 6
     assert payload["processed"] == 6
     assert payload["failed"] == 0
+    assert payload["llm_calls"] == 1
     assert payload["factors"]["news_sentiment_daily"]["rows"] == 3
     assert payload["factors"]["irm_qa_sentiment_daily"]["rows"] == 2
     assert payload["factors"]["policy_sentiment_daily"]["rows"] == 1
-    assert len(chat.calls) == 6
+    assert len(chat.calls) == 1
     assert Path(payload["fields_path"]).is_file()
 
 

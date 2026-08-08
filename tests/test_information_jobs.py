@@ -49,6 +49,8 @@ def test_information_request_models_fail_closed() -> None:
                 "test_end": "2026-08-03",
             },
         )
+    with pytest.raises(ValidationError, match="less than or equal to 100"):
+        CorpusNlpRequest(batch_size=101)
 
 
 def test_announcement_catalog_records_real_source_boundary() -> None:
@@ -78,6 +80,7 @@ def test_pilot_jobs_cannot_certify_full_information_catalog_scope() -> None:
         {
             "start": "2016-01-01",
             "limit": 0,
+            "batch_size": 40,
             "ts_codes": ["000001.SZ"],
         },
     )
@@ -174,6 +177,7 @@ def test_worker_builds_announcement_and_corpus_nlp_commands(tmp_path: Path) -> N
     assert announcement_env == {}
     assert "corpus-nlp" in corpus_command
     assert "major_news,npr" in corpus_command
+    assert corpus_command[corpus_command.index("--batch-size") + 1] == "40"
     assert corpus_result.name == "result.json"
     assert corpus_env == {}
 

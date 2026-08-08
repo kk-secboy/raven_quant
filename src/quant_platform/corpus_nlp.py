@@ -82,7 +82,10 @@ from .announcement_nlp import (
 )
 from .factor_evaluator import normalize_series
 
-PROMPT_VERSION = "corpus-nlp.v1"
+PROMPT_VERSION = "corpus-nlp.v2"
+DEFAULT_BATCH_SIZE = 40
+MAX_BATCH_SIZE = 100
+DEFAULT_BATCH_ITEM_CHARS = 1_000
 
 TOPICS = ("macro", "policy", "industry", "company", "market", "other")
 
@@ -610,6 +613,99 @@ def parse_extraction_payload(raw: str) -> CorpusExtraction:
     return CorpusExtraction(sentiment=sentiment, topic=str(topic), confidence=confidence)
 
 
+def build_batch_extraction_messages(
+    items: Sequence[CorpusItem], *, max_chars: int = DEFAULT_BATCH_ITEM_CHARS
+) -> list[dict[str, str]]:
+    """Build one structured request for multiple independent corpus items."""
+
+    if not items:
+        raise ValueError("batch must contain at least one corpus item")
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+    payload = {
+        "items": [
+            {
+                "item_id": item.item_id,
+                "source_dataset": item.source_dataset,
+                "scope": item.ts_code or f"market-level ({MARKET_INSTRUMENT})",
+                "pub_time": item.pub_time.isoformat(sep=" "),
+                "title": item.title[:240],
+                "text": item.content[:max_chars],
+            }
+            for item in items
+        ]
+    }
+    system = (
+        f"You are an A-share text corpus analysis engine "
+        f"(prompt_version={PROMPT_VERSION}). Return exactly one JSON object with "
+        'an "items" array. Return exactly one output for every input item_id, '
+        "with no duplicates or omissions. Each output must contain item_id, "
+        'sentiment, topic, confidence. "sentiment" is a float in [-1.0, 1.0] '
+        "(negative=bearish, positive=bullish); "
+        f'"topic" must be one of: {", ".join(TOPICS)}; '
+        '"confidence" is a float in [0.0, 1.0].'
+    )
+    return [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        },
+    ]
+
+
+def parse_batch_extraction_payload(
+    raw: str, *, expected_item_ids: Sequence[str]
+) -> dict[str, CorpusExtraction]:
+    """Validate a batch response exactly; any omission/duplicate fails the batch."""
+
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise LlmExtractionError(
+            f"LLM batch response is not valid JSON: {exc}", stage="llm_parse"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        raise LlmExtractionError(
+            'LLM batch response must be an object with an "items" array',
+            stage="llm_parse",
+        )
+    expected = list(expected_item_ids)
+    if len(set(expected)) != len(expected):
+        raise ValueError("expected_item_ids must not contain duplicates")
+    results: dict[str, CorpusExtraction] = {}
+    for row in payload["items"]:
+        if not isinstance(row, dict):
+            raise LlmExtractionError(
+                "LLM batch item must be a JSON object", stage="llm_parse"
+            )
+        item_id = row.get("item_id")
+        if not isinstance(item_id, str) or not item_id:
+            raise LlmExtractionError(
+                "LLM batch item misses item_id", stage="llm_parse"
+            )
+        if item_id in results:
+            raise LlmExtractionError(
+                f"LLM batch response duplicates item_id {item_id}", stage="llm_parse"
+            )
+        results[item_id] = parse_extraction_payload(
+            json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+        )
+    actual = set(results)
+    expected_set = set(expected)
+    if actual != expected_set:
+        missing = sorted(expected_set - actual)
+        unexpected = sorted(actual - expected_set)
+        raise LlmExtractionError(
+            f"LLM batch item_id mismatch; missing={missing}, unexpected={unexpected}",
+            stage="llm_parse",
+        )
+    return results
+
+
 def _empty_fields_frame() -> pd.DataFrame:
     return pd.DataFrame(
         {
@@ -767,6 +863,7 @@ class CorpusNlpSummary:
     processed: int
     skipped: int
     failed: int
+    llm_calls: int
     fields_path: Path | None
     state_path: Path | None
     unit_path: Path | None
@@ -779,6 +876,7 @@ class CorpusNlpSummary:
             "processed": self.processed,
             "skipped": self.skipped,
             "failed": self.failed,
+            "llm_calls": self.llm_calls,
             "fields_path": str(self.fields_path) if self.fields_path else None,
             "state_path": str(self.state_path) if self.state_path else None,
             "unit_path": str(self.unit_path) if self.unit_path else None,
@@ -809,6 +907,8 @@ def process_corpus(
     timeout_seconds: float = 120.0,
     max_attempts: int = 3,
     max_chars: int = MAX_TEXT_CHARS,
+    batch_size: int = 1,
+    batch_item_chars: int = DEFAULT_BATCH_ITEM_CHARS,
     checkpoint_every: int = 100,
     progress_callback: Callable[[dict[str, int]], None] | None = None,
     now: Callable[[], datetime] | None = None,
@@ -826,6 +926,10 @@ def process_corpus(
 
     if checkpoint_every <= 0:
         raise ValueError("checkpoint_every must be positive")
+    if not 1 <= batch_size <= MAX_BATCH_SIZE:
+        raise ValueError(f"batch_size must be between 1 and {MAX_BATCH_SIZE}")
+    if batch_item_chars < 1:
+        raise ValueError("batch_item_chars must be positive")
 
     clock = now or (lambda: datetime.now(UTC))
     selected_datasets = set(datasets) if datasets else set(DEFAULT_CORPUS_DATASETS)
@@ -880,9 +984,13 @@ def process_corpus(
         )
 
     new_field_rows: list[dict] = []
-    processed = skipped = failed = completed = 0
+    processed = skipped = failed = completed = llm_calls = 0
     dirty = False
     unit_path: Path | None = None
+    last_checkpoint_completed = 0
+    pending_batch: list[
+        tuple[CorpusItem, str, datetime, datetime, dict[str, Any]]
+    ] = []
 
     def publish_progress() -> None:
         if progress_callback is None:
@@ -894,6 +1002,7 @@ def process_corpus(
                 "processed": processed,
                 "skipped": skipped,
                 "failed": failed,
+                "llm_calls": llm_calls,
             }
         )
 
@@ -912,14 +1021,78 @@ def process_corpus(
             dirty = False
         publish_progress()
 
+    def maybe_checkpoint() -> None:
+        nonlocal last_checkpoint_completed
+        if completed - last_checkpoint_completed >= checkpoint_every:
+            persist_checkpoint()
+            last_checkpoint_completed = completed
+
+    def flush_batch() -> None:
+        nonlocal pending_batch, processed, failed, completed, llm_calls, dirty
+        if not pending_batch:
+            return
+        batch = pending_batch
+        pending_batch = []
+        llm_calls += 1
+        try:
+            if batch_size == 1:
+                item = batch[0][0]
+                messages = build_extraction_messages(
+                    item=item, text=item.content[:max_chars]
+                )
+                results = {
+                    item.item_id: parse_extraction_payload(
+                        chat_client.complete(messages, model=model)
+                    )
+                }
+            else:
+                batch_items = [entry[0] for entry in batch]
+                messages = build_batch_extraction_messages(
+                    batch_items, max_chars=min(max_chars, batch_item_chars)
+                )
+                results = parse_batch_extraction_payload(
+                    chat_client.complete(messages, model=model),
+                    expected_item_ids=[item.item_id for item in batch_items],
+                )
+        except LlmExtractionError as exc:
+            failed += len(batch)
+            for _item, _process_key, _available_at, _processed_at, state_row in batch:
+                state_row.update(
+                    status="failed", stage=exc.stage, error=str(exc)[:500]
+                )
+        else:
+            for item, process_key, available_at, processed_at, state_row in batch:
+                result = results[item.item_id]
+                field_row = {
+                    "process_key": process_key,
+                    "source_dataset": item.source_dataset,
+                    "item_id": item.item_id,
+                    "ts_code": item.ts_code,
+                    "pub_time": item.pub_time,
+                    "available_at": available_at,
+                    "ingested_at": processed_at,
+                    "sentiment": result.sentiment,
+                    "topic": result.topic,
+                    "confidence": result.confidence,
+                    "model": model,
+                    "prompt_version": PROMPT_VERSION,
+                    "processed_at": processed_at,
+                }
+                fields_records[process_key] = field_row
+                new_field_rows.append(field_row)
+                state_row.update(status="succeeded", stage="completed")
+                processed += 1
+        dirty = True
+        completed += len(batch)
+        maybe_checkpoint()
+
     for item in items:
         process_key = f"{item.item_id}:{PROMPT_VERSION}:{model}"
         existing = state.get(process_key)
         if existing is not None and str(existing["status"]) == "succeeded":
             skipped += 1
             completed += 1
-            if completed % checkpoint_every == 0:
-                persist_checkpoint()
+            maybe_checkpoint()
             continue
         processed_at = clock()
         state_row: dict[str, Any] = {
@@ -942,38 +1115,17 @@ def process_corpus(
         except LookupError as exc:
             failed += 1
             state_row.update(status="failed", stage="availability", error=str(exc)[:500])
+            completed += 1
+            maybe_checkpoint()
         else:
             state_row["available_at"] = available_at
-            try:
-                messages = build_extraction_messages(item=item, text=item.content[:max_chars])
-                result = parse_extraction_payload(chat_client.complete(messages, model=model))
-            except LlmExtractionError as exc:
-                failed += 1
-                state_row.update(status="failed", stage=exc.stage, error=str(exc)[:500])
-            else:
-                field_row = {
-                    "process_key": process_key,
-                    "source_dataset": item.source_dataset,
-                    "item_id": item.item_id,
-                    "ts_code": item.ts_code,
-                    "pub_time": item.pub_time,
-                    "available_at": available_at,
-                    "ingested_at": processed_at,
-                    "sentiment": result.sentiment,
-                    "topic": result.topic,
-                    "confidence": result.confidence,
-                    "model": model,
-                    "prompt_version": PROMPT_VERSION,
-                    "processed_at": processed_at,
-                }
-                fields_records[process_key] = field_row
-                new_field_rows.append(field_row)
-                state_row.update(status="succeeded", stage="completed")
-                processed += 1
-        completed += 1
-        if completed % checkpoint_every == 0:
-            persist_checkpoint()
+            pending_batch.append(
+                (item, process_key, available_at, processed_at, state_row)
+            )
+            if len(pending_batch) >= batch_size:
+                flush_batch()
 
+    flush_batch()
     persist_checkpoint(force=True)
 
     fields = _fields_frame(list(fields_records.values()))
@@ -1018,6 +1170,7 @@ def process_corpus(
         processed=processed,
         skipped=skipped,
         failed=failed,
+        llm_calls=llm_calls,
         fields_path=fields_path,
         state_path=state_path,
         unit_path=unit_path,

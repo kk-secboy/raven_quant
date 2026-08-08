@@ -43,6 +43,7 @@ from quant_platform.announcement_nlp import (
 from quant_platform.announcement_nlp import (
     PROMPT_VERSION as ANNOUNCEMENT_PROMPT_VERSION,
 )
+from quant_platform.corpus_nlp import DEFAULT_BATCH_SIZE as CORPUS_DEFAULT_BATCH_SIZE
 from quant_platform.corpus_nlp import PROMPT_VERSION as CORPUS_PROMPT_VERSION
 from quant_platform.event_market_response import LABEL_SCHEMA_VERSION
 from quant_platform.qlib_factor_baseline import FACTOR_SOURCE_QLIB_BASELINE
@@ -170,6 +171,7 @@ class CorpusNlpRequest(BaseModel):
     ] = Field(default_factory=list)
     ts_codes: list[str] = Field(default_factory=list, max_length=2000)
     limit: int = Field(default=0, ge=0, le=1_000_000)
+    batch_size: int = Field(default=CORPUS_DEFAULT_BATCH_SIZE, ge=1, le=100)
 
     @model_validator(mode="after")
     def validate_range(self) -> CorpusNlpRequest:
@@ -3929,6 +3931,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "datasets": sorted(set(payload.datasets)),
             "ts_codes": sorted(set(payload.ts_codes)),
             "limit": payload.limit,
+            "batch_size": payload.batch_size,
             "prompt_version": CORPUS_PROMPT_VERSION,
         }
         log_path = platform_root / "logs" / (
@@ -3942,7 +3945,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 idempotency_key=(
                     f"corpus-nlp:{CORPUS_PROMPT_VERSION}:{payload.start}:{end_date}:"
                     f"{','.join(serialized['datasets']) or 'all'}:"
-                    f"{','.join(serialized['ts_codes']) or 'all'}:{payload.limit}"
+                    f"{','.join(serialized['ts_codes']) or 'all'}:{payload.limit}:"
+                    f"batch-{payload.batch_size}"
                 ),
             )
         except ValueError as exc:
