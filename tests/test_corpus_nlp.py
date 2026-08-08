@@ -153,6 +153,7 @@ def _seed_corpus(data_root: Path) -> None:
 
 
 def _run(data_root: Path, chat, **kwargs) -> corpus.CorpusNlpSummary:
+    kwargs.setdefault("datasets", set(corpus.SUPPORTED_CORPUS_DATASETS))
     return corpus.process_corpus(
         data_root,
         secret_store=FakeSecretStore(STORE_RECORD),
@@ -699,6 +700,24 @@ def test_process_missing_corpus_fail_closed(tmp_path: Path) -> None:
         _run(tmp_path, FakeChatClient([]))
 
 
+def test_process_default_excludes_audited_unavailable_npr(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    (tmp_path / "units" / "npr" / "data.parquet").unlink()
+    _seed_trade_cal(tmp_path)
+
+    summary = corpus.process_corpus(
+        tmp_path,
+        secret_store=FakeSecretStore(STORE_RECORD),
+        chat_client=FakeChatClient([_payload()] * 6),
+        now=lambda: NOW,
+        environ={},
+    )
+
+    assert summary.planned == 6
+    policy_manifest = summary.factors[corpus.POLICY_FACTOR_NAME]["manifest"]
+    assert policy_manifest["source"]["source_datasets"] == ["cctv_news"]
+
+
 def test_process_missing_trade_cal_fail_closed(tmp_path: Path) -> None:
     _seed_corpus(tmp_path)
     with pytest.raises(RuntimeError, match="trade_cal"):
@@ -850,18 +869,17 @@ def test_cli_runs_with_injected_fakes(tmp_path: Path, monkeypatch) -> None:
     assert payload["dataset"] == "corpus_nlp"
     assert payload["datasets"] == [
         "major_news",
-        "npr",
         "cctv_news",
         "irm_qa_sh",
         "irm_qa_sz",
     ]
-    assert payload["planned"] == 7
-    assert payload["processed"] == 7
+    assert payload["planned"] == 6
+    assert payload["processed"] == 6
     assert payload["failed"] == 0
     assert payload["factors"]["news_sentiment_daily"]["rows"] == 3
     assert payload["factors"]["irm_qa_sentiment_daily"]["rows"] == 2
-    assert payload["factors"]["policy_sentiment_daily"]["rows"] == 2
-    assert len(chat.calls) == 7
+    assert payload["factors"]["policy_sentiment_daily"]["rows"] == 1
+    assert len(chat.calls) == 6
     assert Path(payload["fields_path"]).is_file()
 
 

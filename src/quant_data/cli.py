@@ -15,7 +15,11 @@ from rich.progress import Progress
 from rich.table import Table
 
 from quant_platform.announcement_nlp import process_announcements
-from quant_platform.corpus_nlp import SUPPORTED_CORPUS_DATASETS, process_corpus
+from quant_platform.corpus_nlp import (
+    DEFAULT_CORPUS_DATASETS,
+    SUPPORTED_CORPUS_DATASETS,
+    process_corpus,
+)
 from quant_platform.event_market_response import (
     DEFAULT_BENCHMARK,
     DEFAULT_HORIZONS,
@@ -1849,7 +1853,10 @@ def corpus_nlp_command(
     dataset: Annotated[
         str,
         typer.Option(
-            help="Comma-separated major_news,npr,cctv_news,irm_qa_sh,irm_qa_sz; empty = all"
+            help=(
+                "Comma-separated major_news,npr,cctv_news,irm_qa_sh,irm_qa_sz; "
+                "empty = audited production sources (npr excluded until available)"
+            )
         ),
     ] = "",
     ts_code: Annotated[str, typer.Option(help="Comma-separated Tushare codes to include")] = "",
@@ -1905,7 +1912,7 @@ def corpus_nlp_command(
         "dataset": "corpus_nlp",
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
-        "datasets": sorted(datasets) or list(SUPPORTED_CORPUS_DATASETS),
+        "datasets": sorted(datasets) or list(DEFAULT_CORPUS_DATASETS),
         "ts_codes": _split_codes(ts_code),
         **summary.as_dict(),
     }

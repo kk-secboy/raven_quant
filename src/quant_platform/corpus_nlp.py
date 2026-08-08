@@ -94,6 +94,15 @@ DATASET_CCTV_NEWS = "cctv_news"
 IRM_QA_DATASETS = (DATASET_IRM_QA_SH, DATASET_IRM_QA_SZ)
 POLICY_DATASETS = (DATASET_NPR, DATASET_CCTV_NEWS)
 SUPPORTED_CORPUS_DATASETS = (DATASET_MAJOR_NEWS, *POLICY_DATASETS, *IRM_QA_DATASETS)
+# npr has no persisted production rows as of the audited 2026-08-08 source
+# boundary. It remains explicitly supported for future/native backfills, but a
+# default production run must not fail merely because that unavailable source
+# is absent. Its absence is documented as a source gap rather than fabricated.
+DEFAULT_CORPUS_DATASETS = (
+    DATASET_MAJOR_NEWS,
+    DATASET_CCTV_NEWS,
+    *IRM_QA_DATASETS,
+)
 # Datasets whose rows carry an exact publication moment; every other supported
 # dataset is date-only and conservatively visible from the next trading day.
 EXACT_TIMESTAMP_DATASETS = (DATASET_MAJOR_NEWS, DATASET_NPR)
@@ -819,8 +828,13 @@ def process_corpus(
         raise ValueError("checkpoint_every must be positive")
 
     clock = now or (lambda: datetime.now(UTC))
+    selected_datasets = set(datasets) if datasets else set(DEFAULT_CORPUS_DATASETS)
     items = load_corpus_items(
-        data_root, datasets=datasets, ts_codes=ts_codes, start=start, end=end
+        data_root,
+        datasets=selected_datasets,
+        ts_codes=ts_codes,
+        start=start,
+        end=end,
     )
     if limit is not None and limit > 0:
         items = items[:limit]
@@ -971,7 +985,11 @@ def process_corpus(
         news_series,
         factors_dir,
         name=NEWS_FACTOR_NAME,
-        source_datasets=(DATASET_MAJOR_NEWS,),
+        source_datasets=tuple(
+            dataset
+            for dataset in (DATASET_MAJOR_NEWS,)
+            if dataset in selected_datasets
+        ),
         model=model,
         now=clock(),
     )
@@ -979,7 +997,9 @@ def process_corpus(
         irm_qa_series,
         factors_dir,
         name=IRM_QA_FACTOR_NAME,
-        source_datasets=IRM_QA_DATASETS,
+        source_datasets=tuple(
+            dataset for dataset in IRM_QA_DATASETS if dataset in selected_datasets
+        ),
         model=model,
         now=clock(),
     )
@@ -987,7 +1007,9 @@ def process_corpus(
         policy_series,
         factors_dir,
         name=POLICY_FACTOR_NAME,
-        source_datasets=POLICY_DATASETS,
+        source_datasets=tuple(
+            dataset for dataset in POLICY_DATASETS if dataset in selected_datasets
+        ),
         model=model,
         now=clock(),
     )
