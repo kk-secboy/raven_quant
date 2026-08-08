@@ -259,10 +259,12 @@ def _parquet_files(data_root: Path, dataset: str) -> list[str]:
     return [path.as_posix() for path in candidates]
 
 
-def _read_parquet_union(paths: list[str], query: str) -> pd.DataFrame:
+def _read_parquet_union(
+    paths: list[str], query: str, parameters: Sequence[object] = ()
+) -> pd.DataFrame:
     connection = duckdb.connect()
     try:
-        return connection.execute(query, [paths]).fetchdf()
+        return connection.execute(query, [paths, *parameters]).fetchdf()
     finally:
         connection.close()
 

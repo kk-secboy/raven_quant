@@ -220,20 +220,40 @@ def _available_columns(paths: list[str]) -> set[str]:
     return set(frame.columns)
 
 
-def _major_news_items(paths: list[str]) -> list[CorpusItem]:
+def _date_bounds_sql(
+    expression: str, *, start: date | None, end: date | None
+) -> tuple[str, list[date]]:
+    conditions: list[str] = []
+    parameters: list[date] = []
+    if start is not None:
+        conditions.append(f"CAST({expression} AS DATE) >= ?")
+        parameters.append(start)
+    if end is not None:
+        conditions.append(f"CAST({expression} AS DATE) <= ?")
+        parameters.append(end)
+    return (" WHERE " + " AND ".join(conditions) if conditions else "", parameters)
+
+
+def _major_news_items(
+    paths: list[str], *, start: date | None = None, end: date | None = None
+) -> list[CorpusItem]:
     columns = _available_columns(paths)
     missing = sorted({"title", "content", "pub_time"} - columns)
     if missing:
         raise RuntimeError(f"major_news parquet misses required columns: {missing}")
+    moment_expr = "try_cast(CAST(pub_time AS VARCHAR) AS TIMESTAMP)"
+    where, parameters = _date_bounds_sql(moment_expr, start=start, end=end)
     frame = _read_parquet_union(
         paths,
-        """
+        f"""
         SELECT
             CAST(title AS VARCHAR) AS title,
             CAST(content AS VARCHAR) AS content,
             CAST(pub_time AS VARCHAR) AS pub_time
         FROM read_parquet(?, union_by_name=true)
+        {where}
         """,
+        parameters,
     )
     frame["moment"] = pd.to_datetime(frame["pub_time"], errors="coerce")
     items: list[CorpusItem] = []
@@ -260,7 +280,13 @@ def _major_news_items(paths: list[str]) -> list[CorpusItem]:
     return items
 
 
-def _irm_qa_items(paths: list[str], dataset: str) -> list[CorpusItem]:
+def _irm_qa_items(
+    paths: list[str],
+    dataset: str,
+    *,
+    start: date | None = None,
+    end: date | None = None,
+) -> list[CorpusItem]:
     columns = _available_columns(paths)
     question_col = next((name for name in ("q", "question") if name in columns), None)
     answer_col = next((name for name in ("a", "answer") if name in columns), None)
@@ -269,18 +295,24 @@ def _irm_qa_items(paths: list[str], dataset: str) -> list[CorpusItem]:
         missing.append("q|question")
     if missing:
         raise RuntimeError(f"{dataset} parquet misses required columns: {missing}")
+    trade_date_expr = (
+        "coalesce(try_cast(trade_date AS DATE), "
+        "try_strptime(CAST(trade_date AS VARCHAR), '%Y%m%d')::DATE)"
+    )
     select_parts = [
         "CAST(ts_code AS VARCHAR) AS ts_code",
-        "coalesce(try_cast(trade_date AS DATE), "
-        "try_strptime(CAST(trade_date AS VARCHAR), '%Y%m%d')::DATE) AS trade_date",
+        f"{trade_date_expr} AS trade_date",
         f'CAST("{question_col}" AS VARCHAR) AS question',
     ]
     if answer_col is not None:
         # Tolerant: the answer column is optional; questions alone still carry signal.
         select_parts.append(f'CAST("{answer_col}" AS VARCHAR) AS answer')
+    where, parameters = _date_bounds_sql(trade_date_expr, start=start, end=end)
     frame = _read_parquet_union(
         paths,
-        f"SELECT {', '.join(select_parts)} FROM read_parquet(?, union_by_name=true)",
+        f"SELECT {', '.join(select_parts)} FROM read_parquet(?, union_by_name=true)"
+        f"{where}",
+        parameters,
     )
     items: list[CorpusItem] = []
     for row in frame.itertuples():
@@ -306,7 +338,9 @@ def _irm_qa_items(paths: list[str], dataset: str) -> list[CorpusItem]:
     return items
 
 
-def _npr_items(paths: list[str]) -> list[CorpusItem]:
+def _npr_items(
+    paths: list[str], *, start: date | None = None, end: date | None = None
+) -> list[CorpusItem]:
     """Normalize the 国家政策法规库 rows; exact pubtime, tolerant content column.
 
     The interface defaults to pubtime/title/pcode/puborg/ptype; ``content_html``
@@ -335,9 +369,13 @@ def _npr_items(paths: list[str]) -> list[CorpusItem]:
             f'CAST("{name}" AS VARCHAR)' for name in content_cols
         ) + ")"
         select_parts.append(f"{content_expr} AS content")
+    moment_expr = f"try_cast({time_expr} AS TIMESTAMP)"
+    where, parameters = _date_bounds_sql(moment_expr, start=start, end=end)
     frame = _read_parquet_union(
         paths,
-        f"SELECT {', '.join(select_parts)} FROM read_parquet(?, union_by_name=true)",
+        f"SELECT {', '.join(select_parts)} FROM read_parquet(?, union_by_name=true)"
+        f"{where}",
+        parameters,
     )
     frame["moment"] = pd.to_datetime(frame["pub_time"], errors="coerce")
     items: list[CorpusItem] = []
@@ -365,23 +403,31 @@ def _npr_items(paths: list[str]) -> list[CorpusItem]:
     return items
 
 
-def _cctv_news_items(paths: list[str]) -> list[CorpusItem]:
+def _cctv_news_items(
+    paths: list[str], *, start: date | None = None, end: date | None = None
+) -> list[CorpusItem]:
     """Normalize the 新闻联播文字稿 rows (date-only, conservative availability)."""
 
     columns = _available_columns(paths)
     missing = sorted({"date", "title", "content"} - columns)
     if missing:
         raise RuntimeError(f"cctv_news parquet misses required columns: {missing}")
+    broadcast_expr = (
+        "coalesce(try_cast(date AS DATE), "
+        "try_strptime(CAST(date AS VARCHAR), '%Y%m%d')::DATE)"
+    )
+    where, parameters = _date_bounds_sql(broadcast_expr, start=start, end=end)
     frame = _read_parquet_union(
         paths,
-        """
+        f"""
         SELECT
-            coalesce(try_cast(date AS DATE),
-                try_strptime(CAST(date AS VARCHAR), '%Y%m%d')::DATE) AS broadcast_date,
+            {broadcast_expr} AS broadcast_date,
             CAST(title AS VARCHAR) AS title,
             CAST(content AS VARCHAR) AS content
         FROM read_parquet(?, union_by_name=true)
+        {where}
         """,
+        parameters,
     )
     items: list[CorpusItem] = []
     for row in frame.itertuples():
@@ -436,9 +482,11 @@ def load_corpus_items(
     for dataset in ordered:
         loader = loaders.get(dataset)
         rows = (
-            loader(paths_by_dataset[dataset])
+            loader(paths_by_dataset[dataset], start=start, end=end)
             if loader is not None
-            else _irm_qa_items(paths_by_dataset[dataset], dataset)
+            else _irm_qa_items(
+                paths_by_dataset[dataset], dataset, start=start, end=end
+            )
         )
         for item in rows:
             items.setdefault(item.item_id, item)

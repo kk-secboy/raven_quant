@@ -775,6 +775,39 @@ def test_process_filters_datasets_ts_codes_dates_and_limit(tmp_path: Path) -> No
     assert windowed.planned == 0
 
 
+def test_load_corpus_items_pushes_date_bounds_into_duckdb(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_parquet(
+        tmp_path / "units" / "major_news",
+        [
+            _news_row("旧闻", "旧正文", "2024-01-01 09:00:00"),
+            _news_row("窗口内", "正文", "2024-02-02 09:00:00"),
+        ],
+    )
+    original = corpus._read_parquet_union
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def recording_read(paths, query, parameters=()):
+        calls.append((query, tuple(parameters)))
+        return original(paths, query, parameters)
+
+    monkeypatch.setattr(corpus, "_read_parquet_union", recording_read)
+
+    items = corpus.load_corpus_items(
+        tmp_path,
+        datasets={"major_news"},
+        start=date(2024, 2, 1),
+        end=date(2024, 2, 29),
+    )
+
+    assert [item.title for item in items] == ["窗口内"]
+    bounded = [call for call in calls if call[1]]
+    assert len(bounded) == 1
+    assert "CAST(try_cast" in bounded[0][0]
+    assert bounded[0][1] == (date(2024, 2, 1), date(2024, 2, 29))
+
+
 def test_process_honors_limit(tmp_path: Path) -> None:
     _seed_corpus(tmp_path)
     _seed_trade_cal(tmp_path)
