@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -94,7 +94,9 @@ def default_factors_dir(data_root: Path) -> Path:
     return data_root / NEWS_FLASH_DIR / "factors"
 
 
-def load_news_flash_datetimes(data_root: Path) -> pd.Series:
+def load_news_flash_datetimes(
+    data_root: Path, *, start: date | None = None, end: date | None = None
+) -> pd.Series:
     """Read the news flash publication datetimes; fail closed.
 
     Only the exact ``datetime`` column is needed for a volume factor; rows
@@ -115,10 +117,20 @@ def load_news_flash_datetimes(data_root: Path) -> pd.Series:
     )
     if "datetime" not in available:
         raise RuntimeError("news parquet misses required columns: ['datetime']")
+    clauses = []
+    parameters: list[object] = []
+    if start is not None:
+        clauses.append("TRY_CAST(datetime AS TIMESTAMP) >= ?")
+        parameters.append(datetime.combine(start, datetime.min.time()))
+    if end is not None:
+        clauses.append("TRY_CAST(datetime AS TIMESTAMP) < ?")
+        parameters.append(datetime.combine(end + timedelta(days=1), datetime.min.time()))
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     frame = _read_parquet_union(
         paths,
         "SELECT CAST(datetime AS VARCHAR) AS datetime "
-        "FROM read_parquet(?, union_by_name=true)",
+        f"FROM read_parquet(?, union_by_name=true){where}",
+        parameters,
     )
     moments = pd.to_datetime(frame["datetime"], errors="coerce")
     return moments.dropna().sort_values(kind="stable").reset_index(drop=True)
@@ -189,6 +201,8 @@ def _write_factor_artifact(
     *,
     name: str,
     now: datetime,
+    start: date | None,
+    end: date | None,
 ) -> dict[str, Any]:
     """Write the normalized factor-values parquet plus its sha256 manifest."""
 
@@ -205,6 +219,8 @@ def _write_factor_artifact(
             "producer_version": PRODUCER_VERSION,
             "trailing_window_days": TRAILING_WINDOW_DAYS,
             "min_history_days": MIN_HISTORY_DAYS,
+            "requested_start": start.isoformat() if start is not None else None,
+            "requested_end": end.isoformat() if end is not None else None,
         },
         "instrument_convention": (
             f"{MARKET_INSTRUMENT} is a pseudo-instrument code for market-level "
@@ -250,6 +266,8 @@ def process_news_flash(
     *,
     window_days: int = TRAILING_WINDOW_DAYS,
     min_history_days: int = MIN_HISTORY_DAYS,
+    start: date | None = None,
+    end: date | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> NewsFlashSummary:
     """Build the daily flash counts and the intensity factor artifact.
@@ -261,11 +279,21 @@ def process_news_flash(
     """
 
     clock = now or (lambda: datetime.now(UTC))
-    moments = load_news_flash_datetimes(data_root)
+    if start is not None and end is not None and end < start:
+        raise ValueError("end must not be before start")
+    moments = load_news_flash_datetimes(data_root, start=start, end=end)
     # The trading calendar drives factor dates and the trailing grid; without
     # it the run must not guess (fail closed).
     open_days = load_trade_calendar_open_days(data_root)
     counts = build_daily_counts(moments, open_days, window_days=window_days)
+    if start is not None and not counts.empty:
+        counts = counts.loc[counts["factor_date"].dt.date >= start].reset_index(
+            drop=True
+        )
+    if end is not None and not counts.empty:
+        counts = counts.loc[counts["factor_date"].dt.date <= end].reset_index(
+            drop=True
+        )
     series = build_intensity_series(
         counts, window_days=window_days, min_history_days=min_history_days
     )
@@ -275,7 +303,14 @@ def process_news_flash(
     factors_dir.mkdir(parents=True, exist_ok=True)
     counts_path = base / "daily_counts.parquet"
     _write_parquet_atomic(counts, counts_path)
-    artifact = _write_factor_artifact(series, factors_dir, name=INTENSITY_FACTOR_NAME, now=clock())
+    artifact = _write_factor_artifact(
+        series,
+        factors_dir,
+        name=INTENSITY_FACTOR_NAME,
+        now=clock(),
+        start=start,
+        end=end,
+    )
     return NewsFlashSummary(
         flashes=int(len(moments)),
         count_days=int(len(counts)),

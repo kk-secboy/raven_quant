@@ -44,6 +44,17 @@ INFORMATION_SCHEDULE_KEYS = {
 }
 
 INFORMATION_EVALUATION_KEYS = {"dataset", "periods", "universe", "benchmark"}
+STRUCTURED_INFORMATION_SOURCES = {
+    "report_rc",
+    "major_news_mentions",
+    "news_flash",
+}
+STRUCTURED_INFORMATION_STARTS = {
+    "report_rc": date(2010, 1, 1),
+    "major_news_mentions": date(2018, 11, 20),
+    "news_flash": date(2018, 11, 20),
+}
+INFORMATION_FACTOR_REFRESH_KEYS = {"sources", "weekday", "factor_evaluation"}
 RESEARCH_PERIOD_KEYS = (
     "train_start",
     "train_end",
@@ -196,6 +207,50 @@ def normalize_information_schedule_payload(payload: dict[str, Any]) -> dict[str,
         "snapshot_name": snapshot_name,
         "horizons": horizons,
         "benchmark_code": benchmark_code,
+    }
+
+
+def normalize_information_factor_refresh_payload(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the weekly deterministic information-factor refresh policy."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("information_factor_refresh payload must be an object")
+    unknown_keys = sorted(set(payload) - INFORMATION_FACTOR_REFRESH_KEYS)
+    if unknown_keys:
+        raise ValueError(
+            "information_factor_refresh contains unsupported payload keys: "
+            f"{unknown_keys}"
+        )
+    sources = payload.get("sources", sorted(STRUCTURED_INFORMATION_SOURCES))
+    if not isinstance(sources, list) or not sources or not all(
+        isinstance(item, str) for item in sources
+    ):
+        raise ValueError("information_factor_refresh sources must be a non-empty string list")
+    normalized_sources = sorted(set(sources))
+    unknown_sources = sorted(set(normalized_sources) - STRUCTURED_INFORMATION_SOURCES)
+    if unknown_sources:
+        raise ValueError(
+            "information_factor_refresh sources contain unsupported values: "
+            f"{unknown_sources}"
+        )
+    weekday = payload.get("weekday", 4)
+    if isinstance(weekday, bool):
+        raise ValueError("information_factor_refresh weekday must be an integer")
+    try:
+        weekday = int(weekday)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("information_factor_refresh weekday must be an integer") from exc
+    if not 0 <= weekday <= 4:
+        raise ValueError("information_factor_refresh weekday must be between 0 and 4")
+    evaluation = _normalize_factor_evaluation(
+        payload.get("factor_evaluation"), enabled=True
+    )
+    return {
+        "sources": normalized_sources,
+        "weekday": weekday,
+        "factor_evaluation": evaluation,
     }
 
 

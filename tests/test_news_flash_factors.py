@@ -118,6 +118,17 @@ def test_load_news_drops_unparseable_timestamps(tmp_path: Path) -> None:
 
 
 @pytest.mark.no_database
+def test_load_news_honors_requested_source_range(tmp_path: Path) -> None:
+    _seed_news(tmp_path)
+    moments = m.load_news_flash_datetimes(
+        tmp_path, start=date(2024, 1, 4), end=date(2024, 1, 5)
+    )
+    assert moments.dt.date.min() == date(2024, 1, 4)
+    assert moments.dt.date.max() == date(2024, 1, 5)
+    assert len(moments) == 9
+
+
+@pytest.mark.no_database
 def test_daily_counts_use_the_1500_cutoff_and_zero_fill(tmp_path: Path) -> None:
     _seed_full(tmp_path)
     moments = m.load_news_flash_datetimes(tmp_path)
@@ -228,6 +239,8 @@ def test_process_writes_artifacts_deterministically(tmp_path: Path) -> None:
     assert manifest["rows"] == 5
     assert manifest["source"]["dataset"] == "news"
     assert manifest["source"]["producer_version"] == m.PRODUCER_VERSION
+    assert manifest["source"]["requested_start"] is None
+    assert manifest["source"]["requested_end"] is None
     assert "no look-ahead" in manifest["availability_policy"][m.INTENSITY_FACTOR_NAME]
     assert "MARKET" in manifest["instrument_convention"]
     assert manifest["sha256"] == hashlib.sha256(

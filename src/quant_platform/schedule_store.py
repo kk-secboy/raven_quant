@@ -23,6 +23,7 @@ ACTIVE_SCHEDULE_KINDS = (
     "incremental_sync",
     "data_pipeline",
     "information_pipeline",
+    "information_factor_refresh",
     "ashare_5m_sync",
     "rdagent_research",
     "recommendation_refresh",

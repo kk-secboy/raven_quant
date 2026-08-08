@@ -23,6 +23,8 @@ CONTROLLED_DOCUMENTS = {
     Path("README.md"),
     Path("docs/DEPLOYMENT.md"),
     Path("docs/design-gap-analysis.md"),
+    Path("docs/information-factor-refresh.md"),
+    Path("docs/information-pipeline-operations.md"),
     Path("docs/legacy-market-backfill.md"),
     Path("docs/pit-nlp-gap-report.md"),
     Path(MARKDOWN_NAME),
@@ -65,7 +67,7 @@ def _project_artifacts(pattern: str) -> list[Path]:
             path
             for path in PROJECT_ROOT.rglob(pattern)
             if not any(
-                part in IGNORED_ARTIFACT_PARTS
+                part in IGNORED_ARTIFACT_PARTS or part.startswith(".tmp-pytest")
                 for part in path.relative_to(PROJECT_ROOT).parts
             )
         ),

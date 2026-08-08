@@ -38,11 +38,17 @@ from .data_rollover import qlib_trading_date_on_or_before
 from .execution_algorithms import execution_time_slots
 from .external_factor_evaluation import import_external_evaluations
 from .job_store import JobStore
+from .major_news_mentions import FACTOR_NAMES as MAJOR_NEWS_MENTION_FACTOR_NAMES
+from .major_news_mentions import default_factors_dir as major_news_mentions_factors_dir
 from .market_permission import MarketPermissionStore
+from .news_flash_factors import FACTOR_NAMES as NEWS_FLASH_FACTOR_NAMES
+from .news_flash_factors import default_factors_dir as news_flash_factors_dir
 from .parameter_experiment_store import ParameterExperimentStore
 from .rdagent_runtime import rdagent_command, require_rdagent_runtime_identity
 from .recommendation_account_store import RecommendationAccountStore
 from .recommendation_store import RecommendationStore
+from .report_rc_factors import FACTOR_NAMES as REPORT_RC_FACTOR_NAMES
+from .report_rc_factors import default_factors_dir as report_rc_factors_dir
 from .research_store import ResearchStore
 from .runtime_secret_store import RuntimeSecretStore
 from .services import list_qlib_datasets, resolve_snapshot_dataset
@@ -513,7 +519,14 @@ class LocalJobWorker:
             if payload.get("regulatory_only", True):
                 command.append("--regulatory-only")
             return command, result_path, {}
-        if job["kind"] in {"announcement_nlp", "corpus_nlp", "event_market_response"}:
+        if job["kind"] in {
+            "announcement_nlp",
+            "corpus_nlp",
+            "event_market_response",
+            "report_rc_factors",
+            "major_news_mentions",
+            "news_flash_factors",
+        }:
             output = self.settings.data_root / "artifacts" / "execution-data" / job["id"]
             result_path = output / "result.json"
             command = [sys.executable, "-m", "quant_data.cli"]
@@ -575,7 +588,7 @@ class LocalJobWorker:
                         ),
                     ]
                 )
-            else:
+            elif job["kind"] == "event_market_response":
                 command.extend(
                     [
                         "event-market-response",
@@ -589,18 +602,71 @@ class LocalJobWorker:
                         str(result_path),
                     ]
                 )
+            elif job["kind"] == "report_rc_factors":
+                command.extend(
+                    [
+                        "report-rc-factors",
+                        "--start",
+                        str(payload["start"]),
+                        "--end",
+                        str(payload["end"]),
+                        "--result",
+                        str(result_path),
+                    ]
+                )
+                if payload.get("ts_codes"):
+                    command.extend(["--ts-code", ",".join(payload["ts_codes"])])
+            elif job["kind"] == "major_news_mentions":
+                command.extend(
+                    [
+                        "major-news-mentions",
+                        "--start",
+                        str(payload["start"]),
+                        "--end",
+                        str(payload["end"]),
+                        "--result",
+                        str(result_path),
+                    ]
+                )
+                if payload.get("ts_codes"):
+                    command.extend(["--ts-code", ",".join(payload["ts_codes"])])
+            else:
+                command.extend(
+                    [
+                        "news-flash-factors",
+                        "--start",
+                        str(payload["start"]),
+                        "--end",
+                        str(payload["end"]),
+                        "--result",
+                        str(result_path),
+                    ]
+                )
             return command, result_path, {}
-        if job["kind"] in {"announcement_factor_register", "corpus_factor_register"}:
+        if job["kind"] in {
+            "announcement_factor_register",
+            "corpus_factor_register",
+            "report_rc_factor_register",
+            "major_news_mentions_factor_register",
+            "news_flash_factor_register",
+        }:
             command = [sys.executable, "-m", "quant_platform.db_cli"]
-            command.append(
-                "register-announcement-factor"
-                if job["kind"] == "announcement_factor_register"
-                else "register-corpus-factor"
-            )
+            registration_commands = {
+                "announcement_factor_register": "register-announcement-factor",
+                "corpus_factor_register": "register-corpus-factor",
+                "report_rc_factor_register": "register-report-rc-factor",
+                "major_news_mentions_factor_register": (
+                    "register-major-news-mentions-factor"
+                ),
+                "news_flash_factor_register": "register-news-flash-factor",
+            }
+            command.append(registration_commands[job["kind"]])
+            if job["kind"] != "news_flash_factor_register":
+                command.extend(
+                    ["--factor-name", str(payload.get("factor_name") or "all")]
+                )
             command.extend(
                 [
-                    "--factor-name",
-                    str(payload.get("factor_name") or "all"),
                     "--actor",
                     str(payload.get("actor") or "information-pipeline-worker"),
                 ]
@@ -1910,6 +1976,12 @@ class LocalJobWorker:
                 "corpus_factor_register",
                 "event_market_response",
                 "information_factor_evaluate",
+                "report_rc_factors",
+                "report_rc_factor_register",
+                "major_news_mentions",
+                "major_news_mentions_factor_register",
+                "news_flash_factors",
+                "news_flash_factor_register",
                 *(
                     f"supplemental_{bundle}"
                     for bundle in (
@@ -2142,6 +2214,9 @@ class LocalJobWorker:
             ANNOUNCEMENT_FACTOR_NAME,
             ANNOUNCEMENT_LOGIC_FACTOR_NAME,
             *CORPUS_FACTOR_NAMES,
+            *REPORT_RC_FACTOR_NAMES,
+            *MAJOR_NEWS_MENTION_FACTOR_NAMES,
+            *NEWS_FLASH_FACTOR_NAMES,
         }
         unknown = sorted(set(names) - known)
         if unknown:
@@ -2157,11 +2232,16 @@ class LocalJobWorker:
 
         candidates: list[dict[str, object]] = []
         for name in names:
-            factor_dir = (
-                announcement_factors_dir(self.settings.data_root)
-                if name in {ANNOUNCEMENT_FACTOR_NAME, ANNOUNCEMENT_LOGIC_FACTOR_NAME}
-                else corpus_factors_dir(self.settings.data_root)
-            )
+            if name in {ANNOUNCEMENT_FACTOR_NAME, ANNOUNCEMENT_LOGIC_FACTOR_NAME}:
+                factor_dir = announcement_factors_dir(self.settings.data_root)
+            elif name in CORPUS_FACTOR_NAMES:
+                factor_dir = corpus_factors_dir(self.settings.data_root)
+            elif name in REPORT_RC_FACTOR_NAMES:
+                factor_dir = report_rc_factors_dir(self.settings.data_root)
+            elif name in MAJOR_NEWS_MENTION_FACTOR_NAMES:
+                factor_dir = major_news_mentions_factors_dir(self.settings.data_root)
+            else:
+                factor_dir = news_flash_factors_dir(self.settings.data_root)
             manifest_path = factor_dir / f"{name}.json"
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

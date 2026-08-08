@@ -23,7 +23,9 @@ from .continuous_research import ContinuousResearchController
 from .data_rollover import select_qlib_dataset
 from .health_store import OperationalHealthStore
 from .information_schedule import (
+    STRUCTURED_INFORMATION_STARTS,
     latest_verified_snapshot,
+    normalize_information_factor_refresh_payload,
     normalize_information_schedule_payload,
     resolve_information_evaluation_dataset,
 )
@@ -70,6 +72,12 @@ INFORMATION_CONFLICTING_JOB_KINDS = (
     "corpus_factor_register",
     "event_market_response",
     "information_factor_evaluate",
+    "report_rc_factors",
+    "report_rc_factor_register",
+    "major_news_mentions",
+    "major_news_mentions_factor_register",
+    "news_flash_factors",
+    "news_flash_factor_register",
     "data_verify",
     "data_snapshot",
     "data_qlib",
@@ -254,6 +262,10 @@ class SchedulerEngine:
                 job = self._enqueue_data_pipeline(run, scheduled_for)
             elif run["kind"] == "information_pipeline":
                 job = self._enqueue_information_pipeline(run, scheduled_for)
+                if job is None:
+                    return
+            elif run["kind"] == "information_factor_refresh":
+                job = self._enqueue_information_factor_refresh(run, scheduled_for)
                 if job is None:
                     return
             elif run["kind"] == "ashare_5m_sync":
@@ -544,6 +556,160 @@ class SchedulerEngine:
                 "limit": payload["download_limit"],
                 "regulatory_only": payload["regulatory_only"],
             },
+            log_path,
+            idempotency_key=pipeline_id,
+        )
+
+    def _enqueue_information_factor_refresh(
+        self,
+        run: dict[str, Any],
+        scheduled_for: datetime,
+    ) -> dict[str, Any] | None:
+        """Enqueue one weekly, full-history structured information refresh."""
+
+        payload = normalize_information_factor_refresh_payload(run["payload"])
+        local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
+        if local_date.weekday() != payload["weekday"]:
+            self.schedules.finish_run(
+                run["id"],
+                "skipped",
+                message=(
+                    "information factor refresh is scheduled for weekday "
+                    f"{payload['weekday']}"
+                ),
+            )
+            return None
+        active = self.jobs.count(
+            statuses=("queued", "running"),
+            kinds=INFORMATION_CONFLICTING_JOB_KINDS,
+        )
+        if active:
+            self.schedules.finish_run(
+                run["id"],
+                "skipped",
+                message=f"{active} conflicting data or information job(s) already active",
+            )
+            return None
+
+        evaluation = payload["factor_evaluation"]
+        evaluation_dataset = resolve_information_evaluation_dataset(
+            self.settings.data_root, evaluation
+        )
+        end = local_date.isoformat()
+        stages: list[dict[str, Any]] = []
+        factor_names: list[str] = []
+        selected = set(payload["sources"])
+        if "report_rc" in selected:
+            from .report_rc_factors import FACTOR_NAMES as report_rc_factor_names
+
+            stages.extend(
+                [
+                    {
+                        "kind": "report_rc_factors",
+                        "payload": {
+                            "start": STRUCTURED_INFORMATION_STARTS[
+                                "report_rc"
+                            ].isoformat(),
+                            "end": end,
+                            "ts_codes": [],
+                        },
+                    },
+                    {
+                        "kind": "report_rc_factor_register",
+                        "payload": {
+                            "factor_name": "all",
+                            "actor": "information-scheduler",
+                        },
+                    },
+                ]
+            )
+            factor_names.extend(report_rc_factor_names)
+        if "major_news_mentions" in selected:
+            from .major_news_mentions import FACTOR_NAMES as mention_factor_names
+
+            stages.extend(
+                [
+                    {
+                        "kind": "major_news_mentions",
+                        "payload": {
+                            "start": STRUCTURED_INFORMATION_STARTS[
+                                "major_news_mentions"
+                            ].isoformat(),
+                            "end": end,
+                            "ts_codes": [],
+                        },
+                    },
+                    {
+                        "kind": "major_news_mentions_factor_register",
+                        "payload": {
+                            "factor_name": "all",
+                            "actor": "information-scheduler",
+                        },
+                    },
+                ]
+            )
+            factor_names.extend(mention_factor_names)
+        if "news_flash" in selected:
+            from .news_flash_factors import FACTOR_NAMES as news_flash_factor_names
+
+            stages.extend(
+                [
+                    {
+                        "kind": "news_flash_factors",
+                        "payload": {
+                            "start": STRUCTURED_INFORMATION_STARTS[
+                                "news_flash"
+                            ].isoformat(),
+                            "end": end,
+                        },
+                    },
+                    {
+                        "kind": "news_flash_factor_register",
+                        "payload": {"actor": "information-scheduler"},
+                    },
+                ]
+            )
+            factor_names.extend(news_flash_factor_names)
+        stages.append(
+            {
+                "kind": "information_factor_evaluate",
+                "payload": {
+                    "dataset": evaluation["dataset"],
+                    "dataset_path": evaluation_dataset["path"],
+                    "dataset_identity_sha256": evaluation_dataset["provenance"][
+                        "dataset_identity_sha256"
+                    ],
+                    "periods": evaluation["periods"],
+                    "universe": evaluation["universe"],
+                    "benchmark": evaluation["benchmark"],
+                    "factor_names": sorted(set(factor_names)),
+                },
+            }
+        )
+        first, *remaining = stages
+        pipeline_name = f"information-factors-{local_date:%Y%m%d}"
+        pipeline_id = f"schedule-run:{run['id']}"
+        first_payload = {
+            "pipeline_id": pipeline_id,
+            "profile": "information_factor_refresh",
+            "start": min(
+                STRUCTURED_INFORMATION_STARTS[source] for source in selected
+            ).isoformat(),
+            "end": end,
+            "snapshot_name": pipeline_name,
+            "pipeline_steps": remaining,
+            "pipeline_next_index": 0,
+            **first["payload"],
+        }
+        log_path = (
+            self.settings.data_root
+            / "platform"
+            / "logs"
+            / f"scheduled-information-factors-{run['id']}.log"
+        )
+        return self.jobs.create(
+            first["kind"],
+            first_payload,
             log_path,
             idempotency_key=pipeline_id,
         )

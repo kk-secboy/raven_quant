@@ -263,6 +263,120 @@ def test_information_schedule_skips_when_a_conflicting_job_is_active(
     assert JobStore(database_url).list()[0]["id"] == active["id"]
 
 
+def test_scheduler_creates_weekly_structured_information_factor_refresh(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    current = datetime(2025, 1, 2, 13, 29, tzinfo=UTC)  # Thursday in Shanghai
+    monkeypatch.setattr(
+        "quant_platform.scheduler.resolve_information_evaluation_dataset",
+        lambda _root, _evaluation: {
+            "name": "qlib-frozen",
+            "path": str(tmp_path / "data" / "qlib" / "qlib-frozen"),
+            "provenance": {"dataset_identity_sha256": "a" * 64},
+        },
+    )
+    evaluation = {
+        "dataset": "qlib-frozen",
+        "periods": {
+            "train_start": "2010-01-01",
+            "train_end": "2019-12-31",
+            "valid_start": "2020-01-01",
+            "valid_end": "2022-12-31",
+            "test_start": "2023-01-09",
+            "test_end": "2025-01-02",
+        },
+        "universe": "cn_all",
+        "benchmark": "SH000300",
+    }
+    store = ScheduleStore(database_url)
+    store.create(
+        name="weekly structured information factors",
+        kind="information_factor_refresh",
+        timezone="Asia/Shanghai",
+        run_time=time(21, 30),
+        trading_days_only=True,
+        payload={
+            "weekday": 3,
+            "sources": ["report_rc", "major_news_mentions", "news_flash"],
+            "factor_evaluation": evaluation,
+        },
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+
+    result = SchedulerEngine(_settings(database_url, tmp_path)).tick(
+        current + timedelta(minutes=2)
+    )
+
+    assert result["processed"] == 1
+    run = store.list_runs()[0]
+    assert run["status"] == "enqueued"
+    job = JobStore(database_url).get(run["job_id"])
+    assert job["kind"] == "report_rc_factors"
+    assert job["payload"]["start"] == "2010-01-01"
+    assert job["payload"]["end"] == "2025-01-02"
+    steps = job["payload"]["pipeline_steps"]
+    assert [step["kind"] for step in steps] == [
+        "report_rc_factor_register",
+        "major_news_mentions",
+        "major_news_mentions_factor_register",
+        "news_flash_factors",
+        "news_flash_factor_register",
+        "information_factor_evaluate",
+    ]
+    assert steps[1]["payload"]["start"] == "2018-11-20"
+    assert steps[3]["payload"]["start"] == "2018-11-20"
+    assert steps[-1]["payload"]["factor_names"] == [
+        "major_news_mention_count_daily",
+        "major_news_mention_sentiment_daily",
+        "news_flash_intensity_daily",
+        "report_rc_coverage_20d",
+        "report_rc_eps_revision",
+        "report_rc_rating_change",
+    ]
+
+
+def test_structured_information_refresh_skips_nonmatching_weekday(
+    database_url: str, tmp_path: Path
+) -> None:
+    current = datetime(2025, 1, 2, 13, 29, tzinfo=UTC)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="friday structured information factors",
+        kind="information_factor_refresh",
+        timezone="Asia/Shanghai",
+        run_time=time(21, 30),
+        trading_days_only=True,
+        payload={
+            "weekday": 4,
+            "factor_evaluation": {
+                "dataset": "qlib-frozen",
+                "periods": {
+                    "train_start": "2010-01-01",
+                    "train_end": "2019-12-31",
+                    "valid_start": "2020-01-01",
+                    "valid_end": "2022-12-31",
+                    "test_start": "2023-01-09",
+                    "test_end": "2025-01-02",
+                },
+            },
+        },
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+
+    SchedulerEngine(_settings(database_url, tmp_path)).tick(
+        current + timedelta(minutes=2)
+    )
+
+    run = store.list_runs()[0]
+    assert run["status"] == "skipped"
+    assert "weekday 4" in run["message"]
+    assert JobStore(database_url).list() == []
+
+
 def test_scheduler_creates_daily_full_a_share_five_minute_increment(
     database_url: str, tmp_path: Path
 ) -> None:

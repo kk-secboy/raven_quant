@@ -9,8 +9,10 @@ import pytest
 
 from quant_platform import information_schedule as schedule_module
 from quant_platform.announcement_nlp import FACTOR_NAME
+from quant_platform.api import ScheduleCreateRequest
 from quant_platform.information_schedule import (
     latest_verified_snapshot,
+    normalize_information_factor_refresh_payload,
     normalize_information_schedule_payload,
 )
 from quant_platform.worker import LocalJobWorker
@@ -48,6 +50,100 @@ def test_information_schedule_is_raw_only_and_bounded_by_default() -> None:
     assert payload["factor_evaluation"] is None
     assert payload["announcement_nlp_limit"] == 500
     assert payload["corpus_nlp_limit"] == 500
+
+
+def test_information_factor_refresh_requires_sources_weekday_and_frozen_evaluation() -> None:
+    evaluation = {
+        "dataset": "qlib-frozen",
+        "periods": {
+            "train_start": "2010-01-01",
+            "train_end": "2019-12-31",
+            "valid_start": "2020-01-01",
+            "valid_end": "2022-12-31",
+            "test_start": "2023-01-09",
+            "test_end": "2026-08-03",
+        },
+    }
+    payload = normalize_information_factor_refresh_payload(
+        {
+            "sources": ["news_flash", "report_rc", "news_flash"],
+            "weekday": 4,
+            "factor_evaluation": evaluation,
+        }
+    )
+    assert payload["sources"] == ["news_flash", "report_rc"]
+    assert payload["weekday"] == 4
+    assert payload["factor_evaluation"]["dataset"] == "qlib-frozen"
+
+    with pytest.raises(ValueError, match="non-empty"):
+        normalize_information_factor_refresh_payload(
+            {"sources": [], "factor_evaluation": evaluation}
+        )
+    with pytest.raises(ValueError, match="between 0 and 4"):
+        normalize_information_factor_refresh_payload(
+            {"weekday": 6, "factor_evaluation": evaluation}
+        )
+    with pytest.raises(ValueError, match="unsupported values"):
+        normalize_information_factor_refresh_payload(
+            {"sources": ["social_media"], "factor_evaluation": evaluation}
+        )
+
+    request = ScheduleCreateRequest(
+        name="weekly structured information factors",
+        kind="information_factor_refresh",
+        payload={
+            "sources": ["report_rc"],
+            "weekday": 4,
+            "factor_evaluation": evaluation,
+        },
+    )
+    assert request.kind == "information_factor_refresh"
+
+
+def test_structured_information_steps_are_allowed_in_durable_chain(
+    tmp_path: Path,
+) -> None:
+    class FakeStore:
+        def create(self, kind, payload, log_path, *, idempotency_key):
+            return {
+                "id": idempotency_key,
+                "kind": kind,
+                "payload": payload,
+                "log_path": str(log_path),
+            }
+
+    worker = object.__new__(LocalJobWorker)
+    worker.settings = SimpleNamespace(data_root=tmp_path / "data")
+    worker.store = FakeStore()
+    worker.notify = lambda: None
+    kinds = [
+        "report_rc_factor_register",
+        "major_news_mentions",
+        "major_news_mentions_factor_register",
+        "news_flash_factors",
+        "news_flash_factor_register",
+        "information_factor_evaluate",
+    ]
+    current = {
+        "kind": "report_rc_factors",
+        "payload": {
+            "pipeline_id": "structured-information-fixture",
+            "profile": "information_factor_refresh",
+            "start": "2010-01-01",
+            "end": "2026-08-03",
+            "snapshot_name": "information-factors-20260803",
+            "pipeline_steps": [
+                {"kind": kind, "payload": {}} for kind in kinds
+            ],
+            "pipeline_next_index": 0,
+        },
+    }
+    created = []
+    for kind in kinds:
+        current = worker._queue_data_pipeline_successor(current)
+        assert current["kind"] == kind
+        created.append(current)
+    assert worker._has_data_pipeline_successor(created[-1]) is False
 
 
 def test_information_schedule_requires_explicit_nlp_and_finite_limits() -> None:

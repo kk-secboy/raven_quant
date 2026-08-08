@@ -11,6 +11,7 @@ TUSHARE_NEWS_HISTORY_START = date(2018, 11, 20)
 TUSHARE_HISTORY_STARTS: dict[str, date] = {
     "news": TUSHARE_NEWS_HISTORY_START,
     "major_news": TUSHARE_NEWS_HISTORY_START,
+    "report_rc": date(2010, 1, 1),
     "moneyflow": date(2010, 1, 1),
     "margin_detail": date(2010, 1, 1),
     "repurchase": date(2011, 1, 1),

@@ -70,7 +70,10 @@ from .data_rollover import select_qlib_dataset
 from .data_task_store import DataTaskStore
 from .deployment_readiness import DeploymentReadinessStore
 from .health_store import OperationalHealthStore
-from .information_schedule import normalize_information_schedule_payload
+from .information_schedule import (
+    normalize_information_factor_refresh_payload,
+    normalize_information_schedule_payload,
+)
 from .job_store import JobStore
 from .market_overview import MarketOverviewService
 from .model_artifact_store import ModelArtifactStore
@@ -1119,6 +1122,7 @@ class ScheduleCreateRequest(BaseModel):
         "incremental_sync",
         "data_pipeline",
         "information_pipeline",
+        "information_factor_refresh",
         "ashare_5m_sync",
         "rdagent_research",
         "recommendation_refresh",
@@ -1159,6 +1163,8 @@ class ScheduleCreateRequest(BaseModel):
                 raise ValueError("ashare_5m_sync lookback_days must be between 1 and 30")
         elif self.kind == "information_pipeline":
             normalize_information_schedule_payload(self.payload)
+        elif self.kind == "information_factor_refresh":
+            normalize_information_factor_refresh_payload(self.payload)
         elif self.kind in {"weekly_report", "monthly_decision_day", "preopen_check"}:
             # Operational run-calendar kinds carry no profile/bundle payload;
             # an optional Qlib dataset anchor name is the only recognized key.

@@ -228,6 +228,55 @@ def test_worker_builds_market_response_label_command(tmp_path: Path) -> None:
     assert environment == {}
 
 
+def test_worker_builds_structured_information_factor_commands(tmp_path: Path) -> None:
+    worker = _worker(tmp_path)
+    producer_jobs = (
+        ("report_rc_factors", "report-rc-factors"),
+        ("major_news_mentions", "major-news-mentions"),
+        ("news_flash_factors", "news-flash-factors"),
+    )
+    for kind, cli_command in producer_jobs:
+        command, result_path, environment = worker._command(
+            {
+                "id": f"{kind}-job",
+                "kind": kind,
+                "payload": {
+                    "start": "2018-11-20",
+                    "end": "2026-08-03",
+                    "ts_codes": [],
+                },
+            }
+        )
+        assert cli_command in command
+        assert command[command.index("--start") + 1] == "2018-11-20"
+        assert command[command.index("--end") + 1] == "2026-08-03"
+        assert result_path.name == "result.json"
+        assert environment == {}
+
+    registrations = (
+        ("report_rc_factor_register", "register-report-rc-factor", True),
+        (
+            "major_news_mentions_factor_register",
+            "register-major-news-mentions-factor",
+            True,
+        ),
+        ("news_flash_factor_register", "register-news-flash-factor", False),
+    )
+    for kind, cli_command, has_factor_name in registrations:
+        command, result_path, environment = worker._command(
+            {
+                "id": f"{kind}-job",
+                "kind": kind,
+                "payload": {"factor_name": "all", "actor": "fixture"},
+            }
+        )
+        assert cli_command in command
+        assert ("--factor-name" in command) is has_factor_name
+        assert command[-2:] == ["--actor", "fixture"]
+        assert result_path is None
+        assert environment == {}
+
+
 def test_worker_builds_external_factor_evaluation_command(tmp_path: Path) -> None:
     worker = _worker(tmp_path)
     values_path = tmp_path / "logic.parquet"

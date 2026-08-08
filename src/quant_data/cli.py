@@ -2111,22 +2111,39 @@ def major_news_mentions_command(
 
 @app.command("news-flash-factors")
 def news_flash_factors_command(
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD publication date")] = "2018-11-20",
+    end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
     result_path: Annotated[Path | None, typer.Option("--result")] = None,
 ) -> None:
     """Build the market-level news-flash intensity factor artifact."""
+    start_date = parse_date(start)
+    end_date = parse_date(end, latest=today_cn())
+    if end_date < start_date:
+        raise typer.BadParameter("end must not be before start")
     context = load_context(
         require_credentials=False,
         progress_path=result_path,
-        progress_target={"kind": "news_flash_factors"},
+        progress_target={
+            "kind": "news_flash_factors",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
     )
     context.report_progress(
         "processing", "news flash intensity factor production", {"news"}, force=True
     )
     summary = _produce_factors(
         "news-flash-factors",
-        lambda: process_news_flash(context.settings.data_root),
+        lambda: process_news_flash(
+            context.settings.data_root, start=start_date, end=end_date
+        ),
     )
-    result = {"dataset": "news", **summary.as_dict()}
+    result = {
+        "dataset": "news",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        **summary.as_dict(),
+    }
     _write_optional_result(result_path, result)
     console.print_json(json.dumps(result, ensure_ascii=False))
 
