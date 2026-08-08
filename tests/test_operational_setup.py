@@ -88,6 +88,21 @@ def test_worker_accepts_every_supplemental_download_bundle() -> None:
         assert f"supplemental_{bundle}" in compose
 
 
+@pytest.mark.no_database
+def test_worker_accepts_governed_information_jobs() -> None:
+    root = Path(__file__).resolve().parents[1]
+    compose = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+
+    for kind in (
+        "announcement_nlp",
+        "corpus_nlp",
+        "event_market_response",
+        "external_factor_evaluate",
+    ):
+        assert kind in compose
+    assert "REQUESTS_PER_MINUTE: ${REQUESTS_PER_MINUTE:-99}" in compose
+
+
 def test_factor_sandbox_is_seeded_offline_from_the_release_worker() -> None:
     root = Path(__file__).resolve().parents[1]
     compose = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
