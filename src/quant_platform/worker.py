@@ -450,6 +450,26 @@ class LocalJobWorker:
                 str(result_path),
             ]
             return command, result_path, {}
+        if job["kind"] == "cninfo_announcements_download":
+            output = self.settings.data_root / "artifacts" / "execution-data" / job["id"]
+            result_path = output / "result.json"
+            command = [
+                sys.executable,
+                "-m",
+                "quant_data.cli",
+                "cninfo-announcements",
+                "--start",
+                str(payload["start"]),
+                "--end",
+                str(payload["end"]),
+                "--result",
+                str(result_path),
+            ]
+            if payload.get("ts_codes"):
+                command.extend(["--ts-code", ",".join(payload["ts_codes"])])
+            if int(payload.get("limit") or 0) > 0:
+                command.extend(["--limit", str(payload["limit"])])
+            return command, result_path, {}
         if job["kind"] in {
             "margin_eligibility_download",
             "core_intraday_download",

@@ -12,12 +12,38 @@ from typer.testing import CliRunner
 
 from quant_data import cninfo_announcements as cninfo
 from quant_data.cli import app
+from quant_data.config import Settings
 from quant_data.rate_limit import GlobalRateGate
+from quant_platform.worker import LocalJobWorker
 
 pytestmark = pytest.mark.no_database
 
 NOW = datetime(2026, 7, 18, 12, 0, 0, tzinfo=UTC)
 OPEN_DAYS = [date(2024, 1, 2), date(2024, 1, 3), date(2024, 1, 4), date(2024, 1, 5)]
+
+
+def test_worker_builds_resumable_cninfo_download_command(tmp_path: Path) -> None:
+    worker = LocalJobWorker.__new__(LocalJobWorker)
+    worker.settings = Settings(api_url="", token="", data_root=tmp_path)
+
+    command, result_path, environment = worker._command(
+        {
+            "id": "announcement-job",
+            "kind": "cninfo_announcements_download",
+            "payload": {
+                "start": "2024-01-01",
+                "end": "2026-08-03",
+                "ts_codes": ["000001.SZ", "600519.SH"],
+                "limit": 25,
+            },
+        }
+    )
+
+    assert "cninfo-announcements" in command
+    assert "000001.SZ,600519.SH" in command
+    assert "25" in command
+    assert result_path == tmp_path / "artifacts/execution-data/announcement-job/result.json"
+    assert environment == {}
 
 
 def _pdf(label: str) -> bytes:

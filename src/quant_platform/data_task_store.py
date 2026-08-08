@@ -677,6 +677,7 @@ class DataTaskStore:
             "margin_eligibility_download": "cn_margin_eligibility",
             "core_intraday_download": "pair_execution_1m",
             "ashare_5m_download": "cn_ashare_5m",
+            "cninfo_announcements_download": "cn_cninfo_announcements",
         }
         rows = connection.execute(
             select(

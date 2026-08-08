@@ -83,6 +83,21 @@ def test_catalog_tracks_each_finalize_pipeline_stage(database_url: str, tmp_path
     assert tasks["cn_snapshot_build"]["status"] == "planned"
 
 
+def test_catalog_binds_cninfo_announcement_download(database_url: str, tmp_path: Path) -> None:
+    job = JobStore(database_url).create(
+        "cninfo_announcements_download",
+        {"start": "2024-01-01", "end": "2026-08-03"},
+        tmp_path / "announcements.log",
+    )
+
+    store = DataTaskStore(database_url)
+    store.sync_catalog()
+    task = next(item for item in store.list() if item["task_key"] == "cn_cninfo_announcements")
+
+    assert task["job_id"] == job["id"]
+    assert task["status"] == "queued"
+
+
 def test_newer_pipeline_stage_supersedes_legacy_bootstrap_failure(
     database_url: str, tmp_path: Path
 ) -> None:

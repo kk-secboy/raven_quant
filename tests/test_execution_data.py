@@ -431,6 +431,17 @@ def test_execution_data_api_and_worker_commands(
     assert minute_qlib.status_code == 202
     assert minute_research.status_code == 202
 
+    announcements = JobStore(database_url).create(
+        "cninfo_announcements_download",
+        {
+            "start": "2024-01-01",
+            "end": "2024-01-31",
+            "ts_codes": ["000001.SZ", "600519.SH"],
+            "limit": 25,
+        },
+        tmp_path / "announcements.log",
+    )
+
     settings = Settings(
         api_url="",
         token="",
@@ -458,6 +469,7 @@ def test_execution_data_api_and_worker_commands(
     minute_research_command, minute_research_result, minute_research_env = worker._command(
         minute_research.json()
     )
+    announcement_command, announcement_result, announcement_env = worker._command(announcements)
     assert "margin-eligibility" in margin_command
     assert "core-intraday" in intraday_command
     assert margin_result.name == "result.json"
@@ -495,6 +507,11 @@ def test_execution_data_api_and_worker_commands(
     assert settings.mlflow_tracking_uri in minute_research_command
     assert minute_research_result.name == "result.json"
     assert set(minute_research_env) == {"_MLFLOW_SERVER_ARTIFACT_ROOT"}
+    assert "cninfo-announcements" in announcement_command
+    assert "000001.SZ,600519.SH" in announcement_command
+    assert "25" in announcement_command
+    assert announcement_result.name == "result.json"
+    assert announcement_env == {}
 
 
 def test_minute_qlib_api_rejects_daily_snapshot(
