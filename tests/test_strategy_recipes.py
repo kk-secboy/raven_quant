@@ -66,6 +66,10 @@ def test_document_strategy_recipes_are_versioned_and_defensive() -> None:
         1.0
     )
 
+    multifactor = get_strategy_recipe("full_market_multifactor")
+    assert "mf_net_inflow_ratio" in multifactor["rdagent_objective"]
+    assert "市场认可度训练标签" in multifactor["rdagent_objective"]
+
     recipes[0]["config_overrides"]["topk"] = 999
     assert get_strategy_recipe("index_enhancement")["config_overrides"]["topk"] == 100
 

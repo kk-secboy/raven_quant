@@ -187,3 +187,10 @@ Tushare `report_rc`（券商研报盈利预测与评级，cn_institutional 任�
 - **Qlib 评估接线**：新增 `external_factor_evaluate` durable job/API。任务只接受带外部来源身份、代码/数值 artifact 与 sha256 的候选，绑定可复现日线 Qlib 数据集身份、训练/验证/最终测试窗口及 purge/embargo 间隔；复用 `evaluate_external_factor_batch.py` 的 sparse-event/market-timeseries、HAC、BH-FDR、成本和泄漏哨兵评估，并把通过、证据不足和运行失败全部写入 `factor_evaluations` 审计账本。
 - **限流与恢复**：Tushare 中转站按运营方最新确认改为 99 次/分钟上限（100 次限制保留 1 次余量）；巨潮正文长任务每 100 条原子刷新 index/download-log 并更新 job progress，避免只在任务结束时才出现 checkpoint。
 - **覆盖边界**：逻辑与市场认可度只能覆盖真实落盘且有文本层的公告；当前生产正文任务收敛为 2024 年以来监管类高信号 PDF。不能追溯或未下载的公告不计覆盖，扫描件无文本层时 fail-closed，不用模型虚构字段。
+
+## 十二、资金面进入 Qlib / RD-Agent（2026-08-08 追加）
+
+- **真实数据边界**：资金面使用 Tushare 官方 `moneyflow` 个股逐日主动买卖单数据；官方文档声明接口从 2010 年开始、金额字段单位为万元。2026-08-08 对生产不可变快照 `cn-20080101-20260803-20260808T033243Z` 的实测为 10,630,216 行、5,649 只证券、最早 2016-01-04、最晚 2026-07-29，关键金额列均有值且 `(ts_code, trade_date)` 无重复。生产覆盖只认 2016-01-04 起的真实落盘范围，不把官方理论起点或 2008 年补成伪数据。
+- **紧凑资金面通道**：`qlib_builder.py` 研究字段契约升为 v5，新增三个 Qlib 字段：`mf_net_inflow_amount = net_mf_amount × 10000`（元）、`mf_net_inflow_ratio = net_mf_amount × 10 / daily.amount`（净流入/当日成交额）及 `mf_large_order_imbalance = (大单+特大单主动买入额 - 主动卖出额) / 主动买卖总额`。不把九个高度共线的原始分档列全部灌入模型。
+- **PIT 与质量门**：`moneyflow` 注册为 `same_trade_date_after_close`、`native_history`；只与同股票同交易日行情连接，供当日收盘后的下一决策/下一 Bar 使用。缺少数据集、主键、关键金额列或任何可用行时 Qlib 构建直接失败；来源列缺失和全 NULL 分开记录在 provenance，金额统一换算为元并写入字段单位。
+- **RD-Agent 约束**：全市场行业中性配方升级为 `qlib-rdagent-single-mainline-2026-08-08-v4`，明确允许研究上述资金面字段；公告、研报、新闻、情绪与逻辑因子仍只能走受治理外部因子评估/晋级 artifact，事件后市场认可度只能作训练标签，禁止写回实时特征。

@@ -79,6 +79,30 @@ _DAILY_RESEARCH_FIELDS = (
     "circ_mv",
 )
 
+# The official ``moneyflow`` endpoint is a per-stock, per-session order-flow
+# decomposition.  Source amounts are ten-thousand CNY and are known only after
+# that session closes.  Keep the Qlib surface compact: one amount channel plus
+# two scale-free descriptors are enough for RD-Agent/Qlib to research capital
+# flow without exposing nine highly collinear raw order-size columns.
+_CAPITAL_FLOW_FEATURE_REQUIREMENTS = {
+    "mf_net_inflow_amount": frozenset({"net_mf_amount"}),
+    "mf_net_inflow_ratio": frozenset({"net_mf_amount"}),
+    "mf_large_order_imbalance": frozenset(
+        {
+            "buy_lg_amount",
+            "sell_lg_amount",
+            "buy_elg_amount",
+            "sell_elg_amount",
+        }
+    ),
+}
+
+_CAPITAL_FLOW_FIELD_UNITS = {
+    "mf_net_inflow_amount": "cny_yuan",
+    "mf_net_inflow_ratio": "ratio_unitless",
+    "mf_large_order_imbalance": "ratio_unitless",
+}
+
 # Fundamental research fields dumped into the Qlib binaries, grouped by the
 # source statement table. Every table feeds the same point-in-time channel:
 # an ASOF join keyed on the announcement date (trade_date > ann_date), never
@@ -379,7 +403,9 @@ class QlibBuilder:
 
         units = dict(_DAILY_FIELD_UNITS)
         for field in self.research_feature_contract["fields"]:
-            unit = _FUNDAMENTAL_FIELD_UNITS.get(field)
+            unit = _FUNDAMENTAL_FIELD_UNITS.get(field) or _CAPITAL_FLOW_FIELD_UNITS.get(
+                field
+            )
             if unit is not None:
                 units[field] = unit
         return units
@@ -1255,6 +1281,7 @@ class QlibBuilder:
         limits = _sql_string(str(limit_glob.resolve()))
         daily_features = self.research_feature_contract["daily_fields"]
         fundamental_features = self.research_feature_contract["fundamental_fields"]
+        capital_flow_features = self.research_feature_contract["capital_flow_fields"]
         daily_basic_root = self.snapshot_path / "parquet" / "daily_basic"
 
         joined_daily_select = ""
@@ -1273,6 +1300,57 @@ class QlibBuilder:
                 ) db
                   ON d.ts_code = db.ts_code
                  AND try_cast(d.trade_date AS DATE) = try_cast(db.trade_date AS DATE)
+            """
+
+        capital_flow_select = ""
+        capital_flow_join = ""
+        if capital_flow_features:
+            moneyflow = _sql_string(
+                str(
+                    (
+                        self.snapshot_path
+                        / "parquet"
+                        / "moneyflow"
+                        / "**"
+                        / "*.parquet"
+                    ).resolve()
+                )
+            )
+            large_buy = (
+                "try_cast(mf.buy_lg_amount AS DOUBLE) + "
+                "try_cast(mf.buy_elg_amount AS DOUBLE)"
+            )
+            large_sell = (
+                "try_cast(mf.sell_lg_amount AS DOUBLE) + "
+                "try_cast(mf.sell_elg_amount AS DOUBLE)"
+            )
+            capital_flow_expressions = {
+                # Tushare moneyflow amounts are ten-thousand CNY.
+                "mf_net_inflow_amount": (
+                    "try_cast(mf.net_mf_amount AS DOUBLE) * 10000.0"
+                ),
+                # Daily amount is thousand CNY, hence net_mf_amount * 10 / amount.
+                "mf_net_inflow_ratio": (
+                    "CASE WHEN try_cast(d.amount AS DOUBLE) > 0 "
+                    "THEN try_cast(mf.net_mf_amount AS DOUBLE) * 10.0 "
+                    "/ try_cast(d.amount AS DOUBLE) END"
+                ),
+                "mf_large_order_imbalance": (
+                    f"CASE WHEN ({large_buy}) + ({large_sell}) > 0 "
+                    f"THEN (({large_buy}) - ({large_sell})) "
+                    f"/ (({large_buy}) + ({large_sell})) END"
+                ),
+            }
+            capital_flow_select = "".join(
+                f"\n                    , {capital_flow_expressions[field]} AS {field}"
+                for field in capital_flow_features
+            )
+            capital_flow_join = f"""
+                LEFT JOIN read_parquet(
+                    {moneyflow}, hive_partitioning=true, union_by_name=true
+                ) mf
+                  ON d.ts_code = mf.ts_code
+                 AND try_cast(d.trade_date AS DATE) = try_cast(mf.trade_date AS DATE)
             """
 
         joined_fundamental_select = ""
@@ -1324,6 +1402,7 @@ class QlibBuilder:
                     coalesce(l.down_limit, 0.0) AS down_limit
                     {joined_daily_select}
                     {joined_fundamental_select}
+                    {capital_flow_select}
                     , first_value(d.close * a.adj_factor) OVER (
                         PARTITION BY d.ts_code ORDER BY d.trade_date
                     ) AS base_price
@@ -1334,6 +1413,7 @@ class QlibBuilder:
                   ON d.ts_code = l.ts_code AND d.trade_date = l.trade_date
                 {daily_join}
                 {fundamental_join}
+                {capital_flow_join}
                 WHERE d.ts_code IS NOT NULL AND d.close IS NOT NULL
             )
             SELECT
@@ -1362,6 +1442,7 @@ class QlibBuilder:
                     for features in fundamental_features.values()
                     for target in features.values()
                 )}
+                {''.join(f', {field}' for field in capital_flow_features)}
             FROM joined
             WHERE adj_factor IS NOT NULL AND adj_factor > 0 AND base_price > 0
               AND NOT ({self._invalid_daily_units_predicate("")})
@@ -1389,6 +1470,7 @@ class QlibBuilder:
 
     def _research_feature_contract(self) -> dict[str, object]:
         daily_columns = self._parquet_columns("daily_basic")
+        capital_flow_columns = self._parquet_columns("moneyflow")
         fundamental_columns = {
             dataset: self._parquet_columns(dataset)
             for dataset in _FUNDAMENTAL_RESEARCH_FIELDS
@@ -1423,6 +1505,16 @@ class QlibBuilder:
             for dataset, fields in missing_fundamental_fields.items()
             if fields
         }
+        capital_flow_fields = [
+            target
+            for target, required in _CAPITAL_FLOW_FEATURE_REQUIREMENTS.items()
+            if required.issubset(capital_flow_columns)
+        ]
+        missing_capital_flow_fields = {
+            target: sorted(required - capital_flow_columns)
+            for target, required in _CAPITAL_FLOW_FEATURE_REQUIREMENTS.items()
+            if not required.issubset(capital_flow_columns)
+        }
         # Distinguish "source column does not exist" from "source column
         # exists but holds no non-null value": both keep a field out of the
         # dumped binaries (an all-null channel carries no signal), but only
@@ -1441,20 +1533,49 @@ class QlibBuilder:
             for dataset, fields in all_null_fundamental_fields.items()
             if fields
         }
-        if missing_daily_fields or missing_fundamental_fields:
+        admitted_capital_sources = set().union(
+            *(
+                _CAPITAL_FLOW_FEATURE_REQUIREMENTS[target]
+                for target in capital_flow_fields
+            )
+        ) if capital_flow_fields else set()
+        all_null_capital_sources = self._all_null_columns(
+            "moneyflow", admitted_capital_sources
+        )
+        all_null_capital_flow_fields = {
+            target: sorted(
+                _CAPITAL_FLOW_FEATURE_REQUIREMENTS[target]
+                & all_null_capital_sources
+            )
+            for target in capital_flow_fields
+            if _CAPITAL_FLOW_FEATURE_REQUIREMENTS[target]
+            & all_null_capital_sources
+        }
+        if (
+            missing_daily_fields
+            or missing_fundamental_fields
+            or missing_capital_flow_fields
+        ):
             logger.warning(
                 "research field contract drift: declared source columns absent "
                 "from snapshot parquets (fields skipped, not injected): "
-                "daily_basic=%s fundamentals=%s",
+                "daily_basic=%s fundamentals=%s moneyflow=%s",
                 missing_daily_fields,
                 missing_fundamental_fields,
+                missing_capital_flow_fields,
             )
-        if all_null_daily_fields or all_null_fundamental_fields:
+        if (
+            all_null_daily_fields
+            or all_null_fundamental_fields
+            or all_null_capital_flow_fields
+        ):
             logger.warning(
                 "research field sources contain only null values (fields "
-                "injected as all-NaN channels): daily_basic=%s fundamentals=%s",
+                "injected as all-NaN channels): daily_basic=%s fundamentals=%s "
+                "moneyflow=%s",
                 all_null_daily_fields,
                 all_null_fundamental_fields,
+                all_null_capital_flow_fields,
             )
         # Version 2: availability policies and recoverability levels come from
         # the shared registry in quant_data.availability and now also cover the
@@ -1464,8 +1585,12 @@ class QlibBuilder:
         # Version 4: declared-vs-available coverage diagnostics distinguish
         # source columns missing from the snapshot parquets from columns that
         # exist but are entirely null.
+        # Version 5: evidence-grade moneyflow rows add a compact capital-flow
+        # channel (CNY net amount, turnover-scaled net ratio and large-order
+        # imbalance) with the same after-close PIT semantics as daily_basic.
         availability_datasets = (
             "daily_basic",
+            "moneyflow",
             "fina_indicator",
             "income",
             "balancesheet",
@@ -1474,17 +1599,21 @@ class QlibBuilder:
             "index_member_all",
         )
         return {
-            "version": 4,
+            "version": 5,
             "daily_fields": daily_fields,
             "fundamental_fields": fundamental_fields,
+            "capital_flow_fields": capital_flow_fields,
             "fields": [
                 *daily_fields,
                 *(target for fields in fundamental_fields.values() for target in fields.values()),
+                *capital_flow_fields,
             ],
             "missing_daily_fields": missing_daily_fields,
             "missing_fundamental_fields": missing_fundamental_fields,
+            "missing_capital_flow_fields": missing_capital_flow_fields,
             "all_null_daily_fields": all_null_daily_fields,
             "all_null_fundamental_fields": all_null_fundamental_fields,
+            "all_null_capital_flow_fields": all_null_capital_flow_fields,
             "availability_policy_version": AVAILABILITY_POLICY_VERSION,
             "availability_policy": {
                 dataset: availability_contract_label(dataset)
@@ -1532,6 +1661,15 @@ class QlibBuilder:
         issues: list[str] = []
         required_columns = {
             "daily_basic": {"ts_code", "trade_date", "total_mv"},
+            "moneyflow": {
+                "ts_code",
+                "trade_date",
+                "net_mf_amount",
+                "buy_lg_amount",
+                "sell_lg_amount",
+                "buy_elg_amount",
+                "sell_elg_amount",
+            },
             "fina_indicator": {"ts_code", "ann_date", "end_date"},
             "index_weight": {"index_code", "con_code", "trade_date", "weight"},
             "stock_basic": {"ts_code", "list_date"},
@@ -1574,6 +1712,10 @@ class QlibBuilder:
                 "daily_basic": (
                     f"ts_code IS NOT NULL AND {_as_date_sql('trade_date')} IS NOT NULL "
                     "AND try_cast(total_mv AS DOUBLE) > 0"
+                ),
+                "moneyflow": (
+                    f"ts_code IS NOT NULL AND {_as_date_sql('trade_date')} IS NOT NULL "
+                    "AND try_cast(net_mf_amount AS DOUBLE) IS NOT NULL"
                 ),
                 "fina_indicator": (
                     f"ts_code IS NOT NULL AND {_as_date_sql('ann_date')} IS NOT NULL "

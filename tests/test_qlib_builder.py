@@ -71,6 +71,15 @@ def _write_required_research_inputs(snapshot: Path) -> None:
             "trade_date": "2024-01-02",
             "total_mv": 100_000.0,
         },
+        "moneyflow": {
+            "ts_code": "000001.SZ",
+            "trade_date": "2024-01-02",
+            "net_mf_amount": 5.0,
+            "buy_lg_amount": 30.0,
+            "sell_lg_amount": 20.0,
+            "buy_elg_amount": 10.0,
+            "sell_elg_amount": 10.0,
+        },
         "fina_indicator": {
             "ts_code": "000001.SZ",
             "ann_date": "2024-01-01",
@@ -245,6 +254,18 @@ def test_adds_point_in_time_research_features_without_announcement_leakage(
             }
             for row, value in zip(rows, (1.0, 2.0, 3.0), strict=True)
         ],
+        "moneyflow": [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": row["trade_date"],
+                "net_mf_amount": net_amount,
+                "buy_lg_amount": 30.0,
+                "sell_lg_amount": 20.0,
+                "buy_elg_amount": 10.0,
+                "sell_elg_amount": 10.0,
+            }
+            for row, net_amount in zip(rows, (5.0, -2.0, 0.0), strict=True)
+        ],
         "fina_indicator": [
             {
                 "ts_code": "000001.SZ",
@@ -273,9 +294,17 @@ def test_adds_point_in_time_research_features_without_announcement_leakage(
     assert frame["fund_roe"].iloc[2] == pytest.approx(12.5)
     assert frame["fund_debt_to_assets"].iloc[2] == pytest.approx(45.0)
     assert frame["fund_netprofit_yoy"].iloc[2] == pytest.approx(18.0)
+    assert frame["mf_net_inflow_amount"].tolist() == pytest.approx(
+        [50_000.0, -20_000.0, 0.0]
+    )
+    assert frame["mf_net_inflow_ratio"].tolist() == pytest.approx([0.5, -0.2, 0.0])
+    assert frame["mf_large_order_imbalance"].tolist() == pytest.approx(
+        [1.0 / 7.0] * 3
+    )
     lag_label = f"effective_date_with_lag(days={METADATA_AVAILABILITY_LAG_DAYS})"
     assert builder.research_feature_contract["availability_policy"] == {
         "daily_basic": "same_trade_date_after_close",
+        "moneyflow": "same_trade_date_after_close",
         "fina_indicator": "strictly_after_announcement_date",
         "income": "strictly_after_announcement_date",
         "balancesheet": "strictly_after_announcement_date",
@@ -285,6 +314,7 @@ def test_adds_point_in_time_research_features_without_announcement_leakage(
     }
     assert builder.research_feature_contract["recoverability"] == {
         "daily_basic": "native_history",
+        "moneyflow": "native_history",
         "fina_indicator": "native_history",
         "income": "native_history",
         "balancesheet": "native_history",
@@ -293,6 +323,8 @@ def test_adds_point_in_time_research_features_without_announcement_leakage(
         "index_member_all": "reconstructed",
     }
     assert "fund_roe" in builder.qlib_fields
+    assert "mf_net_inflow_ratio" in builder.qlib_fields
+    assert builder._field_units()["mf_net_inflow_amount"] == "cny_yuan"
 
 
 def test_accepts_tushare_unrestricted_price_limit_sentinel(tmp_path: Path) -> None:
@@ -378,6 +410,7 @@ def test_rejects_qlib_build_without_financial_industry_and_weights(
 
     message = str(raised.value)
     assert "missing daily_basic" in message
+    assert "missing moneyflow" in message
     assert "missing fina_indicator" in message
     assert "missing index_member_all" in message
     assert "missing index_weight" in message
@@ -1270,7 +1303,7 @@ def test_contract_distinguishes_missing_from_all_null_source_columns(
         builder = QlibBuilder(snapshot)
 
     contract = builder.research_feature_contract
-    assert contract["version"] == 4
+    assert contract["version"] == 5
     # The Tushare non-default columns the downloader never receives are
     # reported as missing source columns instead of being silently skipped.
     missing = contract["missing_fundamental_fields"]["fina_indicator"]

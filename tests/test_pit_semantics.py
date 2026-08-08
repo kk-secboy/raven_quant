@@ -119,6 +119,7 @@ def test_snapshot_preserves_ingested_at_and_null_fills_legacy_units(tmp_path: Pa
 def test_availability_registry_declares_all_policy_families() -> None:
     assert availability_contract_label("fina_indicator") == "strictly_after_announcement_date"
     assert availability_contract_label("daily_basic") == "same_trade_date_after_close"
+    assert availability_contract_label("moneyflow") == "same_trade_date_after_close"
     assert availability_contract_label("index_weight") == (
         f"effective_date_with_lag(days={METADATA_AVAILABILITY_LAG_DAYS})"
     )

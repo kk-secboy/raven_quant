@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-07-16-v3"
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-08-v4"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},
@@ -213,14 +213,18 @@ _RECIPES: tuple[dict[str, Any], ...] = (
         "preprocessing": ["PIT行业/市值中性化", "缩尾", "z-score"],
         "rdagent_objective": (
             "在PIT全A股可交易股票池上研究行业中性多因子挑战者。"
-            "候选必须使用同一六因子基线和公告日可得财务数据，不得把沪深300权重"
-            "作为优化目标；行业目标按当期全市场流通市值计算，并通过Qlib滚动样本外、"
-            "成本、容量和事件压力测试。"
+            "候选必须使用同一六因子基线、公告日可得财务数据，以及Qlib资金面字段"
+            "mf_net_inflow_amount、mf_net_inflow_ratio、mf_large_order_imbalance；"
+            "公告、研报、新闻、情绪和逻辑因子只能走外部因子评估与晋级通道，不得把"
+            "事件后的市场认可度训练标签写回实时特征。不得把沪深300权重作为优化目标；"
+            "行业目标按当期全市场流通市值计算，并通过Qlib滚动样本外、成本、容量和"
+            "事件压力测试。"
         ),
         "factor_guidance": [
             "动量20%、反转10%、价值20%、质量20%、成长10%、低波动20%",
             "PIT行业和市值中性化、缩尾与z-score",
             "全市场流通市值行业目标和风格暴露中性",
+            "资金面候选只使用盘后可得moneyflow字段；信息面只接收已治理晋级artifact",
             "月度调仓、容量和换手约束",
         ],
         "config_overrides": {

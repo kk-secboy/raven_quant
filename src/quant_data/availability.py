@@ -80,6 +80,7 @@ AVAILABILITY_POLICIES: dict[str, AvailabilityPolicy] = {
     "daily": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
     "adj_factor": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
     "daily_basic": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
+    "moneyflow": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
     "index_dailybasic": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
     "stk_limit": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
     "index_daily": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
