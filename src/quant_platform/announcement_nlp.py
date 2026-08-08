@@ -696,6 +696,7 @@ class NlpSummary:
     planned: int
     processed: int
     skipped: int
+    unavailable: int
     failed: int
     fields_path: Path | None
     state_path: Path | None
@@ -708,11 +709,19 @@ class NlpSummary:
     logic_factor_rows: int
 
     def as_dict(self) -> dict[str, Any]:
+        status = (
+            "failed"
+            if self.failed
+            else "succeeded_with_source_gaps"
+            if self.unavailable
+            else "succeeded"
+        )
         return {
-            "status": "succeeded",
+            "status": status,
             "planned": self.planned,
             "processed": self.processed,
             "skipped": self.skipped,
+            "unavailable": self.unavailable,
             "failed": self.failed,
             "fields_path": str(self.fields_path) if self.fields_path else None,
             "state_path": str(self.state_path) if self.state_path else None,
@@ -749,15 +758,23 @@ def process_announcements(
     max_attempts: int = 3,
     max_chars: int = MAX_TEXT_CHARS,
     factor_name: str = FACTOR_NAME,
+    checkpoint_every: int = 100,
+    progress_callback: Callable[[dict[str, int]], None] | None = None,
     now: Callable[[], datetime] | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> NlpSummary:
     """Run PDF extraction + LLM structuring over the announcement index.
 
     Idempotent on the processing key sha256+prompt_version+model: rows already
-    succeeded are skipped, failed rows are re-attempted. Every failure is
-    recorded in the state ledger and never produces a signal row (fail closed).
+    succeeded are skipped, transient/LLM failures are re-attempted, and PDFs
+    without a usable text layer are retained as auditable source gaps until a
+    prompt/extractor version changes. Checkpoints persist state and successful
+    fields without publishing a factor, so an interrupted large run resumes
+    without repeating already completed LLM calls.
     """
+
+    if checkpoint_every <= 0:
+        raise ValueError("checkpoint_every must be positive")
 
     clock = now or (lambda: datetime.now(UTC))
     frame = load_announcement_index(
@@ -788,13 +805,56 @@ def process_announcements(
         )
 
     new_field_rows: list[dict] = []
-    processed = skipped = failed = 0
+    processed = skipped = unavailable = failed = completed = 0
+    dirty = False
+    unit_path: Path | None = None
+
+    def publish_progress() -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            {
+                "planned": len(frame),
+                "completed": completed,
+                "processed": processed,
+                "skipped": skipped,
+                "unavailable": unavailable,
+                "failed": failed,
+            }
+        )
+
+    def persist_checkpoint(*, force: bool = False) -> None:
+        nonlocal dirty, new_field_rows, unit_path
+        if dirty or force:
+            if new_field_rows:
+                unit_path = (
+                    units_dir
+                    / f"fields_{clock():%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:8]}.parquet"
+                )
+                _write_parquet_atomic(_fields_frame(new_field_rows), unit_path)
+                new_field_rows = []
+            _write_parquet_atomic(_fields_frame(list(fields_records.values())), fields_path)
+            _write_parquet_atomic(_state_frame(list(state.values())), state_path)
+            dirty = False
+        publish_progress()
+
     for row in frame.itertuples():
         process_key = f"{row.sha256}:{PROMPT_VERSION}:{model}"
         existing = state.get(process_key)
-        if existing is not None and str(existing["status"]) == "succeeded":
-            skipped += 1
-            continue
+        if existing is not None:
+            existing_status = str(existing["status"])
+            if existing_status == "succeeded":
+                skipped += 1
+                completed += 1
+                if completed % checkpoint_every == 0:
+                    persist_checkpoint()
+                continue
+            if existing_status == "source_unavailable":
+                unavailable += 1
+                completed += 1
+                if completed % checkpoint_every == 0:
+                    persist_checkpoint()
+                continue
         processed_at = clock()
         state_row: dict[str, Any] = {
             "process_key": process_key,
@@ -809,6 +869,7 @@ def process_announcements(
             "available_at": pd.Timestamp(row.available_at).date(),
         }
         state[process_key] = state_row
+        dirty = True
         try:
             text = extract_pdf_text(data_root / str(row.file_path), max_chars=max_chars)
             messages = build_extraction_messages(
@@ -820,51 +881,50 @@ def process_announcements(
             )
             result = parse_extraction_payload(chat_client.complete(messages, model=model))
         except PdfTextExtractionError as exc:
-            failed += 1
-            state_row.update(status="failed", stage="pdf_extract", error=str(exc)[:500])
-            continue
+            unavailable += 1
+            state_row.update(
+                status="source_unavailable", stage="pdf_extract", error=str(exc)[:500]
+            )
         except LlmExtractionError as exc:
             failed += 1
             state_row.update(status="failed", stage=exc.stage, error=str(exc)[:500])
-            continue
-        field_row = {
-            "process_key": process_key,
-            "ts_code": str(row.ts_code),
-            "ann_date": pd.Timestamp(row.ann_date).date(),
-            "available_at": pd.Timestamp(row.available_at).date(),
-            "ingested_at": processed_at,
-            "event_type": result.event_type,
-            "tone_score": result.tone_score,
-            "key_numbers": json.dumps(
-                result.key_numbers, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ),
-            "impact_direction": result.impact_direction,
-            "impact_horizon": result.impact_horizon,
-            "impact_channels": json.dumps(
-                result.impact_channels, ensure_ascii=False, separators=(",", ":")
-            ),
-            "logic_summary": result.logic_summary,
-            "confidence": result.confidence,
-            "source_sha256": str(row.sha256),
-            "model": model,
-            "prompt_version": PROMPT_VERSION,
-            "processed_at": processed_at,
-        }
-        fields_records[process_key] = field_row
-        new_field_rows.append(field_row)
-        state_row.update(status="succeeded", stage="completed")
-        processed += 1
+        else:
+            field_row = {
+                "process_key": process_key,
+                "ts_code": str(row.ts_code),
+                "ann_date": pd.Timestamp(row.ann_date).date(),
+                "available_at": pd.Timestamp(row.available_at).date(),
+                "ingested_at": processed_at,
+                "event_type": result.event_type,
+                "tone_score": result.tone_score,
+                "key_numbers": json.dumps(
+                    result.key_numbers,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "impact_direction": result.impact_direction,
+                "impact_horizon": result.impact_horizon,
+                "impact_channels": json.dumps(
+                    result.impact_channels, ensure_ascii=False, separators=(",", ":")
+                ),
+                "logic_summary": result.logic_summary,
+                "confidence": result.confidence,
+                "source_sha256": str(row.sha256),
+                "model": model,
+                "prompt_version": PROMPT_VERSION,
+                "processed_at": processed_at,
+            }
+            fields_records[process_key] = field_row
+            new_field_rows.append(field_row)
+            state_row.update(status="succeeded", stage="completed")
+            processed += 1
+        completed += 1
+        if completed % checkpoint_every == 0:
+            persist_checkpoint()
 
-    unit_path: Path | None = None
-    if new_field_rows:
-        unit_path = (
-            units_dir / f"fields_{clock():%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:8]}.parquet"
-        )
-        _write_parquet_atomic(_fields_frame(new_field_rows), unit_path)
-
+    persist_checkpoint(force=True)
     fields = _fields_frame(list(fields_records.values()))
-    _write_parquet_atomic(fields, fields_path)
-    _write_parquet_atomic(_state_frame(list(state.values())), state_path)
 
     artifact = write_factor_artifact(
         fields, factors_dir, name=factor_name, model=model, now=clock()
@@ -876,6 +936,7 @@ def process_announcements(
         planned=len(frame),
         processed=processed,
         skipped=skipped,
+        unavailable=unavailable,
         failed=failed,
         fields_path=fields_path,
         state_path=state_path,

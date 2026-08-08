@@ -596,12 +596,54 @@ def test_process_records_llm_failures_without_signals(tmp_path: Path) -> None:
 
     assert summary.processed == 5
     assert summary.failed == 2
+    assert summary.as_dict()["status"] == "failed"
     state = pd.read_parquet(summary.state_path)
     failures = state[state["status"] == "failed"]
     assert set(failures["stage"]) == {"llm_parse", "llm_call"}
     assert len(pd.read_parquet(summary.fields_path)) == 5
     # Factor artifacts only aggregate the successful rows.
     assert summary.factors["news_sentiment_daily"]["manifest"]["rows"] == 2
+
+
+def test_process_checkpoints_and_resumes_after_interruption(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    progress: list[dict[str, int]] = []
+
+    with pytest.raises(RuntimeError, match="worker interrupted"):
+        _run(
+            tmp_path,
+            FakeChatClient([_payload(sentiment=0.1), RuntimeError("worker interrupted")]),
+            limit=2,
+            checkpoint_every=1,
+            progress_callback=progress.append,
+        )
+
+    assert len(list((tmp_path / "corpus_nlp/units").glob("*.parquet"))) == 1
+    assert len(pd.read_parquet(tmp_path / "corpus_nlp/fields.parquet")) == 1
+    assert progress[-1]["completed"] == 1
+
+    resumed_progress: list[dict[str, int]] = []
+    resumed = _run(
+        tmp_path,
+        FakeChatClient([_payload(sentiment=0.2)]),
+        limit=2,
+        checkpoint_every=1,
+        progress_callback=resumed_progress.append,
+    )
+
+    assert resumed.skipped == 1
+    assert resumed.processed == 1
+    assert resumed.failed == 0
+    assert len(pd.read_parquet(resumed.fields_path)) == 2
+    assert len(list((tmp_path / "corpus_nlp/units").glob("*.parquet"))) == 2
+    assert resumed_progress[-1] == {
+        "planned": 2,
+        "completed": 2,
+        "processed": 1,
+        "skipped": 1,
+        "failed": 0,
+    }
 
 
 def test_process_retries_failed_rows_on_rerun(tmp_path: Path) -> None:
@@ -788,6 +830,38 @@ def test_cli_runs_with_injected_fakes(tmp_path: Path, monkeypatch) -> None:
     assert payload["factors"]["policy_sentiment_daily"]["rows"] == 2
     assert len(chat.calls) == 7
     assert Path(payload["fields_path"]).is_file()
+
+
+def test_cli_exits_nonzero_when_an_llm_row_fails(tmp_path: Path, monkeypatch) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    monkeypatch.setattr(
+        cli_module, "RuntimeSecretStore", lambda *args, **kwargs: FakeSecretStore(STORE_RECORD)
+    )
+    monkeypatch.setattr(
+        corpus, "OpenAIChatClient", lambda *args, **kwargs: FakeChatClient(["not-json"])
+    )
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "corpus-nlp",
+            "--dataset",
+            "major_news",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-31",
+            "--limit",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 3
+    payload = json.loads(result.output)
+    assert payload["status"] == "failed"
+    assert payload["failed"] == 1
 
 
 def test_cli_rejects_unknown_dataset(tmp_path: Path, monkeypatch) -> None:

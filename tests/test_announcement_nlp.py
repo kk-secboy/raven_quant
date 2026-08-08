@@ -541,7 +541,7 @@ def test_process_reprocesses_when_prompt_version_changes(
     assert summary.factor_rows == 2
 
 
-def test_process_records_pdf_failure_and_continues_fail_closed(tmp_path: Path) -> None:
+def test_process_records_pdf_source_gap_and_continues_fail_closed(tmp_path: Path) -> None:
     rows = [
         _seed_announcement(
             tmp_path,
@@ -569,20 +569,28 @@ def test_process_records_pdf_failure_and_continues_fail_closed(tmp_path: Path) -
 
     assert summary.planned == 2
     assert summary.processed == 1
-    assert summary.failed == 1
+    assert summary.unavailable == 1
+    assert summary.failed == 0
+    assert summary.as_dict()["status"] == "succeeded_with_source_gaps"
     assert len(chat.calls) == 1  # the corrupt PDF never reaches the LLM
 
     fields = pd.read_parquet(summary.fields_path)
     assert fields["ts_code"].tolist() == ["000002.SZ"]
 
     state = pd.read_parquet(summary.state_path)
-    failure = state[state["status"] == "failed"].iloc[0]
-    assert failure["stage"] == "pdf_extract"
-    assert "cannot extract text" in failure["error"]
-    assert failure["ts_code"] == "000001.SZ"
+    source_gap = state[state["status"] == "source_unavailable"].iloc[0]
+    assert source_gap["stage"] == "pdf_extract"
+    assert "cannot extract text" in source_gap["error"]
+    assert source_gap["ts_code"] == "000001.SZ"
 
     factor = pd.read_parquet(tmp_path / "announcements/nlp/factors/announcement_tone.parquet")
     assert factor["instrument"].tolist() == ["000002.SZ"]
+
+    rerun = _run(tmp_path, FakeChatClient([]))
+    assert rerun.processed == 0
+    assert rerun.skipped == 1
+    assert rerun.unavailable == 1
+    assert rerun.failed == 0
 
 
 def test_process_records_llm_failures_without_signals(tmp_path: Path) -> None:
@@ -598,6 +606,7 @@ def test_process_records_llm_failures_without_signals(tmp_path: Path) -> None:
 
     assert summary.processed == 0
     assert summary.failed == 2
+    assert summary.as_dict()["status"] == "failed"
     state = pd.read_parquet(summary.state_path)
     assert set(state["status"]) == {"failed"}
     assert set(state["stage"]) == {"llm_parse", "llm_call"}
@@ -611,6 +620,45 @@ def test_process_records_llm_failures_without_signals(tmp_path: Path) -> None:
         )
     )
     assert manifest["rows"] == 0
+
+
+def test_process_checkpoints_and_resumes_after_interruption(tmp_path: Path) -> None:
+    _seed_two_announcements(tmp_path)
+    progress: list[dict[str, int]] = []
+
+    with pytest.raises(RuntimeError, match="worker interrupted"):
+        _run(
+            tmp_path,
+            FakeChatClient([_payload(tone_score=0.1), RuntimeError("worker interrupted")]),
+            checkpoint_every=1,
+            progress_callback=progress.append,
+        )
+
+    assert len(list((tmp_path / "announcements/nlp/units").glob("*.parquet"))) == 1
+    assert len(pd.read_parquet(tmp_path / "announcements/nlp/fields.parquet")) == 1
+    assert progress[-1]["completed"] == 1
+
+    resumed_progress: list[dict[str, int]] = []
+    resumed = _run(
+        tmp_path,
+        FakeChatClient([_payload(tone_score=0.2)]),
+        checkpoint_every=1,
+        progress_callback=resumed_progress.append,
+    )
+
+    assert resumed.skipped == 1
+    assert resumed.processed == 1
+    assert resumed.failed == 0
+    assert len(pd.read_parquet(resumed.fields_path)) == 2
+    assert len(list((tmp_path / "announcements/nlp/units").glob("*.parquet"))) == 2
+    assert resumed_progress[-1] == {
+        "planned": 2,
+        "completed": 2,
+        "processed": 1,
+        "skipped": 1,
+        "unavailable": 0,
+        "failed": 0,
+    }
 
 
 def test_process_retries_failed_rows_on_rerun(tmp_path: Path) -> None:
@@ -754,6 +802,35 @@ def test_cli_runs_with_injected_fakes(tmp_path: Path, monkeypatch) -> None:
     assert payload["factor_rows"] == 1
     assert len(chat.calls) == 1
     assert Path(payload["fields_path"]).is_file()
+
+
+def test_cli_exits_nonzero_when_an_llm_row_fails(tmp_path: Path, monkeypatch) -> None:
+    _seed_two_announcements(tmp_path)
+    monkeypatch.setattr(
+        cli_module, "RuntimeSecretStore", lambda *args, **kwargs: FakeSecretStore(STORE_RECORD)
+    )
+    monkeypatch.setattr(
+        nlp, "OpenAIChatClient", lambda *args, **kwargs: FakeChatClient(["not-json"])
+    )
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "announcement-nlp",
+            "--category",
+            "regulatory_letter",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-31",
+        ],
+    )
+
+    assert result.exit_code == 3
+    payload = json.loads(result.output)
+    assert payload["status"] == "failed"
+    assert payload["failed"] == 1
 
 
 def test_cli_rejects_unknown_category(tmp_path: Path, monkeypatch) -> None:

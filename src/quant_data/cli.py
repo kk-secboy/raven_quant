@@ -1805,6 +1805,16 @@ def announcement_nlp_command(
     context.report_progress(
         "processing", "announcement NLP extraction", {"announcement_nlp"}, force=True
     )
+
+    def report_announcement_nlp_progress(progress: dict[str, int]) -> None:
+        context.progress.set_target(**progress)
+        context.report_progress(
+            "processing",
+            "announcement NLP extraction",
+            {"announcement_nlp"},
+            force=True,
+        )
+
     settings = context.settings
     secret_store = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
     summary = _produce_factors(
@@ -1817,6 +1827,7 @@ def announcement_nlp_command(
             categories=categories or None,
             limit=limit or None,
             secret_store=secret_store,
+            progress_callback=report_announcement_nlp_progress,
         ),
     )
     result = {
@@ -1829,6 +1840,8 @@ def announcement_nlp_command(
     }
     _write_optional_result(result_path, result)
     console.print_json(json.dumps(result, ensure_ascii=False))
+    if summary.failed:
+        raise typer.Exit(3)
 
 
 @app.command("corpus-nlp")
@@ -1866,6 +1879,13 @@ def corpus_nlp_command(
         },
     )
     context.report_progress("processing", "corpus NLP extraction", {"corpus_nlp"}, force=True)
+
+    def report_corpus_nlp_progress(progress: dict[str, int]) -> None:
+        context.progress.set_target(**progress)
+        context.report_progress(
+            "processing", "corpus NLP extraction", {"corpus_nlp"}, force=True
+        )
+
     settings = context.settings
     secret_store = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
     summary = _produce_factors(
@@ -1878,6 +1898,7 @@ def corpus_nlp_command(
             end=end_date,
             limit=limit or None,
             secret_store=secret_store,
+            progress_callback=report_corpus_nlp_progress,
         ),
     )
     result = {
@@ -1890,6 +1911,8 @@ def corpus_nlp_command(
     }
     _write_optional_result(result_path, result)
     console.print_json(json.dumps(result, ensure_ascii=False))
+    if summary.failed:
+        raise typer.Exit(3)
 
 
 @app.command("event-market-response")

@@ -717,7 +717,7 @@ class CorpusNlpSummary:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "status": "succeeded",
+            "status": "failed" if self.failed else "succeeded",
             "planned": self.planned,
             "processed": self.processed,
             "skipped": self.skipped,
@@ -752,16 +752,23 @@ def process_corpus(
     timeout_seconds: float = 120.0,
     max_attempts: int = 3,
     max_chars: int = MAX_TEXT_CHARS,
+    checkpoint_every: int = 100,
+    progress_callback: Callable[[dict[str, int]], None] | None = None,
     now: Callable[[], datetime] | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> CorpusNlpSummary:
     """Run LLM sentiment/topic structuring over the downloaded text corpus.
 
     Idempotent on the processing key content-sha256+prompt_version+model: rows
-    already succeeded are skipped, failed rows are re-attempted. Every failure
-    is recorded in the state ledger and never produces a signal row
+    already succeeded are skipped and failed rows are re-attempted. Checkpoints
+    persist state and successful fields without publishing factors, so a long
+    interrupted run resumes without repeating completed LLM calls. Every
+    failure is recorded in the state ledger and never produces a signal row
     (fail closed).
     """
+
+    if checkpoint_every <= 0:
+        raise ValueError("checkpoint_every must be positive")
 
     clock = now or (lambda: datetime.now(UTC))
     items = load_corpus_items(
@@ -783,6 +790,22 @@ def process_corpus(
     state = _load_records(state_path)
     fields_records = _load_records(fields_path)
 
+    # Prove calendar coverage before the first LLM call or checkpoint write.
+    # Date-only sources that cannot derive available_at remain auditable row
+    # failures below; an otherwise visible item whose factor date is outside
+    # the calendar is a run-level input defect and must fail with no partial
+    # persistence (the historical fail-closed contract).
+    for existing_field in fields_records.values():
+        factor_date_for(
+            pd.Timestamp(existing_field["available_at"]).to_pydatetime(), open_days
+        )
+    for item in items:
+        try:
+            candidate_available_at = available_at_for(item, open_days)
+        except LookupError:
+            continue
+        factor_date_for(candidate_available_at, open_days)
+
     if credentials is None:
         credentials = load_llm_credentials(secret_store, environ=environ)
     model = credentials.chat_model
@@ -795,12 +818,46 @@ def process_corpus(
         )
 
     new_field_rows: list[dict] = []
-    processed = skipped = failed = 0
+    processed = skipped = failed = completed = 0
+    dirty = False
+    unit_path: Path | None = None
+
+    def publish_progress() -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            {
+                "planned": len(items),
+                "completed": completed,
+                "processed": processed,
+                "skipped": skipped,
+                "failed": failed,
+            }
+        )
+
+    def persist_checkpoint(*, force: bool = False) -> None:
+        nonlocal dirty, new_field_rows, unit_path
+        if dirty or force:
+            if new_field_rows:
+                unit_path = (
+                    units_dir
+                    / f"fields_{clock():%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:8]}.parquet"
+                )
+                _write_parquet_atomic(_fields_frame(new_field_rows), unit_path)
+                new_field_rows = []
+            _write_parquet_atomic(_fields_frame(list(fields_records.values())), fields_path)
+            _write_parquet_atomic(_state_frame(list(state.values())), state_path)
+            dirty = False
+        publish_progress()
+
     for item in items:
         process_key = f"{item.item_id}:{PROMPT_VERSION}:{model}"
         existing = state.get(process_key)
         if existing is not None and str(existing["status"]) == "succeeded":
             skipped += 1
+            completed += 1
+            if completed % checkpoint_every == 0:
+                persist_checkpoint()
             continue
         processed_at = clock()
         state_row: dict[str, Any] = {
@@ -817,57 +874,50 @@ def process_corpus(
             "available_at": None,
         }
         state[process_key] = state_row
+        dirty = True
         try:
             available_at = available_at_for(item, open_days)
         except LookupError as exc:
             failed += 1
             state_row.update(status="failed", stage="availability", error=str(exc)[:500])
-            continue
-        state_row["available_at"] = available_at
-        try:
-            messages = build_extraction_messages(item=item, text=item.content[:max_chars])
-            result = parse_extraction_payload(chat_client.complete(messages, model=model))
-        except LlmExtractionError as exc:
-            failed += 1
-            state_row.update(status="failed", stage=exc.stage, error=str(exc)[:500])
-            continue
-        field_row = {
-            "process_key": process_key,
-            "source_dataset": item.source_dataset,
-            "item_id": item.item_id,
-            "ts_code": item.ts_code,
-            "pub_time": item.pub_time,
-            "available_at": available_at,
-            "ingested_at": processed_at,
-            "sentiment": result.sentiment,
-            "topic": result.topic,
-            "confidence": result.confidence,
-            "model": model,
-            "prompt_version": PROMPT_VERSION,
-            "processed_at": processed_at,
-        }
-        fields_records[process_key] = field_row
-        new_field_rows.append(field_row)
-        state_row.update(status="succeeded", stage="completed")
-        processed += 1
+        else:
+            state_row["available_at"] = available_at
+            try:
+                messages = build_extraction_messages(item=item, text=item.content[:max_chars])
+                result = parse_extraction_payload(chat_client.complete(messages, model=model))
+            except LlmExtractionError as exc:
+                failed += 1
+                state_row.update(status="failed", stage=exc.stage, error=str(exc)[:500])
+            else:
+                field_row = {
+                    "process_key": process_key,
+                    "source_dataset": item.source_dataset,
+                    "item_id": item.item_id,
+                    "ts_code": item.ts_code,
+                    "pub_time": item.pub_time,
+                    "available_at": available_at,
+                    "ingested_at": processed_at,
+                    "sentiment": result.sentiment,
+                    "topic": result.topic,
+                    "confidence": result.confidence,
+                    "model": model,
+                    "prompt_version": PROMPT_VERSION,
+                    "processed_at": processed_at,
+                }
+                fields_records[process_key] = field_row
+                new_field_rows.append(field_row)
+                state_row.update(status="succeeded", stage="completed")
+                processed += 1
+        completed += 1
+        if completed % checkpoint_every == 0:
+            persist_checkpoint()
+
+    persist_checkpoint(force=True)
 
     fields = _fields_frame(list(fields_records.values()))
-    # Factor dates are derived before any write: a calendar too short for the
-    # visibility timestamps fails the run closed instead of persisting a
-    # partial artifact.
     news_series = build_news_sentiment_series(fields, open_days)
     irm_qa_series = build_irm_qa_sentiment_series(fields, open_days)
     policy_series = build_policy_sentiment_series(fields, open_days)
-
-    unit_path: Path | None = None
-    if new_field_rows:
-        unit_path = (
-            units_dir / f"fields_{clock():%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:8]}.parquet"
-        )
-        _write_parquet_atomic(_fields_frame(new_field_rows), unit_path)
-
-    _write_parquet_atomic(fields, fields_path)
-    _write_parquet_atomic(_state_frame(list(state.values())), state_path)
 
     news_artifact = _write_factor_artifact(
         news_series,
