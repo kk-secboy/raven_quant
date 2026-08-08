@@ -204,3 +204,10 @@ Tushare `report_rc`（券商研报盈利预测与评级，cn_institutional 任�
 - **紧凑资金面通道**：`qlib_builder.py` 研究字段契约升为 v5，新增三个 Qlib 字段：`mf_net_inflow_amount = net_mf_amount × 10000`（元）、`mf_net_inflow_ratio = net_mf_amount × 10 / daily.amount`（净流入/当日成交额）及 `mf_large_order_imbalance = (大单+特大单主动买入额 - 主动卖出额) / 主动买卖总额`。不把九个高度共线的原始分档列全部灌入模型。
 - **PIT 与质量门**：`moneyflow` 注册为 `same_trade_date_after_close`、`native_history`；只与同股票同交易日行情连接，供当日收盘后的下一决策/下一 Bar 使用。缺少数据集、主键、关键金额列或任何可用行时 Qlib 构建直接失败；来源列缺失和全 NULL 分开记录在 provenance，金额统一换算为元并写入字段单位。
 - **RD-Agent 约束**：全市场行业中性配方升级为 `qlib-rdagent-single-mainline-2026-08-08-v4`，明确允许研究上述资金面字段；公告、研报、新闻、情绪与逻辑因子仍只能走受治理外部因子评估/晋级 artifact，事件后市场认可度只能作训练标签，禁止写回实时特征。
+
+## 十三、外部信息因子滚动样本外门（2026-08-08 追加）
+
+- **不再用一次验证切分冒充滚动证据**：生产 `evaluate_external_factor_batch.py` 现在从训练起点加载收益标签，并对公告、研报、新闻、情绪和逻辑类外部因子执行 expanding-window walk-forward。每折只在 validation 窗口确定因子方向，保留至少 `max(5, label_horizon)` 个交易日的 purge/embargo 后，再在独立 test 窗口检验；最终保留 OOS 窗口完全不参与该过程。
+- **硬门而非展示指标**：生产评估显式绑定 `require_rolling_walk_forward=true`。默认至少需要 3 个可评估折、正向 test IC/RankIC 的折通过率不低于 60%，且各折平均 test IC 与 RankIC 均为正；历史不足记为 `insufficient_evidence`，跨折不稳记为 gate failed。配置、折边界、跳过原因、方向、测试统计以及 `uses_final_test_data=false` 全部进入不可变评估 artifact 和证据哈希。
+- **兼容真实历史边界**：折历从该因子第一条真实可用记录开始，不把公告 2008–2015 或其他来源尚不存在的文本补成零值/伪信号。只有完整的预最终历史足以形成滚动折时才能晋级；最终策略仍须再经过 Qlib 外层 walk-forward、一次性最终 OOS、成本、消融和信号衰减门。
+- **验证**：新增稳定信号多折通过、embargo 边界、最终 OOS 未消费、短历史证据不足及 gate fail-closed 测试；全套 `no_database` 回归（排除会扫描用户临时 PDF 的文档治理测试）100% 通过，Ruff 与 `git diff --check` 通过。

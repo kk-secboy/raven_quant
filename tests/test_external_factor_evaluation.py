@@ -117,6 +117,51 @@ def _market_inputs(
     return factor, label
 
 
+def _long_sparse_inputs(
+    *, days: int = 900, effect: float = 0.02, seed: int = 73
+) -> tuple[pd.Series, pd.Series, pd.DatetimeIndex]:
+    calendar = pd.bdate_range("2018-01-02", periods=days)
+    rng = np.random.default_rng(seed)
+    # Exactly 25% of the label universe: sparse enough for the governed
+    # external-event shape while retaining five names for a daily IC.
+    event_instruments = INSTRUMENTS[:5]
+    factor_rows = []
+    label_rows = []
+    for day in calendar:
+        signals = {instrument: float(rng.standard_normal()) for instrument in event_instruments}
+        factor_rows.extend((day, instrument, signal) for instrument, signal in signals.items())
+        label_rows.extend(
+            (
+                day,
+                instrument,
+                effect * signals.get(instrument, 0.0) + 0.005 * float(rng.standard_normal()),
+            )
+            for instrument in INSTRUMENTS
+        )
+    return _series(factor_rows, "factor"), _series(label_rows, "label"), calendar
+
+
+def _long_market_inputs(
+    *, days: int = 900, effect: float = 0.02, seed: int = 79
+) -> tuple[pd.Series, pd.Series, pd.DatetimeIndex]:
+    calendar = pd.bdate_range("2018-01-02", periods=days)
+    rng = np.random.default_rng(seed)
+    signal = rng.standard_normal(days)
+    returns = effect * signal + 0.005 * rng.standard_normal(days)
+    factor = _series(
+        [
+            (day, ext.MARKET_INSTRUMENT, float(value))
+            for day, value in zip(calendar, signal, strict=True)
+        ],
+        "factor",
+    )
+    label = _series(
+        [(day, BENCHMARK, float(value)) for day, value in zip(calendar, returns, strict=True)],
+        "label",
+    )
+    return factor, label, calendar
+
+
 def _event_entry(candidate_id: str, metrics: dict, *, family: str = "fam", count: int = 1) -> dict:
     entry = {
         "candidate_id": candidate_id,
@@ -226,9 +271,7 @@ def test_shape_detection_fails_closed_on_ambiguous_and_mixed_shapes() -> None:
             valid_start=PERIODS["valid_start"],
             valid_end=PERIODS["valid_end"],
         )
-    market_rows = [
-        (day, ext.MARKET_INSTRUMENT, 0.1) for day in DAYS[:40]
-    ]
+    market_rows = [(day, ext.MARKET_INSTRUMENT, 0.1) for day in DAYS[:40]]
     mixed = pd.concat([factor, _series(market_rows, "factor")])
     with pytest.raises(ValueError, match="mixes the MARKET pseudo-instrument"):
         ext.detect_external_factor_shape(
@@ -249,6 +292,105 @@ def test_shape_detection_fails_closed_on_ambiguous_and_mixed_shapes() -> None:
 # ---------------------------------------------------------------------------
 # Sparse event evaluation path
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.no_database
+def test_external_walk_forward_uses_only_embargoed_pre_final_holdouts() -> None:
+    factor, label, calendar = _long_sparse_inputs()
+    config = ext.ExternalEvaluationConfig(
+        require_rolling_walk_forward=True,
+        rolling_train_days=252,
+        rolling_validation_days=63,
+        rolling_test_days=63,
+        rolling_purge_days=5,
+        rolling_embargo_days=5,
+        rolling_min_folds=3,
+        rolling_min_pass_rate=0.60,
+    )
+    assert (
+        ext.detect_external_factor_shape(
+            factor,
+            label,
+            valid_start=calendar[0].date(),
+            valid_end=calendar[-1].date(),
+            config=config,
+        )
+        == ext.SHAPE_SPARSE_EVENT
+    )
+    result = ext.evaluate_external_walk_forward(
+        factor,
+        label,
+        evaluation_shape=ext.SHAPE_SPARSE_EVENT,
+        train_start=calendar[0].date(),
+        valid_end=calendar[-1].date(),
+        config=config,
+    )
+    assert result["status"] == "completed"
+    assert result["passed"] is True
+    assert result["fold_count"] >= 3
+    assert result["uses_final_test_data"] is False
+    assert result["mean_test_ic"] > 0
+    for item in result["folds"]:
+        fold = item["fold"]
+        assert pd.Timestamp(fold["validation_end"]) < pd.Timestamp(fold["test_start"])
+        assert item["direction"] == "original"
+
+
+@pytest.mark.no_database
+def test_external_walk_forward_reports_insufficient_history_without_relaxing() -> None:
+    factor, label = _sparse_event_inputs(event_days=40)
+    result = ext.evaluate_external_walk_forward(
+        factor,
+        label,
+        evaluation_shape=ext.SHAPE_SPARSE_EVENT,
+        train_start=PERIODS["valid_start"],
+        valid_end=PERIODS["valid_end"],
+        config=ext.ExternalEvaluationConfig(require_rolling_walk_forward=True),
+    )
+    assert result["status"] == "insufficient_evidence"
+    assert result["passed"] is False
+    assert result["uses_final_test_data"] is False
+    assert result["folds"] == []
+
+
+@pytest.mark.no_database
+def test_market_timeseries_walk_forward_holds_direction_out_of_sample() -> None:
+    factor, label, calendar = _long_market_inputs()
+    result = ext.evaluate_external_walk_forward(
+        factor,
+        label,
+        evaluation_shape=ext.SHAPE_MARKET_TIMESERIES,
+        train_start=calendar[0].date(),
+        valid_end=calendar[-1].date(),
+        config=ext.ExternalEvaluationConfig(require_rolling_walk_forward=True),
+    )
+    assert result["status"] == "completed"
+    assert result["passed"] is True
+    assert result["fold_count"] >= 3
+    assert result["mean_test_rank_ic"] > 0
+
+
+@pytest.mark.no_database
+def test_external_gate_fails_closed_on_bound_rolling_evidence() -> None:
+    factor, label = _sparse_event_inputs(event_days=40)
+    outcome = ext.evaluate_sparse_event_factor(
+        factor,
+        label,
+        valid_start=PERIODS["valid_start"],
+        valid_end=PERIODS["valid_end"],
+        test_start=PERIODS["test_start"],
+        test_end=PERIODS["test_end"],
+    )
+    metrics = outcome["metrics"]
+    metrics["rolling_walk_forward"] = {
+        "status": "insufficient_evidence",
+        "passed": False,
+        "reasons": ["evaluable walk-forward folds=1 below required 3"],
+    }
+    entry = _event_entry("candidate-rolling", metrics)
+    gate_status, reasons = ExternalEventGatePolicy().evaluate(entry["metrics"])
+    assert gate_status == "insufficient_evidence"
+    assert any("walk-forward folds=1" in reason for reason in reasons)
 
 
 @pytest.mark.no_database
@@ -429,9 +571,7 @@ def test_market_timeseries_evaluation_fails_closed_on_wrong_inputs() -> None:
             test_start=PERIODS["test_start"],
             test_end=PERIODS["test_end"],
         )
-    two_benchmarks = pd.concat(
-        [label, _series([(day, "SH000905", 0.01) for day in DAYS], "label")]
-    )
+    two_benchmarks = pd.concat([label, _series([(day, "SH000905", 0.01) for day in DAYS], "label")])
     with pytest.raises(ValueError, match="exactly one instrument"):
         ext.evaluate_market_timeseries_factor(
             factor,
@@ -445,10 +585,20 @@ def test_market_timeseries_evaluation_fails_closed_on_wrong_inputs() -> None:
 
 @pytest.mark.no_database
 def test_family_bh_correction_pads_declared_experiment_count() -> None:
-    first = {"candidate_id": "a", "status": "ok", "metrics": {"hac_p_value": 0.01},
-             "experiment_family_id": "fam", "experiment_count": 4}
-    second = {"candidate_id": "b", "status": "insufficient_evidence", "metrics": None,
-              "experiment_family_id": "fam", "experiment_count": 4}
+    first = {
+        "candidate_id": "a",
+        "status": "ok",
+        "metrics": {"hac_p_value": 0.01},
+        "experiment_family_id": "fam",
+        "experiment_count": 4,
+    }
+    second = {
+        "candidate_id": "b",
+        "status": "insufficient_evidence",
+        "metrics": None,
+        "experiment_family_id": "fam",
+        "experiment_count": 4,
+    }
     ext.apply_family_bh_correction([first, second])
     # p-values [0.01, 1.0] padded to the declared 4 experiments -> q = 0.01 * 4 / 1.
     assert first["metrics"]["bh_q_value"] == pytest.approx(0.04)
@@ -523,9 +673,7 @@ def test_external_event_evaluation_records_and_advances_candidate(
         test_end=PERIODS["test_end"],
     )
     entry = _event_entry(candidate["id"], outcome["metrics"])
-    artifact = _write_result_artifact(
-        tmp_path / "result.json", candidate["id"], entry["metrics"]
-    )
+    artifact = _write_result_artifact(tmp_path / "result.json", candidate["id"], entry["metrics"])
     evaluation = store.record_external_evaluation(
         candidate["id"],
         policy=ExternalEventGatePolicy(),
@@ -571,9 +719,7 @@ def test_external_market_evaluation_records_with_market_policy(
         test_end=PERIODS["test_end"],
     )
     entry = _event_entry(candidate["id"], outcome["metrics"])
-    artifact = _write_result_artifact(
-        tmp_path / "result.json", candidate["id"], entry["metrics"]
-    )
+    artifact = _write_result_artifact(tmp_path / "result.json", candidate["id"], entry["metrics"])
     evaluation = store.record_external_evaluation(
         candidate["id"],
         policy=MarketTimeseriesGatePolicy(),
@@ -717,9 +863,7 @@ def test_external_evaluation_rejects_unbound_evidence_and_wrong_policy(
         test_end=PERIODS["test_end"],
     )
     entry = _event_entry(candidate["id"], outcome["metrics"])
-    artifact = _write_result_artifact(
-        tmp_path / "result.json", candidate["id"], entry["metrics"]
-    )
+    artifact = _write_result_artifact(tmp_path / "result.json", candidate["id"], entry["metrics"])
     with pytest.raises(ValueError, match="requires ExternalEventGatePolicy"):
         store.record_external_evaluation(
             candidate["id"],

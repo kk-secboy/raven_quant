@@ -41,6 +41,7 @@ from quant_platform.external_factor_evaluation import (
     apply_family_bh_correction,
     build_external_evidence,
     detect_external_factor_shape,
+    evaluate_external_walk_forward,
     evaluate_market_timeseries_factor,
     evaluate_sparse_event_factor,
     import_external_evaluations,
@@ -60,9 +61,7 @@ def _load_values(path: str) -> pd.DataFrame:
         # evaluator contract expects a datetime/instrument MultiIndex.
         if {"datetime", "instrument"} <= set(frame.columns):
             value_columns = [
-                column
-                for column in frame.columns
-                if column not in {"datetime", "instrument"}
+                column for column in frame.columns if column not in {"datetime", "instrument"}
             ]
             if len(value_columns) == 1:
                 return to_qlib_instrument_format(
@@ -86,7 +85,7 @@ def _forward_returns(instruments: Any, horizon: int, periods: dict[str, str]) ->
     return D.features(
         instruments,
         [f"Ref($close, -{horizon + 1})/Ref($close, -1)-1"],
-        start_time=periods["valid_start"],
+        start_time=periods["train_start"],
         end_time=periods["valid_end"],
         freq="day",
     )
@@ -137,7 +136,7 @@ def main() -> None:
     comparisons = [_load_values(path) for path in manifest.get("comparison_values", [])]
     cost_schedule = CostScheduleBook.from_mapping(manifest.get("cost_model"))
     reference_order_value = float(manifest.get("cost_reference_order_value", 100_000.0))
-    config = ExternalEvaluationConfig()
+    config = ExternalEvaluationConfig(require_rolling_walk_forward=True)
     period_dates = {key: date.fromisoformat(value) for key, value in periods.items()}
     evaluations: list[dict[str, Any]] = []
     for item in candidates:
@@ -180,6 +179,21 @@ def main() -> None:
                     label_horizon_days=horizon,
                     config=config,
                 )
+            if outcome["status"] == "ok":
+                rolling = evaluate_external_walk_forward(
+                    values,
+                    (
+                        benchmark_labels_by_horizon[horizon]
+                        if shape == SHAPE_MARKET_TIMESERIES
+                        else labels_by_horizon[horizon]
+                    ),
+                    evaluation_shape=shape,
+                    train_start=period_dates["train_start"],
+                    valid_end=period_dates["valid_end"],
+                    label_horizon_days=horizon,
+                    config=config,
+                )
+                outcome["metrics"]["rolling_walk_forward"] = rolling
             evaluations.append(
                 {
                     "candidate_id": item["id"],

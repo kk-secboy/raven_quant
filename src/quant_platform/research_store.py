@@ -224,7 +224,7 @@ class FactorGatePolicy:
 # Executor version bound into external factor evaluation evidence. Mirrors the
 # hardcoded factor-recompute check in record_evaluation: the version lives
 # here because this module validates the evidence chain.
-EXTERNAL_EVALUATOR_VERSION = "external-factor-eval-v2"
+EXTERNAL_EVALUATOR_VERSION = "external-factor-eval-v3-walk-forward"
 
 # Gate status produced when an external factor lacks enough independent events
 # or signal days; the candidate keeps full records and may be re-evaluated.
@@ -244,6 +244,25 @@ def _shared_sign_check_reasons(metrics: dict[str, Any]) -> list[str]:
     if ic is not None and rank_ic is not None and float(ic) * float(rank_ic) <= 0:
         reasons.append("IC and RankIC must have the same direction")
     return reasons
+
+
+def _external_rolling_gate(metrics: dict[str, Any]) -> tuple[str | None, list[str]]:
+    rolling = metrics.get("rolling_walk_forward")
+    if rolling is None:
+        return None, []
+    if not isinstance(rolling, dict):
+        return "failed", ["rolling walk-forward evidence is malformed"]
+    if rolling.get("status") == "insufficient_evidence":
+        return EXTERNAL_GATE_INSUFFICIENT, [
+            *[str(item) for item in rolling.get("reasons") or []],
+            "rolling walk-forward evidence is insufficient",
+        ]
+    if rolling.get("status") != "completed" or rolling.get("passed") is not True:
+        return "failed", [
+            *[str(item) for item in rolling.get("reasons") or []],
+            "rolling walk-forward stability gate did not pass",
+        ]
+    return None, []
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +357,10 @@ class ExternalEventGatePolicy:
                     *reasons,
                 ],
             )
+        rolling_status, rolling_reasons = _external_rolling_gate(metrics)
+        if rolling_status == EXTERNAL_GATE_INSUFFICIENT:
+            return rolling_status, [*rolling_reasons, *reasons]
+        reasons.extend(rolling_reasons)
         return ("passed" if not reasons else "failed", reasons)
 
 
@@ -413,6 +436,10 @@ class MarketTimeseriesGatePolicy:
                     *reasons,
                 ],
             )
+        rolling_status, rolling_reasons = _external_rolling_gate(metrics)
+        if rolling_status == EXTERNAL_GATE_INSUFFICIENT:
+            return rolling_status, [*rolling_reasons, *reasons]
+        reasons.extend(rolling_reasons)
         return ("passed" if not reasons else "failed", reasons)
 
 
@@ -730,12 +757,9 @@ class ResearchStore:
         if recompute_evidence.get("authoritative_values_sha256") != actual_recomputed_sha256:
             raise ValueError("factor recomputation evidence is not bound to authoritative values")
         if (
-            recompute_evidence.get("executor_version")
-            != FACTOR_RECOMPUTE_EXECUTOR_VERSION
+            recompute_evidence.get("executor_version") != FACTOR_RECOMPUTE_EXECUTOR_VERSION
             or recompute_evidence.get("sandbox_mode") != "docker-isolated"
-            or not str(recompute_evidence.get("sandbox_image_id") or "").startswith(
-                "sha256:"
-            )
+            or not str(recompute_evidence.get("sandbox_image_id") or "").startswith("sha256:")
             or len(str(recompute_evidence.get("sandbox_image_id") or "")) != 71
             or recompute_evidence.get("network_mode") != "none"
             or recompute_evidence.get("root_filesystem_read_only") is not True
@@ -974,6 +998,15 @@ class ResearchStore:
             raise ValueError("external evaluation evidence is not bound to the Qlib dataset")
         if external_evidence.get("policy") != asdict(policy):
             raise ValueError("external evaluation evidence is not bound to the gate policy")
+        evaluation_config = external_evidence.get("config")
+        if not isinstance(evaluation_config, dict):
+            raise ValueError("external evaluation evidence has no evaluator configuration")
+        if evaluation_config.get("require_rolling_walk_forward") is True:
+            rolling = metrics.get("rolling_walk_forward") if metrics is not None else None
+            if not isinstance(rolling, dict):
+                raise ValueError("production external evaluation requires rolling walk-forward")
+            if rolling.get("uses_final_test_data") is not False:
+                raise ValueError("rolling walk-forward evidence must not consume final OOS data")
         if int(external_evidence.get("label_horizon_days") or 0) != int(
             candidate["label_horizon_days"]
         ):
@@ -1146,9 +1179,7 @@ class ResearchStore:
             raise ValueError("factor evaluation requires immutable dataset identity")
         candidate = self.get_candidate(candidate_id)
         if candidate["status"] in {"promoted", "retired"}:
-            raise ValueError(
-                f"cannot record a failed evaluation in {candidate['status']} state"
-            )
+            raise ValueError(f"cannot record a failed evaluation in {candidate['status']} state")
         summary = " ".join(str(error or "").split())[:1000] or "evaluation failed"
         periods = {
             "train_start": train_start.isoformat(),

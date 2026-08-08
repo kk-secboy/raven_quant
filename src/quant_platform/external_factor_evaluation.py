@@ -45,6 +45,7 @@ from .factor_evaluator import (
     normalize_series,
     purged_factor_evaluation_days,
 )
+from .formal_validation import build_outer_walk_forward_folds
 from .research_store import (
     EXTERNAL_EVALUATOR_VERSION,
     ExternalEventGatePolicy,
@@ -110,6 +111,19 @@ class ExternalEvaluationConfig:
     placebo_seed: int = 20260721
     placebo_percentile_threshold: float = 0.95
     leakage_collapse_ratio: float = 0.5
+    # Production batch evaluation additionally requires expanding-window,
+    # pre-final walk-forward evidence.  The pure one-window evaluators keep
+    # this disabled by default for backwards-compatible research use; the
+    # durable production entrypoint enables it explicitly and binds the full
+    # configuration into the evaluation evidence.
+    require_rolling_walk_forward: bool = False
+    rolling_train_days: int = 252
+    rolling_validation_days: int = 63
+    rolling_test_days: int = 63
+    rolling_purge_days: int = 5
+    rolling_embargo_days: int = 5
+    rolling_min_folds: int = 3
+    rolling_min_pass_rate: float = 0.60
 
 
 # ValueError messages raised by evaluate_factor_values for caller/config bugs;
@@ -124,9 +138,7 @@ _CONFIG_ERROR_MARKERS = (
 )
 
 
-def _window(
-    values: pd.Series | pd.DataFrame, start: date, end: date
-) -> pd.Series | pd.DataFrame:
+def _window(values: pd.Series | pd.DataFrame, start: date, end: date) -> pd.Series | pd.DataFrame:
     """Same datetime-level filter as factor_evaluator._validation_window."""
 
     if not isinstance(values.index, pd.MultiIndex) or values.index.nlevels != 2:
@@ -136,9 +148,7 @@ def _window(
     return values[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))]
 
 
-def _coverage_stats(
-    factor: pd.Series, label: pd.Series
-) -> tuple[float, float]:
+def _coverage_stats(factor: pd.Series, label: pd.Series) -> tuple[float, float]:
     """(day coverage rate, mean per-day instrument ratio) vs the label universe."""
 
     factor_counts = factor.groupby(level="datetime").size()
@@ -241,9 +251,7 @@ def detect_external_factor_shape(
         if hint not in KNOWN_SHAPES:
             raise ValueError(f"unsupported external factor shape hint: {shape_hint!r}")
         if hint != observed:
-            raise ValueError(
-                f"shape hint {hint!r} contradicts the observed shape {observed!r}"
-            )
+            raise ValueError(f"shape hint {hint!r} contradicts the observed shape {observed!r}")
     return observed
 
 
@@ -256,9 +264,7 @@ def _insufficient(shape: str, reasons: list[str]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _joined_frame(
-    factor: pd.Series, label: pd.Series
-) -> tuple[pd.DataFrame, bool]:
+def _joined_frame(factor: pd.Series, label: pd.Series) -> tuple[pd.DataFrame, bool]:
     """Inner-joined factor/label frame; timeseries mode for single-instrument pairs."""
 
     factor_instruments = set(factor.index.get_level_values("instrument").unique())
@@ -294,9 +300,206 @@ def _ic_statistic(frame: pd.DataFrame, timeseries: bool) -> float:
     return float(daily_ic.mean()) if len(daily_ic) else float("nan")
 
 
-def _placebo_statistic(
-    frame: pd.DataFrame, timeseries: bool, rng: np.random.Generator
-) -> float:
+def _pearson_statistic(frame: pd.DataFrame, timeseries: bool) -> float:
+    """Mean daily Pearson IC (cross-sectional) or full-series correlation."""
+
+    if frame.empty:
+        return float("nan")
+    if timeseries:
+        if len(frame) < 5 or frame["factor"].nunique() < 2 or frame["label"].nunique() < 2:
+            return float("nan")
+        return float(frame["factor"].corr(frame["label"]))
+
+    def daily(group: pd.DataFrame) -> float:
+        if len(group) < 5 or group["factor"].nunique() < 2 or group["label"].nunique() < 2:
+            return float("nan")
+        return float(group["factor"].corr(group["label"]))
+
+    daily_ic = frame.groupby(level="datetime", sort=True).apply(daily).dropna()
+    return float(daily_ic.mean()) if len(daily_ic) else float("nan")
+
+
+def evaluate_external_walk_forward(
+    factor_values: pd.Series | pd.DataFrame,
+    forward_returns: pd.Series | pd.DataFrame,
+    *,
+    evaluation_shape: str,
+    train_start: date,
+    valid_end: date,
+    label_horizon_days: int = 1,
+    config: ExternalEvaluationConfig | None = None,
+) -> dict[str, Any]:
+    """Evaluate a frozen external factor on expanding pre-final holdout folds.
+
+    Each fold learns only the factor direction on its validation window and
+    applies that frozen direction after the configured embargo.  Test-window
+    returns never influence the direction or another fold's selection.  The
+    final reserved OOS window is not touched here.
+    """
+
+    config = config or ExternalEvaluationConfig()
+    if evaluation_shape not in KNOWN_SHAPES:
+        raise ValueError(f"unknown external factor shape: {evaluation_shape!r}")
+    if label_horizon_days < 1:
+        raise ValueError("label_horizon_days must be positive")
+    factor = normalize_series(_window(factor_values, train_start, valid_end), "factor")
+    label = normalize_series(_window(forward_returns, train_start, valid_end), "label")
+    if factor.empty or label.empty:
+        return {
+            "status": "insufficient_evidence",
+            "passed": False,
+            "uses_final_test_data": False,
+            "reasons": ["factor or forward-return history is empty before the final OOS"],
+            "folds": [],
+        }
+    factor_instruments = set(factor.index.get_level_values("instrument").unique())
+    if evaluation_shape == SHAPE_MARKET_TIMESERIES:
+        if factor_instruments != {MARKET_INSTRUMENT}:
+            raise ValueError("market timeseries walk-forward requires MARKET factor values")
+        if len(set(label.index.get_level_values("instrument").unique())) != 1:
+            raise ValueError("market timeseries walk-forward requires one benchmark instrument")
+    elif MARKET_INSTRUMENT in factor_instruments:
+        raise ValueError("sparse event walk-forward cannot consume MARKET factor values")
+
+    factor_dates = pd.DatetimeIndex(
+        factor.index.get_level_values("datetime").unique()
+    ).sort_values()
+    label_dates = pd.DatetimeIndex(label.index.get_level_values("datetime").unique()).sort_values()
+    first_observed = max(pd.Timestamp(train_start), factor_dates[0])
+    calendar = label_dates[
+        (label_dates >= first_observed) & (label_dates <= pd.Timestamp(valid_end))
+    ]
+    purge_days = max(int(config.rolling_purge_days), int(label_horizon_days))
+    embargo_days = max(int(config.rolling_embargo_days), int(label_horizon_days))
+    try:
+        folds = build_outer_walk_forward_folds(
+            calendar,
+            train_days=int(config.rolling_train_days),
+            validation_days=int(config.rolling_validation_days),
+            test_days=int(config.rolling_test_days),
+            purge_days=purge_days,
+            embargo_days=embargo_days,
+        )
+    except ValueError as exc:
+        return {
+            "status": "insufficient_evidence",
+            "passed": False,
+            "uses_final_test_data": False,
+            "reasons": [str(exc)],
+            "folds": [],
+            "observed_start": first_observed.date().isoformat(),
+            "observed_end": pd.Timestamp(valid_end).date().isoformat(),
+        }
+
+    evidence: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    timeseries = evaluation_shape == SHAPE_MARKET_TIMESERIES
+    for fold in folds:
+        valid_factor = normalize_series(
+            _window(
+                factor,
+                date.fromisoformat(fold.validation_start),
+                date.fromisoformat(fold.validation_end),
+            ),
+            "factor",
+        )
+        valid_label = normalize_series(
+            _window(
+                label,
+                date.fromisoformat(fold.validation_start),
+                date.fromisoformat(fold.validation_end),
+            ),
+            "label",
+        )
+        test_factor = normalize_series(
+            _window(factor, date.fromisoformat(fold.test_start), date.fromisoformat(fold.test_end)),
+            "factor",
+        )
+        test_label = normalize_series(
+            _window(label, date.fromisoformat(fold.test_start), date.fromisoformat(fold.test_end)),
+            "label",
+        )
+        validation_frame, _ = _joined_frame(valid_factor, valid_label)
+        test_frame, _ = _joined_frame(test_factor, test_label)
+        validation_days = int(validation_frame.index.get_level_values("datetime").nunique())
+        test_days = int(test_frame.index.get_level_values("datetime").nunique())
+        raw_validation_ic = _pearson_statistic(validation_frame, timeseries)
+        raw_test_ic = _pearson_statistic(test_frame, timeseries)
+        raw_test_rank_ic = _ic_statistic(test_frame, timeseries)
+        if (
+            validation_days < 5
+            or test_days < 5
+            or not all(
+                np.isfinite(value) for value in (raw_validation_ic, raw_test_ic, raw_test_rank_ic)
+            )
+        ):
+            skipped.append(
+                {
+                    "fold": fold.fold,
+                    "validation_days": validation_days,
+                    "test_days": test_days,
+                    "reason": "too few independent observations or undefined IC",
+                }
+            )
+            continue
+        direction = -1.0 if raw_validation_ic < 0 else 1.0
+        test_ic = float(raw_test_ic * direction)
+        test_rank_ic = float(raw_test_rank_ic * direction)
+        evidence.append(
+            {
+                "fold": fold.__dict__,
+                "validation_days": validation_days,
+                "test_days": test_days,
+                "raw_validation_ic": float(raw_validation_ic),
+                "direction": "inverted" if direction < 0 else "original",
+                "raw_test_ic": float(raw_test_ic),
+                "raw_test_rank_ic": float(raw_test_rank_ic),
+                "test_ic": test_ic,
+                "test_rank_ic": test_rank_ic,
+                "passed": bool(test_ic > 0.0 and test_rank_ic > 0.0),
+            }
+        )
+    minimum_folds = int(config.rolling_min_folds)
+    if len(evidence) < minimum_folds:
+        return {
+            "status": "insufficient_evidence",
+            "passed": False,
+            "uses_final_test_data": False,
+            "reasons": [
+                f"evaluable walk-forward folds={len(evidence)} below required {minimum_folds}"
+            ],
+            "fold_count": len(evidence),
+            "candidate_fold_count": len(folds),
+            "skipped_folds": skipped,
+            "folds": evidence,
+            "purge_days": purge_days,
+            "embargo_days": embargo_days,
+        }
+    pass_rate = float(np.mean([item["passed"] for item in evidence]))
+    mean_ic = float(np.mean([item["test_ic"] for item in evidence]))
+    mean_rank_ic = float(np.mean([item["test_rank_ic"] for item in evidence]))
+    passed = bool(
+        pass_rate >= float(config.rolling_min_pass_rate) and mean_ic > 0.0 and mean_rank_ic > 0.0
+    )
+    return {
+        "status": "completed",
+        "passed": passed,
+        "fold_count": len(evidence),
+        "candidate_fold_count": len(folds),
+        "pass_rate": pass_rate,
+        "minimum_pass_rate": float(config.rolling_min_pass_rate),
+        "mean_test_ic": mean_ic,
+        "mean_test_rank_ic": mean_rank_ic,
+        "purge_days": purge_days,
+        "embargo_days": embargo_days,
+        "uses_final_test_data": False,
+        "skipped_folds": skipped,
+        "folds": evidence,
+        "reasons": [] if passed else ["walk-forward holdout stability gate failed"],
+    }
+
+
+def _placebo_statistic(frame: pd.DataFrame, timeseries: bool, rng: np.random.Generator) -> float:
     """One shuffled-label placebo round: same marginals, broken factor/label link."""
 
     if timeseries:
@@ -308,18 +511,14 @@ def _placebo_statistic(
         return _ic_statistic(shifted, timeseries)
     labels = frame["label"]
     permuted = labels.groupby(level="datetime", group_keys=False).apply(
-        lambda series: pd.Series(
-            rng.permutation(series.to_numpy(dtype=float)), index=series.index
-        )
+        lambda series: pd.Series(rng.permutation(series.to_numpy(dtype=float)), index=series.index)
     )
     shuffled = frame.copy()
     shuffled["label"] = permuted
     return _ic_statistic(shuffled, timeseries)
 
 
-def _shifted_factor_stat(
-    frame: pd.DataFrame, timeseries: bool, periods: int
-) -> float:
+def _shifted_factor_stat(frame: pd.DataFrame, timeseries: bool, periods: int) -> float:
     """IC with the factor shifted ``periods`` trading days within each instrument.
 
     ``periods=-1`` pairs today's label with tomorrow's factor (look-ahead
@@ -376,8 +575,7 @@ def evaluate_placebo_leakage_diagnostics(
     placebo = [
         value
         for value in (
-            _placebo_statistic(frame, timeseries, rng)
-            for _ in range(int(config.placebo_rounds))
+            _placebo_statistic(frame, timeseries, rng) for _ in range(int(config.placebo_rounds))
         )
         if np.isfinite(value)
     ]
@@ -395,9 +593,7 @@ def evaluate_placebo_leakage_diagnostics(
 
     forward = _shifted_factor_stat(frame, timeseries, -1)
     lagged = _shifted_factor_stat(frame, timeseries, 1)
-    shifted_magnitudes = [
-        abs(value) for value in (forward, lagged) if np.isfinite(value)
-    ]
+    shifted_magnitudes = [abs(value) for value in (forward, lagged) if np.isfinite(value)]
     if real_abs > 1e-12 and shifted_magnitudes:
         collapse_ratio = float(max(shifted_magnitudes) / real_abs)
     else:
@@ -530,9 +726,7 @@ def evaluate_market_timeseries_factor(
         raise ValueError(
             "market timeseries evaluation requires MARKET pseudo-instrument factor values"
         )
-    label = normalize_series(
-        _window(benchmark_forward_returns, valid_start, valid_end), "label"
-    )
+    label = normalize_series(_window(benchmark_forward_returns, valid_start, valid_end), "label")
     benchmark_instruments = set(label.index.get_level_values("instrument").unique())
     if len(benchmark_instruments) != 1:
         raise ValueError("benchmark forward returns must carry exactly one instrument")
@@ -555,9 +749,7 @@ def evaluate_market_timeseries_factor(
             ],
         )
     try:
-        windows = purged_factor_evaluation_days(
-            days, label_horizon_days=label_horizon_days
-        )
+        windows = purged_factor_evaluation_days(days, label_horizon_days=label_horizon_days)
     except ValueError as exc:
         return _insufficient(
             SHAPE_MARKET_TIMESERIES,
@@ -694,7 +886,8 @@ def apply_family_bh_correction(evaluations: list[dict[str, Any]]) -> None:
             # Undefined HAC (zero long-run variance) pads to 1.0: undefined is
             # treated as insufficient evidence, never as a significant result.
             float(
-                1.0 if (p_value := (item.get("metrics") or {}).get("hac_p_value")) is None
+                1.0
+                if (p_value := (item.get("metrics") or {}).get("hac_p_value")) is None
                 else p_value
             )
             for item in family
