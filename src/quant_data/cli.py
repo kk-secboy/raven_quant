@@ -1766,6 +1766,8 @@ def cninfo_announcements_command(
     }
     _write_optional_result(result_path, result)
     console.print_json(json.dumps(result, ensure_ascii=False))
+    if summary.failed:
+        raise typer.Exit(3)
 
 
 @app.command("announcement-nlp")

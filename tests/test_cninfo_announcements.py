@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -421,23 +421,55 @@ def test_retryable_failures_back_off_then_succeed(tmp_path: Path) -> None:
     assert log.iloc[0]["attempts"] == 3
 
 
-def test_terminal_http_failure_is_logged_and_excluded_from_index(tmp_path: Path) -> None:
+def test_missing_source_is_tombstoned_and_excluded_from_index(tmp_path: Path) -> None:
     row = _ann_row("000001.SZ", "20240102", "已删除公告", "https://static.cninfo.com.cn/gone.pdf")
     _seed_data(tmp_path, [row])
     session = FakeSession({row["url"]: [FakeResponse(404, b"not found")]})
 
     summary = _run(tmp_path, _client(session))
 
-    assert summary.failed == 1
+    assert summary.failed == 0
+    assert summary.unavailable == 1
+    assert summary.as_dict()["status"] == "succeeded_with_source_gaps"
     assert summary.downloaded == 0
     index = pd.read_parquet(summary.index_path)
     assert len(index) == 0
     log = pd.read_parquet(summary.log_path)
     record = log.iloc[0]
-    assert record["status"] == "failed"
+    assert record["status"] == "source_unavailable"
     assert record["attempts"] == 1
     assert "404" in record["error"]
     assert record["fetched_at"] == pd.Timestamp(NOW)
+    unavailable = pd.read_parquet(summary.unavailable_path)
+    assert unavailable.iloc[0]["url"] == row["url"]
+    assert unavailable.iloc[0]["status_code"] == 404
+    assert unavailable.iloc[0]["first_seen_at"] == pd.Timestamp(NOW)
+    assert unavailable.iloc[0]["last_checked_at"] == pd.Timestamp(NOW)
+
+    cached_session = FakeSession({})
+    cached = _run(tmp_path, _client(cached_session))
+
+    assert cached_session.calls == []
+    assert cached.failed == 0
+    assert cached.unavailable == 1
+    assert cached.downloaded == 0
+    cached_log = pd.read_parquet(cached.log_path)
+    assert cached_log.iloc[0]["status"] == "source_unavailable"
+    assert cached_log.iloc[0]["attempts"] == 0
+    assert "cached HTTP 404" in cached_log.iloc[0]["error"]
+
+    recovered_session = FakeSession({row["url"]: [FakeResponse(200, _pdf("restored"))]})
+    recovered = cninfo.download_cninfo_announcements(
+        tmp_path,
+        client=_client(recovered_session),
+        now=lambda: NOW + timedelta(days=31),
+    )
+
+    assert recovered_session.calls == [row["url"]]
+    assert recovered.downloaded == 1
+    assert recovered.unavailable == 0
+    assert len(pd.read_parquet(recovered.index_path)) == 1
+    assert len(pd.read_parquet(recovered.unavailable_path)) == 0
 
 
 def test_non_pdf_body_for_pdf_url_is_terminal(tmp_path: Path) -> None:
@@ -520,6 +552,34 @@ def test_cli_downloads_with_filters_and_limit(tmp_path: Path, monkeypatch) -> No
     index = pd.read_parquet(tmp_path / "announcements" / "index.parquet")
     assert index["url"].tolist() == [rows[0]["url"]]
     assert index.iloc[0]["category"] == "regulatory_letter"
+
+
+def test_cli_exits_nonzero_for_genuine_download_failure(tmp_path: Path, monkeypatch) -> None:
+    row = _ann_row(
+        "000001.SZ", "20240102", "异常响应", "https://static.cninfo.com.cn/a.pdf"
+    )
+    _seed_data(tmp_path, [row])
+    client = _client(FakeSession({row["url"]: [FakeResponse(200, b"<html>error</html>")]}))
+    monkeypatch.setattr(cninfo, "CninfoHttpClient", lambda **kwargs: client)
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("REQUESTS_PER_MINUTE", "60000")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "cninfo-announcements",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-31",
+        ],
+    )
+
+    assert result.exit_code == 3, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "failed"
+    assert payload["failed"] == 1
+    assert payload["unavailable"] == 0
 
 
 def test_resolve_pdf_url_maps_detail_page_to_static_pdf() -> None:

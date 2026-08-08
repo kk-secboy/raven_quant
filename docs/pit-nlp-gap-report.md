@@ -187,6 +187,7 @@ Tushare `report_rc`（券商研报盈利预测与评级，cn_institutional 任�
 - **Qlib 评估接线**：新增 `external_factor_evaluate` durable job/API。任务只接受带外部来源身份、代码/数值 artifact 与 sha256 的候选，绑定可复现日线 Qlib 数据集身份、训练/验证/最终测试窗口及 purge/embargo 间隔；复用 `evaluate_external_factor_batch.py` 的 sparse-event/market-timeseries、HAC、BH-FDR、成本和泄漏哨兵评估，并把通过、证据不足和运行失败全部写入 `factor_evaluations` 审计账本。
 - **限流与恢复**：Tushare 中转站按运营方最新确认改为 99 次/分钟上限（100 次限制保留 1 次余量）；巨潮正文长任务每 100 条原子刷新 index/download-log 并更新 job progress，避免只在任务结束时才出现 checkpoint。
 - **覆盖边界**：逻辑与市场认可度只能覆盖真实落盘且有文本层的公告；当前生产正文任务收敛为 2024 年以来监管类高信号 PDF。不能追溯或未下载的公告不计覆盖，扫描件无文本层时 fail-closed，不用模型虚构字段。
+- **生产下载闭环（2026-08-08）**：监管类清单共 20,687 条，成功请求 17,594、已有文件跳过 2,602、源站不可用 491；491 条逐项核对均为 HTTP 404，未发现 429、5xx、网络错误或非 PDF 响应。`cninfo_announcements` 将 404/410 记入 `source_unavailable.parquet` 审计墓碑而不是伪装成功，30 天后才重新探测；重复运行在冷却期内不再浪费请求。非 404/410、日历缺口、内容校验失败仍计入 `failed`，CLI 返回非零退出码使 durable job 真实失败，避免“有错误但任务显示成功”。
 
 ## 十二、资金面进入 Qlib / RD-Agent（2026-08-08 追加）
 

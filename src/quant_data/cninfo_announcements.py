@@ -8,7 +8,7 @@ import time
 from bisect import bisect_right
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -51,6 +51,19 @@ LOG_COLUMNS = (
     "error",
 )
 LOG_API_NAME = "cninfo_announcement_pdf"
+UNAVAILABLE_COLUMNS = (
+    "url",
+    "ts_code",
+    "ann_date",
+    "title",
+    "status_code",
+    "first_seen_at",
+    "last_checked_at",
+    "attempts",
+    "error",
+)
+SOURCE_UNAVAILABLE_STATUS_CODES = frozenset({404, 410})
+DEFAULT_UNAVAILABLE_RECHECK_DAYS = 30
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -171,21 +184,33 @@ class DownloadSummary:
     planned: int
     downloaded: int
     skipped: int
+    unavailable: int
     failed: int
     bytes_written: int
     index_path: Path | None
     log_path: Path | None
+    unavailable_path: Path | None
 
     def as_dict(self) -> dict:
         return {
-            "status": "succeeded",
+            "status": (
+                "failed"
+                if self.failed
+                else "succeeded_with_source_gaps"
+                if self.unavailable
+                else "succeeded"
+            ),
             "planned": self.planned,
             "downloaded": self.downloaded,
             "skipped": self.skipped,
+            "unavailable": self.unavailable,
             "failed": self.failed,
             "bytes_written": self.bytes_written,
             "index_path": str(self.index_path) if self.index_path else None,
             "log_path": str(self.log_path) if self.log_path else None,
+            "unavailable_path": (
+                str(self.unavailable_path) if self.unavailable_path else None
+            ),
         }
 
 
@@ -408,11 +433,56 @@ def _log_frame(rows: list[dict]) -> pd.DataFrame:
     return frame
 
 
+def _unavailable_records(frame: pd.DataFrame) -> dict[str, dict]:
+    records: dict[str, dict] = {}
+    for row in frame.itertuples():
+        records[str(row.url)] = {
+            "url": str(row.url),
+            "ts_code": str(row.ts_code),
+            "ann_date": pd.Timestamp(row.ann_date).date(),
+            "title": str(row.title),
+            "status_code": int(row.status_code),
+            "first_seen_at": pd.Timestamp(row.first_seen_at).to_pydatetime(),
+            "last_checked_at": pd.Timestamp(row.last_checked_at).to_pydatetime(),
+            "attempts": int(row.attempts),
+            "error": str(row.error),
+        }
+    return records
+
+
+def _unavailable_frame(records: dict[str, dict]) -> pd.DataFrame:
+    if not records:
+        return pd.DataFrame(
+            {
+                "url": pd.Series(dtype="string"),
+                "ts_code": pd.Series(dtype="string"),
+                "ann_date": pd.Series(dtype="datetime64[ns]"),
+                "title": pd.Series(dtype="string"),
+                "status_code": pd.Series(dtype="int64"),
+                "first_seen_at": pd.Series(dtype="datetime64[ns, UTC]"),
+                "last_checked_at": pd.Series(dtype="datetime64[ns, UTC]"),
+                "attempts": pd.Series(dtype="int64"),
+                "error": pd.Series(dtype="string"),
+            }
+        )
+    frame = pd.DataFrame(list(records.values()), columns=list(UNAVAILABLE_COLUMNS))
+    frame["ann_date"] = pd.to_datetime(frame["ann_date"])
+    frame["first_seen_at"] = pd.to_datetime(frame["first_seen_at"], utc=True)
+    frame["last_checked_at"] = pd.to_datetime(frame["last_checked_at"], utc=True)
+    frame["status_code"] = frame["status_code"].astype("int64")
+    frame["attempts"] = frame["attempts"].astype("int64")
+    return frame.sort_values(["ann_date", "ts_code", "url"], kind="stable").reset_index(
+        drop=True
+    )
+
+
 def _persist_download_state(
     records: dict[str, dict],
+    unavailable_records: dict[str, dict],
     log_rows: list[dict],
     *,
     index_path: Path,
+    unavailable_path: Path,
     log_path: Path | None,
 ) -> None:
     """Atomically persist resumable metadata during a long body download."""
@@ -423,6 +493,12 @@ def _persist_download_state(
         temporary_index, index=False, compression="zstd", engine="pyarrow"
     )
     os.replace(temporary_index, index_path)
+    unavailable_frame = _unavailable_frame(unavailable_records)
+    temporary_unavailable = unavailable_path.with_suffix(".parquet.tmp")
+    unavailable_frame.to_parquet(
+        temporary_unavailable, index=False, compression="zstd", engine="pyarrow"
+    )
+    os.replace(temporary_unavailable, unavailable_path)
     if log_path is not None and log_rows:
         temporary_log = log_path.with_suffix(".parquet.tmp")
         _log_frame(log_rows).to_parquet(
@@ -446,6 +522,7 @@ def download_cninfo_announcements(
     max_attempts: int = 5,
     cooldown_seconds: float = 180.0,
     checkpoint_every: int = 100,
+    unavailable_recheck_days: int = DEFAULT_UNAVAILABLE_RECHECK_DAYS,
     progress_callback: Callable[[dict[str, int]], None] | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> DownloadSummary:
@@ -468,6 +545,7 @@ def download_cninfo_announcements(
     files_root = base / "files"
     logs_root = base / "logs"
     index_path = base / "index.parquet"
+    unavailable_path = base / "source_unavailable.parquet"
     files_root.mkdir(parents=True, exist_ok=True)
     logs_root.mkdir(parents=True, exist_ok=True)
 
@@ -475,6 +553,10 @@ def download_cninfo_announcements(
         records = _index_records(pd.read_parquet(index_path))
     else:
         records = {}
+    if unavailable_path.exists():
+        unavailable_records = _unavailable_records(pd.read_parquet(unavailable_path))
+    else:
+        unavailable_records = {}
 
     if refs:
         open_days = load_trade_calendar_open_days(data_root)
@@ -491,11 +573,13 @@ def download_cninfo_announcements(
 
     if checkpoint_every <= 0:
         raise ValueError("checkpoint_every must be positive")
+    if unavailable_recheck_days < 1:
+        raise ValueError("unavailable_recheck_days must be positive")
     log_rows: list[dict] = []
     log_path = (
         logs_root / f"download_log_{clock():%Y%m%dT%H%M%SZ}.parquet" if refs else None
     )
-    downloaded = skipped = failed = bytes_written = 0
+    downloaded = skipped = unavailable = failed = bytes_written = 0
     if progress_callback is not None:
         progress_callback(
             {
@@ -503,6 +587,7 @@ def download_cninfo_announcements(
                 "completed": 0,
                 "downloaded": 0,
                 "skipped": 0,
+                "unavailable": 0,
                 "failed": 0,
                 "bytes_written": 0,
             }
@@ -510,15 +595,21 @@ def download_cninfo_announcements(
     for position, ref in enumerate(refs):
         if position and position % checkpoint_every == 0:
             _persist_download_state(
-                records, log_rows, index_path=index_path, log_path=log_path
+                records,
+                unavailable_records,
+                log_rows,
+                index_path=index_path,
+                unavailable_path=unavailable_path,
+                log_path=log_path,
             )
             if progress_callback is not None:
                 progress_callback(
                     {
                         "planned": len(refs),
-                        "completed": downloaded + skipped + failed,
+                        "completed": downloaded + skipped + unavailable + failed,
                         "downloaded": downloaded,
                         "skipped": skipped,
+                        "unavailable": unavailable,
                         "failed": failed,
                         "bytes_written": bytes_written,
                     }
@@ -549,6 +640,7 @@ def download_cninfo_announcements(
         if existing is not None:
             target = data_root / existing["file_path"]
             if target.is_file() and target.stat().st_size == existing["bytes"]:
+                unavailable_records.pop(ref.url, None)
                 skipped += 1
                 log_row.update(
                     status="skipped",
@@ -559,16 +651,58 @@ def download_cninfo_announcements(
                 )
                 continue
 
+        unavailable_record = unavailable_records.get(ref.url)
+        if unavailable_record is not None:
+            last_checked_at = pd.Timestamp(
+                unavailable_record["last_checked_at"]
+            ).to_pydatetime()
+            if clock() - last_checked_at < timedelta(days=unavailable_recheck_days):
+                unavailable += 1
+                log_row.update(
+                    status="source_unavailable",
+                    fetched_at=clock(),
+                    attempts=0,
+                    error=(
+                        f"cached HTTP {unavailable_record['status_code']}; "
+                        f"next recheck after {unavailable_recheck_days} days"
+                    ),
+                )
+                continue
+
         try:
             body, attempts = client.get(ref.url)
         except CninfoDownloadError as exc:
-            failed += 1
-            log_row.update(
-                status="failed",
-                fetched_at=clock(),
-                attempts=exc.attempts,
-                error=str(exc),
-            )
+            checked_at = clock()
+            if exc.status_code in SOURCE_UNAVAILABLE_STATUS_CODES:
+                unavailable += 1
+                previous = unavailable_records.get(ref.url)
+                unavailable_records[ref.url] = {
+                    "url": ref.url,
+                    "ts_code": ref.ts_code,
+                    "ann_date": ref.ann_date,
+                    "title": ref.title,
+                    "status_code": int(exc.status_code),
+                    "first_seen_at": (
+                        previous["first_seen_at"] if previous else checked_at
+                    ),
+                    "last_checked_at": checked_at,
+                    "attempts": int(exc.attempts),
+                    "error": str(exc),
+                }
+                log_row.update(
+                    status="source_unavailable",
+                    fetched_at=checked_at,
+                    attempts=exc.attempts,
+                    error=str(exc),
+                )
+            else:
+                failed += 1
+                log_row.update(
+                    status="failed",
+                    fetched_at=checked_at,
+                    attempts=exc.attempts,
+                    error=str(exc),
+                )
             continue
 
         digest = hashlib.sha256(body).hexdigest()
@@ -605,6 +739,7 @@ def download_cninfo_announcements(
             "file_path": relative,
             "bytes": len(body),
         }
+        unavailable_records.pop(ref.url, None)
         downloaded += 1
         log_row.update(
             status="succeeded",
@@ -615,14 +750,22 @@ def download_cninfo_announcements(
             file_path=relative,
         )
 
-    _persist_download_state(records, log_rows, index_path=index_path, log_path=log_path)
+    _persist_download_state(
+        records,
+        unavailable_records,
+        log_rows,
+        index_path=index_path,
+        unavailable_path=unavailable_path,
+        log_path=log_path,
+    )
     if progress_callback is not None:
         progress_callback(
             {
                 "planned": len(refs),
-                "completed": downloaded + skipped + failed,
+                "completed": downloaded + skipped + unavailable + failed,
                 "downloaded": downloaded,
                 "skipped": skipped,
+                "unavailable": unavailable,
                 "failed": failed,
                 "bytes_written": bytes_written,
             }
@@ -632,8 +775,10 @@ def download_cninfo_announcements(
         planned=len(refs),
         downloaded=downloaded,
         skipped=skipped,
+        unavailable=unavailable,
         failed=failed,
         bytes_written=bytes_written,
         index_path=index_path,
         log_path=log_path,
+        unavailable_path=unavailable_path,
     )
