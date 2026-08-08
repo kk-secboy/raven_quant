@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import and_, case, func, or_, select, update
@@ -408,9 +408,10 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
         "研究语料",
         "QuantLab",
         "ready",
-        ("cn_institutional", "research_corpus"),
+        ("cn_ashare_daily_full", "cn_institutional", "research_corpus"),
         ("corpus_nlp_fields",),
         "daily",
+        range_start="2018-11-20",
     ),
     DataTaskDefinition(
         "cn_event_market_response",
@@ -624,6 +625,47 @@ DATA_TASK_CATALOG: tuple[DataTaskDefinition, ...] = (
     ),
 )
 
+
+_FULL_SCOPE_JOB_TASKS = frozenset(
+    {
+        "cn_cninfo_announcements",
+        "cn_announcement_nlp",
+        "cn_corpus_nlp",
+    }
+)
+_DATA_TASK_BY_KEY = {definition.task_key: definition for definition in DATA_TASK_CATALOG}
+
+
+def job_covers_catalog_scope(task_key: str, payload: dict[str, Any] | None) -> bool:
+    """Return whether a durable job is evidence for full catalog completion.
+
+    Limited/pilot information jobs are useful operationally, but binding one
+    to the catalog task would make the UI claim the whole data capability is
+    complete. For historical tasks with a declared source boundary, also
+    require the job to start no later than that boundary. The job still remains
+    fully auditable in ``quantlab.jobs``; it simply cannot certify full scope.
+    """
+
+    if task_key not in _FULL_SCOPE_JOB_TASKS:
+        return True
+    job_payload = payload or {}
+    try:
+        limit = int(job_payload.get("limit") or 0)
+    except (TypeError, ValueError):
+        return False
+    if limit > 0:
+        return False
+    definition = _DATA_TASK_BY_KEY[task_key]
+    if definition.range_start is None:
+        return True
+    raw_start = str(job_payload.get("start") or "").strip()
+    if not raw_start:
+        return False
+    try:
+        return date.fromisoformat(raw_start) <= date.fromisoformat(definition.range_start)
+    except ValueError:
+        return False
+
 SUPPLEMENTAL_TASK_KEYS = (
     frozenset(
         {
@@ -717,7 +759,13 @@ class DataTaskStore:
         ).all()
         latest: dict[str, Any] = {}
         for row in rows:
-            latest.setdefault(str(row.kind), row)
+            kind = str(row.kind)
+            task_key = task_by_kind.get(kind)
+            if task_key is None or not job_covers_catalog_scope(
+                task_key, row.payload_json or {}
+            ):
+                continue
+            latest.setdefault(kind, row)
         for kind, task_key in task_by_kind.items():
             current = latest.get(kind)
             if current is None:

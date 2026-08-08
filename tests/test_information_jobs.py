@@ -14,7 +14,7 @@ from quant_platform.api import (
     EventMarketResponseRequest,
     ExternalFactorEvaluationRequest,
 )
-from quant_platform.data_task_store import DATA_TASK_CATALOG
+from quant_platform.data_task_store import DATA_TASK_CATALOG, job_covers_catalog_scope
 from quant_platform.worker import LocalJobWorker
 
 pytestmark = pytest.mark.no_database
@@ -57,7 +57,35 @@ def test_announcement_catalog_records_real_source_boundary() -> None:
     assert tasks["cn_cninfo_announcements"].range_start == "2016-01-01"
     assert tasks["cn_cninfo_announcements"].estimated_storage_gb == 320
     assert tasks["cn_announcement_nlp"].range_start == "2016-01-01"
+    assert tasks["cn_corpus_nlp"].range_start == "2018-11-20"
+    assert "cn_ashare_daily_full" in tasks["cn_corpus_nlp"].depends_on
     assert tasks["cn_event_market_response"].range_start == "2016-01-01"
+
+
+def test_pilot_jobs_cannot_certify_full_information_catalog_scope() -> None:
+    assert not job_covers_catalog_scope(
+        "cn_cninfo_announcements", {"start": "2016-01-01", "limit": 25}
+    )
+    assert not job_covers_catalog_scope(
+        "cn_announcement_nlp", {"start": "2024-01-01", "limit": 0}
+    )
+    assert not job_covers_catalog_scope("cn_announcement_nlp", {"limit": 0})
+    assert job_covers_catalog_scope(
+        "cn_announcement_nlp", {"start": "2016-01-01", "limit": 0}
+    )
+    assert job_covers_catalog_scope(
+        "cn_announcement_nlp", {"start": "2015-12-31", "limit": 0}
+    )
+    assert not job_covers_catalog_scope("cn_corpus_nlp", {"limit": 100})
+    assert not job_covers_catalog_scope("cn_corpus_nlp", {"limit": "not-an-int"})
+    assert not job_covers_catalog_scope("cn_corpus_nlp", {"limit": 0})
+    assert not job_covers_catalog_scope(
+        "cn_corpus_nlp", {"start": "2024-01-01", "limit": 0}
+    )
+    assert job_covers_catalog_scope(
+        "cn_corpus_nlp", {"start": "2018-11-20", "limit": 0}
+    )
+    assert job_covers_catalog_scope("cn_snapshot_build", {"limit": 100})
 
 
 def test_worker_builds_announcement_and_corpus_nlp_commands(tmp_path: Path) -> None:
