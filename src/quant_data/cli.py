@@ -18,6 +18,8 @@ from quant_platform.announcement_nlp import process_announcements
 from quant_platform.corpus_nlp import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_CORPUS_DATASETS,
+    DEFAULT_IRM_PER_INSTRUMENT_DAY,
+    DEFAULT_MAJOR_NEWS_PER_DAY,
     SUPPORTED_CORPUS_DATASETS,
     process_corpus,
 )
@@ -1874,6 +1876,20 @@ def corpus_nlp_command(
             help="Corpus items per LLM request (strict item-id matching)",
         ),
     ] = DEFAULT_BATCH_SIZE,
+    major_news_per_day: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Deterministic major_news sample per publication day (0 = all)",
+        ),
+    ] = DEFAULT_MAJOR_NEWS_PER_DAY,
+    irm_per_instrument_day: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Deterministic IR Q&A sample per instrument/day (0 = all)",
+        ),
+    ] = DEFAULT_IRM_PER_INSTRUMENT_DAY,
     result_path: Annotated[Path | None, typer.Option("--result")] = None,
 ) -> None:
     """Extract structured NLP signal fields from downloaded Tushare text corpora."""
@@ -1914,6 +1930,8 @@ def corpus_nlp_command(
             end=end_date,
             limit=limit or None,
             batch_size=batch_size,
+            max_major_news_per_day=major_news_per_day or None,
+            max_irm_per_instrument_day=irm_per_instrument_day or None,
             secret_store=secret_store,
             progress_callback=report_corpus_nlp_progress,
         ),

@@ -81,6 +81,8 @@ def test_pilot_jobs_cannot_certify_full_information_catalog_scope() -> None:
             "start": "2016-01-01",
             "limit": 0,
             "batch_size": 40,
+            "major_news_per_day": 40,
+            "irm_per_instrument_day": 2,
             "ts_codes": ["000001.SZ"],
         },
     )
@@ -137,6 +139,26 @@ def test_pilot_jobs_cannot_certify_full_information_catalog_scope() -> None:
             "datasets": ["major_news", "cctv_news", "irm_qa_sh", "irm_qa_sz"],
         },
     )
+    assert not job_covers_catalog_scope(
+        "cn_corpus_nlp",
+        {
+            "start": "2018-11-20",
+            "limit": 0,
+            "datasets": ["major_news", "cctv_news", "irm_qa_sh", "irm_qa_sz"],
+            "major_news_per_day": 10,
+            "irm_per_instrument_day": 1,
+        },
+    )
+    assert job_covers_catalog_scope(
+        "cn_corpus_nlp",
+        {
+            "start": "2018-11-20",
+            "limit": 0,
+            "datasets": ["major_news", "cctv_news", "irm_qa_sh", "irm_qa_sz"],
+            "major_news_per_day": 0,
+            "irm_per_instrument_day": 0,
+        },
+    )
     assert job_covers_catalog_scope("cn_snapshot_build", {"limit": 100})
 
 
@@ -178,6 +200,8 @@ def test_worker_builds_announcement_and_corpus_nlp_commands(tmp_path: Path) -> N
     assert "corpus-nlp" in corpus_command
     assert "major_news,npr" in corpus_command
     assert corpus_command[corpus_command.index("--batch-size") + 1] == "40"
+    assert corpus_command[corpus_command.index("--major-news-per-day") + 1] == "40"
+    assert corpus_command[corpus_command.index("--irm-per-instrument-day") + 1] == "2"
     assert corpus_result.name == "result.json"
     assert corpus_env == {}
 

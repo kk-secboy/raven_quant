@@ -17,7 +17,15 @@ from quant_data.config import Settings
 from quant_data.path_utils import to_wsl_path as _to_wsl_path
 
 from .allocation_store import AllocationStore
-from .corpus_nlp import DEFAULT_BATCH_SIZE as CORPUS_DEFAULT_BATCH_SIZE
+from .corpus_nlp import (
+    DEFAULT_BATCH_SIZE as CORPUS_DEFAULT_BATCH_SIZE,
+)
+from .corpus_nlp import (
+    DEFAULT_IRM_PER_INSTRUMENT_DAY as CORPUS_DEFAULT_IRM_PER_INSTRUMENT_DAY,
+)
+from .corpus_nlp import (
+    DEFAULT_MAJOR_NEWS_PER_DAY as CORPUS_DEFAULT_MAJOR_NEWS_PER_DAY,
+)
 from .cost_model import CostModelConfig
 from .data_rollover import qlib_trading_date_on_or_before
 from .execution_algorithms import execution_time_slots
@@ -539,6 +547,22 @@ class LocalJobWorker:
                     [
                         "--batch-size",
                         str(int(payload.get("batch_size") or CORPUS_DEFAULT_BATCH_SIZE)),
+                        "--major-news-per-day",
+                        str(
+                            int(
+                                payload.get("major_news_per_day")
+                                if payload.get("major_news_per_day") is not None
+                                else CORPUS_DEFAULT_MAJOR_NEWS_PER_DAY
+                            )
+                        ),
+                        "--irm-per-instrument-day",
+                        str(
+                            int(
+                                payload.get("irm_per_instrument_day")
+                                if payload.get("irm_per_instrument_day") is not None
+                                else CORPUS_DEFAULT_IRM_PER_INSTRUMENT_DAY
+                            )
+                        ),
                     ]
                 )
             else:

@@ -86,6 +86,8 @@ PROMPT_VERSION = "corpus-nlp.v2"
 DEFAULT_BATCH_SIZE = 40
 MAX_BATCH_SIZE = 100
 DEFAULT_BATCH_ITEM_CHARS = 1_000
+DEFAULT_MAJOR_NEWS_PER_DAY = 40
+DEFAULT_IRM_PER_INSTRUMENT_DAY = 2
 
 TOPICS = ("macro", "policy", "industry", "company", "market", "other")
 
@@ -247,7 +249,11 @@ def _date_bounds_sql(
 
 
 def _major_news_items(
-    paths: list[str], *, start: date | None = None, end: date | None = None
+    paths: list[str],
+    *,
+    start: date | None = None,
+    end: date | None = None,
+    max_items_per_day: int | None = None,
 ) -> list[CorpusItem]:
     columns = _available_columns(paths)
     missing = sorted({"title", "content", "pub_time"} - columns)
@@ -255,18 +261,41 @@ def _major_news_items(
         raise RuntimeError(f"major_news parquet misses required columns: {missing}")
     moment_expr = "try_cast(CAST(pub_time AS VARCHAR) AS TIMESTAMP)"
     where, parameters = _date_bounds_sql(moment_expr, start=start, end=end)
-    frame = _read_parquet_union(
-        paths,
-        f"""
-        SELECT
+    select_sql = f"""
+        SELECT DISTINCT
             CAST(title AS VARCHAR) AS title,
             CAST(content AS VARCHAR) AS content,
-            CAST(pub_time AS VARCHAR) AS pub_time
+            CAST(pub_time AS VARCHAR) AS pub_time,
+            {moment_expr} AS moment
         FROM read_parquet(?, union_by_name=true)
         {where}
-        """,
-        parameters,
-    )
+    """
+    if max_items_per_day is not None:
+        if max_items_per_day < 1:
+            raise ValueError("max_items_per_day must be positive")
+        frame = _read_parquet_union(
+            paths,
+            f"""
+            WITH source AS ({select_sql}), ranked AS (
+                SELECT *, row_number() OVER (
+                    PARTITION BY CAST(moment AS DATE)
+                    ORDER BY hash(title, content, pub_time), title, pub_time
+                ) AS selection_rank
+                FROM source
+                WHERE moment IS NOT NULL
+            )
+            SELECT title, content, pub_time
+            FROM ranked
+            WHERE selection_rank <= ?
+            """,
+            [*parameters, max_items_per_day],
+        )
+    else:
+        frame = _read_parquet_union(
+            paths,
+            f"SELECT title, content, pub_time FROM ({select_sql}) AS source",
+            parameters,
+        )
     frame["moment"] = pd.to_datetime(frame["pub_time"], errors="coerce")
     items: list[CorpusItem] = []
     for row in frame.itertuples():
@@ -298,6 +327,7 @@ def _irm_qa_items(
     *,
     start: date | None = None,
     end: date | None = None,
+    max_items_per_instrument_day: int | None = None,
 ) -> list[CorpusItem]:
     columns = _available_columns(paths)
     question_col = next((name for name in ("q", "question") if name in columns), None)
@@ -320,12 +350,33 @@ def _irm_qa_items(
         # Tolerant: the answer column is optional; questions alone still carry signal.
         select_parts.append(f'CAST("{answer_col}" AS VARCHAR) AS answer')
     where, parameters = _date_bounds_sql(trade_date_expr, start=start, end=end)
-    frame = _read_parquet_union(
-        paths,
-        f"SELECT {', '.join(select_parts)} FROM read_parquet(?, union_by_name=true)"
-        f"{where}",
-        parameters,
+    select_sql = (
+        f"SELECT DISTINCT {', '.join(select_parts)} "
+        f"FROM read_parquet(?, union_by_name=true){where}"
     )
+    if max_items_per_instrument_day is not None:
+        if max_items_per_instrument_day < 1:
+            raise ValueError("max_items_per_instrument_day must be positive")
+        order_columns = "question" + (", answer" if answer_col is not None else "")
+        frame = _read_parquet_union(
+            paths,
+            f"""
+            WITH source AS ({select_sql}), ranked AS (
+                SELECT *, row_number() OVER (
+                    PARTITION BY trade_date, upper(trim(ts_code))
+                    ORDER BY hash({order_columns}), question
+                ) AS selection_rank
+                FROM source
+                WHERE trade_date IS NOT NULL AND trim(ts_code) <> ''
+            )
+            SELECT * EXCLUDE (selection_rank)
+            FROM ranked
+            WHERE selection_rank <= ?
+            """,
+            [*parameters, max_items_per_instrument_day],
+        )
+    else:
+        frame = _read_parquet_union(paths, select_sql, parameters)
     items: list[CorpusItem] = []
     for row in frame.itertuples():
         if pd.isna(row.trade_date):
@@ -470,6 +521,8 @@ def load_corpus_items(
     ts_codes: set[str] | None = None,
     start: date | None = None,
     end: date | None = None,
+    max_major_news_per_day: int | None = None,
+    max_irm_per_instrument_day: int | None = None,
 ) -> list[CorpusItem]:
     """Read corpus parquets from the units/snapshots layout into unified items.
 
@@ -494,10 +547,23 @@ def load_corpus_items(
     for dataset in ordered:
         loader = loaders.get(dataset)
         rows = (
-            loader(paths_by_dataset[dataset], start=start, end=end)
+            loader(
+                paths_by_dataset[dataset],
+                start=start,
+                end=end,
+                **(
+                    {"max_items_per_day": max_major_news_per_day}
+                    if dataset == DATASET_MAJOR_NEWS
+                    else {}
+                ),
+            )
             if loader is not None
             else _irm_qa_items(
-                paths_by_dataset[dataset], dataset, start=start, end=end
+                paths_by_dataset[dataset],
+                dataset,
+                start=start,
+                end=end,
+                max_items_per_instrument_day=max_irm_per_instrument_day,
             )
         )
         for item in rows:
@@ -822,6 +888,7 @@ def _write_factor_artifact(
     *,
     name: str,
     source_datasets: tuple[str, ...],
+    selection_policy: Mapping[str, int | None],
     model: str,
     now: datetime,
 ) -> dict[str, Any]:
@@ -840,6 +907,7 @@ def _write_factor_artifact(
             "source_datasets": list(source_datasets),
             "prompt_version": PROMPT_VERSION,
             "model": model,
+            "selection_policy": dict(selection_policy),
         },
         "generated_at": now.isoformat(),
     }
@@ -864,6 +932,7 @@ class CorpusNlpSummary:
     skipped: int
     failed: int
     llm_calls: int
+    selection_policy: dict[str, int | None]
     fields_path: Path | None
     state_path: Path | None
     unit_path: Path | None
@@ -877,6 +946,7 @@ class CorpusNlpSummary:
             "skipped": self.skipped,
             "failed": self.failed,
             "llm_calls": self.llm_calls,
+            "selection_policy": self.selection_policy,
             "fields_path": str(self.fields_path) if self.fields_path else None,
             "state_path": str(self.state_path) if self.state_path else None,
             "unit_path": str(self.unit_path) if self.unit_path else None,
@@ -909,6 +979,8 @@ def process_corpus(
     max_chars: int = MAX_TEXT_CHARS,
     batch_size: int = 1,
     batch_item_chars: int = DEFAULT_BATCH_ITEM_CHARS,
+    max_major_news_per_day: int | None = DEFAULT_MAJOR_NEWS_PER_DAY,
+    max_irm_per_instrument_day: int | None = DEFAULT_IRM_PER_INSTRUMENT_DAY,
     checkpoint_every: int = 100,
     progress_callback: Callable[[dict[str, int]], None] | None = None,
     now: Callable[[], datetime] | None = None,
@@ -930,6 +1002,10 @@ def process_corpus(
         raise ValueError(f"batch_size must be between 1 and {MAX_BATCH_SIZE}")
     if batch_item_chars < 1:
         raise ValueError("batch_item_chars must be positive")
+    if max_major_news_per_day is not None and max_major_news_per_day < 1:
+        raise ValueError("max_major_news_per_day must be positive")
+    if max_irm_per_instrument_day is not None and max_irm_per_instrument_day < 1:
+        raise ValueError("max_irm_per_instrument_day must be positive")
 
     clock = now or (lambda: datetime.now(UTC))
     selected_datasets = set(datasets) if datasets else set(DEFAULT_CORPUS_DATASETS)
@@ -939,6 +1015,8 @@ def process_corpus(
         ts_codes=ts_codes,
         start=start,
         end=end,
+        max_major_news_per_day=max_major_news_per_day,
+        max_irm_per_instrument_day=max_irm_per_instrument_day,
     )
     if limit is not None and limit > 0:
         items = items[:limit]
@@ -1129,6 +1207,10 @@ def process_corpus(
     persist_checkpoint(force=True)
 
     fields = _fields_frame(list(fields_records.values()))
+    selection_policy: dict[str, int | None] = {
+        "major_news_max_items_per_publication_day": max_major_news_per_day,
+        "irm_max_items_per_instrument_publication_day": max_irm_per_instrument_day,
+    }
     news_series = build_news_sentiment_series(fields, open_days)
     irm_qa_series = build_irm_qa_sentiment_series(fields, open_days)
     policy_series = build_policy_sentiment_series(fields, open_days)
@@ -1142,6 +1224,7 @@ def process_corpus(
             for dataset in (DATASET_MAJOR_NEWS,)
             if dataset in selected_datasets
         ),
+        selection_policy=selection_policy,
         model=model,
         now=clock(),
     )
@@ -1152,6 +1235,7 @@ def process_corpus(
         source_datasets=tuple(
             dataset for dataset in IRM_QA_DATASETS if dataset in selected_datasets
         ),
+        selection_policy=selection_policy,
         model=model,
         now=clock(),
     )
@@ -1162,6 +1246,7 @@ def process_corpus(
         source_datasets=tuple(
             dataset for dataset in POLICY_DATASETS if dataset in selected_datasets
         ),
+        selection_policy=selection_policy,
         model=model,
         now=clock(),
     )
@@ -1171,6 +1256,7 @@ def process_corpus(
         skipped=skipped,
         failed=failed,
         llm_calls=llm_calls,
+        selection_policy=selection_policy,
         fields_path=fields_path,
         state_path=state_path,
         unit_path=unit_path,

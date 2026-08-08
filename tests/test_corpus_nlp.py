@@ -913,6 +913,50 @@ def test_load_corpus_items_pushes_date_bounds_into_duckdb(
     assert bounded[0][1] == (date(2024, 2, 1), date(2024, 2, 29))
 
 
+def test_load_corpus_items_applies_deterministic_production_caps(tmp_path: Path) -> None:
+    _write_parquet(
+        tmp_path / "units" / "major_news",
+        [
+            _news_row(f"新闻{index}", f"正文{index}", "2024-01-02 09:00:00")
+            for index in range(5)
+        ],
+    )
+    first = corpus.load_corpus_items(
+        tmp_path, datasets={"major_news"}, max_major_news_per_day=2
+    )
+    second = corpus.load_corpus_items(
+        tmp_path, datasets={"major_news"}, max_major_news_per_day=2
+    )
+    assert len(first) == 2
+    assert [item.item_id for item in first] == [item.item_id for item in second]
+
+    _write_parquet(
+        tmp_path / "units" / "irm_qa_sh",
+        [
+            {
+                "trade_date": "20240102",
+                "ts_code": "000001.SH",
+                "q": f"问题{index}",
+            }
+            for index in range(4)
+        ]
+        + [
+            {
+                "trade_date": "20240102",
+                "ts_code": "000002.SH",
+                "q": "另一个公司",
+            }
+        ],
+    )
+    irm = corpus.load_corpus_items(
+        tmp_path,
+        datasets={"irm_qa_sh"},
+        max_irm_per_instrument_day=2,
+    )
+    assert len([item for item in irm if item.ts_code == "000001.SH"]) == 2
+    assert len([item for item in irm if item.ts_code == "000002.SH"]) == 1
+
+
 def test_process_honors_limit(tmp_path: Path) -> None:
     _seed_corpus(tmp_path)
     _seed_trade_cal(tmp_path)

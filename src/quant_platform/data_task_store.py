@@ -686,6 +686,15 @@ def job_covers_catalog_scope(task_key: str, payload: dict[str, Any] | None) -> b
         # not a required fake dataset. The four real corpora are mandatory.
         if datasets and not _CORPUS_CATALOG_DATASETS <= datasets:
             return False
+        try:
+            major_cap = int(job_payload.get("major_news_per_day", 40))
+            irm_cap = int(job_payload.get("irm_per_instrument_day", 2))
+        except (TypeError, ValueError):
+            return False
+        # Zero means no cap (a superset). Smaller samples than the governed
+        # production policy cannot certify the catalog's advertised scope.
+        if (0 < major_cap < 40) or (0 < irm_cap < 2):
+            return False
     definition = _DATA_TASK_BY_KEY[task_key]
     if definition.range_start is None:
         return True
