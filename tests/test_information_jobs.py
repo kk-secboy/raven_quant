@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from quant_data.config import Settings
+from quant_platform import worker as worker_module
 from quant_platform.api import (
     AnnouncementNlpRequest,
     CorpusNlpRequest,
     EventMarketResponseRequest,
+    ExternalFactorEvaluationRequest,
 )
 from quant_platform.worker import LocalJobWorker
 
@@ -19,6 +22,7 @@ pytestmark = pytest.mark.no_database
 def _worker(tmp_path: Path) -> LocalJobWorker:
     worker = object.__new__(LocalJobWorker)
     worker.settings = Settings(api_url="", token="", data_root=tmp_path / "data")
+    worker.project_root = tmp_path
     return worker
 
 
@@ -31,6 +35,19 @@ def test_information_request_models_fail_closed() -> None:
         EventMarketResponseRequest(snapshot_name="fixture", horizons=[1, 1])
     with pytest.raises(ValidationError, match="between 1 and 252"):
         EventMarketResponseRequest(snapshot_name="fixture", horizons=[0])
+    with pytest.raises(ValidationError, match="must not contain duplicates"):
+        ExternalFactorEvaluationRequest(
+            dataset="qlib-fixture",
+            candidate_ids=["candidate", "candidate"],
+            periods={
+                "train_start": "2024-01-01",
+                "train_end": "2024-06-28",
+                "valid_start": "2024-07-01",
+                "valid_end": "2024-12-31",
+                "test_start": "2025-01-13",
+                "test_end": "2026-08-03",
+            },
+        )
 
 
 def test_worker_builds_announcement_and_corpus_nlp_commands(tmp_path: Path) -> None:
@@ -94,3 +111,87 @@ def test_worker_builds_market_response_label_command(tmp_path: Path) -> None:
     assert "000300.SH" in command
     assert result_path.name == "result.json"
     assert environment == {}
+
+
+def test_worker_builds_external_factor_evaluation_command(tmp_path: Path) -> None:
+    worker = _worker(tmp_path)
+    values_path = tmp_path / "logic.parquet"
+    values_path.write_bytes(b"fixture")
+    command, result_path, environment = worker._command(
+        {
+            "id": "external-eval-job",
+            "kind": "external_factor_evaluate",
+            "payload": {
+                "dataset": "qlib-fixture",
+                "dataset_path": str(tmp_path / "qlib"),
+                "dataset_identity_sha256": "a" * 64,
+                "periods": {
+                    "train_start": "2024-01-01",
+                    "train_end": "2024-06-28",
+                    "valid_start": "2024-07-01",
+                    "valid_end": "2024-12-31",
+                    "test_start": "2025-01-13",
+                    "test_end": "2026-08-03",
+                },
+                "universe": "cn_all",
+                "benchmark": "SH000300",
+                "candidates": [
+                    {
+                        "id": "candidate",
+                        "values_path": str(values_path),
+                        "code_sha256": "b" * 64,
+                        "values_sha256": "c" * 64,
+                        "experiment_family_id": "logic",
+                        "experiment_count": 1,
+                        "label_horizon_days": 1,
+                    }
+                ],
+            },
+        }
+    )
+
+    assert "evaluate_external_factor_batch.py" in " ".join(command)
+    assert "--provider-uri" in command
+    assert result_path.name == "result.json"
+    assert "_MLFLOW_SERVER_ARTIFACT_ROOT" in environment
+    manifest = json.loads((result_path.parent / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["candidates"][0]["values_sha256"] == "c" * 64
+    assert manifest["comparison_values"] == []
+
+
+def test_worker_imports_external_evaluation_with_bound_periods(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = _worker(tmp_path)
+    worker.research = object()
+    captured: dict = {}
+
+    def fake_import(store, result, **kwargs):
+        captured.update(store=store, result=result, **kwargs)
+        return []
+
+    monkeypatch.setattr(worker_module, "import_external_evaluations", fake_import)
+    job = {
+        "id": "external-eval-job",
+        "payload": {
+            "dataset": "qlib-fixture",
+            "dataset_identity_sha256": "a" * 64,
+            "periods": {
+                "train_start": "2024-01-01",
+                "train_end": "2024-06-28",
+                "valid_start": "2024-07-01",
+                "valid_end": "2024-12-31",
+                "test_start": "2025-01-13",
+                "test_end": "2026-08-03",
+            },
+        },
+    }
+    result = {"status": "ok", "evaluations": []}
+
+    worker._import_external_factor_evaluations(job, result)
+
+    assert captured["store"] is worker.research
+    assert captured["result"] == result
+    assert captured["dataset"] == "qlib-fixture"
+    assert captured["periods"]["test_end"].isoformat() == "2026-08-03"
+    assert captured["artifact_path"].name == "result.json"

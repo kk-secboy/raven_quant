@@ -20,6 +20,7 @@ from .allocation_store import AllocationStore
 from .cost_model import CostModelConfig
 from .data_rollover import qlib_trading_date_on_or_before
 from .execution_algorithms import execution_time_slots
+from .external_factor_evaluation import import_external_evaluations
 from .job_store import JobStore
 from .market_permission import MarketPermissionStore
 from .parameter_experiment_store import ParameterExperimentStore
@@ -197,6 +198,27 @@ class LocalJobWorker:
                         f"{item.get('candidate_id')}: {item.get('error', 'evaluation failed')}"
                         for item in failures
                     )
+                    exit_code = 3
+            if exit_code == 0 and job["kind"] == "external_factor_evaluate":
+                try:
+                    if not isinstance(result, dict):
+                        raise ValueError("external factor evaluation result is missing")
+                    self._import_external_factor_evaluations(job, result)
+                    failures = [
+                        item
+                        for item in result.get("evaluations", [])
+                        if item.get("status") == "failed"
+                    ]
+                    if failures:
+                        raise ValueError(
+                            "; ".join(
+                                f"{item.get('candidate_id')}: "
+                                f"{item.get('error', 'evaluation failed')}"
+                                for item in failures
+                            )
+                        )
+                except (KeyError, TypeError, ValueError) as exc:
+                    logical_error = str(exc)
                     exit_code = 3
             if exit_code == 0 and job["kind"] in {
                 "strategy_backtest",
@@ -920,6 +942,77 @@ class LocalJobWorker:
                     _to_wsl_path(manifest_path) if is_wsl else str(manifest_path),
                     "--output",
                     _to_wsl_path(result_path) if is_wsl else str(result_path),
+                    "--tracking-uri",
+                    self.settings.mlflow_tracking_uri,
+                ]
+            )
+            return (
+                command,
+                result_path,
+                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
+            )
+        if job["kind"] == "external_factor_evaluate":
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "external-factor-evaluations"
+                / job["id"]
+            )
+            output.mkdir(parents=True, exist_ok=True)
+            manifest_path = output / "manifest.json"
+            result_path = output / "result.json"
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+
+            def runtime_path(value: str | Path) -> str:
+                path = Path(value)
+                return _to_wsl_path(path) if is_wsl else str(path)
+
+            manifest = {
+                "research_run_id": job["id"],
+                "dataset": payload["dataset"],
+                "dataset_identity_sha256": payload["dataset_identity_sha256"],
+                "periods": payload["periods"],
+                "universe": payload.get("universe", "cn_all"),
+                "benchmark": payload.get("benchmark", "SH000300"),
+                "candidates": [
+                    {
+                        **item,
+                        "values_path": runtime_path(item["values_path"]),
+                    }
+                    for item in payload["candidates"]
+                ],
+                "comparison_values": [],
+                "cost_model": CostModelConfig.from_mapping(
+                    payload.get("cost_model")
+                ).to_dict(),
+                "cost_reference_order_value": float(
+                    payload.get("cost_reference_order_value", 100_000.0)
+                ),
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            script = self.project_root / "scripts" / "evaluate_external_factor_batch.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    runtime_path(payload["dataset_path"]),
+                    "--manifest",
+                    runtime_path(manifest_path),
+                    "--output",
+                    runtime_path(result_path),
                     "--tracking-uri",
                     self.settings.mlflow_tracking_uri,
                 ]
@@ -1929,6 +2022,25 @@ class LocalJobWorker:
                 recomputed_values_sha256=item["recomputed_values_sha256"],
                 recompute_evidence=item["recompute_evidence"],
             )
+
+    def _import_external_factor_evaluations(self, job: dict, result: dict) -> None:
+        payload = job["payload"]
+        periods = {key: date.fromisoformat(value) for key, value in payload["periods"].items()}
+        artifact_path = (
+            self.settings.data_root
+            / "artifacts"
+            / "external-factor-evaluations"
+            / job["id"]
+            / "result.json"
+        )
+        import_external_evaluations(
+            self.research,
+            result,
+            dataset=str(payload["dataset"]),
+            dataset_identity_sha256=str(payload["dataset_identity_sha256"]),
+            periods=periods,
+            artifact_path=artifact_path,
+        )
 
 
 def _failure_message(log_path: Path, fallback: str) -> str:

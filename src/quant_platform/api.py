@@ -413,6 +413,20 @@ class FactorEvaluationRequest(BaseModel):
     recompute_evidence: dict[str, Any]
 
 
+class ExternalFactorEvaluationRequest(BaseModel):
+    dataset: str
+    candidate_ids: list[str] = Field(min_length=1, max_length=50)
+    periods: ResearchPeriods
+    universe: str = Field(default="cn_all", min_length=2, max_length=100)
+    benchmark: str = Field(default="SH000300", min_length=4, max_length=32)
+
+    @model_validator(mode="after")
+    def validate_candidates(self) -> ExternalFactorEvaluationRequest:
+        if len(set(self.candidate_ids)) != len(self.candidate_ids):
+            raise ValueError("candidate_ids must not contain duplicates")
+        return self
+
+
 class PromotionRequest(BaseModel):
     actor: str = Field(min_length=2, max_length=100)
     reason: str = Field(min_length=10, max_length=2000)
@@ -2307,6 +2321,98 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.get("/api/factors/gate-policy")
     def factor_gate_policy() -> dict:
         return research.policy_summary()
+
+    @app.post("/api/jobs/external-factor-evaluate", status_code=202)
+    def create_external_factor_evaluation(
+        payload: ExternalFactorEvaluationRequest,
+    ) -> dict:
+        if jobs.count(statuses=("queued", "running"), kinds=("external_factor_evaluate",)):
+            raise HTTPException(409, "an external factor evaluation is already active")
+        dataset = require_qlib_dataset(
+            payload.dataset, purpose="external factor evaluation", frequency="day"
+        )
+        periods = payload.periods.model_dump(mode="json")
+        require_research_calendar(dataset, periods)
+        if dataset.get("start_date") and periods["train_start"] < dataset["start_date"]:
+            raise HTTPException(409, "training window starts before the selected dataset")
+        if dataset.get("end_date") and periods["test_end"] > dataset["end_date"]:
+            raise HTTPException(409, "test window ends after the selected dataset")
+
+        candidates: list[dict[str, Any]] = []
+        for candidate_id in payload.candidate_ids:
+            try:
+                candidate = research.get_candidate(candidate_id)
+            except KeyError as exc:
+                raise HTTPException(404, f"factor candidate not found: {candidate_id}") from exc
+            if candidate.get("status") in {"promoted", "retired"}:
+                raise HTTPException(
+                    409,
+                    f"candidate {candidate_id} cannot be evaluated in "
+                    f"{candidate.get('status')} state",
+                )
+            variables = candidate.get("variables") or {}
+            source = variables.get("source") if isinstance(variables, dict) else None
+            if not isinstance(source, dict) or not str(source.get("dataset") or "").strip():
+                raise HTTPException(
+                    409, f"candidate {candidate_id} is not a governed external factor"
+                )
+            required = ("code_path", "values_path", "code_sha256", "values_sha256")
+            if any(not candidate.get(key) for key in required):
+                raise HTTPException(
+                    409, f"candidate {candidate_id} is missing immutable factor artifacts"
+                )
+            if not Path(str(candidate["code_path"])).is_file() or not Path(
+                str(candidate["values_path"])
+            ).is_file():
+                raise HTTPException(
+                    409, f"candidate {candidate_id} factor artifacts are unavailable"
+                )
+            label_horizon_days = int(candidate.get("label_horizon_days") or 1)
+            embargo_days = max(5, label_horizon_days)
+            if (payload.periods.test_start - payload.periods.valid_end).days <= embargo_days:
+                raise HTTPException(
+                    409,
+                    f"candidate {candidate_id} requires a purge/embargo gap greater "
+                    f"than {embargo_days} days",
+                )
+            candidates.append(
+                {
+                    "id": candidate_id,
+                    "values_path": candidate["values_path"],
+                    "code_sha256": candidate["code_sha256"],
+                    "values_sha256": candidate["values_sha256"],
+                    "experiment_family_id": candidate.get("experiment_family_id"),
+                    "experiment_count": int(candidate.get("experiment_count") or 1),
+                    "label_horizon_days": label_horizon_days,
+                }
+            )
+        serialized = {
+            "dataset": payload.dataset,
+            "dataset_path": dataset["path"],
+            "dataset_identity_sha256": dataset["provenance"][
+                "dataset_identity_sha256"
+            ],
+            "periods": periods,
+            "universe": payload.universe,
+            "benchmark": payload.benchmark,
+            "candidates": candidates,
+        }
+        identity = json.dumps(serialized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        log_path = platform_root / "logs" / "external-factor-evaluate.log"
+        try:
+            job = jobs.create(
+                "external_factor_evaluate",
+                serialized,
+                log_path,
+                idempotency_key=(
+                    "external-factor-evaluate:"
+                    f"{uuid.uuid5(uuid.NAMESPACE_URL, identity)}"
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return job
 
     @app.post("/api/factors/{candidate_id}/evaluations", status_code=201)
     def record_factor_evaluation(candidate_id: str, payload: FactorEvaluationRequest) -> dict:

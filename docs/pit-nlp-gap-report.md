@@ -184,5 +184,6 @@ Tushare `report_rc`（券商研报盈利预测与评级，cn_institutional 任�
 - **市场认可度只作标签**：新增 `event_market_response.py`，基于已通过阻断质量门的不可变日线快照，计算公告首个可用交易日起 1/3/5/20 日的个股收益、沪深300收益、超额收益、成交额异常和“公告方向 × 超额收益”的一致性。每个期限均记录 `outcome_end` 与 `label_available_at`；停牌、缺价或样本尾部不足时保持 NULL，不顺延猜测。
 - **防泄漏硬隔离**：标签 manifest 固定 `role=training_label_only`，并明确禁止 `factor_candidates`、Qlib 实时推理特征和 live signal 消费。标签生产器没有因子注册入口；只有公告逻辑因子可通过现有 sha256 治理通道注册。
 - **可运行任务**：新增 `announcement_nlp`、`corpus_nlp`、`event_market_response` 三类 durable worker 命令、API 入队端点和数据目录任务映射。事件标签任务要求指定快照且 `verification.json.ok=true`，公告 NLP 在公告下载仍运行时拒绝重复启动。
+- **Qlib 评估接线**：新增 `external_factor_evaluate` durable job/API。任务只接受带外部来源身份、代码/数值 artifact 与 sha256 的候选，绑定可复现日线 Qlib 数据集身份、训练/验证/最终测试窗口及 purge/embargo 间隔；复用 `evaluate_external_factor_batch.py` 的 sparse-event/market-timeseries、HAC、BH-FDR、成本和泄漏哨兵评估，并把通过、证据不足和运行失败全部写入 `factor_evaluations` 审计账本。
 - **限流与恢复**：Tushare 中转站按运营方最新确认改为 99 次/分钟上限（100 次限制保留 1 次余量）；巨潮正文长任务每 100 条原子刷新 index/download-log 并更新 job progress，避免只在任务结束时才出现 checkpoint。
 - **覆盖边界**：逻辑与市场认可度只能覆盖真实落盘且有文本层的公告；当前生产正文任务收敛为 2024 年以来监管类高信号 PDF。不能追溯或未下载的公告不计覆盖，扫描件无文本层时 fail-closed，不用模型虚构字段。
