@@ -107,6 +107,28 @@ def _validate_body(url: str, body: bytes) -> None:
         )
 
 
+def _normalize_body(url: str, body: bytes) -> bytes:
+    """Extract a PDF embedded in cninfo's occasional multipart response.
+
+    Some historical cninfo/static and datacloud URLs return HTTP 200 with a
+    single ``form-data`` part instead of a bare PDF. The boundary is not always
+    standards-compliant, so parsing by Content-Type is insufficient. Preserve
+    normal responses byte-for-byte; for a PDF URL with leading wrapper bytes,
+    accept only an actual ``%PDF-`` payload terminated by ``%%EOF`` and strip
+    the transport wrapper. A response with no complete PDF still fails closed
+    in ``_validate_body``.
+    """
+
+    path = url.split("?", 1)[0].lower()
+    if not path.endswith(".pdf") or body.startswith(b"%PDF"):
+        return body
+    pdf_start = body.find(b"%PDF-")
+    pdf_end = body.rfind(b"%%EOF")
+    if pdf_start < 0 or pdf_end < pdf_start:
+        return body
+    return body[pdf_start : pdf_end + len(b"%%EOF")]
+
+
 class CninfoHttpClient:
     """Bounded-retry HTTP GET client for static.cninfo.com.cn bodies."""
 
@@ -145,6 +167,7 @@ class CninfoHttpClient:
                 status = int(response.status_code)
                 body = bytes(response.content)
                 if 200 <= status < 300:
+                    body = _normalize_body(url, body)
                     try:
                         _validate_body(url, body)
                     except CninfoDownloadError as exc:
@@ -316,7 +339,7 @@ def load_announcement_manifest(
     frame = frame.sort_values(["url", "ann_date", "ts_code"], kind="stable")
     frame = frame.drop_duplicates("url", keep="first")
     frame = frame.sort_values(["ann_date", "ts_code", "url"], kind="stable")
-    return [
+    resolved = [
         AnnouncementRef(
             ts_code=str(row.ts_code),
             ann_date=row.ann_date.date(),
@@ -325,6 +348,13 @@ def load_announcement_manifest(
         )
         for row in frame.itertuples()
     ]
+    # Different viewer/detail URLs can resolve to the same static PDF. De-dupe
+    # after resolution as well, otherwise a single document is requested and
+    # logged multiple times in the same run.
+    unique: dict[str, AnnouncementRef] = {}
+    for ref in resolved:
+        unique.setdefault(ref.url, ref)
+    return sorted(unique.values(), key=lambda ref: (ref.ann_date, ref.ts_code, ref.url))
 
 
 def load_trade_calendar_open_days(data_root: Path) -> list[date]:

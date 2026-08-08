@@ -183,6 +183,27 @@ def test_manifest_filters_ts_code_and_date_range(tmp_path: Path) -> None:
     assert [ref.url for ref in refs] == ["https://static.cninfo.com.cn/a.pdf"]
 
 
+def test_manifest_dedupes_urls_after_detail_page_resolution(tmp_path: Path) -> None:
+    base = (
+        "https://www.cninfo.com.cn/new/disclosure/detail?"
+        "announcementId=1200000001&announcementTime=2024-01-02"
+    )
+    _write_anns_d(
+        tmp_path,
+        [
+            _ann_row("000001.SZ", "20240102", "A", f"{base}&orgId=a"),
+            _ann_row("000002.SZ", "20240102", "A duplicate", f"{base}&orgId=b"),
+        ],
+    )
+
+    refs = cninfo.load_announcement_manifest(tmp_path)
+
+    assert len(refs) == 1
+    assert refs[0].url == (
+        "http://static.cninfo.com.cn/finalpage/2024-01-02/1200000001.PDF"
+    )
+
+
 def test_manifest_fail_closed_without_anns_d(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="anns_d"):
         cninfo.load_announcement_manifest(tmp_path)
@@ -419,6 +440,24 @@ def test_retryable_failures_back_off_then_succeed(tmp_path: Path) -> None:
     log = pd.read_parquet(summary.log_path)
     assert log.iloc[0]["status"] == "succeeded"
     assert log.iloc[0]["attempts"] == 3
+
+
+def test_client_extracts_pdf_from_historical_multipart_wrapper() -> None:
+    url = "http://dataclouds.cninfo.com.cn/sjother/regulatory_announcement/a.pdf"
+    pdf = _pdf("historical-regulatory-letter")
+    wrapped = (
+        "–---------7d930d1a850658\r\n".encode()
+        + b'Content-Disposition: form-data; name="file"; filename="a.pdf"\r\n'
+        + b"Content-Type: application/pdf\r\n\r\n"
+        + pdf
+        + b"\r\n----------7d930d1a850658--\r\n"
+    )
+    session = FakeSession({url: [FakeResponse(200, wrapped)]})
+
+    body, attempts = _client(session).get(url)
+
+    assert attempts == 1
+    assert body == pdf
 
 
 def test_missing_source_is_tombstoned_and_excluded_from_index(tmp_path: Path) -> None:
