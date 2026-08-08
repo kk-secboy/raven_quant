@@ -51,7 +51,22 @@ class CheckpointStore:
                 statement = (
                     pg_insert(work_units)
                     .values(rows[offset : offset + _INSERT_BATCH_SIZE])
-                    .on_conflict_do_nothing(index_elements=[work_units.c.unit_key])
+                    .on_conflict_do_update(
+                        index_elements=[work_units.c.unit_key],
+                        set_={
+                            "status": "pending",
+                            "attempts": 0,
+                            "max_attempts": pg_insert(work_units).excluded.max_attempts,
+                            "next_retry_at": None,
+                            "lease_until": None,
+                            "last_error": None,
+                            "updated_at": now,
+                        },
+                        where=and_(
+                            work_units.c.status == "superseded",
+                            work_units.c.last_error.like("outside frozen snapshot_end %"),
+                        ),
+                    )
                     .returning(work_units.c.unit_key)
                 )
                 inserted += len(connection.execute(statement).all())

@@ -129,6 +129,40 @@ def test_superseded_units_are_retained_but_not_runnable_or_planned(
     assert verification["superseded"] == 1
 
 
+def test_new_plan_reactivates_only_units_superseded_by_frozen_snapshot_boundary(
+    database_url: str,
+) -> None:
+    store = CheckpointStore(database_url)
+    boundary = spec()
+    repartitioned = FetchSpec(
+        "daily",
+        "daily",
+        {"trade_date": "20240103"},
+        {"trade_date": "20240103"},
+    )
+    store.add([boundary, repartitioned])
+    store.supersede_units(
+        [boundary.unit_key],
+        "outside frozen snapshot_end 2024-01-01; unresolved latest crossed Shanghai midnight",
+    )
+    store.supersede_units(
+        [repartitioned.unit_key],
+        "continued by a smaller partition",
+    )
+
+    assert store.add([boundary, repartitioned]) == 1
+
+    rows = {
+        row["unit_key"]: row
+        for row in store.unit_rows([boundary.unit_key, repartitioned.unit_key])
+    }
+    assert rows[boundary.unit_key]["status"] == "pending"
+    assert rows[boundary.unit_key]["attempts"] == 0
+    assert rows[boundary.unit_key]["last_error"] is None
+    assert rows[repartitioned.unit_key]["status"] == "superseded"
+    assert rows[repartitioned.unit_key]["last_error"] == "continued by a smaller partition"
+
+
 def test_bulk_status_updates_are_chunked(
     database_url: str,
     monkeypatch,
