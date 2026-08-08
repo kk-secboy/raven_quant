@@ -139,6 +139,97 @@ def test_scheduler_creates_recoverable_full_data_pipeline(
     ]
 
 
+def test_scheduler_creates_bounded_recoverable_information_pipeline(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    current = datetime(2025, 1, 2, 13, 29, tzinfo=UTC)
+    snapshot = tmp_path / "data" / "snapshots" / "cn-verified"
+    snapshot.mkdir(parents=True)
+    (snapshot / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": "cn-verified",
+                "start_date": "2008-01-01",
+                "end_date": "2025-01-02",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "verification.json").write_text(
+        json.dumps({"ok": True, "errors": []}), encoding="utf-8"
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    store = ScheduleStore(database_url)
+    store.create(
+        name="daily governed information pipeline",
+        kind="information_pipeline",
+        timezone="Asia/Shanghai",
+        run_time=time(21, 30),
+        trading_days_only=True,
+        payload={
+            "lookback_days": 3,
+            "enable_nlp": True,
+            "announcement_nlp_limit": 125,
+            "corpus_nlp_limit": 175,
+            "corpus_datasets": ["major_news", "irm_qa_sh", "irm_qa_sz"],
+        },
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+
+    result = SchedulerEngine(_settings(database_url, tmp_path)).tick(current + timedelta(minutes=2))
+
+    assert result["processed"] == 1
+    run = store.list_runs()[0]
+    assert run["status"] == "enqueued"
+    job = JobStore(database_url).get(run["job_id"])
+    assert job["kind"] == "cninfo_announcements_download"
+    assert job["payload"]["start"] == "2024-12-30"
+    assert job["payload"]["end"] == "2025-01-02"
+    assert job["payload"]["regulatory_only"] is True
+    steps = job["payload"]["pipeline_steps"]
+    assert [step["kind"] for step in steps] == [
+        "announcement_nlp",
+        "corpus_nlp",
+        "event_market_response",
+    ]
+    assert steps[0]["payload"]["limit"] == 125
+    assert steps[1]["payload"]["limit"] == 175
+    assert steps[2]["payload"]["snapshot_name"] == "cn-verified"
+
+
+def test_information_schedule_skips_when_a_conflicting_job_is_active(
+    database_url: str, tmp_path: Path
+) -> None:
+    current = datetime(2025, 1, 2, 13, 29, tzinfo=UTC)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="daily raw information update",
+        kind="information_pipeline",
+        timezone="Asia/Shanghai",
+        run_time=time(21, 30),
+        trading_days_only=True,
+        payload={},
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+    active = JobStore(database_url).create(
+        "cninfo_announcements_download",
+        {"start": "2016-01-01", "end": "2025-01-02"},
+        tmp_path / "active-cninfo.log",
+    )
+
+    result = SchedulerEngine(_settings(database_url, tmp_path)).tick(current + timedelta(minutes=2))
+
+    assert result["processed"] == 1
+    run = store.list_runs()[0]
+    assert run["status"] == "skipped"
+    assert "already active" in run["message"]
+    assert JobStore(database_url).list()[0]["id"] == active["id"]
+
+
 def test_scheduler_creates_daily_full_a_share_five_minute_increment(
     database_url: str, tmp_path: Path
 ) -> None:

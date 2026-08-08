@@ -22,6 +22,7 @@ from quant_data.database import (
 ACTIVE_SCHEDULE_KINDS = (
     "incremental_sync",
     "data_pipeline",
+    "information_pipeline",
     "ashare_5m_sync",
     "rdagent_research",
     "recommendation_refresh",

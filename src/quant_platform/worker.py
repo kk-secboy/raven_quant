@@ -1857,6 +1857,9 @@ class LocalJobWorker:
                 "data_qlib",
                 "minute_qlib",
                 "qlib_baseline",
+                "announcement_nlp",
+                "corpus_nlp",
+                "event_market_response",
                 *(
                     f"supplemental_{bundle}"
                     for bundle in (

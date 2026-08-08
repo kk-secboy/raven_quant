@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 
 from quant_data.config import Settings
-from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES
+from quant_data.coverage_data import COVERAGE_BUNDLES, DEFAULT_COVERAGE_BUNDLES
 from quant_data.database import (
     jobs,
     recommendation_snapshots,
@@ -22,6 +22,10 @@ from .autonomous_research import AutonomousResearchOrchestrator
 from .continuous_research import ContinuousResearchController
 from .data_rollover import select_qlib_dataset
 from .health_store import OperationalHealthStore
+from .information_schedule import (
+    latest_verified_snapshot,
+    normalize_information_schedule_payload,
+)
 from .job_store import JobStore
 from .ops_calendar import (
     evaluate_recommendation_gate,
@@ -50,6 +54,24 @@ AUTOMATED_DATA_BUNDLES = (
     "global_markets",
     "cn_institutional",
     *sorted(DEFAULT_COVERAGE_BUNDLES),
+)
+
+INFORMATION_CONFLICTING_JOB_KINDS = (
+    "bootstrap",
+    "legacy_market_backfill",
+    "margin_eligibility_download",
+    "core_intraday_download",
+    "ashare_5m_download",
+    "cninfo_announcements_download",
+    "announcement_nlp",
+    "corpus_nlp",
+    "event_market_response",
+    "data_verify",
+    "data_snapshot",
+    "data_qlib",
+    "minute_qlib",
+    "qlib_baseline",
+    *(f"supplemental_{bundle}" for bundle in set(AUTOMATED_DATA_BUNDLES) | COVERAGE_BUNDLES),
 )
 
 
@@ -226,6 +248,10 @@ class SchedulerEngine:
                 job = self._enqueue_incremental(run, scheduled_for)
             elif run["kind"] == "data_pipeline":
                 job = self._enqueue_data_pipeline(run, scheduled_for)
+            elif run["kind"] == "information_pipeline":
+                job = self._enqueue_information_pipeline(run, scheduled_for)
+                if job is None:
+                    return
             elif run["kind"] == "ashare_5m_sync":
                 job = self._enqueue_ashare_5m(run, scheduled_for)
             elif run["kind"] == "rdagent_research":
@@ -346,6 +372,111 @@ class SchedulerEngine:
                 "snapshot_start": snapshot_start,
                 "snapshot_end": local_date.isoformat(),
                 "snapshot_name": snapshot_name,
+            },
+            log_path,
+            idempotency_key=pipeline_id,
+        )
+
+    def _enqueue_information_pipeline(
+        self,
+        run: dict[str, Any],
+        scheduled_for: datetime,
+    ) -> dict[str, Any] | None:
+        payload = normalize_information_schedule_payload(run["payload"])
+        active = self.jobs.count(
+            statuses=("queued", "running"),
+            kinds=INFORMATION_CONFLICTING_JOB_KINDS,
+        )
+        if active:
+            self.schedules.finish_run(
+                run["id"],
+                "skipped",
+                message=f"{active} conflicting data or information job(s) already active",
+            )
+            return None
+
+        if payload["enable_nlp"]:
+            # Decrypt and validate now so a recurring job fails before it creates
+            # a raw-download chain that can never reach its paid NLP stages.
+            from .announcement_nlp import load_llm_credentials
+
+            load_llm_credentials(self.runtime_secrets)
+
+        local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
+        start = (local_date - timedelta(days=payload["lookback_days"])).isoformat()
+        end = local_date.isoformat()
+        pipeline_name = f"information-{local_date:%Y%m%d}"
+        pipeline_id = f"schedule-run:{run['id']}"
+        steps: list[dict[str, Any]] = []
+        if payload["enable_nlp"]:
+            from .announcement_nlp import PROMPT_VERSION as announcement_prompt_version
+
+            steps.append(
+                {
+                    "kind": "announcement_nlp",
+                    "payload": {
+                        "start": start,
+                        "end": end,
+                        "ts_codes": [],
+                        "categories": payload["announcement_categories"],
+                        "limit": payload["announcement_nlp_limit"],
+                        "prompt_version": announcement_prompt_version,
+                    },
+                }
+            )
+            if payload["include_corpus_nlp"]:
+                from .corpus_nlp import PROMPT_VERSION as corpus_prompt_version
+
+                steps.append(
+                    {
+                        "kind": "corpus_nlp",
+                        "payload": {
+                            "start": start,
+                            "end": end,
+                            "datasets": payload["corpus_datasets"],
+                            "ts_codes": [],
+                            "limit": payload["corpus_nlp_limit"],
+                            "batch_size": payload["batch_size"],
+                            "major_news_per_day": payload["major_news_per_day"],
+                            "irm_per_instrument_day": payload["irm_per_instrument_day"],
+                            "prompt_version": corpus_prompt_version,
+                        },
+                    }
+                )
+            if payload["include_event_labels"]:
+                from .event_market_response import LABEL_SCHEMA_VERSION
+
+                snapshot_name = payload["snapshot_name"] or latest_verified_snapshot(
+                    self.settings.data_root, as_of=local_date
+                )
+                steps.append(
+                    {
+                        "kind": "event_market_response",
+                        "payload": {
+                            "snapshot_name": snapshot_name,
+                            "horizons": payload["horizons"],
+                            "benchmark_code": payload["benchmark_code"],
+                            "schema_version": LABEL_SCHEMA_VERSION,
+                        },
+                    }
+                )
+
+        log_path = (
+            self.settings.data_root / "platform" / "logs" / f"scheduled-information-{run['id']}.log"
+        )
+        return self.jobs.create(
+            "cninfo_announcements_download",
+            {
+                "pipeline_id": pipeline_id,
+                "profile": "information",
+                "start": start,
+                "end": end,
+                "snapshot_name": pipeline_name,
+                "pipeline_steps": steps,
+                "pipeline_next_index": 0,
+                "ts_codes": [],
+                "limit": payload["download_limit"],
+                "regulatory_only": payload["regulatory_only"],
             },
             log_path,
             idempotency_key=pipeline_id,

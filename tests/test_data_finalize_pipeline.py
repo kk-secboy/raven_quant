@@ -244,6 +244,69 @@ def test_five_minute_download_chains_to_minute_qlib_build(
     assert worker._has_data_pipeline_successor(successor) is False
 
 
+def test_information_pipeline_keeps_download_nlp_and_labels_as_durable_jobs(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
+    settings = Settings.from_env(tmp_path / ".env")
+    jobs = JobStore(database_url)
+    worker = LocalJobWorker(jobs, tmp_path, settings)
+    steps = [
+        {
+            "kind": "announcement_nlp",
+            "payload": {
+                "start": "2025-01-01",
+                "end": "2025-01-02",
+                "categories": ["regulatory_letter"],
+                "limit": 100,
+            },
+        },
+        {
+            "kind": "corpus_nlp",
+            "payload": {
+                "start": "2025-01-01",
+                "end": "2025-01-02",
+                "datasets": ["major_news"],
+                "limit": 100,
+            },
+        },
+        {
+            "kind": "event_market_response",
+            "payload": {
+                "snapshot_name": "cn-verified",
+                "horizons": [1, 3, 5, 20],
+                "benchmark_code": "000300.SH",
+            },
+        },
+    ]
+    current = {
+        "kind": "cninfo_announcements_download",
+        "payload": {
+            "pipeline_id": "information-fixture",
+            "profile": "information",
+            "start": "2024-12-30",
+            "end": "2025-01-02",
+            "snapshot_name": "information-20250102",
+            "pipeline_steps": steps,
+            "pipeline_next_index": 0,
+        },
+    }
+
+    created = []
+    for expected in ("announcement_nlp", "corpus_nlp", "event_market_response"):
+        successor = worker._queue_data_pipeline_successor(current)
+        assert successor["kind"] == expected
+        created.append(successor)
+        current = successor
+
+    assert created[0]["payload"]["limit"] == 100
+    assert created[1]["payload"]["datasets"] == ["major_news"]
+    assert created[2]["payload"]["snapshot_name"] == "cn-verified"
+    assert worker._has_data_pipeline_successor(created[2]) is False
+
+
 def test_full_snapshot_contract_keeps_execution_frequency_separate() -> None:
     assert "daily" in _profile_datasets("full")
     assert {"stk_premarket", "stk_auction_o", "stk_auction_c"} <= _profile_datasets("full")
