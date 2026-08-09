@@ -74,8 +74,10 @@ USER_AGENT = (
 SSE_BULLETIN_QUERY_URL = (
     "https://query.sse.com.cn/security/stock/queryCompanyBulletin.do"
 )
+SSE_PDF_BASE_URL = "https://big5.sse.com.cn/site/cht/www.sse.com.cn/"
 OFFICIAL_PDF_HOSTS = frozenset(
     {
+        "big5.sse.com.cn",
         "reportdocs.static.szse.cn",
         "static.sse.com.cn",
         "www.sse.com.cn",
@@ -149,7 +151,10 @@ def _sse_bulletin_query_url(ref: AnnouncementRef) -> str:
     params = {
         "isPagination": "false",
         "productId": ref.ts_code.split(".", 1)[0],
-        "securityType": "120100,020100,020200,120200",
+        # ``0101`` is the main-board stock type. Without it, the SSE endpoint
+        # silently returns no rows for ordinary SH listings such as 600654
+        # and 603778 even when the disclosure exists on the requested date.
+        "securityType": "0101,120100,020100,020200,120200",
         "keyWord": "",
         "reportType2": "",
         "reportType": "ALL",
@@ -184,7 +189,10 @@ def _select_sse_fallback_url(
             continue
         if str(row.get("SSEDATE") or "") != ref.ann_date.isoformat():
             continue
-        candidate = urljoin("https://www.sse.com.cn/", str(row.get("URL") or ""))
+        # SSE's normal listedinfo PDF host can return its JavaScript challenge
+        # page to non-browser clients. The exchange's own Big5 mirror serves
+        # the same canonical path as the original PDF without that challenge.
+        candidate = urljoin(SSE_PDF_BASE_URL, str(row.get("URL") or "").lstrip("/"))
         parsed = urlsplit(candidate)
         if (
             parsed.hostname

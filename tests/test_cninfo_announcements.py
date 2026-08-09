@@ -4,6 +4,7 @@ import hashlib
 import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pandas as pd
 import pytest
@@ -544,7 +545,8 @@ def test_sh_non_pdf_uses_exact_official_sse_fallback(tmp_path: Path) -> None:
     )
     query_url = cninfo._sse_bulletin_query_url(ref)
     fallback = (
-        "https://www.sse.com.cn/disclosure/listedinfo/announcement/c/new/"
+        "https://big5.sse.com.cn/site/cht/www.sse.com.cn/"
+        "disclosure/listedinfo/announcement/c/new/"
         "2024-01-02/688772_20240102_TEST.pdf"
     )
     payload = {
@@ -578,6 +580,19 @@ def test_sh_non_pdf_uses_exact_official_sse_fallback(tmp_path: Path) -> None:
     log = pd.read_parquet(summary.log_path)
     assert log.iloc[0]["error"] == f"official fallback: {fallback}"
     assert session.calls == [row["url"], query_url, fallback]
+
+
+def test_sse_query_includes_main_board_security_type() -> None:
+    ref = cninfo.AnnouncementRef(
+        ts_code="600654.SH",
+        ann_date=date(2023, 4, 26),
+        title="main-board disclosure",
+        url="https://example.invalid/disclosure.pdf",
+    )
+
+    query = parse_qs(urlsplit(cninfo._sse_bulletin_query_url(ref)).query)
+
+    assert query["securityType"] == ["0101,120100,020100,020200,120200"]
 
 
 def test_missing_source_is_tombstoned_and_excluded_from_index(tmp_path: Path) -> None:
