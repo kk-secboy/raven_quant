@@ -488,6 +488,98 @@ def test_client_extracts_pdf_from_historical_multipart_wrapper() -> None:
     assert body == pdf
 
 
+def test_client_follows_official_pdf_exposed_by_historical_503_page() -> None:
+    url = "http://static.cninfo.com.cn/finalpage/2022-07-01/1213915330.PDF"
+    upstream = (
+        "https://reportdocs.static.szse.cn/UpFiles/rasinfodisc1/202207/"
+        "RAS_202207_0001818B1F6F3F3FE35A027C3211F13F.pdf"
+    )
+    wrapper = f"<html><body>503 Service Unavailable URL: {upstream}</body></html>".encode()
+    session = FakeSession(
+        {
+            url: [FakeResponse(200, wrapper)],
+            upstream: [FakeResponse(200, _pdf("official-upstream"))],
+        }
+    )
+
+    body, attempts = _client(session).get(url)
+
+    assert body == _pdf("official-upstream")
+    assert attempts == 2
+    assert session.calls == [url, upstream]
+
+
+def test_explicit_szse_html_404_is_tombstoned(tmp_path: Path) -> None:
+    row = _ann_row(
+        "300149.SZ",
+        "20240102",
+        "监管函",
+        "http://dataclouds.cninfo.com.cn/sjother/regulatory_announcement/a.pdf",
+    )
+    _seed_data(tmp_path, [row])
+    body = b"<html><head><title>404</title></head><img src='/maintain/images/404_s.png'></html>"
+    session = FakeSession({row["url"]: [FakeResponse(200, body)]})
+
+    summary = _run(tmp_path, _client(session))
+
+    assert summary.failed == 0
+    assert summary.unavailable == 1
+    unavailable = pd.read_parquet(summary.unavailable_path)
+    assert unavailable.iloc[0]["status_code"] == 404
+
+
+def test_sh_non_pdf_uses_exact_official_sse_fallback(tmp_path: Path) -> None:
+    row = _ann_row(
+        "688772.SH",
+        "20240102",
+        "监管问询函回复",
+        "http://static.cninfo.com.cn/finalpage/2024-01-02/1200000001.PDF",
+    )
+    _seed_data(tmp_path, [row])
+    ref = cninfo.AnnouncementRef(
+        ts_code=row["ts_code"],
+        ann_date=date(2024, 1, 2),
+        title=row["title"],
+        url=row["url"],
+    )
+    query_url = cninfo._sse_bulletin_query_url(ref)
+    fallback = (
+        "https://www.sse.com.cn/disclosure/listedinfo/announcement/c/new/"
+        "2024-01-02/688772_20240102_TEST.pdf"
+    )
+    payload = {
+        "result": [
+            {
+                "SECURITY_CODE": "688772",
+                "SSEDATE": "2024-01-02",
+                "TITLE": "监管问询函回复",
+                "URL": "/disclosure/listedinfo/announcement/c/new/"
+                "2024-01-02/688772_20240102_TEST.pdf",
+            }
+        ]
+    }
+    session = FakeSession(
+        {
+            row["url"]: [FakeResponse(200, b"TSZ#not-a-pdf")],
+            query_url: [
+                FakeResponse(
+                    200,
+                    f"quantlabCallback({json.dumps(payload, ensure_ascii=False)})".encode(),
+                )
+            ],
+            fallback: [FakeResponse(200, _pdf("official-sse"))],
+        }
+    )
+
+    summary = _run(tmp_path, _client(session))
+
+    assert summary.downloaded == 1
+    assert summary.failed == 0
+    log = pd.read_parquet(summary.log_path)
+    assert log.iloc[0]["error"] == f"official fallback: {fallback}"
+    assert session.calls == [row["url"], query_url, fallback]
+
+
 def test_missing_source_is_tombstoned_and_excluded_from_index(tmp_path: Path) -> None:
     row = _ann_row("000001.SZ", "20240102", "已删除公告", "https://static.cninfo.com.cn/gone.pdf")
     _seed_data(tmp_path, [row])

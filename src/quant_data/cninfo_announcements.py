@@ -11,7 +11,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 import duckdb
 import pandas as pd
@@ -71,6 +71,20 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
+SSE_BULLETIN_QUERY_URL = (
+    "https://query.sse.com.cn/security/stock/queryCompanyBulletin.do"
+)
+OFFICIAL_PDF_HOSTS = frozenset(
+    {
+        "reportdocs.static.szse.cn",
+        "static.sse.com.cn",
+        "www.sse.com.cn",
+    }
+)
+OFFICIAL_PDF_URL_PATTERN = re.compile(
+    rb"https?://[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~!$&'()*+,;=:@%/?#-]*)?\.pdf",
+    re.IGNORECASE,
+)
 
 
 class CninfoDownloadError(RuntimeError):
@@ -108,6 +122,77 @@ def _validate_body(url: str, body: bytes) -> None:
             f"response is not a PDF document: {url}: {preview}",
             retryable=False,
         )
+
+
+def _embedded_official_pdf_url(body: bytes) -> str | None:
+    """Return an official exchange PDF URL exposed by a historical error page."""
+
+    for match in OFFICIAL_PDF_URL_PATTERN.finditer(body):
+        candidate = match.group(0).decode("ascii", errors="ignore")
+        parsed = urlsplit(candidate)
+        if parsed.hostname and parsed.hostname.lower() in OFFICIAL_PDF_HOSTS:
+            return candidate
+    return None
+
+
+def _is_explicit_html_not_found(body: bytes) -> bool:
+    """Recognize cninfo/SZSE's HTTP-200 wrapper for an unambiguous 404."""
+
+    sample = body[:16_384].lower()
+    return (
+        b"<title>404</title>" in sample
+        and b"/maintain/images/404_" in sample
+    )
+
+
+def _sse_bulletin_query_url(ref: AnnouncementRef) -> str:
+    params = {
+        "isPagination": "false",
+        "productId": ref.ts_code.split(".", 1)[0],
+        "securityType": "120100,020100,020200,120200",
+        "keyWord": "",
+        "reportType2": "",
+        "reportType": "ALL",
+        "beginDate": ref.ann_date.isoformat(),
+        "endDate": ref.ann_date.isoformat(),
+        "pageHelp.pageSize": "100",
+        "pageHelp.beginPage": "1",
+        "pageHelp.pageCount": "50",
+        "pageHelp.pageNo": "1",
+        "pageHelp.cacheSize": "1",
+        "pageHelp.endPage": "5",
+        "jsonCallBack": "quantlabCallback",
+    }
+    return f"{SSE_BULLETIN_QUERY_URL}?{urlencode(params)}"
+
+
+def _select_sse_fallback_url(
+    ref: AnnouncementRef, payload: dict[str, object]
+) -> str | None:
+    rows = payload.get("result")
+    if not isinstance(rows, list):
+        return None
+    wanted_title = "".join(ref.title.split())
+    wanted_code = ref.ts_code.split(".", 1)[0]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        title = "".join(str(row.get("TITLE") or "").split())
+        if title != wanted_title:
+            continue
+        if str(row.get("SECURITY_CODE") or "") != wanted_code:
+            continue
+        if str(row.get("SSEDATE") or "") != ref.ann_date.isoformat():
+            continue
+        candidate = urljoin("https://www.sse.com.cn/", str(row.get("URL") or ""))
+        parsed = urlsplit(candidate)
+        if (
+            parsed.hostname
+            and parsed.hostname.lower() in OFFICIAL_PDF_HOSTS
+            and parsed.path.lower().endswith(".pdf")
+        ):
+            return candidate
+    return None
 
 
 def _sha256_path(path: Path) -> str:
@@ -179,6 +264,19 @@ class CninfoHttpClient:
                 body = bytes(response.content)
                 if 200 <= status < 300:
                     body = _normalize_body(url, body)
+                    path = url.split("?", 1)[0].lower()
+                    if path.endswith(".pdf") and not body.startswith(b"%PDF"):
+                        upstream_url = _embedded_official_pdf_url(body)
+                        if upstream_url and upstream_url != url:
+                            upstream_body, upstream_attempts = self.get(upstream_url)
+                            return upstream_body, attempt + upstream_attempts
+                        if _is_explicit_html_not_found(body):
+                            raise CninfoDownloadError(
+                                f"official source returned an HTML 404 page: {url}",
+                                retryable=False,
+                                attempts=attempt,
+                                status_code=404,
+                            )
                     try:
                         _validate_body(url, body)
                     except CninfoDownloadError as exc:
@@ -203,6 +301,62 @@ class CninfoHttpClient:
             self.sleeper(delay)
         assert last_error is not None
         raise last_error
+
+    def resolve_sse_pdf_url(self, ref: AnnouncementRef) -> str | None:
+        """Resolve an exact SH disclosure to SSE's canonical PDF endpoint."""
+
+        if not ref.ts_code.upper().endswith(".SH"):
+            return None
+        query_url = _sse_bulletin_query_url(ref)
+        self.rate_gate.wait()
+        try:
+            response = self.session.get(
+                query_url,
+                timeout=(10.0, self.timeout_seconds),
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "*/*",
+                    "Referer": "https://star.sse.com.cn/disclosure/listannouncement/",
+                },
+            )
+        except requests.RequestException:
+            return None
+        if int(response.status_code) != 200:
+            return None
+        text = bytes(response.content).decode("utf-8", errors="replace").strip()
+        if text.startswith("quantlabCallback(") and text.endswith(")"):
+            text = text[len("quantlabCallback(") : -1]
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return _select_sse_fallback_url(ref, payload)
+
+    def get_announcement(self, ref: AnnouncementRef) -> tuple[bytes, int, str | None]:
+        """Fetch a cninfo body, falling back only to an exact official SSE match."""
+
+        try:
+            body, attempts = self.get(ref.url)
+            return body, attempts, None
+        except CninfoDownloadError as original:
+            if original.status_code in SOURCE_UNAVAILABLE_STATUS_CODES:
+                raise
+            fallback_url = self.resolve_sse_pdf_url(ref)
+            if fallback_url is None:
+                raise
+            try:
+                body, attempts = self.get(fallback_url)
+            except CninfoDownloadError as fallback_error:
+                raise CninfoDownloadError(
+                    f"{original}; official SSE fallback {fallback_url} failed: "
+                    f"{fallback_error}",
+                    retryable=fallback_error.retryable,
+                    attempts=original.attempts + fallback_error.attempts,
+                    status_code=fallback_error.status_code,
+                ) from fallback_error
+            return body, original.attempts + attempts, fallback_url
 
 
 @dataclass(frozen=True, slots=True)
@@ -994,8 +1148,9 @@ def download_cninfo_announcements(
                 )
                 continue
 
+        fallback_url: str | None = None
         try:
-            body, attempts = client.get(ref.url)
+            body, attempts, fallback_url = client.get_announcement(ref)
         except CninfoDownloadError as exc:
             checked_at = clock()
             if exc.status_code in SOURCE_UNAVAILABLE_STATUS_CODES:
@@ -1073,6 +1228,7 @@ def download_cninfo_announcements(
             bytes=len(body),
             sha256=digest,
             file_path=relative,
+            error=(f"official fallback: {fallback_url}" if fallback_url else None),
         )
 
     _persist_download_state(
