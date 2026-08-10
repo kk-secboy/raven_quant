@@ -52,6 +52,10 @@ def test_information_request_models_fail_closed() -> None:
         )
     with pytest.raises(ValidationError, match="less than or equal to 100"):
         CorpusNlpRequest(batch_size=101)
+    with pytest.raises(ValidationError, match="less than or equal to 8"):
+        AnnouncementNlpRequest(batch_size=9)
+    with pytest.raises(ValidationError, match="less than or equal to 32"):
+        AnnouncementNlpRequest(workers=33)
     assert MultifaceAuditRequest(dataset="cn-fixture").require_ready is True
 
 
@@ -206,6 +210,8 @@ def test_worker_builds_announcement_and_corpus_nlp_commands(tmp_path: Path) -> N
     assert "announcement-nlp" in announcement_command
     assert "regulatory_letter" in announcement_command
     assert "000001.SZ" in announcement_command
+    assert announcement_command[announcement_command.index("--batch-size") + 1] == "4"
+    assert announcement_command[announcement_command.index("--workers") + 1] == "8"
     assert announcement_result.name == "result.json"
     assert announcement_env == {}
     assert "corpus-nlp" in corpus_command

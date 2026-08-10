@@ -41,6 +41,12 @@ from quant_platform.announcement_nlp import (
     NLP_SUBDIR,
 )
 from quant_platform.announcement_nlp import (
+    DEFAULT_BATCH_SIZE as ANNOUNCEMENT_DEFAULT_BATCH_SIZE,
+)
+from quant_platform.announcement_nlp import DEFAULT_WORKERS as ANNOUNCEMENT_DEFAULT_WORKERS
+from quant_platform.announcement_nlp import MAX_BATCH_SIZE as ANNOUNCEMENT_MAX_BATCH_SIZE
+from quant_platform.announcement_nlp import MAX_WORKERS as ANNOUNCEMENT_MAX_WORKERS
+from quant_platform.announcement_nlp import (
     PROMPT_VERSION as ANNOUNCEMENT_PROMPT_VERSION,
 )
 from quant_platform.corpus_nlp import DEFAULT_BATCH_SIZE as CORPUS_DEFAULT_BATCH_SIZE
@@ -165,6 +171,16 @@ class AnnouncementNlpRequest(BaseModel):
         default_factory=lambda: ["regulatory_letter"]
     )
     limit: int = Field(default=0, ge=0, le=1_000_000)
+    batch_size: int = Field(
+        default=ANNOUNCEMENT_DEFAULT_BATCH_SIZE,
+        ge=1,
+        le=ANNOUNCEMENT_MAX_BATCH_SIZE,
+    )
+    workers: int = Field(
+        default=ANNOUNCEMENT_DEFAULT_WORKERS,
+        ge=1,
+        le=ANNOUNCEMENT_MAX_WORKERS,
+    )
 
     @model_validator(mode="after")
     def validate_range(self) -> AnnouncementNlpRequest:
@@ -3928,6 +3944,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "ts_codes": sorted(set(payload.ts_codes)),
             "categories": sorted(set(payload.categories)),
             "limit": payload.limit,
+            "batch_size": payload.batch_size,
+            "workers": payload.workers,
             "prompt_version": ANNOUNCEMENT_PROMPT_VERSION,
         }
         log_path = platform_root / "logs" / (
@@ -3941,7 +3959,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 idempotency_key=(
                     f"announcement-nlp:{ANNOUNCEMENT_PROMPT_VERSION}:{payload.start}:"
                     f"{end_date}:{','.join(serialized['categories'])}:"
-                    f"{','.join(serialized['ts_codes']) or 'all'}:{payload.limit}"
+                    f"{','.join(serialized['ts_codes']) or 'all'}:{payload.limit}:"
+                    f"batch-{payload.batch_size}:workers-{payload.workers}"
                 ),
             )
         except ValueError as exc:

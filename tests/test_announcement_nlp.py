@@ -82,6 +82,14 @@ def _payload(**overrides) -> str:
     return json.dumps(body, ensure_ascii=False)
 
 
+def _batch_payload(item_ids: list[str], **overrides) -> str:
+    base = json.loads(_payload(**overrides))
+    return json.dumps(
+        {"items": [{"item_id": item_id, **base} for item_id in item_ids]},
+        ensure_ascii=False,
+    )
+
+
 class FakeChatClient:
     """Scripted ChatCompleter stand-in; fails the test on unscripted calls."""
 
@@ -201,6 +209,42 @@ def test_parse_extraction_payload_allows_integer_scores() -> None:
     result = nlp.parse_extraction_payload(_payload(tone_score=1, confidence=0))
     assert result.tone_score == 1.0
     assert result.confidence == 0.0
+
+
+def test_batch_messages_and_parser_require_exact_item_ids() -> None:
+    items = [
+        nlp.AnnouncementBatchItem(
+            item_id="item-a",
+            ts_code="000001.SZ",
+            ann_date=date(2024, 1, 2),
+            title="first",
+            category="announcement",
+            text="a" * 50,
+        ),
+        nlp.AnnouncementBatchItem(
+            item_id="item-b",
+            ts_code="000002.SZ",
+            ann_date=date(2024, 1, 3),
+            title="second",
+            category="regulatory_letter",
+            text="b" * 50,
+        ),
+    ]
+    messages = nlp.build_batch_extraction_messages(items, max_chars=10)
+    request = json.loads(messages[1]["content"])
+    assert [item["item_id"] for item in request["items"]] == ["item-a", "item-b"]
+    assert all(len(item["text"]) == 10 for item in request["items"])
+
+    parsed = nlp.parse_batch_extraction_payload(
+        _batch_payload(["item-a", "item-b"]),
+        expected_item_ids=["item-a", "item-b"],
+    )
+    assert set(parsed) == {"item-a", "item-b"}
+    with pytest.raises(nlp.LlmExtractionError, match="item_id mismatch"):
+        nlp.parse_batch_extraction_payload(
+            _batch_payload(["item-a"]),
+            expected_item_ids=["item-a", "item-b"],
+        )
 
 
 @pytest.mark.parametrize(
@@ -410,6 +454,8 @@ def _seed_two_announcements(data_root: Path) -> list[dict]:
 
 
 def _run(data_root: Path, chat, **kwargs):
+    kwargs.setdefault("batch_size", 1)
+    kwargs.setdefault("workers", 1)
     return nlp.process_announcements(
         data_root,
         secret_store=FakeSecretStore(STORE_RECORD),
@@ -504,6 +550,41 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     assert summary.logic_factor_sha256 == hashlib.sha256(logic_path.read_bytes()).hexdigest()
 
 
+def test_process_batches_announcements_and_falls_back_per_item(tmp_path: Path) -> None:
+    rows = _seed_two_announcements(tmp_path)
+    item_ids = [
+        f"{row['sha256']}:{nlp.PROMPT_VERSION}:test-model" for row in rows
+    ]
+    batched = FakeChatClient([_batch_payload(item_ids)])
+
+    summary = _run(tmp_path, batched, batch_size=2, workers=2)
+
+    assert summary.processed == 2
+    assert summary.failed == 0
+    assert summary.llm_calls == 1
+    assert len(batched.calls) == 1
+
+    retry_root = tmp_path / "fallback"
+    retry_rows = _seed_two_announcements(retry_root)
+    retry_ids = [
+        f"{row['sha256']}:{nlp.PROMPT_VERSION}:test-model" for row in retry_rows
+    ]
+    fallback = FakeChatClient(
+        [
+            _batch_payload(retry_ids[:1]),
+            _payload(tone_score=0.2),
+            _payload(tone_score=-0.2),
+        ]
+    )
+
+    recovered = _run(retry_root, fallback, batch_size=2, workers=1)
+
+    assert recovered.processed == 2
+    assert recovered.failed == 0
+    assert recovered.llm_calls == 3
+    assert len(fallback.calls) == 3
+
+
 def test_process_is_idempotent_on_processing_key(tmp_path: Path) -> None:
     _seed_two_announcements(tmp_path)
     first = _run(tmp_path, FakeChatClient([_payload(), _payload(tone_score=-0.5)]))
@@ -528,15 +609,15 @@ def test_process_reprocesses_when_prompt_version_changes(
     _seed_two_announcements(tmp_path)
     _run(tmp_path, FakeChatClient([_payload(), _payload()]))
 
-    monkeypatch.setattr(nlp, "PROMPT_VERSION", "announcement-nlp.v3")
+    monkeypatch.setattr(nlp, "PROMPT_VERSION", "announcement-nlp.v4")
     chat = FakeChatClient([_payload(tone_score=0.1), _payload(tone_score=0.2)])
     summary = _run(tmp_path, chat)
 
     assert summary.processed == 2
     assert summary.skipped == 0
     fields = pd.read_parquet(summary.fields_path)
-    assert len(fields) == 4  # v1 and v2 rows coexist under distinct processing keys
-    assert set(fields["prompt_version"]) == {"announcement-nlp.v2", "announcement-nlp.v3"}
+    assert len(fields) == 4  # Both governed prompt versions remain auditable.
+    assert set(fields["prompt_version"]) == {"announcement-nlp.v3", "announcement-nlp.v4"}
     # Only the current prompt/model generation is published into the factor.
     assert summary.factor_rows == 2
 
@@ -658,6 +739,7 @@ def test_process_checkpoints_and_resumes_after_interruption(tmp_path: Path) -> N
         "skipped": 1,
         "unavailable": 0,
         "failed": 0,
+        "llm_calls": 1,
     }
 
 
@@ -815,6 +897,10 @@ def test_cli_runs_with_injected_fakes(tmp_path: Path, monkeypatch) -> None:
             "regulatory_letter",
             "--limit",
             "5",
+            "--batch-size",
+            "1",
+            "--workers",
+            "1",
         ],
     )
 
@@ -849,6 +935,10 @@ def test_cli_exits_nonzero_when_an_llm_row_fails(tmp_path: Path, monkeypatch) ->
             "2024-01-01",
             "--end",
             "2024-01-31",
+            "--batch-size",
+            "1",
+            "--workers",
+            "1",
         ],
     )
 

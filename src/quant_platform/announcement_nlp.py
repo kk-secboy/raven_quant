@@ -26,9 +26,11 @@ import hashlib
 import json
 import os
 import random
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -42,7 +44,12 @@ from quant_data.rate_limit import GlobalRateGate
 
 from .factor_evaluator import normalize_series
 
-PROMPT_VERSION = "announcement-nlp.v2"
+PROMPT_VERSION = "announcement-nlp.v3"
+DEFAULT_BATCH_SIZE = 4
+MAX_BATCH_SIZE = 8
+DEFAULT_BATCH_ITEM_CHARS = 10_000
+DEFAULT_WORKERS = 8
+MAX_WORKERS = 32
 
 EVENT_TYPES = (
     "earnings_forecast",
@@ -241,8 +248,18 @@ class OpenAIChatClient:
         self.rate_gate = rate_gate
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max(1, max_attempts)
-        self.session = session or requests.Session()
+        self.session = session
+        self._thread_local = threading.local()
         self.sleeper = sleeper
+
+    def _session(self) -> requests.Session:
+        if self.session is not None:
+            return self.session
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._thread_local.session = session
+        return session
 
     def complete(self, messages: list[dict[str, str]], *, model: str) -> str:
         url = f"{self.credentials.api_base}/chat/completions"
@@ -260,7 +277,7 @@ class OpenAIChatClient:
         for attempt in range(1, self.max_attempts + 1):
             self.rate_gate.wait()
             try:
-                response = self.session.post(
+                response = self._session().post(
                     url,
                     json=payload,
                     headers=headers,
@@ -355,6 +372,16 @@ class ExtractionResult:
     impact_channels: tuple[str, ...]
     logic_summary: str
     confidence: float
+
+
+@dataclass(frozen=True, slots=True)
+class AnnouncementBatchItem:
+    item_id: str
+    ts_code: str
+    ann_date: date
+    title: str
+    category: str
+    text: str
 
 
 def _bounded_float(value: Any, name: str, low: float, high: float) -> float:
@@ -453,6 +480,102 @@ def parse_extraction_payload(raw: str) -> ExtractionResult:
         logic_summary=logic_summary.strip(),
         confidence=confidence,
     )
+
+
+def build_batch_extraction_messages(
+    items: list[AnnouncementBatchItem], *, max_chars: int = DEFAULT_BATCH_ITEM_CHARS
+) -> list[dict[str, str]]:
+    """Build a bounded multi-document request with exact item identifiers."""
+
+    if not items:
+        raise ValueError("batch must contain at least one announcement")
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+    payload = {
+        "items": [
+            {
+                "item_id": item.item_id,
+                "ts_code": item.ts_code,
+                "ann_date": item.ann_date.isoformat(),
+                "category": item.category,
+                "title": item.title[:240],
+                "text": item.text[:max_chars],
+            }
+            for item in items
+        ]
+    }
+    system = (
+        f"You are an A-share announcement analysis engine "
+        f"(prompt_version={PROMPT_VERSION}). Return exactly one JSON object with an "
+        '"items" array. Return exactly one output for every input item_id, with no '
+        "duplicates or omissions. Every output must repeat item_id and contain "
+        '"event_type", "tone_score", "key_numbers", "impact_direction", '
+        '"impact_horizon", "impact_channels", "logic_summary", "confidence". '
+        f'"event_type" must be one of: {", ".join(EVENT_TYPES)}. '
+        '"tone_score" is a float in [-1.0, 1.0]; for regulatory letters, negative '
+        'means more severe. "key_numbers" is a JSON object; use {} when unsupported. '
+        f'"impact_direction" must be one of: {", ".join(IMPACT_DIRECTIONS)}. '
+        f'"impact_horizon" must be one of: {", ".join(IMPACT_HORIZONS)}. '
+        f'"impact_channels" must be a duplicate-free array containing only: '
+        f'{", ".join(IMPACT_CHANNELS)}. "logic_summary" must be evidence-grounded and '
+        f"at most {MAX_LOGIC_SUMMARY_CHARS} characters. Do not infer facts not present "
+        'in that item. "confidence" is a float in [0.0, 1.0].'
+    )
+    return [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        },
+    ]
+
+
+def parse_batch_extraction_payload(
+    raw: str, *, expected_item_ids: list[str]
+) -> dict[str, ExtractionResult]:
+    """Validate a batch response exactly; omissions and duplicates fail closed."""
+
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise LlmExtractionError(
+            f"LLM batch response is not valid JSON: {exc}", stage="llm_parse"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        raise LlmExtractionError(
+            'LLM batch response must be an object with an "items" array',
+            stage="llm_parse",
+        )
+    if len(set(expected_item_ids)) != len(expected_item_ids):
+        raise ValueError("expected_item_ids must not contain duplicates")
+    results: dict[str, ExtractionResult] = {}
+    for row in payload["items"]:
+        if not isinstance(row, dict):
+            raise LlmExtractionError(
+                "LLM batch item must be a JSON object", stage="llm_parse"
+            )
+        item_id = row.get("item_id")
+        if not isinstance(item_id, str) or not item_id:
+            raise LlmExtractionError("LLM batch item misses item_id", stage="llm_parse")
+        if item_id in results:
+            raise LlmExtractionError(
+                f"LLM batch response duplicates item_id {item_id}", stage="llm_parse"
+            )
+        results[item_id] = parse_extraction_payload(
+            json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+        )
+    expected = set(expected_item_ids)
+    actual = set(results)
+    if actual != expected:
+        raise LlmExtractionError(
+            "LLM batch item_id mismatch; "
+            f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}",
+            stage="llm_parse",
+        )
+    return results
 
 
 def _write_parquet_atomic(frame: pd.DataFrame, path: Path) -> None:
@@ -707,6 +830,7 @@ class NlpSummary:
     skipped: int
     unavailable: int
     failed: int
+    llm_calls: int
     fields_path: Path | None
     state_path: Path | None
     unit_path: Path | None
@@ -732,6 +856,7 @@ class NlpSummary:
             "skipped": self.skipped,
             "unavailable": self.unavailable,
             "failed": self.failed,
+            "llm_calls": self.llm_calls,
             "fields_path": str(self.fields_path) if self.fields_path else None,
             "state_path": str(self.state_path) if self.state_path else None,
             "unit_path": str(self.unit_path) if self.unit_path else None,
@@ -766,6 +891,9 @@ def process_announcements(
     timeout_seconds: float = 120.0,
     max_attempts: int = 3,
     max_chars: int = MAX_TEXT_CHARS,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    batch_item_chars: int = DEFAULT_BATCH_ITEM_CHARS,
+    workers: int = DEFAULT_WORKERS,
     factor_name: str = FACTOR_NAME,
     checkpoint_every: int = 100,
     progress_callback: Callable[[dict[str, int]], None] | None = None,
@@ -784,6 +912,12 @@ def process_announcements(
 
     if checkpoint_every <= 0:
         raise ValueError("checkpoint_every must be positive")
+    if not 1 <= batch_size <= MAX_BATCH_SIZE:
+        raise ValueError(f"batch_size must be between 1 and {MAX_BATCH_SIZE}")
+    if batch_item_chars < 1:
+        raise ValueError("batch_item_chars must be positive")
+    if not 1 <= workers <= MAX_WORKERS:
+        raise ValueError(f"workers must be between 1 and {MAX_WORKERS}")
 
     clock = now or (lambda: datetime.now(UTC))
     frame = load_announcement_index(
@@ -814,9 +948,17 @@ def process_announcements(
         )
 
     new_field_rows: list[dict] = []
-    processed = skipped = unavailable = failed = completed = 0
+    processed = skipped = unavailable = failed = completed = llm_calls = 0
     dirty = False
     unit_path: Path | None = None
+    last_checkpoint_completed = 0
+    pending_batch: list[
+        tuple[AnnouncementBatchItem, Any, dict[str, Any], datetime]
+    ] = []
+    inflight: dict[
+        Future[tuple[dict[str, ExtractionResult], dict[str, LlmExtractionError], int]],
+        list[tuple[AnnouncementBatchItem, Any, dict[str, Any], datetime]],
+    ] = {}
 
     def publish_progress() -> None:
         if progress_callback is None:
@@ -829,6 +971,7 @@ def process_announcements(
                 "skipped": skipped,
                 "unavailable": unavailable,
                 "failed": failed,
+                "llm_calls": llm_calls,
             }
         )
 
@@ -847,90 +990,205 @@ def process_announcements(
             dirty = False
         publish_progress()
 
-    for row in frame.itertuples():
-        process_key = f"{row.sha256}:{PROMPT_VERSION}:{model}"
-        existing = state.get(process_key)
-        if existing is not None:
-            existing_status = str(existing["status"])
-            if existing_status == "succeeded":
-                skipped += 1
-                completed += 1
-                if completed % checkpoint_every == 0:
-                    persist_checkpoint()
-                continue
-            if existing_status == "source_unavailable":
+    def maybe_checkpoint() -> None:
+        nonlocal last_checkpoint_completed
+        if completed - last_checkpoint_completed >= checkpoint_every:
+            persist_checkpoint()
+            last_checkpoint_completed = completed
+
+    def execute_batch(
+        batch: list[tuple[AnnouncementBatchItem, Any, dict[str, Any], datetime]],
+    ) -> tuple[dict[str, ExtractionResult], dict[str, LlmExtractionError], int]:
+        items = [entry[0] for entry in batch]
+        call_count = 1
+        try:
+            if batch_size == 1:
+                item = items[0]
+                messages = build_extraction_messages(
+                    ts_code=item.ts_code,
+                    ann_date=item.ann_date,
+                    title=item.title,
+                    category=item.category,
+                    text=item.text,
+                )
+                results = {
+                    item.item_id: parse_extraction_payload(
+                        chat_client.complete(messages, model=model)
+                    )
+                }
+            else:
+                results = parse_batch_extraction_payload(
+                    chat_client.complete(
+                        build_batch_extraction_messages(
+                            items, max_chars=min(max_chars, batch_item_chars)
+                        ),
+                        model=model,
+                    ),
+                    expected_item_ids=[item.item_id for item in items],
+                )
+        except LlmExtractionError as batch_error:
+            if len(items) == 1:
+                return {}, {items[0].item_id: batch_error}, call_count
+            # A malformed/oversized batch must not discard valid documents. Retry
+            # each item independently and retain a per-item fail-closed result.
+            results = {}
+            errors: dict[str, LlmExtractionError] = {}
+            for item in items:
+                call_count += 1
+                try:
+                    messages = build_extraction_messages(
+                        ts_code=item.ts_code,
+                        ann_date=item.ann_date,
+                        title=item.title,
+                        category=item.category,
+                        text=item.text,
+                    )
+                    results[item.item_id] = parse_extraction_payload(
+                        chat_client.complete(messages, model=model)
+                    )
+                except LlmExtractionError as exc:
+                    errors[item.item_id] = exc
+            return results, errors, call_count
+        return results, {}, call_count
+
+    def apply_completed(
+        done: set[
+            Future[
+                tuple[
+                    dict[str, ExtractionResult],
+                    dict[str, LlmExtractionError],
+                    int,
+                ]
+            ]
+        ],
+    ) -> None:
+        nonlocal processed, failed, completed, llm_calls, dirty
+        for future in done:
+            batch = inflight.pop(future)
+            results, errors, batch_calls = future.result()
+            llm_calls += batch_calls
+            for item, row, state_row, processed_at in batch:
+                result = results.get(item.item_id)
+                if result is None:
+                    exc = errors[item.item_id]
+                    failed += 1
+                    state_row.update(
+                        status="failed", stage=exc.stage, error=str(exc)[:500]
+                    )
+                    continue
+                process_key = item.item_id
+                field_row = {
+                    "process_key": process_key,
+                    "ts_code": item.ts_code,
+                    "ann_date": item.ann_date,
+                    "available_at": pd.Timestamp(row.available_at).date(),
+                    "ingested_at": processed_at,
+                    "event_type": result.event_type,
+                    "tone_score": result.tone_score,
+                    "key_numbers": json.dumps(
+                        result.key_numbers,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "impact_direction": result.impact_direction,
+                    "impact_horizon": result.impact_horizon,
+                    "impact_channels": json.dumps(
+                        result.impact_channels,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    "logic_summary": result.logic_summary,
+                    "confidence": result.confidence,
+                    "source_sha256": str(row.sha256),
+                    "model": model,
+                    "prompt_version": PROMPT_VERSION,
+                    "processed_at": processed_at,
+                }
+                fields_records[process_key] = field_row
+                new_field_rows.append(field_row)
+                state_row.update(status="succeeded", stage="completed")
+                processed += 1
+            completed += len(batch)
+            dirty = True
+            maybe_checkpoint()
+
+    def submit_pending(executor: ThreadPoolExecutor) -> None:
+        nonlocal pending_batch
+        if not pending_batch:
+            return
+        batch = pending_batch
+        pending_batch = []
+        inflight[executor.submit(execute_batch, batch)] = batch
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for row in frame.itertuples():
+            process_key = f"{row.sha256}:{PROMPT_VERSION}:{model}"
+            existing = state.get(process_key)
+            if existing is not None:
+                existing_status = str(existing["status"])
+                if existing_status == "succeeded":
+                    skipped += 1
+                    completed += 1
+                    maybe_checkpoint()
+                    continue
+                if existing_status == "source_unavailable":
+                    unavailable += 1
+                    completed += 1
+                    maybe_checkpoint()
+                    continue
+            processed_at = clock()
+            state_row: dict[str, Any] = {
+                "process_key": process_key,
+                "source_sha256": str(row.sha256),
+                "prompt_version": PROMPT_VERSION,
+                "model": model,
+                "status": "",
+                "stage": "",
+                "error": None,
+                "processed_at": processed_at,
+                "ts_code": str(row.ts_code),
+                "available_at": pd.Timestamp(row.available_at).date(),
+            }
+            state[process_key] = state_row
+            dirty = True
+            try:
+                text = extract_pdf_text(data_root / str(row.file_path), max_chars=max_chars)
+            except PdfTextExtractionError as exc:
                 unavailable += 1
                 completed += 1
-                if completed % checkpoint_every == 0:
-                    persist_checkpoint()
+                state_row.update(
+                    status="source_unavailable",
+                    stage="pdf_extract",
+                    error=str(exc)[:500],
+                )
+                maybe_checkpoint()
                 continue
-        processed_at = clock()
-        state_row: dict[str, Any] = {
-            "process_key": process_key,
-            "source_sha256": str(row.sha256),
-            "prompt_version": PROMPT_VERSION,
-            "model": model,
-            "status": "",
-            "stage": "",
-            "error": None,
-            "processed_at": processed_at,
-            "ts_code": str(row.ts_code),
-            "available_at": pd.Timestamp(row.available_at).date(),
-        }
-        state[process_key] = state_row
-        dirty = True
-        try:
-            text = extract_pdf_text(data_root / str(row.file_path), max_chars=max_chars)
-            messages = build_extraction_messages(
-                ts_code=str(row.ts_code),
-                ann_date=pd.Timestamp(row.ann_date).date(),
-                title=str(row.title),
-                category=str(row.category),
-                text=text,
+            pending_batch.append(
+                (
+                    AnnouncementBatchItem(
+                        item_id=process_key,
+                        ts_code=str(row.ts_code),
+                        ann_date=pd.Timestamp(row.ann_date).date(),
+                        title=str(row.title),
+                        category=str(row.category),
+                        text=text,
+                    ),
+                    row,
+                    state_row,
+                    processed_at,
+                )
             )
-            result = parse_extraction_payload(chat_client.complete(messages, model=model))
-        except PdfTextExtractionError as exc:
-            unavailable += 1
-            state_row.update(
-                status="source_unavailable", stage="pdf_extract", error=str(exc)[:500]
-            )
-        except LlmExtractionError as exc:
-            failed += 1
-            state_row.update(status="failed", stage=exc.stage, error=str(exc)[:500])
-        else:
-            field_row = {
-                "process_key": process_key,
-                "ts_code": str(row.ts_code),
-                "ann_date": pd.Timestamp(row.ann_date).date(),
-                "available_at": pd.Timestamp(row.available_at).date(),
-                "ingested_at": processed_at,
-                "event_type": result.event_type,
-                "tone_score": result.tone_score,
-                "key_numbers": json.dumps(
-                    result.key_numbers,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                "impact_direction": result.impact_direction,
-                "impact_horizon": result.impact_horizon,
-                "impact_channels": json.dumps(
-                    result.impact_channels, ensure_ascii=False, separators=(",", ":")
-                ),
-                "logic_summary": result.logic_summary,
-                "confidence": result.confidence,
-                "source_sha256": str(row.sha256),
-                "model": model,
-                "prompt_version": PROMPT_VERSION,
-                "processed_at": processed_at,
-            }
-            fields_records[process_key] = field_row
-            new_field_rows.append(field_row)
-            state_row.update(status="succeeded", stage="completed")
-            processed += 1
-        completed += 1
-        if completed % checkpoint_every == 0:
-            persist_checkpoint()
+            if len(pending_batch) >= batch_size:
+                submit_pending(executor)
+            if len(inflight) >= workers * 2:
+                done, _pending = wait(set(inflight), return_when=FIRST_COMPLETED)
+                apply_completed(done)
+
+        submit_pending(executor)
+        while inflight:
+            done, _pending = wait(set(inflight), return_when=FIRST_COMPLETED)
+            apply_completed(done)
 
     persist_checkpoint(force=True)
     fields = _fields_frame(list(fields_records.values()))
@@ -944,6 +1202,9 @@ def process_announcements(
         "categories": sorted(categories or set()),
         "limit": int(limit or 0),
         "planned": len(frame),
+        "batch_size": batch_size,
+        "batch_item_chars": batch_item_chars,
+        "workers": workers,
     }
 
     artifact = write_factor_artifact(
@@ -970,6 +1231,7 @@ def process_announcements(
         skipped=skipped,
         unavailable=unavailable,
         failed=failed,
+        llm_calls=llm_calls,
         fields_path=fields_path,
         state_path=state_path,
         unit_path=unit_path,

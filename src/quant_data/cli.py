@@ -14,6 +14,12 @@ from rich.console import Console
 from rich.progress import Progress
 from rich.table import Table
 
+from quant_platform.announcement_nlp import (
+    DEFAULT_BATCH_SIZE as ANNOUNCEMENT_DEFAULT_BATCH_SIZE,
+)
+from quant_platform.announcement_nlp import DEFAULT_WORKERS as ANNOUNCEMENT_DEFAULT_WORKERS
+from quant_platform.announcement_nlp import MAX_BATCH_SIZE as ANNOUNCEMENT_MAX_BATCH_SIZE
+from quant_platform.announcement_nlp import MAX_WORKERS as ANNOUNCEMENT_MAX_WORKERS
 from quant_platform.announcement_nlp import process_announcements
 from quant_platform.corpus_nlp import (
     DEFAULT_BATCH_SIZE,
@@ -1811,6 +1817,22 @@ def announcement_nlp_command(
     limit: Annotated[
         int, typer.Option(min=0, help="Maximum announcements to process (0 = all)")
     ] = 0,
+    batch_size: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=ANNOUNCEMENT_MAX_BATCH_SIZE,
+            help="Announcements per LLM request (strict item-id matching)",
+        ),
+    ] = ANNOUNCEMENT_DEFAULT_BATCH_SIZE,
+    workers: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=ANNOUNCEMENT_MAX_WORKERS,
+            help="Concurrent bounded LLM requests",
+        ),
+    ] = ANNOUNCEMENT_DEFAULT_WORKERS,
     result_path: Annotated[Path | None, typer.Option("--result")] = None,
 ) -> None:
     """Extract structured NLP signal fields from downloaded announcement PDFs."""
@@ -1855,6 +1877,8 @@ def announcement_nlp_command(
             end=end_date,
             categories=categories or None,
             limit=limit or None,
+            batch_size=batch_size,
+            workers=workers,
             secret_store=secret_store,
             progress_callback=report_announcement_nlp_progress,
         ),

@@ -18,6 +18,8 @@ from quant_data.path_utils import to_wsl_path as _to_wsl_path
 
 from .allocation_store import AllocationStore
 from .announcement_factor_registry import default_factors_dir as announcement_factors_dir
+from .announcement_nlp import DEFAULT_BATCH_SIZE as ANNOUNCEMENT_DEFAULT_BATCH_SIZE
+from .announcement_nlp import DEFAULT_WORKERS as ANNOUNCEMENT_DEFAULT_WORKERS
 from .announcement_nlp import FACTOR_NAME as ANNOUNCEMENT_FACTOR_NAME
 from .announcement_nlp import LOGIC_FACTOR_NAME as ANNOUNCEMENT_LOGIC_FACTOR_NAME
 from .corpus_nlp import (
@@ -555,6 +557,19 @@ class LocalJobWorker:
                     command.extend(["--category", ",".join(payload["categories"])])
                 if int(payload.get("limit") or 0) > 0:
                     command.extend(["--limit", str(payload["limit"])])
+                command.extend(
+                    [
+                        "--batch-size",
+                        str(
+                            int(
+                                payload.get("batch_size")
+                                or ANNOUNCEMENT_DEFAULT_BATCH_SIZE
+                            )
+                        ),
+                        "--workers",
+                        str(int(payload.get("workers") or ANNOUNCEMENT_DEFAULT_WORKERS)),
+                    ]
+                )
             elif job["kind"] == "corpus_nlp":
                 command.extend(
                     [
