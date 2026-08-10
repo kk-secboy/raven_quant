@@ -965,6 +965,13 @@ def process_announcements(
     frame = load_announcement_index(
         data_root, ts_codes=ts_codes, start=start, end=end, categories=categories
     )
+    # The CNInfo index can contain multiple URLs for the exact same PDF.  The
+    # extraction/state contract is content-addressed by sha256, so submitting
+    # duplicate hashes in the same batch creates duplicate item IDs and pays
+    # for the same material more than once.  Keep the first deterministic
+    # reference before applying the user-facing limit.
+    if not frame.empty:
+        frame = frame.drop_duplicates(subset=["sha256"], keep="first").reset_index(drop=True)
     if limit is not None and limit > 0:
         frame = frame.head(limit)
 

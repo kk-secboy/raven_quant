@@ -591,6 +591,35 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     assert summary.logic_factor_sha256 == hashlib.sha256(logic_path.read_bytes()).hexdigest()
 
 
+def test_process_deduplicates_identical_pdf_references_before_batching(tmp_path: Path) -> None:
+    body = _pdf_bytes(["same regulatory letter", "explain the material loss"])
+    first = _seed_announcement(
+        tmp_path,
+        ts_code="000001.SZ",
+        ann_date=date(2024, 1, 2),
+        available_at=date(2024, 1, 3),
+        title="Regulatory letter original URL",
+        category="regulatory_letter",
+        body=body,
+    )
+    duplicate = {
+        **first,
+        "title": "Regulatory letter duplicate URL",
+        "url": "https://static.cninfo.com.cn/duplicate-reference.pdf",
+    }
+    _write_index(tmp_path, [first, duplicate])
+    item_id = f"{first['sha256']}:{nlp.PROMPT_VERSION}:test-model"
+    chat = FakeChatClient([_batch_payload([item_id])])
+
+    summary = _run(tmp_path, chat, batch_size=8)
+
+    assert summary.planned == 1
+    assert summary.processed == 1
+    assert summary.llm_calls == 1
+    assert len(chat.calls) == 1
+    assert len(pd.read_parquet(summary.fields_path)) == 1
+
+
 def test_process_batches_announcements_and_falls_back_per_item(tmp_path: Path) -> None:
     rows = _seed_two_announcements(tmp_path)
     item_ids = [f"{row['sha256']}:{nlp.PROMPT_VERSION}:test-model" for row in rows]
