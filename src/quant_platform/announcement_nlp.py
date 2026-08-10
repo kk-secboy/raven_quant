@@ -96,6 +96,14 @@ DEFAULT_CHAT_MODEL = "gpt-4.1-mini"
 MAX_TEXT_CHARS = 12_000
 USER_AGENT = "quantlab-announcement-nlp/1.0"
 
+LLM_USAGE_KEYS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
+)
+
 FIELDS_COLUMNS = (
     "process_key",
     "ts_code",
@@ -250,6 +258,8 @@ class OpenAIChatClient:
         self.max_attempts = max(1, max_attempts)
         self.session = session
         self._thread_local = threading.local()
+        self._usage_lock = threading.Lock()
+        self._usage = {key: 0 for key in LLM_USAGE_KEYS}
         self.sleeper = sleeper
 
     def _session(self) -> requests.Session:
@@ -269,6 +279,11 @@ class OpenAIChatClient:
             "temperature": 0.0,
             "response_format": {"type": "json_object"},
         }
+        if self._uses_deepseek_v4(model):
+            # V4 defaults to high-effort thinking. Structured extraction does not
+            # need hidden chain-of-thought, and paying for it at corpus scale is
+            # both wasteful and harder to audit.
+            payload["thinking"] = {"type": "disabled"}
         headers = {
             "Authorization": f"Bearer {self.credentials.api_key}",
             "User-Agent": USER_AGENT,
@@ -288,7 +303,9 @@ class OpenAIChatClient:
             else:
                 status = int(response.status_code)
                 if 200 <= status < 300:
-                    return self._response_content(response)
+                    content, usage = self._response_content_and_usage(response)
+                    self._record_usage(usage)
+                    return content
                 retryable = status == 429 or status >= 500
                 last_error = LlmExtractionError(
                     f"LLM endpoint returned HTTP {status}", stage="llm_call"
@@ -305,8 +322,34 @@ class OpenAIChatClient:
         assert last_error is not None
         raise last_error
 
+    def usage_totals(self) -> dict[str, int]:
+        """Return a thread-safe snapshot of provider-reported token usage."""
+
+        with self._usage_lock:
+            return dict(self._usage)
+
+    def _uses_deepseek_v4(self, model: str) -> bool:
+        return self.credentials.api_base.lower().rstrip("/").startswith(
+            "https://api.deepseek.com"
+        ) and model.lower().startswith("deepseek-v4-")
+
+    def _record_usage(self, usage: Mapping[str, Any]) -> None:
+        with self._usage_lock:
+            for key in LLM_USAGE_KEYS:
+                value = usage.get(key, 0)
+                if isinstance(value, bool):
+                    continue
+                try:
+                    parsed = int(value or 0)
+                except (TypeError, ValueError):
+                    continue
+                if parsed >= 0:
+                    self._usage[key] += parsed
+
     @staticmethod
-    def _response_content(response: requests.Response) -> str:
+    def _response_content_and_usage(
+        response: requests.Response,
+    ) -> tuple[str, Mapping[str, Any]]:
         try:
             body = response.json()
             content = body["choices"][0]["message"]["content"]
@@ -316,7 +359,8 @@ class OpenAIChatClient:
             ) from exc
         if not isinstance(content, str) or not content.strip():
             raise LlmExtractionError("empty chat completion content", stage="llm_call")
-        return content
+        usage = body.get("usage")
+        return content, usage if isinstance(usage, Mapping) else {}
 
 
 def build_extraction_messages(
@@ -339,14 +383,14 @@ def build_extraction_messages(
         "management tone (negative = pessimistic, positive = optimistic); for regulatory "
         "letters it rates issue severity (negative = severe). "
         '"key_numbers" is a JSON object with the key figures mentioned (e.g. forecast net '
-        'profit bounds, year-over-year change ranges); use {} when none can be extracted. '
+        "profit bounds, year-over-year change ranges); use {} when none can be extracted. "
         f'"impact_direction" must be one of: {", ".join(IMPACT_DIRECTIONS)}. '
         f'"impact_horizon" must be one of: {", ".join(IMPACT_HORIZONS)}. '
         f'"impact_channels" is a JSON array containing only: {", ".join(IMPACT_CHANNELS)}; '
-        'use [] when the document does not support a causal channel. '
+        "use [] when the document does not support a causal channel. "
         f'"logic_summary" is an evidence-grounded causal summary of at most '
-        f'{MAX_LOGIC_SUMMARY_CHARS} characters; use an empty string when unsupported. '
-        'Do not infer facts not present in the announcement. '
+        f"{MAX_LOGIC_SUMMARY_CHARS} characters; use an empty string when unsupported. "
+        "Do not infer facts not present in the announcement. "
         '"confidence" is a float in [0.0, 1.0].'
     )
     user = (
@@ -386,9 +430,7 @@ class AnnouncementBatchItem:
 
 def _bounded_float(value: Any, name: str, low: float, high: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise LlmExtractionError(
-            f"{name} must be a number in [{low}, {high}]", stage="llm_parse"
-        )
+        raise LlmExtractionError(f"{name} must be a number in [{low}, {high}]", stage="llm_parse")
     result = float(value)
     if not low <= result <= high:
         raise LlmExtractionError(f"{name}={result} is outside [{low}, {high}]", stage="llm_parse")
@@ -442,8 +484,7 @@ def parse_extraction_payload(raw: str) -> ExtractionResult:
     impact_direction = payload.get("impact_direction")
     if impact_direction not in IMPACT_DIRECTIONS:
         raise LlmExtractionError(
-            f"impact_direction must be one of {list(IMPACT_DIRECTIONS)}; "
-            f"got {impact_direction!r}",
+            f"impact_direction must be one of {list(IMPACT_DIRECTIONS)}; got {impact_direction!r}",
             stage="llm_parse",
         )
     impact_horizon = payload.get("impact_horizon")
@@ -554,9 +595,7 @@ def parse_batch_extraction_payload(
     results: dict[str, ExtractionResult] = {}
     for row in payload["items"]:
         if not isinstance(row, dict):
-            raise LlmExtractionError(
-                "LLM batch item must be a JSON object", stage="llm_parse"
-            )
+            raise LlmExtractionError("LLM batch item must be a JSON object", stage="llm_parse")
         item_id = row.get("item_id")
         if not isinstance(item_id, str) or not item_id:
             raise LlmExtractionError("LLM batch item misses item_id", stage="llm_parse")
@@ -632,9 +671,9 @@ def _fields_frame(rows: list[dict]) -> pd.DataFrame:
     frame["available_at"] = pd.to_datetime(frame["available_at"])
     frame["ingested_at"] = pd.to_datetime(frame["ingested_at"], utc=True)
     frame["processed_at"] = pd.to_datetime(frame["processed_at"], utc=True)
-    return frame.sort_values(
-        ["available_at", "ts_code", "process_key"], kind="stable"
-    ).reset_index(drop=True)
+    return frame.sort_values(["available_at", "ts_code", "process_key"], kind="stable").reset_index(
+        drop=True
+    )
 
 
 def _empty_state_frame() -> pd.DataFrame:
@@ -705,9 +744,7 @@ def load_announcement_index(
         frame = frame[frame["ann_date"] <= pd.Timestamp(end)]
     if categories:
         frame = frame[frame["category"].astype(str).isin(sorted(categories))]
-    return frame.sort_values(["ann_date", "ts_code", "url"], kind="stable").reset_index(
-        drop=True
-    )
+    return frame.sort_values(["ann_date", "ts_code", "url"], kind="stable").reset_index(drop=True)
 
 
 def build_tone_factor_series(fields: pd.DataFrame, name: str = FACTOR_NAME) -> pd.Series:
@@ -741,9 +778,7 @@ _HORIZON_WEIGHT = {
 }
 
 
-def build_logic_factor_series(
-    fields: pd.DataFrame, name: str = LOGIC_FACTOR_NAME
-) -> pd.Series:
+def build_logic_factor_series(fields: pd.DataFrame, name: str = LOGIC_FACTOR_NAME) -> pd.Series:
     """Build an explainable directional logic signal from governed NLP enums.
 
     This is deliberately not a free-form LLM score.  Direction and horizon are
@@ -782,11 +817,10 @@ def write_factor_artifact(
     research-run context instead of being faked here.
     """
 
-    current = fields[
-        (fields["prompt_version"].astype(str) == PROMPT_VERSION)
-        & (fields["model"].astype(str) == model)
-    ]
-    if process_keys is not None:
+    current = fields[fields["prompt_version"].astype(str) == PROMPT_VERSION]
+    if process_keys is None:
+        current = current[current["model"].astype(str) == model]
+    else:
         current = current[current["process_key"].astype(str).isin(process_keys)]
     if name == FACTOR_NAME:
         series = build_tone_factor_series(current, name)
@@ -840,6 +874,11 @@ class NlpSummary:
     logic_factor_manifest_path: Path | None
     logic_factor_sha256: str | None
     logic_factor_rows: int
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    prompt_cache_hit_tokens: int = 0
+    prompt_cache_miss_tokens: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         status = (
@@ -857,6 +896,11 @@ class NlpSummary:
             "unavailable": self.unavailable,
             "failed": self.failed,
             "llm_calls": self.llm_calls,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "prompt_cache_hit_tokens": self.prompt_cache_hit_tokens,
+            "prompt_cache_miss_tokens": self.prompt_cache_miss_tokens,
             "fields_path": str(self.fields_path) if self.fields_path else None,
             "state_path": str(self.state_path) if self.state_path else None,
             "unit_path": str(self.unit_path) if self.unit_path else None,
@@ -866,9 +910,7 @@ class NlpSummary:
             "factor_sha256": self.factor_sha256,
             "factor_rows": self.factor_rows,
             "logic_factor_manifest_path": (
-                str(self.logic_factor_manifest_path)
-                if self.logic_factor_manifest_path
-                else None
+                str(self.logic_factor_manifest_path) if self.logic_factor_manifest_path else None
             ),
             "logic_factor_sha256": self.logic_factor_sha256,
             "logic_factor_rows": self.logic_factor_rows,
@@ -936,6 +978,32 @@ def process_announcements(
     state = _load_records(state_path)
     fields_records = _load_records(fields_path)
 
+    # A model switch must not throw away valid, already-paid-for extraction.
+    # Reuse a terminal row only when the prompt contract is identical and a
+    # succeeded state still has its corresponding structured field record. The
+    # original process_key/model remain untouched for honest provenance.
+    compatible_success: dict[str, dict[str, Any]] = {}
+    compatible_unavailable: dict[str, dict[str, Any]] = {}
+    for record in state.values():
+        if str(record.get("prompt_version")) != PROMPT_VERSION:
+            continue
+        source_sha256 = str(record.get("source_sha256") or "")
+        status = str(record.get("status") or "")
+        process_key = str(record.get("process_key") or "")
+        if not source_sha256:
+            continue
+        if status == "succeeded" and process_key in fields_records:
+            target = compatible_success
+        elif status == "source_unavailable":
+            target = compatible_unavailable
+        else:
+            continue
+        current = target.get(source_sha256)
+        if current is None or str(record.get("processed_at") or "") > str(
+            current.get("processed_at") or ""
+        ):
+            target[source_sha256] = record
+
     if credentials is None:
         credentials = load_llm_credentials(secret_store, environ=environ)
     model = credentials.chat_model
@@ -949,12 +1017,11 @@ def process_announcements(
 
     new_field_rows: list[dict] = []
     processed = skipped = unavailable = failed = completed = llm_calls = 0
+    scope_process_keys: set[str] = set()
     dirty = False
     unit_path: Path | None = None
     last_checkpoint_completed = 0
-    pending_batch: list[
-        tuple[AnnouncementBatchItem, Any, dict[str, Any], datetime]
-    ] = []
+    pending_batch: list[tuple[AnnouncementBatchItem, Any, dict[str, Any], datetime]] = []
     inflight: dict[
         Future[tuple[dict[str, ExtractionResult], dict[str, LlmExtractionError], int]],
         list[tuple[AnnouncementBatchItem, Any, dict[str, Any], datetime]],
@@ -963,25 +1030,26 @@ def process_announcements(
     def publish_progress() -> None:
         if progress_callback is None:
             return
-        progress_callback(
-            {
-                "planned": len(frame),
-                "completed": completed,
-                "processed": processed,
-                "skipped": skipped,
-                "unavailable": unavailable,
-                "failed": failed,
-                "llm_calls": llm_calls,
-            }
-        )
+        progress = {
+            "planned": len(frame),
+            "completed": completed,
+            "processed": processed,
+            "skipped": skipped,
+            "unavailable": unavailable,
+            "failed": failed,
+            "llm_calls": llm_calls,
+        }
+        usage_reader = getattr(chat_client, "usage_totals", None)
+        if callable(usage_reader):
+            progress.update(usage_reader())
+        progress_callback(progress)
 
     def persist_checkpoint(*, force: bool = False) -> None:
         nonlocal dirty, new_field_rows, unit_path
         if dirty or force:
             if new_field_rows:
                 unit_path = (
-                    units_dir
-                    / f"fields_{clock():%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:8]}.parquet"
+                    units_dir / f"fields_{clock():%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:8]}.parquet"
                 )
                 _write_parquet_atomic(_fields_frame(new_field_rows), unit_path)
                 new_field_rows = []
@@ -1072,9 +1140,7 @@ def process_announcements(
                 if result is None:
                     exc = errors[item.item_id]
                     failed += 1
-                    state_row.update(
-                        status="failed", stage=exc.stage, error=str(exc)[:500]
-                    )
+                    state_row.update(status="failed", stage=exc.stage, error=str(exc)[:500])
                     continue
                 process_key = item.item_id
                 field_row = {
@@ -1107,6 +1173,7 @@ def process_announcements(
                 }
                 fields_records[process_key] = field_row
                 new_field_rows.append(field_row)
+                scope_process_keys.add(process_key)
                 state_row.update(status="succeeded", stage="completed")
                 processed += 1
             completed += len(batch)
@@ -1127,7 +1194,8 @@ def process_announcements(
             existing = state.get(process_key)
             if existing is not None:
                 existing_status = str(existing["status"])
-                if existing_status == "succeeded":
+                if existing_status == "succeeded" and process_key in fields_records:
+                    scope_process_keys.add(process_key)
                     skipped += 1
                     completed += 1
                     maybe_checkpoint()
@@ -1137,6 +1205,19 @@ def process_announcements(
                     completed += 1
                     maybe_checkpoint()
                     continue
+            source_sha256 = str(row.sha256)
+            prior_success = compatible_success.get(source_sha256)
+            if prior_success is not None:
+                scope_process_keys.add(str(prior_success["process_key"]))
+                skipped += 1
+                completed += 1
+                maybe_checkpoint()
+                continue
+            if source_sha256 in compatible_unavailable:
+                unavailable += 1
+                completed += 1
+                maybe_checkpoint()
+                continue
             processed_at = clock()
             state_row: dict[str, Any] = {
                 "process_key": process_key,
@@ -1192,9 +1273,15 @@ def process_announcements(
 
     persist_checkpoint(force=True)
     fields = _fields_frame(list(fields_records.values()))
-    scope_process_keys = {
-        f"{row.sha256}:{PROMPT_VERSION}:{model}" for row in frame.itertuples()
-    }
+    scoped_fields = fields[fields["process_key"].astype(str).isin(scope_process_keys)]
+    scope_models = sorted(scoped_fields["model"].dropna().astype(str).unique().tolist())
+    artifact_model = (
+        scope_models[0]
+        if len(scope_models) == 1
+        else f"mixed[{','.join(scope_models)}]"
+        if scope_models
+        else model
+    )
     source_scope = {
         "start_date": start.isoformat() if start else None,
         "end_date": end.isoformat() if end else None,
@@ -1205,13 +1292,15 @@ def process_announcements(
         "batch_size": batch_size,
         "batch_item_chars": batch_item_chars,
         "workers": workers,
+        "requested_model": model,
+        "models": scope_models,
     }
 
     artifact = write_factor_artifact(
         fields,
         factors_dir,
         name=factor_name,
-        model=model,
+        model=artifact_model,
         now=clock(),
         process_keys=scope_process_keys,
         source_scope=source_scope,
@@ -1220,11 +1309,13 @@ def process_announcements(
         fields,
         factors_dir,
         name=LOGIC_FACTOR_NAME,
-        model=model,
+        model=artifact_model,
         now=clock(),
         process_keys=scope_process_keys,
         source_scope=source_scope,
     )
+    usage_reader = getattr(chat_client, "usage_totals", None)
+    usage = usage_reader() if callable(usage_reader) else {}
     return NlpSummary(
         planned=len(frame),
         processed=processed,
@@ -1241,4 +1332,9 @@ def process_announcements(
         logic_factor_manifest_path=logic_artifact["manifest_path"],
         logic_factor_sha256=logic_artifact["manifest"]["sha256"],
         logic_factor_rows=logic_artifact["manifest"]["rows"],
+        prompt_tokens=int(usage.get("prompt_tokens", 0)),
+        completion_tokens=int(usage.get("completion_tokens", 0)),
+        total_tokens=int(usage.get("total_tokens", 0)),
+        prompt_cache_hit_tokens=int(usage.get("prompt_cache_hit_tokens", 0)),
+        prompt_cache_miss_tokens=int(usage.get("prompt_cache_miss_tokens", 0)),
     )

@@ -353,8 +353,11 @@ class _FakeChatSession:
         return outcome
 
 
-def _chat_body(content: str) -> dict:
-    return {"choices": [{"message": {"content": content}}]}
+def _chat_body(content: str, *, usage: dict | None = None) -> dict:
+    body = {"choices": [{"message": {"content": content}}]}
+    if usage is not None:
+        body["usage"] = usage
+    return body
 
 
 def _openai_client(session: _FakeChatSession, delays: list | None = None):
@@ -385,6 +388,48 @@ def test_openai_chat_client_posts_with_auth_header() -> None:
     assert call["headers"]["Authorization"] == "Bearer sk-test-fake-key"
     assert call["json"]["model"] == "test-model"
     assert call["json"]["response_format"] == {"type": "json_object"}
+
+
+def test_deepseek_v4_disables_thinking_and_records_usage() -> None:
+    session = _FakeChatSession(
+        [
+            _FakeChatResponse(
+                200,
+                _chat_body(
+                    _payload(),
+                    usage={
+                        "prompt_tokens": 120,
+                        "completion_tokens": 30,
+                        "total_tokens": 150,
+                        "prompt_cache_hit_tokens": 20,
+                        "prompt_cache_miss_tokens": 100,
+                    },
+                ),
+            )
+        ]
+    )
+    client = nlp.OpenAIChatClient(
+        nlp.LlmCredentials(
+            api_key="sk-test-fake-key",
+            api_base="https://api.deepseek.com",
+            chat_model="deepseek-v4-flash",
+            source="test",
+        ),
+        rate_gate=GlobalRateGate(60_000),
+        session=session,
+        sleeper=lambda _seconds: None,
+    )
+
+    client.complete([], model="deepseek-v4-flash")
+
+    assert session.calls[0]["json"]["thinking"] == {"type": "disabled"}
+    assert client.usage_totals() == {
+        "prompt_tokens": 120,
+        "completion_tokens": 30,
+        "total_tokens": 150,
+        "prompt_cache_hit_tokens": 20,
+        "prompt_cache_miss_tokens": 100,
+    }
 
 
 def test_openai_chat_client_retries_retryable_status() -> None:
@@ -524,9 +569,7 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     assert factor["announcement_tone"].tolist() == [0.6, -0.7]
 
     manifest = json.loads(
-        (tmp_path / "announcements/nlp/factors/announcement_tone.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "announcements/nlp/factors/announcement_tone.json").read_text(encoding="utf-8")
     )
     assert manifest["factor"] == "announcement_tone"
     assert manifest["rows"] == 2
@@ -538,9 +581,7 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     assert manifest["source"]["prompt_version"] == nlp.PROMPT_VERSION
     assert manifest["source"]["model"] == "test-model"
 
-    logic_path = (
-        tmp_path / "announcements/nlp/factors/announcement_logic_score.parquet"
-    )
+    logic_path = tmp_path / "announcements/nlp/factors/announcement_logic_score.parquet"
     logic = pd.read_parquet(logic_path)
     assert logic["announcement_logic_score"].tolist() == [
         pytest.approx(0.765),
@@ -552,9 +593,7 @@ def test_process_end_to_end(tmp_path: Path) -> None:
 
 def test_process_batches_announcements_and_falls_back_per_item(tmp_path: Path) -> None:
     rows = _seed_two_announcements(tmp_path)
-    item_ids = [
-        f"{row['sha256']}:{nlp.PROMPT_VERSION}:test-model" for row in rows
-    ]
+    item_ids = [f"{row['sha256']}:{nlp.PROMPT_VERSION}:test-model" for row in rows]
     batched = FakeChatClient([_batch_payload(item_ids)])
 
     summary = _run(tmp_path, batched, batch_size=2, workers=2)
@@ -566,9 +605,7 @@ def test_process_batches_announcements_and_falls_back_per_item(tmp_path: Path) -
 
     retry_root = tmp_path / "fallback"
     retry_rows = _seed_two_announcements(retry_root)
-    retry_ids = [
-        f"{row['sha256']}:{nlp.PROMPT_VERSION}:test-model" for row in retry_rows
-    ]
+    retry_ids = [f"{row['sha256']}:{nlp.PROMPT_VERSION}:test-model" for row in retry_rows]
     fallback = FakeChatClient(
         [
             _batch_payload(retry_ids[:1]),
@@ -603,9 +640,7 @@ def test_process_is_idempotent_on_processing_key(tmp_path: Path) -> None:
     assert second.factor_rows == 2
 
 
-def test_process_reprocesses_when_prompt_version_changes(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_process_reprocesses_when_prompt_version_changes(tmp_path: Path, monkeypatch) -> None:
     _seed_two_announcements(tmp_path)
     _run(tmp_path, FakeChatClient([_payload(), _payload()]))
 
@@ -696,9 +731,7 @@ def test_process_records_llm_failures_without_signals(tmp_path: Path) -> None:
     assert fields.empty
     assert summary.factor_rows == 0
     manifest = json.loads(
-        (tmp_path / "announcements/nlp/factors/announcement_tone.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "announcements/nlp/factors/announcement_tone.json").read_text(encoding="utf-8")
     )
     assert manifest["rows"] == 0
 
@@ -741,6 +774,83 @@ def test_process_checkpoints_and_resumes_after_interruption(tmp_path: Path) -> N
         "failed": 0,
         "llm_calls": 1,
     }
+
+
+def test_process_reuses_paid_success_after_model_switch(tmp_path: Path) -> None:
+    _seed_two_announcements(tmp_path)
+    pro = nlp.LlmCredentials(
+        api_key="sk-test-fake-key",
+        api_base="https://api.deepseek.com",
+        chat_model="deepseek-v4-pro",
+        source="test",
+    )
+    flash = nlp.LlmCredentials(
+        api_key="sk-test-fake-key",
+        api_base="https://api.deepseek.com",
+        chat_model="deepseek-v4-flash",
+        source="test",
+    )
+    _run(
+        tmp_path,
+        FakeChatClient([_payload(tone_score=0.2), _payload(tone_score=-0.4)]),
+        credentials=pro,
+    )
+
+    resumed = _run(tmp_path, FakeChatClient([]), credentials=flash)
+
+    assert resumed.processed == 0
+    assert resumed.skipped == 2
+    fields = pd.read_parquet(resumed.fields_path)
+    assert len(fields) == 2
+    assert set(fields["model"]) == {"deepseek-v4-pro"}
+    manifest = json.loads(resumed.factor_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source"]["model"] == "deepseek-v4-pro"
+    assert manifest["source"]["scope"]["requested_model"] == "deepseek-v4-flash"
+    assert manifest["source"]["scope"]["models"] == ["deepseek-v4-pro"]
+
+
+def test_process_publishes_mixed_model_scope_without_duplicate_calls(tmp_path: Path) -> None:
+    _seed_two_announcements(tmp_path)
+    pro = nlp.LlmCredentials(
+        api_key="sk-test-fake-key",
+        api_base="https://api.deepseek.com",
+        chat_model="deepseek-v4-pro",
+        source="test",
+    )
+    flash = nlp.LlmCredentials(
+        api_key="sk-test-fake-key",
+        api_base="https://api.deepseek.com",
+        chat_model="deepseek-v4-flash",
+        source="test",
+    )
+    with pytest.raises(RuntimeError, match="worker interrupted"):
+        _run(
+            tmp_path,
+            FakeChatClient([_payload(tone_score=0.2), RuntimeError("worker interrupted")]),
+            credentials=pro,
+            checkpoint_every=1,
+        )
+
+    resumed = _run(
+        tmp_path,
+        FakeChatClient([_payload(tone_score=-0.4)]),
+        credentials=flash,
+        checkpoint_every=1,
+    )
+
+    assert resumed.skipped == 1
+    assert resumed.processed == 1
+    fields = pd.read_parquet(resumed.fields_path)
+    assert len(fields) == 2
+    assert set(fields["model"]) == {"deepseek-v4-pro", "deepseek-v4-flash"}
+    factor = pd.read_parquet(resumed.factor_manifest_path.with_suffix(".parquet"))
+    assert len(factor) == 2
+    manifest = json.loads(resumed.factor_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source"]["model"] == "mixed[deepseek-v4-flash,deepseek-v4-pro]"
+    assert manifest["source"]["scope"]["models"] == [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+    ]
 
 
 def test_process_retries_failed_rows_on_rerun(tmp_path: Path) -> None:
@@ -828,14 +938,10 @@ def test_factor_publication_is_restricted_to_the_requested_scope(tmp_path: Path)
 
     assert scoped.planned == 1
     assert scoped.skipped == 1
-    factor = pd.read_parquet(
-        tmp_path / "announcements/nlp/factors/announcement_tone.parquet"
-    )
+    factor = pd.read_parquet(tmp_path / "announcements/nlp/factors/announcement_tone.parquet")
     assert factor["instrument"].tolist() == ["000002.SZ"]
     manifest = json.loads(
-        (tmp_path / "announcements/nlp/factors/announcement_tone.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "announcements/nlp/factors/announcement_tone.json").read_text(encoding="utf-8")
     )
     assert manifest["source"]["scope"]["categories"] == ["regulatory_letter"]
     assert manifest["source"]["scope_process_key_count"] == 1
