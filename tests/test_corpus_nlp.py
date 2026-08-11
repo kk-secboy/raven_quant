@@ -420,9 +420,7 @@ def test_batch_messages_and_parser_are_exact_on_item_ids(tmp_path: Path) -> None
 
     messages = corpus.build_batch_extraction_messages(items, max_chars=4)
     request = json.loads(messages[1]["content"])
-    assert [row["item_id"] for row in request["items"]] == [
-        item.item_id for item in items
-    ]
+    assert [row["item_id"] for row in request["items"]] == [item.item_id for item in items]
     assert all(len(row["text"]) <= 4 for row in request["items"])
 
     parsed = corpus.parse_batch_extraction_payload(
@@ -509,9 +507,7 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     assert summary.selection_audit["eligible_unique_items"] == 7
     assert summary.selection_audit["selected_after_policy_before_limit"] == 7
     assert summary.selection_audit["selected_after_limit"] == 7
-    assert summary.as_dict()["selection_audit"]["sources"]["major_news"][
-        "date_min"
-    ] == "2024-01-02"
+    assert summary.as_dict()["selection_audit"]["sources"]["major_news"]["date_min"] == "2024-01-02"
     assert len(chat.calls) == 7
     assert chat.calls[0][1] == "test-model"
     assert corpus.PROMPT_VERSION in chat.calls[0][0][0]["content"]
@@ -532,17 +528,13 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     assert news["ts_code"].isna().all()
     # major_news: available_at is the exact publication moment.
     assert news["available_at"].tolist() == list(news["pub_time"])
-    irm = fields[fields["source_dataset"].isin(["irm_qa_sh", "irm_qa_sz"])].sort_values(
-        "pub_time"
-    )
+    irm = fields[fields["source_dataset"].isin(["irm_qa_sh", "irm_qa_sz"])].sort_values("pub_time")
     # irm_qa: next trading day after the trade date (holiday-aware).
     assert irm["available_at"].tolist() == [
         pd.Timestamp(date(2024, 1, 4)),
         pd.Timestamp(date(2024, 1, 8)),
     ]
-    policy = fields[fields["source_dataset"].isin(["npr", "cctv_news"])].sort_values(
-        "pub_time"
-    )
+    policy = fields[fields["source_dataset"].isin(["npr", "cctv_news"])].sort_values("pub_time")
     # npr: exact publication moment; cctv_news: next trading day after the
     # broadcast date (2024-01-05 -> 2024-01-08 over the weekend).
     assert policy["available_at"].tolist() == [
@@ -600,12 +592,11 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     )
     assert news_manifest["factor"] == "news_sentiment_daily"
     assert news_manifest["rows"] == 3
-    assert news_manifest["sha256"] == summary.factors["news_sentiment_daily"]["manifest"][
-        "sha256"
-    ]
-    assert news_manifest["sha256"] == hashlib.sha256(
-        (factors_dir / "news_sentiment_daily.parquet").read_bytes()
-    ).hexdigest()
+    assert news_manifest["sha256"] == summary.factors["news_sentiment_daily"]["manifest"]["sha256"]
+    assert (
+        news_manifest["sha256"]
+        == hashlib.sha256((factors_dir / "news_sentiment_daily.parquet").read_bytes()).hexdigest()
+    )
     assert "pub_time" in news_manifest["availability_policy"]["news_sentiment_daily"]
     assert "15:00" in news_manifest["availability_policy"]["news_sentiment_daily"]
     assert "MARKET" in news_manifest["instrument_convention"]
@@ -617,9 +608,10 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     )
     assert irm_manifest["rows"] == 2
     assert irm_manifest["source"]["source_datasets"] == ["irm_qa_sh", "irm_qa_sz"]
-    assert "next trade_cal trading day" in irm_manifest["availability_policy"][
-        "irm_qa_sentiment_daily"
-    ]
+    assert (
+        "next trade_cal trading day"
+        in irm_manifest["availability_policy"]["irm_qa_sentiment_daily"]
+    )
 
     policy_manifest = json.loads(
         (factors_dir / "policy_sentiment_daily.json").read_text(encoding="utf-8")
@@ -627,9 +619,10 @@ def test_process_end_to_end(tmp_path: Path) -> None:
     assert policy_manifest["rows"] == 2
     assert policy_manifest["source"]["source_datasets"] == ["npr", "cctv_news"]
     assert "MARKET" in policy_manifest["instrument_convention"]
-    assert policy_manifest["sha256"] == hashlib.sha256(
-        (factors_dir / "policy_sentiment_daily.parquet").read_bytes()
-    ).hexdigest()
+    assert (
+        policy_manifest["sha256"]
+        == hashlib.sha256((factors_dir / "policy_sentiment_daily.parquet").read_bytes()).hexdigest()
+    )
 
 
 def test_process_is_idempotent_on_processing_key(tmp_path: Path) -> None:
@@ -668,9 +661,7 @@ def test_process_reprocesses_when_prompt_version_changes(tmp_path: Path, monkeyp
     # Historical prompt generations remain auditable in fields, but only the
     # current prompt/model generation can enter the published factor.
     assert summary.factors["news_sentiment_daily"]["manifest"]["rows"] == 3
-    news = pd.read_parquet(
-        tmp_path / "corpus_nlp/factors/news_sentiment_daily.parquet"
-    )
+    news = pd.read_parquet(tmp_path / "corpus_nlp/factors/news_sentiment_daily.parquet")
     assert news["news_sentiment_daily"].tolist() == [0.1, 0.1, 0.1]
 
 
@@ -748,8 +739,7 @@ def test_process_retries_failed_rows_on_rerun(tmp_path: Path) -> None:
     _seed_corpus(tmp_path)
     _seed_trade_cal(tmp_path)
     failing = FakeChatClient(
-        [LlmExtractionError("LLM request failed: boom", stage="llm_call")]
-        + [_payload()] * 6
+        [LlmExtractionError("LLM request failed: boom", stage="llm_call")] + [_payload()] * 6
     )
     first = _run(tmp_path, failing)
     assert first.failed == 1
@@ -924,20 +914,66 @@ def test_load_corpus_items_pushes_date_bounds_into_duckdb(
     assert bounded[0][1] == (date(2024, 2, 1), date(2024, 2, 29))
 
 
-def test_load_corpus_items_applies_deterministic_production_caps(tmp_path: Path) -> None:
+def test_major_news_multi_year_scan_is_chunked_for_loading_and_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _write_parquet(
         tmp_path / "units" / "major_news",
         [
-            _news_row(f"新闻{index}", f"正文{index}", "2024-01-02 09:00:00")
-            for index in range(5)
+            _news_row("news-2023", "body-2023", "2023-06-01 09:00:00"),
+            _news_row("news-2024", "body-2024", "2024-06-01 09:00:00"),
+            _news_row("news-2025", "body-2025", "2025-06-01 09:00:00"),
         ],
     )
-    first = corpus.load_corpus_items(
-        tmp_path, datasets={"major_news"}, max_major_news_per_day=2
+    original = corpus._read_parquet_union
+    calls: list[tuple[object, ...]] = []
+
+    def recording_read(paths, query, parameters=()):
+        if parameters:
+            calls.append(tuple(parameters))
+        return original(paths, query, parameters)
+
+    monkeypatch.setattr(corpus, "_read_parquet_union", recording_read)
+    start = date(2023, 5, 1)
+    end = date(2025, 7, 1)
+    items = corpus.load_corpus_items(
+        tmp_path,
+        datasets={"major_news"},
+        start=start,
+        end=end,
+        max_major_news_per_day=1,
     )
-    second = corpus.load_corpus_items(
-        tmp_path, datasets={"major_news"}, max_major_news_per_day=2
+    audit = corpus.build_corpus_selection_audit(
+        tmp_path,
+        selected_datasets={"major_news"},
+        selected_before_limit=items,
+        selected_after_limit=items,
+        ts_codes=None,
+        start=start,
+        end=end,
+        limit=None,
+        max_major_news_per_day=1,
+        max_irm_per_instrument_day=None,
     )
+
+    assert [item.title for item in items] == ["news-2023", "news-2024", "news-2025"]
+    assert audit["eligible_unique_items"] == 3
+    # Three bounded year windows for selection, then the same three for the
+    # uncapped denominator audit.  A single multi-year DISTINCT is prohibited.
+    assert len(calls) == 6
+    assert calls[0] == (date(2023, 5, 1), date(2023, 12, 31), 1)
+    assert calls[2] == (date(2025, 1, 1), date(2025, 7, 1), 1)
+    assert calls[3] == (date(2023, 5, 1), date(2023, 12, 31))
+    assert calls[5] == (date(2025, 1, 1), date(2025, 7, 1))
+
+
+def test_load_corpus_items_applies_deterministic_production_caps(tmp_path: Path) -> None:
+    _write_parquet(
+        tmp_path / "units" / "major_news",
+        [_news_row(f"新闻{index}", f"正文{index}", "2024-01-02 09:00:00") for index in range(5)],
+    )
+    first = corpus.load_corpus_items(tmp_path, datasets={"major_news"}, max_major_news_per_day=2)
+    second = corpus.load_corpus_items(tmp_path, datasets={"major_news"}, max_major_news_per_day=2)
     assert len(first) == 2
     assert [item.item_id for item in first] == [item.item_id for item in second]
 
@@ -1013,9 +1049,7 @@ def test_factor_publication_is_restricted_to_current_corpus_scope(tmp_path: Path
 
     assert scoped.planned == 1
     assert scoped.skipped == 1
-    assert sum(
-        entry["manifest"]["rows"] for entry in scoped.factors.values()
-    ) == 1
+    assert sum(entry["manifest"]["rows"] for entry in scoped.factors.values()) == 1
     for entry in scoped.factors.values():
         source = entry["manifest"]["source"]
         assert source["scope"]["planned"] == 1
@@ -1225,9 +1259,7 @@ def test_load_npr_missing_required_columns_fail_closed(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="title"):
         corpus.load_corpus_items(tmp_path, datasets={"npr"})
-    _write_parquet(
-        tmp_path / "units" / "npr", [{"title": "政策"}], name="other.parquet"
-    )
+    _write_parquet(tmp_path / "units" / "npr", [{"title": "政策"}], name="other.parquet")
     with pytest.raises(RuntimeError, match=r"pubtime\|pub_time"):
         corpus.load_corpus_items(tmp_path, datasets={"npr"})
 

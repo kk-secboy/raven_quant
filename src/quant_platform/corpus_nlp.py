@@ -229,9 +229,7 @@ def _corpus_parquet_paths(data_root: Path, datasets: Iterable[str]) -> dict[str,
 
 
 def _available_columns(paths: list[str]) -> set[str]:
-    frame = _read_parquet_union(
-        paths, "SELECT * FROM read_parquet(?, union_by_name=true) LIMIT 0"
-    )
+    frame = _read_parquet_union(paths, "SELECT * FROM read_parquet(?, union_by_name=true) LIMIT 0")
     return set(frame.columns)
 
 
@@ -249,6 +247,31 @@ def _date_bounds_sql(
     return (" WHERE " + " AND ".join(conditions) if conditions else "", parameters)
 
 
+def _bounded_year_windows(
+    start: date | None, end: date | None
+) -> list[tuple[date | None, date | None]]:
+    """Split a bounded historical scan into year-sized DuckDB queries.
+
+    The production corpus contains many duplicate full-text rows across unit and
+    snapshot parquet files.  A single multi-year ``DISTINCT`` + window query can
+    exhaust both memory and DuckDB's temporary spill allowance before the
+    governed daily cap is applied.  Publication dates partition the selection
+    contract, so independent non-overlapping year windows are exactly equivalent
+    while keeping each hash/sort bounded.
+    """
+
+    if start is None or end is None or start.year == end.year:
+        return [(start, end)]
+    windows: list[tuple[date | None, date | None]] = []
+    year = start.year
+    while year <= end.year:
+        window_start = start if year == start.year else date(year, 1, 1)
+        window_end = end if year == end.year else date(year, 12, 31)
+        windows.append((window_start, window_end))
+        year += 1
+    return windows
+
+
 def _major_news_items(
     paths: list[str],
     *,
@@ -261,42 +284,49 @@ def _major_news_items(
     if missing:
         raise RuntimeError(f"major_news parquet misses required columns: {missing}")
     moment_expr = "try_cast(CAST(pub_time AS VARCHAR) AS TIMESTAMP)"
-    where, parameters = _date_bounds_sql(moment_expr, start=start, end=end)
-    select_sql = f"""
-        SELECT DISTINCT
-            CAST(title AS VARCHAR) AS title,
-            CAST(content AS VARCHAR) AS content,
-            CAST(pub_time AS VARCHAR) AS pub_time,
-            {moment_expr} AS moment
-        FROM read_parquet(?, union_by_name=true)
-        {where}
-    """
-    if max_items_per_day is not None:
-        if max_items_per_day < 1:
-            raise ValueError("max_items_per_day must be positive")
-        frame = _read_parquet_union(
-            paths,
-            f"""
-            WITH source AS ({select_sql}), ranked AS (
-                SELECT *, row_number() OVER (
-                    PARTITION BY CAST(moment AS DATE)
-                    ORDER BY hash(title, content, pub_time), title, pub_time
-                ) AS selection_rank
-                FROM source
-                WHERE moment IS NOT NULL
+    if max_items_per_day is not None and max_items_per_day < 1:
+        raise ValueError("max_items_per_day must be positive")
+    frames: list[pd.DataFrame] = []
+    for window_start, window_end in _bounded_year_windows(start, end):
+        where, parameters = _date_bounds_sql(moment_expr, start=window_start, end=window_end)
+        select_sql = f"""
+            SELECT DISTINCT
+                CAST(title AS VARCHAR) AS title,
+                CAST(content AS VARCHAR) AS content,
+                CAST(pub_time AS VARCHAR) AS pub_time,
+                {moment_expr} AS moment
+            FROM read_parquet(?, union_by_name=true)
+            {where}
+        """
+        if max_items_per_day is not None:
+            frames.append(
+                _read_parquet_union(
+                    paths,
+                    f"""
+                    WITH source AS ({select_sql}), ranked AS (
+                        SELECT *, row_number() OVER (
+                            PARTITION BY CAST(moment AS DATE)
+                            ORDER BY hash(title, content, pub_time), title, pub_time
+                        ) AS selection_rank
+                        FROM source
+                        WHERE moment IS NOT NULL
+                    )
+                    SELECT title, content, pub_time
+                    FROM ranked
+                    WHERE selection_rank <= ?
+                    """,
+                    [*parameters, max_items_per_day],
+                )
             )
-            SELECT title, content, pub_time
-            FROM ranked
-            WHERE selection_rank <= ?
-            """,
-            [*parameters, max_items_per_day],
-        )
-    else:
-        frame = _read_parquet_union(
-            paths,
-            f"SELECT title, content, pub_time FROM ({select_sql}) AS source",
-            parameters,
-        )
+        else:
+            frames.append(
+                _read_parquet_union(
+                    paths,
+                    f"SELECT title, content, pub_time FROM ({select_sql}) AS source",
+                    parameters,
+                )
+            )
+    frame = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     frame["moment"] = pd.to_datetime(frame["pub_time"], errors="coerce")
     items: list[CorpusItem] = []
     for row in frame.itertuples():
@@ -350,34 +380,39 @@ def _irm_qa_items(
     if answer_col is not None:
         # Tolerant: the answer column is optional; questions alone still carry signal.
         select_parts.append(f'CAST("{answer_col}" AS VARCHAR) AS answer')
-    where, parameters = _date_bounds_sql(trade_date_expr, start=start, end=end)
-    select_sql = (
-        f"SELECT DISTINCT {', '.join(select_parts)} "
-        f"FROM read_parquet(?, union_by_name=true){where}"
-    )
-    if max_items_per_instrument_day is not None:
-        if max_items_per_instrument_day < 1:
-            raise ValueError("max_items_per_instrument_day must be positive")
-        order_columns = "question" + (", answer" if answer_col is not None else "")
-        frame = _read_parquet_union(
-            paths,
-            f"""
-            WITH source AS ({select_sql}), ranked AS (
-                SELECT *, row_number() OVER (
-                    PARTITION BY trade_date, upper(trim(ts_code))
-                    ORDER BY hash({order_columns}), question
-                ) AS selection_rank
-                FROM source
-                WHERE trade_date IS NOT NULL AND trim(ts_code) <> ''
-            )
-            SELECT * EXCLUDE (selection_rank)
-            FROM ranked
-            WHERE selection_rank <= ?
-            """,
-            [*parameters, max_items_per_instrument_day],
+    if max_items_per_instrument_day is not None and max_items_per_instrument_day < 1:
+        raise ValueError("max_items_per_instrument_day must be positive")
+    frames: list[pd.DataFrame] = []
+    for window_start, window_end in _bounded_year_windows(start, end):
+        where, parameters = _date_bounds_sql(trade_date_expr, start=window_start, end=window_end)
+        select_sql = (
+            f"SELECT DISTINCT {', '.join(select_parts)} "
+            f"FROM read_parquet(?, union_by_name=true){where}"
         )
-    else:
-        frame = _read_parquet_union(paths, select_sql, parameters)
+        if max_items_per_instrument_day is not None:
+            order_columns = "question" + (", answer" if answer_col is not None else "")
+            frames.append(
+                _read_parquet_union(
+                    paths,
+                    f"""
+                    WITH source AS ({select_sql}), ranked AS (
+                        SELECT *, row_number() OVER (
+                            PARTITION BY trade_date, upper(trim(ts_code))
+                            ORDER BY hash({order_columns}), question
+                        ) AS selection_rank
+                        FROM source
+                        WHERE trade_date IS NOT NULL AND trim(ts_code) <> ''
+                    )
+                    SELECT * EXCLUDE (selection_rank)
+                    FROM ranked
+                    WHERE selection_rank <= ?
+                    """,
+                    [*parameters, max_items_per_instrument_day],
+                )
+            )
+        else:
+            frames.append(_read_parquet_union(paths, select_sql, parameters))
+    frame = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     items: list[CorpusItem] = []
     for row in frame.itertuples():
         if pd.isna(row.trade_date):
@@ -421,24 +456,21 @@ def _npr_items(
         raise RuntimeError(f"npr parquet misses required columns: {missing}")
     # Both naming variants can coexist across download windows (union_by_name);
     # coalesce per row instead of preferring one column for every row.
-    time_expr = "coalesce(" + ", ".join(
-        f'CAST("{name}" AS VARCHAR)' for name in time_cols
-    ) + ")"
+    time_expr = "coalesce(" + ", ".join(f'CAST("{name}" AS VARCHAR)' for name in time_cols) + ")"
     select_parts = [
         "CAST(title AS VARCHAR) AS title",
         f"{time_expr} AS pub_time",
     ]
     if content_cols:
-        content_expr = "coalesce(" + ", ".join(
-            f'CAST("{name}" AS VARCHAR)' for name in content_cols
-        ) + ")"
+        content_expr = (
+            "coalesce(" + ", ".join(f'CAST("{name}" AS VARCHAR)' for name in content_cols) + ")"
+        )
         select_parts.append(f"{content_expr} AS content")
     moment_expr = f"try_cast({time_expr} AS TIMESTAMP)"
     where, parameters = _date_bounds_sql(moment_expr, start=start, end=end)
     frame = _read_parquet_union(
         paths,
-        f"SELECT {', '.join(select_parts)} FROM read_parquet(?, union_by_name=true)"
-        f"{where}",
+        f"SELECT {', '.join(select_parts)} FROM read_parquet(?, union_by_name=true){where}",
         parameters,
     )
     frame["moment"] = pd.to_datetime(frame["pub_time"], errors="coerce")
@@ -477,8 +509,7 @@ def _cctv_news_items(
     if missing:
         raise RuntimeError(f"cctv_news parquet misses required columns: {missing}")
     broadcast_expr = (
-        "coalesce(try_cast(date AS DATE), "
-        "try_strptime(CAST(date AS VARCHAR), '%Y%m%d')::DATE)"
+        "coalesce(try_cast(date AS DATE), try_strptime(CAST(date AS VARCHAR), '%Y%m%d')::DATE)"
     )
     where, parameters = _date_bounds_sql(broadcast_expr, start=start, end=end)
     frame = _read_parquet_union(
@@ -612,26 +643,39 @@ def _eligible_corpus_stats(
         if missing:
             raise RuntimeError(f"major_news parquet misses required columns: {missing}")
         moment_expr = "try_cast(CAST(pub_time AS VARCHAR) AS TIMESTAMP)"
-        where, parameters = _date_bounds_sql(moment_expr, start=start, end=end)
-        query = f"""
-            WITH source AS (
-                SELECT DISTINCT
-                    CAST(title AS VARCHAR) AS title,
-                    CAST(content AS VARCHAR) AS content,
-                    CAST(pub_time AS VARCHAR) AS pub_time,
-                    {moment_expr} AS moment
-                FROM read_parquet(?, union_by_name=true)
-                {where}
-            ), eligible AS (
-                SELECT * FROM source
-                WHERE moment IS NOT NULL
-                  AND (trim(coalesce(title, '')) <> '' OR trim(coalesce(content, '')) <> '')
-            )
-            SELECT count(*) AS eligible_unique_items,
-                   min(CAST(moment AS DATE)) AS date_min,
-                   max(CAST(moment AS DATE)) AS date_max
-            FROM eligible
-        """
+        major_frames: list[pd.DataFrame] = []
+        for window_start, window_end in _bounded_year_windows(start, end):
+            where, parameters = _date_bounds_sql(moment_expr, start=window_start, end=window_end)
+            query = f"""
+                WITH source AS (
+                    SELECT DISTINCT
+                        CAST(title AS VARCHAR) AS title,
+                        CAST(content AS VARCHAR) AS content,
+                        CAST(pub_time AS VARCHAR) AS pub_time,
+                        {moment_expr} AS moment
+                    FROM read_parquet(?, union_by_name=true)
+                    {where}
+                ), eligible AS (
+                    SELECT * FROM source
+                    WHERE moment IS NOT NULL
+                      AND (trim(coalesce(title, '')) <> '' OR trim(coalesce(content, '')) <> '')
+                )
+                SELECT count(*) AS eligible_unique_items,
+                       min(CAST(moment AS DATE)) AS date_min,
+                       max(CAST(moment AS DATE)) AS date_max
+                FROM eligible
+            """
+            major_frames.append(_read_parquet_union(paths, query, parameters))
+        if len(major_frames) > 1:
+            combined = pd.concat(major_frames, ignore_index=True)
+            valid_min = pd.to_datetime(combined["date_min"], errors="coerce").dropna()
+            valid_max = pd.to_datetime(combined["date_max"], errors="coerce").dropna()
+            return {
+                "eligible_unique_items": int(combined["eligible_unique_items"].sum()),
+                "date_min": valid_min.min().date().isoformat() if not valid_min.empty else None,
+                "date_max": valid_max.max().date().isoformat() if not valid_max.empty else None,
+            }
+        frame = major_frames[0]
     elif dataset in IRM_QA_DATASETS:
         question_col = next((name for name in ("q", "question") if name in columns), None)
         answer_col = next((name for name in ("a", "answer") if name in columns), None)
@@ -644,31 +688,38 @@ def _eligible_corpus_stats(
             "coalesce(try_cast(trade_date AS DATE), "
             "try_strptime(CAST(trade_date AS VARCHAR), '%Y%m%d')::DATE)"
         )
-        where, parameters = _date_bounds_sql(trade_date_expr, start=start, end=end)
-        answer_select = (
-            f', CAST("{answer_col}" AS VARCHAR) AS answer' if answer_col else ""
-        )
-        query = f"""
-            WITH source AS (
-                SELECT DISTINCT
-                    upper(trim(CAST(ts_code AS VARCHAR))) AS ts_code,
-                    {trade_date_expr} AS trade_date,
-                    CAST("{question_col}" AS VARCHAR) AS question
-                    {answer_select}
-                FROM read_parquet(?, union_by_name=true)
-                {where}
-            ), eligible AS (
-                SELECT * FROM source
-                WHERE trade_date IS NOT NULL
-                  AND ts_code <> ''
-                  AND trim(coalesce(question, '')) <> ''
+        answer_select = f', CAST("{answer_col}" AS VARCHAR) AS answer' if answer_col else ""
+        grouped_frames: list[pd.DataFrame] = []
+        for window_start, window_end in _bounded_year_windows(start, end):
+            where, parameters = _date_bounds_sql(
+                trade_date_expr, start=window_start, end=window_end
             )
-            SELECT ts_code, count(*) AS eligible_unique_items,
-                   min(trade_date) AS date_min, max(trade_date) AS date_max
-            FROM eligible
-            GROUP BY ts_code
-        """
-        grouped = _read_parquet_union(paths, query, parameters)
+            query = f"""
+                WITH source AS (
+                    SELECT DISTINCT
+                        upper(trim(CAST(ts_code AS VARCHAR))) AS ts_code,
+                        {trade_date_expr} AS trade_date,
+                        CAST("{question_col}" AS VARCHAR) AS question
+                        {answer_select}
+                    FROM read_parquet(?, union_by_name=true)
+                    {where}
+                ), eligible AS (
+                    SELECT * FROM source
+                    WHERE trade_date IS NOT NULL
+                      AND ts_code <> ''
+                      AND trim(coalesce(question, '')) <> ''
+                )
+                SELECT ts_code, count(*) AS eligible_unique_items,
+                       min(trade_date) AS date_min, max(trade_date) AS date_max
+                FROM eligible
+                GROUP BY ts_code
+            """
+            grouped_frames.append(_read_parquet_union(paths, query, parameters))
+        grouped = (
+            pd.concat(grouped_frames, ignore_index=True)
+            if len(grouped_frames) > 1
+            else grouped_frames[0]
+        )
         if codes:
             grouped = grouped[grouped["ts_code"].astype(str).isin(codes)]
         if grouped.empty:
@@ -690,13 +741,11 @@ def _eligible_corpus_stats(
             missing.append("pubtime|pub_time")
         if missing:
             raise RuntimeError(f"npr parquet misses required columns: {missing}")
-        time_expr = "coalesce(" + ", ".join(
-            f'CAST("{name}" AS VARCHAR)' for name in time_cols
-        ) + ")"
+        time_expr = (
+            "coalesce(" + ", ".join(f'CAST("{name}" AS VARCHAR)' for name in time_cols) + ")"
+        )
         content_expr = (
-            "coalesce(" + ", ".join(
-                f'CAST("{name}" AS VARCHAR)' for name in content_cols
-            ) + ")"
+            "coalesce(" + ", ".join(f'CAST("{name}" AS VARCHAR)' for name in content_cols) + ")"
             if content_cols
             else "NULL::VARCHAR"
         )
@@ -723,8 +772,7 @@ def _eligible_corpus_stats(
         if missing:
             raise RuntimeError(f"cctv_news parquet misses required columns: {missing}")
         date_expr = (
-            "coalesce(try_cast(date AS DATE), "
-            "try_strptime(CAST(date AS VARCHAR), '%Y%m%d')::DATE)"
+            "coalesce(try_cast(date AS DATE), try_strptime(CAST(date AS VARCHAR), '%Y%m%d')::DATE)"
         )
         where, parameters = _date_bounds_sql(date_expr, start=start, end=end)
         query = f"""
@@ -747,7 +795,8 @@ def _eligible_corpus_stats(
     else:  # guarded by SUPPORTED_CORPUS_DATASETS at the public boundary
         raise ValueError(f"unsupported corpus dataset: {dataset}")
 
-    frame = _read_parquet_union(paths, query, parameters)
+    if dataset != DATASET_MAJOR_NEWS:
+        frame = _read_parquet_union(paths, query, parameters)
     row = frame.iloc[0]
     return {
         "eligible_unique_items": int(row["eligible_unique_items"]),
@@ -990,14 +1039,10 @@ def parse_batch_extraction_payload(
     results: dict[str, CorpusExtraction] = {}
     for row in payload["items"]:
         if not isinstance(row, dict):
-            raise LlmExtractionError(
-                "LLM batch item must be a JSON object", stage="llm_parse"
-            )
+            raise LlmExtractionError("LLM batch item must be a JSON object", stage="llm_parse")
         item_id = row.get("item_id")
         if not isinstance(item_id, str) or not item_id:
-            raise LlmExtractionError(
-                "LLM batch item misses item_id", stage="llm_parse"
-            )
+            raise LlmExtractionError("LLM batch item misses item_id", stage="llm_parse")
         if item_id in results:
             raise LlmExtractionError(
                 f"LLM batch response duplicates item_id {item_id}", stage="llm_parse"
@@ -1304,9 +1349,7 @@ def process_corpus(
     # the calendar is a run-level input defect and must fail with no partial
     # persistence (the historical fail-closed contract).
     for existing_field in fields_records.values():
-        factor_date_for(
-            pd.Timestamp(existing_field["available_at"]).to_pydatetime(), open_days
-        )
+        factor_date_for(pd.Timestamp(existing_field["available_at"]).to_pydatetime(), open_days)
     for item in items:
         try:
             candidate_available_at = available_at_for(item, open_days)
@@ -1330,9 +1373,7 @@ def process_corpus(
     dirty = False
     unit_path: Path | None = None
     last_checkpoint_completed = 0
-    pending_batch: list[
-        tuple[CorpusItem, str, datetime, datetime, dict[str, Any]]
-    ] = []
+    pending_batch: list[tuple[CorpusItem, str, datetime, datetime, dict[str, Any]]] = []
 
     def publish_progress() -> None:
         if progress_callback is None:
@@ -1353,8 +1394,7 @@ def process_corpus(
         if dirty or force:
             if new_field_rows:
                 unit_path = (
-                    units_dir
-                    / f"fields_{clock():%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:8]}.parquet"
+                    units_dir / f"fields_{clock():%Y%m%dT%H%M%SZ}_{uuid.uuid4().hex[:8]}.parquet"
                 )
                 _write_parquet_atomic(_fields_frame(new_field_rows), unit_path)
                 new_field_rows = []
@@ -1379,9 +1419,7 @@ def process_corpus(
         try:
             if batch_size == 1:
                 item = batch[0][0]
-                messages = build_extraction_messages(
-                    item=item, text=item.content[:max_chars]
-                )
+                messages = build_extraction_messages(item=item, text=item.content[:max_chars])
                 results = {
                     item.item_id: parse_extraction_payload(
                         chat_client.complete(messages, model=model)
@@ -1399,9 +1437,7 @@ def process_corpus(
         except LlmExtractionError as exc:
             failed += len(batch)
             for _item, _process_key, _available_at, _processed_at, state_row in batch:
-                state_row.update(
-                    status="failed", stage=exc.stage, error=str(exc)[:500]
-                )
+                state_row.update(status="failed", stage=exc.stage, error=str(exc)[:500])
         else:
             for item, process_key, available_at, processed_at, state_row in batch:
                 result = results[item.item_id]
@@ -1461,9 +1497,7 @@ def process_corpus(
             maybe_checkpoint()
         else:
             state_row["available_at"] = available_at
-            pending_batch.append(
-                (item, process_key, available_at, processed_at, state_row)
-            )
+            pending_batch.append((item, process_key, available_at, processed_at, state_row))
             if len(pending_batch) >= batch_size:
                 flush_batch()
 
@@ -1471,9 +1505,7 @@ def process_corpus(
     persist_checkpoint(force=True)
 
     fields = _fields_frame(list(fields_records.values()))
-    scope_process_keys = {
-        f"{item.item_id}:{PROMPT_VERSION}:{model}" for item in items
-    }
+    scope_process_keys = {f"{item.item_id}:{PROMPT_VERSION}:{model}" for item in items}
     scoped_fields = fields[
         (fields["prompt_version"].astype(str) == PROMPT_VERSION)
         & (fields["model"].astype(str) == model)
@@ -1503,9 +1535,7 @@ def process_corpus(
         factors_dir,
         name=NEWS_FACTOR_NAME,
         source_datasets=tuple(
-            dataset
-            for dataset in (DATASET_MAJOR_NEWS,)
-            if dataset in selected_datasets
+            dataset for dataset in (DATASET_MAJOR_NEWS,) if dataset in selected_datasets
         ),
         selection_policy=selection_policy,
         selection_audit=selection_audit,
@@ -1699,8 +1729,7 @@ def _corpus_metadata(
             "availability_policy": policy,
         },
         rdagent_feedback=(
-            "externally produced corpus NLP factor; "
-            "manifest sha256 verified at registration"
+            "externally produced corpus NLP factor; manifest sha256 verified at registration"
         ),
     )
 
