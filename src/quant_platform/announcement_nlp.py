@@ -235,6 +235,21 @@ class ChatCompleter(Protocol):
     def complete(self, messages: list[dict[str, str]], *, model: str) -> str: ...
 
 
+def _replace_lone_surrogates(value: str) -> str:
+    """Replace invalid standalone UTF-16 surrogate code points.
+
+    Some PDF text layers contain lone surrogates. Python can retain them in a
+    ``str`` and ``requests`` serializes them as ``\\udxxx`` escapes, but strict
+    JSON servers reject those escapes. U+FFFD records the undecodable source
+    character without dropping or inventing surrounding text.
+    """
+
+    return "".join(
+        "\ufffd" if 0xD800 <= ord(character) <= 0xDFFF else character
+        for character in value
+    )
+
+
 class OpenAIChatClient:
     """Bounded-retry client for OpenAI-compatible chat completions.
 
@@ -273,9 +288,13 @@ class OpenAIChatClient:
 
     def complete(self, messages: list[dict[str, str]], *, model: str) -> str:
         url = f"{self.credentials.api_base}/chat/completions"
+        safe_messages = [
+            {**message, "content": _replace_lone_surrogates(message["content"])}
+            for message in messages
+        ]
         payload = {
             "model": model,
-            "messages": messages,
+            "messages": safe_messages,
             "temperature": 0.0,
             "response_format": {"type": "json_object"},
         }
@@ -498,12 +517,14 @@ def parse_extraction_payload(raw: str) -> ExtractionResult:
         not isinstance(impact_channels, list)
         or any(not isinstance(channel, str) for channel in impact_channels)
         or any(channel not in IMPACT_CHANNELS for channel in impact_channels)
-        or len(set(impact_channels)) != len(impact_channels)
     ):
         raise LlmExtractionError(
             "impact_channels must be a duplicate-free JSON array of governed channels",
             stage="llm_parse",
         )
+    # Repeated members carry no additional meaning. Canonicalize this narrow
+    # model formatting defect while keeping unknown channels fail-closed.
+    impact_channels = list(dict.fromkeys(impact_channels))
     logic_summary = payload.get("logic_summary")
     if not isinstance(logic_summary, str) or len(logic_summary) > MAX_LOGIC_SUMMARY_CHARS:
         raise LlmExtractionError(

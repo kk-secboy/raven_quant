@@ -211,6 +211,14 @@ def test_parse_extraction_payload_allows_integer_scores() -> None:
     assert result.confidence == 0.0
 
 
+def test_parse_extraction_payload_canonicalizes_duplicate_channels() -> None:
+    result = nlp.parse_extraction_payload(
+        _payload(impact_channels=["earnings", "cash_flow", "earnings"])
+    )
+
+    assert result.impact_channels == ("earnings", "cash_flow")
+
+
 def test_batch_messages_and_parser_require_exact_item_ids() -> None:
     items = [
         nlp.AnnouncementBatchItem(
@@ -264,7 +272,6 @@ def test_batch_messages_and_parser_require_exact_item_ids() -> None:
         _payload(impact_direction="up"),
         _payload(impact_horizon="forever"),
         _payload(impact_channels="earnings"),
-        _payload(impact_channels=["earnings", "earnings"]),
         _payload(impact_channels=["unsupported"]),
         _payload(logic_summary=42),
         _payload(logic_summary="x" * (nlp.MAX_LOGIC_SUMMARY_CHARS + 1)),
@@ -388,6 +395,19 @@ def test_openai_chat_client_posts_with_auth_header() -> None:
     assert call["headers"]["Authorization"] == "Bearer sk-test-fake-key"
     assert call["json"]["model"] == "test-model"
     assert call["json"]["response_format"] == {"type": "json_object"}
+
+
+def test_openai_chat_client_replaces_lone_surrogates_before_json_request() -> None:
+    session = _FakeChatSession([_FakeChatResponse(200, _chat_body(_payload()))])
+
+    _openai_client(session).complete(
+        [{"role": "user", "content": "before\udcc5after"}],
+        model="test-model",
+    )
+
+    assert session.calls[0]["json"]["messages"] == [
+        {"role": "user", "content": "before\ufffdafter"}
+    ]
 
 
 def test_deepseek_v4_disables_thinking_and_records_usage() -> None:
