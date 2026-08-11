@@ -211,12 +211,19 @@ def test_parse_extraction_payload_allows_integer_scores() -> None:
     assert result.confidence == 0.0
 
 
-def test_parse_extraction_payload_canonicalizes_duplicate_channels() -> None:
+def test_parse_extraction_payload_canonicalizes_channels() -> None:
     result = nlp.parse_extraction_payload(
-        _payload(impact_channels=["earnings", "cash_flow", "earnings"])
+        _payload(
+            impact_channels=["earnings", "technology", "cash_flow", "earnings"]
+        )
     )
 
     assert result.impact_channels == ("earnings", "cash_flow")
+
+    unsupported = nlp.parse_extraction_payload(
+        _payload(impact_channels=["technology", "liquidity"])
+    )
+    assert unsupported.impact_channels == ()
 
 
 def test_batch_messages_and_parser_require_exact_item_ids() -> None:
@@ -272,7 +279,7 @@ def test_batch_messages_and_parser_require_exact_item_ids() -> None:
         _payload(impact_direction="up"),
         _payload(impact_horizon="forever"),
         _payload(impact_channels="earnings"),
-        _payload(impact_channels=["unsupported"]),
+        _payload(impact_channels=[42]),
         _payload(logic_summary=42),
         _payload(logic_summary="x" * (nlp.MAX_LOGIC_SUMMARY_CHARS + 1)),
         _payload(confidence=1.5),

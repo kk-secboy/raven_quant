@@ -516,15 +516,17 @@ def parse_extraction_payload(raw: str) -> ExtractionResult:
     if (
         not isinstance(impact_channels, list)
         or any(not isinstance(channel, str) for channel in impact_channels)
-        or any(channel not in IMPACT_CHANNELS for channel in impact_channels)
     ):
         raise LlmExtractionError(
-            "impact_channels must be a duplicate-free JSON array of governed channels",
+            "impact_channels must be a JSON array of strings",
             stage="llm_parse",
         )
-    # Repeated members carry no additional meaning. Canonicalize this narrow
-    # model formatting defect while keeping unknown channels fail-closed.
-    impact_channels = list(dict.fromkeys(impact_channels))
+    # Repeated members carry no additional meaning. Keep only governed labels:
+    # silently mapping model-invented labels would fabricate semantics, while
+    # dropping them is equivalent to the prompt's conservative [] fallback.
+    impact_channels = list(
+        dict.fromkeys(channel for channel in impact_channels if channel in IMPACT_CHANNELS)
+    )
     logic_summary = payload.get("logic_summary")
     if not isinstance(logic_summary, str) or len(logic_summary) > MAX_LOGIC_SUMMARY_CHARS:
         raise LlmExtractionError(
