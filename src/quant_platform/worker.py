@@ -34,6 +34,7 @@ from .corpus_nlp import (
 from .corpus_nlp import (
     DEFAULT_MAJOR_NEWS_PER_DAY as CORPUS_DEFAULT_MAJOR_NEWS_PER_DAY,
 )
+from .corpus_nlp import DEFAULT_WORKERS as CORPUS_DEFAULT_WORKERS
 from .corpus_nlp import default_factors_dir as corpus_factors_dir
 from .cost_model import CostModelConfig
 from .data_rollover import qlib_trading_date_on_or_before
@@ -122,9 +123,11 @@ class LocalJobWorker:
         backtest_id = job["payload"].get("backtest_id")
         parameter_experiment_id = job["payload"].get("parameter_experiment_id")
         recommendation_snapshot_id = job["payload"].get("recommendation_snapshot_id")
-        simulation_order_plan_portfolio_id = job["payload"].get(
-            "simulation_portfolio_id"
-        ) if job["kind"] == "simulation_order_plan" else None
+        simulation_order_plan_portfolio_id = (
+            job["payload"].get("simulation_portfolio_id")
+            if job["kind"] == "simulation_order_plan"
+            else None
+        )
         simulation_batch_id = job["payload"].get("simulation_batch_id")
         if research_run_id:
             self.research.mark_run(research_run_id, "running")
@@ -360,10 +363,7 @@ class LocalJobWorker:
             if recommendation_snapshot_id:
                 if exit_code == 0 and result:
                     account_risk_state = dict(
-                        dict(result.get("risk_summary") or {}).get(
-                            "account_risk_state"
-                        )
-                        or {}
+                        dict(result.get("risk_summary") or {}).get("account_risk_state") or {}
                     )
                     action_state = self.recommendation_accounts.account_state_for_actions(
                         str(result["portfolio_id"]),
@@ -387,9 +387,7 @@ class LocalJobWorker:
             if simulation_order_plan_portfolio_id and exit_code == 0 and result:
                 batch, created = self.simulations.create_batch_from_order_plan(
                     str(simulation_order_plan_portfolio_id),
-                    order_plan_manifest_sha256=str(
-                        result["order_plan_manifest_sha256"]
-                    ),
+                    order_plan_manifest_sha256=str(result["order_plan_manifest_sha256"]),
                     data_root=self.settings.data_root,
                     actor=str(job["payload"].get("actor") or "simulation-order-plan-worker"),
                 )
@@ -560,12 +558,7 @@ class LocalJobWorker:
                 command.extend(
                     [
                         "--batch-size",
-                        str(
-                            int(
-                                payload.get("batch_size")
-                                or ANNOUNCEMENT_DEFAULT_BATCH_SIZE
-                            )
-                        ),
+                        str(int(payload.get("batch_size") or ANNOUNCEMENT_DEFAULT_BATCH_SIZE)),
                         "--workers",
                         str(int(payload.get("workers") or ANNOUNCEMENT_DEFAULT_WORKERS)),
                     ]
@@ -592,6 +585,8 @@ class LocalJobWorker:
                     [
                         "--batch-size",
                         str(int(payload.get("batch_size") or CORPUS_DEFAULT_BATCH_SIZE)),
+                        "--workers",
+                        str(int(payload.get("workers") or CORPUS_DEFAULT_WORKERS)),
                         "--major-news-per-day",
                         str(
                             int(
@@ -677,16 +672,12 @@ class LocalJobWorker:
                 "announcement_factor_register": "register-announcement-factor",
                 "corpus_factor_register": "register-corpus-factor",
                 "report_rc_factor_register": "register-report-rc-factor",
-                "major_news_mentions_factor_register": (
-                    "register-major-news-mentions-factor"
-                ),
+                "major_news_mentions_factor_register": ("register-major-news-mentions-factor"),
                 "news_flash_factor_register": "register-news-flash-factor",
             }
             command.append(registration_commands[job["kind"]])
             if job["kind"] != "news_flash_factor_register":
-                command.extend(
-                    ["--factor-name", str(payload.get("factor_name") or "all")]
-                )
+                command.extend(["--factor-name", str(payload.get("factor_name") or "all")])
             command.extend(
                 [
                     "--actor",
@@ -789,9 +780,7 @@ class LocalJobWorker:
                     ]
                 )
                 if payload.get("source_lineage_id"):
-                    command.extend(
-                        ["--source-lineage-id", str(payload["source_lineage_id"])]
-                    )
+                    command.extend(["--source-lineage-id", str(payload["source_lineage_id"])])
             else:
                 command.extend(
                     [
@@ -815,9 +804,7 @@ class LocalJobWorker:
             "preopen_check",
             "intraday_execution_check",
         }:
-            output = (
-                self.settings.data_root / "artifacts" / "ops-reports" / job["kind"] / job["id"]
-            )
+            output = self.settings.data_root / "artifacts" / "ops-reports" / job["kind"] / job["id"]
             output.mkdir(parents=True, exist_ok=True)
             result_path = output / "result.json"
             command = [
@@ -893,9 +880,7 @@ class LocalJobWorker:
                 payload["output_name"],
             ]
             if payload.get("target_frequency"):
-                command.extend(
-                    ["--target-frequency", str(payload["target_frequency"])]
-                )
+                command.extend(["--target-frequency", str(payload["target_frequency"])])
             return command, None, {}
         if job["kind"] == "minute_research":
             output = self.settings.data_root / "artifacts" / "minute-research" / job["id"]
@@ -1114,10 +1099,7 @@ class LocalJobWorker:
             )
         if job["kind"] in {"external_factor_evaluate", "information_factor_evaluate"}:
             output = (
-                self.settings.data_root
-                / "artifacts"
-                / "external-factor-evaluations"
-                / job["id"]
+                self.settings.data_root / "artifacts" / "external-factor-evaluations" / job["id"]
             )
             output.mkdir(parents=True, exist_ok=True)
             manifest_path = output / "manifest.json"
@@ -1148,9 +1130,7 @@ class LocalJobWorker:
                     for item in candidates
                 ],
                 "comparison_values": [],
-                "cost_model": CostModelConfig.from_mapping(
-                    payload.get("cost_model")
-                ).to_dict(),
+                "cost_model": CostModelConfig.from_mapping(payload.get("cost_model")).to_dict(),
                 "cost_reference_order_value": float(
                     payload.get("cost_reference_order_value", 100_000.0)
                 ),
@@ -1223,9 +1203,7 @@ class LocalJobWorker:
                 "strategy_version_id": version["id"],
                 "dataset": experiment["dataset"],
                 "benchmark": version["benchmark"],
-                "execution_dataset": (
-                    (payload.get("execution_dataset") or {}).get("name")
-                ),
+                "execution_dataset": ((payload.get("execution_dataset") or {}).get("name")),
                 "periods": experiment["periods"],
                 "parameter_grid": experiment["parameter_grid"],
                 "factors": [
@@ -1304,9 +1282,7 @@ class LocalJobWorker:
                 return _to_wsl_path(Path(value)) if is_wsl else str(value)
 
             execution_dataset = payload.get("execution_dataset")
-            hypothesis_evidence = self.strategies.hypothesis_group_evidence(
-                version["id"]
-            )
+            hypothesis_evidence = self.strategies.hypothesis_group_evidence(version["id"])
             final_periods = {
                 "start": payload["periods"]["start"],
                 "end": payload["periods"]["end"],
@@ -1328,9 +1304,7 @@ class LocalJobWorker:
                     else None
                 ),
                 "execution_contract_version": (
-                    (execution_dataset.get("provenance") or {}).get(
-                        "execution_contract_version"
-                    )
+                    (execution_dataset.get("provenance") or {}).get("execution_contract_version")
                     if isinstance(execution_dataset, dict)
                     else None
                 ),
@@ -1341,19 +1315,13 @@ class LocalJobWorker:
                 "baseline": (
                     {
                         "definition": version["config"].get("baseline_definition"),
-                        "definition_sha256": version["config"].get(
-                            "baseline_definition_sha256"
-                        ),
+                        "definition_sha256": version["config"].get("baseline_definition_sha256"),
                     }
                     if version["config"].get("baseline_definition")
                     else None
                 ),
-                "strategy_trial_count": hypothesis_evidence[
-                    "shared_experiment_count"
-                ],
-                "economic_hypothesis_group": hypothesis_evidence[
-                    "economic_hypothesis_group"
-                ],
+                "strategy_trial_count": hypothesis_evidence["shared_experiment_count"],
+                "economic_hypothesis_group": hypothesis_evidence["economic_hypothesis_group"],
                 "hypothesis_group_evidence": hypothesis_evidence,
                 "periods": final_periods,
                 "historical_validation_periods": historical_validation_periods,
@@ -1506,8 +1474,7 @@ class LocalJobWorker:
             )
             if formal is None:
                 raise ValueError(
-                    "simulation order-plan generation requires a successful "
-                    "formal Qlib backtest"
+                    "simulation order-plan generation requires a successful formal Qlib backtest"
                 )
             datasets = {
                 item["name"]: item
@@ -1521,16 +1488,13 @@ class LocalJobWorker:
             if (
                 provenance.get("dataset_identity_sha256")
                 != portfolio["daily_dataset_identity_sha256"]
-                or provenance.get("dataset_lineage_id")
-                != portfolio["daily_dataset_lineage_id"]
+                or provenance.get("dataset_lineage_id") != portfolio["daily_dataset_lineage_id"]
             ):
                 raise ValueError(
                     "simulation order-plan Qlib dataset no longer matches the "
                     "bound account snapshot"
                 )
-            signal_frequency = str(
-                version.get("signal_frequency") or "day"
-            ).lower()
+            signal_frequency = str(version.get("signal_frequency") or "day").lower()
             signal_at = payload.get("signal_at")
             execution_not_before: str | None = None
             signal_dataset: dict | None = None
@@ -1538,23 +1502,12 @@ class LocalJobWorker:
                 if not signal_at:
                     raise ValueError("minute simulation order-plan requires signal_at")
                 try:
-                    signal_timestamp = datetime.fromisoformat(
-                        str(signal_at).replace("Z", "+00:00")
-                    )
+                    signal_timestamp = datetime.fromisoformat(str(signal_at).replace("Z", "+00:00"))
                 except ValueError as exc:
-                    raise ValueError(
-                        "minute simulation order-plan signal_at is invalid"
-                    ) from exc
-                if (
-                    signal_timestamp.tzinfo is None
-                    or signal_timestamp.utcoffset() is None
-                ):
-                    raise ValueError(
-                        "minute simulation order-plan signal_at requires a timezone"
-                    )
-                local_signal = signal_timestamp.astimezone(
-                    ZoneInfo("Asia/Shanghai")
-                )
+                    raise ValueError("minute simulation order-plan signal_at is invalid") from exc
+                if signal_timestamp.tzinfo is None or signal_timestamp.utcoffset() is None:
+                    raise ValueError("minute simulation order-plan signal_at requires a timezone")
+                local_signal = signal_timestamp.astimezone(ZoneInfo("Asia/Shanghai"))
                 if local_signal.date().isoformat() != str(payload["signal_date"]):
                     raise ValueError(
                         "minute simulation order-plan signal_at does not match signal_date"
@@ -1564,26 +1517,14 @@ class LocalJobWorker:
                     item
                     for item in datasets.values()
                     if item.get("reproducible") is True
-                    and dict(item.get("provenance") or {}).get("lineage_verified")
-                    is True
-                    and str(
-                        dict(item.get("provenance") or {}).get("frequency") or ""
-                    )
+                    and dict(item.get("provenance") or {}).get("lineage_verified") is True
+                    and str(dict(item.get("provenance") or {}).get("frequency") or "")
                     == signal_frequency
-                    and str(
-                        dict(item.get("provenance") or {}).get(
-                            "source_lineage_id"
-                        )
-                        or ""
-                    )
+                    and str(dict(item.get("provenance") or {}).get("source_lineage_id") or "")
                     == source_lineage
                 ]
                 signal_dataset = next(
-                    (
-                        item
-                        for item in candidates
-                        if item["name"] == portfolio["execution_dataset"]
-                    ),
+                    (item for item in candidates if item["name"] == portfolio["execution_dataset"]),
                     candidates[0] if candidates else None,
                 )
                 if signal_dataset is None:
@@ -1602,17 +1543,14 @@ class LocalJobWorker:
             previous_holdings = [
                 {
                     "instrument": str(item["instrument"]),
-                    "weight": max(0.0, float(item.get("market_value") or 0.0))
-                    / nav,
+                    "weight": max(0.0, float(item.get("market_value") or 0.0)) / nav,
                 }
                 for item in positions
                 if nav > 0
                 and str(item.get("position_side") or "long") == "long"
                 and float(item.get("market_value") or 0.0) > 0
             ]
-            strategy_risk_state = self.allocations.strategy_risk_state(
-                str(version["id"])
-            )
+            strategy_risk_state = self.allocations.strategy_risk_state(str(version["id"]))
             required_nav_date = qlib_trading_date_on_or_before(
                 dataset,
                 date.fromisoformat(str(payload["signal_date"])),
@@ -1621,12 +1559,7 @@ class LocalJobWorker:
                 str(portfolio["id"]),
                 required_nav_date=required_nav_date,
             )
-            output = (
-                self.settings.data_root
-                / "artifacts"
-                / "order-plan-jobs"
-                / job["id"]
-            )
+            output = self.settings.data_root / "artifacts" / "order-plan-jobs" / job["id"]
             output.mkdir(parents=True, exist_ok=True)
             manifest_path = output / "manifest.json"
             result_path = output / "result.json"
@@ -1643,9 +1576,7 @@ class LocalJobWorker:
                 "strategy_version_id": version["id"],
                 "formal_backtest_id": formal["id"],
                 "dataset": portfolio["daily_dataset"],
-                "dataset_identity_sha256": portfolio[
-                    "daily_dataset_identity_sha256"
-                ],
+                "dataset_identity_sha256": portfolio["daily_dataset_identity_sha256"],
                 "dataset_lineage_id": portfolio["daily_dataset_lineage_id"],
                 "signal_date": payload["signal_date"],
                 "signal_at": signal_at,
@@ -1655,12 +1586,8 @@ class LocalJobWorker:
                 "universe": version["universe"],
                 "config": version["config"],
                 "construction_notional": nav,
-                "risk_exposure": float(
-                    strategy_risk_state["risk_exposure_override"]
-                ),
-                "risk_exposure_override": float(
-                    strategy_risk_state["risk_exposure_override"]
-                ),
+                "risk_exposure": float(strategy_risk_state["risk_exposure_override"]),
+                "risk_exposure_override": float(strategy_risk_state["risk_exposure_override"]),
                 "allow_new_risk": bool(strategy_risk_state["allow_new_risk"])
                 and bool(account_risk_state["allow_new_risk"]),
                 "member_risk_state": strategy_risk_state,
@@ -1672,15 +1599,15 @@ class LocalJobWorker:
                 "signal_dataset": (
                     {
                         "name": signal_dataset["name"],
-                        "dataset_identity_sha256": dict(
-                            signal_dataset.get("provenance") or {}
-                        ).get("dataset_identity_sha256"),
-                        "dataset_lineage_id": dict(
-                            signal_dataset.get("provenance") or {}
-                        ).get("dataset_lineage_id"),
-                        "source_lineage_id": dict(
-                            signal_dataset.get("provenance") or {}
-                        ).get("source_lineage_id"),
+                        "dataset_identity_sha256": dict(signal_dataset.get("provenance") or {}).get(
+                            "dataset_identity_sha256"
+                        ),
+                        "dataset_lineage_id": dict(signal_dataset.get("provenance") or {}).get(
+                            "dataset_lineage_id"
+                        ),
+                        "source_lineage_id": dict(signal_dataset.get("provenance") or {}).get(
+                            "source_lineage_id"
+                        ),
                         "frequency": signal_frequency,
                     }
                     if signal_dataset is not None
@@ -1724,9 +1651,7 @@ class LocalJobWorker:
                     "--tracking-uri",
                     self.settings.mlflow_tracking_uri,
                     "--order-plan-root",
-                    runtime_path(
-                        self.settings.data_root / "artifacts" / "order-plans"
-                    ),
+                    runtime_path(self.settings.data_root / "artifacts" / "order-plans"),
                 ]
             )
             if signal_dataset is not None:
@@ -1878,10 +1803,9 @@ class LocalJobWorker:
                     (resolved_minute, minute_binding, "minute"),
                     (shortability_dataset, shortability_binding, "shortability"),
                 ):
-                    if (
-                        resolved["manifest_sha256"] != binding.get("manifest_sha256")
-                        or resolved["source_sha256"] != binding.get("source_sha256")
-                    ):
+                    if resolved["manifest_sha256"] != binding.get("manifest_sha256") or resolved[
+                        "source_sha256"
+                    ] != binding.get("source_sha256"):
                         raise ValueError(
                             f"pair replay {label} snapshot no longer matches "
                             "the approved backtest artifact"
@@ -1961,8 +1885,7 @@ class LocalJobWorker:
                             resolved_dividend["manifest_sha256"]
                         ):
                             raise ValueError(
-                                "dividend snapshot no longer matches the bound "
-                                "daily dataset"
+                                "dividend snapshot no longer matches the bound daily dataset"
                             )
                         dividend_dataset = resolved_dividend
             if shortability_dataset is not None:
@@ -1970,9 +1893,7 @@ class LocalJobWorker:
                 command.extend(
                     [
                         "--shortability-path",
-                        _to_wsl_path(shortability_path)
-                        if is_wsl
-                        else str(shortability_path),
+                        _to_wsl_path(shortability_path) if is_wsl else str(shortability_path),
                         "--shortability-source-sha256",
                         str(shortability_dataset["source_sha256"]),
                         "--shortability-manifest-sha256",
@@ -1984,9 +1905,7 @@ class LocalJobWorker:
                 command.extend(
                     [
                         "--dividend-path",
-                        _to_wsl_path(dividend_path)
-                        if is_wsl
-                        else str(dividend_path),
+                        _to_wsl_path(dividend_path) if is_wsl else str(dividend_path),
                     ]
                 )
             return command, result_path, {}
@@ -2243,8 +2162,10 @@ class LocalJobWorker:
         """Bind scheduled evaluation to the exact factor artifacts just registered."""
 
         names = payload.get("factor_names")
-        if not isinstance(names, list) or not names or not all(
-            isinstance(name, str) for name in names
+        if (
+            not isinstance(names, list)
+            or not names
+            or not all(isinstance(name, str) for name in names)
         ):
             raise ValueError("information factor evaluation requires factor_names")
         if len(set(names)) != len(names):
@@ -2293,13 +2214,9 @@ class LocalJobWorker:
                 r"[0-9a-f]{64}", values_sha256
             ):
                 raise ValueError(f"information factor manifest sha256 is invalid: {name}")
-            candidate = self.research.find_candidate(
-                name=name, values_sha256=values_sha256
-            )
+            candidate = self.research.find_candidate(name=name, values_sha256=values_sha256)
             if candidate is None:
-                raise ValueError(
-                    f"registered information factor candidate is missing: {name}"
-                )
+                raise ValueError(f"registered information factor candidate is missing: {name}")
             if candidate.get("status") not in {
                 "awaiting_evaluation",
                 "evaluation_failed",
@@ -2312,9 +2229,10 @@ class LocalJobWorker:
             required = ("code_path", "values_path", "code_sha256", "values_sha256")
             if any(not candidate.get(key) for key in required):
                 raise ValueError(f"information factor {name} misses immutable artifacts")
-            if not Path(str(candidate["code_path"])).is_file() or not Path(
-                str(candidate["values_path"])
-            ).is_file():
+            if (
+                not Path(str(candidate["code_path"])).is_file()
+                or not Path(str(candidate["values_path"])).is_file()
+            ):
                 raise ValueError(f"information factor {name} artifacts are unavailable")
             horizon = int(candidate.get("label_horizon_days") or 1)
             embargo_days = max(5, horizon)

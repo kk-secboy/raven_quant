@@ -26,6 +26,8 @@ from quant_platform.corpus_nlp import (
     DEFAULT_CORPUS_DATASETS,
     DEFAULT_IRM_PER_INSTRUMENT_DAY,
     DEFAULT_MAJOR_NEWS_PER_DAY,
+    DEFAULT_WORKERS,
+    MAX_WORKERS,
     SUPPORTED_CORPUS_DATASETS,
     process_corpus,
 )
@@ -845,13 +847,10 @@ def _full_page_partition_recovery(
         extension_max_pages = _PAGINATION_EXTENSION_MAX_PAGES.get(current.dataset)
         max_pages = int(current.scope.get("max_pages") or 0)
         final_page_is_full = (
-            page_index + 1 >= max_pages
-            and row_counts.get(current.unit_key, -1) >= page_size
+            page_index + 1 >= max_pages and row_counts.get(current.unit_key, -1) >= page_size
         )
         if extension_max_pages and final_page_is_full:
-            children.append(
-                pagination_extension_spec(current, max_pages=extension_max_pages)
-            )
+            children.append(pagination_extension_spec(current, max_pages=extension_max_pages))
             recovered.add(current.unit_key)
             continue
         if not is_adaptive_partition(current):
@@ -1747,6 +1746,7 @@ def cninfo_announcements_command(
     context.report_progress(
         "downloading", "cninfo announcement bodies", {"cninfo_announcements"}, force=True
     )
+
     def report_announcement_progress(progress: dict[str, int]) -> None:
         context.progress.set_target(**progress)
         context.report_progress(
@@ -1922,6 +1922,14 @@ def corpus_nlp_command(
             help="Corpus items per LLM request (strict item-id matching)",
         ),
     ] = DEFAULT_BATCH_SIZE,
+    workers: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=MAX_WORKERS,
+            help="Concurrent LLM requests under the shared global rate gate",
+        ),
+    ] = DEFAULT_WORKERS,
     major_news_per_day: Annotated[
         int,
         typer.Option(
@@ -1960,9 +1968,7 @@ def corpus_nlp_command(
 
     def report_corpus_nlp_progress(progress: dict[str, int]) -> None:
         context.progress.set_target(**progress)
-        context.report_progress(
-            "processing", "corpus NLP extraction", {"corpus_nlp"}, force=True
-        )
+        context.report_progress("processing", "corpus NLP extraction", {"corpus_nlp"}, force=True)
 
     settings = context.settings
     secret_store = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
@@ -1976,6 +1982,7 @@ def corpus_nlp_command(
             end=end_date,
             limit=limit or None,
             batch_size=batch_size,
+            workers=workers,
             max_major_news_per_day=major_news_per_day or None,
             max_irm_per_instrument_day=irm_per_instrument_day or None,
             secret_store=secret_store,
@@ -1998,9 +2005,7 @@ def corpus_nlp_command(
 
 @app.command("event-market-response")
 def event_market_response_command(
-    snapshot_name: Annotated[
-        str, typer.Option(help="Verified immutable snapshot name")
-    ],
+    snapshot_name: Annotated[str, typer.Option(help="Verified immutable snapshot name")],
     horizons: Annotated[
         str, typer.Option(help="Comma-separated positive trading-session horizons")
     ] = ",".join(str(value) for value in DEFAULT_HORIZONS),
@@ -2158,9 +2163,7 @@ def news_flash_factors_command(
     )
     summary = _produce_factors(
         "news-flash-factors",
-        lambda: process_news_flash(
-            context.settings.data_root, start=start_date, end=end_date
-        ),
+        lambda: process_news_flash(context.settings.data_root, start=start_date, end=end_date),
     )
     result = {
         "dataset": "news",

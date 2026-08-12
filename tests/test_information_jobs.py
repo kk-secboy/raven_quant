@@ -56,6 +56,8 @@ def test_information_request_models_fail_closed() -> None:
         AnnouncementNlpRequest(batch_size=9)
     with pytest.raises(ValidationError, match="less than or equal to 32"):
         AnnouncementNlpRequest(workers=33)
+    with pytest.raises(ValidationError, match="less than or equal to 8"):
+        CorpusNlpRequest(workers=9)
     assert MultifaceAuditRequest(dataset="cn-fixture").require_ready is True
 
 
@@ -83,13 +85,9 @@ def test_pilot_jobs_cannot_certify_full_information_catalog_scope() -> None:
     assert not job_covers_catalog_scope(
         "cn_cninfo_announcements", {"start": "2016-01-01", "limit": 25}
     )
-    assert not job_covers_catalog_scope(
-        "cn_announcement_nlp", {"start": "2024-01-01", "limit": 0}
-    )
+    assert not job_covers_catalog_scope("cn_announcement_nlp", {"start": "2024-01-01", "limit": 0})
     assert not job_covers_catalog_scope("cn_announcement_nlp", {"limit": 0})
-    assert job_covers_catalog_scope(
-        "cn_announcement_nlp", {"start": "2016-01-01", "limit": 0}
-    )
+    assert job_covers_catalog_scope("cn_announcement_nlp", {"start": "2016-01-01", "limit": 0})
     assert not job_covers_catalog_scope(
         "cn_announcement_nlp",
         {
@@ -117,18 +115,12 @@ def test_pilot_jobs_cannot_certify_full_information_catalog_scope() -> None:
             "categories": ["regulatory_letter"],
         },
     )
-    assert job_covers_catalog_scope(
-        "cn_announcement_nlp", {"start": "2015-12-31", "limit": 0}
-    )
+    assert job_covers_catalog_scope("cn_announcement_nlp", {"start": "2015-12-31", "limit": 0})
     assert not job_covers_catalog_scope("cn_corpus_nlp", {"limit": 100})
     assert not job_covers_catalog_scope("cn_corpus_nlp", {"limit": "not-an-int"})
     assert not job_covers_catalog_scope("cn_corpus_nlp", {"limit": 0})
-    assert not job_covers_catalog_scope(
-        "cn_corpus_nlp", {"start": "2024-01-01", "limit": 0}
-    )
-    assert job_covers_catalog_scope(
-        "cn_corpus_nlp", {"start": "2018-11-20", "limit": 0}
-    )
+    assert not job_covers_catalog_scope("cn_corpus_nlp", {"start": "2024-01-01", "limit": 0})
+    assert job_covers_catalog_scope("cn_corpus_nlp", {"start": "2018-11-20", "limit": 0})
     assert not job_covers_catalog_scope(
         "cn_corpus_nlp",
         {
@@ -202,9 +194,7 @@ def test_worker_builds_announcement_and_corpus_nlp_commands(tmp_path: Path) -> N
         },
     }
 
-    announcement_command, announcement_result, announcement_env = worker._command(
-        announcement
-    )
+    announcement_command, announcement_result, announcement_env = worker._command(announcement)
     corpus_command, corpus_result, corpus_env = worker._command(corpus)
 
     assert "announcement-nlp" in announcement_command
@@ -217,6 +207,7 @@ def test_worker_builds_announcement_and_corpus_nlp_commands(tmp_path: Path) -> N
     assert "corpus-nlp" in corpus_command
     assert "major_news,npr" in corpus_command
     assert corpus_command[corpus_command.index("--batch-size") + 1] == "40"
+    assert corpus_command[corpus_command.index("--workers") + 1] == "4"
     assert corpus_command[corpus_command.index("--major-news-per-day") + 1] == "40"
     assert corpus_command[corpus_command.index("--irm-per-instrument-day") + 1] == "2"
     assert corpus_result.name == "result.json"

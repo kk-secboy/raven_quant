@@ -48,6 +48,7 @@ import uuid
 from bisect import bisect_left
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from pathlib import Path
@@ -86,6 +87,8 @@ from .factor_evaluator import normalize_series
 PROMPT_VERSION = "corpus-nlp.v2"
 DEFAULT_BATCH_SIZE = 40
 MAX_BATCH_SIZE = 100
+DEFAULT_WORKERS = 4
+MAX_WORKERS = 8
 DEFAULT_BATCH_ITEM_CHARS = 1_000
 DEFAULT_MAJOR_NEWS_PER_DAY = 40
 DEFAULT_IRM_PER_INSTRUMENT_DAY = 2
@@ -1274,6 +1277,7 @@ def process_corpus(
     max_attempts: int = 3,
     max_chars: int = MAX_TEXT_CHARS,
     batch_size: int = 1,
+    workers: int = DEFAULT_WORKERS,
     batch_item_chars: int = DEFAULT_BATCH_ITEM_CHARS,
     max_major_news_per_day: int | None = DEFAULT_MAJOR_NEWS_PER_DAY,
     max_irm_per_instrument_day: int | None = DEFAULT_IRM_PER_INSTRUMENT_DAY,
@@ -1296,6 +1300,8 @@ def process_corpus(
         raise ValueError("checkpoint_every must be positive")
     if not 1 <= batch_size <= MAX_BATCH_SIZE:
         raise ValueError(f"batch_size must be between 1 and {MAX_BATCH_SIZE}")
+    if not 1 <= workers <= MAX_WORKERS:
+        raise ValueError(f"workers must be between 1 and {MAX_WORKERS}")
     if batch_item_chars < 1:
         raise ValueError("batch_item_chars must be positive")
     if max_major_news_per_day is not None and max_major_news_per_day < 1:
@@ -1374,6 +1380,16 @@ def process_corpus(
     unit_path: Path | None = None
     last_checkpoint_completed = 0
     pending_batch: list[tuple[CorpusItem, str, datetime, datetime, dict[str, Any]]] = []
+    inflight: dict[
+        Future[
+            tuple[
+                dict[str, CorpusExtraction],
+                dict[str, LlmExtractionError],
+                int,
+            ]
+        ],
+        list[tuple[CorpusItem, str, datetime, datetime, dict[str, Any]]],
+    ] = {}
 
     def publish_progress() -> None:
         if progress_callback is None:
@@ -1409,16 +1425,14 @@ def process_corpus(
             persist_checkpoint()
             last_checkpoint_completed = completed
 
-    def flush_batch() -> None:
-        nonlocal pending_batch, processed, failed, completed, llm_calls, dirty
-        if not pending_batch:
-            return
-        batch = pending_batch
-        pending_batch = []
-        llm_calls += 1
+    def execute_batch(
+        batch: list[tuple[CorpusItem, str, datetime, datetime, dict[str, Any]]],
+    ) -> tuple[dict[str, CorpusExtraction], dict[str, LlmExtractionError], int]:
+        items = [entry[0] for entry in batch]
+        call_count = 1
         try:
             if batch_size == 1:
-                item = batch[0][0]
+                item = items[0]
                 messages = build_extraction_messages(item=item, text=item.content[:max_chars])
                 results = {
                     item.item_id: parse_extraction_payload(
@@ -1426,21 +1440,56 @@ def process_corpus(
                     )
                 }
             else:
-                batch_items = [entry[0] for entry in batch]
                 messages = build_batch_extraction_messages(
-                    batch_items, max_chars=min(max_chars, batch_item_chars)
+                    items, max_chars=min(max_chars, batch_item_chars)
                 )
                 results = parse_batch_extraction_payload(
                     chat_client.complete(messages, model=model),
-                    expected_item_ids=[item.item_id for item in batch_items],
+                    expected_item_ids=[item.item_id for item in items],
                 )
-        except LlmExtractionError as exc:
-            failed += len(batch)
-            for _item, _process_key, _available_at, _processed_at, state_row in batch:
-                state_row.update(status="failed", stage=exc.stage, error=str(exc)[:500])
-        else:
+        except LlmExtractionError as batch_error:
+            if len(items) == 1:
+                return {}, {items[0].item_id: batch_error}, call_count
+            # Batch responses occasionally omit or mutate one item id. Retrying
+            # the affected batch item-by-item salvages valid source material and
+            # keeps every individual failure explicit in the state ledger.
+            results = {}
+            errors: dict[str, LlmExtractionError] = {}
+            for item in items:
+                call_count += 1
+                try:
+                    messages = build_extraction_messages(item=item, text=item.content[:max_chars])
+                    results[item.item_id] = parse_extraction_payload(
+                        chat_client.complete(messages, model=model)
+                    )
+                except LlmExtractionError as exc:
+                    errors[item.item_id] = exc
+            return results, errors, call_count
+        return results, {}, call_count
+
+    def apply_completed(
+        done: set[
+            Future[
+                tuple[
+                    dict[str, CorpusExtraction],
+                    dict[str, LlmExtractionError],
+                    int,
+                ]
+            ]
+        ],
+    ) -> None:
+        nonlocal processed, failed, completed, llm_calls, dirty
+        for future in done:
+            batch = inflight.pop(future)
+            results, errors, batch_calls = future.result()
+            llm_calls += batch_calls
             for item, process_key, available_at, processed_at, state_row in batch:
-                result = results[item.item_id]
+                result = results.get(item.item_id)
+                if result is None:
+                    exc = errors[item.item_id]
+                    failed += 1
+                    state_row.update(status="failed", stage=exc.stage, error=str(exc)[:500])
+                    continue
                 field_row = {
                     "process_key": process_key,
                     "source_dataset": item.source_dataset,
@@ -1460,48 +1509,64 @@ def process_corpus(
                 new_field_rows.append(field_row)
                 state_row.update(status="succeeded", stage="completed")
                 processed += 1
-        dirty = True
-        completed += len(batch)
-        maybe_checkpoint()
-
-    for item in items:
-        process_key = f"{item.item_id}:{PROMPT_VERSION}:{model}"
-        existing = state.get(process_key)
-        if existing is not None and str(existing["status"]) == "succeeded":
-            skipped += 1
-            completed += 1
+            dirty = True
+            completed += len(batch)
             maybe_checkpoint()
-            continue
-        processed_at = clock()
-        state_row: dict[str, Any] = {
-            "process_key": process_key,
-            "item_id": item.item_id,
-            "source_dataset": item.source_dataset,
-            "prompt_version": PROMPT_VERSION,
-            "model": model,
-            "status": "",
-            "stage": "",
-            "error": None,
-            "processed_at": processed_at,
-            "ts_code": item.ts_code,
-            "available_at": None,
-        }
-        state[process_key] = state_row
-        dirty = True
-        try:
-            available_at = available_at_for(item, open_days)
-        except LookupError as exc:
-            failed += 1
-            state_row.update(status="failed", stage="availability", error=str(exc)[:500])
-            completed += 1
-            maybe_checkpoint()
-        else:
-            state_row["available_at"] = available_at
-            pending_batch.append((item, process_key, available_at, processed_at, state_row))
-            if len(pending_batch) >= batch_size:
-                flush_batch()
 
-    flush_batch()
+    def submit_pending(executor: ThreadPoolExecutor) -> None:
+        nonlocal pending_batch
+        if not pending_batch:
+            return
+        batch = pending_batch
+        pending_batch = []
+        inflight[executor.submit(execute_batch, batch)] = batch
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for item in items:
+            process_key = f"{item.item_id}:{PROMPT_VERSION}:{model}"
+            existing = state.get(process_key)
+            if existing is not None and str(existing["status"]) == "succeeded":
+                skipped += 1
+                completed += 1
+                maybe_checkpoint()
+                continue
+            processed_at = clock()
+            state_row: dict[str, Any] = {
+                "process_key": process_key,
+                "item_id": item.item_id,
+                "source_dataset": item.source_dataset,
+                "prompt_version": PROMPT_VERSION,
+                "model": model,
+                "status": "",
+                "stage": "",
+                "error": None,
+                "processed_at": processed_at,
+                "ts_code": item.ts_code,
+                "available_at": None,
+            }
+            state[process_key] = state_row
+            dirty = True
+            try:
+                available_at = available_at_for(item, open_days)
+            except LookupError as exc:
+                failed += 1
+                state_row.update(status="failed", stage="availability", error=str(exc)[:500])
+                completed += 1
+                maybe_checkpoint()
+            else:
+                state_row["available_at"] = available_at
+                pending_batch.append((item, process_key, available_at, processed_at, state_row))
+                if len(pending_batch) >= batch_size:
+                    submit_pending(executor)
+                if len(inflight) >= workers * 2:
+                    done, _pending = wait(set(inflight), return_when=FIRST_COMPLETED)
+                    apply_completed(done)
+
+        submit_pending(executor)
+        while inflight:
+            done, _pending = wait(set(inflight), return_when=FIRST_COMPLETED)
+            apply_completed(done)
+
     persist_checkpoint(force=True)
 
     fields = _fields_frame(list(fields_records.values()))
@@ -1521,6 +1586,8 @@ def process_corpus(
         "ts_codes": sorted(ts_codes or set()),
         "limit": int(limit or 0),
         "planned": len(items),
+        "batch_size": batch_size,
+        "workers": workers,
         "process_keys_sha256": hashlib.sha256(
             "\n".join(sorted(scope_process_keys)).encode("utf-8")
         ).hexdigest(),

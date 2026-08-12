@@ -4,6 +4,7 @@ import hashlib
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
+from threading import Event, Lock
 
 import pandas as pd
 import pytest
@@ -171,6 +172,7 @@ def _seed_corpus(data_root: Path) -> None:
 
 def _run(data_root: Path, chat, **kwargs) -> corpus.CorpusNlpSummary:
     kwargs.setdefault("datasets", set(corpus.SUPPORTED_CORPUS_DATASETS))
+    kwargs.setdefault("workers", 1)
     return corpus.process_corpus(
         data_root,
         secret_store=FakeSecretStore(STORE_RECORD),
@@ -457,7 +459,7 @@ def test_process_batches_multiple_items_per_llm_call(tmp_path: Path) -> None:
     ]
 
 
-def test_batch_parse_failure_fails_closed_for_every_item(tmp_path: Path) -> None:
+def test_batch_parse_failure_retries_each_item(tmp_path: Path) -> None:
     _seed_corpus(tmp_path)
     _seed_trade_cal(tmp_path)
     items = corpus.load_corpus_items(tmp_path)[:2]
@@ -466,18 +468,50 @@ def test_batch_parse_failure_fails_closed_for_every_item(tmp_path: Path) -> None
 
     summary = _run(
         tmp_path,
-        FakeChatClient([json.dumps(incomplete)]),
+        FakeChatClient([json.dumps(incomplete), _payload(), _payload()]),
         limit=2,
         batch_size=2,
     )
 
-    assert summary.processed == 0
-    assert summary.failed == 2
-    assert summary.llm_calls == 1
-    assert pd.read_parquet(summary.fields_path).empty
+    assert summary.processed == 2
+    assert summary.failed == 0
+    assert summary.llm_calls == 3
+    assert len(pd.read_parquet(summary.fields_path)) == 2
     state = pd.read_parquet(summary.state_path)
-    assert set(state["status"]) == {"failed"}
-    assert set(state["stage"]) == {"llm_parse"}
+    assert set(state["status"]) == {"succeeded"}
+    assert set(state["stage"]) == {"completed"}
+
+
+def test_process_uses_multiple_workers(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+
+    class TrackingChatClient:
+        def __init__(self) -> None:
+            self.lock = Lock()
+            self.release = Event()
+            self.active = 0
+            self.max_active = 0
+            self.started = 0
+
+        def complete(self, messages: list[dict], *, model: str) -> str:
+            with self.lock:
+                self.active += 1
+                self.started += 1
+                self.max_active = max(self.max_active, self.active)
+                if self.started >= 3:
+                    self.release.set()
+            assert self.release.wait(timeout=2)
+            with self.lock:
+                self.active -= 1
+            return _payload()
+
+    chat = TrackingChatClient()
+    summary = _run(tmp_path, chat, batch_size=1, workers=3)
+
+    assert summary.processed == 7
+    assert summary.failed == 0
+    assert chat.max_active >= 3
 
 
 # --- end-to-end processing -----------------------------------------------------

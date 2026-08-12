@@ -56,6 +56,8 @@ from quant_platform.corpus_nlp import (
 from quant_platform.corpus_nlp import (
     DEFAULT_MAJOR_NEWS_PER_DAY as CORPUS_DEFAULT_MAJOR_NEWS_PER_DAY,
 )
+from quant_platform.corpus_nlp import DEFAULT_WORKERS as CORPUS_DEFAULT_WORKERS
+from quant_platform.corpus_nlp import MAX_WORKERS as CORPUS_MAX_WORKERS
 from quant_platform.corpus_nlp import PROMPT_VERSION as CORPUS_PROMPT_VERSION
 from quant_platform.event_market_response import LABEL_SCHEMA_VERSION
 from quant_platform.qlib_factor_baseline import FACTOR_SOURCE_QLIB_BASELINE
@@ -192,16 +194,15 @@ class AnnouncementNlpRequest(BaseModel):
 class CorpusNlpRequest(BaseModel):
     start: date = Field(default=date(2024, 1, 1))
     end: date | Literal["latest"] = "latest"
-    datasets: list[
-        Literal["major_news", "npr", "cctv_news", "irm_qa_sh", "irm_qa_sz"]
-    ] = Field(default_factory=list)
+    datasets: list[Literal["major_news", "npr", "cctv_news", "irm_qa_sh", "irm_qa_sz"]] = Field(
+        default_factory=list
+    )
     ts_codes: list[str] = Field(default_factory=list, max_length=2000)
     limit: int = Field(default=0, ge=0, le=1_000_000)
     batch_size: int = Field(default=CORPUS_DEFAULT_BATCH_SIZE, ge=1, le=100)
+    workers: int = Field(default=CORPUS_DEFAULT_WORKERS, ge=1, le=CORPUS_MAX_WORKERS)
     major_news_per_day: int = Field(default=CORPUS_DEFAULT_MAJOR_NEWS_PER_DAY, ge=0)
-    irm_per_instrument_day: int = Field(
-        default=CORPUS_DEFAULT_IRM_PER_INSTRUMENT_DAY, ge=0
-    )
+    irm_per_instrument_day: int = Field(default=CORPUS_DEFAULT_IRM_PER_INSTRUMENT_DAY, ge=0)
 
     @model_validator(mode="after")
     def validate_range(self) -> CorpusNlpRequest:
@@ -361,9 +362,7 @@ class MinuteQlibRequest(BaseModel):
         max_length=120,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
     )
-    target_frequency: Literal["1min", "5min", "15min", "30min", "60min"] | None = (
-        None
-    )
+    target_frequency: Literal["1min", "5min", "15min", "30min", "60min"] | None = None
 
 
 class MinuteResearchRequest(BaseModel):
@@ -498,20 +497,12 @@ class StrategyConfigRequest(BaseModel):
     ] = "promoted_only"
     challenger_weight: float = Field(default=1.0, ge=0.0, le=1.0)
     baseline_definition: dict[str, Any] | None = None
-    baseline_definition_sha256: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$"
-    )
-    signal_frequency: Literal["day", "1min", "5min", "15min", "30min", "60min"] = (
-        "day"
-    )
+    baseline_definition_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    signal_frequency: Literal["day", "1min", "5min", "15min", "30min", "60min"] = "day"
     signal_period: int = Field(default=1, ge=1, le=1260)
-    execution_frequency: Literal[
-        "day", "1min", "5min", "15min", "30min", "60min"
-    ] = "day"
+    execution_frequency: Literal["day", "1min", "5min", "15min", "30min", "60min"] = "day"
     execution_lag_bars: Literal[1] = 1
-    execution_contract_hash: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$"
-    )
+    execution_contract_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     rebalance_frequency: Literal["bar", "day", "week", "month"] = "day"
     topk: int = Field(default=50, ge=5, le=500)
     n_drop: int = Field(default=5, ge=0, le=100)
@@ -579,9 +570,7 @@ class StrategyConfigRequest(BaseModel):
     # Account capital and capacity stress notionals are different contracts.
     # The personal deployment starts paper evidence with the user's 100k
     # account while retaining larger capacity curves for scalability tests.
-    paper_initial_cash: float = Field(
-        default=100_000, ge=100_000, le=10_000_000_000
-    )
+    paper_initial_cash: float = Field(default=100_000, ge=100_000, le=10_000_000_000)
     capacity_notional: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
     capacity_curve_notionals: list[float] = Field(
         default_factory=lambda: [5_000_000, 20_000_000, 100_000_000],
@@ -626,8 +615,7 @@ class StrategyConfigRequest(BaseModel):
         if self.max_industry_weight < self.max_position_weight:
             raise ValueError("max_industry_weight must not be below max_position_weight")
         if self.max_asset_class_weights is not None and any(
-            not 0 <= float(limit) <= 1
-            for limit in self.max_asset_class_weights.values()
+            not 0 <= float(limit) <= 1 for limit in self.max_asset_class_weights.values()
         ):
             raise ValueError("asset class limits must be between zero and one")
         if (
@@ -688,9 +676,7 @@ def _rebind_strategy_execution_contract(values: dict[str, Any]) -> StrategyConfi
 class StrategyCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=150)
     description: str = Field(min_length=10, max_length=2000)
-    economic_hypothesis_group: str | None = Field(
-        default=None, min_length=1, max_length=200
-    )
+    economic_hypothesis_group: str | None = Field(default=None, min_length=1, max_length=200)
     hypothesis_group_cap: float = Field(default=0.70, gt=0, le=0.70)
     benchmark: str = "SH000300"
     universe: str = "cn_all"
@@ -837,9 +823,7 @@ class ModelArtifactCreateRequest(BaseModel):
             (self.valid_until, "valid_until"),
             (self.scheduled_refit_at, "scheduled_refit_at"),
         ):
-            if value is not None and (
-                value.tzinfo is None or value.utcoffset() is None
-            ):
+            if value is not None and (value.tzinfo is None or value.utcoffset() is None):
                 raise ValueError(f"{label} must include a timezone")
         return self
 
@@ -867,9 +851,9 @@ class ResearchCampaignCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=150)
     objective: str = Field(min_length=10, max_length=2000)
     dataset: str
-    recipe_id: Literal[
-        "index_enhancement", "swing_trend", "full_market_multifactor"
-    ] = "index_enhancement"
+    recipe_id: Literal["index_enhancement", "swing_trend", "full_market_multifactor"] = (
+        "index_enhancement"
+    )
     benchmark: str | None = None
     universe: str | None = None
     loop_n: int = Field(default=2, ge=1, le=20)
@@ -885,9 +869,7 @@ class ResearchCampaignCreateRequest(BaseModel):
     )
     max_trials: int = Field(default=27, ge=1, le=81)
     strategy_config: StrategyConfigRequest | None = None
-    hypothetical_initial_value: float = Field(
-        default=5_000_000, ge=100_000, le=10_000_000_000
-    )
+    hypothetical_initial_value: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
     timezone: str = "Asia/Shanghai"
     recommendation_run_time: time = time(15, 30)
     misfire_grace_seconds: int = Field(default=1800, ge=60, le=86400)
@@ -914,9 +896,9 @@ class ResearchCampaignStatusRequest(BaseModel):
 class ResearchProgramCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=100)
     dataset: str
-    recipe_id: Literal[
-        "index_enhancement", "swing_trend", "full_market_multifactor"
-    ] = "index_enhancement"
+    recipe_id: Literal["index_enhancement", "swing_trend", "full_market_multifactor"] = (
+        "index_enhancement"
+    )
     objective: str | None = Field(default=None, min_length=10, max_length=2000)
     benchmark: str | None = None
     universe: str | None = None
@@ -937,9 +919,7 @@ class ResearchProgramCreateRequest(BaseModel):
     )
     max_trials: int = Field(default=27, ge=1, le=81)
     strategy_config: StrategyConfigRequest | None = None
-    hypothetical_initial_value: float = Field(
-        default=5_000_000, ge=100_000, le=10_000_000_000
-    )
+    hypothetical_initial_value: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
     timezone: str = "Asia/Shanghai"
     recommendation_run_time: time = time(15, 30)
     misfire_grace_seconds: int = Field(default=1800, ge=60, le=86400)
@@ -949,9 +929,7 @@ class ResearchProgramCreateRequest(BaseModel):
     def validate_program(self) -> ResearchProgramCreateRequest:
         validate_duration(self.duration)
         if self.train_trading_days + self.validation_trading_days < 2520:
-            raise ValueError(
-                "continuous research requires at least 2520 pre-final trading days"
-            )
+            raise ValueError("continuous research requires at least 2520 pre-final trading days")
         if self.recommendation_run_time < time(15, 10):
             raise ValueError("recommendation refresh must run after the A-share close")
         try:
@@ -1033,9 +1011,7 @@ class RecommendationPortfolioCreateRequest(BaseModel):
     construction_notional: float = Field(
         default=5_000_000,
         ge=100_000,
-        validation_alias=AliasChoices(
-            "construction_notional", "hypothetical_initial_value"
-        ),
+        validation_alias=AliasChoices("construction_notional", "hypothetical_initial_value"),
     )
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
 
@@ -1106,9 +1082,7 @@ class SimulationOrderPlanGenerationRequest(BaseModel):
             return self
         if self.signal_at.tzinfo is None or self.signal_at.utcoffset() is None:
             raise ValueError("simulation signal timestamp must include a timezone")
-        shanghai_date = self.signal_at.astimezone(
-            ZoneInfo("Asia/Shanghai")
-        ).date()
+        shanghai_date = self.signal_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
         if shanghai_date != self.signal_date:
             raise ValueError("simulation signal timestamp does not match signal_date")
         return self
@@ -1196,9 +1170,7 @@ class ScheduleCreateRequest(BaseModel):
         elif self.kind == "intraday_execution_check":
             unknown = set(self.payload) - {"dataset", "interval_minutes"}
             if unknown:
-                raise ValueError(
-                    f"unsupported {self.kind} payload keys: {sorted(unknown)}"
-                )
+                raise ValueError(f"unsupported {self.kind} payload keys: {sorted(unknown)}")
             interval = int(self.payload.get("interval_minutes", 5))
             validate_intraday_run_time(self.run_time, interval)
         else:
@@ -2165,9 +2137,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "recommendation": {
                         "hypothetical_initial_value": payload.hypothetical_initial_value,
                         "timezone": payload.timezone,
-                        "run_time": payload.recommendation_run_time.isoformat(
-                            timespec="minutes"
-                        ),
+                        "run_time": payload.recommendation_run_time.isoformat(timespec="minutes"),
                         "misfire_grace_seconds": payload.misfire_grace_seconds,
                     },
                     "manual_strategy_approval": True,
@@ -2305,9 +2275,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "recommendation": {
                         "hypothetical_initial_value": payload.hypothetical_initial_value,
                         "timezone": payload.timezone,
-                        "run_time": payload.recommendation_run_time.isoformat(
-                            timespec="minutes"
-                        ),
+                        "run_time": payload.recommendation_run_time.isoformat(timespec="minutes"),
                         "misfire_grace_seconds": payload.misfire_grace_seconds,
                     },
                     "manual_strategy_approval": True,
@@ -2408,9 +2376,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 raise HTTPException(
                     409, f"candidate {candidate_id} is missing immutable factor artifacts"
                 )
-            if not Path(str(candidate["code_path"])).is_file() or not Path(
-                str(candidate["values_path"])
-            ).is_file():
+            if (
+                not Path(str(candidate["code_path"])).is_file()
+                or not Path(str(candidate["values_path"])).is_file()
+            ):
                 raise HTTPException(
                     409, f"candidate {candidate_id} factor artifacts are unavailable"
                 )
@@ -2436,9 +2405,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         serialized = {
             "dataset": payload.dataset,
             "dataset_path": dataset["path"],
-            "dataset_identity_sha256": dataset["provenance"][
-                "dataset_identity_sha256"
-            ],
+            "dataset_identity_sha256": dataset["provenance"]["dataset_identity_sha256"],
             "periods": periods,
             "universe": payload.universe,
             "benchmark": payload.benchmark,
@@ -2452,8 +2419,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 serialized,
                 log_path,
                 idempotency_key=(
-                    "external-factor-evaluate:"
-                    f"{uuid.uuid5(uuid.NAMESPACE_URL, identity)}"
+                    f"external-factor-evaluate:{uuid.uuid5(uuid.NAMESPACE_URL, identity)}"
                 ),
             )
         except ValueError as exc:
@@ -2707,9 +2673,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         dataset = require_qlib_dataset(
             payload.dataset, purpose="strategy backtest", frequency="day"
         )
-        require_native_execution_controls(
-            dataset, start=payload.start, purpose="strategy backtest"
-        )
+        require_native_execution_controls(dataset, start=payload.start, purpose="strategy backtest")
         if dataset.get("start_date") and payload.start.isoformat() < dataset["start_date"]:
             raise HTTPException(409, "backtest starts before the selected dataset")
         if dataset.get("end_date") and payload.end.isoformat() > dataset["end_date"]:
@@ -2723,17 +2687,13 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             execution_method = str(version.get("config", {}).get("execution_method", "open"))
             if execution_method in {"twap", "vwap", "next_bar"}:
                 if not payload.execution_dataset:
-                    raise ValueError(
-                        "minute strategy backtests require a minute execution dataset"
-                    )
+                    raise ValueError("minute strategy backtests require a minute execution dataset")
                 execution_dataset = require_qlib_dataset(
                     payload.execution_dataset, purpose="strategy minute execution"
                 )
                 frequency = str(execution_dataset.get("frequency") or "")
                 if frequency not in NATIVE_MINUTE_FREQUENCIES:
-                    raise ValueError(
-                        "strategy execution requires a native 1/5-minute Qlib dataset"
-                    )
+                    raise ValueError("strategy execution requires a native 1/5-minute Qlib dataset")
                 execution_start = str(execution_dataset.get("start_date") or "")[:10]
                 execution_end = str(execution_dataset.get("end_date") or "")[:10]
                 if execution_start and payload.start.isoformat() < execution_start:
@@ -2741,9 +2701,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 if execution_end and payload.end.isoformat() > execution_end:
                     raise ValueError("backtest ends after the minute execution dataset")
                 bar_minutes = int(frequency.removesuffix("min"))
-                slice_minutes = int(
-                    version.get("config", {}).get("execution_slice_minutes", 20)
-                )
+                slice_minutes = int(version.get("config", {}).get("execution_slice_minutes", 20))
                 if bar_minutes > slice_minutes or slice_minutes % bar_minutes:
                     raise ValueError(
                         "execution_slice_minutes must be an integer multiple of the "
@@ -2759,32 +2717,24 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             }
             trading_dates = load_calendar_days(dataset["path"])
             if (
-                version["config"].get("factor_source_mode")
-                == FACTOR_SOURCE_QLIB_BASELINE
+                version["config"].get("factor_source_mode") == FACTOR_SOURCE_QLIB_BASELINE
                 and not version["factors"]
             ):
                 dataset_start = str(dataset.get("start_date") or "")[:10]
                 if not dataset_start:
-                    raise ValueError(
-                        "baseline final tests require a dated daily dataset"
-                    )
-                embargo_days = int(
-                    version["config"].get("outer_embargo_days", 5)
-                )
+                    raise ValueError("baseline final tests require a dated daily dataset")
+                embargo_days = int(version["config"].get("outer_embargo_days", 5))
                 dates_before_final = sorted(
                     value for value in trading_dates if value < payload.start
                 )
                 if len(dates_before_final) <= embargo_days:
                     raise ValueError(
-                        "baseline dataset has too little history before the "
-                        "final-test embargo"
+                        "baseline dataset has too little history before the final-test embargo"
                     )
                 backtest_periods.update(
                     {
                         "historical_start": dataset_start,
-                        "historical_end": dates_before_final[
-                            -(embargo_days + 1)
-                        ].isoformat(),
+                        "historical_end": dates_before_final[-(embargo_days + 1)].isoformat(),
                     }
                 )
             backtest = strategies.create_backtest(
@@ -3056,9 +3006,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     ) -> dict:
         authenticated_actor(request, payload.actor)
         try:
-            return schedules.set_recommendation_allocation_group_status(
-                allocation_id, "retired"
-            )
+            return schedules.set_recommendation_allocation_group_status(allocation_id, "retired")
         except KeyError as exc:
             raise HTTPException(404, "strategy allocation schedule not found") from exc
         except ValueError as exc:
@@ -3107,9 +3055,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             )
             automation = schedules.get_recommendation_allocation_group_optional(allocation_id)
             if automation and automation["status"] != "retired":
-                schedules.set_recommendation_allocation_group_status(
-                    allocation_id, payload.status
-                )
+                schedules.set_recommendation_allocation_group_status(allocation_id, payload.status)
             return result
         except KeyError as exc:
             raise HTTPException(404, "strategy allocation not found") from exc
@@ -3279,8 +3225,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             )
             if not gate["passed"]:
                 raise ValueError(
-                    "recommendation reconciliation gate blocked: "
-                    + "; ".join(gate["reasons"])
+                    "recommendation reconciliation gate blocked: " + "; ".join(gate["reasons"])
                 )
             snapshot, created = recommendations.create_snapshot(
                 portfolio_id=portfolio_id,
@@ -3331,9 +3276,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             elif source_type == "strategy_version":
                 version = strategies.get_version(source_id)
                 if version["status"] != "approved" or version.get("is_legacy"):
-                    raise ValueError(
-                        "simulation requires an approved non-legacy strategy version"
-                    )
+                    raise ValueError("simulation requires an approved non-legacy strategy version")
                 formal = next(
                     (
                         item
@@ -3415,13 +3358,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "strategy-version simulation"
                 )
             version = strategies.get_version(portfolio["source_id"])
-            if (
-                str(version.get("signal_frequency") or "day") != "day"
-                and payload.signal_at is None
-            ):
-                raise ValueError(
-                    "minute strategy order-plan generation requires signal_at"
-                )
+            if str(version.get("signal_frequency") or "day") != "day" and payload.signal_at is None:
+                raise ValueError("minute strategy order-plan generation requires signal_at")
         except KeyError as exc:
             raise HTTPException(404, "simulation portfolio or strategy source not found") from exc
         except ValueError as exc:
@@ -3438,17 +3376,13 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 "simulation_portfolio_id": portfolio_id,
                 "signal_date": payload.signal_date.isoformat(),
                 "signal_at": (
-                    payload.signal_at.isoformat()
-                    if payload.signal_at is not None
-                    else None
+                    payload.signal_at.isoformat() if payload.signal_at is not None else None
                 ),
                 "actor": actor,
             },
             platform_root / "logs" / f"simulation-order-plan-{portfolio_id}.log",
             dedupe_active_kind=False,
-            idempotency_key=(
-                f"simulation-order-plan:{portfolio_id}:{signal_identity}"
-            ),
+            idempotency_key=(f"simulation-order-plan:{portfolio_id}:{signal_identity}"),
         )
         worker.notify()
         return job
@@ -3475,9 +3409,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             jobs.create(
                 "simulation_replay",
                 {"simulation_batch_id": batch["id"]},
-                platform_root
-                / "logs"
-                / f"simulation-replay-{batch['id']}.log",
+                platform_root / "logs" / f"simulation-replay-{batch['id']}.log",
                 dedupe_active_kind=False,
                 idempotency_key=f"simulation-replay:{batch['id']}",
             )
@@ -3536,9 +3468,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(404, "simulation portfolio not found") from exc
 
-    @app.post(
-        "/api/simulation-portfolios/{portfolio_id}/nav/{trade_date}/review"
-    )
+    @app.post("/api/simulation-portfolios/{portfolio_id}/nav/{trade_date}/review")
     def review_simulation_nav(
         portfolio_id: str,
         trade_date: date,
@@ -3579,9 +3509,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 actor=authenticated_actor(request, payload.actor),
             )
         except KeyError as exc:
-            raise HTTPException(
-                404, "simulation portfolio or fill not found"
-            ) from exc
+            raise HTTPException(404, "simulation portfolio or fill not found") from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 
@@ -3884,10 +3812,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         ):
             raise HTTPException(409, "market-data download or validation is already active")
         validation_path = (
-            settings.data_root
-            / "artifacts"
-            / "data-quality"
-            / "baostock-overlap-2016.json"
+            settings.data_root / "artifacts" / "data-quality" / "baostock-overlap-2016.json"
         )
         try:
             validation = json.loads(validation_path.read_text(encoding="utf-8"))
@@ -3915,8 +3840,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "validation_report": str(validation_path),
             "result_path": str(result_path),
         }
-        log_path = platform_root / "logs" / (
-            f"legacy-market-{payload.start:%Y%m%d}-{payload.end:%Y%m%d}.log"
+        log_path = (
+            platform_root
+            / "logs"
+            / (f"legacy-market-{payload.start:%Y%m%d}-{payload.end:%Y%m%d}.log")
         )
         try:
             job = jobs.create(
@@ -3948,8 +3875,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "workers": payload.workers,
             "prompt_version": ANNOUNCEMENT_PROMPT_VERSION,
         }
-        log_path = platform_root / "logs" / (
-            f"announcement-nlp-{payload.start:%Y%m%d}-{end_date:%Y%m%d}.log"
+        log_path = (
+            platform_root
+            / "logs"
+            / (f"announcement-nlp-{payload.start:%Y%m%d}-{end_date:%Y%m%d}.log")
         )
         try:
             job = jobs.create(
@@ -3980,12 +3909,13 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "ts_codes": sorted(set(payload.ts_codes)),
             "limit": payload.limit,
             "batch_size": payload.batch_size,
+            "workers": payload.workers,
             "major_news_per_day": payload.major_news_per_day,
             "irm_per_instrument_day": payload.irm_per_instrument_day,
             "prompt_version": CORPUS_PROMPT_VERSION,
         }
-        log_path = platform_root / "logs" / (
-            f"corpus-nlp-{payload.start:%Y%m%d}-{end_date:%Y%m%d}.log"
+        log_path = (
+            platform_root / "logs" / (f"corpus-nlp-{payload.start:%Y%m%d}-{end_date:%Y%m%d}.log")
         )
         try:
             job = jobs.create(
@@ -3997,7 +3927,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     f"{','.join(serialized['datasets']) or 'all'}:"
                     f"{','.join(serialized['ts_codes']) or 'all'}:{payload.limit}:"
                     f"batch-{payload.batch_size}:major-{payload.major_news_per_day}:"
-                    f"irm-{payload.irm_per_instrument_day}"
+                    f"irm-{payload.irm_per_instrument_day}:workers-{payload.workers}"
                 ),
             )
         except ValueError as exc:
@@ -4036,9 +3966,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "benchmark_code": payload.benchmark_code.upper(),
             "schema_version": LABEL_SCHEMA_VERSION,
         }
-        log_path = platform_root / "logs" / (
-            f"event-market-response-{payload.snapshot_name}.log"
-        )
+        log_path = platform_root / "logs" / (f"event-market-response-{payload.snapshot_name}.log")
         try:
             job = jobs.create(
                 "event_market_response",
@@ -4064,9 +3992,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(409, "a multi-face readiness audit is already active")
         serialized = {
             "dataset": payload.dataset,
-            "dataset_identity_sha256": dataset["provenance"][
-                "dataset_identity_sha256"
-            ],
+            "dataset_identity_sha256": dataset["provenance"]["dataset_identity_sha256"],
             "snapshot_name": payload.snapshot_name,
             "require_ready": payload.require_ready,
         }
@@ -4303,13 +4229,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         if not supported.intersection(manifest.get("datasets", {})):
             raise HTTPException(409, "execution snapshot has no supported minute datasets")
         target_frequency = payload.target_frequency or source_frequency
-        if (
-            target_frequency in NATIVE_MINUTE_FREQUENCIES
-            and target_frequency != source_frequency
-        ):
-            raise HTTPException(
-                409, "native minute Qlib output must match the snapshot frequency"
-            )
+        if target_frequency in NATIVE_MINUTE_FREQUENCIES and target_frequency != source_frequency:
+            raise HTTPException(409, "native minute Qlib output must match the snapshot frequency")
         output_name = payload.output_name or f"{payload.snapshot_name}-{target_frequency}"
         serialized = {
             "snapshot_name": payload.snapshot_name,
@@ -4326,8 +4247,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 serialized,
                 log_path,
                 idempotency_key=(
-                    f"minute-qlib:{payload.snapshot_name}:{output_name}:"
-                    f"{target_frequency}"
+                    f"minute-qlib:{payload.snapshot_name}:{output_name}:{target_frequency}"
                 ),
             )
         except ValueError as exc:
@@ -4337,23 +4257,17 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.post("/api/jobs/minute-research", status_code=202)
     def create_minute_research(payload: MinuteResearchRequest) -> dict:
-        dataset = require_qlib_dataset(
-            payload.dataset, purpose="minute factor research"
-        )
+        dataset = require_qlib_dataset(payload.dataset, purpose="minute factor research")
         frequency = str(dataset.get("frequency") or "")
         if frequency not in MINUTE_FREQUENCIES:
             raise HTTPException(409, "minute research requires a minute Qlib dataset")
         try:
-            require_minute_signal_contract(
-                dataset["provenance"], frequency=frequency
-            )
+            require_minute_signal_contract(dataset["provenance"], frequency=frequency)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         bar_minutes = int(frequency.removesuffix("min"))
         if any(horizon % bar_minutes for horizon in payload.horizons):
-            raise HTTPException(
-                409, "research horizons must be multiples of the dataset frequency"
-            )
+            raise HTTPException(409, "research horizons must be multiples of the dataset frequency")
         serialized = {
             "dataset": payload.dataset,
             "dataset_path": dataset["path"],
