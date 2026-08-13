@@ -49,9 +49,10 @@ validity is evaluated at pub_time.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -344,7 +345,12 @@ def find_mentions(
     return mentions
 
 
-def _load_fields(data_root: Path) -> pd.DataFrame:
+def _load_fields(
+    data_root: Path,
+    *,
+    start: date | None = None,
+    end: date | None = None,
+) -> pd.DataFrame:
     """Read the corpus NLP fields index (major_news rows only); fail closed."""
 
     fields_path = data_root / CORPUS_NLP_DIR / "fields.parquet"
@@ -353,12 +359,104 @@ def _load_fields(data_root: Path) -> pd.DataFrame:
             f"corpus NLP fields index is missing: {fields_path}; "
             "run the corpus-nlp pipeline first (quant-data corpus-nlp)"
         )
-    fields = pd.read_parquet(fields_path)
-    frame = fields[fields["source_dataset"] == DATASET_MAJOR_NEWS].copy()
-    # Multiple prompt_version/model rows may exist per item; keep the most
-    # recently processed one so reruns converge onto the latest extraction.
-    frame = frame.sort_values(["item_id", "processed_at"], kind="stable")
-    return frame.drop_duplicates("item_id", keep="last")
+    path = fields_path.as_posix()
+    available = set(
+        _read_parquet_union(
+            [path], "SELECT * FROM read_parquet(?, union_by_name=true) LIMIT 0"
+        ).columns
+    )
+    required = {
+        "item_id",
+        "source_dataset",
+        "sentiment",
+        "available_at",
+        "processed_at",
+        "prompt_version",
+        "model",
+    }
+    missing = sorted(required - available)
+    if missing:
+        raise RuntimeError(f"corpus NLP fields index misses required columns: {missing}")
+
+    available_expr = "try_cast(CAST(available_at AS VARCHAR) AS TIMESTAMP)"
+    conditions = ["CAST(source_dataset AS VARCHAR) = ?"]
+    parameters: list[object] = [DATASET_MAJOR_NEWS]
+    if start is not None:
+        conditions.append(f"CAST({available_expr} AS DATE) >= ?")
+        parameters.append(start)
+    if end is not None:
+        conditions.append(f"CAST({available_expr} AS DATE) <= ?")
+        parameters.append(end)
+    where = " AND ".join(conditions)
+    return _read_parquet_union(
+        [path],
+        f"""
+        SELECT
+            CAST(item_id AS VARCHAR) AS item_id,
+            try_cast(CAST(sentiment AS VARCHAR) AS DOUBLE) AS sentiment,
+            {available_expr} AS available_at,
+            try_cast(CAST(processed_at AS VARCHAR) AS TIMESTAMP) AS processed_at,
+            CAST(prompt_version AS VARCHAR) AS prompt_version,
+            CAST(model AS VARCHAR) AS model
+        FROM read_parquet(?, union_by_name=true)
+        WHERE {where}
+        QUALIFY row_number() OVER (
+            PARTITION BY CAST(item_id AS VARCHAR)
+            ORDER BY try_cast(CAST(processed_at AS VARCHAR) AS TIMESTAMP) DESC NULLS LAST,
+                     CAST(processed_at AS VARCHAR) DESC
+        ) = 1
+        """,
+        parameters,
+    )
+
+
+def _bounded_month_windows(start: date, end: date) -> list[tuple[date, date]]:
+    """Return non-overlapping calendar-month windows covering the range."""
+
+    if end < start:
+        raise ValueError("end must be on or after start")
+    windows: list[tuple[date, date]] = []
+    cursor = start
+    while cursor <= end:
+        next_month = (
+            date(cursor.year + 1, 1, 1)
+            if cursor.month == 12
+            else date(cursor.year, cursor.month + 1, 1)
+        )
+        window_end = min(end, next_month - timedelta(days=1))
+        windows.append((cursor, window_end))
+        cursor = next_month
+    return windows
+
+
+def _iter_major_news_batches(
+    data_root: Path,
+    *,
+    start: date | None,
+    end: date | None,
+) -> Iterator[list[Any]]:
+    """Yield bounded major-news batches instead of retaining all full text.
+
+    Production jobs always carry explicit source boundaries.  Splitting those
+    boundaries by calendar month preserves the item-id and de-duplication
+    contract because publication timestamps assign every item to exactly one
+    window.  The optional unbounded API remains compatible for small/manual
+    uses, while bounded historical runs release full article bodies after each
+    month.
+    """
+
+    windows: list[tuple[date | None, date | None]] = (
+        [(start, end)]
+        if start is None or end is None
+        else list(_bounded_month_windows(start, end))
+    )
+    for window_start, window_end in windows:
+        yield load_corpus_items(
+            data_root,
+            datasets={DATASET_MAJOR_NEWS},
+            start=window_start,
+            end=window_end,
+        )
 
 
 def build_mention_events(
@@ -376,47 +474,54 @@ def build_mention_events(
     prompt_version/model of the most recently processed fields row.
     """
 
-    items = load_corpus_items(
-        data_root, datasets={DATASET_MAJOR_NEWS}, start=start, end=end
-    )
-    fields = _load_fields(data_root)
+    batches = iter(_iter_major_news_batches(data_root, start=start, end=end))
+    # Preserve the original fail-closed ordering: validate/read the source
+    # before reporting a downstream corpus-fields gap.
+    first_items = next(batches)
+    fields = _load_fields(data_root, start=start, end=end)
     sentiment_by_item = fields.set_index("item_id")
     aliases = build_alias_table(_load_stock_basic(data_root), _load_namechange(data_root))
     open_days = load_trade_calendar_open_days(data_root)
 
     wanted = {code.strip().upper() for code in ts_codes} if ts_codes else None
-    index_cache: dict[date, dict[str, list[tuple[str, str]]]] = {}
     events: list[dict[str, Any]] = []
-    for item in items:
-        if item.item_id not in sentiment_by_item.index:
-            continue  # no successful LLM extraction -> no signal (fail closed)
-        field_row = sentiment_by_item.loc[item.item_id]
-        day = item.pub_time.date()
-        if day not in index_cache:
-            index_cache[day] = _alias_index_at(aliases, day)
-        text = f"{item.title}\n{item.content}"
-        mentions = find_mentions(text, index_cache[day])
-        for ts_code, matched_alias in sorted(mentions.items()):
-            if wanted is not None and ts_code not in wanted:
-                continue
-            available_at = pd.Timestamp(field_row["available_at"]).to_pydatetime()
-            try:
-                factor_day = factor_date_for(available_at, open_days)
-            except LookupError as exc:
-                raise RuntimeError(
-                    f"cannot derive factor_date for item {item.item_id}: {exc}"
-                ) from exc
-            events.append(
-                {
-                    "item_id": item.item_id,
-                    "ts_code": ts_code,
-                    "matched_alias": matched_alias,
-                    "pub_time": item.pub_time,
-                    "available_at": available_at,
-                    "factor_date": factor_day,
-                    "sentiment": float(field_row["sentiment"]),
-                }
-            )
+    item_count = 0
+    for items in chain((first_items,), batches):
+        item_count += len(items)
+        # Do not retain a full alias index for every day in the multi-year
+        # range.  A monthly cache bounds this structure while reusing it for
+        # all items published on the same day.
+        index_cache: dict[date, dict[str, list[tuple[str, str]]]] = {}
+        for item in items:
+            if item.item_id not in sentiment_by_item.index:
+                continue  # no successful LLM extraction -> no signal (fail closed)
+            field_row = sentiment_by_item.loc[item.item_id]
+            day = item.pub_time.date()
+            if day not in index_cache:
+                index_cache[day] = _alias_index_at(aliases, day)
+            text = f"{item.title}\n{item.content}"
+            mentions = find_mentions(text, index_cache[day])
+            for ts_code, matched_alias in sorted(mentions.items()):
+                if wanted is not None and ts_code not in wanted:
+                    continue
+                available_at = pd.Timestamp(field_row["available_at"]).to_pydatetime()
+                try:
+                    factor_day = factor_date_for(available_at, open_days)
+                except LookupError as exc:
+                    raise RuntimeError(
+                        f"cannot derive factor_date for item {item.item_id}: {exc}"
+                    ) from exc
+                events.append(
+                    {
+                        "item_id": item.item_id,
+                        "ts_code": ts_code,
+                        "matched_alias": matched_alias,
+                        "pub_time": item.pub_time,
+                        "available_at": available_at,
+                        "factor_date": factor_day,
+                        "sentiment": float(field_row["sentiment"]),
+                    }
+                )
     frame = pd.DataFrame(events, columns=list(EVENT_COLUMNS))
     if not frame.empty:
         for column in ("pub_time", "available_at", "factor_date"):
@@ -426,7 +531,7 @@ def build_mention_events(
         ).reset_index(drop=True)
     latest = fields.sort_values("processed_at", kind="stable")
     provenance: dict[str, Any] = {
-        "items": len(items),
+        "items": item_count,
         "prompt_version": str(latest["prompt_version"].iloc[-1]) if len(latest) else "",
         "model": str(latest["model"].iloc[-1]) if len(latest) else "",
     }

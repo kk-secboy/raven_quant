@@ -148,6 +148,7 @@ def _run_corpus(data_root: Path) -> corpus.CorpusNlpSummary:
     return corpus.process_corpus(
         data_root,
         datasets={"major_news"},
+        workers=1,
         secret_store=FakeSecretStore(),
         chat_client=FakeChatClient([_payload(sentiment) for *_r, sentiment in NEWS_ROWS]),
         now=lambda: NOW,
@@ -165,6 +166,42 @@ def _seed_full(data_root: Path) -> None:
 
 def _unused_store() -> ResearchStore:
     return ResearchStore(DUMMY_URL)
+
+
+@pytest.mark.no_database
+def test_major_news_history_is_loaded_in_month_bounded_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[date | None, date | None]] = []
+
+    def fake_load_corpus_items(
+        _data_root: Path,
+        *,
+        datasets: set[str],
+        start: date | None,
+        end: date | None,
+    ) -> list[corpus.CorpusItem]:
+        assert datasets == {corpus.DATASET_MAJOR_NEWS}
+        calls.append((start, end))
+        return []
+
+    monkeypatch.setattr(m, "load_corpus_items", fake_load_corpus_items)
+
+    batches = list(
+        m._iter_major_news_batches(
+            tmp_path,
+            start=date(2024, 1, 30),
+            end=date(2024, 3, 2),
+        )
+    )
+
+    assert batches == [[], [], []]
+    assert calls == [
+        (date(2024, 1, 30), date(2024, 1, 31)),
+        (date(2024, 2, 1), date(2024, 2, 29)),
+        (date(2024, 3, 1), date(2024, 3, 2)),
+    ]
 
 
 # --- alias table rules --------------------------------------------------------
