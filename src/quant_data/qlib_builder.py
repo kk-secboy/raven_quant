@@ -112,12 +112,9 @@ _CAPITAL_FLOW_FIELD_UNITS = {
 #
 # q_profit_yoy, inv_turn, ocf_to_or, ocf_to_profit and salescash_to_or are
 # documented Tushare fina_indicator output columns (doc_id=79) but flagged
-# non-default there, so the downloader (which requests no explicit field
-# list) currently never receives them. They stay declared on purpose: the
-# build-time coverage diagnostics in _research_feature_contract warn about
-# the missing source columns instead of silently dropping the fields, and a
-# future downloader change that requests them explicitly lights the fields
-# up without another contract change.
+# non-default there. The downloader therefore uses an explicit, versioned
+# fina_indicator field contract; the build-time coverage diagnostics below
+# still fail closed if a relay omits any requested source column.
 _FUNDAMENTAL_RESEARCH_FIELDS = {
     "fina_indicator": {
         "roe": "fund_roe",
