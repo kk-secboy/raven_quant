@@ -30,128 +30,23 @@ _CN_EXCHANGES = ("CFFEX", "DCE", "CZCE", "SHFE", "INE", "GFEX")
 ETF_CONSTITUENT_DATASETS = {"etf_sh_cons", "etf_sz_cons"}
 SHARE_FLOAT_PROVIDER_OFFSET_CAP = 100_000
 
-# ``fina_indicator_vip`` omits several documented research fields when the
-# request leaves ``fields`` empty.  Keep an explicit, versioned field contract
-# so a provider-default change cannot silently remove factors from future
-# snapshots.  The list contains every column observed in the legacy default
-# response plus the five non-default columns consumed by Qlib.
-FINA_INDICATOR_EXPLICIT_FIELDS = (
+# ``fina_indicator_vip`` omits these documented research fields when the
+# request leaves ``fields`` empty.  Request them as a narrow companion dataset:
+# the production relay closes large all-column requests without a response,
+# while this small contract is reliable and can be joined point-in-time by
+# ts_code/ann_date/end_date.
+FINA_INDICATOR_NONDEFAULT_FIELDS = (
     "ts_code",
     "ann_date",
     "end_date",
-    "eps",
-    "dt_eps",
-    "total_revenue_ps",
-    "revenue_ps",
-    "capital_rese_ps",
-    "surplus_rese_ps",
-    "undist_profit_ps",
-    "extra_item",
-    "profit_dedt",
-    "gross_margin",
-    "current_ratio",
-    "quick_ratio",
-    "cash_ratio",
+    "q_profit_yoy",
     "inv_turn",
-    "ar_turn",
-    "ca_turn",
-    "fa_turn",
-    "assets_turn",
-    "op_income",
-    "ebit",
-    "ebitda",
-    "fcff",
-    "fcfe",
-    "current_exint",
-    "noncurrent_exint",
-    "interestdebt",
-    "netdebt",
-    "tangible_asset",
-    "working_capital",
-    "networking_capital",
-    "invest_capital",
-    "retained_earnings",
-    "diluted2_eps",
-    "bps",
-    "ocfps",
-    "retainedps",
-    "cfps",
-    "ebit_ps",
-    "fcff_ps",
-    "fcfe_ps",
-    "netprofit_margin",
-    "grossprofit_margin",
-    "cogs_of_sales",
-    "expense_of_sales",
-    "profit_to_gr",
-    "saleexp_to_gr",
-    "adminexp_of_gr",
-    "finaexp_of_gr",
-    "impai_ttm",
-    "gc_of_gr",
-    "op_of_gr",
-    "ebit_of_gr",
-    "roe",
-    "roe_waa",
-    "roe_dt",
-    "roa",
-    "npta",
-    "roic",
-    "roe_yearly",
-    "roa2_yearly",
     "salescash_to_or",
     "ocf_to_or",
     "ocf_to_profit",
-    "debt_to_assets",
-    "assets_to_eqt",
-    "dp_assets_to_eqt",
-    "ca_to_assets",
-    "nca_to_assets",
-    "tbassets_to_totalassets",
-    "int_to_talcap",
-    "eqt_to_talcapital",
-    "currentdebt_to_debt",
-    "longdeb_to_debt",
-    "ocf_to_shortdebt",
-    "debt_to_eqt",
-    "eqt_to_debt",
-    "eqt_to_interestdebt",
-    "tangibleasset_to_debt",
-    "tangasset_to_intdebt",
-    "tangibleasset_to_netdebt",
-    "ocf_to_debt",
-    "turn_days",
-    "roa_yearly",
-    "roa_dp",
-    "fixed_assets",
-    "profit_to_op",
-    "q_saleexp_to_gr",
-    "q_gc_to_gr",
-    "q_roe",
-    "q_dt_roe",
-    "q_npta",
-    "q_ocf_to_sales",
-    "q_profit_yoy",
-    "basic_eps_yoy",
-    "dt_eps_yoy",
-    "cfps_yoy",
-    "op_yoy",
-    "ebt_yoy",
-    "netprofit_yoy",
-    "dt_netprofit_yoy",
-    "ocf_yoy",
-    "roe_yoy",
-    "bps_yoy",
-    "assets_yoy",
-    "eqt_yoy",
-    "tr_yoy",
-    "or_yoy",
-    "q_sales_yoy",
-    "q_op_qoq",
-    "equity_yoy",
     "update_flag",
 )
-FINA_INDICATOR_FIELD_CONTRACT = "fina-indicator-explicit-fields-v1"
+FINA_INDICATOR_FIELD_CONTRACT = "fina-indicator-nondefault-fields-v1"
 _PAGINATION_MAX_PAGES = {
     "index_basic": 16,
     # These are safety ceilings, not pre-planned page counts.  The CLI starts
@@ -168,6 +63,7 @@ _PAGINATION_MAX_PAGES = {
     "balancesheet": 64,
     "cashflow": 64,
     "fina_indicator": 64,
+    "fina_indicator_nondefault": 64,
     "forecast": 64,
     "express": 64,
     "namechange": 64,
@@ -856,32 +752,34 @@ def a_share_bulk_history_specs(*, start: date, end: date, max_attempts: int) -> 
             ("forecast", "forecast_vip"),
             ("express", "express_vip"),
         ):
-            legacy_page_group = f"{dataset}:{period}"
-            page_group = legacy_page_group
-            fields: tuple[str, ...] = ()
-            partition: dict[str, Any] | None = None
-            if dataset == "fina_indicator":
-                page_group = f"{legacy_page_group}:{FINA_INDICATOR_FIELD_CONTRACT}"
-                fields = FINA_INDICATOR_EXPLICIT_FIELDS
-                partition = {
-                    "field_contract": FINA_INDICATOR_FIELD_CONTRACT,
-                    "supersedes_page_group": legacy_page_group,
-                }
             specs.extend(
                 _paged_specs(
                     dataset,
                     api_name,
                     {"period": period},
-                    group=page_group,
+                    group=f"{dataset}:{period}",
                     page_size=1_000,
                     max_pages=_PAGINATION_MAX_PAGES[dataset],
                     max_attempts=max_attempts,
-                    fields=fields,
                     expected_date_field="end_date",
                     expected_date=period,
-                    partition=partition,
                 )
             )
+        specs.extend(
+            _paged_specs(
+                "fina_indicator_nondefault",
+                "fina_indicator_vip",
+                {"period": period},
+                group=f"fina_indicator_nondefault:{period}:{FINA_INDICATOR_FIELD_CONTRACT}",
+                page_size=1_000,
+                max_pages=_PAGINATION_MAX_PAGES["fina_indicator_nondefault"],
+                max_attempts=max_attempts,
+                fields=FINA_INDICATOR_NONDEFAULT_FIELDS,
+                expected_date_field="end_date",
+                expected_date=period,
+                partition={"field_contract": FINA_INDICATOR_FIELD_CONTRACT},
+            )
+        )
 
     for dataset in ("namechange", "repurchase", "share_float", "stk_holdertrade"):
         history_range = clip_history_range(dataset, start, end)

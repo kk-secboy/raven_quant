@@ -306,6 +306,7 @@ def test_adds_point_in_time_research_features_without_announcement_leakage(
         "daily_basic": "same_trade_date_after_close",
         "moneyflow": "same_trade_date_after_close",
         "fina_indicator": "strictly_after_announcement_date",
+        "fina_indicator_nondefault": "strictly_after_announcement_date",
         "income": "strictly_after_announcement_date",
         "balancesheet": "strictly_after_announcement_date",
         "cashflow": "strictly_after_announcement_date",
@@ -316,6 +317,7 @@ def test_adds_point_in_time_research_features_without_announcement_leakage(
         "daily_basic": "native_history",
         "moneyflow": "native_history",
         "fina_indicator": "native_history",
+        "fina_indicator_nondefault": "native_history",
         "income": "native_history",
         "balancesheet": "native_history",
         "cashflow": "native_history",
@@ -1007,6 +1009,34 @@ def _write_revision_fixture(
     fina_rows: list[dict],
     daily_days: tuple[str, ...] = ("2024-01-02",),
 ) -> None:
+    companion_fields = {
+        "q_profit_yoy",
+        "inv_turn",
+        "ocf_to_or",
+        "ocf_to_profit",
+        "salescash_to_or",
+    }
+    companion_keys = {
+        "ts_code",
+        "ann_date",
+        "end_date",
+        "f_ann_date",
+        "update_flag",
+        "ingested_at",
+    }
+    default_fina_rows = [
+        {key: value for key, value in row.items() if key not in companion_fields}
+        for row in fina_rows
+    ]
+    companion_rows = [
+        {
+            key: value
+            for key, value in row.items()
+            if key in companion_keys or key in companion_fields
+        }
+        for row in fina_rows
+        if companion_fields.intersection(row)
+    ]
     rows = [
         {
             "ts_code": "000001.SZ",
@@ -1044,8 +1074,10 @@ def _write_revision_fixture(
             }
             for row in rows
         ],
-        "fina_indicator": fina_rows,
+        "fina_indicator": default_fina_rows,
     }
+    if companion_rows:
+        fixtures["fina_indicator_nondefault"] = companion_rows
     for dataset, data in fixtures.items():
         target = snapshot / "parquet" / dataset / "partition_year=2024"
         target.mkdir(parents=True)
@@ -1211,6 +1243,7 @@ _EXTENDED_FINA_ROW = {
     "roic": 9.5,
     "netprofit_margin": 21.0,
     "assets_turn": 0.8,
+    "q_profit_yoy": 22.0,
     "inv_turn": 5.2,
     "ar_turn": 7.6,
     "quick_ratio": 1.3,
@@ -1235,6 +1268,7 @@ _EXTENDED_FUND_TARGETS = {
     "fund_roic": 9.5,
     "fund_netprofit_margin": 21.0,
     "fund_assets_turnover": 0.8,
+    "fund_quarter_profit_yoy": 22.0,
     "fund_inventory_turnover": 5.2,
     "fund_receivables_turnover": 7.6,
     "fund_quick_ratio": 1.3,
@@ -1303,14 +1337,14 @@ def test_contract_distinguishes_missing_from_all_null_source_columns(
         builder = QlibBuilder(snapshot)
 
     contract = builder.research_feature_contract
-    assert contract["version"] == 5
-    # The Tushare non-default columns the downloader never receives are
-    # reported as missing source columns instead of being silently skipped.
-    missing = contract["missing_fundamental_fields"]["fina_indicator"]
+    assert contract["version"] == 6
+    # A Tushare non-default column omitted by the companion response is
+    # reported as missing instead of being silently skipped.
+    missing = contract["missing_fundamental_fields"]["fina_indicator_nondefault"]
     assert missing["q_profit_yoy"] == "fund_quarter_profit_yoy"
     assert "ocf_to_or" not in missing
     # A column that exists but holds no non-null value is a distinct class.
-    assert contract["all_null_fundamental_fields"]["fina_indicator"] == {
+    assert contract["all_null_fundamental_fields"]["fina_indicator_nondefault"] == {
         "ocf_to_or": "fund_ocf_to_revenue"
     }
     # Missing sources stay out of the injected fields; all-null sources keep

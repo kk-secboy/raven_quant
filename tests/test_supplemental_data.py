@@ -235,14 +235,21 @@ def test_a_share_financial_history_includes_four_quarters_before_start() -> None
     assert periods == {"20230331", "20230630", "20230930", "20231231"}
 
 
-def test_fina_indicator_requests_explicit_research_fields_and_replaces_legacy_pages() -> None:
+def test_fina_indicator_requests_nondefault_research_fields_as_companion_pages() -> None:
     specs = a_share_bulk_history_specs(
         start=date(2024, 1, 1),
         end=date(2024, 1, 2),
         max_attempts=3,
     )
-    indicators = [spec for spec in specs if spec.dataset == "fina_indicator"]
+    defaults = [spec for spec in specs if spec.dataset == "fina_indicator"]
+    indicators = [spec for spec in specs if spec.dataset == "fina_indicator_nondefault"]
 
+    assert defaults
+    assert all(not spec.fields for spec in defaults)
+    assert all(
+        spec.scope["page_group"] == f"fina_indicator:{spec.params['period']}"
+        for spec in defaults
+    )
     assert indicators
     required = {
         "q_profit_yoy",
@@ -253,13 +260,16 @@ def test_fina_indicator_requests_explicit_research_fields_and_replaces_legacy_pa
     }
     for spec in indicators:
         period = spec.params["period"]
-        legacy_group = f"fina_indicator:{period}"
-        assert required <= set(spec.fields)
-        assert {"ts_code", "ann_date", "end_date", "update_flag"} <= set(spec.fields)
-        assert spec.scope["field_contract"] == "fina-indicator-explicit-fields-v1"
-        assert spec.scope["supersedes_page_group"] == legacy_group
+        assert set(spec.fields) == {
+            "ts_code",
+            "ann_date",
+            "end_date",
+            "update_flag",
+            *required,
+        }
+        assert spec.scope["field_contract"] == "fina-indicator-nondefault-fields-v1"
         assert spec.scope["page_group"] == (
-            f"{legacy_group}:fina-indicator-explicit-fields-v1"
+            f"fina_indicator_nondefault:{period}:fina-indicator-nondefault-fields-v1"
         )
 
     first = indicators[0]
@@ -270,9 +280,6 @@ def test_fina_indicator_requests_explicit_research_fields_and_replaces_legacy_pa
     assert len(following) == 1
     assert following[0].fields == first.fields
     assert following[0].scope["field_contract"] == first.scope["field_contract"]
-    assert following[0].scope["supersedes_page_group"] == (
-        first.scope["supersedes_page_group"]
-    )
 
 
 def test_a_share_event_history_clips_only_datasets_with_documented_bounds() -> None:

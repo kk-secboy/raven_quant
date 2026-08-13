@@ -74,6 +74,9 @@ AVAILABILITY_POLICIES: dict[str, AvailabilityPolicy] = {
     "balancesheet": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("ann_date",)),
     "cashflow": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("ann_date",)),
     "fina_indicator": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("ann_date",)),
+    "fina_indicator_nondefault": AvailabilityPolicy(
+        STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("ann_date",)
+    ),
     "forecast": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("ann_date",)),
     "express": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("ann_date",)),
     # Trade-date-derived market fields are known after that session closes.
@@ -171,6 +174,7 @@ RECOVERABILITY_LEVELS: dict[str, str] = {
     "balancesheet": NATIVE_HISTORY,
     "cashflow": NATIVE_HISTORY,
     "fina_indicator": NATIVE_HISTORY,
+    "fina_indicator_nondefault": NATIVE_HISTORY,
     "forecast": NATIVE_HISTORY,
     "express": NATIVE_HISTORY,
     # Announcement/event series keyed by announcement or period date.

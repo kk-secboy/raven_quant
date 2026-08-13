@@ -159,6 +159,13 @@ FUNDAMENTALS: tuple[DatasetDefinition, ...] = (
     DatasetDefinition("balancesheet", "balancesheet", allow_empty=True, date_field="ann_date"),
     DatasetDefinition("cashflow", "cashflow", allow_empty=True, date_field="ann_date"),
     DatasetDefinition("fina_indicator", "fina_indicator", allow_empty=True, date_field="ann_date"),
+    DatasetDefinition(
+        "fina_indicator_nondefault",
+        "fina_indicator_vip",
+        allow_empty=True,
+        date_field="ann_date",
+        primary_key=("ts_code", "ann_date", "end_date", "update_flag"),
+    ),
     DatasetDefinition("forecast", "forecast", allow_empty=True, date_field="ann_date"),
     DatasetDefinition("express", "express", allow_empty=True, date_field="ann_date"),
 )

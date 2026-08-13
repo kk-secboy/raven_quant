@@ -112,9 +112,9 @@ _CAPITAL_FLOW_FIELD_UNITS = {
 #
 # q_profit_yoy, inv_turn, ocf_to_or, ocf_to_profit and salescash_to_or are
 # documented Tushare fina_indicator output columns (doc_id=79) but flagged
-# non-default there. The downloader therefore uses an explicit, versioned
-# fina_indicator field contract; the build-time coverage diagnostics below
-# still fail closed if a relay omits any requested source column.
+# non-default there. The downloader therefore stores a narrow, versioned
+# companion dataset and joins it through the same announcement-date ASOF
+# channel; diagnostics still fail closed if the relay omits a requested field.
 _FUNDAMENTAL_RESEARCH_FIELDS = {
     "fina_indicator": {
         "roe": "fund_roe",
@@ -125,7 +125,6 @@ _FUNDAMENTAL_RESEARCH_FIELDS = {
         "or_yoy": "fund_revenue_yoy",
         "netprofit_yoy": "fund_netprofit_yoy",
         "q_sales_yoy": "fund_quarter_revenue_yoy",
-        "q_profit_yoy": "fund_quarter_profit_yoy",
         "eps": "fund_eps",
         "bps": "fund_bps",
         "ocfps": "fund_ocfps",
@@ -134,7 +133,6 @@ _FUNDAMENTAL_RESEARCH_FIELDS = {
         "roic": "fund_roic",
         "netprofit_margin": "fund_netprofit_margin",
         "assets_turn": "fund_assets_turnover",
-        "inv_turn": "fund_inventory_turnover",
         "ar_turn": "fund_receivables_turnover",
         "quick_ratio": "fund_quick_ratio",
         "debt_to_eqt": "fund_debt_to_equity",
@@ -143,10 +141,14 @@ _FUNDAMENTAL_RESEARCH_FIELDS = {
         "finaexp_of_gr": "fund_finance_expense_ratio",
         "op_yoy": "fund_op_profit_yoy",
         "equity_yoy": "fund_equity_yoy",
+        "interestdebt": "fund_interest_debt",
+    },
+    "fina_indicator_nondefault": {
+        "q_profit_yoy": "fund_quarter_profit_yoy",
+        "inv_turn": "fund_inventory_turnover",
         "ocf_to_or": "fund_ocf_to_revenue",
         "ocf_to_profit": "fund_ocf_to_profit",
         "salescash_to_or": "fund_sales_cash_to_revenue",
-        "interestdebt": "fund_interest_debt",
     },
     "income": {
         "n_income_attr_p": "fund_net_profit",
@@ -1585,10 +1587,14 @@ class QlibBuilder:
         # Version 5: evidence-grade moneyflow rows add a compact capital-flow
         # channel (CNY net amount, turnover-scaled net ratio and large-order
         # imbalance) with the same after-close PIT semantics as daily_basic.
+        # Version 6: non-default fina_indicator columns are sourced from a
+        # narrow companion dataset because the relay rejects an all-field
+        # cross-section request; both use the same announcement-date policy.
         availability_datasets = (
             "daily_basic",
             "moneyflow",
             "fina_indicator",
+            "fina_indicator_nondefault",
             "income",
             "balancesheet",
             "cashflow",
@@ -1596,7 +1602,7 @@ class QlibBuilder:
             "index_member_all",
         )
         return {
-            "version": 5,
+            "version": 6,
             "daily_fields": daily_fields,
             "fundamental_fields": fundamental_fields,
             "capital_flow_fields": capital_flow_fields,
