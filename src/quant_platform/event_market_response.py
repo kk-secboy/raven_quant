@@ -360,8 +360,14 @@ def _read_partition_years(dataset_dir: Path, years: set[int]) -> pd.DataFrame:
 
 def _validated_logic_source(
     manifest_path: Path, *, prompt_version: str
-) -> tuple[dict[str, Any], str]:
-    """Return a checksum-verified logic manifest and its bound model."""
+) -> tuple[dict[str, Any], str, tuple[str, ...]]:
+    """Return a checksum-verified logic manifest and its bound model set.
+
+    Checkpoint reuse can legitimately combine rows produced by multiple
+    governed models.  The factor manifest binds those rows with both a
+    canonical ``mixed[...]`` label and the exact list in ``scope.models``.
+    Validate that binding and return the concrete models for field selection.
+    """
 
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -370,12 +376,29 @@ def _validated_logic_source(
     source = manifest.get("source")
     artifact_name = manifest.get("artifact")
     expected_sha256 = manifest.get("sha256")
+    model = str(source.get("model") or "").strip() if isinstance(source, dict) else ""
+    scope = source.get("scope") if isinstance(source, dict) else None
+    if model.startswith("mixed[") and model.endswith("]"):
+        raw_models = scope.get("models") if isinstance(scope, dict) else None
+        models = tuple(
+            sorted(
+                {
+                    str(value).strip()
+                    for value in raw_models or []
+                    if str(value).strip()
+                }
+            )
+        )
+        model_binding_valid = len(models) > 1 and model == f"mixed[{','.join(models)}]"
+    else:
+        models = (model,) if model else ()
+        model_binding_valid = bool(models)
     if (
         manifest.get("factor") != LOGIC_FACTOR_NAME
         or not isinstance(source, dict)
         or source.get("dataset") != "announcement_nlp_fields"
         or source.get("prompt_version") != prompt_version
-        or not str(source.get("model") or "").strip()
+        or not model_binding_valid
         or not isinstance(artifact_name, str)
         or Path(artifact_name).name != artifact_name
         or not isinstance(expected_sha256, str)
@@ -386,7 +409,7 @@ def _validated_logic_source(
     artifact_path = manifest_path.parent / artifact_name
     if not artifact_path.is_file() or _sha256_file(artifact_path) != expected_sha256:
         raise RuntimeError("governed logic factor artifact failed checksum verification")
-    return manifest, str(source["model"])
+    return manifest, model, models
 
 
 def process_event_market_response(
@@ -422,7 +445,7 @@ def process_event_market_response(
         raise RuntimeError(
             f"governed logic factor manifest is unavailable at {logic_manifest_path}"
         )
-    _, model = _validated_logic_source(
+    _, model, models = _validated_logic_source(
         logic_manifest_path, prompt_version=prompt_version
     )
     fields = pd.read_parquet(fields_path)
@@ -431,7 +454,7 @@ def process_event_market_response(
     )
     fields = fields[
         (fields["prompt_version"].astype(str) == prompt_version)
-        & (fields["model"].astype(str) == model)
+        & (fields["model"].astype(str).isin(models))
     ].copy()
     if fields.empty:
         raise RuntimeError(
@@ -466,5 +489,6 @@ def process_event_market_response(
             "logic_factor_manifest_sha256": _sha256_file(logic_manifest_path),
             "prompt_version": prompt_version,
             "model": model,
+            "models": list(models),
         },
     )

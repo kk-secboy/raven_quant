@@ -11,6 +11,7 @@ import pytest
 from quant_platform.announcement_nlp import LOGIC_FACTOR_NAME, PROMPT_VERSION
 from quant_platform.event_market_response import (
     LABEL_ROLE,
+    _validated_logic_source,
     build_event_market_response_labels,
     process_event_market_response,
     write_event_market_response_labels,
@@ -164,6 +165,40 @@ def test_manifest_marks_artifact_as_training_label_only(tmp_path: Path) -> None:
     ]
 
 
+def test_logic_source_resolves_checksum_bound_mixed_models(tmp_path: Path) -> None:
+    artifact = tmp_path / f"{LOGIC_FACTOR_NAME}.parquet"
+    artifact.write_bytes(b"governed-mixed-model-artifact")
+    manifest_path = tmp_path / f"{LOGIC_FACTOR_NAME}.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "factor": LOGIC_FACTOR_NAME,
+                "artifact": artifact.name,
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "source": {
+                    "dataset": "announcement_nlp_fields",
+                    "prompt_version": PROMPT_VERSION,
+                    "model": "mixed[model-a,model-b]",
+                    "scope": {"models": ["model-b", "model-a"]},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _, model, models = _validated_logic_source(
+        manifest_path, prompt_version=PROMPT_VERSION
+    )
+    assert model == "mixed[model-a,model-b]"
+    assert models == ("model-a", "model-b")
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["source"]["model"] = "mixed[model-a,model-c]"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="incompatible source"):
+        _validated_logic_source(manifest_path, prompt_version=PROMPT_VERSION)
+
+
 def test_process_requires_verified_snapshot_and_binds_source_hashes(tmp_path: Path) -> None:
     snapshot_name = "cn-fixture"
     snapshot = tmp_path / "snapshots" / snapshot_name
@@ -213,6 +248,7 @@ def test_process_requires_verified_snapshot_and_binds_source_hashes(tmp_path: Pa
     assert len(manifest["source"]["snapshot_manifest_sha256"]) == 64
     assert manifest["source"]["prompt_version"] == PROMPT_VERSION
     assert manifest["source"]["model"] == "test-model"
+    assert manifest["source"]["models"] == ["test-model"]
     assert len(manifest["source"]["logic_factor_manifest_sha256"]) == 64
 
     logic_artifact_path.write_bytes(b"tampered")
