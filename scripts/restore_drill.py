@@ -46,7 +46,12 @@ def _timestamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _write_env(path: Path, password: str, secret_key: str) -> None:
+def _write_env(
+    path: Path,
+    password: str,
+    secret_key: str,
+    data_host_path: Path,
+) -> None:
     path.write_text(
         "\n".join(
             (
@@ -62,6 +67,7 @@ def _write_env(path: Path, password: str, secret_key: str) -> None:
                 "RDAGENT_ENABLED=true",
                 "REQUESTS_PER_MINUTE=118",
                 "DOWNLOAD_WORKERS=2",
+                f"QUANTLAB_DATA_HOST_PATH={data_host_path.resolve()}",
             )
         )
         + "\n",
@@ -142,6 +148,10 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
             source_env = scratch / "source.env"
             target_env = scratch / "target.env"
             backup_root = scratch / "backups"
+            source_data = scratch / "source-data"
+            target_data = scratch / "target-data"
+            source_data.mkdir()
+            target_data.mkdir()
             password = secrets.token_urlsafe(32)
             secret_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
             runtime_secret_ciphertext = (
@@ -149,8 +159,8 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                 .encrypt(json.dumps({"sentinel": sentinel}, separators=(",", ":")).encode("utf-8"))
                 .decode("ascii")
             )
-            _write_env(source_env, password, secret_key)
-            _write_env(target_env, password, secret_key)
+            _write_env(source_env, password, secret_key, source_data)
+            _write_env(target_env, password, secret_key, target_data)
             source = compose_context(source_name, source_env, compose_file, (override_file,))
             target = compose_context(target_name, target_env, compose_file, (override_file,))
 
@@ -251,7 +261,8 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                     f"'{sentinel}{sentinel}', '{sentinel}{sentinel}', "
                     "'daily-qlib-field-v3-cny-amount', "
                     f"'{sentinel}{sentinel}', '{sentinel}{sentinel}', "
-                    "'minute-qlib-execution-v4-source-units', 'ashare-minute-simulation-v2', "
+                    "'minute-qlib-execution-v5-daily-source-evidence', "
+                    "'ashare-minute-simulation-v2', "
                     "'cn-effective-cost-v1', '{\"execution_algorithm\":\"twap\"}'::jsonb, "
                     "'restore-drill', now(), now());"
                     "INSERT INTO quantlab.simulation_batches "

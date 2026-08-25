@@ -48,9 +48,17 @@ def test_a_share_five_minute_uses_a_150_session_budget() -> None:
         freq="5min",
     )
 
-    assert len(first) == 1
-    assert len(second) == 2
-    assert second[0].params["end_date"].startswith(dates[149][:4] + "-")
+    assert len(first) == 3
+    assert len(second) == 3
+    assert {spec.unit_key for spec in first[:2]} <= {
+        spec.unit_key for spec in second
+    }
+    assert second[-1].params["end_date"].startswith(dates[-1][:4] + "-")
+    session_dates = [datetime.strptime(value, "%Y%m%d").date() for value in dates]
+    for spec in [*first, *second]:
+        window_start = datetime.fromisoformat(spec.params["start_date"]).date()
+        window_end = datetime.fromisoformat(spec.params["end_date"]).date()
+        assert sum(window_start <= value <= window_end for value in session_dates) <= 150
 
 
 def test_minute_cap_bisects_dates_without_overlap() -> None:

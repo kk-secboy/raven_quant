@@ -9,8 +9,10 @@ from quant_data.config import Settings
 from .autonomous_research import AutonomousResearchOrchestrator
 from .parameter_experiments import split_research_period
 from .research_automation import (
-    derive_rolling_research_periods,
+    MINIMUM_PROFILE_TRAINING_DAYS,
+    RESEARCH_EVALUATION_PROFILES,
     normalize_research_schedule_payload,
+    resolve_research_periods,
     select_latest_program_dataset,
 )
 from .research_program_store import ResearchProgramStore
@@ -100,41 +102,29 @@ class ContinuousResearchController:
             return "deferred"
 
         calendar = self._calendar(dataset)
+        template = program["config"]
+        windows = template["window_days"]
+        test_days = int(windows["test"])
         last_end = program.get("last_dataset_end_date")
         if last_end:
             new_days = sum(day > str(last_end) for day in calendar)
-            if new_days < int(program["min_new_trading_days"]):
+            required_new_days = max(test_days, int(program["min_new_trading_days"]))
+            if new_days < required_new_days:
                 self.programs.checked(
                     program["id"],
                     message=(
-                        f"同血缘仅新增 {new_days} 个交易日；达到 "
-                        f"{program['min_new_trading_days']} 日后再研究"
+                        f"同血缘仅新增 {new_days} 个交易日；完整的新最终样本外窗口需要 "
+                        f"{required_new_days} 日"
                     ),
                     delay_seconds=300,
                 )
                 return "deferred"
 
-        template = program["config"]
-        windows = template["window_days"]
-        embargo_days = int(
-            template["strategy_config"].get("outer_embargo_days") or 5
+        embargo_days = int(template["strategy_config"].get("outer_embargo_days") or 5)
+        profile_history_days = MINIMUM_PROFILE_TRAINING_DAYS + max(
+            int(item["validation_trading_days"]) for item in RESEARCH_EVALUATION_PROFILES
         )
-        if int(windows["train"]) + int(windows["validation"]) < 2520:
-            self.programs.checked(
-                program["id"],
-                message=(
-                    "研究计划的预最终历史少于 2520 个交易日；"
-                    "必须创建符合十年历史门槛的新计划"
-                ),
-                delay_seconds=3600,
-            )
-            return "deferred"
-        required_days = (
-            int(windows["train"])
-            + int(windows["validation"])
-            + embargo_days
-            + int(windows["test"])
-        )
+        required_days = profile_history_days + embargo_days + test_days
         if len(calendar) < required_days:
             self.programs.checked(
                 program["id"],
@@ -145,13 +135,24 @@ class ContinuousResearchController:
                 delay_seconds=3600,
             )
             return "deferred"
-        periods = derive_rolling_research_periods(
+        period_policy = {
+            "test_trading_days": test_days,
+            "embargo_trading_days": embargo_days,
+        }
+        periods, period_resolution = resolve_research_periods(
             calendar,
-            train_days=int(windows["train"]),
-            validation_days=int(windows["validation"]),
-            test_days=int(windows["test"]),
-            embargo_days=embargo_days,
+            period_policy=period_policy,
         )
+        if last_end and periods["test_start"] <= str(last_end):
+            self.programs.checked(
+                program["id"],
+                message=(
+                    "新的最终样本外窗口仍与上次研究重叠；等待完整的新窗口后再研究"
+                ),
+                delay_seconds=300,
+            )
+            return "deferred"
+        period_resolution["dataset_identity_sha256"] = identity
         research = normalize_research_schedule_payload(
             {
                 "objective": program["objective"],
@@ -159,14 +160,18 @@ class ContinuousResearchController:
                 "loop_n": template["loop_n"],
                 "duration": template["duration"],
                 "requested_by": f"research-program:{program['id']}",
+                "period_mode": "explicit",
                 "periods": periods,
             },
             max_loops=self.settings.rdagent_max_loops,
+            max_duration=self.settings.rdagent_max_duration,
+            allow_explicit_periods=True,
         )
         valid_start = date.fromisoformat(periods["valid_start"])
         valid_end = date.fromisoformat(periods["valid_end"])
         config = {
             "research": research,
+            "period_resolution": period_resolution,
             "strategy_config": template["strategy_config"],
             "backtest_periods": {
                 "start": periods["test_start"],

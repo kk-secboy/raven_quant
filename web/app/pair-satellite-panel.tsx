@@ -68,6 +68,19 @@ function strategyTitle(strategy: Strategy, version: StrategyVersion) {
   return legs ? `${strategy.name} · ${legs}` : strategy.name;
 }
 
+async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await apiFetch(url, init);
+  const body: unknown = await response.json();
+  if (!response.ok) {
+    const detail =
+      body && typeof body === "object" && "detail" in body
+        ? String((body as { detail: unknown }).detail)
+        : `HTTP ${response.status}`;
+    throw new Error(detail);
+  }
+  return body as T;
+}
+
 export function PairSatellitePanel({ api }: { api: string }) {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [backtests, setBacktests] = useState<Backtest[]>([]);
@@ -90,10 +103,10 @@ export function PairSatellitePanel({ api }: { api: string }) {
 
   async function load() {
     const [strategyRows, backtestRows, datasetRows, snapshotRows] = await Promise.all([
-      apiFetch<Strategy[]>(api, "/api/strategies"),
-      apiFetch<Backtest[]>(api, "/api/backtests"),
-      apiFetch<Dataset[]>(api, "/api/qlib/datasets"),
-      apiFetch<Snapshot[]>(api, "/api/snapshots"),
+      requestJson<Strategy[]>(`${api}/api/strategies`),
+      requestJson<Backtest[]>(`${api}/api/backtests`),
+      requestJson<Dataset[]>(`${api}/api/qlib/datasets`),
+      requestJson<Snapshot[]>(`${api}/api/snapshots`),
     ]);
     const pairRows = strategyRows.filter((strategy) =>
       strategy.versions.some((version) => Boolean(version.spec_json?.pair)),
@@ -145,7 +158,7 @@ export function PairSatellitePanel({ api }: { api: string }) {
     setBusy(true);
     setMessage("");
     try {
-      await apiFetch(api, "/api/pair-strategies", {
+      await requestJson<unknown>(`${api}/api/pair-strategies`, {
         method: "POST",
         body: JSON.stringify({
           name,
@@ -171,7 +184,7 @@ export function PairSatellitePanel({ api }: { api: string }) {
     setBusy(true);
     setMessage("");
     try {
-      await apiFetch(api, `/api/strategy-versions/${selectedVersion}/pair-backtests/`, {
+      await requestJson<unknown>(`${api}/api/strategy-versions/${selectedVersion}/pair-backtests/`, {
         method: "POST",
         body: JSON.stringify({
           start_date: startDate,

@@ -20,7 +20,22 @@ def main() -> None:
     parser.add_argument(
         "--compose-file", type=Path, default=PROJECT_ROOT / "deploy" / "compose.yaml"
     )
+    parser.add_argument(
+        "--profile",
+        action="append",
+        choices=("gpu",),
+        default=[],
+        help="Enable an optional production Compose profile (repeatable).",
+    )
     parser.add_argument("--backup-root", type=Path, required=True)
+    parser.add_argument(
+        "--reuse-backup",
+        type=Path,
+        help=(
+            "Reuse only the verified backup that owns the current live rollback "
+            "contract; arbitrary older backups are rejected"
+        ),
+    )
     parser.add_argument("--retention-count", type=int, default=14)
     parser.add_argument("--rollback-image-retention", type=int, default=3)
     parser.add_argument("--minimum-free-gb", type=float, default=20.0)
@@ -33,7 +48,12 @@ def main() -> None:
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
 
-    context = compose_context(args.project_name, args.env_file, args.compose_file)
+    context = compose_context(
+        args.project_name,
+        args.env_file,
+        args.compose_file,
+        profiles=args.profile,
+    )
     result = run_release_upgrade(
         context,
         PROJECT_ROOT,
@@ -44,6 +64,7 @@ def main() -> None:
         wait_timeout=args.wait_timeout,
         pull_images=args.pull,
         rollback_image_retention=args.rollback_image_retention,
+        reuse_backup=args.reuse_backup,
     )
     output = json.dumps(result, ensure_ascii=False, indent=2)
     report = args.report

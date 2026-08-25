@@ -3,16 +3,19 @@ from datetime import date
 from types import SimpleNamespace
 
 import pytest
+import typer
 
 from quant_data.cli import (
     _exclude_superseded_specs,
     _reconcile_range_plan,
+    _require_selected_plan_complete,
     _supersede_unplanned_range_units,
     _supersede_unsupported_governance_units,
     _supersede_unsupported_research_units,
     ashare_5m,
     bootstrap,
     snapshot,
+    verify,
 )
 from quant_data.coverage_data import (
     COVERAGE_BUNDLES,
@@ -46,6 +49,9 @@ class _CheckpointStub:
         self.superseded_keys = superseded_keys or set()
 
     def successful(self, dataset: str) -> list[dict]:
+        return []
+
+    def unit_rows(self, _unit_keys) -> list[dict]:
         return []
 
     def unfinished_units(self, dataset: str) -> list[dict]:
@@ -95,10 +101,107 @@ def test_range_plan_classifies_specs_without_quadratic_equality_scans(
     assert _CountingRangeSpec.comparisons == 0
 
 
-def test_scoped_quality_gate_is_applied_only_to_ashare_5m_command() -> None:
-    assert "dataset_filter=" in inspect.getsource(ashare_5m)
-    assert "dataset_filter=" not in inspect.getsource(bootstrap)
-    assert "dataset_filter=" not in inspect.getsource(snapshot)
+def test_scoped_quality_gate_is_explicit_for_bounded_download_commands() -> None:
+    ashare_source = inspect.getsource(ashare_5m)
+    assert '"ashare_5m": rows' in ashare_source
+    assert '"stk_limit": price_limit_rows' in ashare_source
+    assert "_explicit_execution_quality_gate(" in ashare_source
+    assert "selected=execution_selected" in ashare_source
+    assert "dataset_filter=" in inspect.getsource(bootstrap)
+    assert "dataset_filter=" in inspect.getsource(snapshot)
+
+
+def test_publication_commands_keep_strict_plan_gates_and_source_defaults() -> None:
+    assert inspect.signature(bootstrap).parameters["start"].default == "2016-01-01"
+    assert inspect.signature(bootstrap).parameters["snapshot_start"].default == "2008-01-01"
+    assert inspect.signature(snapshot).parameters["start"].default == "2008-01-01"
+    assert "require_all_planned=True" in inspect.getsource(bootstrap)
+    assert "require_all_planned=True" in inspect.getsource(verify)
+    snapshot_source = inspect.getsource(snapshot)
+    assert "require_all_planned=True" in snapshot_source
+    assert "raise typer.Exit(3)" in snapshot_source
+
+
+@pytest.mark.parametrize("invalid_start", ["2015-12-31", "2018-01-01"])
+def test_full_bootstrap_requires_exact_primary_history_boundary(invalid_start: str) -> None:
+    with pytest.raises(typer.BadParameter, match="must equal 2016-01-01"):
+        bootstrap(
+            profile="core",
+            start=invalid_start,
+            snapshot_start="2008-01-01",
+            end="2016-01-04",
+            snapshot_name=None,
+            build_qlib=False,
+            download_only=True,
+        )
+
+
+def test_selected_bootstrap_plan_rejects_pending_and_terminal_failures() -> None:
+    class Checkpoint:
+        @staticmethod
+        def active_units(datasets: set[str] | None = None) -> list[dict]:
+            rows = [
+                {
+                    "unit_key": "daily-succeeded",
+                    "dataset": "daily",
+                    "scope_json": {"trade_date": "20240102"},
+                    "params_json": {},
+                    "status": "succeeded",
+                    "row_count": 1,
+                },
+                {
+                    "unit_key": "daily-pending",
+                    "dataset": "daily",
+                    "scope_json": {"trade_date": "20240103"},
+                    "params_json": {},
+                    "status": "pending",
+                    "row_count": None,
+                },
+                {
+                    "unit_key": "daily-failed",
+                    "dataset": "daily",
+                    "scope_json": {"trade_date": "20240104"},
+                    "params_json": {},
+                    "status": "failed",
+                    "row_count": None,
+                },
+                {
+                    "unit_key": "unrelated-failed",
+                    "dataset": "unrelated",
+                    "scope_json": {"trade_date": "20240104"},
+                    "params_json": {},
+                    "status": "failed",
+                    "row_count": None,
+                },
+            ]
+            return [
+                row
+                for row in rows
+                if datasets is None or str(row["dataset"]) in datasets
+            ]
+
+    context = SimpleNamespace(checkpoint=Checkpoint())
+    with pytest.raises(typer.Exit) as raised:
+        _require_selected_plan_complete(
+            context,
+            {"daily"},
+            label="test plan",
+            snapshot_start=date(2024, 1, 1),
+            snapshot_end=date(2024, 12, 31),
+            required_datasets={"daily"},
+        )
+    assert raised.value.exit_code == 2
+
+    with pytest.raises(typer.Exit) as missing:
+        _require_selected_plan_complete(
+            context,
+            {"missing"},
+            label="empty plan",
+            snapshot_start=date(2024, 1, 1),
+            snapshot_end=date(2024, 12, 31),
+            required_datasets={"missing"},
+        )
+    assert missing.value.exit_code == 2
 
 
 def test_coverage_inventory_matches_audited_default_and_optional_counts() -> None:

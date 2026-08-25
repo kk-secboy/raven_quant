@@ -69,44 +69,76 @@ def _normalise_bars(frame: pd.DataFrame, *, label: str) -> pd.DataFrame:
     return bars.drop_duplicates(key, keep="last").sort_values(key, kind="stable")
 
 
-def _base_close(bars: pd.DataFrame, position: int) -> float | None:
-    if "pre_close" in bars.columns:
-        value = bars.iloc[position]["pre_close"]
-        if pd.notna(value) and float(value) > 0:
-            return float(value)
-    if position > 0:
-        value = bars.iloc[position - 1]["close"]
-        if pd.notna(value) and float(value) > 0:
-            return float(value)
-    return None
-
-
 def _safe_return(end_close: Any, base_close: float | None) -> float | None:
     if base_close is None or pd.isna(end_close) or float(end_close) <= 0:
         return None
     return float(end_close) / base_close - 1.0
 
 
-def _amount_surprise(
-    bars: pd.DataFrame,
-    *,
-    start_position: int,
-    end_date: pd.Timestamp,
-    trailing_sessions: int,
-) -> float | None:
-    if "amount" not in bars.columns:
-        return None
-    history = bars.iloc[max(0, start_position - trailing_sessions) : start_position]["amount"]
-    event = bars[
-        (bars["trade_date"] >= bars.iloc[start_position]["trade_date"])
-        & (bars["trade_date"] <= end_date)
-    ]["amount"]
-    history = history[(history > 0) & history.notna()]
-    event = event[(event > 0) & event.notna()]
-    if len(history) < min(5, trailing_sessions) or event.empty:
-        return None
-    baseline = float(history.median())
-    return None if baseline <= 0 else float(event.mean()) / baseline - 1.0
+@dataclass(frozen=True, slots=True)
+class _BarIndex:
+    """Compact, date-indexed view used by the event loop.
+
+    The old implementation repeatedly filtered a complete security DataFrame
+    for every event and horizon. Exact-date lookup is now logarithmic and the
+    amount calculation only scans the bounded trailing/event slices.
+    """
+
+    trade_dates_ns: np.ndarray
+    close: np.ndarray
+    base_close: np.ndarray
+    amount: np.ndarray | None
+
+    @classmethod
+    def from_bars(cls, bars: pd.DataFrame) -> _BarIndex:
+        close = bars["close"].to_numpy(dtype=float, copy=True)
+        base_close = np.full(len(bars), np.nan, dtype=float)
+        if "pre_close" in bars.columns:
+            pre_close = bars["pre_close"].to_numpy(dtype=float, copy=False)
+            use_pre_close = pd.notna(pre_close) & (pre_close > 0)
+            base_close[use_pre_close] = pre_close[use_pre_close]
+        if len(close) > 1:
+            remaining = base_close[1:]
+            use_previous = pd.isna(remaining) & pd.notna(close[:-1]) & (close[:-1] > 0)
+            remaining[use_previous] = close[:-1][use_previous]
+        amount = (
+            bars["amount"].to_numpy(dtype=float, copy=True) if "amount" in bars.columns else None
+        )
+        return cls(
+            trade_dates_ns=pd.DatetimeIndex(bars["trade_date"]).asi8.copy(),
+            close=close,
+            base_close=base_close,
+            amount=amount,
+        )
+
+    def position_on(self, trade_date: pd.Timestamp) -> int | None:
+        target = int(trade_date.value)
+        position = int(np.searchsorted(self.trade_dates_ns, target, side="left"))
+        if position >= len(self.trade_dates_ns) or self.trade_dates_ns[position] != target:
+            return None
+        return position
+
+    def base_close_at(self, position: int) -> float | None:
+        value = self.base_close[position]
+        return None if pd.isna(value) else float(value)
+
+    def amount_surprise(
+        self,
+        *,
+        start_position: int,
+        end_position: int,
+        trailing_sessions: int,
+    ) -> float | None:
+        if self.amount is None:
+            return None
+        history = self.amount[max(0, start_position - trailing_sessions) : start_position]
+        event = self.amount[start_position : end_position + 1]
+        history = history[(history > 0) & pd.notna(history)]
+        event = event[(event > 0) & pd.notna(event)]
+        if len(history) < min(5, trailing_sessions) or len(event) == 0:
+            return None
+        baseline = float(np.median(history))
+        return None if baseline <= 0 else float(np.mean(event)) / baseline - 1.0
 
 
 def build_event_market_response_labels(
@@ -144,7 +176,7 @@ def build_event_market_response_labels(
     )
     if benchmark.empty:
         raise ValueError(f"benchmark {benchmark_code} is absent from benchmark bars")
-    benchmark_by_date = benchmark.set_index("trade_date", drop=False)
+    benchmark_index = _BarIndex.from_bars(benchmark)
     calendar = benchmark["trade_date"].tolist()
     calendar_position = {date: index for index, date in enumerate(calendar)}
 
@@ -156,8 +188,8 @@ def build_event_market_response_labels(
     if events["available_at"].isna().any():
         raise ValueError("announcement fields contain invalid available_at values")
 
-    stock_groups = {
-        code: group.reset_index(drop=True)
+    stock_indexes = {
+        code: _BarIndex.from_bars(group.reset_index(drop=True))
         for code, group in stocks.groupby("ts_code", sort=False)
     }
     rows: list[dict[str, Any]] = []
@@ -173,14 +205,20 @@ def build_event_market_response_labels(
             "benchmark_code": benchmark_code.upper(),
             "label_role": LABEL_ROLE,
         }
-        stock = stock_groups.get(str(event.ts_code))
+        stock = stock_indexes.get(str(event.ts_code))
         start_calendar_position = calendar_position.get(available_at)
-        start_stock_position: int | None = None
-        if stock is not None:
-            matches = stock.index[stock["trade_date"] == available_at].tolist()
-            if matches:
-                start_stock_position = int(matches[0])
+        start_stock_position = stock.position_on(available_at) if stock is not None else None
         direction_sign = _DIRECTION_SIGN.get(str(event.impact_direction))
+        stock_base_close = (
+            stock.base_close_at(start_stock_position)
+            if stock is not None and start_stock_position is not None
+            else None
+        )
+        benchmark_base_close = (
+            benchmark_index.base_close_at(start_calendar_position)
+            if start_calendar_position is not None
+            else None
+        )
 
         for horizon in horizon_values:
             prefix = f"{horizon}d"
@@ -214,23 +252,13 @@ def build_event_market_response_labels(
             if pd.isna(next_date):
                 result.update(values)
                 continue
-            stock_end = stock[stock["trade_date"] == end_date]
-            if stock_end.empty or available_at not in benchmark_by_date.index:
+            stock_end_position = stock.position_on(end_date)
+            if stock_end_position is None:
                 result.update(values)
                 continue
-            benchmark_end = (
-                benchmark_by_date.loc[end_date]
-                if end_date in benchmark_by_date.index
-                else None
-            )
-            if benchmark_end is None:
-                result.update(values)
-                continue
-            stock_return = _safe_return(
-                stock_end.iloc[0]["close"], _base_close(stock, start_stock_position)
-            )
+            stock_return = _safe_return(stock.close[stock_end_position], stock_base_close)
             benchmark_return = _safe_return(
-                benchmark_end["close"], _base_close(benchmark, start_calendar_position)
+                benchmark_index.close[end_position], benchmark_base_close
             )
             if stock_return is None or benchmark_return is None:
                 result.update(values)
@@ -246,10 +274,9 @@ def build_event_market_response_labels(
                     f"market_recognition_{prefix}": (
                         direction_sign * abnormal if direction_sign is not None else np.nan
                     ),
-                    f"amount_surprise_{prefix}": _amount_surprise(
-                        stock,
+                    f"amount_surprise_{prefix}": stock.amount_surprise(
                         start_position=start_stock_position,
-                        end_date=end_date,
+                        end_position=stock_end_position,
                         trailing_sessions=trailing_sessions,
                     ),
                     f"complete_{prefix}": True,

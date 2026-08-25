@@ -14,6 +14,8 @@ from .factor_evaluator import normalize_series
 
 def compose_factor_scores(
     factors: Sequence[tuple[pd.Series | pd.DataFrame, float, int]],
+    *,
+    require_exact_index: bool = False,
 ) -> pd.Series:
     """Compose immutable factor artifacts into one point-in-time Qlib signal."""
 
@@ -35,6 +37,16 @@ def compose_factor_scores(
 
         zscore = series.groupby(level="datetime", group_keys=False).apply(cross_section)
         normalized.append(zscore * float(weight) * int(direction))
+    if require_exact_index:
+        authoritative_index = normalized[0].index
+        for index, series in enumerate(normalized[1:], start=1):
+            if not series.index.equals(authoritative_index):
+                missing = authoritative_index.difference(series.index)
+                unexpected = series.index.difference(authoritative_index)
+                raise ValueError(
+                    f"factor_{index} index differs from factor_0 "
+                    f"(missing={len(missing)}, unexpected={len(unexpected)})"
+                )
     frame = pd.concat(normalized, axis=1, join="inner").dropna()
     if frame.empty:
         raise ValueError("factor value artifacts have no common observations")
@@ -45,11 +57,13 @@ def build_governed_signal(
     scores: pd.Series | pd.DataFrame,
     *,
     topk: int,
+    n_drop: int = 0,
     liquidity_amount: pd.Series | pd.DataFrame | None = None,
     industry_memberships: pd.DataFrame | None = None,
     benchmark_weights: pd.DataFrame | None = None,
     style_exposures: pd.DataFrame | None = None,
     eligibility_matrix: pd.DataFrame | None = None,
+    max_position_weight: float = 1.0,
     max_industry_weight: float = 1.0,
     max_industry_deviation: float = 1.0,
     min_average_daily_amount: float = 0.0,
@@ -60,6 +74,12 @@ def build_governed_signal(
 ) -> pd.Series:
     """Apply eligibility gates before the shared PortfolioPolicy assigns weights.
 
+    The returned daily candidate set keeps the raw top ``topk + n_drop``
+    instruments visible to ``PortfolioPolicy`` so an existing holding inside
+    the retention buffer can survive a rebalance.  It also includes the
+    industry-constrained TopK feasible set, which may contain lower-ranked
+    substitutes.  Final holdings remain limited to ``topk`` by the policy.
+
     Industry membership and benchmark-weight snapshots are consumed with the
     conservative publication lag from quant_data.availability (versioned by
     AVAILABILITY_LAG_CONFIG_VERSION): the true announcement lag of index and
@@ -68,8 +88,15 @@ def build_governed_signal(
     exposures keep the same-trade-date-after-close policy (lag 0).
     """
 
-    if topk < 1 or liquidity_lookback_days < 2:
-        raise ValueError("topk and liquidity lookback are invalid")
+    if (
+        topk < 1
+        or not 0 <= n_drop <= topk
+        or not 0 < max_position_weight <= 1
+        or liquidity_lookback_days < 2
+    ):
+        raise ValueError(
+            "topk, n_drop, position weight and liquidity lookback are invalid"
+        )
     score = normalize_series(scores, "score")
     liquidity = (
         normalize_series(liquidity_amount, "liquidity_amount")
@@ -165,6 +192,9 @@ def build_governed_signal(
         ranking = ranking.sort_values(ascending=False)
         if len(ranking) < topk:
             continue
+        retention_candidates = set(
+            ranking.index.astype(str)[: min(len(ranking), topk + n_drop)]
+        )
         industries = daily_industries
         benchmark_day = _snapshot(
             benchmark, timestamp, "weight", lag_days=metadata_availability_lag_days
@@ -176,13 +206,16 @@ def build_governed_signal(
         )
         selected: list[str] = []
         counts: dict[str, int] = {}
+        assumed_position_weight = min(1.0 / topk, max_position_weight)
         for instrument in ranking.index.astype(str):
             industry = str(industries.get(instrument, "__unknown__"))
             allowed_weight = min(
                 max_industry_weight,
                 float(benchmark_industry.get(industry, 0.0)) + max_industry_deviation,
             )
-            allowed_count = max(1, int(allowed_weight * topk + 1e-9))
+            allowed_count = int(
+                np.floor(allowed_weight / assumed_position_weight + 1e-12)
+            )
             if memberships is not None and counts.get(industry, 0) >= allowed_count:
                 continue
             selected.append(instrument)
@@ -191,7 +224,10 @@ def build_governed_signal(
                 break
         if len(selected) < topk:
             continue
-        governed = ranking.reindex(selected)
+        visible_candidates = retention_candidates.union(selected)
+        governed = ranking[
+            ranking.index.astype(str).isin(visible_candidates)
+        ]
         governed.index = pd.MultiIndex.from_product(
             [[timestamp], governed.index], names=["datetime", "instrument"]
         )

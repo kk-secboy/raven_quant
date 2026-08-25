@@ -30,9 +30,10 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, insert, select, update
 
@@ -67,6 +68,7 @@ _STAGE_FROZEN = "frozen"
 _REFERENCE_ORDER_VALUE = 100_000.0
 _DEFAULT_PAPER_INITIAL_CASH = 100_000.0
 _RECONCILIATION_TOLERANCE = 1e-6
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -132,20 +134,29 @@ class PromotionStore:
         thresholds: ForwardGateThresholds | None = None,
         **overrides: Any,
     ) -> dict[str, Any]:
-        """Pre-register (or replace) the forward gate; blocked once in paper."""
+        """Pre-register the immutable forward gate before a paper stage exists.
+
+        ``StrategyStore.approve`` commits the formal approval before it invokes
+        this store, so an approved version already carries ``promotion_stage =
+        paper`` here.  The irreversible boundary is therefore the creation of
+        the first paper stage, not that marker.  Identical retries are allowed;
+        thresholds can never be inserted or changed after any stage exists.
+        """
 
         if len(actor.strip()) < 2:
             raise ValueError("a responsible actor is required")
         gate = thresholds or ForwardGateThresholds(**overrides)
         with self.engine.begin() as connection:
             version = connection.execute(
-                select(strategy_versions).where(strategy_versions.c.id == version_id)
+                select(strategy_versions)
+                .where(strategy_versions.c.id == version_id)
+                .with_for_update()
             ).first()
             if version is None:
                 raise KeyError(version_id)
-            if version.promotion_stage in (STAGE_PAPER, STAGE_RECOMMENDATION_ENABLED):
+            if version.promotion_stage == STAGE_RECOMMENDATION_ENABLED:
                 raise ValueError(
-                    "the forward gate must be pre-registered before the version enters paper"
+                    "the forward gate cannot change after recommendations are enabled"
                 )
             now = _now()
             values = {
@@ -158,6 +169,37 @@ class PromotionStore:
                     strategy_forward_gates.c.strategy_version_id == version_id
                 )
             ).first()
+            existing_stage = connection.execute(
+                select(strategy_promotion_stages.c.id)
+                .where(strategy_promotion_stages.c.strategy_version_id == version_id)
+                .limit(1)
+            ).first()
+            if existing is not None:
+                immutable_values = {
+                    key: values[key]
+                    for key in (
+                        "min_forward_calendar_days",
+                        "min_decision_batches",
+                        "min_completed_cycles",
+                        "min_data_completeness",
+                        "min_reconciliation_rate",
+                        "max_cost_deviation",
+                    )
+                }
+                recorded_values = {
+                    key: getattr(existing, key) for key in immutable_values
+                }
+                if recorded_values == immutable_values:
+                    return {"strategy_version_id": version_id, **asdict(gate)}
+                if existing_stage is not None:
+                    raise ValueError(
+                        "the forward gate is immutable after the first paper stage opens"
+                    )
+            elif existing_stage is not None:
+                raise ValueError(
+                    "a paper stage exists without a pre-registered forward gate"
+                )
+
             if existing is None:
                 connection.execute(
                     insert(strategy_forward_gates).values(
@@ -188,40 +230,57 @@ class PromotionStore:
 
         with self.engine.begin() as connection:
             version = connection.execute(
-                select(strategy_versions).where(strategy_versions.c.id == version_id)
+                select(strategy_versions)
+                .where(strategy_versions.c.id == version_id)
+                .with_for_update()
             ).first()
             if version is None:
                 raise KeyError(version_id)
             if str(version.status) != "approved":
                 raise ValueError("paper stage requires an approved strategy version")
+            gate = connection.execute(
+                select(strategy_forward_gates.c.strategy_version_id).where(
+                    strategy_forward_gates.c.strategy_version_id == version_id
+                )
+            ).first()
+            if gate is None:
+                raise ValueError(
+                    "paper stage requires a pre-registered immutable forward gate"
+                )
             existing = connection.execute(
-                select(strategy_promotion_stages).where(
+                select(strategy_promotion_stages)
+                .where(
                     strategy_promotion_stages.c.strategy_version_id == version_id,
                     strategy_promotion_stages.c.status.in_([_STAGE_ACTIVE, _STAGE_AWAITING]),
                 )
+                .order_by(strategy_promotion_stages.c.stage_index.desc())
+                .limit(1)
             ).first()
-            if existing is not None:
+            if existing is not None and str(existing.status) == _STAGE_ACTIVE:
                 return self._stage_dict(existing)
-            next_index = (
+            if existing is not None:
+                stage_id = str(existing.id)
+            else:
+                next_index = (
+                    connection.execute(
+                        select(func.max(strategy_promotion_stages.c.stage_index)).where(
+                            strategy_promotion_stages.c.strategy_version_id == version_id
+                        )
+                    ).scalar()
+                    or 0
+                ) + 1
+                stage_id = uuid.uuid4().hex
                 connection.execute(
-                    select(func.max(strategy_promotion_stages.c.stage_index)).where(
-                        strategy_promotion_stages.c.strategy_version_id == version_id
+                    insert(strategy_promotion_stages).values(
+                        id=stage_id,
+                        strategy_version_id=version_id,
+                        stage_index=next_index,
+                        simulation_portfolio_id=None,
+                        status=_STAGE_AWAITING,
+                        opened_at=_now(),
+                        created_by=actor.strip(),
                     )
-                ).scalar()
-                or 0
-            ) + 1
-            stage_id = uuid.uuid4().hex
-            connection.execute(
-                insert(strategy_promotion_stages).values(
-                    id=stage_id,
-                    strategy_version_id=version_id,
-                    stage_index=next_index,
-                    simulation_portfolio_id=None,
-                    status=_STAGE_AWAITING,
-                    opened_at=_now(),
-                    created_by=actor.strip(),
                 )
-            )
         try:
             datasets = self._load_backtest_datasets(version_id)
             if datasets is None:
@@ -240,6 +299,133 @@ class PromotionStore:
                 payload={"stage_id": stage_id, "error": str(exc)},
             )
         return self.current_stage(version_id)
+
+    def prepare_paper_stage(self, version_id: str, *, actor: str) -> dict[str, Any]:
+        """Idempotently register the default gate, then open the paper stage.
+
+        Registration and stage creation deliberately use separate transactions:
+        a crash can leave a registered gate with no stage, which is safe and
+        recoverable by retry.  The inverse (a stage with no gate) is rejected by
+        :meth:`open_paper_stage`.
+        """
+
+        # Preserve an operator's pre-registered strategy-specific gate.  The
+        # automatic approval transition supplies the governed default only
+        # when no gate exists; it must never silently replace a stricter
+        # preregistration just before opening the stage.
+        with self.engine.begin() as connection:
+            version = connection.execute(
+                select(strategy_versions.c.id)
+                .where(strategy_versions.c.id == version_id)
+                .with_for_update()
+            ).first()
+            if version is None:
+                raise KeyError(version_id)
+            existing_gate = connection.execute(
+                select(strategy_forward_gates.c.strategy_version_id).where(
+                    strategy_forward_gates.c.strategy_version_id == version_id
+                )
+            ).first()
+            existing_stage = connection.execute(
+                select(strategy_promotion_stages.c.id)
+                .where(strategy_promotion_stages.c.strategy_version_id == version_id)
+                .limit(1)
+            ).first()
+            if existing_gate is None:
+                if existing_stage is not None:
+                    raise ValueError(
+                        "a paper stage exists without a pre-registered forward gate"
+                    )
+                now = _now()
+                connection.execute(
+                    insert(strategy_forward_gates).values(
+                        strategy_version_id=version_id,
+                        **asdict(ForwardGateThresholds()),
+                        registered_by=actor.strip(),
+                        registered_at=now,
+                        updated_at=now,
+                    )
+                )
+        return self.open_paper_stage(version_id, actor=actor)
+
+    def require_paper_signal(
+        self,
+        version_id: str,
+        *,
+        portfolio_id: str,
+        signal_date: date,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Bind a paper signal to the active stage's genuinely forward period."""
+
+        current = now or _now()
+        with self.engine.connect() as connection:
+            stage = connection.execute(
+                select(strategy_promotion_stages)
+                .where(
+                    strategy_promotion_stages.c.strategy_version_id == version_id,
+                    strategy_promotion_stages.c.simulation_portfolio_id == portfolio_id,
+                    strategy_promotion_stages.c.status == _STAGE_ACTIVE,
+                )
+                .order_by(strategy_promotion_stages.c.stage_index.desc())
+                .limit(1)
+            ).first()
+            gate = connection.execute(
+                select(strategy_forward_gates.c.strategy_version_id).where(
+                    strategy_forward_gates.c.strategy_version_id == version_id
+                )
+            ).first()
+        if stage is None or gate is None:
+            raise ValueError(
+                "paper signal requires the active isolated promotion stage and its forward gate"
+            )
+        opened_date = stage.opened_at.astimezone(_SHANGHAI).date()
+        current_date = current.astimezone(_SHANGHAI).date()
+        if signal_date <= opened_date:
+            raise ValueError(
+                "paper signal must be from a trading day after the promotion stage opened"
+            )
+        if signal_date > current_date:
+            raise ValueError("paper signal cannot use a future date")
+        return {
+            **self._stage_dict(stage),
+            "forward_signal_after": opened_date.isoformat(),
+        }
+
+    def require_recommendation_signal(
+        self,
+        version_id: str,
+        *,
+        signal_date: date,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Reject recommendation backfills from before human promotion."""
+
+        current = now or _now()
+        with self.engine.connect() as connection:
+            stage = connection.execute(
+                select(strategy_promotion_stages)
+                .where(
+                    strategy_promotion_stages.c.strategy_version_id == version_id,
+                    strategy_promotion_stages.c.promoted_at.is_not(None),
+                )
+                .order_by(strategy_promotion_stages.c.stage_index.desc())
+                .limit(1)
+            ).first()
+        if stage is None or stage.promoted_at is None:
+            raise ValueError("recommendation signal requires a human-promoted paper stage")
+        promoted_date = stage.promoted_at.astimezone(_SHANGHAI).date()
+        current_date = current.astimezone(_SHANGHAI).date()
+        if signal_date <= promoted_date:
+            raise ValueError(
+                "recommendation signal must be from a trading day after human promotion"
+            )
+        if signal_date > current_date:
+            raise ValueError("recommendation signal cannot use a future date")
+        return {
+            **self._stage_dict(stage),
+            "forward_signal_after": promoted_date.isoformat(),
+        }
 
     def attach_paper_simulation(
         self,
@@ -274,28 +460,90 @@ class PromotionStore:
             else config.get("paper_initial_cash", _DEFAULT_PAPER_INITIAL_CASH)
         )
         simulation = SimulationStore(self.database_url)
-        portfolio = simulation.create(
-            name=(
-                f"paper:{version_id[:8]}:v{int(version.version)}:stage{int(stage.stage_index)}"
-            )[:150],
-            source_type="strategy_version",
-            source_id=version_id,
-            daily_dataset=daily_dataset,
-            execution_dataset=execution_dataset,
-            initial_cash=cash,
-            execution_policy={
-                "execution_algorithm": str(config.get("execution_method") or "twap")
-            },
-            cost_schedule_version=str(
-                config.get("cost_schedule_version") or config.get("version") or ""
+        with self.engine.connect() as connection:
+            existing_portfolio = connection.execute(
+                select(simulation_portfolios).where(
+                    simulation_portfolios.c.promotion_stage_id == stage.id
+                )
+            ).first()
+        if existing_portfolio is not None:
+            portfolio = simulation.get(str(existing_portfolio.id))
+        else:
+            try:
+                portfolio = simulation.create(
+                    name=(
+                        f"paper:{version_id[:8]}:v{int(version.version)}:stage{int(stage.stage_index)}"
+                    )[:150],
+                    source_type="strategy_version",
+                    source_id=version_id,
+                    promotion_stage_id=str(stage.id),
+                    daily_dataset=daily_dataset,
+                    execution_dataset=execution_dataset,
+                    initial_cash=cash,
+                    execution_policy={
+                        "execution_algorithm": str(
+                            config.get("execution_method") or "twap"
+                        )
+                    },
+                    cost_schedule_version=str(
+                        config.get("cost_schedule_version") or config.get("version") or ""
+                    ),
+                    actor=actor,
+                    # Paper evidence must advance with immutable descendants of the
+                    # formal snapshot.  The anchor identities remain fixed on the
+                    # account while each batch records the exact rolled snapshots.
+                    daily_roll_policy="latest_compatible",
+                    execution_roll_policy="latest_compatible",
+                )
+            except ValueError:
+                # A crash/concurrent retry may have committed the account but
+                # not yet attached it to the stage. Recover only that exact
+                # stage-owned row; unrelated uniqueness errors still surface.
+                with self.engine.connect() as connection:
+                    raced = connection.execute(
+                        select(simulation_portfolios.c.id).where(
+                            simulation_portfolios.c.promotion_stage_id == stage.id
+                        )
+                    ).first()
+                if raced is None:
+                    raise
+                portfolio = simulation.get(str(raced.id))
+        daily_provenance = dict(daily_dataset.get("provenance") or {})
+        execution_provenance = dict(execution_dataset.get("provenance") or {})
+        expected = (
+            (portfolio.get("source_type"), "strategy_version"),
+            (portfolio.get("source_id"), version_id),
+            (portfolio.get("promotion_stage_id"), str(stage.id)),
+            (portfolio.get("daily_dataset"), str(daily_dataset.get("name") or "")),
+            (
+                portfolio.get("daily_dataset_identity_sha256"),
+                str(daily_provenance.get("dataset_identity_sha256") or ""),
             ),
-            actor=actor,
+            (
+                portfolio.get("execution_dataset"),
+                str(execution_dataset.get("name") or ""),
+            ),
+            (
+                portfolio.get("execution_dataset_identity_sha256"),
+                str(execution_provenance.get("dataset_identity_sha256") or ""),
+            ),
         )
+        if any(
+            str(observed or "") != str(required or "")
+            for observed, required in expected
+        ):
+            raise ValueError(
+                "paper stage already owns a simulation account with different evidence"
+            )
         simulation.set_status(portfolio["id"], "active")
         with self.engine.begin() as connection:
-            connection.execute(
+            attached = connection.execute(
                 update(strategy_promotion_stages)
-                .where(strategy_promotion_stages.c.id == stage.id)
+                .where(
+                    strategy_promotion_stages.c.id == stage.id,
+                    strategy_promotion_stages.c.status == _STAGE_AWAITING,
+                    strategy_promotion_stages.c.simulation_portfolio_id.is_(None),
+                )
                 .values(
                     simulation_portfolio_id=portfolio["id"],
                     status=_STAGE_ACTIVE,
@@ -303,6 +551,18 @@ class PromotionStore:
                     initial_cash=cash,
                 )
             )
+            if not attached.rowcount:
+                current = connection.execute(
+                    select(strategy_promotion_stages).where(
+                        strategy_promotion_stages.c.id == stage.id
+                    )
+                ).first()
+                if (
+                    current is None
+                    or str(current.status) != _STAGE_ACTIVE
+                    or str(current.simulation_portfolio_id) != str(portfolio["id"])
+                ):
+                    raise ValueError("paper stage changed while attaching its account")
         self._event(
             version_id,
             event_type="strategy.paper_stage_opened",
@@ -423,6 +683,15 @@ class PromotionStore:
             evidence = self._collect_evidence(connection, stage, portfolio)
 
         checks = {
+            # A generic/manual batch on the paper account is not forward
+            # evidence.  Treating it merely as absent would allow a mixed
+            # ledger to hide an attempted replay, so any such row blocks the
+            # stage until it is investigated/reset.
+            "governed_batch_integrity": (
+                1.0 if evidence["ungoverned_batches"] == 0 else 0.0,
+                1.0,
+                "min",
+            ),
             "forward_calendar_days": (
                 evidence["forward_calendar_days"],
                 int(gate.min_forward_calendar_days),
@@ -503,6 +772,32 @@ class PromotionStore:
                 raise KeyError(version_id)
             if str(version.status) != "approved" or version.promotion_stage != STAGE_PAPER:
                 raise ValueError("only a paper-stage approved version can be promoted")
+            stage = connection.execute(
+                select(strategy_promotion_stages)
+                .where(strategy_promotion_stages.c.id == evaluation["stage_id"])
+                .with_for_update()
+            ).first()
+            if (
+                stage is None
+                or str(stage.strategy_version_id) != version_id
+                or str(stage.status) != _STAGE_ACTIVE
+                or stage.promoted_at is not None
+                or stage.simulation_portfolio_id is None
+            ):
+                raise ValueError("paper stage changed after forward-gate evaluation")
+            portfolio = connection.execute(
+                select(simulation_portfolios)
+                .where(simulation_portfolios.c.id == stage.simulation_portfolio_id)
+                .with_for_update()
+            ).first()
+            if portfolio is None:
+                raise ValueError("paper stage simulation account disappeared")
+            SimulationStore._require_current_source_contract(connection, portfolio)
+            fresh_evidence = self._collect_evidence(connection, stage, portfolio)
+            if fresh_evidence != evaluation["evidence"]:
+                raise ValueError(
+                    "paper evidence changed during promotion; evaluate the forward gate again"
+                )
             now = _now()
             connection.execute(
                 update(strategy_versions)
@@ -565,19 +860,68 @@ class PromotionStore:
         self, connection: Any, stage: Any, portfolio: Any
     ) -> dict[str, Any]:
         portfolio_id = str(stage.simulation_portfolio_id)
+        opened_at = stage.opened_at
+        opened_date = opened_at.astimezone(_SHANGHAI).date()
         batches = connection.execute(
             select(
                 simulation_batches.c.id,
                 simulation_batches.c.status,
+                simulation_batches.c.trade_date,
+                simulation_batches.c.source_snapshot_id,
+                simulation_batches.c.target_payload_json,
                 simulation_batches.c.summary_json,
-            ).where(simulation_batches.c.portfolio_id == portfolio_id)
+            ).where(
+                simulation_batches.c.portfolio_id == portfolio_id,
+                simulation_batches.c.created_at >= opened_at,
+                simulation_batches.c.signal_date > opened_date,
+            )
         ).all()
-        succeeded = [batch for batch in batches if str(batch.status) == "succeeded"]
+        governed: list[Any] = []
+        ungoverned: list[Any] = []
+        for batch in batches:
+            payload = dict(batch.target_payload_json or {})
+            plan = payload.get("governed_order_plan")
+            source_snapshot = (
+                plan.get("source_snapshot") if isinstance(plan, dict) else None
+            )
+            manifest_sha256 = (
+                str(plan.get("manifest_sha256") or "")
+                if isinstance(plan, dict)
+                else ""
+            )
+            snapshot_id = (
+                str(source_snapshot.get("id") or "")
+                if isinstance(source_snapshot, dict)
+                else ""
+            )
+            is_governed = (
+                isinstance(plan, dict)
+                and plan.get("promotion_stage_id") == str(stage.id)
+                and plan.get("promotion_stage_opened_at") == opened_at.isoformat()
+                and len(manifest_sha256) == 64
+                and all(value in "0123456789abcdef" for value in manifest_sha256.lower())
+                and len(snapshot_id) == 64
+                and snapshot_id == str(batch.source_snapshot_id or "")
+                and isinstance(source_snapshot, dict)
+                and snapshot_id
+                == str(source_snapshot.get("dataset_identity_sha256") or "")
+                and bool(str(plan.get("formal_backtest_id") or ""))
+            )
+            (governed if is_governed else ungoverned).append(batch)
+        succeeded = [batch for batch in governed if str(batch.status) == "succeeded"]
+        succeeded_trade_dates = sorted({batch.trade_date for batch in succeeded})
         nav_span = connection.execute(
             select(
                 func.min(simulation_nav.c.trade_date),
                 func.max(simulation_nav.c.trade_date),
-            ).where(simulation_nav.c.portfolio_id == portfolio_id)
+            ).where(
+                simulation_nav.c.portfolio_id == portfolio_id,
+                simulation_nav.c.created_at >= opened_at,
+                simulation_nav.c.trade_date > opened_date,
+                simulation_nav.c.trade_date.in_(succeeded_trade_dates or [opened_date]),
+                simulation_nav.c.performance_certified.is_(True),
+                simulation_nav.c.has_stale_prices.is_(False),
+            )
         ).one()
         calendar_days = 0
         if nav_span[0] is not None and nav_span[1] is not None:
@@ -611,11 +955,16 @@ class PromotionStore:
         realized_rate = total_fees / total_value if total_value > 0 else 0.0
         scheduled_rate = self._scheduled_one_side_rate(str(portfolio.cost_schedule_version))
         return {
+            "stage_opened_at": opened_at.isoformat(),
+            "forward_signal_after": opened_date.isoformat(),
             "forward_calendar_days": calendar_days,
             "decision_batches": len(succeeded),
-            "total_batches": len(batches),
+            "total_batches": len(governed),
+            "ungoverned_batches": len(ungoverned),
             "completed_cycles": len(sell_batches),
-            "data_completeness": (len(succeeded) / len(batches)) if batches else 0.0,
+            "data_completeness": (
+                (len(succeeded) / len(governed)) if governed else 0.0
+            ),
             "reconciliation_rate": (reconciled / len(succeeded)) if succeeded else 0.0,
             "realized_cost_rate": realized_rate,
             "scheduled_cost_rate": scheduled_rate,

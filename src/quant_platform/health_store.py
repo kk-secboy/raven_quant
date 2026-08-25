@@ -18,6 +18,46 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _qlib_calendar_date(value: object) -> date:
+    raw = str(value).strip()
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is not None:
+            raise ValueError(
+                "Qlib calendar timestamps must be exchange-local and timezone-naive"
+            ) from None
+        return parsed.date()
+
+
+def safe_mode_recovery_health_status(snapshot: dict[str, Any] | None) -> str:
+    """Evaluate recovery health without making safe mode block its own release.
+
+    The persisted overall status is necessarily ``degraded`` while safe mode is
+    active because ``safe_mode`` is itself a health component.  Recovery must
+    therefore ignore only that component and still fail closed unless every
+    other component is healthy (or explicitly not applicable).
+    """
+
+    if not isinstance(snapshot, dict):
+        return "missing"
+    components = snapshot.get("components")
+    if not isinstance(components, dict) or "safe_mode" not in components:
+        return "missing"
+    checked = 0
+    for name, component in components.items():
+        if name == "safe_mode":
+            continue
+        checked += 1
+        if not isinstance(component, dict) or component.get("status") not in {
+            "ok",
+            "not_applicable",
+        }:
+            return "degraded"
+    return "ok" if checked else "missing"
+
+
 class OperationalHealthStore:
     """Durable component, queue, and market-data freshness observations."""
 
@@ -49,6 +89,16 @@ class OperationalHealthStore:
         )
         components["rdagent_worker"] = self._probe_service(
             self.settings.rdagent_worker_url,
+            "/health",
+            required=self.settings.rdagent_enabled and not self.settings.embedded_worker,
+        )
+        components["rdagent_evaluation_worker"] = self._probe_service(
+            self.settings.rdagent_evaluation_worker_url,
+            "/health",
+            required=self.settings.rdagent_enabled and not self.settings.embedded_worker,
+        )
+        components["rdagent_data_science_worker"] = self._probe_service(
+            self.settings.rdagent_data_science_worker_url,
             "/health",
             required=self.settings.rdagent_enabled and not self.settings.embedded_worker,
         )
@@ -212,8 +262,29 @@ class OperationalHealthStore:
                 "message": "no ready Qlib dataset",
                 "dataset_count": 0,
             }
-        latest = max(datasets, key=lambda item: str(item.get("end_date") or ""))
-        end_date = date.fromisoformat(str(latest["end_date"]))
+        parsed: list[tuple[date, dict[str, Any]]] = []
+        invalid: list[dict[str, str]] = []
+        for dataset in datasets:
+            try:
+                parsed.append((_qlib_calendar_date(dataset.get("end_date")), dataset))
+            except (TypeError, ValueError):
+                invalid.append(
+                    {
+                        "dataset": str(dataset.get("name") or ""),
+                        "end_date": str(dataset.get("end_date") or ""),
+                    }
+                )
+        if invalid:
+            return {
+                "status": "degraded",
+                "message": "ready Qlib dataset has an invalid calendar boundary",
+                "dataset_count": len(datasets),
+                "invalid_datasets": sorted(invalid, key=lambda item: item["dataset"]),
+            }
+        end_date, latest = max(
+            parsed,
+            key=lambda item: (item[0], str(item[1].get("end_date") or "")),
+        )
         age_days = max(0, (today - end_date).days)
         status = "degraded" if age_days > self.settings.data_freshness_max_days else "ok"
         return {
@@ -276,7 +347,13 @@ class OperationalHealthStore:
                     jobs.c.finished_at >= failed_after,
                 )
             )
-        status = "degraded" if stale or int(queued or 0) > 100 else "attention" if failed else "ok"
+        # Recent terminal jobs remain visible here and are projected as their
+        # own critical ``job_failure`` alerts.  They are immutable audit
+        # history, not evidence that the queue itself is currently unhealthy.
+        # Double-counting them as queue ``attention`` would also make a fully
+        # evidenced recovery unable to leave safe mode for 24 hours.  Queue
+        # health is therefore driven only by active operational risk.
+        status = "degraded" if stale or int(queued or 0) > 100 else "ok"
         return {
             "status": status,
             "message": "durable worker queue inspected",

@@ -421,6 +421,184 @@ def test_process_report_rc_writes_artifacts_and_manifests(tmp_path: Path) -> Non
 
 
 @pytest.mark.no_database
+def test_terminal_publication_day_reports_are_deferred_with_audit(tmp_path: Path) -> None:
+    days = [
+        date(2024, 1, 2),
+        date(2024, 1, 3),
+        date(2024, 1, 4),
+        date(2024, 1, 5),
+        date(2024, 1, 8),
+        date(2024, 1, 9),
+        date(2024, 1, 10),
+        date(2024, 1, 11),
+        date(2024, 1, 12),
+    ]
+    _seed_trade_cal(tmp_path, days)
+    _seed_report_rc(
+        tmp_path,
+        [
+            _report_row("600519.SH", "安信证券", "20240104", "增持"),
+            _report_row("000001.SZ", "测试证券", "20240105", "买入"),
+        ],
+    )
+
+    summary = m.process_report_rc(
+        tmp_path,
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 5),
+        now=lambda: NOW,
+    )
+
+    assert summary.reports == 2
+    assert summary.eligible_reports == 1
+    assert summary.deferred_reports == 1
+    assert summary.terminal_audit["policy"] == m.TERMINAL_DEFERRAL_POLICY
+    assert summary.terminal_audit["publication_horizon"] == "2024-01-05"
+    assert summary.terminal_audit["deferred_instrument_count"] == 1
+    assert summary.terminal_audit_path.is_file()
+    fields = pd.read_parquet(summary.fields_path)
+    assert fields["ts_code"].tolist() == ["600519.SH"]
+    assert fields["available_at"].max() <= pd.Timestamp("2024-01-05")
+    assert fields["factor_date"].max() <= pd.Timestamp("2024-01-05")
+    for name in m.FACTOR_NAMES:
+        assert (
+            summary.factors[name]["manifest"]["terminal_deferral_audit"]
+            == summary.terminal_audit
+        )
+
+    again = m.process_report_rc(
+        tmp_path,
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 5),
+        now=lambda: NOW,
+    )
+    assert again.terminal_audit == summary.terminal_audit
+
+
+@pytest.mark.no_database
+def test_deferred_report_becomes_eligible_after_market_horizon_extends(tmp_path: Path) -> None:
+    days = [
+        date(2024, 1, 2),
+        date(2024, 1, 3),
+        date(2024, 1, 4),
+        date(2024, 1, 5),
+        date(2024, 1, 8),
+        date(2024, 1, 9),
+        date(2024, 1, 10),
+        date(2024, 1, 11),
+        date(2024, 1, 12),
+    ]
+    _seed_trade_cal(tmp_path, days)
+    _seed_report_rc(
+        tmp_path,
+        [_report_row("000001.SZ", "测试证券", "20240105", "买入")],
+    )
+
+    summary = m.process_report_rc(
+        tmp_path,
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 12),
+        now=lambda: NOW,
+    )
+
+    assert summary.eligible_reports == 1
+    assert summary.deferred_reports == 0
+    fields = pd.read_parquet(summary.fields_path)
+    assert fields["available_at"].tolist() == [pd.Timestamp("2024-01-08")]
+    assert fields["factor_date"].tolist() == [pd.Timestamp("2024-01-12")]
+
+
+@pytest.mark.no_database
+def test_midweek_report_waits_for_the_weekly_grid_close(tmp_path: Path) -> None:
+    days = list(pd.bdate_range("2024-01-02", "2024-01-12").date)
+    _seed_trade_cal(tmp_path, days)
+    _seed_report_rc(
+        tmp_path,
+        [_report_row("000001.SZ", "测试证券", "20240105", "买入")],
+    )
+
+    summary = m.process_report_rc(
+        tmp_path,
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 8),
+        now=lambda: NOW,
+    )
+
+    assert summary.eligible_reports == 0
+    assert summary.deferred_reports == 1
+    assert summary.terminal_audit["calendar_last_open_day"] == "2024-01-12"
+
+
+@pytest.mark.no_database
+def test_weekend_report_is_deferred_instead_of_treated_as_a_calendar_gap(
+    tmp_path: Path,
+) -> None:
+    days = list(pd.bdate_range("2024-01-02", "2024-01-12").date)
+    _seed_trade_cal(tmp_path, days)
+    _seed_report_rc(
+        tmp_path,
+        [_report_row("000001.SZ", "测试证券", "20240107", "买入")],
+    )
+
+    summary = m.process_report_rc(
+        tmp_path,
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 7),
+        now=lambda: NOW,
+    )
+
+    assert summary.eligible_reports == 0
+    assert summary.deferred_reports == 1
+    assert summary.terminal_audit["publication_horizon"] == "2024-01-05"
+
+
+@pytest.mark.no_database
+def test_terminal_audit_hash_binds_all_loaded_source_fields(tmp_path: Path) -> None:
+    days = list(pd.bdate_range("2024-01-02", "2024-01-12").date)
+    _seed_trade_cal(tmp_path, days)
+    first = _report_row("000001.SZ", "测试证券", "20240105", "买入")
+    _seed_report_rc(tmp_path, [first])
+    before = m.process_report_rc(
+        tmp_path,
+        end=date(2024, 1, 5),
+        now=lambda: NOW,
+    ).terminal_audit["deferred_reports_sha256"]
+
+    changed = dict(first)
+    changed["author_name"] = "另一位分析师"
+    changed["eps"] = 2.0
+    _seed_report_rc(tmp_path, [changed])
+    after = m.process_report_rc(
+        tmp_path,
+        end=date(2024, 1, 5),
+        now=lambda: NOW,
+    ).terminal_audit["deferred_reports_sha256"]
+
+    assert after != before
+
+
+@pytest.mark.no_database
+def test_conflicting_calendar_revisions_fail_closed(tmp_path: Path) -> None:
+    _write_parquet(
+        tmp_path / "units" / "trade_cal",
+        [{"cal_date": "20240105", "is_open": 1}],
+        name="old.parquet",
+    )
+    _write_parquet(
+        tmp_path / "units" / "trade_cal",
+        [{"cal_date": "20240105", "is_open": 0}],
+        name="new.parquet",
+    )
+    _seed_report_rc(
+        tmp_path,
+        [_report_row("000001.SZ", "测试证券", "20240104", "买入")],
+    )
+
+    with pytest.raises(RuntimeError, match="conflicting open/closed states"):
+        m.process_report_rc(tmp_path, end=date(2024, 1, 5), now=lambda: NOW)
+
+
+@pytest.mark.no_database
 def test_process_missing_report_rc_fails_closed(tmp_path: Path) -> None:
     _seed_trade_cal(tmp_path)
     with pytest.raises(RuntimeError, match="report_rc parquet is unavailable"):
@@ -631,6 +809,45 @@ def test_register_is_idempotent_for_same_sha256(database_url: str, tmp_path: Pat
         if item["name"] == m.COVERAGE_FACTOR_NAME
     ]
     assert len(candidates) == 1
+
+
+def test_register_same_values_with_new_pit_audit_creates_new_candidate(
+    database_url: str, tmp_path: Path
+) -> None:
+    _seed_full(tmp_path)
+    summary = m.process_report_rc(tmp_path, now=lambda: NOW)
+    store = ResearchStore(database_url)
+    factors_dir = m.default_factors_dir(tmp_path)
+    factor_name = m.COVERAGE_FACTOR_NAME
+
+    first = m.register_report_rc_factor(store, factors_dir, factor_name=factor_name)
+    manifest_path = summary.factors[factor_name]["manifest_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    audit = dict(manifest["terminal_deferral_audit"])
+    audit["calendar_open_days_sha256"] = "f" * 64
+    audit_body = {key: value for key, value in audit.items() if key != "audit_sha256"}
+    audit["audit_sha256"] = hashlib.sha256(
+        json.dumps(
+            audit_body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    manifest["terminal_deferral_audit"] = audit
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    second = m.register_report_rc_factor(store, factors_dir, factor_name=factor_name)
+
+    assert first["values_sha256"] == second["values_sha256"]
+    assert first["provenance_identity_sha256"] != second["provenance_identity_sha256"]
+    assert first["candidate_id"] != second["candidate_id"]
+    candidates = [
+        item
+        for item in store.list_candidates(limit=100)
+        if item["name"] == factor_name
+    ]
+    assert len(candidates) == 2
+    assert Path(candidates[0]["values_path"]).parent != Path(
+        candidates[1]["values_path"]
+    ).parent
 
 
 def test_register_checksum_mismatch_writes_nothing(database_url: str, tmp_path: Path) -> None:

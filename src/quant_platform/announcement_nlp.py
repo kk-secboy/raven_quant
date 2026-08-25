@@ -155,12 +155,65 @@ class LlmCredentialsError(RuntimeError):
     """LLM credentials are not configured; never fall back to fake keys."""
 
 
+LLM_FAILURE_SCOPE_GLOBAL = "global"
+LLM_FAILURE_SCOPE_BATCH_CONTENT = "batch_content"
+LLM_FAILURE_SCOPES = frozenset(
+    {LLM_FAILURE_SCOPE_GLOBAL, LLM_FAILURE_SCOPE_BATCH_CONTENT}
+)
+
+
 class LlmExtractionError(RuntimeError):
     """LLM call or response validation failed; fail closed, no signal emitted."""
 
-    def __init__(self, message: str, *, stage: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        failure_scope: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.stage = stage
+        resolved_scope = failure_scope or (
+            LLM_FAILURE_SCOPE_BATCH_CONTENT
+            if stage == "llm_parse"
+            else LLM_FAILURE_SCOPE_GLOBAL
+        )
+        if resolved_scope not in LLM_FAILURE_SCOPES:
+            raise ValueError(f"unsupported LLM failure scope: {resolved_scope}")
+        self.failure_scope = resolved_scope
+
+    @property
+    def allows_item_isolation(self) -> bool:
+        """Whether retrying the failed batch item-by-item can change the result.
+
+        Response/content validation errors may be caused by one problematic
+        item. Provider, authentication, billing, routing, rate-limit, server,
+        and network failures affect every item and must trip the run circuit
+        instead of multiplying requests.
+        """
+
+        return self.failure_scope == LLM_FAILURE_SCOPE_BATCH_CONTENT
+
+
+class _LlmFailureCircuit:
+    """Thread-safe first-failure latch shared by all batches in one NLP run."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._error: LlmExtractionError | None = None
+
+    def current(self) -> LlmExtractionError | None:
+        with self._lock:
+            return self._error
+
+    def trip(self, error: LlmExtractionError) -> LlmExtractionError:
+        if error.allows_item_isolation:
+            raise ValueError("an item-isolatable LLM error cannot trip the global circuit")
+        with self._lock:
+            if self._error is None:
+                self._error = error
+            return self._error
 
 
 def extract_pdf_text(path: Path, *, max_chars: int = MAX_TEXT_CHARS) -> str:
@@ -327,7 +380,17 @@ class OpenAIChatClient:
                     return content
                 retryable = status == 429 or status >= 500
                 last_error = LlmExtractionError(
-                    f"LLM endpoint returned HTTP {status}", stage="llm_call"
+                    f"LLM endpoint returned HTTP {status}",
+                    stage="llm_call",
+                    # A 413 is the one HTTP failure whose scope is the batch
+                    # payload itself; smaller per-item requests can resolve it.
+                    # Every other provider status is fail-closed/global by
+                    # default, including 401/402/403/404/429 and all 5xx.
+                    failure_scope=(
+                        LLM_FAILURE_SCOPE_BATCH_CONTENT
+                        if status == 413
+                        else LLM_FAILURE_SCOPE_GLOBAL
+                    ),
                 )
                 if status == 429:
                     # Shared cooldown, same discipline as the download providers.
@@ -448,7 +511,7 @@ class AnnouncementBatchItem:
 
 
 def _bounded_float(value: Any, name: str, low: float, high: float) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         raise LlmExtractionError(f"{name} must be a number in [{low}, {high}]", stage="llm_parse")
     result = float(value)
     if not low <= result <= high:
@@ -831,6 +894,7 @@ def write_factor_artifact(
     model: str,
     now: datetime,
     process_keys: set[str] | None = None,
+    processing_process_keys: set[str] | None = None,
     source_scope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the normalized factor-values parquet plus its sha256 manifest.
@@ -840,6 +904,10 @@ def write_factor_artifact(
     research-run context instead of being faked here.
     """
 
+    publication_keys = process_keys or set()
+    processing_keys = (
+        processing_process_keys if processing_process_keys is not None else publication_keys
+    )
     current = fields[fields["prompt_version"].astype(str) == PROMPT_VERSION]
     if process_keys is None:
         current = current[current["model"].astype(str) == model]
@@ -864,10 +932,21 @@ def write_factor_artifact(
             "prompt_version": PROMPT_VERSION,
             "model": model,
             "scope": dict(source_scope or {}),
-            "scope_process_keys_sha256": hashlib.sha256(
-                "\n".join(sorted(process_keys or set())).encode("utf-8")
+            "processing_scope_process_keys_sha256": hashlib.sha256(
+                "\n".join(sorted(processing_keys)).encode("utf-8")
             ).hexdigest(),
-            "scope_process_key_count": len(process_keys or set()),
+            "processing_scope_process_key_count": len(processing_keys),
+            "publication_scope": {
+                "mode": "all_persisted_succeeded_fields_current_prompt",
+                "process_keys_sha256": hashlib.sha256(
+                    "\n".join(sorted(publication_keys)).encode("utf-8")
+                ).hexdigest(),
+                "process_key_count": len(publication_keys),
+            },
+            "scope_process_keys_sha256": hashlib.sha256(
+                "\n".join(sorted(processing_keys)).encode("utf-8")
+            ).hexdigest(),
+            "scope_process_key_count": len(processing_keys),
         },
         "generated_at": now.isoformat(),
     }
@@ -878,6 +957,29 @@ def write_factor_artifact(
         "manifest_path": manifest_path,
         "artifact_path": artifact_path,
     }
+
+
+def _publication_fields(fields: pd.DataFrame, *, requested_model: str) -> pd.DataFrame:
+    """Select the all-history field generation used to publish announcement factors.
+
+    ``start``/``end``/category/limit only bound new extraction work. Published
+    factors are rebuilt from every persisted success under the current prompt
+    contract so an incremental lookback cannot truncate historical values. A
+    current-model row wins when duplicate model generations exist for the same
+    source PDF; otherwise the most recently processed compatible row is used.
+    """
+
+    current = fields[fields["prompt_version"].astype(str) == PROMPT_VERSION].copy()
+    if current.empty:
+        return current
+    current["_requested_model"] = current["model"].astype(str).eq(requested_model)
+    current = current.sort_values(
+        ["source_sha256", "_requested_model", "processed_at", "process_key"],
+        ascending=[True, False, False, True],
+        kind="stable",
+    )
+    current = current.drop_duplicates(subset=["source_sha256"], keep="first")
+    return current.drop(columns=["_requested_model"]).reset_index(drop=True)
 
 
 @dataclass(slots=True)
@@ -972,7 +1074,11 @@ def process_announcements(
     without a usable text layer are retained as auditable source gaps until a
     prompt/extractor version changes. Checkpoints persist state and successful
     fields without publishing a factor, so an interrupted large run resumes
-    without repeating already completed LLM calls.
+    without repeating already completed LLM calls. Input filters bound only
+    extraction work; successful persisted fields under the current prompt are
+    always republished as an all-history factor artifact. A provider-global
+    failure trips a run-level circuit: submitted rows retain the exact failure
+    provenance, while untouched rows remain pending for a later rerun.
     """
 
     if checkpoint_every <= 0:
@@ -1052,6 +1158,7 @@ def process_announcements(
     unit_path: Path | None = None
     last_checkpoint_completed = 0
     pending_batch: list[tuple[AnnouncementBatchItem, Any, dict[str, Any], datetime]] = []
+    failure_circuit = _LlmFailureCircuit()
     inflight: dict[
         Future[tuple[dict[str, ExtractionResult], dict[str, LlmExtractionError], int]],
         list[tuple[AnnouncementBatchItem, Any, dict[str, Any], datetime]],
@@ -1098,6 +1205,9 @@ def process_announcements(
         batch: list[tuple[AnnouncementBatchItem, Any, dict[str, Any], datetime]],
     ) -> tuple[dict[str, ExtractionResult], dict[str, LlmExtractionError], int]:
         items = [entry[0] for entry in batch]
+        global_error = failure_circuit.current()
+        if global_error is not None:
+            return {}, {item.item_id: global_error for item in items}, 0
         call_count = 1
         try:
             if batch_size == 1:
@@ -1125,13 +1235,25 @@ def process_announcements(
                     expected_item_ids=[item.item_id for item in items],
                 )
         except LlmExtractionError as batch_error:
+            if not batch_error.allows_item_isolation:
+                global_error = failure_circuit.trip(batch_error)
+                return {}, {item.item_id: global_error for item in items}, call_count
             if len(items) == 1:
                 return {}, {items[0].item_id: batch_error}, call_count
-            # A malformed/oversized batch must not discard valid documents. Retry
-            # each item independently and retain a per-item fail-closed result.
+            # A malformed response or explicitly batch-scoped content failure
+            # must not discard valid documents. Retry each item independently.
+            # If an item retry reveals a provider-global failure, trip the run
+            # circuit and do not multiply that request across the remaining
+            # items or later batches.
             results = {}
             errors: dict[str, LlmExtractionError] = {}
-            for item in items:
+            for index, item in enumerate(items):
+                global_error = failure_circuit.current()
+                if global_error is not None:
+                    errors.update(
+                        {remaining.item_id: global_error for remaining in items[index:]}
+                    )
+                    break
                 call_count += 1
                 try:
                     messages = build_extraction_messages(
@@ -1146,6 +1268,15 @@ def process_announcements(
                     )
                 except LlmExtractionError as exc:
                     errors[item.item_id] = exc
+                    if not exc.allows_item_isolation:
+                        global_error = failure_circuit.trip(exc)
+                        errors.update(
+                            {
+                                remaining.item_id: global_error
+                                for remaining in items[index + 1 :]
+                            }
+                        )
+                        break
             return results, errors, call_count
         return results, {}, call_count
 
@@ -1220,6 +1351,8 @@ def process_announcements(
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         for row in frame.itertuples():
+            if failure_circuit.current() is not None:
+                break
             process_key = f"{row.sha256}:{PROMPT_VERSION}:{model}"
             existing = state.get(process_key)
             if existing is not None:
@@ -1292,10 +1425,18 @@ def process_announcements(
             )
             if len(pending_batch) >= batch_size:
                 submit_pending(executor)
-            if len(inflight) >= workers * 2:
+            # Keep at most one submitted batch per worker. Besides avoiding an
+            # unnecessary executor backlog, this bounds the number of calls
+            # already in flight when a provider-global failure trips.
+            if len(inflight) >= workers:
                 done, _pending = wait(set(inflight), return_when=FIRST_COMPLETED)
                 apply_completed(done)
+                if failure_circuit.current() is not None:
+                    break
 
+        # A partial batch prepared before another worker tripped the circuit is
+        # still completed against the latched error with zero provider calls,
+        # preserving its state provenance without scheduling untouched rows.
         submit_pending(executor)
         while inflight:
             done, _pending = wait(set(inflight), return_when=FIRST_COMPLETED)
@@ -1305,11 +1446,16 @@ def process_announcements(
     fields = _fields_frame(list(fields_records.values()))
     scoped_fields = fields[fields["process_key"].astype(str).isin(scope_process_keys)]
     scope_models = sorted(scoped_fields["model"].dropna().astype(str).unique().tolist())
+    publication_fields = _publication_fields(fields, requested_model=model)
+    publication_process_keys = set(publication_fields["process_key"].astype(str).tolist())
+    publication_models = sorted(
+        publication_fields["model"].dropna().astype(str).unique().tolist()
+    )
     artifact_model = (
-        scope_models[0]
-        if len(scope_models) == 1
-        else f"mixed[{','.join(scope_models)}]"
-        if scope_models
+        publication_models[0]
+        if len(publication_models) == 1
+        else f"mixed[{','.join(publication_models)}]"
+        if publication_models
         else model
     )
     source_scope = {
@@ -1332,7 +1478,8 @@ def process_announcements(
         name=factor_name,
         model=artifact_model,
         now=clock(),
-        process_keys=scope_process_keys,
+        process_keys=publication_process_keys,
+        processing_process_keys=scope_process_keys,
         source_scope=source_scope,
     )
     logic_artifact = write_factor_artifact(
@@ -1341,7 +1488,8 @@ def process_announcements(
         name=LOGIC_FACTOR_NAME,
         model=artifact_model,
         now=clock(),
-        process_keys=scope_process_keys,
+        process_keys=publication_process_keys,
+        processing_process_keys=scope_process_keys,
         source_scope=source_scope,
     )
     usage_reader = getattr(chat_client, "usage_totals", None)

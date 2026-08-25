@@ -6,6 +6,9 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from .execution_contract import (
+    MINUTE_AMOUNT_ROUNDING_TOLERANCE_CNY,
+    MINUTE_PRICE_TICK_TOLERANCE_CNY,
+    MINUTE_VWAP_RELATIVE_TOLERANCE,
     SIMULATION_MINUTE_SOURCE_DATASETS,
     TUSHARE_HAND_SIZE,
 )
@@ -40,6 +43,7 @@ MINUTE_DATASETS: dict[str, str] = {
 NATIVE_MINUTE_FREQUENCIES = frozenset({"1min", "5min"})
 QLIB_RESAMPLED_MINUTE_FREQUENCIES = frozenset({"15min", "30min", "60min"})
 MINUTE_FREQUENCIES = frozenset({*NATIVE_MINUTE_FREQUENCIES, *QLIB_RESAMPLED_MINUTE_FREQUENCIES})
+ASHARE_5M_MAX_SESSIONS_PER_REQUEST = 150
 
 MARGIN_FIELDS = ("trade_date", "ts_code", "name", "exchange")
 MINUTE_FIELDS = ("ts_code", "trade_time", "open", "close", "high", "low", "vol", "amount")
@@ -195,11 +199,10 @@ def minute_specs(
             if requested_windows is not None:
                 windows = list(requested_windows)
             elif dataset == "ashare_5m" and freq == "5min" and session_dates is not None:
-                windows = _trading_session_ranges(
+                windows = stable_ashare_5m_session_ranges(
                     symbol_start,
                     symbol_end,
                     session_dates,
-                    max_sessions=150,
                 )
             else:
                 windows = (
@@ -393,14 +396,51 @@ def _normalize_share_volume(dataset: str, row: dict[str, Any]) -> bool:
     high = float(row["high"])
     if volume <= 0 or amount <= 0:
         return False
-    direct_price = amount / volume
-    normalized_price = amount / (volume / TUSHARE_HAND_SIZE)
-    direct_valid = low * 0.95 <= direct_price <= high * 1.05
-    normalized_valid = low * 0.95 <= normalized_price <= high * 1.05
+    direct_valid = _share_amount_matches_ohlc(
+        volume=volume,
+        amount=amount,
+        low=low,
+        high=high,
+    )
+    normalized_valid = _share_amount_matches_ohlc(
+        volume=volume / TUSHARE_HAND_SIZE,
+        amount=amount,
+        low=low,
+        high=high,
+    )
     if direct_valid or not normalized_valid:
         return False
     row["vol"] = volume / TUSHARE_HAND_SIZE
     return True
+
+
+def _share_amount_matches_ohlc(
+    *,
+    volume: float,
+    amount: float,
+    low: float,
+    high: float,
+) -> bool:
+    """Return whether share volume and CNY amount have a plausible bar price.
+
+    The relative band preserves the provider's established historical
+    tolerance.  The two absolute clauses have financial units: at most one CNY
+    of whole-amount quantization, or at most one A-share price tick outside the
+    OHLC envelope.  They avoid treating low-price odd lots as a 100x unit
+    anomaly merely because percentage error is large.
+    """
+
+    if volume <= 0 or amount <= 0 or low <= 0 or high <= 0:
+        return False
+    implied_price = amount / volume
+    relative = MINUTE_VWAP_RELATIVE_TOLERANCE
+    if low * (1.0 - relative) <= implied_price <= high * (1.0 + relative):
+        return True
+    amount_distance = max(low * volume - amount, amount - high * volume, 0.0)
+    if amount_distance <= MINUTE_AMOUNT_ROUNDING_TOLERANCE_CNY:
+        return True
+    price_distance = max(low - implied_price, implied_price - high, 0.0)
+    return price_distance <= MINUTE_PRICE_TICK_TOLERANCE_CNY
 
 
 def _validate_bar(dataset: str, row: Mapping[str, Any]) -> None:
@@ -476,20 +516,49 @@ def _fortnight_ranges(start: date, end: date) -> list[tuple[date, date]]:
     return ranges
 
 
-def _trading_session_ranges(
+def stable_ashare_5m_session_ranges(
     start: date,
     end: date,
     trading_dates: Iterable[date],
     *,
-    max_sessions: int,
+    max_sessions: int = ASHARE_5M_MAX_SESSIONS_PER_REQUEST,
 ) -> list[tuple[date, date]]:
+    """Split each calendar-quarter segment into one bounded request.
+
+    ``ExecutionDataPlanner`` first removes sessions covered by successful
+    checkpoint units and invokes this helper separately for every uncovered
+    segment.  A growing open quarter therefore keeps every successful unit key
+    and adds only the missing suffix, without multiplying a short suffix into
+    one provider request per symbol and trading day.
+    """
+
+    if end < start:
+        raise ValueError("end must not be before start")
     if max_sessions <= 0:
         raise ValueError("max_sessions must be positive")
-    sessions = [value for value in trading_dates if start <= value <= end]
-    return [
-        (sessions[offset], sessions[min(offset + max_sessions - 1, len(sessions) - 1)])
-        for offset in range(0, len(sessions), max_sessions)
-    ]
+    sessions = sorted({value for value in trading_dates if start <= value <= end})
+    grouped: dict[tuple[int, int], list[date]] = {}
+    for session in sessions:
+        session_quarter = (session.year, (session.month - 1) // 3)
+        grouped.setdefault(session_quarter, []).append(session)
+
+    ranges: list[tuple[date, date]] = []
+    for quarter_sessions in grouped.values():
+        ranges.append(_bounded_session_range(quarter_sessions, max_sessions=max_sessions))
+    return ranges
+
+
+def _bounded_session_range(
+    sessions: list[date],
+    *,
+    max_sessions: int,
+) -> tuple[date, date]:
+    if len(sessions) > max_sessions:
+        raise ValueError(
+            "A-share 5-minute request exceeds the "
+            f"{max_sessions}-session provider budget"
+        )
+    return sessions[0], sessions[-1]
 
 
 def _normalize_trading_dates(values: Iterable[str]) -> list[date]:

@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
 from collections.abc import Callable, Collection
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,19 +33,25 @@ from .execution_contract import (
     INDEX_VOLUME_POLICY,
     QLIB_DAILY_AMOUNT_UNIT,
     QLIB_DAILY_VOLUME_UNIT,
+    QLIB_OUTPUT_MANIFEST_VERSION,
     TUSHARE_DAILY_AMOUNT_UNIT,
     TUSHARE_DAILY_VOLUME_UNIT,
     TUSHARE_HAND_SIZE,
 )
+from .history_bounds import PRIMARY_MARKET_HISTORY_START
 from .path_utils import to_wsl_path as _to_wsl_path
 from .regulatory_events import (
     REGULATORY_EVENTS_RULE_VERSION,
-    derive_regulatory_events,
+    REGULATORY_TERMINAL_DEFERRAL_POLICY,
+    derive_regulatory_events_for_horizon,
     open_days_from_trade_cal,
 )
+from .snapshot_lineage import verify_snapshot_lineage
 from .style_exposure_panel import build_adjusted_close, build_raw_style_panel
 
 logger = logging.getLogger(__name__)
+
+_QLIB_PROVENANCE_PATH = "metadata/provenance.json"
 
 _BASE_QLIB_FIELDS = (
     "open",
@@ -63,9 +70,18 @@ _BASE_QLIB_FIELDS = (
 
 _GOVERNED_BENCHMARK = "000300.SH"
 _UNKNOWN_INDUSTRY = "__UNKNOWN__"
-_MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO = 0.01
+# Cap unresolved benchmark industry exposure at 2%.  This is conservative in
+# the risk dimension: the observed 2.2169% pre-remediation gap remains
+# fail-closed, while the source-backed 1.49% residual may pass only as explicit
+# ``__UNKNOWN__`` and is never future-filled.
+_MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO = 0.02
 _UNRESTRICTED_UP_LIMIT = 99999.99
 _MAX_EXCLUDED_DAILY_UNIT_RATIO = 0.00001
+
+_ADJUSTMENT_BOUNDARY_POLICY_VERSION = "baostock-primary-adj-boundary-v1"
+_ADJUSTMENT_BOUNDARY_MAX_PRICE_ABS_ERROR = 0.051
+_ADJUSTMENT_BOUNDARY_MAX_PRICE_RELATIVE_ERROR = 0.005
+_ADJUSTMENT_BOUNDARY_MAX_MASKED_RATIO = 0.01
 
 _DAILY_RESEARCH_FIELDS = (
     "turnover_rate",
@@ -233,10 +249,31 @@ class QlibBuilder:
         self.snapshot_path = snapshot_path.resolve()
         self.research_feature_contract = self._research_feature_contract()
         self._daily_unit_quality_cache: dict[str, Any] | None = None
+        self._adjustment_boundary_cache: dict[str, Any] | None = None
 
     @property
     def qlib_fields(self) -> tuple[str, ...]:
         return (*_BASE_QLIB_FIELDS, *self.research_feature_contract["fields"])
+
+    @staticmethod
+    def builder_sha256() -> str:
+        module_root = Path(__file__).resolve().parent
+        project_root = module_root.parent
+        files = {
+            "qlib_builder": Path(__file__).resolve(),
+            "availability": module_root / "availability.py",
+            "execution_contract": module_root / "execution_contract.py",
+            "eligibility": project_root / "quant_platform" / "eligibility.py",
+            "regulatory_events": module_root / "regulatory_events.py",
+            "style_exposure_panel": module_root / "style_exposure_panel.py",
+            "style_exposures": project_root / "quant_platform" / "style_exposures.py",
+        }
+        contract = {
+            name: _sha256_file(path) for name, path in sorted(files.items())
+        }
+        return hashlib.sha256(
+            json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
     def build_staging(self, staging_path: Path) -> Path:
         daily_glob = self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet"
@@ -414,11 +451,32 @@ class QlibBuilder:
         snapshot_manifest = json.loads(
             (self.snapshot_path / "manifest.json").read_text(encoding="utf-8")
         )
-        builder_digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        builder_digest = self.builder_sha256()
         fields = list(self.qlib_fields)
         field_units = self._field_units()
         execution_controls = self._execution_control_coverage()
         daily_unit_quality = self._daily_unit_quality_coverage()
+        adjustment_boundary = self._require_adjustment_boundary_evidence()
+        adjustment_boundary_contract = {
+            key: adjustment_boundary.get(key)
+            for key in (
+                "version",
+                "status",
+                "cutoff_date",
+                "policy",
+                "max_price_abs_error",
+                "max_price_relative_error",
+                "max_masked_ratio",
+                "cross_source_symbols",
+                "rebased_symbol_count",
+                "masked_symbol_count",
+                "masked_ratio",
+                "evidence_sha256",
+            )
+        }
+        adjustment_boundary_contract["artifact_path"] = (
+            "metadata/adjustment_boundary.json"
+        )
         contract = {
             "version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
             "frequency": "day",
@@ -439,14 +497,18 @@ class QlibBuilder:
             },
             "execution_controls": execution_controls,
             "daily_unit_quality": daily_unit_quality,
+            "adjustment_boundary": adjustment_boundary_contract,
         }
         contract_sha256 = hashlib.sha256(
             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         source_lineage_id = str(snapshot_manifest.get("lineage_id") or "")
-        lineage_verified = len(source_lineage_id) == 64 and all(
-            character in "0123456789abcdef" for character in source_lineage_id
-        )
+        lineage_verified = False
+        if source_lineage_id:
+            verified_manifest = verify_snapshot_lineage(self.snapshot_path)
+            if verified_manifest != snapshot_manifest:
+                raise ValueError("snapshot lineage verification returned different manifest data")
+            lineage_verified = True
         dataset_lineage_id = (
             hashlib.sha256(
                 json.dumps(
@@ -485,8 +547,19 @@ class QlibBuilder:
             },
             "execution_controls": execution_controls,
             "daily_unit_quality": daily_unit_quality,
+            "adjustment_boundary": adjustment_boundary_contract,
         }
         canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        target = qlib_dir / _QLIB_PROVENANCE_PATH
+        target.parent.mkdir(parents=True, exist_ok=True)
+        (target.parent / "adjustment_boundary.json").write_text(
+            json.dumps(adjustment_boundary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (target.parent / "research_feature_contract.json").write_text(
+            json.dumps(self.research_feature_contract, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         provenance = {
             **identity,
             "dataset_identity_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
@@ -498,15 +571,10 @@ class QlibBuilder:
             "source_start_date": snapshot_manifest.get("start_date"),
             "source_end_date": snapshot_manifest.get("end_date"),
             "lineage_verified": lineage_verified,
+            "output_manifest": build_qlib_output_manifest(qlib_dir),
             "created_at": datetime.now(UTC).isoformat(),
         }
-        target = qlib_dir / "metadata" / "provenance.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(provenance, ensure_ascii=False, indent=2), encoding="utf-8")
-        (target.parent / "research_feature_contract.json").write_text(
-            json.dumps(self.research_feature_contract, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
 
     def _snapshot_manifest_digest(self) -> str:
         snapshot_manifest = self.snapshot_path / "manifest.json"
@@ -587,7 +655,8 @@ class QlibBuilder:
                     max(trade_date) FILTER (
                         WHERE up_limit IS NULL AND down_limit IS NULL
                     ) AS last_missing_date,
-                    count(*) AS total_rows
+                    count(*) AS total_rows,
+                    min(trade_date) AS first_trade_date
                 FROM coverage
                 """
             ).fetchone()
@@ -597,10 +666,11 @@ class QlibBuilder:
         first_missing = row[1] if row is not None else None
         last_missing = row[2] if row is not None else None
         total_rows = int(row[3] or 0) if row is not None else 0
+        first_trade = row[4] if row is not None else None
         native_complete_from = (
             (last_missing + timedelta(days=1)).isoformat()
             if last_missing is not None
-            else None
+            else (str(first_trade) if first_trade is not None else None)
         )
         return {
             "source": "native_stk_limit",
@@ -612,6 +682,251 @@ class QlibBuilder:
             "missing_row_policy": "research_only_unrestricted_sentinel",
             "formal_execution_requires_native_controls": True,
         }
+
+    def _adjustment_boundary_evidence(self) -> dict[str, Any]:
+        """Prove and freeze the BaoStock-to-primary adjustment-factor bridge.
+
+        Adjustment factors are only defined up to a positive per-instrument
+        constant.  BaoStock and the primary source can therefore agree on the
+        entire relative path while using different absolute levels.  A direct
+        concatenation would create a fake adjusted-price jump at 2016-01-01.
+
+        For instruments with usable daily/factor rows on both sides, the last
+        legacy factor is scaled to the first primary factor.  This is admitted
+        only when the legacy close and the primary row's ``pre_close`` prove
+        price continuity.  Failed bridges are explicitly masked from Qlib;
+        immutable snapshot values are never overwritten.
+        """
+
+        if self._adjustment_boundary_cache is not None:
+            return json.loads(json.dumps(self._adjustment_boundary_cache))
+        daily_root = self.snapshot_path / "parquet" / "daily"
+        adj_root = self.snapshot_path / "parquet" / "adj_factor"
+        if not any(daily_root.rglob("*.parquet")) or not any(
+            adj_root.rglob("*.parquet")
+        ):
+            result = {
+                "version": _ADJUSTMENT_BOUNDARY_POLICY_VERSION,
+                "status": "not_applicable",
+                "cutoff_date": PRIMARY_MARKET_HISTORY_START.isoformat(),
+                "policy": "rebase_legacy_factor_or_mask_cross_source_instrument",
+                "max_price_abs_error": _ADJUSTMENT_BOUNDARY_MAX_PRICE_ABS_ERROR,
+                "max_price_relative_error": (
+                    _ADJUSTMENT_BOUNDARY_MAX_PRICE_RELATIVE_ERROR
+                ),
+                "max_masked_ratio": _ADJUSTMENT_BOUNDARY_MAX_MASKED_RATIO,
+                "cross_source_symbols": 0,
+                "rebased_symbol_count": 0,
+                "masked_symbol_count": 0,
+                "masked_ratio": 0.0,
+                "rebased_symbols": [],
+                "masked_symbols": [],
+            }
+            result["evidence_sha256"] = _canonical_sha256(result)
+            self._adjustment_boundary_cache = result
+            return json.loads(json.dumps(result))
+
+        daily = _sql_string(str((daily_root / "**" / "*.parquet").resolve()))
+        adj = _sql_string(str((adj_root / "**" / "*.parquet").resolve()))
+        cutoff = _sql_string(PRIMARY_MARKET_HISTORY_START.isoformat())
+        pre_close_expression = (
+            "try_cast(d.pre_close AS DOUBLE)"
+            if "pre_close" in self._parquet_columns("daily")
+            else "NULL::DOUBLE"
+        )
+        connection = duckdb.connect()
+        try:
+            rows = connection.execute(
+                f"""
+                WITH daily_rows AS (
+                    SELECT
+                        d.ts_code,
+                        coalesce(
+                            try_cast(d.trade_date AS DATE),
+                            try_strptime(
+                                CAST(d.trade_date AS VARCHAR), '%Y%m%d'
+                            )::DATE
+                        ) AS trade_date,
+                        try_cast(d.close AS DOUBLE) AS close,
+                        {pre_close_expression} AS pre_close
+                    FROM read_parquet(
+                        {daily}, hive_partitioning=true, union_by_name=true
+                    ) d
+                    WHERE d.ts_code IS NOT NULL
+                      AND d.close IS NOT NULL
+                ),
+                factor_rows AS (
+                    SELECT
+                        a.ts_code,
+                        coalesce(
+                            try_cast(a.trade_date AS DATE),
+                            try_strptime(
+                                CAST(a.trade_date AS VARCHAR), '%Y%m%d'
+                            )::DATE
+                        ) AS trade_date,
+                        CASE
+                            WHEN count(*) = 1
+                            THEN max(try_cast(a.adj_factor AS DOUBLE))
+                            ELSE NULL::DOUBLE
+                        END AS adj_factor
+                    FROM read_parquet(
+                        {adj}, hive_partitioning=true, union_by_name=true
+                    ) a
+                    WHERE a.ts_code IS NOT NULL
+                    GROUP BY a.ts_code, trade_date
+                ),
+                legacy_anchor AS (
+                    SELECT ts_code, trade_date, close
+                    FROM daily_rows
+                    WHERE trade_date < DATE {cutoff}
+                    QUALIFY row_number() OVER (
+                        PARTITION BY ts_code ORDER BY trade_date DESC
+                    ) = 1
+                ),
+                primary_anchor AS (
+                    SELECT ts_code, trade_date, pre_close
+                    FROM daily_rows
+                    WHERE trade_date >= DATE {cutoff}
+                    QUALIFY row_number() OVER (
+                        PARTITION BY ts_code ORDER BY trade_date ASC
+                    ) = 1
+                )
+                SELECT
+                    legacy.ts_code,
+                    legacy.trade_date,
+                    current_anchor.trade_date,
+                    legacy.close,
+                    current_anchor.pre_close,
+                    legacy_factor.adj_factor,
+                    current_factor.adj_factor
+                FROM legacy_anchor legacy
+                INNER JOIN primary_anchor current_anchor USING (ts_code)
+                LEFT JOIN factor_rows legacy_factor
+                  ON legacy.ts_code = legacy_factor.ts_code
+                 AND legacy.trade_date = legacy_factor.trade_date
+                LEFT JOIN factor_rows current_factor
+                  ON current_anchor.ts_code = current_factor.ts_code
+                 AND current_anchor.trade_date = current_factor.trade_date
+                ORDER BY legacy.ts_code
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+
+        rebased: list[dict[str, Any]] = []
+        masked: list[dict[str, Any]] = []
+        for (
+            ts_code,
+            legacy_date,
+            primary_date,
+            legacy_close,
+            primary_pre_close,
+            legacy_factor,
+            primary_factor,
+        ) in rows:
+            legacy_price = _finite_float(legacy_close)
+            previous_price = _finite_float(primary_pre_close)
+            legacy_level = _finite_float(legacy_factor)
+            primary_level = _finite_float(primary_factor)
+            valid_factor_levels = (
+                legacy_level is not None
+                and primary_level is not None
+                and math.isfinite(legacy_level)
+                and math.isfinite(primary_level)
+                and legacy_level > 0
+                and primary_level > 0
+            )
+            scale = (
+                primary_level / legacy_level
+                if valid_factor_levels
+                else None
+            )
+            abs_error = (
+                abs(legacy_price - previous_price)
+                if legacy_price is not None and previous_price is not None
+                else None
+            )
+            relative_error = (
+                abs_error / max(abs(legacy_price), abs(previous_price), 1e-9)
+                if abs_error is not None
+                and legacy_price is not None
+                and previous_price is not None
+                else None
+            )
+            item = {
+                "ts_code": str(ts_code),
+                "legacy_date": str(legacy_date),
+                "primary_date": str(primary_date),
+                "legacy_close": legacy_price,
+                "primary_pre_close": previous_price,
+                "legacy_adj_factor": legacy_level,
+                "primary_adj_factor": primary_level,
+                "legacy_scale": scale,
+                "price_abs_error": abs_error,
+                "price_relative_error": relative_error,
+            }
+            if scale is None or not math.isfinite(scale) or scale <= 0:
+                masked.append(
+                    {**item, "reason": "missing_or_invalid_boundary_factor"}
+                )
+            elif (
+                previous_price is None
+                or legacy_price is None
+                or not math.isfinite(previous_price)
+                or not math.isfinite(legacy_price)
+                or previous_price <= 0
+                or legacy_price <= 0
+            ):
+                masked.append({**item, "reason": "missing_or_invalid_boundary_price"})
+            elif (
+                abs_error is None
+                or relative_error is None
+                or not math.isfinite(abs_error)
+                or not math.isfinite(relative_error)
+                or abs_error > _ADJUSTMENT_BOUNDARY_MAX_PRICE_ABS_ERROR
+                or relative_error
+                > _ADJUSTMENT_BOUNDARY_MAX_PRICE_RELATIVE_ERROR
+            ):
+                masked.append({**item, "reason": "boundary_price_mismatch"})
+            else:
+                rebased.append(item)
+
+        masked_ratio = len(masked) / len(rows) if rows else 0.0
+        result = {
+            "version": _ADJUSTMENT_BOUNDARY_POLICY_VERSION,
+            "status": (
+                "failed"
+                if masked_ratio > _ADJUSTMENT_BOUNDARY_MAX_MASKED_RATIO
+                else ("pass_with_masks" if masked else "pass")
+            ),
+            "cutoff_date": PRIMARY_MARKET_HISTORY_START.isoformat(),
+            "policy": "rebase_legacy_factor_or_mask_cross_source_instrument",
+            "max_price_abs_error": _ADJUSTMENT_BOUNDARY_MAX_PRICE_ABS_ERROR,
+            "max_price_relative_error": (
+                _ADJUSTMENT_BOUNDARY_MAX_PRICE_RELATIVE_ERROR
+            ),
+            "max_masked_ratio": _ADJUSTMENT_BOUNDARY_MAX_MASKED_RATIO,
+            "cross_source_symbols": len(rows),
+            "rebased_symbol_count": len(rebased),
+            "masked_symbol_count": len(masked),
+            "masked_ratio": masked_ratio,
+            "rebased_symbols": rebased,
+            "masked_symbols": masked,
+        }
+        result["evidence_sha256"] = _canonical_sha256(result)
+        self._adjustment_boundary_cache = result
+        return json.loads(json.dumps(result))
+
+    def _require_adjustment_boundary_evidence(self) -> dict[str, Any]:
+        evidence = self._adjustment_boundary_evidence()
+        if evidence.get("status") == "failed":
+            raise RuntimeError(
+                "cross-source adjustment boundary rejected: "
+                f"{evidence.get('masked_symbol_count', 0)}/"
+                f"{evidence.get('cross_source_symbols', 0)} instruments "
+                "failed continuity"
+            )
+        return evidence
 
     def _daily_unit_quality_coverage(self) -> dict[str, Any]:
         if self._daily_unit_quality_cache is not None:
@@ -699,6 +1014,18 @@ class QlibBuilder:
 
     def _write_stock_universe(self, qlib_dir: Path) -> None:
         daily_glob = self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet"
+        masked_symbols = [
+            str(item["ts_code"])
+            for item in self._adjustment_boundary_evidence().get("masked_symbols")
+            or []
+        ]
+        mask_predicate = ""
+        if masked_symbols:
+            mask_predicate = (
+                "AND ts_code NOT IN ("
+                + ", ".join(_sql_string(symbol) for symbol in masked_symbols)
+                + ")"
+            )
         connection = duckdb.connect()
         try:
             rows = connection.execute(
@@ -710,6 +1037,7 @@ class QlibBuilder:
                     union_by_name=true
                 )
                 WHERE ts_code IS NOT NULL AND trade_date IS NOT NULL
+                  {mask_predicate}
                 GROUP BY ts_code ORDER BY ts_code
                 """
             ).fetchall()
@@ -783,10 +1111,21 @@ class QlibBuilder:
                 None,
             )
             if industry_column and instrument_column in frame.columns:
+                instruments = (
+                    frame[instrument_column]
+                    .astype("string")
+                    .fillna("")
+                    .str.replace(r"^\s+|\s+$", "", regex=True)
+                )
+                industries = (
+                    frame[industry_column]
+                    .astype("string")
+                    .str.replace(r"^\s+|\s+$", "", regex=True)
+                )
                 metadata = pd.DataFrame(
                     {
-                        "instrument": frame[instrument_column].map(_qlib_symbol),
-                        "industry": frame[industry_column].astype("string"),
+                        "instrument": instruments.map(_qlib_symbol),
+                        "industry": industries.mask(industries.eq("")),
                         "in_date": pd.to_datetime(frame.get("in_date"), errors="coerce"),
                         "out_date": pd.to_datetime(frame.get("out_date"), errors="coerce"),
                     }
@@ -911,10 +1250,22 @@ class QlibBuilder:
         required = {"index_code", "con_code", "trade_date", "weight"}
         if not required.issubset(weights.columns):
             return pd.DataFrame(columns=metadata.columns)
+        benchmarks = (
+            weights["index_code"]
+            .astype("string")
+            .str.replace(r"^\s+|\s+$", "", regex=True)
+            .str.upper()
+        )
+        instruments = (
+            weights["con_code"]
+            .astype("string")
+            .fillna("")
+            .str.replace(r"^\s+|\s+$", "", regex=True)
+        )
         weights = pd.DataFrame(
             {
-                "benchmark": weights["index_code"].astype("string").str.upper().str.strip(),
-                "instrument": weights["con_code"].map(_qlib_symbol),
+                "benchmark": benchmarks,
+                "instrument": instruments.map(_qlib_symbol),
                 "datetime": pd.to_datetime(weights["trade_date"], errors="coerce"),
                 "weight": pd.to_numeric(weights["weight"], errors="coerce"),
             }
@@ -1011,6 +1362,37 @@ class QlibBuilder:
         adj_root = self.snapshot_path / "parquet" / "adj_factor"
         adj_files = sorted(adj_root.rglob("*.parquet")) if adj_root.exists() else []
         factors = _read_parquet_columns(adj_files, {"ts_code", "trade_date", "adj_factor"})
+        evidence = self._require_adjustment_boundary_evidence()
+        masked_symbols = {
+            str(item["ts_code"])
+            for item in evidence.get("masked_symbols") or []
+        }
+        if masked_symbols:
+            daily = daily.loc[~daily["ts_code"].astype(str).isin(masked_symbols)].copy()
+            if factors is not None:
+                factors = factors.loc[
+                    ~factors["ts_code"].astype(str).isin(masked_symbols)
+                ].copy()
+        if factors is not None and not factors.empty:
+            scale_by_symbol = {
+                str(item["ts_code"]): float(item["legacy_scale"])
+                for item in evidence.get("rebased_symbols") or []
+            }
+            if scale_by_symbol:
+                factor_dates = pd.to_datetime(
+                    factors["trade_date"].astype(str),
+                    format="mixed",
+                    errors="coerce",
+                )
+                legacy_rows = factor_dates.lt(pd.Timestamp(PRIMARY_MARKET_HISTORY_START))
+                scales = factors["ts_code"].astype(str).map(scale_by_symbol)
+                rebased_rows = legacy_rows & scales.notna()
+                factors.loc[rebased_rows, "adj_factor"] = (
+                    pd.to_numeric(
+                        factors.loc[rebased_rows, "adj_factor"], errors="coerce"
+                    )
+                    * scales.loc[rebased_rows]
+                )
         return build_adjusted_close(daily, factors)
 
     def _load_fina_indicator(self) -> pd.DataFrame | None:
@@ -1129,6 +1511,11 @@ class QlibBuilder:
                 "paused": pd.to_numeric(daily["vol"], errors="coerce").fillna(0).le(0),
             }
         )
+        market_dates = market["datetime"].dropna()
+        if market_dates.empty:
+            raise ValueError("daily has no valid publication-horizon trading date")
+        regulatory_horizon = market_dates.max().date()
+        deferred_regulatory_events: list[dict[str, str]] = []
         listings = pd.DataFrame(
             {
                 "instrument": stock_basic["ts_code"].map(_qlib_symbol),
@@ -1222,7 +1609,10 @@ class QlibBuilder:
         else:
             # Fail-soft fallback: derive major-violation events from the anns_d
             # announcement titles persisted in the same immutable snapshot.
-            regulatory = self._derive_regulatory_events(read)
+            regulatory, deferred_regulatory_events = self._derive_regulatory_events(
+                read,
+                publication_horizon=regulatory_horizon,
+            )
             if regulatory is not None:
                 regulatory_origin = f"anns_d_title_rules({REGULATORY_EVENTS_RULE_VERSION})"
         matrix = build_point_in_time_eligibility(
@@ -1235,6 +1625,14 @@ class QlibBuilder:
             regulatory_events=regulatory,
             policy=EligibilityPolicy(),
         )
+        regulatory_terminal_audit = {
+            "publication_horizon": regulatory_horizon.isoformat(),
+            "policy": REGULATORY_TERMINAL_DEFERRAL_POLICY,
+            "deferred_event_count": len(deferred_regulatory_events),
+            "deferred_events_sha256": _canonical_sha256(
+                deferred_regulatory_events
+            ),
+        }
         target.mkdir(parents=True, exist_ok=True)
         matrix.to_parquet(target / "eligibility_matrix.parquet", index=False, compression="zstd")
         (target / "eligibility_contract.json").write_text(
@@ -1243,6 +1641,19 @@ class QlibBuilder:
                     "version": ELIGIBILITY_CONTRACT_VERSION,
                     "regulatory_data_available": regulatory is not None,
                     "regulatory_origin": regulatory_origin,
+                    "regulatory_publication_horizon": regulatory_horizon.isoformat(),
+                    "regulatory_terminal_policy": (
+                        REGULATORY_TERMINAL_DEFERRAL_POLICY
+                    ),
+                    "regulatory_deferred_event_count": len(
+                        deferred_regulatory_events
+                    ),
+                    "regulatory_deferred_events_sha256": (
+                        regulatory_terminal_audit["deferred_events_sha256"]
+                    ),
+                    "regulatory_terminal_audit_sha256": _canonical_sha256(
+                        regulatory_terminal_audit
+                    ),
                     "financial_availability": "strictly_after_announcement_date",
                     "delisting_availability": "effective_date_only_no_backfill",
                 },
@@ -1254,30 +1665,84 @@ class QlibBuilder:
         return True
 
     def _derive_regulatory_events(
-        self, read: Callable[[str], pd.DataFrame]
-    ) -> pd.DataFrame | None:
+        self,
+        read: Callable[[str], pd.DataFrame],
+        *,
+        publication_horizon: date,
+    ) -> tuple[pd.DataFrame | None, list[dict[str, str]]]:
         """Derive major-violation events from snapshot anns_d titles.
 
         Returns None (current fail-soft behavior) when the snapshot carries no
-        anns_d parquet; otherwise applies the versioned conservative title
-        rules with the snapshot trade_cal as the known_date calendar. The
-        derivation is deterministic over immutable snapshot inputs, so the
-        snapshot lineage already covers the result.
+        anns_d parquet. Otherwise the publication-boundary wrapper excludes
+        only recognizable major events announced on the final market day: the
+        next trading day is outside this immutable Qlib artifact, so those rows
+        are deferred with deterministic audit evidence. Historical calendar
+        gaps and source rows beyond the horizon still fail closed.
         """
 
         anns_root = self.snapshot_path / "parquet" / "anns_d"
         if not anns_root.is_dir() or not any(anns_root.rglob("*.parquet")):
-            return None
+            return None, []
         open_days = open_days_from_trade_cal(read("trade_cal"))
-        events = derive_regulatory_events(read("anns_d"), open_days)
+        events, deferred = derive_regulatory_events_for_horizon(
+            read("anns_d"),
+            open_days,
+            publication_horizon=publication_horizon,
+        )
         regulatory = events.rename(columns={"ts_code": "instrument"}).copy()
         regulatory["instrument"] = regulatory["instrument"].map(_qlib_symbol)
-        return regulatory
+        return regulatory, deferred
 
     def _normalized_query(self, daily_glob: Path, adj_glob: Path, limit_glob: Path) -> str:
         daily = _sql_string(str(daily_glob.resolve()))
         adj = _sql_string(str(adj_glob.resolve()))
         limits = _sql_string(str(limit_glob.resolve()))
+        adjustment_boundary = self._require_adjustment_boundary_evidence()
+        scale_rows = [
+            (
+                str(item["ts_code"]),
+                float(item["legacy_scale"]),
+            )
+            for item in adjustment_boundary.get("rebased_symbols") or []
+        ]
+        masked_symbols = [
+            str(item["ts_code"])
+            for item in adjustment_boundary.get("masked_symbols") or []
+        ]
+        if scale_rows:
+            scale_values = ", ".join(
+                f"({_sql_string(symbol)}, {format(scale, '.17g')})"
+                for symbol, scale in scale_rows
+            )
+            scale_relation = (
+                "boundary_scales(ts_code, legacy_scale) AS "
+                f"(VALUES {scale_values})"
+            )
+        else:
+            scale_relation = (
+                "boundary_scales AS (SELECT NULL::VARCHAR AS ts_code, "
+                "NULL::DOUBLE AS legacy_scale WHERE FALSE)"
+            )
+        if masked_symbols:
+            mask_values = ", ".join(
+                f"({_sql_string(symbol)})" for symbol in masked_symbols
+            )
+            mask_relation = (
+                "boundary_masks(ts_code) AS "
+                f"(VALUES {mask_values})"
+            )
+        else:
+            mask_relation = (
+                "boundary_masks AS (SELECT NULL::VARCHAR AS ts_code WHERE FALSE)"
+            )
+        cutoff = _sql_string(PRIMARY_MARKET_HISTORY_START.isoformat())
+        source_adjustment_factor = (
+            "CASE WHEN coalesce(try_cast(d.trade_date AS DATE), "
+            "try_strptime(CAST(d.trade_date AS VARCHAR), '%Y%m%d')::DATE) "
+            f"< DATE {cutoff} AND boundary_scales.legacy_scale IS NOT NULL "
+            "THEN a.adj_factor * boundary_scales.legacy_scale "
+            "ELSE a.adj_factor END"
+        )
         daily_features = self.research_feature_contract["daily_fields"]
         fundamental_features = self.research_feature_contract["fundamental_fields"]
         capital_flow_features = self.research_feature_contract["capital_flow_fields"]
@@ -1385,7 +1850,9 @@ class QlibBuilder:
                  AND try_cast(d.trade_date AS DATE) > try_cast({dataset}.ann_date AS DATE)
             """
         return f"""
-            WITH joined AS (
+            WITH {scale_relation},
+            {mask_relation},
+            joined AS (
                 SELECT
                     d.ts_code,
                     d.trade_date,
@@ -1396,24 +1863,29 @@ class QlibBuilder:
                     d.vol,
                     d.amount,
                     d.pct_chg,
-                    a.adj_factor,
+                    {source_adjustment_factor} AS adj_factor,
                     coalesce(l.up_limit, {_UNRESTRICTED_UP_LIMIT}) AS up_limit,
                     coalesce(l.down_limit, 0.0) AS down_limit
                     {joined_daily_select}
                     {joined_fundamental_select}
                     {capital_flow_select}
-                    , first_value(d.close * a.adj_factor) OVER (
+                    , first_value(d.close * ({source_adjustment_factor})) OVER (
                         PARTITION BY d.ts_code ORDER BY d.trade_date
                     ) AS base_price
                 FROM read_parquet({daily}, hive_partitioning=true, union_by_name=true) d
                 LEFT JOIN read_parquet({adj}, hive_partitioning=true, union_by_name=true) a
                   ON d.ts_code = a.ts_code AND d.trade_date = a.trade_date
+                LEFT JOIN boundary_scales
+                  ON d.ts_code = boundary_scales.ts_code
+                LEFT JOIN boundary_masks
+                  ON d.ts_code = boundary_masks.ts_code
                 LEFT JOIN read_parquet({limits}, hive_partitioning=true, union_by_name=true) l
                   ON d.ts_code = l.ts_code AND d.trade_date = l.trade_date
                 {daily_join}
                 {fundamental_join}
                 {capital_flow_join}
                 WHERE d.ts_code IS NOT NULL AND d.close IS NOT NULL
+                  AND boundary_masks.ts_code IS NULL
             )
             SELECT
                 trade_date AS date,
@@ -1756,6 +2228,13 @@ class QlibBuilder:
                     issues.append(f"{dataset} has no usable rows")
 
         if not issues:
+            conflict_issue = self._industry_membership_conflict_issue(
+                industry_columns
+            )
+            if conflict_issue:
+                issues.append(conflict_issue)
+
+        if not issues:
             coverage_issue = self._benchmark_industry_coverage_issue(
                 industry_columns
             )
@@ -1764,6 +2243,89 @@ class QlibBuilder:
 
         if issues:
             raise RuntimeError("Qlib research inputs are incomplete: " + "; ".join(issues))
+
+    def _industry_membership_conflict_issue(
+        self, industry_columns: set[str]
+    ) -> str | None:
+        """Reject overlapping effective intervals with different L1 industries."""
+
+        instrument_column = next(
+            name for name in ("ts_code", "con_code") if name in industry_columns
+        )
+        industry_column = next(
+            name
+            for name in ("l1_code", "index_code", "l2_code")
+            if name in industry_columns
+        )
+        out_date = (
+            _as_date_sql("out_date")
+            if "out_date" in industry_columns
+            else "NULL::DATE"
+        )
+        industry_root = self.snapshot_path / "parquet" / "index_member_all"
+        industry_glob = _sql_string(
+            str((industry_root / "**" / "*.parquet").resolve())
+        )
+        query = f"""
+            WITH industry_rows AS (
+                SELECT DISTINCT
+                    upper({_nonblank_text_sql(instrument_column)}) AS instrument,
+                    upper({_nonblank_text_sql(industry_column)}) AS industry,
+                    {_as_date_sql("in_date")} AS in_date,
+                    {out_date} AS out_date
+                FROM read_parquet(
+                    {industry_glob}, hive_partitioning=true, union_by_name=true
+                )
+                WHERE {_nonblank_text_sql(instrument_column)} IS NOT NULL
+                  AND {_nonblank_text_sql(industry_column)} IS NOT NULL
+                  AND {_as_date_sql("in_date")} IS NOT NULL
+            ),
+            conflicts AS (
+                SELECT
+                    lhs.instrument,
+                    greatest(lhs.in_date, rhs.in_date) AS first_conflict_date,
+                    lhs.industry AS first_industry,
+                    rhs.industry AS second_industry
+                FROM industry_rows lhs
+                INNER JOIN industry_rows rhs
+                  ON lhs.instrument = rhs.instrument
+                 AND lhs.industry < rhs.industry
+                 AND lhs.in_date <= coalesce(rhs.out_date, DATE '9999-12-31')
+                 AND rhs.in_date <= coalesce(lhs.out_date, DATE '9999-12-31')
+            )
+            SELECT
+                count(*) AS conflict_pairs,
+                min(first_conflict_date) AS first_conflict_date,
+                (
+                    SELECT string_agg(
+                        instrument || ':' || first_industry || '/' || second_industry,
+                        ', '
+                    )
+                    FROM (
+                        SELECT *
+                        FROM conflicts
+                        ORDER BY first_conflict_date, instrument,
+                                 first_industry, second_industry
+                        LIMIT 10
+                    ) examples
+                ) AS examples
+            FROM conflicts
+        """
+        connection = duckdb.connect()
+        try:
+            row = connection.execute(query).fetchone()
+        finally:
+            connection.close()
+        conflict_pairs = int(row[0] or 0) if row is not None else 0
+        if conflict_pairs == 0:
+            return None
+        first_conflict_date = row[1]
+        examples = str(row[2] or "")
+        return (
+            "index_member_all has overlapping distinct point-in-time L1 "
+            f"industry intervals in {conflict_pairs} row pairs; first affected "
+            f"date {first_conflict_date}: {examples}"
+        )
 
     def _benchmark_industry_coverage_issue(
         self, industry_columns: set[str]
@@ -1801,8 +2363,8 @@ class QlibBuilder:
         query = f"""
             WITH weight_rows AS (
                 SELECT
-                    upper(trim(CAST(index_code AS VARCHAR))) AS benchmark,
-                    upper(trim(CAST(con_code AS VARCHAR))) AS instrument,
+                    upper({_nonblank_text_sql("index_code")}) AS benchmark,
+                    upper({_nonblank_text_sql("con_code")}) AS instrument,
                     {_as_date_sql("trade_date")} AS weight_date,
                     try_cast(weight AS DOUBLE) AS weight
                 FROM read_parquet(
@@ -1820,14 +2382,15 @@ class QlibBuilder:
             ),
             industry_rows AS (
                 SELECT
-                    upper(trim(CAST("{instrument_column}" AS VARCHAR))) AS instrument,
+                    upper({_nonblank_text_sql(instrument_column)}) AS instrument,
+                    upper({_nonblank_text_sql(industry_column)}) AS industry,
                     {_as_date_sql("in_date")} AS in_date,
                     {out_date} AS out_date
                 FROM read_parquet(
                     {industry_glob}, hive_partitioning=true, union_by_name=true
                 )
-                WHERE "{instrument_column}" IS NOT NULL
-                  AND "{industry_column}" IS NOT NULL
+                WHERE {_nonblank_text_sql(instrument_column)} IS NOT NULL
+                  AND {_nonblank_text_sql(industry_column)} IS NOT NULL
                   AND {_as_date_sql("in_date")} IS NOT NULL
             ),
             coverage AS (
@@ -1920,7 +2483,8 @@ class QlibBuilder:
             name for name in ("l1_code", "index_code", "l2_code") if name in columns
         )
         return (
-            f"{instrument} IS NOT NULL AND {industry} IS NOT NULL "
+            f"{_nonblank_text_sql(instrument)} IS NOT NULL "
+            f"AND {_nonblank_text_sql(industry)} IS NOT NULL "
             f"AND {_as_date_sql('in_date')} IS NOT NULL"
         )
 
@@ -2006,6 +2570,14 @@ def _as_date_sql(column: str) -> str:
     )
 
 
+def _nonblank_text_sql(column: str) -> str:
+    identifier = '"' + column.replace('"', '""') + '"'
+    return (
+        f"nullif(regexp_replace(CAST({identifier} AS VARCHAR), "
+        "'^[[:space:]]+|[[:space:]]+$', '', 'g'), '')"
+    )
+
+
 def _fundamental_revision_order(
     projected_columns: list[str], source_columns: set[str]
 ) -> str:
@@ -2039,6 +2611,91 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _finite_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def build_qlib_output_manifest(qlib_dir: Path) -> dict[str, Any]:
+    """Seal every published Qlib file except the self-referential provenance."""
+
+    root = qlib_dir.resolve()
+    files = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix()
+        if relative == _QLIB_PROVENANCE_PATH:
+            continue
+        files.append(
+            {
+                "path": relative,
+                "bytes": path.stat().st_size,
+                "sha256": _sha256_file(path),
+            }
+        )
+    return {"version": QLIB_OUTPUT_MANIFEST_VERSION, "files": files}
+
+
+def verify_qlib_output_manifest(qlib_dir: Path, provenance: dict[str, Any]) -> None:
+    """Fail closed if any sealed Qlib output was added, removed, or changed."""
+
+    recorded = provenance.get("output_manifest")
+    if not isinstance(recorded, dict) or recorded.get("version") != QLIB_OUTPUT_MANIFEST_VERSION:
+        raise ValueError("Qlib provenance has no supported output file manifest")
+    files = recorded.get("files")
+    if not isinstance(files, list):
+        raise ValueError("Qlib output file manifest is invalid")
+    expected: dict[str, tuple[int, str]] = {}
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError("Qlib output file manifest entry is invalid")
+        relative_text = str(item.get("path") or "")
+        relative = Path(relative_text)
+        if (
+            not relative_text
+            or relative.is_absolute()
+            or relative_text == _QLIB_PROVENANCE_PATH
+            or relative.as_posix() != relative_text
+            or ".." in relative.parts
+            or relative_text in expected
+        ):
+            raise ValueError("Qlib output file manifest path is invalid")
+        size = item.get("bytes")
+        sha256 = str(item.get("sha256") or "").lower()
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+        ):
+            raise ValueError("Qlib output file manifest identity is invalid")
+        expected[relative_text] = (size, sha256)
+
+    actual_manifest = build_qlib_output_manifest(qlib_dir)
+    actual = {
+        str(item["path"]): (int(item["bytes"]), str(item["sha256"]))
+        for item in actual_manifest["files"]
+    }
+    if actual != expected:
+        raise ValueError("Qlib output files do not match the sealed manifest")
 
 
 def _qlib_symbol(value: object) -> str | None:

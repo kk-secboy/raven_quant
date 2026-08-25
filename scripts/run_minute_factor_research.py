@@ -15,6 +15,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from quant_data.execution_contract import require_minute_signal_contract  # noqa: E402
+from quant_data.qlib_builder import verify_qlib_output_manifest  # noqa: E402
 from quant_platform.minute_research import (  # noqa: E402
     evaluate_minute_factor,
     minute_bar_minutes,
@@ -92,6 +93,7 @@ def main() -> None:
     provider = Path(args.provider_uri)
     provenance_path = provider / "metadata" / "provenance.json"
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    verify_qlib_output_manifest(provider, provenance)
     frequency = str(provenance.get("frequency") or "")
     require_minute_signal_contract(provenance, frequency=frequency)
     bar_minutes = minute_bar_minutes(frequency)

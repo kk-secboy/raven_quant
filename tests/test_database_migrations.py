@@ -3,6 +3,22 @@ from sqlalchemy import inspect, text
 from quant_data.database import open_database
 
 
+def test_work_units_page_group_index_matches_runtime_lookup(database_url: str) -> None:
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        definition = connection.execute(
+            text(
+                "SELECT pg_get_indexdef(to_regclass("
+                "'quantlab.idx_work_units_dataset_page_group'))"
+            )
+        ).scalar_one()
+
+    assert "ON quantlab.work_units USING btree" in definition
+    assert "dataset" in definition
+    assert "scope_json ->> 'page_group'::text" in definition
+    assert "character varying" in definition
+
+
 def test_explicit_migration_url_overrides_host_database_environment(
     database_url: str, monkeypatch
 ) -> None:
@@ -30,6 +46,14 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "factor_candidates",
         "factor_evaluations",
         "oos_vintages",
+        "research_assets",
+        "research_asset_consumptions",
+        "research_run_artifacts",
+        "model_candidates",
+        "model_evaluations",
+        "quant_bundle_candidates",
+        "quant_bundle_evaluations",
+        "candidate_asset_links",
         "recommendation_portfolios",
         "recommendation_snapshots",
         "recommendation_holdings",
@@ -114,7 +138,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0058_simulation_benchmark"
+    assert revision == "0065_work_unit_page_group"
     assert {
         "economic_hypothesis_group",
         "hypothesis_group_cap",
@@ -138,6 +162,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "strategy_spec_sha256",
         "model_recipe_sha256",
         "dataset_identity_sha256",
+        "execution_environment_sha256",
         "artifact_sha256",
         "predictions_sha256",
         "valid_until",
@@ -388,6 +413,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
     assert {
         "scope",
         "dataset_identity",
+        "dataset_lineage_id",
         "test_start",
         "test_end",
         "sealed_at",
@@ -408,6 +434,8 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "label_horizon_days",
         "experiment_count",
         "values_sha256",
+        "profile_consensus_json",
+        "profile_consensus_sha256",
         "promoted_evaluation_id",
         "promotion_evidence_sha256",
         "promoted_by",
@@ -448,6 +476,83 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
     }
     assert {"dataset_roll_policy", "dataset_lineage_id"} <= {
         column["name"] for column in inspector.get_columns("paper_portfolios", schema="quantlab")
+    }
+    assert {
+        "asset_key",
+        "content_sha256",
+        "manifest_json",
+        "manifest_sha256",
+        "status",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("research_assets", schema="quantlab")
+    }
+    assert {
+        "asset_id",
+        "research_run_id",
+        "scenario",
+        "selection_mode",
+        "asset_manifest_sha256",
+        "status",
+        "reserved_by",
+        "reserved_at",
+        "completed_at",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "research_asset_consumptions", schema="quantlab"
+        )
+    }
+    assert {
+        "research_run_id",
+        "content_sha256",
+        "manifest_sha256",
+        "capital_eligible",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("research_run_artifacts", schema="quantlab")
+    }
+    assert {
+        "code_artifact_id",
+        "manifest_sha256",
+        "feature_set_definition_sha256",
+        "pre_final_end",
+        "final_oos_start",
+        "final_oos_end",
+        "admission_evidence_sha256",
+        "capital_eligible",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("model_candidates", schema="quantlab")
+    }
+    assert {
+        "evidence_role",
+        "profile_id",
+        "seed",
+        "final_oos_start",
+        "final_oos_end",
+        "evidence_sha256",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("model_evaluations", schema="quantlab")
+    }
+    assert {
+        "model_candidate_id",
+        "factor_candidate_ids_json",
+        "bundle_manifest_sha256",
+        "feature_set_definition_sha256",
+        "pre_final_end",
+        "final_oos_start",
+        "final_oos_end",
+        "ablation_evidence_sha256",
+        "capital_eligible",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("quant_bundle_candidates", schema="quantlab")
+    }
+    assert {"ablation", "profile_id", "seed", "evidence_sha256"} <= {
+        column["name"]
+        for column in inspector.get_columns("quant_bundle_evaluations", schema="quantlab")
     }
     assert {"dataset_roll_policy", "dataset_lineage_id"} <= {
         column["name"]
@@ -554,6 +659,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
     assert {
         "source_type",
         "source_id",
+        "promotion_stage_id",
         "execution_adapter",
         "execution_frequency",
         "execution_contract_hash",
@@ -564,6 +670,24 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         column["name"]
         for column in inspector.get_columns("simulation_portfolios", schema="quantlab")
     }
+    simulation_portfolio_indexes = {
+        item["name"]: item
+        for item in inspector.get_indexes("simulation_portfolios", schema="quantlab")
+    }
+    assert simulation_portfolio_indexes[
+        "uq_simulation_portfolios_source_execution"
+    ]["unique"]
+    assert simulation_portfolio_indexes[
+        "uq_simulation_portfolios_promotion_stage"
+    ]["unique"]
+    simulation_portfolio_fks = inspector.get_foreign_keys(
+        "simulation_portfolios", schema="quantlab"
+    )
+    assert any(
+        item.get("constrained_columns") == ["promotion_stage_id"]
+        and item.get("referred_table") == "strategy_promotion_stages"
+        for item in simulation_portfolio_fks
+    )
     assert {
         "source_snapshot_id",
         "target_payload_json",

@@ -480,7 +480,35 @@ def test_openai_chat_client_fail_closed_on_client_error_without_leaking_key() ->
     with pytest.raises(nlp.LlmExtractionError) as captured:
         _openai_client(session).complete([], model="test-model")
     assert captured.value.stage == "llm_call"
+    assert captured.value.failure_scope == nlp.LLM_FAILURE_SCOPE_GLOBAL
+    assert captured.value.allows_item_isolation is False
     assert "sk-test-fake-key" not in str(captured.value)
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("status", [401, 402, 403, 404, 429, 500])
+def test_openai_provider_failures_are_global_and_not_item_isolatable(status: int) -> None:
+    attempts = 3 if status >= 500 else 1
+    session = _FakeChatSession([_FakeChatResponse(status, {})] * attempts)
+
+    with pytest.raises(nlp.LlmExtractionError) as captured:
+        _openai_client(session, []).complete([], model="test-model")
+
+    assert captured.value.stage == "llm_call"
+    assert captured.value.failure_scope == nlp.LLM_FAILURE_SCOPE_GLOBAL
+    assert captured.value.allows_item_isolation is False
+    assert len(session.calls) == attempts
+
+
+def test_openai_payload_too_large_is_batch_content_isolatable() -> None:
+    session = _FakeChatSession([_FakeChatResponse(413, {})])
+
+    with pytest.raises(nlp.LlmExtractionError) as captured:
+        _openai_client(session).complete([], model="test-model")
+
+    assert captured.value.stage == "llm_call"
+    assert captured.value.failure_scope == nlp.LLM_FAILURE_SCOPE_BATCH_CONTENT
+    assert captured.value.allows_item_isolation is True
     assert len(session.calls) == 1
 
 
@@ -496,6 +524,8 @@ def test_openai_chat_client_wraps_connection_errors() -> None:
     with pytest.raises(nlp.LlmExtractionError) as captured:
         _openai_client(session, []).complete([], model="test-model")
     assert captured.value.stage == "llm_call"
+    assert captured.value.failure_scope == nlp.LLM_FAILURE_SCOPE_GLOBAL
+    assert captured.value.allows_item_isolation is False
     assert "sk-test-fake-key" not in str(captured.value)
     assert len(session.calls) == 3
 
@@ -676,6 +706,49 @@ def test_process_batches_announcements_and_falls_back_per_item(tmp_path: Path) -
     assert recovered.failed == 0
     assert recovered.llm_calls == 3
     assert len(fallback.calls) == 3
+
+
+def test_provider_global_failure_does_not_split_announcement_batch(tmp_path: Path) -> None:
+    _seed_two_announcements(tmp_path)
+    provider_error = nlp.LlmExtractionError(
+        "LLM endpoint returned HTTP 402",
+        stage="llm_call",
+    )
+    chat = FakeChatClient([provider_error])
+
+    summary = _run(tmp_path, chat, batch_size=2, workers=1)
+
+    assert summary.planned == 2
+    assert summary.processed == 0
+    assert summary.failed == 2
+    assert summary.llm_calls == 1
+    assert len(chat.calls) == 1
+    state = pd.read_parquet(summary.state_path)
+    assert set(state["status"]) == {"failed"}
+    assert set(state["stage"]) == {"llm_call"}
+    assert set(state["error"]) == {"LLM endpoint returned HTTP 402"}
+    assert pd.read_parquet(summary.fields_path).empty
+
+
+def test_global_failure_during_item_isolation_stops_remaining_retries(tmp_path: Path) -> None:
+    rows = _seed_two_announcements(tmp_path)
+    item_ids = [f"{row['sha256']}:{nlp.PROMPT_VERSION}:test-model" for row in rows]
+    incomplete_batch = _batch_payload(item_ids[:1])
+    chat = FakeChatClient(
+        [
+            incomplete_batch,
+            nlp.LlmExtractionError("LLM endpoint returned HTTP 503", stage="llm_call"),
+        ]
+    )
+
+    summary = _run(tmp_path, chat, batch_size=2, workers=1)
+
+    assert summary.processed == 0
+    assert summary.failed == 2
+    assert summary.llm_calls == 2
+    assert len(chat.calls) == 2
+    state = pd.read_parquet(summary.state_path)
+    assert set(state["error"]) == {"LLM endpoint returned HTTP 503"}
 
 
 def test_process_is_idempotent_on_processing_key(tmp_path: Path) -> None:
@@ -909,24 +982,24 @@ def test_process_publishes_mixed_model_scope_without_duplicate_calls(tmp_path: P
     ]
 
 
-def test_process_retries_failed_rows_on_rerun(tmp_path: Path) -> None:
+def test_process_retries_failed_and_unattempted_rows_after_global_abort(tmp_path: Path) -> None:
     _seed_two_announcements(tmp_path)
     failing = FakeChatClient(
         [
             nlp.LlmExtractionError("LLM request failed: boom", stage="llm_call"),
-            _payload(tone_score=0.2),
         ]
     )
     first = _run(tmp_path, failing)
     assert first.failed == 1
-    assert first.processed == 1
+    assert first.processed == 0
+    assert first.llm_calls == 1
 
-    chat = FakeChatClient([_payload(tone_score=0.4)])
+    chat = FakeChatClient([_payload(tone_score=0.4), _payload(tone_score=0.2)])
     second = _run(tmp_path, chat)
 
     assert second.planned == 2
-    assert second.skipped == 1  # the previously succeeded row is untouched
-    assert second.processed == 1
+    assert second.skipped == 0
+    assert second.processed == 2
     assert second.failed == 0
     state = pd.read_parquet(second.state_path)
     assert set(state["status"]) == {"succeeded"}
@@ -982,25 +1055,34 @@ def test_process_filters_ts_code_dates_and_category(tmp_path: Path) -> None:
     assert limited.processed == 1
 
 
-def test_factor_publication_is_restricted_to_the_requested_scope(tmp_path: Path) -> None:
+def test_bounded_processing_scope_preserves_full_history_factor(tmp_path: Path) -> None:
     _seed_two_announcements(tmp_path)
     _run(tmp_path, FakeChatClient([_payload(), _payload(tone_score=-0.5)]))
 
     scoped = _run(
         tmp_path,
         FakeChatClient([]),
-        categories={"regulatory_letter"},
+        start=date(2024, 1, 3),
+        end=date(2024, 1, 31),
     )
 
     assert scoped.planned == 1
     assert scoped.skipped == 1
     factor = pd.read_parquet(tmp_path / "announcements/nlp/factors/announcement_tone.parquet")
-    assert factor["instrument"].tolist() == ["000002.SZ"]
+    assert factor["instrument"].tolist() == ["000001.SZ", "000002.SZ"]
     manifest = json.loads(
         (tmp_path / "announcements/nlp/factors/announcement_tone.json").read_text(encoding="utf-8")
     )
-    assert manifest["source"]["scope"]["categories"] == ["regulatory_letter"]
+    assert manifest["source"]["scope"]["start_date"] == "2024-01-03"
+    assert manifest["source"]["scope"]["end_date"] == "2024-01-31"
+    assert manifest["source"]["processing_scope_process_key_count"] == 1
     assert manifest["source"]["scope_process_key_count"] == 1
+    publication_scope = manifest["source"]["publication_scope"]
+    assert publication_scope["mode"] == "all_persisted_succeeded_fields_current_prompt"
+    assert publication_scope["process_key_count"] == 2
+    assert publication_scope["process_keys_sha256"] != manifest["source"][
+        "scope_process_keys_sha256"
+    ]
 
 
 def test_factor_artifact_averages_same_day_instruments(tmp_path: Path) -> None:

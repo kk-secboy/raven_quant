@@ -59,7 +59,9 @@ def permission_for(method: str, path: str) -> str:
         or path.endswith("/parameter-experiments")
     ):
         return "strategy:write"
-    if path.startswith("/api/strategy-versions/") and path.endswith("/approve"):
+    if path.startswith("/api/strategy-versions/") and path.endswith(
+        ("/approve", "/paper-stage", "/promote")
+    ):
         return "strategy:approve"
     if path.startswith("/api/strategy-allocations/") and path.endswith("/approve"):
         return "strategy:approve"

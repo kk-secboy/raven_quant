@@ -86,12 +86,35 @@ def require_upstream_runtime_identity(kind: str, value: Any) -> dict[str, Any]:
         raise ValueError(
             f"{kind} distribution version does not identify the validated commit"
         )
-    return {
+    result = {
         "name": kind,
         "version": version,
         "commit": commit,
         "commit_evidence": evidence,
     }
+    if kind == "rdagent":
+        source_tree_sha256 = str(value.get("source_tree_sha256") or "").lower()
+        runtime_image_digest = str(value.get("runtime_image_digest") or "").lower()
+        if source_tree_sha256 and not re.fullmatch(r"[0-9a-f]{64}", source_tree_sha256):
+            raise ValueError("rdagent runtime source tree digest is invalid")
+        if runtime_image_digest and not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", runtime_image_digest
+        ):
+            raise ValueError("rdagent runtime image digest is invalid")
+        result.update(
+            {
+                "source_tree_sha256": source_tree_sha256 or None,
+                "repository_dirty": value.get("repository_dirty"),
+                "runtime_image_digest": runtime_image_digest or None,
+                "production_reproducible": bool(
+                    value.get("production_reproducible")
+                    and source_tree_sha256
+                    and runtime_image_digest
+                    and value.get("repository_dirty") is not True
+                ),
+            }
+        )
+    return result
 
 
 def upstream_runtime_identity(kind: str) -> dict[str, Any]:

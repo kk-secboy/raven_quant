@@ -35,6 +35,9 @@ from .cninfo_announcements import next_trading_day
 
 REGULATORY_EVENTS_RULE_VERSION = "regulatory-events-title-rules.v1"
 REGULATORY_EVENTS_DATASET = "regulatory_events"
+REGULATORY_TERMINAL_DEFERRAL_POLICY = (
+    "defer-identified-major-event-on-publication-horizon.v1"
+)
 
 # Ordered (event_type, title pattern) rules. The first matching rule classifies
 # a title; every match is a major violation.
@@ -114,6 +117,108 @@ def _empty_events_frame() -> pd.DataFrame:
     )
 
 
+def _classified_announcements(announcements: pd.DataFrame) -> pd.DataFrame:
+    """Normalize and classify announcement rows without changing row order."""
+
+    required = {"ts_code", "ann_date", "title"}
+    missing = sorted(required - set(announcements.columns))
+    if missing:
+        raise RegulatoryEventsError(f"anns_d frame is missing columns: {missing}")
+    frame = announcements.copy()
+    frame["ts_code"] = frame["ts_code"].astype("string").str.upper()
+    frame["ann_date"] = _normalize_ann_date(frame["ann_date"])
+    titles = frame["title"].astype("string")
+    event_types = pd.Series(pd.NA, index=frame.index, dtype="string")
+    for event_type, pattern in EVENT_TYPE_RULES:
+        matches = event_types.isna() & titles.str.contains(pattern, na=False)
+        event_types.loc[matches] = event_type
+    frame["event_type"] = event_types
+    return frame
+
+
+def _matched_announcements(announcements: pd.DataFrame) -> pd.DataFrame:
+    frame = _classified_announcements(announcements)
+    matched = frame.dropna(subset=["ts_code", "ann_date", "event_type"])
+    if matched.empty:
+        return matched
+    matched = matched.sort_values(
+        ["ts_code", "event_type", "ann_date"], kind="stable"
+    )
+    return matched.drop_duplicates(["ts_code", "event_type"], keep="first")
+
+
+def derive_regulatory_events_for_horizon(
+    announcements: pd.DataFrame,
+    open_days: Sequence[date],
+    *,
+    publication_horizon: date,
+) -> tuple[pd.DataFrame, list[dict[str, str]]]:
+    """Derive only events knowable by a frozen Qlib publication horizon.
+
+    The ordinary :func:`derive_regulatory_events` contract remains fail-closed.
+    This wrapper is the Qlib publication boundary: a recognizable major event
+    announced on the final market day is not usable until a later trading day,
+    so it is deferred from the current artifact and returned as deterministic
+    audit input.  Rows dated after the frozen horizon, or historical events
+    whose next trading day falls outside it because the calendar is incomplete,
+    still fail closed.
+    """
+
+    if announcements.empty:
+        return _empty_events_frame(), []
+    classified = _classified_announcements(announcements)
+    beyond = classified.loc[classified["ann_date"].dt.date > publication_horizon]
+    if not beyond.empty:
+        sample = beyond.sort_values(["ann_date", "ts_code"], kind="stable").iloc[0]
+        raise RegulatoryEventsError(
+            "anns_d announcement lies after the Qlib publication horizon: "
+            f"{sample['ts_code']}@{sample['ann_date'].date()} > "
+            f"{publication_horizon}"
+        )
+
+    matched = _matched_announcements(announcements)
+    deferred = matched.loc[matched["ann_date"].dt.date == publication_horizon]
+    terminal_major = (
+        classified["event_type"].notna()
+        & classified["ann_date"].notna()
+        & (classified["ann_date"].dt.date == publication_horizon)
+    )
+    eligible_announcements = announcements.loc[~terminal_major.to_numpy()].copy()
+    events = derive_regulatory_events(eligible_announcements, open_days)
+    if not events.empty:
+        beyond_known = events.loc[
+            pd.to_datetime(events["known_date"], errors="coerce").dt.date
+            > publication_horizon
+        ]
+        if not beyond_known.empty:
+            sample = beyond_known.sort_values(
+                ["known_date", "ts_code"], kind="stable"
+            ).iloc[0]
+            raise RegulatoryEventsError(
+                "regulatory known_date exceeds the Qlib publication horizon; "
+                "the historical trade_cal is incomplete: "
+                f"{sample['ts_code']}@{sample['event_date'].date()} -> "
+                f"{sample['known_date'].date()} > {publication_horizon}"
+            )
+
+    audit_rows = [
+        {
+            "ts_code": str(row.ts_code),
+            "event_date": row.ann_date.date().isoformat(),
+            "event_type": str(row.event_type),
+            "title": "" if pd.isna(row.title) else str(row.title),
+            "url": (
+                ""
+                if "url" not in deferred.columns or pd.isna(row.url)
+                else str(row.url)
+            ),
+            "rule_version": REGULATORY_EVENTS_RULE_VERSION,
+        }
+        for row in deferred.itertuples(index=False)
+    ]
+    return events, audit_rows
+
+
 def derive_regulatory_events(
     announcements: pd.DataFrame,
     open_days: Sequence[date],
@@ -130,25 +235,9 @@ def derive_regulatory_events(
 
     if announcements.empty:
         return _empty_events_frame()
-    required = {"ts_code", "ann_date", "title"}
-    missing = sorted(required - set(announcements.columns))
-    if missing:
-        raise RegulatoryEventsError(f"anns_d frame is missing columns: {missing}")
-    frame = announcements.copy()
-    frame["ts_code"] = frame["ts_code"].astype("string").str.upper()
-    frame["ann_date"] = _normalize_ann_date(frame["ann_date"])
-    frame = frame.dropna(subset=["ts_code", "ann_date"])
-    titles = frame["title"].astype("string")
-    event_types = pd.Series(pd.NA, index=frame.index, dtype="string")
-    for event_type, pattern in EVENT_TYPE_RULES:
-        matches = event_types.isna() & titles.str.contains(pattern, na=False)
-        event_types.loc[matches] = event_type
-    frame["event_type"] = event_types
-    matched = frame.dropna(subset=["event_type"])
+    matched = _matched_announcements(announcements)
     if matched.empty:
         return _empty_events_frame()
-    matched = matched.sort_values(["ts_code", "event_type", "ann_date"], kind="stable")
-    matched = matched.drop_duplicates(["ts_code", "event_type"], keep="first")
 
     rows: list[dict[str, object]] = []
     for row in matched.itertuples(index=False):

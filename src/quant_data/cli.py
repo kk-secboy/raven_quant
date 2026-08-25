@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -41,7 +42,7 @@ from quant_platform.news_flash_factors import process_news_flash
 from quant_platform.report_rc_factors import process_report_rc
 from quant_platform.runtime_secret_store import RuntimeSecretStore
 
-from .baostock_provider import BaoStockProvider
+from .baostock_provider import BAOSTOCK_SOURCE_VERSION, BaoStockProvider
 from .catalog import (
     CORE_DAILY,
     CORPORATE_EVENTS,
@@ -54,13 +55,28 @@ from .checkpoint import CheckpointStore
 from .cninfo_announcements import audit_cninfo_announcements, download_cninfo_announcements
 from .config import Settings
 from .coverage_data import coverage_secondary_specs
-from .execution_data import MARGIN_DATASET, MINUTE_DATASETS, margin_specs
+from .execution_contract import (
+    MINUTE_EXECUTION_CONTRACT_VERSION,
+    require_daily_qlib_contract,
+)
+from .execution_data import MARGIN_DATASET, margin_specs
+from .kaggle_assets import (
+    KAGGLE_CAPABILITY,
+    KaggleAssetError,
+    KaggleCapabilityBlocked,
+    acquire_kaggle_research_asset,
+    kaggle_blocked_result,
+)
 from .legacy_market import (
+    BAOSTOCK_OVERLAP_POLICY_VERSION,
     DEFAULT_OVERLAP_SYMBOLS,
     LEGACY_MARKET_DATASETS,
+    PRIMARY_OVERLAP_PROVIDER,
     baostock_history_specs,
     baostock_reference_specs,
     planned_baostock_universe,
+    require_audited_overlap_symbols,
+    require_current_primary_overlap_evidence,
     validate_baostock_overlap,
 )
 from .minute_qlib_builder import MinuteQlibBuilder
@@ -74,11 +90,32 @@ from .partitioning import (
 )
 from .planner import BootstrapPlanner, ExecutionDataPlanner, compact_date, parse_date, today_cn
 from .provider import TushareHttpProvider
-from .qlib_builder import QlibBuilder
+from .qlib_builder import QlibBuilder, verify_qlib_output_manifest
 from .rate_limit import GlobalRateGate
-from .reference_data import select_current_reference_units
+from .reference_data import (
+    STK_SURV_PROVIDER_PAGE_LIMIT,
+    select_current_reference_units,
+)
+from .release_window import (
+    QLIB_DAILY_REQUIRED_DATASETS,
+    QLIB_RESEARCH_REQUIRED_DATASETS,
+    select_release_window_units,
+    summarize_release_plan,
+)
+from .research_assets import (
+    ResearchAssetError,
+    acquire_manual_https_pdf,
+    ingest_research_assets,
+    register_local_research_asset,
+)
 from .runner import DownloadRunner
-from .snapshot_lineage import file_contract_sha256, make_lineage_id, prepare_lineage_metadata
+from .snapshot_lineage import (
+    canonical_sha256,
+    file_contract_sha256,
+    make_lineage_id,
+    prepare_lineage_metadata,
+    verify_snapshot_lineage,
+)
 from .storage import ParquetStore
 from .supplemental_data import (
     SHARE_FLOAT_PROVIDER_OFFSET_CAP,
@@ -96,11 +133,25 @@ from .supplemental_data import (
     supplemental_specs,
     tdx_member_overflow_repartition_specs,
 )
-from .universe import select_intraday_universe_from_store
-from .verify import quality_gate_payload, verify_downloads, write_report
+from .universe import select_intraday_universe
+from .verify import (
+    quality_gate_payload,
+    verify_ashare_5m_source_files,
+    verify_downloads,
+    write_report,
+)
 
 app = typer.Typer(no_args_is_help=True, help="Resumable Tushare-to-Parquet bootstrap pipeline")
 console = Console()
+
+EXECUTION_SNAPSHOT_CONTRACT_VERSION = (
+    "execution-snapshot-v3-daily-source-universe-bound"
+)
+QLIB_SNAPSHOT_PROFILES = frozenset({"core", "research", "full"})
+RESEARCH_ASSET_SNAPSHOT_PROFILE = "research-assets"
+SNAPSHOT_PROFILES = frozenset(
+    {*QLIB_SNAPSHOT_PROFILES, RESEARCH_ASSET_SNAPSHOT_PROFILE}
+)
 
 
 # Provider probes on 2026-08-04 proved that these non-adaptive interfaces can
@@ -232,7 +283,11 @@ def load_context(
 
 def _phase_for_label(label: str) -> str:
     normalized = label.lower()
-    if "overflow continuation" in normalized or "partition continuation" in normalized:
+    if (
+        "overflow continuation" in normalized
+        or "partition continuation" in normalized
+        or "adaptive takeover" in normalized
+    ):
         return "adaptive_recovery"
     if "pagination" in normalized:
         return "pagination"
@@ -269,6 +324,54 @@ def _run_phase(context: Context, label: str, datasets: set[str]) -> None:
     )
 
 
+def _require_selected_plan_complete(
+    context: Context,
+    datasets: set[str],
+    *,
+    label: str,
+    snapshot_start: date,
+    snapshot_end: date,
+    required_datasets: set[str] | frozenset[str] | None = None,
+) -> None:
+    """Fail closed when a selected release-window work unit is incomplete."""
+
+    selection = select_release_window_units(
+        context.checkpoint.active_units(datasets),
+        snapshot_start=snapshot_start,
+        snapshot_end=snapshot_end,
+        datasets=datasets,
+    )
+    rows = summarize_release_plan(selection.rows)
+    observed = {str(row["dataset"]) for row in rows}
+    missing = sorted(set(required_datasets or datasets) - observed)
+    if missing:
+        console.print(
+            f"[red]{label} has no active plan for: {', '.join(missing)}[/red]"
+        )
+        raise typer.Exit(2)
+    incomplete = [
+        row for row in rows if int(row["succeeded"] or 0) != int(row["planned"] or 0)
+    ]
+    if not incomplete:
+        return
+    remaining = sum(
+        max(0, int(row["planned"] or 0) - int(row["succeeded"] or 0))
+        for row in incomplete
+    )
+    console.print(
+        f"[red]{label} incomplete; refusing to continue[/red]: "
+        f"remaining={remaining} datasets={len(incomplete)}"
+    )
+    for row in incomplete[:20]:
+        console.print(
+            "  - "
+            f"{row['dataset']}: succeeded={int(row['succeeded'] or 0)}/"
+            f"planned={int(row['planned'] or 0)}, failed={int(row['failed'] or 0)}, "
+            f"running={int(row['running'] or 0)}"
+        )
+    raise typer.Exit(2)
+
+
 def _run_paginated_specs(
     context: Context, label: str, initial_specs: list[FetchSpec]
 ) -> tuple[list[FetchSpec], list[dict], int]:
@@ -279,7 +382,8 @@ def _run_paginated_specs(
     specs = _reconcile_range_plan(context, list(initial_specs))
     if not specs:
         return [], [], 0
-    inserted = context.checkpoint.add(specs)
+    specs, inserted = _activate_stk_surv_plan(context, specs)
+    specs = _rehydrate_durable_pagination_specs(context, specs)
     datasets = {spec.dataset for spec in specs}
     ignored_keys: set[str] = set()
     recovery_specs, recovered_keys = _pagination_overflow_recovery(context, specs, ignored_keys)
@@ -289,6 +393,7 @@ def _run_paginated_specs(
         recovery_specs = [spec for spec in recovery_specs if spec.unit_key not in known]
         specs.extend(recovery_specs)
         inserted += context.checkpoint.add(recovery_specs)
+        specs = _rehydrate_durable_pagination_specs(context, specs)
     _supersede_unplanned_range_units(context, specs)
     _run_phase(context, label, datasets)
 
@@ -300,6 +405,7 @@ def _run_paginated_specs(
             recovery_specs = [spec for spec in recovery_specs if spec.unit_key not in known]
             specs.extend(recovery_specs)
             inserted += context.checkpoint.add(recovery_specs)
+            specs = _rehydrate_durable_pagination_specs(context, specs)
             _run_phase(context, f"{label} overflow continuation", datasets)
             continue
 
@@ -309,6 +415,20 @@ def _run_paginated_specs(
         )
         rows = _require_specs_complete(context, active_specs)
         next_specs = next_pagination_specs(active_specs, rows)
+        next_specs, takeover_specs, takeover_ignored_keys = (
+            _reconcile_superseded_next_specs(context, active_specs, next_specs)
+        )
+        if takeover_ignored_keys:
+            ignored_keys.update(takeover_ignored_keys)
+            known = {spec.unit_key for spec in specs}
+            takeover_specs = [
+                spec for spec in takeover_specs if spec.unit_key not in known
+            ]
+            specs.extend(takeover_specs)
+            inserted += context.checkpoint.add(takeover_specs)
+            specs = _rehydrate_durable_pagination_specs(context, specs)
+            _run_phase(context, f"{label} adaptive takeover", datasets)
+            continue
         if not next_specs:
             recovery_specs, recovered_keys = _full_page_partition_recovery(
                 context, active_specs, rows, ignored_keys
@@ -318,6 +438,7 @@ def _run_paginated_specs(
                 recovery_specs = [spec for spec in recovery_specs if spec.unit_key not in known]
                 specs.extend(recovery_specs)
                 inserted += context.checkpoint.add(recovery_specs)
+                specs = _rehydrate_durable_pagination_specs(context, specs)
                 _run_phase(context, f"{label} partition continuation", datasets)
                 continue
             require_pagination_terminated(active_specs, rows)
@@ -327,6 +448,7 @@ def _run_paginated_specs(
             return specs, rows, inserted
 
         specs.extend(next_specs)
+        specs = _rehydrate_durable_pagination_specs(context, specs)
         recovery_specs, recovered_keys = _pagination_overflow_recovery(context, specs, ignored_keys)
         if recovered_keys:
             ignored_keys.update(recovered_keys)
@@ -334,6 +456,7 @@ def _run_paginated_specs(
             recovery_specs = [spec for spec in recovery_specs if spec.unit_key not in known]
             specs.extend(recovery_specs)
             inserted += context.checkpoint.add(recovery_specs)
+            specs = _rehydrate_durable_pagination_specs(context, specs)
             _run_phase(context, f"{label} overflow continuation", datasets)
             continue
 
@@ -355,6 +478,105 @@ _RANGE_REUSE_DATASETS = {
 }
 
 
+def _activate_stk_surv_plan(
+    context: Context, specs: list[FetchSpec]
+) -> tuple[list[FetchSpec], int]:
+    """Durably add replacements before retiring their legacy request units."""
+
+    reconciled, obsolete = _reconcile_stk_surv_plan(context, specs)
+    inserted = context.checkpoint.add(reconciled)
+    if not obsolete:
+        return reconciled, inserted
+    replacement_rows = context.checkpoint.unit_rows(set(obsolete.values()))
+    durable_replacements = {
+        str(row["unit_key"])
+        for row in replacement_rows
+        if str(row.get("status") or "") != "superseded"
+    }
+    retired = [
+        legacy_key
+        for legacy_key, replacement_key in obsolete.items()
+        if replacement_key in durable_replacements
+    ]
+    context.checkpoint.supersede_units(
+        retired,
+        "legacy unpaged stk_surv unit superseded by explicit 400-row pagination",
+    )
+    return reconciled, inserted
+
+
+def _reconcile_stk_surv_plan(
+    context: Context, specs: list[FetchSpec]
+) -> tuple[list[FetchSpec], dict[str, str]]:
+    """Migrate the legacy unpaged survey contract without losing good work.
+
+    A legacy single-day response below 400 rows proves termination and can be
+    reused verbatim. A 400-row success is truncated and is replaced by the new
+    explicit page group. Unfinished legacy units are retained as superseded
+    audit rows so the runner cannot retry the obsolete request contract.
+    """
+
+    targets = [spec for spec in specs if spec.dataset == "stk_surv"]
+    if not targets:
+        return specs, {}
+    target_keys = {spec.unit_key for spec in targets}
+    existing_current = {
+        str(row["unit_key"])
+        for row in context.checkpoint.unit_rows(target_keys)
+        if str(row.get("status") or "") != "superseded"
+    }
+    target_identities = {_stk_surv_day_identity(spec) for spec in targets}
+    reusable: dict[tuple[str, str], FetchSpec] = {}
+    for row in context.checkpoint.successful("stk_surv"):
+        candidate = _checkpoint_row_spec(row)
+        identity = _stk_surv_day_identity(candidate)
+        row_count = row.get("row_count")
+        if (
+            identity in target_identities
+            and _is_legacy_stk_surv_spec(candidate)
+            and row_count is not None
+            and 0 <= int(row_count) < STK_SURV_PROVIDER_PAGE_LIMIT
+        ):
+            reusable[identity] = candidate
+
+    reconciled: list[FetchSpec] = []
+    for spec in specs:
+        if spec.dataset != "stk_surv" or spec.unit_key in existing_current:
+            reconciled.append(spec)
+            continue
+        reconciled.append(reusable.get(_stk_surv_day_identity(spec), spec))
+
+    replacements = {
+        _stk_surv_day_identity(spec): spec.unit_key
+        for spec in reconciled
+        if spec.dataset == "stk_surv" and not _is_legacy_stk_surv_spec(spec)
+    }
+    obsolete: dict[str, str] = {}
+    for row in context.checkpoint.unfinished_units("stk_surv"):
+        candidate = _checkpoint_row_spec(row)
+        replacement_key = replacements.get(_stk_surv_day_identity(candidate))
+        if _is_legacy_stk_surv_spec(candidate) and replacement_key:
+            obsolete[candidate.unit_key] = replacement_key
+    return reconciled, obsolete
+
+
+def _stk_surv_day_identity(spec: FetchSpec) -> tuple[str, str]:
+    return (
+        str(spec.params.get("start_date") or ""),
+        str(spec.params.get("end_date") or ""),
+    )
+
+
+def _is_legacy_stk_surv_spec(spec: FetchSpec) -> bool:
+    return (
+        spec.dataset == "stk_surv"
+        and "page_group" not in spec.scope
+        and "limit" not in spec.params
+        and "offset" not in spec.params
+        and int(spec.scope.get("row_limit") or 0) == STK_SURV_PROVIDER_PAGE_LIMIT
+    )
+
+
 def _reconcile_range_plan(context: Context, specs: list[FetchSpec]) -> list[FetchSpec]:
     """Reuse complete legacy partitions and plan only uncovered session gaps."""
 
@@ -366,6 +588,20 @@ def _reconcile_range_plan(context: Context, specs: list[FetchSpec]) -> list[Fetc
         else:
             untouched.append(spec)
     if not targets:
+        return specs
+    # An exact successful page-zero partition is sufficient to resume the
+    # same frozen plan. The pagination rehydration step restores its durable
+    # siblings and the normal termination check still fails closed if the
+    # group is incomplete. Avoid decoding hundreds of thousands of historical
+    # ETF pages merely to rediscover an unchanged request window.
+    exact_rows = {
+        str(row["unit_key"]): row
+        for row in context.checkpoint.unit_rows(spec.unit_key for spec in targets)
+    }
+    if all(
+        str((exact_rows.get(spec.unit_key) or {}).get("status")) == "succeeded"
+        for spec in targets
+    ):
         return specs
     rows_by_dataset = {
         dataset: context.checkpoint.successful(dataset)
@@ -480,6 +716,175 @@ def _exclude_superseded_specs(context: Context, specs: list[FetchSpec]) -> list[
     return [spec for spec in specs if spec.unit_key not in superseded]
 
 
+def _pagination_contract(spec: FetchSpec) -> tuple[object, ...]:
+    """Return the immutable request contract shared by pages in one group."""
+
+    scope = {
+        key: value
+        for key, value in spec.scope.items()
+        if key not in {"offset", "page_index", "max_pages"}
+    }
+    params = {
+        key: value
+        for key, value in spec.params.items()
+        if key not in {"limit", "offset"}
+    }
+    return (
+        spec.dataset,
+        spec.api_name,
+        scope,
+        params,
+        tuple(spec.fields),
+        bool(spec.allow_empty),
+    )
+
+
+def _rehydrate_durable_pagination_specs(
+    context: Context, specs: list[FetchSpec]
+) -> list[FetchSpec]:
+    """Attach all durable siblings for every pagination group in ``specs``.
+
+    Pagination keys are immutable and content addressed. On restart the
+    planner emits page zero again; without rehydration the loop has to discover
+    page 1..N serially even though every page is already in PostgreSQL. The
+    stored contract is checked against the live group before a page is reused,
+    so a group-name collision fails closed instead of mixing request shapes.
+    """
+
+    group_contracts: dict[tuple[str, str], tuple[object, ...]] = {}
+    for spec in specs:
+        group = str(spec.scope.get("page_group") or "")
+        if not group:
+            continue
+        identity = (spec.dataset, group)
+        contract = _pagination_contract(spec)
+        existing = group_contracts.setdefault(identity, contract)
+        if existing != contract:
+            raise RuntimeError(
+                "pagination plan contains conflicting live contracts for "
+                f"{spec.dataset}/{group}"
+            )
+    if not group_contracts:
+        return specs
+
+    known = {spec.unit_key for spec in specs}
+    durable: list[FetchSpec] = []
+    for row in context.checkpoint.pagination_group_units(group_contracts):
+        candidate = _checkpoint_row_spec(row)
+        group = str(candidate.scope.get("page_group") or "")
+        identity = (candidate.dataset, group)
+        expected = group_contracts.get(identity)
+        if expected is None:
+            continue
+        if _pagination_contract(candidate) != expected:
+            # Refreshable reference datasets intentionally keep a stable page
+            # group across weekly generations. Those older immutable rows are
+            # valid audit history, but they are not siblings of the live
+            # request contract and must simply remain outside this run.
+            continue
+        if candidate.unit_key not in known:
+            known.add(candidate.unit_key)
+            durable.append(candidate)
+    return [*specs, *durable]
+
+
+def _superseded_page_groups(scope: dict[str, Any]) -> set[str]:
+    groups: set[str] = set()
+    singular = scope.get("supersedes_page_group")
+    if singular:
+        groups.add(str(singular))
+    plural = scope.get("supersedes_page_groups")
+    if isinstance(plural, (list, tuple, set, frozenset)):
+        groups.update(str(value) for value in plural if value)
+    return groups
+
+
+def _reconcile_superseded_next_specs(
+    context: Context,
+    current_specs: list[FetchSpec],
+    next_specs: list[FetchSpec],
+) -> tuple[list[FetchSpec], list[FetchSpec], set[str]]:
+    """Stop immutable superseded cursors from being regenerated forever.
+
+    A superseded next-page key is safe to omit only when durable, active child
+    units explicitly declare that they replace the whole parent page group.
+    Merely continuing a group is not replacement evidence: silently dropping
+    the parent in that case would discard its completed prefix.
+    """
+
+    if not next_specs:
+        return [], [], set()
+    rows_by_key = {
+        str(row["unit_key"]): row
+        for row in context.checkpoint.unit_rows(spec.unit_key for spec in next_specs)
+    }
+    superseded = {
+        spec.unit_key
+        for spec in next_specs
+        if str((rows_by_key.get(spec.unit_key) or {}).get("status")) == "superseded"
+    }
+    if not superseded:
+        return next_specs, [], set()
+
+    durable_by_dataset = {
+        dataset: context.checkpoint.dataset_units(dataset)
+        for dataset in {spec.dataset for spec in next_specs if spec.unit_key in superseded}
+    }
+    takeovers: dict[str, FetchSpec] = {}
+    ignored_keys: set[str] = set()
+    taken_over_groups: set[tuple[str, str]] = set()
+    unresolved: list[FetchSpec] = []
+    for candidate in next_specs:
+        if candidate.unit_key not in superseded:
+            continue
+        parent_group = str(candidate.scope.get("page_group") or "")
+        parent_specs = [
+            spec
+            for spec in current_specs
+            if spec.dataset == candidate.dataset
+            and str(spec.scope.get("page_group") or "") == parent_group
+        ]
+        durable_takeovers = [
+            row
+            for row in durable_by_dataset[candidate.dataset]
+            if str(row.get("status")) != "superseded"
+            and parent_group
+            in _superseded_page_groups(dict(row.get("scope_json") or {}))
+        ]
+        if not parent_group or not parent_specs or not durable_takeovers:
+            unresolved.append(candidate)
+            continue
+        taken_over_groups.add((candidate.dataset, parent_group))
+        ignored_keys.update(spec.unit_key for spec in parent_specs)
+        for row in durable_takeovers:
+            spec = _checkpoint_row_spec(row)
+            takeovers[spec.unit_key] = spec
+
+    if unresolved:
+        preview = ", ".join(
+            f"{spec.dataset}/{spec.scope.get('page_group') or spec.unit_key}"
+            for spec in unresolved[:5]
+        )
+        raise RuntimeError(
+            "superseded pagination cursor lacks durable adaptive takeover evidence: "
+            f"{preview}"
+        )
+
+    ignored_keys.update(
+        spec.unit_key
+        for spec in next_specs
+        if (spec.dataset, str(spec.scope.get("page_group") or ""))
+        in taken_over_groups
+    )
+    runnable = [
+        spec
+        for spec in next_specs
+        if (spec.dataset, str(spec.scope.get("page_group") or ""))
+        not in taken_over_groups
+    ]
+    return runnable, list(takeovers.values()), ignored_keys
+
+
 def _supersede_unsupported_governance_units(context: Context) -> int:
     retired_chips = [
         str(row["unit_key"]) for row in context.checkpoint.unfinished_units("cyq_chips")
@@ -591,10 +996,27 @@ def _share_float_overflow_recovery(
 ) -> tuple[list[FetchSpec], set[str]]:
     """Replace provider-capped pages with disjoint date/symbol continuations."""
 
+    share_float_specs = [
+        spec
+        for spec in specs
+        if spec.dataset == "share_float" and spec.unit_key not in ignored_keys
+    ]
+    if not share_float_specs:
+        return [], set()
     rows_by_key = {
         str(row["unit_key"]): row
-        for row in context.checkpoint.unit_rows(spec.unit_key for spec in specs)
+        for row in context.checkpoint.unit_rows(
+            spec.unit_key for spec in share_float_specs
+        )
     }
+    recovery_candidates = [
+        spec
+        for spec in share_float_specs
+        if str((rows_by_key.get(spec.unit_key) or {}).get("status"))
+        in {"failed", "superseded"}
+    ]
+    if not recovery_candidates:
+        return [], set()
     replacements_by_parent: dict[str, list[FetchSpec]] = {}
     for child in context.checkpoint.dataset_units("share_float"):
         if str(child.get("status")) == "superseded":
@@ -605,11 +1027,9 @@ def _share_float_overflow_recovery(
     recovery_specs: list[FetchSpec] = []
     recovered_keys: set[str] = set()
     stock_master: pd.DataFrame | None = None
-    for failed_spec in specs:
-        if failed_spec.unit_key in ignored_keys or failed_spec.dataset != "share_float":
-            continue
+    for failed_spec in recovery_candidates:
         row = rows_by_key.get(failed_spec.unit_key)
-        if not row or str(row.get("status")) not in {"failed", "superseded"}:
+        if not row:
             continue
         if str(row.get("status")) == "superseded":
             # A previous run may already have replaced the unstable monthly
@@ -998,8 +1418,15 @@ def probe() -> None:
 
 @app.command()
 def bootstrap(
-    profile: Annotated[str, typer.Option(help="core, research, or full")] = "core",
-    start: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2018-01-01",
+    profile: Annotated[str, typer.Option(help="core, research, or full")] = "full",
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2016-01-01",
+    snapshot_start: Annotated[
+        str,
+        typer.Option(
+            "--snapshot-start",
+            help="YYYY-MM-DD start of the merged BaoStock + primary-source snapshot",
+        ),
+    ] = "2008-01-01",
     end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
     snapshot_name: Annotated[str | None, typer.Option("--snapshot-name")] = None,
     build_qlib: Annotated[
@@ -1009,17 +1436,39 @@ def bootstrap(
         bool,
         typer.Option("--download-only", help="Stop after durable download units complete"),
     ] = False,
+    incremental: Annotated[
+        bool,
+        typer.Option(
+            "--incremental",
+            help="Internal scheduler mode for a bounded primary-source refresh",
+            hidden=True,
+        ),
+    ] = False,
 ) -> None:
     """Plan, download, verify, and snapshot an initialization range."""
     if profile not in {"core", "research", "full"}:
         raise typer.BadParameter("profile must be core, research, or full")
     start_date = parse_date(start)
+    snapshot_start_date = parse_date(snapshot_start)
     end_date = parse_date(end, latest=today_cn())
+    if incremental is not True and start_date != date(2016, 1, 1):
+        raise typer.BadParameter(
+            "full bootstrap primary download start must equal 2016-01-01; "
+            "use the incremental scheduler for later updates"
+        )
+    if incremental is True and download_only is not True:
+        raise typer.BadParameter("incremental scheduler mode requires --download-only")
+    if build_qlib and profile != "full":
+        raise typer.BadParameter(
+            "Qlib research finalization requires --profile full; "
+            "core/research profiles are download-only subsets"
+        )
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
+    if snapshot_start_date > start_date:
+        raise typer.BadParameter("snapshot-start must not be after the primary download start")
     context = load_context()
     max_attempts = context.settings.max_request_attempts
-
     planned_reference = context.planner.plan_reference(start_date, end_date, max_attempts)
     console.print(f"planned reference units: +{planned_reference}")
     _run_phase(context, "stock and calendar reference", {"stock_basic", "trade_cal"})
@@ -1033,14 +1482,13 @@ def bootstrap(
         f"planned complete index catalog: {len(index_specs)} initial, "
         f"+{index_inserted} inserted with pagination"
     )
-    reference_failures = [
-        row
-        for row in context.checkpoint.failures(1000)
-        if row["dataset"] in {"stock_basic", "trade_cal", "index_basic"}
-    ]
-    if reference_failures:
-        console.print("[red]reference phase failed; daily planning was not attempted[/red]")
-        raise typer.Exit(2)
+    _require_selected_plan_complete(
+        context,
+        {"stock_basic", "trade_cal", "index_basic"},
+        label="reference phase",
+        snapshot_start=snapshot_start_date,
+        snapshot_end=end_date,
+    )
 
     planned = context.planner.plan_profile(profile, start_date, end_date, max_attempts)
     console.print(f"planned data units: {json.dumps(planned, ensure_ascii=False)}")
@@ -1060,16 +1508,54 @@ def bootstrap(
                 "disclosure_date",
             },
         )
+        _require_selected_plan_complete(
+            context,
+            {"index_classify"},
+            label="Shenwan classification phase",
+            snapshot_start=snapshot_start_date,
+            snapshot_end=end_date,
+        )
         planned_members = context.planner.plan_industry_members(max_attempts, as_of=end_date)
         console.print(f"planned historical industry membership units: +{planned_members}")
         _run_phase(context, "historical industry members", {"index_member_all"})
+        _require_selected_plan_complete(
+            context,
+            {"index_member_all", "index_weight"},
+            label="benchmark industry residual prerequisites",
+            snapshot_start=snapshot_start_date,
+            snapshot_end=end_date,
+        )
+        planned_residual_members = (
+            context.planner.plan_benchmark_industry_residual_members(
+                snapshot_start_date,
+                end_date,
+                max_attempts,
+                as_of=end_date,
+            )
+        )
+        console.print(
+            "planned benchmark residual industry membership units: "
+            f"+{planned_residual_members}"
+        )
+        _run_phase(
+            context,
+            "benchmark residual industry members",
+            {"index_member_all"},
+        )
+        _require_selected_plan_complete(
+            context,
+            {"index_member_all"},
+            label="benchmark residual industry phase",
+            snapshot_start=snapshot_start_date,
+            snapshot_end=end_date,
+        )
     if profile == "full":
         bulk_specs = a_share_bulk_history_specs(
             start=start_date,
             end=end_date,
             max_attempts=max_attempts,
         )
-        _, _, bulk_inserted = _run_paginated_specs(
+        bulk_specs, _, bulk_inserted = _run_paginated_specs(
             context,
             "full-market fundamentals and corporate events",
             bulk_specs,
@@ -1098,6 +1584,19 @@ def bootstrap(
         news_plan = context.planner.news_specs(start_date, end_date, max_attempts)
         _run_paginated_specs(context, "market news", news_plan)
 
+    snapshot_datasets = _snapshot_datasets(
+        profile,
+        available=set(context.checkpoint.datasets()),
+    )
+    _require_selected_plan_complete(
+        context,
+        snapshot_datasets,
+        label=f"{profile} bootstrap plan",
+        snapshot_start=snapshot_start_date,
+        snapshot_end=end_date,
+        required_datasets=_required_profile_datasets(profile),
+    )
+
     if download_only:
         console.print("[bold green]download phase complete[/bold green]")
         return
@@ -1105,8 +1604,12 @@ def bootstrap(
     report = verify_downloads(
         context.checkpoint,
         context.settings.data_root,
+        snapshot_start=snapshot_start_date,
         snapshot_end=end_date,
-        require_all_planned=False,
+        require_all_planned=True,
+        dataset_filter=snapshot_datasets,
+        required_datasets=_required_profile_datasets(profile),
+        profile=profile,
     )
     report_path = context.settings.data_root / "verification" / "latest.json"
     write_report(report, report_path)
@@ -1117,10 +1620,16 @@ def bootstrap(
         raise typer.Exit(3)
 
     name = snapshot_name or (
-        f"cn-{start_date:%Y%m%d}-{end_date:%Y%m%d}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+        f"cn-{snapshot_start_date:%Y%m%d}-{end_date:%Y%m%d}-"
+        f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
     )
     snapshot_path = _build_snapshot(
-        context, name, start_date, end_date, profile, quality_gate=quality_gate_payload(report)
+        context,
+        name,
+        snapshot_start_date,
+        end_date,
+        profile,
+        quality_gate=quality_gate_payload(report),
     )
     write_report(report, snapshot_path / "verification.json")
     if build_qlib:
@@ -1190,6 +1699,8 @@ def bootstrap_legacy_market(
         not isinstance(validation, dict)
         or validation.get("ok") is not True
         or validation.get("source") != "baostock-0.9.3"
+        or validation.get("reference_source") != PRIMARY_OVERLAP_PROVIDER
+        or validation.get("policy_version") != BAOSTOCK_OVERLAP_POLICY_VERSION
         or str(validation.get("start_date") or "") > "2016-01-01"
         or str(validation.get("end_date") or "") < "2016-12-31"
     ):
@@ -1205,6 +1716,10 @@ def bootstrap_legacy_market(
             "end_date": end_date.isoformat(),
         },
     )
+    try:
+        require_current_primary_overlap_evidence(validation, context.checkpoint)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     reference_specs = baostock_reference_specs(
         start_date,
         end_date,
@@ -1286,7 +1801,12 @@ def validate_baostock_overlap_command(
     end_date = parse_date(end)
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
-    selected_symbols = tuple(_split_codes(symbols)) or DEFAULT_OVERLAP_SYMBOLS
+    try:
+        selected_symbols = require_audited_overlap_symbols(
+            tuple(_split_codes(symbols)) or DEFAULT_OVERLAP_SYMBOLS
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     context = load_context(require_credentials=False)
     with BaoStockProvider() as provider:
         report = validate_baostock_overlap(
@@ -1349,6 +1869,9 @@ def _trigger_safe_mode_on_quality_gate_failure(settings: Any, report: dict[str, 
 
 @app.command()
 def verify(
+    snapshot_start: Annotated[
+        str, typer.Option("--snapshot-start", help="Successor snapshot start date")
+    ] = "2008-01-01",
     snapshot_end: Annotated[
         str, typer.Option("--snapshot-end", help="Successor snapshot end date")
     ] = "latest",
@@ -1356,17 +1879,50 @@ def verify(
         bool,
         typer.Option(
             "--allow-incomplete-plans",
-            help="Warn about unrelated dormant plans instead of failing the pipeline",
+            help=(
+                "Deprecated compatibility flag; production verification always "
+                "requires the complete active plan"
+            ),
         ),
     ] = False,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            help=(
+                "Strictly verify only the datasets that the selected snapshot "
+                "profile will publish: core, research, full, or research-assets"
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Validate checkpoints, files, checksums, empties, and duplicate core keys."""
     context = load_context(require_credentials=False)
+    if allow_incomplete_plans:
+        console.print(
+            "[yellow]--allow-incomplete-plans is deprecated and ignored; "
+            "production verification remains strict[/yellow]"
+        )
+    if profile is not None and profile not in SNAPSHOT_PROFILES:
+        raise typer.BadParameter(
+            "profile must be core, research, full, or research-assets"
+        )
+    dataset_filter = (
+        _snapshot_datasets(profile, available=set(context.checkpoint.datasets()))
+        if profile is not None
+        else None
+    )
     report = verify_downloads(
         context.checkpoint,
         context.settings.data_root,
+        snapshot_start=parse_date(snapshot_start),
         snapshot_end=parse_date(snapshot_end, latest=today_cn()),
-        require_all_planned=not allow_incomplete_plans,
+        require_all_planned=True,
+        dataset_filter=dataset_filter,
+        required_datasets=(
+            _required_profile_datasets(profile) if profile is not None else None
+        ),
+        profile=profile,
     )
     path = context.settings.data_root / "verification" / "latest.json"
     write_report(report, path)
@@ -1379,9 +1935,17 @@ def verify(
 @app.command()
 def snapshot(
     name: Annotated[str | None, typer.Option()] = None,
-    start: Annotated[str, typer.Option()] = "2018-01-01",
+    start: Annotated[str, typer.Option()] = "2008-01-01",
     end: Annotated[str, typer.Option()] = "latest",
-    profile: Annotated[str, typer.Option()] = "core",
+    profile: Annotated[
+        str,
+        typer.Option(
+            help=(
+                "core, research, full, or the isolated research-assets "
+                "profile (trade_cal + research_report only)"
+            )
+        ),
+    ] = "core",
 ) -> None:
     """Build an immutable compacted Parquet snapshot from successful units."""
     context = load_context(require_credentials=False)
@@ -1390,18 +1954,27 @@ def snapshot(
     name = name or f"cn-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
     # Verify before building so every snapshot manifest records an explicit
     # quality gate; Qlib builds refuse snapshots without quality_gate.ok=true.
+    selected_datasets = _snapshot_datasets(
+        profile,
+        available=set(context.checkpoint.datasets()),
+    )
     report = verify_downloads(
         context.checkpoint,
         context.settings.data_root,
+        snapshot_start=start_date,
         snapshot_end=end_date,
-        require_all_planned=False,
+        require_all_planned=True,
+        dataset_filter=selected_datasets,
+        required_datasets=_required_profile_datasets(profile),
+        profile=profile,
     )
     write_report(report, context.settings.data_root / "verification" / "latest.json")
     if not report["ok"]:
-        console.print("[red]verification failed; snapshot records quality_gate.ok=false[/red]")
+        console.print("[red]verification failed; snapshot build refused[/red]")
         for error in report["errors"][:20]:
             console.print(f"  - {error}")
         _trigger_safe_mode_on_quality_gate_failure(context.settings, report)
+        raise typer.Exit(3)
     path = _build_snapshot(
         context, name, start_date, end_date, profile, quality_gate=quality_gate_payload(report)
     )
@@ -1491,6 +2064,20 @@ def core_intraday(
         str, typer.Option(help="Comma-separated ETF groups: broad,industry,gold,bond")
     ] = "broad,industry,gold,bond",
     snapshot_name: Annotated[str | None, typer.Option("--snapshot-name")] = None,
+    source_lineage_id: Annotated[
+        str | None,
+        typer.Option(
+            "--source-lineage-id",
+            help="Verified daily-source lineage paired with this execution snapshot",
+        ),
+    ] = None,
+    daily_source_dataset: Annotated[
+        str | None,
+        typer.Option(
+            "--daily-source-dataset",
+            help="Exact verified daily Qlib dataset selected by the controller",
+        ),
+    ] = None,
     result_path: Annotated[Path | None, typer.Option("--result")] = None,
 ) -> None:
     """Download bounded 1-minute windows and build pair-execution evidence."""
@@ -1498,6 +2085,12 @@ def core_intraday(
     end_date = parse_date(end, latest=today_cn())
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
+    if not source_lineage_id or len(source_lineage_id) != 64 or any(
+        character not in "0123456789abcdef" for character in source_lineage_id.lower()
+    ):
+        raise typer.BadParameter(
+            "core intraday download requires a verified daily --source-lineage-id"
+        )
     symbols_by_dataset = {
         dataset: values
         for dataset, values in {
@@ -1517,11 +2110,47 @@ def core_intraday(
             "end_date": end_date.isoformat(),
         },
     )
+    source_lineage_evidence = _require_local_daily_source_lineage(
+        context,
+        source_lineage_id=source_lineage_id,
+        daily_source_dataset=daily_source_dataset,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    price_limit_rows = _source_snapshot_dataset_rows(
+        context,
+        source_lineage_evidence=source_lineage_evidence,
+        dataset="stk_limit",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    trading_dates = _source_daily_trading_dates(
+        context,
+        source_lineage_evidence=source_lineage_evidence,
+        start_date=start_date,
+        end_date=end_date,
+    )
     universe_evidence: dict | None = None
     if auto_universe:
-        selected = select_intraday_universe_from_store(
-            context.checkpoint,
-            context.storage,
+        universe_rows: dict[str, list[dict[str, Any]]] = {}
+        for dataset in ("daily", "stock_basic", "fut_mapping", "opt_daily"):
+            try:
+                universe_rows[dataset] = _source_snapshot_dataset_rows(
+                    context,
+                    source_lineage_evidence=source_lineage_evidence,
+                    dataset=dataset,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            except ValueError:
+                if dataset in {"daily", "stock_basic"}:
+                    raise
+                universe_rows[dataset] = []
+        selected = select_intraday_universe(
+            {
+                dataset: context.storage.read_units(rows)
+                for dataset, rows in universe_rows.items()
+            },
             max_stocks=max_stocks,
             max_options=max_options,
             etf_categories=tuple(_split_codes(etf_categories)),
@@ -1532,7 +2161,29 @@ def core_intraday(
             symbols_by_dataset[dataset] = sorted(
                 set(symbols_by_dataset.get(dataset, [])) | set(values)
             )
-        universe_evidence = selected.evidence
+        universe_source_units = [
+            {
+                "dataset": dataset,
+                "unit_key": str(row["unit_key"]),
+                "sha256": str(row["sha256"]),
+                "row_count": int(row.get("row_count") or 0),
+            }
+            for dataset, rows in sorted(universe_rows.items())
+            for row in sorted(rows, key=lambda item: str(item["unit_key"]))
+        ]
+        universe_evidence = {
+            **selected.evidence,
+            "source_snapshot": source_lineage_evidence["source_snapshot"],
+            "source_lineage_id": source_lineage_id.lower(),
+            "source_units_sha256": hashlib.sha256(
+                json.dumps(
+                    universe_source_units,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "source_units": universe_source_units,
+        }
     if not symbols_by_dataset:
         raise typer.BadParameter(
             "at least one ETF, stock, index, future, or option code is required"
@@ -1544,7 +2195,6 @@ def core_intraday(
     context.report_progress(
         "planning", "core intraday planning", set(symbols_by_dataset), force=True
     )
-    trading_dates = context.planner.trading_dates(start_date, end_date)
     required_margin_specs = margin_specs(
         trading_dates,
         max_attempts=context.settings.max_request_attempts,
@@ -1559,6 +2209,7 @@ def core_intraday(
         start_date,
         end_date,
         context.settings.max_request_attempts,
+        trading_dates=trading_dates,
     )
     minute_datasets = set(symbols_by_dataset)
     specs, minute_rows, _ = _run_paginated_specs(context, "core intraday", specs)
@@ -1571,10 +2222,20 @@ def core_intraday(
     name = snapshot_name or (
         f"execution-{start_date:%Y%m%d}-{end_date:%Y%m%d}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
     )
-    selected: dict[str, list[dict]] = {MARGIN_DATASET: margin_rows}
+    selected: dict[str, list[dict]] = {
+        MARGIN_DATASET: margin_rows,
+        "stk_limit": price_limit_rows,
+    }
     for dataset in sorted(minute_datasets):
         keys = {spec.unit_key for spec in specs if spec.dataset == dataset}
         selected[dataset] = [row for row in minute_rows if row["unit_key"] in keys]
+    quality_gate = _explicit_execution_quality_gate(
+        context,
+        selected=selected,
+        start_date=start_date,
+        end_date=end_date,
+        profile="pair_execution",
+    )
     context.report_progress(
         "snapshot", "building immutable execution snapshot", minute_datasets, force=True
     )
@@ -1586,6 +2247,9 @@ def core_intraday(
         end_date=end_date,
         symbols_by_dataset=normalized_symbols,
         universe_evidence=universe_evidence,
+        source_lineage_id=source_lineage_id.lower(),
+        source_lineage_evidence=source_lineage_evidence,
+        quality_gate=quality_gate,
     )
     result = {
         "status": "succeeded",
@@ -1618,6 +2282,13 @@ def ashare_5m(
             help="Verified daily-source lineage paired with this execution snapshot",
         ),
     ] = None,
+    daily_source_dataset: Annotated[
+        str | None,
+        typer.Option(
+            "--daily-source-dataset",
+            help="Exact verified daily Qlib dataset selected by the controller",
+        ),
+    ] = None,
     result_path: Annotated[Path | None, typer.Option("--result")] = None,
 ) -> None:
     """Download resumable 5-minute bars for every A-share active in the range."""
@@ -1626,6 +2297,12 @@ def ashare_5m(
     end_date = parse_date(end, latest=today_cn())
     if end_date < start_date:
         raise typer.BadParameter("end must not be before start")
+    if not source_lineage_id or len(source_lineage_id) != 64 or any(
+        character not in "0123456789abcdef" for character in source_lineage_id.lower()
+    ):
+        raise typer.BadParameter(
+            "A-share five-minute download requires a verified daily --source-lineage-id"
+        )
     context = load_context(
         progress_path=result_path,
         progress_target={
@@ -1635,7 +2312,34 @@ def ashare_5m(
             "frequency": "5min",
         },
     )
-    master = context.storage.read_units(context.checkpoint.successful("stock_basic"))
+    source_lineage_evidence = _require_local_daily_source_lineage(
+        context,
+        source_lineage_id=source_lineage_id,
+        daily_source_dataset=daily_source_dataset,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    price_limit_rows = _source_snapshot_dataset_rows(
+        context,
+        source_lineage_evidence=source_lineage_evidence,
+        dataset="stk_limit",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    stock_master_rows = _source_snapshot_dataset_rows(
+        context,
+        source_lineage_evidence=source_lineage_evidence,
+        dataset="stock_basic",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    trading_dates = _source_daily_trading_dates(
+        context,
+        source_lineage_evidence=source_lineage_evidence,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    master = context.storage.read_units(stock_master_rows)
     active_ranges = _historical_a_share_active_ranges(master, start=start_date, end=end_date)
     symbols = sorted(active_ranges)
 
@@ -1650,38 +2354,34 @@ def ashare_5m(
         context.settings.max_request_attempts,
         freq="5min",
         active_ranges_by_dataset={"ashare_5m": active_ranges},
-        trading_dates=context.planner.trading_dates(start_date, end_date),
+        trading_dates=trading_dates,
     )
     specs, rows, _ = _run_paginated_specs(context, "full A-share 5-minute bars", specs)
     _require_symbol_coverage(specs, rows)
-    report = verify_downloads(
-        context.checkpoint,
-        context.settings.data_root,
-        snapshot_end=end_date,
-        require_all_planned=False,
-        dataset_filter={
-            "ashare_5m",
-            "daily",
-            "trade_cal",
-            "daily_basic",
-            "stock_basic",
-            "adj_factor",
-        },
-    )
-    write_report(report, context.settings.data_root / "verification" / "latest.json")
-    if not report["ok"]:
-        _trigger_safe_mode_on_quality_gate_failure(context.settings, report)
-        raise typer.Exit(3)
     name = snapshot_name or (
         f"ashare-5m-{start_date:%Y%m%d}-{end_date:%Y%m%d}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
     )
+    execution_selected = {
+        "ashare_5m": rows,
+        "stk_limit": price_limit_rows,
+    }
+    quality_gate = _explicit_execution_quality_gate(
+        context,
+        selected=execution_selected,
+        start_date=start_date,
+        end_date=end_date,
+        profile="ashare_intraday",
+    )
+    quality_gate["daily_source_evidence_sha256"] = source_lineage_evidence[
+        "evidence_sha256"
+    ]
     context.report_progress(
         "snapshot", "building immutable 5-minute snapshot", {"ashare_5m"}, force=True
     )
     snapshot_path = _build_execution_snapshot(
         context,
         name=name,
-        selected={"ashare_5m": rows},
+        selected=execution_selected,
         start_date=start_date,
         end_date=end_date,
         symbols_by_dataset={"ashare_5m": symbols},
@@ -1692,10 +2392,11 @@ def ashare_5m(
         },
         frequency="5min",
         profile="ashare_intraday",
-        source_lineage_id=source_lineage_id,
-        quality_gate=quality_gate_payload(report),
+        source_lineage_id=source_lineage_id.lower(),
+        source_lineage_evidence=source_lineage_evidence,
+        quality_gate=quality_gate,
     )
-    write_report(report, snapshot_path / "verification.json")
+    write_report(quality_gate, snapshot_path / "verification.json")
     result = {
         "status": "succeeded",
         "dataset": "ashare_5m",
@@ -2052,6 +2753,333 @@ def event_market_response_command(
     console.print_json(json.dumps(result, ensure_ascii=False))
 
 
+def _read_admin_asset_metadata(path: Path | None) -> dict[str, object]:
+    if path is None:
+        return {}
+    if path.is_symlink() or not path.is_file():
+        raise typer.BadParameter("metadata JSON must be one regular, non-symlink file")
+    if path.stat().st_size > 1024 * 1024:
+        raise typer.BadParameter("metadata JSON must not exceed 1 MiB")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise typer.BadParameter(f"metadata JSON is invalid: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise typer.BadParameter("metadata JSON must contain one object")
+    return {str(key): value for key, value in payload.items()}
+
+
+def _parse_asset_timestamp(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if normalized.endswith(("Z", "z")):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise typer.BadParameter("published-at must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise typer.BadParameter("published-at must include a timezone offset")
+    return parsed
+
+
+@app.command("research-asset-fetch-pdf")
+def research_asset_fetch_pdf_command(
+    url: Annotated[str, typer.Option(help="Public HTTPS PDF URL")],
+    title: Annotated[str, typer.Option(help="Human-readable document title")],
+    asset_id: Annotated[
+        str | None,
+        typer.Option(help="Optional stable lowercase asset ID"),
+    ] = None,
+    asset_type: Annotated[
+        str,
+        typer.Option("--type", help="Runtime asset type label"),
+    ] = "manual_pdf",
+    published_at: Annotated[
+        str | None,
+        typer.Option(
+            "--published-at",
+            help="Optional source publication timestamp with timezone",
+        ),
+    ] = None,
+    metadata_path: Annotated[
+        Path | None,
+        typer.Option("--metadata-json", help="Optional administrator metadata JSON"),
+    ] = None,
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Download one administrator-approved HTTPS PDF into immutable storage."""
+
+    settings = Settings.from_env()
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    try:
+        published = acquire_manual_https_pdf(
+            settings.data_root,
+            url=url,
+            title=title,
+            asset_id=asset_id,
+            asset_type=asset_type,
+            published_at=_parse_asset_timestamp(published_at),
+            metadata=_read_admin_asset_metadata(metadata_path),
+        )
+    except (OSError, ValueError, ResearchAssetError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    result = {
+        "status": "succeeded",
+        "asset_id": published.asset_id,
+        "kind": "pdf",
+        "type": published.manifest.get("type"),
+        "manifest_path": str(published.manifest_path),
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+@app.command("research-asset-register")
+def research_asset_register_command(
+    asset_id: Annotated[str, typer.Option(help="Stable lowercase asset ID")],
+    kind: Annotated[str, typer.Option(help="pdf, dataset, or finetune")],
+    source_path: Annotated[
+        Path,
+        typer.Option("--source", help="Administrator-owned local file or directory"),
+    ],
+    asset_type: Annotated[
+        str,
+        typer.Option("--type", help="Runtime asset type label"),
+    ],
+    metadata_path: Annotated[
+        Path | None,
+        typer.Option("--metadata-json", help="Optional administrator metadata JSON"),
+    ] = None,
+    priority: Annotated[int, typer.Option(help="Auto-selection priority, 0-1000000")] = 0,
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Admin-only copy/seal of a PDF, dataset, or finetune asset."""
+
+    settings = Settings.from_env()
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    try:
+        published = register_local_research_asset(
+            settings.data_root,
+            asset_id=asset_id,
+            kind=kind,
+            source_path=source_path,
+            asset_type=asset_type,
+            metadata=_read_admin_asset_metadata(metadata_path),
+            priority=priority,
+        )
+    except (OSError, ValueError, ResearchAssetError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    result = {
+        "status": "succeeded",
+        "asset_id": published.asset_id,
+        "kind": published.manifest.get("kind"),
+        "type": published.manifest.get("type"),
+        "manifest_path": str(published.manifest_path),
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+def _parse_kaggle_license_timestamp(value: str) -> datetime:
+    normalized = str(value).strip()
+    if normalized.endswith(("Z", "z")):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise KaggleCapabilityBlocked(
+            "license_acceptance_invalid",
+            "license-accepted-at must be an ISO-8601 timestamp with timezone",
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise KaggleCapabilityBlocked(
+            "license_acceptance_invalid",
+            "license-accepted-at must include a timezone",
+        )
+    return parsed
+
+
+@app.command("research-asset-kaggle")
+def research_asset_kaggle_command(
+    allowlist_path: Annotated[
+        Path,
+        typer.Option(
+            "--allowlist-json",
+            help="data_science administrator Kaggle slug allowlist",
+        ),
+    ],
+    source_kind: Annotated[
+        str,
+        typer.Option("--source-kind", help="dataset or competition"),
+    ],
+    slug: Annotated[str, typer.Option(help="Approved Kaggle source slug")],
+    source_version: Annotated[
+        str,
+        typer.Option(
+            "--source-version",
+            help="Pinned dataset version number or governed competition revision",
+        ),
+    ],
+    license_name: Annotated[
+        str,
+        typer.Option("--license", help="Declared source license or competition terms"),
+    ],
+    license_terms_path: Annotated[
+        Path,
+        typer.Option("--license-terms", help="Exact accepted license/terms evidence file"),
+    ],
+    license_accepted_by: Annotated[
+        str,
+        typer.Option(help="data_science administrator identity accepting the terms"),
+    ],
+    license_accepted_at: Annotated[
+        str,
+        typer.Option(help="ISO-8601 license acceptance timestamp with timezone"),
+    ],
+    license_accepted: Annotated[
+        bool,
+        typer.Option(help="Explicitly attest that the sealed terms were accepted"),
+    ] = False,
+    expected_archive_sha256: Annotated[
+        str | None,
+        typer.Option(
+            help="Optional approved archive SHA-256; mandatory for competitions"
+        ),
+    ] = None,
+    asset_id: Annotated[
+        str | None,
+        typer.Option(help="Optional stable lowercase asset ID"),
+    ] = None,
+    priority: Annotated[
+        int,
+        typer.Option(help="Auto-selection priority, 0-1000000"),
+    ] = 0,
+    max_archive_bytes: Annotated[
+        int,
+        typer.Option(help="Maximum downloaded ZIP bytes"),
+    ] = 5 * 1024 * 1024 * 1024,
+    max_unpacked_bytes: Annotated[
+        int,
+        typer.Option(help="Maximum total unpacked payload bytes"),
+    ] = 20 * 1024 * 1024 * 1024,
+    timeout_seconds: Annotated[
+        int,
+        typer.Option(help="Kaggle CLI timeout in seconds"),
+    ] = 6 * 60 * 60,
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Acquire one allowlisted Kaggle source into immutable, secret-free storage."""
+
+    settings = Settings.from_env()
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    try:
+        acquisition = acquire_kaggle_research_asset(
+            settings.data_root,
+            allowlist_path=allowlist_path,
+            source_kind=source_kind,
+            slug=slug,
+            source_version=source_version,
+            license_name=license_name,
+            license_terms_path=license_terms_path,
+            license_accepted=license_accepted,
+            license_accepted_by=license_accepted_by,
+            license_accepted_at=_parse_kaggle_license_timestamp(license_accepted_at),
+            expected_archive_sha256=expected_archive_sha256,
+            asset_id=asset_id,
+            priority=priority,
+            max_archive_bytes=max_archive_bytes,
+            max_unpacked_bytes=max_unpacked_bytes,
+            timeout_seconds=timeout_seconds,
+        )
+    except KaggleCapabilityBlocked as exc:
+        result = kaggle_blocked_result(
+            source_kind=str(source_kind).strip().lower(),
+            slug=str(slug).strip(),
+            reason_code=exc.reason_code,
+            message=str(exc),
+        )
+        _write_optional_result(result_path, result)
+        console.print_json(json.dumps(result, ensure_ascii=False))
+        raise typer.Exit(3) from exc
+    except (OSError, ValueError, KaggleAssetError, ResearchAssetError) as exc:
+        result = {
+            "status": "failed",
+            "capability": KAGGLE_CAPABILITY,
+            "source_kind": str(source_kind).strip().lower(),
+            "slug": str(slug).strip(),
+            "reason_code": "kaggle_asset_rejected",
+            "message": str(exc),
+        }
+        _write_optional_result(result_path, result)
+        console.print_json(json.dumps(result, ensure_ascii=False))
+        raise typer.Exit(2) from exc
+    result = acquisition.as_dict()
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+
+
+@app.command("research-assets")
+def research_assets_command(
+    snapshot_name: Annotated[
+        str,
+        typer.Option("--snapshot", help="Named verified immutable snapshot"),
+    ],
+    as_of: Annotated[
+        str,
+        typer.Option(help="Asia/Shanghai research day, YYYY-MM-DD or latest"),
+    ] = "latest",
+    tushare_report_date: Annotated[
+        str | None,
+        typer.Option(
+            help="Tushare report day; defaults to latest PIT-eligible day in snapshot",
+        ),
+    ] = None,
+    skip_tushare: Annotated[
+        bool,
+        typer.Option(help="Skip Tushare research_report PDF acquisition"),
+    ] = False,
+    skip_arxiv: Annotated[
+        bool,
+        typer.Option(help="Skip arXiv q-fin/cs.LG/stat.ML discovery"),
+    ] = False,
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Safely acquire governed research PDFs from one immutable snapshot."""
+
+    if skip_tushare and skip_arxiv:
+        raise typer.BadParameter("at least one research asset source must be enabled")
+    as_of_date = parse_date(as_of, latest=today_cn())
+    report_date = parse_date(tushare_report_date) if tushare_report_date else None
+    settings = Settings.from_env()
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    try:
+        summary = ingest_research_assets(
+            settings.data_root,
+            snapshot_name=snapshot_name,
+            as_of=as_of_date,
+            include_tushare=not skip_tushare,
+            include_arxiv=not skip_arxiv,
+            tushare_report_date=report_date,
+        )
+    except (OSError, ValueError, ResearchAssetError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    result = summary.as_dict()
+    result.update(
+        {
+            "as_of": as_of_date.isoformat(),
+            "tushare_report_date": (
+                report_date.isoformat() if report_date else "latest_eligible"
+            ),
+        }
+    )
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
+    if summary.failed:
+        raise typer.Exit(3)
+
+
 @app.command("report-rc-factors")
 def report_rc_factors_command(
     ts_code: Annotated[str, typer.Option(help="Comma-separated Tushare codes to include")] = "",
@@ -2283,6 +3311,65 @@ def _supersede_obsolete_derivative_units(context: Context) -> None:
                 "bc_bestotcqt returns anonymous prices without an auditable instrument key"
             ),
         )
+
+
+@app.command("research-report-download")
+def research_report_download(
+    start: Annotated[str, typer.Option(help="YYYY-MM-DD")] = "2017-01-01",
+    end: Annotated[str, typer.Option(help="YYYY-MM-DD or latest")] = "latest",
+    result_path: Annotated[Path | None, typer.Option("--result")] = None,
+) -> None:
+    """Download only Tushare research_report for the isolated asset pipeline."""
+
+    start_date = parse_date(start)
+    end_date = parse_date(end, latest=today_cn())
+    if end_date < start_date:
+        raise typer.BadParameter("end must not be before start")
+    context = load_context(
+        progress_path=result_path,
+        progress_target={
+            "kind": "research_report_download",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        },
+    )
+    specs = [
+        spec
+        for spec in supplemental_specs(
+            "research_corpus",
+            start=start_date,
+            end=end_date,
+            trading_dates=(),
+            max_attempts=context.settings.max_request_attempts,
+        )
+        if spec.dataset == "research_report"
+    ]
+    if not specs:
+        raise RuntimeError("research_report planner produced no acquisition units")
+    planned, rows, inserted = _run_paginated_specs(
+        context,
+        "isolated research_report acquisition",
+        specs,
+    )
+    downloaded_rows = sum(int(row.get("row_count") or 0) for row in rows)
+    if downloaded_rows == 0:
+        raise RuntimeError(
+            "research_report returned no metadata; provider entitlement and "
+            "downloadable PDF coverage are not proven"
+        )
+    result = {
+        "status": "succeeded",
+        "dataset": "research_report",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "units": len(rows),
+        "rows": downloaded_rows,
+        "planned_units": len(planned),
+        "newly_inserted": inserted,
+        "next_step": "snapshot --profile research-assets",
+    }
+    _write_optional_result(result_path, result)
+    console.print_json(json.dumps(result, ensure_ascii=False))
 
 
 @app.command("supplemental-download")
@@ -2547,7 +3634,7 @@ def build_qlib_command(
         bool,
         typer.Option(
             "--skip-quality-gate",
-            help="Build even when the snapshot manifest has no passing quality gate",
+            help="Allow an unverified staging-only diagnostic build; never publishes Qlib data",
         ),
     ] = False,
 ) -> None:
@@ -2572,19 +3659,39 @@ def build_qlib_command(
 def build_minute_qlib_command(
     snapshot_name: Annotated[str, typer.Option("--snapshot")],
     output_name: Annotated[str | None, typer.Option("--output-name")] = None,
+    expected_manifest_sha256: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-manifest-sha256",
+            help="Manifest digest sealed when the build job was created",
+        ),
+    ] = None,
     target_frequency: Annotated[str | None, typer.Option("--target-frequency")] = None,
     staging_only: Annotated[bool, typer.Option("--staging-only")] = False,
     skip_quality_gate: Annotated[
         bool,
         typer.Option(
             "--skip-quality-gate",
-            help="Build even when the snapshot manifest has no passing quality gate",
+            help="Allow an unverified staging-only diagnostic build; never publishes Qlib data",
         ),
     ] = False,
 ) -> None:
     """Build native or Qlib-resampled data without another download path."""
     context = load_context(require_credentials=False)
     snapshot_path = context.storage.snapshots_root / snapshot_name
+    if expected_manifest_sha256 is not None:
+        if not _is_sha256(expected_manifest_sha256):
+            raise typer.BadParameter("expected snapshot manifest SHA-256 is invalid")
+        try:
+            actual_manifest_sha256 = hashlib.sha256(
+                (snapshot_path / "manifest.json").read_bytes()
+            ).hexdigest()
+        except OSError as exc:
+            raise typer.BadParameter("snapshot manifest is missing") from exc
+        if actual_manifest_sha256 != expected_manifest_sha256.lower():
+            raise typer.BadParameter(
+                "snapshot manifest changed after the minute Qlib job was sealed"
+            )
     result = _build_minute_qlib(
         context,
         snapshot_path,
@@ -2609,7 +3716,7 @@ def _require_snapshot_quality_gate(snapshot_path: Path, *, skip: bool = False) -
     if not isinstance(gate, dict) or gate.get("ok") is not True:
         raise ValueError(
             "snapshot has no passing quality gate; rebuild it through the verify "
-            "and snapshot commands, or pass --skip-quality-gate to override"
+            "and snapshot commands"
         )
 
 
@@ -2621,21 +3728,54 @@ def _build_snapshot(
     profile: str,
     quality_gate: dict[str, Any] | None = None,
 ) -> Path:
+    if not quality_gate or quality_gate.get("ok") is not True:
+        raise ValueError("snapshot publication requires a passing bound quality gate")
     module_root = Path(__file__).resolve().parent
+    is_research_asset_source = profile == RESEARCH_ASSET_SNAPSHOT_PROFILE
+    mixed_legacy_source = not is_research_asset_source and start_date < date(2016, 1, 1)
+    provider_contract = (
+        "tushare-compatible+baostock-audited-legacy"
+        if mixed_legacy_source
+        else "tushare-compatible"
+    )
+    contract_files = {
+        "planner": module_root / "planner.py",
+        "provider": module_root / "provider.py",
+        "storage": module_root / "storage.py",
+    }
+    if is_research_asset_source:
+        contract_files.update(
+            {
+                "catalog": module_root / "catalog.py",
+                "research_assets": module_root / "research_assets.py",
+            }
+        )
+    if mixed_legacy_source:
+        contract_files.update(
+            {
+                "baostock_provider": module_root / "baostock_provider.py",
+                "legacy_market": module_root / "legacy_market.py",
+            }
+        )
+    lineage_configuration = {
+        "profile": profile,
+        "start_date": start_date.isoformat(),
+        "provider": provider_contract,
+        "legacy_source": BAOSTOCK_SOURCE_VERSION if mixed_legacy_source else None,
+        "legacy_overlap_policy_version": (
+            BAOSTOCK_OVERLAP_POLICY_VERSION if mixed_legacy_source else None
+        ),
+        "ingestion_contract_sha256": file_contract_sha256(contract_files),
+    }
+    lineage_contract = {
+        "kind": (
+            "research_asset_source" if is_research_asset_source else "qlib_daily_source"
+        ),
+        "configuration": lineage_configuration,
+    }
     lineage_id = make_lineage_id(
-        "qlib_daily_source",
-        {
-            "profile": profile,
-            "start_date": start_date.isoformat(),
-            "provider": "tushare-compatible",
-            "ingestion_contract_sha256": file_contract_sha256(
-                {
-                    "planner": module_root / "planner.py",
-                    "provider": module_root / "provider.py",
-                    "storage": module_root / "storage.py",
-                }
-            ),
-        },
+        lineage_contract["kind"],
+        lineage_configuration,
     )
     existing = context.storage.snapshots_root / name
     if existing.exists():
@@ -2652,20 +3792,55 @@ def _build_snapshot(
         }
         if any(manifest.get(key) != value for key, value in expected.items()):
             raise ValueError(f"existing snapshot {name!r} does not match the requested range")
+        if quality_gate:
+            gate_scope = quality_gate.get("plan_scope_sha256") or quality_gate.get(
+                "release_window_scope_sha256"
+            )
+            if manifest.get("plan_scope_sha256") != gate_scope:
+                raise ValueError(
+                    f"existing snapshot {name!r} does not match the verified plan scope"
+                )
+            if manifest.get("selected_unit_set_sha256") != quality_gate.get(
+                "selected_unit_set_sha256"
+            ):
+                raise ValueError(
+                    f"existing snapshot {name!r} does not match the verified unit set"
+                )
         return existing
     available = set(context.checkpoint.datasets())
-    selected_datasets = _profile_datasets(profile)
-    if profile == "full":
-        # A full immutable research lake must retain every downloaded daily,
-        # reference and alternative dataset. Minute bars and shortability form
-        # a separate execution snapshot with a different frequency contract.
-        selected_datasets.update(available - set(MINUTE_DATASETS) - {MARGIN_DATASET})
-    units = {
-        dataset: select_current_reference_units(
-            context.checkpoint.successful(dataset), snapshot_end=end_date
+    selected_datasets = _snapshot_datasets(profile, available=available)
+    selection = select_release_window_units(
+        context.checkpoint.active_units(selected_datasets & available),
+        snapshot_start=start_date,
+        snapshot_end=end_date,
+        datasets=selected_datasets,
+        profile=profile,
+    )
+    incomplete = [
+        row for row in selection.rows if str(row.get("status") or "") != "succeeded"
+    ]
+    if incomplete:
+        raise ValueError(
+            f"{len(incomplete)} selected release-window work units are incomplete"
         )
-        for dataset in sorted(selected_datasets & available)
-    }
+    if quality_gate:
+        verified_scope = quality_gate.get("plan_scope_sha256") or quality_gate.get(
+            "release_window_scope_sha256"
+        )
+        if verified_scope != selection.plan_scope_sha256:
+            raise ValueError(
+                "snapshot release window no longer matches its verification scope"
+            )
+        if (
+            quality_gate.get("selected_unit_set_sha256")
+            != selection.selected_unit_set_sha256
+        ):
+            raise ValueError(
+                "snapshot selected work units changed after quality verification"
+            )
+    units: dict[str, list[dict[str, Any]]] = {}
+    for row in selection.rows:
+        units.setdefault(str(row["dataset"]), []).append(dict(row))
     if not units:
         raise ValueError(f"no successful {profile} datasets are available for snapshotting")
     lineage = prepare_lineage_metadata(
@@ -2687,7 +3862,22 @@ def _build_snapshot(
             "profile": profile,
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
-            "provider": "tushare-compatible",
+            "plan_scope_sha256": selection.plan_scope_sha256,
+            "selected_unit_set_sha256": selection.selected_unit_set_sha256,
+            "selected_unit_evidence": [
+                dict(item) for item in selection.unit_identities
+            ],
+            "provider": provider_contract,
+            "lineage_contract": lineage_contract,
+            "source_contracts": (
+                {
+                    "primary": "tushare-compatible",
+                    "legacy_market": BAOSTOCK_SOURCE_VERSION,
+                    "legacy_overlap_policy_version": BAOSTOCK_OVERLAP_POLICY_VERSION,
+                }
+                if mixed_legacy_source
+                else {"primary": "tushare-compatible"}
+            ),
             **({"quality_gate": quality_gate} if quality_gate else {}),
             **lineage,
         },
@@ -2702,7 +3892,23 @@ def _build_qlib(
     staging_only: bool,
     skip_quality_gate: bool = False,
 ) -> Path:
+    if skip_quality_gate and not staging_only:
+        raise ValueError(
+            "an unverified snapshot may only be normalized with --staging-only; "
+            "publishing Qlib binaries requires a passing quality gate"
+        )
     _require_snapshot_quality_gate(snapshot_path, skip=skip_quality_gate)
+    try:
+        snapshot_manifest = json.loads(
+            (snapshot_path / "manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("snapshot manifest is missing or invalid") from exc
+    if snapshot_manifest.get("profile") == RESEARCH_ASSET_SNAPSHOT_PROFILE:
+        raise ValueError(
+            "research-assets snapshots are isolated PDF acquisition sources and "
+            "cannot be normalized into a Qlib market dataset"
+        )
     builder = QlibBuilder(snapshot_path)
     staging = context.settings.data_root / "qlib_staging" / snapshot_path.name
     output = context.settings.data_root / "qlib" / snapshot_path.name
@@ -2716,7 +3922,33 @@ def _build_qlib(
         if all(path.exists() for path in required) and any(
             (output / "features").rglob("*.day.bin")
         ):
-            return output
+            provenance_path = output / "metadata" / "provenance.json"
+            try:
+                provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+                snapshot_manifest = verify_snapshot_lineage(snapshot_path)
+                snapshot_manifest_sha256 = builder._snapshot_manifest_digest()
+                require_daily_qlib_contract(provenance)
+                verify_qlib_output_manifest(output, provenance)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                raise ValueError(
+                    f"existing daily Qlib provenance is invalid: {output}"
+                ) from exc
+            expected = {
+                "snapshot_name": snapshot_path.name,
+                "snapshot_manifest_sha256": snapshot_manifest_sha256,
+                "qlib_builder_sha256": builder.builder_sha256(),
+                "source_lineage_id": snapshot_manifest.get("lineage_id"),
+            }
+            if (
+                all(provenance.get(key) == value for key, value in expected.items())
+                and _is_sha256(provenance.get("dataset_identity_sha256"))
+                and _is_sha256(provenance.get("dataset_lineage_id"))
+            ):
+                return output
+            raise ValueError(
+                f"existing daily Qlib output belongs to different inputs or an "
+                f"obsolete builder contract: {output}"
+            )
         raise ValueError(
             f"existing Qlib output is incomplete and requires operator review: {output}"
         )
@@ -2742,6 +3974,11 @@ def _build_minute_qlib(
     staging_only: bool,
     skip_quality_gate: bool = False,
 ) -> Path:
+    if skip_quality_gate and not staging_only:
+        raise ValueError(
+            "an unverified snapshot may only be normalized with --staging-only; "
+            "publishing minute Qlib binaries requires a passing quality gate"
+        )
     _require_snapshot_quality_gate(snapshot_path, skip=skip_quality_gate)
     builder = MinuteQlibBuilder(snapshot_path, target_frequency=target_frequency)
     output_name = output_name or f"{snapshot_path.name}-{builder.frequency}"
@@ -2757,7 +3994,40 @@ def _build_minute_qlib(
         if all(path.exists() for path in required) and any(
             (output / "features").rglob(f"*.{builder.frequency}.bin")
         ):
-            return output
+            provenance_path = output / "metadata" / "provenance.json"
+            try:
+                provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+                verify_qlib_output_manifest(output, provenance)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                raise ValueError(
+                    f"existing minute Qlib provenance is invalid: {output}"
+                ) from exc
+            snapshot_manifest_sha256 = hashlib.sha256(
+                (snapshot_path / "manifest.json").read_bytes()
+            ).hexdigest()
+            expected = {
+                "snapshot_name": snapshot_path.name,
+                "snapshot_manifest_sha256": snapshot_manifest_sha256,
+                "frequency": builder.frequency,
+                "source_frequency": builder.source_frequency,
+                "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
+                "qlib_builder_sha256": builder.builder_sha256(),
+                "source_lineage_id": builder.source_lineage_id,
+                "source_lineage_evidence_sha256": builder.source_lineage_evidence[
+                    "evidence_sha256"
+                ],
+            }
+            if (
+                all(provenance.get(key) == value for key, value in expected.items())
+                and provenance.get("lineage_verified") is True
+                and _is_sha256(provenance.get("dataset_identity_sha256"))
+                and _is_sha256(provenance.get("dataset_lineage_id"))
+            ):
+                return output
+            raise ValueError(
+                f"existing minute Qlib output belongs to different inputs or an "
+                f"obsolete contract: {output}"
+            )
         raise ValueError(
             f"existing minute Qlib output is incomplete and requires operator review: {output}"
         )
@@ -2797,6 +4067,311 @@ def _require_specs_complete(
         suffix = f"; {hint}" if hint else ""
         raise RuntimeError(f"{len(missing)} required work units are incomplete{suffix}")
     return rows
+
+
+def _is_sha256(value: object) -> bool:
+    normalized = str(value or "").lower()
+    return len(normalized) == 64 and all(
+        character in "0123456789abcdef" for character in normalized
+    )
+
+
+def _require_local_daily_source_lineage(
+    context: Context,
+    *,
+    source_lineage_id: str,
+    daily_source_dataset: str | None,
+    start_date: date,
+    end_date: date,
+) -> dict[str, Any]:
+    """Bind an execution snapshot to a real, verified local daily Qlib build."""
+
+    normalized_lineage = str(source_lineage_id).lower()
+    if not _is_sha256(normalized_lineage):
+        raise typer.BadParameter(
+            "minute download requires a valid daily --source-lineage-id"
+        )
+    qlib_root = context.settings.data_root / "qlib"
+    if daily_source_dataset and Path(daily_source_dataset).name != daily_source_dataset:
+        raise typer.BadParameter("--daily-source-dataset must be a local dataset name")
+    candidates: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for qlib_path in sorted(
+        (
+            path
+            for path in qlib_root.iterdir()
+            if path.is_dir()
+            and (not daily_source_dataset or path.name == daily_source_dataset)
+        ),
+        reverse=True,
+    ) if qlib_root.exists() else []:
+        provenance_path = qlib_path / "metadata" / "provenance.json"
+        try:
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(provenance.get("source_lineage_id") or "").lower() != normalized_lineage:
+            continue
+        try:
+            require_daily_qlib_contract(provenance)
+            verify_qlib_output_manifest(qlib_path, provenance)
+            for field in (
+                "dataset_identity_sha256",
+                "dataset_lineage_id",
+                "snapshot_manifest_sha256",
+            ):
+                if not _is_sha256(provenance.get(field)):
+                    raise ValueError(f"daily Qlib provenance has invalid {field}")
+            features = qlib_path / "features"
+            instruments = (
+                qlib_path / "instruments" / "cn_all.txt",
+                qlib_path / "instruments" / "liquid_all.txt",
+                qlib_path / "instruments" / "all.txt",
+            )
+            if not features.is_dir() or not any(path.is_file() for path in instruments):
+                raise ValueError("daily Qlib features or instruments are incomplete")
+            calendar_path = qlib_path / "calendars" / "day.txt"
+            calendar = [
+                date.fromisoformat(line.strip())
+                for line in calendar_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if not calendar or calendar[0] > start_date or calendar[-1] < end_date:
+                raise ValueError("daily Qlib calendar does not cover the minute request")
+            snapshot_name = str(provenance.get("snapshot_name") or "")
+            if not snapshot_name or Path(snapshot_name).name != snapshot_name:
+                raise ValueError("daily Qlib source snapshot name is invalid")
+            snapshot_path = context.settings.data_root / "snapshots" / snapshot_name
+            manifest = verify_snapshot_lineage(snapshot_path)
+            manifest_path = snapshot_path / "manifest.json"
+            if str(manifest.get("lineage_id") or "").lower() != normalized_lineage:
+                raise ValueError("daily Qlib and source snapshot lineage disagree")
+            manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            if manifest_sha256 != provenance["snapshot_manifest_sha256"]:
+                raise ValueError("daily Qlib source snapshot digest is stale")
+        except (OSError, ValueError) as exc:
+            failures.append(f"{qlib_path.name}: {exc}")
+            continue
+        evidence = {
+            "qlib_dataset": qlib_path.name,
+            "qlib_dataset_identity_sha256": provenance["dataset_identity_sha256"],
+            "qlib_dataset_lineage_id": provenance["dataset_lineage_id"],
+            "source_snapshot": snapshot_name,
+            "source_snapshot_manifest_sha256": provenance["snapshot_manifest_sha256"],
+            "source_lineage_id": normalized_lineage,
+            "calendar_start": calendar[0].isoformat(),
+            "calendar_end": calendar[-1].isoformat(),
+        }
+        evidence["evidence_sha256"] = hashlib.sha256(
+            json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        candidates.append(evidence)
+    if not candidates:
+        detail = f" ({failures[0]})" if failures else ""
+        raise typer.BadParameter(
+            "--source-lineage-id does not match a verified local daily Qlib dataset "
+            f"covering {start_date.isoformat()}..{end_date.isoformat()}{detail}"
+        )
+    return max(
+        candidates,
+        key=lambda item: (str(item["calendar_end"]), str(item["qlib_dataset"])),
+    )
+
+
+def _source_snapshot_dataset_rows(
+    context: Context,
+    *,
+    source_lineage_evidence: dict[str, Any],
+    dataset: str,
+    start_date: date,
+    end_date: date,
+) -> list[dict[str, Any]]:
+    """Resolve the exact checkpoint units sealed into a verified source snapshot."""
+
+    snapshot_name = str(source_lineage_evidence.get("source_snapshot") or "")
+    if not snapshot_name or Path(snapshot_name).name != snapshot_name:
+        raise ValueError("execution source snapshot name is invalid")
+    manifest = verify_snapshot_lineage(
+        context.settings.data_root / "snapshots" / snapshot_name
+    )
+    entry = (manifest.get("datasets") or {}).get(dataset)
+    identities = entry.get("source_units") if isinstance(entry, dict) else None
+    if not isinstance(identities, list) or not identities:
+        raise ValueError(f"daily source snapshot has no {dataset} units")
+    expected = {
+        (
+            str(item.get("unit_key") or ""),
+            str(item.get("sha256") or ""),
+            int(item.get("row_count") or 0),
+        )
+        for item in identities
+        if isinstance(item, dict)
+    }
+    if len(expected) != len(identities) or any(
+        not unit_key or not _is_sha256(sha256)
+        for unit_key, sha256, _ in expected
+    ):
+        raise ValueError(f"daily source snapshot {dataset} unit evidence is invalid")
+    rows = context.checkpoint.successful_units(unit_key for unit_key, _, _ in expected)
+    actual = {
+        (
+            str(row.get("unit_key") or ""),
+            str(row.get("sha256") or ""),
+            int(row.get("row_count") or 0),
+        )
+        for row in rows
+        if str(row.get("dataset") or "") == dataset
+    }
+    if actual != expected:
+        raise ValueError(
+            f"checkpoint no longer matches the {dataset} units sealed by the daily source"
+        )
+    selection = select_release_window_units(
+        rows,
+        snapshot_start=start_date,
+        snapshot_end=end_date,
+        datasets={dataset},
+        profile="execution_source",
+    )
+    selected_rows = [dict(row) for row in selection.rows]
+    if not selected_rows:
+        raise ValueError(
+            f"daily source snapshot has no {dataset} units in the execution window"
+        )
+    data_root = context.settings.data_root.resolve()
+    for row in selected_rows:
+        output_path = str(row.get("output_path") or "")
+        target = (data_root / output_path).resolve()
+        try:
+            target.relative_to(data_root)
+        except ValueError as exc:
+            raise ValueError(f"daily source {dataset} unit path is unsafe") from exc
+        if not output_path or not target.is_file():
+            raise ValueError(f"daily source {dataset} unit file is missing")
+        if hashlib.sha256(target.read_bytes()).hexdigest() != str(
+            row.get("sha256") or ""
+        ).lower():
+            raise ValueError(f"daily source {dataset} unit checksum failed")
+    return selected_rows
+
+
+def _source_daily_trading_dates(
+    context: Context,
+    *,
+    source_lineage_evidence: dict[str, Any],
+    start_date: date,
+    end_date: date,
+) -> list[str]:
+    """Use the exact daily Qlib calendar and prove it matches its source snapshot."""
+
+    calendar_rows = _source_snapshot_dataset_rows(
+        context,
+        source_lineage_evidence=source_lineage_evidence,
+        dataset="trade_cal",
+        start_date=start_date,
+        end_date=end_date,
+    )
+    source_dates = _open_market_dates(
+        context.storage.read_units(calendar_rows),
+        start=start_date,
+        end=end_date,
+    )
+    qlib_dataset = str(source_lineage_evidence.get("qlib_dataset") or "")
+    if not qlib_dataset or Path(qlib_dataset).name != qlib_dataset:
+        raise ValueError("daily source Qlib dataset name is invalid")
+    calendar_path = (
+        context.settings.data_root / "qlib" / qlib_dataset / "calendars" / "day.txt"
+    )
+    try:
+        qlib_dates = sorted(
+            {
+                value.strftime("%Y%m%d")
+                for value in (
+                    date.fromisoformat(line.strip())
+                    for line in calendar_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                )
+                if start_date <= value <= end_date
+            }
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError("bound daily Qlib calendar is missing or invalid") from exc
+    if not qlib_dates:
+        raise ValueError("bound daily Qlib calendar has no sessions in the minute window")
+    if qlib_dates != source_dates:
+        raise ValueError("bound daily Qlib calendar disagrees with its source snapshot trade_cal")
+    return qlib_dates
+
+
+def _explicit_execution_quality_gate(
+    context: Context,
+    *,
+    selected: dict[str, list[dict[str, Any]]],
+    start_date: date,
+    end_date: date,
+    profile: str,
+) -> dict[str, Any]:
+    """Checksum and seal the exact bounded units used by an execution snapshot."""
+
+    rows = [dict(row) for dataset_rows in selected.values() for row in dataset_rows]
+    if not rows:
+        raise ValueError("execution snapshot has no selected work units")
+    unit_keys = [str(row.get("unit_key") or "") for row in rows]
+    if any(not key for key in unit_keys) or len(unit_keys) != len(set(unit_keys)):
+        raise ValueError("execution snapshot work-unit identities are missing or duplicated")
+    data_root = context.settings.data_root.resolve()
+    for row in rows:
+        output_path = str(row.get("output_path") or "")
+        target = (data_root / output_path).resolve()
+        try:
+            target.relative_to(data_root)
+        except ValueError as exc:
+            raise ValueError("execution snapshot contains an unsafe unit path") from exc
+        if not output_path or not target.is_file():
+            raise ValueError(f"execution work-unit file is missing: {row['unit_key']}")
+        expected_sha256 = str(row.get("sha256") or "").lower()
+        if not _is_sha256(expected_sha256) or (
+            hashlib.sha256(target.read_bytes()).hexdigest() != expected_sha256
+        ):
+            raise ValueError(f"execution work-unit checksum failed: {row['unit_key']}")
+    selection = select_release_window_units(
+        rows,
+        snapshot_start=start_date,
+        snapshot_end=end_date,
+        datasets=set(selected),
+        profile=profile,
+    )
+    selected_keys = {str(row["unit_key"]) for row in selection.rows}
+    if selected_keys != set(unit_keys):
+        raise ValueError("execution quality gate and snapshot unit selections disagree")
+    minute_source_audits: dict[str, dict[str, Any]] = {}
+    minute_source_warnings: list[str] = []
+    ashare_rows = selected.get("ashare_5m") or []
+    if ashare_rows:
+        ashare_paths = [
+            (data_root / str(row["output_path"])).resolve() for row in ashare_rows
+        ]
+        source_errors, source_warnings, source_audit = verify_ashare_5m_source_files(
+            ashare_paths,
+            snapshot_start=start_date,
+            snapshot_end=end_date,
+        )
+        if source_errors:
+            raise ValueError("; ".join(source_errors))
+        minute_source_audits["ashare_5m"] = source_audit
+        minute_source_warnings.extend(source_warnings)
+    result = quality_gate_payload(
+        {
+            "ok": True,
+            "checked_at": datetime.now(UTC).isoformat(),
+            "errors": [],
+            "release_window": selection.report(),
+        }
+    )
+    if minute_source_audits:
+        result["minute_source_audits"] = minute_source_audits
+        result["minute_source_warnings"] = minute_source_warnings
+    return result
 
 
 def _split_codes(value: str) -> list[str]:
@@ -2846,6 +4421,49 @@ def _produce_factors(label: str, produce: Callable[[], Any]) -> Any:
         raise typer.Exit(2) from exc
 
 
+def _execution_universe_contract(
+    *,
+    profile: str,
+    symbols_by_dataset: dict[str, list[str]],
+    universe_evidence: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Seal the immutable universe definition used for compatible data rolls.
+
+    Exact work-unit content and the requested end date belong to the dataset
+    identity, not its stable lineage.  The lineage must nevertheless separate
+    unrelated manual/auto universes; otherwise ``latest_compatible`` could roll
+    an approved simulation onto minute data for a different set of securities.
+    The full historical A-share feed is policy-defined, so newly listed symbols
+    remain compatible additions to that one universe rather than creating a new
+    lineage every day.
+    """
+
+    normalized_symbols = {
+        str(dataset): sorted({str(symbol) for symbol in symbols if str(symbol)})
+        for dataset, symbols in sorted(symbols_by_dataset.items())
+    }
+    evidence = dict(universe_evidence or {})
+    if (
+        profile == "ashare_intraday"
+        and evidence.get("mode") == "historically_active_a_share_master"
+        and evidence.get("source") == "stock_basic"
+    ):
+        payload: dict[str, Any] = {
+            "mode": "historically_active_a_share_master",
+            "source": "stock_basic",
+        }
+    else:
+        payload = {
+            "mode": "resolved_symbols",
+            "symbols_by_dataset": normalized_symbols,
+        }
+    return {
+        "version": "execution-universe-contract-v1",
+        "payload": payload,
+        "sha256": canonical_sha256(payload),
+    }
+
+
 def _build_execution_snapshot(
     context: Context,
     *,
@@ -2858,29 +4476,63 @@ def _build_execution_snapshot(
     frequency: str = "1min",
     profile: str = "pair_execution",
     source_lineage_id: str | None = None,
+    source_lineage_evidence: dict[str, Any] | None = None,
     quality_gate: dict[str, Any] | None = None,
 ) -> Path:
     module_root = Path(__file__).resolve().parent
-    lineage_id = make_lineage_id(
-        profile,
-        {
-            "start_date": start_date.isoformat(),
-            "frequency": frequency,
-            "provider": "tushare-compatible",
-            "ingestion_contract_sha256": file_contract_sha256(
-                {
-                    "execution_data": module_root / "execution_data.py",
-                    "provider": module_root / "provider.py",
-                    "storage": module_root / "storage.py",
-                }
-            ),
-        },
+    universe_contract = _execution_universe_contract(
+        profile=profile,
+        symbols_by_dataset=symbols_by_dataset,
+        universe_evidence=universe_evidence,
     )
-    paired_source_lineage_id = str(source_lineage_id or lineage_id)
+    lineage_configuration = {
+        "contract_version": EXECUTION_SNAPSHOT_CONTRACT_VERSION,
+        "start_date": start_date.isoformat(),
+        "frequency": frequency,
+        "provider": "tushare-compatible",
+        "universe_contract_sha256": universe_contract["sha256"],
+        "ingestion_contract_sha256": file_contract_sha256(
+            {
+                "execution_data": module_root / "execution_data.py",
+                "provider": module_root / "provider.py",
+                "storage": module_root / "storage.py",
+            }
+        ),
+    }
+    paired_source_lineage_id = str(source_lineage_id or "")
     if len(paired_source_lineage_id) != 64 or any(
         character not in "0123456789abcdef" for character in paired_source_lineage_id
     ):
         raise ValueError("execution snapshot source lineage must be a SHA-256 digest")
+    if (
+        not isinstance(source_lineage_evidence, dict)
+        or source_lineage_evidence.get("source_lineage_id") != paired_source_lineage_id
+        or not _is_sha256(source_lineage_evidence.get("evidence_sha256"))
+        or not _is_sha256(source_lineage_evidence.get("qlib_dataset_lineage_id"))
+    ):
+        raise ValueError("execution snapshot requires verified daily-source evidence")
+    evidence_payload = {
+        key: value
+        for key, value in source_lineage_evidence.items()
+        if key != "evidence_sha256"
+    }
+    expected_evidence_sha256 = hashlib.sha256(
+        json.dumps(evidence_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if source_lineage_evidence["evidence_sha256"] != expected_evidence_sha256:
+        raise ValueError("execution snapshot daily-source evidence digest is inconsistent")
+    if not isinstance(quality_gate, dict) or quality_gate.get("ok") is not True:
+        raise ValueError("execution snapshot requires a passing scoped quality gate")
+    lineage_configuration.update(
+        {
+            "source_lineage_id": paired_source_lineage_id,
+            "source_qlib_dataset_lineage_id": source_lineage_evidence[
+                "qlib_dataset_lineage_id"
+            ],
+        }
+    )
+    lineage_contract = {"kind": profile, "configuration": lineage_configuration}
+    lineage_id = make_lineage_id(profile, lineage_configuration)
     expected = {
         "profile": profile,
         "start_date": start_date.isoformat(),
@@ -2888,8 +4540,12 @@ def _build_execution_snapshot(
         "frequency": frequency,
         "symbols": symbols_by_dataset,
         "universe": universe_evidence or {"mode": "manual"},
+        "universe_contract": universe_contract,
         "lineage_id": lineage_id,
         "source_lineage_id": paired_source_lineage_id,
+        "source_lineage_evidence": source_lineage_evidence,
+        "selected_unit_set_sha256": quality_gate.get("selected_unit_set_sha256"),
+        "plan_scope_sha256": quality_gate.get("plan_scope_sha256"),
     }
     existing = context.storage.snapshots_root / name
     if existing.exists():
@@ -2901,26 +4557,43 @@ def _build_execution_snapshot(
             raise ValueError(f"existing execution snapshot {name!r} has different inputs")
         if set(manifest.get("datasets", {})) != set(selected):
             raise ValueError(f"existing execution snapshot {name!r} has different datasets")
+        existing_gate = manifest.get("quality_gate")
+        stable_gate_fields = (
+            "ok",
+            "plan_scope_sha256",
+            "selected_unit_set_sha256",
+            "daily_source_evidence_sha256",
+        )
+        if not isinstance(existing_gate, dict) or any(
+            existing_gate.get(key) != quality_gate.get(key)
+            for key in stable_gate_fields
+        ):
+            raise ValueError(
+                f"existing execution snapshot {name!r} has different quality evidence"
+            )
+        verified_manifest = verify_snapshot_lineage(existing)
+        if verified_manifest != manifest:
+            raise ValueError(f"existing execution snapshot {name!r} lineage changed")
+        QlibBuilder(existing)._snapshot_manifest_digest()
         return existing
-    lineage = prepare_lineage_metadata(
-        context.storage.snapshots_root,
-        lineage_id=lineage_id,
-        end_date=end_date,
-        successful_units=selected,
-    )
     return context.storage.build_snapshot(
         name=name,
         successful_units=selected,
         manifest_extra={
             **expected,
-            **lineage,
+            "quality_gate": quality_gate,
+            "parent_snapshot": None,
+            "parent_manifest_sha256": None,
+            "lineage_generation": 0,
             "provider": "tushare-compatible",
-            **({"quality_gate": quality_gate} if quality_gate else {}),
+            "lineage_contract": lineage_contract,
         },
     )
 
 
 def _profile_datasets(profile: str) -> set[str]:
+    if profile == RESEARCH_ASSET_SNAPSHOT_PROFILE:
+        return {"trade_cal", "research_report"}
     datasets = {
         "stock_basic",
         "trade_cal",
@@ -2944,6 +4617,37 @@ def _profile_datasets(profile: str) -> set[str]:
         datasets.update(item.name for item in (*FUNDAMENTALS, *CORPORATE_EVENTS))
         datasets.add("news")
     return datasets
+
+
+def _snapshot_datasets(profile: str, *, available: set[str]) -> set[str]:
+    """Return the exact checkpoint datasets one profile will publish.
+
+    Strict verification is scoped to this set so unrelated long-running jobs
+    cannot block a core/research snapshot.  Full snapshots remain strict over
+    every non-minute dataset they would actually include.
+    """
+
+    if profile not in SNAPSHOT_PROFILES:
+        raise typer.BadParameter(
+            "profile must be core, research, full, or research-assets"
+        )
+    datasets = _profile_datasets(profile) | set(_required_profile_datasets(profile))
+    # The profile is an explicit publication contract. Unrelated supplemental,
+    # text or minute downloads in the shared checkpoint must not silently join
+    # it or block a governed Qlib release merely because they already exist.
+    return datasets
+
+
+def _required_profile_datasets(profile: str) -> frozenset[str]:
+    """Datasets that must exist before one profile can be published."""
+
+    if profile == RESEARCH_ASSET_SNAPSHOT_PROFILE:
+        return frozenset({"trade_cal", "research_report"})
+    return (
+        QLIB_RESEARCH_REQUIRED_DATASETS
+        if profile == "full"
+        else QLIB_DAILY_REQUIRED_DATASETS
+    )
 
 
 if __name__ == "__main__":

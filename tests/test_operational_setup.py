@@ -7,6 +7,8 @@ import pytest
 from quant_platform.worker import _failure_message
 from scripts.configure_tushare import update_env, validate_token
 
+pytestmark = pytest.mark.no_database
+
 
 def test_failure_message_extracts_actionable_tail(tmp_path: Path) -> None:
     log = tmp_path / "worker.log"
@@ -16,6 +18,19 @@ def test_failure_message_extracts_actionable_tail(tmp_path: Path) -> None:
     )
     assert _failure_message(log, "fallback") == "ValueError: TUSHARE_TOKEN is required"
     assert _failure_message(tmp_path / "missing.log", "fallback") == "fallback"
+
+
+def test_release_upgrade_drill_uses_isolated_sibling_storage() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "scripts" / "release_upgrade_drill.py").read_text(encoding="utf-8")
+
+    assert 'data_host_path = scratch / "drill-data"' in source
+    assert 'backup_root = scratch / "backups"' in source
+    assert 'docker_host_path = scratch / "rdagent-docker"' in source
+    assert 'registry_host_path = scratch / "rdagent-registry"' in source
+    assert 'f"QUANTLAB_DATA_HOST_PATH={data_host_path.resolve()}"' in source
+    assert 'f"RDAGENT_DOCKER_HOST_PATH={docker_host_path.resolve()}"' in source
+    assert 'f"RDAGENT_REGISTRY_HOST_PATH={registry_host_path.resolve()}"' in source
 
 
 def test_tushare_configuration_is_validated_and_written_atomically(
@@ -54,10 +69,10 @@ def test_compose_bounds_every_service_log_file() -> None:
     assert "x-logging: &default-logging" in compose
     assert "max-size: ${LOG_MAX_SIZE:-20m}" in compose
     assert "max-file: ${LOG_MAX_FILES:-5}" in compose
-    assert compose.count("logging: *default-logging") == 8
+    assert compose.count("logging: *default-logging") == 10
     assert compose.count(
         "${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}"
-    ) == 4
+    ) == 6
 
 
 @pytest.mark.no_database

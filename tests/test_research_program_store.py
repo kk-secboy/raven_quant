@@ -11,8 +11,8 @@ def _create(store: ResearchProgramStore) -> dict:
         benchmark="SH000300",
         universe="cn_all",
         dataset_lineage_id="lineage-a",
-        config={"window_days": {"train": 756, "validation": 252, "test": 504}},
-        min_new_trading_days=20,
+        config={"window_days": {"test": 504}},
+        min_new_trading_days=504,
         max_active_campaigns=1,
         actor="research-admin",
     )

@@ -6,6 +6,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from .reference_data import reference_manifest_metadata
+
 
 def canonical_sha256(value: Any) -> str:
     encoded = json.dumps(
@@ -19,6 +21,70 @@ def canonical_sha256(value: Any) -> str:
 
 def make_lineage_id(kind: str, configuration: dict[str, Any]) -> str:
     return canonical_sha256({"kind": kind, "configuration": configuration})
+
+
+def verify_snapshot_lineage(snapshot_path: Path) -> dict[str, Any]:
+    """Verify the declared lineage contract and every immediate parent link."""
+
+    return _verify_snapshot_lineage(snapshot_path.resolve(), visited=set())
+
+
+def _verify_snapshot_lineage(
+    snapshot_path: Path, *, visited: set[Path]
+) -> dict[str, Any]:
+    if snapshot_path in visited:
+        raise ValueError("snapshot lineage contains a parent cycle")
+    visited.add(snapshot_path)
+    manifest_path = snapshot_path / "manifest.json"
+    try:
+        raw = manifest_path.read_bytes()
+        manifest = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"snapshot lineage manifest is missing or invalid: {snapshot_path}"
+        ) from exc
+    contract = manifest.get("lineage_contract")
+    if not isinstance(contract, dict) or set(contract) != {"kind", "configuration"}:
+        raise ValueError("snapshot lineage contract is missing or invalid")
+    kind = contract.get("kind")
+    configuration = contract.get("configuration")
+    if not isinstance(kind, str) or not kind or not isinstance(configuration, dict):
+        raise ValueError("snapshot lineage contract is missing or invalid")
+    expected_lineage_id = make_lineage_id(kind, configuration)
+    if manifest.get("lineage_id") != expected_lineage_id:
+        raise ValueError("snapshot lineage id does not match its immutable contract")
+    generation = manifest.get("lineage_generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise ValueError("snapshot lineage generation is invalid")
+    parent_name = manifest.get("parent_snapshot")
+    parent_digest = manifest.get("parent_manifest_sha256")
+    if generation == 0:
+        if parent_name is not None or parent_digest is not None:
+            raise ValueError("root snapshot lineage must not declare a parent")
+        return manifest
+    if not isinstance(parent_name, str) or not parent_name or not isinstance(parent_digest, str):
+        raise ValueError("snapshot lineage parent evidence is incomplete")
+    if Path(parent_name).name != parent_name:
+        raise ValueError("snapshot lineage parent name is unsafe")
+    snapshots_root = snapshot_path.parent.resolve()
+    parent_path = (snapshots_root / parent_name).resolve()
+    if parent_path.parent != snapshots_root or parent_path == snapshot_path:
+        raise ValueError("snapshot lineage parent path is unsafe")
+    parent_manifest_path = parent_path / "manifest.json"
+    try:
+        parent_raw = parent_manifest_path.read_bytes()
+    except OSError as exc:
+        raise ValueError("snapshot lineage parent manifest is missing") from exc
+    if hashlib.sha256(parent_raw).hexdigest() != parent_digest:
+        raise ValueError("snapshot lineage parent manifest hash does not match")
+    parent_manifest = _verify_snapshot_lineage(parent_path, visited=visited)
+    if int(parent_manifest.get("lineage_generation", -1)) + 1 != generation:
+        raise ValueError("snapshot lineage generation does not follow its parent")
+    assert_snapshot_descendant(
+        anchor_manifest=parent_manifest,
+        candidate_manifest=manifest,
+    )
+    return manifest
 
 
 def file_contract_sha256(files: dict[str, Path]) -> str:
@@ -82,6 +148,10 @@ def latest_compatible_snapshot(
             continue
         if end_date is not None and candidate_end > end_date:
             continue
+        try:
+            verify_snapshot_lineage(path)
+        except ValueError:
+            continue
         candidates.append(
             (
                 candidate_end,
@@ -117,7 +187,10 @@ def _assert_append_only(
 ) -> None:
     candidate = {
         "datasets": {
-            dataset: {"source_units": _unit_identities(rows)}
+            dataset: {
+                "source_units": _unit_identities(rows),
+                "reference_refresh": reference_manifest_metadata(rows),
+            }
             for dataset, rows in successful_units.items()
         }
     }
@@ -132,8 +205,11 @@ def _assert_manifest_units_subset(
     candidate_datasets = candidate.get("datasets")
     if not isinstance(ancestor_datasets, dict) or not isinstance(candidate_datasets, dict):
         raise ValueError("snapshot lineage requires dataset manifests")
-    if set(ancestor_datasets) != set(candidate_datasets):
-        raise ValueError("snapshot lineage dataset set changed")
+    missing_datasets = set(ancestor_datasets) - set(candidate_datasets)
+    if missing_datasets:
+        raise ValueError(
+            "snapshot lineage removed datasets: " + ", ".join(sorted(missing_datasets))
+        )
     for dataset, entry in ancestor_datasets.items():
         source_units = entry.get("source_units") if isinstance(entry, dict) else None
         candidate_entry = candidate_datasets.get(dataset)
@@ -144,8 +220,36 @@ def _assert_manifest_units_subset(
             raise ValueError("snapshot lineage requires source-unit identities")
         old = {_unit_tuple(item) for item in source_units}
         new = {_unit_tuple(item) for item in candidate_units}
+        old_refresh = _reference_refresh_buckets(entry)
+        new_refresh = _reference_refresh_buckets(candidate_entry)
+        if old_refresh or new_refresh:
+            if not old_refresh or not new_refresh:
+                raise ValueError(
+                    f"snapshot lineage lost reference-refresh evidence for {dataset}"
+                )
+            if min(new_refresh) < min(old_refresh) or max(new_refresh) < max(old_refresh):
+                raise ValueError(
+                    f"snapshot lineage moved reference generation backwards for {dataset}"
+                )
+            if max(new_refresh) > max(old_refresh):
+                continue
         if not old.issubset(new):
             raise ValueError(f"snapshot lineage rewrote or removed source units for {dataset}")
+
+
+def _reference_refresh_buckets(entry: Any) -> tuple[str, ...]:
+    if not isinstance(entry, dict):
+        return ()
+    metadata = entry.get("reference_refresh")
+    if not isinstance(metadata, dict):
+        return ()
+    buckets = metadata.get("selected_buckets")
+    if not isinstance(buckets, list) or not buckets:
+        return ()
+    normalized = tuple(sorted(str(value) for value in buckets if value))
+    if len(normalized) != len(buckets):
+        raise ValueError("snapshot reference-refresh buckets are invalid")
+    return normalized
 
 
 def _unit_identities(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

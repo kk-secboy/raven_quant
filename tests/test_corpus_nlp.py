@@ -482,6 +482,30 @@ def test_batch_parse_failure_retries_each_item(tmp_path: Path) -> None:
     assert set(state["stage"]) == {"completed"}
 
 
+def test_provider_global_failure_does_not_split_or_continue_corpus_batches(
+    tmp_path: Path,
+) -> None:
+    _seed_corpus(tmp_path)
+    _seed_trade_cal(tmp_path)
+    chat = FakeChatClient(
+        [LlmExtractionError("LLM endpoint returned HTTP 402", stage="llm_call")]
+    )
+
+    summary = _run(tmp_path, chat, batch_size=2, workers=1)
+
+    assert summary.planned == 7
+    assert summary.processed == 0
+    assert summary.failed == 2
+    assert summary.llm_calls == 1
+    assert len(chat.calls) == 1
+    state = pd.read_parquet(summary.state_path)
+    assert len(state) == 2  # untouched rows remain pending rather than being fabricated
+    assert set(state["status"]) == {"failed"}
+    assert set(state["stage"]) == {"llm_call"}
+    assert set(state["error"]) == {"LLM endpoint returned HTTP 402"}
+    assert pd.read_parquet(summary.fields_path).empty
+
+
 def test_process_uses_multiple_workers(tmp_path: Path) -> None:
     _seed_corpus(tmp_path)
     _seed_trade_cal(tmp_path)
@@ -716,15 +740,14 @@ def test_process_records_llm_failures_without_signals(tmp_path: Path) -> None:
 
     summary = _run(tmp_path, chat)
 
-    assert summary.processed == 5
+    assert summary.processed == 0
     assert summary.failed == 2
     assert summary.as_dict()["status"] == "failed"
     state = pd.read_parquet(summary.state_path)
     failures = state[state["status"] == "failed"]
     assert set(failures["stage"]) == {"llm_parse", "llm_call"}
-    assert len(pd.read_parquet(summary.fields_path)) == 5
-    # Factor artifacts only aggregate the successful rows.
-    assert summary.factors["news_sentiment_daily"]["manifest"]["rows"] == 2
+    assert pd.read_parquet(summary.fields_path).empty
+    assert summary.factors["news_sentiment_daily"]["manifest"]["rows"] == 0
 
 
 def test_process_checkpoints_and_resumes_after_interruption(tmp_path: Path) -> None:
@@ -769,22 +792,23 @@ def test_process_checkpoints_and_resumes_after_interruption(tmp_path: Path) -> N
     }
 
 
-def test_process_retries_failed_rows_on_rerun(tmp_path: Path) -> None:
+def test_process_retries_failed_and_unattempted_rows_after_global_abort(tmp_path: Path) -> None:
     _seed_corpus(tmp_path)
     _seed_trade_cal(tmp_path)
     failing = FakeChatClient(
-        [LlmExtractionError("LLM request failed: boom", stage="llm_call")] + [_payload()] * 6
+        [LlmExtractionError("LLM request failed: boom", stage="llm_call")]
     )
     first = _run(tmp_path, failing)
     assert first.failed == 1
-    assert first.processed == 6
+    assert first.processed == 0
+    assert first.llm_calls == 1
 
-    chat = FakeChatClient([_payload(sentiment=0.3)])
+    chat = FakeChatClient([_payload(sentiment=0.3)] * 7)
     second = _run(tmp_path, chat)
 
     assert second.planned == 7
-    assert second.skipped == 6
-    assert second.processed == 1
+    assert second.skipped == 0
+    assert second.processed == 7
     assert second.failed == 0
     state = pd.read_parquet(second.state_path)
     assert set(state["status"]) == {"succeeded"}
@@ -1074,20 +1098,38 @@ def test_process_honors_limit(tmp_path: Path) -> None:
     assert limited.processed == 1
 
 
-def test_factor_publication_is_restricted_to_current_corpus_scope(tmp_path: Path) -> None:
+def test_bounded_processing_scope_preserves_full_history_factors(tmp_path: Path) -> None:
     _seed_corpus(tmp_path)
     _seed_trade_cal(tmp_path)
     _run(tmp_path, FakeChatClient([_payload()] * 7))
 
-    scoped = _run(tmp_path, FakeChatClient([]), limit=1)
+    scoped = _run(
+        tmp_path,
+        FakeChatClient([]),
+        start=date(2024, 1, 5),
+        end=date(2024, 1, 6),
+    )
 
-    assert scoped.planned == 1
-    assert scoped.skipped == 1
-    assert sum(entry["manifest"]["rows"] for entry in scoped.factors.values()) == 1
+    assert scoped.planned == 3
+    assert scoped.skipped == 3
+    assert sum(entry["manifest"]["rows"] for entry in scoped.factors.values()) == 7
     for entry in scoped.factors.values():
         source = entry["manifest"]["source"]
-        assert source["scope"]["planned"] == 1
-        assert source["scope"]["process_key_count"] == 1
+        assert source["scope"]["start_date"] == "2024-01-05"
+        assert source["scope"]["end_date"] == "2024-01-06"
+        assert source["scope"]["planned"] == 3
+        assert source["scope"]["process_key_count"] == 3
+        assert source["publication_scope"]["mode"] == (
+            "all_persisted_succeeded_fields_current_prompt_model"
+        )
+        assert source["publication_scope"]["process_key_count"] == 7
+        assert source["publication_scope"]["source_datasets"] == [
+            "cctv_news",
+            "irm_qa_sh",
+            "irm_qa_sz",
+            "major_news",
+            "npr",
+        ]
 
 
 # --- CLI -----------------------------------------------------------------------

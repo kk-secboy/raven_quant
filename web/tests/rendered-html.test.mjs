@@ -96,6 +96,13 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.doesNotMatch(allocation, /模拟滑点/);
 
   assert.match(sourceByName["rdagent-panel.tsx"], /\/api\/strategy-recipes/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /\/api\/rdagent\/scenarios/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /fin_model/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /fin_quant/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /fin_factor_report/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /general_model/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /data_science/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /llm_finetune/);
   assert.match(sourceByName["backtest-panel.tsx"], /full_market_multifactor|文档策略配方/);
   assert.match(sourceByName["backtest-panel.tsx"], /industry_neutral_qp/);
   assert.match(sourceByName["backtest-panel.tsx"], /execution_dataset/);

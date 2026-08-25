@@ -15,6 +15,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.pair_trading import (
     PairTradingConfig,
     run_pair_backtest,
@@ -245,6 +246,15 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = Path(args.manifest)
     manifest: dict[str, Any] = json.loads(manifest_path.read_text(encoding="utf-8"))
+    provider = Path(args.provider_uri)
+    provider_provenance = json.loads(
+        (provider / "metadata" / "provenance.json").read_text(encoding="utf-8")
+    )
+    verify_qlib_output_manifest(provider, provider_provenance)
+    if provider_provenance.get("dataset_identity_sha256") != manifest[
+        "daily_provenance"
+    ].get("dataset_identity_sha256"):
+        raise ValueError("pair backtest provider does not match its sealed manifest")
     pair = manifest["pair"]
     legs = [str(pair["leg_y"]), str(pair["leg_x"])]
     leg_set = set(legs)

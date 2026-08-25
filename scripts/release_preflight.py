@@ -19,10 +19,22 @@ def main() -> None:
     parser.add_argument(
         "--compose-file", type=Path, default=PROJECT_ROOT / "deploy" / "compose.yaml"
     )
+    parser.add_argument(
+        "--profile",
+        action="append",
+        choices=("gpu",),
+        default=[],
+        help="Enable an optional production Compose profile (repeatable).",
+    )
     parser.add_argument("--minimum-free-gb", type=float, default=20.0)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
-    context = compose_context(args.project_name, args.env_file, args.compose_file)
+    context = compose_context(
+        args.project_name,
+        args.env_file,
+        args.compose_file,
+        profiles=args.profile,
+    )
     result = assess_release(
         context,
         PROJECT_ROOT,

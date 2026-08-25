@@ -21,6 +21,7 @@ from quant_platform.qlib_backtest import (
     QLIB_ENGINE_VERSION,
 )
 from quant_platform.research_store import ResearchStore
+from quant_platform.strategy_artifact_manifest import write_backtest_artifact_manifest
 from quant_platform.strategy_store import StrategyStore
 
 DATASET_IDENTITY = "a" * 64
@@ -62,6 +63,7 @@ def create_promoted_factor(
     tmp_path: Path,
     *,
     dataset: str = "snapshot",
+    dataset_identity: str = DATASET_IDENTITY,
     periods: dict | None = None,
 ) -> dict:
     periods = periods or PERIODS
@@ -113,14 +115,14 @@ def create_promoted_factor(
     store.record_evaluation(
         candidate["id"],
         dataset=dataset,
-        dataset_identity_sha256=DATASET_IDENTITY,
+        dataset_identity_sha256=dataset_identity,
         **periods,
         metrics=metrics,
         artifact_path=str(artifact),
         recomputed_values_path=str(recomputed_path),
         recomputed_values_sha256=recomputed_sha256,
         recompute_evidence={
-            "executor_version": "factor-recompute-v3-container-index-exact",
+            "executor_version": "factor-recompute-v4-pit-prefix-invariance",
             "sandbox_mode": "docker-isolated",
             "sandbox_image_id": "sha256:" + "a" * 64,
             "network_mode": "none",
@@ -129,9 +131,21 @@ def create_promoted_factor(
             "no_new_privileges": True,
             "label_horizon_days": 1,
             "code_sha256": hashlib.sha256(code_path.read_bytes()).hexdigest(),
-            "dataset_identity_sha256": DATASET_IDENTITY,
+            "dataset_identity_sha256": dataset_identity,
             "provider_input_sha256": "1" * 64,
             "periods": {key: value.isoformat() for key, value in periods.items()},
+            "pit_invariance": {
+                "contract_version": "factor-pit-prefix-invariance-v1",
+                "status": "passed",
+                "cutpoint_count": 3,
+                "checks": [{"invariant": True}] * 3,
+            },
+            "research_data_boundary": {
+                "latest_input_date": periods["valid_end"].isoformat(),
+                "valid_end": periods["valid_end"].isoformat(),
+                "test_start": periods["test_start"].isoformat(),
+                "final_oos_observations_exposed": False,
+            },
             "submitted_comparison": {
                 "available": True,
                 "exact_match": True,
@@ -151,10 +165,17 @@ def create_strategy_version(
     tmp_path: Path,
     *,
     dataset: str = "snapshot",
+    dataset_identity: str = DATASET_IDENTITY,
     config_overrides: dict | None = None,
     periods: dict | None = None,
 ) -> str:
-    factor = create_promoted_factor(database_url, tmp_path, dataset=dataset, periods=periods)
+    factor = create_promoted_factor(
+        database_url,
+        tmp_path,
+        dataset=dataset,
+        dataset_identity=dataset_identity,
+        periods=periods,
+    )
     config = {
         "topk": 50,
         "n_drop": 5,
@@ -191,8 +212,28 @@ def create_strategy_version(
     return str(strategy["versions"][0]["id"])
 
 
-def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
+def formal_backtest_metrics(
+    version: dict,
+    manifest: Path,
+    *,
+    hypothesis_group_evidence: dict,
+) -> dict:
     manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    shared_experiment_count = int(
+        hypothesis_group_evidence.get("shared_experiment_count") or 0
+    )
+    if shared_experiment_count <= 0:
+        raise ValueError("hypothesis-group evidence must bind a positive trial count")
+    if str(hypothesis_group_evidence.get("economic_hypothesis_group") or "") != str(
+        version["economic_hypothesis_group"]
+    ):
+        raise ValueError("hypothesis-group evidence does not bind the strategy family")
+    if str(version["id"]) not in {
+        str(item) for item in hypothesis_group_evidence.get("strategy_version_ids", [])
+    }:
+        raise ValueError("hypothesis-group evidence does not include the strategy version")
+    manifest_payload["hypothesis_group_evidence"] = hypothesis_group_evidence
+    manifest_payload["strategy_trial_count"] = shared_experiment_count
     history_periods = manifest_payload.setdefault(
         "historical_validation_periods",
         {
@@ -201,6 +242,83 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
         },
     )
     final_periods = manifest_payload["periods"]
+    version_factors = {
+        str(item["factor_candidate_id"]): item for item in version.get("factors", [])
+    }
+    formal_factor_hashes: dict[str, str] = {}
+    formal_factor_evidence: dict[str, dict] = {}
+    for manifest_factor in manifest_payload.get("factors", []):
+        candidate_id = str(manifest_factor["candidate_id"])
+        version_factor = version_factors[candidate_id]
+        execution_mode = (
+            "frozen_code_recompute"
+            if version_factor.get("source_iteration") is not None
+            else "frozen_values"
+        )
+        relative = Path("formal-factor-values") / candidate_id / "authoritative.h5"
+        artifact = manifest.parent / relative
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(f"formal:{candidate_id}".encode())
+        artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        evidence = {
+            "executor_version": (
+                "factor-recompute-v4-pit-prefix-invariance"
+                if execution_mode == "frozen_code_recompute"
+                else "frozen-values-index-exact-v1"
+            ),
+            "code_sha256": version_factor["code_sha256"],
+            "dataset_identity_sha256": DATASET_IDENTITY,
+            "provider_input_sha256": "1" * 64,
+            "periods": {
+                "warmup_start": history_periods["start"],
+                "test_start": final_periods["start"],
+                "test_end": final_periods["end"],
+            },
+            "oos_coverage": {
+                "contract_version": "factor-oos-index-exact-v1",
+                "test_start": final_periods["start"],
+                "test_end": final_periods["end"],
+                "trading_day_count": 252,
+                "row_count": 1000,
+                "finite_row_count": 900,
+                "min_daily_finite_required": 50,
+                "min_coverage_ratio_required": 0.8,
+                "min_good_day_rate_required": 0.95,
+                "minimum_daily_finite_observed": 50,
+                "minimum_coverage_ratio_observed": 0.8,
+                "mean_coverage_ratio_observed": 0.9,
+                "good_day_rate": 0.95,
+                "coverage_gate_passed": True,
+                "index_exact_match": True,
+            },
+            "authoritative_values_sha256": artifact_sha256,
+        }
+        if execution_mode == "frozen_code_recompute":
+            evidence.update(
+                {
+                    "sandbox_mode": "docker-isolated",
+                    "sandbox_image_id": "sha256:" + "a" * 64,
+                    "network_mode": "none",
+                    "root_filesystem_read_only": True,
+                    "capabilities_dropped": "ALL",
+                    "no_new_privileges": True,
+                    "pit_invariance": {
+                        "contract_version": "factor-pit-prefix-invariance-v1",
+                        "status": "passed",
+                        "cutpoint_count": 3,
+                        "checks": [{"invariant": True}] * 3,
+                    },
+                }
+            )
+        manifest_factor["factor_execution_mode"] = execution_mode
+        manifest_factor["formal_factor_artifact"] = {
+            "path": relative.as_posix(),
+            "sha256": artifact_sha256,
+            "execution_mode": execution_mode,
+            "evidence": evidence,
+        }
+        formal_factor_hashes[candidate_id] = artifact_sha256
+        formal_factor_evidence[candidate_id] = evidence
     manifest.write_text(
         json.dumps(manifest_payload, ensure_ascii=False),
         encoding="utf-8",
@@ -251,6 +369,7 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
             "passed": True,
             "artifacts": scenario_artifacts,
         }
+    artifact_manifest = write_backtest_artifact_manifest(manifest.parent)
     return {
         "backtest_engine": "qlib",
         "backtest_engine_version": QLIB_ENGINE_VERSION,
@@ -451,6 +570,9 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
             "source_lineage_id": "9" * 64,
             "strategy_config_sha256": config_hash,
             "execution_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            "artifact_manifest_version": artifact_manifest["version"],
+            "artifact_manifest_sha256": artifact_manifest["sha256"],
+            "artifact_manifest_file_count": artifact_manifest["file_count"],
             "factor_values_sha256": (
                 {
                     factor["factor_candidate_id"]: hashlib.sha256(
@@ -465,6 +587,8 @@ def formal_backtest_metrics(version: dict, manifest: Path) -> dict:
                 if factor
                 else {}
             ),
+            "formal_factor_values_sha256": formal_factor_hashes,
+            "formal_factor_recompute_evidence": formal_factor_evidence,
             "qlib_version": "0.9.8",
             "qlib_commit": "d5379c520f66a39953bad76234a7019a72796fd0",
             "backtest_engine_version": QLIB_ENGINE_VERSION,

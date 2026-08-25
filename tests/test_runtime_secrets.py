@@ -113,7 +113,7 @@ def test_settings_api_validates_saves_and_enables_bootstrap(
         "/api/jobs/bootstrap",
         json={
             "profile": "full",
-            "start": "2024-01-01",
+            "start": "2016-01-01",
             "end": "latest",
             "build_qlib": True,
         },
@@ -150,6 +150,7 @@ def test_worker_injects_latest_tushare_secret(database_url: str, tmp_path: Path)
                 "end": "latest",
                 "snapshot_end": "2024-02-02",
                 "build_qlib": True,
+                "incremental": True,
             },
         }
     )
@@ -158,6 +159,8 @@ def test_worker_injects_latest_tushare_secret(database_url: str, tmp_path: Path)
         "TUSHARE_TOKEN": "latest-token",
     }
     assert "--download-only" in command
+    assert "--no-build-qlib" in command
+    assert "--incremental" in command
     assert "--build-qlib" not in command
     assert command[command.index("--end") + 1] == "2024-02-02"
 

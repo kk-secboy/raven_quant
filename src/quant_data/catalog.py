@@ -141,6 +141,34 @@ RESEARCH_DAILY: tuple[DatasetDefinition, ...] = (
     DatasetDefinition("top_inst", "top_inst", allow_empty=True),
 )
 
+# Tushare ``research_report`` defaults to these metadata columns. ``file_name``
+# is additionally supported by the official interface example and is useful
+# when the linked PDF is materialized into the governed research-asset store.
+RESEARCH_REPORT_FIELDS = (
+    "trade_date",
+    "abstr",
+    "title",
+    "report_type",
+    "author",
+    "name",
+    "ts_code",
+    "inst_csname",
+    "ind_name",
+    "url",
+    "file_name",
+)
+
+RESEARCH_CORPUS: tuple[DatasetDefinition, ...] = (
+    DatasetDefinition(
+        "research_report",
+        "research_report",
+        RESEARCH_REPORT_FIELDS,
+        allow_empty=True,
+        date_field="trade_date",
+        primary_key=("url",),
+    ),
+)
+
 ETF_DAILY: tuple[DatasetDefinition, ...] = (
     DatasetDefinition(
         "fund_daily",
@@ -168,6 +196,13 @@ FUNDAMENTALS: tuple[DatasetDefinition, ...] = (
     ),
     DatasetDefinition("forecast", "forecast", allow_empty=True, date_field="ann_date"),
     DatasetDefinition("express", "express", allow_empty=True, date_field="ann_date"),
+    DatasetDefinition(
+        "fina_audit",
+        "fina_audit_vip",
+        allow_empty=True,
+        date_field="ann_date",
+        primary_key=("ts_code", "ann_date", "end_date"),
+    ),
 )
 
 CORPORATE_EVENTS: tuple[DatasetDefinition, ...] = (
@@ -271,6 +306,7 @@ ALL_DEFINITIONS = {
     for definition in (
         *CORE_DAILY,
         *RESEARCH_DAILY,
+        *RESEARCH_CORPUS,
         *ETF_DAILY,
         *FUNDAMENTALS,
         *CORPORATE_EVENTS,

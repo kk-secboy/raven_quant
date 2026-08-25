@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import date
 from pathlib import Path
@@ -14,6 +15,7 @@ from quant_data.availability import (
 from quant_data.qlib_builder import QlibBuilder
 from quant_data.regulatory_events import (
     REGULATORY_EVENTS_RULE_VERSION,
+    REGULATORY_TERMINAL_DEFERRAL_POLICY,
     RegulatoryEventsError,
     classify_title,
     derive_regulatory_events,
@@ -189,6 +191,34 @@ def _write_snapshot_frame(snapshot: Path, dataset: str, frame: pd.DataFrame) -> 
     frame.to_parquet(target / "data.parquet", index=False)
 
 
+def _terminal_major_announcement(event_date: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": event_date,
+                "title": "关于收到中国证监会《立案告知书》的公告",
+                "url": "http://example/terminal-violation.pdf",
+            }
+        ]
+    )
+
+
+def _extend_market_through(snapshot: Path, trade_date: str) -> None:
+    path = snapshot / "parquet" / "daily" / "data.parquet"
+    daily = pd.read_parquet(path)
+    # Keep the parquet timestamp resolution intact.  Converting the row to a
+    # Series and back widens the mixed row to object under newer pandas, which
+    # pyarrow then persists as datetime64[us] instead of datetime64[ns].
+    row = daily.tail(1).copy()
+    row.loc[row.index, "trade_date"] = pd.Timestamp(trade_date)
+    _write_snapshot_frame(
+        snapshot,
+        "daily",
+        pd.concat([daily, row], ignore_index=True),
+    )
+
+
 def _eligibility_snapshot(tmp_path: Path, *, with_anns_d: bool) -> Path:
     """Snapshot where SZ000001 is fully eligible except for a violation event."""
 
@@ -290,6 +320,130 @@ def test_qlib_build_excludes_violator_strictly_after_announcement(tmp_path: Path
     assert contract["regulatory_origin"] == (
         f"anns_d_title_rules({REGULATORY_EVENTS_RULE_VERSION})"
     )
+
+
+def test_qlib_build_defers_terminal_day_event_with_deterministic_audit(
+    tmp_path: Path,
+) -> None:
+    snapshot = _eligibility_snapshot(tmp_path, with_anns_d=False)
+    _write_snapshot_frame(
+        snapshot,
+        "anns_d",
+        _terminal_major_announcement("20240110"),
+    )
+    target = tmp_path / "qlib"
+
+    assert QlibBuilder(snapshot)._write_eligibility_metadata(target)
+
+    matrix = pd.read_parquet(target / "eligibility_matrix.parquet")
+    assert not bool(matrix["major_violation"].any())
+    contract = json.loads(
+        (target / "eligibility_contract.json").read_text(encoding="utf-8")
+    )
+    expected_audit = [
+        {
+            "ts_code": "000001.SZ",
+            "event_date": "2024-01-10",
+            "event_type": "csrc_investigation",
+            "title": "关于收到中国证监会《立案告知书》的公告",
+            "url": "http://example/terminal-violation.pdf",
+            "rule_version": REGULATORY_EVENTS_RULE_VERSION,
+        }
+    ]
+    expected_sha256 = hashlib.sha256(
+        json.dumps(
+            expected_audit,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    expected_terminal_audit_sha256 = hashlib.sha256(
+        json.dumps(
+            {
+                "publication_horizon": "2024-01-10",
+                "policy": REGULATORY_TERMINAL_DEFERRAL_POLICY,
+                "deferred_event_count": 1,
+                "deferred_events_sha256": expected_sha256,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert contract["regulatory_publication_horizon"] == "2024-01-10"
+    assert contract["regulatory_terminal_policy"] == (
+        REGULATORY_TERMINAL_DEFERRAL_POLICY
+    )
+    assert contract["regulatory_deferred_event_count"] == 1
+    assert contract["regulatory_deferred_events_sha256"] == expected_sha256
+    assert contract["regulatory_terminal_audit_sha256"] == (
+        expected_terminal_audit_sha256
+    )
+
+
+def test_terminal_day_event_becomes_effective_after_market_horizon_extends(
+    tmp_path: Path,
+) -> None:
+    snapshot = _eligibility_snapshot(tmp_path, with_anns_d=False)
+    _write_snapshot_frame(
+        snapshot,
+        "anns_d",
+        _terminal_major_announcement("20240110"),
+    )
+    _extend_market_through(snapshot, "2024-01-11")
+    target = tmp_path / "qlib"
+
+    assert QlibBuilder(snapshot)._write_eligibility_metadata(target)
+
+    matrix = pd.read_parquet(target / "eligibility_matrix.parquet").set_index(
+        "datetime"
+    )
+    assert not bool(matrix.loc["2024-01-10", "major_violation"])
+    assert bool(matrix.loc["2024-01-11", "major_violation"])
+    contract = json.loads(
+        (target / "eligibility_contract.json").read_text(encoding="utf-8")
+    )
+    assert contract["regulatory_publication_horizon"] == "2024-01-11"
+    assert contract["regulatory_deferred_event_count"] == 0
+
+
+def test_qlib_horizon_keeps_historical_trade_calendar_gap_fail_closed(
+    tmp_path: Path,
+) -> None:
+    snapshot = _eligibility_snapshot(tmp_path, with_anns_d=False)
+    _write_snapshot_frame(
+        snapshot,
+        "anns_d",
+        _terminal_major_announcement("20240104"),
+    )
+    _write_snapshot_frame(
+        snapshot,
+        "trade_cal",
+        pd.DataFrame(
+            {
+                "cal_date": ["20240102", "20240103"],
+                "is_open": [1, 1],
+            }
+        ),
+    )
+
+    with pytest.raises(RegulatoryEventsError, match="no trading day after"):
+        QlibBuilder(snapshot)._write_eligibility_metadata(tmp_path / "qlib")
+
+
+def test_qlib_horizon_rejects_announcement_after_frozen_market_day(
+    tmp_path: Path,
+) -> None:
+    snapshot = _eligibility_snapshot(tmp_path, with_anns_d=False)
+    _write_snapshot_frame(
+        snapshot,
+        "anns_d",
+        _terminal_major_announcement("20240111"),
+    )
+
+    with pytest.raises(RegulatoryEventsError, match="after the Qlib publication horizon"):
+        QlibBuilder(snapshot)._write_eligibility_metadata(tmp_path / "qlib")
 
 
 def test_qlib_build_with_anns_d_but_no_violations_marks_data_available(tmp_path: Path) -> None:

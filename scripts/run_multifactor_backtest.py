@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,17 +20,44 @@ from quant_data.availability import filter_available
 from quant_data.execution_contract import (
     require_daily_qlib_contract,
     require_minute_execution_contract,
+    require_native_daily_execution_controls,
     require_strategy_execution_contract,
 )
+from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.cost_model import CostScheduleBook
 from quant_platform.eligibility import eligibility_statistics
 from quant_platform.execution_algorithms import execution_time_slots
+from quant_platform.factor_recompute import (
+    execute_factor_code,
+    normalize_factor_input,
+    require_exact_factor_index,
+    require_exact_oos_coverage,
+    sha256_file,
+    validate_factor_prefix_invariance,
+)
 from quant_platform.formal_validation import (
     FORMAL_VALIDATION_CONTRACT_VERSION,
     build_pre_final_history_evidence,
     run_ablation_suite,
     run_outer_walk_forward,
     run_signal_decay_suite,
+)
+from quant_platform.model_recompute import execute_model_candidate
+from quant_platform.model_research_governance import (
+    MODEL_REFIT_POLICY,
+    MODEL_REFIT_POLICY_SHA256,
+    REQUIRED_QUANT_ABLATIONS,
+    normalize_model_predictions,
+    verify_model_prediction_artifact,
+)
+from quant_platform.model_research_governance import (
+    canonical_sha256 as canonical_model_sha256,
+)
+from quant_platform.model_strategy_contract import (
+    MODEL_FACTOR_VALIDATION_NOT_APPLICABLE_REASON,
+    MODEL_FACTOR_VALIDATION_NOT_APPLICABLE_STATUS,
+    model_signal_identity,
+    validate_model_formal_admission_binding,
 )
 from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
 from quant_platform.qlib_backtest import (
@@ -50,6 +78,7 @@ from quant_platform.statistical_validation import (
     holm_bonferroni,
     paired_moving_block_bootstrap,
 )
+from quant_platform.strategy_artifact_manifest import write_backtest_artifact_manifest
 from quant_platform.strategy_backtest import build_governed_signal, compose_factor_scores
 from quant_platform.upstream_versions import upstream_runtime_identity
 
@@ -414,6 +443,9 @@ def main() -> None:
         raise ValueError("formal Qlib backtest requires dataset provenance metadata")
     provider_provenance = json.loads(provider_provenance_path.read_text(encoding="utf-8"))
     require_daily_qlib_contract(provider_provenance)
+    verify_qlib_output_manifest(Path(args.provider_uri), provider_provenance)
+    periods = manifest["periods"]
+    require_native_daily_execution_controls(provider_provenance, start=periods["start"])
     factor_value_hashes = {
         str(item["candidate_id"]): _sha256_file(item["values_path"]) for item in manifest["factors"]
     }
@@ -421,20 +453,23 @@ def main() -> None:
         str(item["candidate_id"]): item.get("code_sha256") for item in manifest["factors"]
     }
 
-    challenger_entries = [
-        (
-            str(item["candidate_id"]),
-            _load(item["values_path"]),
-            float(item["weight"]),
-            int(item["direction"]),
-        )
-        for item in manifest["factors"]
-    ]
-    challenger_factors = [
-        (values, weight, direction)
-        for _candidate_id, values, weight, direction in challenger_entries
-    ]
     config = manifest["config"]
+    signal_source = str(config.get("signal_source") or "factor_score")
+    model_bundle_factors = manifest.get("model_bundle_factors") or []
+    if not isinstance(model_bundle_factors, list) or any(
+        not isinstance(item, dict) for item in model_bundle_factors
+    ):
+        raise ValueError("formal model bundle factor manifest is invalid")
+    if model_bundle_factors and (
+        signal_source != "model_prediction" or config.get("quant_bundle_candidate_id") is None
+    ):
+        raise ValueError("only a joint model strategy may consume bundle factors")
+    formal_factor_items = [*manifest["factors"], *model_bundle_factors]
+    formal_factor_ids = [str(item.get("candidate_id") or "") for item in formal_factor_items]
+    if any(not item for item in formal_factor_ids) or len(set(formal_factor_ids)) != len(
+        formal_factor_ids
+    ):
+        raise ValueError("formal factor membership contains an invalid or duplicate id")
     strategy_contract = require_strategy_execution_contract(config)
     factor_source_mode = str(config.get("factor_source_mode") or FACTOR_SOURCE_PROMOTED_ONLY)
     signal_frequency = str(config.get("signal_frequency") or "day")
@@ -461,6 +496,7 @@ def main() -> None:
             raise ValueError("minute execution Qlib dataset requires provenance metadata")
         execution_provenance = json.loads(execution_provenance_path.read_text(encoding="utf-8"))
         require_minute_execution_contract(execution_provenance, frequency=args.execution_frequency)
+        verify_qlib_output_manifest(Path(args.execution_provider_uri), execution_provenance)
     import qlib
     from qlib.data import D
 
@@ -473,20 +509,387 @@ def main() -> None:
             str(args.execution_frequency): str(args.execution_provider_uri),
         }
     qlib.init(provider_uri=provider_uri, region="cn")
-    periods = manifest["periods"]
     historical_periods = manifest.get("historical_validation_periods")
     if not isinstance(historical_periods, dict) or set(historical_periods) != {
         "start",
         "end",
     }:
-        raise ValueError(
-            "formal backtest manifest requires isolated pre-final history periods"
-        )
+        raise ValueError("formal backtest manifest requires isolated pre-final history periods")
     data_periods = {
         "start": historical_periods["start"],
         "end": periods["end"],
     }
-    challenger_scores = compose_factor_scores(challenger_factors) if challenger_factors else None
+    final_calendar = D.calendar(
+        start_time=periods["start"],
+        end_time=periods["end"],
+        freq="day",
+    )
+    challenger_entries: list[tuple[str, pd.DataFrame, float, int]] = []
+    formal_factor_hashes: dict[str, str] = {}
+    formal_factor_evidence: dict[str, dict[str, Any]] = {}
+    formal_bundle_factor_hashes: dict[str, str] = {}
+    formal_bundle_factor_evidence: dict[str, dict[str, Any]] = {}
+    bundle_factor_ids = {str(item["candidate_id"]) for item in model_bundle_factors}
+    if formal_factor_items:
+        factor_input = normalize_factor_input(
+            D.features(
+                D.instruments(str(manifest.get("universe") or "cn_all")),
+                ["$open", "$close", "$high", "$low", "$volume", "$factor"],
+                start_time=data_periods["start"],
+                end_time=data_periods["end"],
+                freq="day",
+            )
+            .swaplevel()
+            .sort_index()
+        )
+        factor_root = output / "formal-factor-values"
+        # Failed jobs are retryable under the same immutable backtest id.  A
+        # partial prior execution is not admissible evidence, so rebuild this
+        # narrowly scoped derived directory from the frozen manifest/code.
+        if factor_root.exists():
+            shutil.rmtree(factor_root)
+        factor_root.mkdir(parents=True, exist_ok=False)
+        factor_input_path = factor_root / "daily_pv.h5"
+        factor_input.to_hdf(factor_input_path, key="data", mode="w")
+        factor_input_sha256 = sha256_file(factor_input_path)
+        for item in formal_factor_items:
+            candidate_id = str(item["candidate_id"])
+            safe_id = "".join(
+                character if character.isalnum() or character in "-_" else "_"
+                for character in candidate_id
+            )[:100]
+            if not safe_id:
+                raise ValueError("formal factor candidate id is invalid")
+            candidate_root = factor_root / safe_id
+            execution_mode = str(item.get("factor_execution_mode") or "")
+            if execution_mode == "frozen_code_recompute":
+                code_path = Path(str(item.get("code_path") or ""))
+                expected_code_sha256 = str(item.get("code_sha256") or "")
+                if not code_path.is_file() or sha256_file(code_path) != expected_code_sha256:
+                    raise ValueError(
+                        f"formal factor {candidate_id} frozen code is missing or changed"
+                    )
+                values, execution_evidence = execute_factor_code(
+                    code_path=code_path,
+                    input_path=factor_input_path,
+                    workspace=candidate_root / "full",
+                    timeout_seconds=int(manifest.get("factor_recompute_timeout_seconds", 300)),
+                )
+                values = require_exact_factor_index(
+                    values,
+                    factor_input,
+                    context=f"formal factor {candidate_id}",
+                )
+                pit_evidence = validate_factor_prefix_invariance(
+                    code_path=code_path,
+                    input_path=factor_input_path,
+                    full_values=values,
+                    workspace_root=candidate_root / "prefix-checks",
+                    timeout_seconds=int(manifest.get("factor_recompute_timeout_seconds", 300)),
+                    cutpoint_count=int(manifest.get("factor_pit_cutpoint_count", 3)),
+                )
+                coverage_evidence = require_exact_oos_coverage(
+                    values,
+                    factor_input,
+                    test_start=periods["start"],
+                    test_end=periods["end"],
+                    trading_days=final_calendar,
+                    context=f"formal factor {candidate_id}",
+                    min_daily_finite=int(manifest.get("min_daily_instruments", 50)),
+                )
+                execution_evidence.update(
+                    {
+                        "dataset_identity_sha256": provider_provenance.get(
+                            "dataset_identity_sha256"
+                        ),
+                        "provider_input_sha256": factor_input_sha256,
+                        "periods": {
+                            "warmup_start": data_periods["start"],
+                            "test_start": periods["start"],
+                            "test_end": periods["end"],
+                        },
+                        "pit_invariance": pit_evidence,
+                        "oos_coverage": coverage_evidence,
+                    }
+                )
+            elif execution_mode == "frozen_values":
+                values = require_exact_factor_index(
+                    _load(item["values_path"]),
+                    factor_input,
+                    context=f"formal frozen-value factor {candidate_id}",
+                )
+                coverage_evidence = require_exact_oos_coverage(
+                    values,
+                    factor_input,
+                    test_start=periods["start"],
+                    test_end=periods["end"],
+                    trading_days=final_calendar,
+                    context=f"formal frozen-value factor {candidate_id}",
+                    min_daily_finite=int(manifest.get("min_daily_instruments", 50)),
+                )
+                execution_evidence = {
+                    "executor_version": "frozen-values-index-exact-v1",
+                    "dataset_identity_sha256": provider_provenance.get("dataset_identity_sha256"),
+                    "provider_input_sha256": factor_input_sha256,
+                    "periods": {
+                        "warmup_start": data_periods["start"],
+                        "test_start": periods["start"],
+                        "test_end": periods["end"],
+                    },
+                    "oos_coverage": coverage_evidence,
+                }
+            else:
+                raise ValueError(f"formal factor {candidate_id} has no governed execution mode")
+            values_path = candidate_root / "authoritative.h5"
+            values_path.parent.mkdir(parents=True, exist_ok=True)
+            values.to_hdf(values_path, key="data", mode="w")
+            values_sha256 = sha256_file(values_path)
+            execution_evidence["authoritative_values_sha256"] = values_sha256
+            item["formal_factor_artifact"] = {
+                "path": str(values_path.relative_to(output)).replace("\\", "/"),
+                "sha256": values_sha256,
+                "execution_mode": execution_mode,
+                "evidence": execution_evidence,
+            }
+            target_hashes = (
+                formal_bundle_factor_hashes
+                if candidate_id in bundle_factor_ids
+                else formal_factor_hashes
+            )
+            target_evidence = (
+                formal_bundle_factor_evidence
+                if candidate_id in bundle_factor_ids
+                else formal_factor_evidence
+            )
+            target_hashes[candidate_id] = values_sha256
+            target_evidence[candidate_id] = execution_evidence
+            challenger_entries.append(
+                (
+                    candidate_id,
+                    values,
+                    float(item["weight"]),
+                    int(item["direction"]),
+                )
+            )
+    challenger_factors = [
+        (values, weight, direction)
+        for _candidate_id, values, weight, direction in challenger_entries
+    ]
+    challenger_scores = (
+        compose_factor_scores(challenger_factors, require_exact_index=True)
+        if challenger_factors
+        else None
+    )
+    formal_model_artifact: dict[str, Any] | None = None
+    formal_model_admission: dict[str, Any] | None = None
+    model_scores: pd.Series | None = None
+    additional_factors_path: Path | None = None
+    if signal_source == "model_prediction":
+        formal_model_admission = validate_model_formal_admission_binding(
+            manifest.get("model_formal_admission"),
+            config=config,
+            dataset_identity_sha256=str(provider_provenance.get("dataset_identity_sha256") or ""),
+            pre_final_end=historical_periods["end"],
+        )
+        frozen_model = manifest.get("model_candidate")
+        if not isinstance(frozen_model, dict):
+            raise ValueError("formal model strategy has no frozen candidate manifest")
+        expected_identity = model_signal_identity(config)
+        if manifest.get("model_signal") != expected_identity:
+            raise ValueError("formal model identity does not match the frozen StrategySpec")
+        candidate_manifest = frozen_model.get("candidate_manifest")
+        feature_set = frozen_model.get("feature_set")
+        if not isinstance(candidate_manifest, dict) or not isinstance(feature_set, dict):
+            raise ValueError("formal model candidate manifest is incomplete")
+        if (
+            candidate_manifest.get("id") != config.get("model_candidate_id")
+            or candidate_manifest.get("code_sha256") != config.get("model_code_sha256")
+            or candidate_manifest.get("recipe_sha256") != config.get("model_recipe_sha256")
+            or candidate_manifest.get("feature_set_definition_sha256")
+            != config.get("feature_set_definition_sha256")
+            or feature_set.get("id") != config.get("feature_set_id")
+            or feature_set.get("definition_sha256") != config.get("feature_set_definition_sha256")
+            or candidate_manifest.get("dataset_identity_sha256")
+            != provider_provenance.get("dataset_identity_sha256")
+            or candidate_manifest.get("pre_final_end") != historical_periods["end"]
+            or candidate_manifest.get("final_oos_start") != periods["start"]
+            or candidate_manifest.get("final_oos_end") != periods["end"]
+        ):
+            raise ValueError("formal model candidate does not match the final-OOS run")
+        recipe = candidate_manifest.get("recipe")
+        if not isinstance(recipe, dict):
+            raise ValueError("formal model candidate recipe is missing")
+        model_periods = frozen_model.get("training_periods")
+        if not isinstance(model_periods, dict) or any(
+            not str(model_periods.get(key) or "")
+            for key in ("train_start", "train_end", "valid_start", "valid_end", "seed")
+        ):
+            raise ValueError("formal model candidate has no frozen pre-final training periods")
+        if (
+            frozen_model.get("primary_profile_id") != "recent_3y"
+            or int(model_periods["seed"]) != 11
+            or frozen_model.get("refit_policy") != MODEL_REFIT_POLICY
+            or frozen_model.get("refit_policy_sha256") != MODEL_REFIT_POLICY_SHA256
+            or canonical_model_sha256(frozen_model["refit_policy"])
+            != frozen_model["refit_policy_sha256"]
+        ):
+            raise ValueError("formal model primary cell/refit policy is not governed")
+        if not (
+            str(model_periods["train_start"])
+            <= str(model_periods["train_end"])
+            < str(model_periods["valid_start"])
+            <= str(model_periods["valid_end"])
+            <= historical_periods["end"]
+            < periods["start"]
+        ):
+            raise ValueError("formal model training periods are not isolated before final OOS")
+        code_path = Path(str(frozen_model.get("code_path") or ""))
+        if config.get("quant_bundle_candidate_id") is not None:
+            bundle_contract = config.get("quant_bundle_factor_contract")
+            if not isinstance(bundle_contract, dict):
+                raise ValueError("joint formal model has no bundle factor contract")
+            observed_bundle_factors = [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "candidate_id",
+                        "feature_name",
+                        "code_sha256",
+                        "direction",
+                        "weight",
+                    )
+                }
+                for item in model_bundle_factors
+            ]
+            if observed_bundle_factors != bundle_contract.get("factors") or any(
+                item.get("factor_execution_mode") != "frozen_code_recompute"
+                for item in model_bundle_factors
+            ):
+                raise ValueError(
+                    "joint formal model factors do not match the atomic bundle contract"
+                )
+            if not challenger_entries:
+                raise ValueError("joint formal model strategy has no recomputed factor values")
+            if {item[0] for item in challenger_entries} != bundle_factor_ids:
+                raise ValueError(
+                    "joint formal model cannot mix standalone score factors into its bundle"
+                )
+            combined = pd.concat(
+                [
+                    values.iloc[:, 0].rename(f"factor_{index:03d}")
+                    for index, (_candidate, values, _weight, _direction) in enumerate(
+                        challenger_entries
+                    )
+                ],
+                axis=1,
+                join="inner",
+            ).sort_index()
+            if not combined.index.equals(factor_input.index):
+                raise ValueError("joint formal model factors changed the exact Qlib input index")
+            additional_factors_path = output / "formal-model-factors.parquet"
+            combined.to_parquet(additional_factors_path, compression="zstd")
+        model_root = output / "formal-model"
+        if model_root.exists():
+            shutil.rmtree(model_root)
+        model_result, model_execution = execute_model_candidate(
+            code_path=code_path,
+            provider_path=Path(args.provider_uri),
+            additional_factors_path=additional_factors_path,
+            manifest={
+                "candidate_id": str(candidate_manifest["id"]),
+                "code_sha256": str(candidate_manifest["code_sha256"]),
+                "model_type": str(recipe.get("model_type") or "Tabular"),
+                "model_engine": "rdagent_pytorch",
+                "training_hyperparameters": recipe.get("training_hyperparameters") or {},
+                "feature_set": feature_set,
+                "additional_factor_count": len(challenger_entries),
+                "periods": {
+                    "train_start": str(model_periods["train_start"]),
+                    "train_end": str(model_periods["train_end"]),
+                    "valid_start": str(model_periods["valid_start"]),
+                    "valid_end": str(model_periods["valid_end"]),
+                    "test_start": periods["start"],
+                    "test_end": periods["end"],
+                },
+                "prediction_segment": "test",
+                "seed": int(model_periods["seed"]),
+                "dataset_identity_sha256": provider_provenance.get("dataset_identity_sha256"),
+                "universe": manifest.get("universe", "cn_all"),
+                "benchmark": manifest.get("benchmark", "SH000300"),
+                "account": config.get("capacity_notional", 100_000_000),
+                "topk": config.get("topk", 50),
+                "n_drop": config.get("n_drop", 5),
+                "open_cost": config.get("open_cost", 0.0005),
+                "close_cost": config.get("close_cost", 0.0015),
+                "min_cost": config.get("min_cost", 5.0),
+                "final_oos_opened": True,
+            },
+            workspace=model_root,
+            runner_path=Path(__file__).resolve().with_name("model_sandbox_runner.py"),
+            allow_final_oos=True,
+            timeout_seconds=int(manifest.get("model_timeout_seconds", 7200)),
+        )
+        admitted_environment_sha256 = str(
+            formal_model_admission["model_grid"][
+                "execution_environment_sha256"
+            ]
+        )
+        if (
+            model_result.get("execution_environment_sha256")
+            != admitted_environment_sha256
+            or model_execution.get("execution_environment_sha256")
+            != admitted_environment_sha256
+        ):
+            raise ValueError(
+                "formal model execution environment differs from independent admission"
+            )
+        predictions_path = model_root / "output" / "predictions.parquet"
+        checkpoint_path = model_root / "output" / "checkpoint.pt"
+        model_coverage = verify_model_prediction_artifact(
+            predictions_path,
+            expected_sha256=model_result["predictions_sha256"],
+            test_start=periods["start"],
+            test_end=periods["end"],
+            trading_days=final_calendar,
+            min_daily_finite=int(manifest.get("min_daily_instruments", 50)),
+        )
+        model_execution.update(
+            {
+                "dataset_identity_sha256": provider_provenance.get("dataset_identity_sha256"),
+                "test_start": periods["start"],
+                "test_end": periods["end"],
+                "oos_coverage": model_coverage,
+            }
+        )
+        model_predictions = normalize_model_predictions(pd.read_parquet(predictions_path))
+        prediction_dates = pd.DatetimeIndex(
+            model_predictions.index.get_level_values("datetime")
+        ).normalize()
+        model_predictions = model_predictions.loc[
+            (prediction_dates >= pd.Timestamp(periods["start"]))
+            & (prediction_dates <= pd.Timestamp(periods["end"]))
+        ]
+        model_scores = model_predictions["score"].rename("score")
+        formal_model_artifact = {
+            "predictions_path": str(predictions_path.relative_to(output)).replace("\\", "/"),
+            "predictions_sha256": str(model_result["predictions_sha256"]),
+            "checkpoint_path": str(checkpoint_path.relative_to(output)).replace("\\", "/"),
+            "checkpoint_sha256": str(model_result["checkpoint_sha256"]),
+            "additional_factors_path": (
+                str(additional_factors_path.relative_to(output)).replace("\\", "/")
+                if additional_factors_path is not None
+                else None
+            ),
+            "additional_factors_sha256": (
+                _sha256_file(additional_factors_path)
+                if additional_factors_path is not None
+                else None
+            ),
+            "evidence": model_execution,
+        }
+        manifest["formal_model_artifact"] = formal_model_artifact
+    elif manifest.get("model_formal_admission") is not None:
+        raise ValueError("factor-score backtest cannot carry model admission evidence")
     baseline_artifacts: dict[str, Any] | None = None
     baseline_definition = config.get("baseline_definition")
     baseline_raw: pd.DataFrame | None = None
@@ -512,7 +915,11 @@ def main() -> None:
             "computed_by": "qlib.data.D.features",
             "artifacts": baseline_artifacts,
         }
-    if factor_source_mode == FACTOR_SOURCE_PROMOTED_ONLY:
+    if signal_source == "model_prediction":
+        if model_scores is None:
+            raise ValueError("formal model strategy produced no final-OOS scores")
+        scores = model_scores
+    elif factor_source_mode == FACTOR_SOURCE_PROMOTED_ONLY:
         if challenger_scores is None:
             raise ValueError("a promoted-only strategy has no challenger factor values")
         scores = challenger_scores
@@ -557,8 +964,8 @@ def main() -> None:
         freq="day",
     )
     covariance_start = (
-        pd.Timestamp(data_periods["start"]) - pd.Timedelta(days=120)
-    ).date().isoformat()
+        (pd.Timestamp(data_periods["start"]) - pd.Timedelta(days=120)).date().isoformat()
+    )
     close_history = D.features(
         instruments,
         ["$close"],
@@ -614,20 +1021,23 @@ def main() -> None:
         scenario_config: dict[str, Any],
         signal_scores: pd.Series | None = None,
     ) -> pd.Series:
+        scenario_policy_config = PortfolioPolicyConfig.from_mapping(scenario_config)
         neutralize_baseline = scenario_config.get("portfolio_construction") in {
             "benchmark_relative_qp",
             "industry_neutral_qp",
         }
         return build_governed_signal(
             scores if signal_scores is None else signal_scores,
-            topk=int(scenario_config["topk"]),
+            topk=scenario_policy_config.topk,
+            n_drop=scenario_policy_config.n_drop,
             liquidity_amount=liquidity_amount,
             industry_memberships=industry_memberships,
             benchmark_weights=benchmark_weights,
             style_exposures=style_exposures,
             eligibility_matrix=eligibility_matrix,
-            max_industry_weight=float(scenario_config.get("max_industry_weight", 1.0)),
-            max_industry_deviation=float(scenario_config.get("max_industry_deviation", 1.0)),
+            max_position_weight=scenario_policy_config.max_position_weight,
+            max_industry_weight=scenario_policy_config.max_industry_weight,
+            max_industry_deviation=scenario_policy_config.max_industry_deviation,
             min_average_daily_amount=float(scenario_config.get("min_average_daily_amount", 0.0)),
             liquidity_lookback_days=int(scenario_config.get("liquidity_lookback_days", 20)),
             neutralize_industry=neutralize_baseline,
@@ -753,9 +1163,7 @@ def main() -> None:
         requested_end=historical_periods["end"],
         final_test_start=periods["start"],
         final_test_end=periods["end"],
-        minimum_trading_days=int(
-            config.get("min_pre_final_history_days", 2520)
-        ),
+        minimum_trading_days=int(config.get("min_pre_final_history_days", 2520)),
         minimum_embargo_trading_days=int(config.get("outer_embargo_days", 5)),
     )
     pre_final_history["execution_model"] = {
@@ -887,7 +1295,9 @@ def main() -> None:
                 for candidate_id, values, weight, direction in challenger_entries
                 if candidate_id != removed
             ]
-            challenger_variant = compose_factor_scores(remaining) if remaining else None
+            challenger_variant = (
+                compose_factor_scores(remaining, require_exact_index=True) if remaining else None
+            )
         else:
             raise ValueError(f"unknown ablation component: {component}")
         if factor_source_mode == FACTOR_SOURCE_PROMOTED_ONLY:
@@ -926,13 +1336,30 @@ def main() -> None:
             ),
         }
 
-    ablation = run_ablation_suite(
-        component_ids=ablation_components,
-        full_metrics=formal.metrics,
-        runner=run_ablation,
-        metric="annualized_excess_return",
-        minimum_increment=float(config.get("min_component_increment", 0.0)),
-    )
+    if signal_source == "model_prediction":
+        if formal_model_admission is None:
+            raise ValueError("formal model admission binding was not validated")
+        ablation = {
+            "status": MODEL_FACTOR_VALIDATION_NOT_APPLICABLE_STATUS,
+            "applicable": False,
+            "reason": MODEL_FACTOR_VALIDATION_NOT_APPLICABLE_REASON,
+            "validation_kind": "factor_score_component_ablation",
+            "final_oos_reopened": False,
+            "independent_admission_binding_sha256": formal_model_admission["binding_sha256"],
+            "governed_grid_cell_count": (
+                (formal_model_admission.get("quant_bundle") or {}).get("cell_count")
+                or formal_model_admission["model_grid"]["cell_count"]
+            ),
+            "runs": [],
+        }
+    else:
+        ablation = run_ablation_suite(
+            component_ids=ablation_components,
+            full_metrics=formal.metrics,
+            runner=run_ablation,
+            metric="annualized_excess_return",
+            minimum_increment=float(config.get("min_component_increment", 0.0)),
+        )
 
     def delayed_scores(delay: int) -> pd.Series:
         if delay == 0:
@@ -968,7 +1395,22 @@ def main() -> None:
         minimum_retention=float(config.get("minimum_signal_retention", 0.60)),
     )
 
-    if strategy_trial_count == 1:
+    if signal_source == "model_prediction":
+        if formal_model_admission is None:
+            raise ValueError("formal model admission binding was not validated")
+        outer_walk_forward = {
+            "status": MODEL_FACTOR_VALIDATION_NOT_APPLICABLE_STATUS,
+            "applicable": False,
+            "reason": MODEL_FACTOR_VALIDATION_NOT_APPLICABLE_REASON,
+            "validation_kind": "factor_score_outer_walk_forward",
+            "final_oos_reopened": False,
+            "independent_admission_binding_sha256": formal_model_admission["binding_sha256"],
+            "governed_grid_cell_count": (
+                (formal_model_admission.get("quant_bundle") or {}).get("cell_count")
+                or formal_model_admission["model_grid"]["cell_count"]
+            ),
+        }
+    elif strategy_trial_count == 1:
         outer_walk_forward = run_outer_walk_forward(
             dates=history_calendar,
             candidate_ids=["frozen-strategy"],
@@ -994,12 +1436,8 @@ def main() -> None:
             test_days=int(config.get("outer_test_days", 42)),
             purge_days=int(config.get("outer_purge_days", 5)),
             embargo_days=int(config.get("outer_embargo_days", 5)),
-            minimum_test_metric=float(
-                config.get("minimum_outer_test_excess_return", 0.0)
-            ),
-            minimum_test_pass_rate=float(
-                config.get("minimum_outer_test_pass_rate", 0.60)
-            ),
+            minimum_test_metric=float(config.get("minimum_outer_test_excess_return", 0.0)),
+            minimum_test_pass_rate=float(config.get("minimum_outer_test_pass_rate", 0.60)),
         )
         outer_walk_forward["candidate_coverage"] = {
             "required_group_trials": 1,
@@ -1032,7 +1470,47 @@ def main() -> None:
         samples=int(config.get("bootstrap_samples", 2000)),
         seed=int(config.get("validation_seed", 0)),
     )
-    if strategy_trial_count == 1:
+    governed_multiple_testing = None
+    expected_governed_trial_names: list[str] = []
+    if formal_model_admission is not None:
+        governed_multiple_testing = (
+            (formal_model_admission.get("quant_bundle") or {}).get("multiple_testing")
+            or (formal_model_admission.get("model_grid") or {}).get("multiple_testing")
+        )
+        trial_audit = (
+            (manifest.get("hypothesis_group_evidence") or {}).get("trial_count_audit")
+            or {}
+        )
+        if formal_model_admission.get("quant_bundle") is not None:
+            expected_governed_trial_names = sorted(
+                f"{candidate_id}:{ablation}"
+                for run in trial_audit.get("quant_runs") or []
+                for candidate_id in run.get("all_bundle_candidate_ids") or []
+                for ablation in REQUIRED_QUANT_ABLATIONS
+            )
+        else:
+            expected_governed_trial_names = sorted(
+                str(candidate_id)
+                for run in trial_audit.get("model_runs") or []
+                for candidate_id in run.get("all_candidate_ids") or []
+            )
+    if (
+        signal_source == "model_prediction"
+        and isinstance(governed_multiple_testing, dict)
+        and governed_multiple_testing.get("gate_passed") is True
+        and int(governed_multiple_testing.get("trial_count") or 0)
+        == strategy_trial_count
+        and sorted(governed_multiple_testing.get("trial_names") or [])
+        == expected_governed_trial_names
+        and len(expected_governed_trial_names) == strategy_trial_count
+    ):
+        multiple_testing = {
+            **governed_multiple_testing,
+            "status": "ok",
+            "evidence_scope": "independent_pre_final_run_trial_family",
+            "independent_admission_binding_sha256": formal_model_admission["binding_sha256"],
+        }
+    elif strategy_trial_count == 1:
         multiple_testing = {
             "status": "not_applicable_single_trial",
             "trial_count": 1,
@@ -1052,17 +1530,40 @@ def main() -> None:
                 "pbo": None,
             },
         }
+    factor_validation_passed = (
+        (
+            outer_walk_forward.get("status") == MODEL_FACTOR_VALIDATION_NOT_APPLICABLE_STATUS
+            and ablation.get("status") == MODEL_FACTOR_VALIDATION_NOT_APPLICABLE_STATUS
+            and formal_model_admission is not None
+            and outer_walk_forward.get("independent_admission_binding_sha256")
+            == formal_model_admission["binding_sha256"]
+            and ablation.get("independent_admission_binding_sha256")
+            == formal_model_admission["binding_sha256"]
+        )
+        if signal_source == "model_prediction"
+        else (
+            outer_walk_forward.get("status") == "completed"
+            and outer_walk_forward.get("passed") is True
+            and ablation["status"] == "passed"
+        )
+    )
+    multiple_testing_passed = multiple_testing["status"] == "not_applicable_single_trial" or (
+        signal_source == "model_prediction"
+        and multiple_testing.get("status") == "ok"
+        and multiple_testing.get("gate_passed") is True
+        and multiple_testing.get("final_oos_opened") is False
+        and multiple_testing.get("independent_admission_binding_sha256")
+        == (formal_model_admission or {}).get("binding_sha256")
+    )
     formal_validation = {
         "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
         "pre_final_history": pre_final_history,
         "status": (
             "passed"
-            if outer_walk_forward.get("status") == "completed"
-            and outer_walk_forward.get("passed") is True
-            and ablation["status"] == "passed"
+            if factor_validation_passed
             and signal_decay["maximum_supported_delay_bars"] is not None
             and paired_bootstrap["confidence_interval_95"][0] > 0
-            and multiple_testing["status"] == "not_applicable_single_trial"
+            and multiple_testing_passed
             else "failed"
         ),
         "outer_walk_forward": outer_walk_forward,
@@ -1071,9 +1572,16 @@ def main() -> None:
         "paired_block_bootstrap": paired_bootstrap,
         "multiple_testing": multiple_testing,
     }
+    if formal_model_admission is not None:
+        formal_validation["model_admission"] = formal_model_admission
     deflated_sharpe = deflated_sharpe_probability(
         net_daily_returns,
         trials=strategy_trial_count,
+        trial_sharpes=(
+            multiple_testing.get("trial_daily_sharpes")
+            if multiple_testing.get("status") == "ok"
+            else None
+        ),
     )
     metrics = {
         **formal.metrics,
@@ -1156,6 +1664,46 @@ def main() -> None:
             "execution_manifest_sha256": None,
             "factor_values_sha256": factor_value_hashes,
             "factor_code_sha256": factor_code_hashes,
+            "formal_factor_values_sha256": formal_factor_hashes,
+            "formal_factor_recompute_evidence": formal_factor_evidence,
+            "formal_model_bundle_factor_values_sha256": (
+                formal_bundle_factor_hashes if model_bundle_factors else None
+            ),
+            "formal_model_bundle_factor_recompute_evidence": (
+                formal_bundle_factor_evidence if model_bundle_factors else None
+            ),
+            "quant_bundle_factor_contract_sha256": config.get(
+                "quant_bundle_factor_contract_sha256"
+            ),
+            "signal_source": signal_source,
+            "model_signal_identity_sha256": (
+                (manifest.get("model_signal") or {}).get("identity_sha256")
+                if signal_source == "model_prediction"
+                else None
+            ),
+            "formal_model_predictions_sha256": (
+                formal_model_artifact["predictions_sha256"] if formal_model_artifact else None
+            ),
+            "formal_model_checkpoint_sha256": (
+                formal_model_artifact["checkpoint_sha256"] if formal_model_artifact else None
+            ),
+            "formal_model_evidence_sha256": (
+                canonical_model_sha256(formal_model_artifact["evidence"])
+                if formal_model_artifact
+                else None
+            ),
+            "formal_model_execution_environment_sha256": (
+                formal_model_artifact["evidence"][
+                    "execution_environment_sha256"
+                ]
+                if formal_model_artifact
+                else None
+            ),
+            "formal_model_additional_factors_sha256": (
+                _sha256_file(additional_factors_path)
+                if additional_factors_path is not None
+                else None
+            ),
             "factor_source_mode": factor_source_mode,
             "challenger_weight": float(config.get("challenger_weight") or 0.0),
             "baseline_definition_sha256": config.get("baseline_definition_sha256"),
@@ -1313,6 +1861,15 @@ def main() -> None:
         metrics["provenance"]["execution_manifest_sha256"] = _sha256_file(args.manifest)
         metrics["provenance"]["qlib_workflow"] = recorder_identity
         result["qlib_workflow"] = recorder_identity
+        artifact_manifest = write_backtest_artifact_manifest(output)
+        metrics["provenance"]["artifact_manifest_version"] = artifact_manifest["version"]
+        metrics["provenance"]["artifact_manifest_sha256"] = artifact_manifest["sha256"]
+        metrics["provenance"]["artifact_manifest_file_count"] = artifact_manifest[
+            "file_count"
+        ]
+        result["artifacts"]["artifact_manifest"] = str(
+            output / artifact_manifest["path"]
+        )
         (output / "result.json").write_text(
             json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
         )

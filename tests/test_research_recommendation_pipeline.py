@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -11,12 +11,22 @@ from governance_fixtures import (
     create_strategy_version,
     formal_backtest_metrics,
 )
-from sqlalchemy import update
+from test_promotion_chain import (
+    _daily_dataset,
+    _minute_dataset,
+    _qlib_doubles,
+    _seed_evidence,
+)
 
-from quant_data.database import strategy_versions
+import quant_platform.promotion as promotion_module
+from quant_data.execution_contract import (
+    MINUTE_EXECUTION_CONTRACT_VERSION,
+    MINUTE_SOURCE_UNIT_CONTRACTS,
+)
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.parameter_experiment_store import ParameterExperimentStore
 from quant_platform.portfolio_policy import POLICY_VERSION
+from quant_platform.promotion import ForwardGateThresholds, PromotionStore
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.recommendation_store import RecommendationStore
 from quant_platform.strategy_store import StrategyStore
@@ -24,9 +34,20 @@ from scripts.run_recommendation_refresh import _next_known_trading_date
 
 
 def test_v2_research_to_final_test_and_recommendation_snapshot(
-    tmp_path: Path, database_url: str
+    tmp_path: Path, database_url: str, monkeypatch
 ) -> None:
-    version_id = create_strategy_version(database_url, tmp_path, dataset="synthetic-qlib")
+    _qlib_doubles(monkeypatch)
+    monkeypatch.setattr(
+        promotion_module,
+        "_now",
+        lambda: datetime(2026, 7, 1, tzinfo=UTC),
+    )
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        dataset="synthetic-qlib",
+        config_overrides={"execution_method": "twap", "execution_slice_minutes": 20},
+    )
 
     experiments = ParameterExperimentStore(database_url)
     experiment = experiments.create(
@@ -80,6 +101,7 @@ def test_v2_research_to_final_test_and_recommendation_snapshot(
     backtest = strategies.create_backtest(
         version_id=version_id,
         dataset="synthetic-qlib",
+        execution_dataset="synthetic-5m",
         periods=periods,
         artifact_path=artifact,
     )
@@ -87,9 +109,10 @@ def test_v2_research_to_final_test_and_recommendation_snapshot(
     manifest = artifact / "manifest.json"
     manifest.write_text(
         json.dumps(
-            {
-                "strategy_version_id": version_id,
+                {
+                    "strategy_version_id": version_id,
                     "dataset": "synthetic-qlib",
+                    "execution_dataset": "synthetic-5m",
                     "benchmark": version["benchmark"],
                     "universe": version["universe"],
                     "periods": periods,
@@ -108,25 +131,89 @@ def test_v2_research_to_final_test_and_recommendation_snapshot(
         ),
         encoding="utf-8",
     )
-    metrics = formal_backtest_metrics(version, manifest)
+    metrics = formal_backtest_metrics(
+        version,
+        manifest,
+        hypothesis_group_evidence=strategies.hypothesis_group_evidence(version_id),
+    )
+    metrics.update(
+        {
+            "minute_execution_enforced": True,
+            "capacity_fill_ratio": 0.99,
+            "execution_model": {
+                "method": "twap",
+                "frequency": "5min",
+                "price_assumption": "minute bar vwap fills",
+                "strategy_contract_hash": version["config"]["execution_contract_hash"],
+            },
+        }
+    )
+    metrics["provenance"].update(
+        {
+            "execution_dataset_identity_sha256": "c" * 64,
+            "execution_snapshot_manifest_sha256": "e" * 64,
+            "execution_qlib_builder_sha256": "f" * 64,
+            "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
+            "execution_fields": ["vwap", "volume", "paused", "up_limit", "down_limit"],
+            "execution_source_datasets": ["ashare_5m"],
+            "execution_source_unit_contracts": {
+                "ashare_5m": MINUTE_SOURCE_UNIT_CONTRACTS["ashare_5m"]
+            },
+            "execution_lineage_verified": True,
+            "execution_source_lineage_id": "9" * 64,
+        }
+    )
     strategies.validate_backtest_artifacts(backtest["id"], metrics)
     strategies.mark_backtest(backtest["id"], "succeeded", metrics=metrics)
+    promotion = PromotionStore(database_url)
+    promotion.register_forward_gate(
+        version_id,
+        actor="pipeline-risk-owner",
+        thresholds=ForwardGateThresholds(
+            min_forward_calendar_days=1,
+            min_decision_batches=1,
+            min_completed_cycles=0,
+            min_data_completeness=1.0,
+            min_reconciliation_rate=1.0,
+            max_cost_deviation=0.01,
+        ),
+    )
     approved = strategies.approve(
         version_id,
         actor="risk-owner",
         reason="Approved the frozen strategy after its one reserved final test.",
     )
     assert approved["status"] == "approved"
-    # Fixture shortcut: the promotion chain sets promotion_stage="paper" on
-    # approval; this pipeline test predates the forward gate, so it marks the
-    # version enabled directly (production must pass the forward evidence
-    # gate via PromotionStore.promote).
-    with strategies.engine.begin() as connection:
-        connection.execute(
-            update(strategy_versions)
-            .where(strategy_versions.c.id == version_id)
-            .values(promotion_stage="recommendation_enabled")
-        )
+    stage = promotion.attach_paper_simulation(
+        version_id,
+        actor="pipeline-risk-owner",
+        daily_dataset={**_daily_dataset(), "name": "synthetic-qlib"},
+        execution_dataset={**_minute_dataset(), "name": "synthetic-5m"},
+    )
+    _seed_evidence(
+        promotion,
+        stage["simulation_portfolio_id"],
+        nav_days=1,
+        succeeded=1,
+        fee=0.0,
+        gross=1_000.0,
+    )
+    monkeypatch.setattr(
+        promotion_module,
+        "_now",
+        lambda: datetime(2026, 7, 9, tzinfo=UTC),
+    )
+    promoted = promotion.promote(
+        version_id,
+        actor="pipeline-risk-owner",
+        reason="Enable recommendations after the governed forward gate passed.",
+    )
+    assert promoted["promotion_stage"] == "recommendation_enabled"
+    monkeypatch.setattr(
+        promotion_module,
+        "_now",
+        lambda: datetime(2026, 7, 10, tzinfo=UTC),
+    )
 
     recommendations = RecommendationStore(database_url)
     portfolio = recommendations.create(

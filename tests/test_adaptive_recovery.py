@@ -18,12 +18,11 @@ from quant_data.storage import ParquetStore
 def test_failed_minute_cap_is_superseded_by_disjoint_children(database_url: str) -> None:
     store = CheckpointStore(database_url)
     parent = minute_specs(
-        {"ashare_5m": ["600000.SH"]},
+        {"futures_1m": ["IF2401.CFX"]},
         start=date(2024, 1, 2),
         end=date(2024, 1, 5),
-        trading_dates=["20240102", "20240103", "20240104", "20240105"],
         max_attempts=3,
-        freq="5min",
+        freq="1min",
     )[0]
     store.add([parent])
     store.fail(parent.unit_key, "may be truncated at the 8000-row provider limit", terminal=True)

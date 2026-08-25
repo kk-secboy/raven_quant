@@ -1,7 +1,8 @@
 param(
     [ValidateSet("core", "research", "full")]
-    [string]$Profile = "core",
-    [string]$Start = "2018-01-01",
+    [string]$Profile = "full",
+    [string]$Start = "2016-01-01",
+    [string]$SnapshotStart = "2008-01-01",
     [string]$End = "latest"
 )
 
@@ -18,7 +19,7 @@ if (-not (Test-Path -LiteralPath $python)) {
 Push-Location $repo
 try {
     & $python -m quant_data.cli probe
-    & $python -m quant_data.cli bootstrap --profile $Profile --start $Start --end $End
+    & $python -m quant_data.cli bootstrap --profile $Profile --start $Start --snapshot-start $SnapshotStart --end $End
 }
 finally {
     Pop-Location

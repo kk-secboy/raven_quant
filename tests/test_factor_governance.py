@@ -97,7 +97,7 @@ def _recompute_args(store: ResearchStore, candidate_id: str, tmp_path: Path) -> 
         "recomputed_values_path": str(recomputed_path),
         "recomputed_values_sha256": recomputed_sha256,
         "recompute_evidence": {
-            "executor_version": "factor-recompute-v3-container-index-exact",
+            "executor_version": "factor-recompute-v4-pit-prefix-invariance",
             "sandbox_mode": "docker-isolated",
             "sandbox_image_id": "sha256:" + "a" * 64,
             "network_mode": "none",
@@ -109,6 +109,18 @@ def _recompute_args(store: ResearchStore, candidate_id: str, tmp_path: Path) -> 
             "dataset_identity_sha256": DATASET_IDENTITY,
             "provider_input_sha256": "1" * 64,
             "periods": {key: value.isoformat() for key, value in PERIODS.items()},
+            "pit_invariance": {
+                "contract_version": "factor-pit-prefix-invariance-v1",
+                "status": "passed",
+                "cutpoint_count": 3,
+                "checks": [{"invariant": True}] * 3,
+            },
+            "research_data_boundary": {
+                "latest_input_date": PERIODS["valid_end"].isoformat(),
+                "valid_end": PERIODS["valid_end"].isoformat(),
+                "test_start": PERIODS["test_start"].isoformat(),
+                "final_oos_observations_exposed": False,
+            },
             "submitted_comparison": {
                 "available": True,
                 "exact_match": True,

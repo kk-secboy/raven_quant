@@ -1,7 +1,8 @@
 # QuantLab
 
-QuantLab 是面向 A 股中低频量化研究与模拟交易的本地优先平台。项目只使用
-Tushare 数据，并以 Qlib 和 RD-Agent 组成唯一技术主线。
+QuantLab 是面向 A 股中低频量化研究与模拟交易的本地优先平台。主数据源是
+Tushare；2008–2015 年仅允许使用通过重叠校验的 BaoStock 行情补档。Qlib 和
+RD-Agent 组成唯一研究技术主线。
 
 > **权威关系：**[根目录 Markdown](%E4%B8%AA%E4%BA%BA%E9%87%8F%E5%8C%96%E6%8A%95%E8%B5%84%E4%B8%8E%E6%A8%A1%E6%8B%9F%E7%9B%98%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E7%A8%BF.md)
 > 是产品、策略和风险基准，Qlib/RD-Agent 是技术基准。本 README 只提供项目入口和
@@ -13,7 +14,7 @@ Tushare 数据，并以 Qlib 和 RD-Agent 组成唯一技术主线。
 
 唯一生产主线是：
 
-`Tushare 不可变快照 → Qlib 数据集 → RD-Agent 研究 → 独立复算与准入 → Qlib 正式回测 → 策略审批 → 买卖推荐 → 核心/卫星分配 → 统一模拟交易 → 表现复核与策略生命周期`
+`分源校验后的不可变快照 → Qlib 数据集 → RD-Agent 研究 → 独立复算与准入 → Qlib 正式回测 → 策略审批 → 买卖推荐 → 核心/卫星分配 → 统一模拟交易 → 表现复核与策略生命周期`
 
 项目不做实盘、Tick、Level-2、逐笔或毫秒高频。QMT 仅作为默认关闭的可选插件保留；
 页面、调度和模拟任务不得向 QMT 或任何券商网关发单。
@@ -68,14 +69,39 @@ pnpm run dev
 
 ```powershell
 .\.venv\Scripts\quant-data.exe probe
-.\.venv\Scripts\quant-data.exe bootstrap --profile core --start 2018-01-01 --end latest
+.\.venv\Scripts\quant-data.exe bootstrap --profile full --start 2016-01-01 --snapshot-start 2008-01-01 --end latest
 .\.venv\Scripts\quant-data.exe status
 .\.venv\Scripts\quant-data.exe verify
 ```
 
+主数据网关只从 2016 年开始；2008–2015 年行情必须先通过 BaoStock 2016
+重叠校验，再运行独立的历史回补。只有两段真实数据合并且达到研究窗口要求后，
+系统才允许生成可用于 RD-Agent/Qlib 正式研究的快照。正式研究收口必须使用
+`full` profile；`core` 和 `research` 只用于分阶段下载与审计。
+
 Bootstrap、Qlib 转换、RD-Agent 研究和回测也可以从 Web 控制台创建为持久任务。
 任务关闭浏览器后不会丢失。日线与分钟数据使用隔离的数据集和执行契约；15/30/60
 分钟研究由 Qlib 从 1 分钟或 5 分钟数据重采样，不增加下载线路。
+全 A 股 5 分钟增量任务按成功 checkpoint 的实际交易日覆盖复用旧单元；每个尚未覆盖的
+连续区间按自然季度合并且单次不超过 150 个交易日。这样补齐一个 14 交易日缺口时，
+每只股票只请求一个区间，下一交易日仍只新增后缀，既不重下历史也不改变旧成功单元键。
+
+## RD-Agent 研究中心
+
+平台在同一套不可变数据、作业、制品和审计框架中接入七个场景：
+
+- `fin_factor`：因子提出、实现和迭代；候选仍须独立复算、PIT 检查和三窗口准入。
+- `fin_model`：在固定特征集上研究预测模型；使用固定随机种子重新训练并独立验证。
+- `fin_quant`：联合研究完整的因子集与模型 bundle，并强制因子、模型、联合三组消融。
+- `fin_factor_report`：只读取已验签且满足可用时点的研报 PDF，提取因子后复用因子门禁。
+- `general_model`：从论文实现模型，初始状态仅为 `implementation_ready`；兼容实现可人工送入模型门禁。
+- `data_science`：隔离运行通用数据科学任务，制品只进入实验室。
+- `llm_finetune`：只在密封模型/数据、固定镜像和合格 GPU 能力同时满足时运行，制品不属于交易模型。
+
+官方 RD-Agent 运行成绩只作为研究反馈，不能直接晋级。模型和联合候选必须通过
+QuantLab 的独立 Qlib 评价、密封最终 OOS 和正式回测后，才可由人工批准进入隔离模拟盘。
+平台不公开官方 `server_ui`，现有 Web 页面展示受脱敏保护的日志与 trace 摘要；诊断按钮也
+不替代生产 readiness。项目不连接真实券商，模拟结果不会自动触发实盘。
 
 ## Docker 部署
 

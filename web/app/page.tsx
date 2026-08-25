@@ -29,6 +29,8 @@ type Overview = {
   snapshots: number;
   qlib_datasets: number;
   active_jobs: number;
+  active_bootstrap_jobs: number;
+  active_finalize_jobs: number;
   running_work_units: number;
   legacy_download_coverage: number;
   readiness_percent: number;
@@ -69,7 +71,7 @@ type RetentionPlan = {
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8765";
 const navGroups = [
   { label: "工作台", items: [{ index: 0, label: "总览" }, { index: 11, label: "行情总览" }] },
-  { label: "单主线", items: [{ index: 1, label: "数据快照" }, { index: 3, label: "RD-Agent 研究" }, { index: 5, label: "因子准入" }, { index: 6, label: "Qlib 回测与审批" }, { index: 12, label: "核心 / 卫星分配" }, { index: 8, label: "统一模拟盘" }] },
+  { label: "单主线", items: [{ index: 1, label: "数据快照" }, { index: 3, label: "RD-Agent 研究中心" }, { index: 5, label: "因子准入" }, { index: 6, label: "Qlib 回测与审批" }, { index: 12, label: "核心 / 卫星分配" }, { index: 8, label: "统一模拟盘" }] },
   { label: "研究支持", items: [{ index: 2, label: "Qlib 实验记录" }, { index: 4, label: "连续研究" }, { index: 7, label: "配对卫星" }] },
   { label: "系统", items: [{ index: 9, label: "任务与告警" }, { index: 10, label: "系统设置" }] },
 ];
@@ -77,7 +79,7 @@ const headings: Record<number, [string, string]> = {
   0: ["QUANTLAB / WORKSPACE", "总览"],
   1: ["TUSHARE SNAPSHOTS / QLIB DATASET", "数据快照"],
   2: ["MODEL RESEARCH / QLIB", "Qlib 实验记录"],
-  3: ["AUTONOMOUS RESEARCH / GOVERNED", "RD-Agent 研究"],
+  3: ["AUTONOMOUS RESEARCH / GOVERNED", "RD-Agent 研究中心"],
   4: ["RESEARCH AUTOPILOT / GOVERNED PIPELINE", "连续研究"],
   5: ["FACTOR GOVERNANCE / REGISTRY", "因子准入"],
   6: ["QLIB BACKTEST / RISK APPROVAL", "Qlib 回测与审批"],
@@ -113,8 +115,9 @@ export default function Home() {
   const [retention, setRetention] = useState<RetentionPlan | null>(null);
   const [retentionSelection, setRetentionSelection] = useState<Record<string, boolean>>({});
   const [retentionConfirmation, setRetentionConfirmation] = useState("");
-  const [profile, setProfile] = useState("core");
-  const [start, setStart] = useState("2018-01-01");
+  const [profile, setProfile] = useState("full");
+  const [downloadStart, setDownloadStart] = useState("2016-01-01");
+  const [snapshotStart, setSnapshotStart] = useState("2008-01-01");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
 
@@ -228,7 +231,13 @@ export default function Home() {
     const response = await apiFetch(`${API}/api/jobs/bootstrap`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ profile, start, end: "latest", build_qlib: false }),
+      body: JSON.stringify({
+        profile,
+        start: downloadStart,
+        snapshot_start: snapshotStart,
+        end: "latest",
+        build_qlib: false,
+      }),
     });
     const body = await response.json();
     if (!response.ok) {
@@ -244,7 +253,7 @@ export default function Home() {
     const response = await apiFetch(`${API}/api/jobs/finalize-data`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ profile, start, end: "latest" }),
+      body: JSON.stringify({ profile, start: snapshotStart, end: "latest" }),
     });
     const body = await response.json();
     if (!response.ok) { setMessage(body.detail ?? "数据收口任务创建失败"); return; }
@@ -381,9 +390,9 @@ export default function Home() {
                 <div className="card-heading"><div><span>首次使用</span><strong>初始化 A 股日线基础库</strong></div><span className="status-chip">可恢复</span></div>
                 <p>下载行情、复权、财务和交易约束。下载完成后，质量校验、快照和 Qlib 构建独立执行，失败可单独重试。</p>
                 <label>数据范围<select value={profile} onChange={(e) => setProfile(e.target.value)}><option value="core">基础 · 价格与交易约束</option><option value="research">研究 · 资金与行业</option><option value="full">完整 · 财务与事件</option></select></label>
-                <div className="form-row"><label>开始日期<input type="date" value={start} onChange={(e) => setStart(e.target.value)} /></label><label>结束日期<input value="最新交易日" disabled /></label></div>
-                <button className="primary" disabled={!overview?.credentials_configured || !!overview?.active_jobs}>创建基础下载任务</button>
-                <button type="button" onClick={finalizeData} disabled={!!overview?.active_jobs || !overview?.planned_units || overview.succeeded_units !== overview.planned_units}>基础下载完成，开始质量校验</button>
+                <div className="form-row"><label>主数据开始日期<input type="date" min="2016-01-01" max="2016-01-01" value={downloadStart} onChange={(e) => setDownloadStart(e.target.value)} /></label><label>研究快照开始日期<input type="date" max={downloadStart} value={snapshotStart} onChange={(e) => setSnapshotStart(e.target.value)} /></label></div>
+                <button className="primary" disabled={!overview?.credentials_configured || !!overview?.active_bootstrap_jobs}>创建基础下载任务</button>
+                <button type="button" onClick={finalizeData} disabled={profile !== "full" || !!overview?.active_finalize_jobs || !overview?.planned_units}>完整数据下载完成，开始质量校验</button>
               </form>
               <DataTaskCenter tasks={dataTasks} api={API} mode="create" onCreated={refresh} onMessage={setMessage} />
             </div> : null}

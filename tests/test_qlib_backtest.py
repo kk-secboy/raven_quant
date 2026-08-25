@@ -210,6 +210,66 @@ def test_robustness_runs_all_four_configured_scenarios() -> None:
     assert validation["robustness"]["passed"] is True
 
 
+def test_robustness_uses_policy_ndrop_default_when_config_omits_it() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=80)
+    report = pd.DataFrame(
+        {"return": 0.001, "cost": 0.0, "bench": 0.0, "turnover": 0.0}, index=dates
+    )
+    seen: list[dict] = []
+
+    def runner(start: str, end: str, _costs: CostModelConfig) -> QlibBacktestResult:
+        return _result(report.loc[start:end])
+
+    def robustness(overrides: dict, _costs: CostModelConfig) -> QlibBacktestResult:
+        seen.append(overrides)
+        return _result(report)
+
+    run_qlib_validation_suites(
+        runner=runner,
+        full_result=_result(report),
+        start_time=dates[0].date().isoformat(),
+        end_time=dates[-1].date().isoformat(),
+        cost_model=CostModelConfig(),
+        config={"topk": 50, "event_count": 0, "min_robustness_pass_rate": 1.0},
+        robustness_runner=robustness,
+    )
+
+    assert seen[2] == {"topk": 40, "n_drop": 5}
+    assert seen[3] == {"n_drop": 0}
+
+
+def test_topk_robustness_never_increases_a_small_portfolio() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=80)
+    report = pd.DataFrame(
+        {"return": 0.001, "cost": 0.0, "bench": 0.0, "turnover": 0.0}, index=dates
+    )
+    seen: list[dict] = []
+
+    def runner(start: str, end: str, _costs: CostModelConfig) -> QlibBacktestResult:
+        return _result(report.loc[start:end])
+
+    def robustness(overrides: dict, _costs: CostModelConfig) -> QlibBacktestResult:
+        seen.append(overrides)
+        return _result(report)
+
+    run_qlib_validation_suites(
+        runner=runner,
+        full_result=_result(report),
+        start_time=dates[0].date().isoformat(),
+        end_time=dates[-1].date().isoformat(),
+        cost_model=CostModelConfig(),
+        config={
+            "topk": 3,
+            "n_drop": 3,
+            "event_count": 0,
+            "min_robustness_pass_rate": 1.0,
+        },
+        robustness_runner=robustness,
+    )
+
+    assert seen[2] == {"topk": 2, "n_drop": 2}
+
+
 def test_component_cost_stress_scenarios_touch_only_their_own_channel() -> None:
     dates = pd.bdate_range("2024-01-02", periods=80)
     report = pd.DataFrame(

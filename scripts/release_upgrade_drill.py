@@ -18,7 +18,13 @@ def _stamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _write_env(path: Path) -> None:
+def _write_env(
+    path: Path,
+    *,
+    data_host_path: Path,
+    docker_host_path: Path,
+    registry_host_path: Path,
+) -> None:
     password = secrets.token_urlsafe(32)
     secret = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
     path.write_text(
@@ -37,6 +43,9 @@ def _write_env(path: Path) -> None:
                 "DOWNLOAD_WORKERS=2",
                 "LOG_MAX_SIZE=5m",
                 "LOG_MAX_FILES=2",
+                f"QUANTLAB_DATA_HOST_PATH={data_host_path.resolve()}",
+                f"RDAGENT_DOCKER_HOST_PATH={docker_host_path.resolve()}",
+                f"RDAGENT_REGISTRY_HOST_PATH={registry_host_path.resolve()}",
             )
         )
         + "\n",
@@ -95,7 +104,22 @@ def run_drill(project_root: Path) -> dict:
         scratch = Path(temporary_manager.name)
         env_file = scratch / "drill.env"
         backup_root = scratch / "backups"
-        _write_env(env_file)
+        data_host_path = scratch / "drill-data"
+        docker_host_path = scratch / "rdagent-docker"
+        registry_host_path = scratch / "rdagent-registry"
+        for path in (
+            backup_root,
+            data_host_path,
+            docker_host_path,
+            registry_host_path,
+        ):
+            path.mkdir()
+        _write_env(
+            env_file,
+            data_host_path=data_host_path,
+            docker_host_path=docker_host_path,
+            registry_host_path=registry_host_path,
+        )
         context = compose_context(
             result["drill_project"],
             env_file,
@@ -135,6 +159,26 @@ def run_drill(project_root: Path) -> dict:
             if any(result["cleanup"].values()):
                 result["status"] = "failed"
                 result["cleanup_error"] = "isolated Compose resources remain"
+            context.docker(
+                "run",
+                "--rm",
+                "--volume",
+                f"{scratch}:/scratch",
+                "postgres:16-alpine",
+                "find",
+                "/scratch",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-exec",
+                "rm",
+                "-rf",
+                "--",
+                "{}",
+                "+",
+                check=False,
+            )
         temporary_manager.cleanup()
         result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")
         result["drill_id"] = release_id

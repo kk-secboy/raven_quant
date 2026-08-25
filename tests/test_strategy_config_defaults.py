@@ -34,6 +34,28 @@ def test_cash_yield_cannot_substitute_a_research_risk_free_rate() -> None:
         StrategyConfigRequest(annual_cash_yield_rate=0.02)
 
 
+def test_model_factor_source_sentinel_round_trips_but_is_model_only() -> None:
+    model = StrategyConfigRequest(
+        signal_source="model_prediction",
+        factor_source_mode="not_applicable_model_prediction",
+        challenger_weight=0.0,
+    )
+    assert model.model_dump()["factor_source_mode"] == (
+        "not_applicable_model_prediction"
+    )
+
+    with pytest.raises(ValidationError, match="invalid for factor scores"):
+        StrategyConfigRequest(
+            signal_source="factor_score",
+            factor_source_mode="not_applicable_model_prediction",
+        )
+    with pytest.raises(ValidationError, match="cannot bind a factor-score baseline"):
+        StrategyConfigRequest(
+            signal_source="model_prediction",
+            factor_source_mode="qlib_baseline",
+        )
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -89,10 +111,37 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
     config = StrategyConfigRequest().model_dump()
     code_path = tmp_path / "factor-1.py"
     values_path = tmp_path / "factor-1.parquet"
+    formal_values_path = tmp_path / "formal-factor-1.parquet"
     code_path.write_text("def factor(frame):\n    return frame['close']\n", encoding="utf-8")
     values_path.write_bytes(b"immutable-factor-values")
+    formal_values_path.write_bytes(b"formal-factor-values")
     code_sha256 = _sha256_file(code_path)
     values_sha256 = _sha256_file(values_path)
+    formal_values_sha256 = _sha256_file(formal_values_path)
+    dataset_identity_sha256 = "d" * 64
+    formal_evidence = {
+        "dataset_identity_sha256": dataset_identity_sha256,
+        "periods": {
+            "warmup_start": "2008-01-01",
+            "test_start": "2024-01-01",
+            "test_end": "2026-07-10",
+        },
+        "oos_coverage": {
+            "contract_version": "factor-oos-index-exact-v1",
+            "test_start": "2024-01-01",
+            "test_end": "2026-07-10",
+            "trading_day_count": 252,
+            "row_count": 1_000,
+            "finite_row_count": 900,
+            "min_daily_finite_required": 50,
+            "min_coverage_ratio_required": 0.80,
+            "min_good_day_rate_required": 0.95,
+            "good_day_rate": 0.95,
+            "coverage_gate_passed": True,
+            "index_exact_match": True,
+        },
+        "authoritative_values_sha256": formal_values_sha256,
+    }
     version = {
         "id": "version-1",
         "benchmark": "SH000300",
@@ -140,6 +189,13 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
                 "code_sha256": code_sha256,
                 "weight": 1.0,
                 "direction": 1,
+                "factor_execution_mode": "frozen_values",
+                "formal_factor_artifact": {
+                    "path": formal_values_path.name,
+                    "sha256": formal_values_sha256,
+                    "execution_mode": "frozen_values",
+                    "evidence": formal_evidence,
+                },
             }
         ],
     }
@@ -157,6 +213,13 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
             "strategy_config_sha256": _canonical_sha256(config),
             "factor_code_sha256": {"factor-1": code_sha256},
             "factor_values_sha256": {"factor-1": values_sha256},
+            "formal_factor_values_sha256": {
+                "factor-1": formal_values_sha256,
+            },
+            "formal_factor_recompute_evidence": {
+                "factor-1": formal_evidence,
+            },
+            "dataset_identity_sha256": dataset_identity_sha256,
             "qlib_workflow": qlib_workflow_identity(),
         }
     }

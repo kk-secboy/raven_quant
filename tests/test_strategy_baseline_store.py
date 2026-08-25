@@ -12,7 +12,15 @@ from governance_fixtures import (
     formal_backtest_metrics,
 )
 from qlib_test_doubles import qlib_workflow_identity
+from sqlalchemy import select, update
 
+from quant_data.database import (
+    factor_candidates,
+    factor_evaluations,
+    oos_vintages,
+    open_database,
+    row_dict,
+)
 from quant_platform.api import StrategyConfigRequest
 from quant_platform.qlib_factor_baseline import (
     FACTOR_SOURCE_QLIB_BASELINE,
@@ -89,6 +97,92 @@ def test_core_family_starts_without_rdagent_and_challenger_is_a_new_version(
         baseline["baseline_definition_sha256"]
     )
     assert store.get_version(baseline["id"])["factors"] == []
+
+
+def test_strategy_accepts_the_verified_multi_profile_promotion_hash(
+    database_url: str, tmp_path: Path
+) -> None:
+    factor = create_promoted_factor(database_url, tmp_path)
+    evaluation_id = str(factor["promoted_evaluation_id"])
+    evaluation_evidence_sha256 = str(factor["latest_evaluation"]["evidence_sha256"])
+    consensus = {
+        "status": "passed",
+        "candidate_id": factor["id"],
+        "candidate_code_sha256": factor["code_sha256"],
+        "candidate_values_sha256": factor["values_sha256"],
+        "evaluation_ids": {
+            profile_id: evaluation_id
+            for profile_id in ("recent_3y", "balanced_5y", "robust_10y")
+        },
+        "evaluation_evidence_sha256": {
+            profile_id: evaluation_evidence_sha256
+            for profile_id in ("recent_3y", "balanced_5y", "robust_10y")
+        },
+    }
+    canonical = lambda value: hashlib.sha256(  # noqa: E731
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    consensus_sha256 = canonical(consensus)
+    promotion_sha256 = canonical(
+        {
+            "version": "factor-promotion-evidence-v2-profile-consensus",
+            "primary_evaluation_evidence_sha256": evaluation_evidence_sha256,
+            "profile_consensus_sha256": consensus_sha256,
+        }
+    )
+    with open_database(database_url).begin() as connection:
+        connection.execute(
+            update(factor_candidates)
+            .where(factor_candidates.c.id == factor["id"])
+            .values(
+                profile_consensus_json=consensus,
+                profile_consensus_sha256=consensus_sha256,
+                promotion_evidence_sha256=promotion_sha256,
+            )
+        )
+
+    store = StrategyStore(database_url)
+    family = _create_baseline_strategy(database_url)
+    version = store.create_version(
+        family["id"],
+        benchmark="SH000300",
+        universe="cn_all",
+        factors=[{"candidate_id": factor["id"], "weight": 1.0}],
+        config=_core_config(
+            mode=FACTOR_SOURCE_QLIB_BASELINE_PLUS_CHALLENGER,
+            challenger_weight=0.30,
+        ),
+        actor="test",
+    )
+
+    assert version["factors"][0]["factor_candidate_id"] == factor["id"]
+
+
+def test_external_frozen_values_are_explicitly_research_only(
+    database_url: str, tmp_path: Path
+) -> None:
+    factor = create_promoted_factor(database_url, tmp_path)
+    with open_database(database_url).begin() as connection:
+        connection.execute(
+            update(factor_evaluations)
+            .where(factor_evaluations.c.id == factor["promoted_evaluation_id"])
+            .values(evaluator_version="external-factor-gate-v1")
+        )
+
+    with pytest.raises(ValueError, match="remain research-only"):
+        store = StrategyStore(database_url)
+        family = _create_baseline_strategy(database_url)
+        store.create_version(
+            family["id"],
+            benchmark="SH000300",
+            universe="cn_all",
+            factors=[{"candidate_id": factor["id"], "weight": 1.0}],
+            config=_core_config(
+                mode=FACTOR_SOURCE_QLIB_BASELINE_PLUS_CHALLENGER,
+                challenger_weight=0.30,
+            ),
+            actor="test",
+        )
 
 
 def test_core_family_cannot_silently_start_as_a_challenger(
@@ -190,6 +284,34 @@ def test_baseline_approval_validates_expression_artifacts_hashes_and_recorder(
         periods=periods,
         artifact_path=artifact,
     )
+    with open_database(database_url).connect() as connection:
+        vintages = [
+            row_dict(row) for row in connection.execute(select(oos_vintages)).all()
+        ]
+    assert len(vintages) == 1
+    assert vintages[0]["scope"] == "standalone:global"
+    assert vintages[0]["consumed_at"] is not None
+    assert vintages[0]["sealed_candidate_set_json"] == {
+        "candidate_ids": [],
+        "baseline_definition_sha256": version["baseline_definition_sha256"],
+        "model_signal": None,
+        "strategy_spec_sha256": vintages[0]["sealed_candidate_set_json"][
+            "strategy_spec_sha256"
+        ],
+    }
+    assert len(
+        vintages[0]["sealed_candidate_set_json"]["strategy_spec_sha256"]
+    ) == 64
+    second = _create_baseline_strategy(database_url)["versions"][0]
+    with pytest.raises(
+        ValueError, match="sealed to a different baseline strategy|already been consumed"
+    ):
+        store.create_backtest(
+            version_id=second["id"],
+            dataset="new-snapshot-name",
+            periods=periods,
+            artifact_path=tmp_path / "second-baseline-formal",
+        )
     definition = version["config"]["baseline_definition"]
     baseline_artifacts: dict[str, object] = {"raw": {}, "normalized": {}}
     for artifact_kind in ("raw", "normalized"):
@@ -243,7 +365,11 @@ def test_baseline_approval_validates_expression_artifacts_hashes_and_recorder(
         ),
         encoding="utf-8",
     )
-    metrics = formal_backtest_metrics(version, manifest)
+    metrics = formal_backtest_metrics(
+        version,
+        manifest,
+        hypothesis_group_evidence=store.hypothesis_group_evidence(version["id"]),
+    )
     metrics["provenance"].update(
         {
             "factor_source_mode": FACTOR_SOURCE_QLIB_BASELINE,

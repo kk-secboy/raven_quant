@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+import re
+
+from rdagent.core.conf import RD_AGENT_SETTINGS
+from rdagent.scenarios.qlib.developer.factor_runner import (
+    QlibFactorRunner as UpstreamQlibFactorRunner,
+)
+from rdagent.scenarios.qlib.developer.model_runner import (
+    QlibModelRunner as UpstreamQlibModelRunner,
+)
+from rdagent.scenarios.qlib.experiment.factor_experiment import QlibFactorExperiment
+from rdagent.scenarios.qlib.experiment.model_experiment import QlibModelExperiment
+from rdagent.scenarios.qlib.experiment.workspace import QlibFBWorkspace
+
+_UPSTREAM_MARKET = "market: &market csi300"
+_GOVERNED_MARKET = "market: &market cn_all"
+_BENCHMARK_ANCHOR = "benchmark: &benchmark SH000300"
+_INSTRUMENT_ANCHOR = "instruments: *market"
+_CSI300_PATTERN = re.compile(r"\bcsi300\b", flags=re.IGNORECASE)
+
+_FACTOR_CONFIGS = frozenset(
+    {
+        "conf_baseline.yaml",
+        "conf_combined_factors.yaml",
+        "conf_combined_factors_sota_model.yaml",
+    }
+)
+_MODEL_CONFIGS = frozenset(
+    {
+        "conf_baseline_factors_model.yaml",
+        "conf_sota_factors_model.yaml",
+    }
+)
+
+
+def _govern_experiment_market(
+    experiment: QlibFactorExperiment | QlibModelExperiment,
+    expected_configs: frozenset[str],
+) -> None:
+    """Keep RD-Agent's internal experiment universe aligned with QuantLab.
+
+    The pinned upstream templates use CSI300, while every independently
+    evaluated QuantLab candidate uses the governed ``cn_all`` universe.  Patch
+    only the reviewed template anchors and fail closed on any upstream drift.
+    The CSI300 price series remains the benchmark; it is not the stock pool.
+    """
+
+    if RD_AGENT_SETTINGS.cache_with_pickle:
+        raise RuntimeError("governed RD-Agent runners require pickle cache disabled")
+    workspace = experiment.experiment_workspace
+    if not isinstance(workspace, QlibFBWorkspace):
+        raise RuntimeError("RD-Agent experiment workspace contract drifted")
+    actual_configs = frozenset(
+        name
+        for name in workspace.file_dict
+        if name.lower().endswith((".yaml", ".yml"))
+    )
+    if actual_configs != expected_configs:
+        raise RuntimeError(
+            "RD-Agent Qlib template set drifted: "
+            f"expected {sorted(expected_configs)}, got {sorted(actual_configs)}"
+        )
+
+    updates: dict[str, str] = {}
+    for name in sorted(expected_configs):
+        source = workspace.file_dict.get(name)
+        if not isinstance(source, str):
+            raise RuntimeError(f"RD-Agent Qlib template {name} is unavailable")
+        upstream_count = source.count(_UPSTREAM_MARKET)
+        governed_count = source.count(_GOVERNED_MARKET)
+        if (upstream_count, governed_count) == (1, 0):
+            governed = source.replace(_UPSTREAM_MARKET, _GOVERNED_MARKET)
+        elif (upstream_count, governed_count) == (0, 1):
+            governed = source
+        else:
+            raise RuntimeError(f"RD-Agent Qlib template {name} market anchor drifted")
+        if _CSI300_PATTERN.search(governed):
+            raise RuntimeError(f"RD-Agent Qlib template {name} still selects CSI300")
+        if governed.count(_GOVERNED_MARKET) != 1:
+            raise RuntimeError(f"RD-Agent Qlib template {name} governed market is ambiguous")
+        if governed.count(_BENCHMARK_ANCHOR) != 1:
+            raise RuntimeError(f"RD-Agent Qlib template {name} benchmark anchor drifted")
+        if governed.count(_INSTRUMENT_ANCHOR) != 1:
+            raise RuntimeError(f"RD-Agent Qlib template {name} instrument anchor drifted")
+        updates[name] = governed
+
+    # QlibFBWorkspace.execute reads the physical workspace, so update both its
+    # reproducible file_dict and the files that qrun will consume.
+    workspace.inject_files(**updates)
+
+
+class QuantLabFactorRunner(UpstreamQlibFactorRunner):
+    def develop(self, exp: QlibFactorExperiment) -> QlibFactorExperiment:
+        _govern_experiment_market(exp, _FACTOR_CONFIGS)
+        return super().develop(exp)
+
+
+class QuantLabModelRunner(UpstreamQlibModelRunner):
+    def develop(self, exp: QlibModelExperiment) -> QlibModelExperiment:
+        _govern_experiment_market(exp, _MODEL_CONFIGS)
+        return super().develop(exp)

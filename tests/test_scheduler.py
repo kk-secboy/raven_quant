@@ -1,9 +1,15 @@
 import json
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import pytest
 
 from quant_data.config import Settings
 from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES, OPTIONAL_COVERAGE_BUNDLES
+from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
+from quant_data.qlib_builder import build_qlib_output_manifest
 from quant_platform.alert_store import AlertStore
 from quant_platform.job_store import JobStore
 from quant_platform.research_store import ResearchStore
@@ -23,6 +29,7 @@ def _settings(database_url: str, tmp_path: Path) -> Settings:
         data_root=tmp_path / "data",
         database_url=database_url,
         embedded_worker=False,
+        research_asset_auto_enabled=False,
     )
 
 
@@ -57,10 +64,41 @@ def _write_qlib_dataset(
                 "source_lineage_id": source_lineage_id,
                 "snapshot_manifest_sha256": "d" * 64,
                 "lineage_verified": True,
+                "output_manifest": build_qlib_output_manifest(root),
+                **(
+                    {
+                        "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+                        "source_volume_unit": "hand",
+                        "qlib_volume_unit": "share",
+                        "source_amount_unit": "thousand_cny",
+                        "qlib_amount_unit": "cny",
+                        "source_hand_size": 100,
+                        "index_volume_policy": "excluded_non_tradable_benchmark",
+                    }
+                    if frequency == "day"
+                    else {}
+                ),
             }
         ),
         encoding="utf-8",
     )
+
+
+def _write_trade_calendar(
+    data_root: Path,
+    *,
+    open_days: list[date],
+    closed_days: list[date] | None = None,
+) -> None:
+    target = data_root / "units" / "trade_cal" / "trade_cal.parquet"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(
+        [
+            *({"cal_date": day, "is_open": 1} for day in open_days),
+            *({"cal_date": day, "is_open": 0} for day in (closed_days or [])),
+        ]
+    )
+    frame.to_parquet(target, index=False, compression="zstd", engine="pyarrow")
 
 
 def test_scheduler_materializes_once_and_enqueues_incremental_job(
@@ -94,8 +132,9 @@ def test_scheduler_materializes_once_and_enqueues_incremental_job(
     assert job["payload"]["start"] == "2024-12-26"
     assert job["payload"]["end"] == "latest"
     assert job["payload"]["build_qlib"] is False
+    assert job["payload"]["incremental"] is True
     assert job["payload"]["finalize_after_download"] is False
-    assert job["payload"]["snapshot_start"] == "2018-01-01"
+    assert job["payload"]["snapshot_start"] == "2008-01-01"
 
 
 def test_scheduler_creates_recoverable_full_data_pipeline(
@@ -128,6 +167,8 @@ def test_scheduler_creates_recoverable_full_data_pipeline(
     assert job["kind"] == "bootstrap"
     assert job["payload"]["finalize_after_download"] is False
     assert job["payload"]["start"] == "2024-12-19"
+    assert job["payload"]["snapshot_start"] == "2024-01-01"
+    assert job["payload"]["snapshot_end"] == "2025-01-02"
     assert [step["kind"] for step in job["payload"]["pipeline_steps"]] == [
         "supplemental_cn_extended_daily",
         "supplemental_cn_macro",
@@ -137,6 +178,57 @@ def test_scheduler_creates_recoverable_full_data_pipeline(
         "data_qlib",
         "qlib_baseline",
     ]
+    assert {
+        step["payload"]["end"]
+        for step in job["payload"]["pipeline_steps"]
+        if step["kind"].startswith("supplemental_")
+    } == {"2025-01-02"}
+
+
+@pytest.mark.parametrize("kind", ["incremental_sync", "data_pipeline"])
+@pytest.mark.parametrize("local_day", [date(2025, 1, 4), date(2025, 1, 5)])
+def test_trading_day_data_schedules_skip_shanghai_weekends_without_jobs(
+    database_url: str,
+    tmp_path: Path,
+    kind: str,
+    local_day: date,
+) -> None:
+    zone = ZoneInfo("Asia/Shanghai")
+    current = datetime.combine(local_day, time(15, 29), tzinfo=zone).astimezone(UTC)
+    payload = (
+        {"profile": "full", "lookback_days": 30, "build_qlib": True}
+        if kind == "incremental_sync"
+        else {
+            "profile": "full",
+            "lookback_days": 30,
+            "snapshot_start": "2008-01-01",
+            "bundles": ["cn_extended_daily"],
+        }
+    )
+    store = ScheduleStore(database_url)
+    store.create(
+        name=f"{kind}-{local_day.isoformat()}",
+        kind=kind,
+        timezone="Asia/Shanghai",
+        run_time=time(15, 30),
+        trading_days_only=True,
+        payload=payload,
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+
+    result = SchedulerEngine(_settings(database_url, tmp_path)).tick(
+        current + timedelta(minutes=1)
+    )
+
+    assert result["processed"] == 1
+    run = store.list_runs()[0]
+    assert run["status"] == "skipped"
+    assert run["job_id"] is None
+    assert "weekend" in run["message"]
+    assert local_day.isoformat() in run["message"]
+    assert JobStore(database_url).count(kinds=("bootstrap",)) == 0
 
 
 def test_scheduler_creates_bounded_recoverable_information_pipeline(
@@ -164,7 +256,10 @@ def test_scheduler_creates_bounded_recoverable_information_pipeline(
         lambda _root, _evaluation: {
             "name": "qlib-frozen",
             "path": str(tmp_path / "data" / "qlib" / "qlib-frozen"),
-            "provenance": {"dataset_identity_sha256": "a" * 64},
+            "provenance": {
+                "dataset_identity_sha256": "a" * 64,
+                "snapshot_name": "snapshot-frozen",
+            },
         },
     )
     store = ScheduleStore(database_url)
@@ -278,7 +373,10 @@ def test_scheduler_creates_weekly_structured_information_factor_refresh(
         lambda _root, _evaluation: {
             "name": "qlib-frozen",
             "path": str(tmp_path / "data" / "qlib" / "qlib-frozen"),
-            "provenance": {"dataset_identity_sha256": "a" * 64},
+            "provenance": {
+                "dataset_identity_sha256": "a" * 64,
+                "snapshot_name": "snapshot-frozen",
+            },
         },
     )
     evaluation = {
@@ -319,32 +417,42 @@ def test_scheduler_creates_weekly_structured_information_factor_refresh(
     run = store.list_runs()[0]
     assert run["status"] == "enqueued"
     job = JobStore(database_url).get(run["job_id"])
-    assert job["kind"] == "report_rc_factors"
+    assert job["kind"] == "announcement_factor_register"
     assert job["payload"]["start"] == "2010-01-01"
     assert job["payload"]["end"] == "2025-01-02"
     steps = job["payload"]["pipeline_steps"]
     assert [step["kind"] for step in steps] == [
+        "corpus_factor_register",
+        "report_rc_factors",
         "report_rc_factor_register",
         "major_news_mentions",
         "major_news_mentions_factor_register",
         "news_flash_factors",
         "news_flash_factor_register",
+        "event_market_response",
         "information_factor_evaluate",
         "multiface_audit",
     ]
-    assert steps[1]["payload"]["start"] == "2018-11-20"
+    assert steps[1]["payload"]["start"] == "2010-01-01"
     assert steps[3]["payload"]["start"] == "2018-11-20"
+    assert steps[5]["payload"]["start"] == "2018-11-20"
+    assert steps[-3]["payload"]["snapshot_name"] == "snapshot-frozen"
     assert steps[-2]["payload"]["factor_names"] == [
+        "announcement_logic_score",
+        "announcement_tone",
+        "irm_qa_sentiment_daily",
         "major_news_mention_count_daily",
         "major_news_mention_sentiment_daily",
         "news_flash_intensity_daily",
+        "news_sentiment_daily",
+        "policy_sentiment_daily",
         "report_rc_coverage_20d",
         "report_rc_eps_revision",
         "report_rc_rating_change",
     ]
     assert steps[-1]["payload"] == {
         "dataset": "qlib-frozen",
-        "snapshot_name": None,
+        "snapshot_name": "snapshot-frozen",
         "require_ready": True,
     }
 
@@ -415,6 +523,10 @@ def test_scheduler_creates_daily_full_a_share_five_minute_increment(
         end="2025-01-02",
         source_lineage_id="a" * 64,
     )
+    _write_trade_calendar(
+        settings.data_root,
+        open_days=[date(2025, 1, 2), date(2025, 1, 3)],
+    )
     result = SchedulerEngine(settings).tick(
         datetime(2025, 1, 2, 13, 1, tzinfo=UTC)
     )
@@ -438,8 +550,112 @@ def test_scheduler_creates_daily_full_a_share_five_minute_increment(
     ]
 
 
-def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
+def test_scheduler_skips_five_minute_sync_on_persisted_exchange_closure(
     database_url: str, tmp_path: Path
+) -> None:
+    current = datetime(2025, 1, 4, 12, 59, tzinfo=UTC)  # Saturday 20:59 Shanghai
+    store = ScheduleStore(database_url)
+    store.create(
+        name="daily A-share five-minute sync",
+        kind="ashare_5m_sync",
+        timezone="Asia/Shanghai",
+        run_time=time(21, 0),
+        trading_days_only=True,
+        payload={"history_start": "2024-01-01"},
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+    settings = _settings(database_url, tmp_path)
+    _write_trade_calendar(
+        settings.data_root,
+        open_days=[date(2025, 1, 3), date(2025, 1, 6)],
+        closed_days=[date(2025, 1, 4), date(2025, 1, 5)],
+    )
+
+    result = SchedulerEngine(settings).tick(current + timedelta(minutes=2))
+
+    assert result["processed"] == 1
+    run = store.list_runs()[0]
+    assert run["status"] == "skipped"
+    assert "non-trading day 2025-01-04" in run["message"]
+    assert JobStore(database_url).list() == []
+
+
+def test_scheduler_fails_closed_when_daily_publication_misses_open_session(
+    database_url: str, tmp_path: Path
+) -> None:
+    current = datetime(2025, 1, 3, 12, 59, tzinfo=UTC)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="daily A-share five-minute sync",
+        kind="ashare_5m_sync",
+        timezone="Asia/Shanghai",
+        run_time=time(21, 0),
+        trading_days_only=True,
+        payload={"history_start": "2024-01-01", "daily_dataset": "daily-stale"},
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+    settings = _settings(database_url, tmp_path)
+    _write_trade_calendar(
+        settings.data_root,
+        open_days=[date(2025, 1, 2), date(2025, 1, 3), date(2025, 1, 6)],
+    )
+    _write_qlib_dataset(
+        settings.data_root,
+        name="daily-stale",
+        frequency="day",
+        start="2024-01-01",
+        end="2025-01-02",
+        source_lineage_id="a" * 64,
+    )
+
+    result = SchedulerEngine(settings).tick(current + timedelta(minutes=2))
+
+    assert result["processed"] == 1
+    run = store.list_runs()[0]
+    assert run["status"] == "failed"
+    assert "daily Qlib dataset is required" in run["message"]
+    assert JobStore(database_url).list() == []
+    alerts = AlertStore(database_url).list()
+    assert any(
+        alert["category"] == "schedule_failure" and alert["source_id"] == run["id"]
+        for alert in alerts
+    )
+
+
+def test_scheduler_rejects_five_minute_sync_before_market_is_fully_closed(
+    database_url: str, tmp_path: Path
+) -> None:
+    current = datetime(2025, 1, 2, 6, 29, tzinfo=UTC)  # 14:29 Shanghai
+    store = ScheduleStore(database_url)
+    store.create(
+        name="unsafe pre-close five-minute sync",
+        kind="ashare_5m_sync",
+        timezone="Asia/Shanghai",
+        run_time=time(14, 30),
+        trading_days_only=True,
+        payload={"history_start": "2024-01-01"},
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+
+    result = SchedulerEngine(_settings(database_url, tmp_path)).tick(
+        current + timedelta(minutes=2)
+    )
+
+    assert result["processed"] == 1
+    run = store.list_runs()[0]
+    assert run["status"] == "failed"
+    assert "after the market has fully closed" in run["message"]
+    assert JobStore(database_url).list() == []
+
+
+def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     current = datetime(2025, 1, 2, 12, 29, tzinfo=UTC)
     settings = _settings(database_url, tmp_path)
@@ -448,18 +664,48 @@ def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
     (dataset / "instruments").mkdir()
     (dataset / "features").mkdir()
     (dataset / "metadata").mkdir()
-    (dataset / "calendars" / "day.txt").write_text("2018-01-01\n2025-01-02\n", encoding="utf-8")
+    calendar_start = date(2010, 1, 1)
+    calendar_end = date(2025, 1, 2)
+    calendar_days: list[str] = []
+    cursor = calendar_start
+    while cursor <= calendar_end:
+        if cursor.weekday() < 5:
+            calendar_days.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    (dataset / "calendars" / "day.txt").write_text(
+        "\n".join(calendar_days) + "\n", encoding="utf-8"
+    )
     (dataset / "instruments" / "cn_all.txt").write_text(
-        "SH600000\t2018-01-01\t2025-01-02\n", encoding="utf-8"
+        "SH600000\t2010-01-01\t2025-01-02\n", encoding="utf-8"
     )
     (dataset / "metadata" / "provenance.json").write_text(
         json.dumps(
             {
+                "frequency": "day",
                 "dataset_identity_sha256": "a" * 64,
                 "snapshot_manifest_sha256": "b" * 64,
+                "dataset_lineage_id": "c" * 64,
+                "source_lineage_id": "d" * 64,
+                "lineage_verified": True,
+                "output_manifest": build_qlib_output_manifest(dataset),
             }
         ),
         encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "quant_platform.scheduler.probe_rdagent",
+        lambda _settings, _root: {"status": "ok"},
+    )
+    monkeypatch.setattr(
+        "quant_platform.scheduler.require_ready_scenario",
+        lambda _runtime, _settings, _scenario: None,
+    )
+    monkeypatch.setattr(
+        "quant_platform.scheduler.expected_rdagent_runtime_identity",
+        lambda _runtime, _scenario: {
+            "production_reproducible": True,
+            "source_tree_sha256": "e" * 64,
+        },
     )
     store = ScheduleStore(database_url)
     research_payload = {
@@ -468,14 +714,7 @@ def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
         "loop_n": 2,
         "duration": "1h",
         "requested_by": "research-scheduler",
-        "periods": {
-            "train_start": "2018-01-01",
-            "train_end": "2021-12-31",
-            "valid_start": "2022-01-01",
-            "valid_end": "2023-12-31",
-            "test_start": "2024-01-01",
-            "test_end": "2025-01-02",
-        },
+        "period_mode": "rolling",
     }
     for name in ("daily bounded factor research", "overlapping research guard"):
         store.create(
@@ -548,15 +787,15 @@ def test_job_idempotency_allows_multiple_scheduled_recommendation_jobs(
         dedupe_active_kind=False,
         idempotency_key="slot-two",
     )
-    duplicate = jobs.create(
-        "recommendation_refresh",
-        {"recommendation_portfolio": "different-payload"},
-        tmp_path / "duplicate.log",
-        dedupe_active_kind=False,
-        idempotency_key="slot-one",
-    )
+    with pytest.raises(ValueError, match="different job payload"):
+        jobs.create(
+            "recommendation_refresh",
+            {"recommendation_portfolio": "different-payload"},
+            tmp_path / "duplicate.log",
+            dedupe_active_kind=False,
+            idempotency_key="slot-one",
+        )
     assert first["id"] != second["id"]
-    assert duplicate["id"] == first["id"]
 
 
 def test_alerts_are_idempotent_deliverable_and_acknowledgeable(
@@ -611,3 +850,32 @@ def test_alerts_are_idempotent_deliverable_and_acknowledgeable(
     delivered = alerts.get(delivery["id"])
     assert delivered["delivery_status"] == "delivered"
     assert delivered["delivery_attempts"] == 1
+
+
+def test_empty_alert_webhook_advances_past_not_configured_rows(database_url: str) -> None:
+    alerts = AlertStore(database_url)
+    created = [
+        alerts.create(
+            source_type="job",
+            source_id=f"job-{index}",
+            severity="critical",
+            category="job_failure",
+            title=f"job {index} failed",
+            message="provider timeout",
+            dedupe_key=f"job:job-{index}:failed",
+        )
+        for index in range(3)
+    ]
+
+    for index in range(3):
+        assert alerts.deliver_pending("", limit=1) == 0
+        statuses = [alerts.get(item["id"])["delivery_status"] for item in created]
+        assert statuses[: index + 1] == ["not_configured"] * (index + 1)
+        assert statuses[index + 1 :] == ["pending"] * (2 - index)
+
+    assert alerts.deliver_pending("", limit=1) == 0
+    assert [alerts.get(item["id"])["delivery_status"] for item in created] == [
+        "not_configured",
+        "not_configured",
+        "not_configured",
+    ]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable
 from datetime import date
 from typing import Any
@@ -13,7 +15,9 @@ from .models import FetchSpec
 from .storage import ParquetStore
 
 LEGACY_MARKET_DATASETS = {"trade_cal", "daily", "daily_basic", "adj_factor"}
-BAOSTOCK_OVERLAP_POLICY_VERSION = "daily-aligned-v3"
+BAOSTOCK_OVERLAP_POLICY_VERSION = "daily-aligned-v4-primary-bound"
+PRIMARY_OVERLAP_PROVIDER = "configured-tushare-gateway"
+PRIMARY_OVERLAP_CONTRACT_VERSION = "tushare-daily-adj-factor-v1"
 MIN_OVERLAP_DAYS = 60
 MIN_OVERLAP_COVERAGE = 0.98
 DEFAULT_OVERLAP_SYMBOLS = (
@@ -28,6 +32,35 @@ DEFAULT_OVERLAP_SYMBOLS = (
     "600519.SH",
     "601318.SH",
 )
+
+
+def require_audited_overlap_symbols(symbols: Iterable[str]) -> tuple[str, ...]:
+    """Require the complete governed sample while permitting extra audit symbols."""
+
+    selected = tuple(sorted({str(symbol).strip().upper() for symbol in symbols if symbol}))
+    missing = sorted(set(DEFAULT_OVERLAP_SYMBOLS) - set(selected))
+    if missing:
+        raise ValueError(
+            "BaoStock production overlap validation requires the complete audited "
+            f"ten-stock sample; missing: {', '.join(missing)}"
+        )
+    return selected
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    text = str(value or "")
+    return len(text) == 64 and all(character in "0123456789abcdef" for character in text.lower())
 
 
 def baostock_reference_specs(
@@ -153,6 +186,54 @@ def _period_units(
         if start_text <= trade_date <= end_text:
             selected.append(row)
     return selected
+
+
+def require_current_primary_overlap_evidence(
+    report: dict[str, Any], checkpoint: CheckpointStore
+) -> None:
+    """Bind a passing overlap report to the primary files still in the checkpoint."""
+
+    require_audited_overlap_symbols(report.get("symbols") or ())
+    try:
+        start = date.fromisoformat(str(report["start_date"]))
+        end = date.fromisoformat(str(report["end_date"]))
+    except (KeyError, ValueError) as exc:
+        raise ValueError("overlap report has invalid primary evidence dates") from exc
+    evidence = report.get("primary_source_evidence")
+    if not isinstance(evidence, dict):
+        raise ValueError("overlap report lacks primary source evidence")
+    if (
+        evidence.get("provider") != PRIMARY_OVERLAP_PROVIDER
+        or evidence.get("contract_version") != PRIMARY_OVERLAP_CONTRACT_VERSION
+    ):
+        raise ValueError("overlap report primary provider contract is invalid")
+    recorded_units = evidence.get("units")
+    if not isinstance(recorded_units, list) or not recorded_units:
+        raise ValueError("overlap report primary unit evidence is empty")
+    current_units = sorted(
+        (
+            {
+                "dataset": str(row["dataset"]),
+                "unit_key": str(row["unit_key"]),
+                "sha256": str(row.get("sha256") or ""),
+                "row_count": int(row.get("row_count") or 0),
+            }
+            for dataset in ("daily", "adj_factor")
+            for row in _period_units(checkpoint, dataset, start=start, end=end)
+        ),
+        key=lambda item: (item["dataset"], item["unit_key"]),
+    )
+    expected_units_sha256 = _canonical_sha256(recorded_units)
+    unsigned_evidence = {
+        key: value for key, value in evidence.items() if key != "evidence_sha256"
+    }
+    if (
+        recorded_units != current_units
+        or any(not _is_sha256(item.get("sha256")) for item in recorded_units)
+        or evidence.get("units_sha256") != expected_units_sha256
+        or evidence.get("evidence_sha256") != _canonical_sha256(unsigned_evidence)
+    ):
+        raise ValueError("overlap report no longer matches the primary source units")
 
 
 def _normalize_dates(frame: pd.DataFrame) -> pd.DataFrame:
@@ -368,13 +449,32 @@ def validate_baostock_overlap(
     min_days_per_symbol: int = MIN_OVERLAP_DAYS,
     min_overlap_coverage: float = MIN_OVERLAP_COVERAGE,
 ) -> dict[str, Any]:
-    selected_symbols = sorted(set(symbols))
-    tushare_daily = storage.read_units(
-        _period_units(checkpoint, "daily", start=start, end=end)
+    selected_symbols = require_audited_overlap_symbols(symbols)
+    primary_daily_units = _period_units(checkpoint, "daily", start=start, end=end)
+    primary_adj_units = _period_units(checkpoint, "adj_factor", start=start, end=end)
+    primary_units = sorted(
+        (
+            {
+                "dataset": str(row["dataset"]),
+                "unit_key": str(row["unit_key"]),
+                "sha256": str(row.get("sha256") or ""),
+                "row_count": int(row.get("row_count") or 0),
+            }
+            for row in (*primary_daily_units, *primary_adj_units)
+        ),
+        key=lambda item: (item["dataset"], item["unit_key"]),
     )
-    tushare_adj = storage.read_units(
-        _period_units(checkpoint, "adj_factor", start=start, end=end)
-    )
+    if not primary_units or any(not _is_sha256(item["sha256"]) for item in primary_units):
+        raise RuntimeError("primary overlap source units or checksums are unavailable")
+    primary_evidence = {
+        "provider": PRIMARY_OVERLAP_PROVIDER,
+        "contract_version": PRIMARY_OVERLAP_CONTRACT_VERSION,
+        "units": primary_units,
+    }
+    primary_evidence["units_sha256"] = _canonical_sha256(primary_units)
+    primary_evidence["evidence_sha256"] = _canonical_sha256(primary_evidence)
+    tushare_daily = storage.read_units(primary_daily_units)
+    tushare_adj = storage.read_units(primary_adj_units)
     bao_daily_frames = []
     bao_adj_frames = []
     for symbol in selected_symbols:
@@ -389,7 +489,8 @@ def validate_baostock_overlap(
     baostock_adj = pd.concat(bao_adj_frames, ignore_index=True)
     return {
         "source": BAOSTOCK_SOURCE_VERSION,
-        "reference_source": "configured-tushare-gateway",
+        "reference_source": PRIMARY_OVERLAP_PROVIDER,
+        "primary_source_evidence": primary_evidence,
         "policy_version": BAOSTOCK_OVERLAP_POLICY_VERSION,
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),

@@ -838,8 +838,35 @@ def load_trade_calendar_open_days(data_root: Path) -> list[date]:
     if frame.empty:
         raise RuntimeError("trade_cal trading calendar is empty; refusing to guess available_at")
     frame["cal_date"] = pd.to_datetime(frame["cal_date"], errors="coerce")
-    is_open = frame["is_open"].astype(str).str.lower().isin({"1", "true", "t", "yes"})
-    days = sorted({value.date() for value in frame.loc[is_open, "cal_date"].dropna()})
+    raw_state = frame["is_open"].astype(str).str.strip().str.lower()
+    open_values = {"1", "1.0", "true", "t", "yes"}
+    closed_values = {"0", "0.0", "false", "f", "no"}
+    invalid = frame.loc[~raw_state.isin(open_values | closed_values)]
+    if not invalid.empty:
+        sample = invalid.iloc[0]
+        raise RuntimeError(
+            "trade_cal contains an invalid is_open value: "
+            f"{sample['cal_date']}={sample['is_open']!r}"
+        )
+    frame["open_state"] = raw_state.isin(open_values)
+    conflicts = (
+        frame.dropna(subset=["cal_date"])
+        .groupby("cal_date", sort=True)["open_state"]
+        .nunique()
+    )
+    conflicts = conflicts[conflicts > 1]
+    if not conflicts.empty:
+        sample_day = pd.Timestamp(conflicts.index[0]).date()
+        raise RuntimeError(
+            "trade_cal contains conflicting open/closed states for "
+            f"{sample_day}; reconcile overlapping calendar units before use"
+        )
+    days = sorted(
+        {
+            value.date()
+            for value in frame.loc[frame["open_state"], "cal_date"].dropna()
+        }
+    )
     if not days:
         raise RuntimeError(
             "trade_cal trading calendar has no open day; refusing to guess available_at"

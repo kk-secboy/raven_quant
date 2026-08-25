@@ -5,7 +5,19 @@ from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from typing import Any
 
+from .history_bounds import (
+    PRIMARY_MARKET_HISTORY_DATASETS,
+    PRIMARY_MARKET_HISTORY_START,
+)
 from .models import FetchSpec
+
+
+# Production probe: one exact survey day returned a full first page and 82
+# further rows at offset=400.  Legacy requests omitted limit/offset, so 400 is
+# both the provider page size and the only row count that cannot prove that the
+# old unpaged request was complete.
+STK_SURV_PROVIDER_PAGE_LIMIT = 400
+INDEX_MEMBER_ALL_WEEKLY_COHORT = "shenwan-pit-membership-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +95,7 @@ REFERENCE_REFRESH_POLICIES: dict[str, ReferenceRefreshPolicy] = {
             "fx_obasic",
             "index_basic",
             "index_classify",
+            "index_member_all",
             "stk_surv",
             "bse_mapping",
             "ci_index_member",
@@ -181,6 +194,71 @@ def select_current_reference_units(
     """
 
     materialized = [row for row in rows if not _retired_provider_request_contract(row)]
+    membership_buckets = {
+        str(scope["reference_refresh_bucket"])
+        for row in materialized
+        if str(row.get("dataset") or "") == "index_member_all"
+        and (scope := dict(row.get("scope_json") or {})).get("membership_cohort")
+        == INDEX_MEMBER_ALL_WEEKLY_COHORT
+        and scope.get("reference_refresh_bucket")
+        and _bucket_start(str(scope["reference_refresh_bucket"])) <= snapshot_end
+    }
+    if membership_buckets:
+        latest_membership_bucket = max(membership_buckets)
+        # index_member_all is one weekly cohort, not one independently sticky
+        # generation per L3/ts_code identity. Selecting only the newest whole
+        # cohort retires deleted L3 codes and forces residual successors to be
+        # explicitly present in every published week.
+        materialized = [
+            row
+            for row in materialized
+            if str(row.get("dataset") or "") != "index_member_all"
+            or (
+                (scope := dict(row.get("scope_json") or {})).get(
+                    "membership_cohort"
+                )
+                == INDEX_MEMBER_ALL_WEEKLY_COHORT
+                and str(scope.get("reference_refresh_bucket") or "")
+                == latest_membership_bucket
+            )
+        ]
+    paginated_stk_surv_days = {
+        _stk_surv_request_identity(row)
+        for row in materialized
+        if _is_current_stk_surv_page_zero(row)
+    }
+    # If an explicit page plan already exists for a survey day, it is the
+    # current generation even when still pending/failed. Retaining a legacy
+    # short success for that same day would either duplicate rows or let stale
+    # data mask the incomplete current plan.
+    materialized = [
+        row
+        for row in materialized
+        if not (
+            str(row.get("dataset") or "") == "stk_surv"
+            and "limit" not in dict(row.get("params_json") or {})
+            and "offset" not in dict(row.get("params_json") or {})
+            and _stk_surv_request_identity(row) in paginated_stk_surv_days
+        )
+    ]
+    canonical_fina_audit_periods = {
+        _fina_audit_period(row)
+        for row in materialized
+        if _is_canonical_fina_audit_page_zero(row)
+    }
+    # The corrected fina_audit plan binds every page to its requested report
+    # period. Once its page zero exists, that whole family is authoritative
+    # even while pending/failed; falling back to an older unbound family would
+    # hide an incomplete current plan and may publish rows from another period.
+    materialized = [
+        row
+        for row in materialized
+        if not (
+            str(row.get("dataset") or "") == "fina_audit"
+            and _fina_audit_period(row) in canonical_fina_audit_periods
+            and not _has_canonical_fina_audit_period_contract(row)
+        )
+    ]
     superseded_page_groups: set[str] = set()
     for row in materialized:
         scope = dict(row.get("scope_json") or {})
@@ -253,7 +331,10 @@ def reference_manifest_metadata(rows: Iterable[dict[str, Any]]) -> dict[str, Any
     )
     if not buckets:
         return None
-    dataset = str(materialized[0]["dataset"])
+    # Lineage manifests created before dataset identity was embedded in every
+    # source-unit record still carry a valid refresh bucket.  Keep those
+    # manifests readable; cadence is simply unavailable for that legacy shape.
+    dataset = str(materialized[0].get("dataset") or "")
     policy = REFERENCE_REFRESH_POLICIES.get(dataset)
     return {
         "cadence": policy.cadence if policy else None,
@@ -274,16 +355,132 @@ def _stable_identity(scope: dict[str, Any]) -> str:
     return canonical_json(scope)
 
 
+def _stk_surv_request_identity(row: dict[str, Any]) -> tuple[str, str]:
+    params = dict(row.get("params_json") or {})
+    return (
+        str(params.get("start_date") or ""),
+        str(params.get("end_date") or ""),
+    )
+
+
+def _is_current_stk_surv_page_zero(row: dict[str, Any]) -> bool:
+    if str(row.get("dataset") or "") != "stk_surv":
+        return False
+    params = dict(row.get("params_json") or {})
+    scope = dict(row.get("scope_json") or {})
+    start, end = _stk_surv_request_identity(row)
+    if not start or start != end:
+        return False
+    try:
+        return (
+            int(params.get("limit")) == STK_SURV_PROVIDER_PAGE_LIMIT
+            and int(params.get("offset")) == 0
+            and int(scope.get("page_size")) == STK_SURV_PROVIDER_PAGE_LIMIT
+            and int(scope.get("offset")) == 0
+            and str(scope.get("page_group") or "") == f"stk_surv:{start}"
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _fina_audit_period(row: dict[str, Any]) -> str:
+    params = dict(row.get("params_json") or {})
+    scope = dict(row.get("scope_json") or {})
+    return str(params.get("period") or scope.get("period") or "")
+
+
+def _has_canonical_fina_audit_period_contract(row: dict[str, Any]) -> bool:
+    period = _fina_audit_period(row)
+    scope = dict(row.get("scope_json") or {})
+    return bool(
+        period
+        and str(scope.get("expected_date_field") or "") == "end_date"
+        and str(scope.get("expected_date") or "") == period
+    )
+
+
+def _is_canonical_fina_audit_page_zero(row: dict[str, Any]) -> bool:
+    if str(row.get("dataset") or "") != "fina_audit":
+        return False
+    params = dict(row.get("params_json") or {})
+    scope = dict(row.get("scope_json") or {})
+    period = _fina_audit_period(row)
+    if (
+        not _has_canonical_fina_audit_period_contract(row)
+        or str(params.get("period") or "") != period
+        or str(scope.get("period") or "") != period
+        or str(scope.get("page_group") or "") != f"fina_audit:{period}"
+    ):
+        return False
+    try:
+        page_size = int(scope.get("page_size"))
+        return (
+            page_size > 0
+            and int(params.get("limit")) == page_size
+            and int(params.get("offset")) == 0
+            and int(scope.get("offset")) == 0
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _retired_provider_request_contract(row: dict[str, Any]) -> bool:
-    """Exclude proven-invalid completed requests from successor snapshots.
+    """Exclude proven-invalid or truncated requests from successor snapshots.
 
     The Tushare ``index_member_all`` interface accepts l1/l2/l3_code, not
     index_code. Legacy requests used the ignored index_code parameter, so each
     partition stored the same provider-capped unfiltered rows. Immutable old
-    snapshots retain their manifests; successor selection retires only that
-    invalid request shape after the corrected L3 Y/N partitions were added.
+    snapshots retain their manifests; successor selection retires only proven
+    bad request shapes after corrected contracts are available.
     """
 
-    return str(row.get("dataset")) == "index_member_all" and "index_code" in dict(
-        row.get("params_json") or {}
-    )
+    dataset = str(row.get("dataset") or "")
+    params = dict(row.get("params_json") or {})
+    if dataset == "index_member_all" and "index_code" in params:
+        return True
+
+    # The former stk_surv contract requested one day without limit/offset and
+    # treated the provider's 400-row cap as a terminal validation error.  A
+    # legacy short page is complete and remains reusable, but a legacy full
+    # page is provably truncated and must never enter a successor snapshot.
+    # Current requests carry explicit limit/offset pagination and are retained.
+    if (
+        dataset == "stk_surv"
+        and "limit" not in params
+        and "offset" not in params
+        and int(row.get("row_count") or 0) >= STK_SURV_PROVIDER_PAGE_LIMIT
+    ):
+        return True
+
+    # Before the source split was encoded in ``history_bounds``, a full plan
+    # could request the configured primary gateway for 2008-2015 and later add
+    # the admitted BaoStock backfill into the same dataset.  Selecting both
+    # immutable unit families creates one duplicate business key for almost
+    # every legacy observation.  The provider API name distinguishes the
+    # primary per-date request from the explicitly labelled baostock_* unit;
+    # retire only the former and keep all raw files auditable.
+    if dataset not in PRIMARY_MARKET_HISTORY_DATASETS:
+        return False
+    if str(row.get("api_name") or "") != dataset:
+        return False
+    scope = dict(row.get("scope_json") or {})
+    requested = scope.get("trade_date") or params.get("trade_date")
+    requested_date = _request_date(requested)
+    return requested_date is not None and requested_date < PRIMARY_MARKET_HISTORY_START
+
+
+def _request_date(value: Any) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    compact = text.replace("-", "")
+    if len(compact) < 8 or not compact[:8].isdigit():
+        return None
+    try:
+        return date(
+            int(compact[:4]),
+            int(compact[4:6]),
+            int(compact[6:8]),
+        )
+    except ValueError:
+        return None

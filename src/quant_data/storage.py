@@ -16,6 +16,7 @@ import pandas as pd
 from .availability import availability_contract_label, recoverability_level
 from .models import ProviderResult, UnitResult
 from .reference_data import reference_manifest_metadata
+from .release_window import PIT_CARRY_IN_DATASETS
 from .row_identity import (
     NULL_ON_AMBIGUITY_COLUMNS,
     SEMANTIC_METADATA_COLUMNS,
@@ -278,7 +279,9 @@ class ParquetStore:
             "date_min": None,
             "date_max": None,
             "date_filter_mode": (
-                "interval_overlap" if dataset == "index_member_all" else None
+                "interval_overlap"
+                if dataset in {"index_member_all", "namechange"}
+                else None
             ),
             "ingested_at_min": None,
             "ingested_at_max": None,
@@ -326,12 +329,20 @@ class ParquetStore:
             )
             if not has_valid_dates:
                 date_field = None
+        pit_carry_in = (
+            dataset in PIT_CARRY_IN_DATASETS
+            and date_field in {"ann_date", "f_ann_date"}
+        )
         date_filter_mode = (
             "interval_overlap"
-            if dataset == "index_member_all"
-            else ("point_date" if date_field is not None else None)
+            if dataset in {"index_member_all", "namechange"}
+            else (
+                "announcement_pit_carry_in"
+                if pit_carry_in
+                else ("point_date" if date_field is not None else None)
+            )
         )
-        if dataset == "index_member_all" and base_entry is not None:
+        if dataset in {"index_member_all", "namechange"} and base_entry is not None:
             # Interval membership output depends on both requested bounds.
             # Rebuild this small reference dataset rather than linking a
             # parent that may have been built for another range. Older
@@ -364,7 +375,7 @@ class ParquetStore:
             return dict(base_entry)
         news_identity = {"datetime", "content", "title", "source"}
         legacy_news = dataset == "news" and news_identity.issubset(set(columns))
-        if date_field is None or legacy_news:
+        if date_field is None or legacy_news or pit_carry_in:
             # Non-partitioned datasets (and the legacy global news dedup, whose
             # NOT EXISTS semantics are dataset-wide) keep the single-query
             # export; the memory budget and spill directory still apply.
@@ -427,8 +438,13 @@ class ParquetStore:
             f"SELECT count(*) FROM read_parquet({snapshot_quoted_paths}, union_by_name=true)"
         ).fetchone()[0]
         date_min = date_max = None
-        if date_field is not None:
-            date_expression = _date_sql_expression(date_field)
+        coverage_field = date_field
+        if coverage_field is None and dataset == "index_member_all" and "in_date" in columns:
+            coverage_field = "in_date"
+        if coverage_field is None and dataset == "namechange" and "start_date" in columns:
+            coverage_field = "start_date"
+        if coverage_field is not None:
+            date_expression = _date_sql_expression(coverage_field)
             # The compacted files are the published dataset and already carry
             # exact-row deduplication plus any explicit conflict quarantine.
             # Derive their coverage directly instead of re-running the full
@@ -682,9 +698,9 @@ def _date_field_candidates(dataset: str) -> tuple[str, ...]:
         return ("cal_date",)
     if dataset == "stock_basic":
         return ()
-    if dataset == "index_member_all":
-        # Membership rows describe [in_date, out_date] intervals. They must
-        # not be partitioned or clipped as point observations by in_date.
+    if dataset in {"index_member_all", "namechange"}:
+        # Membership/name-state rows describe intervals. They must not be
+        # partitioned or clipped as point observations by their start date.
         return ()
     if dataset in {"income", "balancesheet", "cashflow", "fina_indicator", "forecast", "express"}:
         return ("ann_date", "f_ann_date", "end_date")
@@ -743,21 +759,57 @@ def _bounded_snapshot_query(
 ) -> str:
     if snapshot_start is None and snapshot_end is None:
         return source_sql
-    if dataset == "index_member_all" and "in_date" in columns:
-        in_date = _date_sql_expression("in_date")
-        predicates = [f"{in_date} IS NOT NULL"]
+    interval_columns = {
+        "index_member_all": ("in_date", "out_date"),
+        "namechange": ("start_date", "end_date"),
+    }
+    interval = interval_columns.get(dataset)
+    if interval is not None and interval[0] in columns:
+        start_field, end_field = interval
+        interval_start = _date_sql_expression(start_field)
+        predicates = [f"{interval_start} IS NOT NULL"]
         if snapshot_end is not None:
-            predicates.append(f"{in_date} <= DATE {_sql_string(snapshot_end)}")
-        if snapshot_start is not None and "out_date" in columns:
-            out_date = _date_sql_expression("out_date")
             predicates.append(
-                f"({out_date} IS NULL OR "
-                f"{out_date} >= DATE {_sql_string(snapshot_start)})"
+                f"{interval_start} <= DATE {_sql_string(snapshot_end)}"
+            )
+        if snapshot_start is not None and end_field in columns:
+            interval_end = _date_sql_expression(end_field)
+            predicates.append(
+                f"({interval_end} IS NULL OR "
+                f"{interval_end} >= DATE {_sql_string(snapshot_start)})"
             )
         return f"SELECT * FROM ({source_sql}) WHERE {' AND '.join(predicates)}"
     if date_field is None:
         return source_sql
     expression = _date_sql_expression(date_field)
+    if (
+        dataset in PIT_CARRY_IN_DATASETS
+        and date_field in {"ann_date", "f_ann_date"}
+        and snapshot_start is not None
+    ):
+        if "ts_code" not in columns:
+            raise ValueError(
+                f"{dataset} requires ts_code to preserve point-in-time carry-in state"
+            )
+        predicates = [f"{expression} IS NOT NULL"]
+        if snapshot_end is not None:
+            predicates.append(f"{expression} <= DATE {_sql_string(snapshot_end)}")
+        bounded = (
+            f"SELECT *, {expression} AS __snapshot_pit_date "
+            f"FROM ({source_sql}) WHERE {' AND '.join(predicates)}"
+        )
+        ranked = (
+            "SELECT *, max(CASE WHEN __snapshot_pit_date < "
+            f"DATE {_sql_string(snapshot_start)} THEN __snapshot_pit_date END) "
+            "OVER (PARTITION BY ts_code) AS __snapshot_pit_carry_date "
+            f"FROM ({bounded})"
+        )
+        return (
+            "SELECT * EXCLUDE (__snapshot_pit_date, __snapshot_pit_carry_date) "
+            f"FROM ({ranked}) WHERE __snapshot_pit_date >= "
+            f"DATE {_sql_string(snapshot_start)} "
+            "OR __snapshot_pit_date = __snapshot_pit_carry_date"
+        )
     predicates = [f"{expression} IS NOT NULL"]
     if snapshot_start is not None:
         predicates.append(f"{expression} >= DATE {_sql_string(snapshot_start)}")

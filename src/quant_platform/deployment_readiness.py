@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +29,198 @@ from quant_data.database import (
 
 from .data_task_store import DataTaskStore
 from .health_store import OperationalHealthStore
+from .information_schedule import (
+    STRUCTURED_INFORMATION_SOURCES,
+    normalize_information_factor_refresh_payload,
+    normalize_information_schedule_payload,
+    resolve_information_evaluation_dataset,
+)
+from .research_automation import (
+    DEFAULT_REQUIRED_RESEARCH_TRADING_DAYS,
+    DEFAULT_RESEARCH_PERIOD_POLICY,
+    MINIMUM_PROFILE_TRAINING_DAYS,
+    RESEARCH_EVALUATION_PROFILES,
+)
 from .runtime_secret_store import RuntimeSecretStore
 from .schedule_store import ACTIVE_SCHEDULE_KINDS
+from .scheduler import AUTOMATED_DATA_BUNDLES
 from .services import list_qlib_datasets
+
+RESEARCH_LONGEST_VALIDATION_TRADING_DAYS = max(
+    int(profile["validation_trading_days"])
+    for profile in RESEARCH_EVALUATION_PROFILES
+)
+RESEARCH_MINIMUM_TRADING_DAYS = DEFAULT_REQUIRED_RESEARCH_TRADING_DAYS
+_GOVERNED_DATA_PIPELINE_BUNDLES = frozenset(AUTOMATED_DATA_BUNDLES)
+_GOVERNED_INFORMATION_CORPUS_DATASETS = frozenset(
+    {"cctv_news", "irm_qa_sh", "irm_qa_sz", "major_news"}
+)
+_GOVERNED_DATA_SCHEDULE_SUITE_KINDS = frozenset(
+    {
+        "data_pipeline",
+        "information_pipeline",
+        "information_factor_refresh",
+        "ashare_5m_sync",
+    }
+)
+
+
+def _is_governed_incremental_sync(row: Any) -> bool:
+    payload = row.payload_json
+    if not isinstance(payload, dict):
+        return False
+    lookback_days = payload.get("lookback_days")
+    return (
+        row.timezone == "Asia/Shanghai"
+        and bool(row.trading_days_only)
+        and payload.get("profile") == "full"
+        and payload.get("snapshot_start") == "2008-01-01"
+        and payload.get("build_qlib") is True
+        and isinstance(lookback_days, int)
+        and not isinstance(lookback_days, bool)
+        and 1 <= lookback_days <= 30
+    )
+
+
+def _is_governed_full_data_pipeline(row: Any) -> bool:
+    payload = row.payload_json
+    if not isinstance(payload, dict):
+        return False
+    bundles = payload.get("bundles")
+    lookback_days = payload.get("lookback_days", 7)
+    return (
+        row.timezone == "Asia/Shanghai"
+        and bool(row.trading_days_only)
+        and payload.get("profile") == "full"
+        and payload.get("snapshot_start") == "2008-01-01"
+        and isinstance(lookback_days, int)
+        and not isinstance(lookback_days, bool)
+        and 1 <= lookback_days <= 90
+        and isinstance(bundles, list)
+        and len(bundles) == len(_GOVERNED_DATA_PIPELINE_BUNDLES)
+        and all(isinstance(bundle, str) for bundle in bundles)
+        and set(bundles) == _GOVERNED_DATA_PIPELINE_BUNDLES
+    )
+
+
+def _is_governed_suite_data_pipeline(row: Any) -> bool:
+    return _is_governed_full_data_pipeline(row) and row.run_time == time(18, 0)
+
+
+def _is_governed_information_pipeline(row: Any) -> bool:
+    try:
+        payload = normalize_information_schedule_payload(row.payload_json)
+    except (TypeError, ValueError):
+        return False
+    return (
+        row.timezone == "Asia/Shanghai"
+        and row.run_time == time(2, 0)
+        and not bool(row.trading_days_only)
+        and payload["lookback_days"] == 7
+        and payload["regulatory_only"] is True
+        and payload["download_limit"] == 0
+        and payload["enable_nlp"] is True
+        and payload["announcement_categories"] == ["regulatory_letter"]
+        and payload["announcement_nlp_limit"] == 500
+        and payload["include_corpus_nlp"] is True
+        and set(payload["corpus_datasets"])
+        == _GOVERNED_INFORMATION_CORPUS_DATASETS
+        and payload["corpus_nlp_limit"] == 500
+        and payload["batch_size"] == 50
+        and payload["major_news_per_day"] == 40
+        and payload["irm_per_instrument_day"] == 2
+        and payload["include_event_labels"] is False
+        and payload["include_factor_evaluation"] is False
+        and payload["factor_evaluation"] is None
+        and payload["snapshot_name"] == ""
+        and payload["horizons"] == [1, 3, 5, 20]
+        and payload["benchmark_code"] == "000300.SH"
+    )
+
+
+def _is_governed_information_factor_refresh(
+    row: Any,
+    *,
+    data_root: Path,
+    reproducible_dataset_names: set[str],
+) -> bool:
+    try:
+        payload = normalize_information_factor_refresh_payload(row.payload_json)
+    except (TypeError, ValueError):
+        return False
+    evaluation = payload["factor_evaluation"] or {}
+    try:
+        resolve_information_evaluation_dataset(data_root, evaluation)
+    except (OSError, TypeError, ValueError):
+        return False
+    return (
+        row.timezone == "Asia/Shanghai"
+        and row.run_time == time(12, 30)
+        and not bool(row.trading_days_only)
+        and set(payload["sources"]) == STRUCTURED_INFORMATION_SOURCES
+        and payload["weekday"] == 4
+        and evaluation.get("dataset") in reproducible_dataset_names
+        and evaluation.get("universe") == "cn_all"
+        and evaluation.get("benchmark") == "SH000300"
+    )
+
+
+def _is_governed_ashare_5m_sync(row: Any) -> bool:
+    payload = row.payload_json
+    if not isinstance(payload, dict):
+        return False
+    lookback_days = payload.get("lookback_days")
+    return (
+        row.timezone == "Asia/Shanghai"
+        and row.run_time == time(23, 30)
+        and bool(row.trading_days_only)
+        and payload.get("history_start") == "2024-01-01"
+        and payload.get("daily_dataset") in (None, "")
+        and isinstance(lookback_days, int)
+        and not isinstance(lookback_days, bool)
+        and 1 <= lookback_days <= 30
+        and set(payload) <= {"history_start", "daily_dataset", "lookback_days"}
+    )
+
+
+def _governed_schedule_suite_state(
+    rows: list[Any],
+    *,
+    data_root: Path,
+    reproducible_dataset_names: set[str],
+) -> tuple[bool, dict[str, list[str]]]:
+    by_kind: dict[str, list[Any]] = {}
+    for row in rows:
+        by_kind.setdefault(str(row.kind), []).append(row)
+    governed: dict[str, list[str]] = {
+        "data_pipeline": [],
+        "information_pipeline": [],
+        "information_factor_refresh": [],
+        "ashare_5m_sync": [],
+    }
+    for row in rows:
+        accepted = False
+        if row.kind == "data_pipeline":
+            accepted = _is_governed_suite_data_pipeline(row)
+        elif row.kind == "information_pipeline":
+            accepted = _is_governed_information_pipeline(row)
+        elif row.kind == "information_factor_refresh":
+            accepted = _is_governed_information_factor_refresh(
+                row,
+                data_root=data_root,
+                reproducible_dataset_names=reproducible_dataset_names,
+            )
+        elif row.kind == "ashare_5m_sync":
+            accepted = _is_governed_ashare_5m_sync(row)
+        if accepted:
+            governed[row.kind].append(str(row.id))
+    ready = (
+        len(rows) == 4
+        and set(by_kind) == _GOVERNED_DATA_SCHEDULE_SUITE_KINDS
+        and all(len(by_kind[kind]) == 1 for kind in _GOVERNED_DATA_SCHEDULE_SUITE_KINDS)
+        and all(len(governed[kind]) == 1 for kind in _GOVERNED_DATA_SCHEDULE_SUITE_KINDS)
+    )
+    return ready, governed
 
 
 def _now() -> datetime:
@@ -101,7 +290,7 @@ class DeploymentReadinessStore:
         )
         return {
             "generated_at": current.isoformat(timespec="seconds"),
-            "policy_version": "2026-07-16.1",
+            "policy_version": "2026-08-24.1",
             "highest_ready_profile": highest_ready,
             "live_trading_supported": False,
             "profiles": profiles,
@@ -277,14 +466,22 @@ class DeploymentReadinessStore:
             key: str(tasks.get(key, {}).get("status", "missing")) for key in required_pipeline
         }
         pipeline_ready = all(status == "succeeded" for status in task_states.values())
-        datasets = [
+        reproducible_datasets = [
             item
             for item in list_qlib_datasets(self.settings.data_root)
             if item["ready"]
             and item.get("reproducible")
             and item.get("lineage_verified")
-            and int(item["trading_days"]) >= 504
         ]
+        datasets = [
+            item
+            for item in reproducible_datasets
+            if int(item["trading_days"]) >= RESEARCH_MINIMUM_TRADING_DAYS
+        ]
+        maximum_trading_days = max(
+            (int(item["trading_days"]) for item in reproducible_datasets),
+            default=0,
+        )
         latest_health = self.health.latest()
         health_ready = bool(latest_health and latest_health["status"] == "ok")
         rdagent_status = (
@@ -331,17 +528,21 @@ class DeploymentReadinessStore:
                 )
                 or 0
             )
-            incremental_schedules = int(
-                connection.scalar(
-                    select(func.count())
-                    .select_from(schedules)
-                    .where(
-                        schedules.c.kind == "incremental_sync",
-                        schedules.c.status == "active",
-                    )
+            active_data_schedules = connection.execute(
+                select(
+                    schedules.c.id,
+                    schedules.c.kind,
+                    schedules.c.timezone,
+                    schedules.c.run_time,
+                    schedules.c.trading_days_only,
+                    schedules.c.payload_json,
+                ).where(
+                    schedules.c.kind.in_(
+                        ("incremental_sync", *_GOVERNED_DATA_SCHEDULE_SUITE_KINDS)
+                    ),
+                    schedules.c.status == "active",
                 )
-                or 0
-            )
+            ).all()
             critical_alerts = int(
                 connection.scalar(
                     select(func.count())
@@ -350,6 +551,54 @@ class DeploymentReadinessStore:
                 )
                 or 0
             )
+        governed_incremental_ids = [
+            str(row.id)
+            for row in active_data_schedules
+            if row.kind == "incremental_sync" and _is_governed_incremental_sync(row)
+        ]
+        rejected_incremental_ids = [
+            str(row.id)
+            for row in active_data_schedules
+            if row.kind == "incremental_sync" and not _is_governed_incremental_sync(row)
+        ]
+        governed_pipeline_ids = [
+            str(row.id)
+            for row in active_data_schedules
+            if row.kind == "data_pipeline" and _is_governed_full_data_pipeline(row)
+        ]
+        rejected_pipeline_ids = [
+            str(row.id)
+            for row in active_data_schedules
+            if row.kind == "data_pipeline" and not _is_governed_full_data_pipeline(row)
+        ]
+        legacy_schedule_ready = (
+            len(active_data_schedules) == 1
+            and len(governed_incremental_ids) + len(governed_pipeline_ids) == 1
+        )
+        suite_ready, governed_suite_ids = _governed_schedule_suite_state(
+            active_data_schedules,
+            data_root=self.settings.data_root,
+            reproducible_dataset_names={str(item["name"]) for item in datasets},
+        )
+        data_schedule_ready = legacy_schedule_ready or suite_ready
+        schedule_mode = (
+            "governed_suite_v1"
+            if suite_ready
+            else "legacy_single"
+            if legacy_schedule_ready
+            else "invalid"
+        )
+        governed_suite_id_set = {
+            schedule_id
+            for ids in governed_suite_ids.values()
+            for schedule_id in ids
+        }
+        rejected_suite_ids = [
+            str(row.id)
+            for row in active_data_schedules
+            if row.kind in _GOVERNED_DATA_SCHEDULE_SUITE_KINDS
+            and str(row.id) not in governed_suite_id_set
+        ]
         code_head = self._code_schema_head()
         return [
             _check(
@@ -391,8 +640,23 @@ class DeploymentReadinessStore:
                 "reproducible_qlib_dataset",
                 "存在可复现 Qlib 数据集",
                 bool(datasets),
-                f"满足 504 交易日和血缘要求的数据集 {len(datasets)} 个",
-                "构建带数据身份、快照身份和血缘证明的 Qlib 数据集",
+                (
+                    f"满足至少 {RESEARCH_MINIMUM_TRADING_DAYS} 个交易日及血缘要求的"
+                    f"数据集 {len(datasets)} 个；当前最长 {maximum_trading_days} 个交易日"
+                ),
+                (
+                    "构建包含至少 "
+                    f"{RESEARCH_MINIMUM_TRADING_DAYS} 个交易日的数据集："
+                    f"训练 {MINIMUM_PROFILE_TRAINING_DAYS} + 最长验证 "
+                    f"{RESEARCH_LONGEST_VALIDATION_TRADING_DAYS}"
+                    f" + 隔离 {DEFAULT_RESEARCH_PERIOD_POLICY['embargo_trading_days']}"
+                    f" + 最终测试 {DEFAULT_RESEARCH_PERIOD_POLICY['test_trading_days']}"
+                ),
+                details={
+                    "minimum_trading_days": RESEARCH_MINIMUM_TRADING_DAYS,
+                    "maximum_available_trading_days": maximum_trading_days,
+                    "eligible_dataset_count": len(datasets),
+                },
             ),
             _check(
                 "operational_health",
@@ -410,10 +674,34 @@ class DeploymentReadinessStore:
             ),
             _check(
                 "incremental_schedule",
-                "增量数据调度已启用",
-                incremental_schedules > 0,
-                f"活动增量调度 {incremental_schedules} 个",
-                "创建活动的 incremental_sync 调度",
+                "受治理的数据更新调度已启用",
+                data_schedule_ready,
+                (
+                    f"活动数据更新调度 {len(active_data_schedules)} 个；"
+                    f"模式 {schedule_mode}；"
+                    f"合格 incremental_sync {len(governed_incremental_ids)} 个；"
+                    f"不合格 incremental_sync {len(rejected_incremental_ids)} 个；"
+                    f"合格 full data_pipeline {len(governed_pipeline_ids)} 个；"
+                    f"不合格 data_pipeline {len(rejected_pipeline_ids)} 个；"
+                    f"合格四计划组件 {sum(len(ids) for ids in governed_suite_ids.values())} 个"
+                ),
+                (
+                    "保留一个兼容的受治理 legacy 数据计划，或精确启用四计划套件："
+                    "18:00 full data_pipeline、23:30 ashare_5m_sync、02:00 bounded "
+                    "information_pipeline、周五 12:30 information_factor_refresh"
+                ),
+                details={
+                    "mode": schedule_mode,
+                    "active_schedule_ids": [str(row.id) for row in active_data_schedules],
+                    "incremental_sync_ids": governed_incremental_ids,
+                    "rejected_incremental_sync_ids": rejected_incremental_ids,
+                    "governed_data_pipeline_ids": governed_pipeline_ids,
+                    "rejected_data_pipeline_ids": rejected_pipeline_ids,
+                    "governed_suite_ids": governed_suite_ids,
+                    "rejected_suite_ids": rejected_suite_ids,
+                    "required_suite_kinds": sorted(_GOVERNED_DATA_SCHEDULE_SUITE_KINDS),
+                    "required_bundles": sorted(_GOVERNED_DATA_PIPELINE_BUNDLES),
+                },
             ),
             _check(
                 "critical_alerts_clear",

@@ -110,6 +110,86 @@ def test_incomplete_or_suspended_horizon_is_null_not_shifted() -> None:
     assert pd.isna(row["label_available_at_20d"])
 
 
+def test_indexed_lookup_matches_scalar_base_close_and_amount_oracle() -> None:
+    dates = pd.date_range("2024-01-02", periods=12, freq="B")
+    stock = pd.DataFrame(
+        {
+            "ts_code": "000001.SZ",
+            "trade_date": dates,
+            "pre_close": [9.0, *[float(value) for value in range(10, 21)]],
+            "close": [float(value) for value in range(10, 22)],
+            "amount": [10.0, 20.0, 0.0, None, 30.0, 40.0, 50.0, 60.0, 0.0, 80.0, 90.0, 100.0],
+        }
+    )
+    # Exercise the exact scalar fallback used before indexing: when pre_close
+    # is unusable, the previous security close is the reaction-session base.
+    stock.loc[stock["trade_date"] == dates[7], "pre_close"] = None
+    benchmark = pd.DataFrame(
+        {
+            "ts_code": "000300.SH",
+            "trade_date": dates,
+            "pre_close": [99.0, *[float(value) for value in range(100, 111)]],
+            "close": [float(value) for value in range(100, 112)],
+        }
+    )
+    fields = pd.DataFrame(
+        {
+            "process_key": ["later", "early"],
+            "ts_code": "000001.SZ",
+            "available_at": [dates[7], dates[6]],
+            "impact_direction": "positive",
+        }
+    )
+
+    labels = build_event_market_response_labels(
+        fields,
+        stock,
+        benchmark,
+        horizons=(1, 3),
+        trailing_sessions=7,
+    ).set_index("process_key")
+
+    def scalar_base_close(frame: pd.DataFrame, position: int) -> float | None:
+        pre_close = frame.iloc[position]["pre_close"]
+        if pd.notna(pre_close) and float(pre_close) > 0:
+            return float(pre_close)
+        if position > 0:
+            previous_close = frame.iloc[position - 1]["close"]
+            if pd.notna(previous_close) and float(previous_close) > 0:
+                return float(previous_close)
+        return None
+
+    def scalar_amount_surprise(start: int, end_date: pd.Timestamp) -> float | None:
+        history = stock.iloc[max(0, start - 7) : start]["amount"]
+        event = stock[
+            (stock["trade_date"] >= stock.iloc[start]["trade_date"])
+            & (stock["trade_date"] <= end_date)
+        ]["amount"]
+        history = history[(history > 0) & history.notna()]
+        event = event[(event > 0) & event.notna()]
+        if len(history) < 5 or event.empty:
+            return None
+        baseline = float(history.median())
+        return None if baseline <= 0 else float(event.mean()) / baseline - 1.0
+
+    for process_key, start in (("early", 6), ("later", 7)):
+        stock_base = scalar_base_close(stock, start)
+        benchmark_base = scalar_base_close(benchmark, start)
+        for horizon in (1, 3):
+            end = start + horizon - 1
+            prefix = f"{horizon}d"
+            expected_stock_return = float(stock.iloc[end]["close"]) / stock_base - 1.0
+            expected_benchmark_return = float(benchmark.iloc[end]["close"]) / benchmark_base - 1.0
+            row = labels.loc[process_key]
+            assert row[f"stock_return_{prefix}"] == pytest.approx(expected_stock_return)
+            assert row[f"benchmark_return_{prefix}"] == pytest.approx(expected_benchmark_return)
+            expected_amount = scalar_amount_surprise(start, dates[end])
+            if expected_amount is None:
+                assert pd.isna(row[f"amount_surprise_{prefix}"])
+            else:
+                assert row[f"amount_surprise_{prefix}"] == pytest.approx(expected_amount)
+
+
 def test_last_snapshot_session_is_not_published_without_next_session() -> None:
     fields = _fields()
     fields["available_at"] = pd.Timestamp("2024-01-10")

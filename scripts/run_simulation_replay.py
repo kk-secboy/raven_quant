@@ -16,6 +16,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from quant_data.execution_contract import require_minute_execution_contract
+from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.corporate_actions import (
     corporate_actions_sha256,
     normalize_dividend_rows,
@@ -350,6 +351,7 @@ def main() -> None:
     )
     execution_frequency = str(manifest["execution_frequency"])
     require_minute_execution_contract(provenance, frequency=execution_frequency)
+    verify_qlib_output_manifest(provider, provenance)
     pair_plan = manifest.get("governed_pair_plan")
     if manifest.get("execution_adapter") == "pair" and not isinstance(pair_plan, dict):
         raise ValueError("pair replay requires a governed immutable pair plan")

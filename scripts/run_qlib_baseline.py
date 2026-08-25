@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.qlib_workflow import (
     qlib_workflow_run,
     require_qlib_workflow_identity,
@@ -75,6 +76,7 @@ def main() -> None:
     if not provenance_path.exists():
         raise RuntimeError("Qlib baseline requires dataset provenance metadata")
     dataset_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    verify_qlib_output_manifest(provider_uri, dataset_provenance)
     output = Path(args.output).resolve()
     if output.exists():
         completed = output / "result.json"

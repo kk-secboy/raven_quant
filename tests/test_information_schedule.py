@@ -104,12 +104,21 @@ def test_structured_information_steps_are_allowed_in_durable_chain(
     tmp_path: Path,
 ) -> None:
     class FakeStore:
-        def create(self, kind, payload, log_path, *, idempotency_key):
+        def create(
+            self,
+            kind,
+            payload,
+            log_path,
+            *,
+            idempotency_key,
+            max_attempts=1,
+        ):
             return {
                 "id": idempotency_key,
                 "kind": kind,
                 "payload": payload,
                 "log_path": str(log_path),
+                "max_attempts": max_attempts,
             }
 
     worker = object.__new__(LocalJobWorker)
@@ -290,6 +299,102 @@ def test_information_evaluation_resolves_only_pinned_reproducible_daily_dataset(
     )
 
 
+def _rolling_calendar_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pre_final_days: int,
+    final_oos_days: int,
+) -> tuple[dict, dict]:
+    dataset_path = tmp_path / "data" / "qlib" / "qlib-frozen"
+    calendar_path = dataset_path / "calendars" / "day.txt"
+    calendar_path.parent.mkdir(parents=True, exist_ok=True)
+    valid_start = date(2024, 1, 2)
+    pre_final = [valid_start + timedelta(days=index) for index in range(pre_final_days)]
+    embargo = [pre_final[-1] + timedelta(days=index) for index in range(1, 6)]
+    final_oos = [embargo[-1] + timedelta(days=index) for index in range(1, final_oos_days + 1)]
+    calendar = [*pre_final, *embargo, *final_oos]
+    calendar_path.write_text(
+        "\n".join(day.isoformat() for day in calendar) + "\n",
+        encoding="utf-8",
+    )
+    evaluation = {
+        "dataset": "qlib-frozen",
+        "periods": {
+            "train_start": "2010-01-01",
+            "train_end": "2023-12-31",
+            "valid_start": pre_final[0].isoformat(),
+            "valid_end": pre_final[-1].isoformat(),
+            "test_start": final_oos[0].isoformat(),
+            "test_end": final_oos[-1].isoformat(),
+        },
+        "universe": "cn_all",
+        "benchmark": "SH000300",
+    }
+    dataset = {
+        "name": "qlib-frozen",
+        "path": str(dataset_path),
+        "ready": True,
+        "reproducible": True,
+        "frequency": "day",
+        "start_date": "2010-01-01",
+        "end_date": final_oos[-1].isoformat(),
+        "provenance": {"dataset_identity_sha256": "a" * 64},
+    }
+    monkeypatch.setattr(schedule_module, "list_qlib_datasets", lambda _root: [dataset])
+    monkeypatch.setattr(
+        schedule_module, "require_daily_qlib_contract", lambda _provenance: None
+    )
+    return dataset, evaluation
+
+
+def test_information_evaluation_accepts_three_folds_and_reserved_half_year_oos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset, evaluation = _rolling_calendar_fixture(
+        tmp_path,
+        monkeypatch,
+        pre_final_days=519,
+        final_oos_days=115,
+    )
+
+    resolved = schedule_module.resolve_information_evaluation_dataset(
+        tmp_path / "data", evaluation
+    )
+
+    assert schedule_module.INFORMATION_MINIMUM_PRE_FINAL_DAYS == 514
+    assert schedule_module.INFORMATION_MINIMUM_FINAL_OOS_DAYS == 63
+    assert resolved == dataset
+    assert evaluation["periods"]["test_start"] > evaluation["periods"]["valid_end"]
+
+
+@pytest.mark.parametrize(
+    ("pre_final_days", "final_oos_days", "message"),
+    [
+        (513, 115, "pre-final calendar"),
+        (519, 62, "reserved final-OOS"),
+    ],
+)
+def test_information_evaluation_rejects_insufficient_folds_or_reserved_oos(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pre_final_days: int,
+    final_oos_days: int,
+    message: str,
+) -> None:
+    _, evaluation = _rolling_calendar_fixture(
+        tmp_path,
+        monkeypatch,
+        pre_final_days=pre_final_days,
+        final_oos_days=final_oos_days,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        schedule_module.resolve_information_evaluation_dataset(
+            tmp_path / "data", evaluation
+        )
+
+
 def test_information_steps_form_a_durable_idempotent_successor_chain(
     tmp_path: Path,
 ) -> None:
@@ -304,6 +409,7 @@ def test_information_steps_form_a_durable_idempotent_successor_chain(
             log_path: Path,
             *,
             idempotency_key: str,
+            max_attempts: int = 1,
         ) -> dict:
             if idempotency_key not in self.by_key:
                 self.by_key[idempotency_key] = {
@@ -311,6 +417,7 @@ def test_information_steps_form_a_durable_idempotent_successor_chain(
                     "kind": kind,
                     "payload": payload,
                     "log_path": str(log_path),
+                    "max_attempts": max_attempts,
                 }
             return self.by_key[idempotency_key]
 

@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from quant_data.execution_contract import require_daily_qlib_contract
+from quant_data.research_assets import (
+    ResearchAssetError,
+    validate_research_asset_source_snapshot,
+)
 
 from .corpus_nlp import (
     DEFAULT_BATCH_SIZE,
@@ -63,6 +67,20 @@ RESEARCH_PERIOD_KEYS = (
     "test_start",
     "test_end",
 )
+INFORMATION_ROLLING_TRAIN_DAYS = 252
+INFORMATION_ROLLING_VALIDATION_DAYS = 63
+INFORMATION_ROLLING_TEST_DAYS = 63
+INFORMATION_ROLLING_PURGE_DAYS = 5
+INFORMATION_ROLLING_EMBARGO_DAYS = 5
+INFORMATION_ROLLING_MINIMUM_FOLDS = 3
+INFORMATION_MINIMUM_PRE_FINAL_DAYS = (
+    INFORMATION_ROLLING_TRAIN_DAYS
+    + INFORMATION_ROLLING_PURGE_DAYS
+    + INFORMATION_ROLLING_VALIDATION_DAYS
+    + INFORMATION_ROLLING_EMBARGO_DAYS
+    + INFORMATION_ROLLING_TEST_DAYS * INFORMATION_ROLLING_MINIMUM_FOLDS
+)
+INFORMATION_MINIMUM_FINAL_OOS_DAYS = INFORMATION_ROLLING_TEST_DAYS
 
 
 def _integer(
@@ -318,7 +336,12 @@ def _normalize_factor_evaluation(value: Any, *, enabled: bool) -> dict[str, Any]
 def resolve_information_evaluation_dataset(
     data_root: Path, evaluation: dict[str, Any]
 ) -> dict[str, Any]:
-    """Resolve one pinned, reproducible daily Qlib dataset for scheduled evaluation."""
+    """Resolve a pinned daily dataset without consuming its reserved final OOS.
+
+    This gate only counts calendar membership.  Research evaluation reads the
+    pre-final ``valid_start..valid_end`` rolling region; ``test_start..test_end`` stays
+    sealed and is checked only for enough future trading-day capacity.
+    """
 
     available = {item["name"]: item for item in list_qlib_datasets(data_root)}
     dataset = available.get(str(evaluation["dataset"]))
@@ -338,29 +361,75 @@ def resolve_information_evaluation_dataset(
         raise ValueError("information factor evaluation ends after the Qlib dataset")
     calendar_path = Path(str(dataset["path"])) / "calendars" / "day.txt"
     try:
-        calendar = [
-            date.fromisoformat(line.strip())
-            for line in calendar_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        calendar = sorted(
+            {
+                date.fromisoformat(line.strip())
+                for line in calendar_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            }
+        )
     except (OSError, ValueError) as exc:
         raise ValueError("information factor evaluation Qlib calendar is invalid") from exc
     valid_start = date.fromisoformat(periods["valid_start"])
     valid_end = date.fromisoformat(periods["valid_end"])
     test_start = date.fromisoformat(periods["test_start"])
     test_end = date.fromisoformat(periods["test_end"])
-    valid_days = sum(valid_start <= day <= valid_end for day in calendar)
-    test_days = sum(test_start <= day <= test_end for day in calendar)
-    if valid_days < 126 or test_days < 252:
+    pre_final_days = sum(valid_start <= day <= valid_end for day in calendar)
+    embargo_days = sum(valid_end < day < test_start for day in calendar)
+    final_oos_days = sum(test_start <= day <= test_end for day in calendar)
+    if pre_final_days < INFORMATION_MINIMUM_PRE_FINAL_DAYS:
         raise ValueError(
-            "information factor evaluation requires at least 126 validation and "
-            f"252 final-test trading days; got {valid_days} and {test_days}"
+            "information factor evaluation pre-final calendar requires at least "
+            f"{INFORMATION_MINIMUM_PRE_FINAL_DAYS} trading days for "
+            f"{INFORMATION_ROLLING_MINIMUM_FOLDS} complete rolling folds; "
+            f"got {pre_final_days}"
+        )
+    if embargo_days < INFORMATION_ROLLING_EMBARGO_DAYS:
+        raise ValueError(
+            "information factor evaluation requires at least "
+            f"{INFORMATION_ROLLING_EMBARGO_DAYS} embargo trading days before "
+            f"the final OOS; got {embargo_days}"
+        )
+    if final_oos_days < INFORMATION_MINIMUM_FINAL_OOS_DAYS:
+        raise ValueError(
+            "information factor evaluation requires at least "
+            f"{INFORMATION_MINIMUM_FINAL_OOS_DAYS} reserved final-OOS trading days; "
+            f"got {final_oos_days}"
         )
     return dataset
 
 
 def latest_verified_snapshot(data_root: Path, *, as_of: date) -> str:
     """Return the latest immutable snapshot that passed its blocking gate."""
+
+    return _latest_verified_snapshot(data_root, as_of=as_of)
+
+
+def latest_verified_research_asset_snapshot(data_root: Path, *, as_of: date) -> str:
+    """Return only a published research-asset source snapshot.
+
+    A normal Qlib snapshot may be newer while deliberately excluding the
+    low-priority ``research_report`` corpus.  Automatic PDF acquisition must
+    therefore bind to the isolated publication profile and prove both source
+    datasets are physically represented in its manifest.
+    """
+
+    return _latest_verified_snapshot(
+        data_root,
+        as_of=as_of,
+        required_profile="research-assets",
+        required_datasets=frozenset({"trade_cal", "research_report"}),
+    )
+
+
+def _latest_verified_snapshot(
+    data_root: Path,
+    *,
+    as_of: date,
+    required_profile: str | None = None,
+    required_datasets: frozenset[str] | None = None,
+) -> str:
+    """Select one verified snapshot under an optional publication contract."""
 
     root = data_root / "snapshots"
     candidates: list[tuple[date, str]] = []
@@ -370,7 +439,11 @@ def latest_verified_snapshot(data_root: Path, *, as_of: date) -> str:
         if not path.is_dir():
             continue
         try:
-            manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+            manifest = (
+                validate_research_asset_source_snapshot(data_root, path.name)
+                if required_profile == "research-assets"
+                else json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+            )
             verification = json.loads((path / "verification.json").read_text(encoding="utf-8"))
             if not isinstance(manifest, dict) or not isinstance(verification, dict):
                 continue
@@ -381,12 +454,30 @@ def latest_verified_snapshot(data_root: Path, *, as_of: date) -> str:
             TypeError,
             ValueError,
             json.JSONDecodeError,
+            ResearchAssetError,
         ):
             continue
         if verification.get("ok") is not True or verification.get("errors"):
             continue
+        if required_profile is not None and manifest.get("profile") != required_profile:
+            continue
+        datasets = manifest.get("datasets")
+        if required_datasets and (
+            not isinstance(datasets, dict)
+            or any(
+                not isinstance(datasets.get(dataset), dict)
+                or not isinstance(datasets[dataset].get("files"), list)
+                or not datasets[dataset]["files"]
+                for dataset in required_datasets
+            )
+        ):
+            continue
         if end_date <= as_of:
             candidates.append((end_date, path.name))
     if not candidates:
+        if required_profile is not None:
+            raise ValueError(
+                f"no verified {required_profile} snapshot covers the requested research day"
+            )
         raise ValueError("no verified immutable snapshot covers the information pipeline")
     return max(candidates)[1]

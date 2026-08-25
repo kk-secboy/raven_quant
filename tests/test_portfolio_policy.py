@@ -217,6 +217,48 @@ def test_policy_enforces_industry_weight_cap() -> None:
     assert bank_weight <= 0.60 + 1e-12
 
 
+def test_retention_buffer_uses_score_order_not_previous_input_order() -> None:
+    scores = pd.Series(
+        {
+            "SH600000": 4.0,
+            "SH600001": 3.0,
+            "SH600002": 2.0,
+            "SZ000001": 1.0,
+        }
+    )
+    industries = pd.Series(
+        {
+            "SH600000": "bank",
+            "SH600001": "bank",
+            "SH600002": "bank",
+            "SZ000001": "technology",
+        }
+    )
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=2,
+            max_position_weight=0.50,
+            max_industry_weight=0.50,
+            max_daily_turnover=1.0,
+        )
+    )
+
+    forward = policy.decide(
+        scores,
+        {"SH600001": 0.50, "SH600002": 0.50},
+        industries=industries,
+    )
+    reversed_input = policy.decide(
+        scores,
+        {"SH600002": 0.50, "SH600001": 0.50},
+        industries=industries,
+    )
+
+    assert forward.target_weights == reversed_input.target_weights
+    assert set(forward.target_weights) == {"SH600001", "SZ000001"}
+
+
 def test_industry_neutral_policy_scales_the_stock_sleeve_to_target_volatility() -> None:
     instruments = pd.Index([f"S{index:02d}" for index in range(10)])
     scores = pd.Series(range(10), index=instruments, dtype=float)

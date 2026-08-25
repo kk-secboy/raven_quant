@@ -59,7 +59,7 @@ def test_controller_creates_one_campaign_per_dataset_identity(
         universe="cn_all",
         dataset_lineage_id="lineage-a",
         config={
-            "window_days": {"train": 2520, "validation": 252, "test": 504},
+            "window_days": {"test": 504},
             "loop_n": 1,
             "duration": "30m",
             "max_factors": 3,
@@ -73,7 +73,7 @@ def test_controller_creates_one_campaign_per_dataset_identity(
                 "misfire_grace_seconds": 1800,
             },
         },
-        min_new_trading_days=20,
+        min_new_trading_days=504,
         max_active_campaigns=1,
         actor="research-admin",
     )

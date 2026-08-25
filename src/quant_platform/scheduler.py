@@ -1,35 +1,40 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
+from quant_data.cninfo_announcements import load_trade_calendar_open_days
 from quant_data.config import Settings
 from quant_data.coverage_data import COVERAGE_BUNDLES, DEFAULT_COVERAGE_BUNDLES
 from quant_data.database import (
     jobs,
+    model_artifacts,
     recommendation_snapshots,
     simulation_batches,
     simulation_portfolios,
     strategy_allocation_events,
 )
+from quant_data.execution_contract import require_daily_qlib_contract
 
 from .alert_store import AlertStore
 from .autonomous_research import AutonomousResearchOrchestrator
 from .continuous_research import ContinuousResearchController
-from .data_rollover import select_qlib_dataset
+from .data_rollover import qlib_trading_date_on_or_before, select_qlib_dataset
 from .health_store import OperationalHealthStore
 from .information_schedule import (
     STRUCTURED_INFORMATION_STARTS,
+    latest_verified_research_asset_snapshot,
     latest_verified_snapshot,
     normalize_information_factor_refresh_payload,
     normalize_information_schedule_payload,
     resolve_information_evaluation_dataset,
 )
-from .job_store import JobStore
+from .job_store import JobStore, research_asset_acquisition_idempotency_key
+from .model_artifact_store import ModelArtifactStore
 from .ops_calendar import (
     evaluate_recommendation_gate,
     is_monthly_decision_day,
@@ -37,8 +42,16 @@ from .ops_calendar import (
     load_calendar_days,
     select_ops_dataset,
 )
+from .rdagent_candidate_store import RDAGentCandidateStore
+from .rdagent_runtime import expected_rdagent_runtime_identity, probe_rdagent
+from .rdagent_scenarios import (
+    get_rdagent_scenario,
+    require_ready_scenario,
+    resolve_rdagent_assets,
+)
 from .recommendation_store import RecommendationStore
-from .research_automation import normalize_research_schedule_payload
+from .research_asset_store import ResearchAssetStore
+from .research_automation import normalize_research_schedule_payload, resolve_research_periods
 from .research_store import ResearchStore
 from .runtime_secret_store import RuntimeSecretStore
 from .safe_mode import SafeModeStore
@@ -96,6 +109,8 @@ class SchedulerEngine:
         self.jobs = JobStore(settings.database_url)
         self.recommendations = RecommendationStore(settings.database_url)
         self.research = ResearchStore(settings.database_url)
+        self.rdagent_candidates = RDAGentCandidateStore(settings.database_url)
+        self.research_assets = ResearchAssetStore(settings.database_url)
         self.schedules = ScheduleStore(settings.database_url)
         self.alerts = AlertStore(settings.database_url)
         self.health = OperationalHealthStore(settings)
@@ -105,10 +120,13 @@ class SchedulerEngine:
         self.autonomous_research = AutonomousResearchOrchestrator(settings)
         self.continuous_research = ContinuousResearchController(settings)
         self.simulations = SimulationStore(settings.database_url)
+        self.model_artifacts = ModelArtifactStore(settings.database_url)
         self.safe_mode = SafeModeStore(settings.database_url)
 
     def tick(self, now: datetime | None = None) -> dict[str, int]:
         current = now or datetime.now(UTC)
+        research_asset_jobs_enqueued = self._enqueue_daily_research_assets(current)
+        model_refits_enqueued = self._enqueue_due_model_refits(current)
         materialized = self.schedules.materialize_due(current)
         processed = 0
         while processed < 100:
@@ -141,7 +159,167 @@ class SchedulerEngine:
             "alerts_delivered": delivered,
             "health_recorded": health_recorded,
             "simulation_replays_enqueued": simulation_replays_enqueued,
+            "model_refits_enqueued": model_refits_enqueued,
+            "research_asset_jobs_enqueued": research_asset_jobs_enqueued,
         }
+
+    def _enqueue_daily_research_assets(self, now: datetime) -> int:
+        """Queue bounded, source-isolated research acquisitions after the local close."""
+
+        if not self.settings.research_asset_auto_enabled:
+            return 0
+        local = now.astimezone(ZoneInfo("Asia/Shanghai"))
+        if (local.hour, local.minute) < (
+            self.settings.research_asset_auto_hour,
+            self.settings.research_asset_auto_minute,
+        ):
+            return 0
+        research_day = local.date()
+
+        # arXiv has no dependency on a Tushare research-report snapshot.  Queue
+        # it first and under its own idempotency key so a missing entitlement,
+        # unavailable report snapshot, or failed Tushare job cannot suppress it.
+        enqueued = self._enqueue_research_asset_source(
+            research_day=research_day,
+            snapshot_name="arxiv-only",
+            include_tushare=False,
+            include_arxiv=True,
+        )
+        try:
+            snapshot_name = latest_verified_research_asset_snapshot(
+                self.settings.data_root,
+                as_of=research_day,
+            )
+        except (OSError, ValueError):
+            # Data publication is independently scheduled.  Do not bind an
+            # acquisition job to a missing or unverified Tushare snapshot.
+            return enqueued
+        return enqueued + self._enqueue_research_asset_source(
+            research_day=research_day,
+            snapshot_name=snapshot_name,
+            include_tushare=True,
+            include_arxiv=False,
+        )
+
+    def _enqueue_research_asset_source(
+        self,
+        *,
+        research_day: date,
+        snapshot_name: str,
+        include_tushare: bool,
+        include_arxiv: bool,
+    ) -> int:
+        """Queue exactly one source so provider failures remain independent."""
+
+        if include_tushare == include_arxiv:
+            raise ValueError("scheduled research asset jobs must enable exactly one source")
+        source = "tushare" if include_tushare else "arxiv"
+        idempotency_key = research_asset_acquisition_idempotency_key(
+            research_day=research_day.isoformat(),
+            snapshot_name=snapshot_name,
+            include_tushare=include_tushare,
+            include_arxiv=include_arxiv,
+        )
+        with self.jobs.engine.connect() as connection:
+            existing = connection.execute(
+                select(jobs.c.id).where(jobs.c.idempotency_key == idempotency_key)
+            ).first()
+        if existing is not None:
+            return 0
+        job = self.jobs.create(
+            "research_asset_acquire",
+            {
+                "mode": "automatic",
+                "snapshot_name": snapshot_name,
+                "as_of": research_day.isoformat(),
+                "include_tushare": include_tushare,
+                "include_arxiv": include_arxiv,
+                "requested_by": "research-asset-scheduler",
+            },
+            self.settings.data_root
+            / "platform"
+            / "logs"
+            / f"research-assets-{source}-{research_day.isoformat()}.log",
+            dedupe_active_kind=False,
+            idempotency_key=idempotency_key,
+            max_attempts=3,
+        )
+        return int(job["status"] in {"queued", "running"})
+
+    def _enqueue_due_model_refits(self, now: datetime) -> int:
+        """Queue one immutable live prediction refresh per approved model strategy."""
+
+        local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        with self.jobs.engine.connect() as connection:
+            due = connection.execute(
+                select(model_artifacts)
+                .where(
+                    model_artifacts.c.status == "active",
+                    model_artifacts.c.scheduled_refit_at.is_not(None),
+                    model_artifacts.c.scheduled_refit_at <= now,
+                )
+                .order_by(model_artifacts.c.scheduled_refit_at)
+                .limit(50)
+            ).all()
+        datasets = {item["name"]: item for item in list_qlib_datasets(self.settings.data_root)}
+        enqueued = 0
+        for row in due:
+            try:
+                version = self.model_artifacts.strategies.get_version(
+                    str(row.strategy_version_id)
+                )
+                model_signal = version.get("model_signal")
+                lineage_id = (
+                    str(model_signal.get("dataset_lineage_id") or "")
+                    if isinstance(model_signal, dict)
+                    else ""
+                )
+                anchor = datasets.get(str(row.dataset))
+                if version.get("status") != "approved" or anchor is None or len(lineage_id) != 64:
+                    continue
+                anchor_date = qlib_trading_date_on_or_before(anchor, local_date)
+                dataset = select_qlib_dataset(
+                    self.settings.data_root,
+                    anchor_name=str(row.dataset),
+                    roll_policy="latest_compatible",
+                    lineage_id=lineage_id,
+                    required_date=anchor_date,
+                )
+                signal_date = qlib_trading_date_on_or_before(dataset, local_date)
+                cutoff_date = row.data_cutoff_at.astimezone(
+                    ZoneInfo("Asia/Shanghai")
+                ).date()
+                if signal_date <= cutoff_date:
+                    continue
+                job = self.jobs.create(
+                    "model_refit",
+                    {
+                        "strategy_version_id": str(row.strategy_version_id),
+                        "source_model_artifact_id": str(row.id),
+                        "dataset": dataset["name"],
+                        "dataset_path": dataset["path"],
+                        "dataset_identity_sha256": dataset["provenance"][
+                            "dataset_identity_sha256"
+                        ],
+                        "dataset_lineage_id": lineage_id,
+                        "signal_date": signal_date.isoformat(),
+                        "valid_for_days": 4,
+                        "actor": "model-refit-scheduler",
+                    },
+                    self.settings.data_root
+                    / "platform"
+                    / "logs"
+                    / f"model-refit-{row.strategy_version_id}-{signal_date}.log",
+                    dedupe_active_kind=False,
+                    idempotency_key=(
+                        f"model-refit:{row.strategy_version_id}:{signal_date.isoformat()}"
+                    ),
+                )
+                if job["status"] in {"queued", "running"}:
+                    enqueued += 1
+            except (KeyError, TypeError, ValueError):
+                continue
+        return enqueued
 
     def _enqueue_due_simulation_replays(self, now: datetime) -> int:
         """Bind due forward batches only after immutable execution data exists."""
@@ -152,20 +330,14 @@ class SchedulerEngine:
                 select(recommendation_snapshots.c.id)
                 .join(
                     simulation_portfolios,
-                    (
-                        simulation_portfolios.c.source_type == "recommendation"
-                    )
+                    (simulation_portfolios.c.source_type == "recommendation")
                     & (
-                        simulation_portfolios.c.source_id
-                        == recommendation_snapshots.c.portfolio_id
+                        simulation_portfolios.c.source_id == recommendation_snapshots.c.portfolio_id
                     ),
                 )
                 .outerjoin(
                     simulation_batches,
-                    (
-                        simulation_batches.c.portfolio_id
-                        == simulation_portfolios.c.id
-                    )
+                    (simulation_batches.c.portfolio_id == simulation_portfolios.c.id)
                     & (
                         simulation_batches.c.recommendation_snapshot_id
                         == recommendation_snapshots.c.id
@@ -219,10 +391,7 @@ class SchedulerEngine:
             job = self.jobs.create(
                 "simulation_replay",
                 {"simulation_batch_id": str(batch_id)},
-                self.settings.data_root
-                / "platform"
-                / "logs"
-                / f"simulation-replay-{batch_id}.log",
+                self.settings.data_root / "platform" / "logs" / f"simulation-replay-{batch_id}.log",
                 dedupe_active_kind=False,
                 idempotency_key=f"simulation-replay:{batch_id}",
             )
@@ -257,6 +426,28 @@ class SchedulerEngine:
             )
             return
         try:
+            if run["kind"] in {"incremental_sync", "data_pipeline"} and run[
+                "trading_days_only"
+            ]:
+                local_date = scheduled_for.astimezone(
+                    ZoneInfo(run["timezone"])
+                ).date()
+                # Do not consult the existing Qlib calendar here: these jobs are
+                # responsible for extending that calendar, so a stale calendar
+                # would permanently block a weekday catch-up.  Weekends are
+                # deterministic; weekday exchange holidays are closed out by the
+                # downloaded trade_cal and downstream data-quality verification.
+                if local_date.weekday() >= 5:
+                    self.schedules.finish_run(
+                        run["id"],
+                        "skipped",
+                        message=(
+                            "scheduled data refresh skipped on local weekend "
+                            f"{local_date.isoformat()}; no snapshot boundary was created"
+                        ),
+                        now=now,
+                    )
+                    return
             if run["kind"] == "incremental_sync":
                 job = self._enqueue_incremental(run, scheduled_for)
             elif run["kind"] == "data_pipeline":
@@ -271,6 +462,8 @@ class SchedulerEngine:
                     return
             elif run["kind"] == "ashare_5m_sync":
                 job = self._enqueue_ashare_5m(run, scheduled_for)
+                if job is None:
+                    return
             elif run["kind"] == "rdagent_research":
                 job = self._enqueue_research(run, scheduled_for)
                 if job is None:
@@ -316,7 +509,7 @@ class SchedulerEngine:
         payload = run["payload"]
         local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
         lookback_days = max(1, min(30, int(payload.get("lookback_days", 7))))
-        snapshot_start = str(payload.get("snapshot_start", "2018-01-01"))
+        snapshot_start = str(payload.get("snapshot_start", "2008-01-01"))
         finalize = bool(payload.get("build_qlib", True))
         snapshot_name = f"cn-{snapshot_start.replace('-', '')}-{local_date:%Y%m%d}"
         log_path = self.settings.data_root / "platform" / "logs" / f"scheduled-sync-{run['id']}.log"
@@ -327,6 +520,7 @@ class SchedulerEngine:
                 "start": (local_date - timedelta(days=lookback_days)).isoformat(),
                 "end": "latest",
                 "build_qlib": False,
+                "incremental": True,
                 "finalize_after_download": finalize,
                 "pipeline_id": run["id"],
                 "snapshot_start": snapshot_start,
@@ -348,20 +542,55 @@ class SchedulerEngine:
         payload = run["payload"]
         local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
         lookback_days = max(1, min(90, int(payload.get("lookback_days", 7))))
-        snapshot_start = str(payload.get("snapshot_start", "2018-01-01"))
+        snapshot_start = str(payload.get("snapshot_start", "2008-01-01"))
+        profile = str(payload.get("profile", "full"))
         bundles = payload.get("bundles") or list(AUTOMATED_DATA_BUNDLES)
         unknown = sorted(set(bundles) - set(AUTOMATED_DATA_BUNDLES))
         if unknown:
             raise ValueError(f"unsupported automated data bundles: {unknown}")
         incremental_start = (local_date - timedelta(days=lookback_days)).isoformat()
-        snapshot_name = f"cn-{snapshot_start.replace('-', '')}-{local_date:%Y%m%d}"
+        snapshot_prefix = "research-assets" if profile == "research-assets" else "cn"
+        snapshot_name = f"{snapshot_prefix}-{snapshot_start.replace('-', '')}-{local_date:%Y%m%d}"
+        if profile == "research-assets":
+            if set(bundles) != {"research_corpus"}:
+                raise ValueError(
+                    "research-assets data pipeline requires exactly research_corpus"
+                )
+            pipeline_id = f"schedule-run:{run['id']}"
+            log_path = (
+                self.settings.data_root
+                / "platform"
+                / "logs"
+                / f"scheduled-research-assets-{run['id']}.log"
+            )
+            return self.jobs.create(
+                "supplemental_research_corpus",
+                {
+                    "bundle": "research_corpus",
+                    "start": incremental_start,
+                    "end": local_date.isoformat(),
+                    "snapshot_start": snapshot_start,
+                    "snapshot_end": local_date.isoformat(),
+                    "symbols": [],
+                    "pipeline_id": pipeline_id,
+                    "profile": profile,
+                    "snapshot_name": snapshot_name,
+                    "pipeline_steps": [
+                        {"kind": "data_verify", "payload": {}},
+                        {"kind": "data_snapshot", "payload": {}},
+                    ],
+                    "pipeline_next_index": 0,
+                },
+                log_path,
+                idempotency_key=pipeline_id,
+            )
         pipeline_steps = [
             {
                 "kind": f"supplemental_{bundle}",
                 "payload": {
                     "bundle": bundle,
                     "start": incremental_start,
-                    "end": "latest",
+                    "end": local_date.isoformat(),
                     "symbols": [],
                 },
             }
@@ -378,10 +607,11 @@ class SchedulerEngine:
         return self.jobs.create(
             "bootstrap",
             {
-                "profile": payload.get("profile", "full"),
+                "profile": profile,
                 "start": incremental_start,
                 "end": "latest",
                 "build_qlib": False,
+                "incremental": True,
                 "finalize_after_download": False,
                 "pipeline_id": pipeline_id,
                 "pipeline_steps": pipeline_steps,
@@ -472,9 +702,7 @@ class SchedulerEngine:
                 )
                 from .corpus_nlp import PROMPT_VERSION as corpus_prompt_version
 
-                selected_corpus = set(
-                    payload["corpus_datasets"] or DEFAULT_CORPUS_DATASETS
-                )
+                selected_corpus = set(payload["corpus_datasets"] or DEFAULT_CORPUS_DATASETS)
                 if DATASET_MAJOR_NEWS in selected_corpus:
                     factor_names.append(NEWS_FACTOR_NAME)
                 if selected_corpus.intersection(IRM_QA_DATASETS):
@@ -587,8 +815,7 @@ class SchedulerEngine:
                 run["id"],
                 "skipped",
                 message=(
-                    "information factor refresh is scheduled for weekday "
-                    f"{payload['weekday']}"
+                    f"information factor refresh is scheduled for weekday {payload['weekday']}"
                 ),
             )
             return None
@@ -608,81 +835,116 @@ class SchedulerEngine:
         evaluation_dataset = resolve_information_evaluation_dataset(
             self.settings.data_root, evaluation
         )
+        source_snapshot_name = str(
+            (evaluation_dataset.get("provenance") or {}).get("snapshot_name") or ""
+        ).strip()
+        if not source_snapshot_name:
+            raise ValueError(
+                "information factor refresh Qlib dataset has no bound source snapshot"
+            )
         end = local_date.isoformat()
-        stages: list[dict[str, Any]] = []
-        factor_names: list[str] = []
+        from .announcement_nlp import FACTOR_NAME as announcement_tone_factor
+        from .announcement_nlp import LOGIC_FACTOR_NAME as announcement_logic_factor
+        from .corpus_nlp import CORPUS_FACTOR_NAMES
+        from .event_market_response import LABEL_SCHEMA_VERSION
+        from .major_news_mentions import FACTOR_NAMES as mention_factor_names
+        from .news_flash_factors import FACTOR_NAMES as news_flash_factor_names
+        from .report_rc_factors import FACTOR_NAMES as report_rc_factor_names
+
+        # A new immutable Qlib publication changes the dataset identity used by
+        # every information-factor evaluation.  Make this weekly refresh
+        # independently complete: bind the already-produced announcement and
+        # corpus artifacts, refresh/register the selected structured sources,
+        # rebuild training-only event labels for the exact source snapshot, and
+        # evaluate all governed information faces before the fail-closed audit.
+        stages: list[dict[str, Any]] = [
+            {
+                "kind": "announcement_factor_register",
+                "payload": {"factor_name": "all", "actor": "information-scheduler"},
+            },
+            {
+                "kind": "corpus_factor_register",
+                "payload": {"factor_name": "all", "actor": "information-scheduler"},
+            },
+        ]
+        factor_names: list[str] = [
+            announcement_tone_factor,
+            announcement_logic_factor,
+            *CORPUS_FACTOR_NAMES,
+            *report_rc_factor_names,
+            *mention_factor_names,
+            *news_flash_factor_names,
+        ]
         selected = set(payload["sources"])
         if "report_rc" in selected:
-            from .report_rc_factors import FACTOR_NAMES as report_rc_factor_names
-
-            stages.extend(
-                [
-                    {
-                        "kind": "report_rc_factors",
-                        "payload": {
-                            "start": STRUCTURED_INFORMATION_STARTS[
-                                "report_rc"
-                            ].isoformat(),
-                            "end": end,
-                            "ts_codes": [],
-                        },
+            stages.append(
+                {
+                    "kind": "report_rc_factors",
+                    "payload": {
+                        "start": STRUCTURED_INFORMATION_STARTS["report_rc"].isoformat(),
+                        "end": end,
+                        "ts_codes": [],
                     },
-                    {
-                        "kind": "report_rc_factor_register",
-                        "payload": {
-                            "factor_name": "all",
-                            "actor": "information-scheduler",
-                        },
-                    },
-                ]
+                }
             )
-            factor_names.extend(report_rc_factor_names)
+        stages.append(
+            {
+                "kind": "report_rc_factor_register",
+                "payload": {
+                    "factor_name": "all",
+                    "actor": "information-scheduler",
+                },
+            }
+        )
         if "major_news_mentions" in selected:
-            from .major_news_mentions import FACTOR_NAMES as mention_factor_names
-
-            stages.extend(
-                [
-                    {
-                        "kind": "major_news_mentions",
-                        "payload": {
-                            "start": STRUCTURED_INFORMATION_STARTS[
-                                "major_news_mentions"
-                            ].isoformat(),
-                            "end": end,
-                            "ts_codes": [],
-                        },
+            stages.append(
+                {
+                    "kind": "major_news_mentions",
+                    "payload": {
+                        "start": STRUCTURED_INFORMATION_STARTS[
+                            "major_news_mentions"
+                        ].isoformat(),
+                        "end": end,
+                        "ts_codes": [],
                     },
-                    {
-                        "kind": "major_news_mentions_factor_register",
-                        "payload": {
-                            "factor_name": "all",
-                            "actor": "information-scheduler",
-                        },
-                    },
-                ]
+                }
             )
-            factor_names.extend(mention_factor_names)
+        stages.append(
+            {
+                "kind": "major_news_mentions_factor_register",
+                "payload": {
+                    "factor_name": "all",
+                    "actor": "information-scheduler",
+                },
+            }
+        )
         if "news_flash" in selected:
-            from .news_flash_factors import FACTOR_NAMES as news_flash_factor_names
-
-            stages.extend(
-                [
-                    {
-                        "kind": "news_flash_factors",
-                        "payload": {
-                            "start": STRUCTURED_INFORMATION_STARTS[
-                                "news_flash"
-                            ].isoformat(),
-                            "end": end,
-                        },
+            stages.append(
+                {
+                    "kind": "news_flash_factors",
+                    "payload": {
+                        "start": STRUCTURED_INFORMATION_STARTS["news_flash"].isoformat(),
+                        "end": end,
                     },
-                    {
-                        "kind": "news_flash_factor_register",
-                        "payload": {"actor": "information-scheduler"},
-                    },
-                ]
+                }
             )
-            factor_names.extend(news_flash_factor_names)
+        stages.append(
+            {
+                "kind": "news_flash_factor_register",
+                "payload": {"actor": "information-scheduler"},
+            }
+        )
+        stages.append(
+            {
+                "kind": "event_market_response",
+                "payload": {
+                    "snapshot_name": source_snapshot_name,
+                    "horizons": [1, 3, 5, 20],
+                    "benchmark_code": "000300.SH",
+                    "schema_version": LABEL_SCHEMA_VERSION,
+                },
+            }
+        )
         stages.append(
             {
                 "kind": "information_factor_evaluate",
@@ -704,7 +966,7 @@ class SchedulerEngine:
                 "kind": "multiface_audit",
                 "payload": {
                     "dataset": evaluation["dataset"],
-                    "snapshot_name": None,
+                    "snapshot_name": source_snapshot_name,
                     "require_ready": True,
                 },
             }
@@ -741,16 +1003,46 @@ class SchedulerEngine:
         self,
         run: dict[str, Any],
         scheduled_for: datetime,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         stored = self.runtime_secrets.get("tushare")
         if not stored and (not self.settings.api_url or not self.settings.token):
             raise ValueError("Tushare credentials are not configured")
         payload = run["payload"]
-        local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
-        history_start = date.fromisoformat(
-            str(payload.get("history_start") or "2024-01-01")
-        )
-        if history_start > local_date:
+        local_scheduled_for = scheduled_for.astimezone(ZoneInfo(run["timezone"]))
+        local_date = local_scheduled_for.date()
+        if local_scheduled_for.time().replace(tzinfo=None) < time(15, 10):
+            raise ValueError(
+                "A-share five-minute sync must run after the market has fully closed"
+            )
+
+        # The raw SSE calendar extends beyond the latest published Qlib
+        # dataset and therefore distinguishes an exchange holiday from a stale
+        # daily publication.  Never infer a closure merely because today's
+        # daily Qlib output is missing.
+        open_days = set(load_trade_calendar_open_days(self.settings.data_root))
+        calendar_horizon = max(open_days)
+        if local_date > calendar_horizon:
+            raise ValueError(
+                "persisted SSE trade calendar does not cover the five-minute sync date"
+            )
+        if local_date not in open_days:
+            self.schedules.finish_run(
+                run["id"],
+                "skipped",
+                message=(
+                    "A-share five-minute sync skipped on persisted SSE non-trading day "
+                    f"{local_date.isoformat()}"
+                ),
+            )
+            return None
+
+        # Because schedules are constrained to post-close slots, an open local
+        # date is also the most recent fully closed trading day.  Bind every
+        # downstream artifact to that exact day; a stale daily Qlib publication
+        # is an error, not a reason to silently reuse the prior session.
+        target_date = local_date
+        history_start = date.fromisoformat(str(payload.get("history_start") or "2024-01-01"))
+        if history_start > target_date:
             raise ValueError("A-share five-minute history start is after the run date")
         daily_datasets = [
             item
@@ -758,12 +1050,12 @@ class SchedulerEngine:
             if item.get("ready")
             and item.get("reproducible")
             and item.get("frequency") == "day"
+            and str(item.get("start_date") or "") <= history_start.isoformat()
+            and str(item.get("end_date") or "") >= target_date.isoformat()
         ]
         requested_daily = str(payload.get("daily_dataset") or "")
         if requested_daily:
-            daily_datasets = [
-                item for item in daily_datasets if item["name"] == requested_daily
-            ]
+            daily_datasets = [item for item in daily_datasets if item["name"] == requested_daily]
         if not daily_datasets:
             raise ValueError(
                 "a reproducible daily Qlib dataset is required before five-minute sync"
@@ -772,12 +1064,17 @@ class SchedulerEngine:
             daily_datasets,
             key=lambda item: (str(item.get("end_date") or ""), str(item["name"])),
         )
+        require_daily_qlib_contract(daily_dataset.get("provenance") or {})
+        if qlib_trading_date_on_or_before(daily_dataset, target_date) != target_date:
+            raise ValueError(
+                "daily Qlib publication does not contain the fully closed trading day"
+            )
         source_lineage_id = str(
             (daily_dataset.get("provenance") or {}).get("source_lineage_id") or ""
         )
         if len(source_lineage_id) != 64:
             raise ValueError("daily Qlib dataset has no verified source lineage")
-        snapshot_name = f"ashare-5m-incremental-{local_date:%Y%m%d}"
+        snapshot_name = f"ashare-5m-incremental-{target_date:%Y%m%d}"
         output_name = f"{snapshot_name}-5min"
         log_path = (
             self.settings.data_root / "platform" / "logs" / f"scheduled-ashare-5m-{run['id']}.log"
@@ -786,7 +1083,7 @@ class SchedulerEngine:
             "ashare_5m_download",
             {
                 "start": history_start.isoformat(),
-                "end": local_date.isoformat(),
+                "end": target_date.isoformat(),
                 "snapshot_name": snapshot_name,
                 "source_lineage_id": source_lineage_id,
                 "daily_dataset": daily_dataset["name"],
@@ -813,67 +1110,166 @@ class SchedulerEngine:
         scheduled_for: datetime,
     ) -> dict[str, Any] | None:
         payload = normalize_research_schedule_payload(
-            run["payload"], max_loops=self.settings.rdagent_max_loops
+            run["payload"],
+            max_loops=self.settings.rdagent_max_loops,
+            max_duration=self.settings.rdagent_max_duration,
         )
-        datasets = {item["name"]: item for item in list_qlib_datasets(self.settings.data_root)}
-        dataset = datasets.get(payload["dataset"])
-        if not dataset or not dataset["ready"] or not dataset.get("reproducible"):
-            raise ValueError("scheduled RD-Agent research Qlib dataset is not reproducible")
-        periods = payload["periods"]
-        if dataset.get("start_date") and periods["train_start"] < dataset["start_date"]:
-            raise ValueError("scheduled RD-Agent training window starts before the dataset")
-        if dataset.get("end_date") and periods["test_end"] > dataset["end_date"]:
-            raise ValueError("scheduled RD-Agent test window ends after the dataset")
-        if run["trading_days_only"]:
-            local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date().isoformat()
-            calendar = set(
+        scenario = get_rdagent_scenario(payload["scenario"])
+        runtime = probe_rdagent(self.settings, Path(__file__).resolve().parents[2])
+        require_ready_scenario(runtime, self.settings, scenario.id)
+        expected_runtime_identity = expected_rdagent_runtime_identity(
+            runtime, scenario.id
+        )
+        dataset: dict[str, Any] | None = None
+        periods: dict[str, str] | None = None
+        period_resolution: dict[str, Any] | None = None
+        if scenario.requires_dataset:
+            datasets = {
+                item["name"]: item for item in list_qlib_datasets(self.settings.data_root)
+            }
+            dataset = datasets.get(payload["dataset"])
+            if not dataset or not dataset["ready"] or not dataset.get("reproducible"):
+                raise ValueError("scheduled RD-Agent research Qlib dataset is not reproducible")
+            calendar = (
                 (Path(dataset["path"]) / "calendars" / "day.txt")
                 .read_text(encoding="utf-8")
                 .splitlines()
             )
-            if local_date not in calendar:
-                self.schedules.finish_run(run["id"], "skipped", message="not a Qlib trading day")
+            periods, period_resolution = resolve_research_periods(
+                calendar,
+                periods=payload.get("periods"),
+                period_policy=payload.get("period_policy"),
+            )
+            period_resolution["dataset_identity_sha256"] = dataset["provenance"][
+                "dataset_identity_sha256"
+            ]
+            if dataset.get("start_date") and periods["train_start"] < dataset["start_date"]:
+                raise ValueError("scheduled RD-Agent training window starts before the dataset")
+            if dataset.get("end_date") and periods["test_end"] > dataset["end_date"]:
+                raise ValueError("scheduled RD-Agent test window ends after the dataset")
+        auto_selected_assets = not payload["asset_ids"] and scenario.auto_select_assets
+        assets = resolve_rdagent_assets(
+            self.settings,
+            scenario,
+            payload["asset_ids"],
+            excluded_auto_asset_ids=(
+                self.research_assets.unavailable_asset_ids()
+                if auto_selected_assets
+                else frozenset()
+            ),
+            pre_final_end=(
+                date.fromisoformat(periods["valid_end"]) if periods is not None else None
+            ),
+            selection_limit=(
+                payload["loop_n"] if scenario.id == "fin_factor_report" else None
+            ),
+        )
+        resolved_asset_ids = list(assets["manifest_sha256"])
+        if auto_selected_assets:
+            for asset_id in resolved_asset_ids:
+                self.rdagent_candidates.import_manifest(
+                    self.settings.data_root
+                    / "artifacts"
+                    / "research-assets"
+                    / asset_id
+                    / "manifest.json",
+                    actor=payload["requested_by"],
+                )
+        if scenario.requires_dataset and run["trading_days_only"]:
+            local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date().isoformat()
+            if local_date not in set(calendar):
+                self.schedules.finish_run(
+                    run["id"], "skipped", message="not a Qlib trading day"
+                )
                 return None
+        elif run["trading_days_only"]:
+            raise ValueError("scheduled RD-Agent lab scenarios must disable trading_days_only")
         artifact_root = self.settings.data_root / "artifacts" / "rdagent"
+        config: dict[str, Any] = {
+            "scenario": scenario.id,
+            "asset_ids": resolved_asset_ids,
+            "asset_manifest_sha256": assets["manifest_sha256"],
+            "asset_selection_mode": "automatic" if auto_selected_assets else "explicit",
+            "feature_set": payload["feature_set"],
+            "expected_rdagent_runtime": expected_runtime_identity,
+        }
+        if dataset is not None and periods is not None and period_resolution is not None:
+            config.update(
+                {
+                    "periods": periods,
+                    "evaluation_profiles": period_resolution["evaluation_profiles"],
+                    "period_resolution": period_resolution,
+                    "dataset_path": dataset["path"],
+                }
+            )
         try:
             research_run = self.research.create_run(
-                kind="factor",
+                kind=scenario.research_kind,
                 objective=payload["objective"],
-                dataset=payload["dataset"],
+                dataset=payload["dataset"] or f"lab:{scenario.id}",
                 requested_by=payload["requested_by"],
                 budget={"loop_n": payload["loop_n"], "duration": payload["duration"]},
-                config={"periods": periods, "dataset_path": dataset["path"]},
+                config=config,
                 artifact_path=artifact_root,
             )
         except ValueError as exc:
-            if "active factor research run" not in str(exc):
+            if f"active {scenario.research_kind} research run" not in str(exc):
                 raise
             self.schedules.finish_run(
                 run["id"],
                 "skipped",
-                message="a bounded factor research run is already active",
+                message=f"a bounded {scenario.id} research run is already active",
             )
             return None
+        if auto_selected_assets:
+            try:
+                self.research_assets.reserve_automatic(
+                    research_run_id=research_run["id"],
+                    scenario=scenario.id,
+                    asset_manifest_sha256=assets["manifest_sha256"],
+                    actor=payload["requested_by"],
+                )
+            except ValueError as exc:
+                self.research.mark_run(
+                    research_run["id"],
+                    "failed",
+                    actor="scheduler",
+                    error=str(exc),
+                )
+                raise
         log_path = (
             self.settings.data_root
             / "platform"
             / "logs"
-            / f"rdagent-factor-{research_run['id']}.log"
+            / f"rdagent-{scenario.id}-{research_run['id']}.log"
         )
         try:
             job = self.jobs.create(
-                "rdagent_factor",
+                scenario.job_kind,
                 {
+                    "scenario": scenario.id,
                     "research_run_id": research_run["id"],
-                    "dataset": payload["dataset"],
-                    "dataset_path": dataset["path"],
-                    "dataset_identity_sha256": dataset["provenance"]["dataset_identity_sha256"],
+                    "dataset": payload["dataset"] or None,
+                    "dataset_path": dataset["path"] if dataset else None,
+                    "dataset_identity_sha256": (
+                        dataset["provenance"]["dataset_identity_sha256"] if dataset else None
+                    ),
+                    "dataset_lineage_id": (dataset.get("lineage_id") if dataset else None),
                     "objective": payload["objective"],
                     "loop_n": payload["loop_n"],
                     "duration": payload["duration"],
                     "periods": periods,
+                    "evaluation_profiles": (
+                        period_resolution["evaluation_profiles"] if period_resolution else []
+                    ),
+                    "period_resolution": period_resolution,
+                    "asset_ids": resolved_asset_ids,
+                    "asset_manifest_sha256": assets["manifest_sha256"],
+                    "feature_set": payload["feature_set"],
+                    "expected_rdagent_runtime": expected_runtime_identity,
                 },
                 log_path,
+                dedupe_active_kind=False,
                 idempotency_key=f"schedule-run:{run['id']}",
             )
         except Exception as exc:
@@ -925,9 +1321,7 @@ class SchedulerEngine:
                     )
                     return None
             elif local_date not in calendar_days:
-                self.schedules.finish_run(
-                    run["id"], "skipped", message="not a Qlib trading day"
-                )
+                self.schedules.finish_run(run["id"], "skipped", message="not a Qlib trading day")
                 return None
         payload = {
             "local_date": local_date.isoformat(),
@@ -969,8 +1363,7 @@ class SchedulerEngine:
                 run["id"],
                 "skipped",
                 message=(
-                    f"safe_mode active since {safe_state['triggered_at']}: "
-                    f"{safe_state['reason']}"
+                    f"safe_mode active since {safe_state['triggered_at']}: {safe_state['reason']}"
                 ),
             )
             self.alerts.create(
@@ -1017,9 +1410,7 @@ class SchedulerEngine:
         # blocks the new snapshot fail-closed; the previous snapshot stays in
         # place and is explicitly reported as retained/stale, never silently
         # reused as if it were a fresh recommendation.
-        gate = evaluate_recommendation_gate(
-            self.simulations, portfolio, signal_date, calendar_days
-        )
+        gate = evaluate_recommendation_gate(self.simulations, portfolio, signal_date, calendar_days)
         if not gate["passed"]:
             latest_snapshot = portfolio.get("latest_snapshot") or {}
             message = "; ".join(gate["reasons"])

@@ -215,7 +215,7 @@ class PortfolioPolicy:
         risk_events: list[dict[str, Any]] = []
         keep_count = min(len(signal), self.config.topk + self.config.n_drop)
         ranked = signal.sort_values(ascending=False)
-        retained = [item for item in previous.index if item in ranked.index[:keep_count]]
+        retained = [item for item in ranked.index[:keep_count] if item in previous.index]
         candidates = list(dict.fromkeys([*retained, *ranked.index]))
         if industries is not None:
             industry_by_instrument = industries.astype(str)

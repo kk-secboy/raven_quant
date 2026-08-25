@@ -76,6 +76,7 @@ from .announcement_nlp import (
     OpenAIChatClient,
     SecretStoreLike,
     _bounded_float,
+    _LlmFailureCircuit,
     _load_records,
     _sha256_file,
     _write_json_atomic,
@@ -1184,6 +1185,7 @@ def _write_factor_artifact(
     selection_policy: Mapping[str, int | None],
     selection_audit: Mapping[str, Any],
     source_scope: Mapping[str, Any],
+    publication_scope: Mapping[str, Any],
     model: str,
     now: datetime,
 ) -> dict[str, Any]:
@@ -1205,6 +1207,7 @@ def _write_factor_artifact(
             "selection_policy": dict(selection_policy),
             "selection_audit": dict(selection_audit),
             "scope": dict(source_scope),
+            "publication_scope": dict(publication_scope),
         },
         "generated_at": now.isoformat(),
     }
@@ -1293,7 +1296,10 @@ def process_corpus(
     persist state and successful fields without publishing factors, so a long
     interrupted run resumes without repeating completed LLM calls. Every
     failure is recorded in the state ledger and never produces a signal row
-    (fail closed).
+    (fail closed). Input filters bound only extraction work; factor publication
+    aggregates all persisted successes for the current prompt/model contract.
+    A provider-global failure trips a run-level circuit: submitted rows retain
+    the exact error, and untouched rows remain pending for a later rerun.
     """
 
     if checkpoint_every <= 0:
@@ -1380,6 +1386,7 @@ def process_corpus(
     unit_path: Path | None = None
     last_checkpoint_completed = 0
     pending_batch: list[tuple[CorpusItem, str, datetime, datetime, dict[str, Any]]] = []
+    failure_circuit = _LlmFailureCircuit()
     inflight: dict[
         Future[
             tuple[
@@ -1429,6 +1436,9 @@ def process_corpus(
         batch: list[tuple[CorpusItem, str, datetime, datetime, dict[str, Any]]],
     ) -> tuple[dict[str, CorpusExtraction], dict[str, LlmExtractionError], int]:
         items = [entry[0] for entry in batch]
+        global_error = failure_circuit.current()
+        if global_error is not None:
+            return {}, {item.item_id: global_error for item in items}, 0
         call_count = 1
         try:
             if batch_size == 1:
@@ -1448,14 +1458,24 @@ def process_corpus(
                     expected_item_ids=[item.item_id for item in items],
                 )
         except LlmExtractionError as batch_error:
+            if not batch_error.allows_item_isolation:
+                global_error = failure_circuit.trip(batch_error)
+                return {}, {item.item_id: global_error for item in items}, call_count
             if len(items) == 1:
                 return {}, {items[0].item_id: batch_error}, call_count
             # Batch responses occasionally omit or mutate one item id. Retrying
-            # the affected batch item-by-item salvages valid source material and
-            # keeps every individual failure explicit in the state ledger.
+            # the affected batch item-by-item salvages valid source material.
+            # A provider-global error found during isolation trips the run
+            # circuit so it is not repeated for every remaining item or batch.
             results = {}
             errors: dict[str, LlmExtractionError] = {}
-            for item in items:
+            for index, item in enumerate(items):
+                global_error = failure_circuit.current()
+                if global_error is not None:
+                    errors.update(
+                        {remaining.item_id: global_error for remaining in items[index:]}
+                    )
+                    break
                 call_count += 1
                 try:
                     messages = build_extraction_messages(item=item, text=item.content[:max_chars])
@@ -1464,6 +1484,15 @@ def process_corpus(
                     )
                 except LlmExtractionError as exc:
                     errors[item.item_id] = exc
+                    if not exc.allows_item_isolation:
+                        global_error = failure_circuit.trip(exc)
+                        errors.update(
+                            {
+                                remaining.item_id: global_error
+                                for remaining in items[index + 1 :]
+                            }
+                        )
+                        break
             return results, errors, call_count
         return results, {}, call_count
 
@@ -1523,6 +1552,8 @@ def process_corpus(
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         for item in items:
+            if failure_circuit.current() is not None:
+                break
             process_key = f"{item.item_id}:{PROMPT_VERSION}:{model}"
             existing = state.get(process_key)
             if existing is not None and str(existing["status"]) == "succeeded":
@@ -1558,10 +1589,18 @@ def process_corpus(
                 pending_batch.append((item, process_key, available_at, processed_at, state_row))
                 if len(pending_batch) >= batch_size:
                     submit_pending(executor)
-                if len(inflight) >= workers * 2:
+                # Keep at most one submitted batch per worker so a provider-
+                # global failure cannot leave a second wave queued behind the
+                # already-running calls.
+                if len(inflight) >= workers:
                     done, _pending = wait(set(inflight), return_when=FIRST_COMPLETED)
                     apply_completed(done)
+                    if failure_circuit.current() is not None:
+                        break
 
+        # Complete any partial batch already prepared when another worker
+        # tripped the circuit. The latched error is recorded with zero further
+        # provider calls; untouched corpus rows remain pending for a later run.
         submit_pending(executor)
         while inflight:
             done, _pending = wait(set(inflight), return_when=FIRST_COMPLETED)
@@ -1571,10 +1610,9 @@ def process_corpus(
 
     fields = _fields_frame(list(fields_records.values()))
     scope_process_keys = {f"{item.item_id}:{PROMPT_VERSION}:{model}" for item in items}
-    scoped_fields = fields[
+    publication_fields = fields[
         (fields["prompt_version"].astype(str) == PROMPT_VERSION)
         & (fields["model"].astype(str) == model)
-        & (fields["process_key"].astype(str).isin(scope_process_keys))
     ]
     selection_policy: dict[str, int | None] = {
         "major_news_max_items_per_publication_day": max_major_news_per_day,
@@ -1593,20 +1631,31 @@ def process_corpus(
         ).hexdigest(),
         "process_key_count": len(scope_process_keys),
     }
-    news_series = build_news_sentiment_series(scoped_fields, open_days)
-    irm_qa_series = build_irm_qa_sentiment_series(scoped_fields, open_days)
-    policy_series = build_policy_sentiment_series(scoped_fields, open_days)
+    publication_process_keys = set(publication_fields["process_key"].astype(str).tolist())
+    publication_datasets = set(publication_fields["source_dataset"].astype(str).tolist())
+    publication_scope = {
+        "mode": "all_persisted_succeeded_fields_current_prompt_model",
+        "process_keys_sha256": hashlib.sha256(
+            "\n".join(sorted(publication_process_keys)).encode("utf-8")
+        ).hexdigest(),
+        "process_key_count": len(publication_process_keys),
+        "source_datasets": sorted(publication_datasets),
+    }
+    news_series = build_news_sentiment_series(publication_fields, open_days)
+    irm_qa_series = build_irm_qa_sentiment_series(publication_fields, open_days)
+    policy_series = build_policy_sentiment_series(publication_fields, open_days)
 
     news_artifact = _write_factor_artifact(
         news_series,
         factors_dir,
         name=NEWS_FACTOR_NAME,
         source_datasets=tuple(
-            dataset for dataset in (DATASET_MAJOR_NEWS,) if dataset in selected_datasets
+            dataset for dataset in (DATASET_MAJOR_NEWS,) if dataset in publication_datasets
         ),
         selection_policy=selection_policy,
         selection_audit=selection_audit,
         source_scope=source_scope,
+        publication_scope=publication_scope,
         model=model,
         now=clock(),
     )
@@ -1615,11 +1664,12 @@ def process_corpus(
         factors_dir,
         name=IRM_QA_FACTOR_NAME,
         source_datasets=tuple(
-            dataset for dataset in IRM_QA_DATASETS if dataset in selected_datasets
+            dataset for dataset in IRM_QA_DATASETS if dataset in publication_datasets
         ),
         selection_policy=selection_policy,
         selection_audit=selection_audit,
         source_scope=source_scope,
+        publication_scope=publication_scope,
         model=model,
         now=clock(),
     )
@@ -1628,11 +1678,12 @@ def process_corpus(
         factors_dir,
         name=POLICY_FACTOR_NAME,
         source_datasets=tuple(
-            dataset for dataset in POLICY_DATASETS if dataset in selected_datasets
+            dataset for dataset in POLICY_DATASETS if dataset in publication_datasets
         ),
         selection_policy=selection_policy,
         selection_audit=selection_audit,
         source_scope=source_scope,
+        publication_scope=publication_scope,
         model=model,
         now=clock(),
     )

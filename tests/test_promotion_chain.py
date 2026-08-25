@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -37,6 +37,7 @@ from quant_data.database import (
     simulation_nav,
     simulation_orders,
     simulation_portfolios,
+    strategy_promotion_stages,
     strategy_versions,
 )
 from quant_data.execution_contract import (
@@ -134,7 +135,19 @@ def _minute_version(
         ),
         encoding="utf-8",
     )
-    metrics = formal_backtest_metrics(version, manifest)
+    if with_datasets:
+        (artifact / "datasets.json").write_text(
+            json.dumps(
+                {"daily": _daily_dataset(), "execution": _minute_dataset()},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    metrics = formal_backtest_metrics(
+        version,
+        manifest,
+        hypothesis_group_evidence=strategies.hypothesis_group_evidence(version_id),
+    )
     metrics.update(
         {
             "minute_execution_enforced": True,
@@ -164,14 +177,6 @@ def _minute_version(
     )
     strategies.validate_backtest_artifacts(backtest["id"], metrics)
     strategies.mark_backtest(backtest["id"], "succeeded", metrics=metrics)
-    if with_datasets:
-        (artifact / "datasets.json").write_text(
-            json.dumps(
-                {"daily": _daily_dataset(), "execution": _minute_dataset()},
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
     strategies.approve(
         version_id,
         actor="allocation-risk-owner",
@@ -205,11 +210,13 @@ def _register_gate(store: PromotionStore, version_id: str, **overrides) -> None:
     thresholds = ForwardGateThresholds(**values)
     engine = store.engine
     with engine.begin() as connection:
-        # Gate registration must happen before paper; seed directly for the
-        # evidence tests (the registration path itself is tested separately).
+        # Approval now registers the immutable default gate before opening the
+        # stage. Evidence tests replace the synthetic fixture values directly;
+        # the public mutation guard is tested separately below.
         connection.execute(
-            insert(_gate_table()).values(
-                strategy_version_id=version_id,
+            update(_gate_table())
+            .where(_gate_table().c.strategy_version_id == version_id)
+            .values(
                 min_forward_calendar_days=thresholds.min_forward_calendar_days,
                 min_decision_batches=thresholds.min_decision_batches,
                 min_completed_cycles=thresholds.min_completed_cycles,
@@ -242,8 +249,14 @@ def _seed_evidence(
     gross: float = 1.0,
 ) -> None:
     engine = store.engine
-    base = date(2026, 7, 1)
     with engine.begin() as connection:
+        promotion_stage = connection.execute(
+            select(strategy_promotion_stages).where(
+                strategy_promotion_stages.c.simulation_portfolio_id == portfolio_id
+            )
+        ).one()
+        opened_at = promotion_stage.opened_at
+        base = opened_at.date() + timedelta(days=1)
         for index in range(nav_days):
             connection.execute(
                 insert(simulation_nav).values(
@@ -282,6 +295,19 @@ def _seed_evidence(
                     execution_dataset_identity_sha256="d" * 64,
                     execution_dataset_lineage_id="e" * 64,
                     simulation_semantics_sha256="f" * 64,
+                    source_snapshot_id="b" * 64,
+                    target_payload_json={
+                        "governed_order_plan": {
+                            "manifest_sha256": f"{index + 1:064x}",
+                            "formal_backtest_id": "formal-forward-test",
+                            "promotion_stage_id": str(promotion_stage.id),
+                            "promotion_stage_opened_at": opened_at.isoformat(),
+                            "source_snapshot": {
+                                "id": "b" * 64,
+                                "dataset_identity_sha256": "b" * 64,
+                            },
+                        }
+                    },
                     signal_date=base,
                     trade_date=base + timedelta(days=index),
                     status="succeeded" if ok else "failed",
@@ -372,8 +398,36 @@ def test_gate_registration_only_before_paper(database_url: str, tmp_path: Path) 
             .where(strategy_versions.c.id == version_id)
             .values(status="approved", promotion_stage="paper")
         )
-    with pytest.raises(ValueError, match="pre-registered before"):
+    promotion.open_paper_stage(version_id, actor=ACTOR)
+    with pytest.raises(ValueError, match="immutable after"):
         promotion.register_forward_gate(version_id, actor=ACTOR)
+
+
+def test_automatic_paper_open_preserves_preregistered_gate(
+    database_url: str, tmp_path: Path
+) -> None:
+    version_id = create_strategy_version(database_url, tmp_path)
+    promotion = PromotionStore(database_url)
+    promotion.register_forward_gate(
+        version_id,
+        actor=ACTOR,
+        min_forward_calendar_days=45,
+    )
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id == version_id)
+            .values(status="approved", promotion_stage="paper")
+        )
+    promotion.prepare_paper_stage(version_id, actor=ACTOR)
+    with engine.connect() as connection:
+        gate = connection.execute(
+            select(_gate_table()).where(
+                _gate_table().c.strategy_version_id == version_id
+            )
+        ).one()
+    assert int(gate.min_forward_calendar_days) == 45
 
 
 def test_attach_creates_isolated_paper_account(
@@ -393,6 +447,7 @@ def test_attach_creates_isolated_paper_account(
     # 独立隔离账户：自己的账本/资本/合同，绑定该版本的冻结来源
     assert str(portfolio.source_type) == "strategy_version"
     assert str(portfolio.source_id) == version_id
+    assert str(portfolio.promotion_stage_id) == stage["id"]
     assert float(portfolio.initial_cash) == 100_000
     assert float(portfolio.initial_cash) != 5_000_000
     assert stage["initial_cash"] == 100_000
@@ -450,6 +505,90 @@ def test_gate_insufficient_evidence_fail_closed(
     assert version["promotion_stage"] == "paper"
 
 
+def test_preopen_and_ungoverned_replay_never_become_forward_evidence(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    version_id, promotion, stage = _gated_paper_version(
+        database_url, tmp_path, monkeypatch
+    )
+    portfolio_id = stage["simulation_portfolio_id"]
+    _seed_evidence(
+        promotion,
+        portfolio_id,
+        nav_days=1,
+        succeeded=1,
+        sell_batches=1,
+    )
+    opened_at = datetime.fromisoformat(stage["opened_at"])
+    opened_date = opened_at.date()
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        # Even a correctly-shaped batch/NAV is historical evidence when its
+        # decision and durable creation predate this promotion stage.
+        connection.execute(
+            update(simulation_batches)
+            .where(simulation_batches.c.portfolio_id == portfolio_id)
+            .values(
+                signal_date=opened_date,
+                trade_date=opened_date,
+                created_at=opened_at - timedelta(seconds=1),
+            )
+        )
+        connection.execute(
+            update(simulation_nav)
+            .where(simulation_nav.c.portfolio_id == portfolio_id)
+            .values(
+                trade_date=opened_date,
+                created_at=opened_at - timedelta(seconds=1),
+            )
+        )
+        # A copied final-OOS/generic payload created after opening is still
+        # not a governed forward order plan and must block, not count.
+        connection.execute(
+            insert(simulation_batches).values(
+                id=uuid.uuid4().hex,
+                portfolio_id=portfolio_id,
+                execution_contract_hash="a" * 64,
+                daily_dataset="promotion-daily",
+                daily_dataset_identity_sha256="b" * 64,
+                daily_dataset_lineage_id="c" * 64,
+                execution_dataset="promotion-minute",
+                execution_dataset_identity_sha256="d" * 64,
+                execution_dataset_lineage_id="e" * 64,
+                simulation_semantics_sha256="f" * 64,
+                source_snapshot_id="b" * 64,
+                target_payload_json={"final_oos_replay": True},
+                signal_date=opened_date + timedelta(days=1),
+                trade_date=opened_date + timedelta(days=2),
+                status="succeeded",
+                idempotency_key=f"replay-{uuid.uuid4().hex}",
+                summary_json={"conservation": {"cash_difference": 0.0}},
+                created_at=datetime.now(UTC),
+            )
+        )
+    evaluation = promotion.evaluate_forward_gate(version_id)
+    assert evaluation["passed"] is False
+    assert evaluation["evidence"]["decision_batches"] == 0
+    assert evaluation["evidence"]["forward_calendar_days"] == 0
+    assert evaluation["evidence"]["ungoverned_batches"] == 1
+    assert evaluation["checks"]["governed_batch_integrity"]["passed"] is False
+
+
+def test_paper_signal_must_start_after_stage_open(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    version_id, promotion, stage = _gated_paper_version(
+        database_url, tmp_path, monkeypatch
+    )
+    opened_date = datetime.fromisoformat(stage["opened_at"]).date()
+    with pytest.raises(ValueError, match="after the promotion stage opened"):
+        promotion.require_paper_signal(
+            version_id,
+            portfolio_id=stage["simulation_portfolio_id"],
+            signal_date=opened_date,
+        )
+
+
 def test_gate_subitems_and_promotion_with_human_approval(
     database_url: str, tmp_path: Path, monkeypatch
 ) -> None:
@@ -470,7 +609,9 @@ def test_gate_subitems_and_promotion_with_human_approval(
     )
     evaluation = promotion.evaluate_forward_gate(version_id)
     checks = evaluation["checks"]
-    assert checks["forward_calendar_days"]["observed"] == 4
+    # Only certified NAV dates backed by a governed succeeded forward batch
+    # count; the fourth day's failed batch cannot lengthen the gate horizon.
+    assert checks["forward_calendar_days"]["observed"] == 3
     assert checks["decision_batches"]["observed"] == 3
     assert checks["completed_cycles"]["observed"] == 1
     assert checks["data_completeness"]["observed"] == pytest.approx(0.75)
@@ -561,6 +702,22 @@ def test_contract_drift_freezes_stage_and_starts_from_zero(
     assert stages[1]["simulation_portfolio_id"] is None
     fresh = promotion.evaluate_forward_gate(version_id)
     assert fresh["passed"] is False
+    replacement = promotion.attach_paper_simulation(
+        version_id,
+        actor=ACTOR,
+        daily_dataset=_daily_dataset(),
+        execution_dataset=_minute_dataset(),
+    )
+    assert replacement["status"] == "active"
+    assert replacement["simulation_portfolio_id"] != portfolio_id
+    with engine.connect() as connection:
+        replacement_portfolio = connection.execute(
+            select(simulation_portfolios).where(
+                simulation_portfolios.c.id
+                == replacement["simulation_portfolio_id"]
+            )
+        ).one()
+    assert str(replacement_portfolio.promotion_stage_id) == replacement["id"]
     # 冻结阶段只读：opened/frozen 时间戳已落
     assert stages[0]["frozen_at"] is not None
 

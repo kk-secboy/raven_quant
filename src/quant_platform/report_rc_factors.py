@@ -62,6 +62,8 @@ layout:
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -87,8 +89,9 @@ from .factor_evaluator import normalize_series
 if TYPE_CHECKING:
     from .research_store import ResearchStore
 
-PRODUCER_VERSION = "report-rc-factors.v1"
+PRODUCER_VERSION = "report-rc-factors.v3"
 RATING_LADDER_VERSION = "rating-ladder.v1"
+TERMINAL_DEFERRAL_POLICY = "defer-report-until-weekly-grid-is-publishable.v2"
 
 DATASET = "report_rc"
 REPORT_RC_DIR = "report_rc"
@@ -336,6 +339,119 @@ def _fields_frame(
     return frame[list(FIELDS_COLUMNS)]
 
 
+def _publication_horizon_partition(
+    reports: pd.DataFrame,
+    open_days: Sequence[date],
+    *,
+    requested_end: date,
+) -> tuple[pd.DataFrame, list[date], dict[str, Any]]:
+    """Partition reports by whether their weekly value is publishable.
+
+    ``open_days`` may extend beyond ``requested_end`` so the official calendar
+    can determine both the next usable trading day and the final open day of
+    that ISO week.  The output artifact itself remains frozen at the last open
+    day on or before ``requested_end``.  Reports whose availability or weekly
+    factor date falls later are deferred with a deterministic, full-row audit.
+    """
+
+    horizon_days = sorted({day for day in open_days if day <= requested_end})
+    if not horizon_days:
+        raise RuntimeError(
+            f"trade_cal has no open day on or before requested end {requested_end}"
+        )
+    publication_horizon = horizon_days[-1]
+    report_dates = pd.to_datetime(reports["report_date"], errors="coerce").dt.date
+    beyond = reports.loc[report_dates > requested_end]
+    if not beyond.empty:
+        sample = beyond.sort_values(["report_date", "ts_code"], kind="stable").iloc[0]
+        raise RuntimeError(
+            "report_rc row lies after the requested publication end: "
+            f"{sample['ts_code']}@{pd.Timestamp(sample['report_date']).date()} > "
+            f"{requested_end}"
+        )
+
+    grid = weekly_grid_days(open_days)
+    audit_rows: list[dict[str, Any]] = []
+    audit_columns = sorted(str(column) for column in reports.columns)
+
+    def audit_value(value: object) -> object:
+        if pd.isna(value):
+            return None
+        if isinstance(value, pd.Timestamp | datetime | date):
+            return pd.Timestamp(value).date().isoformat()
+        if hasattr(value, "item"):
+            return value.item()  # type: ignore[no-any-return]
+        return value
+
+    availability: dict[date, date] = {}
+    factor_dates: dict[date, date] = {}
+    for report_day in sorted(set(report_dates)):
+        try:
+            available_day = next_trading_day(report_day, open_days)
+        except LookupError as exc:
+            raise RuntimeError(
+                f"cannot derive available_at for report_date {report_day}: {exc}"
+            ) from exc
+        availability[report_day] = available_day
+        factor_dates[report_day] = grid[available_day]
+
+    derived_available = report_dates.map(availability)
+    derived_factor = report_dates.map(factor_dates)
+    eligible_mask = derived_factor <= publication_horizon
+    eligible = reports.loc[eligible_mask].copy()
+    deferred = reports.loc[~eligible_mask].copy()
+    deferred["_audit_available_at"] = derived_available.loc[~eligible_mask]
+    deferred["_audit_factor_date"] = derived_factor.loc[~eligible_mask]
+    for _, row in deferred.iterrows():
+        available_day = row["_audit_available_at"]
+        factor_day = row["_audit_factor_date"]
+        source_row = {column: audit_value(row[column]) for column in audit_columns}
+        audit_rows.append(
+            {
+                "source_row": source_row,
+                "available_at": available_day.isoformat(),
+                "factor_date": factor_day.isoformat(),
+                "defer_reason": (
+                    "available_after_publication_horizon"
+                    if available_day > publication_horizon
+                    else "weekly_factor_after_publication_horizon"
+                ),
+            }
+        )
+
+    audit_rows.sort(
+        key=lambda row: json.dumps(
+            row, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    )
+    rows_raw = json.dumps(
+        audit_rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    calendar_days = sorted(set(open_days))
+    calendar_raw = json.dumps(
+        [day.isoformat() for day in calendar_days], separators=(",", ":")
+    ).encode("utf-8")
+    audit: dict[str, Any] = {
+        "policy": TERMINAL_DEFERRAL_POLICY,
+        "requested_end": requested_end.isoformat(),
+        "publication_horizon": publication_horizon.isoformat(),
+        "deferred_report_count": len(audit_rows),
+        "deferred_instrument_count": len(
+            {str(item["source_row"]["ts_code"]) for item in audit_rows}
+        ),
+        "deferred_reports_sha256": hashlib.sha256(rows_raw).hexdigest(),
+        "calendar_open_day_count": len(calendar_days),
+        "calendar_first_open_day": calendar_days[0].isoformat(),
+        "calendar_last_open_day": calendar_days[-1].isoformat(),
+        "calendar_open_days_sha256": hashlib.sha256(calendar_raw).hexdigest(),
+    }
+    audit_raw = json.dumps(
+        audit, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    audit["audit_sha256"] = hashlib.sha256(audit_raw).hexdigest()
+    return eligible.reset_index(drop=True), horizon_days, audit
+
+
 def build_rating_change_events(fields: pd.DataFrame) -> pd.DataFrame:
     """Intra-(ts_code, org_name) rating transitions with a non-zero ladder delta.
 
@@ -493,6 +609,7 @@ def _write_factor_artifact(
     *,
     name: str,
     now: datetime,
+    terminal_audit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write the normalized factor-values parquet plus its sha256 manifest."""
 
@@ -514,6 +631,8 @@ def _write_factor_artifact(
         },
         "generated_at": now.isoformat(),
     }
+    if terminal_audit is not None:
+        manifest["terminal_deferral_audit"] = terminal_audit
     manifest_path = factors_dir / f"{name}.json"
     _write_json_atomic(manifest, manifest_path)
     return {
@@ -526,6 +645,8 @@ def _write_factor_artifact(
 @dataclass(slots=True)
 class ReportRcSummary:
     reports: int
+    eligible_reports: int
+    deferred_reports: int
     rating_events: int
     eps_events: int
     coverage_rows: int
@@ -533,12 +654,16 @@ class ReportRcSummary:
     rating_events_path: Path
     eps_events_path: Path
     coverage_path: Path
+    terminal_audit_path: Path
+    terminal_audit: dict[str, Any]
     factors: dict[str, dict[str, Any]]
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "status": "succeeded",
             "reports": self.reports,
+            "eligible_reports": self.eligible_reports,
+            "deferred_reports": self.deferred_reports,
             "rating_events": self.rating_events,
             "eps_events": self.eps_events,
             "coverage_rows": self.coverage_rows,
@@ -546,6 +671,8 @@ class ReportRcSummary:
             "rating_events_path": str(self.rating_events_path),
             "eps_events_path": str(self.eps_events_path),
             "coverage_path": str(self.coverage_path),
+            "terminal_audit_path": str(self.terminal_audit_path),
+            "terminal_audit": self.terminal_audit,
             "factors": {
                 name: {
                     "manifest_path": str(entry["manifest_path"]),
@@ -580,12 +707,39 @@ def process_report_rc(
     # The trading calendar drives availability and the weekly grid; without it
     # the run must not guess (fail closed).
     open_days = load_trade_calendar_open_days(data_root)
-    fields = _fields_frame(reports, open_days, ingested_at=clock())
+    if end is not None:
+        eligible_reports, factor_open_days, terminal_audit = _publication_horizon_partition(
+            reports,
+            open_days,
+            requested_end=end,
+        )
+    else:
+        eligible_reports = reports
+        factor_open_days = open_days
+        terminal_audit = {
+            "policy": "strict-calendar-without-frozen-publication-horizon",
+            "requested_end": None,
+            "publication_horizon": factor_open_days[-1].isoformat(),
+            "deferred_report_count": 0,
+            "deferred_instrument_count": 0,
+            "deferred_reports_sha256": hashlib.sha256(b"[]").hexdigest(),
+        }
+        audit_raw = json.dumps(
+            terminal_audit, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        terminal_audit["audit_sha256"] = hashlib.sha256(audit_raw).hexdigest()
+    fields = _fields_frame(eligible_reports, open_days, ingested_at=clock())
+    if end is not None and not fields.empty:
+        horizon = pd.Timestamp(terminal_audit["publication_horizon"])
+        if (fields["available_at"] > horizon).any() or (fields["factor_date"] > horizon).any():
+            raise RuntimeError(
+                "report_rc available_at/factor_date exceeds the frozen publication horizon"
+            )
 
     rating_events = build_rating_change_events(fields)
     eps_events = build_eps_revision_events(fields)
     coverage = build_coverage_frame(
-        fields, open_days, window_days=coverage_window_days
+        fields, factor_open_days, window_days=coverage_window_days
     )
 
     base = data_root / REPORT_RC_DIR
@@ -595,27 +749,31 @@ def process_report_rc(
     rating_events_path = base / "events_rating.parquet"
     eps_events_path = base / "events_eps.parquet"
     coverage_path = base / "coverage.parquet"
+    terminal_audit_path = base / "terminal_deferral_audit.json"
     _write_parquet_atomic(fields, fields_path)
     _write_parquet_atomic(rating_events, rating_events_path)
     _write_parquet_atomic(eps_events, eps_events_path)
     _write_parquet_atomic(coverage, coverage_path)
+    _write_json_atomic(terminal_audit, terminal_audit_path)
 
     artifacts = {
         RATING_CHANGE_FACTOR_NAME: _write_factor_artifact(
             build_rating_change_series(rating_events), factors_dir,
-            name=RATING_CHANGE_FACTOR_NAME, now=clock(),
+            name=RATING_CHANGE_FACTOR_NAME, now=clock(), terminal_audit=terminal_audit,
         ),
         COVERAGE_FACTOR_NAME: _write_factor_artifact(
             build_coverage_series(coverage), factors_dir,
-            name=COVERAGE_FACTOR_NAME, now=clock(),
+            name=COVERAGE_FACTOR_NAME, now=clock(), terminal_audit=terminal_audit,
         ),
         EPS_REVISION_FACTOR_NAME: _write_factor_artifact(
             build_eps_revision_series(eps_events), factors_dir,
-            name=EPS_REVISION_FACTOR_NAME, now=clock(),
+            name=EPS_REVISION_FACTOR_NAME, now=clock(), terminal_audit=terminal_audit,
         ),
     }
     return ReportRcSummary(
         reports=int(len(reports)),
+        eligible_reports=int(len(eligible_reports)),
+        deferred_reports=int(terminal_audit["deferred_report_count"]),
         rating_events=int(len(rating_events)),
         eps_events=int(len(eps_events)),
         coverage_rows=int(len(coverage)),
@@ -623,6 +781,8 @@ def process_report_rc(
         rating_events_path=rating_events_path,
         eps_events_path=eps_events_path,
         coverage_path=coverage_path,
+        terminal_audit_path=terminal_audit_path,
+        terminal_audit=terminal_audit,
         factors=artifacts,
     )
 
@@ -683,6 +843,7 @@ def _code_artifact_source(
 
     source = manifest["source"]
     policy = manifest["availability_policy"][factor_name]
+    terminal_audit_sha256 = manifest["terminal_deferral_audit"]["audit_sha256"]
     if factor_name == COVERAGE_FACTOR_NAME:
         input_frame = "coverage.parquet"
         value_column = "report_count"
@@ -714,6 +875,7 @@ producer_version: {source["producer_version"]}
 rating_ladder_version: {source["rating_ladder_version"]}
 availability_policy: {policy}
 values sha256: {values_sha256}
+terminal audit sha256: {terminal_audit_sha256}
 """
 
 from __future__ import annotations
@@ -741,6 +903,7 @@ def _report_rc_metadata(
 ) -> ExternalFactorMetadata:
     source = manifest["source"]
     policy = manifest["availability_policy"]
+    terminal_audit = manifest["terminal_deferral_audit"]
     return ExternalFactorMetadata(
         description=(
             f"{_FACTOR_DESCRIPTIONS[factor_name]} Availability: "
@@ -759,6 +922,7 @@ def _report_rc_metadata(
             "rows": manifest["rows"],
             "rating_ladder": dict(RATING_LEVELS),
             "ingested_fields": ["available_at", "ingested_at"],
+            "terminal_deferral_audit": terminal_audit,
         },
         code_source=_code_artifact_source(
             factor_name=factor_name, manifest=manifest, values_sha256=values_sha256
@@ -767,6 +931,7 @@ def _report_rc_metadata(
             "producer_version": source["producer_version"],
             "rating_ladder_version": source["rating_ladder_version"],
             "availability_policy": policy,
+            "terminal_audit_sha256": terminal_audit["audit_sha256"],
         },
         rdagent_feedback=(
             "externally produced report_rc structured factor; "
@@ -809,4 +974,32 @@ def register_report_rc_factor(
         build_metadata=build_metadata,
         source_dataset=DATASET,
         required_source_keys=("producer_version",),
+        provenance_identity_from_manifest=_report_provenance_identity,
     )
+
+
+def _report_provenance_identity(manifest: dict[str, Any]) -> str:
+    """Bind registration idempotency to values plus the PIT audit contract."""
+
+    source = manifest.get("source")
+    audit = manifest.get("terminal_deferral_audit")
+    if not isinstance(source, dict) or not isinstance(audit, dict):
+        raise ValueError("report_rc manifest misses terminal deferral provenance")
+    claimed_audit_sha = str(audit.get("audit_sha256") or "")
+    audit_body = {key: value for key, value in audit.items() if key != "audit_sha256"}
+    actual_audit_sha = hashlib.sha256(
+        json.dumps(
+            audit_body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    if claimed_audit_sha != actual_audit_sha:
+        raise ValueError("report_rc terminal deferral audit sha256 mismatch")
+    identity = {
+        "producer_version": str(source.get("producer_version") or ""),
+        "terminal_audit_sha256": actual_audit_sha,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()

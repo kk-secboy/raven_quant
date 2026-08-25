@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
+from .catalog import RESEARCH_REPORT_FIELDS
+from .history_bounds import history_start_date
 from .models import FetchSpec
 from .partitioning import partition_metadata
 from .planner import compact_date
@@ -38,6 +40,7 @@ class CoverageRule:
     date_param: str = "trade_date"
     date_field: str = "trade_date"
     variants: tuple[tuple[tuple[str, Any], ...], ...] = ((),)
+    fields: tuple[str, ...] = ()
 
 
 def _variants(**name_values: tuple[Any, ...]) -> tuple[tuple[tuple[str, Any], ...], ...]:
@@ -120,7 +123,13 @@ _RULES: dict[str, tuple[CoverageRule, ...]] = {
     ),
     "research_corpus": (
         CoverageRule("npr", "calendar_daily_range", 500, 8, date_field="pub_time"),
-        CoverageRule("research_report", "calendar_daily", 1_000, 8),
+        CoverageRule(
+            "research_report",
+            "calendar_daily",
+            1_000,
+            8,
+            fields=RESEARCH_REPORT_FIELDS,
+        ),
         CoverageRule("monetary_policy", "once", 1_000, 2, date_field="pub_date"),
         CoverageRule("cctv_news", "calendar_daily", 1_000, 2, "date", "date"),
         CoverageRule("irm_qa_sh", "daily", 3_000, 8),
@@ -234,6 +243,7 @@ _PRIMARY_KEY_OVERRIDES: dict[str, tuple[tuple[str, ...], ...]] = {
     "us_trltr": (("date",),),
     "npr": (("pub_time", "title"), ("datetime", "title")),
     "research_report": (
+        ("url",),
         (
             "url",
             "trade_date",
@@ -323,7 +333,12 @@ def coverage_specs(
     dates = sorted(set(trading_dates)) or _weekdays(start, end)
     specs: list[FetchSpec] = []
     for rule in _RULES[bundle]:
-        rule_start = max(start, _DATASET_START_DATES.get(rule.dataset, start))
+        documented_start = history_start_date(rule.dataset) or start
+        rule_start = max(
+            start,
+            documented_start,
+            _DATASET_START_DATES.get(rule.dataset, start),
+        )
         if rule_start > end:
             continue
         rule_dates = [value for value in dates if value >= compact_date(rule_start)]
@@ -599,6 +614,7 @@ def _paged(
             api_name=rule.dataset,
             params={**base_params, "limit": rule.page_size, "offset": 0},
             scope=scope,
+            fields=rule.fields,
             allow_empty=True,
             max_attempts=max_attempts,
         )

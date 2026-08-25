@@ -3,27 +3,38 @@ from __future__ import annotations
 import json
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
+import quant_data.cli as cli_module
 from quant_data.checkpoint import CheckpointStore
 from quant_data.cli import (
+    _execution_universe_contract,
     _historical_a_share_active_ranges,
     _historical_a_share_symbols,
     _historically_active_symbols,
     _open_market_dates,
+    _source_daily_trading_dates,
 )
 from quant_data.config import Settings
 from quant_data.execution_contract import (
+    DAILY_QLIB_FIELD_CONTRACT_VERSION,
     MINUTE_EXECUTION_CONTRACT_VERSION,
     MINUTE_SOURCE_UNIT_CONTRACTS,
 )
-from quant_data.execution_data import margin_specs, minute_specs, news_specs
+from quant_data.execution_data import (
+    ASHARE_5M_MAX_SESSIONS_PER_REQUEST,
+    margin_specs,
+    minute_specs,
+    news_specs,
+)
 from quant_data.models import ProviderResult
 from quant_data.provider import ProviderError
+from quant_data.qlib_builder import build_qlib_output_manifest
 from quant_data.runner import DownloadRunner
 from quant_data.storage import ParquetStore
 from quant_platform.api import create_app
@@ -57,6 +68,50 @@ class FakeExecutionProvider:
                 }
             ]
         return ProviderResult(api_name, list(rows[0]), rows, json.dumps(rows).encode())
+
+
+def test_execution_universe_contract_separates_manual_symbol_sets() -> None:
+    first = _execution_universe_contract(
+        profile="pair_execution",
+        symbols_by_dataset={"etf_1m": ["510300.SH", "510050.SH"]},
+        universe_evidence={"mode": "manual"},
+    )
+    reordered = _execution_universe_contract(
+        profile="pair_execution",
+        symbols_by_dataset={"etf_1m": ["510050.SH", "510300.SH"]},
+        universe_evidence={"mode": "manual"},
+    )
+    changed = _execution_universe_contract(
+        profile="pair_execution",
+        symbols_by_dataset={"etf_1m": ["510500.SH"]},
+        universe_evidence={"mode": "manual"},
+    )
+
+    assert first["sha256"] == reordered["sha256"]
+    assert first["sha256"] != changed["sha256"]
+
+
+def test_full_ashare_universe_contract_allows_new_listings_in_same_lineage() -> None:
+    first = _execution_universe_contract(
+        profile="ashare_intraday",
+        symbols_by_dataset={"ashare_5m": ["000001.SZ"]},
+        universe_evidence={
+            "mode": "historically_active_a_share_master",
+            "source": "stock_basic",
+            "count": 1,
+        },
+    )
+    expanded = _execution_universe_contract(
+        profile="ashare_intraday",
+        symbols_by_dataset={"ashare_5m": ["000001.SZ", "600000.SH"]},
+        universe_evidence={
+            "mode": "historically_active_a_share_master",
+            "source": "stock_basic",
+            "count": 2,
+        },
+    )
+
+    assert first["sha256"] == expanded["sha256"]
 
 
 def test_plans_daily_market_margin_and_monthly_symbol_windows() -> None:
@@ -118,6 +173,35 @@ def test_full_a_share_five_minute_plans_monthly_resumable_windows() -> None:
     assert {spec.api_name for spec in specs} == {"stk_mins"}
     assert {spec.params["freq"] for spec in specs} == {"5min"}
     assert {spec.dataset for spec in specs} == {"ashare_5m"}
+
+
+@pytest.mark.no_database
+def test_a_share_five_minute_uses_bounded_quarter_chunks() -> None:
+    sessions = ["20240927", "20240930", "20241008", "20241009"]
+    specs = minute_specs(
+        {"ashare_5m": ["600000.SH"]},
+        start=date(2024, 9, 27),
+        end=date(2024, 10, 9),
+        max_attempts=3,
+        freq="5min",
+        trading_dates=sessions,
+    )
+
+    assert [spec.params["start_date"][:10] for spec in specs] == [
+        "2024-09-27",
+        "2024-10-08",
+    ]
+    assert specs[0].params["end_date"][:10] == "2024-09-30"
+    assert specs[1].params["end_date"][:10] == "2024-10-09"
+
+    session_dates = {stamp.date() for stamp in pd.to_datetime(sessions)}
+    for spec in specs:
+        window_start = date.fromisoformat(str(spec.params["start_date"])[:10])
+        window_end = date.fromisoformat(str(spec.params["end_date"])[:10])
+        assert (
+            sum(window_start <= session <= window_end for session in session_dates)
+            <= ASHARE_5M_MAX_SESSIONS_PER_REQUEST
+        )
 
 
 @pytest.mark.no_database
@@ -309,6 +393,38 @@ def test_execution_data_api_and_worker_commands(
     monkeypatch.setenv("PLATFORM_SECRET_KEY", key)
     monkeypatch.setenv("TUSHARE_API_URL", "https://api.tushare.pro")
     monkeypatch.setenv("TUSHARE_TOKEN", "fixture-token")
+    daily_dataset = tmp_path / "data" / "qlib" / "daily-fixture"
+    (daily_dataset / "calendars").mkdir(parents=True)
+    (daily_dataset / "instruments").mkdir()
+    (daily_dataset / "features").mkdir()
+    (daily_dataset / "metadata").mkdir()
+    (daily_dataset / "calendars" / "day.txt").write_text(
+        "2024-01-01\n2024-01-31\n", encoding="utf-8"
+    )
+    (daily_dataset / "instruments" / "cn_all.txt").write_text(
+        "SH600000\t2024-01-01\t2024-01-31\n", encoding="utf-8"
+    )
+    (daily_dataset / "metadata" / "provenance.json").write_text(
+        json.dumps(
+            {
+                "frequency": "day",
+                "dataset_identity_sha256": "1" * 64,
+                "snapshot_manifest_sha256": "2" * 64,
+                "dataset_lineage_id": "3" * 64,
+                "source_lineage_id": "4" * 64,
+                "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+                "source_volume_unit": "hand",
+                "qlib_volume_unit": "share",
+                "source_amount_unit": "thousand_cny",
+                "qlib_amount_unit": "cny",
+                "source_hand_size": 100,
+                    "index_volume_policy": "excluded_non_tradable_benchmark",
+                    "lineage_verified": True,
+                    "output_manifest": build_qlib_output_manifest(daily_dataset),
+                }
+        ),
+        encoding="utf-8",
+    )
     snapshot = tmp_path / "data" / "snapshots" / "execution-fixture"
     snapshot.mkdir(parents=True)
     (snapshot / "manifest.json").write_text(
@@ -341,9 +457,10 @@ def test_execution_data_api_and_worker_commands(
                 "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
                 "fields": ["vwap", "volume", "paused", "up_limit", "down_limit"],
                 "lineage_verified": True,
-                "source_datasets": ["etf_1m"],
-                "source_unit_contracts": {"etf_1m": MINUTE_SOURCE_UNIT_CONTRACTS["etf_1m"]},
-            }
+                    "source_datasets": ["etf_1m"],
+                    "source_unit_contracts": {"etf_1m": MINUTE_SOURCE_UNIT_CONTRACTS["etf_1m"]},
+                    "output_manifest": build_qlib_output_manifest(minute_dataset),
+                }
         ),
         encoding="utf-8",
     )
@@ -480,6 +597,10 @@ def test_execution_data_api_and_worker_commands(
     }
     assert intraday_env == margin_env
     assert "--auto-universe" in intraday_command
+    assert "--source-lineage-id" in intraday_command
+    assert "4" * 64 in intraday_command
+    assert "--daily-source-dataset" in intraday_command
+    assert "daily-fixture" in intraday_command
     assert "--max-stocks" in intraday_command
     assert "supplemental-download" in supplemental_command
     assert "cn_macro" in supplemental_command
@@ -490,6 +611,9 @@ def test_execution_data_api_and_worker_commands(
     assert "000001.SZ,600519.SH" in specialty_minutes_command
     assert "ashare-5m" in ashare_5m_command
     assert "--snapshot-name" in ashare_5m_command
+    assert "--source-lineage-id" in ashare_5m_command
+    assert "--daily-source-dataset" in ashare_5m_command
+    assert "daily-fixture" in ashare_5m_command
     assert ashare_5m_result.name == "result.json"
     assert ashare_5m_env == margin_env
     assert "--symbols" in market_command
@@ -499,6 +623,7 @@ def test_execution_data_api_and_worker_commands(
     assert "build-minute-qlib" in minute_qlib_command
     assert "execution-fixture" in minute_qlib_command
     assert "execution-fixture-1min" in minute_qlib_command
+    assert "--expected-manifest-sha256" in minute_qlib_command
     assert minute_qlib_result is None
     assert minute_qlib_env == {}
     assert any("run_minute_factor_research.py" in item for item in minute_research_command)
@@ -671,3 +796,85 @@ def test_hundredfold_minute_volume_is_normalized_before_storage() -> None:
 
     assert result.rows[0]["vol"] == 258_800.0
     assert result.metadata["normalized_volume_rows"] == 1
+
+
+@pytest.mark.no_database
+def test_share_volume_normalization_uses_absolute_rounding_and_rejects_zero_amount() -> None:
+    spec = minute_specs(
+        {"ashare_5m": ["600112.SH"]},
+        start=date(2024, 4, 26),
+        end=date(2024, 4, 26),
+        max_attempts=2,
+        freq="5min",
+    )[0]
+    rows = [
+        {
+            "ts_code": "600112.SH",
+            "trade_time": "2024-04-26 09:35:00",
+            "open": 0.45,
+            "close": 0.45,
+            "high": 0.45,
+            "low": 0.45,
+            "vol": 100.0,
+            "amount": 1.0,
+        },
+        {
+            "ts_code": "600112.SH",
+            "trade_time": "2024-04-26 09:40:00",
+            "open": 1.0,
+            "close": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "vol": 1.0,
+            "amount": 0.0,
+        },
+    ]
+    from quant_data.execution_data import validate_and_normalize
+
+    result = validate_and_normalize(
+        spec,
+        ProviderResult("stk_mins", list(rows[0]), rows, b"{}"),
+    )
+
+    assert result.rows[0]["vol"] == 1.0
+    assert result.rows[1]["vol"] == 1.0
+    assert result.metadata["normalized_volume_rows"] == 1
+
+
+def test_minute_planning_calendar_is_bound_to_daily_qlib_and_source_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calendar_path = tmp_path / "qlib" / "daily-fixture" / "calendars" / "day.txt"
+    calendar_path.parent.mkdir(parents=True)
+    calendar_path.write_text("2024-01-02\n2024-01-03\n", encoding="utf-8")
+    frame = pd.DataFrame(
+        {
+            "cal_date": ["20240102", "20240103"],
+            "is_open": [1, 1],
+        }
+    )
+    context = SimpleNamespace(
+        settings=SimpleNamespace(data_root=tmp_path),
+        storage=SimpleNamespace(read_units=lambda _rows: frame),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_source_snapshot_dataset_rows",
+        lambda *_args, **_kwargs: [{"unit_key": "trade-cal"}],
+    )
+
+    assert _source_daily_trading_dates(
+        context,  # type: ignore[arg-type]
+        source_lineage_evidence={"qlib_dataset": "daily-fixture"},
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 1, 3),
+    ) == ["20240102", "20240103"]
+
+    calendar_path.write_text("2024-01-02\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="disagrees with its source snapshot"):
+        _source_daily_trading_dates(
+            context,  # type: ignore[arg-type]
+            source_lineage_evidence={"qlib_dataset": "daily-fixture"},
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 3),
+        )

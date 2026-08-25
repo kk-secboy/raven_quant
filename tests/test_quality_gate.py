@@ -163,6 +163,6 @@ def test_build_refuses_snapshot_without_passing_quality_gate(tmp_path: Path) -> 
     _require_snapshot_quality_gate(passed)
 
 
-def test_skip_quality_gate_overrides_the_refusal(tmp_path: Path) -> None:
+def test_skip_quality_gate_is_reserved_for_unpublished_staging(tmp_path: Path) -> None:
     missing = _snapshot_with_manifest(tmp_path, {"name": "snapshot"})
     _require_snapshot_quality_gate(missing, skip=True)

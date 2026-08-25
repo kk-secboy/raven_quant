@@ -33,6 +33,8 @@ def value_for(field: str):
         "actual_date": "20240102",
         "modify_date": "20240102",
         "index_code": "801010.SI",
+        "l1_code": "801010.SI",
+        "l3_code": "850111.SI",
         "con_code": "000001.SZ",
         "in_date": "20240102",
         "out_date": "",
@@ -60,6 +62,9 @@ class FakeTushareHandler(BaseHTTPRequestHandler):
             rows = []
         elif api_name == "index_basic":
             rows = [[value_for(field) for field in fields]]
+        elif api_name == "index_weight":
+            fields = ["index_code", "con_code", "trade_date", "weight"]
+            rows = [["000300.SH", "000001.SZ", "20240102", 100.0]]
         elif api_name in {
             "daily",
             "adj_factor",
@@ -81,11 +86,19 @@ class FakeTushareHandler(BaseHTTPRequestHandler):
             rows = [["510300.SH", "CSI 300 ETF", "E", "20120201"]]
         elif api_name == "index_classify":
             fields = ["index_code", "industry_name", "level", "src"]
-            rows = [["801010.SI", "Agriculture", params["level"], "SW2021"]]
+            index_code = "850111.SI" if params["level"] == "L3" else "801010.SI"
+            rows = [[index_code, "Agriculture", params["level"], params["src"]]]
         elif api_name == "disclosure_date":
             rows = [[value_for(field) for field in fields]]
         elif api_name == "index_member_all":
-            fields = ["index_code", "con_code", "in_date", "out_date", "is_new"]
+            fields = [
+                "l1_code",
+                "l3_code",
+                "ts_code",
+                "in_date",
+                "out_date",
+                "is_new",
+            ]
             rows = [[value_for(field) for field in fields]]
         else:
             fields = fields or ["ts_code", "trade_date"]
@@ -128,11 +141,23 @@ def test_bootstrap_cli_over_real_http(tmp_path: Path, monkeypatch) -> None:
                 "--snapshot-name",
                 "integration",
                 "--download-only",
+                "--incremental",
             ],
         )
         assert result.exit_code == 0, result.output
         assert not (tmp_path / "data" / "snapshots").exists()
-        verified = CliRunner().invoke(app, ["verify"])
+        verified = CliRunner().invoke(
+            app,
+            [
+                "verify",
+                "--snapshot-start",
+                "2024-01-02",
+                "--snapshot-end",
+                "2024-01-02",
+                "--profile",
+                "full",
+            ],
+        )
         assert verified.exit_code == 0, verified.output
         snapshot = CliRunner().invoke(
             app,

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
-DAILY_QLIB_FIELD_CONTRACT_VERSION = "daily-qlib-field-v3-cny-amount"
+DAILY_QLIB_FIELD_CONTRACT_VERSION = "daily-qlib-field-v4-legacy-adj-rebase"
+QLIB_OUTPUT_MANIFEST_VERSION = "qlib-output-files-v1"
 TUSHARE_DAILY_VOLUME_UNIT = "hand"
 QLIB_DAILY_VOLUME_UNIT = "share"
 TUSHARE_DAILY_AMOUNT_UNIT = "thousand_cny"
@@ -13,8 +14,18 @@ QLIB_DAILY_AMOUNT_UNIT = "cny"
 TUSHARE_HAND_SIZE = 100
 INDEX_VOLUME_POLICY = "excluded_non_tradable_benchmark"
 
-MINUTE_EXECUTION_CONTRACT_VERSION = "minute-qlib-execution-v4-source-units"
+MINUTE_EXECUTION_CONTRACT_VERSION = "minute-qlib-execution-v5-daily-source-evidence"
 QLIB_MINUTE_RESAMPLE_CONTRACT_VERSION = "qlib-minute-resample-v1"
+
+# Historical ``stk_mins`` amount is reported in whole CNY while price is
+# quoted on the A-share CNY 0.01 tick.  A VWAP reconstructed from a very small
+# odd-lot bar can therefore fall just outside its OHLC envelope without a unit
+# error.  Keep the three admissibility rules explicit and shared by ingestion,
+# verification and Qlib publication so they cannot drift independently.
+MINUTE_CANONICALIZATION_POLICY_VERSION = "minute-qlib-canonicalization-v1"
+MINUTE_VWAP_RELATIVE_TOLERANCE = 0.05
+MINUTE_AMOUNT_ROUNDING_TOLERANCE_CNY = 1.0
+MINUTE_PRICE_TICK_TOLERANCE_CNY = 0.01
 
 STRATEGY_EXECUTION_CONTRACT_VERSION = "qlib-strategy-execution-v1"
 NATIVE_STRATEGY_FREQUENCIES = frozenset({"day", "1min", "5min"})
@@ -252,6 +263,33 @@ def require_daily_qlib_contract(provenance: dict[str, Any]) -> None:
         raise ValueError("daily Qlib dataset volume/amount units are missing or invalid")
     if provenance.get("lineage_verified") is not True:
         raise ValueError("daily Qlib dataset lineage is not verified")
+
+
+def require_native_daily_execution_controls(
+    provenance: dict[str, Any], *, start: date | str
+) -> None:
+    """Require native A-share price-limit coverage for a formal execution period."""
+
+    controls = provenance.get("execution_controls")
+    if not isinstance(controls, dict) or (
+        controls.get("formal_execution_requires_native_controls") is not True
+    ):
+        raise ValueError("daily Qlib dataset has no governed native execution-control contract")
+    raw_boundary = str(controls.get("native_complete_from") or "")[:10]
+    try:
+        boundary = date.fromisoformat(raw_boundary)
+        requested_start = (
+            start if isinstance(start, date) else date.fromisoformat(str(start)[:10])
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "daily Qlib dataset has no dated native execution-control boundary"
+        ) from exc
+    if requested_start < boundary:
+        raise ValueError(
+            "formal execution starts before native price-limit controls are complete "
+            f"({boundary.isoformat()})"
+        )
 
 
 def require_minute_execution_contract(

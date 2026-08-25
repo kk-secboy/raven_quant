@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import OrderedDict
 from datetime import date
 from pathlib import Path
@@ -17,10 +19,15 @@ from quant_data.baostock_provider import (
 )
 from quant_data.cli import app
 from quant_data.legacy_market import (
+    DEFAULT_OVERLAP_SYMBOLS,
+    PRIMARY_OVERLAP_CONTRACT_VERSION,
+    PRIMARY_OVERLAP_PROVIDER,
     a_share_baostock_codes,
     baostock_history_specs,
     baostock_reference_specs,
     compare_baostock_overlap,
+    require_audited_overlap_symbols,
+    require_current_primary_overlap_evidence,
 )
 from quant_data.runner import DownloadRunner
 from quant_platform.api import BaoStockOverlapRequest, LegacyMarketBackfillRequest
@@ -454,6 +461,74 @@ def test_legacy_api_models_enforce_disjoint_source_periods() -> None:
     assert LegacyMarketBackfillRequest().end == date(2015, 12, 31)
     with pytest.raises(ValidationError, match="before 2016"):
         LegacyMarketBackfillRequest(start=date(2008, 1, 1), end=date(2016, 1, 1))
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        LegacyMarketBackfillRequest.model_validate(
+            {"start": "2008-01-01", "end": "2015-12-31", "unexpected": True}
+        )
+
+
+def test_production_overlap_requires_complete_audited_sample() -> None:
+    with pytest.raises(ValueError, match="complete audited ten-stock sample"):
+        require_audited_overlap_symbols(["600000.SH"])
+    with pytest.raises(ValidationError, match="complete audited ten-stock sample"):
+        BaoStockOverlapRequest(symbols=["600000.SH"])
+
+    selected = require_audited_overlap_symbols([*DEFAULT_OVERLAP_SYMBOLS, "000725.SZ"])
+    assert set(DEFAULT_OVERLAP_SYMBOLS) <= set(selected)
+
+
+def test_primary_overlap_evidence_is_bound_to_current_unit_hashes() -> None:
+    rows = [
+        {
+            "dataset": dataset,
+            "unit_key": f"{dataset}-20160104",
+            "scope_json": {"trade_date": "20160104"},
+            "sha256": digest,
+            "row_count": 10,
+        }
+        for dataset, digest in (("daily", "a" * 64), ("adj_factor", "b" * 64))
+    ]
+
+    class Checkpoint:
+        def successful(self, dataset: str) -> list[dict]:
+            return [row for row in rows if row["dataset"] == dataset]
+
+    units = sorted(
+        (
+            {
+                "dataset": row["dataset"],
+                "unit_key": row["unit_key"],
+                "sha256": row["sha256"],
+                "row_count": row["row_count"],
+            }
+            for row in rows
+        ),
+        key=lambda item: (item["dataset"], item["unit_key"]),
+    )
+
+    def digest(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    evidence = {
+        "provider": PRIMARY_OVERLAP_PROVIDER,
+        "contract_version": PRIMARY_OVERLAP_CONTRACT_VERSION,
+        "units": units,
+        "units_sha256": digest(units),
+    }
+    evidence["evidence_sha256"] = digest(evidence)
+    report = {
+        "symbols": list(DEFAULT_OVERLAP_SYMBOLS),
+        "start_date": "2016-01-01",
+        "end_date": "2016-12-31",
+        "primary_source_evidence": evidence,
+    }
+
+    require_current_primary_overlap_evidence(report, Checkpoint())  # type: ignore[arg-type]
+    rows[0]["sha256"] = "c" * 64
+    with pytest.raises(ValueError, match="no longer matches"):
+        require_current_primary_overlap_evidence(report, Checkpoint())  # type: ignore[arg-type]
 
 
 def test_worker_builds_legacy_commands_without_tushare_secrets() -> None:

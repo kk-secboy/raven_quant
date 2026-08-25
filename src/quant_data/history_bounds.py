@@ -8,10 +8,30 @@ from datetime import date
 # from the provider's interface/permission documentation; unknown datasets stay
 # unbounded instead of guessing an inception date.
 TUSHARE_NEWS_HISTORY_START = date(2018, 11, 20)
+
+# The configured primary Tushare-compatible gateway is the production source
+# from 2016 onward for the three market series that BaoStock backfills for
+# 2008-2015.  Keeping this boundary in the planner prevents both providers from
+# being requested for the same natural primary key.  Immutable units produced
+# before this contract was encoded remain on disk for audit, but successor
+# release selection retires those out-of-contract primary requests.
+PRIMARY_MARKET_HISTORY_START = date(2016, 1, 1)
+PRIMARY_MARKET_HISTORY_DATASETS = frozenset(
+    {"daily", "daily_basic", "adj_factor"}
+)
+
 TUSHARE_HISTORY_STARTS: dict[str, date] = {
+    **{
+        dataset: PRIMARY_MARKET_HISTORY_START
+        for dataset in PRIMARY_MARKET_HISTORY_DATASETS
+    },
     "news": TUSHARE_NEWS_HISTORY_START,
     "major_news": TUSHARE_NEWS_HISTORY_START,
     "report_rc": date(2010, 1, 1),
+    # Official research_report documentation only offers history from this
+    # date; planning an earlier request produces neither valid coverage nor a
+    # meaningful empty-result proof.
+    "research_report": date(2017, 1, 1),
     "moneyflow": date(2010, 1, 1),
     "margin_detail": date(2010, 1, 1),
     "repurchase": date(2011, 1, 1),

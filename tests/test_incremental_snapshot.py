@@ -75,6 +75,69 @@ def test_incremental_build_matches_full_rebuild(tmp_path: Path) -> None:
         assert incremental_entry[key] == full_entry[key], key
 
 
+def test_financial_snapshot_keeps_latest_pre_window_announcement_state(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path / "data")
+    older = {
+        "ts_code": "000001.SZ",
+        "ann_date": "20230630",
+        "end_date": "20230331",
+        "total_assets": 90.0,
+    }
+    carry_in = {
+        "ts_code": "000001.SZ",
+        "ann_date": "20231220",
+        "end_date": "20230930",
+        "total_assets": 100.0,
+    }
+    units = [
+        _write_unit(store, "balancesheet", "old", [older, carry_in]),
+        # Resumed/overlapping provider units must not duplicate the carry-in row.
+        _write_unit(store, "balancesheet", "overlap", [carry_in]),
+        _write_unit(
+            store,
+            "balancesheet",
+            "window",
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "ann_date": "20240331",
+                    "end_date": "20231231",
+                    "total_assets": 110.0,
+                },
+                {
+                    "ts_code": "000002.SZ",
+                    "ann_date": "20220115",
+                    "end_date": "20211231",
+                    "total_assets": 50.0,
+                },
+                {
+                    "ts_code": "000002.SZ",
+                    "ann_date": "20250101",
+                    "end_date": "20241231",
+                    "total_assets": 60.0,
+                },
+            ],
+        ),
+    ]
+
+    snapshot = store.build_snapshot(
+        name="financial-window",
+        successful_units={"balancesheet": units},
+        manifest_extra={"start_date": "2024-01-01", "end_date": "2024-12-31"},
+    )
+
+    frame = _dataset_frame(snapshot, "balancesheet")
+    assert frame[["ts_code", "ann_date"]].astype(str).values.tolist() == [
+        ["000001.SZ", "2023-12-20"],
+        ["000001.SZ", "2024-03-31"],
+        ["000002.SZ", "2022-01-15"],
+    ]
+    entry = _manifest_entry(snapshot, "balancesheet")
+    assert entry["date_filter_mode"] == "announcement_pit_carry_in"
+    assert entry["date_min"] == "2022-01-15"
+    assert entry["date_max"] == "2024-03-31"
+
+
 def test_clean_partitions_are_hard_linked_and_dirty_ones_rebuilt(tmp_path: Path) -> None:
     store = ParquetStore(tmp_path / "data")
     units_a = [

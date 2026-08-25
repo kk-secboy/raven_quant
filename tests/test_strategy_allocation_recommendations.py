@@ -96,7 +96,11 @@ def _approve_version(
     pd.DataFrame(
         {"datetime": returns.index, "return": returns.values, "cost": 0.0}
     ).to_parquet(artifact / "daily_returns.parquet", index=False)
-    metrics = formal_backtest_metrics(version, manifest)
+    metrics = formal_backtest_metrics(
+        version,
+        manifest,
+        hypothesis_group_evidence=strategies.hypothesis_group_evidence(version_id),
+    )
     strategies.validate_backtest_artifacts(backtest["id"], metrics)
     strategies.mark_backtest(backtest["id"], "succeeded", metrics=metrics)
     strategies.approve(
@@ -164,13 +168,19 @@ def test_allocation_uses_recommendation_ledgers_and_propagates_risk(
     dates = pd.bdate_range("2024-01-02", periods=160)
     first = pd.Series(np.sin(np.arange(len(dates)) / 5) * 0.01, index=dates)
     second = pd.Series(np.cos(np.arange(len(dates)) / 7) * 0.012, index=dates)
-    # Each independently researched candidate reserves its own final OOS
-    # window: the vintage seal (design draft 4.1/12.1) makes one calendar
-    # window a one-time resource per scope, so two unrelated candidates can no
-    # longer both consume the same window as this test previously did.
-    second_window = {**PERIODS, "test_start": date(2024, 2, 8)}
+    # Each independently researched candidate consumes a genuinely disjoint
+    # final OOS window in the same fail-closed standalone scope.  A different
+    # dataset identity/lineage would not be a legitimate way to bypass overlap.
+    first_window = {**PERIODS, "test_end": date(2023, 1, 10)}
+    second_window = {**PERIODS, "test_start": date(2023, 1, 11)}
     version_ids = [
-        _approve_version(database_url, tmp_path, suffix="one", returns=first),
+        _approve_version(
+            database_url,
+            tmp_path,
+            suffix="one",
+            returns=first,
+            periods=first_window,
+        ),
         _approve_version(
             database_url, tmp_path, suffix="two", returns=second, periods=second_window
         ),
@@ -288,7 +298,7 @@ def test_allocation_uses_recommendation_ledgers_and_propagates_risk(
                     execution_dataset_identity_sha256="c" * 64,
                     execution_dataset_lineage_id="d" * 64,
                     execution_field_contract_version=(
-                        "minute-qlib-execution-v4-source-units"
+                        "minute-qlib-execution-v5-daily-source-evidence"
                     ),
                     execution_engine_version=SIMULATION_ENGINE_VERSION,
                     cost_schedule_version=COST_SCHEDULE_VERSION,

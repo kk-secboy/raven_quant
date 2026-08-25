@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import re
 import shutil
+from collections.abc import Collection
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+from dotenv import dotenv_values
 
 from .backup_restore import ComposeContext
 
-EXPECTED_SERVICES = {
+LEGACY_EXPECTED_SERVICES = {
     "postgres",
     "api",
     "scheduler",
@@ -19,7 +24,187 @@ EXPECTED_SERVICES = {
     "web",
     "gateway",
 }
-HEALTHCHECK_SERVICES = EXPECTED_SERVICES - {"web", "gateway"}
+EXPECTED_SERVICES = LEGACY_EXPECTED_SERVICES | {"rdagent-data-science-worker"}
+OPTIONAL_PROFILE_SERVICES = {
+    "gpu": {"rdagent-llm-finetune-worker"},
+}
+NON_HEALTHCHECK_SERVICES = {"web", "gateway"}
+HEALTHCHECK_SERVICES = EXPECTED_SERVICES - NON_HEALTHCHECK_SERVICES
+
+_RUNTIME_IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_IMMUTABLE_IMAGE_REFERENCE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
+_CORE_IMAGE_SETTINGS = {
+    "RDAGENT_RUNTIME_IMAGE_DIGEST": _RUNTIME_IMAGE_DIGEST,
+    "RDAGENT_QLIB_SANDBOX_IMAGE": _IMMUTABLE_IMAGE_REFERENCE,
+    "RDAGENT_DATA_SCIENCE_IMAGE": _IMMUTABLE_IMAGE_REFERENCE,
+    "MODEL_SANDBOX_IMAGE": _IMMUTABLE_IMAGE_REFERENCE,
+}
+_GPU_IMAGE_SETTINGS = {
+    "RDAGENT_FINETUNE_IMAGE": _IMMUTABLE_IMAGE_REFERENCE,
+    "RDAGENT_FINETUNE_BENCHMARK_IMAGE": _IMMUTABLE_IMAGE_REFERENCE,
+    "RDAGENT_FINETUNE_GPU_PROBE_IMAGE": _IMMUTABLE_IMAGE_REFERENCE,
+}
+
+
+def expected_services(context: ComposeContext) -> set[str]:
+    services = set(EXPECTED_SERVICES)
+    for profile in getattr(context, "profiles", ()):
+        services.update(OPTIONAL_PROFILE_SERVICES.get(profile, ()))
+    return services
+
+
+def _deployment_environment(context: ComposeContext) -> dict[str, str]:
+    configured = dotenv_values(context.env_file)
+    names = {
+        *_CORE_IMAGE_SETTINGS,
+        *_GPU_IMAGE_SETTINGS,
+    }
+    return {
+        name: str(
+            (os.environ[name] if name in os.environ else configured.get(name)) or ""
+        ).strip()
+        for name in names
+    }
+
+
+def _docker_storage_configuration(context: ComposeContext) -> tuple[bool, str]:
+    try:
+        configured = dotenv_values(context.env_file)
+        values = {}
+        for name, default in (
+            ("QUANTLAB_DATA_HOST_PATH", "/data/quantlab"),
+            ("RDAGENT_DOCKER_HOST_PATH", "/data/quantlab-rdagent-docker"),
+            ("RDAGENT_REGISTRY_HOST_PATH", "/data/quantlab-rdagent-registry"),
+        ):
+            raw = os.environ[name] if name in os.environ else configured.get(name)
+            values[name] = PurePosixPath(str(raw or default).strip())
+    except Exception as exc:
+        return False, f"RD-Agent storage configuration could not be read: {type(exc).__name__}"
+    if not all(path.is_absolute() for path in values.values()):
+        return False, "RD-Agent Docker and registry storage paths must be absolute"
+    market_data = values["QUANTLAB_DATA_HOST_PATH"]
+    isolated = {
+        values["RDAGENT_DOCKER_HOST_PATH"],
+        values["RDAGENT_REGISTRY_HOST_PATH"],
+    }
+    if len(isolated) != 2:
+        return False, "RD-Agent Docker and registry storage paths must be distinct"
+    for path in isolated:
+        try:
+            path.relative_to(market_data)
+        except ValueError:
+            if path.parent == market_data.parent:
+                continue
+            return False, "RD-Agent image storage must be a sibling of market data"
+        return False, "RD-Agent image storage must be outside QUANTLAB_DATA_HOST_PATH"
+    return True, "DinD layers and release registry are isolated from governed market data"
+
+
+def _required_image_settings(context: ComposeContext) -> dict[str, re.Pattern[str]]:
+    required = dict(_CORE_IMAGE_SETTINGS)
+    if "gpu" in set(getattr(context, "profiles", ())):
+        required.update(_GPU_IMAGE_SETTINGS)
+    return required
+
+
+def _immutable_image_configuration(context: ComposeContext) -> tuple[bool, str]:
+    try:
+        configured = _deployment_environment(context)
+    except Exception as exc:
+        return False, f"deployment environment could not be read: {type(exc).__name__}"
+    required = _required_image_settings(context)
+    invalid: list[str] = []
+    for name, pattern in required.items():
+        value = configured[name].lower()
+        if not pattern.fullmatch(value):
+            invalid.append(name)
+    if invalid:
+        return False, "missing or mutable image identity: " + ", ".join(sorted(invalid))
+    if (
+        configured["RDAGENT_QLIB_SANDBOX_IMAGE"].lower()
+        == configured["RDAGENT_DATA_SCIENCE_IMAGE"].lower()
+    ):
+        return False, "Qlib and Data Science must use separately sealed sandbox images"
+    return True, "all required runtime and sandbox images use immutable digests"
+
+
+def _preloaded_image_availability(context: ComposeContext) -> tuple[bool, str]:
+    try:
+        configured = _deployment_environment(context)
+        expected_runtime = configured["RDAGENT_RUNTIME_IMAGE_DIGEST"].lower()
+        runtime_services = ["rdagent-worker", "rdagent-data-science-worker"]
+        if "gpu" in set(getattr(context, "profiles", ())):
+            runtime_services.append("rdagent-llm-finetune-worker")
+        mismatched_runtime: list[str] = []
+        for service in runtime_services:
+            container_id = context.container_id(service)
+            if not container_id:
+                mismatched_runtime.append(service)
+                continue
+            actual = context.docker(
+                "inspect",
+                "--format",
+                "{{.Image}}",
+                container_id,
+                capture=True,
+            ).splitlines()[0].strip().lower()
+            if actual != expected_runtime:
+                mismatched_runtime.append(service)
+
+        nested_images = tuple(
+            dict.fromkeys(
+                configured[name]
+                for name in (
+                    "RDAGENT_QLIB_SANDBOX_IMAGE",
+                    "RDAGENT_DATA_SCIENCE_IMAGE",
+                    "MODEL_SANDBOX_IMAGE",
+                )
+            )
+        )
+        nested_raw = context.run(
+            "exec",
+            "-T",
+            "rdagent-docker",
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            *nested_images,
+            capture=True,
+        )
+        nested_ids = [item.strip().lower() for item in nested_raw.splitlines() if item.strip()]
+        nested_ready = len(nested_ids) == len(nested_images) and all(
+            _RUNTIME_IMAGE_DIGEST.fullmatch(item) for item in nested_ids
+        )
+
+        gpu_ready = True
+        if "gpu" in set(getattr(context, "profiles", ())):
+            gpu_images = tuple(configured[name] for name in _GPU_IMAGE_SETTINGS)
+            gpu_raw = context.docker(
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                *gpu_images,
+                capture=True,
+            )
+            gpu_ids = [item.strip().lower() for item in gpu_raw.splitlines() if item.strip()]
+            gpu_ready = len(gpu_ids) == len(gpu_images) and all(
+                _RUNTIME_IMAGE_DIGEST.fullmatch(item) for item in gpu_ids
+            )
+    except Exception as exc:
+        return False, f"immutable image availability probe failed: {type(exc).__name__}"
+    problems: list[str] = []
+    if mismatched_runtime:
+        problems.append("runtime identity mismatch: " + ", ".join(mismatched_runtime))
+    if not nested_ready:
+        problems.append("RD-Agent DinD sandbox images are not preloaded")
+    if not gpu_ready:
+        problems.append("GPU sandbox images are not preloaded on the host daemon")
+    if problems:
+        return False, "; ".join(problems)
+    return True, "runtime identities match and every governed sandbox image is preloaded"
 
 
 def _check(
@@ -154,6 +339,9 @@ def assess_release(
     project_root: Path,
     *,
     minimum_free_gb: float = 20.0,
+    required_services: Collection[str] | None = None,
+    require_immutable_images: bool = True,
+    verify_image_availability: bool = True,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     try:
@@ -170,6 +358,34 @@ def assess_release(
             compose_valid,
             compose_evidence,
             "Fix environment variables, images, or Compose configuration.",
+        )
+    )
+
+    storage_valid, storage_evidence = _docker_storage_configuration(context)
+    checks.append(
+        _check(
+            "rdagent_image_storage",
+            "RD-Agent image storage uses dedicated data-disk paths",
+            storage_valid,
+            storage_evidence,
+            "Set RDAGENT_DOCKER_HOST_PATH and RDAGENT_REGISTRY_HOST_PATH to "
+            "distinct absolute siblings of QUANTLAB_DATA_HOST_PATH.",
+        )
+    )
+
+    if require_immutable_images:
+        images_valid, images_evidence = _immutable_image_configuration(context)
+    else:
+        images_valid = True
+        images_evidence = "immutable image configuration will be sealed during this upgrade"
+    checks.append(
+        _check(
+            "immutable_images",
+            "Immutable RD-Agent execution images",
+            images_valid,
+            images_evidence,
+            "Configure the required sha256-pinned runtime and sandbox images; "
+            "enable the gpu profile only after its three images are pinned.",
         )
     )
 
@@ -205,6 +421,24 @@ def assess_release(
                 else postgres_error or "PostgreSQL container is not running"
             ),
             "Restore the current deployment's PostgreSQL service first.",
+        )
+    )
+
+    if verify_image_availability:
+        availability_valid, availability_evidence = _preloaded_image_availability(
+            context
+        )
+    else:
+        availability_valid = True
+        availability_evidence = "image availability verification is deferred for this phase"
+    checks.append(
+        _check(
+            "immutable_images_preloaded",
+            "Immutable execution images are present in their target daemons",
+            availability_valid,
+            availability_evidence,
+            "Run the supported release upgrade to publish and preload the sealed "
+            "sandbox images before starting research.",
         )
     )
 
@@ -315,22 +549,28 @@ def assess_release(
         service_error = str(exc)[:500]
     else:
         service_error = fallback_error if not compose_valid else ""
-    missing = EXPECTED_SERVICES - set(services)
+    required = (
+        set(required_services)
+        if required_services is not None
+        else expected_services(context)
+    )
+    healthchecked = required - NON_HEALTHCHECK_SERVICES
+    missing = required - set(services)
     stopped = sorted(
         name
-        for name in EXPECTED_SERVICES & set(services)
+        for name in required & set(services)
         if services[name].get("State") != "running"
     )
     unhealthy = sorted(
         name
-        for name in HEALTHCHECK_SERVICES & set(services)
+        for name in healthchecked & set(services)
         if services[name].get("Health") != "healthy"
     )
     services_ready = not missing and not stopped and not unhealthy
     checks.append(
         _check(
             "services_healthy",
-            "Current eight-service baseline is healthy",
+            f"Current {len(required)}-service baseline is healthy",
             services_ready,
             (
                 f"missing {sorted(missing)}; stopped {stopped}; unhealthy {unhealthy}"

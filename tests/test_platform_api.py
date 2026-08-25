@@ -65,7 +65,7 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
         pair_strategies = client.get("/api/pair-strategies")
         bootstrap = client.post(
             "/api/jobs/bootstrap",
-            json={"profile": "core", "start": "2024-01-01", "end": "latest"},
+            json={"profile": "core", "start": "2016-01-01", "end": "latest"},
         )
     assert health.json() == {
         "status": "ok",
@@ -371,10 +371,10 @@ def test_api_creates_bounded_rdagent_research_run(
     (dataset / "instruments").mkdir()
     (dataset / "features").mkdir()
     (dataset / "calendars" / "day.txt").write_text(
-        _trading_calendar(date(2018, 1, 1), date(2026, 7, 10)), encoding="utf-8"
+        _trading_calendar(date(2010, 1, 1), date(2026, 7, 10)), encoding="utf-8"
     )
     (dataset / "instruments" / "cn_all.txt").write_text(
-        "SH600000\t2018-01-01\t2026-07-10\n", encoding="utf-8"
+        "SH600000\t2010-01-01\t2026-07-10\n", encoding="utf-8"
     )
     (dataset / "metadata").mkdir()
     (dataset / "metadata" / "provenance.json").write_text(
@@ -413,14 +413,6 @@ def test_api_creates_bounded_rdagent_research_run(
                 "dataset": "research-snapshot",
                 "loop_n": 1,
                 "duration": "30m",
-                "periods": {
-                    "train_start": "2018-01-01",
-                    "train_end": "2021-12-31",
-                    "valid_start": "2022-01-01",
-                    "valid_end": "2023-12-31",
-                    "test_start": "2024-01-01",
-                    "test_end": "2026-07-10",
-                },
             },
         )
         scheduled = client.post(
@@ -437,14 +429,6 @@ def test_api_creates_bounded_rdagent_research_run(
                     "loop_n": 1,
                     "duration": "30m",
                     "requested_by": "untrusted-payload-actor",
-                    "periods": {
-                        "train_start": "2018-01-01",
-                        "train_end": "2021-12-31",
-                        "valid_start": "2022-01-01",
-                        "valid_end": "2023-12-31",
-                        "test_start": "2024-01-01",
-                        "test_end": "2026-07-10",
-                    },
                 },
                 "misfire_grace_seconds": 1800,
                 "actor": "operator",
@@ -459,7 +443,6 @@ def test_api_creates_bounded_rdagent_research_run(
                 "recipe_id": "index_enhancement",
                 "loop_n": 1,
                 "duration": "30m",
-                "min_new_trading_days": 20,
             },
         )
         programs = client.get("/api/research-programs").json()
@@ -472,6 +455,7 @@ def test_api_creates_bounded_rdagent_research_run(
     assert scheduled.json()["payload"]["requested_by"] == "local-admin"
     assert program.status_code == 201
     assert program.json()["dataset_lineage_id"] == "lineage-research"
+    assert program.json()["min_new_trading_days"] == 252
     assert programs[0]["id"] == program.json()["id"]
 
 

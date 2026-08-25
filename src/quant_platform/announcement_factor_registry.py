@@ -253,10 +253,13 @@ def _archive_factor_version(
     artifact_path: Path,
     values_sha256: str,
     code_source: str,
+    provenance_identity_sha256: str | None = None,
 ) -> tuple[Path, Path, Path]:
     """Archive exact candidate inputs below ``versions/name/values_sha256``."""
 
     version_dir = factors_dir / "versions" / factor_name / values_sha256
+    if provenance_identity_sha256 is not None:
+        version_dir = version_dir / provenance_identity_sha256
     archived_values = version_dir / artifact_path.name
     archived_manifest = version_dir / f"{factor_name}.json"
     archived_code = version_dir / f"{factor_name}_factor.py"
@@ -312,6 +315,7 @@ def register_external_factor(
     build_metadata: Callable[[dict[str, Any], str], ExternalFactorMetadata],
     source_dataset: str = SOURCE_DATASET,
     required_source_keys: tuple[str, ...] = ("prompt_version", "model"),
+    provenance_identity_from_manifest: Callable[[dict[str, Any]], str] | None = None,
 ) -> dict[str, Any]:
     """Verify and register an external factor artifact; idempotent.
 
@@ -334,7 +338,22 @@ def register_external_factor(
         required_source_keys=required_source_keys,
     )
 
-    existing = store.find_candidate(name=factor_name, values_sha256=values_sha256)
+    provenance_identity_sha256 = (
+        provenance_identity_from_manifest(manifest)
+        if provenance_identity_from_manifest is not None
+        else None
+    )
+    if provenance_identity_sha256 is not None and not _is_sha256(
+        provenance_identity_sha256
+    ):
+        raise ValueError("factor provenance identity must be a sha256 digest")
+    find_kwargs: dict[str, Any] = {
+        "name": factor_name,
+        "values_sha256": values_sha256,
+    }
+    if provenance_identity_sha256 is not None:
+        find_kwargs["provenance_identity_sha256"] = provenance_identity_sha256
+    existing = store.find_candidate(**find_kwargs)
     if existing is not None:
         return {
             "created": False,
@@ -344,6 +363,7 @@ def register_external_factor(
             "status": existing["status"],
             "values_sha256": values_sha256,
             "code_sha256": existing["code_sha256"],
+            "provenance_identity_sha256": provenance_identity_sha256,
         }
 
     metadata = build_metadata(manifest, values_sha256)
@@ -356,8 +376,11 @@ def register_external_factor(
         artifact_path=artifact_path,
         values_sha256=values_sha256,
         code_source=metadata.code_source,
+        provenance_identity_sha256=provenance_identity_sha256,
     )
     variables = {**metadata.variables, "manifest": str(manifest_path)}
+    if provenance_identity_sha256 is not None:
+        variables["provenance_identity_sha256"] = provenance_identity_sha256
     run = store.create_run(
         kind=run_kind,
         objective=(
@@ -372,6 +395,7 @@ def register_external_factor(
             "factor_name": factor_name,
             "values_sha256": values_sha256,
             "manifest": str(manifest_path),
+            "provenance_identity_sha256": provenance_identity_sha256,
         },
         artifact_path=manifest_path.parent,
     )
@@ -416,6 +440,7 @@ def register_external_factor(
         "status": candidate["status"],
         "values_sha256": values_sha256,
         "code_sha256": candidate["code_sha256"],
+        "provenance_identity_sha256": provenance_identity_sha256,
     }
 
 

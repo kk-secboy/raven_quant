@@ -169,6 +169,60 @@ def test_extended_history_respects_documented_st_source_start() -> None:
     ] == ["20080102", "20160104"]
 
 
+def test_stk_surv_uses_400_row_pages_until_a_short_page_proves_completion() -> None:
+    specs = supplemental_specs(
+        "cn_extended_daily",
+        start=date(2024, 1, 2),
+        end=date(2024, 1, 2),
+        trading_dates=["20240102"],
+        max_attempts=3,
+    )
+    first = next(spec for spec in specs if spec.dataset == "stk_surv")
+
+    assert first.params == {
+        "start_date": "20240102",
+        "end_date": "20240102",
+        "limit": 400,
+        "offset": 0,
+    }
+    assert first.scope["page_group"] == "stk_surv:20240102"
+    assert first.scope["page_size"] == 400
+    validate_supplemental(
+        first,
+        ProviderResult("stk_surv", [], [{} for _ in range(400)], b"{}"),
+    )
+
+    second = next_pagination_specs(
+        [first],
+        [{"unit_key": first.unit_key, "row_count": 400}],
+    )
+    assert len(second) == 1
+    assert second[0].params["offset"] == 400
+    require_pagination_terminated(
+        [first, second[0]],
+        [
+            {"unit_key": first.unit_key, "row_count": 400},
+            {"unit_key": second[0].unit_key, "row_count": 82},
+        ],
+    )
+
+
+def test_stk_surv_plans_weekend_survey_dates() -> None:
+    specs = supplemental_specs(
+        "cn_extended_daily",
+        start=date(2024, 1, 6),
+        end=date(2024, 1, 7),
+        trading_dates=[],
+        max_attempts=3,
+    )
+
+    assert [
+        spec.params["start_date"]
+        for spec in specs
+        if spec.dataset == "stk_surv"
+    ] == ["20240106", "20240107"]
+
+
 def test_a_share_financial_specs_use_cross_sectional_vip_batches() -> None:
     specs = supplemental_specs(
         "cn_extended_daily",
@@ -189,6 +243,40 @@ def test_a_share_financial_specs_use_cross_sectional_vip_batches() -> None:
     assert {"fina_audit", "fina_mainbz"} <= bundle_datasets("cn_extended_daily")
 
 
+def test_fina_audit_planners_share_the_canonical_period_page_contract() -> None:
+    start = date(2024, 1, 1)
+    end = date(2024, 1, 2)
+    extended = {
+        (spec.params["period"], spec.params["offset"]): spec
+        for spec in supplemental_specs(
+            "cn_extended_daily",
+            start=start,
+            end=end,
+            trading_dates=[],
+            max_attempts=3,
+        )
+        if spec.dataset == "fina_audit"
+    }
+    bulk = {
+        (spec.params["period"], spec.params["offset"]): spec
+        for spec in a_share_bulk_history_specs(
+            start=start,
+            end=end,
+            max_attempts=3,
+        )
+        if spec.dataset == "fina_audit"
+    }
+
+    assert extended.keys() == bulk.keys()
+    for period_page, extended_spec in extended.items():
+        period, _ = period_page
+        bulk_spec = bulk[period_page]
+        assert extended_spec.scope["expected_date_field"] == "end_date"
+        assert extended_spec.scope["expected_date"] == period
+        assert extended_spec.unit_key == bulk_spec.unit_key
+        assert extended_spec.scope == bulk_spec.scope
+
+
 def test_full_a_share_history_uses_market_cross_sections_instead_of_symbols() -> None:
     specs = a_share_bulk_history_specs(
         start=date(2024, 1, 1),
@@ -201,7 +289,15 @@ def test_full_a_share_history_uses_market_cross_sections_instead_of_symbols() ->
         spec.api_name
         for spec in specs
         if spec.dataset
-        in {"income", "balancesheet", "cashflow", "fina_indicator", "forecast", "express"}
+        in {
+            "income",
+            "balancesheet",
+            "cashflow",
+            "fina_indicator",
+            "forecast",
+            "express",
+            "fina_audit",
+        }
     }
     assert financial_apis == {
         "income_vip",
@@ -210,6 +306,7 @@ def test_full_a_share_history_uses_market_cross_sections_instead_of_symbols() ->
         "fina_indicator_vip",
         "forecast_vip",
         "express_vip",
+        "fina_audit_vip",
     }
     event_datasets = {
         "namechange",

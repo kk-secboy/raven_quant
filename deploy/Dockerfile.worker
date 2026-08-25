@@ -4,6 +4,7 @@ FROM python:3.11-slim
 
 ARG QLIB_COMMIT=d5379c520f66a39953bad76234a7019a72796fd0
 ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PYTORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu
 ARG DEBIAN_MIRROR=deb.debian.org/debian
 ARG APT_RETRIES=5
 ARG APT_TIMEOUT_SECONDS=30
@@ -32,7 +33,31 @@ RUN sed -i "s|deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/
         "https://codeload.github.com/microsoft/qlib/tar.gz/${QLIB_COMMIT}" \
       | tar -xz --strip-components=1 -C /opt/qlib \
     && SETUPTOOLS_SCM_PRETEND_VERSION="0.0.dev0+g${QLIB_COMMIT}" \
-       python -m pip install /opt/qlib lightgbm psycopg[binary]
+       python -m pip install /opt/qlib lightgbm psycopg[binary] \
+    && python -m pip install \
+        --index-url "${PYTORCH_CPU_INDEX_URL}" \
+        --extra-index-url "${PIP_INDEX_URL}" \
+        "torch==2.2.2+cpu" \
+    && python -m pip install \
+        --index-url "${PIP_INDEX_URL}" \
+        "catboost==1.2.8" \
+        "xgboost-cpu==2.1.4" \
+        "scikit-learn==1.7.1" \
+        "matplotlib==3.10.5" \
+        "seaborn==0.13.2"
+
+# Torch 2.2 predates NumPy 2's ABI. Keep this as a separate layer so a release
+# retry can reuse the already-built Qlib/Torch layer. Rebuild Qlib's two Cython
+# extensions locally against NumPy 1.26; this performs no second source fetch.
+RUN python -m pip install --index-url "${PIP_INDEX_URL}" \
+        "numpy==1.26.4" \
+        "Cython==3.0.11" \
+        "cvxpy==1.7.5" \
+    && python -m pip uninstall --yes sparsediffpy \
+    && SETUPTOOLS_SCM_PRETEND_VERSION="0.0.dev0+g${QLIB_COMMIT}" \
+       python -m pip install --no-build-isolation --no-deps --force-reinstall /opt/qlib \
+    && python -m pip check \
+    && python -c "import cvxpy, numpy as np, torch; from qlib.contrib.strategy import TopkDropoutStrategy; from qlib.data._libs.rolling import rolling_mean; assert cvxpy.__version__ == '1.7.5'; assert TopkDropoutStrategy; assert torch.from_numpy(np.arange(3)).numpy().tolist() == [0, 1, 2]; assert rolling_mean(np.arange(3, dtype=float), 2).shape == (3,)"
 
 WORKDIR /app
 COPY --from=docker_cli /usr/local/bin/docker /usr/local/bin/docker
@@ -40,6 +65,8 @@ COPY pyproject.toml README.md alembic.ini ./
 COPY migrations ./migrations
 COPY src ./src
 COPY scripts ./scripts
-RUN python -m pip install .
+RUN python -m pip install . \
+    && python -m pip check \
+    && python -c "import cvxpy, importlib.metadata as md, numpy as np, torch; from qlib.contrib.strategy import TopkDropoutStrategy; from qlib.data._libs.rolling import rolling_mean; names=sorted((dist.metadata.get('Name') or '').lower() for dist in md.distributions()); bad=[name for name in names if name.startswith(('nvidia-', 'cuda-', 'cupy')) or '-cuda' in name]; assert cvxpy.__version__ == '1.7.5'; assert np.__version__ == '1.26.4'; assert torch.__version__ == '2.2.2+cpu'; assert torch.version.cuda is None; assert TopkDropoutStrategy; assert torch.from_numpy(np.arange(3)).numpy().tolist() == [0, 1, 2]; assert rolling_mean(np.arange(3, dtype=float), 2).shape == (3,); assert not bad, f'forbidden accelerator distributions: {bad}'"
 
 CMD ["quant-worker"]

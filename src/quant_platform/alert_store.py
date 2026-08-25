@@ -117,12 +117,17 @@ class AlertStore:
         return self.get(alert_id)
 
     def deliver_pending(self, webhook_url: str, *, limit: int = 20) -> int:
+        delivery_statuses = (
+            ("pending", "failed", "not_configured")
+            if webhook_url
+            else ("pending", "failed")
+        )
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(alerts)
                 .where(
                     alerts.c.status == "open",
-                    alerts.c.delivery_status.in_(("pending", "failed", "not_configured")),
+                    alerts.c.delivery_status.in_(delivery_statuses),
                     alerts.c.delivery_attempts < 10,
                 )
                 .order_by(alerts.c.created_at)

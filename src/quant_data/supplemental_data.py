@@ -12,7 +12,7 @@ from .models import FetchSpec, ProviderResult
 from .partitioning import is_adaptive_partition, partition_metadata, split_partition_spec
 from .planner import compact_date
 from .provider import ProviderError
-from .reference_data import apply_reference_refresh
+from .reference_data import STK_SURV_PROVIDER_PAGE_LIMIT, apply_reference_refresh
 
 SUPPORTED_BUNDLES = {
     "cn_extended_daily",
@@ -57,6 +57,9 @@ _PAGINATION_MAX_PAGES = {
     "stk_holdernumber": 64,
     "top10_holders": 64,
     "top10_floatholders": 64,
+    # stk_surv has a 400-row single-request cap. A production single-day probe
+    # returned 400 + 82 rows, so it must use explicit offset pagination.
+    "stk_surv": 64,
     "stock_st": 4,
     "sw_daily": 4,
     "income": 64,
@@ -767,6 +770,19 @@ def a_share_bulk_history_specs(*, start: date, end: date, max_attempts: int) -> 
             )
         specs.extend(
             _paged_specs(
+                "fina_audit",
+                "fina_audit_vip",
+                {"period": period},
+                group=f"fina_audit:{period}",
+                page_size=1_000,
+                max_pages=_PAGINATION_MAX_PAGES["fina_audit"],
+                max_attempts=max_attempts,
+                expected_date_field="end_date",
+                expected_date=period,
+            )
+        )
+        specs.extend(
+            _paged_specs(
                 "fina_indicator_nondefault",
                 "fina_indicator_vip",
                 {"period": period},
@@ -988,14 +1004,19 @@ def _cn_extended_specs(
                     max_attempts=max_attempts,
                 )
             )
-    for survey_date in _weekdays(start, end):
+    # Investor surveys can be published on weekends (the provider's own
+    # examples include a Sunday), so this endpoint must cover calendar days
+    # rather than borrowing the exchange-session calendar.
+    for survey_date in _calendar_dates(start, end):
         params = {"start_date": survey_date, "end_date": survey_date}
-        specs.append(
-            _spec(
+        specs.extend(
+            _paged_specs(
                 "stk_surv",
                 "stk_surv",
                 params,
-                scope={**params, "row_limit": 400},
+                group=f"stk_surv:{survey_date}",
+                page_size=STK_SURV_PROVIDER_PAGE_LIMIT,
+                max_pages=_PAGINATION_MAX_PAGES["stk_surv"],
                 max_attempts=max_attempts,
             )
         )
@@ -1053,8 +1074,10 @@ def _cn_extended_specs(
                 {"period": period},
                 group=f"fina_audit:{period}",
                 page_size=1_000,
-                max_pages=16,
+                max_pages=_PAGINATION_MAX_PAGES["fina_audit"],
                 max_attempts=max_attempts,
+                expected_date_field="end_date",
+                expected_date=period,
             )
         )
         for business_type in ("P", "D", "I"):

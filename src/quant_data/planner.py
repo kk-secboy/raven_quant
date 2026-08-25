@@ -20,15 +20,22 @@ from .catalog import (
 )
 from .checkpoint import CheckpointStore
 from .execution_data import (
+    ASHARE_5M_MAX_SESSIONS_PER_REQUEST,
     NEWS_DATASET,
     margin_specs,
     minute_specs,
     news_specs,
     news_window_spec,
+    stable_ashare_5m_session_ranges,
 )
 from .history_bounds import history_start_date
 from .models import FetchSpec, canonical_json
-from .reference_data import apply_reference_refresh
+from .reference_data import (
+    INDEX_MEMBER_ALL_WEEKLY_COHORT,
+    apply_reference_refresh,
+    select_current_reference_units,
+)
+from .release_window import select_release_window_units
 from .storage import ParquetStore
 
 
@@ -37,6 +44,15 @@ def compact_date(value: date) -> str:
 
 
 CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
+SHENWAN_CLASSIFICATION_SOURCES = ("SW2014", "SW2021")
+GOVERNED_INDUSTRY_BENCHMARK = "000300.SH"
+# Date-only disclosures are usable on the first persisted trading day strictly
+# after their publication date.  Keep a small, schedule-only horizon beyond
+# the market-data publication boundary so a disclosure on the final snapshot
+# day can be classified without guessing.  Downstream market planning and
+# snapshot publication continue to clip to ``end``; this does not request or
+# publish future prices.
+PIT_CALENDAR_FORWARD_BUFFER_DAYS = 31
 
 
 def today_cn(now: datetime | None = None) -> date:
@@ -72,15 +88,22 @@ class BootstrapPlanner:
                     max_attempts=max_attempts,
                 )
             )
+        calendar_end = end + timedelta(days=PIT_CALENDAR_FORWARD_BUFFER_DAYS)
         specs.append(
             FetchSpec(
                 dataset="trade_cal",
                 api_name="trade_cal",
-                scope={"exchange": "SSE", "start": compact_date(start), "end": compact_date(end)},
+                scope={
+                    "exchange": "SSE",
+                    "start": compact_date(start),
+                    "end": compact_date(calendar_end),
+                    "publication_end": compact_date(end),
+                    "purpose": "pit_availability_horizon",
+                },
                 params={
                     "exchange": "SSE",
                     "start_date": compact_date(start),
-                    "end_date": compact_date(end),
+                    "end_date": compact_date(calendar_end),
                 },
                 fields=REFERENCE_FIELDS["trade_cal"],
                 max_attempts=max_attempts,
@@ -248,17 +271,18 @@ class BootstrapPlanner:
                 max_attempts=max_attempts,
             )
         ]
-        for level in ("L1", "L2", "L3"):
-            specs.append(
-                FetchSpec(
-                    dataset="index_classify",
-                    api_name="index_classify",
-                    scope={"level": level, "src": "SW2021"},
-                    params={"level": level, "src": "SW2021"},
-                    allow_empty=False,
-                    max_attempts=max_attempts,
+        for source in SHENWAN_CLASSIFICATION_SOURCES:
+            for level in ("L1", "L2", "L3"):
+                specs.append(
+                    FetchSpec(
+                        dataset="index_classify",
+                        api_name="index_classify",
+                        scope={"level": level, "src": source},
+                        params={"level": level, "src": source},
+                        allow_empty=False,
+                        max_attempts=max_attempts,
+                    )
                 )
-            )
         disclosure_start = history_start_date("disclosure_date")
         for period in _report_periods(start, end):
             if (
@@ -279,8 +303,23 @@ class BootstrapPlanner:
             )
         return self.checkpoint.add(apply_reference_refresh(specs, as_of=end))
 
-    def industry_codes(self) -> list[str]:
-        frame = self.storage.read_units(self.checkpoint.successful("index_classify"))
+    def industry_codes(self, *, as_of: date | None = None) -> list[str]:
+        rows = self.checkpoint.successful("index_classify")
+        if as_of is not None:
+            selected = select_current_reference_units(
+                self.checkpoint.active_units({"index_classify"}),
+                snapshot_end=as_of,
+            )
+            incomplete = [
+                row for row in selected if str(row.get("status") or "") != "succeeded"
+            ]
+            if incomplete:
+                raise RuntimeError(
+                    "current index_classify generation is incomplete; "
+                    "refusing to plan industry members from stale classifications"
+                )
+            rows = selected
+        frame = self.storage.read_units(rows)
         if frame.empty:
             return []
         column = "index_code" if "index_code" in frame.columns else "ts_code"
@@ -297,15 +336,180 @@ class BootstrapPlanner:
                     "l3_code": index_code,
                     "is_new": membership_status,
                     "row_limit": 2_000,
+                    "membership_cohort": INDEX_MEMBER_ALL_WEEKLY_COHORT,
                 },
                 params={"l3_code": index_code, "is_new": membership_status},
                 allow_empty=True,
                 max_attempts=max_attempts,
             )
-            for index_code in self.industry_codes()
+            for index_code in self.industry_codes(as_of=as_of)
             for membership_status in ("Y", "N")
         ]
         return self.checkpoint.add(apply_reference_refresh(specs, as_of=as_of) if as_of else specs)
+
+    def benchmark_industry_residual_symbols(
+        self,
+        start: date,
+        end: date,
+        *,
+        benchmark: str = GOVERNED_INDUSTRY_BENCHMARK,
+    ) -> list[str]:
+        """Find benchmark constituents lacking an active PIT industry interval.
+
+        The first pass downloads every L3 family from both supported Shenwan
+        taxonomies. This second pass uses only constituent dates already present
+        in ``index_weight`` and never fills an interval from a later industry.
+        """
+
+        weight_selection = select_release_window_units(
+            self.checkpoint.active_units({"index_weight"}),
+            snapshot_start=start,
+            snapshot_end=end,
+            datasets={"index_weight"},
+        )
+        weight_rows = list(weight_selection.rows)
+        if not weight_rows or any(
+            str(row.get("status") or "") != "succeeded" for row in weight_rows
+        ):
+            raise RuntimeError(
+                "current index_weight release-window plan is incomplete; "
+                "refusing to plan benchmark industry residuals"
+            )
+        weights = self.storage.read_units(weight_rows)
+        required_weights = {"index_code", "con_code", "trade_date", "weight"}
+        if weights.empty or not required_weights.issubset(weights.columns):
+            raise RuntimeError(
+                "index_weight is unavailable for benchmark industry residual planning"
+            )
+        weights = weights.loc[:, sorted(required_weights)].copy()
+        weights["index_code"] = (
+            weights["index_code"].astype("string").str.upper().str.strip()
+        )
+        weights["con_code"] = (
+            weights["con_code"].astype("string").str.upper().str.strip()
+        )
+        weights["trade_date"] = pd.to_datetime(weights["trade_date"], errors="coerce")
+        weights["weight"] = pd.to_numeric(weights["weight"], errors="coerce")
+        weights = weights.loc[
+            weights["index_code"].eq(benchmark.upper())
+            & weights["trade_date"].between(pd.Timestamp(start), pd.Timestamp(end))
+            & weights["weight"].gt(0)
+        ].dropna(subset=["con_code", "trade_date"])
+        weights = weights.drop_duplicates(["con_code", "trade_date"])
+        if weights.empty:
+            raise RuntimeError(
+                f"index_weight has no positive {benchmark} constituents in {start}..{end}"
+            )
+
+        selected_members = select_current_reference_units(
+            self.checkpoint.active_units({"index_member_all"}),
+            snapshot_end=end,
+        )
+        taxonomy_rows = [
+            row
+            for row in selected_members
+            if dict(row.get("params_json") or {}).get("l3_code")
+        ]
+        if not taxonomy_rows or any(
+            str(row.get("status") or "") != "succeeded" for row in taxonomy_rows
+        ):
+            raise RuntimeError(
+                "current L3 index_member_all generation is incomplete; "
+                "refusing to plan benchmark residuals"
+            )
+        members = self.storage.read_units(
+            [
+                row
+                for row in selected_members
+                if str(row.get("status") or "") == "succeeded"
+            ]
+        )
+        required_members = {"ts_code", "l1_code", "in_date"}
+        if members.empty or not required_members.issubset(members.columns):
+            raise RuntimeError(
+                "index_member_all has no usable point-in-time L1 industry rows"
+            )
+        member_columns = ["ts_code", "l1_code", "in_date"]
+        if "out_date" in members.columns:
+            member_columns.append("out_date")
+        members = members.loc[:, member_columns].copy()
+        members["ts_code"] = (
+            members["ts_code"].astype("string").str.upper().str.strip()
+        )
+        members["l1_code"] = members["l1_code"].astype("string").str.strip()
+        members["in_date"] = pd.to_datetime(members["in_date"], errors="coerce")
+        if "out_date" not in members.columns:
+            members["out_date"] = pd.NaT
+        else:
+            members["out_date"] = pd.to_datetime(members["out_date"], errors="coerce")
+        members = members.dropna(subset=["ts_code", "in_date"])
+        members = members.loc[members["l1_code"].notna() & members["l1_code"].ne("")]
+
+        observations = weights[["con_code", "trade_date"]].rename(
+            columns={"con_code": "ts_code"}
+        )
+        observations = observations.drop_duplicates().reset_index(drop=True)
+        observations["observation_id"] = observations.index
+        joined = observations.merge(members, on="ts_code", how="left")
+        joined["covered"] = (
+            joined["in_date"].notna()
+            & joined["in_date"].le(joined["trade_date"])
+            & (
+                joined["out_date"].isna()
+                | joined["out_date"].ge(joined["trade_date"])
+            )
+        )
+        covered = joined.groupby("observation_id", sort=False)["covered"].any()
+        missing_ids = set(covered.index[~covered])
+        return sorted(
+            observations.loc[
+                observations["observation_id"].isin(missing_ids), "ts_code"
+            ]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+    def plan_benchmark_industry_residual_members(
+        self,
+        start: date,
+        end: date,
+        max_attempts: int,
+        *,
+        as_of: date,
+        benchmark: str = GOVERNED_INDUSTRY_BENCHMARK,
+    ) -> int:
+        current_missing = self.benchmark_industry_residual_symbols(
+            start, end, benchmark=benchmark
+        )
+        historical_residuals = {
+            str(params["ts_code"]).upper().strip()
+            for row in self.checkpoint.dataset_units("index_member_all")
+            if (params := dict(row.get("params_json") or {})).get("ts_code")
+            and str(dict(row.get("scope_json") or {}).get("residual_benchmark") or "")
+            == benchmark
+        }
+        symbols = sorted({*current_missing, *historical_residuals})
+        specs = [
+            FetchSpec(
+                dataset="index_member_all",
+                api_name="index_member_all",
+                scope={
+                    "ts_code": symbol,
+                    "is_new": membership_status,
+                    "row_limit": 2_000,
+                    "residual_benchmark": benchmark,
+                    "membership_cohort": INDEX_MEMBER_ALL_WEEKLY_COHORT,
+                },
+                params={"ts_code": symbol, "is_new": membership_status},
+                allow_empty=True,
+                max_attempts=max_attempts,
+            )
+            for symbol in symbols
+            for membership_status in ("Y", "N")
+        ]
+        return self.checkpoint.add(apply_reference_refresh(specs, as_of=as_of))
 
     def plan_etf_daily(self, dates: Iterable[str], max_attempts: int) -> int:
         return self.plan_daily(dates, ETF_DAILY, max_attempts)
@@ -566,12 +770,26 @@ class ExecutionDataPlanner:
             for value in desired_sessions:
                 if value in covered:
                     if segment:
-                        symbol_windows.extend(_session_chunks(segment, 150))
+                        symbol_windows.extend(
+                            stable_ashare_5m_session_ranges(
+                                segment[0],
+                                segment[-1],
+                                segment,
+                                max_sessions=ASHARE_5M_MAX_SESSIONS_PER_REQUEST,
+                            )
+                        )
                         segment = []
                 else:
                     segment.append(value)
             if segment:
-                symbol_windows.extend(_session_chunks(segment, 150))
+                symbol_windows.extend(
+                    stable_ashare_5m_session_ranges(
+                        segment[0],
+                        segment[-1],
+                        segment,
+                        max_sessions=ASHARE_5M_MAX_SESSIONS_PER_REQUEST,
+                    )
+                )
             if missing_sessions:
                 windows[symbol] = symbol_windows
 
@@ -614,13 +832,6 @@ def _checkpoint_spec(row: dict[str, object]) -> FetchSpec:
         allow_empty=bool(row.get("allow_empty")),
         max_attempts=int(row.get("max_attempts") or 1),
     )
-
-
-def _session_chunks(values: list[date], size: int) -> list[tuple[date, date]]:
-    return [
-        (values[offset], values[min(offset + size - 1, len(values) - 1)])
-        for offset in range(0, len(values), size)
-    ]
 
 
 def parse_date(value: str, *, latest: date | None = None) -> date:

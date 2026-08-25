@@ -100,7 +100,9 @@ def test_unresolved_member_event_gates_long_and_pair_sources_until_resolution(
                 daily_field_contract_version="daily-qlib-field-v3-cny-amount",
                 execution_dataset_identity_sha256="c" * 64,
                 execution_dataset_lineage_id="d" * 64,
-                execution_field_contract_version="minute-qlib-execution-v4-source-units",
+                execution_field_contract_version=(
+                    "minute-qlib-execution-v5-daily-source-evidence"
+                ),
                 execution_engine_version=SIMULATION_ENGINE_VERSION,
                 cost_schedule_version=COST_SCHEDULE_VERSION,
                 execution_policy_json={"execution_algorithm": "twap"},

@@ -76,7 +76,9 @@ def _seed_simulation_portfolio(database_url: str, *, name: str = "safe-mode-sim"
                 daily_field_contract_version="daily-qlib-field-v3-cny-amount",
                 execution_dataset_identity_sha256="c" * 64,
                 execution_dataset_lineage_id="d" * 64,
-                execution_field_contract_version="minute-qlib-execution-v4-source-units",
+                execution_field_contract_version=(
+                    "minute-qlib-execution-v5-daily-source-evidence"
+                ),
                 execution_engine_version="sim-engine-test",
                 cost_schedule_version="cost-schedule-test",
                 execution_policy_json={"execution_algorithm": "twap"},

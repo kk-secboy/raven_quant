@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
@@ -19,7 +20,11 @@ from quant_data.database import (
     research_runs,
     row_dict,
 )
-from quant_platform.factor_recompute import FACTOR_RECOMPUTE_EXECUTOR_VERSION
+from quant_platform.factor_recompute import (
+    FACTOR_PIT_CONTRACT_VERSION,
+    FACTOR_RECOMPUTE_EXECUTOR_VERSION,
+)
+from quant_platform.jsonb_safety import canonical_jsonb_sha256, normalize_jsonb_document
 from quant_platform.qlib_workflow import require_qlib_workflow_identity
 from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
@@ -31,6 +36,15 @@ def _now() -> datetime:
 def _canonical_sha256(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _finite_database_number(value: Any) -> float | None:
+    """Project a metric scalar to SQL without inventing a value for NaN/Inf."""
+
+    if value is None:
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
 
 
 def _is_sha256(value: Any) -> bool:
@@ -62,7 +76,9 @@ def _artifact_hash(path_value: str | None, label: str, *, required: bool) -> str
     return _sha256_file(path)
 
 
-def _evaluation_artifact_metrics(path_value: str, candidate_id: str) -> dict[str, Any]:
+def _evaluation_artifact_metrics(
+    path_value: str, candidate_id: str, profile_id: str | None = None
+) -> dict[str, Any]:
     path = Path(path_value)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -77,7 +93,12 @@ def _evaluation_artifact_metrics(path_value: str, candidate_id: str) -> dict[str
     matches = [
         item
         for item in evaluations
-        if isinstance(item, dict) and str(item.get("candidate_id")) == candidate_id
+        if isinstance(item, dict)
+        and str(item.get("candidate_id")) == candidate_id
+        and (
+            profile_id is None
+            or str((item.get("metrics") or {}).get("research_profile", {}).get("id")) == profile_id
+        )
     ]
     if len(matches) != 1 or matches[0].get("status") != "ok":
         raise ValueError("Qlib evaluation artifact has no unique successful candidate result")
@@ -660,7 +681,13 @@ class ResearchStore:
         candidate["latest_evaluation"] = self.latest_evaluation(candidate_id)
         return candidate
 
-    def find_candidate(self, *, name: str, values_sha256: str) -> dict[str, Any] | None:
+    def find_candidate(
+        self,
+        *,
+        name: str,
+        values_sha256: str,
+        provenance_identity_sha256: str | None = None,
+    ) -> dict[str, Any] | None:
         statement = (
             select(factor_candidates)
             .where(
@@ -668,21 +695,27 @@ class ResearchStore:
                 factor_candidates.c.values_sha256 == values_sha256,
             )
             .order_by(factor_candidates.c.created_at.asc())
-            .limit(1)
         )
         with self.engine.connect() as connection:
-            row = connection.execute(statement).first()
-        if row is None:
-            return None
-        candidate = self._decode_candidate(row_dict(row))
-        candidate["latest_evaluation"] = self.latest_evaluation(candidate["id"])
-        return candidate
+            rows = list(connection.execute(statement))
+        for row in rows:
+            candidate = self._decode_candidate(row_dict(row))
+            if provenance_identity_sha256 is not None and (
+                candidate.get("variables", {}).get("provenance_identity_sha256")
+                != provenance_identity_sha256
+            ):
+                continue
+            candidate["latest_evaluation"] = self.latest_evaluation(candidate["id"])
+            return candidate
+        return None
 
     def count_candidates(self, *, name: str) -> int:
         """Count immutable trials for a named factor across research runs."""
 
-        statement = select(func.count()).select_from(factor_candidates).where(
-            factor_candidates.c.name == name
+        statement = (
+            select(func.count())
+            .select_from(factor_candidates)
+            .where(factor_candidates.c.name == name)
         )
         with self.engine.connect() as connection:
             return int(connection.scalar(statement) or 0)
@@ -731,6 +764,42 @@ class ResearchStore:
         if not _is_sha256(dataset_identity_sha256):
             raise ValueError("factor evaluation requires immutable dataset identity")
         candidate = self.get_candidate(candidate_id)
+        run = self.get_run(str(candidate["research_run_id"]))
+        configured_profiles = (run.get("config") or {}).get("evaluation_profiles")
+        if configured_profiles:
+            expected_profiles = {
+                str(item.get("id") or ""): item
+                for item in configured_profiles
+                if isinstance(item, dict) and item.get("id")
+            }
+            if set(expected_profiles) != {"recent_3y", "balanced_5y", "robust_10y"}:
+                raise ValueError("research run has an invalid governed profile contract")
+            profile_identity = metrics.get("research_profile")
+            profile_id = (
+                str(profile_identity.get("id") or "")
+                if isinstance(profile_identity, dict)
+                else ""
+            )
+            expected_profile = expected_profiles.get(profile_id)
+            if expected_profile is None:
+                raise ValueError("factor evaluation is not bound to a governed research profile")
+            actual_periods = {
+                "train_start": train_start.isoformat(),
+                "train_end": train_end.isoformat(),
+                "valid_start": valid_start.isoformat(),
+                "valid_end": valid_end.isoformat(),
+                "test_start": test_start.isoformat(),
+                "test_end": test_end.isoformat(),
+            }
+            if expected_profile.get("periods") != actual_periods:
+                raise ValueError("factor evaluation periods do not match the frozen profile")
+            expected_identity = {
+                key: expected_profile[key]
+                for key in ("id", "label", "role", "weight")
+                if key in expected_profile
+            }
+            if profile_identity != expected_identity:
+                raise ValueError("factor evaluation profile identity does not match the run")
         embargo_days = max(5, int(candidate["label_horizon_days"]))
         if (test_start - valid_end).days <= embargo_days:
             raise ValueError(
@@ -747,12 +816,12 @@ class ResearchStore:
         current_code_sha256 = _artifact_hash(
             candidate.get("code_path"), "factor code", required=True
         )
-        submitted_values_sha256 = _artifact_hash(
+        current_values_sha256 = _artifact_hash(
             candidate.get("values_path"), "factor values", required=True
         )
         if current_code_sha256 != candidate.get("code_sha256"):
             raise ValueError("factor code artifact changed after RD-Agent import")
-        if submitted_values_sha256 != candidate.get("values_sha256"):
+        if current_values_sha256 != candidate.get("values_sha256"):
             raise ValueError("factor values artifact changed after RD-Agent import")
         actual_recomputed_sha256 = _artifact_hash(
             recomputed_values_path, "independently recomputed factor values", required=True
@@ -776,6 +845,26 @@ class ResearchStore:
             or recompute_evidence.get("no_new_privileges") is not True
         ):
             raise ValueError("factor recomputation evidence has an unsupported executor version")
+        pit_evidence = recompute_evidence.get("pit_invariance")
+        if not (
+            isinstance(pit_evidence, dict)
+            and pit_evidence.get("contract_version") == FACTOR_PIT_CONTRACT_VERSION
+            and pit_evidence.get("status") == "passed"
+            and int(pit_evidence.get("cutpoint_count") or 0) >= 3
+            and isinstance(pit_evidence.get("checks"), list)
+            and len(pit_evidence["checks"]) == int(pit_evidence["cutpoint_count"])
+            and all(item.get("invariant") is True for item in pit_evidence["checks"])
+        ):
+            raise ValueError("factor recomputation evidence has no valid PIT invariance proof")
+        research_boundary = recompute_evidence.get("research_data_boundary")
+        if not (
+            isinstance(research_boundary, dict)
+            and research_boundary.get("valid_end") == valid_end.isoformat()
+            and research_boundary.get("test_start") == test_start.isoformat()
+            and research_boundary.get("final_oos_observations_exposed") is False
+            and str(research_boundary.get("latest_input_date") or "") <= valid_end.isoformat()
+        ):
+            raise ValueError("factor recomputation evidence does not isolate final OOS data")
         if int(recompute_evidence.get("label_horizon_days") or 0) != int(
             candidate["label_horizon_days"]
         ):
@@ -793,11 +882,25 @@ class ResearchStore:
         if recompute_evidence.get("periods") != expected_periods:
             raise ValueError("factor recomputation evidence is not bound to evaluation periods")
         submitted_comparison = recompute_evidence.get("submitted_comparison")
+        original_submitted_sha256 = (
+            str(submitted_comparison.get("submitted_sha256") or "")
+            if isinstance(submitted_comparison, dict)
+            else ""
+        )
+        prior_evaluations = self.list_evaluations(candidate_id)
+        repeated_profile_evaluation = bool(
+            current_values_sha256 == actual_recomputed_sha256
+            and any(
+                item.get("candidate_values_sha256") == actual_recomputed_sha256
+                and item.get("submitted_values_sha256") == original_submitted_sha256
+                for item in prior_evaluations
+            )
+        )
         if not isinstance(submitted_comparison, dict) or not (
             submitted_comparison.get("available") is True
             and submitted_comparison.get("exact_match") is True
             and submitted_comparison.get("index_exact_match") is True
-            and submitted_comparison.get("submitted_sha256") == submitted_values_sha256
+            and (original_submitted_sha256 == current_values_sha256 or repeated_profile_evaluation)
         ):
             raise ValueError("submitted factor values do not match independent recomputation")
         recompute_evidence_sha256 = _canonical_sha256(recompute_evidence)
@@ -807,7 +910,8 @@ class ResearchStore:
             artifact_path, "Qlib evaluation", required=gate_status == "passed"
         )
         if artifact_path:
-            artifact_metrics = _evaluation_artifact_metrics(artifact_path, candidate_id)
+            profile_id = str((metrics.get("research_profile") or {}).get("id") or "") or None
+            artifact_metrics = _evaluation_artifact_metrics(artifact_path, candidate_id, profile_id)
             if _canonical_sha256(artifact_metrics) != _canonical_sha256(metrics):
                 raise ValueError("Qlib evaluation artifact metrics do not match imported metrics")
         metrics_sha256 = _canonical_sha256(metrics)
@@ -831,7 +935,7 @@ class ResearchStore:
             evaluator_version=self.policy.version,
             candidate_code_sha256=current_code_sha256,
             candidate_values_sha256=actual_recomputed_sha256,
-            submitted_values_sha256=submitted_values_sha256,
+            submitted_values_sha256=original_submitted_sha256,
             recompute_evidence_sha256=recompute_evidence_sha256,
             artifact_sha256=artifact_sha256 or "",
             metrics_sha256=metrics_sha256,
@@ -875,7 +979,7 @@ class ResearchStore:
                     artifact_sha256=artifact_sha256,
                     candidate_code_sha256=current_code_sha256,
                     candidate_values_sha256=actual_recomputed_sha256,
-                    submitted_values_sha256=submitted_values_sha256,
+                    submitted_values_sha256=original_submitted_sha256,
                     recomputed_values_sha256=actual_recomputed_sha256,
                     recompute_evidence_json=recompute_evidence,
                     hac_p_value=metrics.get("hac_p_value"),
@@ -1047,12 +1151,14 @@ class ResearchStore:
         )
         if artifact_path and metrics is not None:
             artifact_metrics = _evaluation_artifact_metrics(artifact_path, candidate_id)
-            if _canonical_sha256(artifact_metrics) != _canonical_sha256(metrics):
+            if canonical_jsonb_sha256(artifact_metrics) != canonical_jsonb_sha256(metrics):
                 raise ValueError(
                     "external evaluation artifact metrics do not match imported metrics"
                 )
-        metrics_payload = metrics if metrics is not None else {}
-        metrics_sha256 = _canonical_sha256(metrics_payload)
+        raw_metrics_payload = metrics if metrics is not None else {}
+        metrics_payload = normalize_jsonb_document(raw_metrics_payload) or {}
+        external_evidence_payload = normalize_jsonb_document(external_evidence) or {}
+        metrics_sha256 = canonical_jsonb_sha256(metrics_payload)
         policy_dict = asdict(policy)
         policy_sha256 = _canonical_sha256(policy_dict)
         evidence = _evaluation_evidence(
@@ -1066,7 +1172,7 @@ class ResearchStore:
             candidate_code_sha256=current_code_sha256,
             candidate_values_sha256=current_values_sha256,
             submitted_values_sha256=current_values_sha256,
-            recompute_evidence_sha256=_canonical_sha256(external_evidence),
+            recompute_evidence_sha256=canonical_jsonb_sha256(external_evidence_payload),
             artifact_sha256=artifact_sha256 or "",
             metrics_sha256=metrics_sha256,
             policy_sha256=policy_sha256,
@@ -1075,7 +1181,7 @@ class ResearchStore:
         evaluation_id = uuid.uuid4().hex
         now = _now()
         scalars = {
-            key: metrics_payload.get(key)
+            key: _finite_database_number(raw_metrics_payload.get(key))
             for key in (
                 "ic",
                 "icir",
@@ -1115,9 +1221,9 @@ class ResearchStore:
                     candidate_values_sha256=current_values_sha256,
                     submitted_values_sha256=current_values_sha256,
                     recomputed_values_sha256=current_values_sha256,
-                    recompute_evidence_json=external_evidence,
-                    hac_p_value=metrics_payload.get("hac_p_value"),
-                    bh_q_value=metrics_payload.get("bh_q_value"),
+                    recompute_evidence_json=external_evidence_payload,
+                    hac_p_value=_finite_database_number(raw_metrics_payload.get("hac_p_value")),
+                    bh_q_value=_finite_database_number(raw_metrics_payload.get("bh_q_value")),
                     statistical_contract_version="research-statistics-v1-hac-bh-dsr",
                     signal_frequency="day",
                     signal_horizon=f"{int(candidate.get('label_horizon_days') or 1)}d",
@@ -1292,6 +1398,73 @@ class ResearchStore:
             )
         return self.get_evaluation(evaluation_id)
 
+    def record_profile_consensus(
+        self,
+        candidate_id: str,
+        *,
+        evaluation_ids: dict[str, str],
+        actor: str,
+    ) -> dict[str, Any]:
+        """Persist the explicit three-profile admission decision before promotion."""
+
+        from quant_platform.research_automation import build_multi_profile_consensus
+
+        normalized_ids = {str(key): str(value) for key, value in evaluation_ids.items()}
+        expected_ids = {"recent_3y", "balanced_5y", "robust_10y"}
+        if set(normalized_ids) != expected_ids or any(
+            not value for value in normalized_ids.values()
+        ):
+            raise ValueError("profile consensus requires exactly three evaluation ids")
+        candidate = self.get_candidate(candidate_id)
+        if candidate["status"] == "promoted":
+            raise ValueError("promoted candidate admission cannot be replaced")
+        evaluations = [self.get_evaluation(value) for value in normalized_ids.values()]
+        if any(item["factor_candidate_id"] != candidate_id for item in evaluations):
+            raise ValueError("profile consensus evaluation belongs to another candidate")
+        candidate["profile_evaluations"] = evaluations
+        consensus = build_multi_profile_consensus(candidate)
+        if consensus is None or consensus["evaluation_ids"] != normalized_ids:
+            raise ValueError("candidate does not satisfy the three-profile consensus contract")
+        consensus_sha256 = _canonical_sha256(consensus)
+        existing = candidate.get("profile_consensus")
+        if existing is not None:
+            if (
+                existing == consensus
+                and candidate.get("profile_consensus_sha256") == consensus_sha256
+            ):
+                return candidate
+            raise ValueError("candidate already has a different profile consensus record")
+        now = _now()
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(factor_candidates)
+                .where(
+                    factor_candidates.c.id == candidate_id,
+                    factor_candidates.c.status != "promoted",
+                    factor_candidates.c.profile_consensus_json.is_(None),
+                )
+                .values(
+                    status="gate_passed",
+                    profile_consensus_json=consensus,
+                    profile_consensus_sha256=consensus_sha256,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                raise ValueError("candidate state changed while recording profile consensus")
+            self._event(
+                connection,
+                run_id=candidate["research_run_id"],
+                candidate_id=candidate_id,
+                event_type="candidate.profile_consensus_passed",
+                actor=actor,
+                payload={
+                    "evaluation_ids": normalized_ids,
+                    "profile_consensus_sha256": consensus_sha256,
+                },
+            )
+        return self.get_candidate(candidate_id)
+
     def promote(self, candidate_id: str, *, actor: str, reason: str) -> dict[str, Any]:
         actor = actor.strip()
         reason = reason.strip()
@@ -1300,9 +1473,47 @@ class ResearchStore:
         if len(reason) < 10:
             raise ValueError("promotion reason must contain at least 10 characters")
         candidate = self.get_candidate(candidate_id)
-        evaluation = candidate["latest_evaluation"]
+        consensus = candidate.get("profile_consensus")
+        if consensus is not None:
+            from quant_platform.research_automation import build_multi_profile_consensus
+
+            if candidate.get("profile_consensus_sha256") != _canonical_sha256(consensus):
+                raise ValueError("profile consensus provenance is invalid")
+            consensus_ids = consensus.get("evaluation_ids")
+            if not isinstance(consensus_ids, dict):
+                raise ValueError("profile consensus has no evaluation ids")
+            profile_evaluations = [
+                self.get_evaluation(str(value)) for value in consensus_ids.values()
+            ]
+            candidate["profile_evaluations"] = profile_evaluations
+            rebuilt_consensus = build_multi_profile_consensus(candidate)
+            if rebuilt_consensus != consensus:
+                raise ValueError("profile consensus no longer matches its Qlib evaluations")
+            evaluation = self.get_evaluation(str(consensus_ids["recent_3y"]))
+        else:
+            run = self.get_run(str(candidate["research_run_id"]))
+            configured_profiles = (run.get("config") or {}).get("evaluation_profiles")
+            if configured_profiles:
+                raise ValueError(
+                    "governed multi-profile research requires an explicit consensus record "
+                    "before promotion"
+                )
+            governed_profile_ids = {
+                str((item.get("metrics") or {}).get("research_profile", {}).get("id") or "")
+                for item in self.list_evaluations(candidate_id)
+            }
+            if governed_profile_ids & {"recent_3y", "balanced_5y", "robust_10y"}:
+                raise ValueError(
+                    "multi-profile candidate requires an explicit consensus record before promotion"
+                )
+            evaluation = candidate["latest_evaluation"]
         if not evaluation or evaluation["gate_status"] != "passed":
-            raise ValueError("candidate must pass the latest Qlib gate before promotion")
+            raise ValueError("candidate must pass the governed Qlib admission before promotion")
+        if evaluation.get("evaluator_version") != self.policy.version:
+            raise ValueError(
+                "external frozen-value factors remain research-only until a formal "
+                "point-in-time availability and final-OOS publication contract is implemented"
+            )
         if candidate["status"] != "gate_passed":
             raise ValueError(f"candidate cannot be promoted from {candidate['status']} state")
         current_code_sha256 = _artifact_hash(
@@ -1335,11 +1546,38 @@ class ResearchStore:
         repeated_status, repeated_reasons = self.policy.evaluate(metrics)
         if repeated_status != "passed" or repeated_reasons != evaluation.get("gate_reasons"):
             raise ValueError("Qlib evaluation no longer passes the recorded factor gate")
+        if evaluation.get("evaluator_version") == self.policy.version:
+            recompute = evaluation.get("recompute_evidence")
+            pit = recompute.get("pit_invariance") if isinstance(recompute, dict) else None
+            boundary = (
+                recompute.get("research_data_boundary")
+                if isinstance(recompute, dict)
+                else None
+            )
+            if not (
+                isinstance(recompute, dict)
+                and recompute.get("executor_version") == FACTOR_RECOMPUTE_EXECUTOR_VERSION
+                and isinstance(pit, dict)
+                and pit.get("contract_version") == FACTOR_PIT_CONTRACT_VERSION
+                and pit.get("status") == "passed"
+                and int(pit.get("cutpoint_count") or 0) >= 3
+                and isinstance(boundary, dict)
+                and boundary.get("valid_end") == evaluation["valid_end"].isoformat()
+                and boundary.get("test_start") == evaluation["test_start"].isoformat()
+                and boundary.get("final_oos_observations_exposed") is False
+            ):
+                raise ValueError(
+                    "Qlib evaluation predates the required PIT isolation gate; "
+                    "re-evaluation is required"
+                )
         artifact_path = evaluation.get("artifact_path")
         artifact_sha256 = _artifact_hash(artifact_path, "Qlib evaluation", required=True)
         if artifact_sha256 != evaluation.get("artifact_sha256"):
             raise ValueError("Qlib evaluation artifact changed after evaluation")
-        artifact_metrics = _evaluation_artifact_metrics(str(artifact_path), candidate_id)
+        profile_id = str((metrics.get("research_profile") or {}).get("id") or "") or None
+        artifact_metrics = _evaluation_artifact_metrics(
+            str(artifact_path), candidate_id, profile_id
+        )
         if _canonical_sha256(artifact_metrics) != evaluation.get("metrics_sha256"):
             raise ValueError("Qlib evaluation artifact no longer matches recorded metrics")
         evidence = _evaluation_evidence(
@@ -1371,6 +1609,15 @@ class ResearchStore:
         evidence_sha256 = _canonical_sha256(evidence)
         if evaluation.get("evidence_sha256") != evidence_sha256:
             raise ValueError("Qlib evaluation evidence provenance is invalid")
+        promotion_evidence_sha256 = evidence_sha256
+        if consensus is not None:
+            promotion_evidence_sha256 = _canonical_sha256(
+                {
+                    "version": "factor-promotion-evidence-v2-profile-consensus",
+                    "primary_evaluation_evidence_sha256": evidence_sha256,
+                    "profile_consensus_sha256": candidate["profile_consensus_sha256"],
+                }
+            )
         now = _now()
         with self.engine.begin() as connection:
             result = connection.execute(
@@ -1382,7 +1629,7 @@ class ResearchStore:
                 .values(
                     status="promoted",
                     promoted_evaluation_id=evaluation["id"],
-                    promotion_evidence_sha256=evidence_sha256,
+                    promotion_evidence_sha256=promotion_evidence_sha256,
                     promoted_by=actor,
                     promoted_at=now,
                     updated_at=now,
@@ -1399,7 +1646,8 @@ class ResearchStore:
                 payload={
                     "reason": reason,
                     "evaluation_id": evaluation["id"],
-                    "evidence_sha256": evidence_sha256,
+                    "evidence_sha256": promotion_evidence_sha256,
+                    "profile_consensus_sha256": candidate.get("profile_consensus_sha256"),
                     "code_sha256": current_code_sha256,
                     "values_sha256": current_values_sha256,
                 },
@@ -1416,6 +1664,16 @@ class ResearchStore:
         with self.engine.connect() as connection:
             row = connection.execute(statement).first()
         return self._decode_evaluation(row_dict(row)) if row else None
+
+    def list_evaluations(self, candidate_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        statement = (
+            select(factor_evaluations)
+            .where(factor_evaluations.c.factor_candidate_id == candidate_id)
+            .order_by(factor_evaluations.c.created_at.asc())
+            .limit(limit)
+        )
+        with self.engine.connect() as connection:
+            return [self._decode_evaluation(row_dict(row)) for row in connection.execute(statement)]
 
     def get_evaluation(self, evaluation_id: str) -> dict[str, Any]:
         with self.engine.connect() as connection:
@@ -1473,6 +1731,7 @@ class ResearchStore:
     @staticmethod
     def _decode_candidate(row: dict[str, Any]) -> dict[str, Any]:
         row["variables"] = row.pop("variables_json")
+        row["profile_consensus"] = row.pop("profile_consensus_json")
         return row
 
     @staticmethod

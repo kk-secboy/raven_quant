@@ -6,6 +6,7 @@ import pytest
 from quant_data.models import FetchSpec, ProviderResult
 from quant_data.reference_data import (
     AUDITED_REFERENCE_DATASETS,
+    INDEX_MEMBER_ALL_WEEKLY_COHORT,
     REFERENCE_REFRESH_POLICIES,
     apply_reference_refresh,
     reference_refresh_bucket,
@@ -56,6 +57,7 @@ def test_refresh_buckets_follow_reviewed_cadence() -> None:
     as_of = date(2026, 7, 15)
     assert reference_refresh_bucket("stock_basic", as_of) == "2026-07-15"
     assert reference_refresh_bucket("index_basic", as_of) == "2026-07-13"
+    assert reference_refresh_bucket("index_member_all", as_of) == "2026-07-13"
     assert reference_refresh_bucket("cn_gdp", as_of) == "2026-07"
     assert reference_refresh_bucket("daily", as_of) is None
 
@@ -203,6 +205,218 @@ def test_snapshot_selection_retires_ignored_index_member_request_shape() -> None
     selected = select_current_reference_units(rows, snapshot_end=date(2026, 7, 29))
 
     assert [item["unit_key"] for item in selected] == ["current-l3"]
+
+
+def test_snapshot_selection_uses_latest_weekly_index_member_generation() -> None:
+    def row(unit_key: str, bucket: str | None, l3_code: str) -> dict:
+        scope = {"l3_code": l3_code, "is_new": "Y", "row_limit": 2_000}
+        if bucket:
+            scope.update(
+                {
+                    "reference_refresh_bucket": bucket,
+                    "reference_refresh_cadence": "weekly",
+                    "membership_cohort": INDEX_MEMBER_ALL_WEEKLY_COHORT,
+                }
+            )
+        return {
+            "dataset": "index_member_all",
+            "unit_key": unit_key,
+            "scope_json": scope,
+            "params_json": {"l3_code": l3_code, "is_new": "Y"},
+        }
+
+    selected = select_current_reference_units(
+        [
+            row("legacy", None, "850412.SI"),
+            row("week-1-retired", "2026-07-20", "850412.SI"),
+            row("week-1-retained", "2026-07-20", "850111.SI"),
+            row("week-2-retained", "2026-07-27", "850111.SI"),
+            row("week-2-new", "2026-07-27", "850112.SI"),
+        ],
+        snapshot_end=date(2026, 7, 29),
+    )
+
+    assert {item["unit_key"] for item in selected} == {
+        "week-2-retained",
+        "week-2-new",
+    }
+
+
+def test_snapshot_selection_retires_only_capped_legacy_stk_surv_units() -> None:
+    rows = [
+        {
+            "dataset": "stk_surv",
+            "unit_key": "legacy-short",
+            "params_json": {"start_date": "20240102", "end_date": "20240102"},
+            "scope_json": {
+                "start_date": "20240102",
+                "end_date": "20240102",
+                "row_limit": 400,
+            },
+            "row_count": 399,
+        },
+        {
+            "dataset": "stk_surv",
+            "unit_key": "legacy-capped",
+            "params_json": {"start_date": "20240103", "end_date": "20240103"},
+            "scope_json": {
+                "start_date": "20240103",
+                "end_date": "20240103",
+                "row_limit": 400,
+            },
+            "row_count": 400,
+        },
+        {
+            "dataset": "stk_surv",
+            "unit_key": "legacy-short-replaced",
+            "params_json": {"start_date": "20240104", "end_date": "20240104"},
+            "scope_json": {
+                "start_date": "20240104",
+                "end_date": "20240104",
+                "row_limit": 400,
+            },
+            "row_count": 399,
+        },
+        {
+            "dataset": "stk_surv",
+            "unit_key": "current-0",
+            "params_json": {
+                "start_date": "20240103",
+                "end_date": "20240103",
+                "limit": 400,
+                "offset": 0,
+            },
+            "scope_json": {
+                "page_group": "stk_surv:20240103",
+                "page_size": 400,
+                "offset": 0,
+            },
+            "row_count": 400,
+        },
+        {
+            "dataset": "stk_surv",
+            "unit_key": "current-400",
+            "params_json": {
+                "start_date": "20240103",
+                "end_date": "20240103",
+                "limit": 400,
+                "offset": 400,
+            },
+            "scope_json": {
+                "page_group": "stk_surv:20240103",
+                "page_size": 400,
+                "offset": 400,
+            },
+            "row_count": 82,
+        },
+        {
+            "dataset": "stk_surv",
+            "unit_key": "current-replaces-short",
+            "params_json": {
+                "start_date": "20240104",
+                "end_date": "20240104",
+                "limit": 400,
+                "offset": 0,
+            },
+            "scope_json": {
+                "page_group": "stk_surv:20240104",
+                "page_size": 400,
+                "offset": 0,
+            },
+            "row_count": 120,
+        },
+        {
+            "dataset": "stk_surv",
+            "unit_key": "legacy-short-with-orphan-continuation",
+            "params_json": {"start_date": "20240105", "end_date": "20240105"},
+            "scope_json": {
+                "start_date": "20240105",
+                "end_date": "20240105",
+                "row_limit": 400,
+            },
+            "row_count": 399,
+        },
+        {
+            "dataset": "stk_surv",
+            "unit_key": "orphan-current-400",
+            "params_json": {
+                "start_date": "20240105",
+                "end_date": "20240105",
+                "limit": 400,
+                "offset": 400,
+            },
+            "scope_json": {
+                "page_group": "stk_surv:20240105",
+                "page_size": 400,
+                "offset": 400,
+            },
+            "row_count": 82,
+        },
+    ]
+
+    selected = select_current_reference_units(rows, snapshot_end=date(2024, 1, 4))
+
+    assert {item["unit_key"] for item in selected} == {
+        "legacy-short",
+        "current-0",
+        "current-400",
+        "current-replaces-short",
+        "legacy-short-with-orphan-continuation",
+        "orphan-current-400",
+    }
+
+
+def test_snapshot_selection_prefers_whole_canonical_fina_audit_page_family() -> None:
+    def page(
+        unit_key: str,
+        period: str,
+        offset: int,
+        *,
+        canonical: bool,
+        status: str = "succeeded",
+    ) -> dict:
+        scope = {
+            "period": period,
+            "page_group": f"fina_audit:{period}",
+            "page_size": 1_000,
+            "offset": offset,
+        }
+        if canonical:
+            scope.update(
+                {
+                    "expected_date_field": "end_date",
+                    "expected_date": period,
+                }
+            )
+        return {
+            "dataset": "fina_audit",
+            "unit_key": unit_key,
+            "status": status,
+            "params_json": {
+                "period": period,
+                "limit": 1_000,
+                "offset": offset,
+            },
+            "scope_json": scope,
+        }
+
+    rows = [
+        page("legacy-only-0", "20221231", 0, canonical=False),
+        page("legacy-only-1000", "20221231", 1_000, canonical=False),
+        page("replaced-legacy-0", "20231231", 0, canonical=False),
+        page("replaced-legacy-1000", "20231231", 1_000, canonical=False),
+        page("canonical-0", "20231231", 0, canonical=True, status="pending"),
+        page("canonical-1000", "20231231", 1_000, canonical=True, status="failed"),
+    ]
+
+    selected = select_current_reference_units(rows, snapshot_end=date(2024, 12, 31))
+
+    assert {item["unit_key"] for item in selected} == {
+        "legacy-only-0",
+        "legacy-only-1000",
+        "canonical-0",
+        "canonical-1000",
+    }
 
 
 def test_snapshot_manifest_records_historical_bounds_and_reference_version(tmp_path) -> None:

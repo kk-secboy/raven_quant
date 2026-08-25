@@ -7,6 +7,7 @@ from quant_data.checkpoint import CheckpointStore
 from quant_data.cli import (
     _full_page_partition_recovery,
     _pagination_overflow_recovery,
+    _reconcile_superseded_next_specs,
     _share_float_overflow_recovery,
 )
 from quant_data.models import FetchSpec
@@ -15,6 +16,38 @@ from quant_data.supplemental_data import (
     next_pagination_specs,
     share_float_overflow_repartition_specs,
 )
+
+
+@pytest.mark.no_database
+def test_share_float_recovery_does_not_scan_takeovers_without_a_failed_cursor() -> None:
+    share_float = next(
+        spec
+        for spec in a_share_bulk_history_specs(
+            start=pd.Timestamp("2024-01-01").date(),
+            end=pd.Timestamp("2024-01-31").date(),
+            max_attempts=3,
+        )
+        if spec.dataset == "share_float"
+    )
+
+    class Checkpoint:
+        @staticmethod
+        def unit_rows(unit_keys) -> list[dict]:
+            assert set(unit_keys) == {share_float.unit_key}
+            return [{"unit_key": share_float.unit_key, "status": "succeeded"}]
+
+        @staticmethod
+        def dataset_units(_dataset: str) -> list[dict]:
+            raise AssertionError("durable takeover rows must be loaded only for recovery")
+
+    replacements, recovered = _share_float_overflow_recovery(
+        SimpleNamespace(checkpoint=Checkpoint()),
+        [share_float],
+        set(),
+    )
+
+    assert replacements == []
+    assert recovered == set()
 
 
 def test_overflow_recovery_preserves_prefix_and_supersedes_bad_cursor(
@@ -151,6 +184,120 @@ def test_restart_rehydrates_existing_daily_share_float_replacement() -> None:
         item.scope["supersedes_page_group"] == parent.scope["page_group"]
         for item in replacements
     )
+
+
+@pytest.mark.no_database
+def test_superseded_next_page_uses_durable_takeover_without_rebuilding_parent() -> None:
+    parent = next(
+        spec
+        for spec in a_share_bulk_history_specs(
+            start=pd.Timestamp("2024-01-01").date(),
+            end=pd.Timestamp("2024-01-31").date(),
+            max_attempts=3,
+        )
+        if spec.dataset == "share_float"
+    )
+    next_page = next_pagination_specs(
+        [parent],
+        [{"unit_key": parent.unit_key, "row_count": 1_000}],
+    )[0]
+    durable = share_float_overflow_repartition_specs(parent)[::2]
+
+    class Checkpoint:
+        @staticmethod
+        def unit_rows(unit_keys) -> list[dict]:
+            assert next_page.unit_key in set(unit_keys)
+            return [{"unit_key": next_page.unit_key, "status": "superseded"}]
+
+        @staticmethod
+        def dataset_units(dataset: str) -> list[dict]:
+            assert dataset == "share_float"
+            return [
+                {
+                    "unit_key": item.unit_key,
+                    "status": "succeeded",
+                    "dataset": item.dataset,
+                    "api_name": item.api_name,
+                    "scope_json": item.scope,
+                    "params_json": item.params,
+                    "fields_json": list(item.fields),
+                    "allow_empty": item.allow_empty,
+                    "max_attempts": item.max_attempts,
+                }
+                for item in durable
+            ]
+
+    runnable, takeovers, ignored = _reconcile_superseded_next_specs(
+        SimpleNamespace(checkpoint=Checkpoint()),
+        [parent],
+        [next_page],
+    )
+
+    assert runnable == []
+    assert {item.unit_key for item in takeovers} == {
+        item.unit_key for item in durable
+    }
+    assert ignored == {parent.unit_key, next_page.unit_key}
+
+
+@pytest.mark.no_database
+def test_superseded_next_page_without_replacement_takeover_fails_closed() -> None:
+    parent = next(
+        spec
+        for spec in a_share_bulk_history_specs(
+            start=pd.Timestamp("2024-01-01").date(),
+            end=pd.Timestamp("2024-01-31").date(),
+            max_attempts=3,
+        )
+        if spec.dataset == "share_float"
+    )
+    next_page = next_pagination_specs(
+        [parent],
+        [{"unit_key": parent.unit_key, "row_count": 1_000}],
+    )[0]
+    continuation = FetchSpec(
+        dataset=parent.dataset,
+        api_name=parent.api_name,
+        params={**parent.params, "offset": 2_000},
+        scope={
+            **parent.scope,
+            "page_group": f"{parent.scope['page_group']}:continuation:2000",
+            "continues_page_group": parent.scope["page_group"],
+            "offset": 2_000,
+        },
+        allow_empty=parent.allow_empty,
+        max_attempts=parent.max_attempts,
+    )
+
+    class Checkpoint:
+        @staticmethod
+        def unit_rows(unit_keys) -> list[dict]:
+            assert next_page.unit_key in set(unit_keys)
+            return [{"unit_key": next_page.unit_key, "status": "superseded"}]
+
+        @staticmethod
+        def dataset_units(dataset: str) -> list[dict]:
+            assert dataset == "share_float"
+            return [
+                {
+                    "unit_key": continuation.unit_key,
+                    "status": "succeeded",
+                    "dataset": continuation.dataset,
+                    "api_name": continuation.api_name,
+                    "scope_json": continuation.scope,
+                    "params_json": continuation.params,
+                    "fields_json": list(continuation.fields),
+                    "allow_empty": continuation.allow_empty,
+                    "max_attempts": continuation.max_attempts,
+                }
+            ]
+
+    with pytest.raises(RuntimeError, match="lacks durable adaptive takeover evidence"):
+        _reconcile_superseded_next_specs(
+            SimpleNamespace(checkpoint=Checkpoint()),
+            [parent],
+            [next_page],
+        )
 
 
 @pytest.mark.no_database

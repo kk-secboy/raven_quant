@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from quant_platform.eligibility import EligibilityPolicy, build_point_in_time_eligibility
+from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
 from quant_platform.strategy_backtest import build_governed_signal
 
 pytestmark = pytest.mark.no_database
@@ -157,6 +158,160 @@ def test_governed_signal_cannot_select_an_ineligible_high_score() -> None:
     )
     result = build_governed_signal(scores, topk=1, eligibility_matrix=eligibility)
     assert result.index.get_level_values("instrument").tolist() == ["SZ000001"]
+
+
+def test_governed_signal_keeps_ndrop_candidates_visible_to_portfolio_policy() -> None:
+    timestamp = pd.Timestamp("2025-06-03")
+    scores = pd.Series(
+        [3.0, 2.0, 1.0],
+        index=pd.MultiIndex.from_tuples(
+            [
+                (timestamp, "SH600002"),
+                (timestamp, "SH600001"),
+                (timestamp, "SH600000"),
+            ],
+            names=["datetime", "instrument"],
+        ),
+    )
+
+    governed = build_governed_signal(scores, topk=2, n_drop=1).xs(
+        timestamp, level="datetime"
+    )
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=1,
+            max_position_weight=0.50,
+            max_daily_turnover=1.0,
+        )
+    )
+    decision = policy.decide(
+        governed,
+        {"SH600000": 0.50, "SH600001": 0.50},
+    )
+
+    assert set(governed.index) == {"SH600000", "SH600001", "SH600002"}
+    assert set(decision.target_weights) == {"SH600000", "SH600001"}
+
+
+def test_governed_signal_keeps_industry_feasible_substitutes_beyond_buffer() -> None:
+    timestamp = pd.Timestamp("2025-06-03")
+    instruments = ["SH600000", "SH600001", "SH600002", "SZ000001"]
+    scores = pd.Series(
+        [4.0, 3.0, 2.0, 1.0],
+        index=pd.MultiIndex.from_product(
+            [[timestamp], instruments], names=["datetime", "instrument"]
+        ),
+    )
+    memberships = pd.DataFrame(
+        {
+            "instrument": instruments,
+            "industry": ["bank", "bank", "bank", "technology"],
+            "in_date": [pd.Timestamp("2020-01-01")] * 4,
+            "out_date": [pd.NaT] * 4,
+        }
+    )
+
+    governed = build_governed_signal(
+        scores,
+        topk=2,
+        n_drop=1,
+        industry_memberships=memberships,
+        max_industry_weight=0.50,
+        max_industry_deviation=1.0,
+        neutralize_industry=False,
+    ).xs(timestamp, level="datetime")
+    no_buffer = build_governed_signal(
+        scores,
+        topk=2,
+        n_drop=0,
+        industry_memberships=memberships,
+        max_industry_weight=0.50,
+        max_industry_deviation=1.0,
+        neutralize_industry=False,
+    ).xs(timestamp, level="datetime")
+    industries = memberships.set_index("instrument")["industry"]
+    previous = {"SH600002": 0.50, "SZ000001": 0.50}
+    with_buffer = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=1,
+            max_position_weight=0.50,
+            max_industry_weight=0.50,
+            max_daily_turnover=1.0,
+        )
+    ).decide(governed, previous, industries=industries)
+    without_buffer = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_industry_weight=0.50,
+            max_daily_turnover=1.0,
+        )
+    ).decide(no_buffer, previous, industries=industries)
+
+    assert set(governed.index) == set(instruments)
+    assert set(no_buffer.index) == {"SH600000", "SH600001", "SZ000001"}
+    assert set(with_buffer.target_weights) == {"SH600002", "SZ000001"}
+    assert set(without_buffer.target_weights) == {"SH600000", "SZ000001"}
+
+
+def test_governed_signal_industry_candidates_match_policy_position_size() -> None:
+    timestamp = pd.Timestamp("2025-06-03")
+    instruments = ["SH600000", "SH600001", "SH600002"]
+    scores = pd.Series(
+        [3.0, 2.0, 1.0],
+        index=pd.MultiIndex.from_product(
+            [[timestamp], instruments], names=["datetime", "instrument"]
+        ),
+    )
+    memberships = pd.DataFrame(
+        {
+            "instrument": instruments,
+            "industry": ["rare", "bank", "bank"],
+            "in_date": [pd.Timestamp("2020-01-01")] * 3,
+            "out_date": [pd.NaT] * 3,
+        }
+    )
+    benchmark = pd.DataFrame(
+        {
+            "datetime": [timestamp],
+            "instrument": ["SH600001"],
+            "weight": [1.0],
+        }
+    )
+
+    governed = build_governed_signal(
+        scores,
+        topk=2,
+        n_drop=0,
+        industry_memberships=memberships,
+        benchmark_weights=benchmark,
+        max_position_weight=0.50,
+        max_industry_weight=1.0,
+        max_industry_deviation=0.10,
+        metadata_availability_lag_days=0,
+        neutralize_industry=False,
+    ).xs(timestamp, level="datetime")
+    decision = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_industry_weight=1.0,
+            max_industry_deviation=0.10,
+            max_daily_turnover=1.0,
+        )
+    ).decide(
+        governed,
+        {},
+        industries=memberships.set_index("instrument")["industry"],
+        benchmark_industry_weights=pd.Series({"bank": 1.0}),
+    )
+
+    assert set(governed.index) == set(instruments)
+    assert set(decision.target_weights) == {"SH600001", "SH600002"}
 
 
 def test_governed_signal_neutralizes_point_in_time_industry_bias() -> None:

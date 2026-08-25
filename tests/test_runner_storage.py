@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from quant_data.checkpoint import CheckpointStore
 from quant_data.models import FetchSpec, ProviderResult
@@ -148,13 +149,46 @@ def test_verifier_uses_successor_generation_and_can_ignore_dormant_plans(
         checkpoint.succeed(spec.unit_key, written)
 
     strict = verify_downloads(checkpoint, tmp_path)
-    relaxed = verify_downloads(checkpoint, tmp_path, require_all_planned=False)
+    relaxed = verify_downloads(
+        checkpoint,
+        tmp_path,
+        require_all_planned=False,
+        dataset_filter={"share_float", "daily"},
+    )
 
     assert strict["ok"] is False
+    assert strict["plan_gate"]["status"] == "block"
+    assert strict["plan_gate"]["incomplete_datasets"] == ["daily"]
     assert any("daily: 0/1 units succeeded" in item for item in strict["errors"])
     assert relaxed["ok"] is True
+    assert relaxed["plan_gate"]["status"] == "warning"
     assert relaxed["duplicate_checks"]["share_float"] == 0
     assert any("daily: 0/1 units succeeded" in item for item in relaxed["warnings"])
+
+
+def test_relaxed_verification_requires_an_explicit_exact_plan_scope(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+
+    with pytest.raises(ValueError, match="explicit dataset_filter"):
+        verify_downloads(checkpoint, tmp_path, require_all_planned=False)
+
+
+def test_scoped_verification_rejects_a_selected_dataset_without_a_plan(
+    tmp_path: Path, database_url: str
+) -> None:
+    checkpoint = CheckpointStore(database_url)
+
+    report = verify_downloads(
+        checkpoint,
+        tmp_path,
+        dataset_filter={"daily"},
+    )
+
+    assert report["ok"] is False
+    assert report["plan_gate"]["missing_planned_datasets"] == ["daily"]
+    assert any("no active plan" in item for item in report["errors"])
 
 
 def test_verifier_dataset_filter_ignores_unrelated_failed_plan(

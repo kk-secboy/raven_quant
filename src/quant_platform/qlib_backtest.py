@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .cost_model import CostModelConfig, CostScheduleBook
+from .portfolio_policy import PortfolioPolicyConfig
 from .qlib_execution_strategy import create_qlib_execution_strategy
 
 QLIB_ENGINE_VERSION = "qlib-policy-engine-v5-single-mainline"
@@ -500,7 +501,9 @@ def run_qlib_validation_suites(
             return robustness_runner(overrides, costs)
         return runner(start_time, end_time, costs)
 
-    topk = int(config.get("topk", 50))
+    baseline_policy_config = PortfolioPolicyConfig.from_mapping(config)
+    topk = baseline_policy_config.topk
+    reduced_topk = max(1, int(np.floor(topk * 0.80)))
     robustness_specs = {
         "double_cost": ({}, schedule.doubled()),
         "turnover_75pct": (
@@ -509,8 +512,8 @@ def run_qlib_validation_suites(
         ),
         "topk_80pct": (
             {
-                "topk": max(5, int(np.floor(topk * 0.80))),
-                "n_drop": min(int(config.get("n_drop", 0)), max(5, int(np.floor(topk * 0.80)))),
+                "topk": reduced_topk,
+                "n_drop": min(baseline_policy_config.n_drop, reduced_topk),
             },
             schedule,
         ),

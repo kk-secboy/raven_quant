@@ -11,6 +11,7 @@ from qlib_test_doubles import qlib_workflow_identity
 
 from quant_platform import external_factor_evaluation as ext
 from quant_platform.factor_evaluator import evaluate_factor_values
+from quant_platform.jsonb_safety import canonical_jsonb_sha256
 from quant_platform.research_store import (
     EXTERNAL_EVALUATOR_VERSION,
     ExternalEventGatePolicy,
@@ -972,6 +973,64 @@ def test_import_external_evaluations_end_to_end(tmp_path: Path, database_url: st
             periods=PERIODS,
             artifact_path=artifact,
         )
+
+
+def test_import_external_evaluation_persists_non_finite_metrics_as_audited_null(
+    tmp_path: Path, database_url: str
+) -> None:
+    store = ResearchStore(database_url)
+    factor, label = _sparse_event_inputs(event_days=40)
+    candidate = _external_candidate(
+        store, tmp_path, factor, name="nan_turnover", run_kind="external_nan_import"
+    )
+    outcome = ext.evaluate_sparse_event_factor(
+        factor,
+        label,
+        valid_start=PERIODS["valid_start"],
+        valid_end=PERIODS["valid_end"],
+        test_start=PERIODS["test_start"],
+        test_end=PERIODS["test_end"],
+    )
+    raw_metrics = dict(outcome["metrics"])
+    raw_metrics["turnover"] = float("nan")
+    entry = _event_entry(candidate["id"], raw_metrics)
+    entry["evidence"] = _evidence(store, candidate["id"], ext.SHAPE_SPARSE_EVENT)
+    entry["evidence"]["diagnostics"] = {"producer_ratio": float("inf")}
+    entry["shape"] = ext.SHAPE_SPARSE_EVENT
+    artifact = _write_result_artifact(tmp_path / "nan-result.json", candidate["id"], raw_metrics)
+    result = {"status": "ok", "evaluations": [entry]}
+
+    imported = ext.import_external_evaluations(
+        store,
+        result,
+        dataset="snapshot-external",
+        dataset_identity_sha256=DATASET_IDENTITY,
+        periods=PERIODS,
+        artifact_path=artifact,
+    )
+
+    assert len(imported) == 1
+    evaluation = imported[0]
+    # The raw NaN participates in the gate and therefore fails; persistence
+    # does not reinterpret it as a passing zero or an originally absent value.
+    assert evaluation["gate_status"] == "failed"
+    assert any("turnover=nan failed" in reason for reason in evaluation["gate_reasons"])
+    assert evaluation["turnover"] is None
+    assert evaluation["metrics"]["turnover"] is None
+    normalization = evaluation["metrics"]["_quantlab_json_normalization"]
+    assert normalization["replacement_count"] == 1
+    assert normalization["recorded_occurrences"][0]["path"] == ["turnover"]
+    assert evaluation["metrics_sha256"] == canonical_jsonb_sha256(evaluation["metrics"])
+    assert evaluation["metrics_sha256"] == canonical_jsonb_sha256(raw_metrics)
+    assert evaluation["recompute_evidence"]["diagnostics"]["producer_ratio"] is None
+    assert (
+        evaluation["recompute_evidence"]["_quantlab_json_normalization"][
+            "replacement_count"
+        ]
+        == 1
+    )
+    assert np.isnan(raw_metrics["turnover"])
+    assert np.isinf(entry["evidence"]["diagnostics"]["producer_ratio"])
 
 
 @pytest.mark.no_database

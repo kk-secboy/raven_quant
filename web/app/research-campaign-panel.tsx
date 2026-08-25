@@ -56,10 +56,6 @@ const STAGE_LABELS: Record<string, string> = {
   complete: "自动流水线完成",
 };
 
-function today() {
-  return new Date().toISOString().slice(0, 10);
-}
-
 export function ResearchCampaignPanel({ api }: { api: string }) {
   const [view, setView] = useState<"programs" | "campaigns">("programs");
   const [programs, setPrograms] = useState<ResearchProgram[]>([]);
@@ -68,15 +64,9 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
   const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [name, setName] = useState("沪深300 自动研究");
   const [programName, setProgramName] = useState("沪深300 持续研究");
-  const [minNewTradingDays, setMinNewTradingDays] = useState(20);
   const [dataset, setDataset] = useState("");
   const [recipeId, setRecipeId] = useState("index_enhancement");
   const [objective, setObjective] = useState("");
-  const [periods, setPeriods] = useState({
-    train_start: "2008-01-01", train_end: "2017-12-31",
-    valid_start: "2018-01-01", valid_end: "2020-12-31",
-    test_start: "2021-01-11", test_end: today(),
-  });
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -127,7 +117,6 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
         dataset,
         recipe_id: recipeId,
         objective,
-        min_new_trading_days: minNewTradingDays,
       }),
     });
     const body = await response.json();
@@ -165,7 +154,7 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
     const response = await apiFetch(`${api}/api/research-campaigns`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, dataset, recipe_id: recipeId, objective, periods }),
+      body: JSON.stringify({ name, dataset, recipe_id: recipeId, objective }),
     });
     const body = await response.json();
     setBusy(false);
@@ -214,8 +203,7 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
         <label>计划名称<input value={programName} onChange={(event) => setProgramName(event.target.value)} minLength={3} maxLength={100} /></label>
         <div className="form-row"><label>策略模板<select value={recipeId} onChange={(event) => { const next = event.target.value; setRecipeId(next); setObjective(recipes.find((item) => item.id === next)?.rdagent_objective ?? ""); }}>{recipes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>数据血缘起点<select value={dataset} onChange={(event) => setDataset(event.target.value)}>{datasets.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label></div>
         <label>RD-Agent 研究目标<textarea value={objective} onChange={(event) => setObjective(event.target.value)} minLength={10} maxLength={2000} rows={5} /></label>
-        <label>累计新增交易日再研究<input type="number" min={1} max={252} value={minNewTradingDays} onChange={(event) => setMinNewTradingDays(Number(event.target.value))} /></label>
-        <details className="campaign-advanced"><summary>严格隔离的时间窗口</summary><p>默认使用最近 756 个训练日、252 个验证日和 504 个独立测试日。数据不足时只等待，不缩短窗口；最终测试不参与跨轮次选择。</p></details>
+        <details className="campaign-advanced"><summary>严格隔离的时间窗口</summary><p>Qlib 同时评估近 3 年、近 5 年和近 10 年，近期结果主导、长期结果负责排雷；三组共同隔离最新 252 个交易日。下一轮必须再获得完整的 252 个新交易日，最终样本外绝不重叠。</p></details>
         <button className="primary" disabled={busy || !dataset || objective.length < 10}>{busy ? "正在保存…" : "启用持续研究"}</button>
         <small>计划只跟随已验证的同一 Qlib 血缘；每个新快照最多创建一次活动，生成推荐组合前仍需人工审批。</small>
       </form>
@@ -224,7 +212,7 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
         <div className="panel-heading"><div><p className="eyebrow">RESEARCH SUPERVISOR</p><h2>持续计划</h2><p>调度器自动检查新快照，并限制同时运行的研究数量。</p></div><span>{programs.length} 个</span></div>
         <div className="campaign-cards">{programs.map((item) => <article className={`campaign-card ${item.status}`} key={item.id}>
           <div className="campaign-card-head"><div><strong>{item.name}</strong><small>{item.recipe_id} · {item.id.slice(0, 8)}</small></div><span className={`state ${item.status === "active" ? "ready" : "partial"}`}>{item.status === "active" ? "自动运行" : item.status === "paused" ? "已暂停" : "已取消"}</span></div>
-          <div className="campaign-stage"><span>新增 {item.min_new_trading_days} 个交易日触发</span><b>并发 ≤ {item.max_active_campaigns}</b></div>
+          <div className="campaign-stage"><span>新增完整 {item.min_new_trading_days} 日 OOS 后触发</span><b>并发 ≤ {item.max_active_campaigns}</b></div>
           {item.last_dataset_name ? <small>最近触发：{item.last_dataset_name} · {item.last_dataset_end_date}</small> : <small>尚未触发研究活动</small>}
           {item.last_message ? <p className="campaign-attention">{item.last_message}</p> : null}
           <div className="campaign-actions">
@@ -241,9 +229,7 @@ export function ResearchCampaignPanel({ api }: { api: string }) {
         <div className="form-row"><label>策略模板<select value={recipeId} onChange={(event) => { const next = event.target.value; setRecipeId(next); setObjective(recipes.find((item) => item.id === next)?.rdagent_objective ?? ""); }}>{recipes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Qlib 数据集<select value={dataset} onChange={(event) => setDataset(event.target.value)}>{datasets.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label></div>
         <label>RD-Agent 研究目标<textarea value={objective} onChange={(event) => setObjective(event.target.value)} minLength={10} maxLength={2000} rows={5} /></label>
         <details className="campaign-advanced"><summary>研究时间窗口</summary>
-          <div className="form-row"><label>训练开始<input type="date" value={periods.train_start} onChange={(event) => setPeriods({ ...periods, train_start: event.target.value })} /></label><label>训练结束<input type="date" value={periods.train_end} onChange={(event) => setPeriods({ ...periods, train_end: event.target.value })} /></label></div>
-          <div className="form-row"><label>验证开始<input type="date" value={periods.valid_start} onChange={(event) => setPeriods({ ...periods, valid_start: event.target.value })} /></label><label>验证结束<input type="date" value={periods.valid_end} onChange={(event) => setPeriods({ ...periods, valid_end: event.target.value })} /></label></div>
-          <div className="form-row"><label>样本外开始<input type="date" value={periods.test_start} onChange={(event) => setPeriods({ ...periods, test_start: event.target.value })} /></label><label>样本外结束<input type="date" value={periods.test_end} onChange={(event) => setPeriods({ ...periods, test_end: event.target.value })} /></label></div>
+          <p>平台按真实交易日历建立近期、均衡、稳健三组窗口并发评估。所有窗口共用同一个最终样本外；候选冻结后只统一打开一次。</p>
         </details>
         <button className="primary" disabled={busy || !dataset || objective.length < 10}>{busy ? "正在创建…" : "启动自动研究"}</button>
         <small>只有评价 v2、统一 Qlib 回测和完整证据均通过，策略才能生成人工审批后的推荐组合。</small>

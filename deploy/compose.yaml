@@ -41,8 +41,20 @@ services:
       RUN_EMBEDDED_WORKER: "false"
       QLIB_WORKER_URL: http://worker:8770
       RDAGENT_WORKER_URL: http://rdagent-worker:8770
+      RDAGENT_GPU_WORKER_URL: http://rdagent-llm-finetune-worker:8770
+      RDAGENT_DATA_SCIENCE_WORKER_URL: http://rdagent-data-science-worker:8770
+      RDAGENT_EVALUATION_WORKER_URL: http://worker:8770
       SCHEDULER_URL: http://scheduler:8780
       RDAGENT_ENABLED: "true"
+      RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
+      RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
+      RDAGENT_DATA_SCIENCE_IMAGE: ${RDAGENT_DATA_SCIENCE_IMAGE:-}
+      MODEL_SANDBOX_IMAGE: ${MODEL_SANDBOX_IMAGE:-}
+      RDAGENT_FINETUNE_MIN_GPU_MEMORY_MB: ${RDAGENT_FINETUNE_MIN_GPU_MEMORY_MB:-16384}
+      RDAGENT_FINETUNE_MIN_DISK_GB: ${RDAGENT_FINETUNE_MIN_DISK_GB:-50}
+      RDAGENT_FINETUNE_IMAGE: ${RDAGENT_FINETUNE_IMAGE:-}
+      RDAGENT_FINETUNE_BENCHMARK_IMAGE: ${RDAGENT_FINETUNE_BENCHMARK_IMAGE:-}
+      RDAGENT_FINETUNE_GPU_PROBE_IMAGE: ${RDAGENT_FINETUNE_GPU_PROBE_IMAGE:-}
       AUTH_MODE: ${AUTH_MODE:-required}
       AUTH_SESSION_HOURS: ${AUTH_SESSION_HOURS:-12}
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
@@ -89,12 +101,25 @@ services:
       TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
       PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
       SCHEDULER_POLL_SECONDS: ${SCHEDULER_POLL_SECONDS:-15}
+      RESEARCH_ASSET_AUTO_ENABLED: ${RESEARCH_ASSET_AUTO_ENABLED:-true}
+      RESEARCH_ASSET_AUTO_HOUR: ${RESEARCH_ASSET_AUTO_HOUR:-20}
+      RESEARCH_ASSET_AUTO_MINUTE: ${RESEARCH_ASSET_AUTO_MINUTE:-30}
       HEALTH_SNAPSHOT_SECONDS: ${HEALTH_SNAPSHOT_SECONDS:-300}
       DATA_FRESHNESS_MAX_DAYS: ${DATA_FRESHNESS_MAX_DAYS:-7}
       STALE_JOB_HOURS: ${STALE_JOB_HOURS:-6}
       QLIB_WORKER_URL: http://worker:8770
       RDAGENT_WORKER_URL: http://rdagent-worker:8770
+      RDAGENT_GPU_WORKER_URL: http://rdagent-llm-finetune-worker:8770
+      RDAGENT_DATA_SCIENCE_WORKER_URL: http://rdagent-data-science-worker:8770
+      RDAGENT_EVALUATION_WORKER_URL: http://worker:8770
       RDAGENT_ENABLED: "true"
+      RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
+      RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
+      RDAGENT_DATA_SCIENCE_IMAGE: ${RDAGENT_DATA_SCIENCE_IMAGE:-}
+      MODEL_SANDBOX_IMAGE: ${MODEL_SANDBOX_IMAGE:-}
+      RDAGENT_FINETUNE_IMAGE: ${RDAGENT_FINETUNE_IMAGE:-}
+      RDAGENT_FINETUNE_BENCHMARK_IMAGE: ${RDAGENT_FINETUNE_BENCHMARK_IMAGE:-}
+      RDAGENT_FINETUNE_GPU_PROBE_IMAGE: ${RDAGENT_FINETUNE_GPU_PROBE_IMAGE:-}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
       BROKER_MODE: ${BROKER_MODE:-disabled}
       BROKER_FEATURE_ENABLED: ${BROKER_FEATURE_ENABLED:-false}
@@ -141,10 +166,11 @@ services:
       PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
       REQUESTS_PER_MINUTE: ${REQUESTS_PER_MINUTE:-99}
       DOWNLOAD_WORKERS: ${DOWNLOAD_WORKERS:-4}
-      WORKER_JOB_KINDS: bootstrap,baostock_overlap_validation,legacy_market_backfill,data_verify,data_snapshot,data_qlib,minute_qlib,minute_research,qlib_baseline,margin_eligibility_download,core_intraday_download,ashare_5m_download,cninfo_announcements_download,announcement_nlp,announcement_factor_register,corpus_nlp,corpus_factor_register,event_market_response,report_rc_factors,report_rc_factor_register,major_news_mentions,major_news_mentions_factor_register,news_flash_factors,news_flash_factor_register,external_factor_evaluate,information_factor_evaluate,multiface_audit,supplemental_download,supplemental_cn_extended_daily,supplemental_cn_funds,supplemental_cn_macro,supplemental_cn_institutional,supplemental_cn_futures,supplemental_cn_options_bonds,supplemental_hk_market,supplemental_us_market,supplemental_global_markets,supplemental_cn_governance_risk,supplemental_cn_capital_flow,supplemental_cn_fund_index_enhanced,supplemental_cn_derivatives_enhanced,supplemental_global_rates_enhanced,supplemental_research_corpus,supplemental_strategy_specialty,supplemental_strategy_specialty_minutes,factor_evaluate,strategy_backtest,parameter_experiment,pair_backtest,recommendation_refresh,simulation_order_plan,simulation_replay
+      WORKER_JOB_KINDS: bootstrap,baostock_overlap_validation,legacy_market_backfill,data_verify,data_snapshot,data_qlib,minute_qlib,minute_research,qlib_baseline,margin_eligibility_download,core_intraday_download,ashare_5m_download,cninfo_announcements_download,announcement_nlp,announcement_factor_register,corpus_nlp,corpus_factor_register,event_market_response,report_rc_factors,report_rc_factor_register,major_news_mentions,major_news_mentions_factor_register,news_flash_factors,news_flash_factor_register,external_factor_evaluate,information_factor_evaluate,multiface_audit,supplemental_download,supplemental_cn_extended_daily,supplemental_cn_funds,supplemental_cn_macro,supplemental_cn_institutional,supplemental_cn_futures,supplemental_cn_options_bonds,supplemental_hk_market,supplemental_us_market,supplemental_global_markets,supplemental_cn_governance_risk,supplemental_cn_capital_flow,supplemental_cn_fund_index_enhanced,supplemental_cn_derivatives_enhanced,supplemental_global_rates_enhanced,supplemental_research_corpus,supplemental_strategy_specialty,supplemental_strategy_specialty_minutes,research_asset_acquire,factor_evaluate,model_evaluate,quant_bundle_evaluate,model_refit,strategy_backtest,parameter_experiment,pair_backtest,recommendation_refresh,simulation_order_plan,simulation_replay
       RDAGENT_ENABLED: "false"
       DOCKER_HOST: tcp://rdagent-docker:2375
       FACTOR_SANDBOX_IMAGE: quantlab-factor-sandbox:v2
+      MODEL_SANDBOX_IMAGE: ${MODEL_SANDBOX_IMAGE:-}
     volumes:
       - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
     depends_on:
@@ -168,16 +194,30 @@ services:
     logging: *default-logging
     environment:
       DOCKER_TLS_CERTDIR: ""
-    command: ["--host=tcp://0.0.0.0:2375", "--tls=false"]
+    command:
+      - --host=tcp://0.0.0.0:2375
+      - --tls=false
+      - --insecure-registry=rdagent-registry:5000
     volumes:
       - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
-      - rdagent_docker:/var/lib/docker
+      # Generated-code images are large and must live on the dedicated data
+      # disk, outside the governed market-data tree and the host root disk.
+      - ${RDAGENT_DOCKER_HOST_PATH:-/data/quantlab-rdagent-docker}:/var/lib/docker
     healthcheck:
       test: ["CMD", "docker", "info"]
       interval: 10s
       timeout: 5s
       retries: 20
       start_period: 20s
+
+  rdagent-registry:
+    profiles: ["sandbox-registry"]
+    image: registry:2.8
+    restart: "no"
+    ports:
+      - "127.0.0.1:${RDAGENT_REGISTRY_PORT:-55000}:5000"
+    volumes:
+      - ${RDAGENT_REGISTRY_HOST_PATH:-/data/quantlab-rdagent-registry}:/var/lib/registry
 
   factor-sandbox-builder:
     image: docker:27-dind
@@ -194,7 +234,29 @@ services:
       rdagent-docker:
         condition: service_healthy
 
+  model-sandbox-builder:
+    # Development-only helper.  Capital-path model execution refuses mutable
+    # tags, so production must preload MODEL_SANDBOX_IMAGE by immutable digest.
+    profiles: ["model-sandbox-dev"]
+    image: docker:27-dind
+    restart: "no"
+    environment:
+      MODEL_SANDBOX_BASE_IMAGE: quantlab-worker-runtime:v2
+      MODEL_SANDBOX_IMAGE: quantlab-model-sandbox:dev
+      MODEL_SANDBOX_DOCKER_HOST: tcp://rdagent-docker:2375
+    command: ["sh", "/context/build.sh"]
+    volumes:
+      - ./model-sandbox:/context:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      rdagent-docker:
+        condition: service_healthy
+
   rdagent-worker:
+    # Both RD-Agent queues must execute the exact same sealed runtime image.
+    # A shared tag prevents two independent legacy-builder invocations from
+    # producing byte-different image IDs from the same Dockerfile/context.
+    image: quantlab-rdagent-runtime:v2
     build:
       context: ..
       dockerfile: deploy/Dockerfile.rdagent
@@ -208,18 +270,110 @@ services:
       DATA_ROOT: /data
       DOCKER_HOST: tcp://rdagent-docker:2375
       RDAGENT_ENABLED: "true"
+      RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
+      RDAGENT_DOCKER_SHARED_ROOT: /data
+      RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
+      RDAGENT_DATA_SCIENCE_IMAGE: ${RDAGENT_DATA_SCIENCE_IMAGE:-}
       RDAGENT_LLM_KEY_ENV: ${RDAGENT_LLM_KEY_ENV:-OPENAI_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_API_BASE: ${OPENAI_API_BASE:-}
       CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
       PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
-      WORKER_JOB_KINDS: rdagent_factor
+      WORKER_JOB_KINDS: rdagent_factor,rdagent_run
     volumes:
       - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
     depends_on:
       api:
         condition: service_healthy
       rdagent-docker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  rdagent-data-science-worker:
+    image: quantlab-rdagent-runtime:v2
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.rdagent
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
+      DATA_ROOT: /data
+      DOCKER_HOST: tcp://rdagent-docker:2375
+      RDAGENT_ENABLED: "true"
+      RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
+      RDAGENT_DOCKER_SHARED_ROOT: /data
+      RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
+      RDAGENT_DATA_SCIENCE_IMAGE: ${RDAGENT_DATA_SCIENCE_IMAGE:-}
+      RDAGENT_LLM_KEY_ENV: ${RDAGENT_LLM_KEY_ENV:-OPENAI_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
+      CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
+      PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
+      WORKER_JOB_KINDS: rdagent_data_science
+    volumes:
+      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
+    depends_on:
+      api:
+        condition: service_healthy
+      rdagent-docker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  rdagent-llm-finetune-worker:
+    profiles: ["gpu"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.rdagent
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
+    restart: unless-stopped
+    logging: *default-logging
+    gpus: all
+    environment:
+      DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
+      DATA_ROOT: /data
+      # The GPU profile intentionally uses the host daemon. Unlike the regular
+      # isolated DinD service, it must have NVIDIA Toolkit/CDI configured.
+      DOCKER_HOST: unix:///var/run/docker.sock
+      RDAGENT_ENABLED: "true"
+      RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
+      RDAGENT_DOCKER_SHARED_ROOT: ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}
+      RDAGENT_LLM_KEY_ENV: ${RDAGENT_LLM_KEY_ENV:-OPENAI_API_KEY}
+      RDAGENT_FINETUNE_MIN_GPU_MEMORY_MB: ${RDAGENT_FINETUNE_MIN_GPU_MEMORY_MB:-16384}
+      RDAGENT_FINETUNE_MIN_DISK_GB: ${RDAGENT_FINETUNE_MIN_DISK_GB:-50}
+      RDAGENT_FINETUNE_IMAGE: ${RDAGENT_FINETUNE_IMAGE:-}
+      RDAGENT_FINETUNE_BENCHMARK_IMAGE: ${RDAGENT_FINETUNE_BENCHMARK_IMAGE:-}
+      RDAGENT_FINETUNE_GPU_PROBE_IMAGE: ${RDAGENT_FINETUNE_GPU_PROBE_IMAGE:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
+      CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
+      WORKER_JOB_KINDS: rdagent_llm_finetune
+    volumes:
+      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
+      # Mount the same source at its host-visible absolute path. RD-Agent sends
+      # absolute bind sources to the host Docker daemon for nested sandboxes.
+      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      api:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]
@@ -262,4 +416,3 @@ services:
 
 volumes:
   quantlab_postgres:
-  rdagent_docker:

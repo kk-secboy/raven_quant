@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from math import isfinite
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import insert, select, update
 from sqlalchemy.exc import IntegrityError
@@ -16,6 +17,7 @@ from quant_data.database import (
     recommendation_portfolios,
     recommendation_snapshots,
     row_dict,
+    strategy_promotion_stages,
 )
 
 from .account_risk_state import assess_account_risk
@@ -140,14 +142,15 @@ class RecommendationStore:
             raise ValueError("legacy strategy versions cannot generate recommendations")
         if version["status"] != "approved" or version.get("strategy_type") != "multifactor":
             raise ValueError("recommendations require an approved multifactor strategy")
-        # Design 6.11: standalone recommendations require the version to have
-        # passed the forward evidence gate. NULL promotion_stage marks legacy
-        # rows/fixtures that predate the promotion chain; "paper" is the only
-        # stage that blocks.
-        if version.get("promotion_stage") == "paper":
+        # Design 6.11: only an explicit human promotion after the immutable
+        # forward gate opens this path.  NULL/unknown legacy markers fail
+        # closed; they must not bypass the paper stage merely because they
+        # predate this state machine.
+        if version.get("promotion_stage") != "recommendation_enabled":
             raise ValueError(
-                "strategy version is in the paper stage; standalone recommendations "
-                "require recommendation_enabled (forward evidence gate plus human approval)"
+                "strategy version has not passed the paper stage; standalone "
+                "recommendations require recommendation_enabled "
+                "(forward evidence gate plus human approval)"
             )
         evaluation_ids = [item.get("factor_evaluation_id") for item in version["factors"]]
         with self.engine.connect() as connection:
@@ -334,6 +337,31 @@ class RecommendationStore:
         portfolio = self.get(portfolio_id)
         if portfolio["status"] != "active":
             raise ValueError("only active recommendation portfolios may refresh")
+        current_date = _now().astimezone(ZoneInfo("Asia/Shanghai")).date()
+        with self.engine.connect() as connection:
+            promoted_stage = connection.execute(
+                select(strategy_promotion_stages)
+                .where(
+                    strategy_promotion_stages.c.strategy_version_id
+                    == portfolio["strategy_version_id"],
+                    strategy_promotion_stages.c.promoted_at.is_not(None),
+                )
+                .order_by(strategy_promotion_stages.c.stage_index.desc())
+                .limit(1)
+            ).first()
+        if promoted_stage is None or promoted_stage.promoted_at is None:
+            raise ValueError(
+                "recommendation snapshot requires a human-promoted paper stage"
+            )
+        promoted_date = promoted_stage.promoted_at.astimezone(
+            ZoneInfo("Asia/Shanghai")
+        ).date()
+        if as_of_date <= promoted_date:
+            raise ValueError(
+                "recommendation snapshot must be from a trading day after human promotion"
+            )
+        if as_of_date > current_date:
+            raise ValueError("recommendation snapshot cannot use a future date")
         roll_policy = str(portfolio.get("dataset_roll_policy") or "pinned")
         if roll_policy == "pinned" and dataset != portfolio["dataset"]:
             raise ValueError("pinned recommendation snapshot dataset must match its portfolio")

@@ -15,6 +15,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.parameter_experiments import evaluate_trial, summarize_trials
 from quant_platform.qlib_workflow import (
     qlib_workflow_run,
@@ -188,6 +189,7 @@ def main() -> None:
     if not provenance_path.is_file():
         raise ValueError("parameter experiment requires Qlib dataset provenance")
     provider_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    verify_qlib_output_manifest(Path(args.provider_uri), provider_provenance)
     import qlib
 
     qlib.init(provider_uri=args.provider_uri, region="cn")

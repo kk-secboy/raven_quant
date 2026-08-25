@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,9 +12,69 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import jobs, open_database, row_dict
+from quant_platform.jsonb_safety import normalize_jsonb_document
+
+FORMAL_DATA_AUTO_RETRY_KINDS = frozenset(
+    {
+        # Formal data, information-factor, and Qlib publication jobs can all
+        # be submitted as a durable pipeline root. Successors already inherit
+        # the root's bound max_attempts value in LocalJobWorker; keeping every
+        # possible root here prevents an otherwise identical chain from
+        # silently dropping to one execution when it starts at a later stage.
+        "announcement_factor_register",
+        "announcement_nlp",
+        "ashare_5m_download",
+        "baostock_overlap_validation",
+        "bootstrap",
+        "cninfo_announcements_download",
+        "core_intraday_download",
+        "corpus_factor_register",
+        "corpus_nlp",
+        "data_qlib",
+        "data_snapshot",
+        "data_verify",
+        "event_market_response",
+        "information_factor_evaluate",
+        "legacy_market_backfill",
+        "major_news_mentions",
+        "major_news_mentions_factor_register",
+        "margin_eligibility_download",
+        "minute_qlib",
+        "minute_research",
+        "multiface_audit",
+        "news_flash_factor_register",
+        "news_flash_factors",
+        "qlib_baseline",
+        "report_rc_factor_register",
+        "report_rc_factors",
+        "supplemental_cn_capital_flow",
+        "supplemental_cn_derivatives_enhanced",
+        "supplemental_cn_extended_daily",
+        "supplemental_cn_fund_index_enhanced",
+        "supplemental_cn_funds",
+        "supplemental_cn_futures",
+        "supplemental_cn_governance_risk",
+        "supplemental_cn_institutional",
+        "supplemental_cn_macro",
+        "supplemental_cn_options_bonds",
+        "supplemental_download",
+        "supplemental_global_markets",
+        "supplemental_global_rates_enhanced",
+        "supplemental_hk_market",
+        "supplemental_research_corpus",
+        "supplemental_strategy_specialty",
+        "supplemental_strategy_specialty_minutes",
+        "supplemental_us_market",
+    }
+)
 
 AUTO_RETRY_ATTEMPTS = {
+    **{kind: 3 for kind in FORMAL_DATA_AUTO_RETRY_KINDS},
+    "research_asset_acquire": 3,
     "rdagent_factor": 3,
+    "rdagent_run": 3,
+    "rdagent_data_science": 1,
+    "rdagent_llm_finetune": 1,
     "recommendation_refresh": 3,
     "simulation_order_plan": 3,
 }
@@ -20,6 +82,28 @@ AUTO_RETRY_ATTEMPTS = {
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def research_asset_acquisition_idempotency_key(
+    *,
+    research_day: str,
+    snapshot_name: str,
+    include_tushare: bool,
+    include_arxiv: bool,
+) -> str:
+    """Bind one automatic acquisition identity to its complete source contract."""
+
+    contract = {
+        "contract_version": "research-asset-acquisition-job-v1",
+        "as_of": str(research_day),
+        "snapshot_name": str(snapshot_name),
+        "include_tushare": bool(include_tushare),
+        "include_arxiv": bool(include_arxiv),
+    }
+    digest = hashlib.sha256(
+        json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"research-assets:auto:{research_day}:{digest}"
 
 
 class JobStore:
@@ -57,9 +141,15 @@ class JobStore:
             with self.engine.begin() as connection:
                 if idempotency_key:
                     existing = connection.execute(
-                        select(jobs.c.id).where(jobs.c.idempotency_key == idempotency_key)
+                        select(jobs.c.id, jobs.c.kind, jobs.c.payload_json).where(
+                            jobs.c.idempotency_key == idempotency_key
+                        )
                     ).first()
                     if existing:
+                        if str(existing.kind) != kind or dict(existing.payload_json) != payload:
+                            raise ValueError(
+                                "idempotency key is already bound to a different job payload"
+                            )
                         existing_id = str(existing.id)
                 if existing_id is None:
                     if dedupe_active_kind:
@@ -98,9 +188,15 @@ class JobStore:
             if idempotency_key:
                 with self.engine.connect() as connection:
                     existing = connection.execute(
-                        select(jobs.c.id).where(jobs.c.idempotency_key == idempotency_key)
+                        select(jobs.c.id, jobs.c.kind, jobs.c.payload_json).where(
+                            jobs.c.idempotency_key == idempotency_key
+                        )
                     ).first()
                 if existing:
+                    if str(existing.kind) != kind or dict(existing.payload_json) != payload:
+                        raise ValueError(
+                            "idempotency key is already bound to a different job payload"
+                        ) from exc
                     return self.get(str(existing.id))
             raise ValueError(f"could not create {kind} job") from exc
         return self.get(existing_id or job_id)
@@ -140,6 +236,7 @@ class JobStore:
         result: dict[str, Any] | None = None,
     ) -> None:
         status = "succeeded" if exit_code == 0 else "failed"
+        persisted_result = normalize_jsonb_document(result)
         with self.engine.begin() as connection:
             connection.execute(
                 update(jobs)
@@ -148,7 +245,7 @@ class JobStore:
                     status=status,
                     exit_code=exit_code,
                     error=error,
-                    progress_json=result,
+                    progress_json=persisted_result,
                     cancel_requested_at=None,
                     next_attempt_at=None,
                     finished_at=_now(),
@@ -158,11 +255,12 @@ class JobStore:
     def update_progress(self, job_id: str, progress: dict[str, Any]) -> None:
         """Persist a live subprocess progress snapshot without changing job state."""
 
+        persisted_progress = normalize_jsonb_document(progress)
         with self.engine.begin() as connection:
             updated = connection.execute(
                 update(jobs)
                 .where(jobs.c.id == job_id, jobs.c.status == "running")
-                .values(progress_json=progress)
+                .values(progress_json=persisted_progress)
             )
         if not int(updated.rowcount or 0):
             current = self.get(job_id)
@@ -185,6 +283,7 @@ class JobStore:
         incremented on claim, so a max_attempts value of three means at most
         three actual process executions.
         """
+        persisted_result = normalize_jsonb_document(result)
         with self.engine.begin() as connection:
             row = connection.execute(
                 select(jobs.c.status, jobs.c.attempts, jobs.c.max_attempts)
@@ -206,7 +305,7 @@ class JobStore:
                         status="queued",
                         exit_code=exit_code,
                         error=error,
-                        progress_json=result,
+                        progress_json=persisted_result,
                         started_at=None,
                         finished_at=None,
                         cancel_requested_at=None,
@@ -221,7 +320,7 @@ class JobStore:
                     status="failed",
                     exit_code=exit_code,
                     error=error,
-                    progress_json=result,
+                    progress_json=persisted_result,
                     cancel_requested_at=None,
                     next_attempt_at=None,
                     finished_at=_now(),

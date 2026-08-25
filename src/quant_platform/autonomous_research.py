@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import time
+from pathlib import Path
 from typing import Any
 
 from quant_data.config import Settings
@@ -15,8 +16,10 @@ from .qlib_factor_baseline import (
     FACTOR_SOURCE_QLIB_CHALLENGER_REPLACEMENT,
     QLIB_BASELINE_RECIPE_IDS,
 )
+from .rdagent_runtime import expected_rdagent_runtime_identity, probe_rdagent
+from .rdagent_scenarios import require_ready_scenario
 from .recommendation_store import RecommendationStore
-from .research_automation import rank_factor_candidates
+from .research_automation import rank_multi_profile_candidates
 from .research_campaign_store import ResearchCampaignStore
 from .research_contracts import default_campaign_research_brief
 from .research_store import ResearchStore
@@ -175,6 +178,11 @@ class AutonomousResearchOrchestrator:
         reference_order_value = float(strategy_config.get("capacity_notional", 5_000_000)) / int(
             strategy_config.get("topk", 50)
         )
+        runtime = probe_rdagent(self.settings, Path(__file__).resolve().parents[2])
+        require_ready_scenario(runtime, self.settings, "fin_factor")
+        expected_runtime_identity = expected_rdagent_runtime_identity(
+            runtime, "fin_factor"
+        )
         try:
             run = self.research.create_run(
                 kind="factor",
@@ -184,6 +192,9 @@ class AutonomousResearchOrchestrator:
                 budget={"loop_n": research["loop_n"], "duration": research["duration"]},
                 config={
                     "periods": research["periods"],
+                    "evaluation_profiles": config.get("period_resolution", {}).get(
+                        "evaluation_profiles", []
+                    ),
                     "dataset_path": evidence["path"],
                     "dataset_identity_sha256": evidence["provenance"]["dataset_identity_sha256"],
                     "campaign_id": campaign["id"],
@@ -193,6 +204,7 @@ class AutonomousResearchOrchestrator:
                     ),
                     "cost_model": cost_model.to_dict(),
                     "cost_reference_order_value": reference_order_value,
+                    "expected_rdagent_runtime": expected_runtime_identity,
                 },
                 artifact_path=self.settings.data_root / "artifacts" / "rdagent",
             )
@@ -216,12 +228,16 @@ class AutonomousResearchOrchestrator:
                     "loop_n": research["loop_n"],
                     "duration": research["duration"],
                     "periods": research["periods"],
+                    "evaluation_profiles": config.get("period_resolution", {}).get(
+                        "evaluation_profiles", []
+                    ),
                     "universe": campaign["universe"],
                     "min_daily_instruments": max(
                         50, int(config["strategy_config"].get("topk", 50))
                     ),
                     "cost_model": cost_model.to_dict(),
                     "cost_reference_order_value": reference_order_value,
+                    "expected_rdagent_runtime": expected_runtime_identity,
                 },
                 log_path,
                 idempotency_key=f"research-campaign:{campaign['id']}:rdagent",
@@ -243,22 +259,39 @@ class AutonomousResearchOrchestrator:
         candidates = self.research.list_candidates(
             run_id=str(campaign["research_run_id"]), limit=500
         )
-        selected = rank_factor_candidates(
+        profiles = campaign["config"].get("period_resolution", {}).get("evaluation_profiles", [])
+        profile_ids = {str(item.get("id")) for item in profiles if isinstance(item, dict)}
+        references = self.research.list_candidates(status="promoted", limit=500)
+        if profile_ids != {"recent_3y", "balanced_5y", "robust_10y"}:
+            raise ValueError(
+                "automatic factor selection requires all three governed research profiles"
+            )
+        for candidate in candidates:
+            candidate["profile_evaluations"] = self.research.list_evaluations(candidate["id"])
+        selected = rank_multi_profile_candidates(
             candidates,
             limit=int(campaign["config"]["max_factors"]),
-            reference_candidates=self.research.list_candidates(status="promoted", limit=500),
+            reference_candidates=references,
         )
         if not selected:
             raise ValueError("RD-Agent produced no candidates that passed the Qlib factor gate")
         actor = f"research-campaign:{campaign['id']}"
         for candidate in selected:
             if candidate["status"] != "promoted":
+                profile_consensus = candidate.get("profile_consensus")
+                if profile_consensus is not None:
+                    self.research.record_profile_consensus(
+                        candidate["id"],
+                        evaluation_ids=profile_consensus["evaluation_ids"],
+                        actor=actor,
+                    )
                 self.research.promote(
                     candidate["id"],
                     actor=actor,
                     reason=(
                         "Automatic promotion after independent Qlib gate and deterministic "
-                        f"campaign ranking score {candidate['automation_score']:.6f}."
+                        f"campaign ranking score {candidate['automation_score']:.6f}; "
+                        f"profile consensus={candidate.get('profile_gate_status')}."
                     ),
                 )
         factor_weight = 1.0 / len(selected)
@@ -304,9 +337,7 @@ class AutonomousResearchOrchestrator:
                     for version in strategy["versions"]
                     if version["created_by"] == actor
                     and version["config"].get("factor_source_mode") == requested_mode
-                    and {
-                        item["factor_candidate_id"] for item in version["factors"]
-                    }
+                    and {item["factor_candidate_id"] for item in version["factors"]}
                     == candidate_ids
                 ),
                 None,
@@ -384,6 +415,8 @@ class AutonomousResearchOrchestrator:
                         "candidate_id": item["id"],
                         "name": item["name"],
                         "score": item["automation_score"],
+                        "profile_scores": item.get("profile_scores"),
+                        "profile_gate_status": item.get("profile_gate_status"),
                     }
                     for item in selected
                 ],
@@ -552,9 +585,10 @@ class AutonomousResearchOrchestrator:
                 dataset=campaign["dataset"],
                 periods=campaign["config"]["backtest_periods"],
                 artifact_path=self.settings.data_root / "artifacts" / "backtests",
-                trading_dates=load_calendar_days(
-                    campaign["config"]["dataset_evidence"]["path"]
-                ),
+                trading_dates=load_calendar_days(campaign["config"]["dataset_evidence"]["path"]),
+                dataset_lineage_id=(
+                    campaign["config"]["dataset_evidence"].get("provenance") or {}
+                ).get("dataset_lineage_id"),
             )
         if backtest.get("job_id"):
             return backtest, self.jobs.get(str(backtest["job_id"]))

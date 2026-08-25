@@ -79,6 +79,9 @@ AVAILABILITY_POLICIES: dict[str, AvailabilityPolicy] = {
     ),
     "forecast": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("ann_date",)),
     "express": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("ann_date",)),
+    "fina_audit": AvailabilityPolicy(
+        STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("ann_date",)
+    ),
     # Trade-date-derived market fields are known after that session closes.
     "daily": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
     "adj_factor": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
@@ -129,9 +132,8 @@ AVAILABILITY_POLICIES: dict[str, AvailabilityPolicy] = {
     # Sell-side research report metadata (research_report, 研报中心): trade_date
     # is the report publication date and the provider refreshes incrementally
     # twice a day; date-only, so strictly-after is the conservative rule. The
-    # platform does not consume this dataset for NLP (see
-    # docs/pit-nlp-gap-report.md section 八) — the policy is registered so the
-    # read guard fails open nowhere.
+    # research-asset acquisition layer applies the same rule concretely as the
+    # first open trading day after trade_date before a PDF can be selected.
     "research_report": AvailabilityPolicy(STRICTLY_AFTER_ANNOUNCEMENT_DATE, ("trade_date",)),
 }
 
@@ -177,6 +179,7 @@ RECOVERABILITY_LEVELS: dict[str, str] = {
     "fina_indicator_nondefault": NATIVE_HISTORY,
     "forecast": NATIVE_HISTORY,
     "express": NATIVE_HISTORY,
+    "fina_audit": NATIVE_HISTORY,
     # Announcement/event series keyed by announcement or period date.
     "anns_d": NATIVE_HISTORY,
     "disclosure_date": NATIVE_HISTORY,

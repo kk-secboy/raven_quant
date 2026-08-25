@@ -9,6 +9,7 @@ from quant_data.snapshot_lineage import (
     file_contract_sha256,
     make_lineage_id,
     prepare_lineage_metadata,
+    verify_snapshot_lineage,
 )
 
 
@@ -23,11 +24,15 @@ def _write_manifest(root: Path, name: str, manifest: dict[str, object]) -> None:
 
 
 def test_prepares_append_only_snapshot_successor(tmp_path: Path) -> None:
-    lineage_id = make_lineage_id("daily", {"start": "2024-01-01"})
+    configuration = {"start": "2024-01-01"}
+    lineage_id = make_lineage_id("daily", configuration)
     ancestor = {
         "name": "daily-v1",
         "lineage_id": lineage_id,
         "lineage_generation": 0,
+        "lineage_contract": {"kind": "daily", "configuration": configuration},
+        "parent_snapshot": None,
+        "parent_manifest_sha256": None,
         "start_date": "2024-01-01",
         "end_date": "2024-01-02",
         "datasets": {
@@ -51,6 +56,71 @@ def test_prepares_append_only_snapshot_successor(tmp_path: Path) -> None:
     assert metadata["parent_snapshot"] == "daily-v1"
     assert metadata["lineage_generation"] == 1
     assert len(str(metadata["parent_manifest_sha256"])) == 64
+
+
+def test_successor_allows_new_dataset_and_forward_reference_refresh(tmp_path: Path) -> None:
+    configuration = {"start": "2024-01-01"}
+    lineage_id = make_lineage_id("daily", configuration)
+    ancestor = {
+        "name": "daily-v1",
+        "lineage_id": lineage_id,
+        "lineage_generation": 0,
+        "lineage_contract": {"kind": "daily", "configuration": configuration},
+        "parent_snapshot": None,
+        "parent_manifest_sha256": None,
+        "start_date": "2024-01-01",
+        "end_date": "2024-01-02",
+        "datasets": {
+            "stock_basic": {
+                "source_units": [_unit("master-old", "a" * 64, 10)],
+                "reference_refresh": {
+                    "selected_buckets": ["2024-01-01"],
+                },
+            },
+        },
+    }
+    _write_manifest(tmp_path, "daily-v1", ancestor)
+    refreshed = {
+        **_unit("master-new", "b" * 64, 11),
+        "scope_json": {"reference_refresh_bucket": "2024-02-01"},
+    }
+
+    metadata = prepare_lineage_metadata(
+        tmp_path,
+        lineage_id=lineage_id,
+        end_date=date(2024, 2, 2),
+        successful_units={
+            "stock_basic": [refreshed],
+            "daily": [_unit("day-1", "c" * 64, 20)],
+        },
+    )
+
+    assert metadata["parent_snapshot"] == "daily-v1"
+    assert metadata["lineage_generation"] == 1
+
+
+def test_verifies_contract_and_rejects_forged_lineage_id(tmp_path: Path) -> None:
+    configuration = {"start": "2024-01-01"}
+    manifest = {
+        "name": "daily-v1",
+        "lineage_id": make_lineage_id("daily", configuration),
+        "lineage_contract": {"kind": "daily", "configuration": configuration},
+        "lineage_generation": 0,
+        "parent_snapshot": None,
+        "parent_manifest_sha256": None,
+        "start_date": "2024-01-01",
+        "end_date": "2024-01-02",
+        "datasets": {"daily": {"source_units": [_unit("day-1", "a" * 64, 10)]}},
+    }
+    _write_manifest(tmp_path, "daily-v1", manifest)
+    assert verify_snapshot_lineage(tmp_path / "daily-v1") == manifest
+
+    manifest["lineage_id"] = "f" * 64
+    (tmp_path / "daily-v1" / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        verify_snapshot_lineage(tmp_path / "daily-v1")
 
 
 def test_file_contract_digest_changes_when_ingestion_code_changes(tmp_path: Path) -> None:

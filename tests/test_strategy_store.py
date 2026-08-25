@@ -94,7 +94,23 @@ def test_only_v2_qlib_policy_backtest_can_be_approved(tmp_path: Path, database_u
         ),
         encoding="utf-8",
     )
-    metrics = formal_backtest_metrics(version, manifest)
+    metrics = formal_backtest_metrics(
+        version,
+        manifest,
+        hypothesis_group_evidence=store.hypothesis_group_evidence(version_id),
+    )
+    store.validate_backtest_artifacts(backtest["id"], metrics)
+    tracked_artifact = artifact / "robustness" / "double_cost" / "daily_report.parquet"
+    tracked_bytes = tracked_artifact.read_bytes()
+    tracked_artifact.write_bytes(b"x" * len(tracked_bytes))
+    with pytest.raises(ValueError, match="artifact SHA-256 changed"):
+        store.validate_backtest_artifacts(backtest["id"], metrics)
+    tracked_artifact.write_bytes(tracked_bytes)
+    unexpected_artifact = artifact / "unexpected-output.bin"
+    unexpected_artifact.write_bytes(b"not declared by the completed worker")
+    with pytest.raises(ValueError, match="artifact set changed.*added"):
+        store.validate_backtest_artifacts(backtest["id"], metrics)
+    unexpected_artifact.unlink()
     store.validate_backtest_artifacts(backtest["id"], metrics)
     failed_oos = deepcopy(metrics)
     failed_oos["formal_validation_passed"] = False
@@ -286,7 +302,11 @@ def test_twap_approval_requires_minute_native_execution_evidence(
         ),
         encoding="utf-8",
     )
-    metrics = formal_backtest_metrics(version, manifest)
+    metrics = formal_backtest_metrics(
+        version,
+        manifest,
+        hypothesis_group_evidence=store.hypothesis_group_evidence(version_id),
+    )
     metrics.update(
         {
             "minute_execution_enforced": True,

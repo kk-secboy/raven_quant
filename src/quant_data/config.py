@@ -58,10 +58,25 @@ class Settings:
     rdagent_command: str = "/mnt/e/venvs/rdagent/bin/rdagent"
     rdagent_wsl_distro: str = "Ubuntu-22.04"
     rdagent_worker_url: str = ""
+    rdagent_gpu_worker_url: str = ""
+    rdagent_data_science_worker_url: str = ""
+    rdagent_evaluation_worker_url: str = ""
     rdagent_enabled: bool = True
     rdagent_llm_key_env: str = "OPENAI_API_KEY"
     rdagent_max_loops: int = 3
     rdagent_max_duration: str = "2h"
+    rdagent_finetune_min_gpu_memory_mb: int = 16384
+    rdagent_finetune_min_disk_gb: float = 50.0
+    rdagent_docker_shared_root: Path | None = None
+    rdagent_qlib_sandbox_image: str = ""
+    rdagent_data_science_image: str = ""
+    rdagent_finetune_image: str = ""
+    rdagent_finetune_benchmark_image: str = ""
+    rdagent_finetune_gpu_probe_image: str = ""
+    model_sandbox_image: str = ""
+    research_asset_auto_enabled: bool = True
+    research_asset_auto_hour: int = 20
+    research_asset_auto_minute: int = 30
     worker_job_kinds: tuple[str, ...] = ()
     scheduler_poll_seconds: float = 15.0
     health_snapshot_seconds: int = 300
@@ -128,10 +143,57 @@ class Settings:
             rdagent_command=os.getenv("RDAGENT_COMMAND", "/mnt/e/venvs/rdagent/bin/rdagent"),
             rdagent_wsl_distro=os.getenv("RDAGENT_WSL_DISTRO", "Ubuntu-22.04"),
             rdagent_worker_url=os.getenv("RDAGENT_WORKER_URL", "").strip().rstrip("/"),
+            rdagent_gpu_worker_url=os.getenv("RDAGENT_GPU_WORKER_URL", "")
+            .strip()
+            .rstrip("/"),
+            rdagent_data_science_worker_url=os.getenv(
+                "RDAGENT_DATA_SCIENCE_WORKER_URL", ""
+            )
+            .strip()
+            .rstrip("/"),
+            rdagent_evaluation_worker_url=os.getenv(
+                "RDAGENT_EVALUATION_WORKER_URL", ""
+            )
+            .strip()
+            .rstrip("/"),
             rdagent_enabled=_bool("RDAGENT_ENABLED", True),
             rdagent_llm_key_env=os.getenv("RDAGENT_LLM_KEY_ENV", "OPENAI_API_KEY").strip(),
             rdagent_max_loops=max(1, int(os.getenv("RDAGENT_MAX_LOOPS", "3"))),
             rdagent_max_duration=os.getenv("RDAGENT_MAX_DURATION", "2h").strip(),
+            rdagent_finetune_min_gpu_memory_mb=max(
+                1024, int(os.getenv("RDAGENT_FINETUNE_MIN_GPU_MEMORY_MB", "16384"))
+            ),
+            rdagent_finetune_min_disk_gb=max(
+                1.0, float(os.getenv("RDAGENT_FINETUNE_MIN_DISK_GB", "50"))
+            ),
+            rdagent_docker_shared_root=(
+                Path(os.environ["RDAGENT_DOCKER_SHARED_ROOT"]).expanduser().resolve()
+                if os.getenv("RDAGENT_DOCKER_SHARED_ROOT", "").strip()
+                else None
+            ),
+            rdagent_qlib_sandbox_image=os.getenv(
+                "RDAGENT_QLIB_SANDBOX_IMAGE", ""
+            ).strip(),
+            rdagent_data_science_image=os.getenv(
+                "RDAGENT_DATA_SCIENCE_IMAGE", ""
+            ).strip(),
+            rdagent_finetune_image=os.getenv(
+                "RDAGENT_FINETUNE_IMAGE", ""
+            ).strip(),
+            rdagent_finetune_benchmark_image=os.getenv(
+                "RDAGENT_FINETUNE_BENCHMARK_IMAGE", ""
+            ).strip(),
+            rdagent_finetune_gpu_probe_image=os.getenv(
+                "RDAGENT_FINETUNE_GPU_PROBE_IMAGE", ""
+            ).strip(),
+            model_sandbox_image=os.getenv("MODEL_SANDBOX_IMAGE", "").strip(),
+            research_asset_auto_enabled=_bool("RESEARCH_ASSET_AUTO_ENABLED", True),
+            research_asset_auto_hour=min(
+                23, max(0, int(os.getenv("RESEARCH_ASSET_AUTO_HOUR", "20")))
+            ),
+            research_asset_auto_minute=min(
+                59, max(0, int(os.getenv("RESEARCH_ASSET_AUTO_MINUTE", "30")))
+            ),
             worker_job_kinds=tuple(
                 item.strip()
                 for item in os.getenv("WORKER_JOB_KINDS", "").split(",")

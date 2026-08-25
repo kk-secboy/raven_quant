@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 
@@ -12,6 +12,7 @@ from quant_data.execution_contract import (
     require_daily_qlib_contract,
     require_minute_execution_contract,
     require_minute_signal_contract,
+    require_native_daily_execution_controls,
     require_next_bar_execution,
     require_strategy_execution_contract,
     strategy_execution_contract_hash,
@@ -38,6 +39,21 @@ def test_daily_contract_requires_share_volume_and_verified_lineage() -> None:
         require_daily_qlib_contract({**valid, "field_contract_version": "v1"})
     with pytest.raises(ValueError, match="lineage is not verified"):
         require_daily_qlib_contract({**valid, "lineage_verified": False})
+
+
+def test_formal_daily_execution_requires_native_price_limit_boundary() -> None:
+    provenance = {
+        "execution_controls": {
+            "formal_execution_requires_native_controls": True,
+            "native_complete_from": "2016-01-01",
+        }
+    }
+    require_native_daily_execution_controls(provenance, start=date(2016, 1, 4))
+
+    with pytest.raises(ValueError, match="before native price-limit controls"):
+        require_native_daily_execution_controls(provenance, start="2015-12-31")
+    with pytest.raises(ValueError, match="no governed native execution-control contract"):
+        require_native_daily_execution_controls({}, start="2024-01-01")
 
 
 def test_minute_contract_requires_version_frequency_and_verified_lineage() -> None:

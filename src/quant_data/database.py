@@ -63,6 +63,11 @@ Index(
     work_units.c.lease_until,
     work_units.c.dataset,
 )
+Index(
+    "idx_work_units_dataset_page_group",
+    work_units.c.dataset,
+    work_units.c.scope_json["page_group"].as_string(),
+)
 
 jobs = Table(
     "jobs",
@@ -167,6 +172,8 @@ factor_candidates = Table(
         Column("values_sha256", String),
         Column("rdagent_decision", Boolean),
         Column("rdagent_feedback", Text),
+        Column("profile_consensus_json", json_type),
+        Column("profile_consensus_sha256", String),
         Column("promoted_evaluation_id", String),
         Column("promotion_evidence_sha256", String),
         Column("promoted_by", String),
@@ -256,17 +263,17 @@ Index(
     factor_evaluations.c.created_at.desc(),
 )
 
-# Sealed one-shot consumption ledger for reserved final out-of-sample windows
-# (design draft 4.1/12.1). The vintage key binds an immutable research scope
-# (research program id when the lineage has one, otherwise the dataset itself)
-# plus the dataset identity and the calendar window — never a campaign,
-# hypothesis-family or strategy name, so renaming cannot mint a new vintage.
+# Sealed one-shot consumption ledger for reserved final out-of-sample windows.
+# Scope is stable across snapshot identities: a research program, a verified
+# dataset lineage, or the fail-closed global standalone scope. Dataset identity
+# remains immutable audit evidence, but it never grants a fresh OOS window.
 oos_vintages = Table(
     "oos_vintages",
     metadata,
     Column("id", String, primary_key=True),
     Column("scope", String, nullable=False),
     Column("dataset_identity", String, nullable=False),
+    Column("dataset_lineage_id", String),
     Column("test_start", Date, nullable=False),
     Column("test_end", Date, nullable=False),
     Column("sealed_at", DateTime(timezone=True), nullable=False),
@@ -282,6 +289,12 @@ oos_vintages = Table(
         "test_end",
         name="uq_oos_vintage_window",
     ),
+)
+Index(
+    "idx_oos_vintage_scope_window",
+    oos_vintages.c.scope,
+    oos_vintages.c.test_start,
+    oos_vintages.c.test_end,
 )
 
 research_events = Table(
@@ -310,6 +323,514 @@ Index(
     "idx_research_events_run_created",
     research_events.c.research_run_id,
     research_events.c.created_at,
+)
+
+# Immutable inputs made available to one or more research runs.  These are
+# deliberately separate from generated run artifacts: a PDF, paper, dataset
+# bundle, or benchmark definition is source evidence, never a capital-bearing
+# candidate by itself.
+research_assets = Table(
+    "research_assets",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("asset_key", String, nullable=False, unique=True),
+    Column("asset_type", String, nullable=False),
+    Column("media_type", String, nullable=False),
+    Column("source_uri", Text),
+    Column("publisher", String),
+    Column("published_at", DateTime(timezone=True)),
+    Column("retrieved_at", DateTime(timezone=True), nullable=False),
+    Column("license_json", json_type, nullable=False),
+    Column("storage_path", Text, nullable=False),
+    Column("content_sha256", String, nullable=False),
+    Column("size_bytes", BigInteger, nullable=False),
+    Column("manifest_json", json_type, nullable=False),
+    Column("manifest_sha256", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("quarantined_at", DateTime(timezone=True)),
+    Column("quarantine_reason", Text),
+    UniqueConstraint(
+        "content_sha256",
+        "manifest_sha256",
+        name="uq_research_assets_content_manifest",
+    ),
+    CheckConstraint(
+        "status IN ('registered', 'quarantined', 'retired')",
+        name="ck_research_assets_status",
+    ),
+    CheckConstraint("size_bytes >= 0", name="ck_research_assets_size"),
+)
+Index(
+    "idx_research_assets_type_created",
+    research_assets.c.asset_type,
+    research_assets.c.created_at.desc(),
+)
+
+# Auto-selected documents are single-use research inputs.  This durable
+# reservation ledger prevents two API/scheduler requests from silently using
+# the same report or paper while keeping explicit operator-selected reuse a
+# separate, auditable decision.
+research_asset_consumptions = Table(
+    "research_asset_consumptions",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "asset_id",
+        String,
+        ForeignKey("quantlab.research_assets.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "research_run_id",
+        String,
+        ForeignKey("quantlab.research_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("scenario", String, nullable=False),
+    Column("selection_mode", String, nullable=False),
+    Column("asset_manifest_sha256", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("reserved_by", String, nullable=False),
+    Column("reserved_at", DateTime(timezone=True), nullable=False),
+    Column("completed_at", DateTime(timezone=True)),
+    Column("details_json", json_type, nullable=False),
+    UniqueConstraint("asset_id", name="uq_research_asset_consumptions_asset"),
+    UniqueConstraint(
+        "research_run_id",
+        "asset_id",
+        name="uq_research_asset_consumptions_run_asset",
+    ),
+    CheckConstraint(
+        "selection_mode IN ('automatic')",
+        name="ck_research_asset_consumptions_mode",
+    ),
+    CheckConstraint(
+        "status IN ('reserved', 'consumed', 'failed')",
+        name="ck_research_asset_consumptions_status",
+    ),
+)
+Index(
+    "idx_research_asset_consumptions_run",
+    research_asset_consumptions.c.research_run_id,
+    research_asset_consumptions.c.reserved_at.desc(),
+)
+
+# Generated files are registered before a candidate or an evaluation may
+# reference them.  Their file and canonical-manifest hashes are immutable;
+# invalidation changes status only and never rewrites the evidence.
+research_run_artifacts = Table(
+    "research_run_artifacts",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "research_run_id",
+        String,
+        ForeignKey("quantlab.research_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("artifact_type", String, nullable=False),
+    Column("contract_version", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("storage_path", Text, nullable=False),
+    Column("content_sha256", String, nullable=False),
+    Column("size_bytes", BigInteger, nullable=False),
+    Column("manifest_json", json_type, nullable=False),
+    Column("manifest_sha256", String, nullable=False),
+    Column("producer", String, nullable=False),
+    Column("source_iteration", Integer),
+    Column("capital_eligible", Boolean, nullable=False, server_default="false"),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("invalidated_by", String),
+    Column("invalidated_at", DateTime(timezone=True)),
+    Column("invalidation_reason", Text),
+    UniqueConstraint(
+        "research_run_id",
+        "artifact_type",
+        "content_sha256",
+        name="uq_research_run_artifacts_content",
+    ),
+    CheckConstraint(
+        "status IN ('recorded', 'invalidated')",
+        name="ck_research_run_artifacts_status",
+    ),
+    CheckConstraint("size_bytes >= 0", name="ck_research_run_artifacts_size"),
+    CheckConstraint(
+        "capital_eligible = false",
+        name="ck_research_run_artifacts_non_capital",
+    ),
+)
+Index(
+    "idx_research_run_artifacts_run_created",
+    research_run_artifacts.c.research_run_id,
+    research_run_artifacts.c.created_at.desc(),
+)
+
+# RD-Agent model output is a research proposal, not a fitted ModelArtifact.
+# Admission here means "eligible for governed downstream research" only.
+model_candidates = Table(
+    "model_candidates",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "research_run_id",
+        String,
+        ForeignKey("quantlab.research_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("name", String, nullable=False),
+    Column("description", Text, nullable=False),
+    Column("status", String, nullable=False),
+    Column("source_iteration", Integer),
+    Column("model_type", String, nullable=False),
+    Column(
+        "code_artifact_id",
+        String,
+        ForeignKey("quantlab.research_run_artifacts.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("code_sha256", String, nullable=False),
+    Column("architecture_json", json_type, nullable=False),
+    Column("model_hyperparameters_json", json_type, nullable=False),
+    Column("training_hyperparameters_json", json_type, nullable=False),
+    Column("base_features_manifest_json", json_type, nullable=False),
+    Column("base_features_manifest_sha256", String, nullable=False),
+    Column("feature_set_definition_sha256", String, nullable=False),
+    Column("dataset", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("pre_final_end", Date, nullable=False),
+    Column("final_oos_start", Date, nullable=False),
+    Column("final_oos_end", Date, nullable=False),
+    Column("manifest_json", json_type, nullable=False),
+    Column("manifest_sha256", String, nullable=False),
+    Column("rdagent_decision", Boolean),
+    Column("rdagent_feedback", Text),
+    Column("admission_evidence_json", json_type),
+    Column("admission_evidence_sha256", String),
+    Column("capital_eligible", Boolean, nullable=False, server_default="false"),
+    Column("admitted_by", String),
+    Column("admitted_at", DateTime(timezone=True)),
+    Column("rejection_reason", Text),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "research_run_id",
+        "name",
+        name="uq_model_candidates_run_name",
+    ),
+    CheckConstraint(
+        "status IN ('awaiting_independent_evaluation', 'evaluating', "
+        "'evaluated', 'research_admitted', 'rejected', 'invalidated')",
+        name="ck_model_candidates_status",
+    ),
+    CheckConstraint(
+        "capital_eligible = false",
+        name="ck_model_candidates_non_capital",
+    ),
+    CheckConstraint(
+        "pre_final_end < final_oos_start AND final_oos_start <= final_oos_end",
+        name="ck_model_candidates_oos_boundary",
+    ),
+)
+Index(
+    "idx_model_candidates_status_updated",
+    model_candidates.c.status,
+    model_candidates.c.updated_at.desc(),
+)
+
+model_evaluations = Table(
+    "model_evaluations",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "model_candidate_id",
+        String,
+        ForeignKey("quantlab.model_candidates.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "run_artifact_id",
+        String,
+        ForeignKey("quantlab.research_run_artifacts.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "oos_vintage_id",
+        String,
+        ForeignKey("quantlab.oos_vintages.id", ondelete="RESTRICT"),
+    ),
+    Column("evidence_role", String, nullable=False),
+    Column("profile_id", String, nullable=False),
+    Column("seed", Integer, nullable=False),
+    Column("dataset", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("train_start", Date, nullable=False),
+    Column("train_end", Date, nullable=False),
+    Column("valid_start", Date, nullable=False),
+    Column("valid_end", Date, nullable=False),
+    Column("final_oos_start", Date, nullable=False),
+    Column("final_oos_end", Date, nullable=False),
+    Column("metrics_json", json_type, nullable=False),
+    Column("metrics_sha256", String, nullable=False),
+    Column("gate_status", String, nullable=False),
+    Column("gate_reasons_json", json_type, nullable=False),
+    Column("evaluator_version", String, nullable=False),
+    Column("candidate_manifest_sha256", String, nullable=False),
+    Column("evidence_json", json_type, nullable=False),
+    Column("evidence_sha256", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "model_candidate_id",
+        "evidence_role",
+        "profile_id",
+        "seed",
+        name="uq_model_evaluations_grid",
+    ),
+    CheckConstraint(
+        "evidence_role IN ('official_feedback', 'independent_gate')",
+        name="ck_model_evaluations_role",
+    ),
+    CheckConstraint(
+        "gate_status IN ('informational', 'passed', 'failed')",
+        name="ck_model_evaluations_gate",
+    ),
+    CheckConstraint(
+        "(evidence_role = 'official_feedback' AND gate_status = 'informational') OR "
+        "(evidence_role = 'independent_gate' AND gate_status IN ('passed', 'failed'))",
+        name="ck_model_evaluations_role_gate",
+    ),
+    CheckConstraint(
+        "oos_vintage_id IS NULL",
+        name="ck_model_evaluations_pre_final",
+    ),
+)
+Index(
+    "idx_model_evaluations_candidate_created",
+    model_evaluations.c.model_candidate_id,
+    model_evaluations.c.created_at.desc(),
+)
+
+# A quant bundle is the exact accepted factor set, active model, base features,
+# and their immutable hashes.  It cannot exist as a model-only or factor-only
+# shell; those forms are evaluation ablations, not publishable bundles.
+quant_bundle_candidates = Table(
+    "quant_bundle_candidates",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "research_run_id",
+        String,
+        ForeignKey("quantlab.research_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("name", String, nullable=False),
+    Column("description", Text, nullable=False),
+    Column("status", String, nullable=False),
+    Column("source_iteration", Integer),
+    Column(
+        "model_candidate_id",
+        String,
+        ForeignKey("quantlab.model_candidates.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("factor_candidate_ids_json", json_type, nullable=False),
+    Column(
+        "bundle_artifact_id",
+        String,
+        ForeignKey("quantlab.research_run_artifacts.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("bundle_artifact_sha256", String, nullable=False),
+    Column("base_features_manifest_json", json_type, nullable=False),
+    Column("base_features_manifest_sha256", String, nullable=False),
+    Column("feature_set_definition_sha256", String, nullable=False),
+    Column("dataset", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("pre_final_end", Date, nullable=False),
+    Column("final_oos_start", Date, nullable=False),
+    Column("final_oos_end", Date, nullable=False),
+    Column("bundle_manifest_json", json_type, nullable=False),
+    Column("bundle_manifest_sha256", String, nullable=False),
+    Column("rdagent_decision", Boolean),
+    Column("rdagent_feedback", Text),
+    Column("ablation_evidence_json", json_type),
+    Column("ablation_evidence_sha256", String),
+    Column("admission_evidence_json", json_type),
+    Column("admission_evidence_sha256", String),
+    Column("capital_eligible", Boolean, nullable=False, server_default="false"),
+    Column("admitted_by", String),
+    Column("admitted_at", DateTime(timezone=True)),
+    Column("rejection_reason", Text),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "research_run_id",
+        "name",
+        name="uq_quant_bundle_candidates_run_name",
+    ),
+    CheckConstraint(
+        "status IN ('awaiting_independent_evaluation', 'evaluating', "
+        "'evaluated', 'research_admitted', 'rejected', 'invalidated')",
+        name="ck_quant_bundle_candidates_status",
+    ),
+    CheckConstraint(
+        "capital_eligible = false",
+        name="ck_quant_bundle_candidates_non_capital",
+    ),
+    CheckConstraint(
+        "pre_final_end < final_oos_start AND final_oos_start <= final_oos_end",
+        name="ck_quant_bundle_candidates_oos_boundary",
+    ),
+)
+Index(
+    "idx_quant_bundle_candidates_status_updated",
+    quant_bundle_candidates.c.status,
+    quant_bundle_candidates.c.updated_at.desc(),
+)
+
+quant_bundle_evaluations = Table(
+    "quant_bundle_evaluations",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "quant_bundle_candidate_id",
+        String,
+        ForeignKey("quantlab.quant_bundle_candidates.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "run_artifact_id",
+        String,
+        ForeignKey("quantlab.research_run_artifacts.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "oos_vintage_id",
+        String,
+        ForeignKey("quantlab.oos_vintages.id", ondelete="RESTRICT"),
+    ),
+    Column("evidence_role", String, nullable=False),
+    Column("ablation", String, nullable=False),
+    Column("profile_id", String, nullable=False),
+    Column("seed", Integer, nullable=False),
+    Column("dataset", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("train_start", Date, nullable=False),
+    Column("train_end", Date, nullable=False),
+    Column("valid_start", Date, nullable=False),
+    Column("valid_end", Date, nullable=False),
+    Column("final_oos_start", Date, nullable=False),
+    Column("final_oos_end", Date, nullable=False),
+    Column("metrics_json", json_type, nullable=False),
+    Column("metrics_sha256", String, nullable=False),
+    Column("gate_status", String, nullable=False),
+    Column("gate_reasons_json", json_type, nullable=False),
+    Column("evaluator_version", String, nullable=False),
+    Column("bundle_manifest_sha256", String, nullable=False),
+    Column("evidence_json", json_type, nullable=False),
+    Column("evidence_sha256", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "quant_bundle_candidate_id",
+        "evidence_role",
+        "ablation",
+        "profile_id",
+        "seed",
+        name="uq_quant_bundle_evaluations_grid",
+    ),
+    CheckConstraint(
+        "evidence_role IN ('official_feedback', 'independent_gate')",
+        name="ck_quant_bundle_evaluations_role",
+    ),
+    CheckConstraint(
+        "ablation IN ('factor_only', 'model_only', 'joint')",
+        name="ck_quant_bundle_evaluations_ablation",
+    ),
+    CheckConstraint(
+        "gate_status IN ('informational', 'passed', 'failed')",
+        name="ck_quant_bundle_evaluations_gate",
+    ),
+    CheckConstraint(
+        "(evidence_role = 'official_feedback' AND gate_status = 'informational') OR "
+        "(evidence_role = 'independent_gate' AND gate_status IN ('passed', 'failed'))",
+        name="ck_quant_bundle_evaluations_role_gate",
+    ),
+    CheckConstraint(
+        "oos_vintage_id IS NULL",
+        name="ck_quant_bundle_evaluations_pre_final",
+    ),
+)
+Index(
+    "idx_quant_bundle_evaluations_candidate_created",
+    quant_bundle_evaluations.c.quant_bundle_candidate_id,
+    quant_bundle_evaluations.c.created_at.desc(),
+)
+
+# Polymorphic links retain database-enforced candidate identity without a weak
+# free-form candidate_id. Exactly one candidate foreign key must be populated.
+candidate_asset_links = Table(
+    "candidate_asset_links",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "asset_id",
+        String,
+        ForeignKey("quantlab.research_assets.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "factor_candidate_id",
+        String,
+        ForeignKey("quantlab.factor_candidates.id", ondelete="CASCADE"),
+    ),
+    Column(
+        "model_candidate_id",
+        String,
+        ForeignKey("quantlab.model_candidates.id", ondelete="CASCADE"),
+    ),
+    Column(
+        "quant_bundle_candidate_id",
+        String,
+        ForeignKey("quantlab.quant_bundle_candidates.id", ondelete="CASCADE"),
+    ),
+    Column("relationship", String, nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "(factor_candidate_id IS NOT NULL AND model_candidate_id IS NULL AND "
+        "quant_bundle_candidate_id IS NULL) OR "
+        "(factor_candidate_id IS NULL AND model_candidate_id IS NOT NULL AND "
+        "quant_bundle_candidate_id IS NULL) OR "
+        "(factor_candidate_id IS NULL AND model_candidate_id IS NULL AND "
+        "quant_bundle_candidate_id IS NOT NULL)",
+        name="ck_candidate_asset_links_one_candidate",
+    ),
+)
+Index(
+    "uq_candidate_asset_links_factor",
+    candidate_asset_links.c.factor_candidate_id,
+    candidate_asset_links.c.asset_id,
+    candidate_asset_links.c.relationship,
+    unique=True,
+    postgresql_where=candidate_asset_links.c.factor_candidate_id.is_not(None),
+)
+Index(
+    "uq_candidate_asset_links_model",
+    candidate_asset_links.c.model_candidate_id,
+    candidate_asset_links.c.asset_id,
+    candidate_asset_links.c.relationship,
+    unique=True,
+    postgresql_where=candidate_asset_links.c.model_candidate_id.is_not(None),
+)
+Index(
+    "uq_candidate_asset_links_quant",
+    candidate_asset_links.c.quant_bundle_candidate_id,
+    candidate_asset_links.c.asset_id,
+    candidate_asset_links.c.relationship,
+    unique=True,
+    postgresql_where=candidate_asset_links.c.quant_bundle_candidate_id.is_not(None),
 )
 
 strategies = Table(
@@ -436,6 +957,10 @@ model_artifacts = Table(
     Column("model_recipe_json", json_type, nullable=False),
     Column("dataset", String, nullable=False),
     Column("dataset_identity_sha256", String, nullable=False),
+    # Nullable only for artifacts created before the governed model-runtime
+    # contract. New model candidates and every activation fail closed when the
+    # independent/formal execution environment identity is absent.
+    Column("execution_environment_sha256", String),
     Column("training_start", Date, nullable=False),
     Column("training_end", Date, nullable=False),
     Column("data_cutoff_at", DateTime(timezone=True), nullable=False),
@@ -891,6 +1416,15 @@ simulation_portfolios = Table(
     ),
     Column("source_type", String, nullable=False, server_default="recommendation"),
     Column("source_id", String, nullable=False),
+    # New promotion-chain accounts bind to the exact isolated stage.  NULL is
+    # retained for recommendation/allocation accounts and legacy rows created
+    # before migration 0064.
+    Column(
+        "promotion_stage_id",
+        String,
+        ForeignKey("quantlab.strategy_promotion_stages.id", ondelete="RESTRICT"),
+        nullable=True,
+    ),
     Column("status", String, nullable=False),
     Column("base_currency", String, nullable=False),
     Column("benchmark", String),
@@ -933,6 +1467,13 @@ Index(
     simulation_portfolios.c.source_id,
     simulation_portfolios.c.execution_dataset,
     unique=True,
+    postgresql_where=simulation_portfolios.c.promotion_stage_id.is_(None),
+)
+Index(
+    "uq_simulation_portfolios_promotion_stage",
+    simulation_portfolios.c.promotion_stage_id,
+    unique=True,
+    postgresql_where=simulation_portfolios.c.promotion_stage_id.is_not(None),
 )
 
 simulation_batches = Table(

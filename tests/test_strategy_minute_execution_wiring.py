@@ -41,7 +41,9 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
                     {
                         "factor_candidate_id": "factor-1",
                         "values_path": str(tmp_path / "factor.parquet"),
+                        "code_path": str(tmp_path / "factor.py"),
                         "code_sha256": "a" * 64,
+                        "source_iteration": 0,
                         "weight": 1.0,
                         "direction": 1,
                     }
@@ -117,6 +119,8 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
         "start": "2010-01-01",
         "end": "2023-12-31",
     }
+    assert manifest["factors"][0]["code_path"] == str(tmp_path / "factor.py")
+    assert manifest["factors"][0]["factor_execution_mode"] == "frozen_code_recompute"
 
 
 def test_worker_builds_production_qlib_order_plan_job(

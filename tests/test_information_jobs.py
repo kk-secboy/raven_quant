@@ -479,6 +479,7 @@ def test_worker_skips_unchanged_information_factor_with_existing_outcome(
                 "id": "evaluated",
                 "status": "gate_passed",
                 "values_sha256": values_sha256,
+                "latest_evaluation": {"dataset_identity_sha256": "a" * 64},
             }
 
     worker.research = EvaluatedResearch()
@@ -508,6 +509,54 @@ def test_worker_skips_unchanged_information_factor_with_existing_outcome(
     result = json.loads(result_path.read_text(encoding="utf-8"))
     assert result["evaluations"] == []
     assert "already have an evaluation" in result["skipped"]
+
+
+def test_worker_reevaluates_unchanged_information_factor_on_new_dataset_identity(
+    tmp_path: Path,
+) -> None:
+    worker = _worker(tmp_path)
+    factors_dir = worker.settings.data_root / "announcements" / "nlp" / "factors"
+    factors_dir.mkdir(parents=True)
+    code_path = factors_dir / "announcement_tone.py"
+    values_path = factors_dir / "announcement_tone.parquet"
+    code_path.write_text("FACTOR = 'announcement_tone'\n", encoding="utf-8")
+    values_path.write_bytes(b"immutable-factor-values")
+    (factors_dir / "announcement_tone.json").write_text(
+        json.dumps({"factor": "announcement_tone", "sha256": "c" * 64}),
+        encoding="utf-8",
+    )
+
+    class PreviouslyEvaluatedResearch:
+        def find_candidate(self, *, name: str, values_sha256: str):
+            return {
+                "id": "evaluated-on-old-dataset",
+                "status": "gate_failed",
+                "variables": {"source": {"dataset": "announcement_nlp_fields"}},
+                "code_path": str(code_path),
+                "values_path": str(values_path),
+                "code_sha256": "b" * 64,
+                "values_sha256": values_sha256,
+                "experiment_family_id": "information-family",
+                "experiment_count": 1,
+                "label_horizon_days": 1,
+                "latest_evaluation": {"dataset_identity_sha256": "d" * 64},
+            }
+
+    worker.research = PreviouslyEvaluatedResearch()
+    candidates = worker._resolve_information_factor_candidates(
+        {
+            "dataset_identity_sha256": "a" * 64,
+            "periods": {
+                "valid_end": "2023-12-31",
+                "test_start": "2024-01-08",
+            },
+            "factor_names": ["announcement_tone"],
+        }
+    )
+
+    assert [candidate["id"] for candidate in candidates] == [
+        "evaluated-on-old-dataset"
+    ]
 
 
 def test_worker_imports_external_evaluation_with_bound_periods(

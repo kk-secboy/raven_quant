@@ -46,7 +46,9 @@ from quant_data.database import (
     simulation_security_events,
     strategy_allocation_members,
     strategy_allocations,
+    strategy_forward_gates,
     strategy_pairs,
+    strategy_promotion_stages,
     strategy_versions,
 )
 from quant_data.execution_contract import (
@@ -1202,6 +1204,7 @@ class SimulationStore:
         execution_contract_hash: str | None = None,
         daily_roll_policy: str = "pinned",
         execution_roll_policy: str = "pinned",
+        promotion_stage_id: str | None = None,
     ) -> dict[str, Any]:
         self.safe_mode.assert_inactive(action="simulation account creation")
         if initial_cash < 100_000:
@@ -1241,10 +1244,30 @@ class SimulationStore:
         normalized_source_id = str(source_id or recommendation_portfolio_id or "").strip()
         if normalized_source_type not in SIMULATION_SOURCE_TYPES or not normalized_source_id:
             raise ValueError("simulation source_type and source_id are required")
+        normalized_stage_id = str(promotion_stage_id or "").strip() or None
         with self.engine.connect() as connection:
             source = self._resolve_source(
                 connection, normalized_source_type, normalized_source_id
             )
+            if normalized_stage_id is not None:
+                if normalized_source_type != "strategy_version":
+                    raise ValueError(
+                        "only strategy-version paper accounts may bind a promotion stage"
+                    )
+                stage = connection.execute(
+                    select(strategy_promotion_stages).where(
+                        strategy_promotion_stages.c.id == normalized_stage_id
+                    )
+                ).first()
+                if (
+                    stage is None
+                    or str(stage.strategy_version_id) != normalized_source_id
+                    or str(stage.status) != "awaiting_simulation"
+                    or stage.simulation_portfolio_id is not None
+                ):
+                    raise ValueError(
+                        "simulation promotion stage is not the exact awaiting source stage"
+                    )
         if str(source["dataset"]) != str(daily_dataset.get("name") or ""):
             raise ValueError("simulation daily dataset must match the governed source")
         normalized_adapter = str(execution_adapter or source["execution_adapter"])
@@ -1308,6 +1331,7 @@ class SimulationStore:
                         ),
                         source_type=normalized_source_type,
                         source_id=normalized_source_id,
+                        promotion_stage_id=normalized_stage_id,
                         status="paused",
                         base_currency="CNY",
                         benchmark=benchmark,
@@ -2287,6 +2311,115 @@ class SimulationStore:
             }
         return bindings
 
+    def _strategy_order_plan_dataset_bindings(
+        self,
+        *,
+        portfolio: Any,
+        daily_dataset: str,
+        source_snapshot: dict[str, Any],
+        signal_date: date,
+        trade_date: date,
+        data_root: Path,
+    ) -> dict[str, str]:
+        """Resolve exact immutable descendants for one forward paper batch."""
+
+        bindings = self._portfolio_batch_dataset_bindings(portfolio)
+        daily_roll = str(portfolio.daily_roll_policy or "pinned")
+        execution_roll = str(portfolio.execution_roll_policy or "pinned")
+        from .services import list_qlib_datasets
+
+        datasets = {str(item["name"]): item for item in list_qlib_datasets(data_root)}
+        selected_daily = datasets.get(daily_dataset)
+        if daily_roll == "pinned":
+            if (
+                daily_dataset != bindings["daily_dataset"]
+                or source_snapshot.get("dataset_identity_sha256")
+                != bindings["daily_dataset_identity_sha256"]
+                or source_snapshot.get("dataset_lineage_id")
+                != bindings["daily_dataset_lineage_id"]
+            ):
+                raise ValueError(
+                    "pinned paper order-plan does not match its account dataset"
+                )
+        elif daily_roll == "latest_compatible":
+            daily = selected_daily
+            provenance = dict((daily or {}).get("provenance") or {})
+            if (
+                daily is None
+                or not daily.get("ready")
+                or not daily.get("reproducible")
+                or provenance.get("dataset_identity_sha256")
+                != source_snapshot.get("dataset_identity_sha256")
+                or provenance.get("dataset_lineage_id")
+                != str(portfolio.daily_dataset_lineage_id)
+                or source_snapshot.get("dataset_lineage_id")
+                != str(portfolio.daily_dataset_lineage_id)
+            ):
+                raise ValueError(
+                    "paper order-plan daily dataset is outside the verified account lineage"
+                )
+            bindings.update(
+                {
+                    "daily_dataset": daily_dataset,
+                    "daily_dataset_identity_sha256": str(
+                        provenance["dataset_identity_sha256"]
+                    ),
+                    "daily_dataset_lineage_id": str(provenance["dataset_lineage_id"]),
+                }
+            )
+        else:
+            raise ValueError("paper simulation daily roll policy is invalid")
+
+        from .data_rollover import qlib_trading_date_on_or_before
+
+        selected_daily = datasets.get(bindings["daily_dataset"])
+        if selected_daily is None or qlib_trading_date_on_or_before(
+            selected_daily,
+            _now().astimezone(ZoneInfo("Asia/Shanghai")).date(),
+        ) != signal_date:
+            raise ValueError(
+                "paper order-plan is not the latest currently available trading day"
+            )
+
+        if execution_roll == "latest_compatible":
+            from .data_rollover import select_qlib_dataset
+
+            execution = select_qlib_dataset(
+                data_root,
+                anchor_name=str(portfolio.execution_dataset),
+                roll_policy=execution_roll,
+                lineage_id=str(portfolio.execution_dataset_lineage_id),
+                required_date=trade_date,
+            )
+            execution_provenance = dict(execution.get("provenance") or {})
+            selected_daily = datasets.get(bindings["daily_dataset"])
+            daily_source_lineage = str(
+                dict((selected_daily or {}).get("provenance") or {}).get(
+                    "source_lineage_id"
+                )
+                or ""
+            )
+            if daily_source_lineage != str(
+                execution_provenance.get("source_lineage_id") or ""
+            ):
+                raise ValueError(
+                    "forward paper daily and execution datasets do not share source lineage"
+                )
+            bindings.update(
+                {
+                    "execution_dataset": str(execution["name"]),
+                    "execution_dataset_identity_sha256": str(
+                        execution_provenance["dataset_identity_sha256"]
+                    ),
+                    "execution_dataset_lineage_id": str(
+                        execution_provenance["dataset_lineage_id"]
+                    ),
+                }
+            )
+        elif execution_roll != "pinned":
+            raise ValueError("paper simulation execution roll policy is invalid")
+        return bindings
+
     def create_batches_for_snapshot(
         self,
         snapshot_id: str,
@@ -2493,6 +2626,35 @@ class SimulationStore:
                     strategy_versions.c.id == portfolio.source_id
                 )
             ).one()
+            promotion_stage = connection.execute(
+                select(strategy_promotion_stages).where(
+                    strategy_promotion_stages.c.strategy_version_id == version.id,
+                    strategy_promotion_stages.c.simulation_portfolio_id == portfolio.id,
+                    strategy_promotion_stages.c.status == "active",
+                )
+            ).first()
+            forward_gate = connection.execute(
+                select(strategy_forward_gates.c.strategy_version_id).where(
+                    strategy_forward_gates.c.strategy_version_id == version.id
+                )
+            ).first()
+            if promotion_stage is None or forward_gate is None:
+                raise ValueError(
+                    "Qlib paper order-plan is not bound to an active gated promotion stage"
+                )
+            opened_date = promotion_stage.opened_at.astimezone(
+                ZoneInfo("Asia/Shanghai")
+            ).date()
+            if (
+                signal_date <= opened_date
+                or signal_date > now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+                or manifest.get("promotion_stage_id") != str(promotion_stage.id)
+                or manifest.get("promotion_stage_opened_at")
+                != promotion_stage.opened_at.isoformat()
+            ):
+                raise ValueError(
+                    "Qlib paper order-plan is outside its genuine forward promotion period"
+                )
             signal_at, execution_not_before = self._validate_order_plan_timing(
                 manifest=manifest,
                 version=version,
@@ -2520,18 +2682,13 @@ class SimulationStore:
                     manifest.get("execution_contract_hash"),
                     str(portfolio.execution_contract_hash),
                 ),
-                (manifest.get("daily_dataset"), str(portfolio.daily_dataset)),
-                (
-                    source_snapshot.get("dataset_identity_sha256"),
-                    str(portfolio.daily_dataset_identity_sha256),
-                ),
                 (
                     source_snapshot.get("dataset_lineage_id"),
                     str(portfolio.daily_dataset_lineage_id),
                 ),
                 (
                     source_snapshot_id,
-                    str(portfolio.daily_dataset_identity_sha256),
+                    str(source_snapshot.get("dataset_identity_sha256") or ""),
                 ),
             )
             if any(observed != expected for observed, expected in required_matches):
@@ -2539,12 +2696,22 @@ class SimulationStore:
                     "Qlib order-plan does not match the simulation source contract "
                     "or immutable snapshot"
                 )
+            dataset_bindings = self._strategy_order_plan_dataset_bindings(
+                portfolio=portfolio,
+                daily_dataset=str(manifest.get("daily_dataset") or ""),
+                source_snapshot=source_snapshot,
+                signal_date=signal_date,
+                trade_date=trade_date,
+                data_root=Path(data_root),
+            )
             plan = {
                 "format_version": QLIB_ORDER_PLAN_FORMAT_VERSION,
                 "manifest_sha256": manifest_sha256,
                 "target_weights_file_sha256": target_file_sha256,
                 "target_weights_sha256": target_weights_sha256,
                 "formal_backtest_id": backtest_id,
+                "promotion_stage_id": str(promotion_stage.id),
+                "promotion_stage_opened_at": promotion_stage.opened_at.isoformat(),
                 "source_snapshot": source_snapshot,
                 "execution_contract_hash": str(portfolio.execution_contract_hash),
                 "signal_at": signal_at.isoformat() if signal_at else None,
@@ -2566,7 +2733,6 @@ class SimulationStore:
             idempotency_key = (
                 f"qlib-order-plan:{portfolio.id}:{manifest_sha256}"
             )
-            dataset_bindings = self._portfolio_batch_dataset_bindings(portfolio)
             inserted_id = connection.scalar(
                 pg_insert(simulation_batches)
                 .values(
@@ -2607,6 +2773,10 @@ class SimulationStore:
                     or dict(existing.target_payload_json or {}) != payload
                     or str(existing.execution_contract_hash)
                     != str(portfolio.execution_contract_hash)
+                    or any(
+                        str(getattr(existing, key)) != str(value)
+                        for key, value in dataset_bindings.items()
+                    )
                     or existing.signal_at != signal_at
                     or existing.execution_not_before != execution_not_before
                 ):

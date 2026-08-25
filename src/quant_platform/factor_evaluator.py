@@ -8,6 +8,11 @@ import numpy as np
 import pandas as pd
 
 from .cost_model import CN_COST_SCHEDULE_BOOK, CostModelConfig, CostScheduleBook
+from .factor_recompute import (
+    FACTOR_MIN_COVERAGE_RATIO,
+    FACTOR_MIN_DAILY_FINITE,
+    FACTOR_MIN_GOOD_DAY_RATE,
+)
 from .statistical_validation import STATISTICAL_CONTRACT_VERSION, newey_west_mean_test
 
 
@@ -162,9 +167,9 @@ def evaluate_factor_values(
     cost_model: CostModelConfig | None = None,
     cost_schedule: CostScheduleBook | None = None,
     reference_order_value: float = 100_000.0,
-    min_daily_instruments: int = 50,
-    min_coverage_ratio: float = 0.80,
-    min_good_day_rate: float = 0.95,
+    min_daily_instruments: int = FACTOR_MIN_DAILY_FINITE,
+    min_coverage_ratio: float = FACTOR_MIN_COVERAGE_RATIO,
+    min_good_day_rate: float = FACTOR_MIN_GOOD_DAY_RATE,
     max_constant_day_rate: float = 0.05,
     label_horizon_days: int = 1,
 ) -> dict[str, Any]:

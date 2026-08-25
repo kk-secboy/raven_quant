@@ -3,12 +3,34 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from quant_platform import release_preflight
 
 pytestmark = pytest.mark.no_database
+_REAL_IMMUTABLE_IMAGE_CONFIGURATION = release_preflight._immutable_image_configuration
+_REAL_DOCKER_STORAGE_CONFIGURATION = release_preflight._docker_storage_configuration
+
+
+@pytest.fixture(autouse=True)
+def _configured_immutable_images(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        release_preflight,
+        "_immutable_image_configuration",
+        lambda _context: (True, "test image identities are pinned"),
+    )
+    monkeypatch.setattr(
+        release_preflight,
+        "_preloaded_image_availability",
+        lambda _context: (True, "test images are preloaded"),
+    )
+    monkeypatch.setattr(
+        release_preflight,
+        "_docker_storage_configuration",
+        lambda _context: (True, "test storage is isolated"),
+    )
 
 
 def _expected_migration_head(project_root: Path) -> str:
@@ -247,6 +269,128 @@ def test_known_older_database_revision_has_upgrade_path() -> None:
     assert code_revision == _expected_migration_head(project_root)
     assert state == "upgrade_required"
     assert compatible is True
+
+
+def test_deployed_0058_database_upgrades_to_0064_head() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+
+    code_revision, state, compatible = release_preflight._schema_compatibility(
+        project_root,
+        "0058_simulation_benchmark",
+    )
+
+    assert code_revision == "0064_paper_stage_account"
+    assert state == "upgrade_required"
+    assert compatible is True
+
+
+def test_all_migration_revision_ids_fit_alembic_version_column() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    revisions: dict[str, str | None] = {}
+    for path in sorted((project_root / "migrations" / "versions").glob("*.py")):
+        values: dict[str, object] = {}
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            target = node.targets[0] if isinstance(node, ast.Assign) else node.target
+            if isinstance(target, ast.Name) and target.id in {
+                "revision",
+                "down_revision",
+            }:
+                values[target.id] = ast.literal_eval(node.value)
+        revision = values.get("revision")
+        if isinstance(revision, str):
+            down_revision = values.get("down_revision")
+            revisions[revision] = (
+                down_revision if isinstance(down_revision, str) else None
+            )
+
+    assert revisions["0063_model_artifact_env"] == "0062_research_asset_consumptions"
+    assert revisions["0064_paper_stage_account"] == "0063_model_artifact_env"
+    assert all(len(revision) <= 32 for revision in revisions)
+
+
+def test_default_and_gpu_service_contracts() -> None:
+    default = type("Context", (), {"profiles": ()})()
+    gpu = type("Context", (), {"profiles": ("gpu",)})()
+
+    assert "rdagent-data-science-worker" in release_preflight.expected_services(default)
+    assert "rdagent-llm-finetune-worker" not in release_preflight.expected_services(default)
+    assert "rdagent-llm-finetune-worker" in release_preflight.expected_services(gpu)
+
+
+def test_immutable_image_contract_is_profile_aware(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for name in (
+        *release_preflight._CORE_IMAGE_SETTINGS,
+        *release_preflight._GPU_IMAGE_SETTINGS,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    env_file = tmp_path / ".env"
+    digest = "a" * 64
+    env_file.write_text(
+        "\n".join(
+            (
+                f"RDAGENT_RUNTIME_IMAGE_DIGEST=sha256:{digest}",
+                f"RDAGENT_QLIB_SANDBOX_IMAGE=example/qlib@sha256:{digest}",
+                f"RDAGENT_DATA_SCIENCE_IMAGE=example/ds@sha256:{digest}",
+                f"MODEL_SANDBOX_IMAGE=example/model@sha256:{digest}",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert _REAL_IMMUTABLE_IMAGE_CONFIGURATION(
+        SimpleNamespace(env_file=env_file, profiles=())  # type: ignore[arg-type]
+    )[0]
+    valid, evidence = _REAL_IMMUTABLE_IMAGE_CONFIGURATION(
+        SimpleNamespace(env_file=env_file, profiles=("gpu",))  # type: ignore[arg-type]
+    )
+    assert valid is False
+    assert "RDAGENT_FINETUNE_IMAGE" in evidence
+
+    content = env_file.read_text(encoding="utf-8")
+    env_file.write_text(
+        content.replace(
+            f"RDAGENT_DATA_SCIENCE_IMAGE=example/ds@sha256:{digest}",
+            f"RDAGENT_DATA_SCIENCE_IMAGE=example/qlib@sha256:{digest}",
+        ),
+        encoding="utf-8",
+    )
+    valid, evidence = _REAL_IMMUTABLE_IMAGE_CONFIGURATION(
+        SimpleNamespace(env_file=env_file, profiles=())  # type: ignore[arg-type]
+    )
+    assert valid is False
+    assert "separately sealed" in evidence
+
+
+def test_dind_storage_must_be_outside_governed_market_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for name in (
+        "QUANTLAB_DATA_HOST_PATH",
+        "RDAGENT_DOCKER_HOST_PATH",
+        "RDAGENT_REGISTRY_HOST_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "QUANTLAB_DATA_HOST_PATH=/data/quantlab\n"
+        "RDAGENT_DOCKER_HOST_PATH=/data/quantlab/docker\n"
+        "RDAGENT_REGISTRY_HOST_PATH=/data/quantlab-registry\n",
+        encoding="utf-8",
+    )
+
+    valid, evidence = _REAL_DOCKER_STORAGE_CONFIGURATION(
+        SimpleNamespace(env_file=env_file)  # type: ignore[arg-type]
+    )
+
+    assert valid is False
+    assert "outside QUANTLAB_DATA_HOST_PATH" in evidence
 
 
 def test_unknown_database_revision_fails_closed() -> None:

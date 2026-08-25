@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -26,6 +28,7 @@ from quant_data.execution_contract import (
     require_daily_qlib_contract,
     require_minute_execution_contract,
     require_minute_signal_contract,
+    require_native_daily_execution_controls,
     require_strategy_execution_contract,
     strategy_execution_contract_hash,
 )
@@ -34,7 +37,13 @@ from quant_data.execution_data import (
     MINUTE_FREQUENCIES,
     NATIVE_MINUTE_FREQUENCIES,
 )
-from quant_data.legacy_market import BAOSTOCK_OVERLAP_POLICY_VERSION
+from quant_data.legacy_market import (
+    BAOSTOCK_OVERLAP_POLICY_VERSION,
+    DEFAULT_OVERLAP_SYMBOLS,
+    PRIMARY_OVERLAP_PROVIDER,
+    require_audited_overlap_symbols,
+    require_current_primary_overlap_evidence,
+)
 from quant_platform.announcement_nlp import (
     ANNOUNCEMENTS_DIR,
     LOGIC_FACTOR_NAME,
@@ -74,25 +83,48 @@ from .cost_model import (
     CURRENT_TRANSFER_FEE_RATE,
     CostModelConfig,
 )
-from .data_rollover import select_qlib_dataset
+from .data_rollover import qlib_trading_date_on_or_before, select_qlib_dataset
 from .data_task_store import DataTaskStore
 from .deployment_readiness import DeploymentReadinessStore
-from .health_store import OperationalHealthStore
+from .feature_set_registry import get_feature_set, list_feature_sets
+from .health_store import OperationalHealthStore, safe_mode_recovery_health_status
 from .information_schedule import (
+    latest_verified_research_asset_snapshot,
     normalize_information_factor_refresh_payload,
     normalize_information_schedule_payload,
 )
-from .job_store import JobStore
+from .job_store import JobStore, research_asset_acquisition_idempotency_key
 from .market_overview import MarketOverviewService
 from .model_artifact_store import ModelArtifactStore
 from .ops_calendar import evaluate_recommendation_gate, load_calendar_days
 from .parameter_experiment_store import ParameterExperimentStore
 from .parameter_experiments import normalize_parameter_grid, split_research_period
 from .platform_config_store import PlatformConfigStore
-from .rdagent_runtime import probe_rdagent, validate_duration
+from .promotion import PromotionStore
+from .rdagent_candidate_store import RDAGentCandidateStore
+from .rdagent_runtime import (
+    expected_rdagent_runtime_identity,
+    probe_rdagent,
+    run_official_rdagent_health_check,
+    validate_duration,
+    validate_duration_limit,
+)
+from .rdagent_scenarios import (
+    get_rdagent_scenario,
+    require_ready_scenario,
+    resolve_rdagent_assets,
+    scenario_from_research_run,
+    validate_asset_id,
+    validate_feature_set_id,
+)
 from .recommendation_account_store import RecommendationAccountStore
 from .recommendation_store import RecommendationStore
-from .research_automation import normalize_research_schedule_payload
+from .research_asset_store import ResearchAssetStore
+from .research_automation import (
+    normalize_research_period_policy,
+    normalize_research_schedule_payload,
+    resolve_research_periods,
+)
 from .research_store import ResearchStore
 from .retention import DataRetentionManager
 from .runtime_secret_store import RuntimeSecretStore
@@ -115,19 +147,38 @@ from .worker import LocalJobWorker
 
 
 class BootstrapRequest(BaseModel):
-    profile: Literal["core", "research", "full"] = "core"
-    start: date = Field(default=date(2018, 1, 1))
+    model_config = ConfigDict(extra="forbid")
+
+    profile: Literal["core", "research", "full"] = "full"
+    # The primary Tushare-compatible gateway starts at 2016.  Pre-2016
+    # history is admitted separately through the audited BaoStock workflow.
+    start: date = Field(default=date(2016, 1, 1))
+    snapshot_start: date = Field(default=date(2008, 1, 1))
     end: date | Literal["latest"] = "latest"
     build_qlib: bool = False
 
     @model_validator(mode="after")
     def validate_range(self) -> BootstrapRequest:
+        if self.start != date(2016, 1, 1):
+            raise ValueError(
+                "full bootstrap primary download start must equal 2016-01-01; "
+                "use the incremental scheduler for later updates"
+            )
         if isinstance(self.end, date) and self.end < self.start:
             raise ValueError("end must not be before start")
+        if self.snapshot_start > self.start:
+            raise ValueError("snapshot_start must not be after the primary download start")
+        if self.build_qlib and self.profile != "full":
+            raise ValueError(
+                "Qlib research finalization requires the full data profile; "
+                "core/research profiles are download-only subsets"
+            )
         return self
 
 
 class BaoStockOverlapRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     start: date = Field(default=date(2016, 1, 1))
     end: date = Field(default=date(2016, 12, 31))
     symbols: list[str] = Field(default_factory=list, max_length=100)
@@ -136,10 +187,13 @@ class BaoStockOverlapRequest(BaseModel):
     def validate_range(self) -> BaoStockOverlapRequest:
         if self.end < self.start:
             raise ValueError("end must not be before start")
+        require_audited_overlap_symbols(self.symbols or DEFAULT_OVERLAP_SYMBOLS)
         return self
 
 
 class LegacyMarketBackfillRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     start: date = Field(default=date(2008, 1, 1))
     end: date = Field(default=date(2015, 12, 31))
 
@@ -153,8 +207,10 @@ class LegacyMarketBackfillRequest(BaseModel):
 
 
 class DataFinalizeRequest(BaseModel):
-    profile: Literal["core", "research", "full"] = "full"
-    start: date = Field(default=date(2018, 1, 1))
+    model_config = ConfigDict(extra="forbid")
+
+    profile: Literal["core", "research", "full", "research-assets"] = "full"
+    start: date = Field(default=date(2008, 1, 1))
     end: date | Literal["latest"] = "latest"
     snapshot_name: str | None = Field(default=None, min_length=3, max_length=120)
 
@@ -162,6 +218,11 @@ class DataFinalizeRequest(BaseModel):
     def validate_range(self) -> DataFinalizeRequest:
         if isinstance(self.end, date) and self.end < self.start:
             raise ValueError("end must not be before start")
+        if self.profile not in {"full", "research-assets"}:
+            raise ValueError(
+                "publication requires the full data profile for Qlib or the isolated "
+                "research-assets profile; core/research are download-only subsets"
+            )
         return self
 
 
@@ -243,6 +304,8 @@ class MarginEligibilityRequest(BaseModel):
 
 
 class CoreIntradayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     start: date = Field(default=date(2024, 1, 1))
     end: date | Literal["latest"] = "latest"
     etfs: list[str] = Field(default_factory=lambda: ["510300.SH", "159919.SZ"], max_length=100)
@@ -257,6 +320,7 @@ class CoreIntradayRequest(BaseModel):
         default_factory=lambda: ["broad", "industry", "gold", "bond"]
     )
     snapshot_name: str | None = Field(default=None, min_length=3, max_length=120)
+    daily_dataset: str | None = Field(default=None, min_length=1, max_length=120)
 
     @model_validator(mode="after")
     def validate_request(self) -> CoreIntradayRequest:
@@ -292,6 +356,8 @@ class SupplementalDownloadRequest(BaseModel):
     start: date = Field(default=date(2024, 1, 1))
     end: date | Literal["latest"] = "latest"
     symbols: list[str] = Field(default_factory=list, max_length=2000)
+    publish_research_assets: bool = False
+    snapshot_name: str | None = Field(default=None, min_length=3, max_length=120)
 
     @model_validator(mode="after")
     def validate_range(self) -> SupplementalDownloadRequest:
@@ -299,13 +365,20 @@ class SupplementalDownloadRequest(BaseModel):
             raise ValueError("end must not be before start")
         if self.bundle == "strategy_specialty_minutes" and not self.symbols:
             raise ValueError("strategy_specialty_minutes requires explicit symbols")
+        if self.publish_research_assets and self.bundle != "research_corpus":
+            raise ValueError(
+                "publish_research_assets is available only for the research_corpus bundle"
+            )
         return self
 
 
 class Ashare5mRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     start: date = Field(default=date(2024, 1, 1))
     end: date | Literal["latest"] = "latest"
     snapshot_name: str | None = Field(default=None, min_length=3, max_length=120)
+    daily_dataset: str | None = Field(default=None, min_length=1, max_length=120)
 
     @model_validator(mode="after")
     def validate_range(self) -> Ashare5mRequest:
@@ -384,15 +457,12 @@ class MinuteResearchRequest(BaseModel):
 
 
 class ResearchPeriods(BaseModel):
-    train_start: date = date(2008, 1, 1)
-    train_end: date = date(2017, 12, 31)
-    valid_start: date = date(2018, 1, 1)
-    valid_end: date = date(2020, 12, 31)
-    # Keep the configured five-trading-day embargo between validation and the
-    # once-only final test.  2021-01-04 through 2021-01-08 are deliberately
-    # unused by the default fixed research window.
-    test_start: date = date(2021, 1, 11)
-    test_end: date = Field(default_factory=date.today)
+    train_start: date
+    train_end: date
+    valid_start: date
+    valid_end: date
+    test_start: date
+    test_end: date
 
     @model_validator(mode="after")
     def validate_windows(self) -> ResearchPeriods:
@@ -426,18 +496,372 @@ class ResearchPeriods(BaseModel):
         return self
 
 
+class ResearchPeriodPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    test_trading_days: int = Field(default=252, ge=252, le=1260)
+    embargo_trading_days: int = Field(default=5, ge=5, le=63)
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> ResearchPeriodPolicy:
+        normalize_research_period_policy(self.model_dump())
+        return self
+
+
+class ResearchAssetAutomaticRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    as_of: date | None = None
+    include_tushare: bool = True
+    include_arxiv: bool = True
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> ResearchAssetAutomaticRequest:
+        if not self.include_tushare and not self.include_arxiv:
+            raise ValueError("at least one automatic research source is required")
+        return self
+
+
+class ResearchAssetManualHttpsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=12, max_length=2000)
+    title: str = Field(min_length=3, max_length=500)
+    document_kind: Literal["paper", "research_report"] = "paper"
+    published_at: datetime | None = None
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_remote_pdf(self) -> ResearchAssetManualHttpsRequest:
+        parsed = urlsplit(self.url.strip())
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise ValueError("manual research documents require a public HTTPS URL")
+        if self.published_at is not None and (
+            self.published_at.tzinfo is None or self.published_at.utcoffset() is None
+        ):
+            raise ValueError("published_at must include a timezone")
+        self.url = self.url.strip()
+        self.title = self.title.strip()
+        return self
+
+
 class RDAgentRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     objective: str = Field(min_length=10, max_length=2000)
-    dataset: str
+    scenario: str = "fin_factor"
+    dataset: str | None = None
+    asset_ids: list[str] = Field(default_factory=list, max_length=20)
+    feature_set_id: str | None = None
     loop_n: int = Field(default=1, ge=1, le=20)
     duration: str = "30m"
     requested_by: str = Field(default="local-operator", min_length=2, max_length=100)
-    periods: ResearchPeriods = Field(default_factory=ResearchPeriods)
+    period_policy: ResearchPeriodPolicy = Field(default_factory=ResearchPeriodPolicy)
 
     @model_validator(mode="after")
     def validate_budget(self) -> RDAgentRunRequest:
         validate_duration(self.duration)
+        scenario = get_rdagent_scenario(self.scenario)
+        self.scenario = scenario.id
+        if (
+            scenario.id in {"fin_model", "fin_quant"}
+            and self.period_policy.embargo_trading_days != 5
+        ):
+            raise ValueError(
+                f"{scenario.id} currently requires the governed 5-trading-day "
+                "model embargo"
+            )
+        self.asset_ids = [validate_asset_id(value) for value in self.asset_ids]
+        if len(set(self.asset_ids)) != len(self.asset_ids):
+            raise ValueError("asset_ids contain duplicates")
+        self.feature_set_id = validate_feature_set_id(self.feature_set_id)
+        if scenario.requires_dataset and not str(self.dataset or "").strip():
+            raise ValueError(f"{scenario.id} requires a Qlib dataset")
+        if not scenario.requires_dataset and self.dataset is not None:
+            raise ValueError(f"{scenario.id} does not accept a Qlib dataset")
+        if scenario.requires_feature_set:
+            if self.feature_set_id is None:
+                raise ValueError(f"{scenario.id} requires a governed feature_set_id")
+            get_feature_set(self.feature_set_id)
+        elif self.feature_set_id is not None:
+            raise ValueError(f"{scenario.id} does not accept feature_set_id")
         return self
+
+
+class GeneralModelValidationRequest(BaseModel):
+    """Promote one implementation artifact into the governed model research gate.
+
+    The client may select only opaque platform identities and a frozen recipe.
+    It can never provide executable paths, commands, or environment variables.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str = Field(min_length=16, max_length=64)
+    dataset: str = Field(min_length=2, max_length=200)
+    feature_set_id: str = Field(min_length=2, max_length=100)
+    name: str | None = Field(default=None, min_length=2, max_length=200)
+    description: str | None = Field(default=None, min_length=2, max_length=2000)
+    model_type: str = Field(default="Tabular", min_length=2, max_length=100)
+    architecture: dict[str, Any] = Field(default_factory=dict)
+    model_hyperparameters: dict[str, Any] = Field(default_factory=dict)
+    training_hyperparameters: dict[str, Any] = Field(default_factory=dict)
+    requested_by: str = Field(default="local-operator", min_length=2, max_length=100)
+    period_policy: ResearchPeriodPolicy = Field(default_factory=ResearchPeriodPolicy)
+
+    @model_validator(mode="after")
+    def validate_governed_ids(self) -> GeneralModelValidationRequest:
+        self.feature_set_id = str(validate_feature_set_id(self.feature_set_id))
+        get_feature_set(self.feature_set_id)
+        if self.period_policy.embargo_trading_days != 5:
+            raise ValueError(
+                "general_model validation currently requires the governed "
+                "5-trading-day model embargo"
+            )
+        return self
+
+
+_PUBLIC_WINDOWS_PATH = re.compile(r"(?i)(?:^|\s)[a-z]:[\\/]")
+_PUBLIC_UNIX_PATH = re.compile(
+    r"(?:^|\s)/(?:app|data|etc|home|mnt|opt|root|run|srv|tmp|usr|var)(?:/|\b)"
+)
+
+
+def _public_string(value: str) -> str:
+    lowered = value.lower()
+    if (
+        "://" in lowered
+        or "bearer " in lowered
+        or value.startswith(("\\\\", "file:"))
+        or _PUBLIC_WINDOWS_PATH.search(value)
+        or _PUBLIC_UNIX_PATH.search(value)
+    ):
+        return "[redacted]"
+    return value
+
+
+def _sanitize_public_value(value: Any) -> Any:
+    hidden_keys = {
+        "artifact_path",
+        "code_path",
+        "command",
+        "cwd",
+        "dataset_path",
+        "env",
+        "environment",
+        "error",
+        "headers",
+        "log",
+        "log_path",
+        "path",
+        "paths",
+        "recomputed_values_path",
+        "storage_path",
+        "trace_path",
+        "traceback",
+        "url",
+        "urls",
+        "uri",
+        "values_path",
+        "workspace_path",
+        "stderr",
+        "stdout",
+    }
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_public_value(item)
+            for key, item in value.items()
+            if str(key).lower() not in hidden_keys
+            and not str(key).lower().endswith(("_path", "_paths", "_url", "_uri"))
+            and not any(
+                token in str(key).lower()
+                for token in (
+                    "api_key",
+                    "authorization",
+                    "cookie",
+                    "credential",
+                    "password",
+                    "secret",
+                    "token",
+                )
+            )
+        }
+    if isinstance(value, list):
+        return [_sanitize_public_value(item) for item in value]
+    if isinstance(value, str):
+        return _public_string(value)
+    return value
+
+
+def _public_rdagent_run(run: dict[str, Any]) -> dict[str, Any]:
+    result = _sanitize_public_value(dict(run))
+    result["error"] = "research run failed" if run.get("error") else None
+    result["scenario"] = scenario_from_research_run(result)
+    return result
+
+
+def _public_rdagent_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Expose readiness decisions, never host/runtime addressing details."""
+
+    scenario_rows = status.get("scenarios")
+    scenarios = scenario_rows if isinstance(scenario_rows, list) else []
+    workers: dict[str, Any] = {}
+    for key in ("evaluation_worker", "data_science_worker", "gpu_worker"):
+        worker = status.get(key)
+        if isinstance(worker, dict):
+            workers[key] = {
+                field: worker.get(field)
+                for field in (
+                    "status",
+                    "ready",
+                    "runtime_identity_matches",
+                    "model_sandbox_ready",
+                    "gpu_available",
+                    "gpu_memory_free_mb",
+                    "gpu_driver_version",
+                    "cuda_version",
+                    "docker_gpu_runtime_available",
+                    "docker_gpu_smoke_passed",
+                    "data_root_free_gb",
+                )
+                if field in worker
+            }
+    public = {
+        "status": status.get("status"),
+        "enabled": bool(status.get("enabled")),
+        "ready": bool(status.get("ready")),
+        "blockers": status.get("blockers") or [],
+        "limits": status.get("limits") or {},
+        "scenarios": scenarios,
+        "llm_credentials_configured": bool(status.get("llm_credentials_configured")),
+        "docker_available": bool(status.get("docker_available")),
+        "qlib_data_ready": bool(status.get("qlib_data_ready")),
+        "workers": workers,
+    }
+    return _sanitize_public_value(public)
+
+
+_PUBLIC_JOB_PAYLOAD_KEYS = frozenset(
+    {
+        "as_of",
+        "bundle",
+        "dataset",
+        "document_kind",
+        "end",
+        "frequency",
+        "mode",
+        "output_name",
+        "pipeline_id",
+        "profile",
+        "scenario",
+        "snapshot_name",
+        "start",
+        "target_frequency",
+    }
+)
+_PUBLIC_JOB_PROGRESS_KEYS = frozenset(
+    {
+        "checkpoint",
+        "completed_count",
+        "datasets",
+        "execution_phase",
+        "failed_count",
+        "phase_label",
+        "status",
+        "succeeded_count",
+        "target",
+        "trial_count",
+        "updated_at",
+    }
+)
+
+
+def _public_job(job: dict[str, Any]) -> dict[str, Any]:
+    payload = job.get("payload")
+    public_payload = (
+        {
+            str(key): value
+            for key, value in payload.items()
+            if str(key) in _PUBLIC_JOB_PAYLOAD_KEYS
+        }
+        if isinstance(payload, dict)
+        else {}
+    )
+    progress = job.get("progress")
+    public_progress = (
+        {
+            str(key): value
+            for key, value in progress.items()
+            if str(key) in _PUBLIC_JOB_PROGRESS_KEYS
+        }
+        if isinstance(progress, dict)
+        else None
+    )
+    result = _sanitize_public_value(
+        {
+            "id": job.get("id"),
+            "kind": job.get("kind"),
+            "status": job.get("status"),
+            "payload": public_payload,
+            "progress": public_progress,
+            "attempts": job.get("attempts"),
+            "max_attempts": job.get("max_attempts"),
+            "next_attempt_at": job.get("next_attempt_at"),
+            "cancel_requested_at": job.get("cancel_requested_at"),
+            "created_at": job.get("created_at"),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+            "exit_code": job.get("exit_code"),
+            "retry_successor": job.get("retry_successor"),
+        }
+    )
+    if job.get("error"):
+        result["error"] = "job execution failed"
+    else:
+        result["error"] = None
+    return result
+
+
+def _public_research_asset_job(job: dict[str, Any]) -> dict[str, Any]:
+    """Expose acquisition state without URLs, commands, paths, or raw payloads."""
+
+    progress = dict(job.get("progress") or {})
+    return {
+        "id": str(job["id"]),
+        "kind": str(job["kind"]),
+        "status": str(job["status"]),
+        "mode": str((job.get("payload") or {}).get("mode") or ""),
+        "attempts": int(job.get("attempts") or 0),
+        "max_attempts": int(job.get("max_attempts") or 0),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        # Worker/log failures can contain URLs or host paths.  The acquisition
+        # detail endpoint intentionally exposes only a stable public message.
+        "error": "research asset acquisition failed" if job.get("error") else None,
+        "result": {
+            key: progress[key]
+            for key in (
+                "status",
+                "mode",
+                "published",
+                "assets",
+                "blocked",
+                "failed",
+                "tushare_selected",
+                "arxiv_selected",
+                "daily_limits",
+            )
+            if key in progress
+        },
+    }
 
 
 class FactorEvaluationRequest(BaseModel):
@@ -494,10 +918,28 @@ class StrategyConfigRequest(BaseModel):
         "qlib_baseline",
         "qlib_baseline_plus_challenger",
         "qlib_challenger_replacement",
+        "not_applicable_model_prediction",
     ] = "promoted_only"
     challenger_weight: float = Field(default=1.0, ge=0.0, le=1.0)
     baseline_definition: dict[str, Any] | None = None
     baseline_definition_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    signal_source: Literal["factor_score", "model_prediction"] = "factor_score"
+    model_candidate_id: str | None = Field(default=None, min_length=1, max_length=128)
+    model_evaluation_id: str | None = Field(default=None, min_length=1, max_length=128)
+    model_code_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    model_recipe_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    model_evidence_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    feature_set_id: str | None = Field(default=None, min_length=1, max_length=128)
+    feature_set_definition_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    quant_bundle_candidate_id: str | None = Field(
+        default=None, min_length=1, max_length=128
+    )
+    quant_bundle_evaluation_id: str | None = Field(
+        default=None, min_length=1, max_length=128
+    )
+    quant_bundle_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     signal_frequency: Literal["day", "1min", "5min", "15min", "30min", "60min"] = "day"
     signal_period: int = Field(default=1, ge=1, le=1260)
     execution_frequency: Literal["day", "1min", "5min", "15min", "30min", "60min"] = "day"
@@ -566,7 +1008,7 @@ class StrategyConfigRequest(BaseModel):
     event_count: int = Field(default=5, ge=1, le=20)
     max_event_underperformance: float = Field(default=0.05, ge=0, le=0.50)
     min_event_stress_pass_rate: float = Field(default=0.60, ge=0, le=1)
-    min_backtest_days: int = Field(default=504, ge=252, le=2520)
+    min_backtest_days: int = Field(default=252, ge=252, le=2520)
     # Account capital and capacity stress notionals are different contracts.
     # The personal deployment starts paper evidence with the user's 100k
     # account while retaining larger capacity curves for scalability tests.
@@ -606,6 +1048,18 @@ class StrategyConfigRequest(BaseModel):
 
     @model_validator(mode="after")
     def valid_dropout(self) -> StrategyConfigRequest:
+        if self.signal_source == "model_prediction":
+            if self.factor_source_mode not in {
+                "promoted_only",
+                "not_applicable_model_prediction",
+            }:
+                raise ValueError(
+                    "model-prediction strategies cannot bind a factor-score baseline"
+                )
+        elif self.factor_source_mode == "not_applicable_model_prediction":
+            raise ValueError(
+                "the model-prediction factor-source sentinel is invalid for factor scores"
+            )
         if self.recipe_id == "custom" and self.recipe_version != "custom":
             raise ValueError("custom strategy config must use the custom recipe version")
         if self.recipe_id != "custom" and self.recipe_version != RECIPE_VERSION:
@@ -648,9 +1102,9 @@ class StrategyConfigRequest(BaseModel):
             + self.outer_embargo_days
             + 3 * self.outer_test_days
         )
-        if self.min_backtest_days < required_outer_days:
+        if self.min_pre_final_history_days < required_outer_days:
             raise ValueError(
-                "min_backtest_days must leave at least three complete outer test folds"
+                "min_pre_final_history_days must leave at least three complete outer test folds"
             )
         if self.execution_slice_minutes % 5:
             raise ValueError("execution_slice_minutes must be a multiple of five")
@@ -801,35 +1255,27 @@ class StrategyBacktestRequest(BaseModel):
 class ModelArtifactCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    artifact_key: str = Field(min_length=1, max_length=200)
-    model_recipe: dict[str, Any]
-    dataset: str = Field(min_length=1, max_length=300)
-    dataset_identity_sha256: str = Field(min_length=64, max_length=64)
-    training_start: date
-    training_end: date
-    data_cutoff_at: datetime
-    scheduled_refit_at: datetime | None = None
+    source_backtest_id: str = Field(min_length=1, max_length=200)
     valid_until: datetime
-    artifact_path: str = Field(min_length=1, max_length=2000)
-    predictions_sha256: str = Field(min_length=64, max_length=64)
     actor: str = Field(default="model-operator", min_length=2, max_length=100)
 
     @model_validator(mode="after")
     def validate_model_artifact(self) -> ModelArtifactCreateRequest:
-        if self.training_end < self.training_start:
-            raise ValueError("model training window is invalid")
-        for value, label in (
-            (self.data_cutoff_at, "data_cutoff_at"),
-            (self.valid_until, "valid_until"),
-            (self.scheduled_refit_at, "scheduled_refit_at"),
-        ):
-            if value is not None and (value.tzinfo is None or value.utcoffset() is None):
-                raise ValueError(f"{label} must include a timezone")
+        if self.valid_until.tzinfo is None or self.valid_until.utcoffset() is None:
+            raise ValueError("valid_until must include a timezone")
         return self
 
 
 class ModelArtifactActivateRequest(BaseModel):
     actor: str = Field(default="model-reviewer", min_length=2, max_length=100)
+
+
+class ModelRefitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    signal_date: date
+    valid_for_days: int = Field(default=4, ge=1, le=7)
+    actor: str = Field(default="model-operator", min_length=2, max_length=100)
 
 
 class ParameterExperimentRequest(BaseModel):
@@ -848,6 +1294,8 @@ class ParameterExperimentRequest(BaseModel):
 
 
 class ResearchCampaignCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=3, max_length=150)
     objective: str = Field(min_length=10, max_length=2000)
     dataset: str
@@ -858,7 +1306,7 @@ class ResearchCampaignCreateRequest(BaseModel):
     universe: str | None = None
     loop_n: int = Field(default=2, ge=1, le=20)
     duration: str = "1h"
-    periods: ResearchPeriods = Field(default_factory=ResearchPeriods)
+    period_policy: ResearchPeriodPolicy = Field(default_factory=ResearchPeriodPolicy)
     max_factors: int = Field(default=5, ge=1, le=20)
     parameter_grid: dict[str, list[int | float]] = Field(
         default_factory=lambda: {
@@ -878,7 +1326,6 @@ class ResearchCampaignCreateRequest(BaseModel):
     @model_validator(mode="after")
     def validate_campaign(self) -> ResearchCampaignCreateRequest:
         validate_duration(self.duration)
-        split_research_period(self.periods.valid_start, self.periods.valid_end)
         if self.recommendation_run_time < time(15, 10):
             raise ValueError("recommendation refresh must run after the A-share close")
         try:
@@ -894,6 +1341,8 @@ class ResearchCampaignStatusRequest(BaseModel):
 
 
 class ResearchProgramCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=3, max_length=100)
     dataset: str
     recipe_id: Literal["index_enhancement", "swing_trend", "full_market_multifactor"] = (
@@ -902,10 +1351,7 @@ class ResearchProgramCreateRequest(BaseModel):
     objective: str | None = Field(default=None, min_length=10, max_length=2000)
     benchmark: str | None = None
     universe: str | None = None
-    train_trading_days: int = Field(default=2520, ge=252, le=2520)
-    validation_trading_days: int = Field(default=252, ge=63, le=756)
-    test_trading_days: int = Field(default=504, ge=252, le=1260)
-    min_new_trading_days: int = Field(default=20, ge=1, le=252)
+    test_trading_days: int = Field(default=252, ge=252, le=1260)
     max_active_campaigns: int = Field(default=1, ge=1, le=3)
     loop_n: int = Field(default=2, ge=1, le=20)
     duration: str = "1h"
@@ -928,8 +1374,6 @@ class ResearchProgramCreateRequest(BaseModel):
     @model_validator(mode="after")
     def validate_program(self) -> ResearchProgramCreateRequest:
         validate_duration(self.duration)
-        if self.train_trading_days + self.validation_trading_days < 2520:
-            raise ValueError("continuous research requires at least 2520 pre-final trading days")
         if self.recommendation_run_time < time(15, 10):
             raise ValueError("recommendation refresh must run after the A-share close")
         try:
@@ -945,6 +1389,19 @@ class ResearchProgramStatusRequest(BaseModel):
 
 
 class StrategyApprovalRequest(BaseModel):
+    actor: str = Field(min_length=2, max_length=100)
+    reason: str = Field(min_length=10, max_length=2000)
+
+
+class PaperStageOpenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+
+class StrategyPromotionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     actor: str = Field(min_length=2, max_length=100)
     reason: str = Field(min_length=10, max_length=2000)
 
@@ -1113,6 +1570,8 @@ class SimulationFinalFeeRequest(BaseModel):
 
 
 class ScheduleCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=3, max_length=150)
     kind: Literal[
         "incremental_sync",
@@ -1175,7 +1634,7 @@ class ScheduleCreateRequest(BaseModel):
             validate_intraday_run_time(self.run_time, interval)
         else:
             profile = self.payload.get("profile", "full")
-            if profile not in {"core", "research", "full"}:
+            if profile not in {"core", "research", "full", "research-assets"}:
                 raise ValueError("data_pipeline profile is invalid")
             allowed = {
                 "cn_extended_daily",
@@ -1195,6 +1654,10 @@ class ScheduleCreateRequest(BaseModel):
             unknown = sorted({str(item) for item in bundles} - allowed)
             if unknown:
                 raise ValueError(f"data_pipeline contains unsupported bundles: {unknown}")
+            if profile == "research-assets" and set(bundles) != {"research_corpus"}:
+                raise ValueError(
+                    "research-assets data_pipeline requires exactly the research_corpus bundle"
+                )
         return self
 
 
@@ -1319,7 +1782,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     jobs = JobStore(settings.database_url)
     data_tasks = DataTaskStore(settings.database_url)
     research = ResearchStore(settings.database_url)
+    rdagent_candidates = RDAGentCandidateStore(settings.database_url)
+    research_assets = ResearchAssetStore(settings.database_url)
     strategies = StrategyStore(settings.database_url)
+    promotions = PromotionStore(settings.database_url)
     recommendations = RecommendationStore(settings.database_url)
     simulations = SimulationStore(settings.database_url)
     model_artifacts = ModelArtifactStore(settings.database_url)
@@ -1452,32 +1918,112 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def require_native_execution_controls(
         dataset: dict[str, Any], *, start: date, purpose: str
     ) -> None:
-        controls = (dataset.get("provenance") or {}).get("execution_controls") or {}
-        if not controls.get("formal_execution_requires_native_controls"):
-            return
-        native_complete_from = str(controls.get("native_complete_from") or "")[:10]
-        if not native_complete_from:
-            raise HTTPException(
-                409,
-                f"{purpose} requires a dated native execution-control boundary",
+        try:
+            require_native_daily_execution_controls(
+                dataset.get("provenance") or {}, start=start
             )
-        if start.isoformat() < native_complete_from:
-            raise HTTPException(
-                409,
-                f"{purpose} starts before native execution controls are complete "
-                f"({native_complete_from})",
-            )
+        except ValueError as exc:
+            raise HTTPException(409, f"{purpose}: {exc}") from exc
 
-    def require_research_calendar(dataset: dict, periods: dict[str, str]) -> None:
+    def require_bound_daily_source(
+        *,
+        requested_name: str | None,
+        start: date,
+        end: date,
+        purpose: str,
+    ) -> tuple[dict[str, Any], str]:
+        """Select one verified daily source and return its snapshot lineage."""
+
+        if requested_name:
+            candidates = [
+                require_qlib_dataset(
+                    requested_name,
+                    purpose=purpose,
+                    frequency="day",
+                )
+            ]
+        else:
+            candidates = [
+                item
+                for item in list_qlib_datasets(settings.data_root)
+                if item.get("ready")
+                and item.get("reproducible")
+                and item.get("frequency") == "day"
+            ]
+        eligible = [
+            item
+            for item in candidates
+            if (not item.get("start_date") or str(item["start_date"]) <= start.isoformat())
+            and (not item.get("end_date") or str(item["end_date"]) >= end.isoformat())
+        ]
+        if not eligible:
+            raise HTTPException(
+                409,
+                f"{purpose} requires a verified daily Qlib dataset covering the request",
+            )
+        dataset = max(
+            eligible,
+            key=lambda item: (str(item.get("end_date") or ""), str(item["name"])),
+        )
+        try:
+            require_daily_qlib_contract(dataset.get("provenance") or {})
+        except ValueError as exc:
+            raise HTTPException(409, f"{purpose}: {exc}") from exc
+        source_lineage_id = str(
+            (dataset.get("provenance") or {}).get("source_lineage_id") or ""
+        ).lower()
+        if len(source_lineage_id) != 64 or any(
+            character not in "0123456789abcdef" for character in source_lineage_id
+        ):
+            raise HTTPException(409, f"{purpose} daily source lineage is invalid")
+        return dataset, source_lineage_id
+
+    def read_research_calendar(dataset: dict[str, Any]) -> list[str]:
         calendar_path = Path(dataset["path"]) / "calendars" / "day.txt"
         try:
             calendar = [
-                date.fromisoformat(line.strip())
+                date.fromisoformat(line.strip()).isoformat()
                 for line in calendar_path.read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
         except (OSError, ValueError) as exc:
             raise HTTPException(409, "Qlib trading calendar is missing or invalid") from exc
+        if not calendar:
+            raise HTTPException(409, "Qlib trading calendar is empty")
+        return calendar
+
+    def resolve_dataset_research_periods(
+        dataset: dict[str, Any],
+        *,
+        periods: ResearchPeriods | dict[str, Any] | None,
+        period_policy: ResearchPeriodPolicy | dict[str, Any] | None,
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        raw_periods = periods.model_dump(mode="json") if isinstance(periods, BaseModel) else periods
+        raw_policy = (
+            period_policy.model_dump(mode="json")
+            if isinstance(period_policy, BaseModel)
+            else period_policy
+        )
+        try:
+            resolved, evidence = resolve_research_periods(
+                read_research_calendar(dataset),
+                periods=raw_periods,
+                period_policy=raw_policy,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        require_research_calendar(dataset, resolved)
+        if dataset.get("start_date") and resolved["train_start"] < dataset["start_date"]:
+            raise HTTPException(409, "training window starts before the selected dataset")
+        if dataset.get("end_date") and resolved["test_end"] > dataset["end_date"]:
+            raise HTTPException(409, "test window ends after the selected dataset")
+        evidence["dataset_identity_sha256"] = (dataset.get("provenance") or {}).get(
+            "dataset_identity_sha256"
+        )
+        return resolved, evidence
+
+    def require_research_calendar(dataset: dict, periods: dict[str, str]) -> None:
+        calendar = [date.fromisoformat(day) for day in read_research_calendar(dataset)]
         valid_start = date.fromisoformat(periods["valid_start"])
         valid_end = date.fromisoformat(periods["valid_end"])
         test_start = date.fromisoformat(periods["test_start"])
@@ -1905,11 +2451,15 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.get("/api/overview")
     def overview() -> dict:
-        return system_summary(effective_settings(), checkpoint, jobs.list(), data_tasks.list())
+        return _sanitize_public_value(
+            system_summary(
+                effective_settings(), checkpoint, jobs.list(), data_tasks.list()
+            )
+        )
 
     @app.get("/api/datasets")
     def datasets() -> list[dict]:
-        return dataset_catalog(checkpoint)
+        return _sanitize_public_value(dataset_catalog(checkpoint))
 
     @app.get("/api/market/overview")
     def market_overview(
@@ -1968,16 +2518,40 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 result = probe_qlib(settings, project_root)
                 if result.get("status") == "ok":
                     qlib_runtime = result
-                return result
-        return qlib_runtime
+                return _sanitize_public_value(
+                    {
+                        key: result.get(key)
+                        for key in (
+                            "status",
+                            "qlib_version",
+                            "lightgbm_version",
+                            "version",
+                            "commit",
+                        )
+                        if key in result
+                    }
+                )
+        return _sanitize_public_value(
+            {
+                key: qlib_runtime.get(key)
+                for key in (
+                    "status",
+                    "qlib_version",
+                    "lightgbm_version",
+                    "version",
+                    "commit",
+                )
+                if key in qlib_runtime
+            }
+        )
 
     @app.get("/api/qlib/datasets")
     def qlib_datasets() -> list[dict]:
-        return list_qlib_datasets(settings.data_root)
+        return _sanitize_public_value(list_qlib_datasets(settings.data_root))
 
     @app.get("/api/qlib/experiments")
     def qlib_experiments() -> list[dict]:
-        return list_qlib_experiments(settings.data_root)
+        return _sanitize_public_value(list_qlib_experiments(settings.data_root))
 
     @app.get("/api/rdagent/status")
     def rdagent_status(refresh: bool = False) -> dict:
@@ -1987,12 +2561,154 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 result = probe_rdagent(settings, project_root)
                 if result.get("status") == "ok":
                     rdagent_runtime = result
-                return result
-        return rdagent_runtime
+                return _public_rdagent_status(result)
+        return _public_rdagent_status(rdagent_runtime)
+
+    @app.get("/api/rdagent/scenarios")
+    def rdagent_scenarios(refresh: bool = False) -> list[dict[str, Any]]:
+        # Public status is already sanitized, but the catalog remains complete.
+        status = rdagent_status(refresh=refresh)
+        scenarios = status.get("scenarios")
+        return scenarios if isinstance(scenarios, list) else []
+
+    @app.get("/api/rdagent/feature-sets")
+    def rdagent_feature_sets() -> list[dict[str, Any]]:
+        return list_feature_sets()
+
+    @app.get("/api/rdagent/assets")
+    def rdagent_research_assets(
+        limit: int = Query(200, ge=1, le=1000),
+    ) -> list[dict[str, Any]]:
+        return research_assets.list_assets(limit=limit)
+
+    @app.get("/api/rdagent/assets/acquisitions")
+    def rdagent_research_asset_acquisitions(
+        limit: int = Query(50, ge=1, le=200),
+    ) -> list[dict[str, Any]]:
+        return [
+            _public_research_asset_job(job)
+            for job in jobs.list(limit=limit, kinds=("research_asset_acquire",))
+        ]
+
+    @app.post("/api/rdagent/assets/acquisitions/automatic", status_code=202)
+    def acquire_automatic_research_assets(
+        payload: ResearchAssetAutomaticRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        research_day = payload.as_of or datetime.now(UTC).astimezone(
+            ZoneInfo("Asia/Shanghai")
+        ).date()
+        if research_day > datetime.now(UTC).astimezone(ZoneInfo("Asia/Shanghai")).date():
+            raise HTTPException(422, "research asset as_of cannot be in the future")
+        try:
+            snapshot_name = (
+                latest_verified_research_asset_snapshot(
+                    settings.data_root, as_of=research_day
+                )
+                if payload.include_tushare
+                else "arxiv-only"
+            )
+            actor = authenticated_actor(request, payload.actor)
+            idempotency_key = research_asset_acquisition_idempotency_key(
+                research_day=research_day.isoformat(),
+                snapshot_name=snapshot_name,
+                include_tushare=payload.include_tushare,
+                include_arxiv=payload.include_arxiv,
+            )
+            job = jobs.create(
+                "research_asset_acquire",
+                {
+                    "mode": "automatic",
+                    "snapshot_name": snapshot_name,
+                    "as_of": research_day.isoformat(),
+                    "include_tushare": payload.include_tushare,
+                    "include_arxiv": payload.include_arxiv,
+                    "requested_by": actor,
+                },
+                platform_root
+                / "logs"
+                / f"research-assets-{research_day.isoformat()}.log",
+                dedupe_active_kind=False,
+                idempotency_key=idempotency_key,
+                max_attempts=3,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return _public_research_asset_job(job)
+
+    @app.post("/api/rdagent/assets/acquisitions/manual-https", status_code=202)
+    def acquire_manual_research_asset(
+        payload: ResearchAssetManualHttpsRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        actor = authenticated_actor(request, payload.actor)
+        source_identity = hashlib.sha256(payload.url.encode("utf-8")).hexdigest()
+        try:
+            job = jobs.create(
+                "research_asset_acquire",
+                {
+                    "mode": "manual_https",
+                    "url": payload.url,
+                    "title": payload.title,
+                    "document_kind": payload.document_kind,
+                    "published_at": (
+                        payload.published_at.isoformat() if payload.published_at else None
+                    ),
+                    "requested_by": actor,
+                },
+                platform_root / "logs" / f"research-asset-manual-{source_identity}.log",
+                dedupe_active_kind=False,
+                idempotency_key=f"research-assets:manual:{source_identity}",
+                max_attempts=3,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        worker.notify()
+        return _public_research_asset_job(job)
+
+    @app.get("/api/rdagent/admitted-signals")
+    def rdagent_admitted_signals(
+        limit: int = Query(100, ge=1, le=500),
+    ) -> list[dict[str, Any]]:
+        return rdagent_candidates.list_admitted_strategy_signals(limit=limit)
+
+    @app.post("/api/rdagent/health-check")
+    def rdagent_health_check() -> dict[str, Any]:
+        try:
+            if settings.rdagent_worker_url:
+                response = requests.post(
+                    f"{settings.rdagent_worker_url}/rdagent/health-check",
+                    timeout=190,
+                )
+                response.raise_for_status()
+                result = response.json()
+            else:
+                llm = runtime_secrets.get("llm")
+                runtime_env = None
+                if llm:
+                    runtime_env = {
+                        settings.rdagent_llm_key_env: llm["api_key"],
+                        "OPENAI_API_BASE": llm.get("api_base", ""),
+                        "CHAT_MODEL": llm.get("chat_model", "gpt-4.1-mini"),
+                    }
+                result = run_official_rdagent_health_check(
+                    settings, project_root, runtime_env=runtime_env
+                )
+        except (requests.RequestException, TypeError, ValueError):
+            result = {
+                "status": "failed",
+                "diagnostic_only": True,
+                "platform_readiness_unchanged": True,
+                "output": "official RD-Agent diagnostic is unavailable",
+            }
+        if not isinstance(result, dict):
+            raise HTTPException(502, "official RD-Agent diagnostic returned invalid data")
+        return _sanitize_public_value(result)
 
     @app.get("/api/rdagent/runs")
     def list_research_runs(limit: int = Query(50, ge=1, le=200)) -> list[dict]:
-        return research.list_runs(limit)
+        return [_public_rdagent_run(item) for item in research.list_runs(limit)]
 
     @app.get("/api/rdagent/runs/{run_id}")
     def get_research_run(run_id: str) -> dict:
@@ -2002,76 +2718,326 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(404, "research run not found") from exc
         run["candidates"] = research.list_candidates(run_id=run_id)
         run["events"] = research.list_events(run_id)
-        return run
+        run.update(rdagent_candidates.run_audit_summary(run_id))
+        run["asset_consumptions"] = research_assets.list_consumptions(
+            research_run_id=run_id
+        )
+        return _public_rdagent_run(run)
+
+    @app.post("/api/rdagent/runs/{run_id}/model-validation", status_code=202)
+    def validate_general_model_implementation(
+        run_id: str,
+        payload: GeneralModelValidationRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Send one paper-derived implementation through the fin_model gate.
+
+        This endpoint deliberately creates only a research candidate.  It does
+        not create a StrategyVersion or ModelArtifact and it never opens the
+        sealed final OOS window.
+        """
+
+        try:
+            run = research.get_run(run_id)
+        except KeyError as exc:
+            raise HTTPException(404, "research run not found") from exc
+        if scenario_from_research_run(run) != "general_model":
+            raise HTTPException(409, "only general_model implementations may use this gate")
+        if run.get("status") != "succeeded":
+            raise HTTPException(409, "general_model must finish before validation")
+        try:
+            artifact = rdagent_candidates.get_run_artifact(payload.artifact_id, verify=True)
+        except KeyError as exc:
+            raise HTTPException(404, "implementation artifact not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if (
+            artifact.get("research_run_id") != run_id
+            or artifact.get("artifact_type") != "general_model_implementation_code"
+            or artifact.get("status") != "recorded"
+        ):
+            raise HTTPException(
+                409,
+                "artifact is not a recorded implementation from this general_model run",
+            )
+
+        dataset = require_qlib_dataset(
+            payload.dataset,
+            purpose="general_model independent validation",
+            frequency="day",
+        )
+        periods, resolution = resolve_dataset_research_periods(
+            dataset,
+            periods=None,
+            period_policy=payload.period_policy,
+        )
+        run_config = dict(run.get("config") or {})
+        try:
+            resolve_rdagent_assets(
+                settings,
+                get_rdagent_scenario("general_model"),
+                list(run_config.get("asset_ids") or []),
+                expected_manifest_sha256=dict(
+                    run_config.get("asset_manifest_sha256") or {}
+                ),
+                pre_final_end=date.fromisoformat(periods["valid_end"]),
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                409,
+                "paper asset is not point-in-time eligible for this validation window: "
+                + str(exc),
+            ) from exc
+        feature_set = get_feature_set(payload.feature_set_id)
+        metadata = dict((artifact.get("manifest_json") or {}).get("metadata") or {})
+        actor = authenticated_actor(request, payload.requested_by)
+        try:
+            candidate = rdagent_candidates.create_model_candidate(
+                research_run_id=run_id,
+                name=str(payload.name or metadata.get("name") or "paper-model"),
+                description=str(
+                    payload.description
+                    or metadata.get("description")
+                    or "Paper-derived model awaiting independent Qlib validation"
+                ),
+                model_type=payload.model_type,
+                code_artifact_id=payload.artifact_id,
+                architecture=payload.architecture,
+                model_hyperparameters=payload.model_hyperparameters,
+                training_hyperparameters=payload.training_hyperparameters,
+                feature_set_id=feature_set["id"],
+                dataset=payload.dataset,
+                dataset_identity_sha256=str(
+                    dataset["provenance"]["dataset_identity_sha256"]
+                ),
+                dataset_lineage_id=(
+                    str(dataset["lineage_id"]) if dataset.get("lineage_id") else None
+                ),
+                pre_final_end=date.fromisoformat(periods["valid_end"]),
+                final_oos_start=date.fromisoformat(periods["test_start"]),
+                final_oos_end=date.fromisoformat(periods["test_end"]),
+                source_iteration=artifact.get("source_iteration"),
+                rdagent_decision=None,
+                rdagent_feedback="general_model implementation submitted to fin_model gate",
+            )
+            for asset_id in run.get("config", {}).get("asset_ids") or []:
+                rdagent_candidates.link_asset(
+                    asset_id=str(asset_id),
+                    candidate_kind="model",
+                    candidate_id=str(candidate["id"]),
+                    relationship="implemented_from_paper",
+                    actor=actor,
+                )
+            evaluation_job = jobs.create(
+                "model_evaluate",
+                {
+                    "research_run_id": run_id,
+                    "dataset": payload.dataset,
+                    "dataset_path": dataset["path"],
+                    "dataset_identity_sha256": dataset["provenance"][
+                        "dataset_identity_sha256"
+                    ],
+                    "evaluation_profiles": resolution["evaluation_profiles"],
+                    "feature_set_id": feature_set["id"],
+                    "feature_set_definition_sha256": feature_set["definition_sha256"],
+                    "candidates": [
+                        {
+                            "id": candidate["id"],
+                            "code_path": artifact["storage_path"],
+                            "code_sha256": artifact["content_sha256"],
+                            "model_type": payload.model_type,
+                            "training_hyperparameters": payload.training_hyperparameters,
+                        }
+                    ],
+                    "universe": "cn_all",
+                    "benchmark": "SH000300",
+                },
+                platform_root / "logs" / f"model-evaluate-{run_id}-{candidate['id']}.log",
+                idempotency_key=(
+                    f"general-model-evaluate:{run_id}:{payload.artifact_id}:"
+                    f"{dataset['provenance']['dataset_identity_sha256']}:"
+                    f"{feature_set['definition_sha256']}"
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        research.attach_job(run_id, evaluation_job["id"])
+        research.mark_run(run_id, "evaluating", actor=actor)
+        worker.notify()
+        return {
+            "status": "queued_for_independent_model_validation",
+            "research_run_id": run_id,
+            "model_candidate_id": candidate["id"],
+            "job_id": evaluation_job["id"],
+            "final_oos_opened": False,
+            "capital_eligible": False,
+        }
 
     @app.post("/api/rdagent/runs", status_code=202)
     def create_research_run(payload: RDAgentRunRequest, request: Request) -> dict:
         runtime = probe_rdagent(settings, project_root)
-        if not runtime.get("ready"):
-            blockers = runtime.get("blockers") or [runtime.get("error") or "runtime unavailable"]
-            raise HTTPException(409, {"message": "RD-Agent is not ready", "blockers": blockers})
+        try:
+            scenario = require_ready_scenario(runtime, settings, payload.scenario)
+        except ValueError as exc:
+            raise HTTPException(
+                409,
+                {"message": f"RD-Agent {payload.scenario} is not ready", "blockers": [str(exc)]},
+            ) from exc
         if payload.loop_n > settings.rdagent_max_loops:
             raise HTTPException(
                 422, f"loop_n exceeds configured limit {settings.rdagent_max_loops}"
             )
-        dataset = require_qlib_dataset(
-            payload.dataset, purpose="RD-Agent research", frequency="day"
+        try:
+            duration = validate_duration_limit(
+                payload.duration, settings.rdagent_max_duration
+            )
+            expected_runtime_identity = expected_rdagent_runtime_identity(
+                runtime, scenario.id
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        dataset: dict[str, Any] | None = None
+        periods: dict[str, str] | None = None
+        period_resolution: dict[str, Any] | None = None
+        auto_selected_assets = not payload.asset_ids and scenario.auto_select_assets
+        try:
+            if scenario.requires_dataset:
+                dataset = require_qlib_dataset(
+                    str(payload.dataset), purpose=f"RD-Agent {scenario.id}", frequency="day"
+                )
+                periods, period_resolution = resolve_dataset_research_periods(
+                    dataset,
+                    periods=None,
+                    period_policy=payload.period_policy,
+                )
+            assets = resolve_rdagent_assets(
+                settings,
+                scenario,
+                payload.asset_ids,
+                excluded_auto_asset_ids=(
+                    research_assets.unavailable_asset_ids()
+                    if auto_selected_assets
+                    else frozenset()
+                ),
+                pre_final_end=(
+                    date.fromisoformat(periods["valid_end"]) if periods is not None else None
+                ),
+                selection_limit=(
+                    payload.loop_n if scenario.id == "fin_factor_report" else None
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        resolved_asset_ids = list(assets["manifest_sha256"])
+        actor = authenticated_actor(request, payload.requested_by)
+        if auto_selected_assets:
+            try:
+                for asset_id in resolved_asset_ids:
+                    rdagent_candidates.import_manifest(
+                        settings.data_root
+                        / "artifacts"
+                        / "research-assets"
+                        / asset_id
+                        / "manifest.json",
+                        actor=actor,
+                    )
+            except (OSError, ValueError) as exc:
+                raise HTTPException(409, str(exc)) from exc
+        feature_set = (
+            get_feature_set(str(payload.feature_set_id))
+            if scenario.requires_feature_set
+            else None
         )
-        periods = payload.periods.model_dump(mode="json")
-        require_research_calendar(dataset, periods)
-        if (
-            dataset.get("start_date")
-            and payload.periods.train_start.isoformat() < dataset["start_date"]
-        ):
-            raise HTTPException(409, "training window starts before the selected dataset")
-        if dataset.get("end_date") and payload.periods.test_end.isoformat() > dataset["end_date"]:
-            raise HTTPException(409, "test window ends after the selected dataset")
         artifact = settings.data_root / "artifacts" / "rdagent"
+        config: dict[str, Any] = {
+            "scenario": scenario.id,
+            "asset_ids": resolved_asset_ids,
+            "asset_manifest_sha256": assets["manifest_sha256"],
+            "asset_selection_mode": "automatic" if auto_selected_assets else "explicit",
+            "feature_set": feature_set,
+            "expected_rdagent_runtime": expected_runtime_identity,
+        }
+        if dataset is not None and periods is not None and period_resolution is not None:
+            config.update(
+                {
+                    "periods": periods,
+                    "evaluation_profiles": period_resolution["evaluation_profiles"],
+                    "period_resolution": period_resolution,
+                    "dataset_path": dataset["path"],
+                }
+            )
         try:
             run = research.create_run(
-                kind="factor",
+                kind=scenario.research_kind,
                 objective=payload.objective,
-                dataset=payload.dataset,
-                requested_by=authenticated_actor(request, payload.requested_by),
-                budget={"loop_n": payload.loop_n, "duration": payload.duration},
-                config={"periods": periods, "dataset_path": dataset["path"]},
+                dataset=str(payload.dataset or f"lab:{scenario.id}"),
+                requested_by=actor,
+                budget={"loop_n": payload.loop_n, "duration": duration},
+                config=config,
                 artifact_path=artifact,
             )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
-        log_path = platform_root / "logs" / f"rdagent-factor-{run['id']}.log"
+        if auto_selected_assets:
+            try:
+                research_assets.reserve_automatic(
+                    research_run_id=run["id"],
+                    scenario=scenario.id,
+                    asset_manifest_sha256=assets["manifest_sha256"],
+                    actor=actor,
+                )
+            except ValueError as exc:
+                research.mark_run(run["id"], "failed", actor="api", error=str(exc))
+                raise HTTPException(409, str(exc)) from exc
+        log_path = platform_root / "logs" / f"rdagent-{scenario.id}-{run['id']}.log"
+        job_payload: dict[str, Any] = {
+            "scenario": scenario.id,
+            "research_run_id": run["id"],
+            "dataset": payload.dataset,
+            "dataset_path": dataset["path"] if dataset else None,
+            "dataset_identity_sha256": (
+                dataset["provenance"]["dataset_identity_sha256"] if dataset else None
+            ),
+            "dataset_lineage_id": (dataset.get("lineage_id") if dataset else None),
+            "objective": payload.objective,
+            "loop_n": payload.loop_n,
+            "duration": duration,
+            "periods": periods,
+            "evaluation_profiles": (
+                period_resolution["evaluation_profiles"] if period_resolution else []
+            ),
+            "period_resolution": period_resolution,
+            "asset_ids": resolved_asset_ids,
+            "asset_manifest_sha256": assets["manifest_sha256"],
+            "feature_set": feature_set,
+            "expected_rdagent_runtime": expected_runtime_identity,
+        }
         try:
             job = jobs.create(
-                "rdagent_factor",
-                {
-                    "research_run_id": run["id"],
-                    "dataset": payload.dataset,
-                    "dataset_path": dataset["path"],
-                    "dataset_identity_sha256": dataset["provenance"]["dataset_identity_sha256"],
-                    "objective": payload.objective,
-                    "loop_n": payload.loop_n,
-                    "duration": payload.duration,
-                    "periods": periods,
-                },
+                scenario.job_kind,
+                job_payload,
                 log_path,
+                dedupe_active_kind=False,
             )
         except ValueError as exc:
             research.mark_run(run["id"], "failed", actor="api", error=str(exc))
             raise HTTPException(409, str(exc)) from exc
         research.attach_job(run["id"], job["id"])
         worker.notify()
-        return research.get_run(run["id"])
+        return _public_rdagent_run(research.get_run(run["id"]))
 
     @app.get("/api/research-programs")
     def list_research_programs(
         limit: int = Query(100, ge=1, le=500),
     ) -> list[dict[str, Any]]:
-        return continuous_research.programs.list(limit=limit)
+        return _sanitize_public_value(continuous_research.programs.list(limit=limit))
 
     @app.get("/api/research-programs/{program_id}")
     def get_research_program(program_id: str) -> dict[str, Any]:
         try:
-            return continuous_research.programs.get(program_id)
+            return _sanitize_public_value(
+                continuous_research.programs.get(program_id)
+            )
         except KeyError as exc:
             raise HTTPException(404, "research program not found") from exc
 
@@ -2083,6 +3049,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(
                 422, f"loop_n exceeds configured limit {settings.rdagent_max_loops}"
             )
+        try:
+            validate_duration_limit(payload.duration, settings.rdagent_max_duration)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         dataset = require_qlib_dataset(
             payload.dataset, purpose="continuous research", frequency="day"
         )
@@ -2097,12 +3067,15 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     {
                         **strategy_defaults_state()["config"],
                         **recipe["config_overrides"],
+                        "min_backtest_days": payload.test_trading_days,
                         "recipe_id": recipe["id"],
                         "recipe_version": recipe["version"],
                     }
                 ).model_dump()
             else:
                 strategy_config = payload.strategy_config.model_dump()
+            if int(strategy_config["min_backtest_days"]) > payload.test_trading_days:
+                raise ValueError("strategy min_backtest_days exceeds the frozen final OOS window")
             parameter_grid, trial_parameters = normalize_parameter_grid(
                 payload.parameter_grid, max_trials=payload.max_trials
             )
@@ -2124,8 +3097,6 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 dataset_lineage_id=str(dataset["lineage_id"]),
                 config={
                     "window_days": {
-                        "train": payload.train_trading_days,
-                        "validation": payload.validation_trading_days,
                         "test": payload.test_trading_days,
                     },
                     "loop_n": payload.loop_n,
@@ -2142,7 +3113,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     },
                     "manual_strategy_approval": True,
                 },
-                min_new_trading_days=payload.min_new_trading_days,
+                # A continuous program may open a new final OOS only after a
+                # complete, non-overlapping OOS block has arrived.
+                min_new_trading_days=payload.test_trading_days,
                 max_active_campaigns=payload.max_active_campaigns,
                 actor=actor,
             )
@@ -2182,12 +3155,14 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def list_research_campaigns(
         limit: int = Query(100, ge=1, le=500),
     ) -> list[dict[str, Any]]:
-        return autonomous_research.campaigns.list(limit=limit)
+        return _sanitize_public_value(autonomous_research.campaigns.list(limit=limit))
 
     @app.get("/api/research-campaigns/{campaign_id}")
     def get_research_campaign(campaign_id: str) -> dict[str, Any]:
         try:
-            return autonomous_research.campaigns.get(campaign_id)
+            return _sanitize_public_value(
+                autonomous_research.campaigns.get(campaign_id)
+            )
         except KeyError as exc:
             raise HTTPException(404, "research campaign not found") from exc
 
@@ -2196,9 +3171,13 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         payload: ResearchCampaignCreateRequest, request: Request
     ) -> dict[str, Any]:
         runtime = probe_rdagent(settings, project_root)
-        if not runtime.get("ready"):
-            blockers = runtime.get("blockers") or [runtime.get("error") or "runtime unavailable"]
-            raise HTTPException(409, {"message": "RD-Agent is not ready", "blockers": blockers})
+        try:
+            require_ready_scenario(runtime, settings, "fin_factor")
+        except ValueError as exc:
+            raise HTTPException(
+                409,
+                {"message": "RD-Agent fin_factor is not ready", "blockers": [str(exc)]},
+            ) from exc
         if payload.loop_n > settings.rdagent_max_loops:
             raise HTTPException(
                 422, f"loop_n exceeds configured limit {settings.rdagent_max_loops}"
@@ -2206,18 +3185,14 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         dataset = require_qlib_dataset(
             payload.dataset, purpose="autonomous research", frequency="day"
         )
-        require_research_calendar(dataset, payload.periods.model_dump(mode="json"))
-        if (
-            dataset.get("start_date")
-            and payload.periods.train_start.isoformat() < dataset["start_date"]
-        ):
-            raise HTTPException(409, "training window starts before the selected dataset")
-        if dataset.get("end_date") and payload.periods.test_end.isoformat() > dataset["end_date"]:
-            raise HTTPException(409, "test window ends after the selected dataset")
+        periods, period_resolution = resolve_dataset_research_periods(
+            dataset,
+            periods=None,
+            period_policy=payload.period_policy,
+        )
         try:
             recipe = get_strategy_recipe(payload.recipe_id)
             actor = authenticated_actor(request, payload.actor)
-            periods = payload.periods.model_dump(mode="json")
             research_payload = normalize_research_schedule_payload(
                 {
                     "objective": payload.objective,
@@ -2225,21 +3200,29 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "loop_n": payload.loop_n,
                     "duration": payload.duration,
                     "requested_by": actor,
+                    "period_mode": "explicit",
                     "periods": periods,
                 },
                 max_loops=settings.rdagent_max_loops,
+                max_duration=settings.rdagent_max_duration,
+                allow_explicit_periods=True,
             )
             if payload.strategy_config is None:
                 strategy_config = _rebind_strategy_execution_contract(
                     {
                         **strategy_defaults_state()["config"],
                         **recipe["config_overrides"],
+                        "min_backtest_days": int(period_resolution["final_test_trading_days"]),
                         "recipe_id": recipe["id"],
                         "recipe_version": recipe["version"],
                     }
                 ).model_dump()
             else:
                 strategy_config = payload.strategy_config.model_dump()
+            if int(strategy_config["min_backtest_days"]) > int(
+                period_resolution["final_test_trading_days"]
+            ):
+                raise ValueError("strategy min_backtest_days exceeds the frozen final OOS window")
             parameter_grid, trial_parameters = normalize_parameter_grid(
                 payload.parameter_grid, max_trials=payload.max_trials
             )
@@ -2261,13 +3244,15 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 recipe_id=payload.recipe_id,
                 config={
                     "research": research_payload,
+                    "period_resolution": period_resolution,
                     "strategy_config": strategy_config,
                     "backtest_periods": {
-                        "start": payload.periods.test_start.isoformat(),
-                        "end": payload.periods.test_end.isoformat(),
+                        "start": periods["test_start"],
+                        "end": periods["test_end"],
                     },
                     "experiment_periods": split_research_period(
-                        payload.periods.valid_start, payload.periods.valid_end
+                        date.fromisoformat(periods["valid_start"]),
+                        date.fromisoformat(periods["valid_end"]),
                     ),
                     "parameter_grid": parameter_grid,
                     "experiment_trials": experiment_trials,
@@ -2744,6 +3729,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 periods=backtest_periods,
                 artifact_path=artifact_root,
                 trading_dates=trading_dates,
+                dataset_lineage_id=dataset.get("lineage_id"),
             )
         except KeyError as exc:
             raise HTTPException(404, "strategy version not found") from exc
@@ -2785,20 +3771,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         request: Request,
     ) -> dict[str, Any]:
         try:
-            return model_artifacts.create(
+            return model_artifacts.create_from_formal_backtest(
                 strategy_version_id=version_id,
-                artifact_key=payload.artifact_key,
-                model_recipe=payload.model_recipe,
-                dataset=payload.dataset,
-                dataset_identity_sha256=payload.dataset_identity_sha256,
-                training_start=payload.training_start,
-                training_end=payload.training_end,
-                data_cutoff_at=payload.data_cutoff_at,
-                scheduled_refit_at=payload.scheduled_refit_at,
+                source_backtest_id=payload.source_backtest_id,
                 valid_until=payload.valid_until,
-                artifact_path=payload.artifact_path,
-                predictions_sha256=payload.predictions_sha256,
                 actor=authenticated_actor(request, payload.actor),
+                backtests_root=settings.data_root / "artifacts" / "backtests",
             )
         except KeyError as exc:
             raise HTTPException(404, "strategy version not found") from exc
@@ -2820,6 +3798,63 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(404, "model artifact not found") from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/strategy-versions/{version_id}/model-refits", status_code=202)
+    def create_model_refit(
+        version_id: str,
+        payload: ModelRefitRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        try:
+            version = strategies.get_version(version_id)
+            model_signal = version.get("model_signal")
+            if (
+                version.get("status") != "approved"
+                or version.get("is_legacy")
+                or not isinstance(model_signal, dict)
+            ):
+                raise ValueError(
+                    "model refit requires an approved governed model-prediction StrategySpec"
+                )
+            lineage_id = str(model_signal.get("dataset_lineage_id") or "")
+            if len(lineage_id) != 64:
+                raise ValueError("model refit requires a verified governed dataset lineage")
+            source = model_artifacts.select_for_inference(version_id)
+            if source.get("selection_status") != "active":
+                raise ValueError("model refit requires an active source ModelArtifact")
+            dataset = select_qlib_dataset(
+                settings.data_root,
+                anchor_name=str(source["dataset"]),
+                roll_policy="latest_compatible",
+                lineage_id=lineage_id,
+                required_date=payload.signal_date,
+            )
+            actor = authenticated_actor(request, payload.actor)
+        except KeyError as exc:
+            raise HTTPException(404, "strategy version not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        job = jobs.create(
+            "model_refit",
+            {
+                "strategy_version_id": version_id,
+                "source_model_artifact_id": source["id"],
+                "dataset": dataset["name"],
+                "dataset_path": dataset["path"],
+                "dataset_identity_sha256": dataset["provenance"][
+                    "dataset_identity_sha256"
+                ],
+                "dataset_lineage_id": lineage_id,
+                "signal_date": payload.signal_date.isoformat(),
+                "valid_for_days": payload.valid_for_days,
+                "actor": actor,
+            },
+            platform_root / "logs" / f"model-refit-{version_id}-{payload.signal_date}.log",
+            dedupe_active_kind=False,
+            idempotency_key=f"model-refit:{version_id}:{payload.signal_date}",
+        )
+        worker.notify()
+        return job
 
     @app.post("/api/strategy-versions/{version_id}/pair-backtests", status_code=202)
     def create_pair_strategy_backtest(
@@ -2860,6 +3895,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 execution_dataset=execution_dataset,
                 periods={"start": payload.start.isoformat(), "end": payload.end.isoformat()},
                 artifact_path=artifact_root,
+                dataset_lineage_id=dataset.get("lineage_id"),
             )
         except KeyError as exc:
             raise HTTPException(404, "strategy version not found") from exc
@@ -2895,6 +3931,54 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     ) -> dict:
         try:
             return strategies.approve(
+                version_id,
+                actor=authenticated_actor(request, payload.actor),
+                reason=payload.reason,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "strategy version not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/strategy-versions/{version_id}/promotion")
+    def get_strategy_promotion(version_id: str) -> dict[str, Any]:
+        try:
+            strategies.get_version(version_id)
+            return {
+                "stage": promotions.current_stage(version_id),
+                "forward_gate": promotions.evaluate_forward_gate(version_id),
+            }
+        except KeyError as exc:
+            raise HTTPException(404, "strategy version not found") from exc
+
+    @app.post("/api/strategy-versions/{version_id}/paper-stage")
+    def open_strategy_paper_stage(
+        version_id: str,
+        payload: PaperStageOpenRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Recover the safe post-approval transition without changing its gate."""
+
+        try:
+            return promotions.prepare_paper_stage(
+                version_id,
+                actor=authenticated_actor(request, payload.actor),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "strategy version not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/strategy-versions/{version_id}/promote")
+    def promote_strategy_recommendations(
+        version_id: str,
+        payload: StrategyPromotionRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Human approval after the immutable forward-paper gate passes."""
+
+        try:
+            return promotions.promote(
                 version_id,
                 actor=authenticated_actor(request, payload.actor),
                 reason=payload.reason,
@@ -3217,6 +4301,17 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 lineage_id=portfolio.get("dataset_lineage_id"),
                 required_date=payload.as_of_date,
             )
+            local_today = datetime.now(UTC).astimezone(ZoneInfo("Asia/Shanghai")).date()
+            current_available_date = qlib_trading_date_on_or_before(dataset, local_today)
+            if payload.as_of_date != current_available_date:
+                raise ValueError(
+                    "recommendation signal must use the latest currently available "
+                    f"governed trading day {current_available_date.isoformat()}"
+                )
+            promotions.require_recommendation_signal(
+                str(portfolio["strategy_version_id"]),
+                signal_date=payload.as_of_date,
+            )
             gate = evaluate_recommendation_gate(
                 simulations,
                 portfolio,
@@ -3360,6 +4455,32 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             version = strategies.get_version(portfolio["source_id"])
             if str(version.get("signal_frequency") or "day") != "day" and payload.signal_at is None:
                 raise ValueError("minute strategy order-plan generation requires signal_at")
+            local_today = datetime.now(UTC).astimezone(ZoneInfo("Asia/Shanghai")).date()
+            datasets = {item["name"]: item for item in list_qlib_datasets(settings.data_root)}
+            anchor = datasets.get(str(portfolio["daily_dataset"]))
+            if anchor is None:
+                raise ValueError("paper simulation anchor dataset is unavailable")
+            anchor_date = qlib_trading_date_on_or_before(anchor, local_today)
+            current_dataset = select_qlib_dataset(
+                settings.data_root,
+                anchor_name=str(portfolio["daily_dataset"]),
+                roll_policy=str(portfolio.get("daily_roll_policy") or "pinned"),
+                lineage_id=portfolio.get("daily_dataset_lineage_id"),
+                required_date=anchor_date,
+            )
+            current_available_date = qlib_trading_date_on_or_before(
+                current_dataset, local_today
+            )
+            if payload.signal_date != current_available_date:
+                raise ValueError(
+                    "paper signal must use the latest currently available governed "
+                    f"trading day {current_available_date.isoformat()}"
+                )
+            promotion_stage = promotions.require_paper_signal(
+                str(version["id"]),
+                portfolio_id=portfolio_id,
+                signal_date=payload.signal_date,
+            )
         except KeyError as exc:
             raise HTTPException(404, "simulation portfolio or strategy source not found") from exc
         except ValueError as exc:
@@ -3378,6 +4499,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 "signal_at": (
                     payload.signal_at.isoformat() if payload.signal_at is not None else None
                 ),
+                "promotion_stage_id": promotion_stage["id"],
+                "promotion_stage_opened_at": promotion_stage["opened_at"],
                 "actor": actor,
             },
             platform_root / "logs" / f"simulation-order-plan-{portfolio_id}.log",
@@ -3548,41 +4671,59 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.get("/api/schedules")
     def list_schedules(limit: int = Query(200, ge=1, le=500)) -> list[dict]:
-        return schedules.list(limit)
+        return _sanitize_public_value(schedules.list(limit))
 
     @app.post("/api/schedules", status_code=201)
     def create_schedule(payload: ScheduleCreateRequest, request: Request) -> dict:
         schedule_actor = authenticated_actor(request, payload.actor)
         schedule_payload = dict(payload.payload)
         if payload.kind == "rdagent_research":
-            runtime = probe_rdagent(settings, project_root)
-            if not runtime.get("ready"):
-                blockers = runtime.get("blockers") or [
-                    runtime.get("error") or "runtime unavailable"
-                ]
-                raise HTTPException(
-                    409,
-                    {"message": "RD-Agent is not ready", "blockers": blockers},
-                )
             try:
                 research_payload = normalize_research_schedule_payload(
-                    schedule_payload, max_loops=settings.rdagent_max_loops
+                    schedule_payload,
+                    max_loops=settings.rdagent_max_loops,
+                    max_duration=settings.rdagent_max_duration,
                 )
+                runtime = probe_rdagent(settings, project_root)
+                scenario = require_ready_scenario(
+                    runtime, settings, research_payload["scenario"]
+                )
+                scheduled_periods: dict[str, str] | None = None
+                if scenario.requires_dataset:
+                    dataset = require_qlib_dataset(
+                        research_payload["dataset"],
+                        purpose="scheduled RD-Agent research",
+                        frequency="day",
+                    )
+                    scheduled_periods, _ = resolve_dataset_research_periods(
+                        dataset,
+                        periods=research_payload.get("periods"),
+                        period_policy=research_payload.get("period_policy"),
+                    )
+                if research_payload["asset_ids"] or not scenario.auto_select_assets:
+                    resolve_rdagent_assets(
+                        settings,
+                        scenario,
+                        research_payload["asset_ids"],
+                        pre_final_end=(
+                            date.fromisoformat(scheduled_periods["valid_end"])
+                            if scheduled_periods is not None
+                            else None
+                        ),
+                        selection_limit=(
+                            research_payload["loop_n"]
+                            if scenario.id == "fin_factor_report"
+                            else None
+                        ),
+                    )
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from exc
+            if not scenario.requires_dataset and payload.trading_days_only:
+                raise HTTPException(
+                    409, "RD-Agent lab scenario schedules must disable trading_days_only"
+                )
             research_payload["requested_by"] = schedule_actor
             schedule_payload = research_payload
-            dataset = require_qlib_dataset(
-                research_payload["dataset"],
-                purpose="scheduled RD-Agent research",
-                frequency="day",
-            )
-            periods = research_payload["periods"]
-            require_research_calendar(dataset, periods)
-            if dataset.get("start_date") and periods["train_start"] < dataset["start_date"]:
-                raise HTTPException(409, "training window starts before the selected dataset")
-            if dataset.get("end_date") and periods["test_end"] > dataset["end_date"]:
-                raise HTTPException(409, "test window ends after the selected dataset")
         elif payload.kind == "recommendation_refresh":
             try:
                 portfolio = recommendations.get(
@@ -3647,20 +4788,20 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         try:
             response = requests.get(f"{settings.scheduler_url}/health", timeout=5)
             response.raise_for_status()
-            return response.json()
-        except (requests.RequestException, ValueError) as exc:
-            return {"status": "unavailable", "error": str(exc)}
+            return _sanitize_public_value(response.json())
+        except (requests.RequestException, ValueError):
+            return {"status": "unavailable"}
 
     @app.get("/api/operations/health")
     def operational_health(limit: int = Query(48, ge=1, le=500)) -> dict:
-        return {
+        return _sanitize_public_value({
             "latest": health_history.latest(),
             "history": health_history.list(limit),
-        }
+        })
 
     @app.get("/api/operations/readiness")
     def operational_readiness() -> dict:
-        return deployment_readiness.assess()
+        return _sanitize_public_value(deployment_readiness.assess())
 
     @app.get("/api/platform/safe-mode")
     def get_safe_mode() -> dict:
@@ -3681,7 +4822,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         health_status = None
         if payload.require_health_ok:
             latest = health_history.latest()
-            health_status = str((latest or {}).get("status") or "")
+            health_status = safe_mode_recovery_health_status(latest)
         try:
             return safe_mode.deactivate(
                 actor=actor,
@@ -3708,30 +4849,33 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         kinds = tuple(item for item in (kind or []) if item.strip())
         response.headers["X-Total-Count"] = str(jobs.count(statuses=statuses, kinds=kinds))
         response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
-        return jobs.list(limit, offset=offset, statuses=statuses, kinds=kinds)
+        return [
+            _public_job(item)
+            for item in jobs.list(
+                limit, offset=offset, statuses=statuses, kinds=kinds
+            )
+        ]
 
     @app.get("/api/data-tasks")
     def list_data_tasks() -> list[dict]:
-        return data_tasks.list()
+        return _sanitize_public_value(data_tasks.list())
 
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: str) -> dict:
         try:
-            return jobs.get(job_id)
+            return _public_job(jobs.get(job_id))
         except KeyError as exc:
             raise HTTPException(404, "job not found") from exc
 
     @app.get("/api/jobs/{job_id}/log")
     def get_job_log(job_id: str, tail: int = Query(200, ge=1, le=2000)) -> dict:
         try:
-            job = jobs.get(job_id)
+            jobs.get(job_id)
         except KeyError as exc:
             raise HTTPException(404, "job not found") from exc
-        path = Path(job["log_path"])
-        if not path.exists():
-            return {"job_id": job_id, "lines": []}
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        return {"job_id": job_id, "lines": lines[-tail:]}
+        # Raw subprocess logs may contain host paths, signed URLs, or upstream
+        # diagnostics with secrets. They are intentionally server-log only.
+        return {"job_id": job_id, "lines": [], "restricted": True}
 
     @app.post("/api/jobs/bootstrap", status_code=202)
     def create_bootstrap(payload: BootstrapRequest) -> dict:
@@ -3748,7 +4892,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(409, f"missing deployment secret: {', '.join(missing)}")
         requested_end = payload.end if isinstance(payload.end, date) else date.today()
         snapshot_name = (
-            f"cn-{payload.start:%Y%m%d}-{requested_end:%Y%m%d}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+            f"cn-{payload.snapshot_start:%Y%m%d}-{requested_end:%Y%m%d}-"
+            f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
         )
         serialized = {
             "profile": payload.profile,
@@ -3760,7 +4905,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "build_qlib": False,
             "finalize_after_download": payload.build_qlib,
             "pipeline_id": uuid.uuid4().hex,
-            "snapshot_start": payload.start.isoformat(),
+            "snapshot_start": payload.snapshot_start.isoformat(),
             "snapshot_end": requested_end.isoformat(),
             "snapshot_name": snapshot_name,
         }
@@ -3822,11 +4967,16 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             not isinstance(validation, dict)
             or validation.get("ok") is not True
             or validation.get("source") != "baostock-0.9.3"
+            or validation.get("reference_source") != PRIMARY_OVERLAP_PROVIDER
             or validation.get("policy_version") != BAOSTOCK_OVERLAP_POLICY_VERSION
             or str(validation.get("start_date") or "") > "2016-01-01"
             or str(validation.get("end_date") or "") < "2016-12-31"
         ):
             raise HTTPException(409, "BaoStock overlap validation did not pass")
+        try:
+            require_current_primary_overlap_evidence(validation, checkpoint)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         result_path = (
             settings.data_root
             / "artifacts"
@@ -4014,18 +5164,11 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         datasets = set(checkpoint.datasets())
         if not datasets:
             raise HTTPException(409, "no downloaded work units are available to finalize")
-        progress = checkpoint.progress_summary(datasets)
-        incomplete = {
-            key: int(progress[key])
-            for key in ("pending", "running", "retry_waiting")
-            if int(progress[key]) > 0
-        }
-        if incomplete:
-            detail = ", ".join(f"{key}={value}" for key, value in sorted(incomplete.items()))
-            raise HTTPException(409, f"download work units are not complete: {detail}")
         end_date = payload.end if isinstance(payload.end, date) else date.today()
         snapshot_name = payload.snapshot_name or (
-            f"cn-{payload.start:%Y%m%d}-{end_date:%Y%m%d}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+            f"{'research-assets' if payload.profile == 'research-assets' else 'cn'}-"
+            f"{payload.start:%Y%m%d}-{end_date:%Y%m%d}-"
+            f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
         )
         pipeline_id = uuid.uuid4().hex
         serialized = {
@@ -4081,6 +5224,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         if not api_url or not token:
             raise HTTPException(409, "Tushare credentials are not configured")
         end_date = payload.end if isinstance(payload.end, date) else date.today()
+        daily_dataset, source_lineage_id = require_bound_daily_source(
+            requested_name=payload.daily_dataset,
+            start=payload.start,
+            end=end_date,
+            purpose="core intraday download",
+        )
         snapshot_name = payload.snapshot_name or (
             f"execution-{payload.start:%Y%m%d}-{end_date:%Y%m%d}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
         )
@@ -4097,6 +5246,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "max_options": payload.max_options,
             "etf_categories": payload.etf_categories,
             "snapshot_name": snapshot_name,
+            "daily_dataset": daily_dataset["name"],
+            "source_lineage_id": source_lineage_id,
         }
         log_path = platform_root / "logs" / f"core-intraday-{snapshot_name}.log"
         try:
@@ -4117,6 +5268,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         if not api_url or not token:
             raise HTTPException(409, "Tushare credentials are not configured")
         end_date = payload.end if isinstance(payload.end, date) else date.today()
+        daily_dataset, source_lineage_id = require_bound_daily_source(
+            requested_name=payload.daily_dataset,
+            start=payload.start,
+            end=end_date,
+            purpose="A-share five-minute download",
+        )
         snapshot_name = payload.snapshot_name or (
             f"ashare-5m-{payload.start:%Y%m%d}-{end_date:%Y%m%d}"
         )
@@ -4124,6 +5281,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "start": payload.start.isoformat(),
             "end": end_date.isoformat(),
             "snapshot_name": snapshot_name,
+            "daily_dataset": daily_dataset["name"],
+            "source_lineage_id": source_lineage_id,
         }
         log_path = platform_root / "logs" / f"ashare-5m-{snapshot_name}.log"
         try:
@@ -4150,6 +5309,23 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "end": end_date.isoformat(),
             "symbols": payload.symbols,
         }
+        if payload.publish_research_assets:
+            snapshot_name = payload.snapshot_name or (
+                f"research-assets-{payload.start:%Y%m%d}-{end_date:%Y%m%d}-"
+                f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+            )
+            serialized.update(
+                {
+                    "pipeline_id": uuid.uuid4().hex,
+                    "profile": "research-assets",
+                    "snapshot_name": snapshot_name,
+                    "pipeline_steps": [
+                        {"kind": "data_verify", "payload": {}},
+                        {"kind": "data_snapshot", "payload": {}},
+                    ],
+                    "pipeline_next_index": 0,
+                }
+            )
         log_path = (
             platform_root
             / "logs"

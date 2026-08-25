@@ -17,7 +17,10 @@ from quant_data.qlib_builder import (
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
     QlibBuilder,
     _to_wsl_path,
+    build_qlib_output_manifest,
+    verify_qlib_output_manifest,
 )
+from quant_data.snapshot_lineage import make_lineage_id
 
 pytestmark = pytest.mark.no_database
 
@@ -208,6 +211,179 @@ def test_builds_per_symbol_normalized_qlib_staging(tmp_path: Path) -> None:
     assert frame["amount"].tolist() == pytest.approx([100_000.0, 25_000.0])
     raw_hands = pd.Series([100.0, 50.0])
     assert (frame["amount"] / (raw_hands * 100)).tolist() == pytest.approx([10.0, 5.0])
+
+
+def _write_cross_source_adjustment_snapshot(
+    tmp_path: Path,
+    *,
+    primary_pre_close: float | None,
+) -> Path:
+    snapshot = tmp_path / "snapshot"
+    fixtures = {
+        "daily": [
+            {
+                "ts_code": "600000.SH",
+                "trade_date": "2015-12-31",
+                "open": 10.0,
+                "high": 10.5,
+                "low": 9.5,
+                "close": 10.0,
+                "pre_close": 9.8,
+                "vol": 100.0,
+                "amount": 100.0,
+                "pct_chg": 2.04,
+            },
+            {
+                "ts_code": "600000.SH",
+                "trade_date": "2016-01-04",
+                "open": 10.0,
+                "high": 11.5,
+                "low": 9.8,
+                "close": 11.0,
+                "pre_close": primary_pre_close,
+                "vol": 100.0,
+                "amount": 110.0,
+                "pct_chg": 10.0,
+            },
+        ],
+        # BaoStock and Tushare agree on the relative path but use different
+        # positive constants (5 versus 2) on opposite sides of the boundary.
+        "adj_factor": [
+            {
+                "ts_code": "600000.SH",
+                "trade_date": "2015-12-31",
+                "adj_factor": 5.0,
+            },
+            {
+                "ts_code": "600000.SH",
+                "trade_date": "2016-01-04",
+                "adj_factor": 2.0,
+            },
+        ],
+        "stk_limit": [
+            {
+                "ts_code": "600000.SH",
+                "trade_date": "2015-12-31",
+                "up_limit": 11.0,
+                "down_limit": 9.0,
+            },
+            {
+                "ts_code": "600000.SH",
+                "trade_date": "2016-01-04",
+                "up_limit": 12.1,
+                "down_limit": 9.9,
+            },
+        ],
+    }
+    for dataset, rows in fixtures.items():
+        target = snapshot / "parquet" / dataset / "data.parquet"
+        target.parent.mkdir(parents=True)
+        pd.DataFrame(rows).to_parquet(target, index=False)
+    _write_required_research_inputs(snapshot)
+    return snapshot
+
+
+def test_rebases_legacy_adjustment_factor_without_mutating_snapshot(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_cross_source_adjustment_snapshot(
+        tmp_path,
+        primary_pre_close=10.0,
+    )
+    source_factor_path = next((snapshot / "parquet" / "adj_factor").rglob("*.parquet"))
+    source_factors = pd.read_parquet(source_factor_path)["adj_factor"].tolist()
+    builder = QlibBuilder(snapshot)
+
+    evidence = builder._adjustment_boundary_evidence()
+    by_symbol = builder.build_staging(tmp_path / "staging")
+    frame = pd.read_parquet(by_symbol / "SH600000.parquet")
+    adjusted_close = builder._load_adjusted_close()
+
+    assert evidence["status"] == "pass"
+    assert evidence["rebased_symbol_count"] == 1
+    assert evidence["masked_symbol_count"] == 0
+    assert evidence["rebased_symbols"][0]["legacy_scale"] == pytest.approx(0.4)
+    assert len(evidence["evidence_sha256"]) == 64
+    # The old segment is rebased from factor 5 to factor 2. The normalized
+    # adjusted close follows the real 10% move instead of jumping to 0.44.
+    assert frame["close"].tolist() == pytest.approx([1.0, 1.1])
+    assert frame["factor"].tolist() == pytest.approx([0.1, 0.1])
+    assert adjusted_close is not None
+    assert adjusted_close["adj_close"].tolist() == pytest.approx([20.0, 22.0])
+    assert pd.read_parquet(source_factor_path)["adj_factor"].tolist() == source_factors
+
+
+def test_masks_cross_source_instrument_when_boundary_price_is_not_proven(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_cross_source_adjustment_snapshot(
+        tmp_path,
+        primary_pre_close=8.0,
+    )
+    post_only = {
+        "daily": {
+            "ts_code": "000001.SZ",
+            "trade_date": "2016-01-04",
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.0,
+            "pre_close": 10.0,
+            "vol": 100.0,
+            "amount": 100.0,
+            "pct_chg": 0.0,
+        },
+        "adj_factor": {
+            "ts_code": "000001.SZ",
+            "trade_date": "2016-01-04",
+            "adj_factor": 1.0,
+        },
+        "stk_limit": {
+            "ts_code": "000001.SZ",
+            "trade_date": "2016-01-04",
+            "up_limit": 11.0,
+            "down_limit": 9.0,
+        },
+    }
+    for dataset, row in post_only.items():
+        path = next((snapshot / "parquet" / dataset).rglob("*.parquet"))
+        pd.concat(
+            [pd.read_parquet(path), pd.DataFrame([row])],
+            ignore_index=True,
+        ).to_parquet(path, index=False)
+    builder = QlibBuilder(snapshot)
+
+    evidence = builder._adjustment_boundary_evidence()
+
+    assert evidence["status"] == "failed"
+    assert evidence["rebased_symbol_count"] == 0
+    assert evidence["masked_symbol_count"] == 1
+    assert evidence["masked_ratio"] == pytest.approx(1.0)
+    assert evidence["max_masked_ratio"] == pytest.approx(0.01)
+    assert evidence["masked_symbols"][0]["reason"] == "boundary_price_mismatch"
+    with pytest.raises(RuntimeError, match="cross-source adjustment boundary rejected"):
+        builder.build_staging(tmp_path / "staging")
+
+
+def test_boundary_evidence_does_not_skip_a_missing_anchor_factor(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_cross_source_adjustment_snapshot(
+        tmp_path,
+        primary_pre_close=10.0,
+    )
+    factor_path = next((snapshot / "parquet" / "adj_factor").rglob("*.parquet"))
+    factors = pd.read_parquet(factor_path)
+    factors.loc[factors["trade_date"] == "2015-12-31", "trade_date"] = "2015-12-30"
+    factors.to_parquet(factor_path, index=False)
+
+    evidence = QlibBuilder(snapshot)._adjustment_boundary_evidence()
+
+    assert evidence["status"] == "failed"
+    assert evidence["cross_source_symbols"] == 1
+    assert evidence["masked_symbols"][0]["reason"] == (
+        "missing_or_invalid_boundary_factor"
+    )
 
 
 def test_adds_point_in_time_research_features_without_announcement_leakage(
@@ -470,8 +646,8 @@ def test_rejects_incomplete_historical_benchmark_industry_coverage(
             }
             for trade_date in ("2024-01-02", "2024-03-01")
             for instrument, weight in (
-                ("000001.SZ", 4.5),
-                ("600000.SH", 3.5),
+                ("000001.SZ", 97.9),
+                ("600000.SH", 2.1),
             )
         ]
     ).to_parquet(weight_path)
@@ -480,7 +656,8 @@ def test_rejects_incomplete_historical_benchmark_industry_coverage(
         RuntimeError,
         match=(
             "no active point-in-time industry for 1/4 "
-            "000300.SH constituent-date rows across 2 benchmark dates"
+            "000300.SH constituent-date rows across 2 benchmark dates.*"
+            "2.1000% exceeds 2.00%"
         ),
     ):
         QlibBuilder(snapshot).build_staging(tmp_path / "staging")
@@ -517,8 +694,8 @@ def test_accepts_bounded_unknown_benchmark_industry_weight(tmp_path: Path) -> No
             },
             {
                 "ts_code": "600000.SH",
-                "l1_code": "801780.SI",
-                "in_date": "2024-02-01",
+                "l1_code": "   ",
+                "in_date": "2021-01-01",
                 "out_date": None,
             },
         ]
@@ -533,11 +710,189 @@ def test_accepts_bounded_unknown_benchmark_industry_weight(tmp_path: Path) -> No
             }
             for trade_date in ("2024-01-02", "2024-03-01")
             for instrument, weight in (
-                ("000001.SZ", 99.5),
-                ("600000.SH", 0.5),
+                ("000001.SZ", 98.5),
+                ("600000.SH", 1.5),
             )
         ]
     ).to_parquet(weight_path)
+
+    builder = QlibBuilder(snapshot)
+    by_symbol = builder.build_staging(tmp_path / "staging")
+    qlib_dir = tmp_path / "qlib"
+    builder._write_portfolio_metadata(qlib_dir)
+    memberships = pd.read_parquet(
+        qlib_dir / "metadata" / "industry_memberships.parquet"
+    )
+
+    assert (by_symbol / "SZ000001.parquet").exists()
+    assert memberships.loc[
+        memberships["instrument"] == "SH600000", "industry"
+    ].tolist() == ["__UNKNOWN__"]
+    assert not memberships["industry"].astype("string").str.strip().eq("").any()
+
+
+def test_rejects_blank_industry_above_unknown_weight_limit(tmp_path: Path) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    membership_path = (
+        snapshot
+        / "parquet"
+        / "index_member_all"
+        / "partition_year=2024"
+        / "research.parquet"
+    )
+    weight_path = (
+        snapshot
+        / "parquet"
+        / "index_weight"
+        / "partition_year=2024"
+        / "research.parquet"
+    )
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "l1_code": "801780.SI",
+                "in_date": "2021-01-01",
+                "out_date": None,
+            },
+            {
+                "ts_code": "600000.SH",
+                "l1_code": "\t ",
+                "in_date": "2021-01-01",
+                "out_date": None,
+            },
+        ]
+    ).to_parquet(membership_path)
+    pd.DataFrame(
+        [
+            {
+                "index_code": "000300.SH",
+                "con_code": instrument,
+                "trade_date": "2024-01-02",
+                "weight": weight,
+            }
+            for instrument, weight in (
+                ("000001.SZ", 97.9),
+                ("600000.SH", 2.1),
+            )
+        ]
+    ).to_parquet(weight_path)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "no active point-in-time industry for 1/2 "
+            "000300.SH constituent-date rows.*2.1000% exceeds 2.00%"
+        ),
+    ):
+        QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+
+def test_blank_instrument_is_not_usable_for_industry(tmp_path: Path) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    membership_path = (
+        snapshot
+        / "parquet"
+        / "index_member_all"
+        / "partition_year=2024"
+        / "research.parquet"
+    )
+    pd.DataFrame(
+        [
+            {
+                "ts_code": " \t ",
+                "l1_code": "801780.SI",
+                "in_date": "2021-01-01",
+                "out_date": None,
+            }
+        ]
+    ).to_parquet(membership_path)
+
+    with pytest.raises(RuntimeError, match="index_member_all has no usable rows"):
+        QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+
+def test_rejects_overlapping_distinct_l1_industry_intervals(tmp_path: Path) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    membership_path = (
+        snapshot
+        / "parquet"
+        / "index_member_all"
+        / "partition_year=2024"
+        / "research.parquet"
+    )
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "l1_code": "801780.SI",
+                "in_date": "2021-01-01",
+                "out_date": "2024-01-02",
+            },
+            {
+                "ts_code": "000001.SZ",
+                "l1_code": "801010.SI",
+                "in_date": "2024-01-02",
+                "out_date": None,
+            },
+        ]
+    ).to_parquet(membership_path)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "overlapping distinct point-in-time L1 industry intervals.*"
+            "2024-01-02.*000001.SZ:801010.SI/801780.SI"
+        ),
+    ):
+        QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+
+def test_accepts_adjacent_l1_industry_interval_switch(tmp_path: Path) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    membership_path = (
+        snapshot
+        / "parquet"
+        / "index_member_all"
+        / "partition_year=2024"
+        / "research.parquet"
+    )
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "l1_code": "801780.SI",
+                "in_date": "2021-01-01",
+                "out_date": "2024-01-01",
+            },
+            {
+                "ts_code": "000001.SZ",
+                "l1_code": "801010.SI",
+                "in_date": "2024-01-02",
+                "out_date": None,
+            },
+        ]
+    ).to_parquet(membership_path)
 
     by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
 
@@ -828,16 +1183,50 @@ def test_writes_reproducible_qlib_dataset_provenance(tmp_path: Path) -> None:
     )
     assert provenance["lineage_verified"] is False
     assert provenance["dataset_lineage_id"] is None
+    assert provenance["adjustment_boundary"]["status"] == "not_applicable"
+    assert len(provenance["adjustment_boundary"]["evidence_sha256"]) == 64
+    assert provenance["output_manifest"]["version"] == "qlib-output-files-v1"
+    assert [item["path"] for item in provenance["output_manifest"]["files"]] == [
+        "metadata/adjustment_boundary.json",
+        "metadata/research_feature_contract.json"
+    ]
+    verify_qlib_output_manifest(qlib_dir, provenance)
+
+
+def test_qlib_output_manifest_rejects_changed_or_unsealed_files(tmp_path: Path) -> None:
+    qlib_dir = tmp_path / "qlib"
+    feature = qlib_dir / "features" / "sh600000" / "close.day.bin"
+    feature.parent.mkdir(parents=True)
+    feature.write_bytes(b"sealed")
+    provenance = {"output_manifest": build_qlib_output_manifest(qlib_dir)}
+
+    verify_qlib_output_manifest(qlib_dir, provenance)
+    feature.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="sealed manifest"):
+        verify_qlib_output_manifest(qlib_dir, provenance)
+
+    feature.write_bytes(b"sealed")
+    (qlib_dir / "calendars").mkdir()
+    (qlib_dir / "calendars" / "day.txt").write_text("2024-01-02\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="sealed manifest"):
+        verify_qlib_output_manifest(qlib_dir, provenance)
 
 
 def test_derives_stable_qlib_lineage_only_from_verified_source_lineage(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
+    lineage_configuration = {"profile": "full", "start_date": "2024-01-01"}
     manifest = {
         "name": "snapshot",
         "profile": "full",
-        "lineage_id": "a" * 64,
-        "lineage_generation": 2,
+        "lineage_id": make_lineage_id("qlib_daily_source", lineage_configuration),
+        "lineage_contract": {
+            "kind": "qlib_daily_source",
+            "configuration": lineage_configuration,
+        },
+        "lineage_generation": 0,
+        "parent_snapshot": None,
+        "parent_manifest_sha256": None,
         "datasets": {"daily": {"rows": 0, "source_sha256": "b" * 64, "files": []}},
     }
     (snapshot / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -850,7 +1239,7 @@ def test_derives_stable_qlib_lineage_only_from_verified_source_lineage(tmp_path:
     )
     assert provenance["lineage_verified"] is True
     assert len(provenance["dataset_lineage_id"]) == 64
-    assert provenance["source_lineage_generation"] == 2
+    assert provenance["source_lineage_generation"] == 0
 
 
 def test_rejects_daily_amount_and_hand_volume_with_impossible_vwap(tmp_path: Path) -> None:

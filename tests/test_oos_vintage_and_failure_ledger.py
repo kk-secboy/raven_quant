@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,10 @@ from quant_data.database import oos_vintages, open_database, row_dict
 from quant_platform.api import StrategyConfigRequest
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.job_store import JobStore
-from quant_platform.research_automation import rank_factor_candidates
+from quant_platform.research_automation import (
+    rank_factor_candidates,
+    rank_multi_profile_candidates,
+)
 from quant_platform.research_campaign_store import ResearchCampaignStore
 from quant_platform.research_program_store import ResearchProgramStore
 from quant_platform.research_store import ResearchStore
@@ -74,9 +78,20 @@ def _version_for_candidate(database_url: str, candidate_id: str) -> str:
     return str(strategy["versions"][0]["id"])
 
 
-def _record_passing_evaluation(store: ResearchStore, tmp_path: Path, candidate: dict) -> dict:
+def _record_passing_evaluation(
+    store: ResearchStore,
+    tmp_path: Path,
+    candidate: dict,
+    *,
+    profile_id: str | None = None,
+    periods: dict | None = None,
+) -> dict:
     suffix = uuid.uuid4().hex
     metrics = passing_factor_metrics()
+    if profile_id is not None:
+        metrics["research_profile"] = {"id": profile_id}
+        metrics["coverage_gate_passed"] = True
+    evaluation_periods = periods or PERIODS
     artifact = tmp_path / f"evaluation-{suffix}.json"
     artifact.write_text(
         json.dumps(
@@ -97,13 +112,13 @@ def _record_passing_evaluation(store: ResearchStore, tmp_path: Path, candidate: 
         candidate["id"],
         dataset="snapshot",
         dataset_identity_sha256=DATASET_IDENTITY,
-        **PERIODS,
+        **evaluation_periods,
         metrics=metrics,
         artifact_path=str(artifact),
         recomputed_values_path=str(recomputed_path),
         recomputed_values_sha256=recomputed_sha256,
         recompute_evidence={
-            "executor_version": "factor-recompute-v3-container-index-exact",
+            "executor_version": "factor-recompute-v4-pit-prefix-invariance",
             "sandbox_mode": "docker-isolated",
             "sandbox_image_id": "sha256:" + "a" * 64,
             "network_mode": "none",
@@ -114,7 +129,19 @@ def _record_passing_evaluation(store: ResearchStore, tmp_path: Path, candidate: 
             "code_sha256": hashlib.sha256(Path(candidate["code_path"]).read_bytes()).hexdigest(),
             "dataset_identity_sha256": DATASET_IDENTITY,
             "provider_input_sha256": "1" * 64,
-            "periods": {key: value.isoformat() for key, value in PERIODS.items()},
+            "periods": {key: value.isoformat() for key, value in evaluation_periods.items()},
+            "pit_invariance": {
+                "contract_version": "factor-pit-prefix-invariance-v1",
+                "status": "passed",
+                "cutpoint_count": 3,
+                "checks": [{"invariant": True}] * 3,
+            },
+            "research_data_boundary": {
+                "latest_input_date": evaluation_periods["valid_end"].isoformat(),
+                "valid_end": evaluation_periods["valid_end"].isoformat(),
+                "test_start": evaluation_periods["test_start"].isoformat(),
+                "final_oos_observations_exposed": False,
+            },
             "submitted_comparison": {
                 "available": True,
                 "exact_match": True,
@@ -178,8 +205,9 @@ def test_first_final_test_seals_and_consumes_vintage(
     rows = _vintage_rows(database_url)
     assert len(rows) == 1
     row = rows[0]
-    assert row["scope"] == f"dataset:{DATASET_IDENTITY}"
+    assert row["scope"] == "standalone:global"
     assert row["dataset_identity"] == DATASET_IDENTITY
+    assert row["dataset_lineage_id"] is None
     assert row["test_start"] == PERIODS["test_start"]
     assert row["test_end"] == PERIODS["test_end"]
     assert row["sealed_at"] is not None
@@ -305,14 +333,51 @@ def test_program_scope_binds_vintage_across_renamed_campaigns(
         links={"research_run_id": str(candidate_b["research_run_id"])},
     )
     version_b = _version_for_candidate(database_url, str(candidate_b["id"]))
+    overlapping_periods = {
+        "start": date(2022, 1, 3).isoformat(),
+        "end": PERIODS["test_end"].isoformat(),
+    }
+    with pytest.raises(ValueError, match="overlaps a reserved or consumed OOS vintage"):
+        strategies.create_backtest(
+            version_id=version_b,
+            dataset="snapshot",
+            periods=overlapping_periods,
+            artifact_path=tmp_path,
+        )
+    assert len(_vintage_rows(database_url)) == 1
+
+
+def test_snapshot_identity_change_cannot_reopen_standalone_oos(
+    tmp_path: Path, database_url: str
+) -> None:
+    """A fresh immutable snapshot is not a fresh final exam."""
+
+    version_a = create_strategy_version(
+        database_url, tmp_path, dataset_identity="a" * 64
+    )
+    strategies = StrategyStore(database_url)
+    strategies.create_backtest(
+        version_id=version_a,
+        dataset="snapshot",
+        periods=FINAL_PERIODS,
+        artifact_path=tmp_path,
+        dataset_lineage_id="9" * 64,
+    )
+    version_b = create_strategy_version(
+        database_url, tmp_path, dataset_identity="b" * 64
+    )
     with pytest.raises(ValueError, match="sealed candidate set"):
         strategies.create_backtest(
             version_id=version_b,
             dataset="snapshot",
             periods=FINAL_PERIODS,
             artifact_path=tmp_path,
+            dataset_lineage_id="9" * 64,
         )
-    assert len(_vintage_rows(database_url)) == 1
+    rows = _vintage_rows(database_url)
+    assert len(rows) == 1
+    assert rows[0]["scope"] == f"lineage:{'9' * 64}"
+    assert rows[0]["dataset_lineage_id"] == "9" * 64
 
 
 def test_failed_evaluation_is_ledgered_and_blocks_promotion(
@@ -338,7 +403,7 @@ def test_failed_evaluation_is_ledgered_and_blocks_promotion(
     # evaluation_failed is unqualified everywhere downstream: the promotion
     # gate rejects it and deterministic ranking excludes it (it is not the
     # same as gate_failed, where the evaluation completed but missed the bar).
-    with pytest.raises(ValueError, match="must pass the latest Qlib gate"):
+    with pytest.raises(ValueError, match="must pass the governed Qlib admission"):
         store.promote(candidate["id"], actor="risk-owner", reason="attempting promotion")
     assert rank_factor_candidates([store.get_candidate(candidate["id"])], limit=1) == []
 
@@ -371,6 +436,59 @@ def test_failed_candidate_can_be_reevaluated_and_promoted(
         if event["event_type"] == "candidate.evaluation_failed"
     ]
     assert evaluations and evaluations[0]["payload"]["evaluation_id"] == failure["id"]
+
+
+def test_multi_profile_promotion_requires_persisted_consensus(
+    tmp_path: Path, database_url: str
+) -> None:
+    store = ResearchStore(database_url)
+    _, candidate = _unevaluated_candidate(store, tmp_path)
+    profile_periods = {
+        "robust_10y": PERIODS,
+        "balanced_5y": {
+            **PERIODS,
+            "train_end": date(2018, 12, 31),
+            "valid_start": date(2019, 1, 1),
+        },
+        "recent_3y": {
+            **PERIODS,
+            "train_end": date(2019, 12, 31),
+            "valid_start": date(2020, 1, 1),
+        },
+    }
+    evaluations = []
+    for profile_id in ("balanced_5y", "recent_3y", "robust_10y"):
+        current = store.get_candidate(candidate["id"])
+        evaluations.append(
+            _record_passing_evaluation(
+                store,
+                tmp_path,
+                current,
+                profile_id=profile_id,
+                periods=profile_periods[profile_id],
+            )
+        )
+    current = store.get_candidate(candidate["id"])
+    current["profile_evaluations"] = evaluations
+    selected = rank_multi_profile_candidates([current], limit=1)
+    assert len(selected) == 1
+    with pytest.raises(ValueError, match="requires an explicit consensus record"):
+        store.promote(candidate["id"], actor="factor-owner", reason="three profiles passed")
+    admitted = store.record_profile_consensus(
+        candidate["id"],
+        evaluation_ids=selected[0]["profile_consensus"]["evaluation_ids"],
+        actor="factor-owner",
+    )
+    assert admitted["status"] == "gate_passed"
+    assert admitted["profile_consensus"]["status"] == "passed"
+    assert len(admitted["profile_consensus_sha256"]) == 64
+    promoted = store.promote(
+        candidate["id"], actor="factor-owner", reason="three profiles passed"
+    )
+    assert promoted["status"] == "promoted"
+    assert promoted["promoted_evaluation_id"] == selected[0]["profile_consensus"][
+        "evaluation_ids"
+    ]["recent_3y"]
 
 
 def test_worker_import_ledgers_failed_evaluations(

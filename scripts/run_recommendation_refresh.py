@@ -21,6 +21,7 @@ from quant_data.execution_contract import (
     require_minute_execution_contract,
     require_strategy_execution_contract,
 )
+from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.eligibility import eligibility_statistics
 from quant_platform.portfolio_policy import (
@@ -46,6 +47,57 @@ def _load(path: str) -> pd.DataFrame:
     if source.suffix.lower() == ".parquet":
         return pd.read_parquet(source)
     raise ValueError(f"unsupported factor artifact: {source}")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _model_prediction_scores(
+    artifact: dict[str, Any], *, expected_dataset_identity: str
+) -> pd.Series:
+    if not isinstance(artifact, dict):
+        raise ValueError(
+            "model-prediction strategy requires an active governed ModelArtifact"
+        )
+    path = Path(str(artifact.get("artifact_path") or ""))
+    recorded = str(artifact.get("predictions_sha256") or "").lower()
+    if (
+        not path.is_file()
+        or len(recorded) != 64
+        or _sha256_file(path) != recorded
+        or str(artifact.get("artifact_sha256") or "").lower() != recorded
+        or str(artifact.get("dataset_identity_sha256") or "")
+        != expected_dataset_identity
+    ):
+        raise ValueError("active ModelArtifact prediction table failed immutable verification")
+    values = _load(str(path))
+    if isinstance(values, pd.Series):
+        scores = values
+    elif values.shape[1] == 1:
+        scores = values.iloc[:, 0]
+    elif "score" in values:
+        scores = values["score"]
+    else:
+        raise ValueError("ModelArtifact prediction table must contain one score column")
+    if not isinstance(scores.index, pd.MultiIndex) or scores.index.nlevels != 2:
+        raise ValueError("ModelArtifact predictions require datetime/instrument indexing")
+    scores = pd.to_numeric(scores, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if scores.index.has_duplicates or scores.dropna().empty:
+        raise ValueError("ModelArtifact predictions are duplicate or empty")
+    names = [str(name or "").lower() for name in scores.index.names]
+    if names == ["instrument", "datetime"]:
+        scores = scores.reorder_levels(["datetime", "instrument"])
+    elif names != ["datetime", "instrument"]:
+        raise ValueError(
+            "ModelArtifact prediction index names must be datetime and instrument"
+        )
+    scores.index = scores.index.set_names(["datetime", "instrument"])
+    return scores.rename("score").sort_index()
 
 
 def _next_known_trading_date(provider_uri: str | Path, as_of: pd.Timestamp) -> str:
@@ -102,6 +154,8 @@ def _write_qlib_order_plan(
         "source_type": "strategy_version",
         "source_id": manifest["strategy_version_id"],
         "formal_backtest_id": manifest["formal_backtest_id"],
+        "promotion_stage_id": manifest["promotion_stage_id"],
+        "promotion_stage_opened_at": manifest["promotion_stage_opened_at"],
         "execution_contract_hash": manifest["config"]["execution_contract_hash"],
         "daily_dataset": manifest["dataset"],
         "signal_date": signal_date,
@@ -122,6 +176,20 @@ def _write_qlib_order_plan(
         plan["execution_not_before"] = str(manifest["execution_not_before"])
     if isinstance(manifest.get("signal_dataset"), dict):
         plan["signal_snapshot"] = dict(manifest["signal_dataset"])
+    if isinstance(manifest.get("model_artifact"), dict):
+        plan["model_prediction"] = {
+            "artifact_id": manifest["model_artifact"].get("id"),
+            "artifact_key": manifest["model_artifact"].get("artifact_key"),
+            "strategy_spec_sha256": manifest["model_artifact"].get(
+                "strategy_spec_sha256"
+            ),
+            "model_recipe_sha256": manifest["model_artifact"].get(
+                "model_recipe_sha256"
+            ),
+            "predictions_sha256": manifest["model_artifact"].get(
+                "predictions_sha256"
+            ),
+        }
     run_id = str(manifest["order_plan_job_id"])
     with qlib_workflow_run(
         run_kind="simulation-order-plan",
@@ -227,6 +295,7 @@ def main() -> None:
         raise ValueError("recommendation refresh requires dataset provenance metadata")
     dataset_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     require_daily_qlib_contract(dataset_provenance)
+    verify_qlib_output_manifest(Path(args.provider_uri), dataset_provenance)
     as_of = pd.Timestamp(
         manifest.get("signal_at") or manifest["as_of_date"]
     ).tz_localize(None)
@@ -256,6 +325,7 @@ def main() -> None:
             frequency=signal_frequency,
             simulation_eligible=True,
         )
+        verify_qlib_output_manifest(Path(signal_provider_uri), signal_provenance)
         expected_signal = dict(manifest.get("signal_dataset") or {})
         if Path(signal_provider_uri).name != str(expected_signal.get("name") or ""):
             raise ValueError(
@@ -274,8 +344,14 @@ def main() -> None:
                     "minute Qlib signal dataset does not match the order-plan manifest"
                 )
     qlib.init(provider_uri=signal_provider_uri, region="cn")
+    signal_source = str(config.get("signal_source") or "factor_score")
     challenger = None
-    if manifest["factors"]:
+    if signal_source == "model_prediction":
+        scores = _model_prediction_scores(
+            manifest.get("model_artifact"),
+            expected_dataset_identity=str(manifest["dataset_identity_sha256"]),
+        )
+    elif manifest["factors"]:
         challenger = compose_factor_scores(
             [
                 (
@@ -287,7 +363,9 @@ def main() -> None:
             ]
         )
     baseline_definition = config.get("baseline_definition")
-    if isinstance(baseline_definition, dict):
+    if signal_source == "model_prediction":
+        pass
+    elif isinstance(baseline_definition, dict):
         expressions = [
             str(item["qlib_expression"])
             for item in baseline_definition.get("factors") or []
@@ -388,16 +466,19 @@ def main() -> None:
         "benchmark_relative_qp",
         "industry_neutral_qp",
     }
+    policy_config = PortfolioPolicyConfig.from_mapping(config)
     governed = build_governed_signal(
         scores.loc[(slice(lookback, as_of), slice(None))],
-        topk=int(config["topk"]),
+        topk=policy_config.topk,
+        n_drop=policy_config.n_drop,
         liquidity_amount=liquidity,
         industry_memberships=memberships,
         benchmark_weights=benchmark_frame,
         style_exposures=styles_frame,
         eligibility_matrix=eligibility_frame,
-        max_industry_weight=float(config.get("max_industry_weight", 1.0)),
-        max_industry_deviation=float(config.get("max_industry_deviation", 1.0)),
+        max_position_weight=policy_config.max_position_weight,
+        max_industry_weight=policy_config.max_industry_weight,
+        max_industry_deviation=policy_config.max_industry_deviation,
         min_average_daily_amount=float(config.get("min_average_daily_amount", 0.0)),
         liquidity_lookback_days=int(config.get("liquidity_lookback_days", 20)),
         neutralize_industry=neutralize_baseline,
@@ -418,7 +499,14 @@ def main() -> None:
     benchmark_industries = industries.reindex(benchmark.index)
     if benchmark_industries.isna().any() or styles.reindex(benchmark.index).isna().any().any():
         raise ValueError("benchmark metadata is incomplete")
-    risk_instruments = signal.index.astype(str).union(benchmark.index.astype(str))
+    previous = {
+        item["instrument"]: item["weight"] for item in manifest.get("previous_holdings", [])
+    }
+    risk_instruments = (
+        signal.index.astype(str)
+        .union(benchmark.index.astype(str))
+        .union(pd.Index(previous, dtype=str))
+    )
     risk_returns = (
         close_history.reindex(columns=risk_instruments)
         .tail(61)
@@ -428,10 +516,7 @@ def main() -> None:
     if len(risk_returns) < 60:
         raise ValueError("recommendation optimizer requires 60 complete return observations")
     cost_model = CostModelConfig.from_mapping(config)
-    policy = PortfolioPolicy(PortfolioPolicyConfig.from_mapping(config), cost_model)
-    previous = {
-        item["instrument"]: item["weight"] for item in manifest.get("previous_holdings", [])
-    }
+    policy = PortfolioPolicy(policy_config, cost_model)
     previous_snapshot = manifest.get("previous_snapshot") or {}
     rebalance_due = is_rebalance_due(
         as_of,

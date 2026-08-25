@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, case, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .database import open_database, row_dict, work_units
@@ -283,6 +283,20 @@ class CheckpointStore:
         with self.engine.connect() as connection:
             return [row_dict(row) for row in connection.execute(statement)]
 
+    def active_units(
+        self, datasets: set[str] | frozenset[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Return all non-superseded plan rows for release-window selection."""
+
+        if datasets is not None and not datasets:
+            return []
+        statement = select(work_units).where(work_units.c.status != "superseded")
+        if datasets is not None:
+            statement = statement.where(work_units.c.dataset.in_(sorted(datasets)))
+        statement = statement.order_by(work_units.c.dataset, work_units.c.unit_key)
+        with self.engine.connect() as connection:
+            return [row_dict(row) for row in connection.execute(statement)]
+
     def unfinished_units(
         self, dataset: str | set[str] | None = None
     ) -> list[dict[str, Any]]:
@@ -419,6 +433,47 @@ class CheckpointStore:
                 statement = select(work_units).where(work_units.c.unit_key.in_(batch))
                 rows.extend(row_dict(row) for row in connection.execute(statement))
         return sorted(rows, key=lambda row: (str(row["dataset"]), str(row["unit_key"])))
+
+    def pagination_group_units(
+        self, groups: Iterable[tuple[str, str]]
+    ) -> list[dict[str, Any]]:
+        """Return active durable pages for exact dataset/page-group identities.
+
+        A resumed bootstrap starts from the first page of every provider
+        request. Fetching the already durable siblings in one bounded query
+        prevents the runner from reconstructing hundreds of successful pages
+        one cursor at a time. Dataset is part of the identity so an unrelated
+        interface cannot be joined merely because it reused a group label.
+        """
+
+        identities = sorted(
+            {
+                (str(dataset), str(group))
+                for dataset, group in groups
+                if str(dataset) and str(group)
+            }
+        )
+        if not identities:
+            return []
+        page_group = work_units.c.scope_json["page_group"].as_string()
+        rows: list[dict[str, Any]] = []
+        with self.engine.connect() as connection:
+            for offset in range(0, len(identities), _SELECT_BATCH_SIZE):
+                batch = identities[offset : offset + _SELECT_BATCH_SIZE]
+                statement = select(work_units).where(
+                    work_units.c.status != "superseded",
+                    tuple_(work_units.c.dataset, page_group).in_(batch),
+                )
+                rows.extend(row_dict(row) for row in connection.execute(statement))
+        return sorted(
+            rows,
+            key=lambda row: (
+                str(row["dataset"]),
+                str(dict(row.get("scope_json") or {}).get("page_group") or ""),
+                int(dict(row.get("scope_json") or {}).get("offset") or 0),
+                str(row["unit_key"]),
+            ),
+        )
 
     def datasets(self) -> list[str]:
         statement = select(work_units.c.dataset).distinct().order_by(work_units.c.dataset)

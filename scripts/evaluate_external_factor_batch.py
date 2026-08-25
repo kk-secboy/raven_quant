@@ -33,6 +33,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.cost_model import CostScheduleBook
 from quant_platform.external_factor_evaluation import (
     POLICY_BY_SHAPE,
@@ -100,6 +101,12 @@ def main() -> None:
     parser.add_argument("--database-url", default=None)
     args = parser.parse_args()
 
+    provider = Path(args.provider_uri)
+    provenance = json.loads(
+        (provider / "metadata" / "provenance.json").read_text(encoding="utf-8")
+    )
+    verify_qlib_output_manifest(provider, provenance)
+
     import qlib
     from qlib.data import D
 
@@ -109,6 +116,8 @@ def main() -> None:
     universe = str(manifest.get("universe") or "cn_all")
     benchmark = str(manifest.get("benchmark") or "SH000300")
     dataset_identity = str(manifest["dataset_identity_sha256"])
+    if provenance.get("dataset_identity_sha256") != dataset_identity:
+        raise ValueError("external evaluation provider does not match the sealed dataset")
     qlib.init(provider_uri=args.provider_uri, region="cn")
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -121,7 +130,11 @@ def main() -> None:
     input_sha_by_horizon: dict[int, dict[str, str]] = {}
     for horizon in horizons:
         labels = _forward_returns(D.instruments(universe), horizon, periods)
-        benchmark_labels = _forward_returns(D.instruments(benchmark), horizon, periods)
+        # A benchmark code is one instrument, not a Qlib instrument-set name.
+        # Passing the bare string to ``D.instruments`` makes Qlib look for an
+        # ``instruments/sh000300.txt`` market file, which is not how benchmark
+        # series are represented in the governed dataset.
+        benchmark_labels = _forward_returns([benchmark], horizon, periods)
         labels_path = evidence_root / f"forward-returns-{horizon}d.h5"
         benchmark_path = evidence_root / f"benchmark-forward-returns-{horizon}d.h5"
         labels.to_hdf(labels_path, key="data", mode="w")
