@@ -165,7 +165,9 @@ RESEARCH_CORPUS: tuple[DatasetDefinition, ...] = (
         RESEARCH_REPORT_FIELDS,
         allow_empty=True,
         date_field="trade_date",
-        primary_key=("url",),
+        # One PDF can be tagged to several stocks/industries on the same
+        # publication date.  Those tags are metadata, not distinct documents.
+        primary_key=("url", "trade_date"),
     ),
 )
 

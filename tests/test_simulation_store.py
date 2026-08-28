@@ -1111,17 +1111,12 @@ def test_legacy_or_changed_source_contract_cannot_be_activated(database_url: str
         store.set_status(simulation["id"], "active")
 
 
-def test_pair_simulation_creation_is_research_only(database_url: str, tmp_path) -> None:
-    """Persistent pair simulation ledgers are research-only rejects (design 6.4.3/13).
-
-    The offline pair backtest path stays available, but the capitalized
-    forward ledger can no longer be opened even for an approved pair version.
-    """
+def test_pair_simulation_creation_is_persistent_shadow_only(database_url: str, tmp_path) -> None:
 
     strategies = StrategyStore(database_url)
     created = strategies.create_pair(
         name="research only pair simulation",
-        description="pair strategies keep offline backtests but no persistent ledger",
+        description="pair strategies may keep a persistent shadow-only ledger",
         leg_y="SH600000",
         leg_x="SH600001",
         asset_class="stock",
@@ -1145,25 +1140,28 @@ def test_pair_simulation_creation_is_research_only(database_url: str, tmp_path) 
             .values(status="approved")
         )
     store = SimulationStore(database_url)
-    with pytest.raises(ValueError, match="research_only"):
-        store.create(
-            name="research only pair simulation ledger",
-            source_type="strategy_version",
-            source_id=version["id"],
-            daily_dataset=_daily_dataset(),
-            execution_dataset=_execution_dataset("1min"),
-            initial_cash=PairTradingConfig().initial_capital,
-            execution_policy={
-                "execution_algorithm": "vwap",
-                "slice_minutes": 5,
-                "max_slices": 1,
-                "max_participation": 0.01,
-                "volume_profile": [{"time": "10:00", "weight": 1.0}],
-            },
-            cost_schedule_version=COST_SCHEDULE_VERSION,
-            actor="simulation-operator",
-            execution_adapter="pair",
-        )
+    simulation = store.create(
+        name="research only pair simulation ledger",
+        source_type="strategy_version",
+        source_id=version["id"],
+        daily_dataset=_daily_dataset(),
+        execution_dataset=_execution_dataset("1min"),
+        initial_cash=PairTradingConfig().initial_capital,
+        execution_policy={
+            "execution_algorithm": "vwap",
+            "slice_minutes": 5,
+            "max_slices": 1,
+            "max_participation": 0.01,
+            "volume_profile": [{"time": "10:00", "weight": 1.0}],
+        },
+        cost_schedule_version=COST_SCHEDULE_VERSION,
+        actor="simulation-operator",
+        execution_adapter="pair",
+    )
+    assert simulation["simulation_mode"] == "shadow_pair"
+    assert simulation["synthetic_short_exposure"] is True
+    assert simulation["financing_enabled"] is False
+    assert simulation["real_trading_eligible"] is False
 
 
 def test_simulation_api_exposes_ledger_and_retires_hypothetical_performance(

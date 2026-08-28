@@ -180,3 +180,47 @@ def test_scoped_execution_gate_seals_minute_source_audit(tmp_path: Path) -> None
     assert gate["minute_source_audits"]["ashare_5m"]["excluded_rows"] == 2
     assert gate["minute_source_audits"]["ashare_5m"]["nontradable_rows"] == 1
     assert gate["minute_source_warnings"]
+
+
+def test_scoped_execution_gate_keeps_empty_units_out_of_parquet_audit(
+    tmp_path: Path,
+) -> None:
+    parquet_relative = Path("units") / "ashare_5m" / "unit.parquet"
+    parquet_path = _write(tmp_path / parquet_relative, _rows())
+    empty_relative = Path("units") / "ashare_5m" / "empty.empty.json"
+    empty_path = tmp_path / empty_relative
+    empty_path.write_text('{"allow_empty":true}', encoding="utf-8")
+    selected = [
+        {
+            "unit_key": "ashare-5m-20241030-data",
+            "dataset": "ashare_5m",
+            "scope_json": {"start_date": "20241030", "end_date": "20241030"},
+            "params_json": {},
+            "status": "succeeded",
+            "output_path": str(parquet_relative).replace("\\", "/"),
+            "sha256": hashlib.sha256(parquet_path.read_bytes()).hexdigest(),
+            "row_count": len(_rows()),
+        },
+        {
+            "unit_key": "ashare-5m-20241030-empty",
+            "dataset": "ashare_5m",
+            "scope_json": {"start_date": "20241030", "end_date": "20241030"},
+            "params_json": {},
+            "status": "succeeded",
+            "output_path": str(empty_relative).replace("\\", "/"),
+            "sha256": hashlib.sha256(empty_path.read_bytes()).hexdigest(),
+            "row_count": 0,
+        },
+    ]
+    context = SimpleNamespace(settings=SimpleNamespace(data_root=tmp_path))
+
+    gate = _explicit_execution_quality_gate(
+        context,  # type: ignore[arg-type]
+        selected={"ashare_5m": selected},
+        start_date=date(2024, 10, 30),
+        end_date=date(2024, 10, 30),
+        profile="ashare_intraday",
+    )
+
+    assert gate["ok"] is True
+    assert gate["minute_source_audits"]["ashare_5m"]["source_rows"] == 51

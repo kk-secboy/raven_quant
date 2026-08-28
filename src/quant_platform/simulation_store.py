@@ -91,7 +91,6 @@ from .simulation_order_state import (
     STATUS_PLANNED,
     apply_order_plan,
 )
-from .strategy_catalog import require_capital_eligible_strategy_type
 from .unitized_performance import (
     UNITIZED_PERFORMANCE_VERSION,
     benchmark_relative_statistics,
@@ -125,6 +124,25 @@ def _benchmark_chain_day(
     dataset_lineage_id: str,
     prior_nav: Any | None,
 ) -> dict[str, Any]:
+    if benchmark == "CASH":
+        prior_wealth = (
+            float(prior_nav.benchmark_wealth)
+            if prior_nav is not None and prior_nav.benchmark_wealth is not None
+            else 1.0
+        )
+        return {
+            "status": "cash_baseline",
+            "benchmark_close": 1.0,
+            "benchmark_return": 0.0,
+            "benchmark_wealth": prior_wealth,
+            "evidence_sha256": _canonical_hash(
+                {
+                    "benchmark": "CASH",
+                    "trade_date": trade_date.isoformat(),
+                    "return": 0.0,
+                }
+            ),
+        }
     if evidence is None:
         return {
             "status": "benchmark_evidence_missing",
@@ -221,6 +239,7 @@ SIMULATION_EXECUTION_FREQUENCIES = frozenset({"1min", "5min"})
 SIMULATION_EXECUTION_SEMANTICS_VERSION = "simulation-execution-semantics-v1"
 SIMULATION_BENCHMARK_EVIDENCE_VERSION = "simulation-benchmark-evidence-v1"
 QLIB_ORDER_PLAN_FORMAT_VERSION = "qlib-order-plan-v1"
+PAPER_TARGET_PROJECTION_VERSION = "paper-target-projection-v1"
 VWAP_PROFILE_METHOD = "qlib-historical-average-volume-v1"
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 CASH_OPENING_BALANCE_AT = datetime(1970, 1, 1, tzinfo=UTC)
@@ -245,6 +264,58 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def paper_target_adjustments(
+    target_weights: dict[str, float],
+    previous_target_weights: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Describe a frozen paper order-plan delta without inventing a thesis.
+
+    The immutable Qlib order-plan artifact deliberately stores executable target
+    weights, not an LLM-written investment rationale.  This projection therefore
+    exposes only the factual reason available at this boundary: how the current
+    frozen target changed from the preceding frozen target.  It must never be
+    confused with the separately gated, human-facing RecommendationStore.
+    """
+
+    current = {str(key).upper(): float(value) for key, value in target_weights.items()}
+    previous = {
+        str(key).upper(): float(value)
+        for key, value in (previous_target_weights or {}).items()
+    }
+    rows: list[dict[str, Any]] = []
+    for instrument in sorted(set(current) | set(previous)):
+        target_weight = current.get(instrument, 0.0)
+        previous_weight = previous.get(instrument, 0.0)
+        delta = target_weight - previous_weight
+        if previous_weight <= 0.0 < target_weight:
+            action = "add"
+            reason = "new frozen Qlib order-plan target"
+        elif target_weight <= 0.0 < previous_weight:
+            action = "remove"
+            reason = "removed by frozen Qlib order-plan target"
+        elif delta > 1e-12:
+            action = "increase"
+            reason = "frozen Qlib order-plan target weight increased"
+        elif delta < -1e-12:
+            action = "decrease"
+            reason = "frozen Qlib order-plan target weight decreased"
+        else:
+            action = "hold"
+            reason = "frozen Qlib order-plan target unchanged"
+        rows.append(
+            {
+                "instrument": instrument,
+                "target_weight": target_weight,
+                "previous_weight": previous_weight,
+                "weight_change": delta,
+                "action": action,
+                "reason": reason,
+                "reason_basis": "frozen_qlib_order_plan_weight_delta",
+            }
+        )
+    return rows
 
 
 def _parse_aware_timestamp(value: Any, *, field: str) -> datetime:
@@ -1275,15 +1346,14 @@ class SimulationStore:
             raise ValueError("simulation execution adapter must be long_only or pair")
         if normalized_adapter != source["execution_adapter"]:
             raise ValueError("simulation adapter does not match the governed strategy source")
-        # Research-only gate (design 6.4.3/13): pair strategies keep offline
-        # backtests but never get a persistent capitalized simulation ledger.
-        # The pair adapter string doubles as the strategy type here.
-        if normalized_adapter == "pair":
-            require_capital_eligible_strategy_type("pair", action="持久模拟")
-        benchmark = str(source.get("benchmark") or "").strip().upper()
-        if not benchmark or benchmark == "CASH":
+        if normalized_adapter != "long_only":
             raise ValueError(
-                "simulation source must bind one non-cash performance benchmark"
+                "pair simulation writes are retired; historical pair ledgers are read-only"
+            )
+        benchmark = str(source.get("benchmark") or "").strip().upper()
+        if not benchmark or (benchmark == "CASH" and normalized_adapter != "pair"):
+            raise ValueError(
+                "long-only simulation sources must bind one non-cash performance benchmark"
             )
         governed_frequency = str(source.get("execution_frequency") or "")
         if governed_frequency and governed_frequency != execution_frequency:
@@ -2153,6 +2223,10 @@ class SimulationStore:
             if portfolio is None:
                 raise KeyError(portfolio_id)
             if status == "active":
+                if str(portfolio.execution_adapter) != "long_only":
+                    raise ValueError(
+                        "pair simulation writes are retired; historical pair ledgers are read-only"
+                    )
                 self._require_current_source_contract(connection, portfolio)
             result = connection.execute(
                 update(simulation_portfolios)
@@ -2419,6 +2493,65 @@ class SimulationStore:
         elif execution_roll != "pinned":
             raise ValueError("paper simulation execution roll policy is invalid")
         return bindings
+
+    def _pair_replay_dataset_bindings(
+        self,
+        *,
+        portfolio: Any,
+        governed_plan: dict[str, Any],
+        trade_date: date,
+        data_root: Path,
+    ) -> dict[str, str]:
+        """Bind a pair shadow day to verified descendants for that exact date."""
+
+        from .data_rollover import select_qlib_dataset
+        daily = select_qlib_dataset(
+            data_root,
+            anchor_name=str(portfolio.daily_dataset),
+            roll_policy=str(portfolio.daily_roll_policy or "pinned"),
+            lineage_id=str(portfolio.daily_dataset_lineage_id),
+            required_date=trade_date,
+        )
+        execution = select_qlib_dataset(
+            data_root,
+            anchor_name=str(portfolio.execution_dataset),
+            roll_policy=str(portfolio.execution_roll_policy or "pinned"),
+            lineage_id=str(portfolio.execution_dataset_lineage_id),
+            required_date=trade_date,
+        )
+        daily_provenance = dict(daily.get("provenance") or {})
+        execution_provenance = dict(execution.get("provenance") or {})
+        minute_binding = dict(governed_plan.get("minute_dataset") or {})
+        if (
+            daily_provenance.get("source_lineage_id")
+            != execution_provenance.get("source_lineage_id")
+        ):
+            raise ValueError("pair forward daily and minute datasets do not share source lineage")
+        if (
+            str(execution_provenance.get("snapshot_name") or "")
+            != str(governed_plan.get("execution_snapshot") or "")
+            or str(minute_binding.get("dataset_name") or "")
+            not in set(execution_provenance.get("source_datasets") or [])
+            or str(execution_provenance.get("snapshot_manifest_sha256") or "")
+            != str(minute_binding.get("manifest_sha256") or "")
+        ):
+            raise ValueError(
+                "pair forward minute dataset is not derived from the governed execution snapshot"
+            )
+        return {
+            "daily_dataset": str(daily["name"]),
+            "daily_dataset_identity_sha256": str(
+                daily_provenance["dataset_identity_sha256"]
+            ),
+            "daily_dataset_lineage_id": str(daily_provenance["dataset_lineage_id"]),
+            "execution_dataset": str(execution["name"]),
+            "execution_dataset_identity_sha256": str(
+                execution_provenance["dataset_identity_sha256"]
+            ),
+            "execution_dataset_lineage_id": str(
+                execution_provenance["dataset_lineage_id"]
+            ),
+        }
 
     def create_batches_for_snapshot(
         self,
@@ -3360,7 +3493,12 @@ class SimulationStore:
                 f"pair-replay:{portfolio.id}:{backtest.id}:{trade_date.isoformat()}:"
                 f"{plan['pair_plan_sha256']}"
             )
-            dataset_bindings = self._portfolio_batch_dataset_bindings(portfolio)
+            dataset_bindings = self._pair_replay_dataset_bindings(
+                portfolio=portfolio,
+                governed_plan=plan,
+                trade_date=trade_date,
+                data_root=data_root,
+            )
             inserted_id = connection.scalar(
                 pg_insert(simulation_batches)
                 .values(
@@ -3510,18 +3648,10 @@ class SimulationStore:
             if isinstance(item, dict)
             and str(item.get("trade_date") or "")[:10] == trade_date.isoformat()
         ]
-        if len(matches) != 1:
+        if len(matches) > 1:
             raise ValueError(
-                "selected trade date must identify exactly one governed pair backtest trade"
+                "selected trade date identifies multiple governed pair backtest trades"
             )
-        trade = matches[0]
-        try:
-            signal_date = date.fromisoformat(str(trade["signal_date"])[:10])
-            direction = int(trade["direction"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("governed pair trade has invalid signal metadata") from exc
-        if signal_date >= trade_date or direction not in {-1, 1}:
-            raise ValueError("governed pair trade violates next-session execution")
         ledger = pd.read_parquet(artifact_root / "daily_ledger.parquet").reset_index()
         datetime_field = next(
             (name for name in ("datetime", "trade_date", "date") if name in ledger),
@@ -3534,6 +3664,47 @@ class SimulationStore:
         if len(rows) != 1 or not {"quantity_y", "quantity_x"}.issubset(rows.columns):
             raise ValueError("pair replay daily ledger has no unique governed target")
         row = rows.iloc[0]
+        prior_dates = sorted(
+            value
+            for value in ledger[datetime_field].dt.date.dropna().unique().tolist()
+            if value < trade_date
+        )
+        if not prior_dates:
+            raise ValueError("pair replay requires a prior governed signal date")
+        if matches:
+            trade = matches[0]
+            try:
+                signal_date = date.fromisoformat(str(trade["signal_date"])[:10])
+                direction = int(trade["direction"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("governed pair trade has invalid signal metadata") from exc
+            action = str(trade.get("action") or "")
+            if action not in {"entry", "exit"}:
+                raise ValueError("pair replay artifact contains an unsupported trade action")
+        else:
+            # A persistent ledger must mark and accrue every holding day, not
+            # only entry/exit days.  Reuse the last governed entry direction
+            # and the immediately preceding immutable ledger date as signal.
+            historical = [
+                item
+                for item in trades
+                if isinstance(item, dict)
+                and str(item.get("trade_date") or "")[:10] < trade_date.isoformat()
+                and str(item.get("action") or "") == "entry"
+            ]
+            historical.sort(key=lambda item: str(item.get("trade_date") or ""))
+            direction = int(historical[-1]["direction"]) if historical else 1
+            signal_date = prior_dates[-1]
+            action = "hold"
+            trade = {
+                "action": action,
+                "direction": direction,
+                "signal_date": signal_date.isoformat(),
+                "trade_date": trade_date.isoformat(),
+                "source": "immutable_daily_ledger",
+            }
+        if signal_date >= trade_date or direction not in {-1, 1}:
+            raise ValueError("governed pair trade violates next-session execution")
         artifact_quantities = {
             str(pair.leg_y): int(row["quantity_y"]),
             str(pair.leg_x): int(row["quantity_x"]),
@@ -3555,9 +3726,6 @@ class SimulationStore:
             instrument: int(abs(quantity) * scale // 100) * 100
             for instrument, quantity in artifact_quantities.items()
         }
-        action = str(trade.get("action") or "")
-        if action not in {"entry", "exit"}:
-            raise ValueError("pair replay artifact contains an unsupported trade action")
         if action == "entry" and (not all(scaled.values())):
             raise ValueError("simulation capital is too small for the governed pair board lots")
         if action == "exit" and any(scaled.values()):
@@ -6004,6 +6172,201 @@ class SimulationStore:
             ).first()
         return self._batch_dict(row) if row is not None else None
 
+    def current_autopilot_paper_target(self) -> dict[str, Any]:
+        """Return the one read-only daily target projection for Autopilot.
+
+        This is intentionally *not* a recommendation endpoint.  It only
+        projects the immutable Qlib order-plan already attached to the active
+        isolated Autopilot paper account.  In particular, a manual simulation,
+        a historical frozen account, an allocation account, or a human-enabled
+        recommendation portfolio can never be selected here.
+        """
+
+        with self.engine.connect() as connection:
+            candidates = connection.execute(
+                select(
+                    simulation_portfolios,
+                    strategy_versions.c.config_json.label("_strategy_config"),
+                    strategy_promotion_stages.c.status.label("_paper_stage_status"),
+                    strategy_promotion_stages.c.opened_at.label("_paper_stage_opened_at"),
+                )
+                .join(
+                    strategy_versions,
+                    strategy_versions.c.id == simulation_portfolios.c.source_id,
+                )
+                .join(
+                    strategy_promotion_stages,
+                    strategy_promotion_stages.c.id
+                    == simulation_portfolios.c.promotion_stage_id,
+                )
+                .where(
+                    simulation_portfolios.c.status == "active",
+                    simulation_portfolios.c.source_type == "strategy_version",
+                    simulation_portfolios.c.execution_adapter == "long_only",
+                )
+                .order_by(simulation_portfolios.c.updated_at.desc())
+            ).all()
+            selected = None
+            for candidate in candidates:
+                metadata = candidate._mapping
+                config = dict(metadata["_strategy_config"] or {})
+                if (
+                    str(config.get("autopilot_completion_contract_version") or "")
+                    .startswith("autopilot-completion-")
+                    and str(metadata["_paper_stage_status"]) == "active"
+                    and config.get("recommendation_enabled") is False
+                    and config.get("broker_connection_enabled") is False
+                    and config.get("real_trading_eligible") is False
+                ):
+                    selected = candidate
+                    break
+            if selected is None:
+                return {
+                    "contract_version": PAPER_TARGET_PROJECTION_VERSION,
+                    "status": "waiting_for_paper_account",
+                    "message": "等待通过最终 OOS 的自动驾驶策略创建隔离多头模拟账户",
+                    "mode": "paper_only",
+                    "recommendation_enabled": False,
+                    "real_trading_eligible": False,
+                    "simulation_portfolio": None,
+                    "signal_date": None,
+                    "trade_date": None,
+                    "targets": [],
+                }
+            batches = connection.execute(
+                select(simulation_batches)
+                .where(simulation_batches.c.portfolio_id == selected.id)
+                .order_by(
+                    simulation_batches.c.trade_date.desc(),
+                    simulation_batches.c.created_at.desc(),
+                )
+            ).all()
+
+        portfolio = selected
+        account = self._portfolio_dict(portfolio)
+        if not batches:
+            return {
+                "contract_version": PAPER_TARGET_PROJECTION_VERSION,
+                "status": "waiting_for_order_plan",
+                "message": "模拟账户已创建，等待首份冻结 Qlib 订单计划",
+                "mode": "paper_only",
+                "recommendation_enabled": False,
+                "real_trading_eligible": False,
+                "simulation_portfolio": {
+                    "id": account["id"],
+                    "name": account["name"],
+                    "status": account["status"],
+                    "strategy_version_id": str(portfolio.source_id),
+                },
+                "signal_date": None,
+                "trade_date": None,
+                "targets": [],
+            }
+        return self._paper_target_projection_from_batches(
+            portfolio=portfolio,
+            account=account,
+            paper_stage_opened_at=selected._mapping["_paper_stage_opened_at"],
+            batches=batches,
+        )
+
+    @classmethod
+    def _paper_target_projection_from_batches(
+        cls,
+        *,
+        portfolio: Any,
+        account: dict[str, Any],
+        paper_stage_opened_at: datetime,
+        batches: list[Any],
+    ) -> dict[str, Any]:
+        """Build a factual target-weight projection from verified batch rows."""
+
+        batch = batches[0]
+        payload = dict(batch.target_payload_json or {})
+        try:
+            cls._require_governed_long_only_target(
+                batch=batch,
+                portfolio=portfolio,
+                target_payload=payload,
+            )
+            plan = dict(payload["governed_order_plan"])
+            if (
+                str(plan.get("promotion_stage_id") or "")
+                != str(portfolio.promotion_stage_id or "")
+                or str(plan.get("promotion_stage_opened_at") or "")
+                != paper_stage_opened_at.isoformat()
+            ):
+                raise ValueError("Qlib order-plan is not bound to the active paper stage")
+            current_weights = cls._normalize_target_payload(
+                {"target_weights": payload.get("target_weights")}, adapter="long_only"
+            )["target_weights"]
+        except (KeyError, TypeError, ValueError) as exc:
+            return {
+                "contract_version": PAPER_TARGET_PROJECTION_VERSION,
+                "status": "blocked_invalid_order_plan",
+                "message": "最新模拟目标未通过不可变订单计划校验，已停止展示候选",
+                "blocker": str(exc),
+                "mode": "paper_only",
+                "recommendation_enabled": False,
+                "real_trading_eligible": False,
+                "simulation_portfolio": {
+                    "id": account["id"],
+                    "name": account["name"],
+                    "status": account["status"],
+                    "strategy_version_id": str(portfolio.source_id),
+                },
+                "signal_date": batch.signal_date.isoformat(),
+                "trade_date": batch.trade_date.isoformat(),
+                "targets": [],
+            }
+
+        previous_weights: dict[str, float] | None = None
+        previous_batch_id: str | None = None
+        if len(batches) > 1:
+            previous = batches[1]
+            previous_payload = dict(previous.target_payload_json or {})
+            try:
+                cls._require_governed_long_only_target(
+                    batch=previous,
+                    portfolio=portfolio,
+                    target_payload=previous_payload,
+                )
+                previous_weights = cls._normalize_target_payload(
+                    {"target_weights": previous_payload.get("target_weights")},
+                    adapter="long_only",
+                )["target_weights"]
+                previous_batch_id = str(previous.id)
+            except (KeyError, TypeError, ValueError):
+                # A corrupted predecessor must never change today's valid
+                # target.  We simply make the delta baseline unavailable.
+                previous_weights = None
+
+        targets = paper_target_adjustments(current_weights, previous_weights)
+        return {
+            "contract_version": PAPER_TARGET_PROJECTION_VERSION,
+            "status": "ready",
+            "message": "仅展示已冻结 Qlib 订单计划的模拟目标，不构成正式荐股或实盘指令",
+            "mode": "paper_only",
+            "recommendation_enabled": False,
+            "real_trading_eligible": False,
+            "simulation_portfolio": {
+                "id": account["id"],
+                "name": account["name"],
+                "status": account["status"],
+                "strategy_version_id": str(portfolio.source_id),
+            },
+            "batch": {
+                "id": str(batch.id),
+                "status": str(batch.status),
+                "order_plan_manifest_sha256": str(plan["manifest_sha256"]),
+                "target_weights_sha256": str(plan["target_weights_sha256"]),
+                "previous_batch_id": previous_batch_id,
+            },
+            "signal_date": batch.signal_date.isoformat(),
+            "trade_date": batch.trade_date.isoformat(),
+            "cash_weight": max(0.0, 1.0 - sum(current_weights.values())),
+            "targets": targets,
+        }
+
     def latest_nav(self, portfolio_id: str) -> dict[str, Any] | None:
         """Most recent NAV row by trade_date (health/certification source)."""
 
@@ -6288,8 +6651,19 @@ class SimulationStore:
             "governed_pair_plan": governed_pair_plan,
         }
 
-    def rows(self, portfolio_id: str, resource: str) -> list[dict[str, Any]]:
+    def rows(
+        self,
+        portfolio_id: str,
+        resource: str,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         resources = {
+            "batches": (
+                simulation_batches,
+                simulation_batches,
+                simulation_batches.c.created_at,
+            ),
             "orders": (
                 simulation_orders.join(
                     simulation_batches,
@@ -6317,6 +6691,26 @@ class SimulationStore:
                 simulation_external_flows,
                 simulation_external_flows,
                 simulation_external_flows.c.trade_date,
+            ),
+            "cash_flows": (
+                simulation_cash_flows,
+                simulation_cash_flows,
+                simulation_cash_flows.c.created_at,
+            ),
+            "corporate_events": (
+                simulation_corporate_events,
+                simulation_corporate_events,
+                simulation_corporate_events.c.created_at,
+            ),
+            "dividend_actions": (
+                simulation_dividend_actions,
+                simulation_dividend_actions,
+                simulation_dividend_actions.c.created_at,
+            ),
+            "dividend_entitlements": (
+                simulation_dividend_entitlements,
+                simulation_dividend_entitlements,
+                simulation_dividend_entitlements.c.updated_at,
             ),
             "fee_adjustments": (
                 simulation_fee_adjustments,
@@ -6362,16 +6756,22 @@ class SimulationStore:
             if resource in {"orders", "fills"}
             else table.c.portfolio_id
         )
+        statement = (
+            select(table)
+            .select_from(source)
+            .where(portfolio_column == portfolio_id)
+        )
+        if limit is None:
+            statement = statement.order_by(ordering)
+        else:
+            statement = statement.order_by(ordering.desc()).limit(limit)
         with self.engine.connect() as connection:
             rows = [
                 row_dict(row)
-                for row in connection.execute(
-                    select(table)
-                    .select_from(source)
-                    .where(portfolio_column == portfolio_id)
-                    .order_by(ordering)
-                )
+                for row in connection.execute(statement)
             ]
+        if limit is not None:
+            rows.reverse()
         if resource == "positions":
             for row in rows:
                 row["free_sellable_quantity"] = int(
@@ -6383,6 +6783,11 @@ class SimulationStore:
     def _portfolio_dict(row: Any) -> dict[str, Any]:
         result = row_dict(row)
         result["execution_policy"] = result.pop("execution_policy_json")
+        is_pair = result["execution_adapter"] == "pair"
+        result["simulation_mode"] = "shadow_pair" if is_pair else "paper"
+        result["synthetic_short_exposure"] = is_pair
+        result["financing_enabled"] = False
+        result["real_trading_eligible"] = False
         result["provenance"] = {
             "daily": {
                 "dataset": result["daily_dataset"],

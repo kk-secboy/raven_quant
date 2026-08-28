@@ -337,7 +337,6 @@ def test_api_keeps_optional_broker_plugin_outside_research_routes(
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
-    monkeypatch.setenv("BROKER_MODE", "disabled")
     app = create_app(tmp_path)
     with TestClient(app) as client:
         state = client.get("/api/broker")
@@ -359,7 +358,7 @@ def test_api_keeps_optional_broker_plugin_outside_research_routes(
         enabled_capabilities = client.get("/api/capabilities").json()
     assert enabled.status_code == 404
     assert enabled_settings.status_code == 404
-    assert enabled_capabilities["broker_qmt"] is True
+    assert enabled_capabilities["broker_qmt"] is False
 
 
 def test_api_creates_bounded_rdagent_research_run(

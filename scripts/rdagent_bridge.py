@@ -71,8 +71,11 @@ def _source_tree_sha256(path: str | None) -> str | None:
         for item in root.rglob("*")
         if item.is_file()
         and not item.is_symlink()
-        and ".git" not in item.relative_to(root).parts
-        and "__pycache__" not in item.relative_to(root).parts
+        and not any(
+            part in {".git", "__pycache__", "build"}
+            or part.endswith(".egg-info")
+            for part in item.relative_to(root).parts
+        )
         and not item.name.endswith((".pyc", ".pyo"))
     )
     for item in files:

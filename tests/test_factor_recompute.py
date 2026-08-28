@@ -6,9 +6,11 @@ import pandas as pd
 import pytest
 
 from quant_platform.factor_recompute import (
+    FACTOR_SUBMITTED_INDEX_CONTRACT_VERSION,
     compare_submitted_values,
     execute_factor_code,
     require_exact_oos_coverage,
+    submitted_comparison_is_admissible,
     validate_factor_code,
     validate_factor_prefix_invariance,
 )
@@ -53,6 +55,27 @@ def test_factor_code_rejects_filesystem_and_process_capabilities() -> None:
         validate_factor_code("import os\nos.system('whoami')\n")
 
 
+def test_factor_code_allows_local_path_boilerplate_in_the_isolated_sandbox() -> None:
+    validate_factor_code(
+        "import os\n"
+        "from pathlib import Path\n"
+        "input_path = os.path.join(os.path.dirname(__file__), 'daily_pv.h5')\n"
+        "output_path = Path(__file__).parent / 'result.h5'\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from pathlib import Path\nvalue = Path('/etc/passwd').read_text()\n",
+        "import os\nvalue = list(os.walk('/'))\n",
+    ],
+)
+def test_factor_code_rejects_path_enumeration_and_reads(source: str) -> None:
+    with pytest.raises(ValueError, match="forbidden capability"):
+        validate_factor_code(source)
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -88,7 +111,9 @@ def test_factor_recompute_fails_closed_without_container(
         )
 
 
-def test_submitted_values_require_the_exact_recomputed_index(tmp_path: Path) -> None:
+def test_submitted_values_reject_coordinates_missing_from_recomputation(
+    tmp_path: Path,
+) -> None:
     pytest.importorskip("tables")
     submitted_index = pd.MultiIndex.from_tuples(
         [
@@ -112,6 +137,162 @@ def test_submitted_values_require_the_exact_recomputed_index(tmp_path: Path) -> 
     comparison = compare_submitted_values(submitted_path, recomputed)
 
     assert comparison["index_exact_match"] is False
+    assert comparison["index_subset_match"] is False
+    assert comparison["overlap_rows"] == 1
+    assert comparison["exact_match"] is False
+
+
+def test_submitted_values_accept_a_complete_bounded_suffix(tmp_path: Path) -> None:
+    pytest.importorskip("tables")
+    recomputed_index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2026-06-30"), "SH600000"),
+            (pd.Timestamp("2026-07-01"), "SH600000"),
+            (pd.Timestamp("2026-07-01"), "SH600001"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    submitted_index = recomputed_index[1:]
+    submitted = pd.DataFrame(
+        {"factor": [1.0, float("nan")]}, index=submitted_index
+    )
+    recomputed = pd.DataFrame(
+        {"factor": [9.0, 1.0, float("nan")]}, index=recomputed_index
+    )
+    submitted_path = tmp_path / "submitted-subset.h5"
+    submitted.to_hdf(submitted_path, key="data", mode="w")
+
+    comparison = compare_submitted_values(submitted_path, recomputed)
+
+    assert comparison["index_exact_match"] is False
+    assert comparison["index_subset_match"] is True
+    assert comparison["overlap_rows"] == 2
+    assert comparison["contract_version"] == FACTOR_SUBMITTED_INDEX_CONTRACT_VERSION
+    assert comparison["index_prefix_extension_match"] is True
+    assert comparison["index_difference_kind"] == "recomputed_history_prefix"
+    assert comparison["recomputed_history_prefix_rows"] == 1
+    assert comparison["missing_on_or_after_submitted_start_rows"] == 0
+    assert comparison["exact_match"] is True
+    assert submitted_comparison_is_admissible(comparison) is True
+    legacy_ambiguous = dict(comparison)
+    legacy_ambiguous.pop("contract_version")
+    assert submitted_comparison_is_admissible(legacy_ambiguous) is False
+    forged_missing_tail = dict(comparison)
+    forged_missing_tail["submitted_end"] = "2026-06-30T00:00:00"
+    assert submitted_comparison_is_admissible(forged_missing_tail) is False
+
+
+@pytest.mark.parametrize("missing_kind", ["interior", "tail"])
+def test_submitted_values_reject_gapped_or_truncated_subsets(
+    tmp_path: Path, missing_kind: str
+) -> None:
+    pytest.importorskip("tables")
+    dates = pd.date_range("2026-07-01", periods=4, freq="B")
+    recomputed_index = pd.MultiIndex.from_product(
+        [dates, ["SH600000", "SH600001"]], names=["datetime", "instrument"]
+    )
+    recomputed = pd.DataFrame(
+        {"factor": range(1, len(recomputed_index) + 1)},
+        index=recomputed_index,
+        dtype=float,
+    )
+    if missing_kind == "interior":
+        submitted = recomputed.drop(index=(dates[2], "SH600001"))
+    else:
+        submitted = recomputed.loc[
+            recomputed.index.get_level_values("datetime") < dates[-1]
+        ]
+    submitted_path = tmp_path / f"submitted-{missing_kind}.h5"
+    submitted.to_hdf(submitted_path, key="data", mode="w")
+
+    comparison = compare_submitted_values(submitted_path, recomputed)
+
+    assert comparison["index_subset_match"] is True
+    assert comparison["index_prefix_extension_match"] is False
+    assert comparison["missing_on_or_after_submitted_start_rows"] > 0
+    assert comparison["exact_match"] is False
+    assert submitted_comparison_is_admissible(comparison) is False
+
+
+def test_submitted_subset_still_requires_exact_values(tmp_path: Path) -> None:
+    pytest.importorskip("tables")
+    recomputed_index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2026-06-30"), "SH600000"),
+            (pd.Timestamp("2026-07-01"), "SH600000"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    submitted = pd.DataFrame(
+        {"factor": [2.0]}, index=recomputed_index[1:]
+    )
+    recomputed = pd.DataFrame(
+        {"factor": [9.0, 1.0]}, index=recomputed_index
+    )
+    submitted_path = tmp_path / "submitted-wrong-value.h5"
+    submitted.to_hdf(submitted_path, key="data", mode="w")
+
+    comparison = compare_submitted_values(submitted_path, recomputed)
+
+    assert comparison["index_subset_match"] is True
+    assert comparison["exact_match"] is False
+
+
+def test_submitted_values_accept_only_leading_warmup_nans(tmp_path: Path) -> None:
+    pytest.importorskip("tables")
+    dates = pd.date_range("2026-07-01", periods=4, freq="B")
+    index = pd.MultiIndex.from_product(
+        [dates, ["SH600000", "SH600001"]], names=["datetime", "instrument"]
+    )
+    recomputed = pd.DataFrame({"factor": range(1, len(index) + 1)}, index=index, dtype=float)
+    submitted = recomputed.copy()
+    submitted.loc[(dates[:2], "SH600000"), "factor"] = float("nan")
+    submitted.loc[(dates[:1], "SH600001"), "factor"] = float("nan")
+    submitted_path = tmp_path / "submitted-warmup.h5"
+    submitted.to_hdf(submitted_path, key="data", mode="w")
+
+    comparison = compare_submitted_values(submitted_path, recomputed)
+
+    assert comparison["exact_match"] is True
+    assert comparison["finite_value_match"] is True
+    assert comparison["warmup_prefix_only"] is True
+    assert comparison["warmup_prefix_rows"] == 3
+
+
+def test_submitted_values_reject_interior_nan_mismatches(tmp_path: Path) -> None:
+    pytest.importorskip("tables")
+    dates = pd.date_range("2026-07-01", periods=4, freq="B")
+    index = pd.MultiIndex.from_product(
+        [dates, ["SH600000"]], names=["datetime", "instrument"]
+    )
+    recomputed = pd.DataFrame({"factor": [1.0, 2.0, 3.0, 4.0]}, index=index)
+    submitted = recomputed.copy()
+    submitted.iloc[2, 0] = float("nan")
+    submitted_path = tmp_path / "submitted-interior-gap.h5"
+    submitted.to_hdf(submitted_path, key="data", mode="w")
+
+    comparison = compare_submitted_values(submitted_path, recomputed)
+
+    assert comparison["finite_value_match"] is True
+    assert comparison["warmup_prefix_only"] is False
+    assert comparison["exact_match"] is False
+
+
+def test_submitted_values_reject_all_nan_instrument(tmp_path: Path) -> None:
+    pytest.importorskip("tables")
+    dates = pd.date_range("2026-07-01", periods=3, freq="B")
+    index = pd.MultiIndex.from_product(
+        [dates, ["SH600000", "SH600001"]], names=["datetime", "instrument"]
+    )
+    recomputed = pd.DataFrame({"factor": range(1, len(index) + 1)}, index=index, dtype=float)
+    submitted = recomputed.copy()
+    submitted.loc[(slice(None), "SH600001"), "factor"] = float("nan")
+    submitted_path = tmp_path / "submitted-hidden-instrument.h5"
+    submitted.to_hdf(submitted_path, key="data", mode="w")
+
+    comparison = compare_submitted_values(submitted_path, recomputed)
+
+    assert comparison["warmup_prefix_only"] is False
     assert comparison["exact_match"] is False
 
 

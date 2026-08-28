@@ -831,6 +831,10 @@ def rdagent_command(
         "QLIB_DOCKER_NETWORK": "none",
         "QLIB_DOCKER_BUILD_FROM_DOCKERFILE": "false",
         "QLIB_DOCKER_IMAGE": settings.rdagent_qlib_sandbox_image,
+        # The regular research queues are deliberately CPU-only.  RD-Agent's
+        # upstream default probes NVIDIA on every Docker run and can leave
+        # failed probe containers behind on a non-GPU host.
+        "QLIB_DOCKER_ENABLE_GPU": "false",
         "DS_DOCKER_NETWORK": "none",
         "DS_DOCKER_BUILD_FROM_DOCKERFILE": "false",
         "DS_DOCKER_IMAGE": settings.rdagent_data_science_image,
@@ -863,6 +867,7 @@ def rdagent_command(
         qlib_home_host = trace_path.parent / "qlib-home"
         qlib_home_host_str = _runtime_path(qlib_home_host, is_wsl=is_wsl)
         dataset_host_str = _runtime_path(research_dataset_path, is_wsl=is_wsl)
+        runtime_root_str = _runtime_path(runtime_root, is_wsl=is_wsl)
         prefix = {
             "fin_factor": "QLIB_FACTOR",
             "fin_factor_report": "QLIB_FACTOR",
@@ -927,6 +932,15 @@ def rdagent_command(
                         qlib_home_host_str: {"bind": "/root/.qlib/", "mode": "rw"},
                         dataset_host_str: {
                             "bind": "/root/.qlib/qlib_data/cn_data",
+                            "mode": "ro",
+                        },
+                        # Generated workspaces contain links into this
+                        # run-scoped source-data tree.  Expose the tree at the
+                        # same absolute path read-only so the Qlib container
+                        # can materialize those inputs before launching the
+                        # narrower networkless factor sandbox.
+                        runtime_root_str: {
+                            "bind": runtime_root_str,
                             "mode": "ro",
                         },
                     },

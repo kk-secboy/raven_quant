@@ -27,6 +27,7 @@ required cycles because cycle shape is strategy-specific.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import asdict, dataclass
@@ -69,6 +70,64 @@ _REFERENCE_ORDER_VALUE = 100_000.0
 _DEFAULT_PAPER_INITIAL_CASH = 100_000.0
 _RECONCILIATION_TOLERANCE = 1e-6
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_autopilot_config(value: Any) -> bool:
+    return isinstance(value, dict) and str(
+        value.get("autopilot_completion_contract_version") or ""
+    ).startswith("autopilot-completion-")
+
+
+def resolve_paper_initial_cash(
+    config: dict[str, Any], *, requested_initial_cash: float | None = None
+) -> float:
+    """Resolve paper capital without changing formal execution economics."""
+
+    capital_contract = config.get("autopilot_capital_execution_contract")
+    if not isinstance(capital_contract, dict):
+        return float(
+            requested_initial_cash
+            if requested_initial_cash is not None
+            else config.get("paper_initial_cash", _DEFAULT_PAPER_INITIAL_CASH)
+        )
+    expected_contract = {
+        "contract_version": "autopilot-capital-execution-v1",
+        "portfolio_construction": str(config.get("portfolio_construction") or ""),
+        "capacity_notional": float(config.get("capacity_notional") or 0.0),
+        "paper_initial_cash": float(config.get("paper_initial_cash") or 0.0),
+        "topk": int(config.get("topk") or 0),
+        "n_drop": int(config.get("n_drop") or 0),
+        "lot_size": int(config.get("lot_size") or 0),
+        "min_commission": float(config.get("min_commission") or 0.0),
+        "cost_schedule_version": str(config.get("cost_schedule_version") or ""),
+    }
+    if (
+        capital_contract != expected_contract
+        or _canonical_sha256(capital_contract)
+        != str(config.get("autopilot_capital_execution_contract_sha256") or "")
+    ):
+        raise ValueError("paper capital execution contract is inconsistent")
+    capacity_notional = float(capital_contract["capacity_notional"])
+    configured_cash = float(capital_contract["paper_initial_cash"])
+    if capacity_notional <= 0.0 or configured_cash != capacity_notional:
+        raise ValueError("paper cash differs from the formal capacity notional")
+    if (
+        requested_initial_cash is not None
+        and float(requested_initial_cash) != capacity_notional
+    ):
+        raise ValueError("caller paper cash differs from the frozen capital contract")
+    return capacity_notional
 
 
 @dataclass(frozen=True)
@@ -454,10 +513,10 @@ class PromotionStore:
                 select(strategy_versions).where(strategy_versions.c.id == version_id)
             ).one()
         config = dict(version.config_json or {})
-        cash = float(
-            initial_cash
-            if initial_cash is not None
-            else config.get("paper_initial_cash", _DEFAULT_PAPER_INITIAL_CASH)
+        # Preserve legacy manually-authored strategy versions, while new
+        # Autopilot versions must satisfy the strict contract.
+        cash = resolve_paper_initial_cash(
+            config, requested_initial_cash=initial_cash
         )
         simulation = SimulationStore(self.database_url)
         with self.engine.connect() as connection:
@@ -535,8 +594,90 @@ class PromotionStore:
             raise ValueError(
                 "paper stage already owns a simulation account with different evidence"
             )
-        simulation.set_status(portfolio["id"], "active")
+        if abs(float(portfolio.get("initial_cash") or 0.0) - cash) > 1e-6:
+            raise ValueError(
+                "paper stage account notional differs from the frozen formal contract"
+            )
         with self.engine.begin() as connection:
+            current_portfolio = connection.execute(
+                select(simulation_portfolios)
+                .where(simulation_portfolios.c.id == portfolio["id"])
+                .with_for_update()
+            ).first()
+            if current_portfolio is None:
+                raise ValueError("paper stage simulation account disappeared")
+            SimulationStore._require_current_source_contract(
+                connection, current_portfolio
+            )
+
+            # Autopilot has one official forward-paper account at a time.  A
+            # new champion does not erase prior ledgers: it freezes their
+            # promotion stage and pauses the account atomically before the new
+            # account becomes active.  Manual/non-Autopilot paper accounts are
+            # outside this policy and are never touched here.
+            if _is_autopilot_config(config):
+                prior_rows = connection.execute(
+                    select(
+                        strategy_promotion_stages,
+                        strategy_versions.c.strategy_id.label("source_strategy_id"),
+                        strategy_versions.c.config_json.label("source_config_json"),
+                    )
+                    .join(
+                        strategy_versions,
+                        strategy_versions.c.id
+                        == strategy_promotion_stages.c.strategy_version_id,
+                    )
+                    .where(
+                        strategy_promotion_stages.c.status == _STAGE_ACTIVE,
+                        strategy_promotion_stages.c.strategy_version_id != version_id,
+                    )
+                    .with_for_update()
+                ).all()
+                now = _now()
+                for prior in prior_rows:
+                    if not _is_autopilot_config(prior.source_config_json):
+                        continue
+                    prior_portfolio_id = str(
+                        prior.simulation_portfolio_id or ""
+                    ).strip()
+                    if prior_portfolio_id:
+                        connection.execute(
+                            update(simulation_portfolios)
+                            .where(
+                                simulation_portfolios.c.id == prior_portfolio_id,
+                                simulation_portfolios.c.status == "active",
+                            )
+                            .values(status="paused", updated_at=now)
+                        )
+                    connection.execute(
+                        update(strategy_promotion_stages)
+                        .where(
+                            strategy_promotion_stages.c.id == prior.id,
+                            strategy_promotion_stages.c.status == _STAGE_ACTIVE,
+                        )
+                        .values(status=_STAGE_FROZEN)
+                    )
+                    connection.execute(
+                        insert(strategy_events).values(
+                            strategy_id=str(prior.source_strategy_id),
+                            strategy_version_id=str(prior.strategy_version_id),
+                            event_type="strategy.paper_stage_superseded",
+                            actor=actor.strip(),
+                            payload_json={
+                                "stage_id": str(prior.id),
+                                "simulation_portfolio_id": prior_portfolio_id or None,
+                                "superseded_by_strategy_version_id": version_id,
+                                "history_retained": True,
+                            },
+                            created_at=now,
+                        )
+                    )
+
+            connection.execute(
+                update(simulation_portfolios)
+                .where(simulation_portfolios.c.id == portfolio["id"])
+                .values(status="active", updated_at=_now())
+            )
             attached = connection.execute(
                 update(strategy_promotion_stages)
                 .where(

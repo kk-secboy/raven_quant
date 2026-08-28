@@ -90,7 +90,11 @@ from .partitioning import (
 )
 from .planner import BootstrapPlanner, ExecutionDataPlanner, compact_date, parse_date, today_cn
 from .provider import TushareHttpProvider
-from .qlib_builder import QlibBuilder, verify_qlib_output_manifest
+from .qlib_builder import (
+    DAILY_QLIB_DUMP_WORKERS,
+    QlibBuilder,
+    verify_qlib_output_manifest,
+)
 from .rate_limit import GlobalRateGate
 from .reference_data import (
     STK_SURV_PROVIDER_PAGE_LIMIT,
@@ -3961,7 +3965,7 @@ def _build_qlib(
         qlib_repo=context.settings.qlib_repo,
         qlib_python=context.settings.qlib_python,
         wsl_distro=context.settings.qlib_wsl_distro,
-        max_workers=min(16, max(1, context.settings.workers * 2)),
+        max_workers=DAILY_QLIB_DUMP_WORKERS,
     )
 
 
@@ -4349,8 +4353,12 @@ def _explicit_execution_quality_gate(
     ashare_rows = selected.get("ashare_5m") or []
     if ashare_rows:
         ashare_paths = [
-            (data_root / str(row["output_path"])).resolve() for row in ashare_rows
+            (data_root / str(row["output_path"])).resolve()
+            for row in ashare_rows
+            if str(row.get("output_path") or "").endswith(".parquet")
         ]
+        if not ashare_paths:
+            raise ValueError("A-share five-minute selection has no non-empty Parquet units")
         source_errors, source_warnings, source_audit = verify_ashare_5m_source_files(
             ashare_paths,
             snapshot_start=start_date,

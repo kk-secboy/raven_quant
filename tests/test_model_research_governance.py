@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -9,12 +10,15 @@ from quant_platform.model_research_governance import (
     MODEL_RESEARCH_CONTRACT_VERSION,
     QUANT_BUNDLE_CONTRACT_VERSION,
     RUN_GROUP_MULTIPLE_TESTING_CONTRACT_VERSION,
+    build_run_multiple_testing_evidence,
     canonical_sha256,
     file_sha256,
     validate_independent_model_evidence,
     validate_quant_bundle_evidence,
     verify_model_prediction_artifact,
 )
+
+pytestmark = pytest.mark.no_database
 
 
 def _multiple_testing(*trial_definitions: dict[str, str]) -> dict:
@@ -46,6 +50,7 @@ def _multiple_testing(*trial_definitions: dict[str, str]) -> dict:
         ),
         "maximum_pbo": 0.50,
         "trial_daily_sharpes": [0.10] * len(names),
+        "trial_daily_means": [0.01] * len(names),
         "returns_path": "run-multiple-testing.parquet",
         "returns_sha256": "f" * 64,
         "observations": 120,
@@ -67,6 +72,104 @@ def _metrics() -> dict[str, float]:
         "total_cost": 0.01,
         "average_turnover": 0.15,
     }
+
+
+def test_failed_preregistered_trial_stays_in_holm_and_pbo_family(
+    tmp_path: Path,
+) -> None:
+    index = pd.date_range("2024-01-02", periods=96, freq="B")
+    first = pd.Series(0.001 + np.sin(np.arange(96)) * 0.0002, index=index)
+    second = pd.Series(0.0008 + np.cos(np.arange(96)) * 0.0003, index=index)
+    failed = pd.Series(0.0, index=index)
+    definitions = [
+        ({"name": "first", "candidate_id": "a", "kind": "model"}, first),
+        ({"name": "second", "candidate_id": "b", "kind": "model"}, second),
+        (
+            {
+                "name": "failed:joint_vs_incumbent",
+                "candidate_id": "failed",
+                "kind": "fin_quant_joint_delta",
+                "ablation": "joint_vs_incumbent",
+            },
+            failed,
+        ),
+    ]
+    evidence = build_run_multiple_testing_evidence(
+        research_run_id="run-with-failure",
+        trial_series=definitions,
+        output=tmp_path / "multiple",
+        forced_raw_p_values={"failed:joint_vs_incumbent": 1.0},
+    )
+    failed_index = evidence["trial_names"].index("failed:joint_vs_incumbent")
+    assert evidence["raw_p_values"][failed_index] == 1.0
+    assert evidence["holm_adjusted_p_values"][failed_index] == 1.0
+    assert evidence["pbo_trial_names"] == evidence["trial_names"]
+    assert evidence["forced_raw_p_values"] == {
+        "failed:joint_vs_incumbent": 1.0
+    }
+
+
+def _quant_incumbent() -> dict:
+    value = {
+        "contract_version": "fin-quant-baseline-prediction-v1",
+        "kind": "model",
+        "candidate_id": "incumbent-model-1",
+        "candidate_manifest_sha256": "1" * 64,
+        "admission_evidence_sha256": "2" * 64,
+        "selection_evidence_sha256": "3" * 64,
+        "dataset_identity_sha256": "c" * 64,
+        "quant_retraining_supported": True,
+    }
+    value["evidence_sha256"] = canonical_sha256(value)
+    return value
+
+
+def _quant_incumbent_comparison() -> dict:
+    value = {
+        "contract_version": "fin-quant-incumbent-comparison-v2",
+        "candidate_id": "bundle-1",
+        "incumbent_candidate_id": "incumbent-model-1",
+        "profile_id": "recent_3y",
+        "seed_aggregation": "equal_mean_fixed_seeds",
+        "multiple_testing_trial_name": "bundle-1:joint_vs_incumbent",
+        "observed_mean_difference": 0.01,
+        "one_sided_p_value": 0.01,
+        "raw_one_sided_p_value": 0.01,
+        "holm_adjusted_one_sided_p_value": 0.02,
+        "family_observed_mean_difference": 0.01,
+        "maximum_one_sided_p_value": 0.05,
+        "pbo_eligible": True,
+        "passed": True,
+        "final_oos_opened": False,
+    }
+    value["evidence_sha256"] = canonical_sha256(value)
+    return value
+
+
+def _quant_multiple_testing() -> dict:
+    return _multiple_testing(
+        {
+            "name": "incumbent:incumbent-model-1",
+            "candidate_id": "incumbent-model-1",
+            "kind": "fin_quant_incumbent",
+            "ablation": "incumbent",
+        },
+        *(
+            {
+                "name": f"bundle-1:{name}",
+                "candidate_id": "bundle-1",
+                "kind": "quant_bundle",
+                "ablation": name,
+            }
+            for name in ("factor_only", "model_only", "joint")
+        ),
+        {
+            "name": "bundle-1:joint_vs_incumbent",
+            "candidate_id": "bundle-1",
+            "kind": "fin_quant_joint_delta",
+            "ablation": "joint_vs_incumbent",
+        },
+    )
 
 
 def _model_evidence() -> dict:
@@ -217,19 +320,14 @@ def test_quant_bundle_rejects_component_mutation() -> None:
         "experiment_family_id": "family-1",
         "factors": [{"candidate_id": "factor-1", "code_sha256": "a" * 64}],
         "model": {"code_sha256": "b" * 64, "recipe_sha256": "d" * 64},
+        "baseline_prediction_champion": _quant_incumbent(),
+        "baseline_prediction_champion_sha256": _quant_incumbent()[
+            "evidence_sha256"
+        ],
+        "incumbent_comparison": _quant_incumbent_comparison(),
         "execution_environment_sha256": "e" * 64,
         "ablations": {name: ablation() for name in ("factor_only", "model_only", "joint")},
-        "multiple_testing": _multiple_testing(
-            *(
-                {
-                    "name": f"bundle-1:{name}",
-                    "candidate_id": "bundle-1",
-                    "kind": "quant_bundle",
-                    "ablation": name,
-                }
-                for name in ("factor_only", "model_only", "joint")
-            )
-        ),
+        "multiple_testing": _quant_multiple_testing(),
     }
     bundle["bundle_sha256"] = canonical_sha256(bundle)
     validate_quant_bundle_evidence(bundle, dataset_identity_sha256="c" * 64)
@@ -277,23 +375,18 @@ def test_quant_bundle_gates_joint_but_keeps_ablations_diagnostic() -> None:
         "experiment_family_id": "family-1",
         "factors": [{"candidate_id": "factor-1", "code_sha256": "a" * 64}],
         "model": {"code_sha256": "b" * 64, "recipe_sha256": "d" * 64},
+        "baseline_prediction_champion": _quant_incumbent(),
+        "baseline_prediction_champion_sha256": _quant_incumbent()[
+            "evidence_sha256"
+        ],
+        "incumbent_comparison": _quant_incumbent_comparison(),
         "execution_environment_sha256": "e" * 64,
         "ablations": {
             "factor_only": ablation(rank_ic=-0.02),
             "model_only": ablation(rank_ic=0.01),
             "joint": ablation(rank_ic=0.04),
         },
-        "multiple_testing": _multiple_testing(
-            *(
-                {
-                    "name": f"bundle-1:{name}",
-                    "candidate_id": "bundle-1",
-                    "kind": "quant_bundle",
-                    "ablation": name,
-                }
-                for name in ("factor_only", "model_only", "joint")
-            )
-        ),
+        "multiple_testing": _quant_multiple_testing(),
     }
     bundle["bundle_sha256"] = canonical_sha256(bundle)
     validate_quant_bundle_evidence(bundle, dataset_identity_sha256="c" * 64)

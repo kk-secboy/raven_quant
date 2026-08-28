@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .model_recompute import verify_governed_checkpoint
 from .model_research_governance import (
     MODEL_PREDICTION_CONTRACT_VERSION,
     MODEL_REFIT_POLICY,
@@ -18,10 +20,15 @@ from .model_research_governance import (
     is_sha256,
     validate_independent_model_evidence,
     validate_quant_bundle_evidence,
+    validate_run_multiple_testing_evidence,
 )
 
 MODEL_SIGNAL_CONTRACT_VERSION = "strategy-model-signal-v1"
+MODEL_ENSEMBLE_SIGNAL_CONTRACT_VERSION = "strategy-model-ensemble-signal-v1"
 MODEL_FORMAL_ADMISSION_CONTRACT_VERSION = "formal-model-admission-binding-v1"
+MODEL_ENSEMBLE_FORMAL_ADMISSION_CONTRACT_VERSION = (
+    "formal-model-ensemble-admission-binding-v1"
+)
 MODEL_FACTOR_VALIDATION_NOT_APPLICABLE_STATUS = "not_applicable_model_prediction_independent_grid"
 MODEL_FACTOR_VALIDATION_NOT_APPLICABLE_REASON = (
     "model predictions are validated by the sealed independent pre-final grid; "
@@ -52,11 +59,79 @@ def normalize_model_signal_config(config: dict[str, Any]) -> dict[str, Any]:
                 "quant_bundle_sha256",
                 "quant_bundle_factor_contract",
                 "quant_bundle_factor_contract_sha256",
+                "model_ensemble_candidate_id",
+                "model_ensemble_evaluation_id",
+                "model_ensemble_manifest_sha256",
+                "model_ensemble_evidence_sha256",
+                "model_component_candidate_ids",
+                "model_component_families",
             )
             if result.get(key) is not None
         ]
         if forbidden:
             raise ValueError("factor-score strategy cannot bind model candidate fields")
+        return result
+
+    ensemble_id = str(result.get("model_ensemble_candidate_id") or "").strip()
+    if ensemble_id:
+        forbidden = (
+            "model_candidate_id",
+            "model_evaluation_id",
+            "model_code_sha256",
+            "model_recipe_sha256",
+            "model_evidence_sha256",
+            "feature_set_id",
+            "feature_set_definition_sha256",
+            "quant_bundle_candidate_id",
+            "quant_bundle_evaluation_id",
+            "quant_bundle_sha256",
+            "quant_bundle_factor_contract",
+            "quant_bundle_factor_contract_sha256",
+        )
+        if any(result.get(key) is not None for key in forbidden):
+            raise ValueError("ensemble strategy cannot bind a substituted single model")
+        if not str(result.get("model_ensemble_evaluation_id") or "").strip():
+            raise ValueError("ensemble strategy must bind its primary evaluation")
+        for key in (
+            "model_ensemble_manifest_sha256",
+            "model_ensemble_evidence_sha256",
+        ):
+            if not is_sha256(result.get(key)):
+                raise ValueError(f"ensemble strategy {key} is missing or invalid")
+        component_ids = result.get("model_component_candidate_ids")
+        families = result.get("model_component_families")
+        if (
+            not isinstance(component_ids, list)
+            or not 2 <= len(component_ids) <= 3
+            or len(set(map(str, component_ids))) != len(component_ids)
+            or any(not str(item).strip() for item in component_ids)
+            or not isinstance(families, list)
+            or len(families) != len(component_ids)
+            or len(set(map(str, families))) != len(families)
+            or any(not str(item).strip() for item in families)
+        ):
+            raise ValueError("ensemble strategy components must be two or three distinct families")
+        if (
+            result.get("model_ensemble_combiner") != "equal_rank"
+            or result.get("model_ensemble_stacking") is not False
+        ):
+            raise ValueError("only non-stacking equal-rank model ensembles are governed")
+        result["model_component_candidate_ids"] = [str(item) for item in component_ids]
+        result["model_component_families"] = [str(item) for item in families]
+        result.setdefault("model_primary_profile_id", PRIMARY_MODEL_PROFILE)
+        result.setdefault("model_primary_seed", PRIMARY_MODEL_SEED)
+        result.setdefault("model_refit_policy", dict(MODEL_REFIT_POLICY))
+        result.setdefault("model_refit_policy_sha256", MODEL_REFIT_POLICY_SHA256)
+        if (
+            result.get("model_primary_profile_id") != PRIMARY_MODEL_PROFILE
+            or int(result.get("model_primary_seed") or 0) != PRIMARY_MODEL_SEED
+            or result.get("model_refit_policy") != MODEL_REFIT_POLICY
+            or result.get("model_refit_policy_sha256") != MODEL_REFIT_POLICY_SHA256
+            or canonical_sha256(result["model_refit_policy"])
+            != result["model_refit_policy_sha256"]
+        ):
+            raise ValueError("ensemble strategy primary cell/refit policy is not governed")
+        result["model_signal_contract_version"] = MODEL_ENSEMBLE_SIGNAL_CONTRACT_VERSION
         return result
 
     required_text = ("model_candidate_id", "model_evaluation_id", "feature_set_id")
@@ -115,6 +190,27 @@ def model_signal_identity(config: dict[str, Any]) -> dict[str, Any] | None:
     normalized = normalize_model_signal_config(config)
     if normalized["signal_source"] != "model_prediction":
         return None
+    if normalized.get("model_ensemble_candidate_id") is not None:
+        fields = (
+            "model_signal_contract_version",
+            "model_ensemble_candidate_id",
+            "model_ensemble_evaluation_id",
+            "model_ensemble_manifest_sha256",
+            "model_ensemble_evidence_sha256",
+            "model_ensemble_combiner",
+            "model_ensemble_stacking",
+            "model_component_candidate_ids",
+            "model_component_families",
+            "model_primary_profile_id",
+            "model_primary_seed",
+            "model_refit_policy_sha256",
+        )
+        identity = {
+            key: normalized.get(key)
+            for key in fields
+            if normalized.get(key) is not None
+        }
+        return {**identity, "identity_sha256": canonical_sha256(identity)}
     fields = (
         "model_signal_contract_version",
         "model_candidate_id",
@@ -304,6 +400,142 @@ def build_model_formal_admission_binding(
     return payload
 
 
+def build_model_ensemble_formal_admission_binding(
+    *,
+    config: dict[str, Any],
+    dataset_identity_sha256: str,
+    pre_final_end: str,
+    ensemble_admission_evidence: Mapping[str, Any],
+    component_model_bindings: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Freeze an admitted equal-rank ensemble and all component admissions."""
+
+    identity = model_signal_identity(config)
+    if identity is None or not identity.get("model_ensemble_candidate_id"):
+        raise ValueError("formal ensemble admission requires an ensemble model signal")
+    if not is_sha256(dataset_identity_sha256):
+        raise ValueError("formal ensemble dataset identity SHA-256 is invalid")
+    admission = dict(ensemble_admission_evidence)
+    recorded_admission_sha = str(admission.get("evidence_sha256") or "")
+    if (
+        canonical_sha256(
+            {key: value for key, value in admission.items() if key != "evidence_sha256"}
+        )
+        != recorded_admission_sha
+        or recorded_admission_sha != identity["model_ensemble_evidence_sha256"]
+        or admission.get("contract_version") != "model-ensemble-admission-v1"
+        or admission.get("status") != "passed"
+    ):
+        raise ValueError("formal ensemble admission wrapper is invalid")
+    independent = admission.get("independent_evidence")
+    if not isinstance(independent, Mapping):
+        raise ValueError("formal ensemble has no independent evidence")
+    independent_value = dict(independent)
+    independent_sha = canonical_sha256(
+        {key: value for key, value in independent_value.items() if key != "evidence_sha256"}
+    )
+    ensemble_id = str(identity["model_ensemble_candidate_id"])
+    profiles = independent_value.get("profiles")
+    multiple = independent_value.get("multiple_testing")
+    if (
+        independent_value.get("evidence_sha256") != independent_sha
+        or admission.get("independent_evidence_sha256") != independent_sha
+        or independent_value.get("contract_version")
+        != "model-ensemble-independent-evaluation-v1"
+        or independent_value.get("source") != "independent_qlib_recompute"
+        or independent_value.get("ensemble_id") != ensemble_id
+        or independent_value.get("ensemble_manifest_sha256")
+        != identity["model_ensemble_manifest_sha256"]
+        or independent_value.get("dataset_identity_sha256") != dataset_identity_sha256
+        or independent_value.get("combiner") != "equal_rank"
+        or independent_value.get("stacking") is not False
+        or independent_value.get("final_oos_opened") is not False
+        or not is_sha256(independent_value.get("execution_environment_sha256"))
+        or not isinstance(profiles, Mapping)
+        or set(profiles) != set(REQUIRED_RESEARCH_PROFILES)
+        or not isinstance(multiple, Mapping)
+    ):
+        raise ValueError("formal ensemble independent evidence is invalid")
+    for profile_id in REQUIRED_RESEARCH_PROFILES:
+        profile = profiles.get(profile_id)
+        periods = profile.get("periods") if isinstance(profile, Mapping) else None
+        seeds = profile.get("seeds") if isinstance(profile, Mapping) else None
+        if (
+            not isinstance(periods, Mapping)
+            or str(periods.get("valid_end") or "") > pre_final_end
+            or not isinstance(seeds, Mapping)
+            or {int(seed) for seed in seeds} != set(REQUIRED_MODEL_SEEDS)
+            or any(
+                not isinstance(seeds.get(str(seed), seeds.get(seed)), Mapping)
+                or seeds.get(str(seed), seeds.get(seed)).get("final_oos_opened") is not False
+                for seed in REQUIRED_MODEL_SEEDS
+            )
+        ):
+            raise ValueError("formal ensemble profile/seed grid is incomplete")
+    validate_run_multiple_testing_evidence(
+        dict(multiple), selected_trial_name=ensemble_id
+    )
+
+    component_ids = list(identity["model_component_candidate_ids"])
+    bindings = [dict(item) for item in component_model_bindings]
+    if (
+        len(bindings) != len(component_ids)
+        or [str(item.get("model_candidate_id") or "") for item in bindings]
+        != component_ids
+        or any(
+            item.get("contract_version") != MODEL_FORMAL_ADMISSION_CONTRACT_VERSION
+            or item.get("dataset_identity_sha256") != dataset_identity_sha256
+            or item.get("pre_final_end") != pre_final_end
+            or not is_sha256(item.get("binding_sha256"))
+            or item.get("binding_sha256")
+            != canonical_sha256(
+                {key: value for key, value in item.items() if key != "binding_sha256"}
+            )
+            for item in bindings
+        )
+    ):
+        raise ValueError("formal ensemble component admission bindings are invalid")
+    payload: dict[str, Any] = {
+        "contract_version": MODEL_ENSEMBLE_FORMAL_ADMISSION_CONTRACT_VERSION,
+        "source": "independent_qlib_recompute",
+        "final_oos_opened": False,
+        "model_signal_identity_sha256": identity["identity_sha256"],
+        "model_ensemble_candidate_id": ensemble_id,
+        "model_ensemble_manifest_sha256": identity[
+            "model_ensemble_manifest_sha256"
+        ],
+        "dataset_identity_sha256": dataset_identity_sha256,
+        "pre_final_end": pre_final_end,
+        "ensemble_admission_evidence_sha256": recorded_admission_sha,
+        "independent_evidence_sha256": independent_sha,
+        "model_grid": {
+            "profiles": list(REQUIRED_RESEARCH_PROFILES),
+            "seeds": list(REQUIRED_MODEL_SEEDS),
+            "cell_count": len(REQUIRED_RESEARCH_PROFILES)
+            * len(REQUIRED_MODEL_SEEDS),
+            "profiles_sha256": canonical_sha256(dict(profiles)),
+            "execution_environment_sha256": independent_value[
+                "execution_environment_sha256"
+            ],
+            "multiple_testing_evidence_sha256": multiple["evidence_sha256"],
+            "selected_trial_name": ensemble_id,
+            "multiple_testing": dict(multiple),
+        },
+        "ensemble": {
+            "combiner": "equal_rank",
+            "stacking": False,
+            "component_model_candidate_ids": component_ids,
+            "component_model_binding_sha256s": [
+                item["binding_sha256"] for item in bindings
+            ],
+        },
+        "component_model_bindings": bindings,
+        "quant_bundle": None,
+    }
+    payload["binding_sha256"] = canonical_sha256(payload)
+    return payload
+
+
 def validate_model_formal_admission_binding(
     binding: Any,
     *,
@@ -318,6 +550,52 @@ def validate_model_formal_admission_binding(
     identity = model_signal_identity(config)
     if identity is None:
         raise ValueError("factor-score strategy cannot carry model admission evidence")
+    if identity.get("model_ensemble_candidate_id") is not None:
+        payload = {key: value for key, value in binding.items() if key != "binding_sha256"}
+        model_grid = binding.get("model_grid")
+        ensemble = binding.get("ensemble")
+        component_bindings = binding.get("component_model_bindings")
+        multiple = model_grid.get("multiple_testing") if isinstance(model_grid, dict) else None
+        if (
+            binding.get("contract_version")
+            != MODEL_ENSEMBLE_FORMAL_ADMISSION_CONTRACT_VERSION
+            or binding.get("source") != "independent_qlib_recompute"
+            or binding.get("final_oos_opened") is not False
+            or binding.get("model_signal_identity_sha256") != identity["identity_sha256"]
+            or binding.get("model_ensemble_candidate_id")
+            != identity["model_ensemble_candidate_id"]
+            or binding.get("model_ensemble_manifest_sha256")
+            != identity["model_ensemble_manifest_sha256"]
+            or binding.get("ensemble_admission_evidence_sha256")
+            != identity["model_ensemble_evidence_sha256"]
+            or binding.get("dataset_identity_sha256") != dataset_identity_sha256
+            or binding.get("pre_final_end") != pre_final_end
+            or not is_sha256(binding.get("independent_evidence_sha256"))
+            or not isinstance(model_grid, dict)
+            or model_grid.get("profiles") != list(REQUIRED_RESEARCH_PROFILES)
+            or model_grid.get("seeds") != list(REQUIRED_MODEL_SEEDS)
+            or model_grid.get("cell_count")
+            != len(REQUIRED_RESEARCH_PROFILES) * len(REQUIRED_MODEL_SEEDS)
+            or not is_sha256(model_grid.get("profiles_sha256"))
+            or not is_sha256(model_grid.get("execution_environment_sha256"))
+            or not isinstance(multiple, dict)
+            or not isinstance(ensemble, dict)
+            or ensemble.get("combiner") != "equal_rank"
+            or ensemble.get("stacking") is not False
+            or ensemble.get("component_model_candidate_ids")
+            != identity["model_component_candidate_ids"]
+            or not isinstance(component_bindings, list)
+            or [item.get("binding_sha256") for item in component_bindings]
+            != ensemble.get("component_model_binding_sha256s")
+            or binding.get("quant_bundle") is not None
+            or binding.get("binding_sha256") != canonical_sha256(payload)
+        ):
+            raise ValueError("formal model ensemble admission binding is invalid")
+        validate_run_multiple_testing_evidence(
+            multiple,
+            selected_trial_name=str(identity["model_ensemble_candidate_id"]),
+        )
+        return dict(binding)
     payload = {key: value for key, value in binding.items() if key != "binding_sha256"}
     model_grid = binding.get("model_grid")
     model_multiple = model_grid.get("multiple_testing") if isinstance(model_grid, dict) else None
@@ -458,6 +736,33 @@ def formal_model_artifact_failures(
     evidence = artifact.get("evidence")
     if not isinstance(evidence, dict):
         return [*failures, "formal model execution evidence is missing"]
+    resource_policy = evidence.get("resource_policy")
+    model_engine = (
+        str(resource_policy.get("model_engine") or "")
+        if isinstance(resource_policy, dict)
+        else ""
+    )
+    try:
+        verify_governed_checkpoint(
+            checkpoint_path,
+            model_engine=model_engine,
+            checkpoint_format=str(artifact.get("checkpoint_format") or ""),
+            expected_sha256=str(artifact.get("checkpoint_sha256") or ""),
+        )
+    except ValueError as exc:
+        failures.append(str(exc))
+    model_data_contract = artifact.get("model_data_contract")
+    model_data_contract_sha256 = str(
+        artifact.get("model_data_contract_sha256") or ""
+    )
+    if (
+        not isinstance(model_data_contract, dict)
+        or not is_sha256(model_data_contract_sha256)
+        or canonical_sha256(model_data_contract) != model_data_contract_sha256
+        or evidence.get("model_data_contract_sha256")
+        != model_data_contract_sha256
+    ):
+        failures.append("formal model data contract is missing or changed")
     coverage = evidence.get("oos_coverage")
     admission = metrics.get("formal_validation")
     admission = (

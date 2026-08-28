@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Produce one governed live prediction table from a frozen model StrategySpec.
+"""Produce one governed daily prediction from a frozen model StrategySpec.
 
-This is deliberately separate from formal OOS validation.  It rolls only the
-training/validation dates forward, keeps the approved code/recipe/features
-unchanged, and never reads labels after the signal date.
+Most sessions load the active immutable checkpoint and call only ``predict``.
+The first trading day of a month (or an explicitly evidenced early trigger)
+rolls the training window and creates a new safe-format checkpoint.  Neither
+path opens the final OOS or reads labels after the signal date.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import sys
 from pathlib import Path
@@ -29,7 +31,11 @@ from quant_platform.factor_recompute import (
     sha256_file,
     validate_factor_prefix_invariance,
 )
-from quant_platform.model_recompute import execute_model_candidate
+from quant_platform.model_recompute import (
+    GOVERNED_MODEL_ENGINES,
+    execute_model_candidate,
+    governed_checkpoint_filename,
+)
 from quant_platform.model_research_governance import (
     MODEL_REFIT_POLICY,
     MODEL_REFIT_POLICY_SHA256,
@@ -38,7 +44,7 @@ from quant_platform.model_research_governance import (
     verify_model_prediction_artifact,
 )
 
-REFIT_CONTRACT_VERSION = "model-live-refit-v1"
+REFIT_CONTRACT_VERSION = "model-live-refresh-v2"
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -74,7 +80,9 @@ def _calendar(
         + embargo_days
         + prediction_days
     )
-    if len(days) < required or days[-1] != signal_date:
+    if not days or days[-1] != signal_date:
+        raise ValueError("model refit signal date is not an available Qlib trading day")
+    if len(days) < required:
         raise ValueError(
             "model refit history does not satisfy the frozen model training policy"
         )
@@ -94,6 +102,132 @@ def _calendar(
     if periods["test_start"] != signal_date:
         raise ValueError("model refit calendar did not resolve the requested signal date")
     return days, periods
+
+
+def _inference_periods(
+    provider: Path,
+    signal_date: str,
+    frozen: dict[str, Any],
+    policy: dict[str, Any],
+) -> dict[str, str]:
+    calendar = [
+        line.strip()
+        for line in (provider / "calendars" / "day.txt").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip() and line.strip() <= signal_date
+    ]
+    positions = {value: index for index, value in enumerate(calendar)}
+    required = ("train_start", "train_end", "valid_start", "valid_end")
+    if not calendar or calendar[-1] != signal_date or any(
+        not isinstance(frozen.get(key), str) for key in required
+    ):
+        raise ValueError("live inference is missing its frozen training periods")
+    try:
+        if (
+            positions[str(frozen["train_end"])]
+            - positions[str(frozen["train_start"])]
+            + 1
+            != int(policy["train_trading_days"])
+            or positions[str(frozen["valid_end"])]
+            - positions[str(frozen["valid_start"])]
+            + 1
+            != int(policy["validation_trading_days"])
+        ):
+            raise ValueError("live inference frozen training window changed")
+        if positions[str(frozen["valid_start"])] - positions[str(frozen["train_end"])] - 1 < int(
+            policy["train_validation_purge_trading_days"]
+        ):
+            raise ValueError("live inference training/validation purge changed")
+        if positions[signal_date] - positions[str(frozen["valid_end"])] - 1 < int(
+            policy["embargo_trading_days"]
+        ):
+            raise ValueError("live inference precedes the frozen validation embargo")
+    except KeyError as exc:
+        raise ValueError("live inference periods are outside the governed calendar") from exc
+    return {
+        "train_start": str(frozen["train_start"]),
+        "train_end": str(frozen["train_end"]),
+        "valid_start": str(frozen["valid_start"]),
+        "valid_end": str(frozen["valid_end"]),
+        "test_start": signal_date,
+        "test_end": signal_date,
+    }
+
+
+def _validate_retrain_evidence(
+    *,
+    provider: Path,
+    signal_date: str,
+    reason: str,
+    evidence: dict[str, Any],
+    dataset_identity_sha256: str,
+    dataset_lineage_id: str,
+    source_model_data_contract_sha256: str,
+) -> None:
+    if reason == "monthly_first_trading_day":
+        calendar = [
+            value.strip()
+            for value in (provider / "calendars" / "day.txt").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if value.strip()
+        ]
+        month = signal_date[:7]
+        month_days = [value for value in calendar if value.startswith(month)]
+        if (
+            not month_days
+            or signal_date != min(month_days)
+            or evidence.get("trigger") != reason
+            or evidence.get("is_first_trading_day") is not True
+            or evidence.get("signal_date") != signal_date
+            or evidence.get("signal_month") != month
+            or evidence.get("calendar_dataset_identity_sha256")
+            != dataset_identity_sha256
+        ):
+            raise ValueError("monthly retraining is not the first governed trading day")
+        return
+    if reason == "persistent_drift":
+        try:
+            observed = float(evidence["observed"])
+            threshold = float(evidence["threshold"])
+            consecutive_windows = int(evidence["consecutive_windows"])
+            window_trading_days = int(evidence["window_trading_days"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("persistent-drift evidence is incomplete") from exc
+        direction = str(evidence.get("comparison") or "")
+        crossed = (direction == "above" and observed >= threshold) or (
+            direction == "below" and observed <= threshold
+        )
+        if (
+            evidence.get("contract_version") != "model-drift-trigger-v1"
+            or evidence.get("as_of") != signal_date
+            or evidence.get("dataset_lineage_id") != dataset_lineage_id
+            or not str(evidence.get("metric") or "").strip()
+            or not math.isfinite(observed)
+            or not math.isfinite(threshold)
+            or consecutive_windows < 3
+            or window_trading_days < 20
+            or not crossed
+        ):
+            raise ValueError("persistent-drift evidence does not cross the frozen trigger")
+        return
+    if reason == "data_contract_change":
+        previous = str(evidence.get("previous_contract_sha256") or "")
+        current = str(evidence.get("current_contract_sha256") or "")
+        if (
+            evidence.get("contract_version") != "model-data-contract-trigger-v1"
+            or evidence.get("as_of") != signal_date
+            or evidence.get("dataset_lineage_id") != dataset_lineage_id
+            or previous != source_model_data_contract_sha256
+            or len(current) != 64
+            or any(character not in "0123456789abcdef" for character in current)
+            or current == previous
+            or evidence.get("compatibility_review_passed") is not True
+        ):
+            raise ValueError("data-contract retraining evidence is invalid")
+        return
+    raise ValueError("model retraining trigger is not governed")
 
 
 def _recompute_bundle_factors(
@@ -190,11 +324,44 @@ def main() -> None:
     provider = Path(args.provider_uri).resolve()
     manifest = _load_json(Path(args.manifest).resolve())
     output = Path(args.output).resolve()
+    existing_result_path = output / "result.json"
+    if existing_result_path.is_file():
+        existing = _load_json(existing_result_path)
+        if (
+            existing.get("contract_version") != REFIT_CONTRACT_VERSION
+            or existing.get("strategy_version_id")
+            != str(manifest.get("strategy_version_id") or "")
+            or existing.get("source_model_artifact_id")
+            != str(manifest.get("source_model_artifact_id") or "")
+            or existing.get("signal_date") != str(manifest.get("signal_date") or "")
+            or existing.get("operation") != str(manifest.get("operation") or "")
+        ):
+            raise ValueError("model refresh output already belongs to another contract")
+        # The worker-side ModelArtifactStore re-verifies the signed result and
+        # every file hash before accepting this idempotent replay.
+        print(json.dumps(existing, ensure_ascii=False))
+        return
     if output.exists():
         shutil.rmtree(output)
     output.mkdir(parents=True, exist_ok=False)
     if manifest.get("contract_version") != REFIT_CONTRACT_VERSION:
         raise ValueError("model refit contract is invalid")
+    operation = str(manifest.get("operation") or "")
+    if operation not in {"inference", "retrain"}:
+        raise ValueError("model live refresh operation is invalid")
+    retrain_reason = str(manifest.get("retrain_reason") or "")
+    retrain_evidence = manifest.get("retrain_evidence")
+    retrain_evidence_sha256 = str(manifest.get("retrain_evidence_sha256") or "")
+    if operation == "inference":
+        if retrain_reason or retrain_evidence is not None or retrain_evidence_sha256:
+            raise ValueError("daily inference cannot carry retraining evidence")
+    elif (
+        retrain_reason
+        not in {"monthly_first_trading_day", "persistent_drift", "data_contract_change"}
+        or not isinstance(retrain_evidence, dict)
+        or canonical_sha256(retrain_evidence) != retrain_evidence_sha256
+    ):
+        raise ValueError("model retraining requires explicit immutable trigger evidence")
     refit_policy = manifest.get("refit_policy")
     if (
         refit_policy != MODEL_REFIT_POLICY
@@ -215,7 +382,27 @@ def main() -> None:
         raise ValueError("model refit provider uses another governed dataset lineage")
 
     signal_date = str(manifest.get("signal_date") or "")
-    _, periods = _calendar(provider, signal_date, dict(refit_policy))
+    if operation == "retrain":
+        _validate_retrain_evidence(
+            provider=provider,
+            signal_date=signal_date,
+            reason=retrain_reason,
+            evidence=dict(retrain_evidence),
+            dataset_identity_sha256=dataset_identity,
+            dataset_lineage_id=str(manifest.get("dataset_lineage_id") or ""),
+            source_model_data_contract_sha256=str(
+                manifest.get("source_model_data_contract_sha256") or ""
+            ),
+        )
+    if operation == "retrain":
+        _, periods = _calendar(provider, signal_date, dict(refit_policy))
+    else:
+        periods = _inference_periods(
+            provider,
+            signal_date,
+            dict(manifest.get("frozen_training_periods") or {}),
+            dict(refit_policy),
+        )
     feature_set = manifest.get("feature_set")
     model = manifest.get("model")
     if not isinstance(feature_set, dict) or not isinstance(model, dict):
@@ -224,6 +411,9 @@ def main() -> None:
         "feature_set_definition_sha256"
     ):
         raise ValueError("model refit feature-set definition is inconsistent")
+    model_engine = str(model.get("model_engine") or "")
+    if model_engine not in GOVERNED_MODEL_ENGINES:
+        raise ValueError("model refit is missing its frozen governed model engine")
 
     import qlib
 
@@ -243,6 +433,7 @@ def main() -> None:
     )
 
     workspace = output / "model"
+    inference_only = operation == "inference"
     result, execution = execute_model_candidate(
         code_path=Path(str(model.get("code_path") or "")),
         provider_path=provider,
@@ -251,21 +442,39 @@ def main() -> None:
             "candidate_id": str(model.get("candidate_id") or ""),
             "code_sha256": str(model.get("code_sha256") or ""),
             "model_type": str(model.get("model_type") or "Tabular"),
-            "model_engine": "rdagent_pytorch",
+            "model_engine": model_engine,
             "training_hyperparameters": model.get("training_hyperparameters") or {},
             "feature_set": feature_set,
             "additional_factor_count": len(bundle_factors),
             "periods": periods,
             "prediction_segment": "test",
             "seed": int(model.get("seed") or 11),
+            "resource_stage": "inference" if inference_only else "production_refit",
             "dataset_identity_sha256": dataset_identity,
             "universe": str(manifest.get("universe") or "cn_all"),
             "final_oos_opened": False,
-            "inference_only": True,
+            "inference_only": inference_only,
+            "live_retrain": not inference_only,
         },
         workspace=workspace,
         runner_path=Path(__file__).resolve().with_name("model_sandbox_runner.py"),
-        allow_inference=True,
+        allow_inference=inference_only,
+        allow_live_retrain=not inference_only,
+        source_checkpoint_path=(
+            Path(str(manifest.get("source_checkpoint_path") or "")).resolve()
+            if inference_only
+            else None
+        ),
+        source_checkpoint_sha256=(
+            str(manifest.get("source_checkpoint_sha256") or "")
+            if inference_only
+            else None
+        ),
+        source_checkpoint_format=(
+            str(manifest.get("source_checkpoint_format") or "")
+            if inference_only
+            else None
+        ),
         timeout_seconds=int(manifest.get("timeout_seconds") or 7200),
     )
     source_environment_sha256 = str(
@@ -279,6 +488,15 @@ def main() -> None:
     ):
         raise ValueError(
             "model refit execution environment differs from the approved artifact"
+        )
+    if (
+        operation == "retrain"
+        and retrain_reason == "data_contract_change"
+        and result.get("model_data_contract_sha256")
+        != retrain_evidence.get("current_contract_sha256")
+    ):
+        raise ValueError(
+            "retrained model data contract does not match the evidenced replacement"
         )
     predictions = workspace / "output" / "predictions.parquet"
     coverage = verify_model_prediction_artifact(
@@ -296,9 +514,32 @@ def main() -> None:
         raise ValueError("model refit produced predictions outside the requested signal date")
 
     final_predictions = output / "predictions.parquet"
-    final_checkpoint = output / "checkpoint.pt"
     shutil.copy2(predictions, final_predictions)
-    shutil.copy2(workspace / "output" / "checkpoint.pt", final_checkpoint)
+    if inference_only:
+        checkpoint_path: str | None = None
+        checkpoint_sha256 = str(manifest.get("source_checkpoint_sha256") or "")
+        checkpoint_format = str(manifest.get("source_checkpoint_format") or "")
+    else:
+        final_checkpoint = output / governed_checkpoint_filename(model_engine)
+        shutil.copy2(
+            workspace / "output" / governed_checkpoint_filename(model_engine),
+            final_checkpoint,
+        )
+        checkpoint_path = final_checkpoint.name
+        checkpoint_sha256 = sha256_file(final_checkpoint)
+        checkpoint_format = str(result.get("checkpoint_format") or "")
+    training_evidence = {
+        "operation": operation,
+        "periods": periods,
+        "retrain_evidence": retrain_evidence if operation == "retrain" else None,
+        "retrain_evidence_sha256": (
+            retrain_evidence_sha256 if operation == "retrain" else None
+        ),
+        "retrain_reason": retrain_reason if operation == "retrain" else None,
+        "source_model_artifact_id": str(
+            manifest.get("source_model_artifact_id") or ""
+        ),
+    }
     payload = {
         "contract_version": REFIT_CONTRACT_VERSION,
         "status": "passed",
@@ -312,11 +553,20 @@ def main() -> None:
         "dataset_identity_sha256": dataset_identity,
         "dataset_lineage_id": str(manifest.get("dataset_lineage_id") or ""),
         "signal_date": signal_date,
+        "operation": operation,
         "periods": periods,
         "predictions_path": "predictions.parquet",
         "predictions_sha256": sha256_file(final_predictions),
-        "checkpoint_path": "checkpoint.pt",
-        "checkpoint_sha256": sha256_file(final_checkpoint),
+        "checkpoint_path": checkpoint_path,
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_format": checkpoint_format,
+        "checkpoint_reused": inference_only,
+        "model_data_contract_sha256": str(
+            result.get("model_data_contract_sha256") or ""
+        ),
+        "model_data_contract": result.get("model_data_contract"),
+        "training_evidence": training_evidence,
+        "training_evidence_sha256": canonical_sha256(training_evidence),
         "coverage": coverage,
         "execution_evidence": execution,
         "execution_environment_sha256": source_environment_sha256,
@@ -324,7 +574,7 @@ def main() -> None:
         "refit_policy": dict(refit_policy),
         "refit_policy_sha256": MODEL_REFIT_POLICY_SHA256,
         "final_oos_opened": False,
-        "inference_only": True,
+        "inference_only": inference_only,
     }
     payload["evidence_sha256"] = canonical_sha256(payload)
     result_path = output / "result.json"

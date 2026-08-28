@@ -27,6 +27,7 @@ from quant_data.database import (
     strategy_allocation_members,
     strategy_allocation_nav,
     strategy_allocations,
+    strategy_versions,
 )
 
 from .member_risk_gate import (
@@ -43,7 +44,6 @@ from .strategy_allocation import (
     analyze_strategy_allocation,
     renormalize_budgets_for_suspended,
 )
-from .strategy_catalog import require_capital_eligible_strategy_type
 from .strategy_store import StrategyStore
 
 
@@ -86,6 +86,25 @@ class AllocationStore:
     def __init__(self, database_url: str) -> None:
         self.strategies = StrategyStore(database_url)
         self.engine = self.strategies.engine
+
+    @staticmethod
+    def _require_long_only_members(connection: Any, allocation_id: str) -> None:
+        retired_pair = connection.execute(
+            select(strategy_versions.c.id)
+            .join(
+                strategy_allocation_members,
+                strategy_allocation_members.c.strategy_version_id == strategy_versions.c.id,
+            )
+            .where(
+                strategy_allocation_members.c.allocation_id == allocation_id,
+                strategy_versions.c.strategy_type == "pair",
+            )
+            .limit(1)
+        ).first()
+        if retired_pair is not None:
+            raise ValueError(
+                "pair allocations are retired; historical allocation evidence is read-only"
+            )
 
     @staticmethod
     def _daily_returns(backtest: dict[str, Any]) -> pd.Series:
@@ -186,11 +205,11 @@ class AllocationStore:
                 version = self.strategies.get_version(version_id)
                 if version["status"] != "approved" or version.get("is_legacy"):
                     raise ValueError("allocations require approved non-legacy strategy versions")
-                # Research-only gate (design 6.4.3/13): pair strategies are
-                # offline research and may never enter a capital allocation,
-                # not even as satellites.
                 if version.get("strategy_type") == "pair":
-                    require_capital_eligible_strategy_type("pair", action="分配")
+                    raise ValueError(
+                        "pair allocations are retired; Autopilot capital allocations are long-only"
+                    )
+                governance[version_id]["simulation_mode"] = "paper"
                 hypothesis = self.strategies.hypothesis_group_evidence(version_id)
                 governance[version_id].update(
                     {
@@ -252,6 +271,18 @@ class AllocationStore:
             },
         )
         analysis = self._apply_member_governance(analysis, governance, max_strategy_weight)
+        shadow_members = sorted(
+            version_id
+            for version_id, item in governance.items()
+            if item.get("simulation_mode") == "shadow_pair"
+        )
+        analysis["simulation_boundary"] = {
+            "mode": "mixed_shadow" if shadow_members else "paper",
+            "shadow_pair_members": shadow_members,
+            "financing_enabled": False,
+            "real_trading_eligible": False,
+            "pair_results_are_hypothetical": bool(shadow_members),
+        }
         allocation_id = uuid.uuid4().hex
         now = _now()
         decision_date = now.date()
@@ -747,6 +778,7 @@ class AllocationStore:
                     strategy_allocation_members.c.allocation_id == allocation_id
                 )
             ).all()
+            self._require_long_only_members(connection, allocation_id)
             certified_evidence: dict[str, Any] = {}
             member_by_version = {
                 str(member.strategy_version_id): member for member in members
@@ -935,6 +967,7 @@ class AllocationStore:
             if allocation.status == "draft":
                 raise ValueError("draft strategy allocations cannot be operated")
             if status == "active":
+                self._require_long_only_members(connection, allocation_id)
                 unresolved = connection.execute(
                     select(strategy_allocation_events.c.id)
                     .where(
@@ -1019,6 +1052,7 @@ class AllocationStore:
                 raise ValueError("legacy paper-backed allocations are read-only")
             if allocation.status not in {"active", "risk_reduction_pending", "liquidation_pending"}:
                 raise ValueError("strategy allocation is not refreshable")
+            self._require_long_only_members(connection, allocation_id)
             # Frozen-decision-day gate (design 6.10/8.1): member budgets are
             # only re-solved when the current artifact has expired; every
             # other refresh reuses the still-valid artifact and never
@@ -1436,6 +1470,10 @@ class AllocationStore:
                     )
                 )
             ]
+            for member in result["members"]:
+                version = self.strategies.get_version(member["strategy_version_id"])
+                member["strategy_type"] = version["strategy_type"]
+                member["simulation_mode"] = version["simulation_mode"]
             result["nav_history"] = [
                 row_dict(item)
                 for item in connection.execute(

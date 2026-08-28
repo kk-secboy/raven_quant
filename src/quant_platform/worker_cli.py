@@ -30,6 +30,7 @@ app = typer.Typer(no_args_is_help=False, help="QuantLab durable background worke
 _MODEL_EVALUATION_JOB_KINDS = frozenset({"model_evaluate", "quant_bundle_evaluate"})
 _IMMUTABLE_IMAGE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
 _PROBE_INTERVAL_SECONDS = 300.0
+_PROBE_FAILURE_RETRY_SECONDS = 15.0
 _PROBE_STALE_AFTER_SECONDS = 660.0
 _PROBE_STOP_TIMEOUT_SECONDS = 5.0
 
@@ -44,15 +45,19 @@ class _PeriodicProbeCache:
         *,
         initial_result: dict[str, object] | None = None,
         interval_seconds: float = _PROBE_INTERVAL_SECONDS,
+        failure_retry_seconds: float = _PROBE_FAILURE_RETRY_SECONDS,
         stale_after_seconds: float = _PROBE_STALE_AFTER_SECONDS,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("probe interval must be positive")
+        if failure_retry_seconds <= 0:
+            raise ValueError("probe failure retry interval must be positive")
         if stale_after_seconds <= interval_seconds:
             raise ValueError("probe stale threshold must exceed its interval")
         self._name = name
         self._probe = probe
         self._interval_seconds = interval_seconds
+        self._failure_retry_seconds = failure_retry_seconds
         self._stale_after_seconds = stale_after_seconds
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -123,6 +128,7 @@ class _PeriodicProbeCache:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
+            probe_failed = False
             try:
                 result = self._probe()
                 if not isinstance(result, dict):
@@ -130,7 +136,9 @@ class _PeriodicProbeCache:
                         f"{self._name} readiness probe returned {type(result).__name__}"
                     )
                 result = copy.deepcopy(result)
+                probe_failed = result.get("status") in {"failed", "unavailable"}
             except Exception as exc:  # noqa: BLE001 - readiness boundary is fail closed
+                probe_failed = True
                 result = {
                     "status": "unavailable",
                     "ready": False,
@@ -140,7 +148,10 @@ class _PeriodicProbeCache:
                 self._result = result
                 self._completed_at = datetime.now(UTC).isoformat()
                 self._completed_monotonic = time.monotonic()
-            if self._stop.wait(self._interval_seconds):
+            retry_after = (
+                self._failure_retry_seconds if probe_failed else self._interval_seconds
+            )
+            if self._stop.wait(retry_after):
                 return
 
 
@@ -240,6 +251,7 @@ def status_server(
     *,
     required_runtime: str,
     capabilities: object | None = None,
+    consumer_running: Callable[[], bool] | None = None,
     diagnostic: object | None = None,
     port: int = 8770,
 ) -> ThreadingHTTPServer:
@@ -269,14 +281,28 @@ def status_server(
                     worker_capabilities.get("model_sandbox_required")
                     and not worker_capabilities.get("model_sandbox_ready")
                 )
-                healthy = runtime_ready and capabilities_ready
+                try:
+                    consumer_ready = (
+                        True if consumer_running is None else bool(consumer_running())
+                    )
+                except Exception:  # noqa: BLE001 - health boundary is fail closed
+                    consumer_ready = False
+                healthy = runtime_ready and capabilities_ready and consumer_ready
                 body = {
                     "status": "ok" if healthy else "unavailable",
-                    "worker": "ready" if healthy else "runtime_unavailable",
+                    "worker": (
+                        "ready"
+                        if healthy
+                        else "consumer_unavailable"
+                        if not consumer_ready
+                        else "runtime_unavailable"
+                    ),
                     "required_runtime": required_runtime,
                     "runtime": runtime,
                     "capabilities": worker_capabilities,
                 }
+                if consumer_running is not None:
+                    body["consumer"] = {"running": consumer_ready}
                 status_code = 200 if healthy else 503
             elif self.path == "/qlib/status":
                 body = _runtime_status(runtimes, "qlib")
@@ -318,7 +344,17 @@ def run() -> None:
     root = Path.cwd().resolve()
     settings = Settings.from_env(root / ".env")
     store = JobStore(settings.database_url)
-    worker = LocalJobWorker(store, root, settings)
+    transformer_gate = threading.Semaphore(1)
+    workers = [
+        LocalJobWorker(
+            store,
+            root,
+            settings,
+            initialize_queue=index == 0,
+            transformer_gate=transformer_gate,
+        )
+        for index in range(settings.worker_concurrency)
+    ]
     runtime_secrets = RuntimeSecretStore(settings.database_url, settings.platform_secret_key)
     stopped = threading.Event()
 
@@ -374,6 +410,7 @@ def run() -> None:
         runtimes,
         required_runtime=required_runtime,
         capabilities=capability_probe.snapshot,
+        consumer_running=lambda: all(worker.running for worker in workers),
         diagnostic=rdagent_diagnostic,
     )
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -383,13 +420,14 @@ def run() -> None:
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    worker_started = False
+    workers_started = 0
     server_started = False
     try:
         for probe in probes:
             probe.start()
-        worker.start()
-        worker_started = True
+        for worker in workers:
+            worker.start()
+            workers_started += 1
         server_thread.start()
         server_started = True
         stopped.wait()
@@ -399,7 +437,7 @@ def run() -> None:
         server.server_close()
         if server_started:
             server_thread.join(timeout=_PROBE_STOP_TIMEOUT_SECONDS)
-        if worker_started:
+        for worker in reversed(workers[:workers_started]):
             worker.stop()
         for probe in reversed(probes):
             probe.stop()

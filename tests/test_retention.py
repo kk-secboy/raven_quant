@@ -91,3 +91,59 @@ def test_retention_api_is_dry_run_by_default(
     assert response.status_code == 200
     assert response.json()["entries"][0]["name"] == "fixture"
     assert (data_root / "snapshots" / "fixture").exists()
+
+
+@pytest.mark.no_database
+def test_display_retention_uses_persisted_inventory_without_rescanning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    data_root = tmp_path / "data"
+    _dataset(data_root, "fixture", "2025-01-01T00:00:00+00:00")
+    manager = DataRetentionManager(
+        data_root,
+        "postgresql+psycopg://quantlab:quantlab@127.0.0.1:1/unused",
+    )
+    monkeypatch.setattr(manager, "_protected_datasets", lambda: {})
+    manager.refresh_display_inventory(now=datetime(2025, 2, 1, tzinfo=UTC))
+
+    def fail_scan(path: Path) -> int:
+        raise AssertionError(f"warm display plan rescanned {path}")
+
+    monkeypatch.setattr(manager, "_directory_size", fail_scan)
+    plan = manager.display_plan(
+        keep_latest=1,
+        min_age_days=1,
+        now=datetime(2025, 2, 1, tzinfo=UTC),
+    )
+
+    assert plan["cache_state"] == "fresh"
+    assert plan["refreshing"] is False
+    assert plan["entries"][0]["name"] == "fixture"
+    assert plan["entries"][0]["inventory_complete"] is True
+
+
+@pytest.mark.no_database
+def test_display_retention_never_marks_new_unmeasured_dataset_eligible(
+    tmp_path: Path, monkeypatch
+) -> None:
+    data_root = tmp_path / "data"
+    _dataset(data_root, "known", "2025-01-01T00:00:00+00:00")
+    manager = DataRetentionManager(
+        data_root,
+        "postgresql+psycopg://quantlab:quantlab@127.0.0.1:1/unused",
+    )
+    monkeypatch.setattr(manager, "_protected_datasets", lambda: {})
+    manager.refresh_display_inventory(now=datetime(2025, 2, 1, tzinfo=UTC))
+    _dataset(data_root, "new-to-cache", "2025-01-02T00:00:00+00:00")
+    monkeypatch.setattr(manager, "_start_inventory_refresh", lambda: None)
+
+    plan = manager.display_plan(
+        keep_latest=1,
+        min_age_days=1,
+        now=datetime(2025, 3, 1, tzinfo=UTC),
+    )
+    entries = {item["name"]: item for item in plan["entries"]}
+
+    assert plan["cache_state"] == "stale"
+    assert entries["new-to-cache"]["inventory_complete"] is False
+    assert entries["new-to-cache"]["state"] != "eligible"

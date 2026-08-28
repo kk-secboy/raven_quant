@@ -145,3 +145,26 @@ def test_dataset_view_seals_the_governed_cn_all_universe(tmp_path: Path) -> None
             destination,
             cutoff="2024-01-03",
         )
+
+
+def test_dataset_view_normalizes_qlib_timestamp_instrument_intervals(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "timestamp-source"
+    destination = tmp_path / "timestamp-view"
+    _write_dataset(
+        source,
+        cn_all=(
+            "SH600000\t2024-01-02 00:00:00\t2024-01-04 00:00:00\n"
+        ),
+    )
+
+    prepare_rdagent_dataset_view(
+        source,
+        destination,
+        cutoff="2024-01-03",
+    )
+
+    assert (destination / "instruments" / "cn_all.txt").read_text(
+        encoding="utf-8"
+    ) == "SH600000\t2024-01-02\t2024-01-03\n"

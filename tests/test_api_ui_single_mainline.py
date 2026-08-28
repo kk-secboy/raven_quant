@@ -19,6 +19,12 @@ SIMULATION_SOURCE = (ROOT / "src" / "quant_platform" / "simulation_store.py").re
 WORKER_SOURCE = (ROOT / "src" / "quant_platform" / "worker.py").read_text(
     encoding="utf-8"
 )
+RDAGENT_PANEL_SOURCE = (ROOT / "web" / "app" / "rdagent-panel.tsx").read_text(
+    encoding="utf-8"
+)
+QLIB_PANEL_SOURCE = (ROOT / "web" / "app" / "qlib-panel.tsx").read_text(
+    encoding="utf-8"
+)
 
 
 def _class_block(source: str, class_name: str) -> str:
@@ -31,12 +37,42 @@ def _class_block(source: str, class_name: str) -> str:
     return match.group(0)
 
 
+def test_runtime_status_recovers_without_serving_two_layers_of_stale_failure() -> None:
+    assert API_SOURCE.count(
+        'current_status in {"checking", "unavailable"}'
+    ) == 2
+    assert '/api/rdagent/status`, { cache: "no-store", forceRefresh: true }' in (
+        RDAGENT_PANEL_SOURCE
+    )
+    assert '/api/qlib/status`, { cache: "no-store", forceRefresh: true }' in (
+        QLIB_PANEL_SOURCE
+    )
+
+
+def test_autopilot_trial_history_is_unified_and_does_not_require_a_tournament() -> None:
+    assert 'raise HTTPException(404, "autopilot cycle not found")' in API_SOURCE
+    assert "AutopilotTrialAuditService" in API_SOURCE
+    assert "list_cycle_trials(cycle)" in API_SOURCE
+    assert "does not need a model tournament" in API_SOURCE
+
+
 def test_legacy_http_execution_surfaces_stay_retired() -> None:
     retired_route = '@app.api_route("/api/portfolios", methods=["GET", "POST"], status_code=410)'
     assert retired_route in API_SOURCE
     assert '"replacement": "/api/recommendation-portfolios"' in API_SOURCE
     assert '"/api/broker' not in API_SOURCE
     assert '"/api/pair-portfolios' not in API_SOURCE
+
+
+def test_real_broker_gateway_is_not_a_production_build_capability() -> None:
+    project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    compose = (ROOT / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+
+    assert "quant-broker-gateway" not in project
+    assert "src/quant_broker_gateway" not in project
+    assert "BROKER_" not in compose
+    assert "src/quant_broker_gateway" in dockerignore
 
 
 def test_scheduler_accepts_research_and_data_work_only() -> None:
@@ -68,7 +104,7 @@ def test_unified_simulation_has_only_governed_sources_and_two_adapters() -> None
         assert marker not in SIMULATION_SOURCE
 
 
-def test_pair_replay_api_cannot_accept_client_authored_legs_or_borrow_rates() -> None:
+def test_pair_replay_write_api_is_retired_and_cannot_restart_shorting() -> None:
     block = _class_block(API_SOURCE, "PairSimulationReplayRequest")
     assert 'ConfigDict(extra="forbid")' in block
     assert "backtest_id:" in block
@@ -85,6 +121,13 @@ def test_pair_replay_api_cannot_accept_client_authored_legs_or_borrow_rates() ->
     assert (
         '"/api/simulation-portfolios/{portfolio_id}/pair-replays"' in API_SOURCE
     )
+    endpoint = API_SOURCE.split("def create_pair_simulation_replay", 1)[1].split(
+        '@app.get("/api/simulation-portfolios/{portfolio_id}")', 1
+    )[0]
+    assert "HTTPException(" in endpoint
+    assert "410" in endpoint
+    assert "Autopilot is long-only" in endpoint
+    assert "create_pair_batch_from_backtest" not in endpoint
     assert (
         "pair simulation batches must be derived from an approved immutable "
         in SIMULATION_SOURCE
@@ -96,6 +139,24 @@ def test_pair_replay_api_cannot_accept_client_authored_legs_or_borrow_rates() ->
         "--shortability-manifest-sha256",
     ):
         assert marker in WORKER_SOURCE
+
+
+def test_pair_shadow_is_not_part_of_the_automatic_capital_line() -> None:
+    tick = SCHEDULER_SOURCE.split("def tick", 1)[1].split(
+        "def _enqueue_due_factor_library_materialization", 1
+    )[0]
+    for forbidden in (
+        "self._ensure_approved_pair_shadow_accounts(",
+        "self._enqueue_due_pair_shadow_backtests(",
+        "self._materialize_due_pair_shadow_batches(",
+    ):
+        assert forbidden not in tick
+    for marker in (
+        "pair_shadow_accounts_created = 0",
+        "pair_shadow_backtests_enqueued = 0",
+        "pair_shadow_batches_materialized = 0",
+    ):
+        assert marker in tick
 
 
 def test_long_only_replay_api_accepts_only_an_immutable_order_plan_identity() -> None:
@@ -141,17 +202,30 @@ def test_web_uses_only_the_single_mainline_routes() -> None:
         "/api/simulation-portfolios",
     ):
         assert marker in sources
-    pair_source = (ROOT / "web" / "app" / "pair-satellite-panel.tsx").read_text(
+    page_source = (ROOT / "web" / "app" / "page.tsx").read_text(encoding="utf-8")
+    assert "PairSatellitePanel" not in page_source
+    assert "配对卫星" not in page_source
+    assert not (ROOT / "web" / "app" / "pair-satellite-panel.tsx").exists()
+
+
+def test_web_defaults_to_a_safe_autopilot_mainline() -> None:
+    page_source = (ROOT / "web" / "app" / "page.tsx").read_text(encoding="utf-8")
+    autopilot_source = (ROOT / "web" / "app" / "autopilot-panel.tsx").read_text(
         encoding="utf-8"
     )
-    assert "/pair-backtests" in pair_source
-    assert "RESEARCH ONLY / NO CAPITAL" in pair_source
+
+    assert 'useState(false)' in page_source
+    assert '打开高级管理' in page_source
+    assert '<AutopilotPanel' in page_source
     for marker in (
-        "/pair-replays",
-        "/approve",
-        "/api/simulation-portfolios",
-        "backtest_id",
-        "target_payload",
-        "annual_borrow_rate",
+        'SINGLE AUTOPILOT CYCLE',
+        '/api/autopilot',
+        '/api/data-automation',
+        '/api/simulation-portfolios',
+        '无需每天点按钮',
+        '不连接真实券商',
+        '不代表实盘建议',
     ):
-        assert marker not in pair_source
+        assert marker in autopilot_source
+    assert '/api/broker' not in autopilot_source
+    assert 'real_trade' not in autopilot_source

@@ -225,11 +225,11 @@ _CATALOG: tuple[dict[str, Any], ...] = (
     },
     {
         "template_id": "stock_pair_stat_arb",
-        "name": "股票对统计套利（永久离线研究）",
+        "name": "股票对统计套利（仅影子模拟）",
         "catalog_role": "research_only",
         "implementation_tier": "conditional",
         "implementation_status": "research",
-        "blocked_reason": None,
+        "blocked_reason": "仅允许研究批准和影子模拟；不得生成推荐、融资融券或实盘资格",
         "parent_template_id": None,
         "recipe_id": None,
     },
@@ -345,6 +345,33 @@ STRATEGY_TYPE_TEMPLATE_IDS: dict[str, str] = {
 RESEARCH_ONLY_MESSAGE = (
     "research_only：{name}只做离线统计研究，不可{action}（设计稿 §6.4.3/§13）"
 )
+
+
+def strategy_type_capabilities(strategy_type: str) -> dict[str, bool]:
+    """Return the product boundary for one strategy type.
+
+    Pair research is deliberately allowed to own a persistent *shadow* ledger.
+    That is not capital eligibility: the short leg is a governed simulation
+    assumption and can never open a broker, margin or live-trading path.
+    """
+
+    if str(strategy_type) == "pair":
+        return {
+            "research_approval_eligible": True,
+            "shadow_simulation_eligible": True,
+            "capital_eligible": False,
+            "recommendation_eligible": False,
+            "financing_enabled": False,
+            "real_trading_eligible": False,
+        }
+    return {
+        "research_approval_eligible": True,
+        "shadow_simulation_eligible": True,
+        "capital_eligible": True,
+        "recommendation_eligible": True,
+        "financing_enabled": False,
+        "real_trading_eligible": False,
+    }
 
 
 def require_capital_eligible_strategy_type(strategy_type: str, *, action: str) -> None:

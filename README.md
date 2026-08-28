@@ -16,14 +16,14 @@ RD-Agent 组成唯一研究技术主线。
 
 `分源校验后的不可变快照 → Qlib 数据集 → RD-Agent 研究 → 独立复算与准入 → Qlib 正式回测 → 策略审批 → 买卖推荐 → 核心/卫星分配 → 统一模拟交易 → 表现复核与策略生命周期`
 
-项目不做实盘、Tick、Level-2、逐笔或毫秒高频。QMT 仅作为默认关闭的可选插件保留；
-页面、调度和模拟任务不得向 QMT 或任何券商网关发单。
+项目不做实盘、Tick、Level-2、逐笔或毫秒高频。历史 QMT 沙箱源码不进入生产镜像，
+也没有启动脚本、配置入口或 Web 开关；页面、调度和模拟任务不得向任何券商网关发单。
 
 ## 代码入口
 
 - `src/quant_data`：Tushare 下载、不可变快照、血缘和 Qlib 数据转换。
 - `src/quant_platform`：研究编排、准入、Qlib 回测、审批、分配、模拟和运维 API。
-- `src/quant_broker_gateway`：默认关闭的可选 QMT 沙箱插件，不在主线运行。
+- 生产发布只到不可变模拟盘账本；真实券商网关不打包、不配置、也不提供开启开关。
 - `web`：数据、RD-Agent、因子准入、Qlib 回测、审批、分配和模拟控制台。
 - `migrations`：PostgreSQL/Alembic 版本化迁移。
 - `deploy`：Docker Compose、镜像和系统服务模板。

@@ -4,7 +4,7 @@ import { FormEvent, useMemo, useState } from "react";
 import { apiFetch } from "./api-client";
 import { usePolling } from "./use-polling";
 
-type Runtime = { status: string; qlib_version?: string; lightgbm_version?: string };
+type Runtime = { status: string; qlib_version?: string; lightgbm_version?: string; execution_environment?: string };
 type QlibDataset = { name: string; ready: boolean; trading_days: number; frequency: string; start_date?: string | null; end_date?: string | null };
 type Experiment = {
   id: string; created_at: string; model: string; features: string;
@@ -14,15 +14,37 @@ type Job = {
   id: string; kind: string; status: string;
   payload: Record<string, unknown>; error?: string | null;
 };
+type AutopilotCycle = { id: string; dataset: string; stage: string; status: string; updated_at: string };
+type TournamentTrial = {
+  id: string; name: string; trial_kind: string; status: string;
+  feature_set_id?: string | null; model_family?: string | null;
+  spec?: { round?: string; profiles?: string[]; seeds?: number[] };
+  metrics?: Record<string, number | null> | null;
+};
+type ModelEnsemble = {
+  id: string; name: string; status: string; combiner: string; dataset: string;
+  components?: { model_family?: string; weight?: number }[];
+};
 
 const pct = (value: number | null | undefined) => value == null ? "—" : `${(value * 100).toFixed(2)}%`;
 const decimal = (value: number | null | undefined) => value == null ? "—" : value.toFixed(3);
+const compactVersion = (value?: string) => !value ? "—" : value.length > 24 ? `${value.slice(0, 21)}…` : value;
+
+async function jsonResponse<T>(request: Promise<Response>): Promise<T> {
+  const response = await request;
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json() as Promise<T>;
+}
 
 export function QlibPanel({ api }: { api: string }) {
   const [runtime, setRuntime] = useState<Runtime | null>(null);
+  const [runtimeLoadState, setRuntimeLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [datasets, setDatasets] = useState<QlibDataset[]>([]);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [tournamentCycle, setTournamentCycle] = useState<AutopilotCycle | null>(null);
+  const [tournamentTrials, setTournamentTrials] = useState<TournamentTrial[]>([]);
+  const [ensembles, setEnsembles] = useState<ModelEnsemble[]>([]);
   const [dataset, setDataset] = useState("");
   const [topk, setTopk] = useState(50);
   const [nDrop, setNDrop] = useState(5);
@@ -32,22 +54,18 @@ export function QlibPanel({ api }: { api: string }) {
   const [minuteEnd, setMinuteEnd] = useState(new Date().toISOString().slice(0, 10));
   const [minuteHorizons, setMinuteHorizons] = useState("5,15,30");
   const [minuteCostBps, setMinuteCostBps] = useState(2);
-  const [message, setMessage] = useState("正在核对本机 Qlib 环境…");
+  const [message, setMessage] = useState("");
 
   async function load() {
-    try {
-      const responses = await Promise.all([
-        apiFetch(`${api}/api/qlib/status`, { cache: "no-store" }),
-        apiFetch(`${api}/api/qlib/datasets`, { cache: "no-store" }),
-        apiFetch(`${api}/api/qlib/experiments`, { cache: "no-store" }),
-        apiFetch(`${api}/api/jobs`, { cache: "no-store" }),
-      ]);
-      const nextRuntime = await responses[0].json();
-      const nextDatasets = await responses[1].json();
-      setRuntime(nextRuntime);
-      setDatasets(nextDatasets);
-      setExperiments(await responses[2].json());
-      setJobs((await responses[3].json()).filter((item: Job) => ["qlib_baseline", "minute_research"].includes(item.kind)));
+    let nextDatasetCount: number | undefined;
+    const requests = [
+      jsonResponse<Runtime>(apiFetch(`${api}/api/qlib/status`, { cache: "no-store", forceRefresh: true })).then((nextRuntime) => {
+        setRuntime(nextRuntime);
+        setRuntimeLoadState("ready");
+      }),
+      jsonResponse<QlibDataset[]>(apiFetch(`${api}/api/qlib/datasets`, { cache: "no-store" })).then((nextDatasets) => {
+        nextDatasetCount = nextDatasets.length;
+        setDatasets(nextDatasets);
       const daily = nextDatasets.filter((item: QlibDataset) => item.frequency === "day");
       const minute = nextDatasets.filter((item: QlibDataset) => item.frequency === "1min");
       if (!dataset && daily.length) setDataset(daily[0].name);
@@ -56,9 +74,28 @@ export function QlibPanel({ api }: { api: string }) {
         if (minute[0].start_date) setMinuteStart(String(minute[0].start_date).slice(0, 10));
         if (minute[0].end_date) setMinuteEnd(String(minute[0].end_date).slice(0, 10));
       }
-      setMessage(nextDatasets.length ? "" : "还没有可训练的 Qlib 数据集，请先在数据中心完成 Core 初始化。 ");
-    } catch {
+      }),
+      jsonResponse<Experiment[]>(apiFetch(`${api}/api/qlib/experiments`, { cache: "no-store" })).then(setExperiments),
+      jsonResponse<Job[]>(apiFetch(`${api}/api/jobs?limit=20&kind=qlib_baseline&kind=minute_research`, { cache: "no-store" })).then(setJobs),
+      jsonResponse<AutopilotCycle[]>(apiFetch(`${api}/api/autopilot/cycles?limit=1`, { cache: "no-store" })).then(async (cycles) => {
+        const cycle = cycles[0] ?? null;
+        setTournamentCycle(cycle);
+        if (!cycle) { setTournamentTrials([]); return; }
+        const response = await apiFetch(`${api}/api/autopilot/cycles/${cycle.id}/trials`, { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        setTournamentTrials(await response.json() as TournamentTrial[]);
+      }),
+      jsonResponse<ModelEnsemble[]>(apiFetch(`${api}/api/model-ensembles?limit=20`, { cache: "no-store" })).then(setEnsembles),
+    ];
+    const results = await Promise.allSettled(requests);
+    const failed = results.filter((item) => item.status === "rejected").length;
+    if (results[0].status === "rejected") setRuntimeLoadState("error");
+    if (failed === results.length) {
       setMessage("无法连接 Qlib 控制接口，请确认 Python 后端正在运行。 ");
+    } else if (failed) {
+      setMessage("部分实时状态暂未更新，已保留上次成功数据。 ");
+    } else {
+      setMessage(nextDatasetCount === 0 ? "还没有可训练的 Qlib 数据集，请先在数据中心完成 Core 初始化。 " : "");
     }
   }
 
@@ -112,17 +149,26 @@ export function QlibPanel({ api }: { api: string }) {
     {message && <div className="notice">{message}</div>}
     <section className="research-hero">
       <article className="runtime-card">
-        <div className="card-heading"><div><span>研究运行时</span><strong>Qlib + LightGBM</strong></div><span className={`status-chip ${runtime?.status === "ok" ? "verified" : ""}`}>{runtime?.status === "ok" ? "已验证" : "检查中"}</span></div>
-        <div className="runtime-grid"><div><span>Qlib</span><strong>{runtime?.qlib_version ?? "—"}</strong></div><div><span>LightGBM</span><strong>{runtime?.lightgbm_version ?? "—"}</strong></div><div><span>特征集</span><strong>Alpha158</strong></div><div><span>执行环境</span><strong>WSL · CPU</strong></div></div>
-        <div className="pipeline"><span>Qlib 数据</span><i>→</i><span>Alpha158</span><i>→</i><span>LightGBM</span><i>→</i><span>Top-K</span><i>→</i><span>含成本回测</span></div>
+        <div className="card-heading"><div><span>研究运行时</span><strong>Qlib 多模型竞赛</strong></div><span className={`status-chip ${runtimeLoadState === "ready" && runtime?.status === "ok" ? "verified" : ""}`}>{runtimeLoadState === "loading" ? "检查中" : runtimeLoadState === "error" ? "读取失败" : runtime?.status === "ok" ? "已验证" : "不可用"}</span></div>
+        <div className="runtime-grid"><div><span>Qlib</span><strong title={runtime?.qlib_version}>{compactVersion(runtime?.qlib_version)}</strong></div><div><span>候选模型</span><strong>Ridge / LGBM / GRU / Transformer</strong></div><div><span>受治理特征</span><strong>Alpha158 / 360 / 种子 / SOTA</strong></div><div><span>执行环境</span><strong>{runtimeLoadState === "loading" ? "检查中" : runtime?.execution_environment ?? "状态未知"}</strong></div></div>
+        <div className="pipeline"><span>冻结数据</span><i>→</i><span>特征集</span><i>→</i><span>候选模型</span><i>→</i><span>选股策略</span><i>→</i><span>独立验证</span></div>
       </article>
       <form className="experiment-card" onSubmit={runBaseline}>
-        <div className="card-heading"><div><span>基线实验</span><strong>训练并回测</strong></div></div>
+        <div className="card-heading"><div><span>高级手工对照</span><strong>Alpha158 + LightGBM</strong></div></div>
+        <p className="muted">自动驾驶会自行完成多特征、多模型竞赛。这里只保留可复现的手工对照，不代表正式准入。</p>
         <label>Qlib 日频数据集<select value={dataset} onChange={(event) => setDataset(event.target.value)} disabled={!dailyDatasets.length}>{dailyDatasets.length ? dailyDatasets.map((item) => <option key={item.name} value={item.name}>{item.name} · {item.trading_days} 日</option>) : <option>无可用日频数据集</option>}</select></label>
         <div className="form-row"><label>初始资金<input type="number" min="100000" step="100000" value={account} onChange={(event) => setAccount(Number(event.target.value))} /></label><label>股票数量<input type="number" min="1" max="500" value={topk} onChange={(event) => setTopk(Number(event.target.value))} /></label></div>
         <div className="form-row"><label>每日替换<input type="number" min="0" max={topk} value={nDrop} onChange={(event) => setNDrop(Number(event.target.value))} /></label><label>基准<input value="沪深300 · SH000300" disabled /></label></div>
-        <button className="primary" disabled={!dailyDatasets.length || runtime?.status !== "ok" || active}>运行 Alpha158 基线</button>
+        <button className="primary" disabled={!dailyDatasets.length || runtime?.status !== "ok" || active}>运行 Alpha158 探索基线</button>
       </form>
+    </section>
+    <section className="data-panel tournament-panel">
+      <div className="panel-heading"><div><p className="eyebrow">AUTOPILOT TOURNAMENT</p><h2>预注册模型试验</h2><p>全部尝试先登记后运行，失败项也会保留并计入多重检验；这里没有手工晋级按钮。</p></div><span>{tournamentCycle ? `${tournamentCycle.dataset} · ${tournamentCycle.stage}` : "等待自动周期"}</span></div>
+      <div className="table-wrap"><table><thead><tr><th>试验</th><th>特征集</th><th>模型家族</th><th>阶段</th><th>窗口 / 种子</th><th>结论</th></tr></thead><tbody>{tournamentTrials.map((item) => <tr key={item.id}><td><code>{item.name}</code></td><td>{item.feature_set_id ?? "—"}</td><td>{item.model_family ?? "—"}</td><td>{item.spec?.round ?? item.trial_kind}</td><td>{item.spec?.profiles?.join(" / ") ?? "—"} · {item.spec?.seeds?.join(", ") ?? "—"}</td><td><span className={`state ${["selected", "passed"].includes(item.status) ? "ready" : ["failed", "rejected"].includes(item.status) ? "failed" : "partial"}`}>{item.status}</span></td></tr>)}</tbody></table>{!tournamentTrials.length ? <div className="empty">尚无预注册竞赛；新 AutopilotCycle 建立后会自动出现。</div> : null}</div>
+    </section>
+    <section className="data-panel tournament-panel">
+      <div className="panel-heading"><div><p className="eyebrow">EQUAL-RANK ENSEMBLES</p><h2>模型集成候选</h2><p>只组合预测相关性不高于 0.90 的不同模型家族，最多三个成员并等权 Rank 融合，不做 Stacking。</p></div><span>{ensembles.length} 个候选</span></div>
+      <div className="table-wrap"><table><thead><tr><th>集成</th><th>数据版本</th><th>模型家族</th><th>组合方式</th><th>状态</th></tr></thead><tbody>{ensembles.map((item) => <tr key={item.id}><td><code>{item.name}</code></td><td>{item.dataset}</td><td>{item.components?.map((component) => component.model_family).filter(Boolean).join(" + ") || "—"}</td><td>{item.combiner === "equal_rank" ? "等权日度 Rank" : item.combiner}</td><td><span className={`state ${item.status === "research_admitted" ? "ready" : item.status === "rejected" ? "failed" : "partial"}`}>{item.status}</span></td></tr>)}</tbody></table>{!ensembles.length ? <div className="empty compact">尚无满足跨家族和相关性约束的集成候选。</div> : null}</div>
     </section>
     <section className="data-panel minute-research-card">
       <div className="panel-heading"><div><p className="eyebrow">INTRADAY FACTOR LAB</p><h2>分钟因子扫描</h2><p>对动量、VWAP 偏离、量能、价格区间和实现波动做含成本横截面检验；结果只进入研究记录，不自动晋级策略。</p></div><span>{minuteDatasets.length} 个分钟数据集</span></div>

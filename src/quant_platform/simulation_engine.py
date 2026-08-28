@@ -922,8 +922,9 @@ def execute_atomic_pair_day(
     ):
         raise ValueError("simulation account balances are invalid")
     if external_flow_open or external_flow_close:
-        # 配对账户是离线研究台账，不接受外部现金流（设计 6.4.3/12.1）。
-        raise ValueError("pair research ledgers do not accept external cash flows")
+        # 配对卫星是隔离影子账本；禁止外部现金流，避免合成卖空现金
+        # 污染统一模拟盘的真实多头资金口径。
+        raise ValueError("pair shadow ledgers do not accept external cash flows")
     cost_model = _resolve_cost_schedule(cost_model, cost_schedule).as_of(trade_date)
     policy = normalize_execution_policy(execution_policy)
     group_id = str(target_payload.get("atomic_group_id") or "").strip()
@@ -1037,6 +1038,8 @@ def execute_atomic_pair_day(
     execution_rows: dict[str, pd.Series] = {}
     executed_at: pd.Timestamp | None = None
     if active and rejection is None:
+        if str(policy.get("execution_algorithm") or "") != "vwap":
+            raise ValueError("pair shadow execution requires coordinated VWAP")
         leg_frames: dict[str, pd.DataFrame] = {}
         for spec in active:
             frame = bars[bars["instrument"] == spec["instrument"]].set_index("datetime")
@@ -1051,15 +1054,27 @@ def execute_atomic_pair_day(
         if not allowed:
             rejection = "missing_common_execution_bar"
         else:
-            executed_at = pd.Timestamp(allowed[0])
+            executed_at = pd.Timestamp(allowed[-1])
             for spec in active:
-                row = leg_frames[spec["instrument"]].loc[executed_at]
-                if isinstance(row, pd.DataFrame):
-                    raise ValueError("pair minute bars contain duplicate timestamps")
-                reason = _bar_rejection_reason(row, spec["cost_side"])
-                if reason:
-                    rejection = reason
+                selected = leg_frames[spec["instrument"]].loc[allowed]
+                if isinstance(selected, pd.Series):
+                    selected = selected.to_frame().T
+                for _, bar in selected.iterrows():
+                    reason = _bar_rejection_reason(bar, spec["cost_side"])
+                    if reason:
+                        rejection = reason
+                        break
+                if rejection:
                     break
+                volumes = pd.to_numeric(selected["volume"], errors="coerce")
+                vwaps = pd.to_numeric(selected["vwap"], errors="coerce")
+                total_volume = float(volumes.sum())
+                if total_volume <= 0:
+                    rejection = "missing_common_execution_bar"
+                    break
+                row = selected.iloc[-1].copy()
+                row["vwap"] = float((vwaps * volumes).sum() / total_volume)
+                row["volume"] = total_volume
                 capacity = int(
                     floor(float(row["volume"]) * float(policy["max_participation"]))
                 )
@@ -1334,7 +1349,7 @@ def _pair_result(
     nav = cash + market_value
     peak = max(high_water_mark, nav)
     certified = certified and not stale
-    # 配对台账无外部现金流：单位化链退化为 NAV 收益连乘，口径与主台账一致。
+    # 配对影子台账无外部现金流：单位化链退化为 NAV 收益连乘。
     unitized = chain_unitized_day(
         prior_nav=prior_nav,
         nav=nav,

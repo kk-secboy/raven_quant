@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -245,9 +246,10 @@ def test_market_overview_reports_not_ready_without_daily_snapshot(tmp_path: Path
 
 
 def test_market_overview_aggregates_snapshot_without_mixing_frequencies(tmp_path: Path) -> None:
-    _build_snapshot(tmp_path)
+    snapshot = _build_snapshot(tmp_path)
 
-    result = MarketOverviewService(tmp_path, cache_seconds=0).get(
+    result = MarketOverviewService(tmp_path, cache_seconds=0).materialize(
+        snapshot_name=snapshot.name,
         symbols=["600001.SH", "510300.SH", "000300.SH"]
     )
 
@@ -273,3 +275,99 @@ def test_market_overview_aggregates_snapshot_without_mixing_frequencies(tmp_path
 def test_market_overview_rejects_snapshot_path_escape(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="outside"):
         MarketOverviewService(tmp_path, cache_seconds=0).get(snapshot_name="../outside")
+
+
+def test_market_overview_reads_a_persisted_materialized_result(tmp_path: Path) -> None:
+    snapshot = _build_snapshot(tmp_path)
+    first = MarketOverviewService(tmp_path, cache_seconds=0).materialize(
+        snapshot_name=snapshot.name
+    )
+
+    class ArtifactOnlyService(MarketOverviewService):
+        def _select_snapshot(self, snapshot_name: str | None):
+            raise AssertionError("latest dashboard should avoid manifest and parquet scans")
+
+    second = ArtifactOnlyService(tmp_path, cache_seconds=0).get()
+
+    assert second == first
+    artifacts = list((tmp_path / "artifacts" / "market-overview").rglob("*.json"))
+    assert len(artifacts) == 3
+
+
+def test_market_overview_cold_projection_never_scans_snapshot_or_duckdb(
+    tmp_path: Path,
+) -> None:
+    _build_snapshot(tmp_path)
+
+    class ProjectionOnlyService(MarketOverviewService):
+        def _select_snapshot(self, snapshot_name: str | None):
+            raise AssertionError("HTTP projection read must not inspect snapshot manifests")
+
+        def _build(self, snapshot, manifest, watchlist):
+            raise AssertionError("HTTP projection read must not open DuckDB")
+
+    started = time.perf_counter()
+    result = ProjectionOnlyService(tmp_path, cache_seconds=0).get()
+
+    assert time.perf_counter() - started < 0.2
+    assert result["status"] == "not_ready"
+    assert "不会现场扫描" in result["message"]
+
+
+def test_market_overview_corrupt_projection_is_nonblocking_and_uses_previous(
+    tmp_path: Path,
+) -> None:
+    snapshot = _build_snapshot(tmp_path)
+    first = MarketOverviewService(tmp_path, cache_seconds=0).materialize(
+        snapshot_name=snapshot.name
+    )
+    # Re-publication creates a durable previous pointer before replacing latest.
+    second = MarketOverviewService(tmp_path, cache_seconds=0).materialize(
+        snapshot_name=snapshot.name
+    )
+    assert second == first
+    latest = tmp_path / "artifacts" / "market-overview" / "latest.json"
+    latest.write_text("{broken", encoding="utf-8")
+
+    class ProjectionOnlyService(MarketOverviewService):
+        def _select_snapshot(self, snapshot_name: str | None):
+            raise AssertionError("damaged display cache must not trigger a manifest scan")
+
+        def _build(self, snapshot, manifest, watchlist):
+            raise AssertionError("damaged display cache must not trigger DuckDB")
+
+    started = time.perf_counter()
+    recovered = ProjectionOnlyService(tmp_path, cache_seconds=0).get()
+
+    assert time.perf_counter() - started < 0.2
+    assert recovered == first
+
+
+def test_market_overview_limits_monthly_partitions_before_touching_files(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshots" / "partitioned"
+    files = []
+    for year, month in ((2025, 12), (2026, 1), (2026, 2), (2026, 3), (2026, 4), (2026, 5)):
+        target = (
+            snapshot
+            / "parquet"
+            / "daily"
+            / f"partition_year={year}"
+            / f"partition_month={month}"
+            / "data.parquet"
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"fixture")
+        files.append({"path": target.relative_to(snapshot).as_posix()})
+
+    selected = MarketOverviewService._entry_files(
+        snapshot,
+        {"files": files},
+        recent_months=2,
+    )
+
+    assert [path.parent.name for path in selected] == [
+        "partition_month=4",
+        "partition_month=5",
+    ]

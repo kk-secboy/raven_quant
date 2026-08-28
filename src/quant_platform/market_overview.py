@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import time
+import uuid
 from datetime import UTC, date, datetime
+from hashlib import sha256
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -23,21 +26,21 @@ INDEX_NAMES = {
     "899050.BJ": "北证50",
 }
 DEFAULT_WATCHLIST = (
-    "000001.SH",
-    "399001.SZ",
-    "399006.SZ",
     "000300.SH",
     "000905.SH",
     "000852.SH",
     "000016.SH",
-    "000688.SH",
-    "899050.BJ",
     "510300.SH",
     "159919.SZ",
     "510500.SH",
     "512100.SH",
 )
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9_.-]{1,31}$")
+_PARTITION_PATTERN = re.compile(
+    r"(?:^|/)partition_year=(\d{4})/partition_month=(\d{1,2})(?:/|$)"
+)
+_MATERIALIZED_SCHEMA_VERSION = "market-overview-v1"
+_RECENT_MARKET_MONTHS = 4
 
 
 class MarketOverviewService:
@@ -55,25 +58,98 @@ class MarketOverviewService:
         snapshot_name: str | None = None,
         symbols: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
-        selected = self._select_snapshot(snapshot_name)
-        if selected is None:
-            return self._empty("尚无包含 A 股日线的不可变快照，请先完成数据收口。")
-        snapshot, manifest, manifest_mtime = selected
+        """Read only a compact publisher-owned projection.
+
+        This method is called from the HTTP request path.  It must never open a
+        snapshot manifest or DuckDB: a cold or damaged projection is a display
+        cache miss, not permission to scan the immutable research lake inside
+        the API process.
+        """
+
         watchlist = self._normalize_symbols(symbols)
+        normalized_snapshot = self._validate_snapshot_name(snapshot_name)
+        materialized = self._read_published_materialized(
+            snapshot_name=normalized_snapshot,
+            watchlist=watchlist,
+        )
+        if materialized is not None:
+            return materialized
+        return self._empty(
+            "行情总览投影尚未由后台生成；页面不会现场扫描历史数据。",
+            snapshot_name=normalized_snapshot,
+        )
+
+    def materialize(
+        self,
+        *,
+        snapshot_name: str,
+        symbols: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        """Create or reuse a compact artifact outside the HTTP request path."""
+
+        watchlist = self._normalize_symbols(symbols)
+        normalized_snapshot = self._validate_snapshot_name(snapshot_name)
+        selected = self._select_snapshot(normalized_snapshot)
+        if selected is None:
+            return self._empty(
+                "所选快照不包含可物化的 A 股日线数据。",
+                snapshot_name=normalized_snapshot,
+            )
+        snapshot, manifest, manifest_mtime, manifest_sha256 = selected
         key = (snapshot.name, watchlist, manifest_mtime)
         now = time.monotonic()
         with self._lock:
             cached = self._cache.get(key)
             if cached and now - cached[0] <= self.cache_seconds:
                 return cached[1]
-        result = self._build(snapshot, manifest, watchlist)
-        with self._lock:
-            self._cache = {key: (now, result)}
-        return result
+            result = self._read_materialized(
+                snapshot=snapshot,
+                manifest_mtime=manifest_mtime,
+                manifest_sha256=manifest_sha256,
+                watchlist=watchlist,
+            )
+            if result is None:
+                result = self._build(snapshot, manifest, watchlist)
+            if result.get("status") == "ready":
+                # Re-publish even when the immutable, content-addressed result
+                # already exists.  The stable request/latest pointers may be
+                # absent after an upgrade or interrupted publication.
+                self._write_materialized(
+                    snapshot=snapshot,
+                    manifest_mtime=manifest_mtime,
+                    manifest_sha256=manifest_sha256,
+                    watchlist=watchlist,
+                    result=result,
+                )
+            self._remember(key, now, result)
+            return result
+
+    def _validate_snapshot_name(self, snapshot_name: str | None) -> str | None:
+        if snapshot_name is None:
+            return None
+        normalized = str(snapshot_name).strip()
+        root = (self.data_root / "snapshots").resolve()
+        candidate = (root / normalized).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("snapshot name resolves outside the snapshot root") from exc
+        return normalized
+
+    def _remember(
+        self,
+        key: tuple[str, tuple[str, ...], int],
+        now: float,
+        result: dict[str, Any],
+    ) -> None:
+        self._cache[key] = (now, result)
+        if len(self._cache) > 16:
+            oldest = min(self._cache, key=lambda item: self._cache[item][0])
+            self._cache.pop(oldest, None)
 
     def _select_snapshot(
         self, snapshot_name: str | None
-    ) -> tuple[Path, dict[str, Any], int] | None:
+    ) -> tuple[Path, dict[str, Any], int, str] | None:
         root = (self.data_root / "snapshots").resolve()
         if snapshot_name:
             candidate = (root / snapshot_name).resolve()
@@ -92,33 +168,37 @@ class MarketOverviewService:
                 key=lambda item: item.stat().st_mtime_ns,
                 reverse=True,
             )
-        valid: list[tuple[datetime, Path, dict[str, Any], int]] = []
+        manifests: list[tuple[int, Path, Path]] = []
         for candidate in candidates:
             manifest_path = candidate / "manifest.json"
+            try:
+                manifests.append((manifest_path.stat().st_mtime_ns, candidate, manifest_path))
+            except FileNotFoundError:
+                continue
+        for _, candidate, manifest_path in sorted(
+            manifests, key=lambda item: item[0], reverse=True
+        ):
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (FileNotFoundError, json.JSONDecodeError):
                 continue
             datasets = manifest.get("datasets")
-            if not isinstance(datasets, dict) or not self._entry_files(
-                candidate, datasets.get("daily")
-            ):
+            if not isinstance(datasets, dict) or not self._entry_has_files(datasets.get("daily")):
                 continue
             if str(manifest.get("frequency") or "day") != "day":
                 continue
-            try:
-                created = datetime.fromisoformat(
-                    str(manifest.get("created_at") or "").replace("Z", "+00:00")
-                )
-            except ValueError:
-                created = datetime.fromtimestamp(manifest_path.stat().st_mtime, UTC)
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=UTC)
-            valid.append((created, candidate, manifest, manifest_path.stat().st_mtime_ns))
-        if not valid:
-            return None
-        _, candidate, manifest, mtime = max(valid, key=lambda item: item[0])
-        return candidate, manifest, mtime
+            if not self._entry_files(
+                candidate, datasets.get("daily"), recent_months=1
+            ):
+                continue
+            raw_manifest = manifest_path.read_bytes()
+            return (
+                candidate,
+                manifest,
+                manifest_path.stat().st_mtime_ns,
+                sha256(raw_manifest).hexdigest(),
+            )
+        return None
 
     def _build(
         self,
@@ -129,7 +209,13 @@ class MarketOverviewService:
         datasets = manifest.get("datasets", {})
         connection = duckdb.connect()
         try:
-            daily = self._relation(connection, snapshot, datasets, "daily")
+            daily = self._relation(
+                connection,
+                snapshot,
+                datasets,
+                "daily",
+                recent_months=_RECENT_MARKET_MONTHS,
+            )
             if daily is None or not {"ts_code", "trade_date", "close"}.issubset(daily[1]):
                 return self._empty(
                     "所选快照缺少可读取的 A 股日线字段。",
@@ -212,7 +298,7 @@ class MarketOverviewService:
             available = [
                 name
                 for name in ("daily", "index_daily", "fund_daily", "fut_daily", "stock_basic")
-                if self._entry_files(snapshot, datasets.get(name))
+                if self._entry_files(snapshot, datasets.get(name), recent_months=1)
             ]
             return {
                 "status": "ready",
@@ -278,7 +364,13 @@ class MarketOverviewService:
         limit: int = 8,
         order_by_amount: bool = False,
     ) -> list[dict[str, Any]]:
-        resolved = self._relation(connection, snapshot, datasets, dataset)
+        resolved = self._relation(
+            connection,
+            snapshot,
+            datasets,
+            dataset,
+            recent_months=_RECENT_MARKET_MONTHS,
+        )
         if resolved is None:
             return []
         relation, columns = resolved
@@ -320,7 +412,13 @@ class MarketOverviewService:
         snapshot: Path,
         datasets: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        resolved = self._relation(connection, snapshot, datasets, "fut_daily")
+        resolved = self._relation(
+            connection,
+            snapshot,
+            datasets,
+            "fut_daily",
+            recent_months=_RECENT_MARKET_MONTHS,
+        )
         if resolved is None:
             return []
         relation, columns = resolved
@@ -438,8 +536,14 @@ class MarketOverviewService:
         snapshot: Path,
         datasets: dict[str, Any],
         dataset: str,
+        *,
+        recent_months: int | None = None,
     ) -> tuple[str, set[str]] | None:
-        files = self._entry_files(snapshot, datasets.get(dataset))
+        files = self._entry_files(
+            snapshot,
+            datasets.get(dataset),
+            recent_months=recent_months,
+        )
         if not files:
             return None
         relation = (
@@ -457,21 +561,247 @@ class MarketOverviewService:
         return relation, columns
 
     @staticmethod
-    def _entry_files(snapshot: Path, entry: Any) -> list[Path]:
+    def _entry_has_files(entry: Any) -> bool:
+        return bool(
+            isinstance(entry, dict)
+            and isinstance(entry.get("files"), list)
+            and entry["files"]
+        )
+
+    @staticmethod
+    def _entry_files(
+        snapshot: Path,
+        entry: Any,
+        *,
+        recent_months: int | None = None,
+    ) -> list[Path]:
         if not isinstance(entry, dict) or not isinstance(entry.get("files"), list):
             return []
-        files: list[Path] = []
+        candidates: list[tuple[Path, tuple[int, int] | None]] = []
         for item in entry["files"]:
             if not isinstance(item, dict) or not item.get("path"):
                 continue
-            target = (snapshot / str(item["path"])).resolve()
+            relative = str(item["path"]).replace("\\", "/")
+            target = (snapshot / relative).resolve()
             try:
                 target.relative_to(snapshot.resolve())
             except ValueError:
                 continue
-            if target.is_file():
-                files.append(target)
-        return files
+            match = _PARTITION_PATTERN.search(relative)
+            partition = (int(match.group(1)), int(match.group(2))) if match else None
+            candidates.append((target, partition))
+        if recent_months and candidates and all(item[1] is not None for item in candidates):
+            partitions = sorted({item[1] for item in candidates if item[1] is not None})
+            keep = set(partitions[-max(1, int(recent_months)) :])
+            candidates = [item for item in candidates if item[1] in keep]
+        return [target for target, _ in candidates if target.is_file()]
+
+    def _materialized_path(
+        self,
+        *,
+        snapshot: Path,
+        manifest_sha256: str,
+        watchlist: tuple[str, ...],
+    ) -> Path:
+        symbols_sha256 = self._symbols_sha256(watchlist)
+        return (
+            self.data_root
+            / "artifacts"
+            / "market-overview"
+            / snapshot.name
+            / manifest_sha256[:16]
+            / f"{symbols_sha256}.json"
+        )
+
+    @staticmethod
+    def _symbols_sha256(watchlist: tuple[str, ...]) -> str:
+        return sha256("\n".join(watchlist).encode("utf-8")).hexdigest()
+
+    def _published_request_path(
+        self,
+        *,
+        snapshot_name: str,
+        watchlist: tuple[str, ...],
+    ) -> Path:
+        snapshot_sha256 = sha256(snapshot_name.encode("utf-8")).hexdigest()
+        return (
+            self.data_root
+            / "artifacts"
+            / "market-overview"
+            / "requests"
+            / snapshot_sha256
+            / f"{self._symbols_sha256(watchlist)}.json"
+        )
+
+    def _latest_path(self, watchlist: tuple[str, ...], *, previous: bool = False) -> Path:
+        if watchlist == DEFAULT_WATCHLIST:
+            filename = "previous.json" if previous else "latest.json"
+        else:
+            prefix = "previous" if previous else "latest"
+            filename = f"{prefix}-{self._symbols_sha256(watchlist)}.json"
+        return self.data_root / "artifacts" / "market-overview" / filename
+
+    def _read_materialized(
+        self,
+        *,
+        snapshot: Path,
+        manifest_mtime: int,
+        manifest_sha256: str,
+        watchlist: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        path = self._materialized_path(
+            snapshot=snapshot,
+            manifest_sha256=manifest_sha256,
+            watchlist=watchlist,
+        )
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        if (
+            payload.get("schema_version") != _MATERIALIZED_SCHEMA_VERSION
+            or payload.get("snapshot_name") != snapshot.name
+            or payload.get("manifest_sha256") != manifest_sha256
+            or payload.get("manifest_mtime_ns") != manifest_mtime
+            or payload.get("symbols") != list(watchlist)
+            or not isinstance(payload.get("result"), dict)
+        ):
+            return None
+        return payload["result"]
+
+    def _read_published_payload(
+        self,
+        path: Path,
+        *,
+        snapshot_name: str | None,
+        watchlist: tuple[str, ...],
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        if (
+            payload.get("schema_version") != _MATERIALIZED_SCHEMA_VERSION
+            or payload.get("symbols") != list(watchlist)
+            or (snapshot_name is not None and payload.get("snapshot_name") != snapshot_name)
+            or not isinstance(payload.get("result"), dict)
+            or payload["result"].get("status") != "ready"
+        ):
+            return None
+        return payload, payload["result"]
+
+    def _read_published_materialized(
+        self,
+        *,
+        snapshot_name: str | None,
+        watchlist: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        if snapshot_name is not None:
+            paths = [
+                self._published_request_path(
+                    snapshot_name=snapshot_name,
+                    watchlist=watchlist,
+                )
+            ]
+        else:
+            # `previous` is deliberately retained across publications.  It is
+            # a small, known path and provides a bounded fallback if `latest`
+            # is damaged; no directory or snapshot discovery occurs here.
+            paths = [
+                self._latest_path(watchlist),
+                self._latest_path(watchlist, previous=True),
+            ]
+        for path in paths:
+            published = self._read_published_payload(
+                path,
+                snapshot_name=snapshot_name,
+                watchlist=watchlist,
+            )
+            if published is not None:
+                return published[1]
+        return None
+
+    def _read_latest_materialized(
+        self, watchlist: tuple[str, ...]
+    ) -> dict[str, Any] | None:
+        """Compatibility wrapper for callers that only need the latest projection."""
+
+        return self._read_published_materialized(
+            snapshot_name=None,
+            watchlist=watchlist,
+        )
+
+    @staticmethod
+    def _publication_order(payload: dict[str, Any]) -> tuple[str, int]:
+        result = payload.get("result")
+        source = result.get("source") if isinstance(result, dict) else None
+        as_of = str(source.get("as_of") or "") if isinstance(source, dict) else ""
+        try:
+            manifest_mtime = int(payload.get("manifest_mtime_ns") or 0)
+        except (TypeError, ValueError):
+            manifest_mtime = 0
+        return as_of, manifest_mtime
+
+    def _write_materialized(
+        self,
+        *,
+        snapshot: Path,
+        manifest_mtime: int,
+        manifest_sha256: str,
+        watchlist: tuple[str, ...],
+        result: dict[str, Any],
+    ) -> None:
+        path = self._materialized_path(
+            snapshot=snapshot,
+            manifest_sha256=manifest_sha256,
+            watchlist=watchlist,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": _MATERIALIZED_SCHEMA_VERSION,
+            "snapshot_name": snapshot.name,
+            "manifest_sha256": manifest_sha256,
+            "manifest_mtime_ns": manifest_mtime,
+            "symbols": list(watchlist),
+            "generated_at": datetime.now(UTC).isoformat(),
+            "result": result,
+        }
+        self._write_json_atomic(path, payload)
+        self._write_json_atomic(
+            self._published_request_path(
+                snapshot_name=snapshot.name,
+                watchlist=watchlist,
+            ),
+            payload,
+        )
+        latest_path = self._latest_path(watchlist)
+        current = self._read_published_payload(
+            latest_path,
+            snapshot_name=None,
+            watchlist=watchlist,
+        )
+        if current is None or self._publication_order(payload) >= self._publication_order(
+            current[0]
+        ):
+            if current is not None and current[0] != payload:
+                self._write_json_atomic(
+                    self._latest_path(watchlist, previous=True),
+                    current[0],
+                )
+            self._write_json_atomic(
+                latest_path,
+                payload,
+            )
+
+    @staticmethod
+    def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
 
     @staticmethod
     def _pct_expression(columns: set[str]) -> str:

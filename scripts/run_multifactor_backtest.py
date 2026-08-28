@@ -42,7 +42,10 @@ from quant_platform.formal_validation import (
     run_outer_walk_forward,
     run_signal_decay_suite,
 )
-from quant_platform.model_recompute import execute_model_candidate
+from quant_platform.model_recompute import (
+    execute_model_candidate,
+    governed_checkpoint_filename,
+)
 from quant_platform.model_research_governance import (
     MODEL_REFIT_POLICY,
     MODEL_REFIT_POLICY_SHA256,
@@ -85,6 +88,139 @@ from quant_platform.upstream_versions import upstream_runtime_identity
 GOVERNED_STYLE_COLUMNS = ("size", "value", "growth", "volatility")
 MAX_STYLE_CROSS_SECTION_MISSING_RATE = 0.05
 STYLE_EXPOSURE_CONTRACT_VERSION = "standardized-neutral-imputation-v1"
+FORMAL_FINAL_OOS_MODE = "formal_final_oos"
+PRE_FINAL_PORTFOLIO_TRIAL_MODE = "pre_final_portfolio_trial"
+GOVERNED_MODEL_ENGINES = frozenset(
+    {
+        "rdagent_pytorch",
+        "ridge_baseline",
+        "lightgbm_baseline",
+        "platform_gru",
+        "platform_transformer",
+    }
+)
+
+
+def _evaluation_mode(manifest: dict[str, Any]) -> str:
+    mode = str(manifest.get("evaluation_mode") or FORMAL_FINAL_OOS_MODE)
+    if mode not in {FORMAL_FINAL_OOS_MODE, PRE_FINAL_PORTFOLIO_TRIAL_MODE}:
+        raise ValueError("unsupported governed backtest evaluation mode")
+    return mode
+
+
+def _frozen_model_engine(
+    recipe: dict[str, Any], *, recipe_sha256: str
+) -> str:
+    if canonical_model_sha256(recipe) != recipe_sha256:
+        raise ValueError("formal model recipe changed after admission")
+    hyperparameters = recipe.get("model_hyperparameters") or {}
+    if not isinstance(hyperparameters, dict):
+        raise ValueError("formal model recipe hyperparameters are invalid")
+    direct = str(recipe.get("model_engine") or "").strip()
+    nested = str(hyperparameters.get("model_engine") or "").strip()
+    if direct and nested and direct != nested:
+        raise ValueError("formal model recipe contains conflicting model engines")
+    engine = str(
+        direct or nested or "rdagent_pytorch"
+    )
+    if engine not in GOVERNED_MODEL_ENGINES:
+        raise ValueError("formal model recipe requests an ungoverned model engine")
+    return engine
+
+
+def _model_execution_authorization(
+    *,
+    evaluation_mode: str,
+    candidate_manifest: dict[str, Any],
+    model_periods: dict[str, Any],
+    periods: dict[str, str],
+    historical_periods: dict[str, str],
+    pre_final_cutoff: str | None,
+) -> dict[str, Any]:
+    """Return the only allowed model prediction scope for this run.
+
+    The default remains the one-shot final-OOS path.  The alternate path is
+    selection-only and can only reuse the admitted primary validation window;
+    it cannot move, alias, or cross the candidate's frozen pre-final cutoff.
+    """
+
+    candidate_cutoff = str(candidate_manifest.get("pre_final_end") or "")
+    final_start = str(candidate_manifest.get("final_oos_start") or "")
+    final_end = str(candidate_manifest.get("final_oos_end") or "")
+    if not candidate_cutoff or not candidate_cutoff < final_start <= final_end:
+        raise ValueError("formal model candidate has an invalid frozen OOS boundary")
+    if evaluation_mode == FORMAL_FINAL_OOS_MODE:
+        if (
+            candidate_cutoff != historical_periods["end"]
+            or final_start != periods["start"]
+            or final_end != periods["end"]
+            or not (
+                str(model_periods["train_start"])
+                <= str(model_periods["train_end"])
+                < str(model_periods["valid_start"])
+                <= str(model_periods["valid_end"])
+                <= historical_periods["end"]
+                < periods["start"]
+            )
+        ):
+            raise ValueError("formal model training periods are not isolated before final OOS")
+        return {
+            "prediction_segment": "test",
+            "final_oos_opened": True,
+            "allow_final_oos": True,
+            "allow_inference": False,
+            "evaluation_scope": "final_oos_once",
+        }
+    if (
+        pre_final_cutoff != candidate_cutoff
+        or periods["end"] > candidate_cutoff
+        or periods["start"] < str(model_periods["valid_start"])
+        or periods["end"] > str(model_periods["valid_end"])
+        or not (
+            str(model_periods["train_start"])
+            <= str(model_periods["train_end"])
+            < str(model_periods["valid_start"])
+            <= str(model_periods["valid_end"])
+            <= candidate_cutoff
+            < final_start
+        )
+    ):
+        raise ValueError("pre-final portfolio trial crosses its admitted validation cutoff")
+    return {
+        "prediction_segment": "test",
+        "final_oos_opened": False,
+        "allow_final_oos": False,
+        "allow_inference": True,
+        "evaluation_scope": "pre_final_only",
+    }
+
+
+def _pre_final_execution_periods(
+    model_periods: dict[str, Any],
+    periods: dict[str, str],
+    calendar: Any,
+    *,
+    embargo_sessions: int = 5,
+) -> dict[str, Any]:
+    """Create an inner validation/test split strictly before the sealed OOS."""
+
+    eligible = pd.DatetimeIndex(calendar).normalize()
+    eligible = eligible[
+        (eligible >= pd.Timestamp(model_periods["valid_start"]))
+        & (eligible < pd.Timestamp(periods["start"]))
+    ]
+    if len(eligible) <= embargo_sessions:
+        raise ValueError(
+            "pre-final portfolio trial has no purged inner validation history"
+        )
+    return {
+        "train_start": str(model_periods["train_start"]),
+        "train_end": str(model_periods["train_end"]),
+        "valid_start": str(model_periods["valid_start"]),
+        "valid_end": eligible[-(embargo_sessions + 1)].date().isoformat(),
+        "test_start": periods["start"],
+        "test_end": periods["end"],
+    }
 
 
 def _load(path: str) -> pd.DataFrame:
@@ -438,6 +574,7 @@ def main() -> None:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    evaluation_mode = _evaluation_mode(manifest)
     provider_provenance_path = Path(args.provider_uri) / "metadata" / "provenance.json"
     if not provider_provenance_path.exists():
         raise ValueError("formal Qlib backtest requires dataset provenance metadata")
@@ -455,6 +592,10 @@ def main() -> None:
 
     config = manifest["config"]
     signal_source = str(config.get("signal_source") or "factor_score")
+    if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE and signal_source != (
+        "model_prediction"
+    ):
+        raise ValueError("pre-final portfolio trial mode requires an admitted model signal")
     model_bundle_factors = manifest.get("model_bundle_factors") or []
     if not isinstance(model_bundle_factors, list) or any(
         not isinstance(item, dict) for item in model_bundle_factors
@@ -685,12 +826,6 @@ def main() -> None:
     model_scores: pd.Series | None = None
     additional_factors_path: Path | None = None
     if signal_source == "model_prediction":
-        formal_model_admission = validate_model_formal_admission_binding(
-            manifest.get("model_formal_admission"),
-            config=config,
-            dataset_identity_sha256=str(provider_provenance.get("dataset_identity_sha256") or ""),
-            pre_final_end=historical_periods["end"],
-        )
         frozen_model = manifest.get("model_candidate")
         if not isinstance(frozen_model, dict):
             raise ValueError("formal model strategy has no frozen candidate manifest")
@@ -701,6 +836,19 @@ def main() -> None:
         feature_set = frozen_model.get("feature_set")
         if not isinstance(candidate_manifest, dict) or not isinstance(feature_set, dict):
             raise ValueError("formal model candidate manifest is incomplete")
+        admission_pre_final_end = (
+            str(candidate_manifest.get("pre_final_end") or "")
+            if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+            else historical_periods["end"]
+        )
+        formal_model_admission = validate_model_formal_admission_binding(
+            manifest.get("model_formal_admission"),
+            config=config,
+            dataset_identity_sha256=str(
+                provider_provenance.get("dataset_identity_sha256") or ""
+            ),
+            pre_final_end=admission_pre_final_end,
+        )
         if (
             candidate_manifest.get("id") != config.get("model_candidate_id")
             or candidate_manifest.get("code_sha256") != config.get("model_code_sha256")
@@ -711,11 +859,8 @@ def main() -> None:
             or feature_set.get("definition_sha256") != config.get("feature_set_definition_sha256")
             or candidate_manifest.get("dataset_identity_sha256")
             != provider_provenance.get("dataset_identity_sha256")
-            or candidate_manifest.get("pre_final_end") != historical_periods["end"]
-            or candidate_manifest.get("final_oos_start") != periods["start"]
-            or candidate_manifest.get("final_oos_end") != periods["end"]
         ):
-            raise ValueError("formal model candidate does not match the final-OOS run")
+            raise ValueError("formal model candidate does not match the governed run")
         recipe = candidate_manifest.get("recipe")
         if not isinstance(recipe, dict):
             raise ValueError("formal model candidate recipe is missing")
@@ -734,15 +879,37 @@ def main() -> None:
             != frozen_model["refit_policy_sha256"]
         ):
             raise ValueError("formal model primary cell/refit policy is not governed")
-        if not (
-            str(model_periods["train_start"])
-            <= str(model_periods["train_end"])
-            < str(model_periods["valid_start"])
-            <= str(model_periods["valid_end"])
-            <= historical_periods["end"]
-            < periods["start"]
-        ):
-            raise ValueError("formal model training periods are not isolated before final OOS")
+        execution_authorization = _model_execution_authorization(
+            evaluation_mode=evaluation_mode,
+            candidate_manifest=candidate_manifest,
+            model_periods=model_periods,
+            periods=periods,
+            historical_periods=historical_periods,
+            pre_final_cutoff=(
+                str(manifest.get("pre_final_cutoff") or "")
+                if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+                else None
+            ),
+        )
+        execution_model_periods = {
+            "train_start": str(model_periods["train_start"]),
+            "train_end": str(model_periods["train_end"]),
+            "valid_start": str(model_periods["valid_start"]),
+            "valid_end": str(model_periods["valid_end"]),
+            "test_start": periods["start"],
+            "test_end": periods["end"],
+        }
+        if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE:
+            execution_model_periods = _pre_final_execution_periods(
+                model_periods,
+                periods,
+                D.calendar(
+                    start_time=str(model_periods["valid_start"]),
+                    end_time=periods["start"],
+                    freq="day",
+                ),
+                embargo_sessions=int(config.get("outer_embargo_days", 5)),
+            )
         code_path = Path(str(frozen_model.get("code_path") or ""))
         if config.get("quant_bundle_candidate_id") is not None:
             bundle_contract = config.get("quant_bundle_factor_contract")
@@ -791,6 +958,10 @@ def main() -> None:
         model_root = output / "formal-model"
         if model_root.exists():
             shutil.rmtree(model_root)
+        formal_model_engine = _frozen_model_engine(
+            recipe,
+            recipe_sha256=str(candidate_manifest["recipe_sha256"]),
+        )
         model_result, model_execution = execute_model_candidate(
             code_path=code_path,
             provider_path=Path(args.provider_uri),
@@ -799,19 +970,12 @@ def main() -> None:
                 "candidate_id": str(candidate_manifest["id"]),
                 "code_sha256": str(candidate_manifest["code_sha256"]),
                 "model_type": str(recipe.get("model_type") or "Tabular"),
-                "model_engine": "rdagent_pytorch",
+                "model_engine": formal_model_engine,
                 "training_hyperparameters": recipe.get("training_hyperparameters") or {},
                 "feature_set": feature_set,
                 "additional_factor_count": len(challenger_entries),
-                "periods": {
-                    "train_start": str(model_periods["train_start"]),
-                    "train_end": str(model_periods["train_end"]),
-                    "valid_start": str(model_periods["valid_start"]),
-                    "valid_end": str(model_periods["valid_end"]),
-                    "test_start": periods["start"],
-                    "test_end": periods["end"],
-                },
-                "prediction_segment": "test",
+                "periods": execution_model_periods,
+                "prediction_segment": execution_authorization["prediction_segment"],
                 "seed": int(model_periods["seed"]),
                 "dataset_identity_sha256": provider_provenance.get("dataset_identity_sha256"),
                 "universe": manifest.get("universe", "cn_all"),
@@ -822,11 +986,13 @@ def main() -> None:
                 "open_cost": config.get("open_cost", 0.0005),
                 "close_cost": config.get("close_cost", 0.0015),
                 "min_cost": config.get("min_cost", 5.0),
-                "final_oos_opened": True,
+                "final_oos_opened": execution_authorization["final_oos_opened"],
+                "inference_only": execution_authorization["allow_inference"],
             },
             workspace=model_root,
             runner_path=Path(__file__).resolve().with_name("model_sandbox_runner.py"),
-            allow_final_oos=True,
+            allow_final_oos=execution_authorization["allow_final_oos"],
+            allow_inference=execution_authorization["allow_inference"],
             timeout_seconds=int(manifest.get("model_timeout_seconds", 7200)),
         )
         admitted_environment_sha256 = str(
@@ -844,7 +1010,9 @@ def main() -> None:
                 "formal model execution environment differs from independent admission"
             )
         predictions_path = model_root / "output" / "predictions.parquet"
-        checkpoint_path = model_root / "output" / "checkpoint.pt"
+        checkpoint_path = (
+            model_root / "output" / governed_checkpoint_filename(formal_model_engine)
+        )
         model_coverage = verify_model_prediction_artifact(
             predictions_path,
             expected_sha256=model_result["predictions_sha256"],
@@ -875,6 +1043,11 @@ def main() -> None:
             "predictions_sha256": str(model_result["predictions_sha256"]),
             "checkpoint_path": str(checkpoint_path.relative_to(output)).replace("\\", "/"),
             "checkpoint_sha256": str(model_result["checkpoint_sha256"]),
+            "checkpoint_format": str(model_result["checkpoint_format"]),
+            "model_data_contract": model_result["model_data_contract"],
+            "model_data_contract_sha256": str(
+                model_result["model_data_contract_sha256"]
+            ),
             "additional_factors_path": (
                 str(additional_factors_path.relative_to(output)).replace("\\", "/")
                 if additional_factors_path is not None
@@ -1157,15 +1330,27 @@ def main() -> None:
     history_calendar = pre_final_calendar[
         pre_final_calendar <= pd.Timestamp(historical_periods["end"])
     ]
-    pre_final_history = build_pre_final_history_evidence(
-        pre_final_calendar,
-        requested_start=historical_periods["start"],
-        requested_end=historical_periods["end"],
-        final_test_start=periods["start"],
-        final_test_end=periods["end"],
-        minimum_trading_days=int(config.get("min_pre_final_history_days", 2520)),
-        minimum_embargo_trading_days=int(config.get("outer_embargo_days", 5)),
-    )
+    if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE:
+        pre_final_history = {
+            "status": "not_applicable_pre_final_portfolio_trial",
+            "scope": "selection_only",
+            "requested_start": historical_periods["start"],
+            "requested_end": historical_periods["end"],
+            "trial_start": periods["start"],
+            "trial_end": periods["end"],
+            "pre_final_cutoff": str(manifest["pre_final_cutoff"]),
+            "final_oos_opened": False,
+        }
+    else:
+        pre_final_history = build_pre_final_history_evidence(
+            pre_final_calendar,
+            requested_start=historical_periods["start"],
+            requested_end=historical_periods["end"],
+            final_test_start=periods["start"],
+            final_test_end=periods["end"],
+            minimum_trading_days=int(config.get("min_pre_final_history_days", 2520)),
+            minimum_embargo_trading_days=int(config.get("outer_embargo_days", 5)),
+        )
     pre_final_history["execution_model"] = {
         "method": "open",
         "frequency": "day",
@@ -1572,6 +1757,12 @@ def main() -> None:
         "paired_block_bootstrap": paired_bootstrap,
         "multiple_testing": multiple_testing,
     }
+    if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE:
+        # Selection evidence is useful for ranking the two frozen construction
+        # policies, but is never promotion evidence and cannot satisfy approve().
+        formal_validation["status"] = "not_applicable_pre_final_only"
+        formal_validation["capital_eligible"] = False
+        formal_validation["final_oos_opened"] = False
     if formal_model_admission is not None:
         formal_validation["model_admission"] = formal_model_admission
     deflated_sharpe = deflated_sharpe_probability(
@@ -1597,6 +1788,18 @@ def main() -> None:
         "deflated_sharpe_probability": deflated_sharpe["probability"],
         "formal_validation": formal_validation,
         "formal_validation_passed": formal_validation["status"] == "passed",
+        "evaluation_mode": evaluation_mode,
+        "evaluation_scope": (
+            "pre_final_only"
+            if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+            else "final_oos_once"
+        ),
+        "final_oos_opened": evaluation_mode == FORMAL_FINAL_OOS_MODE,
+        **(
+            {"capital_eligible": False}
+            if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+            else {}
+        ),
         "execution_model": {
             "method": execution_method,
             "days": int(config.get("execution_days", 1)),
@@ -1637,7 +1840,36 @@ def main() -> None:
         "capacity_curve_points": len(validation["capacity"]["points"]),
         "capacity_curve_passed": validation["capacity"]["passed"],
         "provenance": {
+            "evaluation_mode": evaluation_mode,
+            "evaluation_scope": (
+                "pre_final_only"
+                if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+                else "final_oos_once"
+            ),
+            "final_oos_opened": evaluation_mode == FORMAL_FINAL_OOS_MODE,
             "dataset_identity_sha256": provider_provenance.get("dataset_identity_sha256"),
+            "pre_final_cutoff": (
+                str(manifest.get("pre_final_cutoff") or "")
+                if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+                else None
+            ),
+            "formal_model_admission_binding_sha256": (
+                formal_model_admission.get("binding_sha256")
+                if formal_model_admission is not None
+                else None
+            ),
+            "model_admission_evidence_sha256": (
+                formal_model_admission.get("model_admission_evidence_sha256")
+                if formal_model_admission is not None
+                else None
+            ),
+            "quant_bundle_admission_evidence_sha256": (
+                (formal_model_admission.get("quant_bundle") or {}).get(
+                    "admission_evidence_sha256"
+                )
+                if formal_model_admission is not None
+                else None
+            ),
             "snapshot_manifest_sha256": provider_provenance.get("snapshot_manifest_sha256"),
             "qlib_builder_sha256": provider_provenance.get("qlib_builder_sha256"),
             "field_contract_version": provider_provenance.get("field_contract_version"),
@@ -1686,6 +1918,14 @@ def main() -> None:
             ),
             "formal_model_checkpoint_sha256": (
                 formal_model_artifact["checkpoint_sha256"] if formal_model_artifact else None
+            ),
+            "formal_model_checkpoint_format": (
+                formal_model_artifact["checkpoint_format"] if formal_model_artifact else None
+            ),
+            "formal_model_data_contract_sha256": (
+                formal_model_artifact["model_data_contract_sha256"]
+                if formal_model_artifact
+                else None
             ),
             "formal_model_evidence_sha256": (
                 canonical_model_sha256(formal_model_artifact["evidence"])
@@ -1806,6 +2046,8 @@ def main() -> None:
     result = {
         "status": "ok",
         "backtest_engine": "qlib",
+        "evaluation_mode": evaluation_mode,
+        "final_oos_opened": evaluation_mode == FORMAL_FINAL_OOS_MODE,
         "metrics": metrics,
         "periods": periods,
         "benchmark": manifest["benchmark"],
@@ -1831,7 +2073,11 @@ def main() -> None:
         )
     )
     with qlib_workflow_run(
-        run_kind="formal-backtest",
+        run_kind=(
+            "portfolio-experiment-trial"
+            if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+            else "formal-backtest"
+        ),
         run_id=workflow_run_id,
         tracking_uri=args.tracking_uri,
         dataset_identity_sha256=provider_provenance.get("dataset_identity_sha256"),
@@ -1848,6 +2094,8 @@ def main() -> None:
                 "execution_method": execution_method,
                 "execution_frequency": (args.execution_frequency if minute_execution else "day"),
                 "strategy_config_sha256": metrics["provenance"]["strategy_config_sha256"],
+                "evaluation_mode": evaluation_mode,
+                "final_oos_opened": evaluation_mode == FORMAL_FINAL_OOS_MODE,
             }
         )
         workflow.log_metrics(metrics)

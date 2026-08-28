@@ -23,6 +23,7 @@ from quant_data.database import (
 from quant_platform.factor_recompute import (
     FACTOR_PIT_CONTRACT_VERSION,
     FACTOR_RECOMPUTE_EXECUTOR_VERSION,
+    submitted_comparison_is_admissible,
 )
 from quant_platform.jsonb_safety import canonical_jsonb_sha256, normalize_jsonb_document
 from quant_platform.qlib_workflow import require_qlib_workflow_identity
@@ -158,8 +159,40 @@ class FactorGatePolicy:
     min_selection_days: int = 100
     max_bh_q_value: float = 0.10
 
-    def evaluate(self, metrics: dict[str, float | None]) -> tuple[str, list[str]]:
-        checks = (
+    def evaluate_layers(self, metrics: dict[str, Any]) -> dict[str, Any]:
+        """Separate evidence-integrity gates from standalone-alpha gates.
+
+        A weak but well-formed factor may still add information to a frozen
+        model.  Coverage, non-constant output, complete finite metrics and
+        sufficient observations are therefore *hard* gates; economic effect,
+        direction, significance, turnover and redundancy are standalone-effect
+        gates.  Callers may send only ``hard=passed/effect=failed`` candidates
+        to the governed incremental-ablation path.
+        """
+
+        hard_checks = (
+            (
+                "selection_days",
+                lambda value: value >= self.min_selection_days,
+                f"validation selection days >= {self.min_selection_days}",
+            ),
+            (
+                "coverage_pass_rate",
+                lambda value: value >= 0.95,
+                "coverage pass rate >= 0.95",
+            ),
+            (
+                "mean_coverage_ratio",
+                lambda value: value >= 0.80,
+                "mean universe coverage >= 0.80",
+            ),
+            (
+                "constant_day_rate",
+                lambda value: value <= 0.05,
+                "constant factor days <= 0.05",
+            ),
+        )
+        effect_checks = (
             ("ic", lambda value: value >= self.min_abs_ic, f"directed IC >= {self.min_abs_ic}"),
             (
                 "icir",
@@ -192,26 +225,6 @@ class FactorGatePolicy:
                 f"cost-adjusted return > {self.min_cost_adjusted_return}",
             ),
             (
-                "selection_days",
-                lambda value: value >= self.min_selection_days,
-                f"validation selection days >= {self.min_selection_days}",
-            ),
-            (
-                "coverage_pass_rate",
-                lambda value: value >= 0.95,
-                "coverage pass rate >= 0.95",
-            ),
-            (
-                "mean_coverage_ratio",
-                lambda value: value >= 0.80,
-                "mean universe coverage >= 0.80",
-            ),
-            (
-                "constant_day_rate",
-                lambda value: value <= 0.05,
-                "constant factor days <= 0.05",
-            ),
-            (
                 "hac_p_value",
                 lambda value: 0 <= value <= self.max_bh_q_value,
                 f"HAC p-value <= {self.max_bh_q_value}",
@@ -222,23 +235,58 @@ class FactorGatePolicy:
                 f"BH-FDR q-value <= {self.max_bh_q_value}",
             ),
         )
-        reasons: list[str] = []
-        for name, predicate, expectation in checks:
+        hard_reasons: list[str] = []
+        effect_reasons: list[str] = []
+        required_numeric = {
+            name for name, _, _ in (*hard_checks, *effect_checks)
+        } | {"raw_valid_ic", "raw_selection_ic"}
+        for name in sorted(required_numeric):
             value = metrics.get(name)
             if value is None:
-                reasons.append(f"{name} is missing; expected {expectation}")
-            elif not predicate(float(value)):
-                reasons.append(f"{name}={value:g} failed; expected {expectation}")
+                hard_reasons.append(f"{name} is missing from the independent evaluation")
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                hard_reasons.append(f"{name} is not numeric")
+                continue
+            if not math.isfinite(numeric):
+                hard_reasons.append(f"{name} is not finite")
+        invalid_names = {
+            reason.split(" ", 1)[0] for reason in hard_reasons
+        }
+        for name, predicate, expectation in hard_checks:
+            if name in invalid_names:
+                continue
+            value = float(metrics[name])
+            if not predicate(value):
+                hard_reasons.append(f"{name}={value:g} failed; expected {expectation}")
+        for name, predicate, expectation in effect_checks:
+            if name in invalid_names:
+                continue
+            value = float(metrics[name])
+            if not predicate(value):
+                effect_reasons.append(f"{name}={value:g} failed; expected {expectation}")
         raw_valid_ic = metrics.get("raw_valid_ic")
         raw_selection_ic = metrics.get("raw_selection_ic")
         ic = metrics.get("ic")
         rank_ic = metrics.get("rank_ic")
-        if raw_valid_ic is None or raw_selection_ic is None:
-            reasons.append("raw direction and selection IC are required")
-        elif float(raw_valid_ic) * float(raw_selection_ic) <= 0:
-            reasons.append("raw direction and selection IC must have the same sign")
-        if ic is not None and rank_ic is not None and float(ic) * float(rank_ic) <= 0:
-            reasons.append("IC and RankIC must have the same direction")
+        if not ({"raw_valid_ic", "raw_selection_ic"} & invalid_names):
+            if float(raw_valid_ic) * float(raw_selection_ic) <= 0:
+                effect_reasons.append("raw direction and selection IC must have the same sign")
+        if not ({"ic", "rank_ic"} & invalid_names):
+            if float(ic) * float(rank_ic) <= 0:
+                effect_reasons.append("IC and RankIC must have the same direction")
+        return {
+            "hard_status": "passed" if not hard_reasons else "failed",
+            "hard_reasons": hard_reasons,
+            "effect_status": "passed" if not effect_reasons else "failed",
+            "effect_reasons": effect_reasons,
+        }
+
+    def evaluate(self, metrics: dict[str, Any]) -> tuple[str, list[str]]:
+        layers = self.evaluate_layers(metrics)
+        reasons = [*layers["hard_reasons"], *layers["effect_reasons"]]
         return ("passed" if not reasons else "failed", reasons)
 
 
@@ -534,20 +582,41 @@ class ResearchStore:
         runtime: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> None:
+        active_statuses = {"queued", "running", "evaluating"}
+        terminal_statuses = {"succeeded", "failed", "cancelled", "blocked"}
+        if status not in active_statuses | terminal_statuses:
+            raise ValueError(f"unsupported research run status: {status}")
         now = _now()
         values: dict[str, Any] = {"status": status, "updated_at": now, "error": error}
         if runtime is not None:
             values["runtime_json"] = runtime
+        if status in active_statuses:
+            # A durable retry or a second independent-evaluation stage may
+            # legitimately reactivate a run. Never carry a terminal timestamp
+            # or stale failure message into that active state.
+            values["finished_at"] = None
+            values["error"] = None
+        if status == "queued":
+            values["started_at"] = None
         if status == "running":
             values["started_at"] = now
-        if status in {"succeeded", "failed", "cancelled"}:
+        if status in terminal_statuses:
             values["finished_at"] = now
         with self.engine.begin() as connection:
-            result = connection.execute(
+            current = connection.execute(
+                select(research_runs.c.status)
+                .where(research_runs.c.id == run_id)
+                .with_for_update()
+            ).first()
+            if current is None:
+                raise KeyError(run_id)
+            if str(current.status) in terminal_statuses and status in active_statuses:
+                raise ValueError(
+                    "terminal research runs must be requeued explicitly before reactivation"
+                )
+            connection.execute(
                 update(research_runs).where(research_runs.c.id == run_id).values(**values)
             )
-            if not result.rowcount:
-                raise KeyError(run_id)
             self._event(
                 connection,
                 run_id=run_id,
@@ -807,6 +876,7 @@ class ResearchStore:
             )
         if candidate["status"] in {"promoted", "retired"}:
             raise ValueError(f"cannot evaluate candidate in {candidate['status']} state")
+        gate_layers = self.policy.evaluate_layers(metrics)
         gate_status, reasons = self.policy.evaluate(metrics)
         if metrics.get("statistical_contract_version") not in {
             None,
@@ -896,18 +966,22 @@ class ResearchStore:
                 for item in prior_evaluations
             )
         )
-        if not isinstance(submitted_comparison, dict) or not (
-            submitted_comparison.get("available") is True
-            and submitted_comparison.get("exact_match") is True
-            and submitted_comparison.get("index_exact_match") is True
+        if not (
+            submitted_comparison_is_admissible(
+                submitted_comparison,
+                authoritative_end=str(research_boundary["latest_input_date"]),
+            )
             and (original_submitted_sha256 == current_values_sha256 or repeated_profile_evaluation)
         ):
             raise ValueError("submitted factor values do not match independent recomputation")
         recompute_evidence_sha256 = _canonical_sha256(recompute_evidence)
-        if gate_status == "passed" and not artifact_path:
-            raise ValueError("passed Qlib evaluation requires a durable result artifact")
+        hard_gate_passed = gate_layers["hard_status"] == "passed"
+        if hard_gate_passed and not artifact_path:
+            raise ValueError(
+                "hard-gate-passed Qlib evaluation requires a durable result artifact"
+            )
         artifact_sha256 = _artifact_hash(
-            artifact_path, "Qlib evaluation", required=gate_status == "passed"
+            artifact_path, "Qlib evaluation", required=hard_gate_passed
         )
         if artifact_path:
             profile_id = str((metrics.get("research_profile") or {}).get("id") or "") or None
@@ -956,7 +1030,20 @@ class ResearchStore:
                 "cost_adjusted_return",
             )
         }
-        candidate_status = "gate_passed" if gate_status == "passed" else "gate_failed"
+        if gate_status == "passed" and configured_profiles:
+            # A single nested profile is evidence, not an independent vote.
+            # Standalone admission is persisted only by record_profile_consensus.
+            candidate_status = "profile_pending"
+            admission_path = None
+        elif gate_status == "passed":
+            candidate_status = "gate_passed"
+            admission_path = "standalone"
+        elif hard_gate_passed:
+            candidate_status = "incremental_pending"
+            admission_path = None
+        else:
+            candidate_status = "gate_failed"
+            admission_path = None
         with self.engine.begin() as connection:
             connection.execute(
                 insert(factor_evaluations).values(
@@ -1004,8 +1091,11 @@ class ResearchStore:
                 update(factor_candidates)
                 .where(factor_candidates.c.id == candidate_id)
                 .values(
-                    status=candidate_status,
-                    values_path=recomputed_values_path,
+                     status=candidate_status,
+                     admission_path=admission_path,
+                     incremental_evidence_json=None,
+                     incremental_evidence_sha256=None,
+                     values_path=recomputed_values_path,
                     values_sha256=actual_recomputed_sha256,
                     updated_at=now,
                 )
@@ -1018,8 +1108,13 @@ class ResearchStore:
                 actor=actor,
                 payload={
                     "evaluation_id": evaluation_id,
-                    "reasons": reasons,
-                    "evidence_sha256": evidence_sha256,
+                     "reasons": reasons,
+                     "hard_gate_status": gate_layers["hard_status"],
+                     "hard_gate_reasons": gate_layers["hard_reasons"],
+                     "effect_gate_status": gate_layers["effect_status"],
+                     "effect_gate_reasons": gate_layers["effect_reasons"],
+                     "admission_path": admission_path,
+                     "evidence_sha256": evidence_sha256,
                 },
             )
         return self.get_evaluation(evaluation_id)
@@ -1273,6 +1368,8 @@ class ResearchStore:
         test_start: date,
         test_end: date,
         error: str,
+        evaluation_attempt_id: str | None = None,
+        research_profile_id: str | None = None,
         actor: str = "qlib-evaluator",
     ) -> dict[str, Any]:
         """Ledger an operationally failed/timed-out/aborted evaluation.
@@ -1292,6 +1389,24 @@ class ResearchStore:
             )
         if not _is_sha256(dataset_identity_sha256):
             raise ValueError("factor evaluation requires immutable dataset identity")
+        if evaluation_attempt_id is not None and (
+            not evaluation_attempt_id
+            or len(evaluation_attempt_id) > 128
+            or not all(
+                character.isalnum() or character in "-_"
+                for character in evaluation_attempt_id
+            )
+        ):
+            raise ValueError("factor evaluation attempt identity is invalid")
+        if research_profile_id is not None and (
+            not research_profile_id
+            or len(research_profile_id) > 128
+            or not all(
+                character.isalnum() or character in "-_"
+                for character in research_profile_id
+            )
+        ):
+            raise ValueError("factor evaluation research profile identity is invalid")
         candidate = self.get_candidate(candidate_id)
         if candidate["status"] in {"promoted", "retired"}:
             raise ValueError(f"cannot record a failed evaluation in {candidate['status']} state")
@@ -1311,6 +1426,16 @@ class ResearchStore:
             "periods": periods,
             "evaluator_version": self.policy.version,
             "label_horizon_days": int(candidate.get("label_horizon_days") or 1),
+            **(
+                {"evaluation_attempt_id": evaluation_attempt_id}
+                if evaluation_attempt_id is not None
+                else {}
+            ),
+            **(
+                {"research_profile_id": research_profile_id}
+                if research_profile_id is not None
+                else {}
+            ),
         }
         run_context_sha256 = _canonical_sha256(run_context)
         failure_evidence = {
@@ -1318,6 +1443,16 @@ class ResearchStore:
             "error": summary,
             "run_context": run_context,
             "run_context_sha256": run_context_sha256,
+            **(
+                {"evaluation_attempt_id": evaluation_attempt_id}
+                if evaluation_attempt_id is not None
+                else {}
+            ),
+            **(
+                {"research_profile_id": research_profile_id}
+                if research_profile_id is not None
+                else {}
+            ),
         }
         metrics_sha256 = _canonical_sha256({})
         policy = asdict(self.policy)
@@ -1394,6 +1529,11 @@ class ResearchStore:
                     "evaluation_id": evaluation_id,
                     "error": summary,
                     "run_context_sha256": run_context_sha256,
+                    **(
+                        {"evaluation_attempt_id": evaluation_attempt_id}
+                        if evaluation_attempt_id is not None
+                        else {}
+                    ),
                 },
             )
         return self.get_evaluation(evaluation_id)
@@ -1445,6 +1585,9 @@ class ResearchStore:
                 )
                 .values(
                     status="gate_passed",
+                    admission_path="standalone",
+                    incremental_evidence_json=None,
+                    incremental_evidence_sha256=None,
                     profile_consensus_json=consensus,
                     profile_consensus_sha256=consensus_sha256,
                     updated_at=now,
@@ -1465,6 +1608,261 @@ class ResearchStore:
             )
         return self.get_candidate(candidate_id)
 
+    def record_incremental_admission(
+        self,
+        candidate_id: str,
+        *,
+        evidence: dict[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        """Admit a complementary factor only after frozen-model paired ablation.
+
+        This route never repairs a failed PIT/recompute/coverage contract.  It
+        exists solely for a well-formed factor that missed the standalone-alpha
+        effect threshold but significantly improved the same frozen model.
+        """
+
+        from quant_platform.factor_library_store import validate_incremental_evidence
+
+        actor = actor.strip()
+        if not actor:
+            raise ValueError("incremental admission actor is required")
+        if not isinstance(evidence, dict):
+            raise ValueError("incremental admission evidence must be an object")
+        validate_incremental_evidence(evidence)
+        candidate = self.get_candidate(candidate_id)
+        if candidate["status"] in {"promoted", "retired"}:
+            raise ValueError(f"cannot incrementally admit candidate in {candidate['status']} state")
+        if candidate.get("profile_consensus") is not None:
+            raise ValueError(
+                "standalone profile consensus cannot be replaced by incremental evidence"
+            )
+        if (
+            evidence.get("factor_candidate_id") != candidate_id
+            or evidence.get("candidate_code_sha256") != candidate.get("code_sha256")
+            or evidence.get("candidate_values_sha256") != candidate.get("values_sha256")
+        ):
+            raise ValueError("incremental evidence is not bound to the immutable factor")
+        evaluation_ids = {
+            str(key): str(value)
+            for key, value in dict(evidence.get("evaluation_ids") or {}).items()
+        }
+        evaluations = {
+            profile_id: self.get_evaluation(evaluation_id)
+            for profile_id, evaluation_id in evaluation_ids.items()
+        }
+        identities = {
+            str(item.get("dataset_identity_sha256") or "") for item in evaluations.values()
+        }
+        test_windows = {
+            (item["test_start"].isoformat(), item["test_end"].isoformat())
+            for item in evaluations.values()
+        }
+        if (
+            len(identities) != 1
+            or "" in identities
+            or len(test_windows) != 1
+            or evidence.get("dataset_identity_sha256") != next(iter(identities))
+        ):
+            raise ValueError("incremental profiles are not bound to one frozen dataset/OOS window")
+        profile_periods = evidence.get("profile_periods")
+        if not isinstance(profile_periods, dict) or set(profile_periods) != set(evaluations):
+            raise ValueError("incremental evidence has no frozen profile periods")
+        effect_failures = 0
+        for profile_id, evaluation in evaluations.items():
+            if evaluation.get("factor_candidate_id") != candidate_id:
+                raise ValueError("incremental evaluation belongs to another factor")
+            if evaluation.get("evaluator_version") != self.policy.version:
+                raise ValueError("incremental evaluation is not governed by the factor policy")
+            if evaluation.get("candidate_code_sha256") != candidate.get("code_sha256") or (
+                evaluation.get("candidate_values_sha256") != candidate.get("values_sha256")
+            ):
+                raise ValueError("incremental evaluation no longer matches factor artifacts")
+            recompute = evaluation.get("recompute_evidence")
+            pit = recompute.get("pit_invariance") if isinstance(recompute, dict) else None
+            boundary = (
+                recompute.get("research_data_boundary")
+                if isinstance(recompute, dict)
+                else None
+            )
+            if not (
+                isinstance(recompute, dict)
+                and recompute.get("executor_version") == FACTOR_RECOMPUTE_EXECUTOR_VERSION
+                and recompute.get("dataset_identity_sha256")
+                == evaluation.get("dataset_identity_sha256")
+                and isinstance(pit, dict)
+                and pit.get("contract_version") == FACTOR_PIT_CONTRACT_VERSION
+                and pit.get("status") == "passed"
+                and int(pit.get("cutpoint_count") or 0) >= 3
+                and isinstance(boundary, dict)
+                and boundary.get("valid_end") == evaluation["valid_end"].isoformat()
+                and boundary.get("test_start") == evaluation["test_start"].isoformat()
+                and boundary.get("final_oos_observations_exposed") is False
+            ):
+                raise ValueError("hard PIT/recompute failure cannot enter incremental ablation")
+            metrics = evaluation.get("metrics")
+            if not isinstance(metrics, dict) or evaluation.get(
+                "metrics_sha256"
+            ) != _canonical_sha256(metrics):
+                raise ValueError("incremental evaluation metrics provenance is invalid")
+            layers = self.policy.evaluate_layers(metrics)
+            if layers["hard_status"] != "passed":
+                raise ValueError("hard-gate failure cannot enter incremental ablation")
+            if layers["effect_status"] != "passed":
+                effect_failures += 1
+            artifact_sha256 = _artifact_hash(
+                evaluation.get("artifact_path"), "Qlib evaluation", required=True
+            )
+            if artifact_sha256 != evaluation.get("artifact_sha256"):
+                raise ValueError("incremental evaluation artifact changed")
+            recorded_profile = (metrics.get("research_profile") or {}).get("id")
+            if str(recorded_profile or "") != profile_id:
+                raise ValueError("incremental evaluation profile identity changed")
+            expected_periods = {
+                key: evaluation[key].isoformat()
+                for key in (
+                    "train_start",
+                    "train_end",
+                    "valid_start",
+                    "valid_end",
+                    "test_start",
+                    "test_end",
+                )
+            }
+            if profile_periods.get(profile_id) != expected_periods:
+                raise ValueError("incremental evidence periods changed after evaluation")
+            evidence_profile = (evidence.get("profiles") or {}).get(profile_id) or {}
+            if evidence_profile.get("evaluation_evidence_sha256") != evaluation.get(
+                "evidence_sha256"
+            ):
+                raise ValueError("incremental ablation is not bound to its factor evaluation")
+        recent_metrics = evaluations["recent_3y"]["metrics"]
+        if self.policy.evaluate_layers(recent_metrics)["effect_status"] == "passed":
+            raise ValueError("standalone-passing recent evidence must use the standalone path")
+        if effect_failures < 1:
+            raise ValueError("incremental admission requires a standalone effect-gate failure")
+        evidence_sha256 = _canonical_sha256(evidence)
+        existing = candidate.get("incremental_evidence")
+        if existing is not None:
+            if (
+                existing == evidence
+                and candidate.get("incremental_evidence_sha256") == evidence_sha256
+                and candidate.get("admission_path") == "incremental"
+            ):
+                return candidate
+            raise ValueError("candidate already has different incremental evidence")
+        now = _now()
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(factor_candidates)
+                .where(
+                    factor_candidates.c.id == candidate_id,
+                    factor_candidates.c.status.not_in({"promoted", "retired"}),
+                    factor_candidates.c.incremental_evidence_json.is_(None),
+                )
+                .values(
+                    status="gate_passed",
+                    admission_path="incremental",
+                    incremental_evidence_json=evidence,
+                    incremental_evidence_sha256=evidence_sha256,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount != 1:
+                raise ValueError("candidate state changed while recording incremental admission")
+            self._event(
+                connection,
+                run_id=candidate["research_run_id"],
+                candidate_id=candidate_id,
+                event_type="candidate.incremental_admission_passed",
+                actor=actor,
+                payload={
+                    "evidence_sha256": evidence_sha256,
+                    "evaluation_ids": evaluation_ids,
+                    "frozen_model": evidence["frozen_model"],
+                    "multiplicity": evidence["multiplicity"],
+                },
+            )
+        return self.get_candidate(candidate_id)
+
+    def reconcile_multi_profile_admission_state(
+        self, candidate_id: str, *, actor: str = "worker"
+    ) -> dict[str, Any]:
+        """Project the complete three-profile grid to one candidate state.
+
+        Individual profile imports arrive one at a time.  Their arrival order
+        must not decide whether a factor is standalone-pending or eligible for
+        paired incremental ablation.
+        """
+
+        candidate = self.get_candidate(candidate_id)
+        run = self.get_run(str(candidate["research_run_id"]))
+        configured = (run.get("config") or {}).get("evaluation_profiles") or []
+        expected = {str(item.get("id") or "") for item in configured if isinstance(item, dict)}
+        governed = {"recent_3y", "balanced_5y", "robust_10y"}
+        if expected != governed:
+            return candidate
+        evaluations = self.list_evaluations(candidate_id)
+        by_profile = {
+            str((item.get("metrics") or {}).get("research_profile", {}).get("id") or ""): item
+            for item in evaluations
+        }
+        if set(by_profile) != governed:
+            return candidate
+        layers = {
+            profile_id: self.policy.evaluate_layers(by_profile[profile_id]["metrics"])
+            for profile_id in governed
+        }
+        if any(item["hard_status"] != "passed" for item in layers.values()):
+            status = "gate_failed"
+        elif all(item["effect_status"] == "passed" for item in layers.values()):
+            status = "profile_pending"
+        elif layers["recent_3y"]["effect_status"] == "failed":
+            status = "incremental_pending"
+        else:
+            # The recent window is the registered ranking/significance window.
+            # A failure only in a nested robustness window cannot be repaired by
+            # pretending it is a separate incremental hypothesis.
+            status = "gate_failed"
+        if candidate["status"] == status:
+            return candidate
+        if candidate["status"] in {"promoted", "retired", "gate_passed"}:
+            raise ValueError("terminal factor admission state cannot be reconciled")
+        now = _now()
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(factor_candidates)
+                .where(
+                    factor_candidates.c.id == candidate_id,
+                    factor_candidates.c.status.not_in(
+                        {"promoted", "retired", "gate_passed"}
+                    ),
+                    factor_candidates.c.profile_consensus_json.is_(None),
+                    factor_candidates.c.incremental_evidence_json.is_(None),
+                )
+                .values(status=status, admission_path=None, updated_at=now)
+            )
+            if result.rowcount != 1:
+                raise ValueError("candidate state changed during profile reconciliation")
+            self._event(
+                connection,
+                run_id=str(candidate["research_run_id"]),
+                candidate_id=candidate_id,
+                event_type=f"candidate.{status}",
+                actor=actor,
+                payload={
+                    "profile_ids": sorted(governed),
+                    "hard_gate_statuses": {
+                        key: value["hard_status"] for key, value in layers.items()
+                    },
+                    "effect_gate_statuses": {
+                        key: value["effect_status"] for key, value in layers.items()
+                    },
+                    "arrival_order_independent": True,
+                },
+            )
+        return self.get_candidate(candidate_id)
+
     def promote(self, candidate_id: str, *, actor: str, reason: str) -> dict[str, Any]:
         actor = actor.strip()
         reason = reason.strip()
@@ -1474,7 +1872,23 @@ class ResearchStore:
             raise ValueError("promotion reason must contain at least 10 characters")
         candidate = self.get_candidate(candidate_id)
         consensus = candidate.get("profile_consensus")
-        if consensus is not None:
+        admission_path = str(candidate.get("admission_path") or "standalone")
+        incremental_evidence = candidate.get("incremental_evidence")
+        if admission_path == "incremental":
+            from quant_platform.factor_library_store import validate_incremental_evidence
+
+            if not isinstance(incremental_evidence, dict):
+                raise ValueError("incremental candidate has no admission evidence")
+            validate_incremental_evidence(incremental_evidence)
+            if candidate.get("incremental_evidence_sha256") != _canonical_sha256(
+                incremental_evidence
+            ):
+                raise ValueError("incremental admission provenance is invalid")
+            incremental_ids = incremental_evidence.get("evaluation_ids")
+            if not isinstance(incremental_ids, dict):
+                raise ValueError("incremental admission has no evaluation ids")
+            evaluation = self.get_evaluation(str(incremental_ids["recent_3y"]))
+        elif consensus is not None:
             from quant_platform.research_automation import build_multi_profile_consensus
 
             if candidate.get("profile_consensus_sha256") != _canonical_sha256(consensus):
@@ -1507,7 +1921,9 @@ class ResearchStore:
                     "multi-profile candidate requires an explicit consensus record before promotion"
                 )
             evaluation = candidate["latest_evaluation"]
-        if not evaluation or evaluation["gate_status"] != "passed":
+        if not evaluation or (
+            admission_path != "incremental" and evaluation["gate_status"] != "passed"
+        ):
             raise ValueError("candidate must pass the governed Qlib admission before promotion")
         if evaluation.get("evaluator_version") != self.policy.version:
             raise ValueError(
@@ -1544,7 +1960,17 @@ class ResearchStore:
                 "Qlib evaluation policy is stale or invalid; re-evaluation is required"
             )
         repeated_status, repeated_reasons = self.policy.evaluate(metrics)
-        if repeated_status != "passed" or repeated_reasons != evaluation.get("gate_reasons"):
+        if admission_path == "incremental":
+            layers = self.policy.evaluate_layers(metrics)
+            if (
+                layers["hard_status"] != "passed"
+                or layers["effect_status"] == "passed"
+                or repeated_reasons != evaluation.get("gate_reasons")
+            ):
+                raise ValueError(
+                    "incremental factor no longer matches its effect-only gate failure"
+                )
+        elif repeated_status != "passed" or repeated_reasons != evaluation.get("gate_reasons"):
             raise ValueError("Qlib evaluation no longer passes the recorded factor gate")
         if evaluation.get("evaluator_version") == self.policy.version:
             recompute = evaluation.get("recompute_evidence")
@@ -1610,7 +2036,17 @@ class ResearchStore:
         if evaluation.get("evidence_sha256") != evidence_sha256:
             raise ValueError("Qlib evaluation evidence provenance is invalid")
         promotion_evidence_sha256 = evidence_sha256
-        if consensus is not None:
+        if admission_path == "incremental":
+            promotion_evidence_sha256 = _canonical_sha256(
+                {
+                    "version": "factor-promotion-evidence-v3-incremental",
+                    "primary_evaluation_evidence_sha256": evidence_sha256,
+                    "incremental_evidence_sha256": candidate[
+                        "incremental_evidence_sha256"
+                    ],
+                }
+            )
+        elif consensus is not None:
             promotion_evidence_sha256 = _canonical_sha256(
                 {
                     "version": "factor-promotion-evidence-v2-profile-consensus",
@@ -1648,6 +2084,10 @@ class ResearchStore:
                     "evaluation_id": evaluation["id"],
                     "evidence_sha256": promotion_evidence_sha256,
                     "profile_consensus_sha256": candidate.get("profile_consensus_sha256"),
+                    "admission_path": admission_path,
+                    "incremental_evidence_sha256": candidate.get(
+                        "incremental_evidence_sha256"
+                    ),
                     "code_sha256": current_code_sha256,
                     "values_sha256": current_values_sha256,
                 },
@@ -1674,6 +2114,137 @@ class ResearchStore:
         )
         with self.engine.connect() as connection:
             return [self._decode_evaluation(row_dict(row)) for row in connection.execute(statement)]
+
+    def factor_evaluation_outcome_import_state(
+        self,
+        candidate_id: str,
+        *,
+        evaluation_attempt_id: str,
+        artifact_path: str,
+        dataset: str,
+        dataset_identity_sha256: str,
+        periods: dict[str, date],
+        research_profile_id: str | None,
+        outcome_status: str,
+        metrics: dict[str, Any] | None = None,
+        recomputed_values_sha256: str | None = None,
+        recompute_evidence: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> str:
+        """Classify one evaluator outcome as missing, identical, or conflicting.
+
+        No schema change is required: successful outcomes are bound to the
+        job-owned result artifact, while operational failures carry the job id
+        in ``recompute_evidence_json``. Candidate, frozen periods/profile and
+        outcome evidence then form the precise idempotency key. A row from a
+        different profile of the same candidate is deliberately ignored; a row
+        for this exact profile that differs in kind or evidence fails closed.
+        """
+
+        if outcome_status not in {"ok", "failed"}:
+            raise ValueError("factor evaluation outcome status is invalid")
+        required_period_keys = (
+            "train_start",
+            "train_end",
+            "valid_start",
+            "valid_end",
+            "test_start",
+            "test_end",
+        )
+        if set(periods) != set(required_period_keys) or any(
+            not isinstance(periods[key], date) for key in required_period_keys
+        ):
+            raise ValueError("factor evaluation outcome periods are invalid")
+        statement = select(factor_evaluations).where(
+            factor_evaluations.c.factor_candidate_id == candidate_id
+        )
+        with self.engine.connect() as connection:
+            rows = [row_dict(row) for row in connection.execute(statement)]
+
+        bound_rows: list[dict[str, Any]] = []
+        for row in rows:
+            evidence = row.get("recompute_evidence_json") or {}
+            if row.get("artifact_path") == artifact_path or (
+                isinstance(evidence, dict)
+                and evidence.get("evaluation_attempt_id") == evaluation_attempt_id
+            ):
+                bound_rows.append(row)
+        same_profile_rows = [
+            row
+            for row in bound_rows
+            if all(row.get(key) == periods[key] for key in required_period_keys)
+        ]
+        if not same_profile_rows:
+            return "missing"
+
+        expected_metrics = metrics or {}
+        expected_failure = " ".join(str(error or "").split())[:1000] or "evaluation failed"
+        expected_artifact_sha256 = _artifact_hash(
+            artifact_path, "Qlib evaluation", required=False
+        )
+        expected_gate_status: str | None = None
+        expected_gate_reasons: list[str] | None = None
+        if outcome_status == "ok":
+            expected_gate_status, expected_gate_reasons = self.policy.evaluate(expected_metrics)
+
+        identical_rows: list[dict[str, Any]] = []
+        for row in same_profile_rows:
+            row_metrics = row.get("metrics_json") or {}
+            row_evidence = row.get("recompute_evidence_json") or {}
+            row_profile_id = None
+            if row.get("gate_status") == "evaluation_failed":
+                if isinstance(row_evidence, dict):
+                    row_profile_id = row_evidence.get("research_profile_id")
+            elif isinstance(row_metrics, dict):
+                profile = row_metrics.get("research_profile") or {}
+                if isinstance(profile, dict):
+                    row_profile_id = profile.get("id")
+            if row_profile_id is not None and str(row_profile_id) != str(
+                research_profile_id or ""
+            ):
+                # The same job/candidate/window cannot silently change profile
+                # identity even if an old row omitted the optional JSON label.
+                continue
+
+            common_matches = (
+                row.get("dataset") == dataset
+                and row.get("dataset_identity_sha256") == dataset_identity_sha256
+            )
+            if outcome_status == "failed":
+                exact = (
+                    common_matches
+                    and row.get("gate_status") == "evaluation_failed"
+                    and row.get("artifact_path") is None
+                    and row_metrics == {}
+                    and (row.get("gate_reasons_json") or []) == [expected_failure]
+                    and isinstance(row_evidence, dict)
+                    and row_evidence.get("evaluation_attempt_id")
+                    == evaluation_attempt_id
+                )
+            else:
+                exact = (
+                    common_matches
+                    and row.get("gate_status") == expected_gate_status
+                    and (row.get("gate_reasons_json") or [])
+                    == (expected_gate_reasons or [])
+                    and row.get("artifact_path") == artifact_path
+                    and row.get("artifact_sha256") == expected_artifact_sha256
+                    and row.get("metrics_sha256") == _canonical_sha256(expected_metrics)
+                    and row.get("recomputed_values_sha256")
+                    == recomputed_values_sha256
+                    and _canonical_sha256(row_evidence)
+                    == _canonical_sha256(recompute_evidence or {})
+                )
+            if exact:
+                identical_rows.append(row)
+
+        if len(identical_rows) == 1 and len(same_profile_rows) == 1:
+            return "identical"
+        raise ValueError(
+            "factor evaluation outcome conflicts with the immutable ledger "
+            f"for job {evaluation_attempt_id}, candidate {candidate_id}, "
+            f"profile {research_profile_id or 'default'}"
+        )
 
     def get_evaluation(self, evaluation_id: str) -> dict[str, Any]:
         with self.engine.connect() as connection:
@@ -1731,7 +2302,9 @@ class ResearchStore:
     @staticmethod
     def _decode_candidate(row: dict[str, Any]) -> dict[str, Any]:
         row["variables"] = row.pop("variables_json")
+        row["family_tags"] = row.pop("family_tags_json", None) or []
         row["profile_consensus"] = row.pop("profile_consensus_json")
+        row["incremental_evidence"] = row.pop("incremental_evidence_json", None)
         return row
 
     @staticmethod

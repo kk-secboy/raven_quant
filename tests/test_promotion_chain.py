@@ -473,6 +473,72 @@ def test_approve_auto_creates_paper_account_from_dataset_descriptors(
     assert again["id"] == stage["id"]
 
 
+def test_new_autopilot_champion_pauses_prior_primary_without_deleting_history(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    _qlib_doubles(monkeypatch)
+    promotion = PromotionStore(database_url)
+    engine = open_database(database_url)
+
+    def mark_autopilot(version_id: str) -> None:
+        with engine.begin() as connection:
+            config = dict(
+                connection.scalar(
+                    select(strategy_versions.c.config_json).where(
+                        strategy_versions.c.id == version_id
+                    )
+                )
+                or {}
+            )
+            config["autopilot_completion_contract_version"] = (
+                "autopilot-completion-v1"
+            )
+            connection.execute(
+                update(strategy_versions)
+                .where(strategy_versions.c.id == version_id)
+                .values(config_json=config)
+            )
+
+    first_version = _minute_version(database_url, tmp_path, suffix="primary-one")
+    mark_autopilot(first_version)
+    first_stage = _attach_simulation(promotion, first_version)
+
+    second_version = _minute_version(database_url, tmp_path, suffix="primary-two")
+    mark_autopilot(second_version)
+    second_stage = _attach_simulation(promotion, second_version)
+
+    with engine.connect() as connection:
+        stages = {
+            str(row.strategy_version_id): row
+            for row in connection.execute(
+                select(strategy_promotion_stages).where(
+                    strategy_promotion_stages.c.strategy_version_id.in_(
+                        [first_version, second_version]
+                    )
+                )
+            )
+        }
+        portfolios = {
+            str(row.id): row
+            for row in connection.execute(
+                select(simulation_portfolios).where(
+                    simulation_portfolios.c.id.in_(
+                        [
+                            first_stage["simulation_portfolio_id"],
+                            second_stage["simulation_portfolio_id"],
+                        ]
+                    )
+                )
+            )
+        }
+
+    assert str(stages[first_version].status) == "frozen"
+    assert str(stages[second_version].status) == "active"
+    assert str(portfolios[first_stage["simulation_portfolio_id"]].status) == "paused"
+    assert str(portfolios[second_stage["simulation_portfolio_id"]].status) == "active"
+    assert len(portfolios) == 2  # the superseded ledger is retained and auditable
+
+
 # ---------------------------------------------------------------------------
 # Forward evidence gate
 # ---------------------------------------------------------------------------

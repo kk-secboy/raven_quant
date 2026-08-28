@@ -64,7 +64,7 @@ def _passing_metrics() -> dict:
     }
 
 
-def test_pair_strategy_versions_stay_research_only_at_the_approval_gate(
+def test_pair_strategy_versions_can_receive_shadow_research_approval(
     database_url: str, tmp_path
 ) -> None:
     store = StrategyStore(database_url)
@@ -82,18 +82,19 @@ def test_pair_strategy_versions_stay_research_only_at_the_approval_gate(
         artifact_path=tmp_path,
     )
     store.mark_backtest(backtest["id"], "succeeded", metrics=_passing_metrics())
-    # Research-only (design 6.4.3/13): even a fully passing backtest cannot be
-    # approved; the gate reads the strategy catalog, the single source of truth.
-    with pytest.raises(ValueError, match="research_only"):
-        store.approve(
-            version["id"],
-            actor="risk-approver-b",
-            reason="协整、成本压力、容量和融券证据均通过独立复核。",
-        )
-    assert store.get_version(version["id"])["status"] == "draft"
+    approved = store.approve(
+        version["id"],
+        actor="risk-approver-b",
+        reason="协整、成本压力、容量和影子借券假设均通过独立复核。",
+    )
+    assert approved["status"] == "approved"
+    assert approved["simulation_mode"] == "shadow_pair"
+    assert approved["capabilities"]["shadow_simulation_eligible"] is True
+    assert approved["capabilities"]["capital_eligible"] is False
+    assert approved["capabilities"]["financing_enabled"] is False
 
 
-def test_pair_approval_gate_fires_before_evidence_checks(
+def test_pair_shadow_approval_still_fails_closed_on_evidence(
     database_url: str, tmp_path
 ) -> None:
     store = StrategyStore(database_url)
@@ -105,56 +106,18 @@ def test_pair_approval_gate_fires_before_evidence_checks(
         artifact_path=tmp_path,
     )
     store.mark_backtest(backtest["id"], "succeeded", metrics=_passing_metrics())
-    # The catalog gate is fail-closed and precedes the old evidence checks, so
-    # the rejection names research_only rather than second-operator/dataset gaps.
-    with pytest.raises(ValueError, match="research_only"):
+    with pytest.raises(ValueError, match="second operator"):
         store.approve(
             version["id"],
             actor="researcher-a",
             reason="创建人不得自行批准这套配对策略进入下一阶段。",
         )
-    with pytest.raises(ValueError, match="research_only"):
+    with pytest.raises(ValueError, match="execution dataset"):
         store.approve(
             version["id"],
             actor="risk-approver-b",
             reason="没有分钟执行数据时必须保持失败关闭。",
         )
-
-
-def test_pair_approval_gate_reads_the_catalog(
-    monkeypatch: pytest.MonkeyPatch, database_url: str, tmp_path
-) -> None:
-    # Single-source-of-truth proof: when the catalog role stops being
-    # research_only the same approve call proceeds to the evidence gates.
-    from quant_platform import strategy_catalog
-
-    entry = strategy_catalog.get_catalog_entry("stock_pair_stat_arb")
-    assert entry["catalog_role"] == "research_only"
-    promoted_entry = {**entry, "catalog_role": "alpha_template"}
-    monkeypatch.setattr(
-        strategy_catalog,
-        "get_catalog_entry",
-        lambda template_id: promoted_entry
-        if template_id == "stock_pair_stat_arb"
-        else entry,
-    )
-    store = StrategyStore(database_url)
-    version = _pair(store)["versions"][0]
-    backtest = store.create_backtest(
-        version_id=version["id"],
-        dataset="daily-2024-2026",
-        execution_dataset="minute-2024-2026/liquid_stocks_1m",
-        periods={"start": "2024-01-01", "end": "2025-12-31"},
-        artifact_path=tmp_path,
-    )
-    store.mark_backtest(backtest["id"], "succeeded", metrics=_passing_metrics())
-    approved = store.approve(
-        version["id"],
-        actor="risk-approver-b",
-        reason="目录角色变更后同一批准调用进入既有证据门并通过。",
-    )
-    assert approved["status"] == "approved"
-    assert approved["approved_by"] == "risk-approver-b"
 
 
 def test_recommendation_portfolio_rejects_pair_research_version(
@@ -182,9 +145,9 @@ def test_recommendation_portfolio_rejects_pair_research_version(
         )
 
 
-def test_allocation_rejects_pair_members(database_url: str, tmp_path) -> None:
-    # Research-only (design 6.4.3/13): a pair version may not enter a capital
-    # allocation, not even as a satellite member.
+def test_allocation_rejects_pair_as_core_member(database_url: str, tmp_path) -> None:
+    # Pair strategies may enter a virtual allocation only as tightly capped
+    # shadow satellites; they can never become the capital core.
     from sqlalchemy import update
 
     from quant_data.database import strategy_versions
@@ -210,7 +173,7 @@ def test_allocation_rejects_pair_members(database_url: str, tmp_path) -> None:
             .where(strategy_versions.c.id.in_([first, second]))
             .values(status="approved")
         )
-    with pytest.raises(ValueError, match="research_only"):
+    with pytest.raises(ValueError, match="only be satellite"):
         AllocationStore(database_url).create(
             name="invalid-pair-allocation",
             strategy_version_ids=[first, second],

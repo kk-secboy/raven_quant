@@ -14,6 +14,7 @@ from typing import Any
 
 import duckdb
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from quant_platform.eligibility import (
@@ -21,7 +22,7 @@ from quant_platform.eligibility import (
     EligibilityPolicy,
     build_point_in_time_eligibility,
 )
-from quant_platform.style_exposures import standardize_panel
+from quant_platform.style_exposures import STYLE_COLUMNS, standardize_panel
 
 from .availability import (
     AVAILABILITY_POLICY_VERSION,
@@ -78,6 +79,16 @@ _MAX_UNKNOWN_BENCHMARK_WEIGHT_RATIO = 0.02
 _UNRESTRICTED_UP_LIMIT = 99999.99
 _MAX_EXCLUDED_DAILY_UNIT_RATIO = 0.00001
 
+# A full-market daily build contains wide ASOF joins, ordered windows and
+# cross-sectional metadata.  DuckDB otherwise inherits host-wide defaults
+# (roughly 80% of RAM and every visible core), which can make one durable
+# data_qlib job starve PostgreSQL, SSH and the API.  Spill belongs beside the
+# staging attempt on the governed data volume, never on the container root.
+DAILY_QLIB_DUCKDB_MEMORY_LIMIT = "8GB"
+DAILY_QLIB_DUCKDB_THREADS = 8
+DAILY_QLIB_DUMP_WORKERS = 4
+DAILY_QLIB_STYLE_SYMBOL_BATCH = 128
+
 _ADJUSTMENT_BOUNDARY_POLICY_VERSION = "baostock-primary-adj-boundary-v1"
 _ADJUSTMENT_BOUNDARY_MAX_PRICE_ABS_ERROR = 0.051
 _ADJUSTMENT_BOUNDARY_MAX_PRICE_RELATIVE_ERROR = 0.005
@@ -94,6 +105,18 @@ _DAILY_RESEARCH_FIELDS = (
     "total_mv",
     "circ_mv",
 )
+
+_DAILY_RESEARCH_FIELD_UNITS = {
+    "turnover_rate": "percent",
+    "turnover_rate_f": "percent",
+    "volume_ratio": "ratio_unitless",
+    "pe_ttm": "ratio_unitless",
+    "pb": "ratio_unitless",
+    "ps_ttm": "ratio_unitless",
+    "dv_ttm": "percent",
+    "total_mv": "cny_ten_thousand",
+    "circ_mv": "cny_ten_thousand",
+}
 
 # The official ``moneyflow`` endpoint is a per-stock, per-session order-flow
 # decomposition.  Source amounts are ten-thousand CNY and are known only after
@@ -244,6 +267,55 @@ _DAILY_FIELD_UNITS = {
 }
 
 
+def qlib_research_field_catalog() -> dict[str, dict[str, str]]:
+    """Return the governed field surface exposed to factor research.
+
+    This is a schema contract, not proof that every optional field exists in a
+    particular dataset snapshot. Consumers must still compare it with the
+    sealed Qlib provenance before accepting a factor definition.
+    """
+
+    catalog: dict[str, dict[str, str]] = {
+        name: {
+            "unit": unit,
+            "availability": "after_same_session_close",
+            "source": "daily_market",
+        }
+        for name, unit in _DAILY_FIELD_UNITS.items()
+    }
+    catalog.update(
+        {
+            name: {
+                "unit": unit,
+                "availability": "after_same_session_close",
+                "source": "daily_basic",
+            }
+            for name, unit in _DAILY_RESEARCH_FIELD_UNITS.items()
+        }
+    )
+    catalog.update(
+        {
+            name: {
+                "unit": unit,
+                "availability": "next_session_after_announcement",
+                "source": "fundamental_pit",
+            }
+            for name, unit in _FUNDAMENTAL_FIELD_UNITS.items()
+        }
+    )
+    catalog.update(
+        {
+            name: {
+                "unit": unit,
+                "availability": "after_same_session_close",
+                "source": "moneyflow",
+            }
+            for name, unit in _CAPITAL_FLOW_FIELD_UNITS.items()
+        }
+    )
+    return dict(sorted(catalog.items()))
+
+
 class QlibBuilder:
     def __init__(self, snapshot_path: Path) -> None:
         self.snapshot_path = snapshot_path.resolve()
@@ -275,6 +347,29 @@ class QlibBuilder:
             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
 
+    @staticmethod
+    def _duckdb_connection(
+        *, spill_dir: Path | None = None
+    ) -> duckdb.DuckDBPyConnection:
+        """Open one host-safe DuckDB connection for daily publication work."""
+
+        connection = duckdb.connect()
+        try:
+            connection.execute(
+                f"SET memory_limit='{DAILY_QLIB_DUCKDB_MEMORY_LIMIT}'"
+            )
+            connection.execute(f"SET threads={DAILY_QLIB_DUCKDB_THREADS}")
+            connection.execute("SET preserve_insertion_order=false")
+            if spill_dir is not None:
+                spill_dir.mkdir(parents=True, exist_ok=True)
+                connection.execute(
+                    f"SET temp_directory={_sql_string(str(spill_dir.resolve()))}"
+                )
+        except Exception:
+            connection.close()
+            raise
+        return connection
+
     def build_staging(self, staging_path: Path) -> Path:
         daily_glob = self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet"
         adj_glob = self.snapshot_path / "parquet" / "adj_factor" / "**" / "*.parquet"
@@ -293,10 +388,11 @@ class QlibBuilder:
             shutil.rmtree(temporary)
         partitions = temporary / "partitions"
         by_symbol = temporary / "by_symbol"
+        spill_dir = temporary / "duckdb_spill"
         partitions.mkdir(parents=True, exist_ok=True)
         by_symbol.mkdir(parents=True, exist_ok=True)
 
-        connection = duckdb.connect()
+        connection = self._duckdb_connection(spill_dir=spill_dir)
         try:
             query = self._normalized_query(daily_glob, adj_glob, limit_glob)
             invalid = connection.execute(
@@ -329,6 +425,7 @@ class QlibBuilder:
             )
         finally:
             connection.close()
+            shutil.rmtree(spill_dir, ignore_errors=True)
 
         for partition in sorted(partitions.glob("symbol=*")):
             symbol = partition.name.split("=", 1)[1]
@@ -363,7 +460,7 @@ class QlibBuilder:
         qlib_repo: Path,
         qlib_python: str,
         wsl_distro: str,
-        max_workers: int = 8,
+        max_workers: int = DAILY_QLIB_DUMP_WORKERS,
     ) -> Path:
         script = qlib_repo.resolve() / "scripts" / "dump_bin.py"
         if not script.exists():
@@ -437,7 +534,7 @@ class QlibBuilder:
     def _field_units(self) -> dict[str, str]:
         """Unit declarations for every dumped field, including fundamentals."""
 
-        units = dict(_DAILY_FIELD_UNITS)
+        units = {**_DAILY_FIELD_UNITS, **_DAILY_RESEARCH_FIELD_UNITS}
         for field in self.research_feature_contract["fields"]:
             unit = _FUNDAMENTAL_FIELD_UNITS.get(field) or _CAPITAL_FLOW_FIELD_UNITS.get(
                 field
@@ -627,7 +724,7 @@ class QlibBuilder:
                 (self.snapshot_path / "parquet" / "stk_limit" / "**" / "*.parquet").resolve()
             )
         )
-        connection = duckdb.connect()
+        connection = self._duckdb_connection()
         try:
             row = connection.execute(
                 f"""
@@ -734,7 +831,7 @@ class QlibBuilder:
             if "pre_close" in self._parquet_columns("daily")
             else "NULL::DOUBLE"
         )
-        connection = duckdb.connect()
+        connection = self._duckdb_connection()
         try:
             rows = connection.execute(
                 f"""
@@ -946,7 +1043,7 @@ class QlibBuilder:
             str((self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet").resolve())
         )
         predicate = self._invalid_daily_units_predicate("")
-        connection = duckdb.connect()
+        connection = self._duckdb_connection()
         try:
             row = connection.execute(
                 f"""
@@ -1026,7 +1123,7 @@ class QlibBuilder:
                 + ", ".join(_sql_string(symbol) for symbol in masked_symbols)
                 + ")"
             )
-        connection = duckdb.connect()
+        connection = self._duckdb_connection()
         try:
             rows = connection.execute(
                 f"""
@@ -1177,42 +1274,8 @@ class QlibBuilder:
                     weights.to_parquet(target / "benchmark_weights.parquet", index=False)
                     wrote_metadata = True
 
-        style_source = self.snapshot_path / "parquet" / "daily_basic"
-        style_files = sorted(style_source.rglob("*.parquet")) if style_source.exists() else []
-        if style_files:
-            frame = pd.concat([pd.read_parquet(path) for path in style_files], ignore_index=True)
-            required = {"ts_code", "trade_date", "total_mv"}
-            if required.issubset(frame.columns):
-                styles = self._build_style_exposures(frame)
-                if not styles.empty:
-                    target.mkdir(parents=True, exist_ok=True)
-                    float_cap_column = "circ_mv" if "circ_mv" in frame.columns else "total_mv"
-                    float_cap = pd.DataFrame(
-                        {
-                            "instrument": frame["ts_code"].map(_qlib_symbol),
-                            "datetime": pd.to_datetime(frame["trade_date"], errors="coerce"),
-                            "float_market_cap": pd.to_numeric(
-                                frame[float_cap_column], errors="coerce"
-                            ),
-                        }
-                    ).dropna()
-                    float_cap = float_cap[float_cap["float_market_cap"] > 0]
-                    float_cap.drop_duplicates(
-                        ["instrument", "datetime"], keep="last", inplace=True
-                    )
-                    totals = float_cap.groupby("datetime")["float_market_cap"].transform(
-                        "sum"
-                    )
-                    float_cap["weight"] = float_cap["float_market_cap"] / totals
-                    float_cap[["instrument", "datetime", "weight"]].sort_values(
-                        ["datetime", "instrument"]
-                    ).to_parquet(
-                        target / "full_market_weights.parquet",
-                        index=False,
-                        compression="zstd",
-                    )
-                    styles.to_parquet(target / "style_exposures.parquet", index=False)
-                    wrote_metadata = True
+        if self._write_style_metadata_bounded(target):
+            wrote_metadata = True
 
         if self._write_market_context_metadata(target):
             wrote_metadata = True
@@ -1353,15 +1416,230 @@ class QlibBuilder:
         panel["instrument"] = panel["instrument"].map(_qlib_symbol)
         return standardize_panel(panel)
 
-    def _load_adjusted_close(self) -> pd.DataFrame | None:
+    def _read_dataset_for_symbols(
+        self,
+        dataset: str,
+        columns: Collection[str],
+        symbols: Collection[str],
+        *,
+        required: Collection[str] = (),
+    ) -> pd.DataFrame | None:
+        """Read a bounded full-history symbol batch from one snapshot dataset."""
+
+        selected_symbols = sorted({str(item) for item in symbols if str(item)})
+        available = self._parquet_columns(dataset)
+        selected_columns = sorted(set(columns).intersection(available))
+        if not selected_symbols or not set(required).issubset(selected_columns):
+            return None
+        root = self.snapshot_path / "parquet" / dataset
+        glob = _sql_string(str((root / "**" / "*.parquet").resolve()))
+        projection = ", ".join(_sql_identifier(column) for column in selected_columns)
+        symbol_values = ", ".join(_sql_string(symbol) for symbol in selected_symbols)
+        connection = self._duckdb_connection()
+        try:
+            return connection.execute(
+                f"SELECT {projection} FROM read_parquet({glob}, "
+                "hive_partitioning=true, union_by_name=true) "
+                f"WHERE ts_code IN ({symbol_values})"
+            ).fetch_df()
+        finally:
+            connection.close()
+
+    def _style_symbols(self) -> list[str]:
+        root = self.snapshot_path / "parquet" / "daily_basic"
+        if not root.exists() or not any(root.rglob("*.parquet")):
+            return []
+        glob = _sql_string(str((root / "**" / "*.parquet").resolve()))
+        connection = self._duckdb_connection()
+        try:
+            return [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT trim(CAST(ts_code AS VARCHAR)) AS ts_code "
+                    f"FROM read_parquet({glob}, hive_partitioning=true, "
+                    "union_by_name=true) WHERE ts_code IS NOT NULL "
+                    "ORDER BY ts_code"
+                ).fetchall()
+                if str(row[0] or "")
+            ]
+        finally:
+            connection.close()
+
+    def _write_style_metadata_bounded(self, target: Path) -> bool:
+        """Build full-history descriptors by symbol and standardize by year.
+
+        Rolling descriptors must see each instrument's complete history, while
+        standardization must see the complete cross-section for each date.  A
+        symbol-batch raw pass followed by a year-batch cross-sectional pass
+        preserves both mathematical boundaries without retaining the entire
+        market panel in one pandas object.
+        """
+
+        required = {"ts_code", "trade_date", "total_mv"}
+        if not required.issubset(self._parquet_columns("daily_basic")):
+            return False
+        symbols = self._style_symbols()
+        if not symbols:
+            return False
+        target.mkdir(parents=True, exist_ok=True)
+        work = target / ".style_metadata_attempt"
+        if work.exists():
+            shutil.rmtree(work)
+        raw_dir = work / "raw"
+        spill_dir = work / "duckdb_spill"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        style_tmp = target / ".style_exposures.parquet.tmp"
+        weights_tmp = target / ".full_market_weights.parquet.tmp"
+        style_tmp.unlink(missing_ok=True)
+        weights_tmp.unlink(missing_ok=True)
+        writer: pq.ParquetWriter | None = None
+        try:
+            daily_basic_columns = {
+                "ts_code",
+                "trade_date",
+                "total_mv",
+                "circ_mv",
+                "pb",
+                "pe_ttm",
+                "turnover_rate",
+            }
+            for offset in range(0, len(symbols), DAILY_QLIB_STYLE_SYMBOL_BATCH):
+                batch = symbols[offset : offset + DAILY_QLIB_STYLE_SYMBOL_BATCH]
+                daily_basic = self._read_dataset_for_symbols(
+                    "daily_basic",
+                    daily_basic_columns,
+                    batch,
+                    required=required,
+                )
+                if daily_basic is None or daily_basic.empty:
+                    continue
+                adjusted_close = self._load_adjusted_close(batch)
+                fina_indicator = self._load_fina_indicator(batch)
+                raw = build_raw_style_panel(
+                    daily_basic,
+                    adjusted_close=adjusted_close,
+                    fina_indicator=fina_indicator,
+                )
+                raw = raw.rename(
+                    columns={"ts_code": "instrument", "trade_date": "datetime"}
+                )
+                raw["instrument"] = raw["instrument"].map(_qlib_symbol)
+                if not raw.empty:
+                    raw.to_parquet(
+                        raw_dir / f"batch-{offset // DAILY_QLIB_STYLE_SYMBOL_BATCH:05d}.parquet",
+                        index=False,
+                        compression="zstd",
+                    )
+            raw_files = sorted(raw_dir.glob("*.parquet"))
+            if not raw_files:
+                return False
+
+            raw_glob = _sql_string(str((raw_dir / "*.parquet").resolve()))
+            connection = self._duckdb_connection(spill_dir=spill_dir)
+            try:
+                years = [
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT DISTINCT year(try_cast(datetime AS TIMESTAMP)) AS y "
+                        f"FROM read_parquet({raw_glob}, union_by_name=true) "
+                        "WHERE try_cast(datetime AS TIMESTAMP) IS NOT NULL ORDER BY y"
+                    ).fetchall()
+                ]
+                for year in years:
+                    raw_year = connection.execute(
+                        f"SELECT * FROM read_parquet({raw_glob}, union_by_name=true) "
+                        f"WHERE year(try_cast(datetime AS TIMESTAMP)) = {year} "
+                        "ORDER BY datetime, instrument"
+                    ).fetch_df()
+                    standardized = standardize_panel(raw_year)
+                    if standardized.empty:
+                        continue
+                    ordered_columns = [
+                        "instrument",
+                        "datetime",
+                        "log_market_cap",
+                        *STYLE_COLUMNS,
+                    ]
+                    standardized = standardized.loc[:, ordered_columns]
+                    standardized["instrument"] = standardized["instrument"].astype(str)
+                    standardized["datetime"] = pd.to_datetime(
+                        standardized["datetime"], errors="raise"
+                    )
+                    for column in ordered_columns[2:]:
+                        standardized[column] = pd.to_numeric(
+                            standardized[column], errors="coerce"
+                        ).astype("float64")
+                    table = pa.Table.from_pandas(standardized, preserve_index=False)
+                    if writer is None:
+                        writer = pq.ParquetWriter(style_tmp, table.schema, compression="zstd")
+                    writer.write_table(table)
+
+                connection.execute(
+                    f"COPY ("
+                    "WITH clean AS ("
+                    "SELECT instrument, try_cast(datetime AS TIMESTAMP) AS datetime, "
+                    "try_cast(float_market_cap AS DOUBLE) AS float_market_cap "
+                    f"FROM read_parquet({raw_glob}, union_by_name=true) "
+                    "WHERE try_cast(datetime AS TIMESTAMP) IS NOT NULL "
+                    "AND try_cast(float_market_cap AS DOUBLE) > 0"
+                    "), weighted AS ("
+                    "SELECT instrument, datetime, float_market_cap / "
+                    "sum(float_market_cap) OVER (PARTITION BY datetime) AS weight "
+                    "FROM clean"
+                    ") SELECT instrument, datetime, weight FROM weighted "
+                    "ORDER BY datetime, instrument"
+                    f") TO {_sql_string(str(weights_tmp.resolve()))} "
+                    "(FORMAT PARQUET, COMPRESSION ZSTD)"
+                )
+            finally:
+                connection.close()
+            if writer is None:
+                return False
+            writer.close()
+            writer = None
+            os.replace(style_tmp, target / "style_exposures.parquet")
+            os.replace(weights_tmp, target / "full_market_weights.parquet")
+            return True
+        finally:
+            if writer is not None:
+                writer.close()
+            style_tmp.unlink(missing_ok=True)
+            weights_tmp.unlink(missing_ok=True)
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _load_adjusted_close(
+        self, symbols: Collection[str] | None = None
+    ) -> pd.DataFrame | None:
         daily_root = self.snapshot_path / "parquet" / "daily"
         daily_files = sorted(daily_root.rglob("*.parquet")) if daily_root.exists() else []
-        daily = _read_parquet_columns(daily_files, {"ts_code", "trade_date", "close"})
+        daily = (
+            self._read_dataset_for_symbols(
+                "daily",
+                {"ts_code", "trade_date", "close"},
+                symbols,
+                required={"ts_code", "trade_date", "close"},
+            )
+            if symbols is not None
+            else _read_parquet_columns(
+                daily_files, {"ts_code", "trade_date", "close"}
+            )
+        )
         if daily is None:
             return None
         adj_root = self.snapshot_path / "parquet" / "adj_factor"
         adj_files = sorted(adj_root.rglob("*.parquet")) if adj_root.exists() else []
-        factors = _read_parquet_columns(adj_files, {"ts_code", "trade_date", "adj_factor"})
+        factors = (
+            self._read_dataset_for_symbols(
+                "adj_factor",
+                {"ts_code", "trade_date", "adj_factor"},
+                symbols,
+                required={"ts_code", "trade_date", "adj_factor"},
+            )
+            if symbols is not None
+            else _read_parquet_columns(
+                adj_files, {"ts_code", "trade_date", "adj_factor"}
+            )
+        )
         evidence = self._require_adjustment_boundary_evidence()
         masked_symbols = {
             str(item["ts_code"])
@@ -1395,9 +1673,18 @@ class QlibBuilder:
                 )
         return build_adjusted_close(daily, factors)
 
-    def _load_fina_indicator(self) -> pd.DataFrame | None:
+    def _load_fina_indicator(
+        self, symbols: Collection[str] | None = None
+    ) -> pd.DataFrame | None:
         root = self.snapshot_path / "parquet" / "fina_indicator"
         files = sorted(root.rglob("*.parquet")) if root.exists() else []
+        if symbols is not None:
+            return self._read_dataset_for_symbols(
+                "fina_indicator",
+                {"ts_code", "ann_date", "roe", "or_yoy", "netprofit_yoy", "debt_to_assets"},
+                symbols,
+                required={"ts_code", "ann_date"},
+            )
         return _read_parquet_columns(
             files,
             {"ts_code", "ann_date", "roe", "or_yoy", "netprofit_yoy", "debt_to_assets"},
@@ -2114,7 +2401,7 @@ class QlibBuilder:
             f'count("{column.replace(chr(34), chr(34) * 2)}") AS "c{index}"'
             for index, column in enumerate(ordered)
         )
-        connection = duckdb.connect()
+        connection = self._duckdb_connection()
         try:
             row = connection.execute(
                 f"SELECT {projection} FROM read_parquet({glob}, "
@@ -2311,7 +2598,7 @@ class QlibBuilder:
                 ) AS examples
             FROM conflicts
         """
-        connection = duckdb.connect()
+        connection = self._duckdb_connection()
         try:
             row = connection.execute(query).fetchone()
         finally:
@@ -2435,7 +2722,7 @@ class QlibBuilder:
                 ) AS max_missing_weight_ratio
             FROM coverage
         """
-        connection = duckdb.connect()
+        connection = self._duckdb_connection()
         try:
             row = connection.execute(query).fetchone()
         finally:
@@ -2491,7 +2778,7 @@ class QlibBuilder:
     def _has_usable_row(self, dataset: str, predicate: str) -> bool:
         root = self.snapshot_path / "parquet" / dataset
         glob = _sql_string(str((root / "**" / "*.parquet").resolve()))
-        connection = duckdb.connect()
+        connection = self._duckdb_connection()
         try:
             row = connection.execute(
                 f"SELECT 1 FROM read_parquet({glob}, hive_partitioning=true, "
@@ -2506,7 +2793,7 @@ class QlibBuilder:
         if not root.exists() or not any(root.rglob("*.parquet")):
             return set()
         glob = _sql_string(str((root / "**" / "*.parquet").resolve()))
-        connection = duckdb.connect()
+        connection = self._duckdb_connection()
         try:
             rows = connection.execute(
                 f"DESCRIBE SELECT * FROM read_parquet({glob}, hive_partitioning=true, "
@@ -2540,6 +2827,10 @@ class QlibBuilder:
                 )
               )
         """
+
+
+def _sql_identifier(value: str) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
 
 
 def _sql_string(value: str) -> str:

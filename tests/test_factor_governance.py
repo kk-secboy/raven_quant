@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from qlib_test_doubles import qlib_workflow_identity
 
+from quant_platform.factor_recompute import FACTOR_SUBMITTED_INDEX_CONTRACT_VERSION
 from quant_platform.research_store import ResearchStore
 
 PERIODS = {
@@ -296,6 +297,111 @@ def test_factor_evaluation_rejects_legacy_index_ambiguous_recompute_evidence(
         )
 
 
+def test_factor_evaluation_accepts_proven_complete_bounded_suffix(
+    tmp_path: Path, database_url: str
+) -> None:
+    store = ResearchStore(database_url)
+    candidate = _candidate(store, tmp_path)
+    recompute = _recompute_args(store, candidate["id"], tmp_path)
+    recompute["recompute_evidence"]["submitted_comparison"].update(
+        {
+            "contract_version": FACTOR_SUBMITTED_INDEX_CONTRACT_VERSION,
+            "index_exact_match": False,
+            "index_subset_match": True,
+            "index_prefix_extension_match": True,
+            "index_difference_kind": "recomputed_history_prefix",
+            "overlap_rows": 100,
+            "submitted_rows": 100,
+            "recomputed_rows": 200,
+            "recomputed_history_prefix_rows": 100,
+            "missing_on_or_after_submitted_start_rows": 0,
+            "unexpected_submitted_rows": 0,
+            "submitted_finite_rows": 90,
+            "finite_value_match": True,
+            "warmup_prefix_only": True,
+            "warmup_prefix_rows": 10,
+            "recomputed_start": "2022-01-03T00:00:00",
+            "submitted_start": "2023-01-03T00:00:00",
+            "submitted_end": f"{PERIODS['valid_end'].isoformat()}T00:00:00",
+            "recomputed_end": f"{PERIODS['valid_end'].isoformat()}T00:00:00",
+        }
+    )
+    metrics = _passing_metrics()
+    artifact = _write_evaluation_artifact(
+        tmp_path / "bounded-suffix-evaluation.json", candidate["id"], metrics
+    )
+
+    evaluation = store.record_evaluation(
+        candidate["id"],
+        dataset="snapshot-20260710",
+        dataset_identity_sha256=DATASET_IDENTITY,
+        **PERIODS,
+        metrics=metrics,
+        artifact_path=str(artifact),
+        **recompute,
+    )
+
+    assert evaluation["gate_status"] == "passed"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("missing_on_or_after_submitted_start_rows", 1),
+        ("unexpected_submitted_rows", 1),
+        ("recomputed_end", "2023-12-28T00:00:00"),
+    ],
+)
+def test_factor_evaluation_rejects_unproven_bounded_subset(
+    tmp_path: Path, database_url: str, field: str, value: object
+) -> None:
+    store = ResearchStore(database_url)
+    candidate = _candidate(store, tmp_path)
+    recompute = _recompute_args(store, candidate["id"], tmp_path)
+    comparison = recompute["recompute_evidence"]["submitted_comparison"]
+    comparison.update(
+        {
+            "contract_version": FACTOR_SUBMITTED_INDEX_CONTRACT_VERSION,
+            "index_exact_match": False,
+            "index_subset_match": True,
+            "index_prefix_extension_match": True,
+            "index_difference_kind": "recomputed_history_prefix",
+            "overlap_rows": 100,
+            "submitted_rows": 100,
+            "recomputed_rows": 200,
+            "recomputed_history_prefix_rows": 100,
+            "missing_on_or_after_submitted_start_rows": 0,
+            "unexpected_submitted_rows": 0,
+            "submitted_finite_rows": 90,
+            "finite_value_match": True,
+            "warmup_prefix_only": True,
+            "warmup_prefix_rows": 10,
+            "recomputed_start": "2022-01-03T00:00:00",
+            "submitted_start": "2023-01-03T00:00:00",
+            "submitted_end": f"{PERIODS['valid_end'].isoformat()}T00:00:00",
+            "recomputed_end": f"{PERIODS['valid_end'].isoformat()}T00:00:00",
+        }
+    )
+    comparison[field] = value
+
+    with pytest.raises(ValueError, match="do not match independent recomputation"):
+        store.record_evaluation(
+            candidate["id"],
+            dataset="snapshot-20260710",
+            dataset_identity_sha256=DATASET_IDENTITY,
+            **PERIODS,
+            metrics=_passing_metrics(),
+            artifact_path=str(
+                _write_evaluation_artifact(
+                    tmp_path / f"invalid-bounded-{field}.json",
+                    candidate["id"],
+                    _passing_metrics(),
+                )
+            ),
+            **recompute,
+        )
+
+
 def test_only_one_active_factor_research_pipeline_is_allowed(
     tmp_path: Path, database_url: str
 ) -> None:
@@ -319,3 +425,35 @@ def test_only_one_active_factor_research_pipeline_is_allowed(
             config={},
             artifact_path=tmp_path,
         )
+
+
+def test_reactivated_research_run_clears_terminal_state(
+    tmp_path: Path, database_url: str
+) -> None:
+    store = ResearchStore(database_url)
+    run = store.create_run(
+        kind="model",
+        objective="Verify durable research state timestamps.",
+        dataset="snapshot-a",
+        requested_by="researcher",
+        budget={"loop_n": 1},
+        config={},
+        artifact_path=tmp_path,
+    )
+    store.mark_run(run["id"], "failed", error="first attempt failed")
+    failed = store.get_run(run["id"])
+    assert failed["finished_at"] is not None
+    assert failed["error"] == "first attempt failed"
+
+    store.mark_run(run["id"], "running", error="must not leak")
+    running = store.get_run(run["id"])
+    assert running["status"] == "running"
+    assert running["started_at"] is not None
+    assert running["finished_at"] is None
+    assert running["error"] is None
+
+    store.mark_run(run["id"], "evaluating", error="must not leak either")
+    evaluating = store.get_run(run["id"])
+    assert evaluating["status"] == "evaluating"
+    assert evaluating["finished_at"] is None
+    assert evaluating["error"] is None

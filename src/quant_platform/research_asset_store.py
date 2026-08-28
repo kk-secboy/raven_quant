@@ -163,6 +163,8 @@ class ResearchAssetStore:
                     "authors": list(metadata.get("authors") or []),
                     "categories": list(metadata.get("categories") or []),
                     "published_at": row.published_at,
+                    "available_at": manifest.get("available_at")
+                    or metadata.get("available_at"),
                     "retrieved_at": row.retrieved_at,
                     "content_sha256": str(row.content_sha256),
                     "manifest_sha256": str(row.manifest_sha256),

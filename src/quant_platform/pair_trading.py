@@ -243,44 +243,58 @@ def _kalman_spread(
     )
 
 
-def _execution_price(
+def _atomic_execution_quotes(
     minute: pd.DataFrame,
     trade_date: pd.Timestamp,
-    instrument: str,
-    side: Literal["buy", "sell"],
-    slippage: float,
-) -> tuple[float, float] | None:
-    try:
-        frame = minute.xs(instrument, level="instrument")
-    except KeyError:
+    instruments: tuple[str, str],
+) -> dict[str, tuple[float, float]] | None:
+    """Return coordinated full-window VWAP quotes for both pair legs."""
+
+    frames: dict[str, pd.DataFrame] = {}
+    for instrument in instruments:
+        try:
+            frame = minute.xs(instrument, level="instrument")
+        except KeyError:
+            return None
+        day = frame[frame.index.normalize() == trade_date.normalize()].copy()
+        if day.empty:
+            return None
+        local_time = day.index.time
+        allowed = (
+            (local_time >= pd.Timestamp("10:00").time())
+            & (local_time <= pd.Timestamp("11:20").time())
+        ) | (
+            (local_time >= pd.Timestamp("13:30").time())
+            & (local_time <= pd.Timestamp("14:50").time())
+        )
+        day = day.loc[allowed]
+        day = day[
+            (pd.to_numeric(day["close"], errors="coerce") > 0)
+            & (pd.to_numeric(day["volume"], errors="coerce") > 0)
+        ]
+        if day.empty:
+            return None
+        frames[instrument] = day
+    common = sorted(set(frames[instruments[0]].index) & set(frames[instruments[1]].index))
+    if not common:
         return None
-    day = frame[frame.index.normalize() == trade_date.normalize()].copy()
-    if day.empty:
-        return None
-    local_time = day.index.time
-    allowed = (
-        (local_time >= pd.Timestamp("10:00").time()) & (local_time <= pd.Timestamp("11:20").time())
-    ) | (
-        (local_time >= pd.Timestamp("13:30").time()) & (local_time <= pd.Timestamp("14:50").time())
-    )
-    day = day.loc[allowed]
-    day = day[
-        (pd.to_numeric(day["close"], errors="coerce") > 0)
-        & (pd.to_numeric(day["volume"], errors="coerce") > 0)
-    ]
-    if day.empty:
-        return None
-    volume = pd.to_numeric(day["volume"], errors="coerce").fillna(0.0)
-    if "amount" in day:
-        amount = pd.to_numeric(day["amount"], errors="coerce").fillna(0.0)
-        vwap = float(amount.sum() / volume.sum()) if amount.sum() > 0 else 0.0
-    else:
-        prices = pd.to_numeric(day["close"], errors="coerce")
-        vwap = float((prices * volume).sum() / volume.sum())
-    if not np.isfinite(vwap) or vwap <= 0:
-        return None
-    adjusted = vwap * (1.0 + slippage if side == "buy" else 1.0 - slippage)
-    return float(adjusted), float(volume.sum())
+    quotes: dict[str, tuple[float, float]] = {}
+    for instrument, frame in frames.items():
+        aligned = frame.loc[common]
+        volume = pd.to_numeric(aligned["volume"], errors="coerce").fillna(0.0)
+        if "vwap" in aligned:
+            prices = pd.to_numeric(aligned["vwap"], errors="coerce")
+            vwap = float((prices * volume).sum() / volume.sum())
+        elif "amount" in aligned:
+            amount = pd.to_numeric(aligned["amount"], errors="coerce").fillna(0.0)
+            vwap = float(amount.sum() / volume.sum()) if amount.sum() > 0 else 0.0
+        else:
+            prices = pd.to_numeric(aligned["close"], errors="coerce")
+            vwap = float((prices * volume).sum() / volume.sum())
+        if not np.isfinite(vwap) or vwap <= 0:
+            return None
+        quotes[instrument] = (vwap, float(volume.sum()))
+    return quotes
 
 
 def _trade_allowed(
@@ -402,14 +416,13 @@ def run_pair_backtest(
         if offset < config.formation_window:
             daily_rows.append({"datetime": trade_date, "nav": cash, "position": 0})
             continue
-        if position_direction and offset == len(prices) - 1:
-            pending = {"action": "exit", "reason": "end_of_test", "signal_date": trade_date}
         if pending:
             action = str(pending["action"])
             signal_date = pd.Timestamp(pending["signal_date"]).tz_localize(None)
             pending_reason = str(pending["reason"])
             retry_pending: dict[str, Any] | None = None
             target_quantities = {leg_y: 0, leg_x: 0}
+            reference: dict[str, float] | None = None
             hedge_ratio = float(
                 pending.get("hedge_ratio") or kalman.loc[signal_date, "hedge_ratio"]
             )
@@ -434,22 +447,18 @@ def run_pair_backtest(
                 )
             orders: list[dict[str, Any]] = []
             rejection_reason: str | None = None
+            quotes = _atomic_execution_quotes(minute, trade_date, (leg_y, leg_x))
+            if quotes is None:
+                rejection_reason = "pair:missing_common_execution_window"
             for instrument in (leg_y, leg_x):
                 delta = target_quantities[instrument] - quantities[instrument]
                 if delta == 0:
                     continue
                 side: Literal["buy", "sell"] = "buy" if delta > 0 else "sell"
-                execution = _execution_price(
-                    minute,
-                    trade_date,
-                    instrument,
-                    side,
-                    0.0,
-                )
-                if execution is None:
-                    rejection_reason = f"{instrument}:missing_valid_minute_execution_window"
+                if rejection_reason:
                     break
-                execution_price, minute_volume = execution
+                assert quotes is not None
+                execution_price, minute_volume = quotes[instrument]
                 day_row = daily.loc[(trade_date, instrument)]
                 opening_short = target_quantities[instrument] < 0 and quantities[instrument] >= 0
                 rejection_reason = _trade_allowed(
@@ -477,6 +486,8 @@ def run_pair_backtest(
                         "minute_volume": minute_volume,
                     }
                 )
+            if not rejection_reason and len(orders) != 2:
+                rejection_reason = "pair:unbalanced_target"
             if not rejection_reason and orders:
                 common_fill_ratio = min(
                     1.0,
@@ -498,6 +509,8 @@ def run_pair_backtest(
                     actual_common_ratio = min(order["fill_ratio"] for order in orders)
                     if actual_common_ratio < config.min_capacity_fill_ratio:
                         rejection_reason = "pair:insufficient_lot_rounded_capacity"
+                    elif max(order["fill_ratio"] for order in orders) - actual_common_ratio > 0.02:
+                        rejection_reason = "pair:lot_rounding_hedge_drift"
             if rejection_reason:
                 rejections.append(
                     {
@@ -538,7 +551,11 @@ def run_pair_backtest(
                     position_direction = direction
                     holding_days = 0
                     entry_nav = nav_before - total_cost
-                    filled_entry_notional += total_notional
+                    assert reference is not None
+                    filled_entry_notional += sum(
+                        abs(int(order["delta"])) * reference[str(order["instrument"])]
+                        for order in orders
+                    )
                     position_closed = False
                 else:
                     position_closed = all(quantity == 0 for quantity in quantities.values())
@@ -614,7 +631,9 @@ def run_pair_backtest(
         signal_z = float(zscore.loc[trade_date])
         if position_direction:
             reason: str | None = None
-            if not eligible:
+            if offset == len(prices) - 2:
+                reason = "end_of_test"
+            elif not eligible:
                 reason = "cointegration_breakdown"
                 breakdown_count += 1
             elif abs(signal_z) >= config.stop_zscore:
@@ -626,7 +645,11 @@ def run_pair_backtest(
                 reason = "max_holding_days"
             if reason:
                 pending = {"action": "exit", "reason": reason, "signal_date": trade_date}
-        elif eligible and config.entry_zscore <= abs(signal_z) < config.stop_zscore:
+        elif (
+            offset < len(prices) - 2
+            and eligible
+            and config.entry_zscore <= abs(signal_z) < config.stop_zscore
+        ):
             pending = {
                 "action": "entry",
                 "reason": "negative_spread" if signal_z < 0 else "positive_spread",

@@ -271,7 +271,7 @@ def test_known_older_database_revision_has_upgrade_path() -> None:
     assert compatible is True
 
 
-def test_deployed_0058_database_upgrades_to_0064_head() -> None:
+def test_deployed_0058_database_upgrades_to_current_head() -> None:
     project_root = Path(__file__).resolve().parents[1]
 
     code_revision, state, compatible = release_preflight._schema_compatibility(
@@ -279,7 +279,7 @@ def test_deployed_0058_database_upgrades_to_0064_head() -> None:
         "0058_simulation_benchmark",
     )
 
-    assert code_revision == "0064_paper_stage_account"
+    assert code_revision == "0071_retire_pair_writes"
     assert state == "upgrade_required"
     assert compatible is True
 
@@ -308,6 +308,10 @@ def test_all_migration_revision_ids_fit_alembic_version_column() -> None:
     assert revisions["0063_model_artifact_env"] == "0062_research_asset_consumptions"
     assert revisions["0064_paper_stage_account"] == "0063_model_artifact_env"
     assert all(len(revision) <= 32 for revision in revisions)
+    assert all(
+        down_revision is None or down_revision in revisions
+        for down_revision in revisions.values()
+    )
 
 
 def test_default_and_gpu_service_contracts() -> None:

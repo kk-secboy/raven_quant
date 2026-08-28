@@ -93,3 +93,135 @@ def test_cross_trial_dsr_rewrites_trial_metrics_and_progress() -> None:
             "bailey-lopez-de-prado-cross-trial-v2"
         )
         assert evidence["trial_sharpe_std"] > 0
+
+
+def test_cross_trial_dsr_counts_prior_admitted_model_trials() -> None:
+    script = _script_module()
+    returns = {
+        0: pd.Series([0.001 + (index % 5 - 2) * 0.0002 for index in range(60)]),
+        1: pd.Series([0.0005 + (index % 7 - 3) * 0.0003 for index in range(60)]),
+    }
+    trials = []
+    for index in range(2):
+        provisional = script.deflated_sharpe_probability(returns[index], trials=4)
+        trials.append(
+            {
+                "trial_index": index,
+                "parameters": {
+                    "portfolio_construction": (
+                        "topk_equal_weight" if index == 0 else "industry_neutral_qp"
+                    )
+                },
+                "status": "succeeded",
+                "score": 0.0,
+                "warnings": [],
+                "error": None,
+                "metrics": {
+                    "in_sample": {},
+                    "out_of_sample": {
+                        "deflated_sharpe": provisional,
+                        "deflated_sharpe_probability": provisional["probability"],
+                    },
+                },
+            }
+        )
+
+    assert script._finalize_cross_trial_dsr(
+        trials,
+        returns,
+        trial_count=2,
+        prior_trial_sharpes=[0.02, 0.03],
+    )
+    for trial in trials:
+        evidence = trial["metrics"]["out_of_sample"]["deflated_sharpe"]
+        assert evidence["trials"] == 4
+        assert evidence["trial_sharpe_std"] > 0
+
+
+def test_admitted_trial_distribution_must_be_complete_and_pre_final() -> None:
+    script = _script_module()
+    evidence = {
+        "final_oos_opened": False,
+        "trial_count": 2,
+        "trial_names": ["model-a", "model-b"],
+        "trial_daily_sharpes": [0.01, 0.02],
+    }
+    assert script._admitted_trial_sharpes({"shared_multiple_testing": evidence}) == [
+        0.01,
+        0.02,
+    ]
+    with pytest.raises(ValueError, match="incomplete"):
+        script._admitted_trial_sharpes(
+            {
+                "shared_multiple_testing": {
+                    **evidence,
+                    "final_oos_opened": True,
+                }
+            }
+        )
+
+
+def test_portfolio_trials_require_identical_predictions_and_costs() -> None:
+    script = _script_module()
+    base_config = {
+        "signal_frequency": "day",
+        "signal_period": 1,
+        "rebalance_frequency": "day",
+        "execution_frequency": "day",
+        "execution_method": "open",
+        "execution_days": 1,
+        "execution_lag_bars": 1,
+        "max_volume_participation": 0.1,
+    }
+    manifest = {
+        "evaluation_mode": "pre_final_portfolio_trial",
+        "trials": [
+            {
+                "trial_index": index,
+                "config": {**base_config, "portfolio_construction": construction},
+            }
+            for index, construction in enumerate(
+                ("topk_equal_weight", "industry_neutral_qp")
+            )
+        ],
+    }
+    results = []
+    for index, construction in enumerate(
+        ("topk_equal_weight", "industry_neutral_qp")
+    ):
+        results.append(
+            {
+                "trial_index": index,
+                "parameters": {"portfolio_construction": construction},
+                "status": "succeeded",
+                "metrics": {
+                    segment: {
+                        "cost_model": {"version": "cost-v1", "stamp_tax": 0.001},
+                        "provenance": {
+                            "evaluation_mode": "pre_final_portfolio_trial",
+                            "evaluation_scope": "pre_final_only",
+                            "final_oos_opened": False,
+                            "formal_model_predictions_sha256": "a" * 64,
+                            "formal_model_checkpoint_sha256": "b" * 64,
+                            "model_signal_identity_sha256": "c" * 64,
+                            "dataset_identity_sha256": "d" * 64,
+                            "formal_model_admission_binding_sha256": "e" * 64,
+                            "pre_final_cutoff": "2025-12-31",
+                        },
+                    }
+                    for segment in ("in_sample", "out_of_sample")
+                },
+            }
+        )
+
+    evidence = script._validate_portfolio_trial_comparability(manifest, results)
+    assert evidence is not None
+    assert evidence["segments"]["out_of_sample"][
+        "model_predictions_sha256"
+    ] == ("a" * 64)
+
+    results[1]["metrics"]["out_of_sample"]["provenance"][
+        "formal_model_predictions_sha256"
+    ] = "f" * 64
+    with pytest.raises(ValueError, match="identical model predictions"):
+        script._validate_portfolio_trial_comparability(manifest, results)

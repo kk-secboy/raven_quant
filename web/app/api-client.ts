@@ -12,15 +12,61 @@ type CachePolicy = {
   persist: boolean;
 };
 
-const SESSION_PREFIX = "quantlab:query:";
+const SESSION_ROOT_PREFIX = "quantlab:query:";
+const CACHE_SCHEMA_VERSION = "api-response-v2";
+const CACHE_RELEASE_VERSION = process.env.NEXT_PUBLIC_CACHE_RELEASE ?? "quantlab-web-2026-08-26";
+const SESSION_CACHE_VERSION = `${CACHE_SCHEMA_VERSION}:${CACHE_RELEASE_VERSION}`;
+const SESSION_VERSION_KEY = `${SESSION_ROOT_PREFIX}active-version`;
+const SESSION_PREFIX = `${SESSION_ROOT_PREFIX}${SESSION_CACHE_VERSION}:`;
 const MAX_PERSISTED_BODY = 2_000_000;
 const inflightGets = new Map<string, Promise<CachedResponse>>();
 const responseCache = new Map<string, CachedResponse>();
 let cacheGeneration = 0;
+let sessionCachePrepared = false;
 
 export type ApiRequestInit = RequestInit & {
   forceRefresh?: boolean;
   timeoutMs?: number;
+};
+
+// This is deliberately a paper-ledger projection, not the formal
+// RecommendationStore contract.  It is populated only from an immutable Qlib
+// order-plan already queued for the active isolated Autopilot account.
+export type PaperTargetAdjustment = {
+  instrument: string;
+  target_weight: number;
+  previous_weight: number;
+  weight_change: number;
+  action: "add" | "remove" | "increase" | "decrease" | "hold";
+  reason: string;
+  reason_basis: "frozen_qlib_order_plan_weight_delta";
+};
+
+export type PaperTargetProjection = {
+  contract_version: "paper-target-projection-v1";
+  status: "ready" | "waiting_for_paper_account" | "waiting_for_order_plan" | "blocked_invalid_order_plan";
+  message: string;
+  blocker?: string;
+  mode: "paper_only";
+  recommendation_enabled: false;
+  real_trading_eligible: false;
+  simulation_portfolio: {
+    id: string;
+    name: string;
+    status: string;
+    strategy_version_id: string;
+  } | null;
+  batch?: {
+    id: string;
+    status: string;
+    order_plan_manifest_sha256: string;
+    target_weights_sha256: string;
+    previous_batch_id: string | null;
+  };
+  signal_date: string | null;
+  trade_date: string | null;
+  cash_weight?: number;
+  targets: PaperTargetAdjustment[];
 };
 
 function requestKey(input: RequestInfo | URL) {
@@ -48,12 +94,35 @@ function cachePolicy(key: string): CachePolicy | null {
     return { freshMs: 5 * 60_000, staleMs: 30 * 60_000, persist: true };
   }
   if (path === "/api/market/overview") {
-    return { freshMs: 30_000, staleMs: 5 * 60_000, persist: true };
+    // The payload is bound to an immutable snapshot and carries its as-of
+    // date. Keep the last successful dashboard visible while the next daily
+    // artifact is generated or the API is temporarily busy.
+    return { freshMs: 30_000, staleMs: 7 * 24 * 60 * 60_000, persist: true };
+  }
+  if (path === "/api/qlib/status" || path === "/api/rdagent/status") {
+    // Runtime capability changes must be observed quickly and must never be
+    // restored from a previous browser session or frontend release.
+    return { freshMs: 2_000, staleMs: 10_000, persist: false };
   }
   if (path === "/api/jobs" || path.startsWith("/api/jobs/")) {
     return { freshMs: 3_000, staleMs: 15_000, persist: true };
   }
   return { freshMs: 5_000, staleMs: 5 * 60_000, persist: true };
+}
+
+function prepareSessionCache() {
+  if (sessionCachePrepared) return;
+  sessionCachePrepared = true;
+  try {
+    if (window.sessionStorage.getItem(SESSION_VERSION_KEY) === SESSION_CACHE_VERSION) return;
+    for (let index = window.sessionStorage.length - 1; index >= 0; index -= 1) {
+      const key = window.sessionStorage.key(index);
+      if (key?.startsWith(SESSION_ROOT_PREFIX)) window.sessionStorage.removeItem(key);
+    }
+    window.sessionStorage.setItem(SESSION_VERSION_KEY, SESSION_CACHE_VERSION);
+  } catch {
+    // A disabled session store falls back to the in-memory cache.
+  }
 }
 
 function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number) {
@@ -83,6 +152,7 @@ function responseFromCache(value: CachedResponse, state: "fresh" | "stale" | "ne
 function readCached(key: string, persist: boolean) {
   const memory = responseCache.get(key);
   if (memory || !persist) return memory;
+  prepareSessionCache();
   try {
     const raw = window.sessionStorage.getItem(`${SESSION_PREFIX}${key}`);
     if (!raw) return undefined;
@@ -98,6 +168,7 @@ function readCached(key: string, persist: boolean) {
 function storeCached(key: string, value: CachedResponse, persist: boolean) {
   responseCache.set(key, value);
   if (!persist || value.body.length > MAX_PERSISTED_BODY) return;
+  prepareSessionCache();
   try {
     window.sessionStorage.setItem(`${SESSION_PREFIX}${key}`, JSON.stringify(value));
   } catch {
@@ -148,6 +219,7 @@ export function clearApiCache() {
   cacheGeneration += 1;
   inflightGets.clear();
   responseCache.clear();
+  prepareSessionCache();
   try {
     for (let index = window.sessionStorage.length - 1; index >= 0; index -= 1) {
       const key = window.sessionStorage.key(index);
@@ -159,6 +231,7 @@ export function clearApiCache() {
 }
 
 export function apiFetch(input: RequestInfo | URL, init: ApiRequestInit = {}) {
+  prepareSessionCache();
   const { forceRefresh = false, timeoutMs: requestedTimeout, ...requestInit } = init;
   const method = (requestInit.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
   const timeoutMs = requestedTimeout ?? (method === "GET" ? 15_000 : 30_000);

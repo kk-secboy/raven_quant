@@ -2,49 +2,46 @@ from __future__ import annotations
 
 from typing import Any
 
-from .model_research_governance import canonical_sha256
+from .factor_library import (
+    FACTOR_DEFINITIONS,
+    canonical_sha256,
+    feature_expression_map,
+    library_release_definition,
+)
 
-# This is the exact, fixed 20-feature baseline used by the pinned RD-Agent
-# quantitative workflow.  It is copied into QuantLab so a future upstream
-# change cannot silently alter a governed fin_model/fin_quant comparison.
-RDAGENT_ALPHA20: dict[str, str] = {
-    "RESI5": "Resi($close, 5)/$close",
-    "WVMA5": (
-        "Std(Abs($close/Ref($close, 1)-1)*$volume, 5)/"
-        "(Mean(Abs($close/Ref($close, 1)-1)*$volume, 5)+1e-12)"
-    ),
-    "RSQR5": "Rsquare($close, 5)",
-    "KLEN": "($high-$low)/$open",
-    "RSQR10": "Rsquare($close, 10)",
-    "CORR5": "Corr($close, Log($volume+1), 5)",
-    "CORD5": "Corr($close/Ref($close,1), Log($volume/Ref($volume, 1)+1), 5)",
-    "CORR10": "Corr($close, Log($volume+1), 10)",
-    "ROC60": "Ref($close, 60)/$close",
-    "RESI10": "Resi($close, 10)/$close",
-    "VSTD5": "Std($volume, 5)/($volume+1e-12)",
-    "RSQR60": "Rsquare($close, 60)",
-    "CORR60": "Corr($close, Log($volume+1), 60)",
-    "WVMA60": (
-        "Std(Abs($close/Ref($close, 1)-1)*$volume, 60)/"
-        "(Mean(Abs($close/Ref($close, 1)-1)*$volume, 60)+1e-12)"
-    ),
-    "STD5": "Std($close, 5)/$close",
-    "RSQR20": "Rsquare($close, 20)",
-    "CORD60": "Corr($close/Ref($close,1), Log($volume/Ref($volume, 1)+1), 60)",
-    "CORD10": "Corr($close/Ref($close,1), Log($volume/Ref($volume, 1)+1), 10)",
-    "CORR20": "Corr($close, Log($volume+1), 20)",
-    "KLOW": "(Less($open, $close)-$low)/$open",
-}
+# Compatibility name retained for callers and tests. Values now come from the
+# same immutable definitions as the unified library.
+RDAGENT_ALPHA20: dict[str, str] = feature_expression_map("alpha20")
 
 
-def _record(feature_set_id: str, name: str, features: dict[str, str]) -> dict[str, Any]:
+def _record(
+    feature_set_id: str,
+    name: str,
+    features: dict[str, str],
+    *,
+    source: str,
+    contract_version: str = "governed-feature-set-v2-unified-library",
+    source_in_identity: bool = True,
+) -> dict[str, Any]:
     definition = {
-        "contract_version": "governed-feature-set-v1",
+        "contract_version": contract_version,
         "id": feature_set_id,
         "name": name,
         "features": dict(features),
     }
-    return {**definition, "definition_sha256": canonical_sha256(definition)}
+    identity = {**definition, **({"source": source} if source_in_identity else {})}
+    return {
+        **definition,
+        "source": source,
+        "definition_sha256": canonical_sha256(identity),
+    }
+
+
+def _unified_features() -> dict[str, str]:
+    return {
+        item.id: item.expression
+        for item in sorted(FACTOR_DEFINITIONS, key=lambda definition: definition.id)
+    }
 
 
 FEATURE_SETS: dict[str, dict[str, Any]] = {
@@ -52,8 +49,71 @@ FEATURE_SETS: dict[str, dict[str, Any]] = {
         "governed-baseline",
         "Pinned RD-Agent Alpha20 baseline",
         RDAGENT_ALPHA20,
-    )
+        source="rdagent-alpha20",
+        contract_version="governed-feature-set-v1",
+        source_in_identity=False,
+    ),
+    "qlib-alpha158": _record(
+        "qlib-alpha158",
+        "Pinned Qlib Alpha158",
+        feature_expression_map("alpha158"),
+        source="qlib-alpha158",
+    ),
+    "qlib-alpha360": _record(
+        "qlib-alpha360",
+        "Pinned Qlib Alpha360",
+        feature_expression_map("alpha360"),
+        source="qlib-alpha360",
+    ),
+    "platform-seed-v1": _record(
+        "platform-seed-v1",
+        "QuantLab governed 24-factor seed set",
+        feature_expression_map("platform_seed"),
+        source="platform-seed",
+    ),
+    "unified-research-v1": _record(
+        "unified-research-v1",
+        "Unified deduplicated Qlib and QuantLab research library",
+        _unified_features(),
+        source=library_release_definition()["id"],
+    ),
 }
+
+
+def register_feature_set(definition: dict[str, Any]) -> dict[str, Any]:
+    """Register an immutable feature set assembled from governed DB records."""
+
+    candidate = dict(definition)
+    supplied_sha256 = str(candidate.pop("definition_sha256", ""))
+    feature_set_id = str(candidate.get("id") or "")
+    features = candidate.get("features")
+    if not feature_set_id or not isinstance(features, dict) or not features:
+        raise ValueError("dynamic feature set is incomplete")
+    actual_sha256 = canonical_sha256(candidate)
+    if supplied_sha256 != actual_sha256:
+        raise ValueError("dynamic feature set digest is invalid")
+    normalized = {**candidate, "definition_sha256": actual_sha256}
+    existing = FEATURE_SETS.get(feature_set_id)
+    if existing is not None and existing != normalized:
+        raise ValueError("feature set identity cannot be changed in place")
+    FEATURE_SETS[feature_set_id] = normalized
+    return get_feature_set(feature_set_id)
+
+
+def resolve_feature_set(
+    feature_set_id: str,
+    embedded: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if embedded is not None:
+        if str(embedded.get("id") or "") != feature_set_id:
+            raise ValueError("embedded feature set id disagrees with the request")
+        existing = FEATURE_SETS.get(feature_set_id)
+        if existing is not None:
+            if existing != embedded:
+                raise ValueError("embedded feature set disagrees with the registry")
+        else:
+            register_feature_set(embedded)
+    return get_feature_set(feature_set_id)
 
 
 def get_feature_set(feature_set_id: str) -> dict[str, Any]:
@@ -72,6 +132,7 @@ def list_feature_sets() -> list[dict[str, Any]]:
         {
             "id": item["id"],
             "name": item["name"],
+            "source": item["source"],
             "feature_count": len(item["features"]),
             "definition_sha256": item["definition_sha256"],
             "contract_version": item["contract_version"],

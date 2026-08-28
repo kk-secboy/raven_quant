@@ -22,7 +22,7 @@ test("server-renders the QuantLab authenticated application shell", async () => 
   const html = await response.text();
   assert.match(html, /<html lang="zh-CN">/i);
   assert.match(html, /<title>QuantLab · 量化研究系统<\/title>/i);
-  assert.match(html, /基于 Tushare、Qlib 与 RD-Agent 的本地量化研究平台/);
+  assert.match(html, /基于 Tushare、Qlib 与 RD-Agent 的受控量化研究平台/);
   assert.match(html, /正在检查安全会话/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|SQLite/i);
 });
@@ -42,27 +42,57 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(sourceByName["api-client.ts"], /sessionStorage/);
   assert.match(sourceByName["api-client.ts"], /staleMs/);
   assert.match(sourceByName["api-client.ts"], /clearApiCache/);
+  assert.match(sourceByName["api-client.ts"], /CACHE_SCHEMA_VERSION\s*=\s*"api-response-v2"/);
+  assert.match(sourceByName["api-client.ts"], /NEXT_PUBLIC_CACHE_RELEASE/);
+  assert.match(sourceByName["api-client.ts"], /SESSION_VERSION_KEY/);
+  assert.match(sourceByName["api-client.ts"], /startsWith\(SESSION_ROOT_PREFIX\)/);
+  assert.match(sourceByName["api-client.ts"], /function apiFetch[\s\S]{0,180}prepareSessionCache\(\)/);
+  assert.match(
+    sourceByName["api-client.ts"],
+    /path === "\/api\/qlib\/status" \|\| path === "\/api\/rdagent\/status"[\s\S]{0,240}staleMs:\s*10_000,[\s\S]{0,80}persist:\s*false/,
+  );
   assert.match(sourceByName["use-polling.ts"], /finally[\s\S]*setTimeout/);
   assert.doesNotMatch(allSource, /setInterval/);
   assert.match(sourceByName["page.tsx"], /\/api\/auth\/state/);
+  assert.match(sourceByName["page.tsx"], /if \(activeNav !== 1\) return;/);
+  assert.match(sourceByName["page.tsx"], /activeNav === 1 \? <button[\s\S]{0,160}>刷新概况<\/button> : null/);
   const coreBatchStart = sourceByName["page.tsx"].indexOf("Promise.allSettled([");
   const coreBatchEnd = sourceByName["page.tsx"].indexOf("]);", coreBatchStart);
   assert.ok(coreBatchStart >= 0 && coreBatchEnd > coreBatchStart);
   assert.doesNotMatch(sourceByName["page.tsx"].slice(coreBatchStart, coreBatchEnd), /data-retention/);
   assert.match(sourceByName["auth-panel.tsx"], /bootstrap.*login|login.*bootstrap/s);
   assert.match(sourceByName["page.tsx"], /StrategyAllocationPanel/);
-  assert.match(sourceByName["page.tsx"], /PairSatellitePanel/);
+  assert.doesNotMatch(sourceByName["page.tsx"], /PairSatellitePanel|配对卫星/);
   assert.doesNotMatch(sourceByName["page.tsx"], /<section hidden>/);
   assert.match(sourceByName["page.tsx"], /数据快照/);
-  assert.match(sourceByName["page.tsx"], /因子准入/);
+  assert.match(sourceByName["page.tsx"], /因子库与准入/);
+  assert.match(sourceByName["page.tsx"], /模型竞赛与试验/);
   assert.match(sourceByName["page.tsx"], /Qlib 回测与审批/);
   assert.match(sourceByName["page.tsx"], /核心 \/ 卫星分配/);
   assert.match(sourceByName["page.tsx"], /统一模拟盘/);
   assert.doesNotMatch(sourceByName["page.tsx"], /PairTradingPanel/);
+  assert.doesNotMatch(sourceByName["page.tsx"], /ResearchCampaignPanel|连续研究/);
+  assert.doesNotMatch(allSource, /\/api\/research-programs|\/api\/research-campaigns/);
+
+  const autopilot = sourceByName["autopilot-panel.tsx"];
+  assert.match(autopilot, /\/api\/autopilot/);
+  assert.match(autopilot, /current_stage/);
+  assert.match(autopilot, /next_action/);
+  assert.match(autopilot, /tournament/);
+  assert.match(autopilot, /因子 \/ 模型竞赛/);
+  assert.match(autopilot, /模拟盘 NAV/);
+  assert.match(autopilot, /每日候选/);
+  assert.match(autopilot, /系统下一步/);
+
+  const qlib = sourceByName["qlib-panel.tsx"];
+  assert.match(qlib, /\/api\/autopilot\/cycles/);
+  assert.match(qlib, /\/api\/model-ensembles/);
+  assert.match(qlib, /预注册模型试验/);
+  assert.match(qlib, /等权日度 Rank/);
 
   const portfolio = sourceByName["portfolio-panel.tsx"];
   assert.match(portfolio, /\/api\/recommendation-portfolios/);
-  assert.match(portfolio, /RECOMMENDATION TRACKING/);
+  assert.match(portfolio, /AUTOMATIC RECOMMENDATION/);
   assert.match(portfolio, /UNIFIED SIMULATION LEDGER/);
   assert.match(portfolio, /\/api\/simulation-portfolios/);
   assert.match(portfolio, /source_type/);
@@ -70,16 +100,9 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(portfolio, /allocation/);
   assert.match(portfolio, /execution_frequency/);
   assert.doesNotMatch(portfolio, /hypothetical_performance/);
-  assert.match(portfolio, /不产生订单、成交或券商指令/);
+  assert.match(portfolio, /不生成演示数据/);
 
-  const pair = sourceByName["pair-satellite-panel.tsx"];
-  assert.match(pair, /\/api\/pair-strategies/);
-  assert.match(pair, /\/pair-backtests/);
-  assert.match(pair, /不得批准、创建持久模拟账户/);
-  assert.doesNotMatch(
-    pair,
-    /\/approve|\/api\/simulation-portfolios|\/api\/pair-portfolios|pair_paper|paper[_ -]trading/i,
-  );
+  assert.equal(sourceByName["pair-satellite-panel.tsx"], undefined);
 
   const allocation = sourceByName["strategy-allocation-panel.tsx"];
   assert.match(allocation, /\/api\/strategy-allocations/);
@@ -96,26 +119,39 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.doesNotMatch(allocation, /模拟滑点/);
 
   assert.match(sourceByName["rdagent-panel.tsx"], /\/api\/strategy-recipes/);
-  assert.match(sourceByName["rdagent-panel.tsx"], /\/api\/rdagent\/scenarios/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /\/api\/rdagent\/status/);
   assert.match(sourceByName["rdagent-panel.tsx"], /fin_model/);
   assert.match(sourceByName["rdagent-panel.tsx"], /fin_quant/);
   assert.match(sourceByName["rdagent-panel.tsx"], /fin_factor_report/);
   assert.match(sourceByName["rdagent-panel.tsx"], /general_model/);
   assert.match(sourceByName["rdagent-panel.tsx"], /data_science/);
   assert.match(sourceByName["rdagent-panel.tsx"], /llm_finetune/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /状态未知 · 正在恢复/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /!runtimeOperational \|\| !selectedScenario\.ready/);
+  assert.doesNotMatch(sourceByName["rdagent-panel.tsx"], /Docker 不可用|LLM 未配置/);
   assert.match(sourceByName["backtest-panel.tsx"], /full_market_multifactor|文档策略配方/);
   assert.match(sourceByName["backtest-panel.tsx"], /industry_neutral_qp/);
   assert.match(sourceByName["backtest-panel.tsx"], /execution_dataset/);
   assert.match(sourceByName["backtest-panel.tsx"], /执行契约哈希/);
   assert.match(sourceByName["backtest-panel.tsx"], /预最终历史 \/ 最终 OOS/);
   assert.match(sourceByName["rdagent-panel.tsx"], /2021-01-11/);
-  assert.match(sourceByName["research-campaign-panel.tsx"], /2021-01-11/);
   assert.match(
     sourceByName["strategy-defaults-panel.tsx"],
     /min_pre_final_history_days/,
   );
-  assert.match(sourceByName["research-campaign-panel.tsx"], /\/api\/research-programs/);
   assert.match(sourceByName["market-overview-panel.tsx"], /\/api\/market\/overview/);
+  assert.match(sourceByName["market-overview-panel.tsx"], /function MarketOverviewSkeleton/);
+  assert.match(
+    sourceByName["market-overview-panel.tsx"],
+    /market-source-bar[\s\S]*market-hero[\s\S]*market-stat-strip[\s\S]*market-grid[\s\S]*watchlist-card/,
+  );
+  assert.match(
+    sourceByName["market-overview-panel.tsx"],
+    /if \(loading && !market\)[\s\S]{0,120}return <MarketOverviewSkeleton \/>/,
+  );
+  const globalCss = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(globalCss, /market-skeleton-pulse/);
+  assert.match(globalCss, /prefers-reduced-motion:reduce/);
   assert.match(sourceByName["job-run-center.tsx"], /\/api\/jobs\/\$\{job\.id\}\/log/);
   assert.match(sourceByName["job-run-center.tsx"], /同一流水线的旧失败/);
   assert.match(sourceByName["job-run-center.tsx"], /后续已成功/);

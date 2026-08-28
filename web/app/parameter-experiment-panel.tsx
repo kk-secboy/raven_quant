@@ -37,6 +37,12 @@ const WARNING_LABELS: Record<string, string> = {
 const pct = (value?: number) => typeof value === "number" ? `${(value * 100).toFixed(2)}%` : "—";
 const decimal = (value?: number) => typeof value === "number" ? value.toFixed(3) : "—";
 
+async function jsonResponse<T>(request: Promise<Response>): Promise<T> {
+  const response = await request;
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json() as Promise<T>;
+}
+
 export function ParameterExperimentPanel({ api }: { api: string }) {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
@@ -53,32 +59,72 @@ export function ParameterExperimentPanel({ api }: { api: string }) {
   const [selectedExperiment, setSelectedExperiment] = useState("");
   const [detail, setDetail] = useState<Experiment | null>(null);
   const [message, setMessage] = useState("");
+  const [loadMessage, setLoadMessage] = useState("");
 
   async function load() {
-    try {
-      const responses = await Promise.all([
-        apiFetch(`${api}/api/strategies`, { cache: "no-store" }),
-        apiFetch(`${api}/api/qlib/datasets`, { cache: "no-store" }),
-        apiFetch(`${api}/api/parameter-experiments`, { cache: "no-store" }),
-      ]);
-      if (responses.some((response) => !response.ok)) throw new Error("experiment API unavailable");
-      const nextStrategies: Strategy[] = await responses[0].json();
-      const nextDatasets: Dataset[] = await responses[1].json();
-      const nextExperiments: Experiment[] = await responses[2].json();
-      setStrategies(nextStrategies); setDatasets(nextDatasets); setExperiments(nextExperiments);
-      const versions = nextStrategies.filter((item) => item.strategy_type !== "pair").flatMap((item) => item.versions);
-      if (!selectedVersion && versions.length) setSelectedVersion(versions[0].id);
-      if (!dataset) {
-        const eligible = nextDatasets.find((item) => item.ready && item.reproducible);
-        if (eligible) { setDataset(eligible.name); setStart(eligible.start_date); setEnd(eligible.end_date); }
-      }
-      const target = selectedExperiment || nextExperiments[0]?.id;
-      if (target) {
+    let nextExperiments: Experiment[] | undefined;
+    const resources = [
+      {
+        label: "策略",
+        request: jsonResponse<Strategy[]>(apiFetch(`${api}/api/strategies`, { cache: "no-store" })).then((nextStrategies) => {
+          setStrategies(nextStrategies);
+          const versions = nextStrategies
+            .filter((item) => item.strategy_type !== "pair")
+            .flatMap((item) => item.versions);
+          if (!selectedVersion && versions.length) setSelectedVersion(versions[0].id);
+        }),
+      },
+      {
+        label: "Qlib 数据集",
+        request: jsonResponse<Dataset[]>(apiFetch(`${api}/api/qlib/datasets`, { cache: "no-store" })).then((nextDatasets) => {
+          setDatasets(nextDatasets);
+          if (!dataset) {
+            const eligible = nextDatasets.find((item) => item.ready && item.reproducible);
+            if (eligible) {
+              setDataset(eligible.name);
+              setStart(eligible.start_date);
+              setEnd(eligible.end_date);
+            }
+          }
+        }),
+      },
+      {
+        label: "参数实验",
+        request: jsonResponse<Experiment[]>(apiFetch(`${api}/api/parameter-experiments`, { cache: "no-store" })).then((items) => {
+          nextExperiments = items;
+          setExperiments(items);
+        }),
+      },
+    ];
+    const results = await Promise.allSettled(resources.map((item) => item.request));
+    const failed = results.flatMap((result, index) => result.status === "rejected" ? [resources[index].label] : []);
+    if (nextExperiments) {
+      const target = nextExperiments.some((item) => item.id === selectedExperiment)
+        ? selectedExperiment
+        : nextExperiments[0]?.id;
+      if (!target) {
+        setSelectedExperiment("");
+        setDetail(null);
+      } else {
         setSelectedExperiment(target);
-        const response = await apiFetch(`${api}/api/parameter-experiments/${target}`, { cache: "no-store" });
-        if (response.ok) setDetail(await response.json());
+        try {
+          const nextDetail = await jsonResponse<Experiment>(
+            apiFetch(`${api}/api/parameter-experiments/${target}`, { cache: "no-store" }),
+          );
+          setDetail(nextDetail);
+        } catch {
+          failed.push("实验详情");
+        }
       }
-    } catch { setMessage("无法读取参数实验中心，请确认数据库已升级且 Python 后端正在运行。"); }
+    }
+    const attemptedResources = resources.length + (nextExperiments?.length ? 1 : 0);
+    setLoadMessage(
+      failed.length === 0
+        ? ""
+        : failed.length === attemptedResources
+          ? "参数实验数据暂时无法更新，仍保留上次成功内容。"
+          : `部分实验数据暂未更新，已保留上次成功内容：${failed.join("、")}。`,
+    );
   }
 
   usePolling(load, 8000);
@@ -115,6 +161,7 @@ export function ParameterExperimentPanel({ api }: { api: string }) {
 
   const summary = detail?.summary;
   return <div className="experiment-workspace">
+    {loadMessage && <div className="notice">{loadMessage}</div>}
     {message && <div className="notice">{message}</div>}
     <section className="data-panel">
       <div className="panel-heading"><div><p className="eyebrow">OUT-OF-SAMPLE PARAMETER GOVERNANCE</p><h2>参数实验中心</h2></div><span className={`state ${active ? "running" : "ready"}`}>{active ? "实验运行中" : "可创建实验"}</span></div>

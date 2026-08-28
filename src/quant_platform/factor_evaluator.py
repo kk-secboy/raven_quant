@@ -172,6 +172,7 @@ def evaluate_factor_values(
     min_good_day_rate: float = FACTOR_MIN_GOOD_DAY_RATE,
     max_constant_day_rate: float = 0.05,
     label_horizon_days: int = 1,
+    fixed_direction: int | None = None,
 ) -> dict[str, Any]:
     if valid_end >= test_start or test_start > test_end:
         raise ValueError("validation and reserved final-test windows must not overlap")
@@ -183,6 +184,8 @@ def evaluate_factor_values(
         raise ValueError("max_constant_day_rate must be in [0, 1)")
     if label_horizon_days < 1:
         raise ValueError("label_horizon_days must be positive")
+    if fixed_direction not in {None, -1, 1}:
+        raise ValueError("fixed factor direction must be -1, 1, or None")
     factor = normalize_series(_validation_window(factor_values, valid_start, valid_end), "factor")
     label = normalize_series(_validation_window(forward_returns, valid_start, valid_end), "label")
     joined = pd.concat([factor, label], axis=1, join="inner").dropna()
@@ -212,7 +215,11 @@ def evaluate_factor_values(
     if direction_ic_daily.empty or raw_ic_daily.empty or raw_rank_ic_daily.empty:
         raise ValueError("validation window has insufficient cross-sectional observations")
     raw_valid_ic = float(direction_ic_daily.mean())
-    direction = -1.0 if raw_valid_ic < 0 else 1.0
+    direction = (
+        float(fixed_direction)
+        if fixed_direction is not None
+        else (-1.0 if raw_valid_ic < 0 else 1.0)
+    )
     directed_selection = selection.copy()
     directed_selection["factor"] *= direction
     ic_daily = _daily_correlation(directed_selection, "pearson")
@@ -307,6 +314,7 @@ def evaluate_factor_values(
         "raw_selection_ic": float(raw_ic_daily.mean()),
         "raw_selection_rank_ic": float(raw_rank_ic_daily.mean()),
         "direction": "inverted" if direction < 0 else "original",
+        "direction_source": "fixed" if fixed_direction is not None else "validation",
         "observations": int(len(selection)),
         "selection_days": int(selection.index.get_level_values("datetime").nunique()),
         "direction_start": direction_start.date().isoformat(),

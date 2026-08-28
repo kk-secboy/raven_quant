@@ -69,10 +69,28 @@ def test_compose_bounds_every_service_log_file() -> None:
     assert "x-logging: &default-logging" in compose
     assert "max-size: ${LOG_MAX_SIZE:-20m}" in compose
     assert "max-file: ${LOG_MAX_FILES:-5}" in compose
-    assert compose.count("logging: *default-logging") == 10
+    assert compose.count("logging: *default-logging") == 15
     assert compose.count(
         "${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}"
-    ) == 6
+    ) == 11
+
+
+def test_paper_lifecycle_has_a_reserved_worker_lane() -> None:
+    root = Path(__file__).resolve().parents[1]
+    compose = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+    services_tail = compose.split("\n  evaluation-worker:\n", 1)[1]
+    evaluation, paper_tail = services_tail.split("\n  paper-worker:\n", 1)
+    paper = paper_tail.split("\n  rdagent-docker:\n", 1)[0]
+
+    for kind in (
+        "model_refit",
+        "recommendation_refresh",
+        "simulation_order_plan",
+        "simulation_replay",
+    ):
+        assert kind not in evaluation
+        assert kind in paper
+    assert 'WORKER_CONCURRENCY: "1"' in paper
 
 
 @pytest.mark.no_database
@@ -126,6 +144,18 @@ def test_worker_accepts_governed_information_jobs() -> None:
     ):
         assert kind in compose
     assert "REQUESTS_PER_MINUTE: ${REQUESTS_PER_MINUTE:-99}" in compose
+
+
+def test_worker_accepts_automatic_factor_library_jobs() -> None:
+    root = Path(__file__).resolve().parents[1]
+    compose = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+
+    for kind in (
+        "factor_library_materialize",
+        "factor_library_cluster",
+        "factor_sota_evaluate",
+    ):
+        assert kind in compose
 
 
 def test_factor_sandbox_is_seeded_offline_from_the_release_worker() -> None:

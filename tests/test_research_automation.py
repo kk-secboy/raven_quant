@@ -11,8 +11,10 @@ from quant_platform.research_automation import (
     normalize_research_schedule_payload,
     rank_factor_candidates,
     rank_multi_profile_candidates,
+    required_multi_profile_trading_days,
     resolve_research_periods,
     select_latest_program_dataset,
+    select_latest_program_rebase_dataset,
 )
 
 
@@ -20,8 +22,9 @@ from quant_platform.research_automation import (
 def test_default_research_period_policy_locks_one_year_final_oos() -> None:
     policy = ResearchPeriodPolicy()
 
-    assert policy.embargo_trading_days == 5
+    assert policy.embargo_trading_days == 20
     assert policy.test_trading_days == 252
+    assert required_multi_profile_trading_days() == 3046
 
 
 def _payload() -> dict:
@@ -65,7 +68,7 @@ def test_research_schedule_without_dates_keeps_a_rolling_policy() -> None:
     assert normalized["period_mode"] == "rolling"
     assert normalized["period_policy"] == {
         "test_trading_days": 252,
-        "embargo_trading_days": 5,
+        "embargo_trading_days": 20,
     }
 
 
@@ -217,8 +220,8 @@ def test_default_periods_are_resolved_from_the_latest_qlib_calendar() -> None:
 
     assert periods["test_end"] == calendar[-1]
     assert calendar.index(periods["test_start"]) == len(calendar) - 252
-    assert calendar.index(periods["valid_end"]) == len(calendar) - 258
-    assert evidence["mode"] == "rolling_multi_profile_qlib_calendar_v1"
+    assert calendar.index(periods["valid_end"]) == len(calendar) - 273
+    assert evidence["mode"] == "rolling_multi_profile_qlib_calendar_v2"
     assert {item["id"] for item in evidence["evaluation_profiles"]} == {
         "recent_3y",
         "balanced_5y",
@@ -228,22 +231,139 @@ def test_default_periods_are_resolved_from_the_latest_qlib_calendar() -> None:
 
 @pytest.mark.no_database
 def test_multi_profile_windows_share_one_final_oos() -> None:
-    calendar = [(date(2010, 1, 1) + timedelta(days=offset)).isoformat() for offset in range(4000)]
+    calendar: list[str] = []
+    day = date(2010, 1, 1)
+    while len(calendar) < 4000:
+        if day.weekday() < 5:
+            calendar.append(day.isoformat())
+        day += timedelta(days=1)
     discovery, profiles = derive_multi_profile_research_periods(
         calendar,
         test_days=252,
-        embargo_days=5,
+        embargo_days=20,
     )
 
     assert discovery == next(item["periods"] for item in profiles if item["id"] == "recent_3y")
     assert len({item["periods"]["test_start"] for item in profiles}) == 1
     assert len({item["periods"]["test_end"] for item in profiles}) == 1
-    assert {
+    effective_days = {
         item["id"]: calendar.index(item["periods"]["valid_end"])
         - calendar.index(item["periods"]["valid_start"])
         + 1
         for item in profiles
-    } == {"recent_3y": 756, "robust_10y": 2520, "balanced_5y": 1260}
+    }
+    assert effective_days["recent_3y"] == 756
+    assert effective_days["balanced_5y"] == 1260
+    robust = next(item for item in profiles if item["id"] == "robust_10y")
+    assert robust["validation_trading_days"] == 2520
+    assert robust["requested_validation_trading_days"] == 2520
+    assert robust["effective_validation_trading_days"] == effective_days["robust_10y"]
+    assert robust["effective_validation_trading_days"] < 2520
+    assert robust["periods"]["valid_start"] == "2015-08-03"
+    assert robust["authoritative_cost_schedule_effective_from"] == "2015-08-01"
+    assert robust["authoritative_cost_schedule_first_trading_day"] == "2015-08-03"
+    assert robust["validation_window_truncated"] is True
+    assert robust["validation_window_truncation_reason"] == (
+        "authoritative_cn_cost_schedule_starts_after_requested_validation"
+    )
+    robust_train_days = (
+        calendar.index(robust["periods"]["train_end"])
+        - calendar.index(robust["periods"]["train_start"])
+        + 1
+    )
+    assert robust_train_days == robust["effective_training_trading_days"]
+    assert robust_train_days >= 252
+    assert (
+        calendar.index(robust["periods"]["valid_start"])
+        - calendar.index(robust["periods"]["train_end"])
+        - 1
+        == 2
+    )
+    assert (
+        calendar.index(robust["periods"]["test_start"])
+        - calendar.index(robust["periods"]["valid_end"])
+        - 1
+        == 20
+    )
+
+
+@pytest.mark.no_database
+def test_explicit_pre_cost_validation_is_rejected_instead_of_truncated() -> None:
+    calendar = [
+        (date(2010, 1, 1) + timedelta(days=offset)).isoformat()
+        for offset in range(4000)
+    ]
+    explicit = {
+        "train_start": "2010-01-01",
+        "train_end": "2015-07-28",
+        "valid_start": "2015-07-31",
+        "valid_end": "2018-12-31",
+        "test_start": "2019-01-07",
+        "test_end": "2019-12-31",
+    }
+
+    with pytest.raises(ValueError, match="explicit research validation starts before"):
+        resolve_research_periods(calendar, periods=explicit)
+
+    assert explicit["valid_start"] == "2015-07-31"
+
+
+@pytest.mark.no_database
+def test_rolling_profiles_fail_closed_when_non_robust_history_predates_costs() -> None:
+    calendar: list[str] = []
+    day = date(2005, 1, 3)
+    while len(calendar) < 4000:
+        if day.weekday() < 5:
+            calendar.append(day.isoformat())
+        day += timedelta(days=1)
+
+    with pytest.raises(ValueError, match="balanced_5y validation starts before"):
+        derive_multi_profile_research_periods(
+            calendar,
+            test_days=252,
+            embargo_days=5,
+        )
+
+
+@pytest.mark.no_database
+def test_factor_and_model_use_the_same_cost_covered_rolling_window_contract() -> None:
+    calendar: list[str] = []
+    day = date(2010, 1, 1)
+    while len(calendar) < 4000:
+        if day.weekday() < 5:
+            calendar.append(day.isoformat())
+        day += timedelta(days=1)
+    resolutions = []
+    for scenario, feature_set_id in (
+        ("fin_factor", None),
+        ("fin_model", "governed-baseline"),
+    ):
+        payload = {
+            "scenario": scenario,
+            "objective": "Research reproducible A-share signals under governed windows.",
+            "dataset": "cn-research",
+            "loop_n": 1,
+            "duration": "30m",
+            "requested_by": "test-scheduler",
+            "period_mode": "rolling",
+        }
+        if feature_set_id is not None:
+            payload["feature_set_id"] = feature_set_id
+        normalized = normalize_research_schedule_payload(payload, max_loops=2)
+        resolutions.append(
+            resolve_research_periods(
+                calendar,
+                period_policy=normalized["period_policy"],
+            )
+        )
+
+    assert resolutions[0] == resolutions[1]
+    robust = next(
+        item
+        for item in resolutions[0][1]["evaluation_profiles"]
+        if item["id"] == "robust_10y"
+    )
+    assert robust["periods"]["valid_start"] == "2015-08-03"
 
 
 @pytest.mark.no_database
@@ -368,3 +488,61 @@ def test_continuous_research_never_crosses_dataset_lineage() -> None:
     ]
     selected = select_latest_program_dataset(datasets, lineage_id="lineage-a")
     assert selected and selected["name"] == "approved"
+
+
+@pytest.mark.no_database
+def test_continuous_research_rebase_allows_only_compatible_contract_extension() -> None:
+    contract = {
+        "dataset_contract_sha256": "c" * 64,
+        "field_contract_version": "daily-v1",
+        "frequency": "day",
+        "eligibility_contract_version": "eligibility-v1",
+        "fields": ["open", "close"],
+        "field_units": {"open": "CNY", "close": "CNY"},
+        "source_start_date": "2008-01-01",
+    }
+    anchor = {
+        "name": "old",
+        "ready": True,
+        "reproducible": True,
+        "lineage_verified": True,
+        "lineage_id": "a" * 64,
+        "end_date": "2026-08-21",
+        "provenance": {**contract, "dataset_identity_sha256": "1" * 64},
+    }
+    compatible = {
+        **anchor,
+        "name": "new",
+        "lineage_id": "b" * 64,
+        "end_date": "2026-08-25",
+        "provenance": {
+            **contract,
+            "dataset_contract_sha256": "e" * 64,
+            "fields": ["open", "close", "pit_valuation"],
+            "field_units": {
+                "open": "CNY",
+                "close": "CNY",
+                "pit_valuation": "ratio",
+            },
+            "dataset_identity_sha256": "2" * 64,
+        },
+    }
+    incompatible = {
+        **compatible,
+        "name": "changed-fields",
+        "end_date": "2026-08-26",
+        "lineage_id": "d" * 64,
+        "provenance": {
+            **compatible["provenance"],
+            "dataset_identity_sha256": "3" * 64,
+            "field_units": {
+                "open": "USD",
+                "close": "CNY",
+                "pit_valuation": "ratio",
+            },
+        },
+    }
+    selected = select_latest_program_rebase_dataset(
+        [anchor, compatible, incompatible], anchor=anchor
+    )
+    assert selected and selected["name"] == "new"

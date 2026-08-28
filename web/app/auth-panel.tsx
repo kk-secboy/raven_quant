@@ -47,7 +47,7 @@ export function AuthPanel({ api, state, onAuthenticated }: {
       <div className="auth-brand"><span className="brand-mark">Q</span><span>Quant<span>Lab</span></span></div>
       <p className="eyebrow">LOCAL CONTROL PLANE / SECURED</p>
       <h1>{bootstrap ? "创建初始管理员" : "登录量化研究系统"}</h1>
-      <p className="auth-copy">{bootstrap ? "这是唯一一次无登录创建管理员的机会。密码将使用 Argon2 保存，系统不会保存明文。" : "请输入本地 QuantLab 账户。连续五次失败会锁定账户十五分钟。"}</p>
+      <p className="auth-copy">{bootstrap ? "这是唯一一次无登录创建管理员的机会。密码将使用 Argon2 保存，系统不会保存明文。" : "请输入 QuantLab 账户。连续五次失败会锁定账户十五分钟。"}</p>
       <form onSubmit={submit}>
         <label>用户名<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} /></label>
         {bootstrap && <label>显示名称<input autoComplete="name" value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>}

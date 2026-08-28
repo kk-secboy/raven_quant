@@ -21,6 +21,7 @@ type Runtime = {
   llm_credentials_configured?: boolean;
   blockers?: string[];
   limits?: { max_loops: number; max_duration: string };
+  scenarios?: unknown;
 };
 
 type Scenario = {
@@ -43,6 +44,9 @@ type Scenario = {
 type Dataset = {
   name: string;
   ready: boolean;
+  reproducible?: boolean;
+  lineage_verified?: boolean;
+  frequency?: string | null;
   start_date: string | null;
   end_date: string | null;
   trading_days: number;
@@ -241,6 +245,12 @@ function normalizeScenarios(value: unknown): Scenario[] {
   });
 }
 
+async function jsonResponse<T>(request: Promise<Response>): Promise<T> {
+  const response = await request;
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json() as Promise<T>;
+}
+
 function shortHash(value?: string | null): string {
   return value ? `${value.slice(0, 10)}…` : "—";
 }
@@ -315,61 +325,92 @@ export function RDAgentPanel({ api }: { api: string }) {
   const [duration, setDuration] = useState("30m");
   const [scheduleName, setScheduleName] = useState("每日受控 RD-Agent 研究");
   const [scheduleTime, setScheduleTime] = useState("20:30");
-  const [message, setMessage] = useState("正在核对各场景运行能力…");
+  const [message, setMessage] = useState("");
+  const [runtimeLoadState, setRuntimeLoadState] = useState<"loading" | "ready" | "error">("loading");
+  const [datasetsLoadState, setDatasetsLoadState] = useState<"loading" | "ready" | "error">("loading");
   const [openRunId, setOpenRunId] = useState<string | null>(null);
   const [runDetail, setRunDetail] = useState<ResearchRunDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const recipeApplied = useRef(false);
 
   async function load() {
-    try {
-      const responses = await Promise.all([
-        apiFetch(`${api}/api/rdagent/status`, { cache: "no-store" }),
-        apiFetch(`${api}/api/rdagent/scenarios`, { cache: "no-store" }),
-        apiFetch(`${api}/api/qlib/datasets`, { cache: "no-store" }),
-        apiFetch(`${api}/api/rdagent/runs`, { cache: "no-store" }),
-        apiFetch(`${api}/api/strategy-recipes`, { cache: "no-store" }),
-        apiFetch(`${api}/api/schedules`, { cache: "no-store" }),
-        apiFetch(`${api}/api/rdagent/feature-sets`, { cache: "no-store" }),
-        apiFetch(`${api}/api/rdagent/assets`, { cache: "no-store" }),
-        apiFetch(`${api}/api/rdagent/assets/acquisitions`, { cache: "no-store" }),
-      ]);
-      const nextRuntime = await responses[0].json();
-      const nextScenarios = responses[1].ok ? normalizeScenarios(await responses[1].json()) : fallbackScenarios;
-      const nextDatasets: Dataset[] = await responses[2].json();
-      const recipeBody: { recipes: StrategyRecipe[] } = await responses[4].json();
-      const nextFeatureSets: FeatureSet[] = responses[6].ok ? await responses[6].json() : [];
-      const nextResearchAssets: ResearchAsset[] = responses[7].ok ? await responses[7].json() : [];
-      const nextAssetAcquisitions: ResearchAssetAcquisition[] = responses[8].ok ? await responses[8].json() : [];
-      setRuntime(nextRuntime);
-      setScenarios(nextScenarios);
-      setDatasets(nextDatasets);
-      setRuns(await responses[3].json());
-      setRecipes(recipeBody.recipes);
-      setSchedules((await responses[5].json()).filter((item: ResearchSchedule) => item.kind === "rdagent_research"));
-      setFeatureSets(nextFeatureSets);
-      setResearchAssets(nextResearchAssets);
-      setAssetAcquisitions(nextAssetAcquisitions);
+    const requests = [
+      jsonResponse<Runtime>(apiFetch(`${api}/api/rdagent/status`, { cache: "no-store", forceRefresh: true })).then((nextRuntime) => {
+        setRuntime(nextRuntime);
+        setScenarios(normalizeScenarios(nextRuntime));
+        setRuntimeLoadState("ready");
+      }),
+      jsonResponse<Dataset[]>(apiFetch(`${api}/api/qlib/datasets`, { cache: "no-store" })).then((nextDatasets) => {
+        // Every capital-eligible RD-Agent scenario is governed against a daily
+        // Qlib dataset.  Minute datasets belong to the execution/factor lab and
+        // the API rejects them here, so never offer one as the form default.
+        const eligibleDatasets = nextDatasets
+          .filter((item) => item.ready && item.reproducible && item.lineage_verified && item.frequency === "day")
+          .sort((left, right) =>
+            String(right.end_date ?? "").localeCompare(String(left.end_date ?? ""))
+            || right.trading_days - left.trading_days
+            || left.name.localeCompare(right.name),
+          );
+        setDatasets(eligibleDatasets);
+        setDatasetsLoadState("ready");
+        setDataset((current) =>
+          current && eligibleDatasets.some((item) => item.name === current)
+            ? current
+            : eligibleDatasets[0]?.name ?? "",
+        );
+      }),
+      jsonResponse<ResearchRun[]>(apiFetch(`${api}/api/rdagent/runs`, { cache: "no-store" })).then(setRuns),
+      jsonResponse<{ recipes: StrategyRecipe[] }>(apiFetch(`${api}/api/strategy-recipes`, { cache: "no-store" })).then((recipeBody) => {
+        setRecipes(recipeBody.recipes);
       if (!recipeApplied.current) {
         const recipe = recipeBody.recipes.find((item) => item.id === recipeId) ?? recipeBody.recipes[0];
         if (recipe) { setRecipeId(recipe.id); setObjective(recipe.rdagent_objective); }
         recipeApplied.current = true;
       }
-      if (!dataset && nextDatasets.length) setDataset(nextDatasets[0].name);
+      }),
+      jsonResponse<ResearchSchedule[]>(apiFetch(`${api}/api/schedules`, { cache: "no-store" })).then((items) => setSchedules(items.filter((item) => item.kind === "rdagent_research"))),
+      jsonResponse<FeatureSet[]>(apiFetch(`${api}/api/rdagent/feature-sets`, { cache: "no-store" })).then((nextFeatureSets) => {
+        setFeatureSets(nextFeatureSets);
       if (nextFeatureSets.length && !nextFeatureSets.some((item) => item.id === featureSetId)) {
         setFeatureSetId(nextFeatureSets[0].id);
       }
-      setMessage("");
-    } catch {
+      }),
+      jsonResponse<ResearchAsset[]>(apiFetch(`${api}/api/rdagent/assets`, { cache: "no-store" })).then(setResearchAssets),
+      jsonResponse<ResearchAssetAcquisition[]>(apiFetch(`${api}/api/rdagent/assets/acquisitions`, { cache: "no-store" })).then(setAssetAcquisitions),
+    ];
+    const results = await Promise.allSettled(requests);
+    const failed = results.filter((item) => item.status === "rejected").length;
+    if (results[0].status === "rejected") setRuntimeLoadState("error");
+    if (results[1].status === "rejected") setDatasetsLoadState("error");
+    if (failed === results.length) {
       setMessage("无法读取 RD-Agent 研究中心，请确认 QuantLab API 正在运行。");
+    } else if (failed) {
+      setMessage("部分实时状态暂未更新，已保留上次成功数据。");
+    } else {
+      setMessage("");
     }
   }
 
   usePolling(load, 8000);
 
   const selectedScenario = scenarios.find((item) => item.id === scenarioId) ?? fallbackScenarios[0];
+  const runtimeStatusOk = runtimeLoadState === "ready" && runtime?.status === "ok";
+  const runtimeFieldsKnown = typeof runtime?.docker_available === "boolean" && typeof runtime?.llm_credentials_configured === "boolean";
+  const runtimeUnknown = runtimeLoadState === "error" || (runtimeLoadState === "ready" && (!runtimeStatusOk || !runtimeFieldsKnown));
+  const runtimeOperational = runtimeStatusOk && runtimeFieldsKnown && runtime?.docker_available === true && runtime?.llm_credentials_configured === true;
   const selectedDataset = datasets.find((item) => item.name === dataset);
-  const coverageReady = Boolean(!selectedScenario.requires_dataset || (selectedDataset?.ready && selectedDataset.start_date && selectedDataset.end_date && selectedDataset.trading_days >= 3029));
+  const coverageReady = Boolean(
+    !selectedScenario.requires_dataset
+      || (
+        selectedDataset?.ready
+        && selectedDataset.reproducible
+        && selectedDataset.lineage_verified
+        && selectedDataset.frequency === "day"
+        && selectedDataset.start_date
+        && selectedDataset.end_date
+        && selectedDataset.trading_days >= 3029
+      ),
+  );
   const activeScenario = useMemo(
     () => runs.some((item) => (item.scenario ?? item.kind) === scenarioId && ["queued", "running", "exporting", "evaluating"].includes(item.status)),
     [runs, scenarioId],
@@ -544,7 +585,7 @@ export function RDAgentPanel({ api }: { api: string }) {
     }
   }
 
-  const submitBlocked = !selectedScenario.ready || !coverageReady || !featureSetReady || activeScenario || objective.length < 10 || (explicitAssetsRequired && parsedAssetIds.length === 0);
+  const submitBlocked = !runtimeOperational || !selectedScenario.ready || !coverageReady || !featureSetReady || activeScenario || objective.length < 10 || (explicitAssetsRequired && parsedAssetIds.length === 0);
 
   return <>
     {message && <div className="notice">{message}</div>}
@@ -552,7 +593,7 @@ export function RDAgentPanel({ api }: { api: string }) {
     <section className="scenario-panel">
       <div className="panel-heading"><div><p className="eyebrow">RD-AGENT RESEARCH CENTER</p><h2>选择研究场景</h2></div><button className="inline-action" type="button" onClick={runHealthCheck}>运行环境诊断</button></div>
       <div className="scenario-grid">{scenarios.map((item) => <button type="button" key={item.id} className={`scenario-card ${scenarioId === item.id ? "selected" : ""}`} onClick={() => { setScenarioId(item.id); setAssetIds(""); }}>
-        <span>{item.category === "quant" ? "量化主线" : "研究实验室"}</span><strong>{item.label}</strong><small>{item.description}</small><em className={item.ready ? "ready" : "blocked"}>{item.ready ? "可运行" : "能力未满足"}</em>
+        <span>{item.category === "quant" ? "量化主线" : "研究实验室"}</span><strong>{item.label}</strong><small>{item.description}</small><em className={runtimeLoadState === "loading" || runtimeUnknown ? "checking" : runtimeOperational && item.ready ? "ready" : "blocked"}>{runtimeLoadState === "loading" ? "正在检查" : runtimeUnknown ? "正在恢复" : runtimeOperational && item.ready ? "可运行" : "能力未满足"}</em>
       </button>)}</div>
     </section>
 
@@ -580,12 +621,12 @@ export function RDAgentPanel({ api }: { api: string }) {
 
     <section className="agent-hero">
       <article className="runtime-card">
-        <div className="card-heading"><div><span>{selectedScenario.id}</span><strong>{selectedScenario.label}</strong></div><span className={`status-chip ${selectedScenario.ready ? "verified" : ""}`}>{selectedScenario.ready ? "可运行" : "已阻断"}</span></div>
+        <div className="card-heading"><div><span>{selectedScenario.id}</span><strong>{selectedScenario.label}</strong></div><span className={`status-chip ${runtimeOperational && selectedScenario.ready ? "verified" : ""}`}>{runtimeLoadState === "loading" ? "检查中" : runtimeUnknown ? "正在恢复" : runtimeOperational && selectedScenario.ready ? "可运行" : "已阻断"}</span></div>
         <div className="preflight-list">
-          <div><i className={runtime?.status === "ok" ? "pass" : "block"} /><span>RD-Agent</span><strong>{runtime?.version ?? runtime?.status ?? "检查中"}</strong></div>
-          <div><i className={runtime?.docker_available ? "pass" : "block"} /><span>隔离执行</span><strong>{runtime?.docker_available ? "Docker 可用" : "Docker 不可用"}</strong></div>
-          <div><i className={runtime?.llm_credentials_configured ? "pass" : "block"} /><span>LLM 凭据</span><strong>{runtime?.llm_credentials_configured ? "已配置" : "未配置"}</strong></div>
-          <div><i className={coverageReady ? "pass" : "block"} /><span>输入契约</span><strong>{coverageReady ? "满足" : "数据覆盖不足"}</strong></div>
+          <div><i className={runtimeLoadState === "loading" ? "pending" : runtimeStatusOk ? "pass" : "block"} /><span>RD-Agent</span><strong>{runtimeLoadState === "loading" ? "检查中" : runtimeStatusOk ? runtime?.version ?? "状态正常" : "状态未知 · 正在恢复"}</strong></div>
+          <div><i className={runtimeLoadState === "loading" || !runtimeStatusOk || typeof runtime?.docker_available !== "boolean" ? "pending" : runtime?.docker_available ? "pass" : "block"} /><span>隔离执行</span><strong>{runtimeLoadState === "loading" ? "检查中" : !runtimeStatusOk || typeof runtime?.docker_available !== "boolean" ? "状态未知 · 正在恢复" : runtime?.docker_available ? "Docker 可用" : "隔离执行未就绪"}</strong></div>
+          <div><i className={runtimeLoadState === "loading" || !runtimeStatusOk || typeof runtime?.llm_credentials_configured !== "boolean" ? "pending" : runtime?.llm_credentials_configured ? "pass" : "block"} /><span>LLM 凭据</span><strong>{runtimeLoadState === "loading" ? "检查中" : !runtimeStatusOk || typeof runtime?.llm_credentials_configured !== "boolean" ? "状态未知 · 正在恢复" : runtime?.llm_credentials_configured ? "已配置" : "凭据尚未就绪"}</strong></div>
+          <div><i className={!selectedScenario.requires_dataset ? "pass" : datasetsLoadState === "loading" ? "pending" : datasetsLoadState === "error" ? "block" : coverageReady ? "pass" : "block"} /><span>输入契约</span><strong>{!selectedScenario.requires_dataset ? "无需行情数据" : datasetsLoadState === "loading" ? "正在读取" : datasetsLoadState === "error" ? "读取失败" : coverageReady ? "满足" : "数据覆盖不足"}</strong></div>
         </div>
         {selectedScenario.blockers.length ? <div className="blocker-box"><b>当前阻断</b>{selectedScenario.blockers.map((item) => <span key={item}>{item}</span>)}</div> : null}
         <div className="pipeline"><span>受控输入</span><i>→</i><span>RD-Agent 实验</span><i>→</i><span>不可变制品</span><i>→</i><span>独立 Qlib 门禁</span><i>→</i><span>{selectedScenario.capital_eligible ? "人工批准 / 模拟盘" : "实验室归档"}</span></div>

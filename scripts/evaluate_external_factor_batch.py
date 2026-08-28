@@ -146,7 +146,10 @@ def main() -> None:
             "benchmark_forward_returns_sha256": _sha256_file(benchmark_path),
         }
 
-    comparisons = [_load_values(path) for path in manifest.get("comparison_values", [])]
+    comparison_paths = [
+        str(item.get("path")) if isinstance(item, dict) else str(item)
+        for item in manifest.get("comparison_values", [])
+    ]
     cost_schedule = CostScheduleBook.from_mapping(manifest.get("cost_model"))
     reference_order_value = float(manifest.get("cost_reference_order_value", 100_000.0))
     config = ExternalEvaluationConfig(require_rolling_walk_forward=True)
@@ -179,6 +182,7 @@ def main() -> None:
                     config=config,
                 )
             else:
+                comparisons = (_load_values(path) for path in comparison_paths)
                 outcome = evaluate_sparse_event_factor(
                     values,
                     labels_by_horizon[horizon],

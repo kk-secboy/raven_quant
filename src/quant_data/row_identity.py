@@ -11,6 +11,22 @@ SEMANTIC_METADATA_COLUMNS: dict[str, frozenset[str]] = {
     "ccass_hold_detail": frozenset({"name", "col_participant_name"}),
     "irm_qa_sh": frozenset({"name", "pub_time"}),
     "irm_qa_sz": frozenset({"name", "pub_time"}),
+    # Tushare can repeat one report URL for multiple covered stocks or
+    # industries. Preserve a deterministic representative set of tags while
+    # URL plus publication date remains the PIT document identity.
+    "research_report": frozenset(
+        {
+            "abstr",
+            "title",
+            "report_type",
+            "author",
+            "name",
+            "ts_code",
+            "inst_csname",
+            "ind_name",
+            "file_name",
+        }
+    ),
     # Snapshot-only presentation fields. They are recomputed from the immutable
     # provider title/content on every snapshot build and must never become part
     # of the provider-row identity when an older snapshot is used as a base.

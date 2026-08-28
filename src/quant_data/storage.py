@@ -470,7 +470,18 @@ class ParquetStore:
         for path in sorted(dataset_dir.rglob("*.parquet")):
             relative = path.relative_to(temporary).as_posix()
             reused = base_files.get(relative)
-            if reused is not None and int(reused.get("bytes") or -1) == path.stat().st_size:
+            base_path = base_root.parent / relative if base_root is not None else None
+            if (
+                reused is not None
+                and base_path is not None
+                and base_path.is_file()
+                and path.samefile(base_path)
+            ):
+                # Equal path and byte length do not prove equal content.  A
+                # rebuilt Parquet partition can compress to exactly the same
+                # size as its parent while carrying different rows.  Reuse
+                # the parent's digest only for the actual hard-linked file;
+                # copied fallbacks and rebuilt partitions are hashed below.
                 files.append(dict(reused))
             else:
                 files.append(

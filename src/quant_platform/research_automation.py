@@ -5,8 +5,11 @@ from datetime import date
 from typing import Any
 
 import pandas as pd
+from scipy.optimize import linprog
 
+from .cost_model import CN_COST_SCHEDULE_BOOK
 from .factor_evaluator import normalize_series
+from .factor_library import ECONOMIC_FAMILIES
 from .feature_set_registry import get_feature_set
 from .model_research_governance import MODEL_LABEL_HORIZON_TRADING_DAYS
 from .rdagent_runtime import validate_duration, validate_duration_limit
@@ -27,7 +30,7 @@ RESEARCH_PERIOD_KEYS = (
 
 DEFAULT_RESEARCH_PERIOD_POLICY = {
     "test_trading_days": 252,
-    "embargo_trading_days": 5,
+    "embargo_trading_days": 20,
 }
 
 RESEARCH_EVALUATION_PROFILES = (
@@ -52,6 +55,19 @@ RESEARCH_EVALUATION_PROFILES = (
 )
 MINIMUM_PROFILE_TRAINING_DAYS = 252
 MULTI_PROFILE_CONSENSUS_VERSION = "multi-profile-consensus-v1"
+ROLLING_PERIOD_RESOLUTION_VERSION = "rolling_multi_profile_qlib_calendar_v2"
+
+
+def _first_governed_cost_trading_day(calendar_days: list[str]) -> tuple[int, str, str]:
+    """Return the first listed session covered by the authoritative CN costs."""
+
+    cost_effective_from = CN_COST_SCHEDULE_BOOK.versions[0].effective_from
+    for index, day in enumerate(calendar_days):
+        if day >= cost_effective_from:
+            return index, day, cost_effective_from
+    raise ValueError(
+        "Qlib calendar has no trading day covered by the authoritative CN cost schedule"
+    )
 
 
 def required_multi_profile_trading_days(
@@ -98,8 +114,8 @@ def normalize_research_period_policy(value: Any = None) -> dict[str, int]:
             raise ValueError(f"rdagent_research {key} must be an integer") from exc
     if policy["test_trading_days"] < 252:
         raise ValueError("rdagent_research requires at least 252 final-test trading days")
-    if not 5 <= policy["embargo_trading_days"] <= 63:
-        raise ValueError("rdagent_research embargo must contain 5 to 63 trading days")
+    if not 20 <= policy["embargo_trading_days"] <= 63:
+        raise ValueError("rdagent_research embargo must contain 20 to 63 trading days")
     return policy
 
 
@@ -279,10 +295,38 @@ def derive_multi_profile_research_periods(
     selected = ordered[-required:]
     test_start_index = len(selected) - test_days
     valid_end_index = test_start_index - embargo_days - 1
+    _, first_cost_trading_day, cost_effective_from = _first_governed_cost_trading_day(
+        ordered
+    )
+    cost_start_index = next(
+        index for index, day in enumerate(selected) if day >= first_cost_trading_day
+    )
     profiles: list[dict[str, Any]] = []
     for spec in RESEARCH_EVALUATION_PROFILES:
-        valid_start_index = valid_end_index - int(spec["validation_trading_days"]) + 1
+        requested_validation_days = int(spec["validation_trading_days"])
+        requested_valid_start_index = valid_end_index - requested_validation_days + 1
+        valid_start_index = requested_valid_start_index
+        if spec["id"] == "robust_10y":
+            valid_start_index = max(valid_start_index, cost_start_index)
+        elif selected[valid_start_index] < first_cost_trading_day:
+            raise ValueError(
+                f"{spec['id']} validation starts before the first trading day "
+                "covered by the authoritative CN cost schedule"
+            )
+        if valid_start_index > valid_end_index:
+            raise ValueError(
+                f"{spec['id']} has no validation trading day covered by the "
+                "authoritative CN cost schedule"
+            )
         train_end_index = valid_start_index - MODEL_LABEL_HORIZON_TRADING_DAYS - 1
+        effective_training_days = train_end_index + 1
+        if effective_training_days < MINIMUM_PROFILE_TRAINING_DAYS:
+            raise ValueError(
+                f"{spec['id']} leaves {effective_training_days} training trading days; "
+                f"at least {MINIMUM_PROFILE_TRAINING_DAYS} are required"
+            )
+        effective_validation_days = valid_end_index - valid_start_index + 1
+        truncated = valid_start_index != requested_valid_start_index
         periods = {
             "train_start": selected[0],
             "train_end": selected[train_end_index],
@@ -291,7 +335,36 @@ def derive_multi_profile_research_periods(
             "test_start": selected[test_start_index],
             "test_end": selected[-1],
         }
-        profiles.append({**spec, "periods": periods})
+        profiles.append(
+            {
+                **spec,
+                "requested_validation_trading_days": requested_validation_days,
+                "effective_validation_trading_days": effective_validation_days,
+                "effective_training_trading_days": effective_training_days,
+                "requested_valid_start": selected[requested_valid_start_index],
+                "validation_window_truncated": truncated,
+                "validation_window_truncation_reason": (
+                    "authoritative_cn_cost_schedule_starts_after_requested_validation"
+                    if truncated
+                    else None
+                ),
+                "authoritative_cost_schedule_effective_from": cost_effective_from,
+                "authoritative_cost_schedule_first_trading_day": first_cost_trading_day,
+                "periods": periods,
+            }
+        )
+    profile_starts = {
+        str(item["id"]): str(item["periods"]["valid_start"]) for item in profiles
+    }
+    if not (
+        profile_starts["robust_10y"]
+        < profile_starts["balanced_5y"]
+        < profile_starts["recent_3y"]
+    ):
+        raise ValueError(
+            "cost-covered rolling profiles must preserve robust, balanced, and recent "
+            "validation depth"
+        )
     discovery = next(item["periods"] for item in profiles if item["role"] == "primary")
     return dict(discovery), profiles
 
@@ -316,6 +389,12 @@ def resolve_research_periods(
 
     if periods is not None:
         resolved = normalize_explicit_research_periods(periods)
+        _, first_cost_trading_day, _ = _first_governed_cost_trading_day(ordered)
+        if resolved["valid_start"] < first_cost_trading_day:
+            raise ValueError(
+                "explicit research validation starts before the first trading day "
+                "covered by the authoritative CN cost schedule"
+            )
         mode = "explicit_periods_v1"
         policy = None
         profiles = [
@@ -334,7 +413,7 @@ def resolve_research_periods(
             test_days=policy["test_trading_days"],
             embargo_days=policy["embargo_trading_days"],
         )
-        mode = "rolling_multi_profile_qlib_calendar_v1"
+        mode = ROLLING_PERIOD_RESOLUTION_VERSION
     return resolved, {
         "mode": mode,
         "policy": policy,
@@ -475,6 +554,7 @@ def rank_multi_profile_candidates(
     limit: int,
     reference_candidates: list[dict[str, Any]] | None = None,
     max_abs_spearman: float = 0.75,
+    max_factors_per_family: int = 3,
 ) -> list[dict[str, Any]]:
     """Rank only candidates with an explicit three-profile admission record."""
 
@@ -535,6 +615,7 @@ def rank_multi_profile_candidates(
         key=lambda item: (-float(item["automation_score"]), str(item.get("id") or "")),
     )
     selected: list[dict[str, Any]] = []
+    family_counts: dict[str, int] = {}
     references = list(reference_candidates or [])
     for candidate in ranked:
         if any(
@@ -542,7 +623,12 @@ def rank_multi_profile_candidates(
             for other in [*references, *selected]
         ):
             continue
+        families = candidate_economic_families(candidate)
+        if any(family_counts.get(family, 0) >= max_factors_per_family for family in families):
+            continue
         selected.append(candidate)
+        for family in families:
+            family_counts[family] = family_counts.get(family, 0) + 1
         if len(selected) == limit:
             break
     return selected
@@ -563,6 +649,72 @@ def select_latest_program_dataset(
         and item.get("end_date")
         and (item.get("provenance") or {}).get("dataset_identity_sha256")
     ]
+    if not eligible:
+        return None
+    return max(eligible, key=lambda item: (str(item["end_date"]), str(item["name"])))
+
+
+def select_latest_program_rebase_dataset(
+    datasets: list[dict[str, Any]], *, anchor: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Select a newer, contract-compatible dataset for an audited lineage rebase.
+
+    A source or builder code revision intentionally starts a new immutable
+    lineage.  Long-running research policies must not become pinned forever,
+    but neither may they silently treat the new lineage as a descendant.  This
+    selector therefore requires the public Qlib data contract to preserve every
+    existing field and unit.  Additive PIT-governed fields are allowed; the
+    controller records the lineage change as a separate governance event.
+    """
+
+    anchor_provenance = anchor.get("provenance") or {}
+    scalar_contract_keys = (
+        "field_contract_version",
+        "frequency",
+        "eligibility_contract_version",
+        "source_start_date",
+    )
+    anchor_contract = {
+        key: anchor_provenance.get(key) for key in scalar_contract_keys
+    }
+    anchor_fields = set(anchor_provenance.get("fields") or [])
+    anchor_units = anchor_provenance.get("field_units") or {}
+    if not (
+        anchor_provenance.get("dataset_contract_sha256")
+        and anchor_fields
+        and isinstance(anchor_units, dict)
+    ):
+        return None
+    eligible = []
+    for item in datasets:
+        provenance = item.get("provenance") or {}
+        if not (
+            item.get("ready")
+            and item.get("reproducible")
+            and item.get("lineage_verified")
+            and item.get("lineage_id")
+            and item.get("lineage_id") != anchor.get("lineage_id")
+            and item.get("end_date")
+            and str(item["end_date"]) > str(anchor.get("end_date") or "")
+            and provenance.get("dataset_identity_sha256")
+        ):
+            continue
+        candidate_contract = {
+            key: provenance.get(key) for key in scalar_contract_keys
+        }
+        candidate_fields = set(provenance.get("fields") or [])
+        candidate_units = provenance.get("field_units") or {}
+        preserves_units = isinstance(candidate_units, dict) and all(
+            anchor_units.get(field) is None
+            or candidate_units.get(field) == anchor_units.get(field)
+            for field in anchor_fields
+        )
+        if (
+            candidate_contract == anchor_contract
+            and anchor_fields.issubset(candidate_fields)
+            and preserves_units
+        ):
+            eligible.append(item)
     if not eligible:
         return None
     return max(eligible, key=lambda item: (str(item["end_date"]), str(item["name"])))
@@ -599,6 +751,7 @@ def rank_factor_candidates(
     limit: int,
     reference_candidates: list[dict[str, Any]] | None = None,
     max_abs_spearman: float = 0.75,
+    max_factors_per_family: int = 3,
 ) -> list[dict[str, Any]]:
     if limit < 1:
         raise ValueError("factor selection limit must be positive")
@@ -612,6 +765,7 @@ def rank_factor_candidates(
         key=lambda item: (-float(item["automation_score"]), str(item.get("id") or "")),
     )
     selected: list[dict[str, Any]] = []
+    family_counts: dict[str, int] = {}
     references = list(reference_candidates or [])
     for candidate in ranked:
         if any(
@@ -619,10 +773,67 @@ def rank_factor_candidates(
             for other in [*references, *selected]
         ):
             continue
+        families = candidate_economic_families(candidate)
+        if any(family_counts.get(family, 0) >= max_factors_per_family for family in families):
+            continue
         selected.append(candidate)
+        for family in families:
+            family_counts[family] = family_counts.get(family, 0) + 1
         if len(selected) == limit:
             break
     return selected
+
+
+def candidate_economic_families(candidate: dict[str, Any]) -> tuple[str, ...]:
+    tags = {
+        str(value)
+        for value in (candidate.get("family_tags") or [])
+        if str(value) in ECONOMIC_FAMILIES and str(value) != "mixed"
+    }
+    primary = str(candidate.get("economic_family") or "mixed")
+    if primary in ECONOMIC_FAMILIES and primary != "mixed":
+        tags.add(primary)
+    return tuple(sorted(tags or {"mixed"}))
+
+
+def allocate_governed_factor_weights(
+    candidates: list[dict[str, Any]],
+    *,
+    max_factor_weight: float = 0.25,
+    max_family_weight: float = 0.35,
+) -> list[float]:
+    """Find explicit weights without silently relaxing factor/family caps."""
+
+    if not candidates:
+        raise ValueError("factor weighting requires at least one candidate")
+    families = sorted(
+        {family for item in candidates for family in candidate_economic_families(item)}
+    )
+    family_rows = [
+        [
+            1.0 if family in candidate_economic_families(item) else 0.0
+            for item in candidates
+        ]
+        for family in families
+    ]
+    scores = [float(item.get("automation_score") or 0.0) for item in candidates]
+    result = linprog(
+        c=[-score - index * 1e-12 for index, score in enumerate(scores)],
+        A_ub=family_rows,
+        b_ub=[max_family_weight] * len(family_rows),
+        A_eq=[[1.0] * len(candidates)],
+        b_eq=[1.0],
+        bounds=[(0.01, max_factor_weight)] * len(candidates),
+        method="highs",
+    )
+    if not result.success:
+        raise ValueError(
+            "selected factors cannot satisfy the 25% single-factor and 35% family caps"
+        )
+    weights = [float(value) for value in result.x]
+    if abs(sum(weights) - 1.0) > 1e-8:
+        raise ValueError("governed factor weights failed the sum-to-one invariant")
+    return weights
 
 
 def _factor_spearman(left: dict[str, Any], right: dict[str, Any]) -> float:
@@ -649,3 +860,9 @@ def _factor_spearman(left: dict[str, Any], right: dict[str, Any]) -> float:
         lambda group: group.iloc[:, 0].rank().corr(group.iloc[:, 1].rank())
     )
     return float(daily.abs().mean()) if daily.notna().any() else 1.0
+
+
+def factor_spearman(left: dict[str, Any], right: dict[str, Any]) -> float:
+    """Public governed similarity primitive used by selection and the DB ledger."""
+
+    return _factor_spearman(left, right)

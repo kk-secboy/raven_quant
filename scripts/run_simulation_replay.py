@@ -419,7 +419,7 @@ def main() -> None:
     benchmark = str(manifest.get("benchmark") or "").strip().upper()
     if not benchmark:
         raise ValueError("simulation manifest has no governed benchmark")
-    benchmark_evidence = _benchmark_evidence(
+    benchmark_evidence = None if benchmark == "CASH" else _benchmark_evidence(
         D,
         benchmark=benchmark,
         signal_date=str(manifest["signal_date"]),

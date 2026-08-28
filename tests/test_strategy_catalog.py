@@ -52,6 +52,7 @@ def test_research_only_pair_arb_is_registered_not_blocked() -> None:
     assert entry["catalog_role"] == "research_only"
     assert entry["implementation_tier"] == "conditional"
     assert entry["implementation_status"] == "research"
+    assert "影子模拟" in entry["name"]
 
 
 def test_catalog_contract_validates() -> None:

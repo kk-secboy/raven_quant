@@ -5,9 +5,17 @@ import inspect
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 
 from quant_data.config import Settings
+from quant_data.database import jobs
 from quant_platform import api
+from quant_platform.job_store import (
+    EVALUATION_STATUS_COUNTS_KEY,
+    JobStore,
+    _with_evaluation_status_counts,
+)
 from quant_platform.rdagent_runtime import (
     require_matching_rdagent_runtime_identity,
     validate_duration_limit,
@@ -17,9 +25,30 @@ from quant_platform.rdagent_scenarios import (
     RDAGENT_GENERIC_JOB_KIND,
     RDAGENT_LEGACY_FACTOR_JOB_KIND,
     RDAGENT_LLM_FINETUNE_JOB_KIND,
+    RDAGENT_MODEL_JOB_KIND,
+    RDAGENT_QUANT_JOB_KIND,
+    RDAGENT_REPORT_JOB_KIND,
     SCENARIOS,
     rdagent_scenario_catalog,
 )
+
+
+def test_public_rdagent_status_keeps_safe_credential_readiness_boolean() -> None:
+    from quant_platform.api import _public_rdagent_status
+
+    public = _public_rdagent_status(
+        {
+            "status": "ok",
+            "enabled": True,
+            "ready": True,
+            "llm_credentials_configured": True,
+            "docker_available": True,
+            "scenarios": [],
+        }
+    )
+
+    assert public["llm_credentials_configured"] is True
+    assert "credential" not in str(public.get("blockers") or []).lower()
 
 pytestmark = pytest.mark.no_database
 
@@ -43,9 +72,7 @@ def test_registry_keeps_capital_and_lab_boundaries_explicit() -> None:
         "fin_quant",
         "fin_factor_report",
     }
-    assert all(
-        not item.capital_eligible for item in SCENARIOS.values() if item.category == "lab"
-    )
+    assert all(not item.capital_eligible for item in SCENARIOS.values() if item.category == "lab")
 
 
 def test_scenario_catalog_has_the_public_api_contract(tmp_path: Path) -> None:
@@ -73,9 +100,12 @@ def test_scenario_catalog_has_the_public_api_contract(tmp_path: Path) -> None:
     assert all(required <= set(item) for item in rdagent_scenario_catalog(runtime, settings))
 
 
-def test_dangerous_lab_scenarios_have_dedicated_physical_queues() -> None:
+def test_scenarios_have_bounded_physical_queues() -> None:
     assert SCENARIOS["fin_factor"].job_kind == RDAGENT_LEGACY_FACTOR_JOB_KIND
-    assert SCENARIOS["fin_model"].job_kind == RDAGENT_GENERIC_JOB_KIND
+    assert SCENARIOS["fin_model"].job_kind == RDAGENT_MODEL_JOB_KIND
+    assert SCENARIOS["fin_quant"].job_kind == RDAGENT_QUANT_JOB_KIND
+    assert SCENARIOS["fin_factor_report"].job_kind == RDAGENT_REPORT_JOB_KIND
+    assert SCENARIOS["general_model"].job_kind == RDAGENT_GENERIC_JOB_KIND
     assert SCENARIOS["data_science"].job_kind == RDAGENT_DATA_SCIENCE_JOB_KIND
     assert SCENARIOS["llm_finetune"].job_kind == RDAGENT_LLM_FINETUNE_JOB_KIND
 
@@ -96,9 +126,7 @@ def test_research_asset_acquisition_api_accepts_only_governed_inputs() -> None:
         "include_arxiv",
         "actor",
     }
-    assert {"url", "title", "document_kind", "published_at", "actor"} == set(
-        manual_fields
-    )
+    assert {"url", "title", "document_kind", "published_at", "actor"} == set(manual_fields)
     assert not ({"command", "environment", "path", "cwd"} & set(manual_fields))
     with pytest.raises(ValueError, match="public HTTPS URL"):
         api.ResearchAssetManualHttpsRequest.model_validate(
@@ -110,14 +138,14 @@ def test_research_asset_acquisition_api_accepts_only_governed_inputs() -> None:
 
 
 def test_ui_uses_feature_registry_and_server_asset_endpoints() -> None:
-    source = (
-        Path(__file__).parents[1] / "web" / "app" / "rdagent-panel.tsx"
-    ).read_text(encoding="utf-8")
+    source = (Path(__file__).parents[1] / "web" / "app" / "rdagent-panel.tsx").read_text(
+        encoding="utf-8"
+    )
     assert "/api/rdagent/feature-sets" in source
     assert "/api/rdagent/assets/acquisitions/automatic" in source
     assert "/api/rdagent/assets/acquisitions/manual-https" in source
-    assert '<select value={featureSetId}' in source
-    assert '<input value={featureSetId}' not in source
+    assert "<select value={featureSetId}" in source
+    assert "<input value={featureSetId}" not in source
 
 
 def test_general_model_handoff_accepts_only_governed_ids_and_recipe() -> None:
@@ -147,7 +175,7 @@ def test_general_model_handoff_accepts_only_governed_ids_and_recipe() -> None:
 @pytest.mark.no_database
 def test_model_capital_scenarios_reject_noncanonical_embargo() -> None:
     for scenario in ("fin_model", "fin_quant"):
-        with pytest.raises(ValueError, match="5-trading-day model embargo"):
+        with pytest.raises(ValueError, match="20-trading-day final-OOS embargo"):
             api.RDAgentRunRequest.model_validate(
                 {
                     "objective": "Research a governed model without changing the final OOS.",
@@ -156,12 +184,12 @@ def test_model_capital_scenarios_reject_noncanonical_embargo() -> None:
                     "feature_set_id": "governed-baseline",
                     "period_policy": {
                         "test_trading_days": 252,
-                        "embargo_trading_days": 10,
+                        "embargo_trading_days": 21,
                     },
                 }
             )
 
-    with pytest.raises(ValueError, match="5-trading-day model embargo"):
+    with pytest.raises(ValueError, match="20-trading-day final-OOS embargo"):
         api.GeneralModelValidationRequest.model_validate(
             {
                 "artifact_id": "a" * 32,
@@ -169,7 +197,7 @@ def test_model_capital_scenarios_reject_noncanonical_embargo() -> None:
                 "feature_set_id": "governed-baseline",
                 "period_policy": {
                     "test_trading_days": 252,
-                    "embargo_trading_days": 10,
+                    "embargo_trading_days": 21,
                 },
             }
         )
@@ -189,12 +217,18 @@ def test_runner_is_allowlisted_and_fin_quant_replays_accepted_state() -> None:
     assert "one governed report per allowed loop" in runner
 
 
+def test_factor_prompt_uses_library_digest_without_embedding_all_member_hashes() -> None:
+    source = (
+        Path(__file__).parents[1] / "src" / "quant_platform" / "rdagent_scenario.py"
+    ).read_text(encoding="utf-8")
+    assert 'if key != "member_definition_sha256"' in source
+    assert '"active_library_definition_sha256"' in source
+    assert '"active_library_version_id"' in source
+
+
 def test_official_health_check_is_side_effect_limited_and_diagnostic_only() -> None:
     runtime = (
-        Path(__file__).parents[1]
-        / "src"
-        / "quant_platform"
-        / "rdagent_runtime.py"
+        Path(__file__).parents[1] / "src" / "quant_platform" / "rdagent_runtime.py"
     ).read_text(encoding="utf-8")
     assert '"health_check", "--no-check-docker", "--no-check-ports"' in runtime
     assert '"platform_readiness_unchanged": True' in runtime
@@ -230,6 +264,78 @@ def test_public_job_projection_removes_paths_urls_logs_and_raw_errors() -> None:
     assert projected["error"] == "job execution failed"
 
 
+def test_public_job_projection_exposes_model_gate_outcome_not_private_evidence() -> None:
+    projected = api._public_job(
+        {
+            "id": "job-model-1",
+            "kind": "model_evaluate",
+            "status": "succeeded",
+            "payload": {"dataset": "cn-v1"},
+            "progress": {
+                "resource_blocked_count": 1,
+                EVALUATION_STATUS_COUNTS_KEY: {"resource_blocked": 1},
+                "evaluations": [
+                    {
+                        "status": "resource_blocked",
+                        "error": "private path /data/model.py",
+                    }
+                ],
+            },
+        }
+    )
+    assert projected["status"] == "succeeded"
+    assert projected["outcome_status"] == "blocked"
+    assert "计算资源预算" in projected["outcome_message"]
+    assert projected["progress"] == {}
+    assert "/data/model.py" not in str(projected)
+
+
+def test_public_job_projection_preserves_passed_model_outcome_from_bounded_count() -> None:
+    projected = api._public_job(
+        {
+            "id": "job-model-2",
+            "kind": "model_evaluate",
+            "status": "succeeded",
+            "payload": {"dataset": "cn-v1"},
+            "progress": {EVALUATION_STATUS_COUNTS_KEY: {"passed": 2}},
+        }
+    )
+    assert projected["outcome_status"] == "passed"
+    assert projected["outcome_message"] == "独立模型门禁通过 2 个候选。"
+    assert projected["progress"] == {}
+
+
+def test_job_progress_projection_uses_bounded_evaluation_counts() -> None:
+    normalized = _with_evaluation_status_counts(
+        {
+            "evaluations": [
+                {"status": "passed", "evidence": "large-private-evidence"},
+                {"status": "passed"},
+                {"status": "resource_blocked"},
+            ]
+        }
+    )
+    assert normalized is not None
+    assert normalized[EVALUATION_STATUS_COUNTS_KEY] == {
+        "passed": 2,
+        "resource_blocked": 1,
+    }
+
+    columns = JobStore._projected_columns(
+        payload_keys=(),
+        progress_keys=("resource_blocked_count",),
+        progress_evaluation_statuses=("passed", "resource_blocked"),
+        progress_evaluation_kind="model_evaluate",
+    )
+    assert all(column is not jobs.c.progress_json for column in columns)
+    statement = select(*columns)
+    compiled = statement.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "jsonb_path_query_array" in sql
+    assert any("evaluations" in str(value) for value in compiled.params.values())
+    assert "model_evaluate" in compiled.params.values()
+
+
 def test_rdagent_runtime_identity_is_frozen_across_queue_and_worker() -> None:
     identity = {
         "version": "0.0.dev0",
@@ -240,9 +346,10 @@ def test_rdagent_runtime_identity_is_frozen_across_queue_and_worker() -> None:
         "runtime_image_digest": "sha256:" + "b" * 64,
         "production_reproducible": True,
     }
-    assert require_matching_rdagent_runtime_identity(identity, dict(identity))[
-        "source_tree_sha256"
-    ] == "a" * 64
+    assert (
+        require_matching_rdagent_runtime_identity(identity, dict(identity))["source_tree_sha256"]
+        == "a" * 64
+    )
     with pytest.raises(ValueError, match="changed after enqueue"):
         require_matching_rdagent_runtime_identity(
             identity, {**identity, "source_tree_sha256": "c" * 64}
@@ -264,9 +371,7 @@ def test_worker_closes_model_quant_and_generic_audit_chains() -> None:
 
 
 def test_data_science_and_finetune_use_explicit_isolated_runtime_contracts() -> None:
-    runtime_path = (
-        Path(__file__).parents[1] / "src" / "quant_platform" / "rdagent_runtime.py"
-    )
+    runtime_path = Path(__file__).parents[1] / "src" / "quant_platform" / "rdagent_runtime.py"
     runtime = runtime_path.read_text(encoding="utf-8")
     for marker in (
         '"DS_SCEN": "rdagent.scenarios.data_science.scen.DataScienceScen"',

@@ -12,13 +12,15 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from quant_data.qlib_builder import verify_qlib_output_manifest
+from quant_data.qlib_builder import qlib_research_field_catalog, verify_qlib_output_manifest
 from quant_platform.cost_model import CostScheduleBook
 from quant_platform.factor_evaluator import evaluate_factor_values
+from quant_platform.factor_library import compile_qlib_expression
 from quant_platform.factor_recompute import (
     compare_submitted_values,
     execute_factor_code,
@@ -38,6 +40,91 @@ def _load_values(path: str) -> pd.DataFrame:
     if source.suffix.lower() == ".parquet":
         return pd.read_parquet(source)
     raise ValueError(f"unsupported factor values format: {source.suffix}")
+
+
+def _qlib_expression_values(
+    data_api: Any,
+    instruments: Any,
+    expression: str,
+    *,
+    start: str,
+    end: str,
+) -> pd.DataFrame:
+    compiled = compile_qlib_expression(expression)
+    values = (
+        data_api.features(
+            instruments,
+            [compiled.expression],
+            start_time=start,
+            end_time=end,
+            freq="day",
+        )
+        .swaplevel()
+        .sort_index()
+    )
+    if values.shape[1] != 1:
+        raise ValueError("Qlib expression did not produce exactly one factor column")
+    values.columns = ["factor"]
+    return values
+
+
+def _qlib_prefix_evidence(
+    data_api: Any,
+    instruments: Any,
+    expression: str,
+    full_values: pd.DataFrame,
+    *,
+    start: str,
+    cutpoint_count: int,
+) -> dict[str, Any]:
+    dates = pd.DatetimeIndex(
+        full_values.index.get_level_values("datetime").unique()
+    ).sort_values()
+    if len(dates) < 2:
+        raise ValueError("Qlib expression has insufficient dates for PIT prefix checks")
+    positions = sorted(
+        {
+            max(0, min(len(dates) - 1, int(len(dates) * step / (cutpoint_count + 1))))
+            for step in range(1, cutpoint_count + 1)
+        }
+    )
+    checks: list[dict[str, Any]] = []
+    for position in positions:
+        cutoff = dates[position]
+        prefix = _qlib_expression_values(
+            data_api,
+            instruments,
+            expression,
+            start=start,
+            end=cutoff.date().isoformat(),
+        )
+        expected = full_values.loc[
+            full_values.index.get_level_values("datetime") <= cutoff
+        ]
+        prefix = require_exact_factor_index(
+            prefix,
+            expected,
+            context=f"Qlib expression prefix {cutoff.date().isoformat()}",
+        )
+        if not pd.Series(prefix.iloc[:, 0]).equals(pd.Series(expected.iloc[:, 0])):
+            left = prefix.iloc[:, 0].to_numpy(dtype=float)
+            right = expected.iloc[:, 0].to_numpy(dtype=float)
+            if not bool(
+                np.allclose(
+                    left,
+                    right,
+                    rtol=1e-10,
+                    atol=1e-12,
+                    equal_nan=True,
+                )
+            ):
+                raise ValueError("Qlib factor expression changes under a PIT prefix cutoff")
+        checks.append({"cutoff": cutoff.date().isoformat(), "rows": len(prefix)})
+    return {
+        "contract_version": "qlib-expression-prefix-invariance-v1",
+        "passed": True,
+        "checks": checks,
+    }
 
 
 def main() -> None:
@@ -86,10 +173,30 @@ def main() -> None:
     if recompute_root.exists():
         shutil.rmtree(recompute_root)
     recompute_root.mkdir(parents=True)
+    compiled_candidates = {
+        str(item["id"]): compile_qlib_expression(str(item["expression"]))
+        for item in candidates
+        if item.get("implementation_kind") == "qlib_expression"
+    }
+    declared_fields = {
+        str(field)
+        for item in candidates
+        for field in (item.get("required_fields") or [])
+    }
+    unknown_declared = declared_fields - set(qlib_research_field_catalog())
+    if unknown_declared:
+        raise ValueError(
+            "candidate required fields are outside the governed Qlib catalog: "
+            + ", ".join(sorted(unknown_declared))
+        )
+    required_input_fields = sorted(
+        {"open", "close", "high", "low", "volume", "factor"} | declared_fields
+    )
+    instruments = D.instruments(str(manifest.get("universe") or "cn_all"))
     factor_input = normalize_factor_input(
         D.features(
-            D.instruments(str(manifest.get("universe") or "cn_all")),
-            ["$open", "$close", "$high", "$low", "$volume", "$factor"],
+            instruments,
+            [f"${field}" for field in required_input_fields],
             start_time=periods["train_start"],
             end_time=periods["valid_end"],
             freq="day",
@@ -106,37 +213,62 @@ def main() -> None:
     factor_input.to_hdf(input_path, key="data", mode="w")
     input_sha256 = sha256_file(input_path)
     labels_by_horizon: dict[int, pd.DataFrame] = {}
-    comparisons = []
-    for path in manifest.get("comparison_values", []):
-        comparison = _load_values(path)
-        if isinstance(comparison.index, pd.MultiIndex) and "datetime" in comparison.index.names:
-            comparison_dates = pd.to_datetime(
-                comparison.index.get_level_values("datetime"), errors="coerce"
-            )
-            comparison = comparison.loc[comparison_dates <= valid_end]
-        comparisons.append(comparison)
+    comparison_records: list[dict[str, str]] = []
+    for entry in manifest.get("comparison_values", []):
+        record = entry if isinstance(entry, dict) else {"path": entry}
+        comparison_records.append(
+            {
+                "candidate_id": str(record.get("candidate_id") or ""),
+                "path": str(record["path"]),
+            }
+        )
     evaluations = []
     for item in candidates:
         try:
             candidate_root = recompute_root / str(item["id"])
-            recomputed, recompute_evidence = execute_factor_code(
-                code_path=Path(item["code_path"]),
-                input_path=input_path,
-                workspace=candidate_root / "full",
-                timeout_seconds=int(manifest.get("factor_recompute_timeout_seconds", 300)),
-            )
+            if item.get("implementation_kind") == "qlib_expression":
+                compiled = compiled_candidates[str(item["id"])]
+                if set(compiled.required_fields) != set(item.get("required_fields") or []):
+                    raise ValueError("candidate required fields disagree with its expression")
+                recomputed = _qlib_expression_values(
+                    D,
+                    instruments,
+                    compiled.expression,
+                    start=periods["train_start"],
+                    end=periods["valid_end"],
+                )
+                recompute_evidence = {
+                    "executor_version": "qlib-expression-recompute-v1",
+                    "factor_definition_id": item.get("factor_definition_id"),
+                    "expression_sha256": compiled.expression_sha256,
+                }
+                pit_evidence = _qlib_prefix_evidence(
+                    D,
+                    instruments,
+                    compiled.expression,
+                    recomputed,
+                    start=periods["train_start"],
+                    cutpoint_count=int(manifest.get("factor_pit_cutpoint_count", 3)),
+                )
+            else:
+                recomputed, recompute_evidence = execute_factor_code(
+                    code_path=Path(item["code_path"]),
+                    input_path=input_path,
+                    workspace=candidate_root / "full",
+                    timeout_seconds=int(manifest.get("factor_recompute_timeout_seconds", 300)),
+                )
+                pit_evidence = validate_factor_prefix_invariance(
+                    code_path=Path(item["code_path"]),
+                    input_path=input_path,
+                    full_values=recomputed,
+                    workspace_root=candidate_root / "prefix-checks",
+                    timeout_seconds=int(manifest.get("factor_recompute_timeout_seconds", 300)),
+                    cutpoint_count=int(manifest.get("factor_pit_cutpoint_count", 3)),
+                )
             recomputed = require_exact_factor_index(
                 recomputed,
                 factor_input,
                 context=f"research candidate {item['id']}",
-            )
-            pit_evidence = validate_factor_prefix_invariance(
-                code_path=Path(item["code_path"]),
-                input_path=input_path,
-                full_values=recomputed,
-                workspace_root=candidate_root / "prefix-checks",
-                timeout_seconds=int(manifest.get("factor_recompute_timeout_seconds", 300)),
-                cutpoint_count=int(manifest.get("factor_pit_cutpoint_count", 3)),
             )
             recomputed_path = candidate_root / "recomputed.h5"
             recomputed.to_hdf(recomputed_path, key="data", mode="w")
@@ -182,6 +314,22 @@ def main() -> None:
                 candidate_path: Path = recomputed_path,
             ) -> dict[str, Any]:
                 current = profile["periods"]
+                def comparisons() -> Any:
+                    for record in comparison_records:
+                        if record["candidate_id"] == str(candidate["id"]):
+                            continue
+                        comparison = _load_values(record["path"])
+                        if (
+                            isinstance(comparison.index, pd.MultiIndex)
+                            and "datetime" in comparison.index.names
+                        ):
+                            comparison_dates = pd.to_datetime(
+                                comparison.index.get_level_values("datetime"),
+                                errors="coerce",
+                            )
+                            comparison = comparison.loc[comparison_dates <= valid_end]
+                        yield comparison
+
                 metrics = evaluate_factor_values(
                     recomputed_values,
                     labels_by_horizon[horizon],
@@ -189,7 +337,7 @@ def main() -> None:
                     valid_end=pd.Timestamp(current["valid_end"]).date(),
                     test_start=pd.Timestamp(current["test_start"]).date(),
                     test_end=pd.Timestamp(current["test_end"]).date(),
-                    comparison_values=comparisons,
+                    comparison_values=comparisons(),
                     cost_schedule=CostScheduleBook.from_mapping(manifest.get("cost_model")),
                     reference_order_value=float(manifest["cost_reference_order_value"]),
                     min_daily_instruments=int(manifest.get("min_daily_instruments", 50)),

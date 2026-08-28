@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -160,6 +161,48 @@ def test_clean_partitions_are_hard_linked_and_dirty_ones_rebuilt(tmp_path: Path)
     assert linked.samefile(original)
     assert (incremental / february).exists()
     assert not (base / february).exists()
+
+
+def test_rebuilt_same_size_partition_gets_a_new_content_digest(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path / "data")
+    old_unit = _write_unit(
+        store,
+        "daily",
+        "daily_20240102",
+        _daily_rows("20240102"),
+    )
+    base = store.build_snapshot(
+        name="s1",
+        successful_units={"daily": [old_unit]},
+        manifest_extra={},
+    )
+    new_unit = _write_unit(
+        store,
+        "daily",
+        "daily_20240102",
+        [
+            {"ts_code": "000001.SZ", "trade_date": "20240102", "close": 20.0},
+            {"ts_code": "000002.SZ", "trade_date": "20240102", "close": 21.0},
+        ],
+    )
+    successor = store.build_snapshot(
+        name="s2",
+        successful_units={"daily": [new_unit]},
+        manifest_extra={},
+        base_snapshot=base,
+    )
+
+    relative = Path("parquet/daily/partition_year=2024/partition_month=1/data.parquet")
+    base_file = base / relative
+    successor_file = successor / relative
+    assert base_file.stat().st_size == successor_file.stat().st_size
+    assert not successor_file.samefile(base_file)
+
+    base_entry = _manifest_entry(base, "daily")["files"][0]
+    successor_entry = _manifest_entry(successor, "daily")["files"][0]
+    actual_sha256 = hashlib.sha256(successor_file.read_bytes()).hexdigest()
+    assert successor_entry["sha256"] == actual_sha256
+    assert successor_entry["sha256"] != base_entry["sha256"]
 
 
 def test_unchanged_dataset_is_fully_linked(tmp_path: Path) -> None:

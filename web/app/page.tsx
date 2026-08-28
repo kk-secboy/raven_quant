@@ -6,14 +6,13 @@ import { BacktestPanel } from "./backtest-panel";
 import { DataTask, DataTaskCenter } from "./data-task-center";
 import { phaseLabel, targetText } from "./data-progress";
 import { AuthPanel, AuthState } from "./auth-panel";
+import { AutopilotPanel } from "./autopilot-panel";
 import { FactorLibraryPanel } from "./factor-library-panel";
 import { JobRunCenter } from "./job-run-center";
 import { MarketOverviewPanel } from "./market-overview-panel";
-import { PairSatellitePanel } from "./pair-satellite-panel";
 import { PortfolioPanel } from "./portfolio-panel";
 import { QlibPanel } from "./qlib-panel";
 import { RDAgentPanel } from "./rdagent-panel";
-import { ResearchCampaignPanel } from "./research-campaign-panel";
 import { SettingsPanel } from "./settings-panel";
 import { StrategyAllocationPanel } from "./strategy-allocation-panel";
 import { usePolling } from "./use-polling";
@@ -61,31 +60,34 @@ type Dataset = {
 
 type RetentionEntry = {
   name: string; created_at: string; bytes: number; locations: string[];
-  state: "protected" | "keep_latest" | "keep_young" | "eligible"; reasons: string[];
+  state: "protected" | "keep_latest" | "keep_young" | "eligible" | "inventory_pending";
+  reasons: string[]; inventory_complete?: boolean;
 };
 type RetentionPlan = {
   total_bytes: number; eligible_bytes: number; keep_latest: number; min_age_days: number;
-  entries: RetentionEntry[];
+  entries: RetentionEntry[]; inventory_generated_at?: string; cache_state?: "fresh" | "stale" | "building";
+  refreshing?: boolean;
 };
 
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8765";
 const navGroups = [
-  { label: "工作台", items: [{ index: 0, label: "总览" }, { index: 11, label: "行情总览" }] },
-  { label: "单主线", items: [{ index: 1, label: "数据快照" }, { index: 3, label: "RD-Agent 研究中心" }, { index: 5, label: "因子准入" }, { index: 6, label: "Qlib 回测与审批" }, { index: 12, label: "核心 / 卫星分配" }, { index: 8, label: "统一模拟盘" }] },
-  { label: "研究支持", items: [{ index: 2, label: "Qlib 实验记录" }, { index: 4, label: "连续研究" }, { index: 7, label: "配对卫星" }] },
-  { label: "系统", items: [{ index: 9, label: "任务与告警" }, { index: 10, label: "系统设置" }] },
+  { label: "日常运行", items: [{ index: 0, label: "自动驾驶" }, { index: 11, label: "行情总览" }, { index: 8, label: "统一模拟盘" }] },
+  { label: "研究治理", items: [{ index: 1, label: "数据快照" }, { index: 3, label: "RD-Agent 研究中心" }, { index: 5, label: "因子库与准入" }, { index: 2, label: "模型竞赛与试验" }, { index: 6, label: "Qlib 回测与审批" }, { index: 12, label: "核心 / 卫星分配" }] },
+  { label: "审计与系统", items: [{ index: 9, label: "任务、告警与历史" }, { index: 10, label: "系统设置" }] },
+];
+const simpleNavGroups = [
+  { label: "日常使用", items: [{ index: 0, label: "自动驾驶" }, { index: 11, label: "行情总览" }, { index: 8, label: "模拟盘" }] },
+  { label: "需要处理", items: [{ index: 9, label: "异常" }] },
 ];
 const headings: Record<number, [string, string]> = {
-  0: ["QUANTLAB / WORKSPACE", "总览"],
+  0: ["QUANTLAB / AUTOPILOT", "自动驾驶"],
   1: ["TUSHARE SNAPSHOTS / QLIB DATASET", "数据快照"],
-  2: ["MODEL RESEARCH / QLIB", "Qlib 实验记录"],
+  2: ["MODEL TOURNAMENT / QLIB", "模型竞赛与试验"],
   3: ["AUTONOMOUS RESEARCH / GOVERNED", "RD-Agent 研究中心"],
-  4: ["RESEARCH AUTOPILOT / GOVERNED PIPELINE", "连续研究"],
-  5: ["FACTOR GOVERNANCE / REGISTRY", "因子准入"],
+  5: ["FACTOR GOVERNANCE / REGISTRY", "因子库与准入"],
   6: ["QLIB BACKTEST / RISK APPROVAL", "Qlib 回测与审批"],
-  7: ["STATISTICAL ARBITRAGE / UNIFIED SIMULATION", "配对卫星"],
   8: ["APPROVED SOURCES / DURABLE LEDGER", "统一模拟盘"],
-  9: ["AUTOMATION / ALERTS / RECOVERY", "任务与告警"],
+  9: ["AUTOMATION / ALERTS / AUDIT", "任务、告警与历史"],
   10: ["SERVER CONFIGURATION / ENCRYPTED", "系统设置"],
   11: ["MARKET INTELLIGENCE / RESEARCH SNAPSHOT", "行情总览"],
   12: ["CORE SATELLITE / RISK BUDGET", "核心 / 卫星分配"],
@@ -105,9 +107,16 @@ function statusLabel(status: string) {
   return ({ queued: "排队", running: "运行中", succeeded: "成功", failed: "失败" } as Record<string, string>)[status] ?? status;
 }
 
+function retentionStateLabel(state: RetentionEntry["state"]) {
+  if (state === "eligible") return "可清理";
+  if (state === "inventory_pending") return "统计中";
+  return "受保护";
+}
+
 export default function Home() {
   const [auth, setAuth] = useState<AuthState | null>(null);
   const [activeNav, setActiveNav] = useState(0);
+  const [advancedMode, setAdvancedMode] = useState(false);
   const [dataView, setDataView] = useState("overview");
   const [overview, setOverview] = useState<Overview | null>(null);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
@@ -119,6 +128,11 @@ export default function Home() {
   const [downloadStart, setDownloadStart] = useState("2016-01-01");
   const [snapshotStart, setSnapshotStart] = useState("2008-01-01");
   const [message, setMessage] = useState("");
+
+  function navigateTo(index: number) {
+    setMessage("");
+    setActiveNav(index);
+  }
   const [loading, setLoading] = useState(true);
 
   const checkAuth = useCallback(async () => {
@@ -163,7 +177,12 @@ export default function Home() {
         timeoutMs: 120_000,
       });
       if (!response.ok) throw new Error("retention unavailable");
-      setRetention(await response.json());
+      const next = await response.json() as RetentionPlan;
+      setRetention(next);
+      const selectable = new Set(next.entries.filter((item) => item.state === "eligible").map((item) => item.name));
+      setRetentionSelection((current) => Object.fromEntries(
+        Object.entries(current).filter(([name, selected]) => selected && selectable.has(name)),
+      ));
     } catch {
       setMessage("存储容量统计暂时不可用；其他数据不受影响。");
     }
@@ -183,8 +202,9 @@ export default function Home() {
   usePolling(loadRetention, 60 * 60 * 1000, storageViewEnabled);
 
   async function refreshVisible() {
+    if (activeNav !== 1) return;
     await refresh(true);
-    if (activeNav === 1 && dataView === "storage") await loadRetention(true);
+    if (dataView === "storage") await loadRetention(true);
   }
 
   async function logout() {
@@ -292,57 +312,39 @@ export default function Home() {
       <aside className="sidebar">
         <div className="brand"><span className="brand-mark">Q</span><span>Quant<span>Lab</span></span></div>
         <nav aria-label="主导航">
-          {navGroups.map((group) => (
+          {(advancedMode ? navGroups : simpleNavGroups).map((group) => (
             <div className="nav-group" key={group.label}>
               <span className="nav-group-label">{group.label}</span>
               {group.items.map((item) => (
-                <button className={item.index === activeNav ? "nav-item active" : "nav-item"} key={item.label} disabled={item.index === 10 && auth.user?.role !== "admin"} onClick={() => setActiveNav(item.index)}>
+                <button className={item.index === activeNav ? "nav-item active" : "nav-item"} key={item.label} disabled={item.index === 10 && auth.user?.role !== "admin"} onClick={() => navigateTo(item.index)}>
                   <span className="nav-dot" />{item.label}
                 </button>
               ))}
             </div>
           ))}
         </nav>
+        <button className="sidebar-mode" type="button" onClick={() => {
+          const next = !advancedMode;
+          setAdvancedMode(next);
+          if (!next) navigateTo(0);
+        }}>
+          {advancedMode ? "返回日常模式" : "打开高级管理"}
+        </button>
         <div className="sidebar-foot">
           <span className={overview?.credentials_configured ? "pulse ok" : "pulse"} />
-          <div><strong>本地研究模式</strong><small>{overview?.credentials_configured ? "数据源已配置" : "等待 Tushare 凭据"}</small></div>
+          <div><strong>受控研究模式</strong><small>{overview?.credentials_configured ? "数据源已配置" : "等待 Tushare 凭据"}</small></div>
         </div>
       </aside>
 
       <section className="workspace">
         <header className="topbar">
           <div><p className="eyebrow">{headings[activeNav]?.[0]}</p><h1>{headings[activeNav]?.[1]}</h1></div>
-          <div className="top-actions"><span className="system-live"><i />当前页面自动更新</span><span className="account-chip"><b>{auth.user?.display_name}</b><small>{auth.user?.role}</small></span><button onClick={() => void refreshVisible()}>刷新</button>{auth.status === "authenticated" && <button onClick={logout}>退出</button>}</div>
+          <div className="top-actions"><span className="system-live"><i />受控研究工作台</span><span className="account-chip"><b>{auth.user?.display_name}</b><small>{auth.user?.role}</small></span>{activeNav === 1 ? <button onClick={() => void refreshVisible()}>刷新概况</button> : null}{auth.status === "authenticated" && <button onClick={logout}>退出</button>}</div>
         </header>
 
         {message && <div className="notice">{message}</div>}
 
-        {activeNav === 0 ? (
-          <div className="overview-page">
-            <section className="overview-kpis">
-              <article><span>平均目录覆盖度</span><strong>{overview?.readiness_percent ?? 0}%</strong><small>{overview?.ready_tasks ?? 0} / {overview?.actionable_tasks ?? 0} 项已完全可用</small></article>
-              <article><span>运行中的任务</span><strong>{overview?.active_jobs ?? 0}</strong><small>{overview?.active_jobs ? "后台正在处理" : "当前队列空闲"}</small></article>
-              <article><span>研究数据</span><strong>{overview?.qlib_datasets ?? 0}</strong><small>Qlib 数据集 · {overview?.snapshots ?? 0} 份快照</small></article>
-              <article><span>已存数据</span><strong>{formatNumber(overview?.rows ?? 0)}</strong><small>数据行</small></article>
-            </section>
-            <section className="overview-grid">
-              <article className="workspace-card next-actions">
-                <div className="section-heading"><div><h2>接下来要做什么</h2><p>只显示当前需要关注的事项。</p></div><button onClick={() => { setActiveNav(1); setDataView("overview"); }}>打开数据中心</button></div>
-                {dataTasks.filter((task) => task.status !== "succeeded" && !["permission_probe", "external_source_required"].includes(task.implementation_status)).slice(0, 5).map((task) => <div className="action-row" key={task.task_key}><span className={`task-status ${task.status}`}>{statusLabel(task.status) === task.status ? ({ planned: "待开始", partial: "需补齐" } as Record<string, string>)[task.status] ?? task.status : statusLabel(task.status)}</span><div><strong>{task.title}</strong><small>{task.status === "running" ? `${task.coverage}% · 正在下载` : task.dependencies_satisfied ? "可以开始" : "等待前置数据"}</small></div></div>)}
-                {!dataTasks.some((task) => task.status !== "succeeded" && !["permission_probe", "external_source_required"].includes(task.implementation_status)) ? <div className="empty compact">当前数据计划已全部就绪。</div> : null}
-              </article>
-              <article className="workspace-card quick-entry">
-                <div className="section-heading"><div><h2>工作入口</h2><p>按工作目标进入，不必记系统模块。</p></div></div>
-                <button onClick={() => { setActiveNav(1); setDataView("create"); }}><b>补充市场数据</b><span>新建日线、分钟线或海外数据任务</span></button>
-                <button onClick={() => setActiveNav(11)}><b>查看研究行情</b><span>指数、市场宽度、行业强弱与自选观察池</span></button>
-                <button onClick={() => setActiveNav(2)}><b>训练 Qlib 模型</b><span>管理数据集和基线实验</span></button>
-                <button onClick={() => setActiveNav(4)}><b>启动连续研究</b><span>RD-Agent 候选、独立复算与 Qlib 挑战者实验</span></button>
-                <button onClick={() => setActiveNav(6)}><b>运行 Qlib 回测并审批</b><span>验证收益、风险、执行契约和样本外证据</span></button>
-                <button onClick={() => setActiveNav(8)}><b>进入统一模拟盘</b><span>只消费推荐、已审批策略或已审批分配版本</span></button>
-              </article>
-            </section>
-          </div>
-        ) : activeNav === 1 ? (
+        {activeNav === 0 ? <AutopilotPanel api={API} onNavigate={navigateTo} onOpenAdvanced={(index) => { setAdvancedMode(true); navigateTo(index); }} /> : activeNav === 1 ? (
           <div className="data-center-page">
             <div className="page-tabs" role="tablist" aria-label="数据中心页面">
               {[['overview', '运行概况'], ['catalog', '数据目录'], ['create', '新建任务'], ['runs', '运行记录'], ['storage', '存储与版本']].map(([value, label]) => <button role="tab" aria-selected={dataView === value} className={dataView === value ? "active" : ""} onClick={() => setDataView(value)} key={value}>{label}{value === "runs" && overview?.active_jobs ? <i>{overview.active_jobs}</i> : null}</button>)}
@@ -400,11 +402,38 @@ export default function Home() {
             {dataView === "runs" ? <JobRunCenter api={API} canControl={auth.user?.role === "admin" || auth.user?.role === "operator"} onChanged={refresh} onMessage={setMessage} /> : null}
 
             {dataView === "storage" ? <div className="storage-stack">
-              <section className="data-panel storage-panel"><div className="panel-heading"><div><h2>不可变快照与 Qlib 数据</h2><p>被研究、回测和推荐组合引用的数据不会被清理。</p></div><span>{formatBytes(retention?.eligible_bytes ?? 0)} 可清理</span></div><div className="table-wrap"><table><thead><tr><th>选择</th><th>数据集</th><th>创建时间</th><th>占用</th><th>状态 / 原因</th></tr></thead><tbody>{retention?.entries.map((item) => <tr key={item.name}><td><input aria-label={`选择清理 ${item.name}`} type="checkbox" disabled={item.state !== "eligible" || auth.user?.role !== "admin"} checked={!!retentionSelection[item.name]} onChange={(event) => setRetentionSelection({ ...retentionSelection, [item.name]: event.target.checked })} /></td><td><code>{item.name}</code></td><td>{new Date(item.created_at).toLocaleString("zh-CN")}</td><td>{formatBytes(item.bytes)}</td><td><span className={`state ${item.state === "eligible" ? "failed" : "ready"}`}>{item.state === "eligible" ? "可清理" : "受保护"}</span><small>{item.reasons.join("；") || "未被引用且已过保留期"}</small></td></tr>)}</tbody></table>{!retention?.entries.length ? <div className="empty compact">尚无快照或 Qlib 数据集。</div> : null}</div>{auth.user?.role === "admin" ? <div className="retention-action"><label>输入 DELETE_UNREFERENCED_DATASETS 确认<input value={retentionConfirmation} onChange={(event) => setRetentionConfirmation(event.target.value)} /></label><button className="primary" onClick={applyRetention} disabled={retentionConfirmation !== "DELETE_UNREFERENCED_DATASETS" || !Object.values(retentionSelection).some(Boolean)}>清理所选数据</button></div> : null}</section>
-              <section className="data-panel"><div className="panel-heading"><div><h2>基础数据集</h2><p>用于核对旧初始化流水线的工作单元。</p></div><div className="segmented">{["core", "research", "full"].map((value) => <button className={profile === value ? "selected" : ""} onClick={() => setProfile(value)} key={value}>{value}</button>)}</div></div><div className="table-wrap"><table><thead><tr><th>数据集</th><th>层级</th><th>状态</th><th>进度</th><th>数据行</th><th>失败</th></tr></thead><tbody>{visibleDatasets.map((item) => <tr key={item.name}><td><code>{item.name}</code></td><td><span className={`tier ${item.profile}`}>{item.profile}</span></td><td><span className={`state ${item.state}`}>{item.state === "ready" ? "已就绪" : item.state === "partial" ? "部分完成" : "未下载"}</span></td><td><div className="mini-progress"><i style={{ width: `${item.coverage}%` }} /></div><small>{item.coverage}%</small></td><td>{formatNumber(item.rows)}</td><td className={item.failed ? "danger" : "muted"}>{item.failed}</td></tr>)}</tbody></table></div></section>
+              <section className="data-panel storage-panel">
+                <div className="panel-heading">
+                  <div>
+                    <h2>不可变快照与 Qlib 数据</h2>
+                    <p>
+                      被研究、回测和推荐组合引用的数据不会被清理。
+                      {retention?.inventory_generated_at
+                        ? ` 容量摘要截至 ${new Date(retention.inventory_generated_at).toLocaleString("zh-CN")}；删除前会实时复核。`
+                        : " 正在读取容量摘要。"}
+                    </p>
+                  </div>
+                  <span>{retention?.refreshing ? "后台更新中 · " : ""}{formatBytes(retention?.eligible_bytes ?? 0)} 可清理</span>
+                </div>
+                <div className="table-wrap">
+                  <table>
+                    <thead><tr><th>选择</th><th>数据集</th><th>创建时间</th><th>占用</th><th>状态 / 原因</th></tr></thead>
+                    <tbody>{retention?.entries.map((item) => <tr key={item.name}>
+                      <td><input aria-label={`选择清理 ${item.name}`} type="checkbox" disabled={item.state !== "eligible" || auth.user?.role !== "admin"} checked={!!retentionSelection[item.name]} onChange={(event) => setRetentionSelection({ ...retentionSelection, [item.name]: event.target.checked })} /></td>
+                      <td><code>{item.name}</code></td>
+                      <td>{new Date(item.created_at).toLocaleString("zh-CN")}</td>
+                      <td>{item.inventory_complete === false ? "统计中" : formatBytes(item.bytes)}</td>
+                      <td><span className={`state ${item.state === "eligible" ? "failed" : item.state === "inventory_pending" ? "partial" : "ready"}`}>{retentionStateLabel(item.state)}</span><small>{item.reasons.join("；") || "未被引用且已过保留期"}</small></td>
+                    </tr>)}</tbody>
+                  </table>
+                  {retention === null ? <div className="empty compact">正在读取上一版容量摘要…</div> : !retention.entries.length ? <div className="empty compact">当前没有快照或 Qlib 数据集。</div> : null}
+                </div>
+                {auth.user?.role === "admin" ? <div className="retention-action"><label>输入 DELETE_UNREFERENCED_DATASETS 确认<input value={retentionConfirmation} onChange={(event) => setRetentionConfirmation(event.target.value)} /></label><button className="primary" onClick={applyRetention} disabled={retentionConfirmation !== "DELETE_UNREFERENCED_DATASETS" || !Object.values(retentionSelection).some(Boolean)}>清理所选数据</button></div> : null}
+              </section>
+              <section className="data-panel"><div className="panel-heading"><div><h2>基础数据集</h2><p>用于核对旧初始化流水线的工作单元。</p></div><div className="segmented">{["core", "research", "full"].map((value) => <button className={profile === value ? "selected" : ""} onClick={() => setProfile(value)} key={value}>{value}</button>)}</div></div><div className="table-wrap"><table className="dataset-catalog-table"><thead><tr><th>数据集</th><th>层级</th><th>状态</th><th>进度</th><th>数据行</th><th>失败</th></tr></thead><tbody>{visibleDatasets.map((item) => <tr key={item.name}><td><code>{item.name}</code></td><td><span className={`tier ${item.profile}`}>{item.profile}</span></td><td><span className={`state ${item.state}`}>{item.state === "ready" ? "已就绪" : item.state === "partial" ? "部分完成" : "未下载"}</span></td><td><div className="mini-progress"><i style={{ width: `${item.coverage}%` }} /></div><small>{item.coverage}%</small></td><td>{formatNumber(item.rows)}</td><td className={item.failed ? "danger" : "muted"}>{item.failed}</td></tr>)}</tbody></table></div></section>
             </div> : null}
           </div>
-        ) : activeNav === 11 ? <MarketOverviewPanel api={API} onOpenData={() => { setActiveNav(1); setDataView("overview"); }} /> : activeNav === 2 ? <QlibPanel api={API} /> : activeNav === 3 ? <RDAgentPanel api={API} /> : activeNav === 4 ? <ResearchCampaignPanel api={API} /> : activeNav === 5 ? <FactorLibraryPanel api={API} /> : activeNav === 6 ? <BacktestPanel api={API} /> : activeNav === 7 ? <PairSatellitePanel api={API} /> : activeNav === 8 ? <PortfolioPanel api={API} /> : activeNav === 12 ? <StrategyAllocationPanel api={API} /> : activeNav === 9 ? <JobRunCenter api={API} canControl={auth.user?.role === "admin" || auth.user?.role === "operator"} onChanged={refresh} onMessage={setMessage} /> : <SettingsPanel api={API} />}
+        ) : activeNav === 11 ? <MarketOverviewPanel api={API} onOpenData={() => { navigateTo(1); setDataView("overview"); }} /> : activeNav === 2 ? <QlibPanel api={API} /> : activeNav === 3 ? <RDAgentPanel api={API} /> : activeNav === 5 ? <FactorLibraryPanel api={API} /> : activeNav === 6 ? <BacktestPanel api={API} /> : activeNav === 8 ? <PortfolioPanel api={API} /> : activeNav === 12 ? <StrategyAllocationPanel api={API} /> : activeNav === 9 ? <JobRunCenter api={API} canControl={auth.user?.role === "admin" || auth.user?.role === "operator"} onChanged={refresh} onMessage={setMessage} /> : <SettingsPanel api={API} />}
       </section>
     </main>
   );

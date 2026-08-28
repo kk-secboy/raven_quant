@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from quant_platform.job_store import (
+    MAX_NUMERICAL_THREADS_PER_JOB,
+    research_job_cpu_cost,
+    research_job_memory_gb,
+)
+
+pytestmark = pytest.mark.no_database
+
+
+def test_research_resource_costs_match_the_governed_queue_contract() -> None:
+    assert MAX_NUMERICAL_THREADS_PER_JOB == 8
+    assert research_job_cpu_cost("data_qlib") == 16
+    assert research_job_memory_gb("data_qlib") == 24
+    assert research_job_cpu_cost("minute_qlib") == 16
+    assert research_job_memory_gb("minute_qlib") == 24
+    assert research_job_cpu_cost("rdagent_factor") == 8
+    assert research_job_memory_gb("rdagent_factor") == 12
+    assert research_job_cpu_cost("rdagent_model") == 8
+    assert research_job_memory_gb("rdagent_model") == 16
+    assert research_job_cpu_cost("rdagent_factor_report") == 4
+    assert research_job_memory_gb("rdagent_factor_report") == 8
+    assert research_job_cpu_cost("rdagent_quant") == 12
+    assert research_job_memory_gb("rdagent_quant") == 20
+    assert research_job_cpu_cost("model_refit") == 0
+    assert research_job_memory_gb("simulation_replay") == 0
+
+
+def test_all_cpu_research_workers_share_one_host_budget() -> None:
+    compose = (Path(__file__).parents[1] / "deploy" / "compose.yaml").read_text(
+        encoding="utf-8"
+    )
+
+    assert compose.count('RESEARCH_CPU_BUDGET: "24"') == 7
+    assert compose.count('RESEARCH_MEMORY_BUDGET_GB: "48"') == 7
+    assert 'WORKER_JOB_KINDS: model_refit,recommendation_refresh,' in compose
+
+
+def test_primary_data_worker_has_hard_limits_and_numerical_thread_caps() -> None:
+    compose = (Path(__file__).parents[1] / "deploy" / "compose.yaml").read_text(
+        encoding="utf-8"
+    )
+    worker_block = compose.split("\n  worker:\n", 1)[1].split(
+        "\n  evaluation-worker:\n", 1
+    )[0]
+
+    assert 'cpus: "16.0"' in worker_block
+    assert "mem_limit: 32g" in worker_block
+    assert "pids_limit: 512" in worker_block
+    assert 'WORKER_CONCURRENCY: "1"' in worker_block
+    assert 'RESEARCH_CPU_BUDGET: "24"' in worker_block
+    assert 'RESEARCH_MEMORY_BUDGET_GB: "48"' in worker_block
+    for variable in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "NUMEXPR_MAX_THREADS",
+    ):
+        assert f'{variable}: "8"' in worker_block

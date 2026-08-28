@@ -164,6 +164,11 @@ def test_role_permission_matrix_is_closed_by_default() -> None:
     )
     assert not has_permission("researcher", permission_for("POST", "/api/factors/id/promote"))
     assert has_permission("operator", permission_for("POST", "/api/schedules"))
+    assert has_permission("operator", permission_for("PUT", "/api/data-automation"))
+    assert has_permission("operator", permission_for("PUT", "/api/autopilot"))
+    assert has_permission(
+        "operator", permission_for("POST", "/api/autopilot/reconcile")
+    )
     assert has_permission(
         "operator", permission_for("POST", "/api/recommendation-portfolios")
     )

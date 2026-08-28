@@ -6,24 +6,133 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-ALLOWED_IMPORT_ROOTS = {"math", "numpy", "pandas"}
+ALLOWED_IMPORT_ROOTS = {"math", "numpy", "os", "pandas", "pathlib"}
 FORBIDDEN_CALLS = {"breakpoint", "compile", "eval", "exec", "input", "open", "__import__"}
+FORBIDDEN_CAPABILITY_METHODS = {
+    "chmod",
+    "chown",
+    "execv",
+    "execve",
+    "listdir",
+    "mkdir",
+    "makedirs",
+    "popen",
+    "read_bytes",
+    "read_text",
+    "remove",
+    "removedirs",
+    "rename",
+    "renames",
+    "rmdir",
+    "scandir",
+    "spawnl",
+    "spawnle",
+    "spawnlp",
+    "spawnlpe",
+    "spawnv",
+    "spawnve",
+    "spawnvp",
+    "spawnvpe",
+    "system",
+    "unlink",
+    "walk",
+    "write_bytes",
+    "write_text",
+}
 FORBIDDEN_FUTURE_METHODS = {"backfill", "bfill"}
 PERIOD_METHODS = {"diff", "pct_change", "shift"}
 FACTOR_RECOMPUTE_EXECUTOR_VERSION = "factor-recompute-v4-pit-prefix-invariance"
 FACTOR_PIT_CONTRACT_VERSION = "factor-pit-prefix-invariance-v1"
+FACTOR_SUBMITTED_INDEX_CONTRACT_VERSION = "factor-submitted-index-prefix-extension-v1"
 FACTOR_PIT_RTOL = 1e-10
 FACTOR_PIT_ATOL = 1e-12
 FACTOR_MIN_DAILY_FINITE = 50
 FACTOR_MIN_COVERAGE_RATIO = 0.80
 FACTOR_MIN_GOOD_DAY_RATE = 0.95
+
+
+def submitted_comparison_is_admissible(
+    comparison: object, *, authoritative_end: str | None = None
+) -> bool:
+    """Accept exact domains or a structurally proven history-prefix extension.
+
+    RD-Agent may execute a causal factor on a bounded suffix of the governed
+    input while the independent evaluator recomputes it over the full history.
+    That is safe only when the submitted coordinates are the *complete tail*
+    of the authoritative coordinates.  Arbitrary interior gaps, a missing
+    tail, or submitted future coordinates are never an admissible subset.
+    """
+
+    if not isinstance(comparison, Mapping) or not (
+        comparison.get("available") is True
+        and comparison.get("exact_match") is True
+    ):
+        return False
+    if comparison.get("index_exact_match") is True:
+        # Preserve immutable exact-index evidence written before the bounded
+        # suffix contract was introduced. Exact equality has no ambiguity.
+        return True
+    if not (
+        comparison.get("contract_version")
+        == FACTOR_SUBMITTED_INDEX_CONTRACT_VERSION
+        and comparison.get("index_subset_match") is True
+        and comparison.get("index_prefix_extension_match") is True
+        and comparison.get("index_difference_kind") == "recomputed_history_prefix"
+        and comparison.get("finite_value_match") is True
+        and comparison.get("warmup_prefix_only") is True
+    ):
+        return False
+    try:
+        submitted_rows = int(comparison["submitted_rows"])
+        recomputed_rows = int(comparison["recomputed_rows"])
+        overlap_rows = int(comparison["overlap_rows"])
+        history_prefix_rows = int(comparison["recomputed_history_prefix_rows"])
+        missing_tail_rows = int(comparison["missing_on_or_after_submitted_start_rows"])
+        unexpected_rows = int(comparison["unexpected_submitted_rows"])
+        submitted_finite_rows = int(comparison["submitted_finite_rows"])
+        warmup_prefix_rows = int(comparison["warmup_prefix_rows"])
+        recomputed_start = pd.Timestamp(str(comparison["recomputed_start"]))
+        submitted_start = pd.Timestamp(str(comparison["submitted_start"]))
+        submitted_end = pd.Timestamp(str(comparison["submitted_end"]))
+        recomputed_end = pd.Timestamp(str(comparison["recomputed_end"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if authoritative_end is not None:
+        try:
+            expected_end = pd.Timestamp(authoritative_end)
+        except (TypeError, ValueError):
+            return False
+        if pd.isna(expected_end) or recomputed_end.normalize() != expected_end.normalize():
+            return False
+    try:
+        date_boundaries_valid = bool(
+            not any(
+                pd.isna(value)
+                for value in (recomputed_start, submitted_start, submitted_end, recomputed_end)
+            )
+            and recomputed_start < submitted_start <= submitted_end
+            and submitted_end == recomputed_end
+        )
+    except TypeError:
+        return False
+    return bool(
+        submitted_rows > 0
+        and submitted_finite_rows > 0
+        and overlap_rows == submitted_rows
+        and recomputed_rows > submitted_rows
+        and history_prefix_rows == recomputed_rows - submitted_rows
+        and missing_tail_rows == 0
+        and unexpected_rows == 0
+        and 0 <= warmup_prefix_rows <= submitted_rows
+        and date_boundaries_valid
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -55,6 +164,8 @@ def validate_factor_code(source: str) -> None:
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
         method = node.func.attr
+        if method in FORBIDDEN_CAPABILITY_METHODS:
+            raise ValueError(f"factor code calls forbidden capability: {method}")
         if method in FORBIDDEN_FUTURE_METHODS:
             raise ValueError(f"factor code calls forward-looking method: {method}")
         if method in PERIOD_METHODS:
@@ -528,22 +639,136 @@ def compare_submitted_values(
     if submitted_path is None or not submitted_path.is_file():
         return {"available": False, "exact_match": False}
     submitted = normalize_factor_values(pd.read_hdf(submitted_path))
+    recomputed = normalize_factor_values(recomputed)
     same_index = submitted.index.equals(recomputed.index)
-    equal = bool(
-        same_index
-        and np.allclose(
-            submitted.iloc[:, 0].to_numpy(dtype=float),
-            recomputed.iloc[:, 0].to_numpy(dtype=float),
-            equal_nan=True,
-            rtol=1e-10,
-            atol=1e-12,
+
+    # RD-Agent commonly exports only its experiment/test slice while the
+    # independent platform recomputation intentionally covers the complete
+    # governed snapshot.  Requiring both frames to have the same domain turns
+    # that legitimate coverage difference into a false value-mismatch.  Keep
+    # value comparison strict, but perform it over every submitted coordinate
+    # and reject any coordinate that the independent recomputation did not
+    # produce.
+    positions = recomputed.index.get_indexer(submitted.index)
+    index_subset_match = bool(len(submitted) > 0 and np.all(positions >= 0))
+    overlap_rows = int(np.count_nonzero(positions >= 0))
+    submitted_dates = pd.DatetimeIndex(submitted.index.get_level_values("datetime"))
+    recomputed_dates = pd.DatetimeIndex(recomputed.index.get_level_values("datetime"))
+    submitted_start = submitted_dates.min() if len(submitted_dates) else pd.NaT
+    submitted_end = submitted_dates.max() if len(submitted_dates) else pd.NaT
+    recomputed_start = recomputed_dates.min() if len(recomputed_dates) else pd.NaT
+    recomputed_end = recomputed_dates.max() if len(recomputed_dates) else pd.NaT
+    recomputed_history_prefix_rows = 0
+    missing_on_or_after_submitted_start_rows = 0
+    unexpected_submitted_rows = max(0, len(submitted) - overlap_rows)
+    index_prefix_extension_match = False
+    if index_subset_match and not pd.isna(submitted_start):
+        suffix_mask = recomputed_dates >= submitted_start
+        recomputed_suffix = recomputed.index[suffix_mask]
+        recomputed_history_prefix_rows = int((~suffix_mask).sum())
+        missing_on_or_after_submitted_start_rows = max(
+            0, len(recomputed_suffix) - overlap_rows
+        )
+        index_prefix_extension_match = bool(submitted.index.equals(recomputed_suffix))
+    equal = False
+    finite_value_match = False
+    warmup_prefix_only = False
+    submitted_finite_rows = 0
+    recomputed_finite_rows_on_submitted_domain = 0
+    warmup_prefix_rows = 0
+    if index_subset_match:
+        submitted_values = submitted.iloc[:, 0].to_numpy(dtype=float)
+        aligned = recomputed.iloc[positions, 0].to_numpy(dtype=float)
+        submitted_finite = np.isfinite(submitted_values)
+        recomputed_finite = np.isfinite(aligned)
+        submitted_finite_rows = int(submitted_finite.sum())
+        recomputed_finite_rows_on_submitted_domain = int(recomputed_finite.sum())
+
+        # RD-Agent's coding sandbox intentionally uses a bounded research
+        # slice.  A causal rolling factor therefore has NaNs at the leading
+        # edge because the sandbox has no pre-slice warm-up rows, while the
+        # authoritative recomputation has the complete governed history.  The
+        # submitted artifact is only reproducibility evidence; the full
+        # recomputation remains authoritative for coverage and scoring.
+        #
+        # Accept that boundary difference only when every submitted finite
+        # value exists and matches, and every recomputed-only finite value is
+        # a strict leading prefix before the first submitted finite value for
+        # the same instrument.  Interior gaps and all-NaN instruments still
+        # fail closed, so a candidate cannot hide mismatches behind NaNs.
+        finite_value_match = bool(
+            submitted_finite_rows > 0
+            and not np.any(submitted_finite & ~recomputed_finite)
+            and np.allclose(
+                submitted_values[submitted_finite],
+                aligned[submitted_finite],
+                equal_nan=False,
+                rtol=1e-10,
+                atol=1e-12,
+            )
+        )
+        missing_from_submitted = ~submitted_finite & recomputed_finite
+        warmup_prefix_rows = int(missing_from_submitted.sum())
+        warmup_prefix_only = True
+        if warmup_prefix_rows:
+            instruments = submitted.index.get_level_values("instrument")
+            for instrument in instruments[missing_from_submitted].unique():
+                instrument_positions = np.flatnonzero(instruments == instrument)
+                instrument_submitted_finite = submitted_finite[instrument_positions]
+                instrument_warmup = missing_from_submitted[instrument_positions]
+                finite_positions = np.flatnonzero(instrument_submitted_finite)
+                warmup_positions = np.flatnonzero(instrument_warmup)
+                if (
+                    not len(finite_positions)
+                    or not len(warmup_positions)
+                    or int(warmup_positions.max()) >= int(finite_positions.min())
+                ):
+                    warmup_prefix_only = False
+                    break
+        equal = bool(
+            finite_value_match
+            and warmup_prefix_only
+            and index_prefix_extension_match
+        )
+    index_difference_kind = (
+        "none"
+        if same_index
+        else (
+            "recomputed_history_prefix"
+            if index_prefix_extension_match
+            else "invalid"
         )
     )
+
+    def boundary(value: pd.Timestamp) -> str | None:
+        return None if pd.isna(value) else pd.Timestamp(value).isoformat()
+
     return {
+        "contract_version": FACTOR_SUBMITTED_INDEX_CONTRACT_VERSION,
         "available": True,
         "submitted_sha256": sha256_file(submitted_path),
         "exact_match": equal,
         "index_exact_match": same_index,
+        "index_subset_match": index_subset_match,
+        "index_prefix_extension_match": index_prefix_extension_match,
+        "index_difference_kind": index_difference_kind,
+        "overlap_rows": overlap_rows,
         "submitted_rows": len(submitted),
         "recomputed_rows": len(recomputed),
+        "recomputed_history_prefix_rows": recomputed_history_prefix_rows,
+        "missing_on_or_after_submitted_start_rows": (
+            missing_on_or_after_submitted_start_rows
+        ),
+        "unexpected_submitted_rows": unexpected_submitted_rows,
+        "submitted_start": boundary(submitted_start),
+        "submitted_end": boundary(submitted_end),
+        "recomputed_start": boundary(recomputed_start),
+        "recomputed_end": boundary(recomputed_end),
+        "submitted_finite_rows": submitted_finite_rows,
+        "recomputed_finite_rows_on_submitted_domain": (
+            recomputed_finite_rows_on_submitted_domain
+        ),
+        "finite_value_match": finite_value_match,
+        "warmup_prefix_only": warmup_prefix_only,
+        "warmup_prefix_rows": warmup_prefix_rows,
     }

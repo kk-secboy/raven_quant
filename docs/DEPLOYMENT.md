@@ -189,21 +189,10 @@ python scripts/restore.py \
 - **升级预检失败：**读取 JSON 报告中的独立 blocker，逐项处理，不要跳过协调备份。
 - **恢复后不健康：**核对密钥指纹、数据卷、数据库 revision 和 Worker 固定版本。
 
-## 9. 可选 QMT 附录
+## 9. 真实交易边界
 
-QMT 插件默认关闭，不属于研究、回测、审批、分配或模拟主线。不启用 QMT，不删除
-插件代码。页面、调度器和模拟任务不得向 QMT 或任何券商网关发单；系统也不提供
-实盘模式。
-
-只有隔离的运维验收需要验证插件自身时，才可复制 `deploy/qmt-gateway.env.example`，
-保持沙箱环境并在 Windows MiniQMT 主机上手工启动：
-
-```powershell
-Copy-Item deploy\qmt-gateway.env.example deploy\qmt-gateway.env
-.\scripts\start_qmt_gateway.ps1
-```
-
-验收完成后停止插件并恢复默认关闭状态。插件不得被 Web、调度器或模拟任务自动启动，
-也不得接收上述主线产生的订单。
+生产发布不打包 QMT 或任何券商网关，也不提供启动脚本、账户配置、Web 开关或自动
+实盘模式。历史沙箱源码仅作为仓库审计材料保留，并由发布上下文明确排除。页面、
+调度器、回测、推荐和模拟任务只能写入 QuantLab 的隔离模拟账本。
 
 返回 [项目入口](../README.md)。

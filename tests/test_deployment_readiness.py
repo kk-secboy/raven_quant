@@ -12,6 +12,7 @@ from quant_data.config import Settings
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_data.qlib_builder import build_qlib_output_manifest
 from quant_platform.auth_store import AuthStore
+from quant_platform.data_automation import DEFAULT_STRATEGY_MINUTE_SYMBOLS
 from quant_platform.data_task_store import DataTaskStore
 from quant_platform.deployment_readiness import (
     RESEARCH_MINIMUM_TRADING_DAYS,
@@ -215,7 +216,7 @@ def _create_governed_schedule_suite(
                 "batch_size": 50,
                 "major_news_per_day": 40,
                 "irm_per_instrument_day": 2,
-                "include_event_labels": False,
+                "include_event_labels": True,
                 "include_factor_evaluation": False,
                 "horizons": [1, 3, 5, 20],
                 "benchmark_code": "000300.SH",
@@ -230,6 +231,18 @@ def _create_governed_schedule_suite(
                 "sources": ["major_news_mentions", "news_flash", "report_rc"],
                 "weekday": 4,
                 "factor_evaluation": evaluation,
+            },
+        ),
+        (
+            "governed daily auxiliary research data publication",
+            "auxiliary_data_pipeline",
+            time(4, 0),
+            False,
+            {
+                "history_start": "2024-01-01",
+                "max_stocks": 100,
+                "max_options": 100,
+                "strategy_minute_symbols": list(DEFAULT_STRATEGY_MINUTE_SYMBOLS),
             },
         ),
     )
@@ -312,7 +325,7 @@ def test_readiness_accepts_one_governed_full_data_pipeline(
     assert check["details"]["incremental_sync_ids"] == []
 
 
-def test_readiness_accepts_exact_governed_four_schedule_suite(
+def test_readiness_accepts_exact_governed_five_schedule_suite(
     tmp_path: Path, monkeypatch, database_url: str
 ) -> None:
     data_root = tmp_path / "data"
@@ -330,6 +343,7 @@ def test_readiness_accepts_exact_governed_four_schedule_suite(
         "information_pipeline",
         "information_factor_refresh",
         "ashare_5m_sync",
+        "auxiliary_data_pipeline",
     }
     assert all(
         len(ids) == 1 for ids in check["details"]["governed_suite_ids"].values()
@@ -362,7 +376,7 @@ def test_readiness_rejects_schedule_suite_time_drift(
     DataTaskStore(database_url).sync_catalog()
     _qlib_dataset(data_root)
     _create_governed_schedule_suite(
-        database_url, minute_run_time=time(23, 0)
+        database_url, minute_run_time=time(15, 0)
     )
 
     check = _data_schedule_check(settings)

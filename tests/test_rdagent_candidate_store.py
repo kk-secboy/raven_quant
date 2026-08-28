@@ -140,6 +140,7 @@ def test_candidate_schema_is_additive_immutable_and_non_capital() -> None:
     assert "feature_set_definition_sha256" in model_candidates.c
     assert "bundle_manifest_sha256" in quant_bundle_candidates.c
     assert "feature_set_definition_sha256" in quant_bundle_candidates.c
+    assert "model_ensemble_candidate_id" in quant_bundle_candidates.c
     model_checks = {
         str(constraint.sqltext)
         for constraint in model_candidates.constraints
@@ -157,6 +158,12 @@ def test_candidate_schema_is_additive_immutable_and_non_capital() -> None:
     }
     assert "capital_eligible = false" in model_checks
     assert "capital_eligible = false" in quant_checks
+    assert any(
+        "model_candidate_id IS NOT NULL"
+        in value
+        and "model_ensemble_candidate_id IS NOT NULL" in value
+        for value in quant_checks
+    )
     assert "oos_vintage_id IS NULL" in evaluation_checks
 
 

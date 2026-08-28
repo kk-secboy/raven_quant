@@ -1,18 +1,30 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
+    factor_candidates,
+    factor_evaluations,
+    oos_vintages,
     open_database,
+    research_campaigns,
     research_program_events,
     research_programs,
     row_dict,
 )
+
+_FINAL_OOS_STAGES = {
+    "final_backtest",
+    "strategy_approval",
+    "recommendation_portfolio",
+    "recommendation_schedule",
+    "complete",
+}
 
 
 def _now() -> datetime:
@@ -290,6 +302,139 @@ class ResearchProgramStore:
             )
         return self.get(program_id)
 
+    def irreversible_final_oos_windows(
+        self, program_id: str
+    ) -> list[dict[str, Any]]:
+        """Return every final-OOS window already opened by a research program.
+
+        Campaign success is deliberately not the authority here.  Creating a
+        formal final backtest consumes the final sample before that backtest can
+        later succeed or fail.  The OOS ledger is authoritative; campaign links,
+        stages and factor-evaluation consumption markers are retained as
+        fail-closed recovery evidence for legacy or partially settled runs.
+        """
+
+        scope = f"program:{program_id}"
+        with self.engine.connect() as connection:
+            if connection.scalar(
+                select(research_programs.c.id).where(
+                    research_programs.c.id == program_id
+                )
+            ) is None:
+                raise KeyError(program_id)
+            ledger_rows = connection.execute(
+                select(oos_vintages).where(oos_vintages.c.scope == scope)
+            ).all()
+            campaign_rows = connection.execute(
+                select(research_campaigns).where(
+                    research_campaigns.c.research_program_id == program_id
+                )
+            ).all()
+            marker_campaign_ids = {
+                str(value)
+                for value in connection.execute(
+                    select(research_campaigns.c.id)
+                    .distinct()
+                    .select_from(
+                        research_campaigns.join(
+                            factor_candidates,
+                            factor_candidates.c.research_run_id
+                            == research_campaigns.c.research_run_id,
+                        ).join(
+                            factor_evaluations,
+                            factor_evaluations.c.factor_candidate_id
+                            == factor_candidates.c.id,
+                        )
+                    )
+                    .where(
+                        research_campaigns.c.research_program_id == program_id,
+                        factor_evaluations.c.final_test_consumed_at.is_not(None),
+                    )
+                ).scalars()
+            }
+
+        windows: dict[tuple[date, date], dict[str, Any]] = {}
+
+        def add_window(
+            start: date,
+            end: date,
+            *,
+            source: str,
+            campaign_id: str | None = None,
+        ) -> None:
+            if start > end:
+                raise ValueError(
+                    f"research program {program_id} has an invalid final-OOS window"
+                )
+            key = (start, end)
+            entry = windows.setdefault(
+                key,
+                {
+                    "test_start": start.isoformat(),
+                    "test_end": end.isoformat(),
+                    "sources": [],
+                    "campaign_ids": [],
+                },
+            )
+            if source not in entry["sources"]:
+                entry["sources"].append(source)
+            if campaign_id and campaign_id not in entry["campaign_ids"]:
+                entry["campaign_ids"].append(campaign_id)
+
+        for row in ledger_rows:
+            add_window(
+                row.test_start,
+                row.test_end,
+                source="oos_vintage_ledger",
+            )
+
+        for row in campaign_rows:
+            campaign_id = str(row.id)
+            state = dict(row.state_json or {})
+            has_formal_backtest = bool(
+                row.backtest_id or state.get("final_backtest_id")
+            )
+            has_consumption_marker = campaign_id in marker_campaign_ids
+            irreversible = bool(
+                row.status == "succeeded"
+                or row.stage in _FINAL_OOS_STAGES
+                or has_formal_backtest
+                or has_consumption_marker
+            )
+            if not irreversible:
+                continue
+            config = dict(row.config_json or {})
+            periods = config.get("backtest_periods")
+            if not isinstance(periods, dict):
+                raise ValueError(
+                    f"campaign {campaign_id} opened final OOS without frozen periods"
+                )
+            try:
+                start = date.fromisoformat(str(periods["start"]))
+                end = date.fromisoformat(str(periods["end"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"campaign {campaign_id} has invalid frozen final-OOS periods"
+                ) from exc
+            sources = []
+            if row.status == "succeeded":
+                sources.append("campaign_succeeded")
+            if row.stage in _FINAL_OOS_STAGES:
+                sources.append("campaign_final_stage")
+            if has_formal_backtest:
+                sources.append("formal_backtest_created")
+            if has_consumption_marker:
+                sources.append("factor_consumption_marker")
+            for source in sources:
+                add_window(
+                    start,
+                    end,
+                    source=source,
+                    campaign_id=campaign_id,
+                )
+
+        return [windows[key] for key in sorted(windows)]
+
     def set_status(self, program_id: str, status: str, *, actor: str) -> dict[str, Any]:
         if status not in {"active", "paused", "cancelled"}:
             raise ValueError("program status must be active, paused, or cancelled")
@@ -346,6 +491,60 @@ class ResearchProgramStore:
                 event_type="program.check_requested",
                 actor=actor,
                 payload={},
+            )
+        return self.get(program_id)
+
+    def rebase_lineage(
+        self,
+        program_id: str,
+        *,
+        dataset: dict[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        """Move a research policy to a compatible immutable lineage with audit."""
+
+        new_lineage_id = str(dataset.get("lineage_id") or "")
+        provenance = dataset.get("provenance") or {}
+        contract_sha256 = str(provenance.get("dataset_contract_sha256") or "")
+        if len(new_lineage_id) != 64 or len(contract_sha256) != 64:
+            raise ValueError("research lineage rebase requires sealed dataset contracts")
+        current = _now()
+        with self.engine.begin() as connection:
+            row = connection.execute(
+                select(research_programs)
+                .where(research_programs.c.id == program_id)
+                .with_for_update()
+            ).first()
+            if row is None:
+                raise KeyError(program_id)
+            old_lineage_id = str(row.dataset_lineage_id)
+            if old_lineage_id == new_lineage_id:
+                return self.get(program_id)
+            connection.execute(
+                update(research_programs)
+                .where(research_programs.c.id == program_id)
+                .values(
+                    dataset_lineage_id=new_lineage_id,
+                    last_message=f"数据契约未变，已审计切换至 {dataset['name']} 的新血缘",
+                    next_check_at=current,
+                    lease_until=None,
+                    updated_at=current,
+                )
+            )
+            self._event(
+                connection,
+                program_id=program_id,
+                event_type="program.lineage_rebased",
+                actor=actor,
+                payload={
+                    "from_lineage_id": old_lineage_id,
+                    "to_lineage_id": new_lineage_id,
+                    "dataset": dataset["name"],
+                    "dataset_identity_sha256": provenance.get(
+                        "dataset_identity_sha256"
+                    ),
+                    "dataset_contract_sha256": contract_sha256,
+                },
             )
         return self.get(program_id)
 

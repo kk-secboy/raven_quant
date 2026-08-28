@@ -1,13 +1,73 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from quant_data.checkpoint import CheckpointStore
+from quant_data.database import jobs, open_database
 from quant_data.models import FetchSpec, UnitResult
 from quant_data.supplemental_data import SUPPORTED_BUNDLES, bundle_datasets
 from quant_platform.api import create_app
 from quant_platform.data_task_store import DATA_TASK_CATALOG, DataTaskStore
 from quant_platform.job_store import JobStore
+
+
+def test_recover_interrupted_requeues_with_warmup_without_resetting_attempts(
+    database_url: str, tmp_path: Path
+) -> None:
+    store = JobStore(database_url)
+    created = store.create(
+        "data_qlib",
+        {"snapshot_name": "recoverable"},
+        tmp_path / "recoverable.log",
+        max_attempts=3,
+    )
+    claimed = store.claim_next(("data_qlib",))
+    assert claimed is not None and claimed["id"] == created["id"]
+    before = datetime.now(UTC)
+
+    assert store.recover_interrupted(("data_qlib",)) == 1
+
+    recovered = store.get(created["id"])
+    assert recovered["status"] == "queued"
+    assert recovered["attempts"] == 1
+    assert recovered["started_at"] is None
+    assert recovered["finished_at"] is None
+    assert recovered["next_attempt_at"] is not None
+    assert recovered["next_attempt_at"] >= before + timedelta(seconds=119)
+    assert store.claim_next(("data_qlib",)) is None
+
+
+def test_recover_interrupted_fails_job_at_bounded_attempt_limit(
+    database_url: str, tmp_path: Path
+) -> None:
+    store = JobStore(database_url)
+    created = store.create(
+        "data_qlib",
+        {"snapshot_name": "exhausted"},
+        tmp_path / "exhausted.log",
+        max_attempts=1,
+    )
+    claimed = store.claim_next(("data_qlib",))
+    assert claimed is not None and claimed["id"] == created["id"]
+
+    assert store.recover_interrupted(("data_qlib",)) == 1
+
+    recovered = store.get(created["id"])
+    assert recovered["status"] == "failed"
+    assert recovered["attempts"] == 1
+    assert recovered["exit_code"] == 143
+    assert recovered["next_attempt_at"] is None
+    assert recovered["finished_at"] is not None
+    assert "bounded attempt limit" in recovered["error"]
+
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        persisted_status = connection.scalar(
+            select(jobs.c.status).where(jobs.c.id == created["id"])
+        )
+    assert persisted_status == "failed"
 
 
 def test_catalog_is_ordered_and_dependency_aware(database_url: str) -> None:

@@ -48,6 +48,12 @@ type EventStressReport = {
 const pct = (value: unknown) => typeof value === "number" ? `${(value * 100).toFixed(2)}%` : "—";
 const decimal = (value: unknown) => typeof value === "number" ? value.toFixed(3) : "—";
 
+async function jsonResponse<T>(request: Promise<Response>): Promise<T> {
+  const response = await request;
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json() as Promise<T>;
+}
+
 export function BacktestPanel({ api }: { api: string }) {
   const [view, setView] = useState("create");
   const [factors, setFactors] = useState<Factor[]>([]);
@@ -101,6 +107,7 @@ export function BacktestPanel({ api }: { api: string }) {
   const [end, setEnd] = useState(new Date().toISOString().slice(0, 10));
   const [approvalReason, setApprovalReason] = useState("");
   const [message, setMessage] = useState("");
+  const [loadMessage, setLoadMessage] = useState("");
   const [serverDefaults, setServerDefaults] = useState<Record<string, number | string>>({});
   const defaultsApplied = useRef(false);
 
@@ -143,56 +150,77 @@ export function BacktestPanel({ api }: { api: string }) {
   }
 
   async function load() {
-    try {
-      const responses = await Promise.all([
-        apiFetch(`${api}/api/factors?status=promoted`, { cache: "no-store" }),
-        apiFetch(`${api}/api/qlib/datasets`, { cache: "no-store" }),
-        apiFetch(`${api}/api/strategies`, { cache: "no-store" }),
-        apiFetch(`${api}/api/backtests`, { cache: "no-store" }),
-        apiFetch(`${api}/api/settings/strategy-defaults`, { cache: "no-store" }),
-        apiFetch(`${api}/api/strategy-recipes`, { cache: "no-store" }),
-      ]);
-      const nextFactors = await responses[0].json();
-      const nextDatasets = await responses[1].json();
-      const nextStrategies = await responses[2].json();
-      setFactors(nextFactors);
-      setDatasets(nextDatasets);
-      setStrategies(nextStrategies);
-      setBacktests(await responses[3].json());
-      const defaults = await responses[4].json();
-      if (!responses[4].ok) throw new Error(defaults.detail ?? "strategy defaults unavailable");
-      setServerDefaults(defaults.config);
-      const recipeBody: { recipes: StrategyRecipe[] } = await responses[5].json();
-      setRecipes(recipeBody.recipes.filter((item) => item.category === "multifactor"));
-      if (!defaultsApplied.current) {
-        applyVisibleConfig(defaults.config as Record<string, number | string>);
-        defaultsApplied.current = true;
-      }
-      if (!Object.keys(selectedFactors).length && nextFactors.length) {
-        setSelectedFactors({ [nextFactors[0].id]: 1 });
-      }
-      if (!dataset && nextDatasets.length) {
-        const eligible = nextDatasets.find((item: Dataset) =>
-          item.ready && item.reproducible && item.frequency === "day",
-        );
-        if (eligible) {
-          setDataset(eligible.name);
-          setStart(eligible.start_date);
-          setEnd(eligible.end_date);
-        }
-      }
-      if (!executionDataset) {
-        const eligibleExecution = nextDatasets.find((item: Dataset) =>
-          item.ready && item.reproducible && ["1min", "5min"].includes(item.frequency),
-        );
-        if (eligibleExecution) setExecutionDataset(eligibleExecution.name);
-      }
-      if (!selectedVersion && nextStrategies.length) {
-        setSelectedVersion(nextStrategies[0].versions[0]?.id ?? "");
-      }
-    } catch {
-      setMessage("无法读取策略控制面，请确认 Python 后端正在运行。");
-    }
+    const resources = [
+      {
+        label: "因子",
+        request: jsonResponse<Factor[]>(apiFetch(`${api}/api/factors?status=promoted`, { cache: "no-store" })).then((nextFactors) => {
+          setFactors(nextFactors);
+          setSelectedFactors((current) => Object.keys(current).length || !nextFactors.length
+            ? current
+            : { [nextFactors[0].id]: 1 });
+        }),
+      },
+      {
+        label: "Qlib 数据集",
+        request: jsonResponse<Dataset[]>(apiFetch(`${api}/api/qlib/datasets`, { cache: "no-store" })).then((nextDatasets) => {
+          setDatasets(nextDatasets);
+          const eligible = nextDatasets.find((item) =>
+            item.ready && item.reproducible && item.frequency === "day",
+          );
+          if (!dataset && eligible) {
+            setDataset(eligible.name);
+            setStart(eligible.start_date);
+            setEnd(eligible.end_date);
+          }
+          if (!executionDataset) {
+            const eligibleExecution = nextDatasets.find((item) =>
+              item.ready && item.reproducible && ["1min", "5min"].includes(item.frequency),
+            );
+            if (eligibleExecution) setExecutionDataset(eligibleExecution.name);
+          }
+        }),
+      },
+      {
+        label: "策略",
+        request: jsonResponse<Strategy[]>(apiFetch(`${api}/api/strategies`, { cache: "no-store" })).then((nextStrategies) => {
+          setStrategies(nextStrategies);
+          if (!selectedVersion && nextStrategies.length) {
+            setSelectedVersion(nextStrategies[0].versions[0]?.id ?? "");
+          }
+        }),
+      },
+      {
+        label: "回测",
+        request: jsonResponse<Backtest[]>(apiFetch(`${api}/api/backtests`, { cache: "no-store" })).then(setBacktests),
+      },
+      {
+        label: "策略默认值",
+        request: jsonResponse<{ config: Record<string, number | string> }>(
+          apiFetch(`${api}/api/settings/strategy-defaults`, { cache: "no-store" }),
+        ).then((defaults) => {
+          setServerDefaults(defaults.config);
+          if (!defaultsApplied.current) {
+            applyVisibleConfig(defaults.config);
+            defaultsApplied.current = true;
+          }
+        }),
+      },
+      {
+        label: "策略配方",
+        request: jsonResponse<{ recipes: StrategyRecipe[] }>(
+          apiFetch(`${api}/api/strategy-recipes`, { cache: "no-store" }),
+        ).then((body) => setRecipes(body.recipes.filter((item) => item.category === "multifactor"))),
+      },
+    ];
+    const results = await Promise.allSettled(resources.map((item) => item.request));
+    const failed = results.flatMap((result, index) => result.status === "rejected" ? [resources[index].label] : []);
+    setLoadMessage(
+      failed.length === 0
+        ? ""
+        : failed.length === resources.length
+          ? "策略控制面暂时无法更新，仍保留上次成功数据。"
+          : `部分数据暂未更新，已保留上次成功内容：${failed.join("、")}。`,
+    );
   }
 
   usePolling(load, 8000);
@@ -379,6 +407,7 @@ export function BacktestPanel({ api }: { api: string }) {
     ? metrics.event_stress as EventStressReport : null;
   const selectedRecipe = recipes.find((item) => item.id === recipeId);
   return <>
+    {loadMessage && <div className="notice">{loadMessage}</div>}
     {message && <div className="notice">{message}</div>}
     <div className="page-tabs" role="tablist" aria-label="回测工作区">
       {[["create", "新建回测"], ["results", "结果与压力测试"], ["experiments", "参数实验"], ["history", "运行记录"]].map(([value, label]) => <button type="button" role="tab" aria-selected={view === value} className={view === value ? "active" : ""} onClick={() => setView(value)} key={value}>{label}</button>)}

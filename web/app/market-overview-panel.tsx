@@ -98,6 +98,46 @@ function shortDate(value: string | null | undefined) {
   return Number.isNaN(parsed.getTime()) ? value : `${parsed.getMonth() + 1}/${parsed.getDate()}`;
 }
 
+function MarketOverviewSkeleton() {
+  return <div className="market-page market-skeleton" aria-busy="true" aria-label="正在读取研究行情">
+    <section className="market-source-bar" aria-hidden="true">
+      <div><i className="skeleton-dot" /><span className="skeleton-line wide" /></div>
+      <div><span className="skeleton-line short" /><strong className="skeleton-line medium" /></div>
+      <div><span className="skeleton-line short" /><strong className="skeleton-line medium" /></div>
+      <div className="market-source-name"><span className="skeleton-line short" /><strong className="skeleton-line wide" /></div>
+      <span className="skeleton-button" />
+    </section>
+
+    <section className="market-hero" aria-hidden="true">
+      <article className="breadth-card">
+        <div className="market-card-heading"><div><span className="skeleton-line short" /><span className="skeleton-line heading" /></div><span className="skeleton-line short" /></div>
+        <div className="market-skeleton-breadth"><span className="skeleton-circle" /><div><span className="skeleton-line heading" /><span className="skeleton-line medium" /><span className="skeleton-line short" /></div></div>
+        <div className="market-skeleton-footer"><span /><span /><span /></div>
+      </article>
+      <article className="index-board">
+        <div className="market-card-heading"><div><span className="skeleton-line short" /><span className="skeleton-line heading" /></div><span className="skeleton-line short" /></div>
+        <div className="index-grid">{[0, 1, 2, 3].map((item) => <div className="index-tile" key={item}><span className="skeleton-line medium" /><strong className="skeleton-line heading" /><em className="skeleton-line short" /><small className="skeleton-line medium" /></div>)}</div>
+      </article>
+    </section>
+
+    <section className="market-stat-strip" aria-hidden="true">
+      {[0, 1, 2, 3, 4, 5].map((item) => <article key={item}><span className="skeleton-line medium" /><strong className="skeleton-line short" /></article>)}
+    </section>
+
+    <section className="market-grid" aria-hidden="true">
+      {["pulse-card", "sector-card", "asset-list-card", "asset-list-card"].map((kind, index) => <article className={`market-card ${kind}`} key={`${kind}-${index}`}>
+        <div className="market-card-heading"><div><span className="skeleton-line heading" /><span className="skeleton-line wide" /></div></div>
+        <div className="market-skeleton-rows">{[0, 1, 2, 3, 4].map((row) => <div key={row}><span className="skeleton-line medium" /><span className="skeleton-line short" /></div>)}</div>
+      </article>)}
+    </section>
+
+    <section className="market-card watchlist-card" aria-hidden="true">
+      <div className="market-card-heading"><div><span className="skeleton-line heading" /><span className="skeleton-line wide" /></div><span className="skeleton-button wide" /></div>
+      <div className="market-skeleton-table">{[0, 1, 2].map((row) => <div key={row}>{[0, 1, 2, 3, 4, 5].map((cell) => <span className="skeleton-line" key={cell} />)}</div>)}</div>
+    </section>
+  </div>;
+}
+
 export function MarketOverviewPanel({ api, onOpenData }: MarketOverviewPanelProps) {
   const [market, setMarket] = useState<MarketOverview | null>(null);
   const [loading, setLoading] = useState(true);
@@ -107,7 +147,10 @@ export function MarketOverviewPanel({ api, onOpenData }: MarketOverviewPanelProp
 
   const refresh = useCallback(async (forceRefresh = false) => {
     try {
-      const response = await apiFetch(`${api}/api/market/overview?symbols=${encodeURIComponent(querySymbols)}`, {
+      const query = querySymbols === defaultWatchlist
+        ? ""
+        : `?symbols=${encodeURIComponent(querySymbols)}`;
+      const response = await apiFetch(`${api}/api/market/overview${query}`, {
         cache: "no-store",
         forceRefresh,
       });
@@ -137,7 +180,7 @@ export function MarketOverviewPanel({ api, onOpenData }: MarketOverviewPanelProp
   }
 
   if (loading && !market) {
-    return <section className="market-empty"><span className="market-loading" /><h2>正在整理研究行情</h2><p>从最新不可变快照读取指数、市场宽度和资产行情。</p></section>;
+    return <MarketOverviewSkeleton />;
   }
 
   if (!market || market.status !== "ready") {

@@ -502,6 +502,7 @@ def test_worker_import_ledgers_failed_evaluations(
     store = ResearchStore(database_url)
     run, candidate = _unevaluated_candidate(store, tmp_path)
     job = {
+        "id": "factor-evaluate-attempt-a",
         "payload": {
             "research_run_id": run["id"],
             "dataset": "snapshot",
@@ -511,7 +512,15 @@ def test_worker_import_ledgers_failed_evaluations(
     }
     result = {
         "evaluations": [
-            {"candidate_id": candidate["id"], "status": "failed", "error": "recompute timeout"}
+            {
+                "candidate_id": candidate["id"],
+                "status": "failed",
+                "error": "recompute timeout",
+                "periods": {
+                    **job["payload"]["periods"],
+                    "generated_at": "00:00:00",
+                },
+            }
         ]
     }
     worker._import_factor_evaluations(job, result)

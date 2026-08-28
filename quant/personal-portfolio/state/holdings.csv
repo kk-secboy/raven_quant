@@ -1,0 +1,3 @@
+as_of,ticker,name,quantity,cost_cny,verification_status,source
+2026-08-12,000636.SZ,风华高科,1400,65.616,CONFIRMED_BY_NAME_AND_MARKET_MATCH,user_message_2026-08-12
+2026-08-12,600667.SH,太极实业,1000,22.655,CONFIRMED_BY_EXACT_NAME,user_message_2026-08-12

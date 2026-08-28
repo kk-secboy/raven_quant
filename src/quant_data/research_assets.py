@@ -1879,6 +1879,35 @@ def ingest_research_assets(
     )
 
 
+def research_report_dates_in_snapshot(
+    data_root: Path,
+    *,
+    snapshot_name: str,
+    start: date,
+    end: date,
+    as_of: date,
+) -> list[date]:
+    """List PIT-eligible report dates from a verified isolated snapshot."""
+
+    if start > end or end > as_of:
+        raise ValueError("research-report backfill date range is invalid")
+    snapshot_path, manifest = _load_verified_snapshot(data_root, snapshot_name)
+    rows = _read_snapshot_rows(snapshot_path, manifest, "research_report")
+    open_days = _read_snapshot_trade_calendar(snapshot_path, manifest)
+    eligible: set[date] = set()
+    for row in rows:
+        report_date = _parse_source_date(row.get("trade_date"))
+        if not start <= report_date <= end:
+            continue
+        try:
+            available = _next_open_day(report_date, open_days)
+        except LookupError:
+            continue
+        if available <= as_of:
+            eligible.add(report_date)
+    return sorted(eligible, reverse=True)
+
+
 def _load_verified_snapshot(
     data_root: Path,
     snapshot_name: str,
@@ -2891,12 +2920,19 @@ def _reject_non_public_peer(response: Any) -> None:
 
 
 def _parse_source_date(value: object) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
     text = str(value or "").strip()
-    for format_string in ("%Y%m%d", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text, format_string).date()
-        except ValueError:
-            continue
+    try:
+        return datetime.strptime(text, "%Y%m%d").date()
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        pass
     raise ValueError(f"invalid source date: {text or '<blank>'}")
 
 

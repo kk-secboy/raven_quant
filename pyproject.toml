@@ -44,10 +44,9 @@ quant-db = "quant_platform.db_cli:app"
 quant-worker = "quant_platform.worker_cli:app"
 quant-scheduler = "quant_platform.scheduler_cli:app"
 quant-web = "quant_platform.cli:app"
-quant-broker-gateway = "quant_broker_gateway.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/quant_data", "src/quant_platform", "src/quant_broker_gateway"]
+packages = ["src/quant_data", "src/quant_platform"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

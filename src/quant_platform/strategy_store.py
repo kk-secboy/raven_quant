@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from math import isfinite
@@ -15,10 +15,13 @@ from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
     backtest_runs,
+    capital_oos_alpha_batches,
     factor_candidates,
     factor_evaluations,
     model_artifacts,
     model_candidates,
+    model_ensemble_candidates,
+    model_ensemble_evaluations,
     model_evaluations,
     oos_vintages,
     open_database,
@@ -40,20 +43,33 @@ from quant_data.execution_contract import (
     require_strategy_execution_contract,
     strategy_execution_contract_hash,
 )
+from quant_platform.alpha_spending_ledger import (
+    CapitalOOSAlphaLedgerStore,
+    capital_oos_vintage_link_payload,
+)
+from quant_platform.capital_oos_receipt import (
+    require_capital_oos_receipt,
+)
+from quant_platform.capital_oos_receipt import (
+    sha256_file as capital_oos_sha256_file,
+)
 from quant_platform.cost_model import KNOWN_COST_SCHEDULE_VERSIONS, CostModelConfig
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
+from quant_platform.factor_library_store import validate_incremental_evidence
 from quant_platform.factor_recompute import (
     FACTOR_MIN_COVERAGE_RATIO,
     FACTOR_MIN_DAILY_FINITE,
     FACTOR_MIN_GOOD_DAY_RATE,
     FACTOR_PIT_CONTRACT_VERSION,
     FACTOR_RECOMPUTE_EXECUTOR_VERSION,
+    submitted_comparison_is_admissible,
 )
 from quant_platform.formal_validation import (
     FORMAL_VALIDATION_CONTRACT_VERSION,
     PRE_FINAL_HISTORY_CONTRACT_VERSION,
     SIGNAL_DECAY_FRONTIER_VERSION,
 )
+from quant_platform.model_ensemble import prediction_grid_from_admission
 from quant_platform.model_research_governance import (
     MODEL_REFIT_POLICY,
     MODEL_REFIT_POLICY_SHA256,
@@ -70,6 +86,7 @@ from quant_platform.model_strategy_contract import (
     MODEL_FACTOR_VALIDATION_NOT_APPLICABLE_STATUS,
     QUANT_BUNDLE_FACTOR_CONTRACT_VERSION,
     QUANT_BUNDLE_FACTOR_WEIGHT_POLICY,
+    build_model_ensemble_formal_admission_binding,
     build_model_formal_admission_binding,
     formal_model_artifact_failures,
     model_signal_identity,
@@ -87,12 +104,13 @@ from quant_platform.qlib_factor_baseline import (
     bind_factor_source_config,
 )
 from quant_platform.qlib_workflow import require_qlib_workflow_identity
+from quant_platform.research_store import FactorGatePolicy
 from quant_platform.statistical_validation import DEFLATED_SHARPE_METHOD_VERSION
 from quant_platform.strategy_artifact_manifest import (
     STRATEGY_BACKTEST_ARTIFACT_MANIFEST_VERSION,
     validate_backtest_artifact_manifest,
 )
-from quant_platform.strategy_catalog import require_capital_eligible_strategy_type
+from quant_platform.strategy_catalog import strategy_type_capabilities
 from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
 
@@ -113,6 +131,186 @@ def _is_sha256(value: Any) -> bool:
 def _canonical_sha256(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _factor_evaluation_artifact_metrics(
+    path_value: str,
+    *,
+    candidate_id: str,
+    profile_id: str | None,
+) -> dict[str, Any]:
+    path = Path(path_value)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Qlib factor evaluation artifact is unreadable") from exc
+    require_qlib_workflow_identity(
+        payload.get("qlib_workflow") if isinstance(payload, dict) else None
+    )
+    evaluations = payload.get("evaluations") if isinstance(payload, dict) else None
+    matches = [
+        item
+        for item in evaluations or []
+        if isinstance(item, dict)
+        and str(item.get("candidate_id") or "") == candidate_id
+        and item.get("status") == "ok"
+        and (
+            profile_id is None
+            or str(((item.get("metrics") or {}).get("research_profile") or {}).get("id") or "")
+            == profile_id
+        )
+    ]
+    if len(matches) != 1 or not isinstance(matches[0].get("metrics"), dict):
+        raise ValueError("Qlib factor evaluation artifact has no unique governed result")
+    return dict(matches[0]["metrics"])
+
+
+def _validate_governed_factor_evaluation(
+    evaluation: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    expected_profile_id: str | None,
+    require_gate_passed: bool,
+) -> dict[str, Any]:
+    """Revalidate immutable PIT, recompute and policy evidence at strategy use."""
+
+    candidate_id = str(candidate["id"])
+    policy = FactorGatePolicy()
+    if (
+        str(evaluation.get("factor_candidate_id") or "") != candidate_id
+        or evaluation.get("is_legacy") is True
+        or evaluation.get("evaluator_version") != policy.version
+        or evaluation.get("candidate_code_sha256") != candidate.get("code_sha256")
+        or evaluation.get("candidate_values_sha256") != candidate.get("values_sha256")
+        or evaluation.get("recomputed_values_sha256") != candidate.get("values_sha256")
+    ):
+        raise ValueError(f"promoted factor {candidate_id} evaluation binding is invalid")
+    metrics = evaluation.get("metrics_json")
+    expected_policy = asdict(policy)
+    if (
+        not isinstance(metrics, dict)
+        or _canonical_sha256(metrics) != evaluation.get("metrics_sha256")
+        or evaluation.get("policy_json") != expected_policy
+        or _canonical_sha256(expected_policy) != evaluation.get("policy_sha256")
+    ):
+        raise ValueError(f"promoted factor {candidate_id} evaluation provenance is invalid")
+    gate_status, gate_reasons = policy.evaluate(metrics)
+    layers = policy.evaluate_layers(metrics)
+    if (
+        layers["hard_status"] != "passed"
+        or evaluation.get("gate_status") != gate_status
+        or list(evaluation.get("gate_reasons_json") or []) != gate_reasons
+        or (require_gate_passed and gate_status != "passed")
+    ):
+        raise ValueError(f"promoted factor {candidate_id} no longer passes its governed gate")
+    profile_id = str(((metrics.get("research_profile") or {}).get("id")) or "") or None
+    if expected_profile_id is not None and profile_id != expected_profile_id:
+        raise ValueError(f"promoted factor {candidate_id} profile identity changed")
+    periods = {
+        key: evaluation[key].isoformat()
+        for key in (
+            "train_start",
+            "train_end",
+            "valid_start",
+            "valid_end",
+            "test_start",
+            "test_end",
+        )
+    }
+    recompute = evaluation.get("recompute_evidence_json")
+    pit = recompute.get("pit_invariance") if isinstance(recompute, dict) else None
+    boundary = (
+        recompute.get("research_data_boundary") if isinstance(recompute, dict) else None
+    )
+    comparison = (
+        recompute.get("submitted_comparison") if isinstance(recompute, dict) else None
+    )
+    if not (
+        isinstance(recompute, dict)
+        and recompute.get("executor_version") == FACTOR_RECOMPUTE_EXECUTOR_VERSION
+        and recompute.get("sandbox_mode") == "docker-isolated"
+        and str(recompute.get("sandbox_image_id") or "").startswith("sha256:")
+        and len(str(recompute.get("sandbox_image_id") or "")) == 71
+        and recompute.get("network_mode") == "none"
+        and recompute.get("root_filesystem_read_only") is True
+        and recompute.get("capabilities_dropped") == "ALL"
+        and recompute.get("no_new_privileges") is True
+        and recompute.get("code_sha256") == candidate.get("code_sha256")
+        and recompute.get("dataset_identity_sha256")
+        == evaluation.get("dataset_identity_sha256")
+        and recompute.get("authoritative_values_sha256")
+        == evaluation.get("recomputed_values_sha256")
+        and int(recompute.get("label_horizon_days") or 0)
+        == int(candidate.get("label_horizon_days") or 1)
+        and bool(recompute.get("provider_input_sha256"))
+        and recompute.get("periods") == periods
+        and isinstance(pit, dict)
+        and pit.get("contract_version") == FACTOR_PIT_CONTRACT_VERSION
+        and pit.get("status") == "passed"
+        and int(pit.get("cutpoint_count") or 0) >= 3
+        and isinstance(pit.get("checks"), list)
+        and len(pit["checks"]) == int(pit["cutpoint_count"])
+        and all(
+            isinstance(item, dict) and item.get("invariant") is True
+            for item in pit["checks"]
+        )
+        and isinstance(boundary, dict)
+        and boundary.get("valid_end") == periods["valid_end"]
+        and boundary.get("test_start") == periods["test_start"]
+        and boundary.get("final_oos_observations_exposed") is False
+        and str(boundary.get("latest_input_date") or "") <= periods["valid_end"]
+        and submitted_comparison_is_admissible(
+            comparison,
+            authoritative_end=str(boundary.get("latest_input_date") or ""),
+        )
+        and str((comparison or {}).get("submitted_sha256") or "")
+        == str(evaluation.get("submitted_values_sha256") or "")
+    ):
+        raise ValueError(f"promoted factor {candidate_id} lacks strict PIT/recompute evidence")
+    artifact_path = Path(str(evaluation.get("artifact_path") or ""))
+    if (
+        not artifact_path.is_file()
+        or _sha256_file(artifact_path) != evaluation.get("artifact_sha256")
+        or _canonical_sha256(
+            _factor_evaluation_artifact_metrics(
+                str(artifact_path),
+                candidate_id=candidate_id,
+                profile_id=profile_id,
+            )
+        )
+        != evaluation.get("metrics_sha256")
+    ):
+        raise ValueError(f"promoted factor {candidate_id} evaluation artifact changed")
+    evaluation_evidence = {
+        "candidate_id": candidate_id,
+        "dataset": evaluation.get("dataset"),
+        "dataset_identity_sha256": evaluation.get("dataset_identity_sha256"),
+        "periods": periods,
+        "gate_status": evaluation.get("gate_status"),
+        "gate_reasons": list(evaluation.get("gate_reasons_json") or []),
+        "evaluator_version": evaluation.get("evaluator_version"),
+        "candidate_code_sha256": evaluation.get("candidate_code_sha256"),
+        "candidate_values_sha256": evaluation.get("candidate_values_sha256"),
+        "submitted_values_sha256": evaluation.get("submitted_values_sha256"),
+        "recompute_evidence_sha256": _canonical_sha256(recompute),
+        "artifact_sha256": evaluation.get("artifact_sha256"),
+        "metrics_sha256": evaluation.get("metrics_sha256"),
+        "policy_sha256": evaluation.get("policy_sha256"),
+    }
+    if (
+        _canonical_sha256(evaluation_evidence) != evaluation.get("evidence_sha256")
+        or evaluation.get("execution_contract_hash") != evaluation.get("evidence_sha256")
+        or evaluation.get("qlib_commit") != QLIB_COMMIT
+        or evaluation.get("rdagent_commit") != RDAGENT_COMMIT
+        or evaluation.get("signal_frequency") != "day"
+        or evaluation.get("execution_frequency") != "day"
+        or evaluation.get("signal_horizon")
+        != f"{int(candidate.get('label_horizon_days') or 1)}d"
+        or evaluation.get("final_test_key") is not None
+        or evaluation.get("final_test_consumed_at") is not None
+    ):
+        raise ValueError(f"promoted factor {candidate_id} evaluation seal is invalid")
+    return layers
 
 
 def _version_contract_columns(config: dict[str, Any], *, strategy_type: str) -> dict[str, Any]:
@@ -1043,14 +1241,133 @@ class StrategyStore:
             ).first()
             if not evaluation:
                 raise ValueError(f"promoted factor {candidate_id} is not bound to its evaluation")
-            if str(evaluation.evaluator_version) != "factor-gate-v3-hac-bh":
-                raise ValueError(
-                    f"factor {candidate_id} uses frozen external values; external factors "
-                    "remain research-only until a formal point-in-time availability and "
-                    "final-OOS publication contract is implemented"
-                )
+            candidate_data = row_dict(candidate)
+            evaluation_data = row_dict(evaluation)
+            admission_path = str(candidate.admission_path or "standalone")
             consensus = candidate.profile_consensus_json
-            if consensus is None:
+            incremental = candidate.incremental_evidence_json
+            if admission_path == "incremental":
+                if consensus is not None or not isinstance(incremental, dict):
+                    raise ValueError(
+                        f"promoted factor {candidate_id} mixes standalone and incremental evidence"
+                    )
+                validate_incremental_evidence(dict(incremental))
+                evaluation_ids = incremental.get("evaluation_ids")
+                profiles = incremental.get("profiles")
+                profile_periods = incremental.get("profile_periods")
+                expected_profile_ids = {"recent_3y", "balanced_5y", "robust_10y"}
+                if (
+                    _canonical_sha256(incremental)
+                    != candidate.incremental_evidence_sha256
+                    or incremental.get("factor_candidate_id") != candidate_id
+                    or incremental.get("candidate_code_sha256") != candidate.code_sha256
+                    or incremental.get("candidate_values_sha256") != candidate.values_sha256
+                    or not isinstance(evaluation_ids, dict)
+                    or set(evaluation_ids) != expected_profile_ids
+                    or len(set(evaluation_ids.values())) != len(expected_profile_ids)
+                    or evaluation_ids.get("recent_3y") != str(evaluation.id)
+                    or not isinstance(profiles, dict)
+                    or set(profiles) != expected_profile_ids
+                    or not isinstance(profile_periods, dict)
+                    or set(profile_periods) != expected_profile_ids
+                ):
+                    raise ValueError(
+                        f"promoted factor {candidate_id} has invalid incremental evidence"
+                    )
+                evaluation_rows = connection.execute(
+                    select(factor_evaluations).where(
+                        factor_evaluations.c.id.in_(list(evaluation_ids.values()))
+                    )
+                ).all()
+                bound = {str(item.id): row_dict(item) for item in evaluation_rows}
+                if len(bound) != len(expected_profile_ids):
+                    raise ValueError(
+                        f"promoted factor {candidate_id} incremental evaluations are missing"
+                    )
+                dataset_identities: set[str] = set()
+                test_windows: set[tuple[date, date]] = set()
+                for profile_id in sorted(expected_profile_ids):
+                    profile_evaluation = bound.get(str(evaluation_ids[profile_id]))
+                    if profile_evaluation is None:
+                        raise ValueError(
+                            f"promoted factor {candidate_id} incremental profile is missing"
+                        )
+                    layers = _validate_governed_factor_evaluation(
+                        profile_evaluation,
+                        candidate_data,
+                        expected_profile_id=profile_id,
+                        require_gate_passed=False,
+                    )
+                    if profile_id == "recent_3y" and layers["effect_status"] == "passed":
+                        raise ValueError(
+                            f"factor {candidate_id} must use standalone admission when it passes"
+                        )
+                    expected_periods = {
+                        key: profile_evaluation[key].isoformat()
+                        for key in (
+                            "train_start",
+                            "train_end",
+                            "valid_start",
+                            "valid_end",
+                            "test_start",
+                            "test_end",
+                        )
+                    }
+                    if (
+                        profile_periods.get(profile_id) != expected_periods
+                        or (profiles.get(profile_id) or {}).get(
+                            "evaluation_evidence_sha256"
+                        )
+                        != profile_evaluation.get("evidence_sha256")
+                    ):
+                        raise ValueError(
+                            f"factor {candidate_id} incremental profile evidence changed"
+                        )
+                    dataset_identities.add(
+                        str(profile_evaluation.get("dataset_identity_sha256") or "")
+                    )
+                    test_windows.add(
+                        (
+                            profile_evaluation["test_start"],
+                            profile_evaluation["test_end"],
+                        )
+                    )
+                if (
+                    dataset_identities != {str(incremental.get("dataset_identity_sha256") or "")}
+                    or "" in dataset_identities
+                    or len(test_windows) != 1
+                ):
+                    raise ValueError(
+                        f"factor {candidate_id} incremental profiles do not share one dataset/OOS"
+                    )
+                expected_promotion_evidence = _canonical_sha256(
+                    {
+                        "version": "factor-promotion-evidence-v3-incremental",
+                        "primary_evaluation_evidence_sha256": evaluation.evidence_sha256,
+                        "incremental_evidence_sha256": candidate.incremental_evidence_sha256,
+                    }
+                )
+            elif incremental is not None:
+                raise ValueError(
+                    f"promoted factor {candidate_id} has incremental evidence on a standalone path"
+                )
+            elif consensus is None:
+                profile_id = str(
+                    ((evaluation_data.get("metrics_json") or {}).get("research_profile") or {}).get(
+                        "id"
+                    )
+                    or ""
+                )
+                if profile_id in {"recent_3y", "balanced_5y", "robust_10y"}:
+                    raise ValueError(
+                        f"promoted factor {candidate_id} lacks multi-profile consensus evidence"
+                    )
+                _validate_governed_factor_evaluation(
+                    evaluation_data,
+                    candidate_data,
+                    expected_profile_id=None,
+                    require_gate_passed=True,
+                )
                 expected_promotion_evidence = evaluation.evidence_sha256
             else:
                 consensus_ids = (
@@ -1080,24 +1397,28 @@ class StrategyStore:
                         f"promoted factor {candidate_id} has invalid profile consensus evidence"
                     )
                 consensus_rows = connection.execute(
-                    select(
-                        factor_evaluations.c.id,
-                        factor_evaluations.c.factor_candidate_id,
-                        factor_evaluations.c.evidence_sha256,
-                    ).where(factor_evaluations.c.id.in_(list(consensus_ids.values())))
+                    select(factor_evaluations).where(
+                        factor_evaluations.c.id.in_(list(consensus_ids.values()))
+                    )
                 ).all()
-                bound_evidence = {
-                    str(row.id): (str(row.factor_candidate_id), str(row.evidence_sha256))
-                    for row in consensus_rows
-                }
-                if len(bound_evidence) != len(set(consensus_ids.values())) or any(
-                    bound_evidence.get(str(consensus_ids[profile_id]))
-                    != (candidate_id, str(consensus_evidence[profile_id]))
-                    for profile_id in expected_profile_ids
-                ):
-                    raise ValueError(
-                        f"promoted factor {candidate_id} consensus evaluations "
-                        "changed or are missing"
+                bound_evidence = {str(row.id): row_dict(row) for row in consensus_rows}
+                for profile_id in sorted(expected_profile_ids):
+                    profile_evaluation = bound_evidence.get(str(consensus_ids[profile_id]))
+                    if (
+                        profile_evaluation is None
+                        or profile_evaluation.get("factor_candidate_id") != candidate_id
+                        or profile_evaluation.get("evidence_sha256")
+                        != str(consensus_evidence[profile_id])
+                    ):
+                        raise ValueError(
+                            f"promoted factor {candidate_id} consensus evaluations "
+                            "changed or are missing"
+                        )
+                    _validate_governed_factor_evaluation(
+                        profile_evaluation,
+                        candidate_data,
+                        expected_profile_id=profile_id,
+                        require_gate_passed=True,
                     )
                 expected_promotion_evidence = _canonical_sha256(
                     {
@@ -1107,9 +1428,7 @@ class StrategyStore:
                     }
                 )
             if (
-                evaluation.gate_status != "passed"
-                or evaluation.is_legacy
-                or expected_promotion_evidence != candidate.promotion_evidence_sha256
+                expected_promotion_evidence != candidate.promotion_evidence_sha256
                 or not _is_sha256(evaluation.evidence_sha256)
             ):
                 raise ValueError(f"promoted factor {candidate_id} has invalid promotion evidence")
@@ -1291,6 +1610,230 @@ class StrategyStore:
         return runtime_factors, contract
 
     @staticmethod
+    def _model_ensemble_signal_evidence(
+        connection: Any,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Bind an equal-rank ensemble to its grid and every component model."""
+
+        identity = model_signal_identity(config)
+        if identity is None or not identity.get("model_ensemble_candidate_id"):
+            raise ValueError("ensemble StrategySpec identity is missing")
+        ensemble_id = str(identity["model_ensemble_candidate_id"])
+        ensemble = connection.execute(
+            select(model_ensemble_candidates).where(
+                model_ensemble_candidates.c.id == ensemble_id
+            )
+        ).first()
+        if ensemble is None or str(ensemble.status) != "research_admitted":
+            raise ValueError("ensemble strategy requires a research-admitted candidate")
+        manifest = dict(ensemble.manifest_json or {})
+        admission = dict(ensemble.admission_evidence_json or {})
+        independent = admission.get("independent_evidence")
+        result_path = Path(str(admission.get("result_artifact_path") or ""))
+        if (
+            _canonical_sha256(manifest) != str(ensemble.manifest_sha256)
+            or str(ensemble.manifest_sha256)
+            != str(identity["model_ensemble_manifest_sha256"])
+            or _canonical_sha256(
+                {key: value for key, value in admission.items() if key != "evidence_sha256"}
+            )
+            != str(admission.get("evidence_sha256") or "")
+            or str(admission.get("evidence_sha256") or "")
+            != str(ensemble.admission_evidence_sha256)
+            or str(ensemble.admission_evidence_sha256)
+            != str(identity["model_ensemble_evidence_sha256"])
+            or admission.get("status") != "passed"
+            or not isinstance(independent, dict)
+            or admission.get("independent_evidence_sha256")
+            != independent.get("evidence_sha256")
+            or _canonical_sha256(
+                {key: value for key, value in independent.items() if key != "evidence_sha256"}
+            )
+            != independent.get("evidence_sha256")
+            or not result_path.is_file()
+            or _sha256_file(result_path)
+            != str(admission.get("result_artifact_sha256") or "")
+            or manifest.get("combiner") != "equal_rank"
+            or manifest.get("stacking") is not False
+            or independent.get("final_oos_opened") is not False
+        ):
+            raise ValueError("ensemble StrategySpec immutable admission is invalid")
+        components = [dict(item) for item in ensemble.components_json or []]
+        component_ids = [str(item.get("model_candidate_id") or "") for item in components]
+        component_families = [str(item.get("model_family") or "") for item in components]
+        if (
+            component_ids != list(identity.get("model_component_candidate_ids") or [])
+            or component_families != list(identity.get("model_component_families") or [])
+            or len(set(component_ids)) != len(component_ids)
+            or len(set(component_families)) != len(component_families)
+            or not 2 <= len(component_ids) <= 3
+        ):
+            raise ValueError("ensemble StrategySpec component identities changed")
+        grid_rows = connection.execute(
+            select(model_ensemble_evaluations).where(
+                model_ensemble_evaluations.c.model_ensemble_candidate_id == ensemble_id
+            )
+        ).all()
+        required_grid = {
+            (profile, seed)
+            for profile in REQUIRED_RESEARCH_PROFILES
+            for seed in REQUIRED_MODEL_SEEDS
+        }
+        observed_grid = {(str(row.profile_id), int(row.seed)) for row in grid_rows}
+        primary_evaluation = next(
+            (
+                row
+                for row in grid_rows
+                if str(row.profile_id) == PRIMARY_MODEL_PROFILE
+                and int(row.seed) == PRIMARY_MODEL_SEED
+            ),
+            None,
+        )
+
+        def cell_artifacts_valid(row: Any) -> bool:
+            evidence = dict(row.evidence_json or {})
+            for path_key, sha_key in (
+                ("predictions_path", "predictions_sha256"),
+                ("portfolio_report_path", "portfolio_report_sha256"),
+            ):
+                path = Path(str(evidence.get(path_key) or ""))
+                if (
+                    not path.is_file()
+                    or not _is_sha256(evidence.get(sha_key))
+                    or _sha256_file(path) != str(evidence.get(sha_key))
+                ):
+                    return False
+            return True
+
+        environment_path = Path(
+            str(independent.get("execution_environment_path") or "")
+        )
+        if (
+            observed_grid != required_grid
+            or len(grid_rows) != len(required_grid)
+            or primary_evaluation is None
+            or str(primary_evaluation.id)
+            != str(identity["model_ensemble_evaluation_id"])
+            or any(
+                str(row.gate_status) != "passed"
+                or _canonical_sha256(dict(row.evidence_json or {}))
+                != str(row.evidence_sha256)
+                or (row.evidence_json or {}).get("final_oos_opened") is not False
+                or (row.evidence_json or {}).get("ensemble_manifest_sha256")
+                != str(ensemble.manifest_sha256)
+                or not cell_artifacts_valid(row)
+                for row in grid_rows
+            )
+            or not environment_path.is_file()
+            or _sha256_file(environment_path)
+            != str(independent.get("execution_environment_file_sha256") or "")
+            or _canonical_sha256(
+                dict(independent.get("execution_environment") or {})
+            )
+            != str(independent.get("execution_environment_sha256") or "")
+        ):
+            raise ValueError("ensemble independent evaluation grid is incomplete")
+
+        component_evidence: list[dict[str, Any]] = []
+        for component in components:
+            candidate_id = str(component["model_candidate_id"])
+            candidate = connection.execute(
+                select(model_candidates).where(model_candidates.c.id == candidate_id)
+            ).first()
+            if candidate is None:
+                raise ValueError("ensemble component model is missing")
+            base = dict(candidate.base_features_manifest_json or {})
+            candidate_manifest = dict(candidate.manifest_json or {})
+            primary = connection.execute(
+                select(model_evaluations).where(
+                    model_evaluations.c.model_candidate_id == candidate_id,
+                    model_evaluations.c.evidence_role == "independent_gate",
+                    model_evaluations.c.gate_status == "passed",
+                    model_evaluations.c.oos_vintage_id.is_(None),
+                    model_evaluations.c.profile_id == PRIMARY_MODEL_PROFILE,
+                    model_evaluations.c.seed == PRIMARY_MODEL_SEED,
+                )
+            ).first()
+            if primary is None:
+                raise ValueError("ensemble component has no primary independent cell")
+            grid = prediction_grid_from_admission(row_dict(candidate))
+            if (
+                str(candidate.manifest_sha256)
+                != str(component.get("model_manifest_sha256") or "")
+                or str(candidate.admission_evidence_sha256)
+                != str(component.get("model_admission_evidence_sha256") or "")
+                or str(grid["prediction_grid_sha256"])
+                != str(component.get("prediction_grid_sha256") or "")
+            ):
+                raise ValueError("ensemble component immutable evidence changed")
+            component_config = {
+                "signal_source": "model_prediction",
+                "model_candidate_id": candidate_id,
+                "model_evaluation_id": str(primary.id),
+                "model_code_sha256": str(candidate.code_sha256),
+                "model_recipe_sha256": str(candidate_manifest.get("recipe_sha256") or ""),
+                "model_evidence_sha256": str(candidate.admission_evidence_sha256),
+                "feature_set_id": str(base.get("feature_set_id") or ""),
+                "feature_set_definition_sha256": str(
+                    candidate.feature_set_definition_sha256
+                ),
+                "model_primary_profile_id": PRIMARY_MODEL_PROFILE,
+                "model_primary_seed": PRIMARY_MODEL_SEED,
+                "model_refit_policy": dict(MODEL_REFIT_POLICY),
+                "model_refit_policy_sha256": MODEL_REFIT_POLICY_SHA256,
+            }
+            bound = StrategyStore._model_signal_evidence(connection, component_config)
+            if bound is None:
+                raise ValueError("ensemble component could not be independently bound")
+            component_evidence.append(bound)
+        datasets = {
+            (
+                str(item["candidate"].dataset),
+                str(item["candidate"].dataset_identity_sha256),
+                item["candidate"].pre_final_end,
+                item["candidate"].final_oos_start,
+                item["candidate"].final_oos_end,
+            )
+            for item in component_evidence
+        }
+        if len(datasets) != 1:
+            raise ValueError("ensemble components do not share one sealed data/OOS contract")
+        dataset_name, dataset_identity, pre_final_end, _oos_start, _oos_end = next(
+            iter(datasets)
+        )
+        if (
+            dataset_name != str(ensemble.dataset)
+            or dataset_identity != str(ensemble.dataset_identity_sha256)
+        ):
+            raise ValueError("ensemble and component dataset identities differ")
+        formal_admission_binding = build_model_ensemble_formal_admission_binding(
+            config=config,
+            dataset_identity_sha256=dataset_identity,
+            pre_final_end=pre_final_end.isoformat(),
+            ensemble_admission_evidence=admission,
+            component_model_bindings=[
+                item["formal_admission_binding"] for item in component_evidence
+            ],
+        )
+        return {
+            "signal_kind": "ensemble",
+            "identity": identity,
+            "ensemble_candidate": ensemble,
+            "ensemble_evaluation": primary_evaluation,
+            "components": component_evidence,
+            "formal_admission_binding": formal_admission_binding,
+            "candidate": None,
+            "evaluation": None,
+            "code_path": None,
+            "bundle": None,
+            "bundle_evaluation": None,
+            "bundle_artifact": None,
+            "bundle_factors": [],
+            "bundle_factor_contract": None,
+        }
+
+    @staticmethod
     def _model_signal_evidence(
         connection: Any,
         config: dict[str, Any],
@@ -1308,6 +1851,10 @@ class StrategyStore:
         identity = model_signal_identity(config)
         if identity is None:
             return None
+        if identity.get("model_ensemble_candidate_id") is not None:
+            if not require_bundle_factor_contract:
+                raise ValueError("ensemble strategy cannot request quant bundle factors")
+            return StrategyStore._model_ensemble_signal_evidence(connection, config)
         candidate_id = str(identity["model_candidate_id"])
         candidate = connection.execute(
             select(model_candidates).where(model_candidates.c.id == candidate_id)
@@ -1629,6 +2176,7 @@ class StrategyStore:
             ),
         )
         return {
+            "signal_kind": "model",
             "identity": identity,
             "candidate": candidate,
             "evaluation": evaluation,
@@ -1913,8 +2461,8 @@ class StrategyStore:
             raise ValueError("pair strategy requires two distinct instruments")
         if asset_class not in {"etf", "stock", "mixed"}:
             raise ValueError("pair asset_class must be etf, stock, or mixed")
-        if shorting_mode != "margin_borrow":
-            raise ValueError("only governed margin_borrow pair strategies are supported")
+        if shorting_mode not in {"shadow_borrow", "margin_borrow"}:
+            raise ValueError("pair shorting mode must be shadow_borrow or legacy margin_borrow")
         validated = PairTradingConfig(**config)
         return {
             "leg_y": first,
@@ -2172,10 +2720,92 @@ class StrategyStore:
         result["config"] = result.pop("config_json")
         result["factors"] = [row_dict(item) for item in factor_rows]
         result["pair"] = row_dict(pair_row) if pair_row else None
+        result["capabilities"] = strategy_type_capabilities(result["strategy_type"])
+        result["simulation_mode"] = (
+            "shadow_pair" if result["strategy_type"] == "pair" else "paper"
+        )
         result["factor_source_mode"] = result["config"].get("factor_source_mode", "promoted_only")
         result["baseline_definition_sha256"] = result["config"].get("baseline_definition_sha256")
         if model_evidence is None:
             result["model_signal"] = None
+        elif model_evidence.get("signal_kind") == "ensemble":
+            ensemble = model_evidence["ensemble_candidate"]
+            components: list[dict[str, Any]] = []
+            for component in model_evidence["components"]:
+                candidate = component["candidate"]
+                candidate_manifest = dict(candidate.manifest_json or {})
+                components.append(
+                    {
+                        **component["identity"],
+                        "code_path": component["code_path"],
+                        "model_type": str(candidate.model_type),
+                        "architecture": dict(candidate.architecture_json or {}),
+                        "model_hyperparameters": dict(
+                            candidate.model_hyperparameters_json or {}
+                        ),
+                        "training_hyperparameters": dict(
+                            candidate.training_hyperparameters_json or {}
+                        ),
+                        "model_manifest_sha256": str(candidate.manifest_sha256),
+                        "dataset": str(candidate.dataset),
+                        "dataset_identity_sha256": str(
+                            candidate.dataset_identity_sha256
+                        ),
+                        "dataset_lineage_id": candidate_manifest.get(
+                            "dataset_lineage_id"
+                        ),
+                        "pre_final_end": candidate.pre_final_end.isoformat(),
+                        "final_oos_start": candidate.final_oos_start.isoformat(),
+                        "final_oos_end": candidate.final_oos_end.isoformat(),
+                        "recipe": dict(candidate_manifest.get("recipe") or {}),
+                        "primary_profile_id": PRIMARY_MODEL_PROFILE,
+                        "primary_seed": PRIMARY_MODEL_SEED,
+                        "refit_policy": dict(MODEL_REFIT_POLICY),
+                        "refit_policy_sha256": MODEL_REFIT_POLICY_SHA256,
+                        "primary_training_periods": {
+                            "train_start": component[
+                                "evaluation"
+                            ].train_start.isoformat(),
+                            "train_end": component[
+                                "evaluation"
+                            ].train_end.isoformat(),
+                            "valid_start": component[
+                                "evaluation"
+                            ].valid_start.isoformat(),
+                            "valid_end": component[
+                                "evaluation"
+                            ].valid_end.isoformat(),
+                            "seed": int(component["evaluation"].seed),
+                        },
+                    }
+                )
+            first = components[0]
+            result["model_signal"] = {
+                **model_evidence["identity"],
+                "signal_kind": "ensemble",
+                "combiner": "equal_rank",
+                "stacking": False,
+                "ensemble_manifest": dict(ensemble.manifest_json or {}),
+                "ensemble_manifest_sha256": str(ensemble.manifest_sha256),
+                "ensemble_admission_binding": model_evidence[
+                    "formal_admission_binding"
+                ],
+                "components": components,
+                "dataset": first["dataset"],
+                "dataset_identity_sha256": first["dataset_identity_sha256"],
+                "dataset_lineage_id": first["dataset_lineage_id"],
+                "pre_final_end": first["pre_final_end"],
+                "final_oos_start": first["final_oos_start"],
+                "final_oos_end": first["final_oos_end"],
+                "primary_profile_id": PRIMARY_MODEL_PROFILE,
+                "primary_seed": PRIMARY_MODEL_SEED,
+                "primary_training_periods": dict(
+                    first["primary_training_periods"]
+                ),
+                "refit_policy": dict(MODEL_REFIT_POLICY),
+                "refit_policy_sha256": MODEL_REFIT_POLICY_SHA256,
+                "bundle_factors": [],
+            }
         else:
             candidate = model_evidence["candidate"]
             candidate_manifest = dict(candidate.manifest_json or {})
@@ -2260,14 +2890,22 @@ class StrategyStore:
             ).all()
             bound_models: dict[str, list[str]] = {}
             bound_bundles: dict[str, list[str]] = {}
+            bound_ensembles: dict[str, list[str]] = {}
             for row in version_rows:
                 config = dict(row.config_json or {})
                 model_candidate_id = str(config.get("model_candidate_id") or "")
                 bundle_candidate_id = str(config.get("quant_bundle_candidate_id") or "")
+                ensemble_candidate_id = str(
+                    config.get("model_ensemble_candidate_id") or ""
+                )
                 if model_candidate_id:
                     bound_models.setdefault(model_candidate_id, []).append(str(row.id))
                 if bundle_candidate_id:
                     bound_bundles.setdefault(bundle_candidate_id, []).append(str(row.id))
+                if ensemble_candidate_id:
+                    bound_ensembles.setdefault(ensemble_candidate_id, []).append(
+                        str(row.id)
+                    )
 
             model_rows = (
                 connection.execute(
@@ -2288,12 +2926,44 @@ class StrategyStore:
                 if bound_bundles
                 else []
             )
+            ensemble_rows = (
+                connection.execute(
+                    select(
+                        model_ensemble_candidates.c.id,
+                        model_ensemble_candidates.c.tournament_id,
+                    ).where(
+                        model_ensemble_candidates.c.id.in_(sorted(bound_ensembles))
+                    )
+                ).all()
+                if bound_ensembles
+                else []
+            )
             missing_models = set(bound_models) - {str(row.id) for row in model_rows}
             missing_bundles = set(bound_bundles) - {str(row.id) for row in bundle_rows}
-            if missing_models or missing_bundles:
+            missing_ensembles = set(bound_ensembles) - {
+                str(row.id) for row in ensemble_rows
+            }
+            if missing_models or missing_bundles or missing_ensembles:
                 raise ValueError(
-                    "hypothesis-group model/bundle bindings reference missing candidates"
+                    "hypothesis-group model/bundle/ensemble bindings reference missing candidates"
                 )
+            ensemble_tournament_ids = {
+                str(row.tournament_id) for row in ensemble_rows
+            }
+            ensemble_tournament_rows = (
+                connection.execute(
+                    select(
+                        model_ensemble_candidates.c.id,
+                        model_ensemble_candidates.c.tournament_id,
+                    ).where(
+                        model_ensemble_candidates.c.tournament_id.in_(
+                            ensemble_tournament_ids
+                        )
+                    )
+                ).all()
+                if ensemble_tournament_ids
+                else []
+            )
             quant_run_ids = {str(row.research_run_id) for row in bundle_rows}
             model_run_ids = {
                 str(row.research_run_id)
@@ -2342,7 +3012,13 @@ class StrategyStore:
         factor_trial_count = sum(family_counts.values())
         model_trial_count = sum(model_run_counts.values())
         quant_trial_count = sum(quant_run_counts.values()) * len(REQUIRED_QUANT_ABLATIONS)
-        research_trial_count = factor_trial_count + model_trial_count + quant_trial_count
+        ensemble_trial_count = len(ensemble_tournament_rows)
+        research_trial_count = (
+            factor_trial_count
+            + model_trial_count
+            + quant_trial_count
+            + ensemble_trial_count
+        )
         shared_count = max(1, len(version_ids), research_trial_count)
         return {
             "economic_hypothesis_group": group,
@@ -2354,6 +3030,7 @@ class StrategyStore:
                 "factor_trial_count": factor_trial_count,
                 "model_trial_count": model_trial_count,
                 "quant_trial_count": quant_trial_count,
+                "ensemble_trial_count": ensemble_trial_count,
                 "research_trial_count": research_trial_count,
                 "model_runs": [
                     {
@@ -2391,6 +3068,30 @@ class StrategyStore:
                     }
                     for run_id, count in sorted(quant_run_counts.items())
                 ],
+                "ensemble_tournaments": [
+                    {
+                        "tournament_id": tournament_id,
+                        "candidate_count": sum(
+                            str(row.tournament_id) == tournament_id
+                            for row in ensemble_tournament_rows
+                        ),
+                        "trial_count": sum(
+                            str(row.tournament_id) == tournament_id
+                            for row in ensemble_tournament_rows
+                        ),
+                        "all_candidate_ids": sorted(
+                            str(row.id)
+                            for row in ensemble_tournament_rows
+                            if str(row.tournament_id) == tournament_id
+                        ),
+                        "bound_candidate_ids": sorted(
+                            str(row.id)
+                            for row in ensemble_rows
+                            if str(row.tournament_id) == tournament_id
+                        ),
+                    }
+                    for tournament_id in sorted(ensemble_tournament_ids)
+                ],
                 "bound_versions": [
                     {
                         "strategy_version_id": str(row.id),
@@ -2402,10 +3103,18 @@ class StrategyStore:
                             (row.config_json or {}).get("quant_bundle_candidate_id") or ""
                         )
                         or None,
+                        "model_ensemble_candidate_id": str(
+                            (row.config_json or {}).get(
+                                "model_ensemble_candidate_id"
+                            )
+                            or ""
+                        )
+                        or None,
                     }
                     for row in sorted(version_rows, key=lambda item: str(item.id))
                     if (row.config_json or {}).get("model_candidate_id")
                     or (row.config_json or {}).get("quant_bundle_candidate_id")
+                    or (row.config_json or {}).get("model_ensemble_candidate_id")
                 ],
             },
         }
@@ -2420,8 +3129,47 @@ class StrategyStore:
         execution_dataset: str | None = None,
         trading_dates: Sequence[date | str] | None = None,
         dataset_lineage_id: str | None = None,
+        capital_oos_alpha_batch_id: str | None = None,
+        capital_oos_sealed_candidate_set_patch: Mapping[str, Any] | None = None,
+        capital_oos_dataset_identity_sha256: str | None = None,
     ) -> dict[str, Any]:
         version = self.get_version(version_id)
+        capital_values_present = (
+            capital_oos_alpha_batch_id is not None,
+            capital_oos_sealed_candidate_set_patch is not None,
+            capital_oos_dataset_identity_sha256 is not None,
+        )
+        if any(capital_values_present) and not all(capital_values_present):
+            raise ValueError(
+                "capital OOS backtest requires batch, sealed patch, and dataset identity"
+            )
+        capital_batch_id: str | None = None
+        capital_dataset_identity: str | None = None
+        capital_sealed_patch: dict[str, Any] | None = None
+        if all(capital_values_present):
+            if version.get("strategy_type") != "multifactor":
+                raise ValueError("capital OOS alpha binding is only valid for multifactor")
+            capital_batch_id = str(capital_oos_alpha_batch_id).strip().lower()
+            capital_dataset_identity = str(
+                capital_oos_dataset_identity_sha256
+            ).strip().lower()
+            if not _is_sha256(capital_batch_id) or not _is_sha256(
+                capital_dataset_identity
+            ):
+                raise ValueError("capital OOS batch and dataset identity must be SHA-256")
+            if not isinstance(capital_oos_sealed_candidate_set_patch, Mapping):
+                raise ValueError("capital OOS sealed candidate patch must be an object")
+            try:
+                capital_sealed_patch = json.loads(
+                    json.dumps(
+                        dict(capital_oos_sealed_candidate_set_patch),
+                        ensure_ascii=False,
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "capital OOS sealed candidate patch must be JSON serializable"
+                ) from exc
         try:
             requested_start = date.fromisoformat(str(periods["start"]))
             requested_end = date.fromisoformat(str(periods["end"]))
@@ -2485,10 +3233,20 @@ class StrategyStore:
                 model_candidate = (
                     model_evidence["candidate"] if model_evidence is not None else None
                 )
-                if model_candidate is not None and (
-                    str(model_candidate.dataset) != dataset
-                    or requested_start != model_candidate.final_oos_start
-                    or requested_end != model_candidate.final_oos_end
+                ensemble_components = (
+                    [item["candidate"] for item in model_evidence["components"]]
+                    if model_evidence is not None
+                    and model_evidence.get("signal_kind") == "ensemble"
+                    else []
+                )
+                governed_model_candidates = (
+                    [model_candidate] if model_candidate is not None else ensemble_components
+                )
+                if any(
+                    str(candidate.dataset) != dataset
+                    or requested_start != candidate.final_oos_start
+                    or requested_end != candidate.final_oos_end
+                    for candidate in governed_model_candidates
                 ):
                     raise ValueError(
                         "formal model backtest must exactly match its sealed dataset "
@@ -2498,13 +3256,14 @@ class StrategyStore:
                     raise ValueError("reserved final test has already been consumed")
                 history_starts = [item.train_start for item in factor_windows]
                 history_ends = [item.valid_end for item in factor_windows]
-                if model_candidate is not None:
+                for governed_candidate in governed_model_candidates:
                     model_rows = connection.execute(
                         select(
                             model_evaluations.c.train_start,
                             model_evaluations.c.valid_end,
                         ).where(
-                            model_evaluations.c.model_candidate_id == model_candidate.id,
+                            model_evaluations.c.model_candidate_id
+                            == governed_candidate.id,
                             model_evaluations.c.evidence_role == "independent_gate",
                             model_evaluations.c.gate_status == "passed",
                         )
@@ -2512,7 +3271,7 @@ class StrategyStore:
                     if not model_rows:
                         raise ValueError("model candidate has no independent evaluation grid")
                     history_starts.append(min(item.train_start for item in model_rows))
-                    history_ends.append(model_candidate.pre_final_end)
+                    history_ends.append(governed_candidate.pre_final_end)
                 if history_starts:
                     # Every selected factor must have observed the same
                     # pre-final history.  The intersection is authoritative:
@@ -2554,20 +3313,36 @@ class StrategyStore:
                 )
                 if trading_dates is not None:
                     try:
-                        calendar = sorted(
-                            {
-                                value if isinstance(value, date) else date.fromisoformat(str(value))
-                                for value in trading_dates
-                            }
-                        )
+                        supplied_calendar = [
+                            value
+                            if isinstance(value, date)
+                            else date.fromisoformat(str(value))
+                            for value in trading_dates
+                        ]
+                        calendar = sorted(set(supplied_calendar))
                     except (TypeError, ValueError) as exc:
                         raise ValueError("Qlib trading calendar contains invalid dates") from exc
+                    if capital_batch_id is not None and supplied_calendar != calendar:
+                        raise ValueError(
+                            "capital OOS requires a strictly increasing unique Qlib calendar"
+                        )
                     history_trading_days = sum(
                         history_start <= value <= history_end for value in calendar
                     )
                     embargo_trading_days = sum(
                         history_end < value < requested_start for value in calendar
                     )
+                    final_trading_days = sum(
+                        requested_start <= value <= requested_end for value in calendar
+                    )
+                    minimum_final_days = max(
+                        252,
+                        int(version["config"].get("min_backtest_days") or 252),
+                    )
+                    if requested_start not in calendar or requested_end not in calendar:
+                        raise ValueError(
+                            "final OOS boundaries must be exact Qlib trading dates"
+                        )
                     if history_trading_days < minimum_history_days:
                         raise ValueError(
                             "pre-final history has "
@@ -2579,6 +3354,12 @@ class StrategyStore:
                             "pre-final history leaves "
                             f"{embargo_trading_days} trading days for the configured "
                             f"{minimum_embargo_days}-trading-day embargo"
+                        )
+                    if final_trading_days < minimum_final_days:
+                        raise ValueError(
+                            "final OOS has "
+                            f"{final_trading_days} trading days; "
+                            f"{minimum_final_days} are required"
                         )
                 else:
                     # Compatibility callers without a bound dataset calendar
@@ -2654,8 +3435,60 @@ class StrategyStore:
                     # a snapshot identity. This value is audit-only; stable scope
                     # below, never the snapshot name, controls OOS reuse.
                     dataset_identities = set()
-                if model_candidate is not None:
-                    dataset_identities.add(str(model_candidate.dataset_identity_sha256 or ""))
+                for governed_candidate in governed_model_candidates:
+                    dataset_identities.add(
+                        str(governed_candidate.dataset_identity_sha256 or "")
+                    )
+                if capital_batch_id is not None:
+                    assert capital_dataset_identity is not None
+                    assert capital_sealed_patch is not None
+                    if trading_dates is None:
+                        raise ValueError(
+                            "capital OOS requires the exact Qlib trading calendar"
+                        )
+                    normalized_lineage = str(dataset_lineage_id or "").strip().lower()
+                    if not _is_sha256(normalized_lineage):
+                        raise ValueError(
+                            "capital OOS requires a valid dataset lineage SHA-256"
+                        )
+                    observed_identities = {
+                        str(value).strip().lower()
+                        for value in dataset_identities
+                        if str(value).strip()
+                    }
+                    if observed_identities and observed_identities != {
+                        capital_dataset_identity
+                    }:
+                        raise ValueError(
+                            "capital OOS dataset identity differs from governed signal evidence"
+                        )
+                    final_calendar = [
+                        item.isoformat()
+                        for item in calendar
+                        if requested_start <= item <= requested_end
+                    ]
+                    embargo_calendar = [
+                        item.isoformat()
+                        for item in calendar
+                        if history_end < item < requested_start
+                    ]
+                    self._validate_capital_oos_batch_binding(
+                        connection,
+                        batch_id=capital_batch_id,
+                        sealed_candidate_set_patch=capital_sealed_patch,
+                        dataset_lineage_id=normalized_lineage,
+                        dataset_identity_sha256=capital_dataset_identity,
+                        research_data_end=history_end,
+                        test_start=requested_start,
+                        test_end=requested_end,
+                        final_oos_trading_dates=final_calendar,
+                        embargo_trading_dates=embargo_calendar,
+                    )
+                    if set(capital_sealed_patch) & set(sealed_member_set):
+                        raise ValueError(
+                            "capital OOS sealed candidate patch collides with strategy evidence"
+                        )
+                    sealed_member_set.update(capital_sealed_patch)
                 # Every multifactor final test, including a pure Qlib baseline,
                 # consumes the same governed OOS ledger.
                 self._seal_and_consume_oos_vintage(
@@ -2669,6 +3502,8 @@ class StrategyStore:
                     test_start=requested_start,
                     test_end=requested_end,
                     consumed_at=consumed_at,
+                    capital_oos_alpha_batch_id=capital_batch_id,
+                    capital_oos_dataset_identity_sha256=capital_dataset_identity,
                 )
                 for item in factor_windows:
                     key = hashlib.sha256(
@@ -2707,6 +3542,69 @@ class StrategyStore:
         return self.get_backtest(backtest_id)
 
     @staticmethod
+    def _validate_capital_oos_batch_binding(
+        connection: Any,
+        *,
+        batch_id: str,
+        sealed_candidate_set_patch: Mapping[str, Any],
+        dataset_lineage_id: str,
+        dataset_identity_sha256: str,
+        research_data_end: date,
+        test_start: date,
+        test_end: date,
+        final_oos_trading_dates: Sequence[str],
+        embargo_trading_dates: Sequence[str],
+    ) -> None:
+        """Lock and validate preregistration before any final-OOS row is written."""
+
+        batch = connection.execute(
+            select(capital_oos_alpha_batches)
+            .where(capital_oos_alpha_batches.c.id == batch_id)
+            .with_for_update()
+        ).first()
+        if batch is None:
+            raise ValueError("capital OOS alpha batch does not exist")
+        if str(batch.status) != "reserved":
+            raise ValueError("capital OOS alpha batch is not reserved")
+        expected_patch = {
+            "capital_oos_alpha_ledger": capital_oos_vintage_link_payload(
+                batch_id=str(batch.id),
+                preregistration_sha256=str(batch.preregistration_sha256),
+                frozen_bundle_manifest_sha256=str(
+                    batch.frozen_bundle_manifest_sha256
+                ),
+                frozen_baseline_manifest_sha256=str(
+                    batch.frozen_baseline_manifest_sha256
+                ),
+            )
+        }
+        if dict(sealed_candidate_set_patch) != expected_patch:
+            raise ValueError(
+                "capital OOS sealed candidate patch differs from preregistration"
+            )
+        if (
+            str(batch.dataset_lineage_id) != dataset_lineage_id
+            or str(batch.dataset_identity_sha256) != dataset_identity_sha256
+            or batch.research_data_end != research_data_end
+            or batch.final_oos_start != test_start
+            or batch.final_oos_end != test_end
+            or list(batch.trading_dates_json or [])
+            != list(final_oos_trading_dates)
+            or list(batch.embargo_trading_dates_json or [])
+            != list(embargo_trading_dates)
+        ):
+            raise ValueError(
+                "formal backtest data or window differs from capital OOS preregistration"
+            )
+        linked = connection.execute(
+            select(oos_vintages.c.id).where(
+                oos_vintages.c.capital_oos_alpha_batch_id == batch_id
+            )
+        ).first()
+        if linked is not None:
+            raise ValueError("capital OOS alpha batch already has a linked vintage")
+
+    @staticmethod
     def _seal_and_consume_oos_vintage(
         connection: Any,
         *,
@@ -2719,6 +3617,8 @@ class StrategyStore:
         test_start: date,
         test_end: date,
         consumed_at: datetime,
+        capital_oos_alpha_batch_id: str | None = None,
+        capital_oos_dataset_identity_sha256: str | None = None,
     ) -> str:
         """Seal and consume one final-test window in a stable research scope.
 
@@ -2728,11 +3628,15 @@ class StrategyStore:
         missing lineage fails closed into one global standalone scope.
         """
 
-        dataset_identity = (
-            next(iter(dataset_identities))
-            if len(dataset_identities) == 1 and dataset_identities != {""}
-            else f"name:{dataset}"
-        )
+        dataset_identity = str(capital_oos_dataset_identity_sha256 or "").strip()
+        if dataset_identity and not _is_sha256(dataset_identity):
+            raise ValueError("capital OOS dataset identity must be a SHA-256")
+        if not dataset_identity:
+            dataset_identity = (
+                next(iter(dataset_identities))
+                if len(dataset_identities) == 1 and dataset_identities != {""}
+                else f"name:{dataset}"
+            )
         candidate_program_ids = {
             str(row.research_program_id)
             for row in connection.execute(
@@ -2818,6 +3722,12 @@ class StrategyStore:
                 "in the same research scope"
             )
         if row is not None:
+            if str(row.capital_oos_alpha_batch_id or "") != str(
+                capital_oos_alpha_batch_id or ""
+            ):
+                raise ValueError(
+                    "final test window is linked to a different capital OOS batch"
+                )
             recorded_members = dict(row.sealed_candidate_set_json or {})
             recorded_candidates = set(recorded_members.get("candidate_ids") or [])
             if candidate_ids and not set(candidate_ids) <= recorded_candidates:
@@ -2849,6 +3759,7 @@ class StrategyStore:
                 sealed_at=consumed_at,
                 first_opened_at=consumed_at,
                 consumed_at=consumed_at,
+                capital_oos_alpha_batch_id=capital_oos_alpha_batch_id,
                 sealed_candidate_set_json=sealed_member_set,
                 sealed_candidate_set_sha256=_canonical_sha256(sealed_member_set),
                 created_at=consumed_at,
@@ -2988,10 +3899,9 @@ class StrategyStore:
         actor: str,
         reason: str,
     ) -> dict[str, Any]:
-        # Research-only gate (design 6.4.3/13): pair strategies are offline
-        # statistical research and can never be approved for capital use.
-        # The verdict comes from the strategy catalog, the single source of truth.
-        require_capital_eligible_strategy_type("pair", action="批准")
+        # This is a research approval, not capital approval.  A passing pair may
+        # own a persistent shadow ledger, while its catalog capabilities keep
+        # recommendations, financing and real trading permanently disabled.
         config = PairTradingConfig(**version["config"])
         metrics = dict(backtest["metrics"] or {})
         failures: list[str] = []
@@ -3129,11 +4039,14 @@ class StrategyStore:
                 connection,
                 strategy_id=version["strategy_id"],
                 version_id=version["id"],
-                event_type="strategy.pair_approved",
+                event_type="strategy.pair_shadow_approved",
                 actor=actor,
                 payload={
                     "reason": reason,
                     "backtest_id": backtest["id"],
+                    "simulation_mode": "shadow_pair",
+                    "financing_enabled": False,
+                    "real_trading_eligible": False,
                     "gate_evidence": {name: value[0] for name, value in checks.items()},
                 },
             )
@@ -3152,6 +4065,79 @@ class StrategyStore:
         if backtests[0].get("is_legacy"):
             raise ValueError("legacy backtests cannot approve a new strategy")
         config = version["config"]
+        # Autopilot strategies are capital-facing only after the single fresh
+        # final OOS is both settled in the persistent alpha ledger and bound
+        # back to this exact immutable artifact.  ``approve`` is deliberately
+        # a second authority boundary: callers cannot bypass the Autopilot
+        # completion service by invoking StrategyStore directly.
+        if (
+            config.get("autopilot_completion_contract_version")
+            == "autopilot-completion-v1"
+        ):
+            try:
+                receipt = require_capital_oos_receipt(
+                    metrics.get("capital_oos_receipt"),
+                    backtest_id=str(backtests[0]["id"]),
+                    strategy_version_id=version_id,
+                    dataset=str(backtests[0]["dataset"]),
+                    periods=dict(backtests[0]["periods"]),
+                )
+                daily_returns = Path(str(backtests[0]["artifact_path"])) / "daily_returns.parquet"
+                if not daily_returns.is_file() or capital_oos_sha256_file(daily_returns) != str(
+                    receipt["formal_oos_artifact_sha256"]
+                ):
+                    raise ValueError(
+                        "capital OOS receipt artifact does not match the formal backtest"
+                    )
+                batch = CapitalOOSAlphaLedgerStore(self.database_url).get_batch(
+                    str(receipt["batch_id"])
+                )
+                vintage = CapitalOOSAlphaLedgerStore(self.database_url).get_vintage_binding(
+                    str(receipt["batch_id"])
+                )
+                settlement = batch.get("settlement_evidence_json")
+                support = (
+                    settlement.get("supporting_evidence")
+                    if isinstance(settlement, Mapping)
+                    else None
+                )
+                if (
+                    str(batch.get("status") or "") != "settled"
+                    or batch.get("passed") is not True
+                    or str(batch.get("settlement_evidence_sha256") or "")
+                    != str(receipt["batch_settlement_evidence_sha256"])
+                    or str(batch.get("dataset_identity_sha256") or "")
+                    != str(receipt["dataset_identity_sha256"])
+                    or str(batch.get("dataset_lineage_id") or "")
+                    != str(receipt["dataset_lineage_id"])
+                    or str(batch.get("trading_dates_sha256") or "")
+                    != str(receipt["trading_dates_sha256"])
+                    or str(batch.get("frozen_bundle_manifest_sha256") or "")
+                    != str(receipt["frozen_bundle_manifest_sha256"])
+                    or str(batch.get("frozen_baseline_manifest_sha256") or "")
+                    != str(receipt["frozen_baseline_manifest_sha256"])
+                    or str(vintage.get("final_oos_start") or "")
+                    != str(backtests[0]["periods"].get("start") or "")
+                    or str(vintage.get("final_oos_end") or "")
+                    != str(backtests[0]["periods"].get("end") or "")
+                    or not isinstance(support, Mapping)
+                    or str(support.get("formal_oos_artifact_sha256") or "")
+                    != str(receipt["formal_oos_artifact_sha256"])
+                    or str(support.get("backtest_id") or "") != str(backtests[0]["id"])
+                    or str(support.get("strategy_version_id") or "") != version_id
+                    or str(support.get("dataset") or "")
+                    != str(backtests[0]["dataset"])
+                    or str(support.get("oos_vintage_id") or "")
+                    != str(vintage.get("oos_vintage_id") or "")
+                ):
+                    raise ValueError(
+                        "capital OOS receipt does not match the settled ledger evidence"
+                    )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "autopilot strategy requires a settled passing capital OOS receipt: "
+                    + str(exc)
+                ) from exc
         if version.get("strategy_type") == "pair":
             return self._approve_pair(
                 version,

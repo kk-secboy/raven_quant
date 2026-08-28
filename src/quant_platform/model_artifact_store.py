@@ -18,6 +18,11 @@ from quant_data.database import (
     strategy_versions,
 )
 
+from .model_recompute import (
+    GOVERNED_MODEL_ENGINES,
+    governed_checkpoint_format,
+    verify_governed_checkpoint,
+)
 from .model_research_governance import (
     MODEL_REFIT_POLICY,
     MODEL_REFIT_POLICY_SHA256,
@@ -25,7 +30,7 @@ from .model_research_governance import (
 )
 from .strategy_store import StrategyStore
 
-MODEL_ARTIFACT_CONTRACT_VERSION = "model-artifact-lifecycle-v1"
+MODEL_ARTIFACT_CONTRACT_VERSION = "model-artifact-lifecycle-v2-checkpointed"
 INITIAL_FORMAL_ARTIFACT_VALID_DAYS = 7
 
 
@@ -57,12 +62,62 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _structural_model_data_contract(value: dict[str, Any]) -> dict[str, Any]:
+    """Remove only rolling date values; every semantic field stays frozen."""
+
+    result = json.loads(json.dumps(value, ensure_ascii=False))
+    normalization = result.get("feature_normalization")
+    if isinstance(normalization, dict):
+        normalization.pop("fit_start_time", None)
+        normalization.pop("fit_end_time", None)
+    return result
+
+
+def _frozen_model_engine(model_signal: dict[str, Any]) -> str:
+    recipe = dict(model_signal.get("recipe") or {})
+    recipe_hyperparameters = dict(recipe.get("model_hyperparameters") or {})
+    signal_hyperparameters = dict(model_signal.get("model_hyperparameters") or {})
+    engine = str(
+        recipe.get("model_engine")
+        or recipe_hyperparameters.get("model_engine")
+        or signal_hyperparameters.get("model_engine")
+        or "rdagent_pytorch"
+    )
+    if engine not in GOVERNED_MODEL_ENGINES:
+        raise ValueError("frozen strategy requests an ungoverned model engine")
+    return engine
+
+
 class ModelArtifactStore:
     """Immutable fitted-model artifacts under one frozen StrategySpec."""
 
     def __init__(self, database_url: str) -> None:
         self.strategies = StrategyStore(database_url)
         self.engine = open_database(database_url)
+
+    @staticmethod
+    def _verify_fitted_checkpoint(row: Any) -> None:
+        evidence = row.training_evidence_json
+        evidence_sha256 = str(row.training_evidence_sha256 or "").lower()
+        model_data_contract = (
+            evidence.get("model_data_contract") if isinstance(evidence, dict) else None
+        )
+        if (
+            not isinstance(evidence, dict)
+            or not _is_sha256(evidence_sha256)
+            or _canonical_sha256(evidence) != evidence_sha256
+            or not _is_sha256(row.model_data_contract_sha256)
+            or not isinstance(model_data_contract, dict)
+            or _canonical_sha256(model_data_contract)
+            != str(row.model_data_contract_sha256)
+        ):
+            raise ValueError("ModelArtifact fitted-model provenance is incomplete")
+        verify_governed_checkpoint(
+            Path(str(row.checkpoint_path or "")).resolve(),
+            model_engine=str(evidence.get("model_engine") or ""),
+            checkpoint_format=str(row.checkpoint_format or ""),
+            expected_sha256=str(row.checkpoint_sha256 or ""),
+        )
 
     def strategy_spec_sha256(self, strategy_version_id: str) -> str:
         version = self.strategies.get_version(strategy_version_id)
@@ -138,6 +193,12 @@ class ModelArtifactStore:
         valid_until: datetime,
         artifact_path: str | Path,
         predictions_sha256: str,
+        checkpoint_path: str | Path,
+        checkpoint_sha256: str,
+        checkpoint_format: str,
+        model_data_contract_sha256: str,
+        training_kind: str,
+        training_evidence: dict[str, Any],
         actor: str,
         scheduled_refit_at: datetime | None = None,
         allow_dataset_rollover: bool = False,
@@ -166,10 +227,16 @@ class ModelArtifactStore:
             or scheduled_refit_at.utcoffset() is None
         ):
             raise ValueError("scheduled refit timestamp must include a timezone")
-        if not _is_sha256(dataset_identity_sha256) or not _is_sha256(
-            predictions_sha256
+        if (
+            not _is_sha256(dataset_identity_sha256)
+            or not _is_sha256(predictions_sha256)
+            or not _is_sha256(checkpoint_sha256)
+            or not _is_sha256(model_data_contract_sha256)
         ):
-            raise ValueError("ModelArtifact requires immutable dataset and prediction hashes")
+            raise ValueError(
+                "ModelArtifact requires immutable dataset, prediction, checkpoint and "
+                "data-contract hashes"
+            )
         governed_environment_sha256 = self._governed_execution_environment_sha256(
             strategy_version_id
         )
@@ -188,6 +255,33 @@ class ModelArtifactStore:
         if not path.is_file():
             raise ValueError("model artifact file does not exist")
         artifact_sha256 = _file_sha256(path)
+        fitted_checkpoint_path = Path(checkpoint_path).resolve()
+        if not isinstance(training_evidence, dict):
+            raise ValueError("ModelArtifact training evidence is required")
+        model_engine = str(training_evidence.get("model_engine") or "")
+        model_data_contract = training_evidence.get("model_data_contract")
+        if training_kind not in {
+            "formal_oos",
+            "monthly_retrain",
+            "early_retrain",
+            "daily_inference",
+        }:
+            raise ValueError("ModelArtifact training kind is invalid")
+        if (
+            not model_engine
+            or model_engine != _frozen_model_engine(model_signal)
+            or not isinstance(model_data_contract, dict)
+            or _canonical_sha256(model_data_contract)
+            != model_data_contract_sha256.lower()
+        ):
+            raise ValueError("ModelArtifact training evidence is required")
+        verify_governed_checkpoint(
+            fitted_checkpoint_path,
+            model_engine=model_engine,
+            checkpoint_format=checkpoint_format,
+            expected_sha256=checkpoint_sha256,
+        )
+        training_evidence_sha256 = _canonical_sha256(training_evidence)
         spec_sha256 = self.strategy_spec_sha256(strategy_version_id)
         recipe_sha256 = _canonical_sha256(model_recipe)
         if recipe_sha256 != str(model_signal.get("model_recipe_sha256") or ""):
@@ -248,6 +342,13 @@ class ModelArtifactStore:
                         artifact_path=str(path),
                         artifact_sha256=artifact_sha256,
                         predictions_sha256=predictions_sha256.lower(),
+                        checkpoint_path=str(fitted_checkpoint_path),
+                        checkpoint_sha256=checkpoint_sha256.lower(),
+                        checkpoint_format=checkpoint_format,
+                        model_data_contract_sha256=model_data_contract_sha256.lower(),
+                        training_kind=training_kind,
+                        training_evidence_json=training_evidence,
+                        training_evidence_sha256=training_evidence_sha256,
                         created_by=creator,
                         created_at=now,
                     )
@@ -367,6 +468,39 @@ class ModelArtifactStore:
         ):
             raise ValueError("formal model predictions failed immutable verification")
 
+        relative_checkpoint = Path(str(formal.get("checkpoint_path") or ""))
+        checkpoint_path = (artifact_root / relative_checkpoint).resolve()
+        try:
+            checkpoint_path.relative_to(artifact_root)
+        except ValueError as exc:
+            raise ValueError("formal model checkpoint path escapes the backtest") from exc
+        checkpoint_sha256 = str(formal.get("checkpoint_sha256") or "").lower()
+        resource_policy = evidence.get("resource_policy")
+        model_engine = (
+            str(resource_policy.get("model_engine") or "")
+            if isinstance(resource_policy, dict)
+            else ""
+        )
+        checkpoint_format = governed_checkpoint_format(model_engine)
+        verify_governed_checkpoint(
+            checkpoint_path,
+            model_engine=model_engine,
+            checkpoint_format=checkpoint_format,
+            expected_sha256=checkpoint_sha256,
+        )
+        model_data_contract = formal.get("model_data_contract")
+        model_data_contract_sha256 = str(
+            formal.get("model_data_contract_sha256") or ""
+        ).lower()
+        if (
+            not isinstance(model_data_contract, dict)
+            or not _is_sha256(model_data_contract_sha256)
+            or _canonical_sha256(model_data_contract) != model_data_contract_sha256
+            or evidence.get("model_data_contract_sha256")
+            != model_data_contract_sha256
+        ):
+            raise ValueError("formal model artifact has no immutable data contract")
+
         try:
             training_start = date.fromisoformat(str(training["train_start"]))
             training_end = date.fromisoformat(str(training["valid_end"]))
@@ -416,6 +550,13 @@ class ModelArtifactStore:
                 != predictions_path
                 or existing.get("artifact_sha256") != predictions_sha256
                 or existing.get("predictions_sha256") != predictions_sha256
+                or Path(str(existing.get("checkpoint_path") or "")).resolve()
+                != checkpoint_path
+                or existing.get("checkpoint_sha256") != checkpoint_sha256
+                or existing.get("checkpoint_format") != checkpoint_format
+                or existing.get("model_data_contract_sha256")
+                != model_data_contract_sha256
+                or existing.get("training_kind") != "formal_oos"
                 or existing.get("valid_until") <= current
                 or existing.get("scheduled_refit_at") is None
                 or existing.get("scheduled_refit_at") > current
@@ -433,6 +574,16 @@ class ModelArtifactStore:
                     "expired evidence"
                 )
             return existing
+        training_evidence = {
+            "model_engine": model_engine,
+            "operation": "formal_oos",
+            "periods": training,
+            "source_backtest_id": source_backtest_id,
+            "execution_evidence_sha256": str(
+                evidence.get("evidence_sha256") or ""
+            ),
+            "model_data_contract": model_data_contract,
+        }
         return self.create(
             strategy_version_id=strategy_version_id,
             artifact_key=artifact_key,
@@ -446,6 +597,12 @@ class ModelArtifactStore:
             valid_until=effective_valid_until,
             artifact_path=predictions_path,
             predictions_sha256=predictions_sha256,
+            checkpoint_path=checkpoint_path,
+            checkpoint_sha256=checkpoint_sha256,
+            checkpoint_format=checkpoint_format,
+            model_data_contract_sha256=model_data_contract_sha256,
+            training_kind="formal_oos",
+            training_evidence=training_evidence,
             actor=actor,
             scheduled_refit_at=_now(),
         )
@@ -459,24 +616,29 @@ class ModelArtifactStore:
         actor: str,
         valid_for_days: int = 4,
     ) -> dict[str, Any]:
-        """Register a server-produced one-day prediction table after refit.
+        """Register one server-produced daily prediction and fitted checkpoint.
 
-        The worker supplies only its own result file.  Model identity, recipe,
-        dataset and all digests are re-bound to the approved StrategySpec and
-        the currently active source artifact before rotation.
+        Daily inference must reuse the active checkpoint byte-for-byte.  A
+        monthly/evidenced retrain must create a new governed-format checkpoint.
+        Model identity, recipe, dataset and all digests are re-bound to the
+        approved StrategySpec and active source artifact before rotation.
         """
 
         source = self.get(source_model_artifact_id)
         if str(source["strategy_version_id"]) != str(strategy_version_id):
             raise ValueError("model refit source belongs to another StrategySpec")
-        if str(source.get("status") or "") != "active":
+        source_status = str(source.get("status") or "")
+        if source_status not in {"active", "retired"}:
             raise ValueError("model refit source is no longer the active ModelArtifact")
         path = Path(result_path).resolve()
         try:
             result = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("model refit result is unreadable") from exc
-        if not isinstance(result, dict) or result.get("contract_version") != "model-live-refit-v1":
+        if (
+            not isinstance(result, dict)
+            or result.get("contract_version") != "model-live-refresh-v2"
+        ):
             raise ValueError("model refit result contract is invalid")
         recorded_evidence_sha256 = str(result.get("evidence_sha256") or "")
         unsigned = {key: value for key, value in result.items() if key != "evidence_sha256"}
@@ -484,10 +646,14 @@ class ModelArtifactStore:
             recorded_evidence_sha256
         ):
             raise ValueError("model refit result evidence hash is invalid")
+        operation = str(result.get("operation") or "")
+        inference_only = operation == "inference"
+        if operation not in {"inference", "retrain"}:
+            raise ValueError("model live refresh operation is invalid")
         if (
             result.get("status") != "passed"
             or result.get("final_oos_opened") is not False
-            or result.get("inference_only") is not True
+            or (result.get("inference_only") is True) is not inference_only
             or result.get("strategy_version_id") != strategy_version_id
             or result.get("source_model_artifact_id") != source_model_artifact_id
         ):
@@ -525,14 +691,14 @@ class ModelArtifactStore:
             raise ValueError("model refit periods or coverage evidence are missing")
         try:
             signal_date = date.fromisoformat(str(result["signal_date"]))
-            training_start = date.fromisoformat(str(periods["train_start"]))
-            training_end = date.fromisoformat(str(periods["valid_end"]))
+            observed_training_start = date.fromisoformat(str(periods["train_start"]))
+            observed_training_end = date.fromisoformat(str(periods["valid_end"]))
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("model refit periods are invalid") from exc
         if (
             periods.get("test_start") != signal_date.isoformat()
             or periods.get("test_end") != signal_date.isoformat()
-            or not (training_start <= training_end < signal_date)
+            or not (observed_training_start <= observed_training_end < signal_date)
             or coverage.get("coverage_gate_passed") is not True
             or coverage.get("test_start") != signal_date.isoformat()
             or coverage.get("test_end") != signal_date.isoformat()
@@ -550,7 +716,8 @@ class ModelArtifactStore:
             or execution.get("network_mode") != "none"
             or execution.get("root_filesystem_read_only") is not True
             or execution.get("final_oos_opened") is not False
-            or execution.get("inference_only") is not True
+            or (execution.get("inference_only") is True) is not inference_only
+            or (execution.get("live_retrain") is True) is not (not inference_only)
             or not _is_sha256(execution_hash)
             or _canonical_sha256(unsigned_execution) != execution_hash
             or execution.get("execution_environment_sha256")
@@ -606,20 +773,104 @@ class ModelArtifactStore:
             test_end=signal_date.isoformat(),
             trading_days=[signal_date.isoformat()],
         )
-        relative_checkpoint = Path(str(result.get("checkpoint_path") or ""))
         checkpoint_sha256 = str(result.get("checkpoint_sha256") or "").lower()
-        checkpoint_path = (result_root / relative_checkpoint).resolve()
-        try:
-            checkpoint_path.relative_to(result_root)
-        except ValueError as exc:
-            raise ValueError("model refit checkpoint escapes its governed artifact root") from exc
+        checkpoint_format = str(result.get("checkpoint_format") or "")
+        model_engine = str(
+            (source.get("training_evidence") or {}).get("model_engine") or ""
+        )
+        if not model_engine:
+            raise ValueError("source ModelArtifact has no governed model engine")
+        if inference_only:
+            if (
+                result.get("checkpoint_path") is not None
+                or result.get("checkpoint_reused") is not True
+                or checkpoint_sha256 != source.get("checkpoint_sha256")
+                or checkpoint_format != source.get("checkpoint_format")
+            ):
+                raise ValueError("daily inference did not reuse the active checkpoint")
+            checkpoint_path = Path(str(source.get("checkpoint_path") or "")).resolve()
+        else:
+            relative_checkpoint = Path(str(result.get("checkpoint_path") or ""))
+            checkpoint_path = (result_root / relative_checkpoint).resolve()
+            try:
+                checkpoint_path.relative_to(result_root)
+            except ValueError as exc:
+                raise ValueError(
+                    "model refit checkpoint escapes its governed artifact root"
+                ) from exc
+            if relative_checkpoint.is_absolute() or result.get("checkpoint_reused") is True:
+                raise ValueError("model retraining did not create a new checkpoint")
+        verify_governed_checkpoint(
+            checkpoint_path,
+            model_engine=model_engine,
+            checkpoint_format=checkpoint_format,
+            expected_sha256=checkpoint_sha256,
+        )
+        model_data_contract = result.get("model_data_contract")
+        model_data_contract_sha256 = str(
+            result.get("model_data_contract_sha256") or ""
+        ).lower()
+        source_training_evidence = source.get("training_evidence") or {}
+        source_model_data_contract = source_training_evidence.get(
+            "model_data_contract"
+        )
         if (
-            relative_checkpoint.is_absolute()
-            or not checkpoint_path.is_file()
-            or not _is_sha256(checkpoint_sha256)
-            or _file_sha256(checkpoint_path) != checkpoint_sha256
+            not isinstance(model_data_contract, dict)
+            or _canonical_sha256(model_data_contract)
+            != model_data_contract_sha256
+            or not _is_sha256(model_data_contract_sha256)
+            or not isinstance(source_model_data_contract, dict)
         ):
-            raise ValueError("model refit checkpoint failed immutable verification")
+            raise ValueError("model live refresh changed the fitted data contract")
+        if inference_only:
+            if model_data_contract_sha256 != str(
+                source.get("model_data_contract_sha256") or ""
+            ):
+                raise ValueError("daily inference changed the fitted data contract")
+        elif _structural_model_data_contract(
+            model_data_contract
+        ) != _structural_model_data_contract(source_model_data_contract):
+            raise ValueError("model retraining changed the structural data contract")
+        training_evidence = result.get("training_evidence")
+        training_evidence_sha256 = str(
+            result.get("training_evidence_sha256") or ""
+        ).lower()
+        if (
+            not isinstance(training_evidence, dict)
+            or training_evidence.get("operation") != operation
+            or training_evidence.get("source_model_artifact_id")
+            != source_model_artifact_id
+            or not _is_sha256(training_evidence_sha256)
+            or _canonical_sha256(training_evidence) != training_evidence_sha256
+        ):
+            raise ValueError("model live refresh training evidence is invalid")
+        if inference_only:
+            source_periods = (source.get("training_evidence") or {}).get("periods")
+            if (
+                not isinstance(source_periods, dict)
+                or any(
+                    periods.get(key) != source_periods.get(key)
+                    for key in ("train_start", "train_end", "valid_start", "valid_end")
+                )
+            ):
+                raise ValueError("daily inference changed the checkpoint training window")
+            training_start = source["training_start"]
+            training_end = source["training_end"]
+            training_kind = "daily_inference"
+        else:
+            retrain_reason = str(training_evidence.get("retrain_reason") or "")
+            training_start = observed_training_start
+            training_end = observed_training_end
+            training_kind = (
+                "monthly_retrain"
+                if retrain_reason == "monthly_first_trading_day"
+                else "early_retrain"
+            )
+        persisted_training_evidence = {
+            **training_evidence,
+            "model_engine": model_engine,
+            "model_data_contract": model_data_contract,
+        }
 
         bounded_validity = min(max(int(valid_for_days), 1), 7)
         cutoff = datetime.combine(
@@ -635,6 +886,8 @@ class ModelArtifactStore:
             existing = None
         if existing is not None:
             if (
+                (source_status == "retired" and existing.get("status") != "active")
+                or
                 existing.get("predictions_sha256") != predictions_sha256
                 or existing.get("dataset_identity_sha256")
                 != result.get("dataset_identity_sha256")
@@ -644,9 +897,17 @@ class ModelArtifactStore:
                 != self.strategy_spec_sha256(strategy_version_id)
                 or existing.get("model_recipe_sha256")
                 != str(model_signal.get("model_recipe_sha256") or "")
+                or existing.get("checkpoint_sha256") != checkpoint_sha256
+                or existing.get("checkpoint_format") != checkpoint_format
+                or existing.get("model_data_contract_sha256")
+                != model_data_contract_sha256
+                or existing.get("training_kind") != training_kind
+                or existing.get("training_evidence") != persisted_training_evidence
             ):
                 raise ValueError("model refit key already exists with different evidence")
             return existing
+        if source_status != "active":
+            raise ValueError("retired model source cannot create another live artifact")
         return self.create(
             strategy_version_id=strategy_version_id,
             artifact_key=artifact_key,
@@ -663,6 +924,12 @@ class ModelArtifactStore:
             valid_until=cutoff + timedelta(days=bounded_validity),
             artifact_path=predictions_path,
             predictions_sha256=predictions_sha256,
+            checkpoint_path=checkpoint_path,
+            checkpoint_sha256=checkpoint_sha256,
+            checkpoint_format=checkpoint_format,
+            model_data_contract_sha256=model_data_contract_sha256,
+            training_kind=training_kind,
+            training_evidence=persisted_training_evidence,
             actor=actor,
             allow_dataset_rollover=True,
         )
@@ -735,6 +1002,7 @@ class ModelArtifactStore:
             path = Path(str(candidate.artifact_path))
             if not path.is_file() or _file_sha256(path) != str(candidate.artifact_sha256):
                 raise ValueError("ModelArtifact file failed immutable verification")
+            self._verify_fitted_checkpoint(candidate)
             active = connection.execute(
                 select(model_artifacts)
                 .where(
@@ -828,6 +1096,7 @@ class ModelArtifactStore:
                     "active ModelArtifact no longer matches its StrategySpec or "
                     "execution environment"
                 )
+            self._verify_fitted_checkpoint(active)
             result = self._decode(active)
             result["selection_status"] = "active"
             result["contract_version"] = MODEL_ARTIFACT_CONTRACT_VERSION
@@ -865,6 +1134,14 @@ class ModelArtifactStore:
         path = Path(str(selected["artifact_path"]))
         if not path.is_file() or _file_sha256(path) != str(selected["artifact_sha256"]):
             raise ValueError("active ModelArtifact failed immutable verification")
+        verify_governed_checkpoint(
+            Path(str(selected.get("checkpoint_path") or "")).resolve(),
+            model_engine=str(
+                (selected.get("training_evidence") or {}).get("model_engine") or ""
+            ),
+            checkpoint_format=str(selected.get("checkpoint_format") or ""),
+            expected_sha256=str(selected.get("checkpoint_sha256") or ""),
+        )
         return selected
 
     def get(self, artifact_id: str) -> dict[str, Any]:
@@ -908,5 +1185,6 @@ class ModelArtifactStore:
     def _decode(row: Any) -> dict[str, Any]:
         result = row_dict(row)
         result["model_recipe"] = result.pop("model_recipe_json")
+        result["training_evidence"] = result.pop("training_evidence_json")
         result["contract_version"] = MODEL_ARTIFACT_CONTRACT_VERSION
         return result

@@ -1,8 +1,11 @@
 FROM node:22-alpine AS build
 WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@11.9.0 --activate
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+RUN npm install --global pnpm@11.9.0 --registry="${NPM_REGISTRY}" \
+    && pnpm config set registry "${NPM_REGISTRY}" \
+    && pnpm --version
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile --registry="${NPM_REGISTRY}"
 COPY web ./
 ENV NEXT_PUBLIC_API_BASE=""
 RUN pnpm run build

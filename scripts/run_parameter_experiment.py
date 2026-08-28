@@ -16,7 +16,11 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from quant_data.qlib_builder import verify_qlib_output_manifest
-from quant_platform.parameter_experiments import evaluate_trial, summarize_trials
+from quant_platform.parameter_experiments import (
+    evaluate_trial,
+    portfolio_trial_comparability_evidence,
+    summarize_trials,
+)
 from quant_platform.qlib_workflow import (
     qlib_workflow_run,
     require_qlib_workflow_identity,
@@ -30,7 +34,11 @@ def _canonical_sha256(value: Any) -> str:
 
 
 def _read_completed_result(
-    result_path: Path, *, config: dict[str, Any], periods: dict[str, str]
+    result_path: Path,
+    *,
+    config: dict[str, Any],
+    periods: dict[str, str],
+    evaluation_mode: str | None = None,
 ) -> dict[str, Any] | None:
     if not result_path.exists():
         return None
@@ -41,6 +49,12 @@ def _read_completed_result(
         if result.get("periods") != periods:
             return None
         if provenance.get("strategy_config_sha256") != _canonical_sha256(config):
+            return None
+        if evaluation_mode == "pre_final_portfolio_trial" and (
+            provenance.get("evaluation_mode") != evaluation_mode
+            or provenance.get("evaluation_scope") != "pre_final_only"
+            or provenance.get("final_oos_opened") is not False
+        ):
             return None
         if (
             metrics.get("backtest_engine") != "qlib"
@@ -67,14 +81,32 @@ def _run_segment(
 ) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
     result_path = output / "result.json"
-    completed = _read_completed_result(result_path, config=config, periods=periods)
+    evaluation_mode = base_manifest.get("evaluation_mode")
+    completed = _read_completed_result(
+        result_path,
+        config=config,
+        periods=periods,
+        evaluation_mode=(str(evaluation_mode) if evaluation_mode else None),
+    )
     if completed is not None:
         return completed
     manifest = {
         "strategy_version_id": base_manifest["strategy_version_id"],
         "dataset": base_manifest["dataset"],
         "benchmark": base_manifest["benchmark"],
+        "universe": base_manifest.get("universe", "cn_all"),
         "execution_dataset": base_manifest.get("execution_dataset"),
+        "evaluation_mode": evaluation_mode,
+        "pre_final_cutoff": base_manifest.get("pre_final_cutoff"),
+        "historical_validation_periods": base_manifest.get(
+            "historical_validation_periods"
+        ),
+        "strategy_trial_count": base_manifest.get("strategy_trial_count"),
+        "shared_multiple_testing": base_manifest.get("shared_multiple_testing"),
+        "model_signal": base_manifest.get("model_signal"),
+        "model_formal_admission": base_manifest.get("model_formal_admission"),
+        "model_candidate": base_manifest.get("model_candidate"),
+        "model_bundle_factors": base_manifest.get("model_bundle_factors") or [],
         "periods": periods,
         "config": config,
         "factors": base_manifest["factors"],
@@ -114,7 +146,12 @@ def _run_segment(
     if process.returncode != 0:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         raise RuntimeError("; ".join(lines[-8:]) or f"backtest exited {process.returncode}")
-    completed = _read_completed_result(result_path, config=config, periods=periods)
+    completed = _read_completed_result(
+        result_path,
+        config=config,
+        periods=periods,
+        evaluation_mode=(str(evaluation_mode) if evaluation_mode else None),
+    )
     if completed is None:
         raise RuntimeError("backtest result failed provenance validation")
     return completed
@@ -147,22 +184,26 @@ def _finalize_cross_trial_dsr(
     out_of_sample_returns: dict[int, pd.Series],
     *,
     trial_count: int,
+    prior_trial_sharpes: list[float] | None = None,
 ) -> bool:
     successful_trials = [
         item for item in trial_results if item.get("status") == "succeeded"
     ]
     if len(successful_trials) != trial_count:
         return False
-    trial_sharpes = [
+    current_trial_sharpes = [
         float(item["metrics"]["out_of_sample"]["deflated_sharpe"]["daily_sharpe"])
         for item in successful_trials
     ]
+    prior_trial_sharpes = list(prior_trial_sharpes or [])
+    trial_sharpes = [*prior_trial_sharpes, *current_trial_sharpes]
+    governed_trial_count = len(prior_trial_sharpes) + trial_count
     for item in successful_trials:
         trial_index = int(item["trial_index"])
         out_of_sample = item["metrics"]["out_of_sample"]
         dsr = deflated_sharpe_probability(
             out_of_sample_returns[trial_index],
-            trials=trial_count,
+            trials=governed_trial_count,
             trial_sharpes=trial_sharpes,
         )
         out_of_sample["deflated_sharpe"] = dsr
@@ -171,6 +212,49 @@ def _finalize_cross_trial_dsr(
             item["metrics"]["in_sample"], out_of_sample
         )
     return True
+
+
+def _admitted_trial_sharpes(manifest: dict[str, Any]) -> list[float]:
+    evidence = manifest.get("shared_multiple_testing")
+    if evidence is None:
+        return []
+    if not isinstance(evidence, dict):
+        raise ValueError("shared multiple-testing evidence is invalid")
+    names = evidence.get("trial_names")
+    sharpes = evidence.get("trial_daily_sharpes")
+    trial_count = evidence.get("trial_count")
+    if (
+        evidence.get("final_oos_opened") is not False
+        or not isinstance(names, list)
+        or not isinstance(sharpes, list)
+        or int(trial_count or 0) != len(names)
+        or len(sharpes) != len(names)
+        or len({str(item) for item in names}) != len(names)
+    ):
+        raise ValueError("shared multiple-testing evidence is incomplete")
+    normalized = [float(value) for value in sharpes]
+    if any(
+        not pd.notna(value) or value == float("inf") or value == float("-inf")
+        for value in normalized
+    ):
+        raise ValueError("shared multiple-testing Sharpe distribution is invalid")
+    return normalized
+
+
+def _validate_portfolio_trial_comparability(
+    manifest: dict[str, Any], trial_results: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    if manifest.get("evaluation_mode") != "pre_final_portfolio_trial":
+        return None
+    specs = {int(item["trial_index"]): item for item in manifest.get("trials") or []}
+    combined = []
+    for result in trial_results:
+        trial_index = int(result["trial_index"])
+        spec = specs.get(trial_index)
+        if spec is None:
+            raise ValueError("portfolio result contains an unregistered trial")
+        combined.append({**result, "config": spec["config"]})
+    return portfolio_trial_comparability_evidence(combined)
 
 
 def main() -> None:
@@ -183,6 +267,25 @@ def main() -> None:
     parser.add_argument("--tracking-uri", required=True)
     args = parser.parse_args()
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    evaluation_mode = manifest.get("evaluation_mode")
+    if manifest.get("model_signal") is not None and evaluation_mode != (
+        "pre_final_portfolio_trial"
+    ):
+        raise ValueError("model parameter experiments must be explicitly pre-final only")
+    if evaluation_mode == "pre_final_portfolio_trial":
+        cutoff = str(manifest.get("pre_final_cutoff") or "")
+        governance = (manifest.get("periods") or {}).get("governance") or {}
+        if (
+            not cutoff
+            or governance.get("mode") != "model_portfolio_pre_final"
+            or governance.get("final_oos_opened") is not False
+            or any(
+                str((manifest.get("periods") or {}).get(segment, {}).get("end") or "")
+                > cutoff
+                for segment in ("in_sample", "out_of_sample")
+            )
+        ):
+            raise ValueError("model parameter experiment crosses the pre-final cutoff")
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     provenance_path = Path(args.provider_uri) / "metadata" / "provenance.json"
@@ -196,6 +299,10 @@ def main() -> None:
     backtest_script = Path(__file__).with_name("run_multifactor_backtest.py")
     trial_results: list[dict[str, Any]] = []
     out_of_sample_returns: dict[int, pd.Series] = {}
+    prior_trial_sharpes = _admitted_trial_sharpes(manifest)
+    governed_trial_count = len(prior_trial_sharpes) + len(manifest["trials"])
+    if int(manifest.get("strategy_trial_count") or governed_trial_count) != governed_trial_count:
+        raise ValueError("parameter experiment trial count omits prior admitted trials")
     for trial in manifest["trials"]:
         trial_index = int(trial["trial_index"])
         trial_output = output / f"trial-{trial_index:03d}"
@@ -230,7 +337,7 @@ def main() -> None:
                     )
                     out_of_sample_returns[trial_index] = returns
                     dsr = deflated_sharpe_probability(
-                        returns, trials=len(manifest["trials"])
+                        returns, trials=governed_trial_count
                     )
                     segment_metrics[segment]["deflated_sharpe"] = dsr
                     segment_metrics[segment]["deflated_sharpe_probability"] = dsr[
@@ -262,7 +369,9 @@ def main() -> None:
         trial_results,
         out_of_sample_returns,
         trial_count=len(manifest["trials"]),
+        prior_trial_sharpes=prior_trial_sharpes,
     )
+    comparability = _validate_portfolio_trial_comparability(manifest, trial_results)
     # The last in-loop progress snapshot predates the cross-trial DSR. Rewrite
     # it so the live UI and the final result expose the same scores/warnings.
     (output / "progress.json").write_text(
@@ -274,6 +383,11 @@ def main() -> None:
         encoding="utf-8",
     )
     summary = summarize_trials(trial_results, manifest["parameter_grid"])
+    summary["prior_admitted_trial_count"] = len(prior_trial_sharpes)
+    summary["governed_trial_count"] = governed_trial_count
+    summary["final_oos_opened"] = False
+    if comparability is not None:
+        summary["comparability"] = comparability
     if not summary["succeeded_count"]:
         raise RuntimeError(
             "no parameter trial passed statistical acceptance; inspect the trial evidence"
@@ -283,6 +397,8 @@ def main() -> None:
         "experiment_id": manifest["experiment_id"],
         "strategy_version_id": manifest["strategy_version_id"],
         "dataset": manifest["dataset"],
+        "evaluation_mode": evaluation_mode,
+        "final_oos_opened": False,
         "periods": manifest["periods"],
         "trials": trial_results,
         "summary": summary,
@@ -300,7 +416,10 @@ def main() -> None:
                 "dataset": manifest["dataset"],
                 "benchmark": manifest["benchmark"],
                 "trial_count": len(manifest["trials"]),
+                "governed_trial_count": governed_trial_count,
                 "parameter_grid_sha256": _canonical_sha256(manifest["parameter_grid"]),
+                "evaluation_mode": evaluation_mode,
+                "final_oos_opened": False,
             }
         )
         workflow.log_metrics(

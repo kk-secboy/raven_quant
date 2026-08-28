@@ -182,16 +182,30 @@ def _truncate_instruments(path: Path, cutoff: str) -> list[str]:
     cutoff_date = date.fromisoformat(cutoff)
     result: list[str] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
-        fields = raw.split()
+        fields = [item.strip() for item in raw.split("\t")]
+        if len(fields) < 3:
+            tokens = raw.split()
+            dated = [token for token in tokens[1:] if _iso_date_prefix(token) is not None]
+            fields = [tokens[0], *dated[:2]] if tokens and len(dated) >= 2 else []
         if len(fields) < 3:
             continue
-        start = date.fromisoformat(fields[1])
-        end = date.fromisoformat(fields[2])
+        start = _iso_date_prefix(fields[1])
+        end = _iso_date_prefix(fields[2])
+        if start is None or end is None:
+            raise ValueError(f"invalid Qlib instrument interval: {raw}")
         if start > cutoff_date:
             continue
+        fields[1] = start.isoformat()
         fields[2] = min(end, cutoff_date).isoformat()
         result.append("\t".join(fields))
     return result
+
+
+def _iso_date_prefix(value: str) -> date | None:
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None
 
 
 def _copy_truncated_day_feature(source: Path, destination: Path, cutoff_index: int) -> bool:

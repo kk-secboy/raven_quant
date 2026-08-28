@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, date, datetime, timedelta
 
+import pandas as pd
 import pytest
 from governance_fixtures import create_strategy_version
 
@@ -19,8 +22,44 @@ def _artifact(
     recipe: dict | None = None,
     valid_until: datetime | None = None,
 ):
-    path = tmp_path / f"{key}.bin"
-    path.write_bytes(f"artifact:{key}".encode())
+    path = tmp_path / f"{key}.parquet"
+    pd.DataFrame(
+        {"datetime": [pd.Timestamp("2026-07-28")], "instrument": ["SH600000"], "score": [0.1]}
+    ).set_index(["datetime", "instrument"]).to_parquet(path)
+    predictions_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    checkpoint = tmp_path / f"{key}-checkpoint.json"
+    checkpoint.write_text(
+        json.dumps(
+            {
+                "coefficients": [0.1],
+                "feature_count": 1,
+                "format": "ridge-numeric-v1",
+                "intercept": 0.0,
+                "model_engine": "ridge_baseline",
+                "model_spec_sha256": "c" * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    model_data_contract = {
+        "contract_version": "model-data-contract-v1-train-window-normalized",
+        "feature_normalization": {
+            "class": "RobustZScoreNorm",
+            "fit_start_time": "2020-01-01",
+            "fit_end_time": "2025-12-31",
+        },
+    }
+    model_data_contract_sha256 = hashlib.sha256(
+        json.dumps(
+            model_data_contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     return store.create(
         strategy_version_id=version_id,
         artifact_key=key,
@@ -33,7 +72,24 @@ def _artifact(
         scheduled_refit_at=NOW,
         valid_until=valid_until or NOW + timedelta(days=90),
         artifact_path=path,
-        predictions_sha256="b" * 64,
+        predictions_sha256=predictions_sha256,
+        checkpoint_path=checkpoint,
+        checkpoint_sha256=checkpoint_sha256,
+        checkpoint_format="ridge_numeric_json",
+        model_data_contract_sha256=model_data_contract_sha256,
+        training_kind="monthly_retrain",
+        training_evidence={
+            "model_engine": "ridge_baseline",
+            "model_data_contract": model_data_contract,
+            "operation": "retrain",
+            "periods": {
+                "train_start": "2020-01-01",
+                "train_end": "2025-06-30",
+                "valid_start": "2025-07-03",
+                "valid_end": "2025-12-31",
+            },
+            "retrain_reason": "monthly_first_trading_day",
+        },
         actor="model-trainer",
     )
 
@@ -115,7 +171,7 @@ def test_expired_active_model_falls_back_to_simple_baseline(
     assert selected == {
         "status": "simple_baseline_required",
         "reason": "active_model_artifact_expired",
-        "contract_version": "model-artifact-lifecycle-v1",
+        "contract_version": "model-artifact-lifecycle-v2-checkpointed",
     }
 
 
@@ -125,7 +181,7 @@ def test_artifact_tampering_is_rejected_on_activation(
     version_id = create_strategy_version(database_url, tmp_path)
     store = ModelArtifactStore(database_url)
     artifact = _artifact(store, tmp_path, version_id, key="tampered")
-    (tmp_path / "tampered.bin").write_bytes(b"changed")
+    (tmp_path / "tampered.parquet").write_bytes(b"changed")
 
     with pytest.raises(ValueError, match="immutable verification"):
         store.activate(artifact["id"], actor="model-reviewer", now=NOW)

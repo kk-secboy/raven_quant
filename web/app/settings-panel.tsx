@@ -2,6 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { apiFetch } from "./api-client";
+import { DataAutomationPanel } from "./data-automation-panel";
 import { StrategyDefaultsPanel } from "./strategy-defaults-panel";
 
 type SecretState = {
@@ -145,6 +146,7 @@ export function SettingsPanel({ api }: { api: string }) {
       </form>
 
     </section>
+    <DataAutomationPanel api={api} />
     <StrategyDefaultsPanel api={api} />
   </>;
 }

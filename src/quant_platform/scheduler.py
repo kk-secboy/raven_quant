@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -11,19 +13,24 @@ from quant_data.cninfo_announcements import load_trade_calendar_open_days
 from quant_data.config import Settings
 from quant_data.coverage_data import COVERAGE_BUNDLES, DEFAULT_COVERAGE_BUNDLES
 from quant_data.database import (
+    backtest_runs,
     jobs,
     model_artifacts,
     recommendation_snapshots,
     simulation_batches,
+    simulation_nav,
     simulation_portfolios,
     strategy_allocation_events,
+    strategy_versions,
 )
 from quant_data.execution_contract import require_daily_qlib_contract
+from quant_data.research_assets import research_report_dates_in_snapshot
 
 from .alert_store import AlertStore
-from .autonomous_research import AutonomousResearchOrchestrator
-from .continuous_research import ContinuousResearchController
+from .autopilot import AutopilotController
+from .cost_model import COST_SCHEDULE_VERSION
 from .data_rollover import qlib_trading_date_on_or_before, select_qlib_dataset
+from .feature_set_registry import get_feature_set
 from .health_store import OperationalHealthStore
 from .information_schedule import (
     STRUCTURED_INFORMATION_STARTS,
@@ -35,6 +42,8 @@ from .information_schedule import (
 )
 from .job_store import JobStore, research_asset_acquisition_idempotency_key
 from .model_artifact_store import ModelArtifactStore
+from .model_drift import build_persistent_drift_evidence
+from .model_research_governance import canonical_sha256
 from .ops_calendar import (
     evaluate_recommendation_gate,
     is_monthly_decision_day,
@@ -42,6 +51,7 @@ from .ops_calendar import (
     load_calendar_days,
     select_ops_dataset,
 )
+from .promotion import PromotionStore
 from .rdagent_candidate_store import RDAGentCandidateStore
 from .rdagent_runtime import expected_rdagent_runtime_identity, probe_rdagent
 from .rdagent_scenarios import (
@@ -52,12 +62,14 @@ from .rdagent_scenarios import (
 from .recommendation_store import RecommendationStore
 from .research_asset_store import ResearchAssetStore
 from .research_automation import normalize_research_schedule_payload, resolve_research_periods
+from .research_report_backfill import ResearchReportBackfillStore
 from .research_store import ResearchStore
 from .runtime_secret_store import RuntimeSecretStore
 from .safe_mode import SafeModeStore
 from .schedule_store import ScheduleStore
-from .services import list_qlib_datasets
+from .services import list_qlib_datasets, resolve_snapshot_dataset
 from .simulation_store import SimulationStore
+from .strategy_store import StrategyStore
 
 AUTOMATED_DATA_BUNDLES = (
     "cn_extended_daily",
@@ -69,6 +81,7 @@ AUTOMATED_DATA_BUNDLES = (
     "us_market",
     "global_markets",
     "cn_institutional",
+    "strategy_specialty",
     *sorted(DEFAULT_COVERAGE_BUNDLES),
 )
 
@@ -101,6 +114,102 @@ INFORMATION_CONFLICTING_JOB_KINDS = (
 )
 
 
+def model_refresh_decision(
+    *,
+    signal_date: date,
+    calendar_days: set[date],
+    dataset_name: str,
+    dataset_identity_sha256: str,
+) -> dict[str, Any]:
+    """Choose predict-vs-fit without guessing from weekdays.
+
+    A model is fitted only on the first persisted trading day of a month.
+    Other sessions are immutable-checkpoint inference unless a separately
+    validated drift/data-contract trigger explicitly requests an early fit.
+    """
+
+    monthly_retrain = is_monthly_decision_day(signal_date, calendar_days)
+    evidence = (
+        {
+            "calendar_dataset": dataset_name,
+            "calendar_dataset_identity_sha256": dataset_identity_sha256,
+            "is_first_trading_day": True,
+            "signal_date": signal_date.isoformat(),
+            "signal_month": signal_date.strftime("%Y-%m"),
+            "trigger": "monthly_first_trading_day",
+        }
+        if monthly_retrain
+        else None
+    )
+    return {
+        "operation": "retrain" if monthly_retrain else "inference",
+        "retrain_reason": "monthly_first_trading_day" if monthly_retrain else "",
+        "retrain_evidence": evidence,
+        "retrain_evidence_sha256": (
+            canonical_sha256(evidence) if evidence is not None else ""
+        ),
+    }
+
+PAIR_MINUTE_SOURCE_NAMES = (
+    "etf_minute_bars",
+    "a_share_minute_bars",
+    "liquid_stocks_1m",
+    "etf_1m",
+)
+PAIR_SHORTABILITY_SOURCE_NAMES = (
+    "margin_eligibility",
+    "cn_margin_eligibility",
+)
+
+FACTOR_LIBRARY_MIN_FREE_BYTES = 300 * 1024**3
+
+
+def _download_runtime_limits(payload: dict[str, Any]) -> dict[str, int]:
+    workers = payload.get("download_workers", 4)
+    requests_per_minute = payload.get("requests_per_minute", 99)
+    if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 16:
+        raise ValueError("download_workers must be an integer from 1 to 16")
+    if (
+        isinstance(requests_per_minute, bool)
+        or not isinstance(requests_per_minute, int)
+        or not 1 <= requests_per_minute <= 99
+    ):
+        raise ValueError("requests_per_minute must be an integer from 1 to 99")
+    return {
+        "download_workers": workers,
+        "requests_per_minute": requests_per_minute,
+    }
+
+
+def _try_resolve_snapshot_dataset(
+    data_root: Path, *, snapshot_name: str, dataset_name: str
+) -> dict[str, Any] | None:
+    try:
+        return resolve_snapshot_dataset(
+            data_root,
+            snapshot_name=snapshot_name,
+            dataset_name=dataset_name,
+        )
+    except (FileNotFoundError, KeyError, OSError, ValueError):
+        return None
+
+
+def _latest_lineage_coverage_date(
+    datasets: dict[str, dict[str, Any]], *, lineage_id: str, as_of: date
+) -> date | None:
+    values: list[date] = []
+    for item in datasets.values():
+        if str(item.get("lineage_id") or "") != lineage_id:
+            continue
+        try:
+            end = date.fromisoformat(str(item["end_date"]))
+        except (KeyError, ValueError):
+            continue
+        if end <= as_of:
+            values.append(end)
+    return max(values) if values else None
+
+
 class SchedulerEngine:
     """Materializes daily slots and safely enqueues durable platform jobs."""
 
@@ -111,22 +220,28 @@ class SchedulerEngine:
         self.research = ResearchStore(settings.database_url)
         self.rdagent_candidates = RDAGentCandidateStore(settings.database_url)
         self.research_assets = ResearchAssetStore(settings.database_url)
+        self.research_report_backfill = ResearchReportBackfillStore(settings.database_url)
         self.schedules = ScheduleStore(settings.database_url)
         self.alerts = AlertStore(settings.database_url)
         self.health = OperationalHealthStore(settings)
         self.runtime_secrets = RuntimeSecretStore(
             settings.database_url, settings.platform_secret_key
         )
-        self.autonomous_research = AutonomousResearchOrchestrator(settings)
-        self.continuous_research = ContinuousResearchController(settings)
         self.simulations = SimulationStore(settings.database_url)
+        self.strategies = StrategyStore(settings.database_url)
         self.model_artifacts = ModelArtifactStore(settings.database_url)
+        self.promotions = PromotionStore(settings.database_url)
         self.safe_mode = SafeModeStore(settings.database_url)
+        self.autopilot = AutopilotController(settings)
 
     def tick(self, now: datetime | None = None) -> dict[str, int]:
         current = now or datetime.now(UTC)
         research_asset_jobs_enqueued = self._enqueue_daily_research_assets(current)
+        research_report_backfill_enqueued = self._enqueue_research_report_backfill(current)
         model_refits_enqueued = self._enqueue_due_model_refits(current)
+        factor_library_materializations_enqueued = (
+            self._enqueue_due_factor_library_materialization(current)
+        )
         materialized = self.schedules.materialize_due(current)
         processed = 0
         while processed < 100:
@@ -135,8 +250,26 @@ class SchedulerEngine:
                 break
             self._process_run(run, current)
             processed += 1
-        program_result = self.continuous_research.tick(limit=5, now=current)
-        campaign_result = self.autonomous_research.tick(limit=10)
+        try:
+            autopilot_result = self.autopilot.tick(now=current)
+        except Exception as exc:  # fail one automation lane without stopping data/paper
+            autopilot_result = {"cycles": 0, "branches": 0, "failed": 1}
+            self.alerts.create(
+                source_type="platform",
+                source_id="autopilot",
+                severity="critical",
+                category="autopilot_tick_failed",
+                title="自动驾驶研究编排失败",
+                message=str(exc),
+                dedupe_key=f"platform:autopilot:{current.date().isoformat()}:failed",
+            )
+        simulation_order_plans_enqueued = self._enqueue_due_simulation_order_plans(current)
+        # Pair trading requires short sales and borrow-cost assumptions.  The
+        # single Autopilot capital line is deliberately long-only, so legacy
+        # pair records remain readable but are never scheduled or traded.
+        pair_shadow_accounts_created = 0
+        pair_shadow_backtests_enqueued = 0
+        pair_shadow_batches_materialized = 0
         simulation_replays_enqueued = self._enqueue_due_simulation_replays(current)
         projected = self.project_alerts()
         health_recorded = 0
@@ -148,20 +281,722 @@ class SchedulerEngine:
         return {
             "materialized": materialized,
             "processed": processed,
-            "research_campaigns_processed": campaign_result["processed"],
-            "research_campaigns_deferred": campaign_result["deferred"],
-            "research_campaigns_failed": campaign_result["failed"],
-            "research_programs_checked": program_result["checked"],
-            "research_programs_created": program_result["created"],
-            "research_programs_deferred": program_result["deferred"],
-            "research_programs_failed": program_result["failed"],
             "alerts_projected": projected,
             "alerts_delivered": delivered,
             "health_recorded": health_recorded,
             "simulation_replays_enqueued": simulation_replays_enqueued,
+            "simulation_order_plans_enqueued": simulation_order_plans_enqueued,
+            "pair_shadow_batches_materialized": pair_shadow_batches_materialized,
+            "pair_shadow_backtests_enqueued": pair_shadow_backtests_enqueued,
+            "pair_shadow_accounts_created": pair_shadow_accounts_created,
             "model_refits_enqueued": model_refits_enqueued,
+            "factor_library_materializations_enqueued": (
+                factor_library_materializations_enqueued
+            ),
             "research_asset_jobs_enqueued": research_asset_jobs_enqueued,
+            "research_report_backfill_enqueued": research_report_backfill_enqueued,
+            "autopilot_cycles_checked": int(autopilot_result.get("cycles", 0)),
+            "autopilot_branches_enqueued": int(autopilot_result.get("branches", 0)),
+            "autopilot_failures": int(autopilot_result.get("failed", 0)),
         }
+
+    def _enqueue_due_factor_library_materialization(self, now: datetime) -> int:
+        """Materialize the governed factor library once for every sealed daily dataset.
+
+        The job uses the complete registered date range and universe.  It is
+        idempotent on dataset identity plus feature-set identity, so every
+        scheduler tick is safe and a newly published Qlib version triggers the
+        work without a Web button.
+        """
+
+        if self.jobs.count(
+            statuses=("queued", "running"),
+            kinds=("factor_library_materialize", "factor_library_cluster"),
+        ):
+            return 0
+        try:
+            free_bytes = shutil.disk_usage(self.settings.data_root).free
+        except OSError:
+            return 0
+        if free_bytes < FACTOR_LIBRARY_MIN_FREE_BYTES:
+            self.alerts.create(
+                source_type="platform",
+                source_id="factor-library",
+                severity="warning",
+                category="factor_library_disk_guard",
+                title="因子库计算已等待磁盘空间",
+                message="可用磁盘低于 300GB，未启动新的全因子物化。",
+                dedupe_key=(
+                    "platform:factor-library:disk-guard:"
+                    f"{now.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()}"
+                ),
+                details={"free_bytes": free_bytes},
+            )
+            return 0
+
+        candidates: list[dict[str, Any]] = []
+        for dataset in list_qlib_datasets(self.settings.data_root):
+            provenance = dataset.get("provenance")
+            if not dataset.get("ready") or not dataset.get("reproducible"):
+                continue
+            if not isinstance(provenance, dict) or dataset.get("frequency") != "day":
+                continue
+            try:
+                require_daily_qlib_contract(provenance)
+                date.fromisoformat(str(dataset["start_date"]))
+                date.fromisoformat(str(dataset["end_date"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            candidates.append(dataset)
+        if not candidates:
+            return 0
+        dataset = max(
+            candidates,
+            key=lambda item: (
+                str(item["end_date"]),
+                int(item.get("trading_days") or 0),
+                str(item["name"]),
+            ),
+        )
+        feature_set = get_feature_set("unified-research-v1")
+        identity = str(dataset["provenance"]["dataset_identity_sha256"])
+        start = str(dataset["start_date"])
+        end = str(dataset["end_date"])
+        output = (
+            self.settings.data_root
+            / "artifacts"
+            / "factor-library-materializations"
+            / identity
+            / str(feature_set["definition_sha256"])[:16]
+            / "manifest.json"
+        )
+        if output.is_file():
+            try:
+                manifest = json.loads(output.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                manifest = {}
+            if (
+                manifest.get("dataset_identity_sha256") == identity
+                and manifest.get("feature_set_definition_sha256")
+                == feature_set["definition_sha256"]
+                and manifest.get("universe") == "cn_all"
+                and manifest.get("start") == start
+                and manifest.get("end") == end
+                and manifest.get("status") in {"complete", "complete_with_blockers"}
+            ):
+                return 0
+        payload = {
+            "dataset": str(dataset["name"]),
+            "dataset_path": str(dataset["path"]),
+            "dataset_identity_sha256": identity,
+            "feature_set_id": feature_set["id"],
+            "feature_set_definition_sha256": feature_set["definition_sha256"],
+            "library_version_id": (
+                feature_set["source"]
+                if str(feature_set.get("source") or "").startswith(
+                    "unified-factor-library"
+                )
+                else None
+            ),
+            "universe": "cn_all",
+            "start": start,
+            "end": end,
+        }
+        try:
+            job = self.jobs.create(
+                "factor_library_materialize",
+                payload,
+                self.settings.data_root
+                / "platform"
+                / "logs"
+                / f"factor-library-{identity[:12]}.log",
+                idempotency_key=(
+                    f"factor-library:{identity}:{feature_set['definition_sha256']}:"
+                    f"cn_all:{start}:{end}"
+                ),
+                max_attempts=2,
+            )
+        except ValueError as exc:
+            if "active factor_library_materialize job" in str(exc):
+                return 0
+            raise
+        return int(job["status"] in {"queued", "running"})
+
+    def _enqueue_due_simulation_order_plans(self, now: datetime) -> int:
+        """Generate one immutable daily paper order plan per active strategy account."""
+
+        local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        datasets = {
+            item["name"]: item
+            for item in list_qlib_datasets(self.settings.data_root)
+            if item.get("ready") and item.get("reproducible")
+        }
+        with self.jobs.engine.connect() as connection:
+            portfolio_ids = connection.scalars(
+                select(simulation_portfolios.c.id)
+                .where(
+                    simulation_portfolios.c.status == "active",
+                    simulation_portfolios.c.source_type == "strategy_version",
+                    simulation_portfolios.c.execution_adapter == "long_only",
+                )
+                .order_by(simulation_portfolios.c.created_at)
+                .limit(100)
+            ).all()
+        enqueued = 0
+        for portfolio_id in portfolio_ids:
+            try:
+                portfolio = self.simulations.get(str(portfolio_id))
+                version = self.strategies.get_version(str(portfolio["source_id"]))
+                anchor = datasets.get(str(portfolio["daily_dataset"]))
+                if anchor is None:
+                    continue
+                anchor_date = qlib_trading_date_on_or_before(anchor, local_date)
+                current_dataset = select_qlib_dataset(
+                    self.settings.data_root,
+                    anchor_name=str(portfolio["daily_dataset"]),
+                    roll_policy=str(portfolio.get("daily_roll_policy") or "pinned"),
+                    lineage_id=portfolio.get("daily_dataset_lineage_id"),
+                    required_date=anchor_date,
+                )
+                signal_date = qlib_trading_date_on_or_before(current_dataset, local_date)
+                dataset_identity_sha256 = str(
+                    dict(current_dataset.get("provenance") or {}).get(
+                        "dataset_identity_sha256"
+                    )
+                    or ""
+                )
+                if len(dataset_identity_sha256) != 64:
+                    continue
+
+                # A model-prediction paper account must wait for the immutable
+                # checkpoint/prediction artifact for *this* daily publication.
+                # Merely queueing model_refit earlier in the same scheduler
+                # tick is not a dependency: the order-plan worker can otherwise
+                # win the race, exhaust its short retries and permanently bind
+                # the day's idempotency key to a failed job.  Readiness is
+                # therefore checked before the order plan is materialized.
+                model_artifact_binding: dict[str, str] | None = None
+                if str(
+                    version.get("config", {}).get("signal_source")
+                    or "factor_score"
+                ) == "model_prediction":
+                    model_artifact = self.model_artifacts.require_for_inference(
+                        str(version["id"]),
+                        dataset_identity_sha256=dataset_identity_sha256,
+                        now=now,
+                    )
+                    model_artifact_binding = {
+                        "id": str(model_artifact["id"]),
+                        "artifact_sha256": str(model_artifact["artifact_sha256"]),
+                        "checkpoint_sha256": str(model_artifact["checkpoint_sha256"]),
+                        "dataset_identity_sha256": str(
+                            model_artifact["dataset_identity_sha256"]
+                        ),
+                    }
+                stage = self.promotions.require_paper_signal(
+                    str(portfolio["source_id"]),
+                    portfolio_id=str(portfolio_id),
+                    signal_date=signal_date,
+                    now=now,
+                )
+                job = self.jobs.create(
+                    "simulation_order_plan",
+                    {
+                        "simulation_portfolio_id": str(portfolio_id),
+                        "signal_date": signal_date.isoformat(),
+                        "signal_at": None,
+                        "promotion_stage_id": stage["id"],
+                        "promotion_stage_opened_at": stage["opened_at"],
+                        "dataset_identity_sha256": dataset_identity_sha256,
+                        "model_artifact_binding": model_artifact_binding,
+                        "actor": "autopilot",
+                    },
+                    self.settings.data_root
+                    / "platform"
+                    / "logs"
+                    / f"simulation-order-plan-{portfolio_id}.log",
+                    dedupe_active_kind=False,
+                    idempotency_key=(
+                        "simulation-order-plan-v2:"
+                        f"{portfolio_id}:{signal_date.isoformat()}:"
+                        f"{dataset_identity_sha256}"
+                    ),
+                )
+                if job["status"] in {"queued", "running"}:
+                    enqueued += 1
+            except (KeyError, OSError, ValueError):
+                # A new publication or stage may still be materializing.  The
+                # next scheduler tick retries the exact idempotent signal day.
+                continue
+        return enqueued
+
+    def _ensure_approved_pair_shadow_accounts(self, now: datetime) -> int:
+        """Create the isolated account automatically after pair research approval."""
+
+        datasets = {
+            item["name"]: item
+            for item in list_qlib_datasets(self.settings.data_root)
+            if item.get("ready") and item.get("reproducible")
+        }
+        with self.jobs.engine.connect() as connection:
+            version_ids = connection.scalars(
+                select(strategy_versions.c.id)
+                .where(
+                    strategy_versions.c.strategy_type == "pair",
+                    strategy_versions.c.status == "approved",
+                    strategy_versions.c.is_legacy.is_(False),
+                )
+                .order_by(strategy_versions.c.created_at)
+                .limit(100)
+            ).all()
+            existing_sources = set(
+                connection.scalars(
+                    select(simulation_portfolios.c.source_id).where(
+                        simulation_portfolios.c.source_type == "strategy_version",
+                        simulation_portfolios.c.execution_adapter == "pair",
+                    )
+                ).all()
+            )
+        created = 0
+        for raw_version_id in version_ids:
+            version_id = str(raw_version_id)
+            if version_id in {str(value) for value in existing_sources}:
+                continue
+            try:
+                version = self.strategies.get_version(version_id)
+                formal = next(
+                    (
+                        item
+                        for item in self.strategies.list_backtests(version_id)
+                        if item.get("status") == "succeeded" and not item.get("is_legacy")
+                    ),
+                    None,
+                )
+                if formal is None:
+                    continue
+                daily = datasets.get(str(formal["dataset"]))
+                if daily is None:
+                    continue
+                manifest = json.loads(
+                    (Path(str(formal["artifact_path"])) / "manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                snapshot_name = str(manifest.get("execution_snapshot") or "")
+                minute_name = str(
+                    dict(manifest.get("minute_dataset") or {}).get("dataset_name") or ""
+                )
+                daily_source = str(
+                    dict(daily.get("provenance") or {}).get("source_lineage_id") or ""
+                )
+                execution = next(
+                    (
+                        item
+                        for item in datasets.values()
+                        if item.get("frequency") == "1min"
+                        and str(
+                            dict(item.get("provenance") or {}).get("source_lineage_id") or ""
+                        )
+                        == daily_source
+                        and str(
+                            dict(item.get("provenance") or {}).get("snapshot_name") or ""
+                        )
+                        == snapshot_name
+                        and minute_name
+                        in set(
+                            dict(item.get("provenance") or {}).get("source_datasets") or []
+                        )
+                    ),
+                    None,
+                )
+                if execution is None:
+                    continue
+                portfolio = self.simulations.create(
+                    name=f"配对影子模拟-{version_id[:8]}",
+                    source_type="strategy_version",
+                    source_id=version_id,
+                    daily_dataset=daily,
+                    execution_dataset=execution,
+                    initial_cash=float(
+                        dict(version.get("config") or {}).get("initial_capital") or 5_000_000
+                    ),
+                    execution_policy={
+                        "execution_algorithm": "vwap",
+                        "slice_minutes": 5,
+                        "max_slices": 24,
+                        "max_participation": float(
+                            dict(version.get("config") or {}).get(
+                                "max_volume_participation", 0.01
+                            )
+                        ),
+                    },
+                    cost_schedule_version=str(
+                        dict(version.get("config") or {}).get(
+                            "cost_schedule_version", COST_SCHEDULE_VERSION
+                        )
+                    ),
+                    actor="autopilot-shadow-pair",
+                    execution_adapter="pair",
+                    daily_roll_policy="latest_compatible",
+                    execution_roll_policy="latest_compatible",
+                )
+                self.simulations.set_status(portfolio["id"], "active")
+                created += 1
+            except (
+                FileNotFoundError,
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                continue
+        return created
+
+    def _enqueue_due_pair_shadow_backtests(self, now: datetime) -> int:
+        """Extend each active pair shadow source through the latest governed day."""
+
+        local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        datasets = {
+            item["name"]: item
+            for item in list_qlib_datasets(self.settings.data_root)
+            if item.get("ready") and item.get("reproducible")
+        }
+        with self.jobs.engine.connect() as connection:
+            accounts = connection.execute(
+                select(
+                    simulation_portfolios.c.source_id,
+                    simulation_portfolios.c.daily_dataset,
+                    simulation_portfolios.c.daily_dataset_lineage_id,
+                    simulation_portfolios.c.execution_dataset,
+                    simulation_portfolios.c.execution_dataset_lineage_id,
+                )
+                .where(
+                    simulation_portfolios.c.status == "active",
+                    simulation_portfolios.c.source_type == "strategy_version",
+                    simulation_portfolios.c.execution_adapter == "pair",
+                )
+                .order_by(simulation_portfolios.c.created_at)
+                .limit(100)
+            ).all()
+        enqueued = 0
+        seen_versions: set[str] = set()
+        for account in accounts:
+            version_id = str(account.source_id)
+            if version_id in seen_versions:
+                continue
+            seen_versions.add(version_id)
+            try:
+                required_date = _latest_lineage_coverage_date(
+                    datasets,
+                    lineage_id=str(account.daily_dataset_lineage_id),
+                    as_of=local_date,
+                )
+                if required_date is None:
+                    continue
+                daily = select_qlib_dataset(
+                    self.settings.data_root,
+                    anchor_name=str(account.daily_dataset),
+                    roll_policy="latest_compatible",
+                    lineage_id=str(account.daily_dataset_lineage_id),
+                    required_date=required_date,
+                )
+                trade_date = qlib_trading_date_on_or_before(daily, local_date)
+                execution = select_qlib_dataset(
+                    self.settings.data_root,
+                    anchor_name=str(account.execution_dataset),
+                    roll_policy="latest_compatible",
+                    lineage_id=str(account.execution_dataset_lineage_id),
+                    required_date=trade_date,
+                )
+                execution_provenance = dict(execution.get("provenance") or {})
+                snapshot_name = str(execution_provenance.get("snapshot_name") or "")
+                source_names = set(execution_provenance.get("source_datasets") or [])
+                minute_name = next(
+                    (name for name in PAIR_MINUTE_SOURCE_NAMES if name in source_names),
+                    None,
+                )
+                if not snapshot_name or minute_name is None:
+                    continue
+                minute = resolve_snapshot_dataset(
+                    self.settings.data_root,
+                    snapshot_name=snapshot_name,
+                    dataset_name=minute_name,
+                )
+                shortability = next(
+                    (
+                        resolved
+                        for name in PAIR_SHORTABILITY_SOURCE_NAMES
+                        if (
+                            resolved := _try_resolve_snapshot_dataset(
+                            self.settings.data_root,
+                            snapshot_name=snapshot_name,
+                            dataset_name=name,
+                        )
+                        ) is not None
+                    ),
+                    None,
+                )
+                if shortability is None:
+                    continue
+                backtests = self.strategies.list_backtests(version_id)
+                latest_start: date | None = None
+                already_covered = False
+                already_active = False
+                for item in backtests:
+                    periods = dict(item.get("periods") or {})
+                    try:
+                        item_start = date.fromisoformat(str(periods.get("start") or ""))
+                        item_end = date.fromisoformat(str(periods.get("end") or ""))
+                    except ValueError:
+                        continue
+                    latest_start = min(latest_start, item_start) if latest_start else item_start
+                    if item_end >= trade_date and item.get("status") == "succeeded":
+                        already_covered = True
+                    if item_end >= trade_date and item.get("status") in {"queued", "running"}:
+                        already_active = True
+                if already_covered or already_active:
+                    continue
+                daily_start = date.fromisoformat(str(daily["start_date"]))
+                start = max(
+                    daily_start,
+                    latest_start or (trade_date - timedelta(days=4 * 365)),
+                )
+                if start >= trade_date:
+                    continue
+                execution_dataset = (
+                    f"{snapshot_name}/{minute_name}"
+                    f"+{shortability['dataset_name']}"
+                )
+                backtest = self.strategies.create_backtest(
+                    version_id=version_id,
+                    dataset=str(daily["name"]),
+                    execution_dataset=execution_dataset,
+                    periods={"start": start.isoformat(), "end": trade_date.isoformat()},
+                    artifact_path=self.settings.data_root / "artifacts" / "backtests",
+                    dataset_lineage_id=str(
+                        dict(daily.get("provenance") or {}).get("dataset_lineage_id") or ""
+                    ),
+                )
+                job = self.jobs.create(
+                    "pair_backtest",
+                    {
+                        "backtest_id": backtest["id"],
+                        "strategy_version_id": version_id,
+                        "dataset": str(daily["name"]),
+                        "dataset_path": str(daily["path"]),
+                        "daily_provenance": dict(daily.get("provenance") or {}),
+                        "execution_snapshot": snapshot_name,
+                        "minute_dataset": minute,
+                        "shortability_dataset": shortability,
+                        "periods": backtest["periods"],
+                    },
+                    self.settings.data_root
+                    / "platform"
+                    / "logs"
+                    / f"pair-shadow-backtest-{version_id}-{trade_date}.log",
+                    dedupe_active_kind=False,
+                    idempotency_key=f"pair-shadow-backtest:{version_id}:{trade_date}:{snapshot_name}",
+                )
+                self.strategies.attach_job(backtest["id"], job["id"])
+                enqueued += int(job["status"] in {"queued", "running"})
+            except (KeyError, OSError, TypeError, ValueError):
+                continue
+        return enqueued
+
+    def _materialize_due_pair_shadow_batches(self, now: datetime) -> int:
+        """Create one governed shadow-pair ledger day for each active account.
+
+        The immutable pair backtest owns the targets.  This scheduler only
+        selects the latest available governed day; the normal replay worker
+        still enforces minute bars, dated shortability, costs and atomic legs.
+        """
+
+        local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        datasets = {
+            item["name"]: item
+            for item in list_qlib_datasets(self.settings.data_root)
+            if item.get("ready") and item.get("reproducible")
+        }
+        with self.jobs.engine.connect() as connection:
+            accounts = connection.execute(
+                select(
+                    simulation_portfolios.c.id,
+                    simulation_portfolios.c.source_id,
+                    simulation_portfolios.c.daily_dataset,
+                    simulation_portfolios.c.daily_dataset_lineage_id,
+                )
+                .where(
+                    simulation_portfolios.c.status == "active",
+                    simulation_portfolios.c.source_type == "strategy_version",
+                    simulation_portfolios.c.execution_adapter == "pair",
+                )
+                .order_by(simulation_portfolios.c.created_at)
+                .limit(100)
+            ).all()
+        created = 0
+        for account in accounts:
+            try:
+                anchor = datasets.get(str(account.daily_dataset))
+                if anchor is None:
+                    continue
+                required_date = _latest_lineage_coverage_date(
+                    datasets,
+                    lineage_id=str(account.daily_dataset_lineage_id),
+                    as_of=local_date,
+                )
+                if required_date is None:
+                    continue
+                current_daily = select_qlib_dataset(
+                    self.settings.data_root,
+                    anchor_name=str(account.daily_dataset),
+                    roll_policy="latest_compatible",
+                    lineage_id=str(account.daily_dataset_lineage_id),
+                    required_date=required_date,
+                )
+                trade_date = qlib_trading_date_on_or_before(current_daily, local_date)
+                with self.jobs.engine.connect() as connection:
+                    candidates = connection.execute(
+                        select(backtest_runs.c.id, backtest_runs.c.periods_json)
+                        .where(
+                            backtest_runs.c.strategy_version_id == account.source_id,
+                            backtest_runs.c.status == "succeeded",
+                            backtest_runs.c.is_legacy.is_(False),
+                        )
+                        .order_by(backtest_runs.c.finished_at.desc())
+                        .limit(20)
+                    ).all()
+                backtest_id = next(
+                    (
+                        str(item.id)
+                        for item in candidates
+                        if date.fromisoformat(
+                            str(dict(item.periods_json or {}).get("end") or "1900-01-01")
+                        )
+                        >= trade_date
+                    ),
+                    None,
+                )
+                if backtest_id is None:
+                    continue
+                _, inserted = self.simulations.create_pair_batch_from_backtest(
+                    str(account.id),
+                    backtest_id=str(backtest_id),
+                    trade_date=trade_date,
+                    data_root=self.settings.data_root,
+                    actor="autopilot-shadow-pair",
+                )
+                created += int(inserted)
+            except (KeyError, OSError, TypeError, ValueError):
+                # A newly approved shadow account may be waiting for today's
+                # backtest artifact or shortability snapshot.  The next tick
+                # retries the same immutable date and idempotency key.
+                continue
+        return created
+
+    def _enqueue_research_report_backfill(self, now: datetime) -> int:
+        """Resume the selected three-year PDF backlog without starving live data."""
+
+        self.research_report_backfill.reconcile()
+        if not self.settings.research_asset_auto_enabled:
+            return 0
+        local = now.astimezone(ZoneInfo("Asia/Shanghai"))
+        if (local.hour, local.minute) < (
+            self.settings.research_asset_auto_hour,
+            self.settings.research_asset_auto_minute,
+        ):
+            return 0
+        if shutil.disk_usage(self.settings.data_root).free < 300 * 1024**3:
+            return 0
+        with self.jobs.engine.connect() as connection:
+            active_live = connection.scalar(
+                select(jobs.c.id)
+                .where(
+                    jobs.c.kind == "research_asset_acquire",
+                    jobs.c.status.in_(("queued", "running")),
+                    jobs.c.payload_json["include_tushare"].as_boolean() == True,  # noqa: E712
+                    jobs.c.payload_json["tushare_report_date"].as_string().is_(None),
+                )
+                .limit(1)
+            )
+            main_data_active = connection.scalar(
+                select(jobs.c.id)
+                .where(
+                    jobs.c.status.in_(("queued", "running")),
+                    jobs.c.kind.in_(
+                        (
+                            "bootstrap",
+                            "legacy_market_backfill",
+                            "data_verify",
+                            "data_snapshot",
+                            "data_qlib",
+                            "minute_qlib",
+                            "ashare_5m_download",
+                        )
+                    ),
+                )
+                .limit(1)
+            )
+        if active_live is not None or main_data_active is not None:
+            return 0
+        research_day = local.date()
+        try:
+            snapshot_name = latest_verified_research_asset_snapshot(
+                self.settings.data_root, as_of=research_day
+            )
+            dates = research_report_dates_in_snapshot(
+                self.settings.data_root,
+                snapshot_name=snapshot_name,
+                start=date(2023, 8, 25),
+                end=research_day,
+                as_of=research_day,
+            )
+        except (OSError, ValueError):
+            return 0
+        self.research_report_backfill.seed(dates, snapshot_name=snapshot_name)
+
+        day_start_local = datetime.combine(research_day, time.min, tzinfo=local.tzinfo)
+        day_start = day_start_local.astimezone(UTC)
+        attempts_left = max(
+            0, 100 - self.research_report_backfill.attempts_started_since(day_start)
+        )
+        if attempts_left < 20:
+            return 0
+        if self.research_report_backfill.bytes_finished_since(day_start) >= 5 * 1024**3:
+            return 0
+        slots = max(0, 2 - self.research_report_backfill.active_count())
+        enqueued = 0
+        for row in self.research_report_backfill.pending(limit=min(slots, attempts_left // 20)):
+            report_date = row["report_date"]
+            idempotency_key = research_asset_acquisition_idempotency_key(
+                research_day=research_day.isoformat(),
+                snapshot_name=str(row["snapshot_name"]),
+                include_tushare=True,
+                include_arxiv=False,
+                report_date=report_date.isoformat(),
+            )
+            job = self.jobs.create(
+                "research_asset_acquire",
+                {
+                    "mode": "automatic",
+                    "snapshot_name": str(row["snapshot_name"]),
+                    "as_of": research_day.isoformat(),
+                    "tushare_report_date": report_date.isoformat(),
+                    "include_tushare": True,
+                    "include_arxiv": False,
+                    "requested_by": "research-report-backfill",
+                },
+                self.settings.data_root
+                / "platform"
+                / "logs"
+                / f"research-report-backfill-{report_date.isoformat()}.log",
+                dedupe_active_kind=False,
+                idempotency_key=idempotency_key,
+                max_attempts=3,
+            )
+            self.research_report_backfill.mark_queued(report_date, job_id=job["id"])
+            enqueued += 1
+        return enqueued
 
     def _enqueue_daily_research_assets(self, now: datetime) -> int:
         """Queue bounded, source-isolated research acquisitions after the local close."""
@@ -247,7 +1082,7 @@ class SchedulerEngine:
         return int(job["status"] in {"queued", "running"})
 
     def _enqueue_due_model_refits(self, now: datetime) -> int:
-        """Queue one immutable live prediction refresh per approved model strategy."""
+        """Queue daily checkpoint inference; fit only on the monthly decision day."""
 
         local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
         with self.jobs.engine.connect() as connection:
@@ -265,9 +1100,7 @@ class SchedulerEngine:
         enqueued = 0
         for row in due:
             try:
-                version = self.model_artifacts.strategies.get_version(
-                    str(row.strategy_version_id)
-                )
+                version = self.model_artifacts.strategies.get_version(str(row.strategy_version_id))
                 model_signal = version.get("model_signal")
                 lineage_id = (
                     str(model_signal.get("dataset_lineage_id") or "")
@@ -286,11 +1119,44 @@ class SchedulerEngine:
                     required_date=anchor_date,
                 )
                 signal_date = qlib_trading_date_on_or_before(dataset, local_date)
-                cutoff_date = row.data_cutoff_at.astimezone(
-                    ZoneInfo("Asia/Shanghai")
-                ).date()
+                cutoff_date = row.data_cutoff_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
                 if signal_date <= cutoff_date:
                     continue
+                refresh_decision = model_refresh_decision(
+                    signal_date=signal_date,
+                    calendar_days=load_calendar_days(str(dataset["path"])),
+                    dataset_name=str(dataset["name"]),
+                    dataset_identity_sha256=str(
+                        dataset["provenance"]["dataset_identity_sha256"]
+                    ),
+                )
+                if refresh_decision["operation"] == "inference":
+                    drift_policy = version.get("config", {}).get("model_drift_policy")
+                    drift_policy_sha256 = version.get("config", {}).get(
+                        "model_drift_policy_sha256"
+                    )
+                    if (
+                        isinstance(drift_policy, dict)
+                        and drift_policy.get("contract_version")
+                        == "model-drift-policy-v1"
+                        and canonical_sha256(drift_policy) == drift_policy_sha256
+                    ):
+                        drift_evidence = self._persistent_model_drift_evidence(
+                            strategy_version_id=str(row.strategy_version_id),
+                            signal_date=signal_date,
+                            calendar_days=load_calendar_days(str(dataset["path"])),
+                            dataset_lineage_id=lineage_id,
+                            policy=drift_policy,
+                        )
+                        if drift_evidence is not None:
+                            refresh_decision = {
+                                "operation": "retrain",
+                                "retrain_reason": "persistent_drift",
+                                "retrain_evidence": drift_evidence,
+                                "retrain_evidence_sha256": canonical_sha256(
+                                    drift_evidence
+                                ),
+                            }
                 job = self.jobs.create(
                     "model_refit",
                     {
@@ -298,11 +1164,10 @@ class SchedulerEngine:
                         "source_model_artifact_id": str(row.id),
                         "dataset": dataset["name"],
                         "dataset_path": dataset["path"],
-                        "dataset_identity_sha256": dataset["provenance"][
-                            "dataset_identity_sha256"
-                        ],
+                        "dataset_identity_sha256": dataset["provenance"]["dataset_identity_sha256"],
                         "dataset_lineage_id": lineage_id,
                         "signal_date": signal_date.isoformat(),
+                        **refresh_decision,
                         "valid_for_days": 4,
                         "actor": "model-refit-scheduler",
                     },
@@ -320,6 +1185,74 @@ class SchedulerEngine:
             except (KeyError, TypeError, ValueError):
                 continue
         return enqueued
+
+    def _persistent_model_drift_evidence(
+        self,
+        *,
+        strategy_version_id: str,
+        signal_date: date,
+        calendar_days: set[date],
+        dataset_lineage_id: str,
+        policy: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Build an early-refit trigger from the active isolated paper ledger.
+
+        Missing, stale or uncertified NAV never becomes evidence.  Manual and
+        aggregate accounts are excluded so another portfolio cannot retrain the
+        governed strategy.
+        """
+
+        try:
+            window = int(policy["window_trading_days"])
+            consecutive = int(policy["consecutive_windows"])
+            required = window * consecutive
+        except (KeyError, TypeError, ValueError):
+            return None
+        with self.jobs.engine.connect() as connection:
+            portfolio = connection.execute(
+                select(simulation_portfolios.c.id)
+                .where(
+                    simulation_portfolios.c.source_type == "strategy_version",
+                    simulation_portfolios.c.source_id == strategy_version_id,
+                    simulation_portfolios.c.status == "active",
+                    simulation_portfolios.c.execution_adapter == "long_only",
+                    simulation_portfolios.c.created_by == "autopilot",
+                )
+                .order_by(simulation_portfolios.c.created_at.desc())
+                .limit(1)
+            ).first()
+            if portfolio is None:
+                return None
+            rows = connection.execute(
+                select(
+                    simulation_nav.c.trade_date,
+                    simulation_nav.c.twr_daily_return,
+                    simulation_nav.c.benchmark_return,
+                    simulation_nav.c.performance_certified,
+                    simulation_nav.c.has_stale_prices,
+                    simulation_nav.c.status,
+                )
+                .where(
+                    simulation_nav.c.portfolio_id == str(portfolio.id),
+                    simulation_nav.c.trade_date <= signal_date,
+                )
+                .order_by(simulation_nav.c.trade_date.desc())
+                .limit(required)
+            ).mappings().all()
+        try:
+            return build_persistent_drift_evidence(
+                nav_rows=list(reversed(rows)),
+                trading_days=sorted(calendar_days),
+                as_of=signal_date,
+                dataset_lineage_id=dataset_lineage_id,
+                metric=str(policy["metric"]),
+                window_trading_days=window,
+                consecutive_windows=consecutive,
+                threshold=float(policy["threshold"]),
+                comparison=str(policy["comparison"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def _enqueue_due_simulation_replays(self, now: datetime) -> int:
         """Bind due forward batches only after immutable execution data exists."""
@@ -347,6 +1280,7 @@ class SchedulerEngine:
                     recommendation_snapshots.c.status == "succeeded",
                     recommendation_snapshots.c.effective_date <= local_date,
                     simulation_portfolios.c.status == "active",
+                    simulation_portfolios.c.execution_adapter == "long_only",
                     simulation_batches.c.id.is_(None),
                 )
                 .order_by(recommendation_snapshots.c.effective_date)
@@ -382,6 +1316,8 @@ class SchedulerEngine:
                     simulation_batches.c.status == "queued",
                     simulation_batches.c.trade_date <= local_date,
                     simulation_portfolios.c.status == "active",
+                    simulation_portfolios.c.execution_adapter == "long_only",
+                    simulation_batches.c.execution_adapter == "long_only",
                 )
                 .order_by(simulation_batches.c.trade_date, simulation_batches.c.created_at)
                 .limit(100)
@@ -426,12 +1362,16 @@ class SchedulerEngine:
             )
             return
         try:
-            if run["kind"] in {"incremental_sync", "data_pipeline"} and run[
-                "trading_days_only"
-            ]:
-                local_date = scheduled_for.astimezone(
-                    ZoneInfo(run["timezone"])
-                ).date()
+            if (
+                run["kind"]
+                in {
+                    "incremental_sync",
+                    "data_pipeline",
+                    "auxiliary_data_pipeline",
+                }
+                and run["trading_days_only"]
+            ):
+                local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
                 # Do not consult the existing Qlib calendar here: these jobs are
                 # responsible for extending that calendar, so a stale calendar
                 # would permanently block a weekday catch-up.  Weekends are
@@ -462,6 +1402,10 @@ class SchedulerEngine:
                     return
             elif run["kind"] == "ashare_5m_sync":
                 job = self._enqueue_ashare_5m(run, scheduled_for)
+                if job is None:
+                    return
+            elif run["kind"] == "auxiliary_data_pipeline":
+                job = self._enqueue_auxiliary_data(run, scheduled_for)
                 if job is None:
                     return
             elif run["kind"] == "rdagent_research":
@@ -540,6 +1484,7 @@ class SchedulerEngine:
         if not stored and (not self.settings.api_url or not self.settings.token):
             raise ValueError("Tushare credentials are not configured")
         payload = run["payload"]
+        runtime_limits = _download_runtime_limits(payload)
         local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
         lookback_days = max(1, min(90, int(payload.get("lookback_days", 7))))
         snapshot_start = str(payload.get("snapshot_start", "2008-01-01"))
@@ -553,9 +1498,7 @@ class SchedulerEngine:
         snapshot_name = f"{snapshot_prefix}-{snapshot_start.replace('-', '')}-{local_date:%Y%m%d}"
         if profile == "research-assets":
             if set(bundles) != {"research_corpus"}:
-                raise ValueError(
-                    "research-assets data pipeline requires exactly research_corpus"
-                )
+                raise ValueError("research-assets data pipeline requires exactly research_corpus")
             pipeline_id = f"schedule-run:{run['id']}"
             log_path = (
                 self.settings.data_root
@@ -580,11 +1523,12 @@ class SchedulerEngine:
                         {"kind": "data_snapshot", "payload": {}},
                     ],
                     "pipeline_next_index": 0,
+                    **runtime_limits,
                 },
                 log_path,
                 idempotency_key=pipeline_id,
             )
-        pipeline_steps = [
+        supplemental_steps = [
             {
                 "kind": f"supplemental_{bundle}",
                 "payload": {
@@ -596,10 +1540,15 @@ class SchedulerEngine:
             }
             for bundle in bundles
         ]
-        pipeline_steps.extend(
+        publication_steps = [
             {"kind": kind, "payload": {}}
             for kind in ("data_verify", "data_snapshot", "data_qlib", "qlib_baseline")
-        )
+        ]
+        # Daily A-share publication is the latency-critical path. Optional
+        # regional and research bundles remain durable successors, but must
+        # never delay the verified snapshot or Qlib dataset used by research.
+        # Their atomic unit files are picked up by the next daily snapshot.
+        pipeline_steps = [*publication_steps, *supplemental_steps]
         pipeline_id = f"schedule-run:{run['id']}"
         log_path = (
             self.settings.data_root / "platform" / "logs" / f"scheduled-pipeline-{run['id']}.log"
@@ -619,6 +1568,7 @@ class SchedulerEngine:
                 "snapshot_start": snapshot_start,
                 "snapshot_end": local_date.isoformat(),
                 "snapshot_name": snapshot_name,
+                **runtime_limits,
             },
             log_path,
             idempotency_key=pipeline_id,
@@ -839,9 +1789,7 @@ class SchedulerEngine:
             (evaluation_dataset.get("provenance") or {}).get("snapshot_name") or ""
         ).strip()
         if not source_snapshot_name:
-            raise ValueError(
-                "information factor refresh Qlib dataset has no bound source snapshot"
-            )
+            raise ValueError("information factor refresh Qlib dataset has no bound source snapshot")
         end = local_date.isoformat()
         from .announcement_nlp import FACTOR_NAME as announcement_tone_factor
         from .announcement_nlp import LOGIC_FACTOR_NAME as announcement_logic_factor
@@ -901,9 +1849,7 @@ class SchedulerEngine:
                 {
                     "kind": "major_news_mentions",
                     "payload": {
-                        "start": STRUCTURED_INFORMATION_STARTS[
-                            "major_news_mentions"
-                        ].isoformat(),
+                        "start": STRUCTURED_INFORMATION_STARTS["major_news_mentions"].isoformat(),
                         "end": end,
                         "ts_codes": [],
                     },
@@ -977,9 +1923,7 @@ class SchedulerEngine:
         first_payload = {
             "pipeline_id": pipeline_id,
             "profile": "information_factor_refresh",
-            "start": min(
-                STRUCTURED_INFORMATION_STARTS[source] for source in selected
-            ).isoformat(),
+            "start": min(STRUCTURED_INFORMATION_STARTS[source] for source in selected).isoformat(),
             "end": end,
             "snapshot_name": pipeline_name,
             "pipeline_steps": remaining,
@@ -1008,12 +1952,11 @@ class SchedulerEngine:
         if not stored and (not self.settings.api_url or not self.settings.token):
             raise ValueError("Tushare credentials are not configured")
         payload = run["payload"]
+        runtime_limits = _download_runtime_limits(payload)
         local_scheduled_for = scheduled_for.astimezone(ZoneInfo(run["timezone"]))
         local_date = local_scheduled_for.date()
         if local_scheduled_for.time().replace(tzinfo=None) < time(15, 10):
-            raise ValueError(
-                "A-share five-minute sync must run after the market has fully closed"
-            )
+            raise ValueError("A-share five-minute sync must run after the market has fully closed")
 
         # The raw SSE calendar extends beyond the latest published Qlib
         # dataset and therefore distinguishes an exchange holiday from a stale
@@ -1066,9 +2009,7 @@ class SchedulerEngine:
         )
         require_daily_qlib_contract(daily_dataset.get("provenance") or {})
         if qlib_trading_date_on_or_before(daily_dataset, target_date) != target_date:
-            raise ValueError(
-                "daily Qlib publication does not contain the fully closed trading day"
-            )
+            raise ValueError("daily Qlib publication does not contain the fully closed trading day")
         source_lineage_id = str(
             (daily_dataset.get("provenance") or {}).get("source_lineage_id") or ""
         )
@@ -1099,9 +2040,115 @@ class SchedulerEngine:
                 "pipeline_next_index": 0,
                 "pipeline_id": f"schedule-run:{run['id']}",
                 "profile": "ashare_intraday",
+                **runtime_limits,
             },
             log_path,
             idempotency_key=f"schedule-run:{run['id']}",
+        )
+
+    def _enqueue_auxiliary_data(
+        self,
+        run: dict[str, Any],
+        scheduled_for: datetime,
+    ) -> dict[str, Any] | None:
+        """Publish the five catalog capabilities outside the daily raw chain."""
+
+        stored = self.runtime_secrets.get("tushare")
+        if not stored and (not self.settings.api_url or not self.settings.token):
+            raise ValueError("Tushare credentials are not configured")
+        payload = run["payload"]
+        runtime_limits = _download_runtime_limits(payload)
+        candidates = [
+            item
+            for item in list_qlib_datasets(self.settings.data_root)
+            if item.get("ready")
+            and item.get("reproducible")
+            and item.get("frequency") == "day"
+            and item.get("end_date")
+        ]
+        if not candidates:
+            raise ValueError("auxiliary data refresh requires a reproducible daily Qlib dataset")
+        daily_dataset = max(
+            candidates,
+            key=lambda item: (str(item["end_date"]), str(item["name"])),
+        )
+        require_daily_qlib_contract(daily_dataset.get("provenance") or {})
+        target_date = date.fromisoformat(str(daily_dataset["end_date"]))
+        history_start = date.fromisoformat(str(payload.get("history_start") or "2024-01-01"))
+        if history_start > target_date:
+            raise ValueError("auxiliary data history start is after the latest daily dataset")
+        source_lineage_id = str(
+            (daily_dataset.get("provenance") or {}).get("source_lineage_id") or ""
+        )
+        if len(source_lineage_id) != 64:
+            raise ValueError("daily Qlib dataset has no verified source lineage")
+        symbols = payload.get("strategy_minute_symbols")
+        if not isinstance(symbols, list) or not symbols:
+            raise ValueError("auxiliary data refresh requires strategy minute symbols")
+        max_stocks = int(payload.get("max_stocks", 100))
+        max_options = int(payload.get("max_options", 100))
+        snapshot_name = f"execution-{history_start:%Y%m%d}-{target_date:%Y%m%d}-auto"
+        pipeline_id = f"auxiliary-data:{target_date.isoformat()}"
+        root_payload = {
+            "start": history_start.isoformat(),
+            "end": target_date.isoformat(),
+            "snapshot_start": history_start.isoformat(),
+            "snapshot_end": target_date.isoformat(),
+            "snapshot_name": snapshot_name,
+            "pipeline_snapshot_name": snapshot_name,
+            "pipeline_id": pipeline_id,
+            "profile": "auxiliary_daily",
+            **runtime_limits,
+            "pipeline_steps": [
+                {
+                    "kind": "core_intraday_download",
+                    "payload": {
+                        "start": history_start.isoformat(),
+                        "end": target_date.isoformat(),
+                        "snapshot_name": snapshot_name,
+                        "daily_dataset": daily_dataset["name"],
+                        "source_lineage_id": source_lineage_id,
+                        "etfs": ["510300.SH", "159919.SZ"],
+                        "stocks": [],
+                        "indices": [],
+                        "futures": [],
+                        "options": [],
+                        "auto_select": True,
+                        "max_stocks": max_stocks,
+                        "max_options": max_options,
+                        "etf_categories": ["broad", "industry", "gold", "bond"],
+                    },
+                },
+                {
+                    "kind": "minute_qlib",
+                    "payload": {
+                        "output_name": f"{snapshot_name}-1min",
+                        "target_frequency": "1min",
+                    },
+                },
+                {
+                    "kind": "supplemental_strategy_specialty_minutes",
+                    "payload": {
+                        "bundle": "strategy_specialty_minutes",
+                        "start": history_start.isoformat(),
+                        "end": target_date.isoformat(),
+                        "symbols": sorted({str(item).upper() for item in symbols}),
+                    },
+                },
+            ],
+            "pipeline_next_index": 0,
+        }
+        log_path = (
+            self.settings.data_root
+            / "platform"
+            / "logs"
+            / f"scheduled-auxiliary-data-{target_date:%Y%m%d}.log"
+        )
+        return self.jobs.create(
+            "margin_eligibility_download",
+            root_payload,
+            log_path,
+            idempotency_key=pipeline_id,
         )
 
     def _enqueue_research(
@@ -1117,16 +2164,12 @@ class SchedulerEngine:
         scenario = get_rdagent_scenario(payload["scenario"])
         runtime = probe_rdagent(self.settings, Path(__file__).resolve().parents[2])
         require_ready_scenario(runtime, self.settings, scenario.id)
-        expected_runtime_identity = expected_rdagent_runtime_identity(
-            runtime, scenario.id
-        )
+        expected_runtime_identity = expected_rdagent_runtime_identity(runtime, scenario.id)
         dataset: dict[str, Any] | None = None
         periods: dict[str, str] | None = None
         period_resolution: dict[str, Any] | None = None
         if scenario.requires_dataset:
-            datasets = {
-                item["name"]: item for item in list_qlib_datasets(self.settings.data_root)
-            }
+            datasets = {item["name"]: item for item in list_qlib_datasets(self.settings.data_root)}
             dataset = datasets.get(payload["dataset"])
             if not dataset or not dataset["ready"] or not dataset.get("reproducible"):
                 raise ValueError("scheduled RD-Agent research Qlib dataset is not reproducible")
@@ -1160,9 +2203,7 @@ class SchedulerEngine:
             pre_final_end=(
                 date.fromisoformat(periods["valid_end"]) if periods is not None else None
             ),
-            selection_limit=(
-                payload["loop_n"] if scenario.id == "fin_factor_report" else None
-            ),
+            selection_limit=(payload["loop_n"] if scenario.id == "fin_factor_report" else None),
         )
         resolved_asset_ids = list(assets["manifest_sha256"])
         if auto_selected_assets:
@@ -1178,9 +2219,7 @@ class SchedulerEngine:
         if scenario.requires_dataset and run["trading_days_only"]:
             local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date().isoformat()
             if local_date not in set(calendar):
-                self.schedules.finish_run(
-                    run["id"], "skipped", message="not a Qlib trading day"
-                )
+                self.schedules.finish_run(run["id"], "skipped", message="not a Qlib trading day")
                 return None
         elif run["trading_days_only"]:
             raise ValueError("scheduled RD-Agent lab scenarios must disable trading_days_only")

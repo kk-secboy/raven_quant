@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +44,7 @@ from .research_automation import (
 from .runtime_secret_store import RuntimeSecretStore
 from .schedule_store import ACTIVE_SCHEDULE_KINDS
 from .scheduler import AUTOMATED_DATA_BUNDLES
-from .services import list_qlib_datasets
+from .services import list_qlib_datasets_for_display
 
 RESEARCH_LONGEST_VALIDATION_TRADING_DAYS = max(
     int(profile["validation_trading_days"])
@@ -61,6 +61,7 @@ _GOVERNED_DATA_SCHEDULE_SUITE_KINDS = frozenset(
         "information_pipeline",
         "information_factor_refresh",
         "ashare_5m_sync",
+        "auxiliary_data_pipeline",
     }
 )
 
@@ -104,7 +105,7 @@ def _is_governed_full_data_pipeline(row: Any) -> bool:
 
 
 def _is_governed_suite_data_pipeline(row: Any) -> bool:
-    return _is_governed_full_data_pipeline(row) and row.run_time == time(18, 0)
+    return _is_governed_full_data_pipeline(row) and row.run_time >= time(15, 10)
 
 
 def _is_governed_information_pipeline(row: Any) -> bool:
@@ -114,7 +115,6 @@ def _is_governed_information_pipeline(row: Any) -> bool:
         return False
     return (
         row.timezone == "Asia/Shanghai"
-        and row.run_time == time(2, 0)
         and not bool(row.trading_days_only)
         and payload["lookback_days"] == 7
         and payload["regulatory_only"] is True
@@ -129,7 +129,7 @@ def _is_governed_information_pipeline(row: Any) -> bool:
         and payload["batch_size"] == 50
         and payload["major_news_per_day"] == 40
         and payload["irm_per_instrument_day"] == 2
-        and payload["include_event_labels"] is False
+        and payload["include_event_labels"] is True
         and payload["include_factor_evaluation"] is False
         and payload["factor_evaluation"] is None
         and payload["snapshot_name"] == ""
@@ -155,7 +155,6 @@ def _is_governed_information_factor_refresh(
         return False
     return (
         row.timezone == "Asia/Shanghai"
-        and row.run_time == time(12, 30)
         and not bool(row.trading_days_only)
         and set(payload["sources"]) == STRUCTURED_INFORMATION_SOURCES
         and payload["weekday"] == 4
@@ -169,17 +168,42 @@ def _is_governed_ashare_5m_sync(row: Any) -> bool:
     payload = row.payload_json
     if not isinstance(payload, dict):
         return False
+    try:
+        date.fromisoformat(str(payload.get("history_start") or ""))
+    except ValueError:
+        return False
     lookback_days = payload.get("lookback_days")
     return (
         row.timezone == "Asia/Shanghai"
-        and row.run_time == time(23, 30)
+        and row.run_time >= time(15, 10)
         and bool(row.trading_days_only)
-        and payload.get("history_start") == "2024-01-01"
         and payload.get("daily_dataset") in (None, "")
         and isinstance(lookback_days, int)
         and not isinstance(lookback_days, bool)
         and 1 <= lookback_days <= 30
         and set(payload) <= {"history_start", "daily_dataset", "lookback_days"}
+    )
+
+
+def _is_governed_auxiliary_data_pipeline(row: Any) -> bool:
+    payload = row.payload_json
+    if not isinstance(payload, dict):
+        return False
+    try:
+        date.fromisoformat(str(payload.get("history_start") or ""))
+    except ValueError:
+        return False
+    return (
+        row.timezone == "Asia/Shanghai"
+        and not bool(row.trading_days_only)
+        and isinstance(payload.get("max_stocks"), int)
+        and not isinstance(payload.get("max_stocks"), bool)
+        and 1 <= payload["max_stocks"] <= 500
+        and isinstance(payload.get("max_options"), int)
+        and not isinstance(payload.get("max_options"), bool)
+        and 1 <= payload["max_options"] <= 500
+        and isinstance(payload.get("strategy_minute_symbols"), list)
+        and bool(payload["strategy_minute_symbols"])
     )
 
 
@@ -197,6 +221,7 @@ def _governed_schedule_suite_state(
         "information_pipeline": [],
         "information_factor_refresh": [],
         "ashare_5m_sync": [],
+        "auxiliary_data_pipeline": [],
     }
     for row in rows:
         accepted = False
@@ -212,6 +237,8 @@ def _governed_schedule_suite_state(
             )
         elif row.kind == "ashare_5m_sync":
             accepted = _is_governed_ashare_5m_sync(row)
+        elif row.kind == "auxiliary_data_pipeline":
+            accepted = _is_governed_auxiliary_data_pipeline(row)
         if accepted:
             governed[row.kind].append(str(row.id))
     ready = (
@@ -274,10 +301,17 @@ class DeploymentReadinessStore:
 
     def assess(self, now: datetime | None = None) -> dict[str, Any]:
         current = now or _now()
-        research_checks = self._research_checks()
+        # DataTaskStore.list() reconciles the operational projection and groups
+        # the durable work-unit ledger.  Build it once per assessment so the
+        # research and pair profiles cannot repeat that expensive work.
+        tasks = {
+            str(item["task_key"]): item
+            for item in self.data_tasks.list()
+        }
+        research_checks = self._research_checks(tasks)
         recommendation_checks = [*research_checks, *self._recommendation_checks()]
         allocation_checks = [*recommendation_checks, *self._allocation_checks(current)]
-        pair_checks = [*research_checks, *self._pair_research_checks()]
+        pair_checks = [*research_checks, *self._pair_research_checks(tasks)]
         profiles = [
             _profile("research", "研究与回测", research_checks),
             _profile("recommendation_tracking", "推荐组合与假设跟踪", recommendation_checks),
@@ -396,8 +430,10 @@ class DeploymentReadinessStore:
             ),
         ]
 
-    def _pair_research_checks(self) -> list[dict[str, Any]]:
-        tasks = {item["task_key"]: item for item in self.data_tasks.list()}
+    def _pair_research_checks(
+        self,
+        tasks: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         minute_status = str(tasks.get("pair_execution_1m", {}).get("status", "missing"))
         shortability_status = str(tasks.get("margin_eligibility", {}).get("status", "missing"))
         with self.engine.connect() as connection:
@@ -453,8 +489,10 @@ class DeploymentReadinessStore:
             ),
         ]
 
-    def _research_checks(self) -> list[dict[str, Any]]:
-        tasks = {item["task_key"]: item for item in self.data_tasks.list()}
+    def _research_checks(
+        self,
+        tasks: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         required_pipeline = (
             "cn_ashare_daily_full",
             "cn_data_verify",
@@ -466,9 +504,13 @@ class DeploymentReadinessStore:
             key: str(tasks.get(key, {}).get("status", "missing")) for key in required_pipeline
         }
         pipeline_ready = all(status == "succeeded" for status in task_states.values())
+        # Readiness is an operational display, not an admission or capital
+        # boundary.  Use the persisted bounded projection here; every formal
+        # research/backtest/simulation action still performs strict per-dataset
+        # provenance and sealed-output verification before it may proceed.
         reproducible_datasets = [
             item
-            for item in list_qlib_datasets(self.settings.data_root)
+            for item in list_qlib_datasets_for_display(self.settings.data_root)
             if item["ready"]
             and item.get("reproducible")
             and item.get("lineage_verified")
@@ -683,12 +725,13 @@ class DeploymentReadinessStore:
                     f"不合格 incremental_sync {len(rejected_incremental_ids)} 个；"
                     f"合格 full data_pipeline {len(governed_pipeline_ids)} 个；"
                     f"不合格 data_pipeline {len(rejected_pipeline_ids)} 个；"
-                    f"合格四计划组件 {sum(len(ids) for ids in governed_suite_ids.values())} 个"
+                    f"合格五计划组件 {sum(len(ids) for ids in governed_suite_ids.values())} 个"
                 ),
                 (
-                    "保留一个兼容的受治理 legacy 数据计划，或精确启用四计划套件："
+                    "保留一个兼容的受治理 legacy 数据计划，或精确启用五计划套件："
                     "18:00 full data_pipeline、23:30 ashare_5m_sync、02:00 bounded "
-                    "information_pipeline、周五 12:30 information_factor_refresh"
+                    "information_pipeline、周五 12:30 information_factor_refresh、"
+                    "04:00 auxiliary_data_pipeline"
                 ),
                 details={
                     "mode": schedule_mode,

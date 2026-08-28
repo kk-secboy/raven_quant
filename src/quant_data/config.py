@@ -78,11 +78,13 @@ class Settings:
     research_asset_auto_hour: int = 20
     research_asset_auto_minute: int = 30
     worker_job_kinds: tuple[str, ...] = ()
+    worker_concurrency: int = 1
+    research_cpu_budget: int = 0
+    research_memory_budget_gb: int = 0
     scheduler_poll_seconds: float = 15.0
     health_snapshot_seconds: int = 300
     data_freshness_max_days: int = 7
     stale_job_hours: int = 6
-    broker_feature_enabled: bool = False
     alert_webhook_url: str = ""
     scheduler_url: str = ""
     auth_mode: str = "disabled"
@@ -199,11 +201,19 @@ class Settings:
                 for item in os.getenv("WORKER_JOB_KINDS", "").split(",")
                 if item.strip()
             ),
+            worker_concurrency=min(
+                3, max(1, int(os.getenv("WORKER_CONCURRENCY", "1")))
+            ),
+            research_cpu_budget=min(
+                256, max(0, int(os.getenv("RESEARCH_CPU_BUDGET", "0")))
+            ),
+            research_memory_budget_gb=min(
+                2048, max(0, int(os.getenv("RESEARCH_MEMORY_BUDGET_GB", "0")))
+            ),
             scheduler_poll_seconds=max(1.0, float(os.getenv("SCHEDULER_POLL_SECONDS", "15"))),
             health_snapshot_seconds=max(60, int(os.getenv("HEALTH_SNAPSHOT_SECONDS", "300"))),
             data_freshness_max_days=max(1, int(os.getenv("DATA_FRESHNESS_MAX_DAYS", "7"))),
             stale_job_hours=max(1, int(os.getenv("STALE_JOB_HOURS", "6"))),
-            broker_feature_enabled=_bool("BROKER_FEATURE_ENABLED", False),
             alert_webhook_url=os.getenv("ALERT_WEBHOOK_URL", "").strip(),
             scheduler_url=os.getenv("SCHEDULER_URL", "").strip().rstrip("/"),
             auth_mode=auth_mode,

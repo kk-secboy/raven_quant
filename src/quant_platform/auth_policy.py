@@ -45,6 +45,8 @@ def permission_for(method: str, path: str) -> str:
         return "research:write"
     if path.startswith("/api/research-campaigns") or path.startswith("/api/research-programs"):
         return "research:write"
+    if path.startswith("/api/factor-library") or path.startswith("/api/research-sota"):
+        return "research:write"
     if path.startswith("/api/factors/") and path.endswith("/promote"):
         return "factor:approve"
     if path.startswith("/api/factors/"):
@@ -86,6 +88,10 @@ def permission_for(method: str, path: str) -> str:
     if path.startswith("/api/simulation-portfolios"):
         return "portfolio:write"
     if path.startswith("/api/schedules"):
+        return "automation:manage"
+    if path.startswith("/api/autopilot"):
+        return "automation:manage"
+    if path.startswith("/api/data-automation"):
         return "automation:manage"
     if path.startswith("/api/alerts"):
         return "alerts:manage"

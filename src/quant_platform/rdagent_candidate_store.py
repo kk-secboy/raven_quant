@@ -17,6 +17,8 @@ from quant_data.database import (
     factor_candidates,
     factor_evaluations,
     model_candidates,
+    model_ensemble_candidates,
+    model_ensemble_evaluations,
     model_evaluations,
     open_database,
     quant_bundle_candidates,
@@ -29,6 +31,7 @@ from quant_data.database import (
 from quant_data.research_assets import load_research_asset_manifest
 
 from .feature_set_registry import get_feature_set
+from .model_recompute import verify_governed_checkpoint
 from .model_research_governance import (
     MODEL_REFIT_POLICY,
     MODEL_REFIT_POLICY_SHA256,
@@ -53,6 +56,12 @@ RUN_ARTIFACT_CONTRACT_VERSION = "research-run-artifact-v1"
 MODEL_CANDIDATE_CONTRACT_VERSION = "model-candidate-v1"
 QUANT_BUNDLE_CANDIDATE_CONTRACT_VERSION = "quant-bundle-candidate-v1"
 ADMISSION_CONTRACT_VERSION = "rdagent-independent-admission-v1"
+RESEARCH_SCREENING_MARKERS: dict[str, bool] = {
+    "research_screening_only": True,
+    "not_capital_confirmation": True,
+    "cross_cycle_fwer_claimed": False,
+    "final_oos_opened": False,
+}
 
 EvidenceRole = Literal["official_feedback", "independent_gate"]
 CandidateKind = Literal["factor", "model", "quant_bundle"]
@@ -220,6 +229,8 @@ def _verify_model_seed_artifacts(
         evidence.get("portfolio_report_sha256"), "model portfolio report"
     )
     _sha(evidence.get("execution_environment_sha256"), "model execution environment")
+    checkpoint_format = str(evidence.get("checkpoint_format") or "")
+    model_engine = str(evidence.get("model_engine") or "")
     for path_key, expected in (
         ("predictions_path", predictions_sha256),
         ("checkpoint_path", checkpoint_sha256),
@@ -228,6 +239,13 @@ def _verify_model_seed_artifacts(
         path, observed, _ = _path_evidence(str(evidence.get(path_key) or ""))
         if observed != expected:
             raise ValueError(f"model evidence file hash changed: {path}")
+        if path_key == "checkpoint_path":
+            verify_governed_checkpoint(
+                path,
+                model_engine=model_engine,
+                checkpoint_format=checkpoint_format,
+                expected_sha256=checkpoint_sha256,
+            )
     coverage = evidence.get("coverage")
     if not isinstance(coverage, Mapping) or coverage.get("coverage_gate_passed") is not True:
         raise ValueError("model prediction coverage proof is missing or failed")
@@ -243,7 +261,6 @@ def _verify_quant_seed_artifacts(
     evidence: Mapping[str, Any], *, valid_start: date, valid_end: date
 ) -> None:
     predictions_sha256 = _sha(evidence.get("predictions_sha256"), "quant predictions")
-    checkpoint_sha256 = _sha(evidence.get("checkpoint_sha256"), "quant checkpoint")
     report_sha256 = _sha(
         evidence.get("portfolio_report_sha256"), "quant portfolio report"
     )
@@ -267,14 +284,174 @@ def _verify_quant_seed_artifacts(
     path, observed, _ = _path_evidence(str(coverage.get("artifact_path") or ""))
     if observed != predictions_sha256:
         raise ValueError(f"quant prediction artifact changed after evaluation: {path}")
-    checkpoint_path, observed_checkpoint, _ = _path_evidence(path.parent / "checkpoint.pt")
-    if observed_checkpoint != checkpoint_sha256:
-        raise ValueError(f"quant checkpoint changed after evaluation: {checkpoint_path}")
+    if evidence.get("prediction_component_kind") == "ensemble":
+        if (
+            evidence.get("combiner") != "equal_rank"
+            or evidence.get("stacking") is not False
+        ):
+            raise ValueError("quant ensemble cell changed its equal-rank contract")
+        members = evidence.get("member_artifacts")
+        aggregate_execution = evidence.get("execution_evidence")
+        if (
+            not isinstance(aggregate_execution, Mapping)
+            or aggregate_execution.get("contract_version")
+            != "fin-quant-ensemble-member-retraining-cell-v1"
+            or canonical_sha256(
+                {
+                    key: value
+                    for key, value in aggregate_execution.items()
+                    if key != "evidence_sha256"
+                }
+            )
+            != str(aggregate_execution.get("evidence_sha256") or "")
+            or aggregate_execution.get("evidence_sha256")
+            != evidence.get("execution_evidence_sha256")
+        ):
+            raise ValueError("quant ensemble execution evidence is invalid")
+        if not isinstance(members, list) or not 2 <= len(members) <= 3:
+            raise ValueError("quant ensemble cell member grid is incomplete")
+        member_ids: set[str] = set()
+        for member in members:
+            if not isinstance(member, Mapping):
+                raise ValueError("quant ensemble cell member evidence is malformed")
+            member_id = str(member.get("model_candidate_id") or "")
+            if (
+                not member_id
+                or member_id in member_ids
+                or not is_sha256(member.get("feature_set_definition_sha256"))
+            ):
+                raise ValueError("quant ensemble cell member identity is invalid")
+            member_ids.add(member_id)
+            _verify_model_seed_artifacts(
+                member, valid_start=valid_start, valid_end=valid_end
+            )
+            member_execution = member.get("execution_evidence")
+            if (
+                not isinstance(member_execution, Mapping)
+                or member_execution.get("evidence_sha256")
+                != member.get("execution_evidence_sha256")
+            ):
+                raise ValueError("quant ensemble member execution proof is invalid")
+        combination = evidence.get("combination_evidence")
+        if (
+            not isinstance(combination, Mapping)
+            or combination.get("combiner") != "equal_rank"
+            or combination.get("stacking") is not False
+            or set(str(item) for item in combination.get("member_ids") or [])
+            != member_ids
+            or canonical_sha256(
+                {
+                    key: value
+                    for key, value in combination.items()
+                    if key != "evidence_sha256"
+                }
+            )
+            != str(combination.get("evidence_sha256") or "")
+        ):
+            raise ValueError("quant ensemble combination evidence is invalid")
+    else:
+        checkpoint_sha256 = _sha(
+            evidence.get("checkpoint_sha256"), "quant checkpoint"
+        )
+        checkpoint_path, observed_checkpoint, _ = _path_evidence(
+            str(evidence.get("checkpoint_path") or "")
+        )
+        if observed_checkpoint != checkpoint_sha256:
+            raise ValueError(
+                f"quant checkpoint changed after evaluation: {checkpoint_path}"
+            )
+        verify_governed_checkpoint(
+            checkpoint_path,
+            model_engine=str(evidence.get("model_engine") or ""),
+            checkpoint_format=str(evidence.get("checkpoint_format") or ""),
+            expected_sha256=checkpoint_sha256,
+        )
     report_path, observed_report, _ = _path_evidence(
         str(evidence.get("portfolio_report_path") or "")
     )
     if observed_report != report_sha256:
         raise ValueError(f"quant portfolio report changed after evaluation: {report_path}")
+
+
+def _verify_ensemble_seed_artifacts(
+    evidence: Mapping[str, Any],
+    *,
+    valid_start: date,
+    valid_end: date,
+    expected_member_ids: set[str],
+) -> None:
+    """Verify a sealed equal-rank cell without inventing a synthetic checkpoint."""
+
+    predictions_sha256 = _sha(
+        evidence.get("predictions_sha256"), "ensemble predictions"
+    )
+    report_sha256 = _sha(
+        evidence.get("portfolio_report_sha256"), "ensemble portfolio report"
+    )
+    _sha(
+        evidence.get("execution_environment_sha256"),
+        "ensemble execution environment",
+    )
+    try:
+        latest = date.fromisoformat(
+            str(evidence.get("latest_prediction_date") or "")
+        )
+    except ValueError as exc:
+        raise ValueError("ensemble evaluation has no latest prediction date") from exc
+    if latest > valid_end:
+        raise ValueError("ensemble evaluation predictions reach final OOS")
+    coverage = evidence.get("coverage")
+    if (
+        not isinstance(coverage, Mapping)
+        or coverage.get("coverage_gate_passed") is not True
+        or str(coverage.get("artifact_sha256") or "").lower()
+        != predictions_sha256
+        or str(coverage.get("test_start") or "") != valid_start.isoformat()
+        or str(coverage.get("test_end") or "") != valid_end.isoformat()
+    ):
+        raise ValueError("ensemble prediction coverage proof is invalid")
+    for path_key, expected in (
+        ("predictions_path", predictions_sha256),
+        ("portfolio_report_path", report_sha256),
+    ):
+        path, observed, _ = _path_evidence(str(evidence.get(path_key) or ""))
+        if observed != expected:
+            raise ValueError(f"ensemble evidence file hash changed: {path}")
+    members = evidence.get("member_prediction_artifacts")
+    observed_ids = {
+        str(item.get("model_candidate_id") or "")
+        for item in members or []
+        if isinstance(item, Mapping)
+    }
+    if (
+        not isinstance(members, list)
+        or observed_ids != expected_member_ids
+        or len(members) != len(expected_member_ids)
+    ):
+        raise ValueError("ensemble member prediction evidence is incomplete")
+    for item in members:
+        member_path, member_sha256, _ = _path_evidence(
+            str(item.get("predictions_path") or "")
+        )
+        if member_sha256 != _sha(
+            item.get("predictions_sha256"), "ensemble member predictions"
+        ):
+            raise ValueError(
+                f"ensemble member prediction artifact changed: {member_path}"
+            )
+    combination = evidence.get("combination_evidence")
+    if (
+        not isinstance(combination, Mapping)
+        or combination.get("combiner") != "equal_rank"
+        or combination.get("stacking") is not False
+        or set(str(item) for item in combination.get("member_ids") or [])
+        != expected_member_ids
+        or canonical_sha256(
+            {key: value for key, value in combination.items() if key != "evidence_sha256"}
+        )
+        != str(combination.get("evidence_sha256") or "")
+    ):
+        raise ValueError("ensemble equal-rank combination evidence is invalid")
 
 
 def _validate_factor_recompute_evidence(
@@ -952,6 +1129,379 @@ class RDAGentCandidateStore:
                     raise ValueError("model candidate unexpectedly became capital eligible")
         return row_dict(row)
 
+    def _freeze_quant_model_member(
+        self,
+        *,
+        candidate_id: str,
+        dataset: str,
+        dataset_identity_sha256: str,
+        pre_final_end: date,
+        final_oos_start: date,
+        final_oos_end: date,
+    ) -> dict[str, Any]:
+        candidate = self.get_model_candidate(candidate_id, verify=True)
+        if (
+            str(candidate["status"]) != "research_admitted"
+            or str(candidate["dataset"]) != dataset
+            or str(candidate["dataset_identity_sha256"])
+            != dataset_identity_sha256
+            or candidate["pre_final_end"] != pre_final_end
+            or candidate["final_oos_start"] != final_oos_start
+            or candidate["final_oos_end"] != final_oos_end
+        ):
+            raise ValueError("fin_quant baseline model identity is inconsistent")
+        admission = dict(candidate.get("admission_evidence_json") or {})
+        profiles: dict[str, Any] = {}
+        for profile_id in REQUIRED_RESEARCH_PROFILES:
+            raw_profile = admission.get("profiles", {}).get(profile_id)
+            if not isinstance(raw_profile, Mapping):
+                raise ValueError("fin_quant baseline model grid is incomplete")
+            raw_seeds = raw_profile.get("seeds")
+            if not isinstance(raw_seeds, Mapping):
+                raise ValueError("fin_quant baseline model seed grid is incomplete")
+            periods = dict(raw_profile.get("periods") or {})
+            seeds: dict[str, Any] = {}
+            for seed in REQUIRED_MODEL_SEEDS:
+                raw_cell = raw_seeds.get(str(seed), raw_seeds.get(seed))
+                if not isinstance(raw_cell, Mapping):
+                    raise ValueError("fin_quant baseline model seed is missing")
+                cell = dict(raw_cell)
+                _verify_model_seed_artifacts(
+                    cell,
+                    valid_start=date.fromisoformat(str(periods["valid_start"])),
+                    valid_end=date.fromisoformat(str(periods["valid_end"])),
+                )
+                seeds[str(seed)] = {
+                    key: cell[key]
+                    for key in (
+                        "status",
+                        "metrics",
+                        "latest_prediction_date",
+                        "predictions_path",
+                        "predictions_sha256",
+                        "checkpoint_path",
+                        "checkpoint_sha256",
+                        "checkpoint_format",
+                        "model_engine",
+                        "portfolio_report_path",
+                        "portfolio_report_sha256",
+                        "execution_evidence_sha256",
+                        "execution_environment_sha256",
+                        "coverage",
+                    )
+                    if key in cell
+                }
+            profiles[profile_id] = {"periods": periods, "seeds": seeds}
+        with self.engine.connect() as connection:
+            artifact = self._one(
+                connection,
+                research_run_artifacts,
+                str(candidate["code_artifact_id"]),
+                "fin_quant baseline model code",
+            )
+            self._verify_artifact_row(artifact)
+        manifest = dict(candidate.get("manifest_json") or {})
+        hyperparameters = dict(candidate.get("model_hyperparameters_json") or {})
+        model_engine = str(hyperparameters.get("model_engine") or "").strip()
+        if not model_engine:
+            raise ValueError("fin_quant baseline model has no governed model engine")
+        base_features = dict(candidate.get("base_features_manifest_json") or {})
+        feature_set_id = str(base_features.get("feature_set_id") or "")
+        feature_set = get_feature_set(feature_set_id)
+        if (
+            str(feature_set.get("definition_sha256") or "")
+            != str(candidate["feature_set_definition_sha256"])
+            or dict(feature_set.get("features") or {})
+            != dict(base_features.get("feature_expressions") or {})
+        ):
+            raise ValueError("fin_quant baseline model feature contract changed")
+        return {
+            "model_candidate_id": candidate_id,
+            "candidate_manifest_sha256": str(candidate["manifest_sha256"]),
+            "admission_evidence_sha256": str(
+                candidate["admission_evidence_sha256"]
+            ),
+            "feature_set_id": feature_set_id,
+            "feature_set_definition_sha256": str(
+                candidate["feature_set_definition_sha256"]
+            ),
+            "feature_set": feature_set,
+            "model": {
+                "candidate_id": candidate_id,
+                "code_path": str(artifact.storage_path),
+                "code_sha256": str(candidate["code_sha256"]),
+                "model_type": str(candidate["model_type"]),
+                "model_engine": model_engine,
+                "architecture": dict(candidate.get("architecture_json") or {}),
+                "model_hyperparameters": hyperparameters,
+                "training_hyperparameters": dict(
+                    candidate.get("training_hyperparameters_json") or {}
+                ),
+                "recipe_sha256": str(manifest.get("recipe_sha256") or ""),
+            },
+            "profiles": profiles,
+        }
+
+    def freeze_quant_baseline_prediction(
+        self,
+        *,
+        candidate_kind: str,
+        candidate_id: str,
+        dataset: str,
+        dataset_identity_sha256: str,
+        pre_final_end: date,
+        final_oos_start: date,
+        final_oos_end: date,
+    ) -> dict[str, Any]:
+        """Freeze the incumbent used by fin_quant's factor-only ablation.
+
+        The returned object is an evaluator input, not a capital admission.
+        Both single models and equal-rank ensembles carry immutable recipes,
+        feature contracts and sealed pre-final return grids.  An ensemble can
+        enter factor-only only when every member can be retrained exactly.
+        """
+
+        kind = str(candidate_kind or "").strip().lower()
+        identity = _sha(dataset_identity_sha256, "dataset identity")
+        dataset_name = _nonempty(dataset, "dataset")
+        if kind == "model":
+            member = self._freeze_quant_model_member(
+                candidate_id=candidate_id,
+                dataset=dataset_name,
+                dataset_identity_sha256=identity,
+                pre_final_end=pre_final_end,
+                final_oos_start=final_oos_start,
+                final_oos_end=final_oos_end,
+            )
+            frozen = {
+                "contract_version": "fin-quant-baseline-prediction-v1",
+                "kind": "model",
+                "candidate_id": candidate_id,
+                "candidate_manifest_sha256": member["candidate_manifest_sha256"],
+                "admission_evidence_sha256": member["admission_evidence_sha256"],
+                "dataset": dataset_name,
+                "dataset_identity_sha256": identity,
+                "pre_final_end": pre_final_end.isoformat(),
+                "final_oos_start": final_oos_start.isoformat(),
+                "final_oos_end": final_oos_end.isoformat(),
+                "feature_set_id": member["feature_set_id"],
+                "feature_set_definition_sha256": member[
+                    "feature_set_definition_sha256"
+                ],
+                "feature_set": member["feature_set"],
+                "model": member["model"],
+                "profiles": member["profiles"],
+                "quant_retraining_supported": True,
+            }
+        elif kind == "ensemble":
+            with self.engine.connect() as connection:
+                ensemble = self._one(
+                    connection,
+                    model_ensemble_candidates,
+                    candidate_id,
+                    "fin_quant baseline ensemble",
+                )
+                manifest = dict(ensemble.manifest_json or {})
+                admission = dict(ensemble.admission_evidence_json or {})
+                if (
+                    str(ensemble.status) != "research_admitted"
+                    or str(ensemble.dataset) != dataset_name
+                    or str(ensemble.dataset_identity_sha256) != identity
+                    or str(ensemble.combiner) != "equal_rank"
+                    or canonical_sha256(manifest) != str(ensemble.manifest_sha256)
+                    or canonical_sha256(
+                        {
+                            key: value
+                            for key, value in admission.items()
+                            if key != "evidence_sha256"
+                        }
+                    )
+                    != str(admission.get("evidence_sha256") or "")
+                    or str(admission.get("evidence_sha256") or "")
+                    != str(ensemble.admission_evidence_sha256)
+                    or admission.get("status") != "passed"
+                ):
+                    raise ValueError("fin_quant baseline ensemble identity is inconsistent")
+                components = [dict(item) for item in ensemble.components_json or []]
+                component_rows = connection.execute(
+                    select(model_candidates).where(
+                        model_candidates.c.id.in_(
+                            [str(item["model_candidate_id"]) for item in components]
+                        )
+                    )
+                ).all()
+                if len(component_rows) != len(components) or any(
+                    str(item.status) != "research_admitted"
+                    or str(item.dataset) != dataset_name
+                    or str(item.dataset_identity_sha256) != identity
+                    or item.pre_final_end != pre_final_end
+                    or item.final_oos_start != final_oos_start
+                    or item.final_oos_end != final_oos_end
+                    for item in component_rows
+                ):
+                    raise ValueError("fin_quant baseline ensemble components drifted")
+            frozen_components: list[dict[str, Any]] = []
+            for component in components:
+                member_id = str(component["model_candidate_id"])
+                member = self._freeze_quant_model_member(
+                    candidate_id=member_id,
+                    dataset=dataset_name,
+                    dataset_identity_sha256=identity,
+                    pre_final_end=pre_final_end,
+                    final_oos_start=final_oos_start,
+                    final_oos_end=final_oos_end,
+                )
+                prediction_grid = {
+                    "candidate_id": member_id,
+                    "candidate_manifest_sha256": member[
+                        "candidate_manifest_sha256"
+                    ],
+                    "admission_evidence_sha256": member[
+                        "admission_evidence_sha256"
+                    ],
+                    "profiles": {
+                        profile_id: {
+                            "periods": dict(profile["periods"]),
+                            "seeds": {
+                                seed: {
+                                    "predictions_path": str(
+                                        cell["predictions_path"]
+                                    ),
+                                    "predictions_sha256": str(
+                                        cell["predictions_sha256"]
+                                    ),
+                                }
+                                for seed, cell in profile["seeds"].items()
+                            },
+                        }
+                        for profile_id, profile in member["profiles"].items()
+                    },
+                }
+                prediction_grid["prediction_grid_sha256"] = canonical_sha256(
+                    prediction_grid
+                )
+                if (
+                    member["candidate_manifest_sha256"]
+                    != str(component.get("model_manifest_sha256") or "")
+                    or member["admission_evidence_sha256"]
+                    != str(component.get("model_admission_evidence_sha256") or "")
+                    or prediction_grid["prediction_grid_sha256"]
+                    != str(component.get("prediction_grid_sha256") or "")
+                    or float(component.get("weight") or 0.0)
+                    != 1.0 / len(components)
+                ):
+                    raise ValueError(
+                        "fin_quant baseline ensemble member recipe changed"
+                    )
+                frozen_components.append({**dict(component), **member})
+            independent = dict(admission.get("independent_evidence") or {})
+            if (
+                independent.get("source") != "independent_qlib_recompute"
+                or independent.get("ensemble_id") != candidate_id
+                or independent.get("ensemble_manifest_sha256")
+                != str(ensemble.manifest_sha256)
+                or independent.get("dataset_identity_sha256") != identity
+                or independent.get("combiner") != "equal_rank"
+                or independent.get("stacking") is not False
+                or independent.get("final_oos_opened") is not False
+            ):
+                raise ValueError(
+                    "fin_quant baseline ensemble independent evidence is invalid"
+                )
+            expected_member_ids = {
+                str(item["model_candidate_id"]) for item in frozen_components
+            }
+            frozen_profiles: dict[str, Any] = {}
+            raw_profiles = independent.get("profiles")
+            if not isinstance(raw_profiles, Mapping) or set(raw_profiles) != set(
+                REQUIRED_RESEARCH_PROFILES
+            ):
+                raise ValueError("fin_quant baseline ensemble grid is incomplete")
+            for profile_id in REQUIRED_RESEARCH_PROFILES:
+                raw_profile = raw_profiles[profile_id]
+                if not isinstance(raw_profile, Mapping):
+                    raise ValueError("fin_quant baseline ensemble profile is invalid")
+                periods = dict(raw_profile.get("periods") or {})
+                if (
+                    periods.get("valid_end") != pre_final_end.isoformat()
+                    or periods.get("test_start") != final_oos_start.isoformat()
+                    or periods.get("test_end") != final_oos_end.isoformat()
+                ):
+                    raise ValueError(
+                        "fin_quant baseline ensemble periods changed"
+                    )
+                raw_seeds = raw_profile.get("seeds")
+                if not isinstance(raw_seeds, Mapping):
+                    raise ValueError(
+                        "fin_quant baseline ensemble seed grid is incomplete"
+                    )
+                seeds: dict[str, Any] = {}
+                for seed in REQUIRED_MODEL_SEEDS:
+                    raw_cell = raw_seeds.get(str(seed), raw_seeds.get(seed))
+                    if not isinstance(raw_cell, Mapping):
+                        raise ValueError(
+                            "fin_quant baseline ensemble seed is missing"
+                        )
+                    cell = dict(raw_cell)
+                    _verify_ensemble_seed_artifacts(
+                        cell,
+                        valid_start=date.fromisoformat(
+                            str(periods["valid_start"])
+                        ),
+                        valid_end=date.fromisoformat(str(periods["valid_end"])),
+                        expected_member_ids=expected_member_ids,
+                    )
+                    seeds[str(seed)] = {
+                        key: cell[key]
+                        for key in (
+                            "status",
+                            "metrics",
+                            "latest_prediction_date",
+                            "predictions_path",
+                            "predictions_sha256",
+                            "portfolio_report_path",
+                            "portfolio_report_sha256",
+                            "coverage",
+                            "combination_evidence",
+                            "member_prediction_artifacts",
+                            "execution_environment_sha256",
+                            "final_oos_opened",
+                        )
+                        if key in cell
+                    }
+                frozen_profiles[profile_id] = {
+                    "periods": periods,
+                    "seeds": seeds,
+                }
+            frozen = {
+                "contract_version": "fin-quant-baseline-prediction-v1",
+                "kind": "ensemble",
+                "candidate_id": candidate_id,
+                "candidate_manifest_sha256": str(ensemble.manifest_sha256),
+                "admission_evidence_sha256": str(
+                    ensemble.admission_evidence_sha256
+                ),
+                "dataset": dataset_name,
+                "dataset_identity_sha256": identity,
+                "pre_final_end": pre_final_end.isoformat(),
+                "final_oos_start": final_oos_start.isoformat(),
+                "final_oos_end": final_oos_end.isoformat(),
+                "feature_set_id": None,
+                "feature_set_definition_sha256": None,
+                "combiner": "equal_rank",
+                "stacking": False,
+                "components": frozen_components,
+                "profiles": frozen_profiles,
+                "member_retraining_contract_version": (
+                    "fin-quant-ensemble-member-retraining-v1"
+                ),
+                "quant_retraining_supported": True,
+            }
+        else:
+            raise ValueError("fin_quant baseline prediction kind is invalid")
+        frozen["evidence_sha256"] = canonical_sha256(frozen)
+        return frozen
+
     def record_model_evaluation(
         self,
         *,
@@ -1197,6 +1747,8 @@ class RDAGentCandidateStore:
                         "predictions_sha256": evidence.get("predictions_sha256"),
                         "checkpoint_path": evidence.get("checkpoint_path"),
                         "checkpoint_sha256": evidence.get("checkpoint_sha256"),
+                        "checkpoint_format": evidence.get("checkpoint_format"),
+                        "model_engine": evidence.get("model_engine"),
                         "portfolio_report_path": evidence.get(
                             "portfolio_report_path"
                         ),
@@ -1252,11 +1804,11 @@ class RDAGentCandidateStore:
                 "candidate_manifest_sha256": str(candidate.manifest_sha256),
                 "feature_set_definition_sha256": str(candidate.feature_set_definition_sha256),
                 "dataset_identity_sha256": str(candidate.dataset_identity_sha256),
-                "final_oos_opened": False,
                 "execution_environment_sha256": next(iter(environment_hashes)),
                 "multiple_testing": next(iter(multiple_evidence.values())),
                 "multiple_testing_trial_name": next(iter(multiple_trial_names)),
                 "profiles": profiles,
+                **RESEARCH_SCREENING_MARKERS,
             }
             validated = validate_model_evaluation_evidence(
                 aggregate,
@@ -1337,6 +1889,7 @@ class RDAGentCandidateStore:
                         "run_artifact_id": run_artifact_id,
                         "run_artifact_sha256": str(artifact.content_sha256),
                         "recorded_by": responsible_actor,
+                        **RESEARCH_SCREENING_MARKERS,
                     }
                     connection.execute(
                         update(model_candidates)
@@ -1368,8 +1921,13 @@ class RDAGentCandidateStore:
                 or item.get("evidence_sha256") != evidence_sha256
             ):
                 raise ValueError("model result evidence SHA-256 is invalid")
+            admission_input = {
+                **evidence_without_hash,
+                "independent_evaluator_evidence_sha256": evidence_sha256,
+                **RESEARCH_SCREENING_MARKERS,
+            }
             validated = validate_model_evaluation_evidence(
-                evidence,
+                admission_input,
                 candidate_id=model_candidate_id,
                 dataset_identity_sha256=str(candidate.dataset_identity_sha256),
                 pre_final_end=candidate.pre_final_end,
@@ -1445,6 +2003,8 @@ class RDAGentCandidateStore:
                         "predictions_sha256": seed_result["predictions_sha256"],
                         "checkpoint_path": seed_result["checkpoint_path"],
                         "checkpoint_sha256": seed_result.get("checkpoint_sha256"),
+                        "checkpoint_format": seed_result.get("checkpoint_format"),
+                        "model_engine": seed_result.get("model_engine"),
                         "portfolio_report_path": seed_result["portfolio_report_path"],
                         "portfolio_report_sha256": seed_result[
                             "portfolio_report_sha256"
@@ -1494,7 +2054,7 @@ class RDAGentCandidateStore:
                 .values(
                     status="research_admitted",
                     admission_evidence_json=validated,
-                    admission_evidence_sha256=evidence_sha256,
+                    admission_evidence_sha256=str(validated["evidence_sha256"]),
                     admitted_by=responsible_actor,
                     admitted_at=now,
                     updated_at=now,
@@ -1509,7 +2069,7 @@ class RDAGentCandidateStore:
         research_run_id: str,
         name: str,
         description: str,
-        model_candidate_id: str,
+        model_candidate_id: str | None,
         factor_candidate_ids: Sequence[str],
         bundle_artifact_id: str,
         experiment_family_id: str,
@@ -1522,6 +2082,7 @@ class RDAGentCandidateStore:
         source_iteration: int | None = None,
         rdagent_decision: bool | None = None,
         rdagent_feedback: str | None = None,
+        model_ensemble_candidate_id: str | None = None,
     ) -> dict[str, Any]:
         factor_ids = [str(item) for item in factor_candidate_ids]
         if not factor_ids or len(set(factor_ids)) != len(factor_ids):
@@ -1532,28 +2093,87 @@ class RDAGentCandidateStore:
         feature_sha = _sha(features["definition_sha256"], "feature-set definition")
         if not pre_final_end < final_oos_start <= final_oos_end:
             raise ValueError("quant bundle final OOS boundary is invalid")
+        if bool(model_candidate_id) == bool(model_ensemble_candidate_id):
+            raise ValueError(
+                "quant bundle requires exactly one model or model ensemble"
+            )
         bundle_id = uuid.uuid4().hex
         now = _now()
         with self.engine.begin() as connection:
             self._one(connection, research_runs, research_run_id, "research run")
-            model = self._one(connection, model_candidates, model_candidate_id, "model candidate")
-            if str(model.status) != "research_admitted":
-                raise ValueError("quant bundle model has not passed independent research admission")
-            if str(model.research_run_id) != research_run_id:
-                raise ValueError("quant bundle model belongs to another research run")
-            model_admission_sha256 = _sha(
-                model.admission_evidence_sha256, "model admission evidence"
-            )
-            if str(model.dataset_identity_sha256) != identity:
-                raise ValueError("quant bundle model uses another dataset identity")
-            if str(model.dataset) != dataset_name:
-                raise ValueError("quant bundle model uses another dataset")
-            if str(model.feature_set_definition_sha256) != feature_sha:
-                raise ValueError("quant bundle model uses another governed base feature set")
-            if model.pre_final_end != pre_final_end:
-                raise ValueError("quant bundle model uses another pre-final boundary")
-            if model.final_oos_start != final_oos_start or model.final_oos_end != final_oos_end:
-                raise ValueError("quant bundle model uses another final OOS boundary")
+            model = None
+            ensemble = None
+            prediction_component: dict[str, Any]
+            if model_candidate_id:
+                model = self._one(
+                    connection, model_candidates, model_candidate_id, "model candidate"
+                )
+                if str(model.status) != "research_admitted":
+                    raise ValueError(
+                        "quant bundle model has not passed independent research admission"
+                    )
+                model_admission_sha256 = _sha(
+                    model.admission_evidence_sha256, "model admission evidence"
+                )
+                if str(model.dataset_identity_sha256) != identity:
+                    raise ValueError("quant bundle model uses another dataset identity")
+                if str(model.dataset) != dataset_name:
+                    raise ValueError("quant bundle model uses another dataset")
+                if str(model.feature_set_definition_sha256) != feature_sha:
+                    raise ValueError(
+                        "quant bundle model uses another governed base feature set"
+                    )
+                if model.pre_final_end != pre_final_end:
+                    raise ValueError("quant bundle model uses another pre-final boundary")
+                if (
+                    model.final_oos_start != final_oos_start
+                    or model.final_oos_end != final_oos_end
+                ):
+                    raise ValueError("quant bundle model uses another final OOS boundary")
+                recipe = {
+                    "model_type": str(model.model_type),
+                    "architecture": dict(model.architecture_json or {}),
+                    "model_hyperparameters": dict(
+                        model.model_hyperparameters_json or {}
+                    ),
+                    "training_hyperparameters": dict(
+                        model.training_hyperparameters_json or {}
+                    ),
+                }
+                prediction_component = {
+                    "kind": "model",
+                    "candidate_id": model_candidate_id,
+                    "code_sha256": str(model.code_sha256),
+                    "recipe_sha256": canonical_sha256(recipe),
+                    "admission_evidence_sha256": model_admission_sha256,
+                }
+            else:
+                frozen_ensemble = self.freeze_quant_baseline_prediction(
+                    candidate_kind="ensemble",
+                    candidate_id=str(model_ensemble_candidate_id),
+                    dataset=dataset_name,
+                    dataset_identity_sha256=identity,
+                    pre_final_end=pre_final_end,
+                    final_oos_start=final_oos_start,
+                    final_oos_end=final_oos_end,
+                )
+                ensemble = self._one(
+                    connection,
+                    model_ensemble_candidates,
+                    str(model_ensemble_candidate_id),
+                    "model ensemble candidate",
+                )
+                prediction_component = {
+                    "kind": "ensemble",
+                    "candidate_id": str(model_ensemble_candidate_id),
+                    "manifest_sha256": str(ensemble.manifest_sha256),
+                    "admission_evidence_sha256": str(
+                        ensemble.admission_evidence_sha256
+                    ),
+                    "combiner": "equal_rank",
+                    "stacking": False,
+                    "components": list(frozen_ensemble["components"]),
+                }
             artifact = self._one(
                 connection, research_run_artifacts, bundle_artifact_id, "bundle artifact"
             )
@@ -1598,12 +2218,6 @@ class RDAGentCandidateStore:
                 "feature_expressions": dict(features["features"]),
                 "definition_sha256": feature_sha,
             }
-            recipe = {
-                "model_type": str(model.model_type),
-                "architecture": dict(model.architecture_json or {}),
-                "model_hyperparameters": dict(model.model_hyperparameters_json or {}),
-                "training_hyperparameters": dict(model.training_hyperparameters_json or {}),
-            }
             manifest = {
                 "contract_version": QUANT_BUNDLE_CANDIDATE_CONTRACT_VERSION,
                 "id": bundle_id,
@@ -1622,12 +2236,12 @@ class RDAGentCandidateStore:
                 "bundle_artifact_id": bundle_artifact_id,
                 "bundle_artifact_sha256": str(artifact.content_sha256),
                 "factors": factors,
-                "model": {
-                    "candidate_id": model_candidate_id,
-                    "code_sha256": str(model.code_sha256),
-                    "recipe_sha256": canonical_sha256(recipe),
-                    "admission_evidence_sha256": model_admission_sha256,
-                },
+                "prediction_component": prediction_component,
+                **(
+                    {"model": prediction_component}
+                    if prediction_component["kind"] == "model"
+                    else {"model_ensemble": prediction_component}
+                ),
             }
             try:
                 connection.execute(
@@ -1639,6 +2253,7 @@ class RDAGentCandidateStore:
                         status="awaiting_independent_evaluation",
                         source_iteration=source_iteration,
                         model_candidate_id=model_candidate_id,
+                        model_ensemble_candidate_id=model_ensemble_candidate_id,
                         factor_candidate_ids_json=sorted(factor_ids),
                         bundle_artifact_id=bundle_artifact_id,
                         bundle_artifact_sha256=str(artifact.content_sha256),
@@ -1670,6 +2285,7 @@ class RDAGentCandidateStore:
         name: str,
         description: str,
         model_candidate_id: str,
+        baseline_prediction_champion: Mapping[str, Any],
         factors: Sequence[Mapping[str, Any]],
         bundle_artifact_id: str,
         experiment_family_id: str,
@@ -1700,6 +2316,37 @@ class RDAGentCandidateStore:
         if not pre_final_end < final_oos_start <= final_oos_end:
             raise ValueError("joint quant proposal final OOS boundary is invalid")
         family_id = _nonempty(experiment_family_id, "experiment family id")
+        baseline_input = dict(baseline_prediction_champion or {})
+        baseline = self.freeze_quant_baseline_prediction(
+            candidate_kind=str(baseline_input.get("kind") or ""),
+            candidate_id=str(baseline_input.get("candidate_id") or ""),
+            dataset=dataset_name,
+            dataset_identity_sha256=identity,
+            pre_final_end=pre_final_end,
+            final_oos_start=final_oos_start,
+            final_oos_end=final_oos_end,
+        )
+        selection_sha = str(
+            baseline_input.get("selection_evidence_sha256") or ""
+        ).lower()
+        if selection_sha:
+            baseline["selection_evidence_sha256"] = _sha(
+                selection_sha, "prediction champion selection evidence"
+            )
+            baseline["evidence_sha256"] = canonical_sha256(
+                {
+                    key: value
+                    for key, value in baseline.items()
+                    if key != "evidence_sha256"
+                }
+            )
+        if canonical_sha256(baseline_input) != canonical_sha256(baseline):
+            raise ValueError("joint quant proposal baseline prediction changed")
+        if (
+            baseline["kind"] == "model"
+            and baseline.get("feature_set_definition_sha256") != feature_sha
+        ):
+            raise ValueError("joint quant baseline uses another governed feature set")
         bundle_id = uuid.uuid4().hex
         now = _now()
         with self.engine.begin() as connection:
@@ -1804,6 +2451,7 @@ class RDAGentCandidateStore:
                 "base_features_manifest_sha256": canonical_sha256(base_features),
                 "bundle_artifact_id": bundle_artifact_id,
                 "bundle_artifact_sha256": str(artifact.content_sha256),
+                "baseline_prediction_champion": baseline,
                 "factors": frozen_factors,
                 "model": {
                     "candidate_id": model_candidate_id,
@@ -1885,36 +2533,121 @@ class RDAGentCandidateStore:
                     or manifest.get("final_oos_end") != row.final_oos_end.isoformat()
                 ):
                     raise ValueError("quant bundle columns do not match its frozen manifest")
-                model = self._one(
-                    connection,
-                    model_candidates,
-                    str(row.model_candidate_id),
-                    "quant bundle model",
-                )
-                frozen_model = dict(manifest.get("model") or {})
                 joint_proposal = (
                     manifest.get("contract_version") == "quant-bundle-joint-proposal-v1"
                 )
-                if (
-                    (not joint_proposal and str(model.status) != "research_admitted")
-                    or (
-                        joint_proposal
-                        and str(model.status)
-                        not in {
-                            "awaiting_independent_evaluation",
-                            "evaluating",
-                            "research_admitted",
-                        }
-                    )
-                    or frozen_model.get("candidate_id") != str(model.id)
-                    or frozen_model.get("code_sha256") != str(model.code_sha256)
-                    or (
-                        not joint_proposal
-                        and frozen_model.get("admission_evidence_sha256")
-                        != str(model.admission_evidence_sha256)
-                    )
+                if bool(row.model_candidate_id) == bool(
+                    row.model_ensemble_candidate_id
                 ):
-                    raise ValueError("quant bundle model component is no longer valid")
+                    raise ValueError("quant bundle prediction component XOR is invalid")
+                if row.model_candidate_id:
+                    model = self._one(
+                        connection,
+                        model_candidates,
+                        str(row.model_candidate_id),
+                        "quant bundle model",
+                    )
+                    frozen_model = dict(manifest.get("model") or {})
+                    if (
+                        (not joint_proposal and str(model.status) != "research_admitted")
+                        or (
+                            joint_proposal
+                            and str(model.status)
+                            not in {
+                                "awaiting_independent_evaluation",
+                                "evaluating",
+                                "research_admitted",
+                            }
+                        )
+                        or frozen_model.get("candidate_id") != str(model.id)
+                        or frozen_model.get("code_sha256") != str(model.code_sha256)
+                        or (
+                            not joint_proposal
+                            and frozen_model.get("admission_evidence_sha256")
+                            != str(model.admission_evidence_sha256)
+                        )
+                        or (
+                            not joint_proposal
+                            and dict(manifest.get("prediction_component") or {})
+                            != frozen_model
+                        )
+                    ):
+                        raise ValueError(
+                            "quant bundle model component is no longer valid"
+                        )
+                    if joint_proposal:
+                        frozen_baseline = dict(
+                            manifest.get("baseline_prediction_champion") or {}
+                        )
+                        observed_baseline = self.freeze_quant_baseline_prediction(
+                            candidate_kind=str(frozen_baseline.get("kind") or ""),
+                            candidate_id=str(
+                                frozen_baseline.get("candidate_id") or ""
+                            ),
+                            dataset=str(row.dataset),
+                            dataset_identity_sha256=str(
+                                row.dataset_identity_sha256
+                            ),
+                            pre_final_end=row.pre_final_end,
+                            final_oos_start=row.final_oos_start,
+                            final_oos_end=row.final_oos_end,
+                        )
+                        selection_sha = str(
+                            frozen_baseline.get("selection_evidence_sha256") or ""
+                        )
+                        if selection_sha:
+                            observed_baseline[
+                                "selection_evidence_sha256"
+                            ] = _sha(
+                                selection_sha,
+                                "prediction champion selection evidence",
+                            )
+                            observed_baseline["evidence_sha256"] = canonical_sha256(
+                                {
+                                    key: value
+                                    for key, value in observed_baseline.items()
+                                    if key != "evidence_sha256"
+                                }
+                            )
+                        if canonical_sha256(frozen_baseline) != canonical_sha256(
+                            observed_baseline
+                        ):
+                            raise ValueError(
+                                "quant bundle incumbent prediction changed"
+                            )
+                else:
+                    if joint_proposal:
+                        raise ValueError(
+                            "RD-Agent joint challenger cannot masquerade as an ensemble"
+                        )
+                    ensemble = self._one(
+                        connection,
+                        model_ensemble_candidates,
+                        str(row.model_ensemble_candidate_id),
+                        "quant bundle model ensemble",
+                    )
+                    frozen_ensemble = dict(manifest.get("model_ensemble") or {})
+                    if (
+                        str(ensemble.status) != "research_admitted"
+                        or str(ensemble.dataset) != str(row.dataset)
+                        or str(ensemble.dataset_identity_sha256)
+                        != str(row.dataset_identity_sha256)
+                        or frozen_ensemble.get("kind") != "ensemble"
+                        or frozen_ensemble.get("candidate_id") != str(ensemble.id)
+                        or frozen_ensemble.get("manifest_sha256")
+                        != str(ensemble.manifest_sha256)
+                        or frozen_ensemble.get("admission_evidence_sha256")
+                        != str(ensemble.admission_evidence_sha256)
+                        or frozen_ensemble.get("combiner") != "equal_rank"
+                        or frozen_ensemble.get("stacking") is not False
+                        or list(frozen_ensemble.get("components") or [])
+                        != list(ensemble.components_json or [])
+                        or dict(manifest.get("prediction_component") or {})
+                        != frozen_ensemble
+                    ):
+                        raise ValueError(
+                            "quant bundle ensemble component is no longer valid"
+                        )
                 frozen_factors = {
                     str(item.get("candidate_id")): item
                     for item in (manifest.get("factors") or [])
@@ -2202,6 +2935,27 @@ class RDAGentCandidateStore:
                 raise ValueError("quant evaluation result artifact is unreadable") from exc
             if not isinstance(envelope, dict) or envelope.get("status") != "ok":
                 raise ValueError("quant evaluation batch did not complete successfully")
+            ledger_receipt = dict(envelope.get("research_trial_ledger_receipt") or {})
+            ledger_receipt_sha256 = canonical_sha256(
+                {
+                    key: value
+                    for key, value in ledger_receipt.items()
+                    if key != "evidence_sha256"
+                }
+            )
+            if (
+                ledger_receipt.get("contract_version")
+                != "fin-quant-research-ledger-receipt-v1"
+                or ledger_receipt.get("evidence_sha256")
+                != ledger_receipt_sha256
+                or ledger_receipt.get("research_screening_only") is not True
+                or ledger_receipt.get("not_capital_confirmation") is not True
+                or ledger_receipt.get("cross_cycle_fwer_claimed") is not False
+                or ledger_receipt.get("final_oos_opened") is not False
+                or quant_bundle_candidate_id
+                not in dict(ledger_receipt.get("candidate_statuses") or {})
+            ):
+                raise ValueError("quant research trial-ledger receipt is invalid")
             matches = [
                 item
                 for item in (envelope.get("evaluations") or [])
@@ -2220,6 +2974,9 @@ class RDAGentCandidateStore:
                     "run_artifact_id": run_artifact_id,
                     "run_artifact_sha256": str(artifact.content_sha256),
                     "recorded_by": responsible_actor,
+                    "research_trial_ledger_receipt": ledger_receipt,
+                    "research_trial_ledger_receipt_sha256": ledger_receipt_sha256,
+                    **RESEARCH_SCREENING_MARKERS,
                 }
                 connection.execute(
                     update(quant_bundle_candidates)
@@ -2249,6 +3006,26 @@ class RDAGentCandidateStore:
                 ):
                     raise ValueError("quant result identity or immutable hash is invalid")
                 composition = dict(candidate.bundle_manifest_json or {})
+                frozen_baseline = dict(
+                    composition.get("baseline_prediction_champion") or {}
+                )
+                result_baseline = dict(
+                    validated.get("baseline_prediction_champion") or {}
+                )
+                if (
+                    not frozen_baseline
+                    or canonical_sha256(frozen_baseline)
+                    != canonical_sha256(result_baseline)
+                    or validated.get("baseline_prediction_champion_sha256")
+                    != frozen_baseline.get("evidence_sha256")
+                    or validated.get("incumbent_comparison", {}).get(
+                        "incumbent_candidate_id"
+                    )
+                    != frozen_baseline.get("candidate_id")
+                ):
+                    raise ValueError(
+                        "quant result changed the frozen incumbent prediction"
+                    )
                 model_candidate = self._one(
                     connection,
                     model_candidates,
@@ -2386,8 +3163,39 @@ class RDAGentCandidateStore:
                                 "gate_status": "passed",
                                 "gate_reasons": [],
                                 "metrics_sha256": canonical_sha256(metrics),
+                                "predictions_path": seed_result["predictions_path"],
                                 "predictions_sha256": seed_result["predictions_sha256"],
-                                "checkpoint_sha256": seed_result["checkpoint_sha256"],
+                                **(
+                                    {
+                                        "prediction_component_kind": "ensemble",
+                                        "combiner": seed_result["combiner"],
+                                        "stacking": seed_result["stacking"],
+                                        "execution_evidence": seed_result[
+                                            "execution_evidence"
+                                        ],
+                                        "combination_evidence": seed_result[
+                                            "combination_evidence"
+                                        ],
+                                        "member_artifacts": seed_result[
+                                            "member_artifacts"
+                                        ],
+                                    }
+                                    if seed_result.get("prediction_component_kind")
+                                    == "ensemble"
+                                    else {
+                                        "prediction_component_kind": "model",
+                                        "checkpoint_path": seed_result[
+                                            "checkpoint_path"
+                                        ],
+                                        "checkpoint_sha256": seed_result[
+                                            "checkpoint_sha256"
+                                        ],
+                                        "checkpoint_format": seed_result[
+                                            "checkpoint_format"
+                                        ],
+                                        "model_engine": seed_result["model_engine"],
+                                    }
+                                ),
                                 "portfolio_report_path": seed_result[
                                     "portfolio_report_path"
                                 ],
@@ -2404,6 +3212,15 @@ class RDAGentCandidateStore:
                                 "coverage": seed_result["coverage"],
                                 "run_multiple_testing": validated[
                                     "multiple_testing"
+                                ],
+                                "baseline_prediction_champion": validated[
+                                    "baseline_prediction_champion"
+                                ],
+                                "baseline_prediction_champion_sha256": validated[
+                                    "baseline_prediction_champion_sha256"
+                                ],
+                                "incumbent_comparison": validated[
+                                    "incumbent_comparison"
                                 ],
                                 "multiple_testing_trial_name": (
                                     f"{quant_bundle_candidate_id}:{ablation}"
@@ -2457,8 +3274,8 @@ class RDAGentCandidateStore:
                         "multiple_testing_trial_name": (
                             f"{quant_bundle_candidate_id}:model_only"
                         ),
-                        "final_oos_opened": False,
                         "profiles": model_profiles,
+                        **RESEARCH_SCREENING_MARKERS,
                     },
                     candidate_id=str(model_candidate.id),
                     dataset_identity_sha256=str(candidate.dataset_identity_sha256),
@@ -2511,6 +3328,8 @@ class RDAGentCandidateStore:
                             "predictions_sha256": seed_result["predictions_sha256"],
                             "checkpoint_path": seed_result["checkpoint_path"],
                             "checkpoint_sha256": seed_result["checkpoint_sha256"],
+                            "checkpoint_format": seed_result["checkpoint_format"],
+                            "model_engine": seed_result["model_engine"],
                             "portfolio_report_path": seed_result[
                                 "portfolio_report_path"
                             ],
@@ -2578,7 +3397,9 @@ class RDAGentCandidateStore:
                     "bundle_manifest_sha256": str(candidate.bundle_manifest_sha256),
                     "independent_bundle": validated,
                     "independent_bundle_sha256": validated["bundle_sha256"],
-                    "final_oos_opened": False,
+                    "research_trial_ledger_receipt": ledger_receipt,
+                    "research_trial_ledger_receipt_sha256": ledger_receipt_sha256,
+                    **RESEARCH_SCREENING_MARKERS,
                 }
                 connection.execute(
                     update(quant_bundle_candidates)
@@ -2627,6 +3448,8 @@ class RDAGentCandidateStore:
             combined_factor_values_sha256: str | None = None
             composition = dict(candidate.bundle_manifest_json or {})
             run_multiple_testing: dict[str, Any] | None = None
+            baseline_prediction: dict[str, Any] | None = None
+            incumbent_comparison: dict[str, Any] | None = None
             for row in rows:
                 if str(row.gate_status) != "passed":
                     raise ValueError("every quant bundle ablation/profile/seed must pass")
@@ -2662,6 +3485,24 @@ class RDAGentCandidateStore:
                     run_multiple_testing
                 ):
                     raise ValueError("quant cells use different run-level statistics")
+                observed_baseline = dict(
+                    evidence.get("baseline_prediction_champion") or {}
+                )
+                observed_comparison = dict(
+                    evidence.get("incumbent_comparison") or {}
+                )
+                if baseline_prediction is None:
+                    baseline_prediction = observed_baseline
+                    incumbent_comparison = observed_comparison
+                elif (
+                    canonical_sha256(observed_baseline)
+                    != canonical_sha256(baseline_prediction)
+                    or canonical_sha256(observed_comparison)
+                    != canonical_sha256(incumbent_comparison or {})
+                ):
+                    raise ValueError(
+                        "quant cells use different incumbent comparison evidence"
+                    )
                 periods = (
                     row.train_start,
                     row.train_end,
@@ -2695,6 +3536,12 @@ class RDAGentCandidateStore:
                     )
             if factor_proofs is None or combined_factor_values_sha256 is None:
                 raise ValueError("quant bundle has no independent factor/PIT anchor evidence")
+            if not baseline_prediction or not incumbent_comparison:
+                raise ValueError("quant bundle has no frozen incumbent evidence")
+            if canonical_sha256(baseline_prediction) != canonical_sha256(
+                dict(composition.get("baseline_prediction_champion") or {})
+            ):
+                raise ValueError("quant bundle incumbent differs from its manifest")
             ablation_evidence: dict[str, Any] = {}
             for ablation in REQUIRED_QUANT_ABLATIONS:
                 profiles: dict[str, Any] = {}
@@ -2716,7 +3563,36 @@ class RDAGentCandidateStore:
                             "metrics": dict(row.metrics_json or {}),
                             "latest_prediction_date": evidence["latest_prediction_date"],
                             "predictions_sha256": evidence["predictions_sha256"],
-                            "checkpoint_sha256": evidence["checkpoint_sha256"],
+                            "predictions_path": evidence["predictions_path"],
+                            **(
+                                {
+                                    "prediction_component_kind": "ensemble",
+                                    "combiner": evidence["combiner"],
+                                    "stacking": evidence["stacking"],
+                                    "execution_evidence": evidence[
+                                        "execution_evidence"
+                                    ],
+                                    "combination_evidence": evidence[
+                                        "combination_evidence"
+                                    ],
+                                    "member_artifacts": evidence[
+                                        "member_artifacts"
+                                    ],
+                                }
+                                if evidence.get("prediction_component_kind")
+                                == "ensemble"
+                                else {
+                                    "prediction_component_kind": "model",
+                                    "checkpoint_path": evidence["checkpoint_path"],
+                                    "checkpoint_sha256": evidence[
+                                        "checkpoint_sha256"
+                                    ],
+                                    "checkpoint_format": evidence[
+                                        "checkpoint_format"
+                                    ],
+                                    "model_engine": evidence["model_engine"],
+                                }
+                            ),
                             "portfolio_report_path": evidence[
                                 "portfolio_report_path"
                             ],
@@ -2761,7 +3637,7 @@ class RDAGentCandidateStore:
                 ablation_payload["evidence_sha256"] = canonical_sha256(ablation_payload)
                 ablation_evidence[ablation] = ablation_payload
             governed_bundle = {
-                "contract_version": "quant-bundle-ablation-v1",
+                "contract_version": "quant-bundle-ablation-v2",
                 "id": candidate_id,
                 "dataset_identity_sha256": str(candidate.dataset_identity_sha256),
                 "feature_set_definition_sha256": str(candidate.feature_set_definition_sha256),
@@ -2770,6 +3646,11 @@ class RDAGentCandidateStore:
                 "factor_recompute_evidence": factor_proofs,
                 "combined_factor_values_sha256": combined_factor_values_sha256,
                 "model": composition["model"],
+                "baseline_prediction_champion": baseline_prediction,
+                "baseline_prediction_champion_sha256": baseline_prediction[
+                    "evidence_sha256"
+                ],
+                "incumbent_comparison": incumbent_comparison,
                 "execution_environment_sha256": next(
                     iter(
                         {
@@ -2793,7 +3674,7 @@ class RDAGentCandidateStore:
                 "bundle_manifest_sha256": str(candidate.bundle_manifest_sha256),
                 "independent_bundle": validated,
                 "independent_bundle_sha256": str(validated["bundle_sha256"]),
-                "final_oos_opened": False,
+                **RESEARCH_SCREENING_MARKERS,
             }
             connection.execute(
                 update(quant_bundle_candidates)
@@ -2895,17 +3776,20 @@ class RDAGentCandidateStore:
                         quant_bundle_candidates.c.status == "research_admitted",
                     )
                 ).all()
-                if not bundles:
-                    results.append(
-                        {
-                            "kind": "model",
-                            "id": str(model.id),
-                            "name": str(model.name),
-                            "description": str(model.description),
-                            "dataset": str(model.dataset),
-                            "strategy_config": model_config,
-                        }
-                    )
+                # Keep the independently admitted model visible even after a
+                # joint challenger is admitted.  It is the frozen incumbent
+                # control and must remain in the completion comparison pool;
+                # suppressing it here made every joint bundle win by default.
+                results.append(
+                    {
+                        "kind": "model",
+                        "id": str(model.id),
+                        "name": str(model.name),
+                        "description": str(model.description),
+                        "dataset": str(model.dataset),
+                        "strategy_config": model_config,
+                    }
+                )
                 for bundle in bundles:
                     bundle_evaluation = connection.execute(
                         select(quant_bundle_evaluations)
@@ -2936,7 +3820,103 @@ class RDAGentCandidateStore:
                             },
                         }
                     )
-            return results[:bounded_limit]
+            ensemble_rows = connection.execute(
+                select(model_ensemble_candidates)
+                .where(model_ensemble_candidates.c.status == "research_admitted")
+                .order_by(model_ensemble_candidates.c.updated_at.desc())
+                .limit(bounded_limit)
+            ).all()
+            for ensemble in ensemble_rows:
+                manifest = dict(ensemble.manifest_json or {})
+                admission = dict(ensemble.admission_evidence_json or {})
+                if (
+                    canonical_sha256(manifest) != str(ensemble.manifest_sha256)
+                    or canonical_sha256(
+                        {key: value for key, value in admission.items() if key != "evidence_sha256"}
+                    )
+                    != str(admission.get("evidence_sha256") or "")
+                    or str(admission.get("evidence_sha256") or "")
+                    != str(ensemble.admission_evidence_sha256)
+                    or admission.get("status") != "passed"
+                ):
+                    raise ValueError("admitted ensemble immutable evidence is invalid")
+                result_path, result_sha, _ = _path_evidence(
+                    str(admission.get("result_artifact_path") or "")
+                )
+                if result_sha != str(admission.get("result_artifact_sha256") or ""):
+                    raise ValueError(
+                        f"admitted ensemble result changed after admission: {result_path}"
+                    )
+                grid = connection.execute(
+                    select(model_ensemble_evaluations).where(
+                        model_ensemble_evaluations.c.model_ensemble_candidate_id
+                        == ensemble.id
+                    )
+                ).all()
+                observed = {
+                    (str(item.profile_id), int(item.seed))
+                    for item in grid
+                    if str(item.gate_status) == "passed"
+                }
+                required = {
+                    (profile, seed)
+                    for profile in REQUIRED_RESEARCH_PROFILES
+                    for seed in REQUIRED_MODEL_SEEDS
+                }
+                if observed != required or len(grid) != len(required):
+                    raise ValueError("admitted ensemble independent grid is incomplete")
+                primary = next(
+                    item
+                    for item in grid
+                    if str(item.profile_id) == PRIMARY_MODEL_PROFILE
+                    and int(item.seed) == PRIMARY_MODEL_SEED
+                )
+                components = [dict(item) for item in ensemble.components_json or []]
+                ensemble_config = {
+                    "signal_source": "model_prediction",
+                    "model_ensemble_candidate_id": str(ensemble.id),
+                    "model_ensemble_evaluation_id": str(primary.id),
+                    "model_ensemble_manifest_sha256": str(
+                        ensemble.manifest_sha256
+                    ),
+                    "model_ensemble_evidence_sha256": str(
+                        ensemble.admission_evidence_sha256
+                    ),
+                    "model_ensemble_combiner": "equal_rank",
+                    "model_ensemble_stacking": False,
+                    "model_component_candidate_ids": [
+                        str(item["model_candidate_id"]) for item in components
+                    ],
+                    "model_component_families": [
+                        str(item["model_family"]) for item in components
+                    ],
+                    "model_primary_profile_id": PRIMARY_MODEL_PROFILE,
+                    "model_primary_seed": PRIMARY_MODEL_SEED,
+                    "model_refit_policy": dict(MODEL_REFIT_POLICY),
+                    "model_refit_policy_sha256": MODEL_REFIT_POLICY_SHA256,
+                }
+                results.append(
+                    {
+                        "kind": "ensemble",
+                        "id": str(ensemble.id),
+                        "name": str(ensemble.name),
+                        "description": "Governed equal-rank cross-family model ensemble",
+                        "dataset": str(ensemble.dataset),
+                        "strategy_config": ensemble_config,
+                    }
+                )
+            # A large model archive must not make a governed ensemble
+            # undiscoverable merely because single-model rows were appended
+            # first.  Capital callers still apply their immutable candidate
+            # allow-list and score every returned signal.
+            kind_order = {"joint": 0, "ensemble": 1, "model": 2}
+            return sorted(
+                results,
+                key=lambda item: (
+                    kind_order.get(str(item.get("kind") or ""), 99),
+                    str(item.get("id") or ""),
+                ),
+            )[:bounded_limit]
 
     def run_audit_summary(self, research_run_id: str) -> dict[str, list[dict[str, Any]]]:
         """Return path-free model, bundle, artifact, asset, and provenance summaries."""
@@ -3050,7 +4030,19 @@ class RDAGentCandidateStore:
                 "description": str(row.description),
                 "status": str(row.status),
                 "source_iteration": row.source_iteration,
-                "model_candidate_id": str(row.model_candidate_id),
+                "prediction_component_kind": (
+                    "model" if row.model_candidate_id is not None else "ensemble"
+                ),
+                "model_candidate_id": (
+                    str(row.model_candidate_id)
+                    if row.model_candidate_id is not None
+                    else None
+                ),
+                "model_ensemble_candidate_id": (
+                    str(row.model_ensemble_candidate_id)
+                    if row.model_ensemble_candidate_id is not None
+                    else None
+                ),
                 "factor_candidate_ids": list(row.factor_candidate_ids_json or []),
                 "bundle_artifact_sha256": str(row.bundle_artifact_sha256),
                 "feature_set_definition_sha256": str(row.feature_set_definition_sha256),

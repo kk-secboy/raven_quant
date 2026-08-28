@@ -38,6 +38,7 @@ UNSTABLE_PAGINATION_DATASETS = frozenset(
         "moneyflow_ind_dc",
         "irm_qa_sh",
         "irm_qa_sz",
+        "research_report",
         "us_tbr",
         "us_tltr",
         "us_trltr",

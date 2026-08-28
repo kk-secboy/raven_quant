@@ -111,7 +111,7 @@ def test_research_report_contract_is_clipped_to_official_history() -> None:
     assert history_start_date("research_report") == date(2017, 1, 1)
     definition = ALL_DEFINITIONS["research_report"]
     assert definition.fields == RESEARCH_REPORT_FIELDS
-    assert definition.primary_key == ("url",)
+    assert definition.primary_key == ("url", "trade_date")
     specs = supplemental_specs(
         "research_corpus",
         start=date(2016, 12, 30),
@@ -243,6 +243,22 @@ def test_tushare_selection_caps_each_day_and_uses_next_real_open_day() -> None:
     assert {candidate.selection_rank for candidate in selected} == set(range(1, 21))
     assert {candidate.available_at.date() for candidate in selected} == {date(2026, 8, 17)}
     assert all(candidate.available_at > candidate.published_at for candidate in selected)
+
+
+def test_tushare_selection_accepts_snapshot_timestamp_dates() -> None:
+    selected = select_tushare_research_reports(
+        [
+            {
+                "trade_date": "2026-08-14 00:00:00",
+                "title": "timestamp report",
+                "url": "https://research.example/timestamp.pdf",
+            }
+        ],
+        open_days=(date(2026, 8, 14), date(2026, 8, 17)),
+    )
+    assert len(selected) == 1
+    assert selected[0].published_at.date() == date(2026, 8, 14)
+    assert selected[0].available_at.date() == date(2026, 8, 17)
 
 
 def test_tushare_asset_is_not_downloaded_before_next_open_day(tmp_path: Path) -> None:
@@ -406,7 +422,7 @@ def test_manual_acquisition_uses_verification_clock_not_backfilled_time(tmp_path
         materialize_research_asset(
             tmp_path,
             candidate,
-            _verified_pdf(_PDF_BODY),
+            _verified_pdf(_PDF_BODY, url="https://example.com/manual.pdf"),
             acquired_at=verified_at,
         )
 

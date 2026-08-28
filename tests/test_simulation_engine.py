@@ -264,6 +264,37 @@ def test_pair_execution_books_both_legs_as_one_atomic_group() -> None:
     assert result["conservation"]["cash_difference"] == pytest.approx(0.0)
 
 
+def test_pair_execution_uses_one_coordinated_vwap_window_for_both_legs() -> None:
+    first = pd.concat(
+        [
+            _bars(instrument="SH600000", price=10.0, volume=100_000),
+            _bars(instrument="SH600001", price=20.0, volume=100_000),
+        ],
+        ignore_index=True,
+    )
+    second = pd.concat(
+        [
+            _bars(
+                instrument="SH600000", price=12.0, volume=300_000,
+                up_limit=13.0, down_limit=9.0,
+            ),
+            _bars(
+                instrument="SH600001", price=24.0, volume=300_000,
+                up_limit=26.0, down_limit=18.0,
+            ),
+        ],
+        ignore_index=True,
+    )
+    second["datetime"] = "2025-01-03 14:00:00"
+    result = _pair_run(minute_bars=pd.concat([first, second], ignore_index=True))
+
+    fills = {item["instrument"]: item for item in result["fills"]}
+    assert fills["SH600000"]["price"] == pytest.approx(11.5)
+    assert fills["SH600001"]["price"] == pytest.approx(23.0)
+    assert all(item["minute_volume"] == 400_000 for item in fills.values())
+    assert all(item["executed_at"].hour == 14 for item in fills.values())
+
+
 def test_pair_simulation_accrues_borrow_cost_on_an_unchanged_short_leg() -> None:
     opened = _pair_run()
     next_day = date(2025, 1, 6)

@@ -25,3 +25,17 @@ def test_tushare_relay_rate_preserves_stricter_operator_limit(
     settings = Settings.from_env(tmp_path / ".env.missing")
 
     assert settings.requests_per_minute == 60.0
+
+
+@pytest.mark.parametrize(("configured", "expected"), [("0", 1), ("2", 2), ("9", 3)])
+def test_worker_concurrency_is_bounded_for_shared_cpu_queues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str,
+    expected: int,
+) -> None:
+    monkeypatch.setenv("WORKER_CONCURRENCY", configured)
+
+    settings = Settings.from_env(tmp_path / ".env.missing")
+
+    assert settings.worker_concurrency == expected

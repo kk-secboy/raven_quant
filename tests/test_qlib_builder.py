@@ -14,6 +14,8 @@ from quant_data.availability import (
 )
 from quant_data.qlib_builder import (
     _MAX_EXCLUDED_DAILY_UNIT_RATIO,
+    DAILY_QLIB_DUCKDB_MEMORY_LIMIT,
+    DAILY_QLIB_DUCKDB_THREADS,
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
     QlibBuilder,
     _to_wsl_path,
@@ -23,6 +25,149 @@ from quant_data.qlib_builder import (
 from quant_data.snapshot_lineage import make_lineage_id
 
 pytestmark = pytest.mark.no_database
+
+
+def test_daily_duckdb_connection_applies_host_safe_resource_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_connect = __import__("duckdb").connect
+    statements: list[str] = []
+
+    class RecordingConnection:
+        def __init__(self) -> None:
+            self.connection = real_connect()
+
+        def execute(self, query: str):
+            statements.append(query)
+            return self.connection.execute(query)
+
+        def close(self) -> None:
+            self.connection.close()
+
+    monkeypatch.setattr(
+        "quant_data.qlib_builder.duckdb.connect",
+        lambda: RecordingConnection(),
+    )
+    spill = tmp_path / "daily-spill"
+
+    connection = QlibBuilder._duckdb_connection(spill_dir=spill)
+    connection.close()
+
+    normalized = [statement.replace("\\", "/") for statement in statements]
+    assert f"SET memory_limit='{DAILY_QLIB_DUCKDB_MEMORY_LIMIT}'" in statements
+    assert f"SET threads={DAILY_QLIB_DUCKDB_THREADS}" in statements
+    assert "SET preserve_insertion_order=false" in statements
+    assert f"SET temp_directory='{spill.resolve().as_posix()}'" in normalized
+
+
+def test_style_metadata_symbol_batches_match_full_panel_math(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    rows: list[dict[str, object]] = []
+    daily_rows: list[dict[str, object]] = []
+    factor_rows: list[dict[str, object]] = []
+    for symbol, market_cap, close in (
+        ("000001.SZ", 100_000.0, 10.0),
+        ("600000.SH", 400_000.0, 20.0),
+    ):
+        for trade_date, multiplier in (
+            ("2023-12-29", 1.0),
+            ("2024-01-02", 1.01),
+        ):
+            rows.append(
+                {
+                    "ts_code": symbol,
+                    "trade_date": trade_date,
+                    "total_mv": market_cap * multiplier,
+                    "circ_mv": market_cap * multiplier * 0.8,
+                    "pb": 2.0,
+                    "pe_ttm": 10.0,
+                    "turnover_rate": 1.0,
+                }
+            )
+            daily_rows.append(
+                {
+                    "ts_code": symbol,
+                    "trade_date": trade_date,
+                    "close": close * multiplier,
+                }
+            )
+            factor_rows.append(
+                {
+                    "ts_code": symbol,
+                    "trade_date": trade_date,
+                    "adj_factor": 1.0,
+                }
+            )
+    for dataset, frame in (
+        ("daily_basic", pd.DataFrame(rows)),
+        ("daily", pd.DataFrame(daily_rows)),
+        ("adj_factor", pd.DataFrame(factor_rows)),
+        (
+            "fina_indicator",
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": symbol,
+                        "ann_date": "2023-01-01",
+                        "roe": 10.0,
+                        "or_yoy": 5.0,
+                        "netprofit_yoy": 6.0,
+                        "debt_to_assets": 40.0,
+                    }
+                    for symbol in ("000001.SZ", "600000.SH")
+                ]
+            ),
+        ),
+    ):
+        root = snapshot / "parquet" / dataset
+        root.mkdir(parents=True)
+        frame.to_parquet(root / "data.parquet", index=False)
+
+    builder = QlibBuilder(snapshot)
+    expected = builder._build_style_exposures(pd.DataFrame(rows))
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    original_read = builder._read_dataset_for_symbols
+
+    def recording_read(
+        dataset: str,
+        columns,
+        symbols,
+        *,
+        required=(),
+    ):
+        calls.append((dataset, tuple(symbols)))
+        return original_read(dataset, columns, symbols, required=required)
+
+    monkeypatch.setattr(
+        "quant_data.qlib_builder.DAILY_QLIB_STYLE_SYMBOL_BATCH", 1
+    )
+    monkeypatch.setattr(builder, "_read_dataset_for_symbols", recording_read)
+    target = tmp_path / "metadata"
+
+    assert builder._write_style_metadata_bounded(target) is True
+
+    actual = pd.read_parquet(target / "style_exposures.parquet")
+    columns = list(expected.columns)
+    pd.testing.assert_frame_equal(
+        actual.loc[:, columns].sort_values(["datetime", "instrument"]).reset_index(drop=True),
+        expected.loc[:, columns]
+        .sort_values(["datetime", "instrument"])
+        .reset_index(drop=True),
+        check_dtype=False,
+        check_exact=False,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    daily_basic_batches = [symbols for dataset, symbols in calls if dataset == "daily_basic"]
+    assert daily_basic_batches == [("000001.SZ",), ("600000.SH",)]
+    assert all(len(symbols) == 1 for _, symbols in calls)
+    weights = pd.read_parquet(target / "full_market_weights.parquet")
+    assert weights.groupby("datetime")["weight"].sum().tolist() == pytest.approx(
+        [1.0, 1.0]
+    )
+    assert not (target / ".style_metadata_attempt").exists()
 
 
 def _write_market_control_snapshot(

@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import subprocess
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,52 @@ _QLIB_OUTPUT_VERIFY_CACHE_VERSION = 1
 _QLIB_OUTPUT_VERIFY_CACHE_FILE = ".catalog-output-verification-v1.json"
 _QLIB_PROVENANCE_PATH = "metadata/provenance.json"
 _QLIB_OUTPUT_VERIFY_MEMORY: dict[str, dict[str, Any]] = {}
+
+# The strict catalog above is deliberately expensive: it restats every sealed
+# output before it may describe a dataset as reproducible.  Browser pages do
+# not make capital decisions, so they read this small, persisted projection
+# instead.  A publication changes the lightweight marker signature; HTTP
+# reads keep returning the previous good projection, and the data worker
+# replaces it after publication.  Formal consumers continue to call
+# ``list_qlib_datasets``.
+_QLIB_DISPLAY_CATALOG_CACHE_VERSION = 2
+_QLIB_DISPLAY_CATALOG_CACHE_FILE = ".catalog-display-v2.json"
+_QLIB_DISPLAY_CATALOG_CACHE_MAX_BYTES = 5_000_000
+_QLIB_DISPLAY_CATALOG_MAX_DATASETS = 5_000
+_QLIB_DISPLAY_CATALOG_CACHE_LOCK = threading.Lock()
+_QLIB_DISPLAY_CATALOG_MEMORY: dict[str, dict[str, Any]] = {}
+
+# Snapshot manifests preserve every source-unit hash and can be hundreds of
+# megabytes each.  The browser only needs snapshot identity and dataset-level
+# coverage.  Keep a separate, non-authoritative catalog that is parsed with
+# bounded memory and published by the data worker when a new immutable
+# snapshot directory appears. Browser requests only read the last artifact.
+_SNAPSHOT_DISPLAY_CATALOG_CACHE_VERSION = 1
+_SNAPSHOT_DISPLAY_CATALOG_CACHE_FILE = ".catalog-display-v1.json"
+_SNAPSHOT_DISPLAY_CATALOG_CACHE_MAX_BYTES = 5_000_000
+_SNAPSHOT_DISPLAY_CATALOG_CACHE_LOCK = threading.Lock()
+_SNAPSHOT_DISPLAY_CATALOG_MEMORY: dict[str, dict[str, Any]] = {}
+_SNAPSHOT_DISPLAY_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "created_at",
+        "end_date",
+        "frequency",
+        "name",
+        "snapshot_type",
+        "start_date",
+    }
+)
+_SNAPSHOT_DISPLAY_DATASET_FIELDS = frozenset(
+    {
+        "date_field",
+        "date_max",
+        "date_min",
+        "empty_units",
+        "rows",
+        "source_rows",
+        "unit_files",
+    }
+)
 
 
 def _qlib_output_stat_fingerprint(
@@ -426,6 +474,121 @@ def dataset_catalog(checkpoint: CheckpointStore) -> list[dict[str, Any]]:
     return result
 
 
+class CheckpointCatalogProjection:
+    """Persist and refresh checkpoint aggregates outside HTTP request work.
+
+    ``work_units`` can contain millions of immutable rows, so calculating the
+    same grouped counts independently for the overview and dataset catalog on
+    every browser poll is needlessly expensive.  This cache is deliberately
+    kept at the API/display boundary: strict research and admission code still
+    queries its authoritative inputs directly.
+    """
+
+    def __init__(
+        self,
+        checkpoint: CheckpointStore,
+        *,
+        ttl_seconds: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
+        cache_path: Path | None = None,
+    ) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        self._checkpoint = checkpoint
+        self._ttl_seconds = float(ttl_seconds)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._cache_path = cache_path
+        self._catalog = self._read_cache()
+        self._checked_at = 0.0
+        self._refreshing = False
+
+    def _read_cache(self) -> list[dict[str, Any]] | None:
+        if self._cache_path is None:
+            return None
+        try:
+            if self._cache_path.stat().st_size > 10_000_000:
+                return None
+            payload = json.loads(self._cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        catalog = payload.get("catalog") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != 1
+            or not isinstance(catalog, list)
+            or any(not isinstance(item, dict) for item in catalog)
+        ):
+            return None
+        return catalog
+
+    def _write_cache(self, catalog: list[dict[str, Any]]) -> None:
+        if self._cache_path is None:
+            return
+        temporary = self._cache_path.with_name(
+            f".{self._cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(
+                    {"version": 1, "generated_at_ns": time.time_ns(), "catalog": catalog},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self._cache_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def refresh(self) -> list[dict[str, Any]]:
+        catalog = dataset_catalog(self._checkpoint)
+        try:
+            self._write_cache(catalog)
+        except OSError:
+            # The in-memory display projection remains usable when a read-only
+            # or temporarily full cache volume prevents persistence.
+            pass
+        with self._lock:
+            self._catalog = catalog
+            self._checked_at = self._clock()
+            self._refreshing = False
+        return catalog
+
+    def _refresh_in_background(self) -> None:
+        try:
+            self.refresh()
+        except Exception:
+            with self._lock:
+                self._checked_at = self._clock()
+                self._refreshing = False
+
+    def get(self) -> list[dict[str, Any]]:
+        now = self._clock()
+        launch = False
+        with self._lock:
+            if self._catalog is not None and now - self._checked_at < self._ttl_seconds:
+                return self._catalog
+            if not self._refreshing:
+                self._refreshing = True
+                launch = True
+            catalog = self._catalog or []
+        if launch:
+            try:
+                threading.Thread(
+                    target=self._refresh_in_background,
+                    name="checkpoint-catalog-projection",
+                    daemon=True,
+                ).start()
+            except Exception:
+                with self._lock:
+                    self._refreshing = False
+                    self._checked_at = self._clock()
+        return catalog
+
+
 def list_snapshots(data_root: Path) -> list[dict[str, Any]]:
     root = data_root / "snapshots"
     snapshots = []
@@ -441,6 +604,228 @@ def list_snapshots(data_root: Path) -> list[dict[str, Any]]:
             manifest = {"name": path.name, "datasets": {}, "invalid": True}
         snapshots.append(manifest)
     return snapshots
+
+
+def _snapshot_display_inventory(data_root: Path) -> tuple[str, dict[str, list[int]]]:
+    root = data_root / "snapshots"
+    digest = hashlib.sha256()
+    digest.update(f"v{_SNAPSHOT_DISPLAY_CATALOG_CACHE_VERSION}\0".encode("ascii"))
+    markers: dict[str, list[int]] = {}
+    if not root.exists():
+        digest.update(b"missing")
+        return digest.hexdigest(), markers
+    try:
+        directories = sorted(
+            (item for item in root.iterdir() if item.is_dir()),
+            key=lambda item: item.name,
+        )
+    except OSError:
+        digest.update(b"unreadable")
+        return digest.hexdigest(), markers
+    for directory in directories:
+        manifest = directory / "manifest.json"
+        try:
+            stat = manifest.stat()
+            marker = [int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns)]
+        except OSError:
+            marker = [-1, -1, -1]
+        markers[directory.name] = marker
+        digest.update(directory.name.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+        digest.update(f"{marker[0]}:{marker[1]}:{marker[2]}\n".encode("ascii"))
+    return digest.hexdigest(), markers
+
+
+def _snapshot_display_scalar(line: str) -> tuple[str, Any] | None:
+    stripped = line.strip()
+    if not stripped.startswith('"') or ":" not in stripped:
+        return None
+    raw_key, raw_value = stripped.split(":", 1)
+    raw_value = raw_value.strip().removesuffix(",").strip()
+    if not raw_value or raw_value[0] in "[{":
+        return None
+    try:
+        key = json.loads(raw_key)
+        value = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(key, str) or isinstance(value, (dict, list)):
+        return None
+    return key, value
+
+
+def _stream_snapshot_display_summary(manifest_path: Path) -> dict[str, Any]:
+    """Read a pretty-printed snapshot manifest without materializing source units.
+
+    SnapshotStorage is the only publisher and writes two-space-indented JSON.
+    Dataset source-unit arrays are the large portion; line-by-line parsing
+    retains only immediate scalar coverage fields and dataset names.
+    """
+
+    summary: dict[str, Any] = {"datasets": {}}
+    datasets = summary["datasets"]
+    in_datasets = False
+    current_dataset: str | None = None
+    saw_document_end = False
+    try:
+        with manifest_path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                stripped = line.lstrip(" ")
+                indent = len(line) - len(stripped)
+                if not in_datasets:
+                    if indent == 0 and stripped.strip() == "}":
+                        saw_document_end = True
+                        continue
+                    if indent == 2 and stripped.startswith('"datasets"'):
+                        in_datasets = True
+                        current_dataset = None
+                        continue
+                    if indent == 2:
+                        scalar = _snapshot_display_scalar(line)
+                        if scalar and scalar[0] in _SNAPSHOT_DISPLAY_TOP_LEVEL_FIELDS:
+                            summary[scalar[0]] = scalar[1]
+                    continue
+                if indent == 2 and stripped.startswith("}"):
+                    in_datasets = False
+                    current_dataset = None
+                    continue
+                if indent == 4 and stripped.startswith('"') and ":" in stripped:
+                    raw_key, raw_value = stripped.split(":", 1)
+                    if raw_value.strip().startswith("{"):
+                        try:
+                            current_dataset = str(json.loads(raw_key))
+                        except json.JSONDecodeError:
+                            current_dataset = None
+                        if current_dataset:
+                            datasets[current_dataset] = {}
+                    continue
+                if indent == 6 and current_dataset:
+                    scalar = _snapshot_display_scalar(line)
+                    if scalar and scalar[0] in _SNAPSHOT_DISPLAY_DATASET_FIELDS:
+                        datasets[current_dataset][scalar[0]] = scalar[1]
+    except (OSError, UnicodeDecodeError):
+        return {
+            "name": manifest_path.parent.name,
+            "datasets": {},
+            "invalid": True,
+        }
+    declared_name = summary.get("name")
+    summary["name"] = manifest_path.parent.name
+    summary["invalid"] = bool(
+        not saw_document_end or declared_name != manifest_path.parent.name
+    )
+    return summary
+
+
+def _read_snapshot_display_catalog(cache_path: Path) -> dict[str, Any] | None:
+    try:
+        if cache_path.stat().st_size > _SNAPSHOT_DISPLAY_CATALOG_CACHE_MAX_BYTES:
+            return None
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    signature = payload.get("signature") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != _SNAPSHOT_DISPLAY_CATALOG_CACHE_VERSION
+        or not isinstance(signature, str)
+        or len(signature) != 64
+        or not isinstance(entries, dict)
+        or any(
+            not isinstance(name, str)
+            or not isinstance(entry, dict)
+            or not isinstance(entry.get("marker"), list)
+            or len(entry["marker"]) != 3
+            or not all(isinstance(value, int) for value in entry["marker"])
+            or not isinstance(entry.get("summary"), dict)
+            for name, entry in entries.items()
+        )
+    ):
+        return None
+    return payload
+
+
+def _snapshot_display_catalog_cache_fingerprint(
+    cache_path: Path,
+) -> tuple[int, int, int] | None:
+    try:
+        stat = cache_path.stat()
+    except OSError:
+        return None
+    return int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns)
+
+
+def _write_snapshot_display_catalog(cache_path: Path, payload: dict[str, Any]) -> None:
+    temporary = cache_path.with_name(
+        f".{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, cache_path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def refresh_snapshot_display_catalog(data_root: Path) -> list[dict[str, Any]]:
+    root = data_root / "snapshots"
+    cache_path = root / _SNAPSHOT_DISPLAY_CATALOG_CACHE_FILE
+    cache_key = str(cache_path.resolve())
+    previous = _read_snapshot_display_catalog(cache_path) or {}
+    previous_entries = previous.get("entries") or {}
+    for _attempt in range(2):
+        before_signature, markers = _snapshot_display_inventory(data_root)
+        entries: dict[str, dict[str, Any]] = {}
+        for name, marker in markers.items():
+            old = previous_entries.get(name)
+            if isinstance(old, dict) and old.get("marker") == marker:
+                summary = old.get("summary")
+            else:
+                summary = _stream_snapshot_display_summary(root / name / "manifest.json")
+            entries[name] = {"marker": marker, "summary": summary}
+        after_signature, after_markers = _snapshot_display_inventory(data_root)
+        if before_signature == after_signature and markers == after_markers:
+            payload = {
+                "version": _SNAPSHOT_DISPLAY_CATALOG_CACHE_VERSION,
+                "signature": after_signature,
+                "generated_at_ns": time.time_ns(),
+                "entries": entries,
+            }
+            _write_snapshot_display_catalog(cache_path, payload)
+            payload["_cache_fingerprint"] = (
+                _snapshot_display_catalog_cache_fingerprint(cache_path)
+            )
+            with _SNAPSHOT_DISPLAY_CATALOG_CACHE_LOCK:
+                _SNAPSHOT_DISPLAY_CATALOG_MEMORY[cache_key] = payload
+            return [entries[name]["summary"] for name in sorted(entries, reverse=True)]
+        previous_entries = entries
+    raise RuntimeError("snapshot publication changed during display catalog refresh")
+
+
+def list_snapshots_for_display(data_root: Path) -> list[dict[str, Any]]:
+    root = data_root / "snapshots"
+    cache_path = root / _SNAPSHOT_DISPLAY_CATALOG_CACHE_FILE
+    cache_key = str(cache_path.resolve())
+    with _SNAPSHOT_DISPLAY_CATALOG_CACHE_LOCK:
+        payload = _SNAPSHOT_DISPLAY_CATALOG_MEMORY.get(cache_key)
+        fingerprint = _snapshot_display_catalog_cache_fingerprint(cache_path)
+        if payload is None or payload.get("_cache_fingerprint") != fingerprint:
+            disk_payload = _read_snapshot_display_catalog(cache_path)
+            if disk_payload is not None:
+                disk_payload["_cache_fingerprint"] = fingerprint
+                payload = disk_payload
+                _SNAPSHOT_DISPLAY_CATALOG_MEMORY[cache_key] = disk_payload
+        if payload is None:
+            return []
+        entries = payload["entries"]
+        return [entries[name]["summary"] for name in sorted(entries, reverse=True)]
 
 
 def list_qlib_datasets(data_root: Path) -> list[dict[str, Any]]:
@@ -514,21 +899,311 @@ def list_qlib_datasets(data_root: Path) -> list[dict[str, Any]]:
     return datasets
 
 
-def list_qlib_experiments(data_root: Path) -> list[dict[str, Any]]:
+def _qlib_display_catalog_signature(data_root: Path) -> str:
+    """Fingerprint dataset publication markers without walking feature files."""
+
+    root = data_root / "qlib"
+    digest = hashlib.sha256()
+    digest.update(f"v{_QLIB_DISPLAY_CATALOG_CACHE_VERSION}\0".encode("ascii"))
+    if not root.exists():
+        digest.update(b"missing")
+        return digest.hexdigest()
+
+    try:
+        datasets = sorted(
+            (item for item in root.iterdir() if item.is_dir()),
+            key=lambda item: item.name,
+        )
+    except OSError:
+        digest.update(b"unreadable")
+        return digest.hexdigest()
+
+    for dataset in datasets:
+        digest.update(dataset.name.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+        # Qlib datasets are immutable once their provenance manifest is
+        # published.  These small directories/files are sufficient to detect
+        # a new publication or an in-progress dataset becoming readable; the
+        # potentially millions of feature files are intentionally not walked.
+        marker_paths = [
+            dataset / "metadata" / "provenance.json",
+            dataset / "calendars",
+            dataset / "instruments",
+            dataset / "features",
+        ]
+        for marker in marker_paths:
+            try:
+                stat = marker.stat()
+                digest.update(marker.relative_to(dataset).as_posix().encode("utf-8"))
+                digest.update(
+                    f":{int(stat.st_size)}:{int(stat.st_mtime_ns)}:{int(stat.st_ctime_ns)}\n".encode(
+                        "ascii"
+                    )
+                )
+            except OSError:
+                digest.update(marker.relative_to(dataset).as_posix().encode("utf-8"))
+                digest.update(b":missing\n")
+
+        for directory_name in ("calendars", "instruments"):
+            directory = dataset / directory_name
+            try:
+                children = sorted(
+                    (item for item in directory.iterdir() if item.is_file()),
+                    key=lambda item: item.name,
+                )
+            except OSError:
+                children = []
+            for child in children:
+                try:
+                    stat = child.stat()
+                except OSError:
+                    continue
+                digest.update(child.relative_to(dataset).as_posix().encode("utf-8"))
+                digest.update(
+                    f":{int(stat.st_size)}:{int(stat.st_mtime_ns)}:{int(stat.st_ctime_ns)}\n".encode(
+                        "ascii"
+                    )
+                )
+    return digest.hexdigest()
+
+
+def _read_qlib_display_catalog_cache(cache_path: Path) -> dict[str, Any] | None:
+    try:
+        if cache_path.stat().st_size > _QLIB_DISPLAY_CATALOG_CACHE_MAX_BYTES:
+            return None
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    signature = payload.get("signature") if isinstance(payload, dict) else None
+    datasets = payload.get("datasets") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != _QLIB_DISPLAY_CATALOG_CACHE_VERSION
+        or not isinstance(signature, str)
+        or len(signature) != 64
+        or any(character not in "0123456789abcdef" for character in signature)
+        or not isinstance(datasets, list)
+        or len(datasets) > _QLIB_DISPLAY_CATALOG_MAX_DATASETS
+        or any(not isinstance(item, dict) for item in datasets)
+        or any(
+            forbidden in item
+            for item in datasets
+            for forbidden in ("path", "provenance", "output_manifest")
+        )
+    ):
+        return None
+    return payload
+
+
+def _qlib_display_catalog_cache_fingerprint(cache_path: Path) -> tuple[int, int, int] | None:
+    """Return a metadata-only cross-process publication fingerprint."""
+
+    try:
+        stat = cache_path.stat()
+    except OSError:
+        return None
+    return int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns)
+
+
+def _write_qlib_display_catalog_cache(
+    cache_path: Path,
+    *,
+    signature: str,
+    datasets: list[dict[str, Any]],
+) -> None:
+    payload = {
+        "version": _QLIB_DISPLAY_CATALOG_CACHE_VERSION,
+        "signature": signature,
+        "generated_at_ns": time.time_ns(),
+        "datasets": datasets,
+    }
+    temporary = cache_path.with_name(
+        f".{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, cache_path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _project_qlib_dataset_for_display(dataset: dict[str, Any]) -> dict[str, Any]:
+    """Drop the sealed output manifest and host path from browser responses.
+
+    A production provenance document can contain hundreds of thousands of
+    per-file hashes.  Sending it through a catalog endpoint made a nominal
+    status request exceed 100 MiB even after the filesystem scan was cached.
+    The UI needs only this bounded summary; authoritative identity remains in
+    the immutable provenance file and is re-read by strict consumers.
+    """
+
+    provenance = dataset.get("provenance")
+    provenance_row = provenance if isinstance(provenance, dict) else {}
+    return {
+        key: dataset.get(key)
+        for key in (
+            "name",
+            "ready",
+            "reproducible",
+            "frequency",
+            "lineage_id",
+            "lineage_verified",
+            "output_files_verified",
+            "output_verification",
+            "start_date",
+            "end_date",
+            "trading_days",
+            "instruments",
+        )
+    } | {
+        "dataset_identity_sha256": provenance_row.get("dataset_identity_sha256"),
+        "snapshot_manifest_sha256": provenance_row.get("snapshot_manifest_sha256"),
+    }
+
+
+def refresh_qlib_display_catalog(data_root: Path) -> list[dict[str, Any]]:
+    """Synchronously rebuild the non-authoritative browser projection."""
+
+    datasets: list[dict[str, Any]] | None = None
+    signature = ""
+    # Never label a scan of the old publication with the signature of a newer
+    # one.  Snapshot publication is normally atomic; the retry only covers the
+    # narrow interval where a directory changes during the catalog pass.
+    for _attempt in range(2):
+        before = _qlib_display_catalog_signature(data_root)
+        strict_rows = list_qlib_datasets(data_root)
+        after = _qlib_display_catalog_signature(data_root)
+        if before == after:
+            signature = after
+            datasets = [
+                _project_qlib_dataset_for_display(item)
+                for item in strict_rows
+            ]
+            break
+    if datasets is None:
+        raise RuntimeError("Qlib dataset publication changed during display catalog refresh")
+    cache_path = data_root / "qlib" / _QLIB_DISPLAY_CATALOG_CACHE_FILE
+    cache_key = str(cache_path.resolve())
+    payload = {
+        "version": _QLIB_DISPLAY_CATALOG_CACHE_VERSION,
+        "signature": signature,
+        "generated_at_ns": time.time_ns(),
+        "datasets": datasets,
+    }
+    _write_qlib_display_catalog_cache(
+        cache_path,
+        signature=signature,
+        datasets=datasets,
+    )
+    payload["_cache_fingerprint"] = _qlib_display_catalog_cache_fingerprint(cache_path)
+    with _QLIB_DISPLAY_CATALOG_CACHE_LOCK:
+        _QLIB_DISPLAY_CATALOG_MEMORY[cache_key] = payload
+    return datasets
+
+
+def list_qlib_datasets_for_display(data_root: Path) -> list[dict[str, Any]]:
+    """Read the last publisher-generated browser projection without scanning.
+
+    HTTP requests never launch ``list_qlib_datasets``.  A new Qlib publication
+    may make the signature stale, but the previous good projection remains
+    visible until the data worker explicitly calls
+    :func:`refresh_qlib_display_catalog`.  Formal consumers still use the
+    strict catalog and therefore keep all immutable-output checks.
+    """
+
+    cache_path = data_root / "qlib" / _QLIB_DISPLAY_CATALOG_CACHE_FILE
+    cache_key = str(cache_path.resolve())
+    signature = _qlib_display_catalog_signature(data_root)
+    with _QLIB_DISPLAY_CATALOG_CACHE_LOCK:
+        payload = _QLIB_DISPLAY_CATALOG_MEMORY.get(cache_key)
+        cache_fingerprint = _qlib_display_catalog_cache_fingerprint(cache_path)
+        disk_payload: dict[str, Any] | None = None
+        if payload is None or payload.get("_cache_fingerprint") != cache_fingerprint:
+            disk_payload = _read_qlib_display_catalog_cache(cache_path)
+            if disk_payload is not None:
+                disk_payload["_cache_fingerprint"] = cache_fingerprint
+                _QLIB_DISPLAY_CATALOG_MEMORY[cache_key] = disk_payload
+                payload = disk_payload
+        if payload is not None and payload.get("signature") == signature:
+            return payload["datasets"]
+        # The Qlib publisher normally runs in another container/process.  A
+        # mismatching in-memory signature must therefore re-read the tiny
+        # persisted projection; otherwise an API process could serve yesterday's
+        # catalog forever even though the worker successfully published today's.
+        if disk_payload is None:
+            disk_payload = _read_qlib_display_catalog_cache(cache_path)
+            if disk_payload is not None:
+                disk_payload["_cache_fingerprint"] = cache_fingerprint
+        if disk_payload is not None and disk_payload.get("signature") == signature:
+            _QLIB_DISPLAY_CATALOG_MEMORY[cache_key] = disk_payload
+            return disk_payload["datasets"]
+        candidates = [item for item in (payload, disk_payload) if item is not None]
+        if candidates:
+            newest = max(
+                candidates,
+                key=lambda item: int(item.get("generated_at_ns") or 0),
+            )
+            _QLIB_DISPLAY_CATALOG_MEMORY[cache_key] = newest
+            return newest["datasets"]
+    return []
+
+
+def list_qlib_experiments(
+    data_root: Path,
+    *,
+    job_ids: list[str] | tuple[str, ...],
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Read a bounded DB-selected experiment set without scanning artifacts."""
+
+    if limit <= 0 or limit > 200:
+        raise ValueError("Qlib experiment limit must be between 1 and 200")
     root = data_root / "artifacts" / "qlib"
     experiments = []
     if not root.exists():
         return experiments
-    for path in sorted((item for item in root.iterdir() if item.is_dir()), reverse=True):
+    seen: set[str] = set()
+    for raw_job_id in job_ids:
+        job_id = str(raw_job_id).strip().lower()
+        if (
+            len(experiments) >= limit
+            or job_id in seen
+            or len(job_id) != 32
+            or any(character not in "0123456789abcdef" for character in job_id)
+        ):
+            continue
+        seen.add(job_id)
+        path = root / job_id
         result_path = path / "result.json"
-        if not result_path.exists():
-            continue
         try:
+            if result_path.stat().st_size > 5_000_000:
+                continue
             result = json.loads(result_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError):
             continue
-        experiments.append({"id": path.name, **result})
+        if not isinstance(result, dict):
+            continue
+        experiments.append({"id": job_id, **result})
     return experiments
+
+
+def _execution_environment_label(*, wsl: bool = False) -> str:
+    if wsl:
+        return "Windows / WSL · CPU"
+    system = platform.system() or ("Windows" if os.name == "nt" else "Linux")
+    containerized = Path("/.dockerenv").exists() or bool(os.getenv("container"))
+    parts = [system]
+    if containerized:
+        parts.append("Docker")
+    parts.append("CPU")
+    return " · ".join(parts)
 
 
 def probe_qlib(settings: Settings, project_root: Path) -> dict[str, Any]:
@@ -539,7 +1214,14 @@ def probe_qlib(settings: Settings, project_root: Path) -> dict[str, Any]:
                 timeout=8,
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            if isinstance(result, dict):
+                # In production the API and Qlib worker are sibling Linux
+                # containers.  Older locked worker images may not yet return
+                # this display-only field, so the API supplies its deployment
+                # environment without inventing a WSL label.
+                result.setdefault("execution_environment", _execution_environment_label())
+            return result
         except (requests.RequestException, ValueError) as exc:
             return {"status": "unavailable", "error": str(exc)}
     script = project_root / "scripts" / "run_qlib_baseline.py"
@@ -563,7 +1245,13 @@ def probe_qlib(settings: Settings, project_root: Path) -> dict[str, Any]:
             (item for item in reversed(completed.stdout.splitlines()) if item.startswith("{")),
             "{}",
         )
-        return json.loads(line)
+        result = json.loads(line)
+        if isinstance(result, dict):
+            result.setdefault(
+                "execution_environment",
+                _execution_environment_label(wsl=is_wsl),
+            )
+        return result
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         return {"status": "unavailable", "error": str(exc)}
 
@@ -579,14 +1267,20 @@ def system_summary(
     checkpoint: CheckpointStore,
     jobs: list[dict],
     data_tasks: list[dict] | None = None,
+    *,
+    catalog: list[dict[str, Any]] | None = None,
 ) -> dict:
-    catalog = dataset_catalog(checkpoint)
+    # Multiple operational endpoints may reuse one bounded display snapshot.
+    # Without one this remains a live query, preserving existing semantics.
+    catalog = catalog if catalog is not None else dataset_catalog(checkpoint)
     total_rows = sum(item["rows"] for item in catalog)
     planned = sum(item["planned"] for item in catalog)
     succeeded = sum(item["succeeded"] for item in catalog)
     running_work_units = sum(item["running"] for item in catalog)
-    snapshots = list_snapshots(settings.data_root)
-    qlib_datasets = len(list_qlib_datasets(settings.data_root))
+    snapshots = list_snapshots_for_display(settings.data_root)
+    # Overview is operational display only; strict consumers independently
+    # re-verify the selected dataset before research or capital use.
+    qlib_datasets = len(list_qlib_datasets_for_display(settings.data_root))
     active_job_rows = [job for job in jobs if job["status"] in {"queued", "running"}]
     active_jobs = len(active_job_rows)
     active_bootstrap_jobs = sum(job.get("kind") == "bootstrap" for job in active_job_rows)

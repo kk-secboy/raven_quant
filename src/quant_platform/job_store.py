@@ -3,16 +3,111 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import case, cast, func, literal, select, text, update
+from sqlalchemy.dialects.postgresql import JSONPATH
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import jobs, open_database, row_dict
 from quant_platform.jsonb_safety import normalize_jsonb_document
+
+EVALUATION_STATUS_COUNTS_KEY = "_quantlab_evaluation_status_counts"
+MAX_NUMERICAL_THREADS_PER_JOB = 8
+
+# Global heavy-work CPU tokens.  This is deliberately independent of Docker's
+# per-container ceiling: several individually capped containers can still
+# overcommit one host when they run together.  Full daily/minute Qlib
+# publication participates in the same ledger after an unbounded data_qlib
+# attempt starved the API and SSH on a 32-core host.  The live paper lifecycle
+# remains outside this ledger and therefore retains its service reserve.
+RESEARCH_JOB_CPU_COST = {
+    "data_qlib": 16,
+    "minute_qlib": 16,
+    "rdagent_factor": 8,
+    "rdagent_run": 8,
+    "rdagent_model": 8,
+    "rdagent_factor_report": 4,
+    "rdagent_quant": 12,
+    "rdagent_data_science": 8,
+    "minute_research": 4,
+    "qlib_baseline": 8,
+    "external_factor_evaluate": 4,
+    "information_factor_evaluate": 4,
+    "multiface_audit": 4,
+    "factor_library_materialize": 8,
+    "factor_library_cluster": 8,
+    "factor_sota_evaluate": 8,
+    "factor_evaluate": 8,
+    "model_evaluate": 8,
+    "model_ensemble_evaluate": 8,
+    "quant_bundle_evaluate": 12,
+    "strategy_backtest": 8,
+    "parameter_experiment": 8,
+}
+
+RESEARCH_JOB_MEMORY_GB = {
+    "data_qlib": 24,
+    "minute_qlib": 24,
+    "rdagent_factor": 12,
+    "rdagent_run": 12,
+    "rdagent_model": 16,
+    "rdagent_factor_report": 8,
+    "rdagent_quant": 20,
+    "rdagent_data_science": 16,
+    "minute_research": 8,
+    "qlib_baseline": 12,
+    "external_factor_evaluate": 8,
+    "information_factor_evaluate": 8,
+    "multiface_audit": 8,
+    "factor_library_materialize": 12,
+    "factor_library_cluster": 12,
+    "factor_sota_evaluate": 12,
+    "factor_evaluate": 12,
+    "model_evaluate": 16,
+    "model_ensemble_evaluate": 16,
+    "quant_bundle_evaluate": 20,
+    "strategy_backtest": 12,
+    "parameter_experiment": 12,
+}
+
+
+def research_job_cpu_cost(kind: str) -> int:
+    return int(RESEARCH_JOB_CPU_COST.get(str(kind), 0))
+
+
+def research_job_memory_gb(kind: str) -> int:
+    return int(RESEARCH_JOB_MEMORY_GB.get(str(kind), 0))
+
+
+def _with_evaluation_status_counts(
+    document: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Persist bounded evaluation counters beside potentially large evidence.
+
+    The complete evaluation array remains the immutable worker result, but
+    operational job polling must not transfer and deserialize that array merely
+    to render a one-line outcome. New writes therefore carry small counters;
+    read projections retain a DB-side fallback for historical rows.
+    """
+
+    if document is None:
+        return None
+    evaluations = document.get("evaluations")
+    if not isinstance(evaluations, list):
+        return document
+    counts = Counter(
+        str(item.get("status"))
+        for item in evaluations
+        if isinstance(item, dict) and isinstance(item.get("status"), str)
+    )
+    document[EVALUATION_STATUS_COUNTS_KEY] = dict(sorted(counts.items()))
+    return document
+
 
 FORMAL_DATA_AUTO_RETRY_KINDS = frozenset(
     {
@@ -73,8 +168,15 @@ AUTO_RETRY_ATTEMPTS = {
     "research_asset_acquire": 3,
     "rdagent_factor": 3,
     "rdagent_run": 3,
+    "rdagent_model": 3,
+    "rdagent_quant": 3,
+    "rdagent_factor_report": 3,
     "rdagent_data_science": 1,
     "rdagent_llm_finetune": 1,
+    "factor_sota_evaluate": 2,
+    "factor_library_materialize": 2,
+    "factor_library_cluster": 2,
+    "model_refit": 3,
     "recommendation_refresh": 3,
     "simulation_order_plan": 3,
 }
@@ -90,6 +192,7 @@ def research_asset_acquisition_idempotency_key(
     snapshot_name: str,
     include_tushare: bool,
     include_arxiv: bool,
+    report_date: str | None = None,
 ) -> str:
     """Bind one automatic acquisition identity to its complete source contract."""
 
@@ -99,6 +202,7 @@ def research_asset_acquisition_idempotency_key(
         "snapshot_name": str(snapshot_name),
         "include_tushare": bool(include_tushare),
         "include_arxiv": bool(include_arxiv),
+        "report_date": str(report_date or ""),
     }
     digest = hashlib.sha256(
         json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -113,17 +217,38 @@ class JobStore:
         self.engine = open_database(database_url)
 
     def recover_interrupted(self, allowed_kinds: tuple[str, ...] = ()) -> int:
-        statement = update(jobs).where(jobs.c.status == "running")
+        predicate = [jobs.c.status == "running"]
         if allowed_kinds:
-            statement = statement.where(jobs.c.kind.in_(allowed_kinds))
-        statement = statement.values(
-            status="queued",
-            started_at=None,
-            next_attempt_at=None,
-            error="Worker restarted; job safely requeued",
-        )
+            predicate.append(jobs.c.kind.in_(allowed_kinds))
         with self.engine.begin() as connection:
-            return int(connection.execute(statement).rowcount or 0)
+            exhausted = connection.execute(
+                update(jobs)
+                .where(*predicate, jobs.c.attempts >= jobs.c.max_attempts)
+                .values(
+                    status="failed",
+                    exit_code=143,
+                    error=(
+                        "Worker restarted after the bounded attempt limit; "
+                        "operator review is required"
+                    ),
+                    cancel_requested_at=None,
+                    next_attempt_at=None,
+                    finished_at=_now(),
+                )
+            )
+            recoverable = connection.execute(
+                update(jobs)
+                .where(*predicate, jobs.c.attempts < jobs.c.max_attempts)
+                .values(
+                    status="queued",
+                    started_at=None,
+                    # Let PostgreSQL, the API and readiness probes settle before
+                    # a full-market build can reclaim its bounded resources.
+                    next_attempt_at=_now() + timedelta(seconds=120),
+                    error="Worker restarted; job safely requeued after warm-up",
+                )
+            )
+        return int(exhausted.rowcount or 0) + int(recoverable.rowcount or 0)
 
     def create(
         self,
@@ -201,16 +326,66 @@ class JobStore:
             raise ValueError(f"could not create {kind} job") from exc
         return self.get(existing_id or job_id)
 
-    def claim_next(self, allowed_kinds: tuple[str, ...] = ()) -> dict[str, Any] | None:
+    def claim_next(
+        self,
+        allowed_kinds: tuple[str, ...] = (),
+        *,
+        research_cpu_budget: int = 0,
+        research_memory_budget_gb: int = 0,
+    ) -> dict[str, Any] | None:
         statement = select(jobs).where(
             jobs.c.status == "queued",
             (jobs.c.next_attempt_at.is_(None)) | (jobs.c.next_attempt_at <= _now()),
         )
         if allowed_kinds:
             statement = statement.where(jobs.c.kind.in_(allowed_kinds))
-        statement = statement.order_by(jobs.c.created_at).limit(1).with_for_update(skip_locked=True)
+        governed_resources = research_cpu_budget > 0 or research_memory_budget_gb > 0
+        candidate_limit = 100 if governed_resources else 1
+        statement = (
+            statement.order_by(jobs.c.created_at)
+            .limit(candidate_limit)
+            .with_for_update(skip_locked=True)
+        )
         with self.engine.begin() as connection:
-            row = connection.execute(statement).first()
+            if governed_resources:
+                connection.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtext('quantlab-research-cpu-budget'))"
+                    )
+                )
+                running_kinds = connection.scalars(
+                    select(jobs.c.kind).where(jobs.c.status == "running")
+                ).all()
+                used_cpu = sum(research_job_cpu_cost(kind) for kind in running_kinds)
+                used_memory_gb = sum(
+                    research_job_memory_gb(kind) for kind in running_kinds
+                )
+            else:
+                used_cpu = 0
+                used_memory_gb = 0
+            rows = connection.execute(statement).all()
+            row = next(
+                (
+                    item
+                    for item in rows
+                    if (
+                        (
+                            research_cpu_budget <= 0
+                            or research_job_cpu_cost(str(item.kind)) == 0
+                            or used_cpu + research_job_cpu_cost(str(item.kind))
+                            <= research_cpu_budget
+                        )
+                        and (
+                            research_memory_budget_gb <= 0
+                            or research_job_memory_gb(str(item.kind)) == 0
+                            or used_memory_gb + research_job_memory_gb(str(item.kind))
+                            <= research_memory_budget_gb
+                        )
+                    )
+                ),
+                None,
+            )
             if row is None:
                 return None
             connection.execute(
@@ -236,7 +411,7 @@ class JobStore:
         result: dict[str, Any] | None = None,
     ) -> None:
         status = "succeeded" if exit_code == 0 else "failed"
-        persisted_result = normalize_jsonb_document(result)
+        persisted_result = _with_evaluation_status_counts(normalize_jsonb_document(result))
         with self.engine.begin() as connection:
             connection.execute(
                 update(jobs)
@@ -255,7 +430,7 @@ class JobStore:
     def update_progress(self, job_id: str, progress: dict[str, Any]) -> None:
         """Persist a live subprocess progress snapshot without changing job state."""
 
-        persisted_progress = normalize_jsonb_document(progress)
+        persisted_progress = _with_evaluation_status_counts(normalize_jsonb_document(progress))
         with self.engine.begin() as connection:
             updated = connection.execute(
                 update(jobs)
@@ -283,7 +458,7 @@ class JobStore:
         incremented on claim, so a max_attempts value of three means at most
         three actual process executions.
         """
-        persisted_result = normalize_jsonb_document(result)
+        persisted_result = _with_evaluation_status_counts(normalize_jsonb_document(result))
         with self.engine.begin() as connection:
             row = connection.execute(
                 select(jobs.c.status, jobs.c.attempts, jobs.c.max_attempts)
@@ -292,11 +467,7 @@ class JobStore:
             ).first()
             if row is None:
                 raise KeyError(job_id)
-            if (
-                retryable
-                and row.status == "running"
-                and int(row.attempts) < int(row.max_attempts)
-            ):
+            if retryable and row.status == "running" and int(row.attempts) < int(row.max_attempts):
                 delay_seconds = min(900, 30 * (2 ** max(0, int(row.attempts) - 1)))
                 connection.execute(
                     update(jobs)
@@ -407,8 +578,19 @@ class JobStore:
         offset: int = 0,
         statuses: tuple[str, ...] = (),
         kinds: tuple[str, ...] = (),
+        payload_keys: tuple[str, ...] | None = None,
+        progress_keys: tuple[str, ...] | None = None,
+        progress_evaluation_statuses: tuple[str, ...] = (),
+        progress_evaluation_kind: str | None = None,
     ) -> list[dict[str, Any]]:
-        statement = select(jobs)
+        statement = select(
+            *self._projected_columns(
+                payload_keys=payload_keys,
+                progress_keys=progress_keys,
+                progress_evaluation_statuses=progress_evaluation_statuses,
+                progress_evaluation_kind=progress_evaluation_kind,
+            )
+        )
         if statuses:
             statement = statement.where(jobs.c.status.in_(statuses))
         if kinds:
@@ -417,6 +599,28 @@ class JobStore:
         with self.engine.connect() as connection:
             rows = [self._decode(row_dict(row)) for row in connection.execute(statement)]
             return self._annotate_retry_successors(connection, rows)
+
+    def status_summaries(
+        self,
+        *,
+        statuses: tuple[str, ...],
+        limit: int = 1_000,
+    ) -> list[dict[str, Any]]:
+        """Return the bounded fields needed by operational counters.
+
+        A completed research job may keep megabytes of immutable evidence in
+        ``progress_json``.  Operational badges need only kind and status; do
+        not deserialize that evidence on every overview poll.
+        """
+
+        statement = (
+            select(jobs.c.id, jobs.c.kind, jobs.c.status)
+            .where(jobs.c.status.in_(statuses))
+            .order_by(jobs.c.created_at.desc())
+            .limit(limit)
+        )
+        with self.engine.connect() as connection:
+            return [row_dict(row) for row in connection.execute(statement)]
 
     def count(
         self,
@@ -432,13 +636,110 @@ class JobStore:
         with self.engine.connect() as connection:
             return int(connection.execute(statement).scalar_one())
 
-    def get(self, job_id: str) -> dict[str, Any]:
+    def get(
+        self,
+        job_id: str,
+        *,
+        payload_keys: tuple[str, ...] | None = None,
+        progress_keys: tuple[str, ...] | None = None,
+        progress_evaluation_statuses: tuple[str, ...] = (),
+        progress_evaluation_kind: str | None = None,
+    ) -> dict[str, Any]:
         with self.engine.connect() as connection:
-            row = connection.execute(select(jobs).where(jobs.c.id == job_id)).first()
+            row = connection.execute(
+                select(
+                    *self._projected_columns(
+                        payload_keys=payload_keys,
+                        progress_keys=progress_keys,
+                        progress_evaluation_statuses=progress_evaluation_statuses,
+                        progress_evaluation_kind=progress_evaluation_kind,
+                    )
+                ).where(jobs.c.id == job_id)
+            ).first()
             if row is None:
                 raise KeyError(job_id)
             decoded = self._decode(row_dict(row))
             return self._annotate_retry_successors(connection, [decoded])[0]
+
+    @staticmethod
+    def _evaluation_status_count(column, status: str, *, job_kind: str | None = None):
+        persisted = column[EVALUATION_STATUS_COUNTS_KEY][status].as_integer()
+        json_path = cast(
+            literal(f'$.evaluations[*] ? (@.status == "{status}")'),
+            JSONPATH,
+        )
+        historical = func.jsonb_array_length(func.jsonb_path_query_array(column, json_path))
+        count = func.coalesce(persisted, historical, 0)
+        if job_kind is not None:
+            return case((jobs.c.kind == job_kind, count), else_=0)
+        return count
+
+    @classmethod
+    def _jsonb_projection(
+        cls,
+        column,
+        keys: tuple[str, ...],
+        label: str,
+        *,
+        evaluation_statuses: tuple[str, ...] = (),
+        evaluation_kind: str | None = None,
+    ):
+        arguments: list[Any] = []
+        for key in keys:
+            arguments.extend((key, column[key]))
+        if evaluation_statuses:
+            count_arguments: list[Any] = []
+            for status in evaluation_statuses:
+                count_arguments.extend(
+                    (
+                        status,
+                        cls._evaluation_status_count(
+                            column,
+                            status,
+                            job_kind=evaluation_kind,
+                        ),
+                    )
+                )
+            arguments.extend(
+                (
+                    EVALUATION_STATUS_COUNTS_KEY,
+                    func.jsonb_build_object(*count_arguments),
+                )
+            )
+        return func.jsonb_strip_nulls(func.jsonb_build_object(*arguments)).label(label)
+
+    @classmethod
+    def _projected_columns(
+        cls,
+        *,
+        payload_keys: tuple[str, ...] | None,
+        progress_keys: tuple[str, ...] | None,
+        progress_evaluation_statuses: tuple[str, ...] = (),
+        progress_evaluation_kind: str | None = None,
+    ) -> list[Any]:
+        projected = [
+            column
+            for column in jobs.c
+            if not (
+                (column.name == "payload_json" and payload_keys is not None)
+                or (column.name == "progress_json" and progress_keys is not None)
+            )
+        ]
+        if payload_keys is not None:
+            projected.append(
+                cls._jsonb_projection(jobs.c.payload_json, payload_keys, "payload_json")
+            )
+        if progress_keys is not None:
+            projected.append(
+                cls._jsonb_projection(
+                    jobs.c.progress_json,
+                    progress_keys,
+                    "progress_json",
+                    evaluation_statuses=progress_evaluation_statuses,
+                    evaluation_kind=progress_evaluation_kind,
+                )
+            )
+        return projected
 
     @staticmethod
     def _lineage_identity(job: dict[str, Any]) -> tuple[str, str, str] | None:
@@ -478,18 +779,30 @@ class JobStore:
         }
         earliest = min(failed_created_at.values())
         failed_kinds = sorted({str(row["kind"]) for row in failed})
-        candidates = [
-            (raw.created_at, cls._decode(row_dict(raw)))
-            for raw in connection.execute(
-                select(jobs)
-                .where(
-                    jobs.c.created_at > earliest,
-                    jobs.c.kind.in_(failed_kinds),
-                    jobs.c.status.in_(("queued", "running", "succeeded")),
-                )
-                .order_by(jobs.c.created_at.desc())
+        successor_payload = cls._jsonb_projection(
+            jobs.c.payload_json,
+            ("pipeline_id", "snapshot_name"),
+            "payload_json",
+        )
+        candidates = []
+        for raw in connection.execute(
+            select(
+                jobs.c.id,
+                jobs.c.kind,
+                jobs.c.status,
+                jobs.c.created_at,
+                successor_payload,
             )
-        ]
+            .where(
+                jobs.c.created_at > earliest,
+                jobs.c.kind.in_(failed_kinds),
+                jobs.c.status.in_(("queued", "running", "succeeded")),
+            )
+            .order_by(jobs.c.created_at.desc())
+        ):
+            candidate = row_dict(raw)
+            candidate["payload"] = candidate.pop("payload_json") or {}
+            candidates.append((raw.created_at, candidate))
         for row in failed:
             identity = cls._lineage_identity(row)
             successor = next(

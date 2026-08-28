@@ -146,6 +146,70 @@ Index(
     postgresql_where=research_runs.c.status.in_(("queued", "running", "evaluating")),
 )
 
+factor_definitions = Table(
+    "factor_definitions",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("expression", Text, nullable=False),
+    Column("expression_sha256", String, nullable=False, unique=True),
+    Column("definition_sha256", String, nullable=False, unique=True),
+    Column("required_fields_json", json_type, nullable=False),
+    Column("max_lookback_days", Integer, nullable=False),
+    Column("economic_family", String, nullable=False),
+    Column("family_tags_json", json_type, nullable=False),
+    Column("aliases_json", json_type, nullable=False),
+    Column("source_refs_json", json_type, nullable=False),
+    Column("availability_policy", String, nullable=False),
+    Column("qlib_commit", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_factor_definitions_family_name",
+    factor_definitions.c.economic_family,
+    factor_definitions.c.name,
+)
+
+factor_library_versions = Table(
+    "factor_library_versions",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("contract_version", String, nullable=False),
+    Column("definition_sha256", String, nullable=False, unique=True),
+    Column("member_count", Integer, nullable=False),
+    Column("source_alias_counts_json", json_type, nullable=False),
+    Column("qlib_commit", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("retired_at", DateTime(timezone=True)),
+)
+Index(
+    "uq_factor_library_versions_active",
+    factor_library_versions.c.status,
+    unique=True,
+    postgresql_where=factor_library_versions.c.status == "active",
+)
+
+factor_library_members = Table(
+    "factor_library_members",
+    metadata,
+    Column(
+        "library_version_id",
+        String,
+        ForeignKey("quantlab.factor_library_versions.id", ondelete="RESTRICT"),
+        primary_key=True,
+    ),
+    Column(
+        "factor_definition_id",
+        String,
+        ForeignKey("quantlab.factor_definitions.id", ondelete="RESTRICT"),
+        primary_key=True,
+    ),
+    Column("ordinal", Integer, nullable=False),
+    UniqueConstraint("library_version_id", "ordinal", name="uq_factor_library_member_ordinal"),
+)
+
 factor_candidates = Table(
     "factor_candidates",
     metadata,
@@ -161,6 +225,14 @@ factor_candidates = Table(
         Column("description", Text, nullable=False),
         Column("formulation", Text),
         Column("variables_json", json_type, nullable=False),
+        Column(
+            "factor_definition_id",
+            String,
+            ForeignKey("quantlab.factor_definitions.id", ondelete="RESTRICT"),
+        ),
+        Column("economic_family", String),
+        Column("family_tags_json", json_type),
+        Column("similarity_cluster_id", String),
         Column("status", String, nullable=False),
         Column("source_iteration", Integer),
         Column("experiment_family_id", String),
@@ -176,6 +248,9 @@ factor_candidates = Table(
         Column("profile_consensus_sha256", String),
         Column("promoted_evaluation_id", String),
         Column("promotion_evidence_sha256", String),
+        Column("admission_path", String),
+        Column("incremental_evidence_json", json_type),
+        Column("incremental_evidence_sha256", String),
         Column("promoted_by", String),
         Column("promoted_at", DateTime(timezone=True)),
         Column("created_at", DateTime(timezone=True), nullable=False),
@@ -192,6 +267,12 @@ Index(
     "idx_factor_candidates_status_updated",
     factor_candidates.c.status,
     factor_candidates.c.updated_at.desc(),
+)
+Index("idx_factor_candidates_definition", factor_candidates.c.factor_definition_id)
+Index(
+    "idx_factor_candidates_family_status",
+    factor_candidates.c.economic_family,
+    factor_candidates.c.status,
 )
 
 factor_evaluations = Table(
@@ -263,6 +344,155 @@ Index(
     factor_evaluations.c.created_at.desc(),
 )
 
+factor_similarity_edges = Table(
+    "factor_similarity_edges",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("profile_id", String, nullable=False),
+    Column(
+        "left_factor_candidate_id",
+        String,
+        ForeignKey("quantlab.factor_candidates.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "right_factor_candidate_id",
+        String,
+        ForeignKey("quantlab.factor_candidates.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("mean_abs_spearman", Float, nullable=False),
+    Column("relationship", String, nullable=False),
+    Column("cluster_id", String),
+    Column("evidence_json", json_type, nullable=False),
+    Column("evidence_sha256", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "dataset_identity_sha256",
+        "profile_id",
+        "left_factor_candidate_id",
+        "right_factor_candidate_id",
+        name="uq_factor_similarity_edge",
+    ),
+)
+
+factor_definition_similarity_edges = Table(
+    "factor_definition_similarity_edges",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "library_version_id",
+        String,
+        ForeignKey("quantlab.factor_library_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column(
+        "left_factor_definition_id",
+        String,
+        ForeignKey("quantlab.factor_definitions.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "right_factor_definition_id",
+        String,
+        ForeignKey("quantlab.factor_definitions.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("mean_abs_spearman", Float, nullable=False),
+    Column("relationship", String, nullable=False),
+    Column("cluster_id", String, nullable=False),
+    Column("evidence_json", json_type, nullable=False),
+    Column("evidence_sha256", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "library_version_id",
+        "dataset_identity_sha256",
+        "left_factor_definition_id",
+        "right_factor_definition_id",
+        name="uq_factor_definition_similarity_edge",
+    ),
+)
+
+research_sota_versions = Table(
+    "research_sota_versions",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "library_version_id",
+        String,
+        ForeignKey("quantlab.factor_library_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "predecessor_id",
+        String,
+        ForeignKey("quantlab.research_sota_versions.id", ondelete="RESTRICT"),
+    ),
+    Column("dataset", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("universe", String, nullable=False),
+    Column("label_horizon_days", Integer, nullable=False),
+    Column("periods_json", json_type, nullable=False),
+    Column("policy_json", json_type, nullable=False),
+    Column("policy_sha256", String, nullable=False),
+    Column("evidence_json", json_type, nullable=False),
+    Column("evidence_sha256", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("activated_at", DateTime(timezone=True), nullable=False),
+    Column("superseded_at", DateTime(timezone=True)),
+)
+Index(
+    "uq_research_sota_active_scope",
+    research_sota_versions.c.dataset,
+    research_sota_versions.c.universe,
+    research_sota_versions.c.label_horizon_days,
+    unique=True,
+    postgresql_where=research_sota_versions.c.status == "active",
+)
+
+research_sota_members = Table(
+    "research_sota_members",
+    metadata,
+    Column(
+        "sota_version_id",
+        String,
+        ForeignKey("quantlab.research_sota_versions.id", ondelete="RESTRICT"),
+        primary_key=True,
+    ),
+    Column(
+        "factor_candidate_id",
+        String,
+        ForeignKey("quantlab.factor_candidates.id", ondelete="RESTRICT"),
+        primary_key=True,
+    ),
+    Column(
+        "factor_definition_id",
+        String,
+        ForeignKey("quantlab.factor_definitions.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "factor_evaluation_id",
+        String,
+        ForeignKey("quantlab.factor_evaluations.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("economic_family", String, nullable=False),
+    Column("family_tags_json", json_type, nullable=False),
+    Column("similarity_cluster_id", String, nullable=False),
+    Column("member_rank", Integer, nullable=False),
+    Column("weight", Float),
+    Column("action", String, nullable=False),
+    Column("replaced_factor_candidate_id", String),
+    Column("incremental_evidence_json", json_type, nullable=False),
+    Column("incremental_evidence_sha256", String, nullable=False),
+    UniqueConstraint("sota_version_id", "member_rank", name="uq_research_sota_member_rank"),
+)
+
 # Sealed one-shot consumption ledger for reserved final out-of-sample windows.
 # Scope is stable across snapshot identities: a research program, a verified
 # dataset lineage, or the fail-closed global standalone scope. Dataset identity
@@ -279,6 +509,12 @@ oos_vintages = Table(
     Column("sealed_at", DateTime(timezone=True), nullable=False),
     Column("first_opened_at", DateTime(timezone=True), nullable=False),
     Column("consumed_at", DateTime(timezone=True)),
+    Column(
+        "capital_oos_alpha_batch_id",
+        String,
+        ForeignKey("quantlab.capital_oos_alpha_batches.id", ondelete="RESTRICT"),
+        unique=True,
+    ),
     Column("sealed_candidate_set_json", json_type, nullable=False),
     Column("sealed_candidate_set_sha256", String, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
@@ -633,7 +869,11 @@ quant_bundle_candidates = Table(
         "model_candidate_id",
         String,
         ForeignKey("quantlab.model_candidates.id", ondelete="RESTRICT"),
-        nullable=False,
+    ),
+    Column(
+        "model_ensemble_candidate_id",
+        String,
+        ForeignKey("quantlab.model_ensemble_candidates.id", ondelete="RESTRICT"),
     ),
     Column("factor_candidate_ids_json", json_type, nullable=False),
     Column(
@@ -682,6 +922,11 @@ quant_bundle_candidates = Table(
     CheckConstraint(
         "pre_final_end < final_oos_start AND final_oos_start <= final_oos_end",
         name="ck_quant_bundle_candidates_oos_boundary",
+    ),
+    CheckConstraint(
+        "(model_candidate_id IS NOT NULL AND model_ensemble_candidate_id IS NULL) OR "
+        "(model_candidate_id IS NULL AND model_ensemble_candidate_id IS NOT NULL)",
+        name="ck_quant_bundle_candidates_prediction_xor",
     ),
 )
 Index(
@@ -969,6 +1214,16 @@ model_artifacts = Table(
     Column("artifact_path", Text, nullable=False),
     Column("artifact_sha256", String, nullable=False),
     Column("predictions_sha256", String, nullable=False),
+    # Prediction tables and fitted checkpoints are separate immutable
+    # artifacts.  Rows created before migration 0069 remain nullable and are
+    # deliberately ineligible for live inference until rebuilt.
+    Column("checkpoint_path", Text),
+    Column("checkpoint_sha256", String),
+    Column("checkpoint_format", String),
+    Column("model_data_contract_sha256", String),
+    Column("training_kind", String),
+    Column("training_evidence_json", json_type),
+    Column("training_evidence_sha256", String),
     Column("created_by", String, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("activated_by", String),
@@ -983,6 +1238,16 @@ model_artifacts = Table(
     CheckConstraint(
         "status IN ('candidate', 'active', 'retired', 'failed', 'expired')",
         name="ck_model_artifacts_status",
+    ),
+    CheckConstraint(
+        "checkpoint_format IS NULL OR checkpoint_format IN "
+        "('lightgbm_text', 'pytorch_state_dict', 'ridge_numeric_json')",
+        name="ck_model_artifacts_checkpoint_format",
+    ),
+    CheckConstraint(
+        "training_kind IS NULL OR training_kind IN "
+        "('formal_oos', 'monthly_retrain', 'early_retrain', 'daily_inference')",
+        name="ck_model_artifacts_training_kind",
     ),
 )
 Index(
@@ -1318,9 +1583,7 @@ Index(
     "uq_recommendation_portfolios_single_active_sender",
     recommendation_portfolios.c.status,
     unique=True,
-    postgresql_where=text(
-        "status = 'active' AND recommendation_scope = 'standalone'"
-    ),
+    postgresql_where=text("status = 'active' AND recommendation_scope = 'standalone'"),
 )
 
 recommendation_snapshots = Table(
@@ -1354,9 +1617,7 @@ recommendation_snapshots = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("started_at", DateTime(timezone=True)),
     Column("finished_at", DateTime(timezone=True)),
-    UniqueConstraint(
-        "portfolio_id", "as_of_date", name="uq_recommendation_snapshots_as_of"
-    ),
+    UniqueConstraint("portfolio_id", "as_of_date", name="uq_recommendation_snapshots_as_of"),
 )
 Index(
     "idx_recommendation_snapshots_portfolio_created",
@@ -1468,6 +1729,478 @@ Index(
     simulation_portfolios.c.execution_dataset,
     unique=True,
     postgresql_where=simulation_portfolios.c.promotion_stage_id.is_(None),
+)
+
+# One recoverable umbrella workflow per immutable daily Qlib publication.
+autopilot_cycles = Table(
+    "autopilot_cycles",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("dataset", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False, unique=True),
+    Column("dataset_lineage_id", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("stage", String, nullable=False),
+    Column("config_revision", Integer, nullable=False),
+    Column("state_json", json_type, nullable=False),
+    Column("error", Text),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("finished_at", DateTime(timezone=True)),
+    CheckConstraint(
+        "status IN ('active', 'blocked', 'succeeded', 'paused')",
+        name="ck_autopilot_cycles_status",
+    ),
+)
+Index(
+    "idx_autopilot_cycles_status_updated",
+    autopilot_cycles.c.status,
+    autopilot_cycles.c.updated_at.desc(),
+)
+
+autopilot_branches = Table(
+    "autopilot_branches",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "cycle_id",
+        String,
+        ForeignKey("quantlab.autopilot_cycles.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("scenario", String, nullable=False),
+    Column("scope_key", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("research_run_id", String, ForeignKey("quantlab.research_runs.id", ondelete="SET NULL")),
+    Column("job_id", String, ForeignKey("quantlab.jobs.id", ondelete="SET NULL")),
+    Column("details_json", json_type, nullable=False),
+    Column("error", Text),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("finished_at", DateTime(timezone=True)),
+    UniqueConstraint("cycle_id", "scenario", "scope_key", name="uq_autopilot_branch_scope"),
+    CheckConstraint(
+        "status IN ('queued', 'running', 'evaluating', 'succeeded', "
+        "'failed', 'blocked', 'skipped')",
+        name="ck_autopilot_branches_status",
+    ),
+)
+Index(
+    "idx_autopilot_branches_cycle_status",
+    autopilot_branches.c.cycle_id,
+    autopilot_branches.c.status,
+)
+
+# One immutable pre-registered tournament for each decision stage in an
+# Autopilot cycle.  This is the shared trial ledger: failed and rejected trials
+# remain part of the family and therefore cannot disappear from the final
+# multiple-testing count.
+research_tournaments = Table(
+    "research_tournaments",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "cycle_id",
+        String,
+        ForeignKey("quantlab.autopilot_cycles.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("stage", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("manifest_json", json_type, nullable=False),
+    Column("manifest_sha256", String, nullable=False),
+    Column("max_trials", Integer, nullable=False),
+    Column("selected_trial_ids_json", json_type, nullable=False),
+    Column("multiple_testing_json", json_type),
+    Column("multiple_testing_sha256", String),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("finished_at", DateTime(timezone=True)),
+    UniqueConstraint("cycle_id", "stage", name="uq_research_tournament_cycle_stage"),
+    CheckConstraint(
+        "stage IN ('feature_screen', 'model_screen', 'model_full', "
+        "'ensemble', 'quant', 'portfolio')",
+        name="ck_research_tournament_stage",
+    ),
+    CheckConstraint(
+        "status IN ('planned', 'running', 'succeeded', 'failed', 'blocked')",
+        name="ck_research_tournament_status",
+    ),
+    CheckConstraint("max_trials > 0", name="ck_research_tournament_trial_limit"),
+)
+Index(
+    "idx_research_tournaments_cycle_status",
+    research_tournaments.c.cycle_id,
+    research_tournaments.c.status,
+)
+
+research_tournament_trials = Table(
+    "research_tournament_trials",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "tournament_id",
+        String,
+        ForeignKey("quantlab.research_tournaments.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "branch_id",
+        String,
+        ForeignKey("quantlab.autopilot_branches.id", ondelete="SET NULL"),
+    ),
+    Column("trial_kind", String, nullable=False),
+    Column("name", String, nullable=False),
+    Column("feature_set_id", String),
+    Column("feature_set_definition_sha256", String),
+    Column("model_family", String),
+    Column("candidate_id", String),
+    Column("status", String, nullable=False),
+    Column("spec_json", json_type, nullable=False),
+    Column("spec_sha256", String, nullable=False),
+    Column("metrics_json", json_type),
+    Column("evidence_json", json_type),
+    Column("evidence_sha256", String),
+    Column("resource_json", json_type, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("tournament_id", "name", name="uq_research_tournament_trial_name"),
+    CheckConstraint(
+        "trial_kind IN ('feature_set', 'model', 'model_ensemble', "
+        "'quant_bundle', 'portfolio')",
+        name="ck_research_tournament_trial_kind",
+    ),
+    CheckConstraint(
+        "status IN ('preregistered', 'queued', 'running', 'passed', "
+        "'failed', 'rejected', 'selected')",
+        name="ck_research_tournament_trial_status",
+    ),
+)
+Index(
+    "idx_research_tournament_trials_status",
+    research_tournament_trials.c.tournament_id,
+    research_tournament_trials.c.status,
+)
+
+model_ensemble_candidates = Table(
+    "model_ensemble_candidates",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "tournament_id",
+        String,
+        ForeignKey("quantlab.research_tournaments.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("name", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("dataset", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("components_json", json_type, nullable=False),
+    Column("combiner", String, nullable=False),
+    Column("manifest_json", json_type, nullable=False),
+    Column("manifest_sha256", String, nullable=False, unique=True),
+    Column("admission_evidence_json", json_type),
+    Column("admission_evidence_sha256", String),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("tournament_id", "name", name="uq_model_ensemble_tournament_name"),
+    CheckConstraint(
+        "status IN ('awaiting_evaluation', 'evaluating', 'research_admitted', "
+        "'rejected', 'invalidated')",
+        name="ck_model_ensemble_status",
+    ),
+    CheckConstraint("combiner = 'equal_rank'", name="ck_model_ensemble_combiner"),
+)
+Index(
+    "idx_model_ensemble_candidates_status",
+    model_ensemble_candidates.c.status,
+    model_ensemble_candidates.c.updated_at.desc(),
+)
+
+model_ensemble_evaluations = Table(
+    "model_ensemble_evaluations",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "model_ensemble_candidate_id",
+        String,
+        ForeignKey("quantlab.model_ensemble_candidates.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("profile_id", String, nullable=False),
+    Column("seed", Integer, nullable=False),
+    Column("metrics_json", json_type, nullable=False),
+    Column("gate_status", String, nullable=False),
+    Column("evidence_json", json_type, nullable=False),
+    Column("evidence_sha256", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "model_ensemble_candidate_id",
+        "profile_id",
+        "seed",
+        name="uq_model_ensemble_evaluation_grid",
+    ),
+    CheckConstraint(
+        "gate_status IN ('passed', 'failed')",
+        name="ck_model_ensemble_evaluation_gate",
+    ),
+)
+
+# Cross-cycle type-I error control is reserved for capital-facing, one-shot
+# final OOS tests. Research tournaments retain their own within-cycle Holm/PBO
+# ledgers and do not spend or claim this capital alpha.
+capital_oos_alpha_families = Table(
+    "capital_oos_alpha_families",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("capital_oos_family_sha256", String, nullable=False),
+    Column("mandate_json", json_type, nullable=False),
+    Column("total_alpha", Numeric(38, 28), nullable=False),
+    Column("policy_json", json_type, nullable=False),
+    Column("policy_sha256", String, nullable=False),
+    Column("next_ordinal", Integer, nullable=False),
+    Column("reserved_alpha", Numeric(38, 28), nullable=False),
+    Column("settled_alpha", Numeric(38, 28), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "capital_oos_family_sha256", name="uq_capital_oos_alpha_family"
+    ),
+    CheckConstraint("total_alpha = 0.05", name="ck_capital_oos_alpha_total"),
+    CheckConstraint(
+        "capital_oos_family_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND policy_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND jsonb_typeof(mandate_json) = 'object' "
+        "AND jsonb_typeof(policy_json) = 'object'",
+        name="ck_capital_oos_alpha_family_identity",
+    ),
+    CheckConstraint(
+        "next_ordinal > 0 AND reserved_alpha >= 0 AND settled_alpha >= 0 "
+        "AND settled_alpha <= reserved_alpha AND reserved_alpha <= total_alpha",
+        name="ck_capital_oos_alpha_family_counters",
+    ),
+)
+Index(
+    "idx_capital_oos_alpha_families_created",
+    capital_oos_alpha_families.c.created_at,
+)
+
+capital_oos_legacy_attempts = Table(
+    "capital_oos_legacy_attempts",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "oos_vintage_id",
+        String,
+        ForeignKey("quantlab.oos_vintages.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("status", String, nullable=False),
+    Column("scope", String, nullable=False),
+    Column("dataset_identity", String, nullable=False),
+    Column("dataset_lineage_id", String),
+    Column("final_oos_start", Date, nullable=False),
+    Column("final_oos_end", Date, nullable=False),
+    Column("first_opened_at", DateTime(timezone=True), nullable=False),
+    Column("consumed_at", DateTime(timezone=True)),
+    Column("sealed_candidate_set_sha256", String, nullable=False),
+    Column("raw_p_value", Float, nullable=False),
+    Column("passed", Boolean, nullable=False),
+    Column("failure_recorded", Boolean, nullable=False),
+    Column("legacy_evidence_json", json_type, nullable=False),
+    Column("legacy_evidence_sha256", String, nullable=False),
+    Column(
+        "reconciled_family_id",
+        String,
+        ForeignKey("quantlab.capital_oos_alpha_families.id", ondelete="RESTRICT"),
+    ),
+    Column("ordinal", Integer),
+    Column("spent_alpha", Numeric(38, 28)),
+    Column("reconciliation_json", json_type),
+    Column("reconciliation_sha256", String),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("reconciled_at", DateTime(timezone=True)),
+    UniqueConstraint(
+        "reconciled_family_id",
+        "ordinal",
+        name="uq_capital_oos_legacy_family_ordinal",
+    ),
+    CheckConstraint(
+        "status IN ('unreconciled', 'reconciled')",
+        name="ck_capital_oos_legacy_status",
+    ),
+    CheckConstraint(
+        "length(btrim(scope)) > 0 AND length(btrim(dataset_identity)) > 0 "
+        "AND final_oos_end >= final_oos_start "
+        "AND sealed_candidate_set_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND legacy_evidence_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND jsonb_typeof(legacy_evidence_json) = 'object' "
+        "AND raw_p_value = 1 AND passed IS FALSE AND failure_recorded IS TRUE",
+        name="ck_capital_oos_legacy_evidence",
+    ),
+    CheckConstraint(
+        "(status = 'unreconciled' AND reconciled_family_id IS NULL "
+        "AND ordinal IS NULL AND spent_alpha IS NULL "
+        "AND reconciliation_json IS NULL AND reconciliation_sha256 IS NULL "
+        "AND reconciled_at IS NULL) OR "
+        "(status = 'reconciled' AND reconciled_family_id IS NOT NULL "
+        "AND ordinal > 0 AND spent_alpha > 0 "
+        "AND jsonb_typeof(reconciliation_json) = 'object' "
+        "AND reconciliation_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND reconciled_at IS NOT NULL)",
+        name="ck_capital_oos_legacy_reconciliation",
+    ),
+)
+Index(
+    "idx_capital_oos_legacy_status",
+    capital_oos_legacy_attempts.c.status,
+    capital_oos_legacy_attempts.c.first_opened_at,
+)
+Index(
+    "idx_capital_oos_legacy_family_window",
+    capital_oos_legacy_attempts.c.reconciled_family_id,
+    capital_oos_legacy_attempts.c.final_oos_start,
+    capital_oos_legacy_attempts.c.final_oos_end,
+)
+
+capital_oos_alpha_batches = Table(
+    "capital_oos_alpha_batches",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "family_id",
+        String,
+        ForeignKey("quantlab.capital_oos_alpha_families.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("batch_key", String, nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("status", String, nullable=False),
+    Column("frozen_bundle_manifest_sha256", String, nullable=False),
+    Column("frozen_baseline_manifest_sha256", String, nullable=False),
+    Column("dataset_lineage_id", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("hypothesis_count", Integer, nullable=False),
+    Column("research_data_end", Date, nullable=False),
+    Column("final_oos_start", Date, nullable=False),
+    Column("final_oos_end", Date, nullable=False),
+    Column("trading_day_count", Integer, nullable=False),
+    Column("trading_dates_json", json_type, nullable=False),
+    Column("trading_dates_sha256", String, nullable=False),
+    Column("embargo_trading_day_count", Integer, nullable=False),
+    Column("embargo_trading_dates_json", json_type, nullable=False),
+    Column("embargo_trading_dates_sha256", String, nullable=False),
+    Column("preregistration_json", json_type, nullable=False),
+    Column("preregistration_sha256", String, nullable=False),
+    Column("batch_alpha", Numeric(38, 28), nullable=False),
+    Column("raw_p_value", Float),
+    Column("passed", Boolean),
+    Column("failure_recorded", Boolean),
+    Column("settlement_evidence_json", json_type),
+    Column("settlement_evidence_sha256", String),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("settled_at", DateTime(timezone=True)),
+    UniqueConstraint("family_id", "batch_key", name="uq_capital_oos_alpha_batch_key"),
+    UniqueConstraint(
+        "family_id", "ordinal", name="uq_capital_oos_alpha_batch_ordinal"
+    ),
+    CheckConstraint(
+        "ordinal > 0 AND hypothesis_count = 1 AND batch_alpha > 0",
+        name="ck_capital_oos_alpha_batch_values",
+    ),
+    CheckConstraint(
+        "status IN ('reserved', 'settled')",
+        name="ck_capital_oos_alpha_batch_status",
+    ),
+    CheckConstraint(
+        "research_data_end < final_oos_start "
+        "AND final_oos_end >= final_oos_start AND trading_day_count >= 252 "
+        "AND embargo_trading_day_count >= 20 "
+        "AND (embargo_trading_dates_json ->> 0)::date > research_data_end "
+        "AND (embargo_trading_dates_json ->> "
+        "(embargo_trading_day_count - 1))::date < final_oos_start",
+        name="ck_capital_oos_alpha_batch_window",
+    ),
+    CheckConstraint(
+        "frozen_bundle_manifest_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND frozen_baseline_manifest_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND dataset_lineage_id ~ '^[0-9a-f]{64}$' "
+        "AND dataset_identity_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND trading_dates_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND embargo_trading_dates_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND preregistration_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND jsonb_typeof(trading_dates_json) = 'array' "
+        "AND jsonb_array_length(trading_dates_json) = trading_day_count "
+        "AND jsonb_typeof(embargo_trading_dates_json) = 'array' "
+        "AND jsonb_array_length(embargo_trading_dates_json) = embargo_trading_day_count "
+        "AND jsonb_typeof(preregistration_json) = 'object' "
+        "AND (settlement_evidence_sha256 IS NULL OR "
+        "settlement_evidence_sha256 ~ '^[0-9a-f]{64}$')",
+        name="ck_capital_oos_alpha_batch_evidence",
+    ),
+    CheckConstraint(
+        "(status = 'reserved' AND raw_p_value IS NULL AND passed IS NULL "
+        "AND failure_recorded IS NULL AND settlement_evidence_json IS NULL "
+        "AND settlement_evidence_sha256 IS NULL AND settled_at IS NULL) OR "
+        "(status = 'settled' AND raw_p_value IS NOT NULL AND passed IS NOT NULL "
+        "AND failure_recorded IS NOT NULL AND settlement_evidence_json IS NOT NULL "
+        "AND settlement_evidence_sha256 IS NOT NULL AND settled_at IS NOT NULL)",
+        name="ck_capital_oos_alpha_batch_settlement",
+    ),
+    CheckConstraint(
+        "status = 'reserved' OR (raw_p_value > 0 AND raw_p_value <= 1 "
+        "AND (failure_recorded IS FALSE OR "
+        "(failure_recorded IS TRUE AND raw_p_value = 1 AND passed IS FALSE)))",
+        name="ck_capital_oos_alpha_batch_result",
+    ),
+)
+Index(
+    "idx_capital_oos_alpha_batches_family_window",
+    capital_oos_alpha_batches.c.family_id,
+    capital_oos_alpha_batches.c.final_oos_start,
+    capital_oos_alpha_batches.c.final_oos_end,
+)
+Index(
+    "uq_capital_oos_alpha_one_reserved_family",
+    capital_oos_alpha_batches.c.family_id,
+    unique=True,
+    postgresql_where=capital_oos_alpha_batches.c.status == "reserved",
+)
+
+# A date-level cursor makes the three-year PDF backfill resumable and auditable.
+research_report_backfill_days = Table(
+    "research_report_backfill_days",
+    metadata,
+    Column("report_date", Date, primary_key=True),
+    Column("snapshot_name", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("attempts", Integer, nullable=False),
+    Column("selected_count", Integer, nullable=False),
+    Column("published_count", Integer, nullable=False),
+    Column("blocked_count", Integer, nullable=False),
+    Column("bytes_downloaded", BigInteger, nullable=False),
+    Column("job_id", String, ForeignKey("quantlab.jobs.id", ondelete="SET NULL")),
+    Column("last_error", Text),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("finished_at", DateTime(timezone=True)),
+    CheckConstraint(
+        "status IN ('pending', 'queued', 'running', 'succeeded', 'blocked')",
+        name="ck_research_report_backfill_status",
+    ),
+    CheckConstraint(
+        "attempts >= 0 AND selected_count >= 0 AND published_count >= 0 "
+        "AND blocked_count >= 0 AND bytes_downloaded >= 0",
+        name="ck_research_report_backfill_counts",
+    ),
+)
+Index(
+    "idx_research_report_backfill_status_date",
+    research_report_backfill_days.c.status,
+    research_report_backfill_days.c.report_date.desc(),
 )
 Index(
     "uq_simulation_portfolios_promotion_stage",
@@ -1961,9 +2694,7 @@ simulation_corporate_events = Table(
     Column("details_json", json_type, nullable=False),
     Column("batch_id", String),
     Column("created_at", DateTime(timezone=True), nullable=False),
-    UniqueConstraint(
-        "portfolio_id", "event_key", name="uq_simulation_corporate_events_key"
-    ),
+    UniqueConstraint("portfolio_id", "event_key", name="uq_simulation_corporate_events_key"),
 )
 Index(
     "idx_simulation_corporate_events_portfolio_date",
@@ -2111,8 +2842,7 @@ simulation_cash_event_allocations = Table(
         name="uq_simulation_cash_event_allocations",
     ),
     CheckConstraint(
-        "action IN ('create', 'freeze', 'consume_free', "
-        "'consume_frozen', 'release', 'reclassify')",
+        "action IN ('create', 'freeze', 'consume_free', 'consume_frozen', 'release', 'reclassify')",
         name="ck_simulation_cash_event_allocations_action",
     ),
     CheckConstraint(
@@ -2153,8 +2883,7 @@ simulation_cash_reservations = Table(
         name="uq_simulation_cash_reservations_order_lot",
     ),
     CheckConstraint(
-        "reserved_amount > 0 AND remaining_amount >= 0 "
-        "AND remaining_amount <= reserved_amount",
+        "reserved_amount > 0 AND remaining_amount >= 0 AND remaining_amount <= reserved_amount",
         name="ck_simulation_cash_reservations_amounts",
     ),
 )

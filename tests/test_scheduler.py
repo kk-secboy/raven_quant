@@ -101,6 +101,42 @@ def _write_trade_calendar(
     frame.to_parquet(target, index=False, compression="zstd", engine="pyarrow")
 
 
+def test_scheduler_automatically_enqueues_factor_library_materialization(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(database_url, tmp_path)
+    _write_qlib_dataset(
+        settings.data_root,
+        name="cn-daily-20250102",
+        frequency="day",
+        start="2024-01-02",
+        end="2025-01-02",
+        source_lineage_id="a" * 64,
+    )
+    monkeypatch.setattr(
+        "quant_platform.scheduler.FACTOR_LIBRARY_MIN_FREE_BYTES", 0
+    )
+    engine = SchedulerEngine(settings)
+
+    assert engine._enqueue_due_factor_library_materialization(
+        datetime(2025, 1, 2, 10, tzinfo=UTC)
+    ) == 1
+    assert engine._enqueue_due_factor_library_materialization(
+        datetime(2025, 1, 2, 10, 1, tzinfo=UTC)
+    ) == 0
+
+    queued = JobStore(database_url).list(
+        kinds=("factor_library_materialize",), limit=10
+    )
+    assert len(queued) == 1
+    payload = queued[0]["payload"]
+    assert payload["dataset"] == "cn-daily-20250102"
+    assert payload["feature_set_id"] == "unified-research-v1"
+    assert payload["universe"] == "cn_all"
+    assert payload["start"] == "2024-01-02"
+    assert payload["end"] == "2025-01-02"
+
+
 def test_scheduler_materializes_once_and_enqueues_incremental_job(
     database_url: str, tmp_path: Path
 ) -> None:
@@ -170,19 +206,55 @@ def test_scheduler_creates_recoverable_full_data_pipeline(
     assert job["payload"]["snapshot_start"] == "2024-01-01"
     assert job["payload"]["snapshot_end"] == "2025-01-02"
     assert [step["kind"] for step in job["payload"]["pipeline_steps"]] == [
-        "supplemental_cn_extended_daily",
-        "supplemental_cn_macro",
-        "supplemental_global_markets",
         "data_verify",
         "data_snapshot",
         "data_qlib",
         "qlib_baseline",
+        "supplemental_cn_extended_daily",
+        "supplemental_cn_macro",
+        "supplemental_global_markets",
     ]
     assert {
         step["payload"]["end"]
         for step in job["payload"]["pipeline_steps"]
         if step["kind"].startswith("supplemental_")
     } == {"2025-01-02"}
+
+
+def test_daily_publication_precedes_every_optional_supplemental_bundle(
+    database_url: str, tmp_path: Path
+) -> None:
+    current = datetime(2025, 1, 2, 7, 29, tzinfo=UTC)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="daily publication priority fixture",
+        kind="data_pipeline",
+        timezone="Asia/Shanghai",
+        run_time=time(15, 30),
+        trading_days_only=True,
+        payload={
+            "profile": "full",
+            "lookback_days": 7,
+            "snapshot_start": "2008-01-01",
+            "bundles": list(AUTOMATED_DATA_BUNDLES),
+        },
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+
+    SchedulerEngine(_settings(database_url, tmp_path)).tick(current + timedelta(minutes=1))
+
+    run = store.list_runs()[0]
+    job = JobStore(database_url).get(run["job_id"])
+    kinds = [step["kind"] for step in job["payload"]["pipeline_steps"]]
+    assert kinds[:4] == [
+        "data_verify",
+        "data_snapshot",
+        "data_qlib",
+        "qlib_baseline",
+    ]
+    assert all(kind.startswith("supplemental_") for kind in kinds[4:])
 
 
 @pytest.mark.parametrize("kind", ["incremental_sync", "data_pipeline"])

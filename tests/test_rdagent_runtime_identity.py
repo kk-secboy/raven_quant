@@ -196,6 +196,7 @@ def test_runtime_command_forwards_repository_for_bridge_verification(
     assert environment["QLIB_FACTOR_TEST_END"] < "2023-01-01"
     assert environment["MODEL_COSTEER_ENV_TYPE"] == "docker"
     assert environment["QLIB_DOCKER_NETWORK"] == "none"
+    assert environment["QLIB_DOCKER_ENABLE_GPU"] == "false"
     assert environment["QLIB_DOCKER_ENABLE_CACHE"] == "false"
     assert environment["QLIB_FACTOR_RUNNER"] == (
         "quant_platform.rdagent_runner.QuantLabFactorRunner"
@@ -218,6 +219,14 @@ def test_runtime_command_forwards_repository_for_bridge_verification(
         "debug",
     )
     mounted = json.loads(environment["QLIB_DOCKER_EXTRA_VOLUMES"])
+    runtime_mounts = [
+        (Path(path), config)
+        for path, config in mounted.items()
+        if config == {"bind": path, "mode": "ro"}
+    ]
+    assert len(runtime_mounts) == 1
+    runtime_source, runtime_config = runtime_mounts[0]
+    assert runtime_config == {"bind": str(runtime_source), "mode": "ro"}
     research_dataset = next(
         Path(path) for path, config in mounted.items() if config["bind"].endswith("cn_data")
     )

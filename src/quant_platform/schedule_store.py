@@ -17,6 +17,7 @@ from quant_data.database import (
     schedules,
     strategy_allocation_members,
     strategy_allocations,
+    strategy_versions,
 )
 
 ACTIVE_SCHEDULE_KINDS = (
@@ -25,6 +26,7 @@ ACTIVE_SCHEDULE_KINDS = (
     "information_pipeline",
     "information_factor_refresh",
     "ashare_5m_sync",
+    "auxiliary_data_pipeline",
     "rdagent_research",
     "recommendation_refresh",
     "weekly_report",
@@ -159,6 +161,25 @@ class ScheduleStore:
     def __init__(self, database_url: str) -> None:
         self.engine = open_database(database_url)
 
+    @staticmethod
+    def _require_long_only_allocation(connection: Any, allocation_id: str) -> None:
+        retired_pair = connection.execute(
+            select(strategy_versions.c.id)
+            .join(
+                strategy_allocation_members,
+                strategy_allocation_members.c.strategy_version_id == strategy_versions.c.id,
+            )
+            .where(
+                strategy_allocation_members.c.allocation_id == allocation_id,
+                strategy_versions.c.strategy_type == "pair",
+            )
+            .limit(1)
+        ).first()
+        if retired_pair is not None:
+            raise ValueError(
+                "pair allocation schedules are retired; historical evidence is read-only"
+            )
+
     def create(
         self,
         *,
@@ -237,6 +258,105 @@ class ScheduleStore:
             row = connection.execute(select(schedules).where(schedules.c.name == name)).first()
         return self._schedule_row(row) if row else None
 
+    def upsert_managed(
+        self,
+        *,
+        name: str,
+        kind: str,
+        timezone: str,
+        run_time: time,
+        trading_days_only: bool,
+        payload: dict[str, Any],
+        misfire_grace_seconds: int,
+        actor: str,
+        enabled: bool,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Create or atomically reconcile one platform-owned schedule."""
+
+        if kind not in ACTIVE_SCHEDULE_KINDS:
+            raise ValueError("unsupported schedule kind")
+        current = now or _now()
+        existing = self.get_by_name(name)
+        if existing is None:
+            created = self.create(
+                name=name,
+                kind=kind,
+                timezone=timezone,
+                run_time=run_time,
+                trading_days_only=trading_days_only,
+                payload=payload,
+                misfire_grace_seconds=misfire_grace_seconds,
+                actor=actor,
+                now=current,
+            )
+            return (
+                created
+                if enabled
+                else self.set_status(str(created["id"]), "paused", now=current)
+            )
+        if existing["kind"] != kind:
+            raise ValueError(f"managed schedule {name!r} has an incompatible kind")
+        effective_status = "active" if enabled else "paused"
+        unchanged = (
+            existing["timezone"] == timezone
+            and existing["run_time"] == run_time.isoformat(timespec="minutes")
+            and bool(existing["trading_days_only"]) == trading_days_only
+            and existing["payload"] == payload
+            and int(existing["misfire_grace_seconds"]) == misfire_grace_seconds
+            and existing["status"] == effective_status
+            and existing["desired_status"] == effective_status
+            and existing.get("suspension_reason") is None
+        )
+        if unchanged:
+            return existing
+        next_run_at = next_occurrence(current, timezone, run_time)
+        with self.engine.begin() as connection:
+            connection.execute(
+                update(schedules)
+                .where(schedules.c.id == existing["id"])
+                .values(
+                    status=effective_status,
+                    desired_status=effective_status,
+                    suspension_reason=None,
+                    timezone=timezone,
+                    run_time=run_time,
+                    trading_days_only=trading_days_only,
+                    payload_json=payload,
+                    misfire_grace_seconds=misfire_grace_seconds,
+                    next_run_at=next_run_at,
+                    updated_at=current,
+                )
+            )
+        return self.get(str(existing["id"]))
+
+    def trigger_now(
+        self,
+        schedule_id: str,
+        *,
+        actor: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current = now or _now()
+        schedule = self.get(schedule_id)
+        if schedule["kind"] not in ACTIVE_SCHEDULE_KINDS:
+            raise ValueError("legacy schedules cannot be triggered")
+        run_id = uuid.uuid4().hex
+        with self.engine.begin() as connection:
+            connection.execute(
+                insert(schedule_runs).values(
+                    id=run_id,
+                    schedule_id=schedule_id,
+                    scheduled_for=current,
+                    status="pending",
+                    attempts=0,
+                    dedupe_key=f"manual:{schedule_id}:{run_id}",
+                    message=f"manually triggered by {actor.strip() or 'operator'}",
+                    created_at=current,
+                )
+            )
+        return self.get_run(run_id)
+
     def list(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -310,6 +430,7 @@ class ScheduleStore:
                 raise KeyError(allocation_id)
             if allocation.status == "draft":
                 raise ValueError("approve the strategy allocation before scheduling it")
+            self._require_long_only_allocation(connection, allocation_id)
             members = connection.execute(
                 select(
                     strategy_allocation_members.c.recommendation_portfolio_id,
@@ -426,6 +547,8 @@ class ScheduleStore:
                 raise ValueError("legacy paper-backed allocations are read-only")
             if status == "active" and allocation.status != "active":
                 raise ValueError("a paused or risk-blocked allocation cannot activate schedules")
+            if status == "active":
+                self._require_long_only_allocation(connection, allocation_id)
             for member in group["members"]:
                 values = {
                     "status": status,

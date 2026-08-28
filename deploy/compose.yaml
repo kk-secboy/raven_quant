@@ -39,11 +39,11 @@ services:
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       DATA_ROOT: /data
       RUN_EMBEDDED_WORKER: "false"
-      QLIB_WORKER_URL: http://worker:8770
+      QLIB_WORKER_URL: http://evaluation-worker:8770
       RDAGENT_WORKER_URL: http://rdagent-worker:8770
       RDAGENT_GPU_WORKER_URL: http://rdagent-llm-finetune-worker:8770
       RDAGENT_DATA_SCIENCE_WORKER_URL: http://rdagent-data-science-worker:8770
-      RDAGENT_EVALUATION_WORKER_URL: http://worker:8770
+      RDAGENT_EVALUATION_WORKER_URL: http://evaluation-worker:8770
       SCHEDULER_URL: http://scheduler:8780
       RDAGENT_ENABLED: "true"
       RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
@@ -61,17 +61,10 @@ services:
       PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
       TUSHARE_API_URL: ${TUSHARE_API_URL:-}
       TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
-      BROKER_MODE: ${BROKER_MODE:-disabled}
-      BROKER_FEATURE_ENABLED: ${BROKER_FEATURE_ENABLED:-false}
-      BROKER_GATEWAY_URL: ${BROKER_GATEWAY_URL:-}
-      BROKER_HMAC_SECRET: ${BROKER_HMAC_SECRET:-}
-      BROKER_TIMEOUT_SECONDS: ${BROKER_TIMEOUT_SECONDS:-10}
-      BROKER_MAX_ORDER_NOTIONAL: ${BROKER_MAX_ORDER_NOTIONAL:-1000000}
-      BROKER_MAX_ATTEMPTS: ${BROKER_MAX_ATTEMPTS:-3}
     command:
       - /bin/sh
       - -c
-      - quant-db upgrade && quant-web --host 0.0.0.0 --port 8765
+      - quant-db upgrade && python scripts/retire_legacy_research.py --apply && quant-web --host 0.0.0.0 --port 8765
     volumes:
       - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
     depends_on:
@@ -107,11 +100,11 @@ services:
       HEALTH_SNAPSHOT_SECONDS: ${HEALTH_SNAPSHOT_SECONDS:-300}
       DATA_FRESHNESS_MAX_DAYS: ${DATA_FRESHNESS_MAX_DAYS:-7}
       STALE_JOB_HOURS: ${STALE_JOB_HOURS:-6}
-      QLIB_WORKER_URL: http://worker:8770
+      QLIB_WORKER_URL: http://evaluation-worker:8770
       RDAGENT_WORKER_URL: http://rdagent-worker:8770
       RDAGENT_GPU_WORKER_URL: http://rdagent-llm-finetune-worker:8770
       RDAGENT_DATA_SCIENCE_WORKER_URL: http://rdagent-data-science-worker:8770
-      RDAGENT_EVALUATION_WORKER_URL: http://worker:8770
+      RDAGENT_EVALUATION_WORKER_URL: http://evaluation-worker:8770
       RDAGENT_ENABLED: "true"
       RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
       RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
@@ -121,19 +114,16 @@ services:
       RDAGENT_FINETUNE_BENCHMARK_IMAGE: ${RDAGENT_FINETUNE_BENCHMARK_IMAGE:-}
       RDAGENT_FINETUNE_GPU_PROBE_IMAGE: ${RDAGENT_FINETUNE_GPU_PROBE_IMAGE:-}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
-      BROKER_MODE: ${BROKER_MODE:-disabled}
-      BROKER_FEATURE_ENABLED: ${BROKER_FEATURE_ENABLED:-false}
-      BROKER_GATEWAY_URL: ${BROKER_GATEWAY_URL:-}
-      BROKER_HMAC_SECRET: ${BROKER_HMAC_SECRET:-}
-      BROKER_TIMEOUT_SECONDS: ${BROKER_TIMEOUT_SECONDS:-10}
-      BROKER_MAX_ORDER_NOTIONAL: ${BROKER_MAX_ORDER_NOTIONAL:-1000000}
-      BROKER_MAX_ATTEMPTS: ${BROKER_MAX_ATTEMPTS:-3}
     volumes:
       - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
     depends_on:
       api:
         condition: service_healthy
       worker:
+        condition: service_healthy
+      evaluation-worker:
+        condition: service_healthy
+      paper-worker:
         condition: service_healthy
       rdagent-worker:
         condition: service_healthy
@@ -153,6 +143,9 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
     restart: unless-stopped
+    cpus: "16.0"
+    mem_limit: 32g
+    pids_limit: 512
     logging: *default-logging
     environment:
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
@@ -166,7 +159,102 @@ services:
       PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
       REQUESTS_PER_MINUTE: ${REQUESTS_PER_MINUTE:-99}
       DOWNLOAD_WORKERS: ${DOWNLOAD_WORKERS:-4}
-      WORKER_JOB_KINDS: bootstrap,baostock_overlap_validation,legacy_market_backfill,data_verify,data_snapshot,data_qlib,minute_qlib,minute_research,qlib_baseline,margin_eligibility_download,core_intraday_download,ashare_5m_download,cninfo_announcements_download,announcement_nlp,announcement_factor_register,corpus_nlp,corpus_factor_register,event_market_response,report_rc_factors,report_rc_factor_register,major_news_mentions,major_news_mentions_factor_register,news_flash_factors,news_flash_factor_register,external_factor_evaluate,information_factor_evaluate,multiface_audit,supplemental_download,supplemental_cn_extended_daily,supplemental_cn_funds,supplemental_cn_macro,supplemental_cn_institutional,supplemental_cn_futures,supplemental_cn_options_bonds,supplemental_hk_market,supplemental_us_market,supplemental_global_markets,supplemental_cn_governance_risk,supplemental_cn_capital_flow,supplemental_cn_fund_index_enhanced,supplemental_cn_derivatives_enhanced,supplemental_global_rates_enhanced,supplemental_research_corpus,supplemental_strategy_specialty,supplemental_strategy_specialty_minutes,research_asset_acquire,factor_evaluate,model_evaluate,quant_bundle_evaluate,model_refit,strategy_backtest,parameter_experiment,pair_backtest,recommendation_refresh,simulation_order_plan,simulation_replay
+      WORKER_JOB_KINDS: bootstrap,baostock_overlap_validation,legacy_market_backfill,data_verify,data_snapshot,data_qlib,minute_qlib,margin_eligibility_download,core_intraday_download,ashare_5m_download,cninfo_announcements_download,announcement_nlp,announcement_factor_register,corpus_nlp,corpus_factor_register,event_market_response,report_rc_factors,report_rc_factor_register,major_news_mentions,major_news_mentions_factor_register,news_flash_factors,news_flash_factor_register,supplemental_download,supplemental_cn_extended_daily,supplemental_cn_funds,supplemental_cn_macro,supplemental_cn_institutional,supplemental_cn_futures,supplemental_cn_options_bonds,supplemental_hk_market,supplemental_us_market,supplemental_global_markets,supplemental_cn_governance_risk,supplemental_cn_capital_flow,supplemental_cn_fund_index_enhanced,supplemental_cn_derivatives_enhanced,supplemental_global_rates_enhanced,supplemental_research_corpus,supplemental_strategy_specialty,supplemental_strategy_specialty_minutes,research_asset_acquire
+      WORKER_CONCURRENCY: "1"
+      RESEARCH_CPU_BUDGET: "24"
+      RESEARCH_MEMORY_BUDGET_GB: "48"
+      OMP_NUM_THREADS: "8"
+      MKL_NUM_THREADS: "8"
+      OPENBLAS_NUM_THREADS: "8"
+      NUMEXPR_NUM_THREADS: "8"
+      NUMEXPR_MAX_THREADS: "8"
+      RDAGENT_ENABLED: "false"
+      DOCKER_HOST: tcp://rdagent-docker:2375
+      FACTOR_SANDBOX_IMAGE: quantlab-factor-sandbox:v2
+      MODEL_SANDBOX_IMAGE: ${MODEL_SANDBOX_IMAGE:-}
+    volumes:
+      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
+    depends_on:
+      api:
+        condition: service_healthy
+      rdagent-docker:
+        condition: service_healthy
+      factor-sandbox-builder:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+
+  evaluation-worker:
+    image: quantlab-worker-runtime:v2
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
+    restart: unless-stopped
+    cpus: "24.0"
+    mem_limit: 48g
+    logging: *default-logging
+    environment:
+      DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
+      MLFLOW_TRACKING_URI: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab?options=-csearch_path%3Dpublic
+      _MLFLOW_SERVER_ARTIFACT_ROOT: /data/artifacts/mlflow
+      DATA_ROOT: /data
+      QLIB_REPO: /opt/qlib
+      QLIB_PYTHON: /usr/local/bin/python
+      PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
+      WORKER_JOB_KINDS: minute_research,qlib_baseline,external_factor_evaluate,information_factor_evaluate,multiface_audit,factor_library_materialize,factor_library_cluster,factor_sota_evaluate,factor_evaluate,model_evaluate,model_ensemble_evaluate,quant_bundle_evaluate,strategy_backtest,parameter_experiment
+      WORKER_CONCURRENCY: "3"
+      RESEARCH_CPU_BUDGET: "24"
+      RESEARCH_MEMORY_BUDGET_GB: "48"
+      RDAGENT_ENABLED: "false"
+      DOCKER_HOST: tcp://rdagent-docker:2375
+      FACTOR_SANDBOX_IMAGE: quantlab-factor-sandbox:v2
+      MODEL_SANDBOX_IMAGE: ${MODEL_SANDBOX_IMAGE:-}
+    volumes:
+      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
+    depends_on:
+      api:
+        condition: service_healthy
+      rdagent-docker:
+        condition: service_healthy
+      factor-sandbox-builder:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+
+  paper-worker:
+    # Reserve one worker for the live paper lifecycle.  Long factor/model
+    # research can fill evaluation-worker without delaying daily inference,
+    # target generation, T+1 replay, or NAV publication.
+    image: quantlab-worker-runtime:v2
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
+      MLFLOW_TRACKING_URI: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab?options=-csearch_path%3Dpublic
+      _MLFLOW_SERVER_ARTIFACT_ROOT: /data/artifacts/mlflow
+      DATA_ROOT: /data
+      QLIB_REPO: /opt/qlib
+      QLIB_PYTHON: /usr/local/bin/python
+      PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
+      WORKER_JOB_KINDS: model_refit,recommendation_refresh,simulation_order_plan,simulation_replay
+      WORKER_CONCURRENCY: "1"
       RDAGENT_ENABLED: "false"
       DOCKER_HOST: tcp://rdagent-docker:2375
       FACTOR_SANDBOX_IMAGE: quantlab-factor-sandbox:v2
@@ -264,6 +352,8 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
     restart: unless-stopped
+    cpus: "8.0"
+    mem_limit: 12g
     logging: *default-logging
     environment:
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
@@ -278,8 +368,136 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_API_BASE: ${OPENAI_API_BASE:-}
       CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
+      FACTOR_COSTEER_PYTHON_BIN: python /app/scripts/run_factor_codegen_sandbox.py
+      FACTOR_SANDBOX_IMAGE: quantlab-factor-sandbox:v2
       PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
       WORKER_JOB_KINDS: rdagent_factor,rdagent_run
+      RESEARCH_CPU_BUDGET: "24"
+      RESEARCH_MEMORY_BUDGET_GB: "48"
+    volumes:
+      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
+    depends_on:
+      api:
+        condition: service_healthy
+      rdagent-docker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  rdagent-model-worker:
+    image: quantlab-rdagent-runtime:v2
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.rdagent
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
+    restart: unless-stopped
+    cpus: "8.0"
+    mem_limit: 16g
+    logging: *default-logging
+    environment:
+      DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
+      DATA_ROOT: /data
+      DOCKER_HOST: tcp://rdagent-docker:2375
+      RDAGENT_ENABLED: "true"
+      RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
+      RDAGENT_DOCKER_SHARED_ROOT: /data
+      RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
+      RDAGENT_LLM_KEY_ENV: ${RDAGENT_LLM_KEY_ENV:-OPENAI_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
+      CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
+      PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
+      WORKER_JOB_KINDS: rdagent_model
+      RESEARCH_CPU_BUDGET: "24"
+      RESEARCH_MEMORY_BUDGET_GB: "48"
+    volumes:
+      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
+    depends_on:
+      api:
+        condition: service_healthy
+      rdagent-docker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  rdagent-report-worker:
+    image: quantlab-rdagent-runtime:v2
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.rdagent
+    restart: unless-stopped
+    cpus: "4.0"
+    mem_limit: 8g
+    logging: *default-logging
+    environment:
+      DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
+      DATA_ROOT: /data
+      DOCKER_HOST: tcp://rdagent-docker:2375
+      RDAGENT_ENABLED: "true"
+      RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
+      RDAGENT_DOCKER_SHARED_ROOT: /data
+      RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
+      RDAGENT_LLM_KEY_ENV: ${RDAGENT_LLM_KEY_ENV:-OPENAI_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
+      CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
+      FACTOR_COSTEER_PYTHON_BIN: python /app/scripts/run_factor_codegen_sandbox.py
+      FACTOR_SANDBOX_IMAGE: quantlab-factor-sandbox:v2
+      PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
+      WORKER_JOB_KINDS: rdagent_factor_report
+      RESEARCH_CPU_BUDGET: "24"
+      RESEARCH_MEMORY_BUDGET_GB: "48"
+    volumes:
+      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
+    depends_on:
+      api:
+        condition: service_healthy
+      rdagent-docker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  rdagent-quant-worker:
+    image: quantlab-rdagent-runtime:v2
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.rdagent
+    restart: unless-stopped
+    cpus: "12.0"
+    mem_limit: 20g
+    logging: *default-logging
+    environment:
+      DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
+      DATA_ROOT: /data
+      DOCKER_HOST: tcp://rdagent-docker:2375
+      RDAGENT_ENABLED: "true"
+      RDAGENT_RUNTIME_IMAGE_DIGEST: ${RDAGENT_RUNTIME_IMAGE_DIGEST:-}
+      RDAGENT_DOCKER_SHARED_ROOT: /data
+      RDAGENT_QLIB_SANDBOX_IMAGE: ${RDAGENT_QLIB_SANDBOX_IMAGE:-}
+      RDAGENT_LLM_KEY_ENV: ${RDAGENT_LLM_KEY_ENV:-OPENAI_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
+      CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
+      FACTOR_COSTEER_PYTHON_BIN: python /app/scripts/run_factor_codegen_sandbox.py
+      FACTOR_SANDBOX_IMAGE: quantlab-factor-sandbox:v2
+      PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
+      WORKER_JOB_KINDS: rdagent_quant
+      RESEARCH_CPU_BUDGET: "24"
+      RESEARCH_MEMORY_BUDGET_GB: "48"
     volumes:
       - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
     depends_on:
@@ -303,6 +521,8 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
     restart: unless-stopped
+    cpus: "8.0"
+    mem_limit: 16g
     logging: *default-logging
     environment:
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
@@ -319,6 +539,8 @@ services:
       CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
       PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
       WORKER_JOB_KINDS: rdagent_data_science
+      RESEARCH_CPU_BUDGET: "24"
+      RESEARCH_MEMORY_BUDGET_GB: "48"
     volumes:
       - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
     depends_on:

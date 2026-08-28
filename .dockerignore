@@ -27,3 +27,9 @@ web/node_modules
 web/tsconfig.tsbuildinfo
 **/__pycache__
 **/*.pyc
+# Real-broker experiments are deliberately excluded from every production
+# image. QuantLab's supported capital boundary ends at the paper ledger.
+src/quant_broker_gateway
+scripts/accept_qmt_gateway.py
+scripts/start_qmt_gateway.ps1
+deploy/qmt-gateway.env.example

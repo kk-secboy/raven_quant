@@ -45,7 +45,24 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "research_runs",
         "factor_candidates",
         "factor_evaluations",
+        "factor_definitions",
+        "factor_library_versions",
+        "factor_library_members",
+        "factor_similarity_edges",
+        "factor_definition_similarity_edges",
+        "research_sota_versions",
+        "research_sota_members",
         "oos_vintages",
+        "autopilot_cycles",
+        "autopilot_branches",
+        "research_tournaments",
+        "research_tournament_trials",
+        "model_ensemble_candidates",
+        "model_ensemble_evaluations",
+        "capital_oos_alpha_families",
+        "capital_oos_alpha_batches",
+        "capital_oos_legacy_attempts",
+        "research_report_backfill_days",
         "research_assets",
         "research_asset_consumptions",
         "research_run_artifacts",
@@ -138,7 +155,11 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0065_work_unit_page_group"
+    assert revision == "0071_retire_pair_writes"
+    assert "capital_oos_alpha_batch_id" in {
+        column["name"]
+        for column in inspector.get_columns("oos_vintages", schema="quantlab")
+    }
     assert {
         "economic_hypothesis_group",
         "hypothesis_group_cap",
@@ -165,6 +186,13 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "execution_environment_sha256",
         "artifact_sha256",
         "predictions_sha256",
+        "checkpoint_path",
+        "checkpoint_sha256",
+        "checkpoint_format",
+        "model_data_contract_sha256",
+        "training_kind",
+        "training_evidence_json",
+        "training_evidence_sha256",
         "valid_until",
     } <= {
         column["name"]
@@ -538,6 +566,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
     }
     assert {
         "model_candidate_id",
+        "model_ensemble_candidate_id",
         "factor_candidate_ids_json",
         "bundle_manifest_sha256",
         "feature_set_definition_sha256",

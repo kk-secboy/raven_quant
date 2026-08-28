@@ -10,20 +10,29 @@ import threading
 import time
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+from sqlalchemy import select, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from quant_data.config import Settings
+from quant_data.database import autopilot_cycles, research_sota_versions
 from quant_data.path_utils import to_wsl_path as _to_wsl_path
 from quant_data.supplemental_data import SUPPORTED_BUNDLES
 
 from .allocation_store import AllocationStore
+from .alpha_spending_ledger import CapitalOOSAlphaLedgerStore
 from .announcement_factor_registry import default_factors_dir as announcement_factors_dir
 from .announcement_nlp import DEFAULT_BATCH_SIZE as ANNOUNCEMENT_DEFAULT_BATCH_SIZE
 from .announcement_nlp import DEFAULT_WORKERS as ANNOUNCEMENT_DEFAULT_WORKERS
 from .announcement_nlp import FACTOR_NAME as ANNOUNCEMENT_FACTOR_NAME
 from .announcement_nlp import LOGIC_FACTOR_NAME as ANNOUNCEMENT_LOGIC_FACTOR_NAME
+from .capital_oos_receipt import (
+    capital_oos_receipt,
+    formal_oos_paired_returns,
+)
 from .corpus_nlp import (
     CORPUS_FACTOR_NAMES,
 )
@@ -42,14 +51,33 @@ from .cost_model import CostModelConfig
 from .data_rollover import qlib_trading_date_on_or_before, select_qlib_dataset
 from .execution_algorithms import execution_time_slots
 from .external_factor_evaluation import import_external_evaluations
-from .job_store import JobStore
+from .factor_autopilot import canonical_sha256 as factor_sota_sha256
+from .factor_autopilot import (
+    validate_factor_sota_result_contract,
+    validate_promoted_factor_sota_admission,
+)
+from .factor_evaluation_recovery import (
+    RecoverySafetyError,
+    inspect_orphan_factor_evaluation,
+    validate_factor_evaluation_result_contract,
+)
+from .factor_library_store import FactorLibraryStore
+from .feature_set_registry import get_feature_set, register_feature_set
+from .job_store import (
+    MAX_NUMERICAL_THREADS_PER_JOB,
+    JobStore,
+    research_job_cpu_cost,
+)
 from .major_news_mentions import FACTOR_NAMES as MAJOR_NEWS_MENTION_FACTOR_NAMES
 from .major_news_mentions import default_factors_dir as major_news_mentions_factors_dir
+from .market_overview import MarketOverviewService
 from .market_permission import MarketPermissionStore
 from .model_artifact_store import ModelArtifactStore
+from .model_recompute import GOVERNED_MODEL_ENGINES
 from .news_flash_factors import FACTOR_NAMES as NEWS_FLASH_FACTOR_NAMES
 from .news_flash_factors import default_factors_dir as news_flash_factors_dir
 from .parameter_experiment_store import ParameterExperimentStore
+from .parameter_experiments import merge_admitted_trial_ledgers
 from .promotion import PromotionStore
 from .rdagent_candidate_store import RDAGentCandidateStore
 from .rdagent_runtime import (
@@ -63,10 +91,27 @@ from .recommendation_store import RecommendationStore
 from .report_rc_factors import FACTOR_NAMES as REPORT_RC_FACTOR_NAMES
 from .report_rc_factors import default_factors_dir as report_rc_factors_dir
 from .research_store import ResearchStore
+from .research_tournament import (
+    RESEARCH_SCREENING_MARKERS,
+    ResearchTournamentStore,
+    build_quant_screening_evidence,
+)
+from .research_tournament import (
+    canonical_sha256 as tournament_sha256,
+)
 from .runtime_secret_store import RuntimeSecretStore
-from .services import list_qlib_datasets, resolve_snapshot_dataset, resolve_snapshot_manifest
+from .services import (
+    list_qlib_datasets,
+    refresh_qlib_display_catalog,
+    refresh_snapshot_display_catalog,
+    resolve_snapshot_dataset,
+    resolve_snapshot_manifest,
+)
 from .simulation_store import SimulationStore
 from .strategy_store import StrategyStore
+
+_DATABASE_RETRY_INITIAL_SECONDS = 0.5
+_DATABASE_RETRY_MAX_SECONDS = 5.0
 
 
 def _qlib_workflow_environment(settings: Settings, *, is_wsl: bool) -> dict[str, str]:
@@ -78,16 +123,132 @@ def _qlib_workflow_environment(settings: Settings, *, is_wsl: bool) -> dict[str,
     }
 
 
+def _frozen_model_engine(model_signal: dict) -> str:
+    recipe = dict(model_signal.get("recipe") or {})
+    recipe_hyperparameters = dict(recipe.get("model_hyperparameters") or {})
+    signal_hyperparameters = dict(model_signal.get("model_hyperparameters") or {})
+    engine = str(
+        recipe.get("model_engine")
+        or recipe_hyperparameters.get("model_engine")
+        or signal_hyperparameters.get("model_engine")
+        or "rdagent_pytorch"
+    )
+    if engine not in GOVERNED_MODEL_ENGINES:
+        raise ValueError("frozen strategy requests an ungoverned model engine")
+    return engine
+
+
+def _frozen_rdagent_model_hyperparameters(model: dict) -> dict:
+    hyperparameters = dict(model.get("model_hyperparameters") or {})
+    requested = str(
+        model.get("model_engine") or hyperparameters.get("model_engine") or ""
+    ).strip()
+    if requested and requested != "rdagent_pytorch":
+        raise ValueError("RD-Agent generated code cannot select a platform model engine")
+    hyperparameters["model_engine"] = "rdagent_pytorch"
+    return hyperparameters
+
+
+def _frozen_evaluation_feature_set(payload: dict) -> dict:
+    feature_set_id = str(payload.get("feature_set_id") or "")
+    embedded = payload.get("feature_set")
+    feature_set = dict(embedded) if isinstance(embedded, dict) else get_feature_set(feature_set_id)
+    if (
+        not feature_set_id
+        or str(feature_set.get("id") or "") != feature_set_id
+        or str(feature_set.get("definition_sha256") or "")
+        != str(payload.get("feature_set_definition_sha256") or "")
+        or not isinstance(feature_set.get("features"), dict)
+        or not feature_set["features"]
+    ):
+        raise ValueError("model evaluation feature set changed after job creation")
+    return feature_set
+
+
+def _indexed_independent_evaluations(job: dict, result: dict) -> dict[str, dict]:
+    payload = job["payload"]
+    expected_ids = [str(item["id"]) for item in payload.get("candidates") or []]
+    evaluations = result.get("evaluations") if isinstance(result, dict) else None
+    if result.get("status") != "ok" or not isinstance(evaluations, list):
+        raise ValueError("independent evaluation batch did not complete")
+    indexed: dict[str, dict] = {}
+    for item in evaluations:
+        if not isinstance(item, dict):
+            raise ValueError("independent evaluation item is malformed")
+        candidate_id = str(item.get("candidate_id") or "")
+        if candidate_id in indexed:
+            raise ValueError("independent evaluation contains a duplicate candidate")
+        if item.get("status") not in {"passed", "failed", "resource_blocked"}:
+            raise ValueError("independent evaluation has an unknown terminal state")
+        indexed[candidate_id] = item
+    if len(expected_ids) != len(set(expected_ids)) or set(indexed) != set(expected_ids):
+        raise ValueError("independent evaluation candidate set disagrees with the job")
+    return indexed
+
+
+def _requires_transformer_exclusive_lane(value: Any) -> bool:
+    """Return whether one immutable job can execute the CPU Transformer.
+
+    Platform full-validation jobs contain several candidates, so the lock is
+    deliberately held for the complete mixed job.  This is conservative but
+    guarantees that two feature lanes never train Transformers concurrently.
+    """
+
+    if isinstance(value, dict):
+        if value.get("model_engine") == "platform_transformer" or value.get(
+            "model_family"
+        ) == "transformer":
+            return True
+        return any(_requires_transformer_exclusive_lane(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_requires_transformer_exclusive_lane(item) for item in value)
+    return False
+
+
+def _require_supported_simulation_execution(
+    job_kind: str, *, execution_adapter: str | None = None
+) -> None:
+    """Fail closed for every retired short-selling execution path.
+
+    Historical pair jobs remain queryable and generic job retry is intentionally
+    broad.  The worker is therefore the final authority boundary: neither an
+    old queued job nor a retried cancelled job may start pair backtest/replay
+    code after the long-only Autopilot release.
+    """
+
+    if str(job_kind) == "pair_backtest":
+        raise ValueError(
+            "pair backtest execution is retired; historical artifacts are read-only"
+        )
+    if (
+        str(job_kind) == "simulation_replay"
+        and str(execution_adapter or "") != "long_only"
+    ):
+        raise ValueError(
+            "pair simulation execution is retired; historical ledgers are read-only"
+        )
+
+
 class LocalJobWorker:
     """Runs one durable local job at a time in a child Python process."""
 
-    def __init__(self, store: JobStore, project_root: Path, settings: Settings) -> None:
+    def __init__(
+        self,
+        store: JobStore,
+        project_root: Path,
+        settings: Settings,
+        *,
+        initialize_queue: bool = True,
+        transformer_gate: threading.Semaphore | None = None,
+    ) -> None:
         self.store = store
         self.project_root = project_root
         self.settings = settings
         self.research = ResearchStore(settings.database_url)
+        self.factor_library = FactorLibraryStore(self.research.engine)
         self.rdagent_candidates = RDAGentCandidateStore(settings.database_url)
         self.strategies = StrategyStore(settings.database_url)
+        self.capital_oos = CapitalOOSAlphaLedgerStore(settings.database_url)
         self.model_artifacts = ModelArtifactStore(settings.database_url)
         self.recommendations = RecommendationStore(settings.database_url)
         self.simulations = SimulationStore(settings.database_url)
@@ -99,9 +260,12 @@ class LocalJobWorker:
         self.market_permissions = MarketPermissionStore(settings.database_url)
         self.allocations = AllocationStore(settings.database_url)
         self.parameter_experiments = ParameterExperimentStore(settings.database_url)
+        self.research_tournaments = ResearchTournamentStore(settings.database_url)
         self.runtime_secrets = RuntimeSecretStore(
             settings.database_url, settings.platform_secret_key
         )
+        self._initialize_queue = initialize_queue
+        self._transformer_gate = transformer_gate
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -109,9 +273,25 @@ class LocalJobWorker:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
-        self.store.recover_interrupted(self.settings.worker_job_kinds)
+        if self._initialize_queue:
+            self.factor_library.sync_builtin_library()
+            for sota in self.factor_library.list_sota(limit=200):
+                register_feature_set(
+                    self.factor_library.sota_feature_set(str(sota["id"]))
+                )
+            # Only the first consumer in a process may recover jobs. A second
+            # pool member doing this after its sibling claimed work would
+            # incorrectly classify a healthy running job as interrupted.
+            self.store.recover_interrupted(self.settings.worker_job_kinds)
         self._thread = threading.Thread(target=self._loop, name="quant-job-worker", daemon=True)
         self._thread.start()
+
+    @property
+    def running(self) -> bool:
+        """Whether the durable queue consumer thread is still alive."""
+
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive())
 
     def stop(self) -> None:
         self._stop.set()
@@ -123,13 +303,257 @@ class LocalJobWorker:
         self._wake.set()
 
     def _loop(self) -> None:
+        claim_retry_seconds = _DATABASE_RETRY_INITIAL_SECONDS
         while not self._stop.is_set():
-            job = self.store.claim_next(self.settings.worker_job_kinds)
+            try:
+                research_cpu_budget = int(
+                    getattr(self.settings, "research_cpu_budget", 0) or 0
+                )
+                research_memory_budget_gb = int(
+                    getattr(self.settings, "research_memory_budget_gb", 0) or 0
+                )
+                if (
+                    research_cpu_budget > 0
+                    or research_memory_budget_gb > 0
+                ):
+                    job = self.store.claim_next(
+                        self.settings.worker_job_kinds,
+                        research_cpu_budget=research_cpu_budget,
+                        research_memory_budget_gb=research_memory_budget_gb,
+                    )
+                else:
+                    job = self.store.claim_next(self.settings.worker_job_kinds)
+            except SQLAlchemyError:
+                # PostgreSQL can briefly reject connections during recovery or
+                # a controlled restart.  Losing the only consumer thread would
+                # leave a healthy-looking container unable to process durable
+                # work, so retry only this idempotent claim boundary with a
+                # short, bounded and shutdown-aware backoff.
+                if self._stop.wait(timeout=claim_retry_seconds):
+                    return
+                claim_retry_seconds = min(
+                    _DATABASE_RETRY_MAX_SECONDS,
+                    claim_retry_seconds * 2,
+                )
+                continue
+            claim_retry_seconds = _DATABASE_RETRY_INITIAL_SECONDS
             if job is None:
                 self._wake.wait(timeout=2)
                 self._wake.clear()
                 continue
-            self._run(job)
+            try:
+                gate = (
+                    self._transformer_gate
+                    if _requires_transformer_exclusive_lane(job.get("payload") or {})
+                    else None
+                )
+                if gate is None:
+                    self._run(job)
+                else:
+                    with gate:
+                        self._run(job)
+            except SQLAlchemyError as exc:
+                # `_run` retries every database touch made while its child is
+                # alive.  This final guard covers failures before spawn or
+                # after the child has exited and keeps a second finalization
+                # outage from killing the durable consumer itself.
+                job_id = str(job["id"])
+                error_message = str(exc)
+                requeued = self._retry_transient_database(
+                    lambda job_id=job_id, error_message=error_message: self.store.finish_or_retry(
+                        job_id,
+                        exit_code=1,
+                        error=error_message,
+                        retryable=True,
+                    )
+                )
+                if not requeued:
+                    self._mark_unhandled_job_failure(job, error_message)
+
+    def _retry_transient_database(self, operation):
+        """Retry one transactional database operation with bounded backoff."""
+
+        retry_seconds = _DATABASE_RETRY_INITIAL_SECONDS
+        while True:
+            try:
+                return operation()
+            except SQLAlchemyError:
+                # Do not unwind an active child process merely because its
+                # progress/cancellation channel is temporarily unavailable.
+                # The delay is bounded; the same operation and child remain in
+                # place until PostgreSQL accepts connections again.
+                time.sleep(retry_seconds)
+                retry_seconds = min(
+                    _DATABASE_RETRY_MAX_SECONDS,
+                    retry_seconds * 2,
+                )
+
+    def _mark_unhandled_job_failure(self, job: dict, error: str) -> None:
+        payload = job.get("payload") or {}
+        research_run_id = payload.get("research_run_id")
+        backtest_id = payload.get("backtest_id")
+        parameter_experiment_id = payload.get("parameter_experiment_id")
+        recommendation_snapshot_id = payload.get("recommendation_snapshot_id")
+        simulation_batch_id = payload.get("simulation_batch_id")
+        if research_run_id:
+            self._retry_transient_database(
+                lambda: self.research.mark_run(research_run_id, "failed", error=error)
+            )
+        if backtest_id:
+            self._retry_transient_database(
+                lambda: self.strategies.mark_backtest(backtest_id, "failed", error=error)
+            )
+        self._settle_capital_oos_failure(job, error)
+        if parameter_experiment_id:
+            self._retry_transient_database(
+                lambda: self.parameter_experiments.mark(
+                    parameter_experiment_id, "failed", error=error
+                )
+            )
+        if recommendation_snapshot_id:
+            self._retry_transient_database(
+                lambda: self.recommendations.mark_failed(
+                    recommendation_snapshot_id, error
+                )
+            )
+        if simulation_batch_id:
+            self._retry_transient_database(
+                lambda: self.simulations.mark_batch_failed(simulation_batch_id, error)
+            )
+
+    def _settle_capital_oos_failure(self, job: dict, reason: str) -> None:
+        """Spend a reserved final OOS if its one immutable job terminates.
+
+        This is intentionally idempotent: the ledger accepts the same failed
+        evidence on recovery, but rejects an attempt to replace a settled
+        receipt.  Ordinary research jobs never carry this payload field.
+        """
+
+        if str(job.get("kind") or "") != "strategy_backtest":
+            return
+        batch_id = str((job.get("payload") or {}).get("capital_oos_batch_id") or "")
+        if not batch_id:
+            return
+        payload = dict(job.get("payload") or {})
+        evidence = {
+            "stage": "strategy_backtest_worker",
+            "backtest_id": str(payload.get("backtest_id") or ""),
+            "strategy_version_id": str(payload.get("strategy_version_id") or ""),
+            "dataset": str(payload.get("dataset") or ""),
+            "failure_reason": str(reason),
+        }
+        self.capital_oos.settle_batch(
+            batch_id,
+            failed=True,
+            failure_reason=str(reason) or "formal OOS worker failed",
+            supporting_evidence=evidence,
+        )
+
+    def _settle_capital_oos_success(self, job: dict) -> dict[str, Any] | None:
+        """Settle one preregistered final OOS from the verified Qlib artifact."""
+
+        if str(job.get("kind") or "") != "strategy_backtest":
+            return None
+        payload = dict(job.get("payload") or {})
+        batch_id = str(payload.get("capital_oos_batch_id") or "")
+        if not batch_id:
+            return None
+        backtest_id = str(payload.get("backtest_id") or "")
+        if not backtest_id:
+            raise ValueError("capital OOS strategy backtest payload has no backtest id")
+        backtest = self.strategies.get_backtest(backtest_id)
+        batch = self.capital_oos.get_batch(batch_id)
+        artifact = Path(str(backtest.get("artifact_path") or "")) / "daily_returns.parquet"
+        candidate, baseline, artifact_evidence = formal_oos_paired_returns(
+            artifact,
+            expected_trading_dates=list(batch.get("trading_dates_json") or []),
+        )
+        vintage = self.capital_oos.get_vintage_binding(batch_id)
+        settlement = self.capital_oos.settle_batch(
+            batch_id,
+            candidate_net_returns=candidate,
+            baseline_net_returns=baseline,
+            supporting_evidence={
+                **artifact_evidence,
+                "backtest_id": backtest_id,
+                "strategy_version_id": str(backtest.get("strategy_version_id") or ""),
+                "dataset": str(backtest.get("dataset") or ""),
+                "oos_vintage_id": str(vintage.get("oos_vintage_id") or ""),
+            },
+        )
+        if settlement.get("passed") is not True:
+            # The Qlib execution itself succeeded, but the one pre-opened
+            # capital test did not. Persist an explicit non-passing receipt;
+            # approval will reject it without attempting to settle the same
+            # immutable batch a second time as an execution failure.
+            return {
+                "contract_version": "capital-oos-approval-receipt-v1",
+                "batch_id": str(settlement.get("id") or batch_id),
+                "batch_settlement_evidence_sha256": str(
+                    settlement.get("settlement_evidence_sha256") or ""
+                ),
+                "passed": False,
+                "backtest_id": backtest_id,
+                "strategy_version_id": str(backtest.get("strategy_version_id") or ""),
+                "dataset": str(backtest.get("dataset") or ""),
+                "dataset_identity_sha256": str(
+                    settlement.get("dataset_identity_sha256") or ""
+                ),
+                "dataset_lineage_id": str(settlement.get("dataset_lineage_id") or ""),
+                "final_oos_start": str(backtest.get("periods", {}).get("start") or ""),
+                "final_oos_end": str(backtest.get("periods", {}).get("end") or ""),
+                "trading_dates_sha256": str(settlement.get("trading_dates_sha256") or ""),
+                "formal_oos_artifact_sha256": str(
+                    artifact_evidence["formal_oos_artifact_sha256"]
+                ),
+                "frozen_bundle_manifest_sha256": str(
+                    settlement.get("frozen_bundle_manifest_sha256") or ""
+                ),
+                "frozen_baseline_manifest_sha256": str(
+                    settlement.get("frozen_baseline_manifest_sha256") or ""
+                ),
+            }
+        return capital_oos_receipt(
+            settlement,
+            backtest_id=backtest_id,
+            strategy_version_id=str(backtest.get("strategy_version_id") or ""),
+            dataset=str(backtest.get("dataset") or ""),
+            periods=dict(backtest.get("periods") or {}),
+            formal_oos_artifact_sha256=str(
+                artifact_evidence["formal_oos_artifact_sha256"]
+            ),
+        )
+
+    def _monitor_process(
+        self,
+        job_id: str,
+        result_path: Path | None,
+        process,
+    ) -> tuple[bool, int | None]:
+        """Monitor one child without abandoning it during a database outage."""
+
+        cancelled = False
+        progress_mtime_ns: int | None = None
+        while process.poll() is None:
+            progress_mtime_ns = self._retry_transient_database(
+                lambda last_seen=progress_mtime_ns: self._sync_live_progress(
+                    job_id, result_path, last_seen
+                )
+            )
+            cancellation_requested = self._retry_transient_database(
+                lambda: self.store.cancellation_requested(job_id)
+            )
+            if cancellation_requested:
+                cancelled = True
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                break
+            time.sleep(1)
+        return cancelled, progress_mtime_ns
 
     def _run(self, job: dict) -> None:
         research_run_id = job["payload"].get("research_run_id")
@@ -142,6 +566,8 @@ class LocalJobWorker:
             else None
         )
         simulation_batch_id = job["payload"].get("simulation_batch_id")
+        if self._settle_claimed_factor_evaluation_with_terminal_run(job):
+            return
         if research_run_id:
             self.research.mark_run(research_run_id, "running")
         if backtest_id:
@@ -150,12 +576,61 @@ class LocalJobWorker:
             self.parameter_experiments.mark(parameter_experiment_id, "running")
         try:
             command, result_path, extra_env = self._command(job)
+            limits = {
+                "download_workers": ("DOWNLOAD_WORKERS", 1, 16),
+                "requests_per_minute": ("REQUESTS_PER_MINUTE", 1, 99),
+            }
+            for payload_key, (environment_key, minimum, maximum) in limits.items():
+                value = job["payload"].get(payload_key)
+                if value is None:
+                    continue
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(f"{payload_key} must be an integer")
+                if not minimum <= value <= maximum:
+                    raise ValueError(
+                        f"{payload_key} must be between {minimum} and {maximum}"
+                    )
+                extra_env[environment_key] = str(value)
+            research_threads = research_job_cpu_cost(str(job["kind"]))
+            if research_threads > 0:
+                # Match the durable global token charge with each numerical
+                # runtime.  Without this, BLAS/PyTorch may detect all host
+                # cores and exceed the token budget inside one subprocess.
+                numerical_threads = min(
+                    research_threads, MAX_NUMERICAL_THREADS_PER_JOB
+                )
+                for environment_key in (
+                    "OMP_NUM_THREADS",
+                    "MKL_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS",
+                    "NUMEXPR_MAX_THREADS",
+                ):
+                    extra_env[environment_key] = str(numerical_threads)
         except ValueError as exc:
-            self.store.finish(job["id"], exit_code=2, error=str(exc))
+            error_message = str(exc)
+            if job["kind"] == "quant_bundle_evaluate":
+                try:
+                    self._settle_quant_tournament_failure(
+                        job, reason=error_message
+                    )
+                except Exception as ledger_exc:
+                    error_message = (
+                        f"{error_message}; fin_quant trial-ledger settlement failed: "
+                        f"{ledger_exc}"
+                    )
             if research_run_id:
-                self.research.mark_run(research_run_id, "failed", error=str(exc))
+                self.research.mark_run(research_run_id, "failed", error=error_message)
+            self._retry_transient_database(
+                lambda error_message=error_message: self.store.finish(
+                    job["id"], exit_code=2, error=error_message
+                )
+            )
             if backtest_id:
-                self.strategies.mark_backtest(backtest_id, "failed", error=str(exc))
+                self.strategies.mark_backtest(
+                    backtest_id, "failed", error=error_message
+                )
+            self._settle_capital_oos_failure(job, error_message)
             if parameter_experiment_id:
                 self.parameter_experiments.mark(parameter_experiment_id, "failed", error=str(exc))
             if recommendation_snapshot_id:
@@ -168,6 +643,8 @@ class LocalJobWorker:
         if result_path is not None:
             result_path.unlink(missing_ok=True)
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        factor_research_settled = False
+        factor_evaluation_contract_error: str | None = None
         try:
             with log_path.open("a", encoding="utf-8") as log:
                 process = subprocess.Popen(
@@ -179,36 +656,34 @@ class LocalJobWorker:
                     creationflags=creationflags,
                     env={**os.environ, **extra_env},
                 )
-                cancelled = False
-                progress_mtime_ns: int | None = None
-                while process.poll() is None:
-                    progress_mtime_ns = self._sync_live_progress(
-                        job["id"], result_path, progress_mtime_ns
-                    )
-                    if self.store.cancellation_requested(job["id"]):
-                        cancelled = True
-                        process.terminate()
-                        try:
-                            process.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait(timeout=5)
-                        break
-                    time.sleep(1)
+                cancelled, progress_mtime_ns = self._monitor_process(
+                    job["id"], result_path, process
+                )
                 exit_code = int(process.returncode or 0)
             if cancelled:
-                self.store.mark_cancelled(job["id"])
                 cancellation_error = "Cancelled by operator"
+                if job["kind"] == "quant_bundle_evaluate":
+                    self._settle_quant_tournament_failure(
+                        job, reason=cancellation_error
+                    )
                 if research_run_id:
                     self.research.mark_run(research_run_id, "failed", error=cancellation_error)
+                self._retry_transient_database(
+                    lambda: self.store.mark_cancelled(job["id"])
+                )
                 if backtest_id:
                     self.strategies.mark_backtest(backtest_id, "failed", error=cancellation_error)
+                self._settle_capital_oos_failure(job, cancellation_error)
                 if parameter_experiment_id:
                     self.parameter_experiments.mark(
                         parameter_experiment_id, "failed", error=cancellation_error
                     )
                 return
-            self._sync_live_progress(job["id"], result_path, progress_mtime_ns)
+            self._retry_transient_database(
+                lambda: self._sync_live_progress(
+                    job["id"], result_path, progress_mtime_ns
+                )
+            )
             process_error = (
                 None
                 if exit_code == 0
@@ -280,16 +755,70 @@ class LocalJobWorker:
                 except (TypeError, ValueError) as exc:
                     logical_error = str(exc)
                     exit_code = 3
-            if job["kind"] == "factor_evaluate" and result:
-                failures = [
-                    item for item in result.get("evaluations", []) if item.get("status") != "ok"
-                ]
-                if failures:
-                    logical_error = "; ".join(
-                        f"{item.get('candidate_id')}: {item.get('error', 'evaluation failed')}"
-                        for item in failures
-                    )
+            if exit_code == 0 and job["kind"] == "factor_evaluate":
+                try:
+                    validate_factor_evaluation_result_contract(job, result)
+                    factor_evaluation_error = self._factor_evaluation_logical_error(result)
+                    if factor_evaluation_error:
+                        logical_error = factor_evaluation_error
+                        exit_code = 3
+                except (TypeError, ValueError) as exc:
+                    logical_error = str(exc)
+                    factor_evaluation_contract_error = logical_error
                     exit_code = 3
+            if exit_code == 0 and job["kind"] == "factor_sota_evaluate":
+                try:
+                    if not isinstance(result, dict):
+                        raise ValueError("factor SOTA result must be an object")
+                    validate_factor_sota_result_contract(job["payload"], result)
+                except (TypeError, ValueError) as exc:
+                    logical_error = str(exc)
+                    exit_code = 3
+            if exit_code == 0 and job["kind"] == "model_ensemble_evaluate":
+                if (
+                    not isinstance(result, dict)
+                    or result.get("status") != "ok"
+                    or not isinstance(result.get("evaluations"), list)
+                    or {
+                        str(item.get("ensemble_id") or "")
+                        for item in result.get("evaluations") or []
+                        if isinstance(item, dict)
+                    }
+                    != {
+                        str(item.get("id") or "")
+                        for item in job["payload"].get("candidates") or []
+                    }
+                ):
+                    logical_error = "model ensemble evaluation result is incomplete"
+                    exit_code = 3
+            if exit_code == 0 and job["kind"] == "factor_library_materialize":
+                if (
+                    not isinstance(result, dict)
+                    or result.get("dataset_identity_sha256")
+                    != job["payload"].get("dataset_identity_sha256")
+                    or result.get("feature_set_definition_sha256")
+                    != job["payload"].get("feature_set_definition_sha256")
+                ):
+                    logical_error = "factor library materialization identity is invalid"
+                    exit_code = 3
+            if exit_code == 0 and job["kind"] == "factor_library_cluster":
+                if (
+                    not isinstance(result, dict)
+                    or result.get("status") != "complete"
+                    or result.get("pair_count") != result.get("expected_pair_count")
+                    or result.get("dataset_identity_sha256")
+                    != job["payload"].get("dataset_identity_sha256")
+                ):
+                    logical_error = "factor library clustering evidence is incomplete"
+                    exit_code = 3
+                else:
+                    self.factor_library.import_definition_similarity_clusters(
+                        library_version_id=str(job["payload"]["library_version_id"]),
+                        dataset_identity_sha256=str(
+                            job["payload"]["dataset_identity_sha256"]
+                        ),
+                        edges=list(result.get("edges") or []),
+                    )
             if exit_code == 0 and job["kind"] in {
                 "external_factor_evaluate",
                 "information_factor_evaluate",
@@ -329,6 +858,9 @@ class LocalJobWorker:
                     if not isinstance(result, dict) or not isinstance(result.get("metrics"), dict):
                         raise ValueError("strategy backtest result is missing metrics")
                     self.strategies.validate_backtest_artifacts(str(backtest_id), result["metrics"])
+                    receipt = self._settle_capital_oos_success(job)
+                    if receipt is not None:
+                        result["metrics"]["capital_oos_receipt"] = receipt
                 except (KeyError, TypeError, ValueError) as exc:
                     logical_error = str(exc)
                     exit_code = 3
@@ -375,6 +907,69 @@ class LocalJobWorker:
                 ):
                     logical_error = "Qlib simulation order-plan result is missing"
                     exit_code = 3
+            if (
+                exit_code == 0
+                and job["kind"] == "data_snapshot"
+                and job["payload"].get("profile") != "research-assets"
+            ):
+                overview_evidence: dict[str, object]
+                try:
+                    overview = MarketOverviewService(
+                        self.settings.data_root, cache_seconds=0
+                    ).materialize(snapshot_name=str(job["payload"]["snapshot_name"]))
+                    overview_evidence = {
+                        "status": str(overview.get("status") or "unknown"),
+                        "snapshot_name": overview.get("source", {}).get("snapshot_name"),
+                        "as_of": overview.get("source", {}).get("as_of"),
+                    }
+                except Exception as exc:
+                    # A dashboard derivative must not block the governed Qlib
+                    # publication chain. The API keeps serving the previous
+                    # published projection and never materializes on an HTTP
+                    # request; preserve the publisher failure as job evidence.
+                    overview_evidence = {"status": "failed", "error": str(exc)}
+                if result is None:
+                    result = {}
+                result["market_overview"] = overview_evidence
+            if exit_code == 0 and job["kind"] == "data_snapshot":
+                try:
+                    snapshot_rows = refresh_snapshot_display_catalog(
+                        self.settings.data_root
+                    )
+                    snapshot_display_evidence: dict[str, object] = {
+                        "status": "refreshed",
+                        "snapshots": len(snapshot_rows),
+                    }
+                except Exception as exc:
+                    snapshot_display_evidence = {
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                if result is None:
+                    result = {}
+                result["snapshot_display_catalog"] = snapshot_display_evidence
+            if exit_code == 0 and job["kind"] == "data_qlib":
+                # The UI projection is a publication derivative, not an
+                # admission input.  Build it once in the data worker after the
+                # immutable Qlib dataset is complete; an HTTP request must
+                # never start the expensive sealed-file inventory itself.
+                try:
+                    display_rows = refresh_qlib_display_catalog(
+                        self.settings.data_root
+                    )
+                    display_evidence: dict[str, object] = {
+                        "status": "refreshed",
+                        "datasets": len(display_rows),
+                    }
+                except Exception as exc:
+                    # Keep the prior projection and continue the governed data
+                    # pipeline.  Strict research reads the sealed catalog and
+                    # is unaffected by this display-only derivative.
+                    display_evidence = {"status": "failed", "error": str(exc)}
+                if result is None:
+                    result = {}
+                result["qlib_display_catalog"] = display_evidence
+
             pipeline_stage = job["kind"] in {"data_verify", "data_snapshot", "data_qlib"}
             bootstrap_finalize = job["kind"] == "bootstrap" and bool(
                 job["payload"].get("finalize_after_download")
@@ -388,15 +983,53 @@ class LocalJobWorker:
                     exit_code = 4
             if exit_code != 0:
                 failure_error = logical_error or process_error or "job failed"
-                requeued = self.store.finish_or_retry(
-                    job["id"],
-                    exit_code=exit_code,
-                    error=failure_error,
-                    result=result,
-                    retryable=logical_error is None,
+                retryable_failure = logical_error is None
+                if (
+                    job["kind"] == "factor_evaluate"
+                    and research_run_id
+                    and not self._job_has_retry_remaining(
+                        job, retryable=retryable_failure
+                    )
+                ):
+                    if factor_evaluation_contract_error is not None:
+                        # A malformed evaluator result is not a partial batch.
+                        # Fail the run without importing or settling any outcome.
+                        self.research.mark_run(
+                            research_run_id,
+                            "failed",
+                            error=factor_evaluation_contract_error,
+                        )
+                    else:
+                        self._settle_factor_evaluation_research(
+                            job,
+                            result if isinstance(result, dict) else {},
+                            succeeded=False,
+                            error=failure_error,
+                        )
+                    factor_research_settled = True
+                requeued = self._retry_transient_database(
+                    lambda: self.store.finish_or_retry(
+                        job["id"],
+                        exit_code=exit_code,
+                        error=failure_error,
+                        result=result,
+                        retryable=retryable_failure,
+                    )
                 )
                 if requeued:
                     return
+                if job["kind"] == "model_ensemble_evaluate":
+                    for candidate in job["payload"].get("candidates") or []:
+                        self.research_tournaments.mark_ensemble_failed(
+                            str(candidate["id"]),
+                            reason=failure_error,
+                            evidence={"job_id": str(job["id"]), "exit_code": exit_code},
+                        )
+                elif job["kind"] == "quant_bundle_evaluate":
+                    self._settle_quant_tournament_failure(
+                        job, reason=failure_error
+                    )
+                self._settle_capital_oos_failure(job, failure_error)
             if research_run_id:
                 if exit_code == 0:
                     if is_rdagent_job(job["kind"]):
@@ -444,15 +1077,30 @@ class LocalJobWorker:
                                             asset_id=str(asset_id),
                                             candidate_kind="factor",
                                             candidate_id=str(candidate["id"]),
-                                            relationship="extracted_from_report",
-                                            actor="worker",
-                                        )
-                            self._queue_factor_evaluation(job, candidates)
-                            self.research.mark_run(
-                                research_run_id,
-                                "evaluating",
-                                runtime={**runtime, "candidates": len(candidates)},
-                            )
+                                        relationship="extracted_from_report",
+                                        actor="worker",
+                                    )
+                            if scenario.id == "fin_factor_report" and not candidates:
+                                # A verified report can legitimately contain no
+                                # machine-testable factor.  That is a completed
+                                # negative research result, not an infrastructure
+                                # failure and must not be retried indefinitely.
+                                self.research.mark_run(
+                                    research_run_id,
+                                    "succeeded",
+                                    runtime={
+                                        **runtime,
+                                        "candidates": 0,
+                                        "negative_result": "no_testable_factor",
+                                    },
+                                )
+                            else:
+                                self._queue_factor_evaluation(job, candidates)
+                                self.research.mark_run(
+                                    research_run_id,
+                                    "evaluating",
+                                    runtime={**runtime, "candidates": len(candidates)},
+                                )
                         else:
                             lab_archive = self._archive_rdagent_lab_artifacts(
                                 research_run_id,
@@ -470,28 +1118,110 @@ class LocalJobWorker:
                             )
                     elif job["kind"] == "model_evaluate":
                         self._import_model_evaluations(job, result or {})
-                        self.research.mark_run(research_run_id, "succeeded")
+                        resource_blocks = [
+                            item
+                            for item in (result or {}).get("evaluations") or []
+                            if item.get("status") == "resource_blocked"
+                        ]
+                        if resource_blocks:
+                            self.research.mark_run(
+                                research_run_id,
+                                "blocked",
+                                runtime={
+                                    "reason_code": "model_resource_limit",
+                                    "resource_blocked_candidates": [
+                                        {
+                                            "candidate_id": item.get("candidate_id"),
+                                            "reason_code": item.get("reason_code"),
+                                            "error": item.get("error"),
+                                        }
+                                        for item in resource_blocks
+                                    ],
+                                },
+                                error=(
+                                    "one or more models exceeded the governed research budget; "
+                                    "no investment-performance rejection was recorded"
+                                ),
+                            )
+                        else:
+                            self.research.mark_run(research_run_id, "succeeded")
                     elif job["kind"] == "quant_bundle_evaluate":
-                        self._import_quant_bundle_evaluation_artifact(job, result or {})
-                        self.research.mark_run(research_run_id, "succeeded")
+                        resource_blocks = self._import_quant_bundle_evaluation_artifact(
+                            job, result or {}
+                        )
+                        if resource_blocks:
+                            blocked_codes = {
+                                str(item.get("reason_code") or "")
+                                for item in resource_blocks
+                            }
+                            ensemble_unsupported = blocked_codes == {
+                                "ensemble_member_retraining_not_implemented"
+                            }
+                            self.research.mark_run(
+                                research_run_id,
+                                "blocked",
+                                runtime={
+                                    "reason_code": (
+                                        "quant_ensemble_retraining_unsupported"
+                                        if ensemble_unsupported
+                                        else "quant_model_resource_limit"
+                                    ),
+                                    "resource_blocked_candidates": [
+                                        {
+                                            "candidate_id": item.get("candidate_id"),
+                                            "reason_code": item.get("reason_code"),
+                                            "error": item.get("error"),
+                                        }
+                                        for item in resource_blocks
+                                    ],
+                                },
+                                error=(
+                                    "ensemble incumbent cannot enter factor-only quant "
+                                    "ablation until every member can be independently "
+                                    "retrained; no substitute model was used"
+                                    if ensemble_unsupported
+                                    else "one or more quant bundles exceeded the governed "
+                                    "research budget; no investment-performance rejection "
+                                    "was recorded"
+                                ),
+                            )
+                        else:
+                            self.research.mark_run(research_run_id, "succeeded")
                     elif job["kind"] == "factor_evaluate":
-                        self._import_factor_evaluations(job, result or {})
-                        self.research.mark_run(research_run_id, "succeeded")
+                        self._settle_factor_evaluation_research(
+                            job,
+                            result or {},
+                            succeeded=True,
+                            error=None,
+                        )
+                    elif job["kind"] == "factor_sota_evaluate":
+                        summary = self._import_factor_sota_evaluation(job, result or {})
+                        self.research.mark_run(
+                            research_run_id,
+                            "succeeded",
+                            runtime={
+                                "contract_version": "factor-sota-autopilot-runtime-v2",
+                                **summary,
+                            },
+                        )
                 else:
-                    if (
-                        job["kind"] == "factor_evaluate"
-                        and isinstance(result, dict)
-                        and result.get("evaluations")
-                    ):
-                        # A partially failed batch still owes the trial ledger
-                        # every outcome: import ok and failed evaluations before
-                        # marking the run failed (design draft 4.2/6.6).
-                        self._import_factor_evaluations(job, result)
-                    self.research.mark_run(
-                        research_run_id,
-                        "failed",
-                        error=logical_error or process_error,
-                    )
+                    if job["kind"] == "factor_evaluate":
+                        if not factor_research_settled:
+                            self._settle_factor_evaluation_research(
+                                job,
+                                result if isinstance(result, dict) else {},
+                                succeeded=False,
+                                error=logical_error or process_error or "job failed",
+                            )
+                            factor_research_settled = True
+                    else:
+                        self.research.mark_run(
+                            research_run_id,
+                            "failed",
+                            error=logical_error or process_error,
+                        )
+            if job["kind"] == "model_ensemble_evaluate" and exit_code == 0:
+                self._import_model_ensemble_evaluations(job, result or {}, result_path)
             if backtest_id:
                 if exit_code == 0 and result:
                     self.strategies.mark_backtest(
@@ -555,7 +1285,9 @@ class LocalJobWorker:
                     )
                 result["simulation_batch_id"] = batch["id"]
                 result["simulation_batch_created"] = created
-                self.store.finish(job["id"], exit_code=0, result=result)
+                self._retry_transient_database(
+                    lambda: self.store.finish(job["id"], exit_code=0, result=result)
+                )
             elif simulation_batch_id and exit_code == 0 and result:
                 if result_path is None:
                     raise ValueError("simulation replay result path is missing")
@@ -573,26 +1305,100 @@ class LocalJobWorker:
                 self.allocations.refresh_for_simulation_source(
                     str(manifest["source_type"]), str(manifest["source_id"])
                 )
-                self.store.finish(job["id"], exit_code=0, result=result)
+                self._retry_transient_database(
+                    lambda: self.store.finish(job["id"], exit_code=0, result=result)
+                )
             elif simulation_batch_id:
                 self.simulations.mark_batch_failed(
                     simulation_batch_id, logical_error or process_error
                 )
             elif exit_code == 0:
-                self.store.finish(job["id"], exit_code=0, result=result)
+                self._retry_transient_database(
+                    lambda: self.store.finish(job["id"], exit_code=0, result=result)
+                )
+                if (
+                    job["kind"] == "factor_library_materialize"
+                    and job["payload"].get("library_version_id")
+                ):
+                    materialization = (
+                        self.settings.data_root
+                        / "artifacts"
+                        / "factor-library-materializations"
+                        / str(job["payload"]["dataset_identity_sha256"])
+                        / str(job["payload"]["feature_set_definition_sha256"])[:16]
+                    )
+                    cluster_job = self.store.create(
+                        "factor_library_cluster",
+                        {
+                            "dataset_identity_sha256": job["payload"][
+                                "dataset_identity_sha256"
+                            ],
+                            "library_version_id": job["payload"]["library_version_id"],
+                            "materialization_path": str(materialization),
+                        },
+                        self.settings.data_root
+                        / "platform"
+                        / "logs"
+                        / (
+                            "factor-library-cluster-"
+                            f"{job['payload']['dataset_identity_sha256'][:12]}.log"
+                        ),
+                        idempotency_key=(
+                            "factor-library-cluster:"
+                            f"{job['payload']['dataset_identity_sha256']}:"
+                            f"{job['payload']['feature_set_definition_sha256']}"
+                        ),
+                        max_attempts=2,
+                    )
+                    if cluster_job["status"] == "queued":
+                        self.notify()
         except Exception as exc:
-            requeued = self.store.finish_or_retry(
-                job["id"],
-                exit_code=1,
-                error=str(exc),
-                retryable=True,
+            error_message = str(exc)
+            if (
+                research_run_id
+                and job["kind"] == "factor_evaluate"
+                and not factor_research_settled
+                and not self._job_has_retry_remaining(job, retryable=True)
+            ):
+                self.research.mark_run(
+                    research_run_id, "failed", error=error_message
+                )
+                factor_research_settled = True
+            requeued = self._retry_transient_database(
+                lambda error_message=error_message: self.store.finish_or_retry(
+                    job["id"],
+                    exit_code=1,
+                    error=error_message,
+                    retryable=True,
+                )
             )
             if requeued:
                 return
-            if research_run_id:
-                self.research.mark_run(research_run_id, "failed", error=str(exc))
+            self._settle_capital_oos_failure(job, error_message)
+            if job["kind"] == "model_ensemble_evaluate":
+                for candidate in job["payload"].get("candidates") or []:
+                    ensemble_id = str(candidate["id"])
+                    current = self.research_tournaments.get_ensemble(ensemble_id)
+                    if current["status"] not in {
+                        "research_admitted",
+                        "rejected",
+                        "invalidated",
+                    }:
+                        self.research_tournaments.mark_ensemble_failed(
+                            ensemble_id,
+                            reason=error_message,
+                            evidence={"job_id": str(job["id"]), "import_failure": True},
+                        )
+            elif job["kind"] == "quant_bundle_evaluate":
+                self._settle_quant_tournament_failure(
+                    job, reason=error_message
+                )
+            if research_run_id and not factor_research_settled:
+                self.research.mark_run(research_run_id, "failed", error=error_message)
             if backtest_id:
-                self.strategies.mark_backtest(backtest_id, "failed", error=str(exc))
+                self.strategies.mark_backtest(
+                    backtest_id, "failed", error=error_message
+                )
             if parameter_experiment_id:
                 self.parameter_experiments.mark(parameter_experiment_id, "failed", error=str(exc))
             if recommendation_snapshot_id:
@@ -618,6 +1424,263 @@ class LocalJobWorker:
         if isinstance(payload, dict):
             self.store.update_progress(job_id, payload)
         return mtime_ns
+
+    @staticmethod
+    def _factor_evaluation_logical_error(result: dict) -> str | None:
+        evaluations = result.get("evaluations", [])
+        if not isinstance(evaluations, list) or any(
+            not isinstance(item, dict) for item in evaluations
+        ):
+            raise ValueError("factor evaluation result has an invalid evaluations list")
+        failures = [
+            item
+            for item in evaluations
+            if item.get("status") != "ok"
+        ]
+        if not failures:
+            return None
+        return "; ".join(
+            f"{item.get('candidate_id')}: {item.get('error', 'evaluation failed')}"
+            for item in failures
+        )
+
+    @staticmethod
+    def _job_has_retry_remaining(job: dict, *, retryable: bool) -> bool:
+        """Predict the queue decision from the immutable claimed-job counters."""
+
+        if not retryable or job.get("status") != "running":
+            return False
+        try:
+            return int(job["attempts"]) < int(job["max_attempts"])
+        except (KeyError, TypeError, ValueError):
+            # `_run` receives a complete claimed row. Fail conservatively for
+            # test doubles or old callers: let JobStore decide before making a
+            # research run terminal.
+            return True
+
+    def _settle_claimed_factor_evaluation_with_terminal_run(self, job: dict) -> bool:
+        """Finish a recovered job without reopening an already-terminal run.
+
+        The normal factor settlement order is ledger -> research run -> job. A
+        worker/process crash can therefore leave the first two durable while
+        the job is still ``running``. ``JobStore.recover_interrupted`` queues
+        that job again on startup. Re-executing it would be unsafe: ``_command``
+        rewrites its manifest and the normal spawn path unlinks ``result.json``.
+
+        For that narrow crash window, prove that the private result artifact is
+        complete and that every outcome is already bound *identically* in the
+        immutable ledger, then fill in only the missing job terminal state. A
+        missing/changed artifact or ledger mismatch is terminalized fail-closed
+        and is never retried automatically. Active runs continue through the
+        ordinary retry path unchanged.
+        """
+
+        if job.get("kind") != "factor_evaluate":
+            return False
+        payload = job.get("payload") or {}
+        research_run_id = str(payload.get("research_run_id") or "")
+        if not research_run_id:
+            return False
+        try:
+            run = self.research.get_run(research_run_id)
+        except SQLAlchemyError:
+            raise
+        except Exception as exc:
+            self._finish_terminal_factor_recovery_fail_closed(
+                job, f"research run state is unavailable: {exc}"
+            )
+            return True
+        run_status = str(run.get("status") or "")
+        if run_status in {"queued", "running", "evaluating"}:
+            return False
+        if run_status not in {"succeeded", "failed", "cancelled", "blocked"}:
+            self._finish_terminal_factor_recovery_fail_closed(
+                job, f"research run has unsupported status {run_status or 'missing'}"
+            )
+            return True
+        if run_status in {"cancelled", "blocked"}:
+            self._finish_terminal_factor_recovery_fail_closed(
+                job,
+                f"research run is already {run_status}: "
+                f"{str(run.get('error') or 'no terminal reason recorded')}",
+            )
+            return True
+
+        try:
+            inspection = inspect_orphan_factor_evaluation(
+                self.store,
+                data_root=self.settings.data_root,
+                job_id=str(job["id"]),
+            )
+            if inspection.job.get("payload") != payload:
+                raise RecoverySafetyError(
+                    "factor evaluation job payload changed during terminal recovery"
+                )
+            result = inspection.result
+            logical_error = self._factor_evaluation_logical_error(result)
+            if run_status == "succeeded":
+                if logical_error is not None or run.get("error"):
+                    raise RecoverySafetyError(
+                        "successful research run conflicts with evaluator result"
+                    )
+            else:
+                if logical_error is None:
+                    raise RecoverySafetyError(
+                        "failed research run has no failed evaluator outcome"
+                    )
+                if str(run.get("error") or "") != logical_error:
+                    raise RecoverySafetyError(
+                        "failed research run reason differs from evaluator result"
+                    )
+            self._require_factor_evaluation_outcomes_already_imported(
+                job,
+                result,
+                artifact_path=inspection.result_path,
+            )
+        except SQLAlchemyError:
+            raise
+        except Exception as exc:
+            self._finish_terminal_factor_recovery_fail_closed(job, str(exc))
+            return True
+
+        if run_status == "succeeded":
+            self._retry_transient_database(
+                lambda: self.store.finish(job["id"], exit_code=0, result=result)
+            )
+        else:
+            requeued = self._retry_transient_database(
+                lambda: self.store.finish_or_retry(
+                    job["id"],
+                    exit_code=3,
+                    error=str(logical_error),
+                    result=result,
+                    retryable=False,
+                )
+            )
+            if requeued:
+                raise RuntimeError(
+                    "terminal factor evaluation recovery unexpectedly requeued the job"
+                )
+        return True
+
+    def _finish_terminal_factor_recovery_fail_closed(
+        self, job: dict, reason: str
+    ) -> None:
+        error = (
+            "terminal factor evaluation could not be reconciled safely; "
+            + " ".join(str(reason).split())[:1600]
+        )
+        requeued = self._retry_transient_database(
+            lambda: self.store.finish_or_retry(
+                str(job["id"]),
+                exit_code=1,
+                error=error,
+                retryable=False,
+            )
+        )
+        if requeued:
+            raise RuntimeError(
+                "fail-closed factor evaluation recovery unexpectedly requeued the job"
+            )
+
+    def _require_factor_evaluation_outcomes_already_imported(
+        self,
+        job: dict,
+        result: dict,
+        *,
+        artifact_path: Path,
+    ) -> None:
+        """Prove terminal-run recovery owes no ledger mutation."""
+
+        validate_factor_evaluation_result_contract(job, result)
+        for item in result["evaluations"]:
+            import_state, _, _ = self._factor_evaluation_outcome_import_state(
+                job,
+                item,
+                artifact_path=artifact_path,
+            )
+            if import_state != "identical":
+                raise RecoverySafetyError(
+                    "terminal research run is missing an immutable evaluator outcome"
+                )
+
+    def _settle_factor_evaluation_research(
+        self,
+        job: dict,
+        result: dict,
+        *,
+        succeeded: bool,
+        error: str | None,
+    ) -> None:
+        """Apply the shared factor-evaluation ledger and research-run semantics."""
+
+        research_run_id = str((job.get("payload") or {}).get("research_run_id") or "")
+        if not research_run_id:
+            raise ValueError("factor evaluation job has no research run identity")
+        if succeeded or result.get("evaluations"):
+            # Partially failed batches still owe the trial ledger every outcome
+            # before the research run becomes terminal (design draft 4.2/6.6).
+            self._import_factor_evaluations(job, result)
+        self.research.mark_run(
+            research_run_id,
+            "succeeded" if succeeded else "failed",
+            error=None if succeeded else (error or "job failed"),
+        )
+
+    def finalize_completed_factor_evaluation(self, job: dict, result: dict) -> dict[str, object]:
+        """Finalize an already-exited factor evaluator through normal worker semantics.
+
+        This is intentionally narrow and is used only by the guarded orphan
+        recovery command. Process and artifact safety checks live at that
+        command boundary; this method rechecks the durable job state and owns
+        the exact import/research-run/job transitions used by ``_run``.
+        """
+
+        job_id = str(job.get("id") or "")
+        current = self.store.get(job_id)
+        if current.get("kind") != "factor_evaluate":
+            raise ValueError("recovery only supports factor_evaluate jobs")
+        if current.get("status") != "running":
+            raise ValueError("factor evaluation recovery requires a running orphan job")
+        if current.get("payload") != job.get("payload"):
+            raise ValueError("factor evaluation job payload changed during recovery")
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            raise ValueError("factor evaluation result is not complete")
+        validate_factor_evaluation_result_contract(current, result)
+        research_run_id = str(current["payload"].get("research_run_id") or "")
+        run = self.research.get_run(research_run_id)
+        if run.get("status") != "running":
+            raise ValueError("factor evaluation research run is already terminal or changed")
+        logical_error = self._factor_evaluation_logical_error(result)
+        if logical_error:
+            # Import every partial outcome and make the research run terminal
+            # before exposing a terminal job. This keeps UI/recovery state from
+            # observing `job=failed, research_run=running`.
+            self._settle_factor_evaluation_research(
+                current,
+                result,
+                succeeded=False,
+                error=logical_error,
+            )
+            requeued = self.store.finish_or_retry(
+                job_id,
+                exit_code=3,
+                error=logical_error,
+                result=result,
+                retryable=False,
+            )
+            if requeued:  # Defensive: retryable=False must always be terminal.
+                raise RuntimeError("factor evaluation recovery unexpectedly requeued the job")
+            return {"status": "failed", "exit_code": 3, "error": logical_error}
+
+        self._settle_factor_evaluation_research(
+            current,
+            result,
+            succeeded=True,
+            error=None,
+        )
+        self.store.finish(job_id, exit_code=0, result=result)
+        return {"status": "succeeded", "exit_code": 0, "error": None}
 
     def _project_research_asset_acquisition_result(
         self,
@@ -663,6 +1726,7 @@ class LocalJobWorker:
                     "asset_id": asset_id,
                     "content_sha256": str(registered["content_sha256"]),
                     "manifest_sha256": str(registered["manifest_sha256"]),
+                    "size_bytes": int(registered.get("size_bytes") or 0),
                 }
             )
 
@@ -689,6 +1753,8 @@ class LocalJobWorker:
 
     def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
         payload = job["payload"]
+        if job["kind"] == "pair_backtest":
+            _require_supported_simulation_execution("pair_backtest")
         if job["kind"] == "research_asset_acquire":
             output = (
                 self.settings.data_root
@@ -722,6 +1788,9 @@ class LocalJobWorker:
                         str(result_path),
                     ]
                 )
+                if payload.get("tushare_report_date"):
+                    report_date = date.fromisoformat(str(payload["tushare_report_date"]))
+                    command.extend(["--tushare-report-date", report_date.isoformat()])
                 if not payload.get("include_tushare"):
                     command.append("--skip-tushare")
                 if not payload.get("include_arxiv"):
@@ -1368,11 +2437,146 @@ class LocalJobWorker:
                 asset_manifest_sha256=dict(payload.get("asset_manifest_sha256") or {}),
                 feature_set=payload.get("feature_set"),
             )
+            if scenario.id == "fin_quant":
+                baseline = self._freeze_fin_quant_baseline(payload)
+                reference = {
+                    "contract_version": baseline["contract_version"],
+                    "kind": baseline["kind"],
+                    "candidate_id": baseline["candidate_id"],
+                    "candidate_manifest_sha256": baseline[
+                        "candidate_manifest_sha256"
+                    ],
+                    "admission_evidence_sha256": baseline[
+                        "admission_evidence_sha256"
+                    ],
+                    "selection_evidence_sha256": baseline[
+                        "selection_evidence_sha256"
+                    ],
+                    "feature_set_id": baseline.get("feature_set_id"),
+                    "feature_set_definition_sha256": baseline.get(
+                        "feature_set_definition_sha256"
+                    ),
+                    "combiner": baseline.get("combiner"),
+                    "stacking": baseline.get("stacking"),
+                    "component_count": len(baseline.get("components") or []),
+                    "quant_retraining_supported": baseline[
+                        "quant_retraining_supported"
+                    ],
+                    "unsupported_reason_code": baseline.get(
+                        "unsupported_reason_code"
+                    ),
+                }
+                env["QUANTLAB_PREDICTION_CHAMPION_JSON"] = json.dumps(
+                    reference, ensure_ascii=False, sort_keys=True
+                )
+            if scenario.factor_output or scenario.id == "fin_quant":
+                active_library = next(
+                    (
+                        item
+                        for item in self.factor_library.list_library_versions()
+                        if item["status"] == "active"
+                    ),
+                    None,
+                )
+                if active_library is None:
+                    raise ValueError("RD-Agent factor research has no active factor library")
+                env["QUANTLAB_FACTOR_LIBRARY_VERSION_ID"] = str(active_library["id"])
+                env["QUANTLAB_FACTOR_LIBRARY_DEFINITION_SHA256"] = str(
+                    active_library["definition_sha256"]
+                )
             if llm:
                 env[self.settings.rdagent_llm_key_env] = llm["api_key"]
                 env["OPENAI_API_BASE"] = llm.get("api_base", "")
                 env["CHAT_MODEL"] = llm.get("chat_model", "gpt-4.1-mini")
             return command, result_path, env
+        if job["kind"] == "model_ensemble_evaluate":
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "model-ensemble-evaluations"
+                / str(payload["tournament_id"])
+                / job["id"]
+            )
+            output.mkdir(parents=True, exist_ok=True)
+            manifest_path = output / "manifest.json"
+            result_path = output / "result.json"
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+
+            def runtime_path(value: str | Path) -> str:
+                path = Path(value)
+                return _to_wsl_path(path) if is_wsl else str(path)
+
+            candidates: list[dict] = []
+            for raw_candidate in payload.get("candidates") or []:
+                candidate = dict(raw_candidate)
+                components: list[dict] = []
+                for raw_component in candidate.get("components") or []:
+                    component = dict(raw_component)
+                    grid = dict(component.get("prediction_grid") or {})
+                    profiles: dict[str, dict] = {}
+                    for profile_id, raw_profile in (grid.get("profiles") or {}).items():
+                        profile = dict(raw_profile)
+                        seeds = {
+                            str(seed): {
+                                **dict(cell),
+                                "predictions_path": runtime_path(
+                                    str(cell["predictions_path"])
+                                ),
+                            }
+                            for seed, cell in (profile.get("seeds") or {}).items()
+                        }
+                        profiles[str(profile_id)] = {**profile, "seeds": seeds}
+                    component["prediction_grid"] = {**grid, "profiles": profiles}
+                    components.append(component)
+                candidate["components"] = components
+                candidates.append(candidate)
+            manifest = {
+                "contract_version": "model-ensemble-evaluation-input-v1",
+                "tournament_id": payload["tournament_id"],
+                "dataset": payload["dataset"],
+                "dataset_identity_sha256": payload["dataset_identity_sha256"],
+                "evaluation_profiles": payload.get("evaluation_profiles") or [],
+                "candidates": candidates,
+                "universe": payload.get("universe", "cn_all"),
+                "benchmark": payload.get("benchmark", "SH000300"),
+                "account": int(payload.get("account", 100_000_000)),
+                "topk": int(payload.get("topk", 50)),
+                "n_drop": int(payload.get("n_drop", 5)),
+                "open_cost": float(payload.get("open_cost", 0.0005)),
+                "close_cost": float(payload.get("close_cost", 0.0015)),
+                "min_cost": float(payload.get("min_cost", 5.0)),
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            script = self.project_root / "scripts" / "evaluate_model_ensemble.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    runtime_path(str(payload["dataset_path"])),
+                    "--manifest",
+                    runtime_path(manifest_path),
+                    "--output",
+                    runtime_path(result_path),
+                ]
+            )
+            return (
+                command,
+                result_path,
+                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
+            )
         if job["kind"] in {"model_evaluate", "quant_bundle_evaluate"}:
             if not str(os.getenv("MODEL_SANDBOX_IMAGE") or "").strip():
                 raise ValueError("MODEL_SANDBOX_IMAGE is required for model isolation")
@@ -1383,6 +2587,7 @@ class LocalJobWorker:
             )
             output = (
                 self.settings.data_root / "artifacts" / evaluation_name / payload["research_run_id"]
+                / job["id"]
             )
             output.mkdir(parents=True, exist_ok=True)
             manifest_path = output / "manifest.json"
@@ -1419,11 +2624,93 @@ class LocalJobWorker:
                         **item["model"],
                         "code_path": runtime_path(str(item["model"]["code_path"])),
                     }
+                    frozen_baseline = dict(
+                        item.get("baseline_prediction_champion") or {}
+                    )
+                    runtime_baseline = json.loads(
+                        json.dumps(frozen_baseline, ensure_ascii=False)
+                    )
+                    if runtime_baseline.get("kind") == "model":
+                        runtime_baseline["model"]["code_path"] = runtime_path(
+                            str(runtime_baseline["model"]["code_path"])
+                        )
+                        for profile in runtime_baseline.get(
+                            "profiles", {}
+                        ).values():
+                            for cell in profile.get("seeds", {}).values():
+                                cell["predictions_path"] = runtime_path(
+                                    str(cell["predictions_path"])
+                                )
+                                cell["portfolio_report_path"] = runtime_path(
+                                    str(cell["portfolio_report_path"])
+                                )
+                                if cell.get("checkpoint_path"):
+                                    cell["checkpoint_path"] = runtime_path(
+                                        str(cell["checkpoint_path"])
+                                    )
+                    elif runtime_baseline.get("kind") == "ensemble":
+                        for component in runtime_baseline.get("components", []):
+                            component["model"]["code_path"] = runtime_path(
+                                str(component["model"]["code_path"])
+                            )
+                            for profile in component.get("profiles", {}).values():
+                                for cell in profile.get("seeds", {}).values():
+                                    for path_key in (
+                                        "predictions_path",
+                                        "checkpoint_path",
+                                        "portfolio_report_path",
+                                    ):
+                                        cell[path_key] = runtime_path(
+                                            str(cell[path_key])
+                                        )
+                        for profile in runtime_baseline.get("profiles", {}).values():
+                            for cell in profile.get("seeds", {}).values():
+                                cell["predictions_path"] = runtime_path(
+                                    str(cell["predictions_path"])
+                                )
+                                cell["portfolio_report_path"] = runtime_path(
+                                    str(cell["portfolio_report_path"])
+                                )
+                                for member in cell.get(
+                                    "member_prediction_artifacts", []
+                                ):
+                                    member["predictions_path"] = runtime_path(
+                                        str(member["predictions_path"])
+                                    )
+                    item["baseline_prediction_runtime"] = runtime_baseline
                 candidates.append(item)
+            feature_set = _frozen_evaluation_feature_set(payload)
             manifest = {
                 "research_run_id": payload["research_run_id"],
                 "candidates": candidates,
                 "feature_set_id": payload["feature_set_id"],
+                # Dynamic SOTA feature sets are registered in the long-lived
+                # worker process but are not necessarily present in the clean
+                # evaluator subprocess.  Freeze the complete definition into
+                # the immutable job manifest so the subprocess validates the
+                # same feature set instead of falling back to its static
+                # registry.
+                "feature_set": feature_set,
+                **(
+                    {
+                        "baseline_prediction_champion": payload[
+                            "baseline_prediction_champion"
+                        ],
+                        "research_tournament_id": payload[
+                            "research_tournament_id"
+                        ],
+                        "parent_research_tournament_id": payload[
+                            "parent_research_tournament_id"
+                        ],
+                        "research_tournament_manifest_sha256": payload[
+                            "research_tournament_manifest_sha256"
+                        ],
+                        "research_trial_ids": payload["research_trial_ids"],
+                        **RESEARCH_SCREENING_MARKERS,
+                    }
+                    if job["kind"] == "quant_bundle_evaluate"
+                    else {}
+                ),
                 "dataset_identity_sha256": payload["dataset_identity_sha256"],
                 "evaluation_profiles": payload.get("evaluation_profiles") or [],
                 "universe": payload.get("universe", "cn_all"),
@@ -1478,6 +2765,7 @@ class LocalJobWorker:
                 / "artifacts"
                 / "factor-evaluations"
                 / payload["research_run_id"]
+                / job["id"]
             )
             output.mkdir(parents=True, exist_ok=True)
             manifest_path = output / "manifest.json"
@@ -1488,6 +2776,34 @@ class LocalJobWorker:
                 return _to_wsl_path(Path(value)) if is_wsl else str(value)
 
             promoted = self.research.list_candidates(status="promoted", limit=500)
+            library_comparisons: list[dict[str, str]] = []
+            materialization_root = (
+                self.settings.data_root
+                / "artifacts"
+                / "factor-library-materializations"
+                / str(payload["dataset_identity_sha256"])
+            )
+            manifests = sorted(
+                materialization_root.glob("*/manifest.json"),
+                key=lambda path: path.stat().st_mtime_ns,
+                reverse=True,
+            )
+            if manifests:
+                materialized = json.loads(manifests[0].read_text(encoding="utf-8"))
+                if (
+                    materialized.get("dataset_identity_sha256")
+                    == payload["dataset_identity_sha256"]
+                ):
+                    for name, evidence in (materialized.get("completed") or {}).items():
+                        path = manifests[0].parent / str(evidence["relative_path"])
+                        if path.is_file():
+                            library_comparisons.append(
+                                {
+                                    "candidate_id": f"library:{name}",
+                                    "path": runtime_path(str(path)),
+                                    "source": "unified_factor_library",
+                                }
+                            )
             manifest = {
                 "research_run_id": payload["research_run_id"],
                 "candidates": [
@@ -1503,8 +2819,12 @@ class LocalJobWorker:
                 "evaluation_profiles": payload.get("evaluation_profiles") or [],
                 "universe": payload.get("universe", "cn_all"),
                 "min_daily_instruments": int(payload.get("min_daily_instruments", 50)),
-                "comparison_values": [
-                    runtime_path(item["values_path"])
+                "comparison_values": library_comparisons + [
+                    {
+                        "candidate_id": str(item["id"]),
+                        "path": runtime_path(str(item["values_path"])),
+                        "source": "promoted_library",
+                    }
                     for item in promoted
                     if item.get("values_path") and Path(item["values_path"]).exists()
                 ],
@@ -1548,6 +2868,163 @@ class LocalJobWorker:
                 result_path,
                 _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
             )
+        if job["kind"] == "factor_library_materialize":
+            feature_set = get_feature_set(str(payload["feature_set_id"]))
+            if (
+                feature_set["definition_sha256"]
+                != payload["feature_set_definition_sha256"]
+            ):
+                raise ValueError("factor library materialization feature set changed")
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "factor-library-materializations"
+                / str(payload["dataset_identity_sha256"])
+                / str(payload["feature_set_definition_sha256"])[:16]
+            )
+            output.mkdir(parents=True, exist_ok=True)
+            result_path = output / "manifest.json"
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+
+            def runtime_path(value: str | Path) -> str:
+                path = Path(value)
+                return _to_wsl_path(path) if is_wsl else str(path)
+
+            script = self.project_root / "scripts" / "materialize_factor_library.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    runtime_path(payload["dataset_path"]),
+                    "--output",
+                    runtime_path(output),
+                    "--feature-set-id",
+                    feature_set["id"],
+                    "--universe",
+                    str(payload["universe"]),
+                    "--start",
+                    str(payload["start"]),
+                    "--end",
+                    str(payload["end"]),
+                ]
+            )
+            return (
+                command,
+                result_path,
+                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
+            )
+        if job["kind"] == "factor_library_cluster":
+            materialization = Path(str(payload["materialization_path"])).resolve(
+                strict=True
+            )
+            output = materialization / "clusters"
+            output.mkdir(parents=True, exist_ok=True)
+            result_path = output / "result.json"
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+
+            def runtime_path(value: str | Path) -> str:
+                path = Path(value)
+                return _to_wsl_path(path) if is_wsl else str(path)
+
+            script = self.project_root / "scripts" / "cluster_factor_library.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--materialization",
+                    runtime_path(materialization),
+                    "--output",
+                    runtime_path(output),
+                ]
+            )
+            return command, result_path, {}
+        if job["kind"] == "factor_sota_evaluate":
+            evaluation_scope_id = str(
+                payload.get("evaluation_scope_id")
+                or payload.get("research_campaign_id")
+                or job["id"]
+            )
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "factor-sota-evaluations"
+                / evaluation_scope_id
+            )
+            output.mkdir(parents=True, exist_ok=True)
+            manifest_path = output / "manifest.json"
+            result_path = output / "result.json"
+            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+
+            def runtime_path(value: str | Path) -> str:
+                path = Path(value)
+                return _to_wsl_path(path) if is_wsl else str(path)
+
+            manifest = {
+                **payload,
+                "frozen_model_runtime_code_path": runtime_path(
+                    payload["frozen_model"]["code_path"]
+                ),
+                "baseline_members": [
+                    {**item, "values_path": runtime_path(item["values_path"])}
+                    for item in payload.get("baseline_members") or []
+                ],
+                "candidates": [
+                    {**item, "values_path": runtime_path(item["values_path"])}
+                    for item in payload.get("candidates") or []
+                ],
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            script = self.project_root / "scripts" / "evaluate_factor_sota_increment.py"
+            command = (
+                [
+                    "wsl",
+                    "-d",
+                    self.settings.qlib_wsl_distro,
+                    "--exec",
+                    self.settings.qlib_python,
+                    _to_wsl_path(script),
+                ]
+                if is_wsl
+                else [self.settings.qlib_python, str(script)]
+            )
+            command.extend(
+                [
+                    "--provider-uri",
+                    runtime_path(payload["dataset_path"]),
+                    "--manifest",
+                    runtime_path(manifest_path),
+                    "--output",
+                    runtime_path(result_path),
+                ]
+            )
+            return (
+                command,
+                result_path,
+                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
+            )
         if job["kind"] in {"external_factor_evaluate", "information_factor_evaluate"}:
             output = (
                 self.settings.data_root / "artifacts" / "external-factor-evaluations" / job["id"]
@@ -1581,7 +3058,18 @@ class LocalJobWorker:
                     }
                     for item in candidates
                 ],
-                "comparison_values": [],
+                "comparison_values": [
+                    {
+                        "candidate_id": str(item["id"]),
+                        "path": runtime_path(item["values_path"]),
+                        "source": "promoted_library",
+                    }
+                    for item in self.research.list_candidates(
+                        status="promoted", limit=500
+                    )
+                    if item.get("values_path")
+                    and Path(str(item["values_path"])).exists()
+                ],
                 "cost_model": CostModelConfig.from_mapping(payload.get("cost_model")).to_dict(),
                 "cost_reference_order_value": float(
                     payload.get("cost_reference_order_value", 100_000.0)
@@ -1646,11 +3134,41 @@ class LocalJobWorker:
             source_artifact = self.model_artifacts.get(
                 str(payload["source_model_artifact_id"])
             )
-            if (
-                source_artifact.get("strategy_version_id") != version["id"]
-                or source_artifact.get("status") != "active"
-            ):
+            if source_artifact.get("strategy_version_id") != version["id"]:
                 raise ValueError("model refit source is not the active StrategySpec artifact")
+            if source_artifact.get("status") == "retired":
+                try:
+                    replay_artifact = self.model_artifacts.get_by_key(
+                        version["id"],
+                        f"live-refit-{str(payload['signal_date']).replace('-', '')}",
+                    )
+                except KeyError as exc:
+                    raise ValueError(
+                        "retired model source has no idempotent active refresh"
+                    ) from exc
+                if (
+                    replay_artifact.get("status") != "active"
+                    or (replay_artifact.get("training_evidence") or {}).get(
+                        "source_model_artifact_id"
+                    )
+                    != source_artifact["id"]
+                ):
+                    raise ValueError(
+                        "retired model source does not own the active replay artifact"
+                    )
+            elif source_artifact.get("status") != "active":
+                raise ValueError("model refit source is not the active StrategySpec artifact")
+            operation = str(payload.get("operation") or "")
+            if operation not in {"inference", "retrain"}:
+                raise ValueError("model live refresh operation is invalid")
+            source_training_evidence = source_artifact.get("training_evidence")
+            source_periods = (
+                source_training_evidence.get("periods")
+                if isinstance(source_training_evidence, dict)
+                else None
+            )
+            if not isinstance(source_periods, dict):
+                raise ValueError("source ModelArtifact has no frozen training periods")
             output = (
                 self.settings.data_root
                 / "artifacts"
@@ -1670,6 +3188,7 @@ class LocalJobWorker:
                 str(model_signal["model_candidate_id"]), verify=True
             )
             base = dict(candidate.get("base_features_manifest_json") or {})
+            frozen_model_engine = _frozen_model_engine(model_signal)
             feature_set = {
                 "id": str(base.get("feature_set_id") or ""),
                 "contract_version": str(base.get("contract_version") or ""),
@@ -1677,7 +3196,8 @@ class LocalJobWorker:
                 "definition_sha256": str(base.get("definition_sha256") or ""),
             }
             manifest = {
-                "contract_version": "model-live-refit-v1",
+                "contract_version": "model-live-refresh-v2",
+                "operation": operation,
                 "strategy_version_id": version["id"],
                 "source_model_artifact_id": source_artifact["id"],
                 "execution_environment_sha256": str(
@@ -1687,6 +3207,48 @@ class LocalJobWorker:
                 "dataset_identity_sha256": str(payload["dataset_identity_sha256"]),
                 "dataset_lineage_id": str(payload["dataset_lineage_id"]),
                 "signal_date": str(payload["signal_date"]),
+                "frozen_training_periods": {
+                    key: str(source_periods[key])
+                    for key in (
+                        "train_start",
+                        "train_end",
+                        "valid_start",
+                        "valid_end",
+                    )
+                },
+                "source_checkpoint_path": (
+                    runtime_path(str(source_artifact["checkpoint_path"]))
+                    if operation == "inference"
+                    else None
+                ),
+                "source_checkpoint_sha256": (
+                    str(source_artifact["checkpoint_sha256"])
+                    if operation == "inference"
+                    else None
+                ),
+                "source_checkpoint_format": (
+                    str(source_artifact["checkpoint_format"])
+                    if operation == "inference"
+                    else None
+                ),
+                "source_model_data_contract_sha256": str(
+                    source_artifact["model_data_contract_sha256"]
+                ),
+                "retrain_reason": (
+                    str(payload.get("retrain_reason") or "")
+                    if operation == "retrain"
+                    else ""
+                ),
+                "retrain_evidence": (
+                    payload.get("retrain_evidence")
+                    if operation == "retrain"
+                    else None
+                ),
+                "retrain_evidence_sha256": (
+                    str(payload.get("retrain_evidence_sha256") or "")
+                    if operation == "retrain"
+                    else ""
+                ),
                 "universe": version["universe"],
                 "feature_set": feature_set,
                 "feature_set_definition_sha256": str(
@@ -1698,6 +3260,7 @@ class LocalJobWorker:
                     "code_sha256": str(model_signal["model_code_sha256"]),
                     "recipe_sha256": str(model_signal["model_recipe_sha256"]),
                     "model_type": str(model_signal.get("model_type") or "Tabular"),
+                    "model_engine": frozen_model_engine,
                     "training_hyperparameters": dict(
                         model_signal.get("training_hyperparameters") or {}
                     ),
@@ -1760,14 +3323,154 @@ class LocalJobWorker:
             def runtime_path(value: str) -> str:
                 return _to_wsl_path(Path(value)) if is_wsl else str(Path(value))
 
+            with self.strategies.engine.connect() as connection:
+                model_signal = self.strategies._model_signal_evidence(
+                    connection, version["config"]
+                )
+            governance = experiment["periods"].get("governance") or {}
+            if model_signal is not None:
+                if (
+                    governance.get("mode") != "model_portfolio_pre_final"
+                    or governance.get("final_oos_opened") is not False
+                    or payload.get("dataset_identity_sha256")
+                    != governance.get("dataset_identity_sha256")
+                    or governance.get("dataset_identity_sha256")
+                    != str(model_signal["candidate"].dataset_identity_sha256)
+                    or governance.get("model_signal_identity_sha256")
+                    != model_signal["identity"]["identity_sha256"]
+                    or governance.get("formal_admission_binding_sha256")
+                    != model_signal["formal_admission_binding"]["binding_sha256"]
+                ):
+                    raise ValueError(
+                        "model portfolio experiment governance no longer matches admission"
+                    )
+                admitted_multiple_testing = merge_admitted_trial_ledgers(
+                    model_signal["formal_admission_binding"]
+                )
+            else:
+                admitted_multiple_testing = None
+
             manifest = {
                 "experiment_id": experiment["id"],
                 "strategy_version_id": version["id"],
                 "dataset": experiment["dataset"],
                 "benchmark": version["benchmark"],
+                "universe": version["universe"],
                 "execution_dataset": ((payload.get("execution_dataset") or {}).get("name")),
                 "periods": experiment["periods"],
                 "parameter_grid": experiment["parameter_grid"],
+                "evaluation_mode": (
+                    "pre_final_portfolio_trial" if model_signal is not None else None
+                ),
+                "pre_final_cutoff": (
+                    str(model_signal["candidate"].pre_final_end)
+                    if model_signal is not None
+                    else None
+                ),
+                "historical_validation_periods": (
+                    {
+                        "start": model_signal["evaluation"].train_start.isoformat(),
+                        "end": model_signal["evaluation"].train_end.isoformat(),
+                    }
+                    if model_signal is not None
+                    else None
+                ),
+                "strategy_trial_count": (
+                    int(admitted_multiple_testing["trial_count"])
+                    + len(experiment["trials"])
+                    if admitted_multiple_testing is not None
+                    else len(experiment["trials"])
+                ),
+                "shared_multiple_testing": admitted_multiple_testing,
+                "model_signal": (
+                    model_signal["identity"] if model_signal is not None else None
+                ),
+                "model_formal_admission": (
+                    model_signal["formal_admission_binding"]
+                    if model_signal is not None
+                    else None
+                ),
+                "model_candidate": (
+                    {
+                        "candidate_manifest": dict(
+                            model_signal["candidate"].manifest_json or {}
+                        ),
+                        "feature_set": {
+                            "id": str(
+                                (
+                                    model_signal[
+                                        "candidate"
+                                    ].base_features_manifest_json
+                                    or {}
+                                ).get("feature_set_id")
+                                or ""
+                            ),
+                            "contract_version": str(
+                                (
+                                    model_signal[
+                                        "candidate"
+                                    ].base_features_manifest_json
+                                    or {}
+                                ).get("contract_version")
+                                or ""
+                            ),
+                            "features": dict(
+                                (
+                                    model_signal[
+                                        "candidate"
+                                    ].base_features_manifest_json
+                                    or {}
+                                ).get("feature_expressions")
+                                or {}
+                            ),
+                            "definition_sha256": str(
+                                model_signal[
+                                    "candidate"
+                                ].feature_set_definition_sha256
+                            ),
+                        },
+                        "code_path": runtime_path(model_signal["code_path"]),
+                        "training_periods": {
+                            "train_start": model_signal[
+                                "evaluation"
+                            ].train_start.isoformat(),
+                            "train_end": model_signal["evaluation"].train_end.isoformat(),
+                            "valid_start": model_signal[
+                                "evaluation"
+                            ].valid_start.isoformat(),
+                            "valid_end": model_signal["evaluation"].valid_end.isoformat(),
+                            "seed": int(model_signal["evaluation"].seed),
+                        },
+                        "primary_profile_id": str(model_signal["evaluation"].profile_id),
+                        "refit_policy": version["config"].get("model_refit_policy"),
+                        "refit_policy_sha256": version["config"].get(
+                            "model_refit_policy_sha256"
+                        ),
+                    }
+                    if model_signal is not None
+                    else None
+                ),
+                "model_bundle_factors": (
+                    [
+                        {
+                            **{
+                                key: item[key]
+                                for key in (
+                                    "candidate_id",
+                                    "feature_name",
+                                    "code_sha256",
+                                    "direction",
+                                    "weight",
+                                    "factor_execution_mode",
+                                )
+                            },
+                            "code_path": runtime_path(str(item["code_path"])),
+                        }
+                        for item in model_signal["bundle_factors"]
+                    ]
+                    if model_signal is not None
+                    else []
+                ),
                 "factors": [
                     {
                         "candidate_id": item["factor_candidate_id"],
@@ -2157,6 +3860,12 @@ class LocalJobWorker:
             )
             provenance = dict(dataset.get("provenance") or {})
             signal_date = date.fromisoformat(str(payload["signal_date"]))
+            if str(payload.get("dataset_identity_sha256") or "") != str(
+                provenance.get("dataset_identity_sha256") or ""
+            ):
+                raise ValueError(
+                    "paper order-plan job changed its immutable dataset binding"
+                )
             current_available_date = qlib_trading_date_on_or_before(dataset, local_today)
             if signal_date != current_available_date:
                 raise ValueError(
@@ -2254,6 +3963,22 @@ class LocalJobWorker:
                 model_artifact = self.model_artifacts.require_for_inference(
                     str(version["id"]),
                     dataset_identity_sha256=str(provenance["dataset_identity_sha256"]),
+                )
+                expected_model_binding = {
+                    "id": str(model_artifact["id"]),
+                    "artifact_sha256": str(model_artifact["artifact_sha256"]),
+                    "checkpoint_sha256": str(model_artifact["checkpoint_sha256"]),
+                    "dataset_identity_sha256": str(
+                        model_artifact["dataset_identity_sha256"]
+                    ),
+                }
+                if payload.get("model_artifact_binding") != expected_model_binding:
+                    raise ValueError(
+                        "paper order-plan job changed its active ModelArtifact binding"
+                    )
+            elif payload.get("model_artifact_binding") is not None:
+                raise ValueError(
+                    "factor-score paper order-plan must not bind a ModelArtifact"
                 )
 
             manifest = {
@@ -2497,6 +4222,10 @@ class LocalJobWorker:
             return command, result_path, {}
         if job["kind"] == "simulation_replay":
             manifest = self.simulations.execution_manifest(payload["simulation_batch_id"])
+            _require_supported_simulation_execution(
+                "simulation_replay",
+                execution_adapter=str(manifest.get("execution_adapter") or ""),
+            )
             datasets = {
                 item["name"]: item
                 for item in list_qlib_datasets(self.settings.data_root)
@@ -2684,6 +4413,8 @@ class LocalJobWorker:
                 "data_qlib",
                 "minute_qlib",
                 "qlib_baseline",
+                "core_intraday_download",
+                "margin_eligibility_download",
                 "announcement_nlp",
                 "announcement_factor_register",
                 "corpus_nlp",
@@ -2717,6 +4448,9 @@ class LocalJobWorker:
                 "snapshot_start": snapshot_start,
                 "snapshot_end": snapshot_end,
             }
+            for key in ("download_workers", "requests_per_minute"):
+                if key in payload and key not in successor_payload:
+                    successor_payload[key] = payload[key]
             if kind == "minute_qlib":
                 snapshot = resolve_snapshot_manifest(
                     self.settings.data_root,
@@ -2806,13 +4540,15 @@ class LocalJobWorker:
         imported = []
         source_candidates = result.get("candidates", [])
         for item in source_candidates:
-            imported.append(
-                self.research.add_candidate(
+            variables = dict(item.get("variables") or {})
+            if item.get("hypothesis") is not None:
+                variables["hypothesis"] = item["hypothesis"]
+            candidate = self.research.add_candidate(
                     run_id,
                     name=str(item["name"]),
                     description=str(item.get("description") or ""),
                     formulation=item.get("formulation"),
-                    variables=item.get("variables") or {},
+                    variables=variables,
                     source_iteration=item.get("source_iteration"),
                     code_path=_local_artifact_path(item.get("code_path")),
                     values_path=_local_artifact_path(item.get("values_path")),
@@ -2823,7 +4559,24 @@ class LocalJobWorker:
                     label_horizon_days=int(item.get("label_horizon_days") or 1),
                     experiment_count=len(source_candidates),
                 )
-            )
+            formulation = str(item.get("formulation") or "").strip()
+            if formulation:
+                try:
+                    candidate = self.factor_library.register_candidate_expression(
+                        str(candidate["id"]),
+                        name=str(candidate["name"]),
+                        expression=formulation,
+                        proposed_family=str(
+                            variables.get("economic_family") or ""
+                        ),
+                        source_ref=f"rdagent-run:{run_id}",
+                    )
+                    candidate = self.research.get_candidate(str(candidate["id"]))
+                except ValueError:
+                    # Existing Python factor implementations remain compatible,
+                    # but cannot enter SOTA until they have a governed expression.
+                    pass
+            imported.append(candidate)
         return imported
 
     def _archive_rdagent_lab_artifacts(
@@ -3041,11 +4794,17 @@ class LocalJobWorker:
             "scenario-inputs",
             "isolated-qlib",
         }
+        omitted_symlinks = 0
         for path in sorted(root.rglob("*")):
+            # Upstream creates convenience links such as
+            # ``docker_execution_latest.log``.  They are not evidence and must
+            # never be followed, but their presence must not invalidate the
+            # immutable regular-file inventory either.
+            if path.is_symlink():
+                omitted_symlinks += 1
+                continue
             if not path.is_file() or path == sanitized_path:
                 continue
-            if path.is_symlink():
-                raise ValueError("RD-Agent audit evidence cannot contain symbolic links")
             resolved = path.resolve(strict=True)
             if not resolved.is_relative_to(root):
                 raise ValueError("RD-Agent audit evidence escapes its governed run root")
@@ -3075,6 +4834,7 @@ class LocalJobWorker:
             "scenario": scenario_id,
             "capital_eligible": False,
             "trace_summary": result.get("trace_summary") or {},
+            "omitted_symlink_count": omitted_symlinks,
             "files": inventory,
         }
         inventory_path = root / "trace-inventory.json"
@@ -3100,7 +4860,6 @@ class LocalJobWorker:
             "sanitized_result_sha256": str(result_artifact["content_sha256"]),
             "trace_inventory_artifact_id": str(inventory_artifact["id"]),
         }
-
     def _import_rdagent_model_candidates(self, run_id: str, job: dict, result: dict) -> list[dict]:
         payload = job["payload"]
         feature_set = payload.get("feature_set") or {}
@@ -3133,6 +4892,7 @@ class LocalJobWorker:
                 source_iteration=item.get("source_iteration"),
                 metadata={"scenario": "fin_model", "name": item.get("name")},
             )
+            model_hyperparameters = _frozen_rdagent_model_hyperparameters(item)
             candidate = self.rdagent_candidates.create_model_candidate(
                 research_run_id=run_id,
                 name=str(item.get("name") or f"model-{len(imported) + 1}"),
@@ -3140,7 +4900,7 @@ class LocalJobWorker:
                 model_type=str(item.get("model_type") or "Tabular"),
                 code_artifact_id=str(artifact["id"]),
                 architecture=dict(item.get("architecture") or {}),
-                model_hyperparameters=dict(item.get("model_hyperparameters") or {}),
+                model_hyperparameters=model_hyperparameters,
                 training_hyperparameters=dict(item.get("training_hyperparameters") or {}),
                 feature_set_id=str(feature_set["id"]),
                 dataset=str(payload["dataset"]),
@@ -3163,6 +4923,8 @@ class LocalJobWorker:
                     "code_path": str(code_path),
                     "code_sha256": expected_sha256,
                     "model_type": str(item.get("model_type") or "Tabular"),
+                    "model_engine": "rdagent_pytorch",
+                    "model_hyperparameters": model_hyperparameters,
                     "training_hyperparameters": dict(item.get("training_hyperparameters") or {}),
                 }
             )
@@ -3173,6 +4935,68 @@ class LocalJobWorker:
     def _queue_model_evaluation(self, job: dict, candidates: list[dict]) -> None:
         payload = job["payload"]
         feature_set = payload.get("feature_set") or {}
+        tournament_id = str(payload.get("research_tournament_id") or "")
+        if tournament_id:
+            if len(candidates) > 4:
+                raise ValueError(
+                    "one RD-Agent model lane may register at most four executable candidates"
+                )
+            for item in candidates:
+                candidate = self.rdagent_candidates.get_model_candidate(
+                    str(item["id"]), verify=True
+                )
+                manifest = dict(candidate.get("manifest_json") or {})
+                recipe = dict(manifest.get("recipe") or {})
+                hyperparameters = dict(recipe.get("model_hyperparameters") or {})
+                engine = str(
+                    recipe.get("model_engine")
+                    or hyperparameters.get("model_engine")
+                    or "rdagent_pytorch"
+                )
+                architecture_text = json.dumps(
+                    recipe.get("architecture") or {},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).lower()
+                if engine == "ridge_baseline":
+                    family = "ridge"
+                elif engine == "lightgbm_baseline":
+                    family = "lightgbm"
+                elif engine == "platform_gru" or "gru" in architecture_text:
+                    family = "gru"
+                elif engine == "platform_transformer" or "transformer" in architecture_text:
+                    family = "transformer"
+                else:
+                    family = "rdagent_custom"
+                self.research_tournaments.register_dynamic_model_trial(
+                    tournament_id=tournament_id,
+                    name=(
+                        f"rdagent-model:{payload['research_run_id']}:"
+                        f"{item['id']}"
+                    ),
+                    feature_set_id=str(feature_set["id"]),
+                    feature_set_definition_sha256=str(
+                        feature_set["definition_sha256"]
+                    ),
+                    model_family=family,
+                    candidate_id=str(item["id"]),
+                    spec={
+                        "source": "rdagent_fin_model",
+                        "research_run_id": str(payload["research_run_id"]),
+                        "candidate_manifest_sha256": str(
+                            candidate["manifest_sha256"]
+                        ),
+                        "model_engine": engine,
+                        "profiles": ["recent_3y", "balanced_5y", "robust_10y"],
+                        "seeds": [11, 29, 47],
+                        "final_oos_opened": False,
+                    },
+                    resource={
+                        "cpu_only": True,
+                        "evaluation_concurrency_cap": 3,
+                        "reserved_service_fraction": 0.25,
+                    },
+                )
         log_path = (
             self.settings.data_root
             / "platform"
@@ -3189,22 +5013,26 @@ class LocalJobWorker:
                 "evaluation_profiles": payload.get("evaluation_profiles") or [],
                 "feature_set_id": feature_set["id"],
                 "feature_set_definition_sha256": feature_set["definition_sha256"],
+                "feature_set": feature_set,
                 "candidates": candidates,
                 "universe": payload.get("universe", "cn_all"),
                 "benchmark": payload.get("benchmark", "SH000300"),
             },
             log_path,
+            dedupe_active_kind=False,
             idempotency_key=f"model-evaluate:{payload['research_run_id']}",
         )
         self.research.attach_job(payload["research_run_id"], evaluation_job["id"])
 
     def _import_model_evaluations(self, job: dict, result: dict) -> None:
         payload = job["payload"]
+        by_id = _indexed_independent_evaluations(job, result)
         artifact_path = (
             self.settings.data_root
             / "artifacts"
             / "model-evaluations"
             / payload["research_run_id"]
+            / job["id"]
             / "result.json"
         )
         artifact = self.rdagent_candidates.register_run_artifact(
@@ -3219,10 +5047,138 @@ class LocalJobWorker:
                 "feature_set_id": payload["feature_set_id"],
             },
         )
-        by_id = {str(item.get("candidate_id")): item for item in result.get("evaluations") or []}
+        if str(payload.get("evaluation_stage") or "") == "feature_screen":
+            if result.get("evaluation_stage") != "feature_screen":
+                raise ValueError("feature-screen evaluator returned another stage")
+            tournament_id = str(payload.get("research_tournament_id") or "")
+            raw_bindings = payload.get("candidate_bindings") or []
+            if (
+                not tournament_id
+                or result.get("research_tournament_id") != tournament_id
+                or result.get("candidate_bindings_sha256")
+                != factor_sota_sha256(raw_bindings)
+            ):
+                raise ValueError("feature-screen tournament identity changed")
+            bindings = {
+                str(item.get("candidate_id") or ""): str(item.get("trial_id") or "")
+                for item in raw_bindings
+                if isinstance(item, dict)
+            }
+            if (
+                len(bindings) != len(raw_bindings)
+                or len(set(bindings.values())) != len(raw_bindings)
+                or set(bindings) != {str(item["id"]) for item in payload["candidates"]}
+            ):
+                raise ValueError("feature-screen trial bindings are incomplete")
+            for candidate in payload["candidates"]:
+                candidate_id = str(candidate["id"])
+                trial_id = bindings[candidate_id]
+                item = by_id[candidate_id]
+                trial = self.research_tournaments.get_trial(trial_id)
+                if (
+                    str(trial.get("tournament_id") or "") != tournament_id
+                    or str(trial.get("candidate_id") or "") != candidate_id
+                ):
+                    raise ValueError("feature-screen candidate is bound to another trial")
+                if trial["status"] == "queued":
+                    self.research_tournaments.transition_trial(trial_id, "running")
+                if item.get("status") == "passed":
+                    evidence = item.get("evidence")
+                    if not isinstance(evidence, dict):
+                        raise ValueError("feature-screen evidence is missing")
+                    expected_sha = factor_sota_sha256(
+                        {
+                            key: value
+                            for key, value in evidence.items()
+                            if key != "evidence_sha256"
+                        }
+                    )
+                    cells = evidence.get("cells") or []
+                    if (
+                        evidence.get("contract_version")
+                        != "model-feature-screen-v1"
+                        or evidence.get("source") != "independent_qlib_recompute"
+                        or evidence.get("candidate_id") != candidate_id
+                        or evidence.get("dataset_identity_sha256")
+                        != payload["dataset_identity_sha256"]
+                        or evidence.get("feature_set_definition_sha256")
+                        != payload["feature_set_definition_sha256"]
+                        or evidence.get("selection_profile") != "recent_3y"
+                        or evidence.get("selection_seed") != 11
+                        or evidence.get("final_oos_opened") is not False
+                        or evidence.get("evidence_sha256") != expected_sha
+                        or item.get("evidence_sha256") != expected_sha
+                        or len(cells) != 1
+                    ):
+                        raise ValueError("feature-screen evidence identity is invalid")
+                    cell = dict(cells[0])
+                    for path_key, hash_key in (
+                        ("predictions_path", "predictions_sha256"),
+                        ("checkpoint_path", "checkpoint_sha256"),
+                        ("portfolio_report_path", "portfolio_report_sha256"),
+                    ):
+                        path = Path(str(cell.get(path_key) or "")).resolve()
+                        if (
+                            not path.is_file()
+                            or _sha256_path(path) != str(cell.get(hash_key) or "")
+                        ):
+                            raise ValueError(
+                                f"feature-screen {path_key} artifact changed"
+                            )
+                    self.research_tournaments.transition_trial(
+                        trial_id,
+                        "passed",
+                        candidate_id=candidate_id,
+                        metrics={"cells": [cell]},
+                        evidence=evidence,
+                    )
+                    self.rdagent_candidates.transition_candidate(
+                        "model",
+                        candidate_id,
+                        status="invalidated",
+                        reason="screening-only model; full-round candidate required",
+                        actor="autopilot",
+                    )
+                elif item.get("status") == "resource_blocked":
+                    self.research_tournaments.transition_trial(
+                        trial_id,
+                        "failed",
+                        candidate_id=candidate_id,
+                        metrics={"reason_code": item.get("reason_code")},
+                        evidence={
+                            "contract_version": "model-feature-screen-failure-v1",
+                            "error": str(item.get("error") or "resource blocked"),
+                            "investment_hypothesis_rejected": False,
+                        },
+                    )
+                else:
+                    self.research_tournaments.transition_trial(
+                        trial_id,
+                        "failed",
+                        candidate_id=candidate_id,
+                        metrics={"reason_code": "screen_execution_failed"},
+                        evidence={
+                            "contract_version": "model-feature-screen-failure-v1",
+                            "error": str(item.get("error") or "screen failed"),
+                            "investment_hypothesis_rejected": True,
+                        },
+                    )
+                    self.rdagent_candidates.transition_candidate(
+                        "model",
+                        candidate_id,
+                        status="rejected",
+                        reason=str(item.get("error") or "feature screen failed"),
+                        actor="autopilot",
+                    )
+            return
         for candidate in payload["candidates"]:
             candidate_id = str(candidate["id"])
             item = by_id.get(candidate_id)
+            if item and item.get("status") == "resource_blocked":
+                # Resource feasibility is an operational outcome. Keep the
+                # candidate non-terminal so it can be retried under a reviewed
+                # budget; never mislabel it as a failed investment hypothesis.
+                continue
             if not item or item.get("status") != "passed":
                 self.rdagent_candidates.transition_candidate(
                     "model",
@@ -3238,11 +5194,111 @@ class LocalJobWorker:
                 actor="worker",
             )
 
+    def _import_model_ensemble_evaluations(
+        self,
+        job: dict,
+        result: dict,
+        result_path: Path | None,
+    ) -> None:
+        if result_path is None or not result_path.is_file():
+            raise ValueError("model ensemble result artifact is missing")
+        by_id = {
+            str(item.get("ensemble_id") or ""): item
+            for item in result.get("evaluations") or []
+            if isinstance(item, dict)
+        }
+        for candidate in job["payload"].get("candidates") or []:
+            ensemble_id = str(candidate["id"])
+            evaluation = by_id.get(ensemble_id)
+            if evaluation is None:
+                raise ValueError("model ensemble result omitted a preregistered candidate")
+            self.research_tournaments.ingest_ensemble_evaluation_result(
+                ensemble_id,
+                evaluation=evaluation,
+                result_artifact_path=result_path,
+            )
+
+    def _freeze_fin_quant_baseline(self, payload: dict) -> dict[str, Any]:
+        champion = payload.get("prediction_champion")
+        selection = payload.get("prediction_champion_evidence")
+        if not isinstance(champion, dict) or not isinstance(selection, dict):
+            raise ValueError("fin_quant job has no frozen prediction champion")
+        selection_without_hash = {
+            key: value for key, value in selection.items() if key != "evidence_sha256"
+        }
+        global_multiple = selection.get("global_multiple_testing")
+        global_multiple_valid = (
+            isinstance(global_multiple, dict)
+            and global_multiple.get("contract_version")
+            == "prediction-finalist-multiple-testing-v2"
+            and factor_sota_sha256(
+                {
+                    key: value
+                    for key, value in global_multiple.items()
+                    if key != "evidence_sha256"
+                }
+            )
+            == str(global_multiple.get("evidence_sha256") or "")
+            and str(selection.get("global_multiple_testing_evidence_sha256") or "")
+            == str(global_multiple.get("evidence_sha256") or "")
+        )
+        if (
+            factor_sota_sha256(selection_without_hash)
+            != str(selection.get("evidence_sha256") or "")
+            or selection.get("contract_version")
+            != "prediction-champion-selection-v1"
+            or selection.get("selection_data") != "pre_final_only"
+            or selection.get("final_oos_opened") is not False
+            or str(selection.get("selected_kind") or "")
+            != str(champion.get("kind") or "")
+            or str(selection.get("selected_candidate_id") or "")
+            != str(champion.get("candidate_id") or "")
+            or not global_multiple_valid
+        ):
+            raise ValueError("fin_quant prediction champion evidence is invalid")
+        periods = dict(payload.get("periods") or {})
+        try:
+            pre_final_end = date.fromisoformat(str(periods["valid_end"]))
+            final_oos_start = date.fromisoformat(str(periods["test_start"]))
+            final_oos_end = date.fromisoformat(str(periods["test_end"]))
+        except (KeyError, ValueError) as exc:
+            raise ValueError("fin_quant prediction windows are invalid") from exc
+        frozen = self.rdagent_candidates.freeze_quant_baseline_prediction(
+            candidate_kind=str(champion.get("kind") or ""),
+            candidate_id=str(champion.get("candidate_id") or ""),
+            dataset=str(payload.get("dataset") or ""),
+            dataset_identity_sha256=str(
+                payload.get("dataset_identity_sha256") or ""
+            ),
+            pre_final_end=pre_final_end,
+            final_oos_start=final_oos_start,
+            final_oos_end=final_oos_end,
+        )
+        if (
+            str(champion.get("kind") or "") != str(frozen["kind"])
+            or str(champion.get("candidate_id") or "")
+            != str(frozen["candidate_id"])
+            or str(champion.get("manifest_sha256") or "")
+            != str(frozen["candidate_manifest_sha256"])
+            or str(champion.get("admission_evidence_sha256") or "")
+            != str(frozen["admission_evidence_sha256"])
+        ):
+            raise ValueError(
+                "fin_quant prediction champion changed after tournament selection"
+            )
+        frozen["selection_evidence_sha256"] = str(selection["evidence_sha256"])
+        frozen["evidence_sha256"] = factor_sota_sha256(
+            {key: value for key, value in frozen.items() if key != "evidence_sha256"}
+        )
+        return frozen
+
     def _queue_quant_bundle_evaluation(self, job: dict, result: dict) -> int:
         payload = job["payload"]
         feature_set = payload.get("feature_set") or {}
         periods = payload.get("periods") or {}
+        baseline = self._freeze_fin_quant_baseline(payload)
         eligible: list[dict] = []
+        preregistration_candidates: list[dict[str, Any]] = []
         model_artifacts: dict[str, dict] = {}
         for bundle in result.get("quant_bundles") or []:
             factors = []
@@ -3251,14 +5307,50 @@ class LocalJobWorker:
                 if not code_path.is_file() or _sha256_path(code_path) != factor.get("code_sha256"):
                     raise ValueError("RD-Agent quant factor artifact is invalid")
                 values_path = _local_artifact_path(factor.get("submitted_values_path"))
+                definition = None
+                formulation = str(factor.get("formulation") or "").strip()
+                if formulation:
+                    try:
+                        definition = self.factor_library.register_expression_definition(
+                            name=str(factor.get("name") or factor["id"]),
+                            expression=formulation,
+                            proposed_family=str(
+                                (factor.get("variables") or {}).get("economic_family")
+                                or ""
+                            ),
+                            alias=f"rdagent-quant:{factor['id']}",
+                            source_ref=(
+                                f"rdagent-quant-run:{payload['research_run_id']}"
+                            ),
+                        )
+                    except ValueError:
+                        definition = None
                 factors.append(
                     {
                         **factor,
                         "code_path": str(code_path),
                         "submitted_values_path": values_path,
+                        "implementation_kind": (
+                            "qlib_expression" if definition else "python_legacy"
+                        ),
+                        "factor_definition_id": (
+                            definition.get("id") if definition else None
+                        ),
+                        "expression": (
+                            definition.get("expression") if definition else None
+                        ),
+                        "required_fields": (
+                            definition.get("required_fields") if definition else []
+                        ),
+                        "economic_family": (
+                            definition.get("economic_family") if definition else None
+                        ),
                     }
                 )
             model = dict(bundle.get("model") or {})
+            model_hyperparameters = _frozen_rdagent_model_hyperparameters(model)
+            model["model_engine"] = "rdagent_pytorch"
+            model["model_hyperparameters"] = model_hyperparameters
             model_path = Path(str(_local_artifact_path(model.get("code_path"))))
             if (
                 not factors
@@ -3288,7 +5380,7 @@ class LocalJobWorker:
                 model_type=str(model.get("model_type") or "Tabular"),
                 code_artifact_id=str(model_artifact["id"]),
                 architecture=dict(model.get("architecture") or {}),
-                model_hyperparameters=dict(model.get("model_hyperparameters") or {}),
+                model_hyperparameters=model_hyperparameters,
                 training_hyperparameters=dict(model.get("training_hyperparameters") or {}),
                 feature_set_id=str(feature_set["id"]),
                 dataset=str(payload["dataset"]),
@@ -3330,6 +5422,7 @@ class LocalJobWorker:
                 name=str(bundle.get("name") or bundle["id"]),
                 description=str(bundle.get("description") or "RD-Agent fin_quant bundle"),
                 model_candidate_id=str(model_candidate["id"]),
+                baseline_prediction_champion=baseline,
                 factors=factors,
                 bundle_artifact_id=str(proposal_artifact["id"]),
                 experiment_family_id=str(bundle["experiment_family_id"]),
@@ -3352,6 +5445,7 @@ class LocalJobWorker:
                     "id": str(governed["id"]),
                     "experiment_family_id": str(bundle["experiment_family_id"]),
                     "feature_set_id": str(feature_set["id"]),
+                    "baseline_prediction_champion": baseline,
                     "factors": [
                         {
                             **factor,
@@ -3368,8 +5462,46 @@ class LocalJobWorker:
                     },
                 }
             )
+            preregistration_candidates.append(
+                {
+                    "candidate_id": str(governed["id"]),
+                    "bundle_manifest_sha256": str(
+                        governed["bundle_manifest_sha256"]
+                    ),
+                    "model_candidate_id": str(model_candidate["id"]),
+                    "factor_candidate_ids": sorted(
+                        str(item["candidate_id"])
+                        for item in governed["bundle_manifest_json"]["factors"]
+                    ),
+                    "experiment_family_id": str(bundle["experiment_family_id"]),
+                    "feature_set_id": str(feature_set["id"]),
+                    "feature_set_definition_sha256": str(
+                        feature_set["definition_sha256"]
+                    ),
+                    "baseline_prediction_champion_sha256": str(
+                        baseline["evidence_sha256"]
+                    ),
+                }
+            )
         if not eligible:
             raise ValueError("RD-Agent produced no executable factor/model bundle")
+        parent_tournament_id = str(payload.get("research_tournament_id") or "")
+        if not parent_tournament_id:
+            raise ValueError(
+                "fin_quant evaluation has no sealed model-tournament parent"
+            )
+        quant_tournament = self.research_tournaments.ensure_quant_preregistered(
+            parent_tournament_id=parent_tournament_id,
+            dataset_identity_sha256=str(payload["dataset_identity_sha256"]),
+            baseline_prediction_champion=baseline,
+            candidates=preregistration_candidates,
+        )
+        trial_ids = {
+            str(item["candidate_id"]): str(item["id"])
+            for item in quant_tournament["trials"]
+        }
+        if set(trial_ids) != {str(item["id"]) for item in eligible}:
+            raise ValueError("fin_quant evaluator candidates changed after preregistration")
         log_path = (
             self.settings.data_root
             / "platform"
@@ -3386,25 +5518,136 @@ class LocalJobWorker:
                 "evaluation_profiles": payload.get("evaluation_profiles") or [],
                 "feature_set_id": feature_set["id"],
                 "feature_set_definition_sha256": feature_set["definition_sha256"],
+                "feature_set": feature_set,
+                "baseline_prediction_champion": baseline,
                 "candidates": eligible,
+                "research_tournament_id": str(quant_tournament["id"]),
+                "parent_research_tournament_id": parent_tournament_id,
+                "research_tournament_manifest_sha256": str(
+                    quant_tournament["manifest_sha256"]
+                ),
+                "research_trial_ids": trial_ids,
+                **RESEARCH_SCREENING_MARKERS,
                 "universe": payload.get("universe", "cn_all"),
                 "benchmark": payload.get("benchmark", "SH000300"),
             },
             log_path,
-            idempotency_key=f"quant-bundle-evaluate:{payload['research_run_id']}",
+            idempotency_key=(
+                f"quant-bundle-evaluate:{payload['research_run_id']}:"
+                f"{quant_tournament['manifest_sha256']}"
+            ),
         )
         self.research.attach_job(payload["research_run_id"], evaluation_job["id"])
         return len(eligible)
 
-    def _import_quant_bundle_evaluation_artifact(self, job: dict, result: dict) -> None:
+    def _import_quant_bundle_evaluation_artifact(
+        self, job: dict, result: dict
+    ) -> list[dict]:
         payload = job["payload"]
-        if result.get("status") != "ok":
-            raise ValueError("quant bundle independent evaluation did not complete")
+        by_id = _indexed_independent_evaluations(job, result)
+        tournament_id = str(payload.get("research_tournament_id") or "")
+        parent_tournament_id = str(
+            payload.get("parent_research_tournament_id") or ""
+        )
+        trial_ids = {
+            str(key): str(value)
+            for key, value in dict(payload.get("research_trial_ids") or {}).items()
+        }
+        if (
+            not tournament_id
+            or not parent_tournament_id
+            or set(trial_ids) != set(by_id)
+            or payload.get("research_screening_only") is not True
+            or payload.get("not_capital_confirmation") is not True
+            or payload.get("cross_cycle_fwer_claimed") is not False
+            or payload.get("final_oos_opened") is not False
+        ):
+            raise ValueError("quant evaluator has no complete research-ledger binding")
+        receipt = dict(result.get("research_trial_ledger_receipt") or {})
+        receipt_sha = tournament_sha256(
+            {key: value for key, value in receipt.items() if key != "evidence_sha256"}
+        )
+        if (
+            receipt.get("contract_version")
+            != "fin-quant-research-ledger-receipt-v1"
+            or receipt.get("evidence_sha256") != receipt_sha
+            or receipt.get("research_tournament_id") != tournament_id
+            or receipt.get("parent_research_tournament_id")
+            != parent_tournament_id
+            or receipt.get("research_tournament_manifest_sha256")
+            != payload.get("research_tournament_manifest_sha256")
+            or dict(receipt.get("research_trial_ids") or {}) != trial_ids
+            or dict(receipt.get("candidate_statuses") or {})
+            != {
+                candidate_id: str(item.get("status") or "")
+                for candidate_id, item in by_id.items()
+            }
+            or receipt.get("research_screening_only") is not True
+            or receipt.get("not_capital_confirmation") is not True
+            or receipt.get("cross_cycle_fwer_claimed") is not False
+            or receipt.get("final_oos_opened") is not False
+        ):
+            raise ValueError("quant evaluator research-ledger receipt is invalid")
+        run_multiple = result.get("multiple_testing")
+        if run_multiple is not None:
+            if not isinstance(run_multiple, dict):
+                raise ValueError("quant run-level multiple-testing evidence is malformed")
+            multiple_sha = tournament_sha256(
+                {
+                    key: value
+                    for key, value in run_multiple.items()
+                    if key != "evidence_sha256"
+                }
+            )
+            definitions = [
+                dict(item) for item in run_multiple.get("trial_definitions") or []
+            ]
+            names = [str(item.get("name") or "") for item in definitions]
+            required_names = {
+                f"{candidate_id}:{ablation}"
+                for candidate_id in by_id
+                for ablation in (
+                    "factor_only",
+                    "model_only",
+                    "joint",
+                    "joint_vs_incumbent",
+                )
+            }
+            forced = {
+                str(key): float(value)
+                for key, value in dict(
+                    run_multiple.get("forced_raw_p_values") or {}
+                ).items()
+            }
+            failed_names = {
+                f"{candidate_id}:{ablation}"
+                for candidate_id, item in by_id.items()
+                if item.get("status") != "passed"
+                for ablation in (
+                    "factor_only",
+                    "model_only",
+                    "joint",
+                    "joint_vs_incumbent",
+                )
+            }
+            if (
+                run_multiple.get("evidence_sha256") != multiple_sha
+                or set(run_multiple.get("trial_names") or []) != set(names)
+                or not required_names.issubset(names)
+                or any(forced.get(name) != 1.0 for name in failed_names)
+                or run_multiple.get("final_oos_opened") is not False
+                or receipt.get("run_multiple_testing_evidence_sha256")
+                != multiple_sha
+            ):
+                raise ValueError("quant Holm/PBO family changed after evaluation")
+        elif any(item.get("status") == "passed" for item in by_id.values()):
+            raise ValueError("a quant candidate passed without batch-level statistics")
         artifact_path = (
             self.settings.data_root
             / "artifacts"
             / "quant-bundle-evaluations"
             / payload["research_run_id"]
+            / job["id"]
             / "result.json"
         )
         artifact = self.rdagent_candidates.register_run_artifact(
@@ -3422,35 +5665,478 @@ class LocalJobWorker:
                 ),
             },
         )
-        evaluated_ids = {str(item.get("candidate_id")) for item in result.get("evaluations") or []}
-        expected_ids = {str(item["id"]) for item in payload["candidates"]}
-        if evaluated_ids != expected_ids:
-            raise ValueError("quant evaluation candidate set disagrees with the job")
-        for candidate_id in sorted(expected_ids):
-            self.rdagent_candidates.ingest_quant_bundle_evaluation_result(
-                quant_bundle_candidate_id=candidate_id,
-                run_artifact_id=str(artifact["id"]),
-                actor="worker",
+        resource_blocks: list[dict] = []
+        outcomes: list[dict[str, Any]] = []
+        for candidate_id in sorted(by_id):
+            item = by_id[candidate_id]
+            evaluator_status = str(item.get("status") or "")
+            independent_evidence = dict(item.get("evidence") or {})
+            independent_sha = str(
+                item.get("evidence_sha256")
+                or independent_evidence.get("bundle_sha256")
+                or tournament_sha256(independent_evidence or item)
+            )
+            if item.get("status") == "resource_blocked":
+                resource_blocks.append(item)
+                terminal_status = "failed"
+            else:
+                current = self.rdagent_candidates.get_quant_bundle_candidate(
+                    candidate_id, verify=True
+                )
+                expected_status = (
+                    "research_admitted" if evaluator_status == "passed" else "rejected"
+                )
+                if str(current.get("status") or "") != expected_status:
+                    current = self.rdagent_candidates.ingest_quant_bundle_evaluation_result(
+                        quant_bundle_candidate_id=candidate_id,
+                        run_artifact_id=str(artifact["id"]),
+                        actor="worker",
+                    )
+                if str(current.get("status") or "") != expected_status:
+                    raise ValueError("quant candidate terminal projection is inconsistent")
+                terminal_status = (
+                    "passed"
+                    if evaluator_status == "passed"
+                    else (
+                        "rejected"
+                        if independent_evidence.get("multiple_testing")
+                        else "failed"
+                    )
+                )
+            trial_evidence = {
+                "contract_version": "fin-quant-research-trial-outcome-v1",
+                "research_tournament_id": tournament_id,
+                "research_trial_id": trial_ids[candidate_id],
+                "candidate_id": candidate_id,
+                "evaluator_status": evaluator_status,
+                "terminal_status": terminal_status,
+                "result_artifact_id": str(artifact["id"]),
+                "result_artifact_sha256": str(artifact["content_sha256"]),
+                "independent_evidence_sha256": independent_sha,
+                "run_multiple_testing_evidence_sha256": (
+                    str(run_multiple.get("evidence_sha256") or "")
+                    if isinstance(run_multiple, dict)
+                    else None
+                ),
+                "research_trial_ledger_receipt_sha256": receipt_sha,
+                "reason": str(item.get("error") or item.get("reason_code") or "")[:3000],
+                **RESEARCH_SCREENING_MARKERS,
+            }
+            outcomes.append(
+                {
+                    "candidate_id": candidate_id,
+                    "status": terminal_status,
+                    "evidence_sha256": independent_sha,
+                    "reason": trial_evidence["reason"],
+                    "evidence": trial_evidence,
+                }
+            )
+        screening_evidence = build_quant_screening_evidence(
+            tournament_id=tournament_id,
+            parent_tournament_id=parent_tournament_id,
+            dataset_identity_sha256=str(payload["dataset_identity_sha256"]),
+            outcomes=outcomes,
+            run_multiple_testing=run_multiple,
+        )
+        screening_evidence["research_trial_ledger_receipt"] = receipt
+        screening_evidence["research_trial_ledger_receipt_sha256"] = receipt_sha
+        screening_evidence["evidence_sha256"] = tournament_sha256(
+            {
+                key: value
+                for key, value in screening_evidence.items()
+                if key != "evidence_sha256"
+            }
+        )
+        self.research_tournaments.complete_quant_screening(
+            tournament_id,
+            outcomes=outcomes,
+            screening_evidence=screening_evidence,
+        )
+        return resource_blocks
+
+    def _settle_quant_tournament_failure(self, job: dict, *, reason: str) -> None:
+        """Retain every preregistered quant hypothesis after a terminal job failure."""
+
+        if job.get("kind") != "quant_bundle_evaluate":
+            return
+        payload = dict(job.get("payload") or {})
+        tournament_id = str(payload.get("research_tournament_id") or "")
+        parent_tournament_id = str(
+            payload.get("parent_research_tournament_id") or ""
+        )
+        if not tournament_id or not parent_tournament_id:
+            return
+        tournament = self.research_tournaments.get_tournament(tournament_id)
+        if str(tournament.get("status") or "") == "succeeded":
+            return
+        trial_ids = {
+            str(key): str(value)
+            for key, value in dict(payload.get("research_trial_ids") or {}).items()
+        }
+        candidate_ids = sorted(
+            str(item.get("id") or "") for item in payload.get("candidates") or []
+        )
+        if not candidate_ids or set(candidate_ids) != set(trial_ids):
+            raise ValueError("failed quant job lost its preregistered candidate family")
+        outcomes: list[dict[str, Any]] = []
+        for candidate_id in candidate_ids:
+            trial_evidence = {
+                "contract_version": "fin-quant-research-trial-outcome-v1",
+                "research_tournament_id": tournament_id,
+                "research_trial_id": trial_ids[candidate_id],
+                "candidate_id": candidate_id,
+                "evaluator_status": "job_failed",
+                "terminal_status": "failed",
+                "reason": str(reason or "quant evaluation job failed")[:3000],
+                **RESEARCH_SCREENING_MARKERS,
+            }
+            outcomes.append(
+                {
+                    "candidate_id": candidate_id,
+                    "status": "failed",
+                    "evidence_sha256": tournament_sha256(trial_evidence),
+                    "reason": trial_evidence["reason"],
+                    "evidence": trial_evidence,
+                }
+            )
+        screening_evidence = build_quant_screening_evidence(
+            tournament_id=tournament_id,
+            parent_tournament_id=parent_tournament_id,
+            dataset_identity_sha256=str(payload["dataset_identity_sha256"]),
+            outcomes=outcomes,
+            run_multiple_testing=None,
+            failure_reason=reason,
+        )
+        self.research_tournaments.complete_quant_screening(
+            tournament_id,
+            outcomes=outcomes,
+            screening_evidence=screening_evidence,
+        )
+
+    def _import_factor_sota_evaluation(
+        self, job: dict, result: dict
+    ) -> dict[str, object]:
+        payload = job["payload"]
+        validate_factor_sota_result_contract(payload, result)
+        result_path = (
+            self.settings.data_root
+            / "artifacts"
+            / "factor-sota-evaluations"
+            / str(
+                payload.get("evaluation_scope_id")
+                or payload.get("research_campaign_id")
+                or job["id"]
+            )
+            / "result.json"
+        )
+        if not result_path.is_file():
+            raise ValueError("factor SOTA result artifact is missing")
+        artifact_sha256 = _sha256_path(result_path)
+        trial_hashes: dict[str, str] = {}
+        for trial in result.get("trials") or []:
+            candidate_id = str(trial["factor_candidate_id"])
+            trial_hash = factor_sota_sha256(trial)
+            trial["trial_evidence_sha256"] = trial_hash
+            trial_hashes[candidate_id] = trial_hash
+        result["result_artifact_sha256"] = artifact_sha256
+        result["trial_evidence_sha256"] = trial_hashes
+        result["research_screening_only"] = True
+        result["not_capital_confirmation"] = True
+        accepted = list(result.get("accepted") or [])
+        if not accepted:
+            return {
+                "accepted_factor_candidate_id": None,
+                "research_sota_version_id": None,
+                "attempted_hypotheses": int(result.get("attempted_hypotheses") or 0),
+                "result_artifact_sha256": artifact_sha256,
+                "negative_result": "no_factor_sota_candidate_passed",
+            }
+        member = accepted[0]
+        candidate_id = str(member["factor_candidate_id"])
+        incremental = dict(member.get("incremental_evidence") or {})
+        periods = {
+            str(item["id"]): dict(item["periods"])
+            for item in payload.get("evaluation_profiles") or []
+        }
+        sota = self._admit_factor_sota_acceptance(
+            job=job,
+            result=result,
+            member=member,
+            incremental=incremental,
+            periods=periods,
+            artifact_sha256=artifact_sha256,
+            trial_hashes=trial_hashes,
+        )
+        register_feature_set(self.factor_library.sota_feature_set(str(sota["id"])))
+        result["research_sota_version_id"] = str(sota["id"])
+        return {
+            "accepted_factor_candidate_id": candidate_id,
+            "research_sota_version_id": str(sota["id"]),
+            "attempted_hypotheses": int(result.get("attempted_hypotheses") or 0),
+            "result_artifact_sha256": artifact_sha256,
+        }
+
+    def _admit_factor_sota_acceptance(
+        self,
+        *,
+        job: dict,
+        result: dict,
+        member: dict,
+        incremental: dict,
+        periods: dict[str, dict],
+        artifact_sha256: str,
+        trial_hashes: dict[str, str],
+    ) -> dict:
+        """Atomically consume one frozen baseline before factor promotion."""
+
+        payload = job["payload"]
+        candidate_id = str(member["factor_candidate_id"])
+        admission_path = str(member.get("admission_path") or "")
+        if admission_path not in {"standalone", "incremental"}:
+            raise ValueError("factor SOTA result has an invalid admission path")
+        dataset = str(payload["dataset"])
+        universe = str(payload.get("universe") or "cn_all")
+        label_horizon_days = int(member.get("label_horizon_days") or 1)
+        expected_predecessor_id = payload.get("predecessor_id")
+        evidence = {
+            "contract_version": str(result["contract_version"]),
+            "job_id": str(job["id"]),
+            "research_run_id": str(payload["research_run_id"]),
+            "autopilot_cycle_id": str(payload["autopilot_cycle_id"]),
+            "frozen_model_sha256": str(payload["frozen_model_sha256"]),
+            "experiment_family_id": str(payload["experiment_family_id"]),
+            "attempted_hypotheses": int(result.get("attempted_hypotheses") or 0),
+            "result_artifact_sha256": artifact_sha256,
+            "trial_evidence_sha256": trial_hashes,
+            "accepted_factor_candidate_id": candidate_id,
+            "admission_path": admission_path,
+            "dataset_identity_sha256": str(payload["dataset_identity_sha256"]),
+            "dataset_lineage_id": str(payload["dataset_lineage_id"]),
+            "dataset_lineage_verified": payload.get("dataset_lineage_verified") is True,
+            "dataset_end_date": str(payload["dataset_end_date"]),
+            "predecessor_id": expected_predecessor_id,
+            "predecessor_roll_forward": payload.get("predecessor_roll_forward"),
+            "research_screening_only": True,
+            "not_capital_confirmation": True,
+            "final_oos_opened": False,
+        }
+        admission_scope = (
+            "factor-sota-admission-lineage:"
+            f"{payload['dataset_lineage_id']}:{universe}:{label_horizon_days}"
+        )
+        published_daily = [
+            item
+            for item in list_qlib_datasets(self.settings.data_root)
+            if item.get("ready")
+            and item.get("reproducible")
+            and item.get("lineage_verified")
+            and item.get("lineage_id")
+            and item.get("frequency") == "day"
+        ]
+        latest_daily = max(
+            published_daily,
+            key=lambda item: (str(item.get("end_date") or ""), str(item["name"])),
+            default=None,
+        )
+        if (
+            latest_daily is None
+            or str((latest_daily.get("provenance") or {}).get("dataset_identity_sha256") or "")
+            != str(payload["dataset_identity_sha256"])
+        ):
+            raise ValueError(
+                "factor SOTA result is not bound to the latest published daily Qlib identity"
+            )
+        with self.factor_library.engine.begin() as connection:
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:scope))"),
+                {"scope": admission_scope},
+            )
+            cycle = connection.execute(
+                select(
+                    autopilot_cycles.c.status,
+                    autopilot_cycles.c.dataset_identity_sha256,
+                    autopilot_cycles.c.state_json,
+                )
+                .where(
+                    autopilot_cycles.c.id
+                    == str(payload["autopilot_cycle_id"])
+                )
+                .with_for_update()
+            ).first()
+            cycle_state = dict(cycle.state_json or {}) if cycle is not None else {}
+            if (
+                cycle is None
+                or str(cycle.status) != "active"
+                or str(cycle.dataset_identity_sha256)
+                != str(payload["dataset_identity_sha256"])
+                or cycle_state.get("historical_results_only") is True
+                or cycle_state.get("capital_eligible") is False
+                or cycle_state.get("final_oos_must_not_open") is True
+            ):
+                raise ValueError(
+                    "factor SOTA result belongs to a superseded or non-current "
+                    "autopilot cycle"
+                )
+            active = connection.execute(
+                select(
+                    research_sota_versions.c.id,
+                    research_sota_versions.c.evidence_json,
+                ).where(
+                    research_sota_versions.c.dataset == dataset,
+                    research_sota_versions.c.universe == universe,
+                    research_sota_versions.c.label_horizon_days == label_horizon_days,
+                    research_sota_versions.c.status == "active",
+                )
+            ).first()
+            active_id = str(active.id) if active is not None else None
+            if (
+                active is not None
+                and (active.evidence_json or {}).get("result_artifact_sha256")
+                == artifact_sha256
+            ):
+                candidate = self.research.get_candidate(candidate_id)
+                validate_promoted_factor_sota_admission(
+                    candidate,
+                    admission_path=admission_path,
+                    paired_evidence=incremental,
+                )
+                return self.factor_library.get_sota(active_id)
+            if active_id != expected_predecessor_id:
+                roll_forward = payload.get("predecessor_roll_forward")
+                if not (
+                    active_id is None
+                    and expected_predecessor_id is not None
+                    and isinstance(roll_forward, dict)
+                    and str(roll_forward.get("predecessor_id") or "")
+                    == str(expected_predecessor_id)
+                    and roll_forward.get("mode") in {"exact", "roll_forward"}
+                ):
+                    raise ValueError(
+                        "factor SOTA frozen baseline was already consumed by another candidate"
+                    )
+                source = connection.execute(
+                    select(
+                        research_sota_versions.c.status,
+                        research_sota_versions.c.dataset,
+                        research_sota_versions.c.dataset_identity_sha256,
+                        research_sota_versions.c.universe,
+                        research_sota_versions.c.label_horizon_days,
+                    ).where(research_sota_versions.c.id == expected_predecessor_id)
+                ).first()
+                if (
+                    source is None
+                    or source.status != "active"
+                    or str(source.dataset)
+                    != str(roll_forward.get("source_dataset") or "")
+                    or str(source.dataset_identity_sha256)
+                    != str(
+                        roll_forward.get("source_dataset_identity_sha256") or ""
+                    )
+                    or source.universe != universe
+                    or int(source.label_horizon_days) != label_horizon_days
+                ):
+                    raise ValueError(
+                        "factor SOTA roll-forward predecessor was already consumed or changed"
+                    )
+
+            candidate = self.research.get_candidate(candidate_id)
+            if candidate["status"] == "promoted":
+                validate_promoted_factor_sota_admission(
+                    candidate,
+                    admission_path=admission_path,
+                    paired_evidence=incremental,
+                )
+            elif admission_path == "standalone":
+                self.research.record_profile_consensus(
+                    candidate_id,
+                    evaluation_ids={
+                        str(profile_id): str(evaluation_id)
+                        for profile_id, evaluation_id in dict(
+                            incremental.get("evaluation_ids") or {}
+                        ).items()
+                    },
+                    actor="autopilot",
+                )
+                self.research.promote(
+                    candidate_id,
+                    actor="autopilot",
+                    reason=(
+                        "Automatic research promotion after three-window standalone "
+                        "consensus and frozen-model paired SOTA ablation with shared "
+                        "BH correction."
+                    ),
+                )
+            else:
+                self.research.record_incremental_admission(
+                    candidate_id,
+                    evidence=incremental,
+                    actor="autopilot",
+                )
+                self.research.promote(
+                    candidate_id,
+                    actor="autopilot",
+                    reason=(
+                        "Automatic research promotion after frozen-model paired increment, "
+                        "three governed windows and shared BH correction."
+                    ),
+                )
+            validate_promoted_factor_sota_admission(
+                self.research.get_candidate(candidate_id),
+                admission_path=admission_path,
+                paired_evidence=incremental,
+            )
+            return self.factor_library.activate_sota(
+                dataset=dataset,
+                dataset_identity_sha256=str(payload["dataset_identity_sha256"]),
+                universe=universe,
+                label_horizon_days=label_horizon_days,
+                periods=periods,
+                members=list(result["members"]),
+                evidence=evidence,
+                actor="autopilot",
+                expected_predecessor_id=expected_predecessor_id,
             )
 
     def _queue_factor_evaluation(self, job: dict, candidates: list[dict]) -> None:
         payload = job["payload"]
-        eligible = [
-            {
-                "id": item["id"],
-                "code_path": item["code_path"],
-                "values_path": item["values_path"],
-                "experiment_family_id": item["experiment_family_id"],
-                "label_horizon_days": item["label_horizon_days"],
-                "experiment_count": item["experiment_count"],
-            }
-            for item in candidates
-            if item.get("rdagent_decision") is not False
-            and item.get("code_path")
-            and Path(item["code_path"]).exists()
-            and item.get("values_path")
-            and Path(item["values_path"]).exists()
-        ]
+        eligible: list[dict] = []
+        for item in candidates:
+            if not (
+                item.get("rdagent_decision") is not False
+                and item.get("code_path")
+                and Path(item["code_path"]).exists()
+                and item.get("values_path")
+                and Path(item["values_path"]).exists()
+            ):
+                continue
+            definition = None
+            if item.get("factor_definition_id"):
+                definition = self.factor_library.get_definition(
+                    str(item["factor_definition_id"])
+                )
+            legacy_fields = list(
+                (item.get("variables") or {}).get("required_fields")
+                or ["open", "close", "high", "low", "volume", "factor"]
+            )
+            eligible.append(
+                {
+                    "id": item["id"],
+                    "code_path": item["code_path"],
+                    "values_path": item["values_path"],
+                    "implementation_kind": (
+                        "qlib_expression" if definition is not None else "python_legacy"
+                    ),
+                    "factor_definition_id": item.get("factor_definition_id"),
+                    "expression": definition.get("expression") if definition else None,
+                    "required_fields": (
+                        definition.get("required_fields") if definition else legacy_fields
+                    ),
+                    "economic_family": item.get("economic_family"),
+                    "experiment_family_id": item["experiment_family_id"],
+                    "label_horizon_days": item["label_horizon_days"],
+                    "experiment_count": item["experiment_count"],
+                }
+            )
         if not eligible:
             raise ValueError("RD-Agent produced no executable factor value artifacts")
         log_path = (
@@ -3482,23 +6168,37 @@ class LocalJobWorker:
         self.research.attach_job(payload["research_run_id"], evaluation_job["id"])
 
     def _import_factor_evaluations(self, job: dict, result: dict) -> None:
+        validate_factor_evaluation_result_contract(job, result)
         payload = job["payload"]
         artifact_path = (
             self.settings.data_root
             / "artifacts"
             / "factor-evaluations"
             / payload["research_run_id"]
+            / job["id"]
             / "result.json"
         )
         evaluations = sorted(
             result.get("evaluations", []),
-            key=lambda item: str(
-                ((item.get("metrics") or {}).get("research_profile") or {}).get("id") or ""
+            key=lambda item: (
+                str(item.get("candidate_id") or ""),
+                0 if item.get("status") == "ok" else 1,
+                str(
+                    ((item.get("metrics") or {}).get("research_profile") or {}).get("id")
+                    or ""
+                ),
             ),
         )
         for item in evaluations:
-            period_values = item.get("periods") or payload["periods"]
-            periods = {key: date.fromisoformat(value) for key, value in period_values.items()}
+            import_state, periods, profile_id = (
+                self._factor_evaluation_outcome_import_state(
+                    job,
+                    item,
+                    artifact_path=artifact_path,
+                )
+            )
+            if import_state == "identical":
+                continue
             if item.get("status") != "ok":
                 # Design draft 4.2/6.6: failed/timed-out trials are ledgered as
                 # evaluation_failed, never silently dropped.
@@ -3508,6 +6208,8 @@ class LocalJobWorker:
                     dataset_identity_sha256=payload["dataset_identity_sha256"],
                     **periods,
                     error=str(item.get("error") or "evaluation failed"),
+                    evaluation_attempt_id=str(job["id"]),
+                    research_profile_id=profile_id,
                 )
                 continue
             self.research.record_evaluation(
@@ -3521,6 +6223,106 @@ class LocalJobWorker:
                 recomputed_values_sha256=item["recomputed_values_sha256"],
                 recompute_evidence=item["recompute_evidence"],
             )
+        for candidate_id in sorted(
+            {str(item.get("candidate_id") or "") for item in evaluations}
+        ):
+            if candidate_id:
+                self.research.reconcile_multi_profile_admission_state(candidate_id)
+
+    def _factor_evaluation_outcome_import_state(
+        self,
+        job: dict,
+        item: dict,
+        *,
+        artifact_path: Path,
+    ) -> tuple[str, dict[str, date], str | None]:
+        """Resolve one frozen outcome and query its exact ledger binding."""
+
+        payload = job["payload"]
+        period_values = item.get("periods") or payload["periods"]
+        required_period_keys = (
+            "train_start",
+            "train_end",
+            "valid_start",
+            "valid_end",
+            "test_start",
+            "test_end",
+        )
+        try:
+            periods = {
+                key: date.fromisoformat(str(period_values[key]))
+                for key in required_period_keys
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("factor evaluation periods are invalid") from exc
+        profile_id = self._factor_evaluation_profile_id(payload, item, periods)
+        outcome_status = "ok" if item.get("status") == "ok" else "failed"
+        import_state = self.research.factor_evaluation_outcome_import_state(
+            str(item["candidate_id"]),
+            evaluation_attempt_id=str(job["id"]),
+            artifact_path=str(artifact_path),
+            dataset=str(payload["dataset"]),
+            dataset_identity_sha256=str(payload["dataset_identity_sha256"]),
+            periods=periods,
+            research_profile_id=profile_id,
+            outcome_status=outcome_status,
+            metrics=item.get("metrics") if outcome_status == "ok" else None,
+            recomputed_values_sha256=(
+                str(item["recomputed_values_sha256"])
+                if outcome_status == "ok"
+                else None
+            ),
+            recompute_evidence=(
+                item.get("recompute_evidence") if outcome_status == "ok" else None
+            ),
+            error=(
+                str(item.get("error") or "evaluation failed")
+                if outcome_status == "failed"
+                else None
+            ),
+        )
+        return import_state, periods, profile_id
+
+    @staticmethod
+    def _factor_evaluation_profile_id(
+        payload: dict,
+        item: dict,
+        periods: dict[str, date],
+    ) -> str | None:
+        """Bind an outcome to exactly one frozen profile, including failures."""
+
+        period_strings = {key: value.isoformat() for key, value in periods.items()}
+        configured_profiles = payload.get("evaluation_profiles") or []
+        reported_profile = (item.get("metrics") or {}).get("research_profile") or {}
+        reported_profile_id = (
+            str(reported_profile.get("id") or "")
+            if isinstance(reported_profile, dict)
+            else ""
+        )
+        if not configured_profiles:
+            return reported_profile_id or None
+        matches = []
+        for profile in configured_profiles:
+            if not isinstance(profile, dict):
+                continue
+            frozen_periods = profile.get("periods") or {}
+            if all(
+                str(frozen_periods.get(key) or "") == value
+                for key, value in period_strings.items()
+            ):
+                matches.append(profile)
+        if len(matches) != 1:
+            raise ValueError(
+                "factor evaluation outcome does not match exactly one frozen profile"
+            )
+        profile_id = str(matches[0].get("id") or "")
+        if not profile_id:
+            raise ValueError("factor evaluation profile has no immutable identity")
+        if reported_profile_id and reported_profile_id != profile_id:
+            raise ValueError("factor evaluation reported the wrong research profile")
+        if item.get("status") == "ok" and reported_profile_id != profile_id:
+            raise ValueError("successful factor evaluation omitted its research profile")
+        return profile_id
 
     def _import_external_factor_evaluations(self, job: dict, result: dict) -> None:
         payload = job["payload"]
@@ -3652,6 +6454,10 @@ class LocalJobWorker:
                 }
             )
         return candidates
+
+
+# Backwards-compatible public name used by diagnostics and older deployments.
+Worker = LocalJobWorker
 
 
 def _failure_message(log_path: Path, fallback: str) -> str:

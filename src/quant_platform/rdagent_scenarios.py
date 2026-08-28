@@ -15,12 +15,18 @@ from quant_data.research_assets import validate_finetune_asset_contract
 
 RDAGENT_GENERIC_JOB_KIND = "rdagent_run"
 RDAGENT_LEGACY_FACTOR_JOB_KIND = "rdagent_factor"
+RDAGENT_MODEL_JOB_KIND = "rdagent_model"
+RDAGENT_QUANT_JOB_KIND = "rdagent_quant"
+RDAGENT_REPORT_JOB_KIND = "rdagent_factor_report"
 RDAGENT_DATA_SCIENCE_JOB_KIND = "rdagent_data_science"
 RDAGENT_LLM_FINETUNE_JOB_KIND = "rdagent_llm_finetune"
 RDAGENT_JOB_KINDS = frozenset(
     {
         RDAGENT_GENERIC_JOB_KIND,
         RDAGENT_LEGACY_FACTOR_JOB_KIND,
+        RDAGENT_MODEL_JOB_KIND,
+        RDAGENT_QUANT_JOB_KIND,
+        RDAGENT_REPORT_JOB_KIND,
         RDAGENT_DATA_SCIENCE_JOB_KIND,
         RDAGENT_LLM_FINETUNE_JOB_KIND,
     }
@@ -63,6 +69,9 @@ class RDAgentScenario:
         # share the generic, registry-dispatched durable worker path.
         return {
             "fin_factor": RDAGENT_LEGACY_FACTOR_JOB_KIND,
+            "fin_model": RDAGENT_MODEL_JOB_KIND,
+            "fin_quant": RDAGENT_QUANT_JOB_KIND,
+            "fin_factor_report": RDAGENT_REPORT_JOB_KIND,
             "data_science": RDAGENT_DATA_SCIENCE_JOB_KIND,
             "llm_finetune": RDAGENT_LLM_FINETUNE_JOB_KIND,
         }.get(self.id, RDAGENT_GENERIC_JOB_KIND)

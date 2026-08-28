@@ -15,13 +15,21 @@ import threading
 import time
 from pathlib import Path
 
-from quant_platform.feature_set_registry import get_feature_set
+from quant_platform.feature_set_registry import resolve_feature_set
 from quant_platform.rdagent_scenarios import get_rdagent_scenario
 
 
 def _duration_seconds(value: str) -> int:
     amount = int(value[:-1])
     return amount * (60 if value.endswith("m") else 3600)
+
+
+def _normalize_openai_compatible_model(env: dict[str, str]) -> None:
+    """Give LiteLLM an explicit provider for OpenAI-compatible endpoints."""
+
+    model = str(env.get("CHAT_MODEL") or "").strip()
+    if model and "/" not in model and str(env.get("OPENAI_API_BASE") or "").strip():
+        env["CHAT_MODEL"] = f"openai/{model}"
 
 
 def _read_options(path: str | None) -> dict[str, str]:
@@ -322,12 +330,12 @@ def _verify_feature_set(args: argparse.Namespace) -> str | None:
         return None
     if not args.feature_set_id or not args.feature_set_sha256 or not args.base_features:
         raise ValueError(f"{args.scenario} requires a governed feature set")
-    expected = get_feature_set(args.feature_set_id)
-    if expected["definition_sha256"] != args.feature_set_sha256:
-        raise ValueError("governed feature set digest disagrees with the registry")
     root = Path(_require_path(args.base_features, directory=True))
     base_factors = json.loads((root / "base_factors.json").read_text(encoding="utf-8"))
     definition = json.loads((root / "definition.json").read_text(encoding="utf-8"))
+    expected = resolve_feature_set(args.feature_set_id, definition)
+    if expected["definition_sha256"] != args.feature_set_sha256:
+        raise ValueError("governed feature set digest disagrees with the registry")
     if base_factors != expected["features"] or definition != expected:
         raise ValueError("staged governed feature set definition disagrees")
     return str(root)
@@ -338,6 +346,9 @@ def _scenario_command(args: argparse.Namespace) -> list[str]:
     assets = list(args.asset)
     options = _read_options(args.scenario_options)
     base_features = _verify_feature_set(args)
+    governed_module_runner = str(
+        Path(__file__).resolve().with_name("run_rdagent_module.py")
+    )
     if scenario.id in {
         "fin_factor",
         "fin_model",
@@ -358,11 +369,12 @@ def _scenario_command(args: argparse.Namespace) -> list[str]:
         raise ValueError(f"{scenario.id} does not accept document/data assets")
     if scenario.id == "fin_factor":
         return [
-            args.command,
-            scenario.command,
-            "--loop-n",
+            sys.executable,
+            governed_module_runner,
+            "rdagent.app.qlib_rd_loop.factor",
+            "--loop_n",
             str(args.loop_n),
-            "--all-duration",
+            "--all_duration",
             args.duration,
         ]
     if scenario.id in {"fin_model", "fin_quant"}:
@@ -372,7 +384,7 @@ def _scenario_command(args: argparse.Namespace) -> list[str]:
         }[scenario.id]
         return [
             sys.executable,
-            "-m",
+            governed_module_runner,
             module,
             "--loop_n",
             str(args.loop_n),
@@ -391,11 +403,12 @@ def _scenario_command(args: argparse.Namespace) -> list[str]:
                 "fin_factor_report requires one governed report per allowed loop"
             )
         return [
-            args.command,
-            scenario.command,
-            "--report-folder",
+            sys.executable,
+            governed_module_runner,
+            "rdagent.app.qlib_rd_loop.factor_from_report",
+            "--report_folder",
             str(report_root),
-            "--all-duration",
+            "--all_duration",
             args.duration,
         ]
     if scenario.id == "general_model":
@@ -468,6 +481,7 @@ def _scenario_command(args: argparse.Namespace) -> list[str]:
 
 def run(args: argparse.Namespace) -> None:
     env = os.environ.copy()
+    _normalize_openai_compatible_model(env)
     env["LOG_TRACE_PATH"] = args.trace
     env["QUANTLAB_RDAGENT_SCENARIO"] = args.scenario
     command = _scenario_command(args)

@@ -114,6 +114,11 @@ def test_pair_backtest_uses_minute_execution_costs_and_atomic_legs() -> None:
     assert metrics["borrow_cost_enforced"] is True
     assert metrics["capacity_fill_ratio"] >= 0.95
     assert all(len(item["orders"]) == 2 for item in result["trades"])
+    assert all(
+        pd.Timestamp(item["signal_date"]) < pd.Timestamp(item["trade_date"])
+        for item in result["trades"]
+    )
+    assert metrics["open_position_at_end"] is False
     assert (result["daily"]["nav"] > 0).all()
 
 
@@ -156,7 +161,7 @@ def test_pair_backtest_rejects_missing_minute_execution_evidence() -> None:
     )
     assert result["metrics"]["trade_count"] == 0
     assert any(
-        "missing_valid_minute_execution_window" in item["reason"]
+        "missing_common_execution_window" in item["reason"]
         for item in result["rejections"]
     )
 
