@@ -243,6 +243,11 @@ def model_refresh_decision(
     }
 
 FACTOR_LIBRARY_MIN_FREE_BYTES = 300 * 1024**3
+FACTOR_LIBRARY_MATERIALIZATION_RETRY_CONTRACT_VERSION = (
+    "factor-library-materialization-retry-v1"
+)
+FACTOR_LIBRARY_MATERIALIZATION_MAX_EPISODES = 3
+FACTOR_LIBRARY_MATERIALIZATION_ATTEMPTS_PER_EPISODE = 2
 
 
 class ScheduleRunWaiting(RuntimeError):
@@ -772,6 +777,135 @@ class SchedulerEngine:
         identity = str(dataset["provenance"]["dataset_identity_sha256"])
         start = str(dataset["start_date"])
         end = str(dataset["end_date"])
+        desired_feature_sets = self._desired_factor_materialization_feature_sets()
+        selected: tuple[dict[str, Any], str, dict[str, Any]] | None = None
+        for candidate_set in desired_feature_sets:
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "factor-library-materializations"
+                / identity
+                / str(candidate_set["definition_sha256"])[:16]
+                / "manifest.json"
+            )
+            manifest: dict[str, Any] = {}
+            if output.is_file():
+                try:
+                    manifest = json.loads(output.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    pass
+            if factor_materialization_manifest_matches(
+                manifest,
+                dataset_identity_sha256=identity,
+                feature_set=candidate_set,
+                start=start,
+                end=end,
+            ):
+                continue
+            base_key = (
+                f"factor-library:{identity}:{candidate_set['definition_sha256']}:"
+                f"cn_all:{start}:{end}"
+            )
+            retry_plan = self._factor_materialization_retry_plan(base_key)
+            if retry_plan["decision"] == "enqueue":
+                selected = (candidate_set, base_key, retry_plan)
+                break
+            if retry_plan["decision"] in {"cancelled", "exhausted"}:
+                self.alerts.create(
+                    source_type="platform",
+                    source_id=str(candidate_set["definition_sha256"]),
+                    severity=(
+                        "error" if retry_plan["decision"] == "exhausted" else "warning"
+                    ),
+                    category="factor_library_materialization_blocked",
+                    title="因子物化自动重试已停止",
+                    message=(
+                        "该冻结因子集已耗尽自动重试预算，需检查失败证据后人工处理。"
+                        if retry_plan["decision"] == "exhausted"
+                        else "该冻结因子集的最近任务已被取消，不会自动恢复。"
+                    ),
+                    dedupe_key=(
+                        "platform:factor-library:materialization-blocked:"
+                        f"{identity}:{candidate_set['definition_sha256']}:"
+                        f"{retry_plan['decision']}"
+                    ),
+                    details={
+                        "dataset_identity_sha256": identity,
+                        "feature_set_id": candidate_set["id"],
+                        "feature_set_definition_sha256": candidate_set[
+                            "definition_sha256"
+                        ],
+                        "retry_contract_version": (
+                            FACTOR_LIBRARY_MATERIALIZATION_RETRY_CONTRACT_VERSION
+                        ),
+                        "max_episodes": FACTOR_LIBRARY_MATERIALIZATION_MAX_EPISODES,
+                        "attempts_per_episode": (
+                            FACTOR_LIBRARY_MATERIALIZATION_ATTEMPTS_PER_EPISODE
+                        ),
+                        "latest_job_id": retry_plan.get("parent_job_id"),
+                    },
+                )
+        if selected is None:
+            return 0
+        feature_set, idempotency_base, retry_plan = selected
+        episode = int(retry_plan["episode"])
+        materialization_target = {
+            "contract_version": "factor-library-materialization-target-v1",
+            "dataset_identity_sha256": identity,
+            "feature_set_definition_sha256": feature_set["definition_sha256"],
+            "universe": "cn_all",
+            "start": start,
+            "end": end,
+        }
+        payload = {
+            "dataset": str(dataset["name"]),
+            "dataset_path": str(dataset["path"]),
+            "dataset_identity_sha256": identity,
+            "feature_set_id": feature_set["id"],
+            "feature_set_definition_sha256": feature_set["definition_sha256"],
+            "feature_set_definition": (
+                feature_set
+                if str(feature_set["id"]).startswith("strategy-health:")
+                else None
+            ),
+            "library_version_id": (
+                feature_set["source"]
+                if str(feature_set.get("source") or "").startswith(
+                    "unified-factor-library"
+                )
+                else None
+            ),
+            "universe": "cn_all",
+            "start": start,
+            "end": end,
+            "materialization_target_sha256": canonical_sha256(materialization_target),
+            "retry_contract_version": (
+                FACTOR_LIBRARY_MATERIALIZATION_RETRY_CONTRACT_VERSION
+            ),
+            "retry_episode": episode,
+            "retry_parent_evidence": retry_plan.get("parent_evidence"),
+        }
+        try:
+            job = self.jobs.create(
+                "factor_library_materialize",
+                payload,
+                self.settings.data_root
+                / "platform"
+                / "logs"
+                / (
+                    f"factor-library-{identity[:12]}-"
+                    f"{str(feature_set['definition_sha256'])[:12]}-e{episode}.log"
+                ),
+                idempotency_key=f"{idempotency_base}:episode:{episode}",
+                max_attempts=FACTOR_LIBRARY_MATERIALIZATION_ATTEMPTS_PER_EPISODE,
+            )
+        except ValueError as exc:
+            if "active factor_library_materialize job" in str(exc):
+                return 0
+            raise
+        return int(job["status"] in {"queued", "running"})
+
+    def _desired_factor_materialization_feature_sets(self) -> list[dict[str, Any]]:
         desired_feature_sets = [get_feature_set("unified-research-v1")]
         with self.jobs.engine.connect() as connection:
             active_version_ids = connection.scalars(
@@ -805,75 +939,80 @@ class SchedulerEngine:
                     )
                 }
             )
-        feature_set: dict[str, Any] | None = None
-        for candidate_set in desired_feature_sets:
-            output = (
-                self.settings.data_root
-                / "artifacts"
-                / "factor-library-materializations"
-                / identity
-                / str(candidate_set["definition_sha256"])[:16]
-                / "manifest.json"
-            )
-            manifest: dict[str, Any] = {}
-            if output.is_file():
-                try:
-                    manifest = json.loads(output.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    pass
-            if factor_materialization_manifest_matches(
-                manifest,
-                dataset_identity_sha256=identity,
-                feature_set=candidate_set,
-                start=start,
-                end=end,
-            ):
-                continue
-            feature_set = candidate_set
-            break
-        if feature_set is None:
-            return 0
-        payload = {
-            "dataset": str(dataset["name"]),
-            "dataset_path": str(dataset["path"]),
-            "dataset_identity_sha256": identity,
-            "feature_set_id": feature_set["id"],
-            "feature_set_definition_sha256": feature_set["definition_sha256"],
-            "feature_set_definition": (
-                feature_set
-                if str(feature_set["id"]).startswith("strategy-health:")
-                else None
-            ),
-            "library_version_id": (
-                feature_set["source"]
-                if str(feature_set.get("source") or "").startswith(
-                    "unified-factor-library"
-                )
-                else None
-            ),
-            "universe": "cn_all",
-            "start": start,
-            "end": end,
+        return desired_feature_sets
+
+    def _factor_materialization_retry_plan(self, idempotency_base: str) -> dict[str, Any]:
+        episode_keys = {
+            idempotency_base: 1,
+            **{
+                f"{idempotency_base}:episode:{episode}": episode
+                for episode in range(1, FACTOR_LIBRARY_MATERIALIZATION_MAX_EPISODES + 1)
+            },
         }
-        try:
-            job = self.jobs.create(
-                "factor_library_materialize",
-                payload,
-                self.settings.data_root
-                / "platform"
-                / "logs"
-                / f"factor-library-{identity[:12]}.log",
-                idempotency_key=(
-                    f"factor-library:{identity}:{feature_set['definition_sha256']}:"
-                    f"cn_all:{start}:{end}"
-                ),
-                max_attempts=2,
-            )
-        except ValueError as exc:
-            if "active factor_library_materialize job" in str(exc):
-                return 0
-            raise
-        return int(job["status"] in {"queued", "running"})
+        with self.jobs.engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    jobs.c.id,
+                    jobs.c.idempotency_key,
+                    jobs.c.status,
+                    jobs.c.attempts,
+                    jobs.c.max_attempts,
+                    jobs.c.exit_code,
+                    jobs.c.error,
+                    jobs.c.created_at,
+                ).where(
+                    jobs.c.kind == "factor_library_materialize",
+                    jobs.c.idempotency_key.in_(tuple(episode_keys)),
+                )
+            ).all()
+        if not rows:
+            return {"decision": "enqueue", "episode": 1}
+        history = sorted(
+            (
+                (episode_keys[str(row.idempotency_key)], row)
+                for row in rows
+                if str(row.idempotency_key) in episode_keys
+            ),
+            key=lambda item: (item[0], item[1].created_at, str(item[1].id)),
+        )
+        episode, parent = history[-1]
+        parent_evidence = {
+            "job_id": str(parent.id),
+            "status": str(parent.status),
+            "episode": episode,
+            "attempts": int(parent.attempts),
+            "max_attempts": int(parent.max_attempts),
+            "exit_code": parent.exit_code,
+            "error_sha256": canonical_sha256({"error": str(parent.error or "")}),
+        }
+        parent_evidence["evidence_sha256"] = canonical_sha256(parent_evidence)
+        if str(parent.status) in {"queued", "running"}:
+            return {
+                "decision": "wait",
+                "episode": episode,
+                "parent_job_id": str(parent.id),
+                "parent_evidence": parent_evidence,
+            }
+        if str(parent.status) == "cancelled":
+            return {
+                "decision": "cancelled",
+                "episode": episode,
+                "parent_job_id": str(parent.id),
+                "parent_evidence": parent_evidence,
+            }
+        if episode >= FACTOR_LIBRARY_MATERIALIZATION_MAX_EPISODES:
+            return {
+                "decision": "exhausted",
+                "episode": episode,
+                "parent_job_id": str(parent.id),
+                "parent_evidence": parent_evidence,
+            }
+        return {
+            "decision": "enqueue",
+            "episode": episode + 1,
+            "parent_job_id": str(parent.id),
+            "parent_evidence": parent_evidence,
+        }
 
     def _enqueue_due_simulation_order_plans(self, now: datetime) -> int:
         """Generate one immutable daily paper order plan per active strategy account."""

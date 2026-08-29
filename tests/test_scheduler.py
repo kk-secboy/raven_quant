@@ -7,9 +7,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 from governance_fixtures import governed_etf_ready_evidence
+from sqlalchemy import update
 
 from quant_data.config import Settings
 from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES, OPTIONAL_COVERAGE_BUNDLES
+from quant_data.database import jobs
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_data.qlib_builder import build_qlib_output_manifest
@@ -22,6 +24,9 @@ from quant_platform.research_store import ResearchStore
 from quant_platform.schedule_store import ScheduleStore
 from quant_platform.scheduler import (
     AUTOMATED_DATA_BUNDLES,
+    FACTOR_LIBRARY_MATERIALIZATION_ATTEMPTS_PER_EPISODE,
+    FACTOR_LIBRARY_MATERIALIZATION_MAX_EPISODES,
+    FACTOR_LIBRARY_MATERIALIZATION_RETRY_CONTRACT_VERSION,
     SchedulerEngine,
     factor_materialization_manifest_matches,
 )
@@ -199,6 +204,156 @@ def test_scheduler_automatically_enqueues_factor_library_materialization(
     assert payload["universe"] == "cn_all"
     assert payload["start"] == "2024-01-02"
     assert payload["end"] == "2025-01-02"
+    assert payload["retry_episode"] == 1
+    assert payload["retry_parent_evidence"] is None
+    assert payload["retry_contract_version"] == (
+        FACTOR_LIBRARY_MATERIALIZATION_RETRY_CONTRACT_VERSION
+    )
+    assert len(payload["materialization_target_sha256"]) == 64
+    assert queued[0]["max_attempts"] == (
+        FACTOR_LIBRARY_MATERIALIZATION_ATTEMPTS_PER_EPISODE
+    )
+
+
+def test_scheduler_bounds_failed_materialization_episodes_and_advances_feature_sets(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(database_url, tmp_path)
+    _write_qlib_dataset(
+        settings.data_root,
+        name="cn-daily-20250102",
+        frequency="day",
+        start="2024-01-02",
+        end="2025-01-02",
+        source_lineage_id="a" * 64,
+    )
+    monkeypatch.setattr("quant_platform.scheduler.FACTOR_LIBRARY_MIN_FREE_BYTES", 0)
+    engine = SchedulerEngine(settings)
+    primary = get_feature_set("unified-research-v1")
+    secondary = {
+        "contract_version": "feature-set-v1",
+        "id": "strategy-health:test-secondary",
+        "name": "strategy health secondary",
+        "features": {"secondary-factor": "$close/$open-1"},
+        "source": "strategy-version:test-secondary",
+        "definition_sha256": "e" * 64,
+    }
+    monkeypatch.setattr(
+        engine,
+        "_desired_factor_materialization_feature_sets",
+        lambda: [primary, secondary],
+    )
+    store = JobStore(database_url)
+    identity = "b" * 64
+    legacy_base_key = (
+        f"factor-library:{identity}:{primary['definition_sha256']}:"
+        "cn_all:2024-01-02:2025-01-02"
+    )
+    legacy = store.create(
+        "factor_library_materialize",
+        {
+            "dataset": "cn-daily-20250102",
+            "dataset_path": str(settings.data_root / "qlib" / "cn-daily-20250102"),
+            "dataset_identity_sha256": identity,
+            "feature_set_id": primary["id"],
+            "feature_set_definition_sha256": primary["definition_sha256"],
+            "feature_set_definition": None,
+            "library_version_id": primary["source"],
+            "universe": "cn_all",
+            "start": "2024-01-02",
+            "end": "2025-01-02",
+        },
+        settings.data_root / "platform" / "logs" / "legacy-materialization.log",
+        idempotency_key=legacy_base_key,
+        max_attempts=FACTOR_LIBRARY_MATERIALIZATION_ATTEMPTS_PER_EPISODE,
+    )
+    with store.engine.begin() as connection:
+        connection.execute(
+            update(jobs)
+            .where(jobs.c.id == legacy["id"])
+            .values(
+                status="failed",
+                attempts=legacy["max_attempts"],
+                exit_code=1,
+                error="legacy fixed-key materialization failed",
+                finished_at=datetime.now(UTC),
+            )
+        )
+    prior_id = str(legacy["id"])
+    for episode in range(2, FACTOR_LIBRARY_MATERIALIZATION_MAX_EPISODES + 1):
+        assert engine._enqueue_due_factor_library_materialization(
+            datetime(2025, 1, 2, 10, episode, tzinfo=UTC)
+        ) == 1
+        current = store.list(
+            statuses=("queued",), kinds=("factor_library_materialize",), limit=1
+        )[0]
+        assert current["payload"]["feature_set_id"] == primary["id"]
+        assert current["payload"]["retry_episode"] == episode
+        assert current["max_attempts"] == (
+            FACTOR_LIBRARY_MATERIALIZATION_ATTEMPTS_PER_EPISODE
+        )
+        parent = current["payload"]["retry_parent_evidence"]
+        assert parent["job_id"] == prior_id
+        assert parent["status"] == "failed"
+        assert parent["episode"] == episode - 1
+        assert len(parent["error_sha256"]) == 64
+        assert len(parent["evidence_sha256"]) == 64
+        with store.engine.begin() as connection:
+            connection.execute(
+                update(jobs)
+                .where(jobs.c.id == current["id"])
+                .values(
+                    status="failed",
+                    attempts=current["max_attempts"],
+                    exit_code=1,
+                    error=f"materialization episode {episode} failed",
+                    finished_at=datetime.now(UTC),
+                )
+            )
+        prior_id = str(current["id"])
+
+    # The exhausted primary target is not recreated on every tick.  The same
+    # scheduler pass advances to the next governed strategy feature set.
+    exhausted = engine._factor_materialization_retry_plan(legacy_base_key)
+    assert exhausted["decision"] == "exhausted"
+    assert exhausted["episode"] == FACTOR_LIBRARY_MATERIALIZATION_MAX_EPISODES
+    assert exhausted["parent_job_id"] == prior_id
+    assert engine._enqueue_due_factor_library_materialization(
+        datetime(2025, 1, 2, 10, 10, tzinfo=UTC)
+    ) == 1
+    latest = store.list(
+        statuses=("queued",), kinds=("factor_library_materialize",), limit=1
+    )[0]
+    assert latest["payload"]["feature_set_id"] == secondary["id"]
+    assert latest["payload"]["retry_episode"] == 1
+    assert latest["payload"]["retry_parent_evidence"] is None
+    all_jobs = store.list(kinds=("factor_library_materialize",), limit=20)
+    primary_jobs = [
+        item
+        for item in all_jobs
+        if item["payload"]["feature_set_id"] == primary["id"]
+    ]
+    assert len(primary_jobs) == FACTOR_LIBRARY_MATERIALIZATION_MAX_EPISODES
+    assert sum("retry_episode" not in item["payload"] for item in primary_jobs) == 1
+    assert {
+        item["payload"]["retry_episode"]
+        for item in primary_jobs
+        if "retry_episode" in item["payload"]
+    } == set(range(2, FACTOR_LIBRARY_MATERIALIZATION_MAX_EPISODES + 1))
+    with store.engine.begin() as connection:
+        connection.execute(
+            update(jobs)
+            .where(jobs.c.id == latest["id"])
+            .values(status="cancelled", finished_at=datetime.now(UTC))
+        )
+    job_count = len(all_jobs)
+    assert engine._enqueue_due_factor_library_materialization(
+        datetime(2025, 1, 2, 10, 11, tzinfo=UTC)
+    ) == 0
+    assert engine._enqueue_due_factor_library_materialization(
+        datetime(2025, 1, 2, 10, 12, tzinfo=UTC)
+    ) == 0
+    assert len(store.list(kinds=("factor_library_materialize",), limit=20)) == job_count
 
 
 def test_scheduler_materializes_once_and_enqueues_incremental_job(
