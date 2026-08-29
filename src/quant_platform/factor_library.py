@@ -12,7 +12,7 @@ from quant_data.qlib_builder import qlib_research_field_catalog
 from .upstream_versions import QLIB_COMMIT
 
 FACTOR_LIBRARY_CONTRACT_VERSION = "factor-library-v1"
-QLIB_EXPRESSION_CONTRACT_VERSION = "qlib-expression-allowlist-v1"
+QLIB_EXPRESSION_CONTRACT_VERSION = "qlib-expression-allowlist-v2"
 FACTOR_FAMILY_POLICY_VERSION = "economic-family-v1"
 
 ECONOMIC_FAMILIES = frozenset(
@@ -38,6 +38,7 @@ _ALLOWED_FUNCTIONS = frozenset(
         "Corr",
         "EMA",
         "Greater",
+        "If",
         "IdxMax",
         "IdxMin",
         "Less",

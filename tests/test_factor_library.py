@@ -125,6 +125,16 @@ def test_expression_compiler_rejects_future_and_unknown_capabilities() -> None:
         compile_qlib_expression("Mean($secret_field,20)")
 
 
+def test_expression_compiler_allows_pinned_qlib_conditional_operator() -> None:
+    compiled = compile_qlib_expression(
+        "If(Greater($high-$low,Abs($high-Ref($close,1))),$high-$low,0)"
+    )
+
+    assert compiled.functions == ("Abs", "Greater", "If", "Ref")
+    assert compiled.max_lookback_days == 1
+    assert compiled.to_dict()["contract_version"] == "qlib-expression-allowlist-v2"
+
+
 def test_duplicate_and_cluster_thresholds_are_distinct() -> None:
     assert relationship_for_correlation(0.75) == "independent"
     assert relationship_for_correlation(0.75001) == "clustered"

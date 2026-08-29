@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from quant_platform.api import StrategyConfigRequest
+from quant_platform.factor_library import compile_qlib_expression
 from quant_platform.portfolio_policy import PortfolioPolicyConfig
 from quant_platform.strategy_recipes import (
     RECIPE_VERSION,
@@ -125,9 +126,12 @@ def test_transparent_short_swing_long_research_baselines_have_fixed_rule_ir() ->
     assert long["config_overrides"]["industry_relative_rank"] is True
     assert long["config_overrides"]["portfolio_construction"] == "topk_equal_weight"
     for recipe_id in horizons:
-        execution = get_strategy_recipe(recipe_id)["config_overrides"]
+        recipe = get_strategy_recipe(recipe_id)
+        execution = recipe["config_overrides"]
         assert execution["execution_method"] == "open"
         assert execution["execution_frequency"] == "day"
+        for factor in recipe["factor_baseline"]:
+            compile_qlib_expression(factor["qlib_expression"])
 
 
 def test_unknown_strategy_recipe_fails_closed() -> None:
