@@ -504,7 +504,7 @@ def run(args: argparse.Namespace) -> None:
     )
     env["QUANTLAB_COSTEER_KNOWLEDGE_STATUS_JSON"] = json.dumps(
         {
-            "contract_version": "costeer-knowledge-status-v1",
+            "contract_version": "costeer-knowledge-status-v2",
             "status": (
                 "embedding_retrieval_configured"
                 if embeddings_configured
@@ -514,13 +514,24 @@ def run(args: argparse.Namespace) -> None:
             "retrieval_mode": (
                 "embedding_rag" if embeddings_configured else "typed_empty_knowledge"
             ),
-            "costeer_used": args.scenario != "fin_strategy",
+            "costeer_used": True,
             "empty_knowledge_forced": (
                 not embeddings_configured
                 and args.scenario
-                in {"fin_factor", "fin_model", "fin_quant", "fin_factor_report"}
+                in {
+                    "fin_factor",
+                    "fin_model",
+                    "fin_quant",
+                    "fin_factor_report",
+                    "fin_strategy",
+                }
             ),
-            "strategy_codegen_used": False if args.scenario == "fin_strategy" else None,
+            "strategy_codegen_used": True if args.scenario == "fin_strategy" else None,
+            "strategy_codegen_target": (
+                "allowlisted_rule_ir_and_contract_tests"
+                if args.scenario == "fin_strategy"
+                else None
+            ),
             "strategy_compiler": (
                 "deterministic_allowlist" if args.scenario == "fin_strategy" else None
             ),

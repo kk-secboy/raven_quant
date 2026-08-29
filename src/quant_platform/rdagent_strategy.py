@@ -4,12 +4,24 @@ import asyncio
 import json
 import os
 import re
+from collections.abc import Generator
 from copy import deepcopy
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
+from rdagent.components.coder.CoSTEER import CoSTEER
+from rdagent.components.coder.CoSTEER.config import CoSTEERSettings
+from rdagent.components.coder.CoSTEER.evaluators import (
+    CoSTEERMultiFeedback,
+    CoSTEERSingleFeedback,
+)
+from rdagent.components.coder.CoSTEER.evolvable_subjects import EvolvingItem
+from rdagent.components.coder.CoSTEER.task import CoSTEERTask
 from rdagent.core.conf import RD_AGENT_SETTINGS
-from rdagent.core.experiment import Experiment, Task
+from rdagent.core.evolving_agent import RAGEvaluator
+from rdagent.core.evolving_framework import EvolvingStrategy, EvoStep, QueriedKnowledge
+from rdagent.core.experiment import Experiment, FBWorkspace
 from rdagent.core.proposal import Hypothesis, HypothesisFeedback, Trace
 from rdagent.core.scenario import Scenario
 from rdagent.log import rdagent_logger as logger
@@ -166,6 +178,7 @@ def _proposal_prompt(
     seed: dict[str, Any],
     features: dict[str, str],
     prior_artifacts: list[dict[str, Any]],
+    repair_feedback: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     system_prompt = (
         "You are the proposal stage of a governed, simulation-only A-share strategy research loop. "
@@ -200,9 +213,12 @@ def _proposal_prompt(
             },
             "complete_valid_seed": seed,
             "prior_structurally_accepted_artifacts": prior_artifacts[-3:],
+            "previous_deterministic_validation": repair_feedback,
             "instruction": (
                 "Propose one falsifiable challenger. Preserve every frozen field exactly. "
-                "Return the complete proposal, including all eight slots in the seed order."
+                "If previous_deterministic_validation is present, repair that exact structural "
+                "failure. Return the complete proposal, including all eight slots in the seed "
+                "order."
             ),
         },
         ensure_ascii=False,
@@ -249,6 +265,212 @@ class StrategyExperiment(Experiment):
     pass
 
 
+class StrategyProposalTask(CoSTEERTask):
+    """One governed rule-IR proposal task evolved by official CoSTEER."""
+
+    def __init__(
+        self,
+        *,
+        seed: dict[str, Any],
+        objective: str,
+        features: dict[str, str],
+        prior_artifacts: list[dict[str, Any]],
+    ) -> None:
+        super().__init__(
+            name=str(seed["name"]),
+            description="Generate and repair one research-only allowlisted strategy-rule IR.",
+        )
+        self.seed = deepcopy(seed)
+        self.objective = objective
+        self.features = dict(features)
+        self.prior_artifacts = deepcopy(prior_artifacts)
+
+    def get_task_information(self) -> str:
+        """Keep the RAG identity governed and free of untrusted research prose."""
+
+        return json.dumps(
+            {
+                "contract_version": STRATEGY_PROPOSAL_VERSION,
+                "horizon": self.seed["horizon"],
+                "baseline_recipe_id": self.seed["baseline_recipe_id"],
+                "baseline_rules_sha256": self.seed["baseline_rules_sha256"],
+                "parent_strategy_version_id": self.seed["parent_strategy_version_id"],
+                "dataset_snapshot_id": self.seed["data_contract"]["dataset_snapshot_id"],
+                "feature_set_definition_sha256": self.seed["data_contract"][
+                    "feature_set_definition_sha256"
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+
+class StrategyProposalWorkspace(FBWorkspace):
+    """A JSON-only CoSTEER workspace; no generated code is executable."""
+
+    @property
+    def all_codes(self) -> str:
+        return self._format_code_dict(self.file_dict)
+
+
+def _repair_feedback(evolving_trace: list[EvoStep] | None) -> dict[str, Any] | None:
+    if not evolving_trace:
+        return None
+    feedback = evolving_trace[-1].feedback
+    if not isinstance(feedback, CoSTEERMultiFeedback) or not len(feedback):
+        return None
+    item = feedback[0]
+    if item is None or item.final_decision:
+        return None
+    validation = str(item.return_checking or item.execution).strip()
+    return {
+        "attempt": len(evolving_trace),
+        "contract_accepted": False,
+        "feedback": validation[:2000],
+    }
+
+
+class StrategyProposalEvolvingStrategy(EvolvingStrategy[EvolvingItem]):
+    """Use CoSTEER's evolving trace to repair governed proposal JSON."""
+
+    def evolve_iter(
+        self,
+        evo: EvolvingItem,
+        queried_knowledge: QueriedKnowledge | None = None,
+        evolving_trace: list[EvoStep] | None = None,
+    ) -> Generator[EvolvingItem, None, None]:
+        if len(evo.sub_tasks) != 1 or not isinstance(
+            evo.sub_tasks[0], StrategyProposalTask
+        ):
+            raise RuntimeError("fin_strategy CoSTEER received an unsupported task")
+        task = evo.sub_tasks[0]
+        system_prompt, user_prompt = _proposal_prompt(
+            objective=task.objective,
+            seed=task.seed,
+            features=task.features,
+            prior_artifacts=task.prior_artifacts,
+            repair_feedback=_repair_feedback(evolving_trace),
+        )
+        response = APIBackend().build_messages_and_create_chat_completion(
+            user_prompt,
+            system_prompt,
+            json_mode=True,
+            json_target_type=dict[str, Any],
+            chat_cache_prefix=(
+                f"fin-strategy-coster-{1 if not evolving_trace else len(evolving_trace) + 1}"
+            ),
+        )
+        if not isinstance(response, str):
+            raise ValueError("fin_strategy CoSTEER returned a non-text proposal")
+        workspace = evo.sub_workspace_list[0]
+        if not isinstance(workspace, StrategyProposalWorkspace):
+            workspace = StrategyProposalWorkspace(target_task=task)
+            evo.sub_workspace_list[0] = workspace
+        workspace.inject_files(**{"strategy_proposal.json": response})
+        workspace.change_summary = (
+            "Generated governed proposal JSON"
+            if not evolving_trace
+            else "Repaired proposal JSON from deterministic contract feedback"
+        )
+        # queried_knowledge is deliberately mediated by CoSTEER. This scenario keeps
+        # cross-run pickle knowledge disabled and consumes the in-run evolving trace.
+        _ = queried_knowledge
+        yield evo
+
+
+class StrategyProposalEvaluator(RAGEvaluator):
+    """Return CoSTEER feedback from deterministic proposal and IR checks."""
+
+    @staticmethod
+    def _evaluate(evo: EvolvingItem) -> CoSTEERMultiFeedback:
+        if len(evo.sub_tasks) != 1 or not isinstance(
+            evo.sub_tasks[0], StrategyProposalTask
+        ):
+            raise RuntimeError("fin_strategy CoSTEER evaluator received an unsupported task")
+        task = evo.sub_tasks[0]
+        workspace = evo.sub_workspace_list[0]
+        try:
+            if not isinstance(workspace, StrategyProposalWorkspace):
+                raise ValueError("strategy proposal workspace is missing")
+            raw = workspace.file_dict.get("strategy_proposal.json")
+            proposal = parse_strategy_proposal_json(raw)
+            _enforce_frozen_bindings(proposal, seed=task.seed)
+            artifact = compile_strategy_proposal(
+                proposal,
+                allowed_factor_ids=set(task.features),
+            )
+            workspace.running_info.result = artifact
+        except ValueError as exc:
+            return CoSTEERMultiFeedback(
+                [
+                    CoSTEERSingleFeedback(
+                        execution="No generated strategy code was executed.",
+                        return_checking=f"{type(exc).__name__}: {exc}",
+                        code="The proposal failed deterministic allowlist checks.",
+                        final_decision=False,
+                        source_feedback={"strategy_rule_contract": False},
+                    )
+                ]
+            )
+        return CoSTEERMultiFeedback(
+            [
+                CoSTEERSingleFeedback(
+                    execution="No generated strategy code was executed.",
+                    return_checking=(
+                        "Proposal JSON, frozen bindings, component parameters and compiled "
+                        "strategy-rule IR passed deterministic checks."
+                    ),
+                    code="Only allowlisted strategy-rule IR was accepted.",
+                    final_decision=True,
+                    source_feedback={"strategy_rule_contract": True},
+                )
+            ]
+        )
+
+    def evaluate_iter(
+        self,
+        queried_knowledge: object | None = None,
+        evolving_trace: list[EvoStep] | None = None,
+    ) -> Generator[CoSTEERMultiFeedback, EvolvingItem | None, CoSTEERMultiFeedback]:
+        evo = yield CoSTEERMultiFeedback([])
+        if evo is None:
+            return CoSTEERMultiFeedback([])
+        feedback = self._evaluate(evo)
+        yield feedback
+        _ = queried_knowledge, evolving_trace
+        return feedback
+
+
+class StrategyProposalCoSTEER(CoSTEER):
+    """Official CoSTEER with ephemeral knowledge and deterministic IR evaluation."""
+
+    def __init__(self, scenario: StrategyScenario) -> None:
+        settings = CoSTEERSettings(
+            max_loop=3,
+            knowledge_base_path=None,
+            new_knowledge_base_path=None,
+            enable_filelock=False,
+            filelock_path=None,
+        )
+        # Pinned RD-Agent v2 hardcodes graph.pkl beneath cwd. Construct the empty
+        # graph in a fresh directory so an untrusted cross-run pickle can never load.
+        original_cwd = Path.cwd()
+        with TemporaryDirectory(prefix="quantlab-fin-strategy-coster-") as temp_dir:
+            try:
+                os.chdir(temp_dir)
+                super().__init__(
+                    settings,
+                    StrategyProposalEvaluator(),
+                    StrategyProposalEvolvingStrategy(scenario),
+                    evolving_version=2,
+                    with_knowledge=True,
+                    knowledge_self_gen=False,
+                    max_loop=3,
+                )
+            finally:
+                os.chdir(original_cwd)
+
+
 class StrategyRDLoop(LoopBase, metaclass=LoopMeta):
     def __init__(self, base_features_path: str) -> None:
         if RD_AGENT_SETTINGS.get_max_parallel() != 1:
@@ -258,7 +480,9 @@ class StrategyRDLoop(LoopBase, metaclass=LoopMeta):
         if not self.objective:
             raise ValueError("fin_strategy requires a governed research objective")
         self.horizon, self.parent_strategy_version_id = _frozen_strategy_binding()
-        self.trace = Trace(scen=StrategyScenario())
+        scenario = StrategyScenario()
+        self.trace = Trace(scen=scenario)
+        self.coder = StrategyProposalCoSTEER(scenario)
         super().__init__()
 
     def proposal(self, prev_out: dict[str, Any]) -> StrategyExperiment:
@@ -271,48 +495,8 @@ class StrategyRDLoop(LoopBase, metaclass=LoopMeta):
             features=self.features,
             parent_strategy_version_id=self.parent_strategy_version_id,
         )
-        system_prompt, user_prompt = _proposal_prompt(
-            objective=self.objective,
-            seed=seed,
-            features=self.features,
-            prior_artifacts=horizon_prior,
-        )
-        proposal: dict[str, Any] | None = None
-        last_error: ValueError | None = None
-        for attempt in range(1, 4):
-            attempt_prompt = user_prompt
-            if attempt > 1:
-                attempt_prompt += (
-                    "\nA previous response failed deterministic contract validation. "
-                    "Return the complete seed unchanged except for a deliberate, valid "
-                    "challenger diff."
-                )
-            response = APIBackend().build_messages_and_create_chat_completion(
-                attempt_prompt,
-                system_prompt,
-                json_mode=True,
-                json_target_type=dict[str, Any],
-                chat_cache_prefix=f"fin-strategy-attempt-{attempt}",
-            )
-            try:
-                proposal = parse_strategy_proposal_json(response)
-                _enforce_frozen_bindings(proposal, seed=seed)
-                # Validate the whole rule IR before the proposal enters Trace.
-                compile_strategy_proposal(proposal, allowed_factor_ids=set(self.features))
-                break
-            except ValueError as exc:
-                proposal = None
-                last_error = exc
-                logger.warning(
-                    f"Rejected fin_strategy JSON attempt {attempt} of 3: "
-                    f"{type(exc).__name__}"
-                )
-        if proposal is None:
-            raise ValueError("fin_strategy failed to produce governed JSON after 3 attempts") from (
-                last_error
-            )
         hypothesis = Hypothesis(
-            hypothesis=proposal["economic_hypothesis"],
+            hypothesis=self.objective,
             reason=f"Research-only {horizon} strategy-rule proposal",
             concise_reason="governed strategy proposal",
             concise_observation="no performance claim",
@@ -320,15 +504,45 @@ class StrategyRDLoop(LoopBase, metaclass=LoopMeta):
             concise_knowledge="allowlisted structured rules only",
         )
         experiment = StrategyExperiment(
-            [Task(name=proposal["name"], description=proposal["description"])],
+            [
+                StrategyProposalTask(
+                    seed=seed,
+                    objective=self.objective,
+                    features=self.features,
+                    prior_artifacts=horizon_prior,
+                )
+            ],
             hypothesis=hypothesis,
         )
+        return experiment
+
+    def develop(self, prev_out: dict[str, Any]) -> StrategyExperiment:
+        experiment = self.coder.develop(prev_out["proposal"])
+        workspace = experiment.sub_workspace_list[0]
+        if not isinstance(workspace, StrategyProposalWorkspace):
+            raise RuntimeError("fin_strategy CoSTEER returned no governed workspace")
+        task = experiment.sub_tasks[0]
+        if not isinstance(task, StrategyProposalTask):
+            raise RuntimeError("fin_strategy CoSTEER returned an unsupported task")
+        proposal = parse_strategy_proposal_json(
+            workspace.file_dict.get("strategy_proposal.json")
+        )
+        _enforce_frozen_bindings(proposal, seed=task.seed)
+        compile_strategy_proposal(proposal, allowed_factor_ids=set(self.features))
         experiment.strategy_proposal = proposal
+        experiment.hypothesis = Hypothesis(
+            hypothesis=proposal["economic_hypothesis"],
+            reason=f"Research-only {self.horizon} strategy-rule proposal",
+            concise_reason="governed strategy proposal",
+            concise_observation="no performance claim",
+            concise_justification="requires formal rolling OOS comparison",
+            concise_knowledge="allowlisted structured rules only",
+        )
         logger.log_object(proposal, tag="strategy proposal")
         return experiment
 
     def compile(self, prev_out: dict[str, Any]) -> StrategyExperiment:
-        experiment = prev_out["proposal"]
+        experiment = prev_out["develop"]
         artifact = compile_strategy_proposal(
             experiment.strategy_proposal,
             allowed_factor_ids=set(self.features),

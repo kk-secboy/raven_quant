@@ -22,13 +22,16 @@ def _costeer_knowledge_status(env: dict[str, str], *, module: str) -> dict[str, 
     configured = _embedding_is_configured(env)
     strategy_compiler = module == "quant_platform.rdagent_strategy"
     return {
-        "contract_version": "costeer-knowledge-status-v1",
+        "contract_version": "costeer-knowledge-status-v2",
         "status": "embedding_retrieval_configured" if configured else "degraded_empty_retrieval",
         "embedding_retrieval_configured": configured,
         "retrieval_mode": "embedding_rag" if configured else "typed_empty_knowledge",
-        "costeer_used": not strategy_compiler,
-        "empty_knowledge_forced": not configured and not strategy_compiler,
-        "strategy_codegen_used": False if strategy_compiler else None,
+        "costeer_used": True,
+        "empty_knowledge_forced": not configured,
+        "strategy_codegen_used": True if strategy_compiler else None,
+        "strategy_codegen_target": (
+            "allowlisted_rule_ir_and_contract_tests" if strategy_compiler else None
+        ),
         "strategy_compiler": "deterministic_allowlist" if strategy_compiler else None,
     }
 
@@ -113,8 +116,8 @@ def main(argv: list[str]) -> int:
     )
     if module != "quant_platform.rdagent_strategy":
         _enable_qlib_file_tracking_compatibility()
-        if not _embedding_is_configured(dict(os.environ)):
-            _disable_optional_costeer_embeddings()
+    if not _embedding_is_configured(dict(os.environ)):
+        _disable_optional_costeer_embeddings()
     target = importlib.import_module(module)
     entry = getattr(target, "main", None)
     if not callable(entry):

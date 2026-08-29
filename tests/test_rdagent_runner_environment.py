@@ -57,10 +57,20 @@ def test_embedding_provider_detection_requires_a_real_embedding_endpoint() -> No
         module="quant_platform.rdagent_strategy",
     )
     assert configured["status"] == "embedding_retrieval_configured"
-    assert configured["costeer_used"] is False
+    assert configured["costeer_used"] is True
     assert configured["empty_knowledge_forced"] is False
-    assert configured["strategy_codegen_used"] is False
+    assert configured["strategy_codegen_used"] is True
+    assert configured["strategy_codegen_target"] == (
+        "allowlisted_rule_ir_and_contract_tests"
+    )
     assert configured["strategy_compiler"] == "deterministic_allowlist"
+
+    strategy_degraded = run_rdagent_module._costeer_knowledge_status(
+        {}, module="quant_platform.rdagent_strategy"
+    )
+    assert strategy_degraded["costeer_used"] is True
+    assert strategy_degraded["empty_knowledge_forced"] is True
+    assert strategy_degraded["strategy_codegen_used"] is True
 
 
 def test_disposable_qlib_container_allows_local_mlflow_tracking(
@@ -89,6 +99,53 @@ def test_disposable_qlib_container_allows_local_mlflow_tracking(
     assert FakeDockerEnv()._run("python test.py", "/tmp/work", {"POSITIONAL": "yes"}) == {
         "POSITIONAL": "yes",
         "MLFLOW_ALLOW_FILE_STORE": "true",
+    }
+
+
+def test_missing_strategy_embeddings_use_typed_empty_costeer_knowledge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import run_rdagent_module
+
+    class FakeCoSTEER:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeQueriedKnowledge:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeRAGStrategy:
+        pass
+
+    module_names = [
+        "rdagent",
+        "rdagent.components",
+        "rdagent.components.coder",
+    ]
+    for name in module_names:
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    costeer_module = ModuleType("rdagent.components.coder.CoSTEER")
+    costeer_module.CoSTEER = FakeCoSTEER
+    knowledge_module = ModuleType(
+        "rdagent.components.coder.CoSTEER.knowledge_management"
+    )
+    knowledge_module.CoSTEERQueriedKnowledgeV2 = FakeQueriedKnowledge
+    knowledge_module.CoSTEERRAGStrategyV2 = FakeRAGStrategy
+    monkeypatch.setitem(sys.modules, costeer_module.__name__, costeer_module)
+    monkeypatch.setitem(sys.modules, knowledge_module.__name__, knowledge_module)
+
+    run_rdagent_module._disable_optional_costeer_embeddings()
+
+    coder = FakeCoSTEER(with_knowledge=False, knowledge_self_gen=True)
+    assert coder.kwargs["with_knowledge"] is True
+    assert coder.kwargs["knowledge_self_gen"] is False
+    task = SimpleNamespace(get_task_information=lambda: "governed-strategy-task")
+    knowledge = FakeRAGStrategy().query(SimpleNamespace(sub_tasks=[task]), [])
+    assert knowledge.success_task_to_knowledge_dict == {}
+    assert knowledge.failed_task_info_set == set()
+    assert knowledge.task_to_former_failed_traces == {
+        "governed-strategy-task": ([], None)
     }
 
 
@@ -172,3 +229,18 @@ def test_strategy_loop_is_horizon_directed_and_keeps_the_incumbent_frozen() -> N
     assert "parent_strategy_version_id=self.parent_strategy_version_id" in source
     assert "loop_id % len(_HORIZON_BASELINES)" not in source
     assert '"long_1_3y": 756' in source
+
+
+def test_strategy_loop_uses_official_costeer_for_governed_ir_repairs() -> None:
+    source = (
+        Path(__file__).parents[1] / "src" / "quant_platform" / "rdagent_strategy.py"
+    ).read_text(encoding="utf-8")
+
+    assert "class StrategyProposalCoSTEER(CoSTEER):" in source
+    assert 'self.coder.develop(prev_out["proposal"])' in source
+    assert "class StrategyProposalEvaluator(RAGEvaluator):" in source
+    assert "previous_deterministic_validation" in source
+    assert "knowledge_self_gen=False" in source
+    assert "TemporaryDirectory(" in source
+    assert "compile_strategy_proposal(" in source
+    assert "for attempt in range(1, 4)" not in source

@@ -164,7 +164,7 @@ def _costeer_knowledge_status() -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise RuntimeError("CoSTEER knowledge status is invalid") from exc
     if not isinstance(status, dict) or status.get("contract_version") != (
-        "costeer-knowledge-status-v1"
+        "costeer-knowledge-status-v2"
     ):
         raise RuntimeError("CoSTEER knowledge status contract drifted")
     if status.get("status") not in {
@@ -1276,8 +1276,10 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
     if args.scenario == "fin_strategy" and not strategy_proposals:
         raise RuntimeError("fin_strategy produced no governed strategy proposal")
     if args.scenario == "fin_strategy" and (
-        costeer_knowledge["costeer_used"] is not False
-        or costeer_knowledge.get("strategy_codegen_used") is not False
+        costeer_knowledge["costeer_used"] is not True
+        or costeer_knowledge.get("strategy_codegen_used") is not True
+        or costeer_knowledge.get("strategy_codegen_target")
+        != "allowlisted_rule_ir_and_contract_tests"
         or costeer_knowledge.get("strategy_compiler") != "deterministic_allowlist"
     ):
         raise RuntimeError("fin_strategy execution boundary disagrees")
