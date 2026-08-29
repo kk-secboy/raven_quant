@@ -83,7 +83,7 @@ def test_release_upgrade_drill_uses_isolated_sibling_storage() -> None:
     )
 
 
-def test_release_upgrade_drill_uses_only_unique_candidate_image_aliases(
+def test_release_upgrade_drill_uses_only_isolated_candidate_image_families(
     tmp_path: Path,
 ) -> None:
     module = _load_release_upgrade_drill_module()
@@ -96,7 +96,7 @@ def test_release_upgrade_drill_uses_only_unique_candidate_image_aliases(
     assert set(services) == set(BUILT_APPLICATION_SERVICES) | {
         "factor-sandbox-builder"
     }
-    assert len(images) == len(BUILT_APPLICATION_SERVICES)
+    assert len(images) == 4
     assert all(image.endswith(":deadbeef") for image in images)
     assert all(image.startswith("quantlab-upgrade-drill-") for image in images)
     assert all(
@@ -106,6 +106,19 @@ def test_release_upgrade_drill_uses_only_unique_candidate_image_aliases(
     assert services["factor-sandbox-builder"]["environment"][
         "FACTOR_SANDBOX_BASE_IMAGE"
     ] == services["worker"]["image"]
+    assert services["api"]["image"] == services["scheduler"]["image"]
+    assert services["worker"]["image"] == services["evaluation-worker"]["image"]
+    assert services["worker"]["image"] == services["paper-worker"]["image"]
+    rdagent_image = services["rdagent-worker"]["image"]
+    assert all(
+        services[service]["image"] == rdagent_image
+        for service in (
+            "rdagent-model-worker",
+            "rdagent-report-worker",
+            "rdagent-quant-worker",
+            "rdagent-data-science-worker",
+        )
+    )
     assert not any(
         image.startswith("quantlab-platform-")
         or image in {"quantlab-worker-runtime:v2", "quantlab-rdagent-runtime:v2"}

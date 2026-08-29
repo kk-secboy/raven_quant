@@ -77,10 +77,25 @@ def _write_candidate_runtime_override(
     path: Path,
     suffix: str,
 ) -> tuple[str, ...]:
-    images = {
-        service: f"quantlab-upgrade-drill-{service}:{suffix}"
-        for service in BUILT_APPLICATION_SERVICES
+    image_families = {
+        "api-runtime": ("api", "scheduler"),
+        "worker-runtime": ("worker", "evaluation-worker", "paper-worker"),
+        "rdagent-runtime": (
+            "rdagent-worker",
+            "rdagent-model-worker",
+            "rdagent-report-worker",
+            "rdagent-quant-worker",
+            "rdagent-data-science-worker",
+        ),
+        "web": ("web",),
     }
+    images = {
+        service: f"quantlab-upgrade-drill-{family}:{suffix}"
+        for family, services in image_families.items()
+        for service in services
+    }
+    if set(images) != set(BUILT_APPLICATION_SERVICES):
+        raise RuntimeError("candidate image families do not cover the built service topology")
     payload = {
         "services": {
             **{
