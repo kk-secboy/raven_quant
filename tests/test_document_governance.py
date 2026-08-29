@@ -1005,6 +1005,13 @@ def test_retained_documents_do_not_reactivate_retired_execution_paths() -> None:
             )
 
 
+def test_authoritative_design_requires_bounded_daily_data_recovery() -> None:
+    text = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+
+    assert "只合并补跑截至当前的最新已到期工作日数据槽" in text
+    assert "非主行情任务超过 `misfire grace` 仍 `fail-closed`" in text
+
+
 @pytest.mark.parametrize(
     "relative", ["README.md", "docs/DEPLOYMENT.md", MARKDOWN_NAME]
 )
