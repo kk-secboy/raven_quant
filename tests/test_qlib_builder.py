@@ -277,6 +277,137 @@ def _write_required_research_inputs(snapshot: Path) -> None:
         pd.DataFrame([row]).to_parquet(target / "research.parquet")
 
 
+def test_eligibility_metadata_reads_full_history_in_bounded_symbol_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path, ts_code="000001.SZ", up_limit=11.0, down_limit=9.0
+    )
+    daily_path = next((snapshot / "parquet" / "daily").rglob("*.parquet"))
+    daily = pd.read_parquet(daily_path)
+    second = daily.iloc[0].copy()
+    second["ts_code"] = "600000.SH"
+    second["vol"] = 0.0
+    pd.concat([daily, second.to_frame().T], ignore_index=True).to_parquet(
+        daily_path, index=False
+    )
+    for dataset, extra in (
+        ("stock_basic", {"ts_code": "600000.SH", "list_date": "2020-01-02"}),
+        (
+            "balancesheet",
+            {
+                "ts_code": "600000.SH",
+                "ann_date": "2024-01-01",
+                "total_hldr_eqy_exc_min_int": 10_000_000.0,
+            },
+        ),
+        (
+            "fina_audit",
+            {
+                "ts_code": "600000.SH",
+                "ann_date": "2024-01-01",
+                "audit_result": "standard_unqualified",
+            },
+        ),
+        (
+            "namechange",
+            {
+                "ts_code": "600000.SH",
+                "name": "*ST浦发",
+                "start_date": "2024-01-02",
+                "end_date": None,
+            },
+        ),
+    ):
+        path = next((snapshot / "parquet" / dataset).rglob("*.parquet"))
+        frame = pd.read_parquet(path)
+        pd.concat([frame, pd.DataFrame([extra])], ignore_index=True).to_parquet(
+            path, index=False
+        )
+    regulatory_root = snapshot / "parquet" / "regulatory_events"
+    regulatory_root.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "600000.SH",
+                "event_date": "2024-01-01",
+                "known_date": "2024-01-02",
+                "major": True,
+            }
+        ]
+    ).to_parquet(regulatory_root / "events.parquet", index=False)
+
+    builder = QlibBuilder(snapshot)
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    original_read = builder._read_dataset_for_symbols
+
+    def recording_read(dataset, columns, symbols, *, required=()):
+        calls.append((dataset, tuple(symbols)))
+        return original_read(dataset, columns, symbols, required=required)
+
+    monkeypatch.setattr(
+        "quant_data.qlib_builder.DAILY_QLIB_ELIGIBILITY_SYMBOL_BATCH", 1
+    )
+    monkeypatch.setattr(builder, "_read_dataset_for_symbols", recording_read)
+    target = tmp_path / "metadata"
+
+    assert builder._write_eligibility_metadata(target) is True
+
+    daily_batches = [symbols for dataset, symbols in calls if dataset == "daily"]
+    assert daily_batches == [("000001.SZ",), ("600000.SH",)]
+    assert all(len(symbols) == 1 for _, symbols in calls)
+    result = pd.read_parquet(target / "eligibility_matrix.parquet").set_index(
+        "instrument"
+    )
+    second_reasons = json.loads(result.loc["SH600000", "reasons"])
+    assert result.loc["SH600000", "suspended"]
+    assert result.loc["SH600000", "major_violation"]
+    assert "st" in second_reasons
+    assert "suspended" in second_reasons
+    assert "major_violation" in second_reasons
+    assert not (target / ".eligibility_attempt").exists()
+
+
+def test_eligibility_rejects_symbols_that_collide_after_qlib_normalization(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path, ts_code="000001.SZ", up_limit=11.0, down_limit=9.0
+    )
+    daily_path = next((snapshot / "parquet" / "daily").rglob("*.parquet"))
+    daily = pd.read_parquet(daily_path)
+    duplicate = daily.iloc[0].copy()
+    duplicate["ts_code"] = "000001.sz"
+    pd.concat([daily, duplicate.to_frame().T], ignore_index=True).to_parquet(
+        daily_path, index=False
+    )
+
+    with pytest.raises(ValueError, match="collide after Qlib normalization"):
+        QlibBuilder(snapshot)._write_eligibility_metadata(tmp_path / "metadata")
+
+
+def test_eligibility_requires_trade_calendar_for_announcement_fallback(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path, ts_code="000001.SZ", up_limit=11.0, down_limit=9.0
+    )
+    anns_root = snapshot / "parquet" / "anns_d" / "partition_year=2024"
+    anns_root.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-02",
+                "title": "关于重大违法事项的公告",
+            }
+        ]
+    ).to_parquet(anns_root / "announcements.parquet", index=False)
+
+    with pytest.raises(ValueError, match="requires a valid trading calendar"):
+        QlibBuilder(snapshot)._write_eligibility_metadata(tmp_path / "metadata")
+
+
 def test_builds_per_symbol_normalized_qlib_staging(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshot"
     daily_dir = snapshot / "parquet" / "daily" / "partition_year=2024" / "partition_month=1"

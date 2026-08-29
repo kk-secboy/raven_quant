@@ -13,6 +13,8 @@ from sqlalchemy.exc import OperationalError
 import quant_platform.worker as worker_module
 from quant_platform.worker import (
     LocalJobWorker,
+    _command_with_cpu_affinity,
+    _CpuAffinityPool,
     _frozen_evaluation_feature_set,
     _frozen_model_engine,
     _frozen_rdagent_model_hyperparameters,
@@ -22,6 +24,63 @@ from quant_platform.worker import (
 from quant_platform.worker_cli import _PeriodicProbeCache, status_server
 
 pytestmark = pytest.mark.no_database
+
+
+def test_linux_numerical_command_is_hard_limited_to_first_allowed_cpus() -> None:
+    command, affinity = _command_with_cpu_affinity(
+        ["python", "model.py", "--fit"],
+        3,
+        platform="linux",
+        affinity_getter=lambda _pid: {11, 7, 19, 3},
+    )
+
+    assert affinity == (3, 7, 11)
+    assert command[:3] == [
+        worker_module.sys.executable,
+        "-c",
+        worker_module._LINUX_CPU_AFFINITY_EXEC,
+    ]
+    assert command[3:] == ["3,7,11", "python", "model.py", "--fit"]
+
+
+def test_linux_affinity_failure_is_fail_closed() -> None:
+    def unavailable(_pid: int):
+        raise OSError("affinity unavailable")
+
+    with pytest.raises(ValueError, match="could not read Linux worker CPU affinity"):
+        _command_with_cpu_affinity(
+            ["python", "model.py"],
+            8,
+            platform="linux",
+            affinity_getter=unavailable,
+        )
+
+
+def test_windows_keeps_command_and_thread_limit_contract() -> None:
+    command, affinity = _command_with_cpu_affinity(
+        ["python.exe", "model.py"], 8, platform="win32"
+    )
+
+    assert command == ["python.exe", "model.py"]
+    assert affinity is None
+
+
+def test_cpu_affinity_pool_partitions_and_reuses_container_capacity() -> None:
+    pool = _CpuAffinityPool(
+        platform="linux", affinity_getter=lambda _pid: set(range(24))
+    )
+
+    first = pool.acquire(8)
+    second = pool.acquire(8)
+    third = pool.acquire(8)
+    assert first == tuple(range(8))
+    assert second == tuple(range(8, 16))
+    assert third == tuple(range(16, 24))
+    with pytest.raises(ValueError, match="insufficient free CPUs"):
+        pool.acquire(1)
+
+    pool.release(second)
+    assert pool.acquire(8) == second
 
 
 def test_only_transformer_jobs_require_the_exclusive_cpu_lane() -> None:

@@ -19,6 +19,8 @@ def test_research_resource_costs_match_the_governed_queue_contract() -> None:
     assert research_job_memory_gb("data_qlib") == 24
     assert research_job_cpu_cost("minute_qlib") == 16
     assert research_job_memory_gb("minute_qlib") == 24
+    assert research_job_cpu_cost("qlib_baseline") == 8
+    assert research_job_memory_gb("qlib_baseline") == 40
     assert research_job_cpu_cost("rdagent_factor") == 8
     assert research_job_memory_gb("rdagent_factor") == 12
     assert research_job_cpu_cost("rdagent_model") == 8
@@ -27,6 +29,16 @@ def test_research_resource_costs_match_the_governed_queue_contract() -> None:
     assert research_job_memory_gb("rdagent_factor_report") == 8
     assert research_job_cpu_cost("rdagent_quant") == 12
     assert research_job_memory_gb("rdagent_quant") == 20
+    assert (
+        research_job_memory_gb("qlib_baseline")
+        + research_job_memory_gb("model_evaluate")
+        > 40
+    )
+    assert (
+        research_job_memory_gb("qlib_baseline")
+        + research_job_memory_gb("external_factor_evaluate")
+        > 40
+    )
     assert research_job_cpu_cost("model_refit") == 0
     assert research_job_memory_gb("simulation_replay") == 0
 
@@ -37,7 +49,7 @@ def test_all_cpu_research_workers_share_one_host_budget() -> None:
     )
 
     assert compose.count('RESEARCH_CPU_BUDGET: "24"') == 7
-    assert compose.count('RESEARCH_MEMORY_BUDGET_GB: "48"') == 7
+    assert compose.count('RESEARCH_MEMORY_BUDGET_GB: "40"') == 7
     assert 'WORKER_JOB_KINDS: model_refit,recommendation_refresh,' in compose
 
 
@@ -54,7 +66,7 @@ def test_primary_data_worker_has_hard_limits_and_numerical_thread_caps() -> None
     assert "pids_limit: 512" in worker_block
     assert 'WORKER_CONCURRENCY: "1"' in worker_block
     assert 'RESEARCH_CPU_BUDGET: "24"' in worker_block
-    assert 'RESEARCH_MEMORY_BUDGET_GB: "48"' in worker_block
+    assert 'RESEARCH_MEMORY_BUDGET_GB: "40"' in worker_block
     for variable in (
         "OMP_NUM_THREADS",
         "MKL_NUM_THREADS",
@@ -63,3 +75,18 @@ def test_primary_data_worker_has_hard_limits_and_numerical_thread_caps() -> None
         "NUMEXPR_MAX_THREADS",
     ):
         assert f'{variable}: "8"' in worker_block
+
+
+def test_evaluation_worker_keeps_host_capacity_but_not_a_48gb_ledger() -> None:
+    compose = (Path(__file__).parents[1] / "deploy" / "compose.yaml").read_text(
+        encoding="utf-8"
+    )
+    evaluation_block = compose.split("\n  evaluation-worker:\n", 1)[1].split(
+        "\n  paper-worker:\n", 1
+    )[0]
+
+    assert 'cpus: "24.0"' in evaluation_block
+    assert "mem_limit: 48g" in evaluation_block
+    assert 'WORKER_CONCURRENCY: "3"' in evaluation_block
+    assert 'RESEARCH_CPU_BUDGET: "24"' in evaluation_block
+    assert 'RESEARCH_MEMORY_BUDGET_GB: "40"' in evaluation_block

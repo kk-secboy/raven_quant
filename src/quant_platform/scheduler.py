@@ -210,6 +210,25 @@ def _latest_lineage_coverage_date(
     return max(values) if values else None
 
 
+def _is_latest_due_weekday_slot(run: dict[str, Any], now: datetime) -> bool:
+    """Return whether a daily slot is the latest due weekday at ``now``.
+
+    Full market-data recovery follows the normal scheduler's narrow calendar
+    rule: weekends are known closures, while exchange holidays remain for the
+    refreshed ``trade_cal`` and downstream quality gates to decide.
+    """
+
+    zone = ZoneInfo(str(run["timezone"]))
+    scheduled = datetime.fromisoformat(str(run["scheduled_for"])).astimezone(zone)
+    local_now = now.astimezone(zone)
+    latest_date = local_now.date()
+    if local_now.timetz().replace(tzinfo=None) < scheduled.timetz().replace(tzinfo=None):
+        latest_date -= timedelta(days=1)
+    while latest_date.weekday() >= 5:
+        latest_date -= timedelta(days=1)
+    return scheduled.date() == latest_date
+
+
 class SchedulerEngine:
     """Materializes daily slots and safely enqueues durable platform jobs."""
 
@@ -1347,20 +1366,54 @@ class SchedulerEngine:
     def _process_run(self, run: dict[str, Any], now: datetime) -> None:
         scheduled_for = datetime.fromisoformat(run["scheduled_for"])
         delay = (now - scheduled_for).total_seconds()
+        payload = dict(run.get("payload") or {})
+        recoverable_full_data_slot = (
+            run["kind"] == "data_pipeline"
+            and payload.get("profile") == "full"
+            and bool(run["trading_days_only"])
+        )
         if delay > int(run["misfire_grace_seconds"]):
-            message = f"schedule was late by {int(delay)} seconds and failed closed"
-            self.schedules.finish_run(run["id"], "missed", message=message, now=now)
-            self.alerts.create(
-                source_type="schedule_run",
-                source_id=run["id"],
-                severity="critical",
-                category="schedule_misfire",
-                title=f"调度错过执行窗口：{run['schedule_name']}",
-                message=message,
-                dedupe_key=f"schedule-run:{run['id']}:missed",
-                details={"scheduled_for": run["scheduled_for"]},
-            )
-            return
+            if recoverable_full_data_slot:
+                local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
+                if local_date.weekday() >= 5:
+                    self.schedules.finish_run(
+                        run["id"],
+                        "skipped",
+                        message=(
+                            "superseded full market-data recovery slot skipped on local "
+                            f"weekend {local_date.isoformat()}"
+                        ),
+                        now=now,
+                    )
+                    return
+                if not _is_latest_due_weekday_slot(run, now):
+                    self.schedules.finish_run(
+                        run["id"],
+                        "skipped",
+                        message=(
+                            "superseded by a newer due full market-data weekday slot; "
+                            f"old slot {local_date.isoformat()} was not enqueued"
+                        ),
+                        now=now,
+                    )
+                    return
+                # The newest due weekday publication is the bounded catch-up
+                # root. Its lookback and downstream trade_cal/quality gates
+                # recover observations without one pipeline per stale slot.
+            else:
+                message = f"schedule was late by {int(delay)} seconds and failed closed"
+                self.schedules.finish_run(run["id"], "missed", message=message, now=now)
+                self.alerts.create(
+                    source_type="schedule_run",
+                    source_id=run["id"],
+                    severity="critical",
+                    category="schedule_misfire",
+                    title=f"调度错过执行窗口：{run['schedule_name']}",
+                    message=message,
+                    dedupe_key=f"schedule-run:{run['id']}:missed",
+                    details={"scheduled_for": run["scheduled_for"]},
+                )
+                return
         try:
             if (
                 run["kind"]

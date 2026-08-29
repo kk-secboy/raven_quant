@@ -60,7 +60,10 @@ RESEARCH_JOB_MEMORY_GB = {
     "rdagent_quant": 20,
     "rdagent_data_science": 16,
     "minute_research": 8,
-    "qlib_baseline": 12,
+    # The full Alpha158/LightGBM baseline reached about 36.4 GiB RSS on the
+    # production 32-core/64-GiB host.  Charge the full 40-GiB research budget
+    # so this memory-heavy baseline is exclusive among governed research jobs.
+    "qlib_baseline": 40,
     "external_factor_evaluate": 8,
     "information_factor_evaluate": 8,
     "multiface_audit": 8,

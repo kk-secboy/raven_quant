@@ -303,6 +303,81 @@ def test_trading_day_data_schedules_skip_shanghai_weekends_without_jobs(
     assert JobStore(database_url).count(kinds=("bootstrap",)) == 0
 
 
+def test_full_data_pipeline_recovery_coalesces_to_latest_due_weekday(
+    database_url: str, tmp_path: Path
+) -> None:
+    zone = ZoneInfo("Asia/Shanghai")
+    before_friday_slot = datetime(2025, 1, 3, 15, 29, tzinfo=zone).astimezone(UTC)
+    recovered_on_monday = datetime(2025, 1, 6, 16, 0, tzinfo=zone).astimezone(UTC)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="recover full daily market data",
+        kind="data_pipeline",
+        timezone="Asia/Shanghai",
+        run_time=time(15, 30),
+        trading_days_only=True,
+        payload={
+            "profile": "full",
+            "lookback_days": 7,
+            "snapshot_start": "2008-01-01",
+            "bundles": ["cn_extended_daily"],
+        },
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=before_friday_slot,
+    )
+
+    engine = SchedulerEngine(_settings(database_url, tmp_path))
+    for _ in range(4):
+        engine.tick(recovered_on_monday)
+
+    runs = sorted(store.list_runs(), key=lambda item: item["scheduled_for"])
+    assert [item["status"] for item in runs] == [
+        "skipped",
+        "skipped",
+        "skipped",
+        "enqueued",
+    ]
+    assert "superseded by a newer due" in runs[0]["message"]
+    assert "weekend" in runs[1]["message"]
+    assert "weekend" in runs[2]["message"]
+    job = JobStore(database_url).get(runs[3]["job_id"])
+    assert job["payload"]["snapshot_end"] == "2025-01-06"
+    assert JobStore(database_url).count(kinds=("bootstrap",)) == 1
+
+
+def test_non_full_data_pipeline_recovery_keeps_misfire_fail_closed(
+    database_url: str, tmp_path: Path
+) -> None:
+    zone = ZoneInfo("Asia/Shanghai")
+    before_slot = datetime(2025, 1, 3, 15, 29, tzinfo=zone).astimezone(UTC)
+    recovered = datetime(2025, 1, 3, 17, 0, tzinfo=zone).astimezone(UTC)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="research assets still fail closed",
+        kind="data_pipeline",
+        timezone="Asia/Shanghai",
+        run_time=time(15, 30),
+        trading_days_only=True,
+        payload={
+            "profile": "research-assets",
+            "lookback_days": 7,
+            "snapshot_start": "2023-01-01",
+            "bundles": ["research_corpus"],
+        },
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=before_slot,
+    )
+
+    SchedulerEngine(_settings(database_url, tmp_path)).tick(recovered)
+
+    run = store.list_runs()[0]
+    assert run["status"] == "missed"
+    assert "failed closed" in run["message"]
+    assert JobStore(database_url).count(kinds=("bootstrap",)) == 0
+
+
 def test_scheduler_creates_bounded_recoverable_information_pipeline(
     database_url: str, tmp_path: Path, monkeypatch
 ) -> None:

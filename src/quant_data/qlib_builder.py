@@ -88,6 +88,7 @@ DAILY_QLIB_DUCKDB_MEMORY_LIMIT = "8GB"
 DAILY_QLIB_DUCKDB_THREADS = 8
 DAILY_QLIB_DUMP_WORKERS = 4
 DAILY_QLIB_STYLE_SYMBOL_BATCH = 128
+DAILY_QLIB_ELIGIBILITY_SYMBOL_BATCH = 128
 
 _ADJUSTMENT_BOUNDARY_POLICY_VERSION = "baostock-primary-adj-boundary-v1"
 _ADJUSTMENT_BOUNDARY_MAX_PRICE_ABS_ERROR = 0.051
@@ -319,6 +320,7 @@ def qlib_research_field_catalog() -> dict[str, dict[str, str]]:
 class QlibBuilder:
     def __init__(self, snapshot_path: Path) -> None:
         self.snapshot_path = snapshot_path.resolve()
+        self._parquet_columns_cache: dict[str, set[str]] = {}
         self.research_feature_contract = self._research_feature_contract()
         self._daily_unit_quality_cache: dict[str, Any] | None = None
         self._adjustment_boundary_cache: dict[str, Any] | None = None
@@ -1445,6 +1447,37 @@ class QlibBuilder:
         finally:
             connection.close()
 
+    def _read_dataset_columns(
+        self,
+        dataset: str,
+        columns: Collection[str],
+        *,
+        required: Collection[str] = (),
+    ) -> pd.DataFrame | None:
+        """Read only a projected snapshot surface into pandas.
+
+        This is reserved for bounded reference/event tables. Full-history
+        market panels must use ``_read_dataset_for_symbols`` instead.
+        """
+
+        available = self._parquet_columns(dataset)
+        selected_columns = sorted(set(columns).intersection(available))
+        if not set(required).issubset(selected_columns):
+            return None
+        root = self.snapshot_path / "parquet" / dataset
+        if not root.exists() or not any(root.rglob("*.parquet")):
+            return None
+        glob = _sql_string(str((root / "**" / "*.parquet").resolve()))
+        projection = ", ".join(_sql_identifier(column) for column in selected_columns)
+        connection = self._duckdb_connection()
+        try:
+            return connection.execute(
+                f"SELECT {projection} FROM read_parquet({glob}, "
+                "hive_partitioning=true, union_by_name=true)"
+            ).fetch_df()
+        finally:
+            connection.close()
+
     def _style_symbols(self) -> list[str]:
         root = self.snapshot_path / "parquet" / "daily_basic"
         if not root.exists() or not any(root.rglob("*.parquet")):
@@ -1775,47 +1808,68 @@ class QlibBuilder:
         return True
 
     def _write_eligibility_metadata(self, target: Path) -> bool:
-        def read(dataset: str) -> pd.DataFrame:
-            root = self.snapshot_path / "parquet" / dataset
-            files = sorted(root.rglob("*.parquet")) if root.exists() else []
-            return (
-                pd.concat([pd.read_parquet(path) for path in files], ignore_index=True)
-                if files
-                else pd.DataFrame()
-            )
+        """Write PIT eligibility without materializing the full daily panel."""
 
-        daily = read("daily")
-        stock_basic = read("stock_basic")
-        balancesheet = read("balancesheet")
-        audit = read("fina_audit")
-        if any(frame.empty for frame in (daily, stock_basic, balancesheet, audit)):
+        required_daily = {"ts_code", "trade_date", "amount", "vol"}
+        if not required_daily.issubset(self._parquet_columns("daily")):
             return False
-        market = pd.DataFrame(
-            {
-                "datetime": pd.to_datetime(daily["trade_date"], errors="coerce"),
-                "instrument": daily["ts_code"].map(_qlib_symbol),
-                "amount": pd.to_numeric(daily["amount"], errors="coerce") * 1000.0,
-                "paused": pd.to_numeric(daily["vol"], errors="coerce").fillna(0).le(0),
-            }
+        daily_glob = _sql_string(
+            str((self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet").resolve())
         )
-        market_dates = market["datetime"].dropna()
-        if market_dates.empty:
-            raise ValueError("daily has no valid publication-horizon trading date")
-        regulatory_horizon = market_dates.max().date()
-        deferred_regulatory_events: list[dict[str, str]] = []
+        connection = self._duckdb_connection()
+        try:
+            calendar_rows = connection.execute(
+                f"SELECT DISTINCT {_as_date_sql('trade_date')} AS trade_date "
+                f"FROM read_parquet({daily_glob}, hive_partitioning=true, "
+                "union_by_name=true) WHERE ts_code IS NOT NULL "
+                f"AND {_as_date_sql('trade_date')} IS NOT NULL ORDER BY trade_date"
+            ).fetchall()
+            symbols = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT trim(CAST(ts_code AS VARCHAR)) AS ts_code "
+                    f"FROM read_parquet({daily_glob}, hive_partitioning=true, "
+                    "union_by_name=true) WHERE ts_code IS NOT NULL ORDER BY ts_code"
+                ).fetchall()
+                if str(row[0] or "")
+            ]
+        finally:
+            connection.close()
+        trading_calendar = pd.DatetimeIndex([row[0] for row in calendar_rows])
+        if trading_calendar.empty or not symbols:
+            raise ValueError("daily has no valid publication-horizon market rows")
+        normalized_symbols = [_qlib_symbol(symbol) for symbol in symbols]
+        if any(symbol is None for symbol in normalized_symbols):
+            raise ValueError("daily contains a symbol that cannot be normalized for Qlib")
+        if len(set(normalized_symbols)) != len(normalized_symbols):
+            raise ValueError("daily symbols collide after Qlib normalization")
+        regulatory_horizon = trading_calendar.max().date()
+
+        stock_basic = self._read_dataset_columns(
+            "stock_basic",
+            {"ts_code", "list_date", "delist_date"},
+            required={"ts_code", "list_date"},
+        )
+        if stock_basic is None or stock_basic.empty:
+            return False
         listings = pd.DataFrame(
             {
                 "instrument": stock_basic["ts_code"].map(_qlib_symbol),
                 "list_date": pd.to_datetime(stock_basic["list_date"], errors="coerce"),
                 "delist_date": pd.to_datetime(
-                    stock_basic.get("delist_date"), errors="coerce"
+                    stock_basic.get(
+                        "delist_date", pd.Series(pd.NaT, index=stock_basic.index)
+                    ),
+                    errors="coerce",
                 ),
             }
         )
-        namechange = read("namechange")
-        if not namechange.empty and {"ts_code", "name", "start_date"}.issubset(
-            namechange.columns
-        ):
+        namechange = self._read_dataset_columns(
+            "namechange",
+            {"ts_code", "name", "start_date", "end_date"},
+            required={"ts_code", "name", "start_date"},
+        )
+        if namechange is not None and not namechange.empty:
             st_source = namechange[
                 namechange["name"].astype(str).str.contains(r"(?:\*?ST|退)", regex=True)
             ]
@@ -1831,25 +1885,8 @@ class QlibBuilder:
             st_intervals = pd.DataFrame(
                 columns=["instrument", "start_date", "end_date", "is_st"]
             )
-        suspend = read("suspend_d")
-        suspension_rows: list[dict[str, Any]] = []
-        if not suspend.empty and "ts_code" in suspend:
-            date_column = next(
-                (name for name in ("suspend_date", "trade_date") if name in suspend), None
-            )
-            if date_column:
-                suspension_rows = [
-                    {
-                        "instrument": _qlib_symbol(row.ts_code),
-                        "datetime": getattr(row, date_column),
-                        "suspended": True,
-                    }
-                    for row in suspend.itertuples(index=False)
-                ]
-        suspensions = pd.DataFrame(
-            suspension_rows,
-            columns=["instrument", "datetime", "suspended"],
-        )
+
+        balance_columns = self._parquet_columns("balancesheet")
         equity_column = next(
             (
                 name
@@ -1858,86 +1895,142 @@ class QlibBuilder:
                     "total_hldr_eqy_inc_min_int",
                     "total_hldr_eqy",
                 )
-                if name in balancesheet
+                if name in balance_columns
             ),
             None,
         )
-        if equity_column is None or "ann_date" not in balancesheet:
+        if equity_column is None or "ann_date" not in balance_columns:
             raise ValueError("balancesheet has no announced shareholder equity")
-        financials = pd.DataFrame(
-            {
-                "instrument": balancesheet["ts_code"].map(_qlib_symbol),
-                "announcement_date": balancesheet["ann_date"],
-                "equity": pd.to_numeric(balancesheet[equity_column], errors="coerce"),
-            }
-        )
+        audit_columns = self._parquet_columns("fina_audit")
         opinion_column = next(
-            (name for name in ("audit_result", "audit_opinion") if name in audit), None
+            (
+                name
+                for name in ("audit_result", "audit_opinion")
+                if name in audit_columns
+            ),
+            None,
         )
-        if opinion_column is None or "ann_date" not in audit:
+        if opinion_column is None or "ann_date" not in audit_columns:
             raise ValueError("fina_audit has no announced audit opinion")
-        audits = pd.DataFrame(
-            {
-                "instrument": audit["ts_code"].map(_qlib_symbol),
-                "announcement_date": audit["ann_date"],
-                "audit_opinion": audit[opinion_column].astype(str),
-            }
+
+        regulatory_columns = self._parquet_columns("regulatory_events")
+        has_regulatory_source = bool(regulatory_columns) and self._has_usable_row(
+            "regulatory_events", "TRUE"
         )
-        regulatory_source = read("regulatory_events")
-        regulatory = None
-        regulatory_origin: str | None = None
-        if not regulatory_source.empty:
-            required = {"ts_code", "event_date", "known_date", "major"}
-            if not required.issubset(regulatory_source.columns):
-                raise ValueError("regulatory event source violates its data contract")
-            regulatory = regulatory_source.rename(columns={"ts_code": "instrument"}).copy()
-            regulatory["instrument"] = regulatory["instrument"].map(_qlib_symbol)
-            regulatory_origin = "materialized_dataset"
-        else:
-            # Fail-soft fallback: derive major-violation events from the anns_d
-            # announcement titles persisted in the same immutable snapshot.
-            regulatory, deferred_regulatory_events = self._derive_regulatory_events(
-                read,
-                publication_horizon=regulatory_horizon,
+        if has_regulatory_source and not {
+            "ts_code",
+            "event_date",
+            "known_date",
+            "major",
+        }.issubset(regulatory_columns):
+            raise ValueError("regulatory event source violates its data contract")
+        anns_root = self.snapshot_path / "parquet" / "anns_d"
+        has_anns_source = anns_root.is_dir() and any(anns_root.rglob("*.parquet"))
+        anns_columns = self._parquet_columns("anns_d")
+        has_anns_fallback = not has_regulatory_source and has_anns_source
+        open_days: list[date] = []
+        if has_anns_fallback:
+            if not {"ts_code", "ann_date", "title"}.issubset(anns_columns):
+                raise ValueError(
+                    "anns_d source violates its regulatory fallback contract"
+                )
+            trade_cal = self._read_dataset_columns(
+                "trade_cal",
+                {"cal_date", "is_open"},
+                required={"cal_date", "is_open"},
             )
-            if regulatory is not None:
-                regulatory_origin = f"anns_d_title_rules({REGULATORY_EVENTS_RULE_VERSION})"
-        matrix = build_point_in_time_eligibility(
-            market=market,
-            listings=listings,
-            st_intervals=st_intervals,
-            suspensions=suspensions,
-            financials=financials,
-            audits=audits,
-            regulatory_events=regulatory,
-            policy=EligibilityPolicy(),
+            if trade_cal is None or trade_cal.empty:
+                raise ValueError(
+                    "anns_d regulatory fallback requires a valid trading calendar"
+                )
+            open_days = open_days_from_trade_cal(trade_cal)
+        regulatory_origin = (
+            "materialized_dataset"
+            if has_regulatory_source
+            else (
+                f"anns_d_title_rules({REGULATORY_EVENTS_RULE_VERSION})"
+                if has_anns_fallback
+                else None
+            )
         )
+        target.mkdir(parents=True, exist_ok=True)
+        work = target / ".eligibility_attempt"
+        if work.exists():
+            shutil.rmtree(work)
+        batches_dir = work / "batches"
+        spill_dir = work / "duckdb_spill"
+        batches_dir.mkdir(parents=True)
+        final_tmp = target / ".eligibility_matrix.parquet.tmp"
+        final_tmp.unlink(missing_ok=True)
+        deferred_regulatory_events: list[dict[str, str]] = []
+        try:
+            for offset in range(0, len(symbols), DAILY_QLIB_ELIGIBILITY_SYMBOL_BATCH):
+                batch = symbols[offset : offset + DAILY_QLIB_ELIGIBILITY_SYMBOL_BATCH]
+                matrix, deferred = self._eligibility_symbol_batch(
+                    batch=batch,
+                    required_daily=required_daily,
+                    listings=listings,
+                    st_intervals=st_intervals,
+                    equity_column=equity_column,
+                    opinion_column=opinion_column,
+                    has_regulatory_source=has_regulatory_source,
+                    has_anns_fallback=has_anns_fallback,
+                    open_days=open_days,
+                    regulatory_horizon=regulatory_horizon,
+                    trading_calendar=trading_calendar,
+                )
+                deferred_regulatory_events.extend(deferred)
+                matrix.to_parquet(
+                    batches_dir
+                    / f"batch-{offset // DAILY_QLIB_ELIGIBILITY_SYMBOL_BATCH:05d}.parquet",
+                    index=False,
+                    compression="zstd",
+                )
+            batch_glob = _sql_string(str((batches_dir / "*.parquet").resolve()))
+            connection = self._duckdb_connection(spill_dir=spill_dir)
+            try:
+                duplicate = connection.execute(
+                    "SELECT datetime, instrument, COUNT(*) AS row_count "
+                    f"FROM read_parquet({batch_glob}, union_by_name=true) "
+                    "GROUP BY datetime, instrument HAVING COUNT(*) > 1 LIMIT 1"
+                ).fetchone()
+                if duplicate is not None:
+                    raise ValueError(
+                        "eligibility batches contain duplicate datetime/instrument keys"
+                    )
+                connection.execute(
+                    "COPY (SELECT * FROM read_parquet("
+                    f"{batch_glob}, union_by_name=true) ORDER BY datetime, instrument) "
+                    f"TO {_sql_string(str(final_tmp.resolve()))} "
+                    "(FORMAT PARQUET, COMPRESSION ZSTD)"
+                )
+            finally:
+                connection.close()
+            os.replace(final_tmp, target / "eligibility_matrix.parquet")
+        finally:
+            final_tmp.unlink(missing_ok=True)
+            shutil.rmtree(work, ignore_errors=True)
+
         regulatory_terminal_audit = {
             "publication_horizon": regulatory_horizon.isoformat(),
             "policy": REGULATORY_TERMINAL_DEFERRAL_POLICY,
             "deferred_event_count": len(deferred_regulatory_events),
-            "deferred_events_sha256": _canonical_sha256(
-                deferred_regulatory_events
-            ),
+            "deferred_events_sha256": _canonical_sha256(deferred_regulatory_events),
         }
-        target.mkdir(parents=True, exist_ok=True)
-        matrix.to_parquet(target / "eligibility_matrix.parquet", index=False, compression="zstd")
         (target / "eligibility_contract.json").write_text(
             json.dumps(
                 {
                     "version": ELIGIBILITY_CONTRACT_VERSION,
-                    "regulatory_data_available": regulatory is not None,
+                    "regulatory_data_available": (
+                        has_regulatory_source or has_anns_fallback
+                    ),
                     "regulatory_origin": regulatory_origin,
                     "regulatory_publication_horizon": regulatory_horizon.isoformat(),
-                    "regulatory_terminal_policy": (
-                        REGULATORY_TERMINAL_DEFERRAL_POLICY
-                    ),
-                    "regulatory_deferred_event_count": len(
-                        deferred_regulatory_events
-                    ),
-                    "regulatory_deferred_events_sha256": (
-                        regulatory_terminal_audit["deferred_events_sha256"]
-                    ),
+                    "regulatory_terminal_policy": REGULATORY_TERMINAL_DEFERRAL_POLICY,
+                    "regulatory_deferred_event_count": len(deferred_regulatory_events),
+                    "regulatory_deferred_events_sha256": regulatory_terminal_audit[
+                        "deferred_events_sha256"
+                    ],
                     "regulatory_terminal_audit_sha256": _canonical_sha256(
                         regulatory_terminal_audit
                     ),
@@ -1950,6 +2043,147 @@ class QlibBuilder:
             encoding="utf-8",
         )
         return True
+
+    def _eligibility_symbol_batch(
+        self,
+        *,
+        batch: list[str],
+        required_daily: set[str],
+        listings: pd.DataFrame,
+        st_intervals: pd.DataFrame,
+        equity_column: str,
+        opinion_column: str,
+        has_regulatory_source: bool,
+        has_anns_fallback: bool,
+        open_days: list[date],
+        regulatory_horizon: date,
+        trading_calendar: pd.DatetimeIndex,
+    ) -> tuple[pd.DataFrame, list[dict[str, str]]]:
+        daily = self._read_dataset_for_symbols(
+            "daily", required_daily, batch, required=required_daily
+        )
+        balancesheet = self._read_dataset_for_symbols(
+            "balancesheet",
+            {"ts_code", "ann_date", equity_column},
+            batch,
+            required={"ts_code", "ann_date", equity_column},
+        )
+        audit = self._read_dataset_for_symbols(
+            "fina_audit",
+            {"ts_code", "ann_date", opinion_column},
+            batch,
+            required={"ts_code", "ann_date", opinion_column},
+        )
+        if daily is None or daily.empty:
+            raise ValueError("eligibility symbol batch lacks daily market evidence")
+        if balancesheet is None or audit is None:
+            raise ValueError("eligibility financial source schema changed during publication")
+        market = pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(daily["trade_date"], errors="coerce"),
+                "instrument": daily["ts_code"].map(_qlib_symbol),
+                "amount": pd.to_numeric(daily["amount"], errors="coerce") * 1000.0,
+                "paused": pd.to_numeric(daily["vol"], errors="coerce").fillna(0).le(0),
+            }
+        )
+        instruments = set(market["instrument"].dropna().astype(str))
+        suspension_columns = self._parquet_columns("suspend_d")
+        suspension_date = next(
+            (
+                name
+                for name in ("suspend_date", "trade_date")
+                if name in suspension_columns
+            ),
+            None,
+        )
+        suspend = (
+            self._read_dataset_for_symbols(
+                "suspend_d",
+                {"ts_code", suspension_date},
+                batch,
+                required={"ts_code", suspension_date},
+            )
+            if suspension_date is not None
+            else None
+        )
+        suspensions = pd.DataFrame(
+            {
+                "instrument": (
+                    suspend["ts_code"].map(_qlib_symbol)
+                    if suspend is not None
+                    else pd.Series(dtype="object")
+                ),
+                "datetime": (
+                    suspend[suspension_date]
+                    if suspend is not None
+                    else pd.Series(dtype="datetime64[ns]")
+                ),
+                "suspended": True,
+            }
+        )
+        financials = pd.DataFrame(
+            {
+                "instrument": balancesheet["ts_code"].map(_qlib_symbol),
+                "announcement_date": balancesheet["ann_date"],
+                "equity": pd.to_numeric(balancesheet[equity_column], errors="coerce"),
+            }
+        )
+        audits = pd.DataFrame(
+            {
+                "instrument": audit["ts_code"].map(_qlib_symbol),
+                "announcement_date": audit["ann_date"],
+                "audit_opinion": audit[opinion_column].astype(str),
+            }
+        )
+        regulatory: pd.DataFrame | None = None
+        deferred: list[dict[str, str]] = []
+        if has_regulatory_source:
+            source = self._read_dataset_for_symbols(
+                "regulatory_events",
+                {"ts_code", "event_date", "known_date", "major"},
+                batch,
+                required={"ts_code", "event_date", "known_date", "major"},
+            )
+            regulatory = (
+                source.rename(columns={"ts_code": "instrument"}).copy()
+                if source is not None
+                else pd.DataFrame(
+                    columns=["instrument", "event_date", "known_date", "major"]
+                )
+            )
+            regulatory["instrument"] = regulatory["instrument"].map(_qlib_symbol)
+        elif has_anns_fallback:
+            anns = self._read_dataset_for_symbols(
+                "anns_d",
+                {"ts_code", "ann_date", "title", "url"},
+                batch,
+                required={"ts_code", "ann_date", "title"},
+            )
+            if anns is None:
+                raise ValueError(
+                    "anns_d source schema changed during eligibility publication"
+                )
+            events, deferred = derive_regulatory_events_for_horizon(
+                anns, open_days, publication_horizon=regulatory_horizon
+            )
+            regulatory = events.rename(columns={"ts_code": "instrument"}).copy()
+            regulatory["instrument"] = regulatory["instrument"].map(_qlib_symbol)
+        return (
+            build_point_in_time_eligibility(
+                market=market,
+                listings=listings[listings["instrument"].isin(instruments)].copy(),
+                st_intervals=st_intervals[
+                    st_intervals["instrument"].isin(instruments)
+                ].copy(),
+                suspensions=suspensions,
+                financials=financials,
+                audits=audits,
+                regulatory_events=regulatory,
+                policy=EligibilityPolicy(),
+                trading_calendar=trading_calendar,
+            ),
+            deferred,
+        )
 
     def _derive_regulatory_events(
         self,
@@ -2789,8 +3023,12 @@ class QlibBuilder:
         return row is not None
 
     def _parquet_columns(self, dataset: str) -> set[str]:
+        cached = self._parquet_columns_cache.get(dataset)
+        if cached is not None:
+            return set(cached)
         root = self.snapshot_path / "parquet" / dataset
         if not root.exists() or not any(root.rglob("*.parquet")):
+            self._parquet_columns_cache[dataset] = set()
             return set()
         glob = _sql_string(str((root / "**" / "*.parquet").resolve()))
         connection = self._duckdb_connection()
@@ -2801,7 +3039,9 @@ class QlibBuilder:
             ).fetchall()
         finally:
             connection.close()
-        return {str(row[0]) for row in rows}
+        result = {str(row[0]) for row in rows}
+        self._parquet_columns_cache[dataset] = result
+        return set(result)
 
     @staticmethod
     def _missing_market_controls_query(daily_glob: Path, adj_glob: Path, limit_glob: Path) -> str:

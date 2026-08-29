@@ -74,6 +74,19 @@ def test_announcement_date_is_not_usable_until_the_following_day() -> None:
     assert result.loc[dates[11], "financial_announcement_date"] == dates[10]
 
 
+def test_explicit_global_calendar_preserves_listing_day_math_across_batches() -> None:
+    dates, inputs = _inputs()
+    inputs["market"] = inputs["market"].iloc[[0, 2]].copy()
+    result = build_point_in_time_eligibility(
+        **inputs,
+        policy=EligibilityPolicy(min_listing_trading_days=3, liquidity_lookback_days=2),
+        trading_calendar=dates,
+    ).set_index("datetime")
+
+    assert result.loc[dates[2], "listing_trading_days"] == 3
+    assert "new_listing" not in json.loads(result.loc[dates[2], "reasons"])
+
+
 def test_new_stock_st_suspension_and_liquidity_are_point_in_time_filters() -> None:
     dates, inputs = _inputs()
     inputs["st_intervals"] = pd.DataFrame(

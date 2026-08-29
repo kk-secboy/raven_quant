@@ -23,7 +23,7 @@ from .rdagent_runtime import probe_rdagent, run_official_rdagent_health_check
 from .rdagent_scenarios import RDAGENT_JOB_KINDS
 from .runtime_secret_store import RuntimeSecretStore
 from .services import probe_qlib
-from .worker import LocalJobWorker
+from .worker import LocalJobWorker, _CpuAffinityPool
 
 app = typer.Typer(no_args_is_help=False, help="QuantLab durable background worker")
 
@@ -345,6 +345,7 @@ def run() -> None:
     settings = Settings.from_env(root / ".env")
     store = JobStore(settings.database_url)
     transformer_gate = threading.Semaphore(1)
+    cpu_affinity_pool = _CpuAffinityPool()
     workers = [
         LocalJobWorker(
             store,
@@ -352,6 +353,7 @@ def run() -> None:
             settings,
             initialize_queue=index == 0,
             transformer_gate=transformer_gate,
+            cpu_affinity_pool=cpu_affinity_pool,
         )
         for index in range(settings.worker_concurrency)
     ]

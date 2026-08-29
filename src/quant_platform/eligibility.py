@@ -36,6 +36,7 @@ def build_point_in_time_eligibility(
     audits: pd.DataFrame,
     regulatory_events: pd.DataFrame | None,
     policy: EligibilityPolicy | None = None,
+    trading_calendar: pd.Index | pd.Series | list[Any] | tuple[Any, ...] | None = None,
 ) -> pd.DataFrame:
     """Build one fail-closed eligibility row per observed stock and trading date."""
 
@@ -75,7 +76,18 @@ def build_point_in_time_eligibility(
     if listing["instrument"].duplicated().any() or listing["list_date"].isna().any():
         raise ValueError("listing metadata is duplicated or missing list dates")
     base = base.merge(listing, on="instrument", how="left", validate="many_to_one")
-    calendar = pd.DatetimeIndex(base["datetime"].unique()).sort_values()
+    observed_calendar = pd.DatetimeIndex(base["datetime"].unique()).sort_values()
+    if trading_calendar is None:
+        calendar = observed_calendar
+    else:
+        normalized_calendar = pd.to_datetime(
+            pd.Series(list(trading_calendar)), errors="coerce"
+        ).dt.normalize()
+        calendar = pd.DatetimeIndex(normalized_calendar.dropna().unique()).sort_values()
+        if calendar.empty:
+            raise ValueError("eligibility trading calendar has no valid dates")
+        if not observed_calendar.isin(calendar).all():
+            raise ValueError("eligibility market dates fall outside the trading calendar")
     # Count calendar positions with vectorized binary searches.  Expanding a
     # calendar mask per market row is O(rows * trading_days), which becomes
     # tens of billions of comparisons for a full A-share history.

@@ -113,6 +113,125 @@ from .strategy_store import StrategyStore
 _DATABASE_RETRY_INITIAL_SECONDS = 0.5
 _DATABASE_RETRY_MAX_SECONDS = 5.0
 
+_LINUX_CPU_AFFINITY_EXEC = """
+import os
+import sys
+
+requested = {int(value) for value in sys.argv[1].split(",") if value}
+if not requested:
+    raise RuntimeError("governed CPU affinity is empty")
+os.sched_setaffinity(0, requested)
+actual = set(os.sched_getaffinity(0))
+if actual != requested:
+    raise RuntimeError(
+        f"governed CPU affinity mismatch: requested={sorted(requested)} "
+        f"actual={sorted(actual)}"
+    )
+os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
+"""
+
+
+def _command_with_cpu_affinity(
+    command: list[str],
+    cpu_limit: int,
+    *,
+    platform: str | None = None,
+    affinity_getter=None,
+) -> tuple[list[str], tuple[int, ...] | None]:
+    """Hard-limit one numerical child before its real executable starts.
+
+    ``preexec_fn`` is unsafe here because LocalJobWorker itself is threaded.
+    On Linux a tiny Python launcher applies and verifies ``sched_setaffinity``
+    and then replaces itself with the original command. Windows keeps the
+    existing numerical thread environment; production uses the Linux path.
+    """
+
+    normalized = [str(value) for value in command]
+    if not normalized:
+        raise ValueError("worker subprocess command must not be empty")
+    if isinstance(cpu_limit, bool) or not isinstance(cpu_limit, int) or cpu_limit < 1:
+        raise ValueError("per-job CPU limit must be a positive integer")
+    runtime_platform = platform or sys.platform
+    if not runtime_platform.startswith("linux"):
+        return normalized, None
+    getter = affinity_getter or getattr(os, "sched_getaffinity", None)
+    if getter is None or (
+        affinity_getter is None and not hasattr(os, "sched_setaffinity")
+    ):
+        raise ValueError("Linux worker cannot enforce governed CPU affinity")
+    try:
+        allowed = sorted(int(value) for value in getter(0))
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"could not read Linux worker CPU affinity: {exc}") from exc
+    if not allowed:
+        raise ValueError("Linux worker has no allowed CPUs")
+    selected = tuple(allowed[: min(cpu_limit, len(allowed))])
+    return (
+        [
+            sys.executable,
+            "-c",
+            _LINUX_CPU_AFFINITY_EXEC,
+            ",".join(str(value) for value in selected),
+            *normalized,
+        ],
+        selected,
+    )
+
+
+class _CpuAffinityPool:
+    """Allocate non-overlapping Linux CPU sets to concurrent worker threads."""
+
+    def __init__(
+        self,
+        *,
+        platform: str | None = None,
+        affinity_getter=None,
+    ) -> None:
+        self._platform = platform or sys.platform
+        self._affinity_getter = affinity_getter
+        self._allowed: tuple[int, ...] | None = None
+        self._used: set[int] = set()
+        self._lock = threading.Lock()
+
+    def acquire(self, cpu_limit: int) -> tuple[int, ...] | None:
+        if not self._platform.startswith("linux"):
+            return None
+        getter = self._affinity_getter or getattr(os, "sched_getaffinity", None)
+        if getter is None or (
+            self._affinity_getter is None and not hasattr(os, "sched_setaffinity")
+        ):
+            raise ValueError("Linux worker cannot enforce governed CPU affinity")
+        with self._lock:
+            if self._allowed is None:
+                try:
+                    self._allowed = tuple(sorted(int(value) for value in getter(0)))
+                except (OSError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"could not read Linux worker CPU affinity: {exc}"
+                    ) from exc
+                if not self._allowed:
+                    raise ValueError("Linux worker has no allowed CPUs")
+            free = [value for value in self._allowed if value not in self._used]
+            if len(free) < cpu_limit:
+                raise ValueError(
+                    "Linux worker has insufficient free CPUs for the governed "
+                    f"per-job limit: requested={cpu_limit} free={len(free)}"
+                )
+            selected = tuple(free[:cpu_limit])
+            self._used.update(selected)
+            return selected
+
+    def release(self, cpus: tuple[int, ...] | None) -> None:
+        if cpus is None:
+            return
+        with self._lock:
+            missing = set(cpus) - self._used
+            if missing:
+                raise RuntimeError(
+                    f"CPU affinity reservation was not active: {sorted(missing)}"
+                )
+            self._used.difference_update(cpus)
+
 
 def _qlib_workflow_environment(settings: Settings, *, is_wsl: bool) -> dict[str, str]:
     artifact_root = settings.data_root / "artifacts" / "mlflow"
@@ -240,6 +359,7 @@ class LocalJobWorker:
         *,
         initialize_queue: bool = True,
         transformer_gate: threading.Semaphore | None = None,
+        cpu_affinity_pool: _CpuAffinityPool | None = None,
     ) -> None:
         self.store = store
         self.project_root = project_root
@@ -266,6 +386,7 @@ class LocalJobWorker:
         )
         self._initialize_queue = initialize_queue
         self._transformer_gate = transformer_gate
+        self._cpu_affinity_pool = cpu_affinity_pool or _CpuAffinityPool()
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -556,6 +677,7 @@ class LocalJobWorker:
         return cancelled, progress_mtime_ns
 
     def _run(self, job: dict) -> None:
+        affinity_reservation: tuple[int, ...] | None = None
         research_run_id = job["payload"].get("research_run_id")
         backtest_id = job["payload"].get("backtest_id")
         parameter_experiment_id = job["payload"].get("parameter_experiment_id")
@@ -607,7 +729,25 @@ class LocalJobWorker:
                     "NUMEXPR_MAX_THREADS",
                 ):
                     extra_env[environment_key] = str(numerical_threads)
+                affinity_reservation = self._cpu_affinity_pool.acquire(
+                    numerical_threads
+                )
+                command, affinity = _command_with_cpu_affinity(
+                    command,
+                    numerical_threads,
+                    affinity_getter=(
+                        (lambda _pid: affinity_reservation)
+                        if affinity_reservation is not None
+                        else None
+                    ),
+                )
+                if affinity is not None:
+                    extra_env["QUANTLAB_JOB_CPU_AFFINITY"] = ",".join(
+                        str(value) for value in affinity
+                    )
         except ValueError as exc:
+            self._cpu_affinity_pool.release(affinity_reservation)
+            affinity_reservation = None
             error_message = str(exc)
             if job["kind"] == "quant_bundle_evaluate":
                 try:
@@ -646,20 +786,24 @@ class LocalJobWorker:
         factor_research_settled = False
         factor_evaluation_contract_error: str | None = None
         try:
-            with log_path.open("a", encoding="utf-8") as log:
-                process = subprocess.Popen(
-                    command,
-                    cwd=self.project_root,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    creationflags=creationflags,
-                    env={**os.environ, **extra_env},
-                )
-                cancelled, progress_mtime_ns = self._monitor_process(
-                    job["id"], result_path, process
-                )
-                exit_code = int(process.returncode or 0)
+            try:
+                with log_path.open("a", encoding="utf-8") as log:
+                    process = subprocess.Popen(
+                        command,
+                        cwd=self.project_root,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        creationflags=creationflags,
+                        env={**os.environ, **extra_env},
+                    )
+                    cancelled, progress_mtime_ns = self._monitor_process(
+                        job["id"], result_path, process
+                    )
+                    exit_code = int(process.returncode or 0)
+            finally:
+                self._cpu_affinity_pool.release(affinity_reservation)
+                affinity_reservation = None
             if cancelled:
                 cancellation_error = "Cancelled by operator"
                 if job["kind"] == "quant_bundle_evaluate":
