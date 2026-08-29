@@ -9,11 +9,17 @@ existing position, but may never increase it.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
-from .research_horizon import LONG_1_3Y, SHORT_1_5D, SWING_1_6M
+from .research_horizon import (
+    LONG_1_3Y,
+    SHORT_1_5D,
+    SWING_1_6M,
+    canonical_sha256,
+)
 
 HEALTHY = "healthy"
 WATCH = "watch"
@@ -68,6 +74,226 @@ DEFAULT_HEALTH_CRITERIA = {
 }
 
 _SEVERITY = {HEALTHY: 0, WATCH: 1, RESTRICTED: 2, SUSPENDED: 3, RETIRED: 4}
+
+FEATURE_DRIFT_EPISODE_CONTRACT_VERSION = "strategy-feature-drift-episode-v1"
+
+
+def resolve_feature_drift_episode(
+    snapshots: Iterable[Mapping[str, Any]],
+    *,
+    expected_strategy_version_id: str,
+    expected_horizon_profile: str,
+    expected_horizon_contract_sha256: str,
+    observed_at: datetime,
+) -> dict[str, Any]:
+    """Resolve one content-addressed feature-drift breach episode.
+
+    The input is the append-only health history for the exact incumbent,
+    newest first.  A missing or ungoverned latest observation fails closed;
+    it is never interpreted as zero drift.  Once the latest observation is a
+    governed breach, older contiguous breaches resolve to one stable episode
+    start, so daily scheduler retries cannot create fresh research work.
+    """
+
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("feature drift observed_at must be timezone-aware")
+    if expected_horizon_profile not in HEALTH_WINDOWS_BY_HORIZON:
+        raise ValueError("feature drift horizon is invalid")
+    _require_digest(
+        expected_horizon_contract_sha256,
+        field="feature drift horizon contract",
+    )
+    cutoff = observed_at.astimezone(UTC)
+    ordered: list[dict[str, Any]] = []
+    for raw in snapshots:
+        try:
+            normalized = _normalize_drift_snapshot(
+                raw,
+                expected_strategy_version_id=expected_strategy_version_id,
+                expected_horizon_profile=expected_horizon_profile,
+                expected_horizon_contract_sha256=expected_horizon_contract_sha256,
+            )
+        except (KeyError, TypeError, ValueError):
+            return _no_drift_event("feature_drift_evidence_invalid")
+        if normalized["as_of"] > cutoff or normalized["recorded_at"] > cutoff:
+            continue
+        ordered.append(normalized)
+    ordered.sort(
+        key=lambda item: (
+            item["as_of"],
+            item["recorded_at"],
+            item["snapshot_sha256"],
+        ),
+        reverse=True,
+    )
+    if not ordered:
+        return _no_drift_event("feature_drift_evidence_missing")
+
+    latest = ordered[0]
+    if latest["observation"] is None:
+        return _no_drift_event("feature_drift_evidence_missing")
+    if not latest["observation"]["hard_gates_passed"]:
+        return _no_drift_event("feature_drift_hard_gate_failed")
+    if not latest["observation"]["breached"]:
+        return _no_drift_event("feature_drift_below_watch_threshold")
+
+    episode_start = latest
+    for candidate in ordered[1:]:
+        observation = candidate["observation"]
+        if (
+            observation is None
+            or not observation["hard_gates_passed"]
+            or not observation["breached"]
+        ):
+            break
+        episode_start = candidate
+
+    identity = {
+        "contract_version": FEATURE_DRIFT_EPISODE_CONTRACT_VERSION,
+        "strategy_version_id": expected_strategy_version_id,
+        "horizon_profile": expected_horizon_profile,
+        "episode_start_snapshot_sha256": episode_start["snapshot_sha256"],
+    }
+    trigger_id = canonical_sha256(identity)
+    latest_observation = latest["observation"]
+    return {
+        "due": True,
+        "reason": "feature_drift_episode_due",
+        "trigger_id": trigger_id,
+        "event": {
+            **identity,
+            "trigger_id": trigger_id,
+            "kind": "feature_drift_episode",
+            "source": "strategy_health_snapshots",
+            "metric": "feature_drift",
+            "threshold_key": "watch_feature_drift",
+            "latest_snapshot_sha256": latest["snapshot_sha256"],
+            "latest_as_of": latest["as_of"].isoformat(),
+            "latest_recorded_at": latest["recorded_at"].isoformat(),
+            "latest_evidence_sha256": latest["evidence_sha256"],
+            "latest_criteria_sha256": latest["criteria_sha256"],
+            "feature_drift": latest_observation["feature_drift"],
+            "watch_feature_drift": latest_observation["watch_feature_drift"],
+        },
+    }
+
+
+def _normalize_drift_snapshot(
+    raw: Mapping[str, Any],
+    *,
+    expected_strategy_version_id: str,
+    expected_horizon_profile: str,
+    expected_horizon_contract_sha256: str,
+) -> dict[str, Any]:
+    snapshot = dict(raw)
+    snapshot_sha256 = _require_digest(
+        snapshot.get("snapshot_sha256"), field="strategy health snapshot"
+    )
+    if _require_digest(snapshot.get("id"), field="strategy health snapshot id") != snapshot_sha256:
+        raise ValueError("strategy health snapshot id differs from its seal")
+    if str(snapshot.get("strategy_version_id") or "") != expected_strategy_version_id:
+        raise ValueError("strategy health snapshot belongs to another version")
+    if str(snapshot.get("horizon_profile") or "") != expected_horizon_profile:
+        raise ValueError("strategy health snapshot belongs to another horizon")
+    as_of = _aware_datetime(snapshot.get("as_of"), field="strategy health as_of")
+    recorded_at = _aware_datetime(
+        snapshot.get("recorded_at"), field="strategy health recorded_at"
+    )
+    criteria = dict(snapshot.get("criteria_json") or {})
+    evidence = dict(snapshot.get("evidence_json") or {})
+    criteria_sha256 = _require_digest(
+        snapshot.get("criteria_sha256"), field="strategy health criteria"
+    )
+    evidence_sha256 = _require_digest(
+        snapshot.get("evidence_sha256"), field="strategy health evidence"
+    )
+    if canonical_sha256(criteria) != criteria_sha256:
+        raise ValueError("strategy health criteria seal is invalid")
+    if canonical_sha256(evidence) != evidence_sha256:
+        raise ValueError("strategy health evidence seal is invalid")
+    sealed_snapshot = {
+        "contract_version": "strategy-health-snapshot-v1",
+        "strategy_version_id": expected_strategy_version_id,
+        "horizon_profile": expected_horizon_profile,
+        "horizon_contract_sha256": expected_horizon_contract_sha256,
+        "as_of": as_of.astimezone(UTC).replace(microsecond=0).isoformat(),
+        "health_status": str(snapshot.get("health_status") or ""),
+        "criteria_json": criteria,
+        "criteria_sha256": criteria_sha256,
+        "evidence_json": evidence,
+        "evidence_sha256": evidence_sha256,
+        "recorded_by": str(snapshot.get("recorded_by") or ""),
+    }
+    if canonical_sha256(sealed_snapshot) != snapshot_sha256:
+        raise ValueError("strategy health snapshot content seal is invalid")
+    return {
+        "snapshot_sha256": snapshot_sha256,
+        "as_of": as_of.astimezone(UTC),
+        "recorded_at": recorded_at.astimezone(UTC),
+        "criteria_sha256": criteria_sha256,
+        "evidence_sha256": evidence_sha256,
+        "observation": _drift_observation(criteria, evidence),
+    }
+
+
+def _drift_observation(
+    criteria: Mapping[str, Any], evidence: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    required = {
+        "watch_feature_drift",
+        "feature_drift",
+        "data_integrity_ok",
+        "ledger_reconciled",
+    }
+    if not required.issubset(set(criteria) | set(evidence)):
+        return None
+    if "watch_feature_drift" not in criteria or any(
+        field not in evidence
+        for field in ("feature_drift", "data_integrity_ok", "ledger_reconciled")
+    ):
+        return None
+    try:
+        feature_drift = float(evidence["feature_drift"])
+        threshold = float(criteria["watch_feature_drift"])
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isfinite(feature_drift)
+        or feature_drift < 0
+        or not isfinite(threshold)
+        or not 0 <= threshold <= 1
+        or not isinstance(evidence["data_integrity_ok"], bool)
+        or not isinstance(evidence["ledger_reconciled"], bool)
+    ):
+        return None
+    hard_gates_passed = (
+        evidence["data_integrity_ok"] is True
+        and evidence["ledger_reconciled"] is True
+    )
+    return {
+        "feature_drift": feature_drift,
+        "watch_feature_drift": threshold,
+        "hard_gates_passed": hard_gates_passed,
+        "breached": feature_drift >= threshold,
+    }
+
+
+def _require_digest(value: Any, *, field: str) -> str:
+    digest = str(value or "").strip().lower()
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    return digest
+
+
+def _aware_datetime(value: Any, *, field: str) -> datetime:
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value or ""))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field} must be timezone-aware")
+    return parsed
+
+
+def _no_drift_event(reason: str) -> dict[str, Any]:
+    return {"due": False, "reason": reason, "trigger_id": None, "event": None}
 
 
 def health_allows_new_risk(status: str | None) -> bool:

@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import cast, select
+from sqlalchemy.dialects.postgresql import JSONB
 
 from quant_data.cninfo_announcements import load_trade_calendar_open_days
 from quant_data.config import Settings
@@ -18,10 +19,12 @@ from quant_data.database import (
     recommendation_portfolios,
     recommendation_snapshots,
     research_runs,
+    row_dict,
     simulation_batches,
     simulation_nav,
     simulation_portfolios,
     strategy_allocation_events,
+    strategy_health_snapshots,
     strategy_versions,
 )
 from quant_data.execution_contract import require_daily_qlib_contract
@@ -88,6 +91,7 @@ from .safe_mode import SafeModeActiveError, SafeModeStore
 from .schedule_store import ScheduleStore
 from .services import list_qlib_datasets
 from .simulation_store import ExecutionDataNotReadyError, SimulationStore
+from .strategy_health import resolve_feature_drift_episode
 from .strategy_store import StrategyStore
 from .three_horizon_account import ThreeHorizonAccountService
 from .transparent_baseline_bootstrap import (
@@ -2268,6 +2272,7 @@ class SchedulerEngine:
                     strategy_versions.c.status,
                     strategy_versions.c.promotion_stage,
                     strategy_versions.c.horizon_profile,
+                    strategy_versions.c.horizon_contract_sha256,
                     strategy_versions.c.approved_at,
                     strategy_versions.c.created_at,
                     strategy_versions.c.version,
@@ -2287,6 +2292,7 @@ class SchedulerEngine:
                 int(str(item.promotion_stage) == "recommendation_enabled"),
                 item.approved_at or item.created_at,
                 int(item.version),
+                str(item.id),
             ),
         )
         return {
@@ -2294,8 +2300,67 @@ class SchedulerEngine:
             "status": str(row.status),
             "promotion_stage": str(row.promotion_stage),
             "horizon_profile": str(row.horizon_profile),
+            "horizon_contract_sha256": str(row.horizon_contract_sha256),
             "version": int(row.version),
         }
+
+    def _managed_fin_strategy_drift_event(
+        self,
+        incumbent_strategy: dict[str, Any],
+        *,
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        """Resolve the exact incumbent's latest governed drift episode."""
+
+        with self.jobs.engine.connect() as connection:
+            rows = connection.execute(
+                select(strategy_health_snapshots)
+                .where(
+                    strategy_health_snapshots.c.strategy_version_id
+                    == incumbent_strategy["id"],
+                    strategy_health_snapshots.c.horizon_profile
+                    == incumbent_strategy["horizon_profile"],
+                    strategy_health_snapshots.c.as_of <= observed_at,
+                    strategy_health_snapshots.c.recorded_at <= observed_at,
+                )
+                .order_by(
+                    strategy_health_snapshots.c.as_of.desc(),
+                    strategy_health_snapshots.c.recorded_at.desc(),
+                    strategy_health_snapshots.c.snapshot_sha256.desc(),
+                )
+            )
+            return resolve_feature_drift_episode(
+                (row_dict(item) for item in rows),
+                expected_strategy_version_id=str(incumbent_strategy["id"]),
+                expected_horizon_profile=str(incumbent_strategy["horizon_profile"]),
+                expected_horizon_contract_sha256=str(
+                    incumbent_strategy["horizon_contract_sha256"]
+                ),
+                observed_at=observed_at,
+            )
+
+    def _consumed_managed_fin_strategy_trigger_ids(
+        self, trigger_ids: list[str]
+    ) -> set[str]:
+        """Return trigger ids already attached to any immutable research run."""
+
+        consumed: set[str] = set()
+        with self.jobs.engine.connect() as connection:
+            trigger_path = research_runs.c.config_json["managed_fin_strategy_run"][
+                "trigger_ids"
+            ]
+            for trigger_id in sorted(set(trigger_ids)):
+                existing = connection.scalar(
+                    select(research_runs.c.id)
+                    .where(
+                        research_runs.c.kind == "strategy",
+                        trigger_path.op("@>")(cast([trigger_id], JSONB)),
+                    )
+                    .limit(1)
+                )
+                if existing is not None:
+                    consumed.add(trigger_id)
+        return consumed
 
     def _existing_managed_fin_strategy_run(
         self, run_sha256: str
@@ -2308,23 +2373,19 @@ class SchedulerEngine:
                     research_runs.c.status,
                     research_runs.c.config_json,
                 )
-                .where(research_runs.c.kind == "strategy")
-                .order_by(research_runs.c.created_at.desc())
-                .limit(1000)
+                .where(
+                    research_runs.c.kind == "strategy",
+                    research_runs.c.config_json["managed_fin_strategy_run"][
+                        "run_sha256"
+                    ].as_string()
+                    == run_sha256,
+                )
             ).all()
-        matches = [
-            item
-            for item in rows
-            if dict(item.config_json or {})
-            .get("managed_fin_strategy_run", {})
-            .get("run_sha256")
-            == run_sha256
-        ]
-        if len(matches) > 1:
+        if len(rows) > 1:
             raise ValueError("managed fin_strategy run identity is not unique")
-        if not matches:
+        if not rows:
             return None
-        item = matches[0]
+        item = rows[0]
         return {
             "id": str(item.id),
             "job_id": str(item.job_id) if item.job_id else None,
@@ -2349,6 +2410,7 @@ class SchedulerEngine:
         calendar: list[str] = []
         local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
         cadence_event: dict[str, Any] | None = None
+        managed_trigger_events: list[dict[str, Any]] = []
         if scenario.requires_dataset:
             available = list_qlib_datasets(self.settings.data_root)
             if managed is not None:
@@ -2416,17 +2478,13 @@ class SchedulerEngine:
                     )
                 except (FileNotFoundError, ValueError) as exc:
                     raise ScheduleRunWaiting(str(exc)) from exc
-                if not cadence_event["due"]:
+                if cadence_event["reason"] == "exchange_closed":
                     self.schedules.finish_run(
                         run["id"],
                         "skipped",
                         message=str(cadence_event["reason"]),
                     )
                     return None
-                if local_date.isoformat() not in set(calendar):
-                    raise ScheduleRunWaiting(
-                        "latest reproducible daily Qlib has not published the schedule session"
-                    )
             elif run["trading_days_only"] and local_date.isoformat() not in set(calendar):
                 self.schedules.finish_run(
                     run["id"], "skipped", message="not a Qlib trading day"
@@ -2441,8 +2499,65 @@ class SchedulerEngine:
                 str(managed["horizon_profile"])
             )
             if incumbent_strategy is None:
+                if cadence_event["due"]:
+                    raise ScheduleRunWaiting(
+                        "managed fin_strategy is waiting for an approved paper or active incumbent"
+                    )
+                self.schedules.finish_run(
+                    run["id"],
+                    "skipped",
+                    message=(
+                        f"{cadence_event['reason']}; no incumbent exists for drift evidence"
+                    ),
+                )
+                return None
+            drift_event = self._managed_fin_strategy_drift_event(
+                incumbent_strategy,
+                observed_at=scheduled_for,
+            )
+            if cadence_event["due"]:
+                calendar_identity = {
+                    "contract_version": "managed-fin-strategy-trigger-id-v1",
+                    "kind": "calendar",
+                    "schedule_contract_sha256": managed["contract_sha256"],
+                    "calendar_event": cadence_event["event"],
+                }
+                managed_trigger_events.append(
+                    {
+                        **calendar_identity,
+                        "trigger_id": fin_strategy_schedule_sha256(calendar_identity),
+                    }
+                )
+            if drift_event["due"]:
+                managed_trigger_events.append(dict(drift_event["event"]))
+            if not managed_trigger_events:
+                self.schedules.finish_run(
+                    run["id"],
+                    "skipped",
+                    message=f"{cadence_event['reason']}; {drift_event['reason']}",
+                )
+                return None
+            consumed_trigger_ids = self._consumed_managed_fin_strategy_trigger_ids(
+                [str(item["trigger_id"]) for item in managed_trigger_events]
+            )
+            managed_trigger_events = sorted(
+                (
+                    item
+                    for item in managed_trigger_events
+                    if str(item["trigger_id"]) not in consumed_trigger_ids
+                ),
+                key=lambda item: str(item["trigger_id"]),
+            )
+            if not managed_trigger_events:
+                self.schedules.finish_run(
+                    run["id"],
+                    "skipped",
+                    message="managed fin_strategy trigger events are already consumed",
+                )
+                return None
+            if local_date.isoformat() not in set(calendar):
                 raise ScheduleRunWaiting(
-                    "managed fin_strategy is waiting for an approved paper or active incumbent"
+                    "latest reproducible daily Qlib has not published the schedule session"
                 )
 
         try:
@@ -2510,10 +2625,15 @@ class SchedulerEngine:
         )
         managed_run: dict[str, Any] | None = None
         if managed is not None:
+            trigger_ids = [
+                str(item["trigger_id"]) for item in managed_trigger_events
+            ]
             managed_run = {
-                "contract_version": "managed-fin-strategy-run-v1",
+                "contract_version": "managed-fin-strategy-run-v2",
                 "schedule_contract_sha256": managed["contract_sha256"],
                 "calendar_event": cadence_event["event"],
+                "trigger_events": managed_trigger_events,
+                "trigger_ids": trigger_ids,
                 "scheduled_session": local_date.isoformat(),
                 "dataset_binding": dataset_binding,
                 "research_window_contract_sha256": period_resolution[

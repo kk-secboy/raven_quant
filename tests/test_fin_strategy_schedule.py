@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,7 +46,16 @@ def test_managed_specs_bind_current_recipe_and_minimal_horizon_features() -> Non
             str(item["id"]): str(item["qlib_expression"])
             for item in recipe["factor_baseline"]
         }
-        assert managed["trigger_policy"]["drift_trigger"] == "not_implemented"
+        assert managed["contract_version"] == "managed-fin-strategy-schedules-v2"
+        assert managed["trigger_policy"]["drift_trigger"] == {
+            "contract_version": "managed-fin-strategy-drift-trigger-v1",
+            "source": "strategy_health_snapshots",
+            "metric": "feature_drift",
+            "threshold_key": "watch_feature_drift",
+            "comparison": "greater_than_or_equal",
+            "required_hard_gates": ["data_integrity_ok", "ledger_reconciled"],
+            "dedupe": "contiguous_breach_episode",
+        }
     short = next(
         item
         for item in specs
@@ -56,6 +66,17 @@ def test_managed_specs_bind_current_recipe_and_minimal_horizon_features() -> Non
         "features"
     ]
     assert all("$fund_" not in expression for expression in short_features.values())
+
+
+@pytest.mark.no_database
+def test_managed_schedule_rejects_legacy_or_tampered_drift_policy() -> None:
+    payload = deepcopy(build_managed_fin_strategy_schedule_specs()[0]["payload"])
+    payload["managed_fin_strategy"]["trigger_policy"][
+        "drift_trigger"
+    ] = "not_implemented"
+
+    with pytest.raises(ValueError, match="contract digest changed"):
+        validate_managed_fin_strategy_payload(payload)
 
 
 @pytest.mark.no_database
@@ -211,6 +232,34 @@ def test_managed_schedule_reconcile_is_database_idempotent(database_url: str) ->
     )
 
 
+def test_managed_trigger_consumption_includes_unattached_research_run(
+    database_url: str, tmp_path: Path
+) -> None:
+    trigger_id = "a" * 64
+    research = ResearchStore(database_url)
+    created = research.create_run(
+        kind="strategy",
+        objective="test managed trigger consumption",
+        dataset="test-dataset",
+        requested_by="test",
+        budget={"loop_n": 1, "duration": "30m"},
+        config={
+            "managed_fin_strategy_run": {
+                "contract_version": "managed-fin-strategy-run-v2",
+                "trigger_ids": [trigger_id],
+            }
+        },
+        artifact_path=tmp_path,
+    )
+    assert created["job_id"] is None
+    engine = object.__new__(SchedulerEngine)
+    engine.jobs = SimpleNamespace(engine=research.engine)
+
+    assert engine._consumed_managed_fin_strategy_trigger_ids(
+        [trigger_id, "b" * 64]
+    ) == {trigger_id}
+
+
 def test_managed_run_freezes_actual_dataset_window_feature_and_incumbent(
     database_url: str,
     tmp_path: Path,
@@ -317,7 +366,23 @@ def test_managed_run_freezes_actual_dataset_window_feature_and_incumbent(
             "status": "approved",
             "promotion_stage": "paper",
             "horizon_profile": "short_1_5d",
+            "horizon_contract_sha256": "e" * 64,
             "version": 1,
+        },
+    )
+    drift_trigger_id = "f" * 64
+    monkeypatch.setattr(
+        engine,
+        "_managed_fin_strategy_drift_event",
+        lambda *_args, **_kwargs: {
+            "due": True,
+            "reason": "feature_drift_episode_due",
+            "trigger_id": drift_trigger_id,
+            "event": {
+                "contract_version": "strategy-feature-drift-episode-v1",
+                "kind": "feature_drift_episode",
+                "trigger_id": drift_trigger_id,
+            },
         },
     )
 
@@ -336,7 +401,22 @@ def test_managed_run_freezes_actual_dataset_window_feature_and_incumbent(
         "end_date": "2026-01-05",
     }
     managed_run = research_run["config"]["managed_fin_strategy_run"]
+    assert managed_run["contract_version"] == "managed-fin-strategy-run-v2"
     assert managed_run["calendar_event"] == "week:2026-W02"
+    assert len(managed_run["trigger_ids"]) == 2
+    assert drift_trigger_id in managed_run["trigger_ids"]
+    calendar_trigger = next(
+        item for item in managed_run["trigger_events"] if item["kind"] == "calendar"
+    )
+    assert calendar_trigger == {
+        "contract_version": "managed-fin-strategy-trigger-id-v1",
+        "kind": "calendar",
+        "schedule_contract_sha256": spec["payload"]["managed_fin_strategy"][
+            "contract_sha256"
+        ],
+        "calendar_event": "week:2026-W02",
+        "trigger_id": calendar_trigger["trigger_id"],
+    }
     assert managed_run["research_window_contract_sha256"] == "c" * 64
     assert managed_run["incumbent_strategy_version_id"] == "1" * 32
     assert research_run["config"]["feature_set"]["features"] == {

@@ -15,7 +15,8 @@ from .research_automation import normalize_research_period_policy
 from .schedule_store import ScheduleStore
 from .strategy_recipes import TRANSPARENT_RESEARCH_BASELINE_IDS, get_strategy_recipe
 
-MANAGED_FIN_STRATEGY_SCHEDULE_VERSION = "managed-fin-strategy-schedules-v1"
+MANAGED_FIN_STRATEGY_SCHEDULE_VERSION = "managed-fin-strategy-schedules-v2"
+MANAGED_FIN_STRATEGY_DRIFT_TRIGGER_VERSION = "managed-fin-strategy-drift-trigger-v1"
 LATEST_REPRODUCIBLE_DAILY_DATASET = "managed:latest-reproducible-daily"
 MANAGED_FIN_STRATEGY_ACTOR = "system:fin-strategy-scheduler"
 MANAGED_FIN_STRATEGY_RUN_TIME = time(23, 0)
@@ -30,6 +31,16 @@ _SCHEDULE_NAMES = {
     "short_relative_strength": "QuantLab / fin_strategy / short",
     "swing_trend": "QuantLab / fin_strategy / swing",
     "long_quality_value": "QuantLab / fin_strategy / long",
+}
+
+_DRIFT_TRIGGER_POLICY = {
+    "contract_version": MANAGED_FIN_STRATEGY_DRIFT_TRIGGER_VERSION,
+    "source": "strategy_health_snapshots",
+    "metric": "feature_drift",
+    "threshold_key": "watch_feature_drift",
+    "comparison": "greater_than_or_equal",
+    "required_hard_gates": ["data_integrity_ok", "ledger_reconciled"],
+    "dedupe": "contiguous_breach_episode",
 }
 
 
@@ -73,7 +84,7 @@ def build_managed_fin_strategy_schedule_specs() -> list[dict[str, Any]]:
             "cadence": _CADENCES[recipe_id],
             "trigger_policy": {
                 "calendar": "persisted_exchange_trade_calendar",
-                "drift_trigger": "not_implemented",
+                "drift_trigger": dict(_DRIFT_TRIGGER_POLICY),
             },
         }
         managed["contract_sha256"] = canonical_sha256(managed)
@@ -159,7 +170,7 @@ def validate_managed_fin_strategy_payload(value: Any) -> dict[str, Any] | None:
         or trigger_policy
         != {
             "calendar": "persisted_exchange_trade_calendar",
-            "drift_trigger": "not_implemented",
+            "drift_trigger": _DRIFT_TRIGGER_POLICY,
         }
         or value.get("scenario") != "fin_strategy"
         or value.get("dataset") != LATEST_REPRODUCIBLE_DAILY_DATASET
