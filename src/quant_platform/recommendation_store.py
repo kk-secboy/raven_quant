@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
     factor_evaluations,
+    jobs,
     recommendation_holdings,
     recommendation_nav,
     recommendation_portfolios,
@@ -35,6 +36,15 @@ from .strategy_store import StrategyStore
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _requires_job_attachment(snapshot: dict[str, Any]) -> bool:
+    """Return whether a durable snapshot still needs its worker job binding."""
+
+    return (
+        str(snapshot.get("status") or "") == "queued"
+        and not str(snapshot.get("job_id") or "").strip()
+    )
 
 
 def _build_account_action_plan(
@@ -277,7 +287,18 @@ class RecommendationStore:
                 )
             ]
         result["snapshots"] = snapshots
-        result["latest_snapshot"] = snapshots[0] if snapshots else None
+        # A crash between the append-only snapshot insert and job attachment
+        # must not make the scheduler believe today's refresh is already in
+        # flight.  Keep the orphan visible for audit/recovery, but do not
+        # project it as the operational latest snapshot until a job is bound.
+        result["pending_snapshot"] = next(
+            (item for item in snapshots if _requires_job_attachment(item)),
+            None,
+        )
+        result["latest_snapshot"] = next(
+            (item for item in snapshots if not _requires_job_attachment(item)),
+            None,
+        )
         result["construction_notional"] = result.pop("hypothetical_initial_value")
         result["historical_hypothetical_observations"] = nav
         return result
@@ -412,14 +433,58 @@ class RecommendationStore:
                     )
                 )
         except IntegrityError:
-            with self.engine.connect() as connection:
+            with self.engine.begin() as connection:
                 row = connection.execute(
-                    select(recommendation_snapshots).where(
+                    select(recommendation_snapshots)
+                    .where(
                         recommendation_snapshots.c.portfolio_id == portfolio_id,
                         recommendation_snapshots.c.as_of_date == as_of_date,
                     )
+                    .with_for_update()
                 ).one()
-                return self._snapshot_row(row, connection), False
+                snapshot = self._snapshot_row(row, connection)
+                if not _requires_job_attachment(snapshot):
+                    return snapshot, False
+
+                # The process may have committed JobStore.create() and failed
+                # immediately before attach_job().  Recover that exact active
+                # job instead of creating a duplicate.  If no job exists, the
+                # caller receives ``True`` and can safely enqueue the missing
+                # work using its stable idempotency key.
+                existing_job = connection.execute(
+                    select(jobs.c.id, jobs.c.started_at)
+                    .where(
+                        jobs.c.kind == "recommendation_refresh",
+                        jobs.c.status.in_(("queued", "running")),
+                        jobs.c.payload_json[
+                            "recommendation_snapshot_id"
+                        ].as_string()
+                        == str(snapshot["id"]),
+                    )
+                    .order_by(jobs.c.created_at.desc())
+                    .limit(1)
+                ).first()
+                if existing_job is None:
+                    return snapshot, True
+                connection.execute(
+                    update(recommendation_snapshots)
+                    .where(
+                        recommendation_snapshots.c.id == str(snapshot["id"]),
+                        recommendation_snapshots.c.status == "queued",
+                        recommendation_snapshots.c.job_id.is_(None),
+                    )
+                    .values(
+                        job_id=str(existing_job.id),
+                        status="running",
+                        started_at=existing_job.started_at or _now(),
+                    )
+                )
+                repaired = connection.execute(
+                    select(recommendation_snapshots).where(
+                        recommendation_snapshots.c.id == str(snapshot["id"])
+                    )
+                ).one()
+                return self._snapshot_row(repaired, connection), False
         return self.get_snapshot(snapshot_id), True
 
     def attach_job(self, snapshot_id: str, job_id: str) -> None:

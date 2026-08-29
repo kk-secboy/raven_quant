@@ -12,6 +12,7 @@ from governance_fixtures import (
 from sqlalchemy import func, select, update
 
 from quant_data.database import paper_fills, paper_orders, strategy_versions
+from quant_platform.job_store import JobStore
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.recommendation_store import RecommendationStore
@@ -97,6 +98,83 @@ def test_recommendation_snapshot_is_independent_of_paper_orders_and_fills(
             connection.scalar(select(func.count()).select_from(paper_fills)),
         )
     assert after == before
+
+
+def test_unattached_queued_snapshot_is_retryable_and_recovers_existing_job(
+    tmp_path, database_url: str
+) -> None:
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        recipe_id="short_relative_strength",
+    )
+    store = RecommendationStore(database_url)
+    with store.engine.begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id == version_id)
+            .values(status="approved")
+        )
+    enable_recommendation_authority_for_test(database_url, [version_id])
+    portfolio = store.create(
+        name="recover queued recommendation",
+        strategy_version_id=version_id,
+        dataset="snapshot",
+        hypothetical_initial_value=100_000,
+        actor="test",
+    )
+    as_of = date(2026, 7, 10)
+    snapshot, created = store.create_snapshot(
+        portfolio_id=portfolio["id"],
+        as_of_date=as_of,
+        dataset="snapshot",
+        dataset_identity_sha256=DATASET_IDENTITY,
+    )
+    assert created is True
+
+    # The append-only row remains visible, but it must not suppress the next
+    # scheduler attempt merely because the insert committed before JobStore.
+    orphaned = store.get(portfolio["id"])
+    assert orphaned["latest_snapshot"] is None
+    assert orphaned["pending_snapshot"]["id"] == snapshot["id"]
+    retry, should_enqueue = store.create_snapshot(
+        portfolio_id=portfolio["id"],
+        as_of_date=as_of,
+        dataset="snapshot",
+        dataset_identity_sha256=DATASET_IDENTITY,
+    )
+    assert retry["id"] == snapshot["id"]
+    assert should_enqueue is True
+
+    # Model a process that committed job creation and died before attach_job.
+    job = JobStore(database_url).create(
+        "recommendation_refresh",
+        {
+            "recommendation_portfolio_id": portfolio["id"],
+            "recommendation_snapshot_id": snapshot["id"],
+            "dataset": "snapshot",
+            "dataset_path": str(tmp_path),
+            "dataset_identity_sha256": DATASET_IDENTITY,
+            "as_of_date": as_of.isoformat(),
+        },
+        tmp_path / "recommendation-refresh.log",
+        dedupe_active_kind=False,
+        idempotency_key=f"test-recommendation-refresh:{snapshot['id']}",
+    )
+    repaired, should_enqueue = store.create_snapshot(
+        portfolio_id=portfolio["id"],
+        as_of_date=as_of,
+        dataset="snapshot",
+        dataset_identity_sha256=DATASET_IDENTITY,
+    )
+    assert should_enqueue is False
+    assert repaired["id"] == snapshot["id"]
+    assert repaired["job_id"] == job["id"]
+    assert repaired["status"] == "running"
+
+    tracked = store.get(portfolio["id"])
+    assert tracked["pending_snapshot"] is None
+    assert tracked["latest_snapshot"]["id"] == snapshot["id"]
 
 
 def test_recommendation_result_identity_is_bound_and_cash_only_is_valid(
