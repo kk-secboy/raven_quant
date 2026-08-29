@@ -38,6 +38,7 @@ from quant_data.execution_contract import (
     MINUTE_EXECUTION_CONTRACT_VERSION,
     MINUTE_SOURCE_UNIT_CONTRACTS,
 )
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.allocation_store import AllocationStore
 from quant_platform.cost_model import COST_SCHEDULE_VERSION
 from quant_platform.simulation_engine import SIMULATION_ENGINE_VERSION
@@ -134,6 +135,9 @@ def _daily_dataset() -> dict:
             "source_hand_size": 100,
             "index_volume_policy": "excluded_non_tradable_benchmark",
             "governed_etf_whitelist": governed_etf_ready_evidence(),
+            "execution_controls": {
+                "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+            },
             "lineage_verified": True,
         },
     }

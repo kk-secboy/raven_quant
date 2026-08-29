@@ -785,6 +785,9 @@ def formal_backtest_metrics(
             "source_hand_size": 100,
             "index_volume_policy": "excluded_non_tradable_benchmark",
             "governed_etf_whitelist": governed_etf_ready_evidence(),
+            "execution_controls": {
+                "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+            },
             "lineage_verified": True,
             "source_lineage_id": "9" * 64,
             "strategy_config_sha256": config_hash,
