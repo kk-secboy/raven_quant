@@ -1195,6 +1195,13 @@ class LocalJobWorker:
                 ):
                     logical_error = "factor library materialization identity is invalid"
                     exit_code = 3
+                elif result_path is None or not result_path.is_file():
+                    logical_error = "factor library materialization manifest is missing"
+                    exit_code = 3
+                else:
+                    result["materialization_manifest_sha256"] = hashlib.sha256(
+                        result_path.read_bytes()
+                    ).hexdigest()
             if exit_code == 0 and job["kind"] == "factor_library_cluster":
                 if (
                     not isinstance(result, dict)
@@ -3388,7 +3395,12 @@ class LocalJobWorker:
                 _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
             )
         if job["kind"] == "factor_library_materialize":
-            feature_set = get_feature_set(str(payload["feature_set_id"]))
+            embedded_feature_set = payload.get("feature_set_definition")
+            feature_set = (
+                register_feature_set(dict(embedded_feature_set))
+                if isinstance(embedded_feature_set, dict)
+                else get_feature_set(str(payload["feature_set_id"]))
+            )
             if (
                 feature_set["definition_sha256"]
                 != payload["feature_set_definition_sha256"]
@@ -3403,6 +3415,18 @@ class LocalJobWorker:
             )
             output.mkdir(parents=True, exist_ok=True)
             result_path = output / "manifest.json"
+            feature_set_path: Path | None = None
+            if isinstance(embedded_feature_set, dict):
+                feature_set_path = output / "feature-set-input.json"
+                feature_set_path.write_text(
+                    json.dumps(
+                        feature_set,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
             is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
 
             def runtime_path(value: str | Path) -> str:
@@ -3438,6 +3462,10 @@ class LocalJobWorker:
                     str(payload["end"]),
                 ]
             )
+            if feature_set_path is not None:
+                command.extend(
+                    ["--feature-set-definition", runtime_path(feature_set_path)]
+                )
             return (
                 command,
                 result_path,

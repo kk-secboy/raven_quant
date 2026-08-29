@@ -93,6 +93,9 @@ class Settings:
     quantlab_release_id: str = ""
     quantlab_config_digest: str = ""
     health_snapshot_seconds: int = 300
+    # Strategy evidence reads sealed factor materializations and formal OOS
+    # artifacts, so it runs less often than cheap process health collection.
+    strategy_health_snapshot_seconds: int = 3600
     data_freshness_max_days: int = 7
     stale_job_hours: int = 6
     alert_webhook_url: str = ""
@@ -229,6 +232,10 @@ class Settings:
             .strip()
             .lower(),
             health_snapshot_seconds=max(60, int(os.getenv("HEALTH_SNAPSHOT_SECONDS", "300"))),
+            strategy_health_snapshot_seconds=max(
+                300,
+                int(os.getenv("STRATEGY_HEALTH_SNAPSHOT_SECONDS", "3600")),
+            ),
             data_freshness_max_days=max(1, int(os.getenv("DATA_FRESHNESS_MAX_DAYS", "7"))),
             stale_job_hours=max(1, int(os.getenv("STALE_JOB_HOURS", "6"))),
             alert_webhook_url=os.getenv("ALERT_WEBHOOK_URL", "").strip(),

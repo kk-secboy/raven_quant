@@ -96,7 +96,9 @@ from .safe_mode import SafeModeActiveError, SafeModeStore
 from .schedule_store import ScheduleStore
 from .services import list_qlib_datasets
 from .simulation_store import ExecutionDataNotReadyError, SimulationStore
+from .strategy_feature_drift_source import StrategyFeatureDriftSource
 from .strategy_health import resolve_feature_drift_episode
+from .strategy_health_collector import StrategyHealthCollector
 from .strategy_store import StrategyStore
 from .three_horizon_account import ThreeHorizonAccountService
 from .transparent_baseline_bootstrap import (
@@ -143,6 +145,65 @@ INFORMATION_CONFLICTING_JOB_KINDS = (
     "qlib_baseline",
     *(f"supplemental_{bundle}" for bundle in set(AUTOMATED_DATA_BUNDLES) | COVERAGE_BUNDLES),
 )
+
+
+def factor_materialization_manifest_matches(
+    manifest: dict[str, Any],
+    *,
+    dataset_identity_sha256: str,
+    feature_set: dict[str, Any],
+    start: str,
+    end: str,
+) -> bool:
+    """Match a frozen materialization request without invalidating v1 artifacts.
+
+    The original unified 533-factor v1 manifest predates the optional embedded
+    ``feature_set`` and compact ``recent`` files.  Its original identity fields
+    remain sufficient.  Strategy-health materializations are new, private
+    inputs and require both additions because the collector reads those compact
+    files and must prove the exact per-version expression set.
+    """
+
+    if not (
+        manifest.get("dataset_identity_sha256") == dataset_identity_sha256
+        and manifest.get("feature_set_id") == feature_set["id"]
+        and manifest.get("feature_set_definition_sha256")
+        == feature_set["definition_sha256"]
+        and manifest.get("universe") == "cn_all"
+        and manifest.get("start") == start
+        and manifest.get("end") == end
+        and manifest.get("status") in {"complete", "complete_with_blockers"}
+    ):
+        return False
+    if not str(feature_set["id"]).startswith("strategy-health:"):
+        return True
+    frozen = {
+        key: feature_set[key]
+        for key in (
+            "contract_version",
+            "id",
+            "name",
+            "features",
+            "source",
+            "definition_sha256",
+        )
+    }
+    completed = manifest.get("completed")
+    if manifest.get("feature_set") != frozen or not isinstance(completed, dict):
+        return False
+    required_entry_fields = {
+        "relative_path",
+        "sha256",
+        "recent_relative_path",
+        "recent_sha256",
+        "recent_start",
+        "recent_end",
+    }
+    return all(
+        isinstance(completed.get(factor_id), dict)
+        and required_entry_fields.issubset(completed[factor_id])
+        for factor_id in feature_set["features"]
+    )
 
 
 def model_refresh_decision(
@@ -263,6 +324,15 @@ class SchedulerEngine:
         )
         self.simulations = SimulationStore(settings.database_url)
         self.strategies = StrategyStore(settings.database_url)
+        self.strategy_feature_drift = StrategyFeatureDriftSource(
+            settings.database_url,
+            settings.data_root,
+        )
+        self.strategy_health_collector = StrategyHealthCollector(
+            settings.database_url,
+            data_root=settings.data_root,
+            interval_seconds=settings.strategy_health_snapshot_seconds,
+        )
         self.model_artifacts = ModelArtifactStore(settings.database_url)
         self.promotions = PromotionStore(settings.database_url)
         self.safe_mode = SafeModeStore(settings.database_url)
@@ -335,6 +405,21 @@ class SchedulerEngine:
         pair_shadow_backtests_enqueued = 0
         pair_shadow_batches_materialized = 0
         simulation_replays_enqueued = self._enqueue_due_simulation_replays(current)
+        strategy_health_result = self.strategy_health_collector.collect_due(current)
+        for failure in strategy_health_result["failures"]:
+            version_id = str(failure["strategy_version_id"])
+            self.alerts.create(
+                source_type="strategy_version",
+                source_id=version_id,
+                severity="warning",
+                category="strategy_health_collection_failed",
+                title="策略健康证据尚未就绪",
+                message=str(failure["error"]),
+                dedupe_key=(
+                    "strategy-health-collector:"
+                    f"{version_id}:{current.astimezone(ZoneInfo('Asia/Shanghai')).date()}"
+                ),
+            )
         projected = self.project_alerts()
         health_recorded = 0
         if self.health.due(current):
@@ -348,6 +433,9 @@ class SchedulerEngine:
             "alerts_projected": projected,
             "alerts_delivered": delivered,
             "health_recorded": health_recorded,
+            "strategy_health_scanned": int(strategy_health_result["scanned"]),
+            "strategy_health_recorded": int(strategy_health_result["recorded"]),
+            "strategy_health_failures": len(strategy_health_result["failures"]),
             "simulation_replays_enqueued": simulation_replays_enqueued,
             "simulation_order_plans_enqueued": simulation_order_plans_enqueued,
             "strategies_auto_promoted": strategies_auto_promoted,
@@ -681,39 +769,81 @@ class SchedulerEngine:
                 str(item["name"]),
             ),
         )
-        feature_set = get_feature_set("unified-research-v1")
         identity = str(dataset["provenance"]["dataset_identity_sha256"])
         start = str(dataset["start_date"])
         end = str(dataset["end_date"])
-        output = (
-            self.settings.data_root
-            / "artifacts"
-            / "factor-library-materializations"
-            / identity
-            / str(feature_set["definition_sha256"])[:16]
-            / "manifest.json"
-        )
-        if output.is_file():
+        desired_feature_sets = [get_feature_set("unified-research-v1")]
+        with self.jobs.engine.connect() as connection:
+            active_version_ids = connection.scalars(
+                select(strategy_versions.c.id)
+                .where(
+                    strategy_versions.c.status == "approved",
+                    strategy_versions.c.is_legacy.is_(False),
+                    strategy_versions.c.promotion_stage.in_(
+                        ("paper", "recommendation_enabled")
+                    ),
+                )
+                .order_by(strategy_versions.c.id)
+            ).all()
+        for version_id in active_version_ids:
             try:
-                manifest = json.loads(output.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                manifest = {}
-            if (
-                manifest.get("dataset_identity_sha256") == identity
-                and manifest.get("feature_set_definition_sha256")
-                == feature_set["definition_sha256"]
-                and manifest.get("universe") == "cn_all"
-                and manifest.get("start") == start
-                and manifest.get("end") == end
-                and manifest.get("status") in {"complete", "complete_with_blockers"}
+                strategy_set = self.strategy_feature_drift.feature_set(str(version_id))
+            except (KeyError, TypeError, ValueError):
+                # The health collector reports the exact unsupported source;
+                # never substitute an unrelated factor library.
+                continue
+            desired_feature_sets.append(
+                {
+                    key: strategy_set[key]
+                    for key in (
+                        "contract_version",
+                        "id",
+                        "name",
+                        "features",
+                        "source",
+                        "definition_sha256",
+                    )
+                }
+            )
+        feature_set: dict[str, Any] | None = None
+        for candidate_set in desired_feature_sets:
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "factor-library-materializations"
+                / identity
+                / str(candidate_set["definition_sha256"])[:16]
+                / "manifest.json"
+            )
+            manifest: dict[str, Any] = {}
+            if output.is_file():
+                try:
+                    manifest = json.loads(output.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    pass
+            if factor_materialization_manifest_matches(
+                manifest,
+                dataset_identity_sha256=identity,
+                feature_set=candidate_set,
+                start=start,
+                end=end,
             ):
-                return 0
+                continue
+            feature_set = candidate_set
+            break
+        if feature_set is None:
+            return 0
         payload = {
             "dataset": str(dataset["name"]),
             "dataset_path": str(dataset["path"]),
             "dataset_identity_sha256": identity,
             "feature_set_id": feature_set["id"],
             "feature_set_definition_sha256": feature_set["definition_sha256"],
+            "feature_set_definition": (
+                feature_set
+                if str(feature_set["id"]).startswith("strategy-health:")
+                else None
+            ),
             "library_version_id": (
                 feature_set["source"]
                 if str(feature_set.get("source") or "").startswith(

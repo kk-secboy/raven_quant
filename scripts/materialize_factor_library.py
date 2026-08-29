@@ -20,7 +20,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from quant_data.qlib_builder import verify_qlib_output_manifest
-from quant_platform.feature_set_registry import get_feature_set
+from quant_platform.feature_set_registry import get_feature_set, resolve_feature_set
+
+RECENT_SESSION_LIMIT = 512
 
 
 def _sha256(path: Path) -> str:
@@ -45,6 +47,7 @@ def main() -> None:
     parser.add_argument("--provider-uri", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--feature-set-id", default="unified-research-v1")
+    parser.add_argument("--feature-set-definition")
     parser.add_argument("--universe", default="cn_all")
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
@@ -61,7 +64,16 @@ def main() -> None:
         (provider / "metadata" / "provenance.json").read_text(encoding="utf-8")
     )
     verify_qlib_output_manifest(provider, provenance)
-    feature_set = get_feature_set(args.feature_set_id)
+    embedded_feature_set = None
+    if args.feature_set_definition:
+        embedded_feature_set = json.loads(
+            Path(args.feature_set_definition).read_text(encoding="utf-8")
+        )
+    feature_set = (
+        resolve_feature_set(args.feature_set_id, embedded_feature_set)
+        if embedded_feature_set is not None
+        else get_feature_set(args.feature_set_id)
+    )
     output = Path(args.output).resolve()
     values_root = output / "values"
     values_root.mkdir(parents=True, exist_ok=True)
@@ -108,7 +120,8 @@ def main() -> None:
     pending = [
         (name, expression)
         for name, expression in feature_set["features"].items()
-        if name not in checkpoint["completed"] and name not in checkpoint["blocked"]
+        if not _completed_with_recent(checkpoint["completed"].get(name))
+        and name not in checkpoint["blocked"]
     ]
     for offset in range(0, len(pending), args.batch_size):
         batch = pending[offset : offset + args.batch_size]
@@ -148,6 +161,7 @@ def main() -> None:
     result = {
         **expected_identity,
         "contract_version": "factor-library-materialization-v1",
+        "feature_set": feature_set,
         "completed_count": len(checkpoint["completed"]),
         "blocked_count": len(checkpoint["blocked"]),
         "completed": checkpoint["completed"],
@@ -170,12 +184,53 @@ def _persist_one(
     temporary = target.with_suffix(".tmp.h5")
     frame.to_hdf(temporary, key="data", mode="w")
     os.replace(temporary, target)
+    dates = pd.DatetimeIndex(
+        pd.to_datetime(frame.index.get_level_values("datetime"), errors="raise")
+    ).tz_localize(None).normalize()
+    recent_sessions = dates.unique().sort_values()[-RECENT_SESSION_LIMIT:]
+    recent = frame.loc[dates.isin(recent_sessions)]
+    recent_root = values_root.parent / "recent"
+    recent_root.mkdir(parents=True, exist_ok=True)
+    recent_target = recent_root / f"{safe_name}.parquet"
+    recent_temporary = recent_target.with_suffix(".tmp.parquet")
+    recent.to_parquet(
+        recent_temporary,
+        compression="zstd",
+        engine="pyarrow",
+    )
+    os.replace(recent_temporary, recent_target)
     checkpoint["completed"][name] = {
         "relative_path": target.relative_to(values_root.parent).as_posix(),
         "sha256": _sha256(target),
         "rows": len(frame),
         "finite": int(pd.to_numeric(frame["factor"], errors="coerce").notna().sum()),
+        "recent_relative_path": recent_target.relative_to(
+            values_root.parent
+        ).as_posix(),
+        "recent_sha256": _sha256(recent_target),
+        "recent_rows": len(recent),
+        "recent_start": (
+            recent_sessions[0].date().isoformat() if len(recent_sessions) else None
+        ),
+        "recent_end": (
+            recent_sessions[-1].date().isoformat() if len(recent_sessions) else None
+        ),
+        "recent_session_limit": RECENT_SESSION_LIMIT,
     }
+
+
+def _completed_with_recent(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required = {
+        "relative_path",
+        "sha256",
+        "recent_relative_path",
+        "recent_sha256",
+        "recent_start",
+        "recent_end",
+    }
+    return required.issubset(value)
 
 
 if __name__ == "__main__":

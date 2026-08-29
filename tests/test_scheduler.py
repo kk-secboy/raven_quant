@@ -20,7 +20,11 @@ from quant_platform.job_store import JobStore
 from quant_platform.research_horizon import canonical_sha256
 from quant_platform.research_store import ResearchStore
 from quant_platform.schedule_store import ScheduleStore
-from quant_platform.scheduler import AUTOMATED_DATA_BUNDLES, SchedulerEngine
+from quant_platform.scheduler import (
+    AUTOMATED_DATA_BUNDLES,
+    SchedulerEngine,
+    factor_materialization_manifest_matches,
+)
 
 
 @pytest.mark.no_database
@@ -49,6 +53,33 @@ def test_research_report_backfill_waits_for_missing_data_volume(tmp_path: Path) 
 def test_automatic_pipeline_includes_default_coverage_but_not_optional_specialties() -> None:
     assert DEFAULT_COVERAGE_BUNDLES <= set(AUTOMATED_DATA_BUNDLES)
     assert OPTIONAL_COVERAGE_BUNDLES.isdisjoint(AUTOMATED_DATA_BUNDLES)
+
+
+@pytest.mark.no_database
+def test_legacy_unified_533_manifest_remains_complete_without_new_optional_fields() -> None:
+    feature_set = get_feature_set("unified-research-v1")
+    assert len(feature_set["features"]) == 533
+    legacy_manifest = {
+        "contract_version": "factor-library-materialization-v1",
+        "dataset_identity_sha256": "b" * 64,
+        "feature_set_id": feature_set["id"],
+        "feature_set_definition_sha256": feature_set["definition_sha256"],
+        "universe": "cn_all",
+        "start": "2008-01-02",
+        "end": "2026-08-26",
+        "status": "complete",
+        "completed_count": 533,
+        # Deliberately no embedded feature_set and no recent sidecars: those
+        # fields did not exist when the server's completed v1 artifact was made.
+    }
+
+    assert factor_materialization_manifest_matches(
+        legacy_manifest,
+        dataset_identity_sha256="b" * 64,
+        feature_set=feature_set,
+        start="2008-01-02",
+        end="2026-08-26",
+    )
 
 
 def _settings(database_url: str, tmp_path: Path) -> Settings:
@@ -104,6 +135,9 @@ def _write_qlib_dataset(
                         "source_hand_size": 100,
                         "index_volume_policy": "excluded_non_tradable_benchmark",
                         "governed_etf_whitelist": governed_etf_ready_evidence(),
+                        "execution_controls": {
+                            "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+                        },
                     }
                     if frequency == "day"
                     else {}

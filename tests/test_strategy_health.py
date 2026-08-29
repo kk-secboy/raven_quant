@@ -247,6 +247,28 @@ def test_health_assessment_escalates_and_recovers_one_step_at_a_time() -> None:
     assert transition_strategy_health(RESTRICTED, "healthy") == WATCH
 
 
+def test_model_calibration_is_not_fabricated_for_factor_strategies() -> None:
+    factor = assess_strategy_health(
+        "short_1_5d",
+        _healthy_evidence(
+            model_calibration_drift=None,
+            model_calibration_required=False,
+            model_calibration_evidence_available=False,
+        ),
+    )
+    assert factor["evidence"]["model_calibration_drift"] is None
+
+    with pytest.raises(ValueError, match="calibration evidence is unavailable"):
+        assess_strategy_health(
+            "short_1_5d",
+            _healthy_evidence(
+                model_calibration_drift=None,
+                model_calibration_required=True,
+                model_calibration_evidence_available=False,
+            ),
+        )
+
+
 def test_restricted_targets_allow_reductions_and_exits_but_never_increases() -> None:
     targets, gate = cap_targets_for_health(
         {"A": 0.20, "B": 0.05, "C": 0.10},

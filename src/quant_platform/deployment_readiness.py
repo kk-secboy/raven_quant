@@ -19,6 +19,7 @@ from quant_data.database import (
     recommendation_portfolios,
     recommendation_snapshots,
     schedules,
+    simulation_batches,
     simulation_nav,
     simulation_portfolios,
     strategy_allocation_events,
@@ -36,6 +37,7 @@ from quant_data.execution_contract import (
 )
 
 from .data_task_store import DataTaskStore
+from .feature_drift import validate_factor_psi_observation
 from .health_store import OperationalHealthStore
 from .information_schedule import (
     STRUCTURED_INFORMATION_SOURCES,
@@ -43,12 +45,14 @@ from .information_schedule import (
     normalize_information_schedule_payload,
     resolve_information_evaluation_dataset,
 )
+from .model_calibration_drift import validate_model_calibration_observation
 from .research_automation import (
     DEFAULT_REQUIRED_RESEARCH_TRADING_DAYS,
     DEFAULT_RESEARCH_PERIOD_POLICY,
     MINIMUM_PROFILE_TRAINING_DAYS,
     RESEARCH_EVALUATION_PROFILES,
 )
+from .research_horizon import canonical_sha256
 from .runtime_secret_store import RuntimeSecretStore
 from .schedule_store import ACTIVE_SCHEDULE_KINDS
 from .scheduler import AUTOMATED_DATA_BUNDLES
@@ -80,6 +84,7 @@ _NON_BLOCKING_PAPER_HEALTH = frozenset(
 _NON_BLOCKING_RECOMMENDATION_HEALTH = frozenset({"healthy", "watch"})
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _DAILY_CLOSE = time(15, 0)
+_STRATEGY_HEALTH_COLLECTOR_ACTOR = "system:strategy-health-collector"
 
 
 def _latest_closed_trading_day(
@@ -193,6 +198,140 @@ def _daily_qlib_business_check(
     }
 
 
+def _strategy_health_evidence_check(
+    snapshot: Any,
+    *,
+    version_id: str,
+    horizon_profile: str,
+    horizon_contract_sha256: str,
+    current_dataset_identity_sha256: str | None,
+    expected_trade_date: date,
+    now: datetime,
+    max_age_seconds: int,
+    current_dataset_lineage_id: str | None = None,
+    current_batch_id: str | None = None,
+    current_source_snapshot_id: str | None = None,
+    expected_feature_date: date | None = None,
+) -> dict[str, Any]:
+    """Verify the newest activity-health row and its embedded drift receipt."""
+
+    if snapshot is None:
+        return {"ready": False, "reasons": ["strategy_health_evidence_missing"]}
+    row = snapshot._mapping if hasattr(snapshot, "_mapping") else snapshot
+    values = dict(row)
+    reasons: list[str] = []
+    criteria = dict(values.get("criteria_json") or {})
+    evidence = dict(values.get("evidence_json") or {})
+    criteria_sha256 = str(values.get("criteria_sha256") or "")
+    evidence_sha256 = str(values.get("evidence_sha256") or "")
+    if canonical_sha256(criteria) != criteria_sha256:
+        reasons.append("strategy_health_criteria_seal_invalid")
+    if canonical_sha256(evidence) != evidence_sha256:
+        reasons.append("strategy_health_evidence_seal_invalid")
+    as_of = values.get("as_of")
+    if not isinstance(as_of, datetime) or as_of.tzinfo is None or as_of.utcoffset() is None:
+        reasons.append("strategy_health_as_of_invalid")
+    else:
+        normalized_as_of = as_of.astimezone(UTC).replace(microsecond=0)
+        age_seconds = (now.astimezone(UTC) - normalized_as_of).total_seconds()
+        if age_seconds < -300:
+            reasons.append("strategy_health_evidence_from_future")
+        elif age_seconds > max_age_seconds:
+            reasons.append("strategy_health_evidence_stale")
+        snapshot_payload = {
+            "contract_version": "strategy-health-snapshot-v1",
+            "strategy_version_id": version_id,
+            "horizon_profile": horizon_profile,
+            "horizon_contract_sha256": horizon_contract_sha256,
+            "as_of": normalized_as_of.isoformat(),
+            "health_status": str(values.get("health_status") or ""),
+            "criteria_json": criteria,
+            "criteria_sha256": criteria_sha256,
+            "evidence_json": evidence,
+            "evidence_sha256": evidence_sha256,
+            "recorded_by": str(values.get("recorded_by") or ""),
+        }
+        expected_snapshot_sha256 = canonical_sha256(snapshot_payload)
+        if (
+            str(values.get("id") or "") != expected_snapshot_sha256
+            or str(values.get("snapshot_sha256") or "") != expected_snapshot_sha256
+        ):
+            reasons.append("strategy_health_snapshot_seal_invalid")
+    if values.get("recorded_by") != _STRATEGY_HEALTH_COLLECTOR_ACTOR:
+        reasons.append("strategy_health_not_periodically_collected")
+    if evidence.get("contract_version") != "strategy-health-live-evidence-v2":
+        reasons.append("strategy_health_live_evidence_missing")
+    expected_text = expected_trade_date.isoformat()
+    if evidence.get("evidence_trade_date") != expected_text:
+        reasons.append("strategy_health_nav_evidence_stale")
+    feature_date = expected_feature_date or expected_trade_date
+    feature_text = feature_date.isoformat()
+    if evidence.get("feature_drift_current_end") != feature_text:
+        reasons.append("strategy_health_feature_evidence_stale")
+    if evidence.get("feature_signal_date") != feature_text:
+        reasons.append("strategy_health_feature_signal_binding_invalid")
+    if evidence.get("simulation_batch_id") != current_batch_id:
+        reasons.append("strategy_health_batch_binding_invalid")
+    if evidence.get("daily_dataset_identity_sha256") != current_dataset_identity_sha256:
+        reasons.append("strategy_health_dataset_binding_invalid")
+    if evidence.get("daily_dataset_lineage_id") != current_dataset_lineage_id:
+        reasons.append("strategy_health_dataset_lineage_invalid")
+    if evidence.get("source_snapshot_id") != current_source_snapshot_id:
+        reasons.append("strategy_health_source_snapshot_invalid")
+    if evidence.get("feature_drift_evidence_available") is not True:
+        reasons.append("strategy_health_feature_evidence_missing")
+    if not current_dataset_identity_sha256:
+        reasons.append("strategy_health_dataset_identity_missing")
+    else:
+        try:
+            observation = validate_factor_psi_observation(
+                evidence.get("feature_drift_observation"),
+                strategy_version_id=version_id,
+                current_dataset_identity_sha256=current_dataset_identity_sha256,
+                expected_as_of=feature_date,
+            )
+            if (
+                observation.get("observation_sha256")
+                != evidence.get("feature_drift_observation_sha256")
+                or float(observation.get("feature_drift"))
+                != float(evidence.get("feature_drift"))
+            ):
+                reasons.append("strategy_health_feature_evidence_mismatch")
+        except (TypeError, ValueError):
+            reasons.append("strategy_health_feature_evidence_invalid")
+    model_required = evidence.get("model_calibration_required") is True
+    if model_required:
+        if evidence.get("model_calibration_evidence_available") is not True:
+            reasons.append("strategy_health_model_calibration_missing")
+        else:
+            try:
+                model_observation = validate_model_calibration_observation(
+                    evidence.get("model_calibration_observation"),
+                    strategy_version_id=version_id,
+                    current_dataset_identity_sha256=str(
+                        current_dataset_identity_sha256 or ""
+                    ),
+                    expected_as_of=feature_date,
+                )
+                if (
+                    model_observation.get("observation_sha256")
+                    != evidence.get("model_calibration_observation_sha256")
+                    or float(model_observation["model_calibration_drift"])
+                    != float(evidence.get("model_calibration_drift"))
+                ):
+                    reasons.append("strategy_health_model_calibration_mismatch")
+            except (TypeError, ValueError):
+                reasons.append("strategy_health_model_calibration_invalid")
+    return {
+        "ready": not reasons,
+        "reasons": list(dict.fromkeys(reasons)),
+        "as_of": as_of.isoformat() if isinstance(as_of, datetime) else None,
+        "evidence_trade_date": evidence.get("evidence_trade_date"),
+        "feature_drift_current_end": evidence.get("feature_drift_current_end"),
+        "snapshot_sha256": values.get("snapshot_sha256"),
+    }
+
+
 def _assess_horizon_candidates(
     horizon: str,
     candidates: list[dict[str, Any]],
@@ -217,13 +356,7 @@ def _assess_horizon_candidates(
         item = dict(raw)
         stage = str(item.get("promotion_stage") or "")
         raw_health = item.get("health_status")
-        health = (
-            str(raw_health)
-            if raw_health
-            else "insufficient_evidence"
-            if stage == "paper"
-            else "missing"
-        )
+        health = str(raw_health) if raw_health else "missing"
         contract_ready = bool(item.get("contract_ready"))
         daily_execution = (
             item.get("signal_frequency") == "day"
@@ -249,6 +382,13 @@ def _assess_horizon_candidates(
             blockers.append("production_runner_unavailable")
         if not health_ready:
             blockers.append(f"strategy_health_{health}")
+        if item.get("health_evidence_ready") is not True:
+            blockers.extend(
+                str(reason)
+                for reason in item.get("health_evidence_reasons") or [
+                    "strategy_health_evidence_missing"
+                ]
+            )
         item.update(
             {
                 "health_status": health,
@@ -565,7 +705,13 @@ class DeploymentReadinessStore:
                 "reason": str(exc)[:500],
             }
         try:
-            horizons = self._horizon_production_check()
+            expected_trade_date = date.fromisoformat(
+                str(daily_data["expected_end_date"])
+            )
+            horizons = self._horizon_production_check(
+                expected_trade_date=expected_trade_date,
+                now=current,
+            )
         except Exception as exc:  # noqa: BLE001 - readiness must fail closed
             horizons = {
                 "status": "unavailable",
@@ -593,7 +739,12 @@ class DeploymentReadinessStore:
             "blockers": blockers,
         }
 
-    def _horizon_production_check(self) -> dict[str, Any]:
+    def _horizon_production_check(
+        self,
+        *,
+        expected_trade_date: date,
+        now: datetime,
+    ) -> dict[str, Any]:
         def sealed_sha256(value: Any) -> bool:
             text_value = str(value or "")
             return len(text_value) == 64 and all(
@@ -627,7 +778,7 @@ class DeploymentReadinessStore:
             for version in versions:
                 version_id = str(version.id)
                 latest_health = connection.execute(
-                    select(strategy_health_snapshots.c.health_status)
+                    select(strategy_health_snapshots)
                     .where(
                         strategy_health_snapshots.c.strategy_version_id == version_id
                     )
@@ -649,12 +800,61 @@ class DeploymentReadinessStore:
                     .limit(1)
                 ).first()
                 simulation_status = None
+                current_daily_dataset_identity = None
+                current_daily_dataset_lineage = None
+                current_batch_id = None
+                current_source_snapshot_id = None
+                current_feature_date = None
                 if stage is not None and stage.simulation_portfolio_id is not None:
-                    simulation_status = connection.scalar(
-                        select(simulation_portfolios.c.status).where(
+                    simulation = connection.execute(
+                        select(
+                            simulation_portfolios.c.status,
+                            simulation_portfolios.c.daily_dataset_identity_sha256,
+                            simulation_portfolios.c.daily_dataset_lineage_id,
+                        ).where(
                             simulation_portfolios.c.id == stage.simulation_portfolio_id
                         )
-                    )
+                    ).first()
+                    if simulation is not None:
+                        simulation_status = simulation.status
+                        batch_rows = connection.execute(
+                            select(
+                                simulation_batches.c.id,
+                                simulation_batches.c.signal_date,
+                                simulation_batches.c.trade_date,
+                                simulation_batches.c.source_snapshot_id,
+                                simulation_batches.c.daily_dataset_identity_sha256,
+                                simulation_batches.c.daily_dataset_lineage_id,
+                            )
+                            .where(
+                                simulation_batches.c.portfolio_id
+                                == stage.simulation_portfolio_id,
+                                simulation_batches.c.status == "succeeded",
+                                simulation_batches.c.trade_date
+                                == expected_trade_date,
+                            )
+                            .order_by(simulation_batches.c.finished_at.desc())
+                            .limit(2)
+                        ).all()
+                        if len(batch_rows) == 1:
+                            batch = batch_rows[0]
+                            identity = str(batch.daily_dataset_identity_sha256)
+                            lineage = str(batch.daily_dataset_lineage_id)
+                            source_snapshot_id = str(batch.source_snapshot_id or "")
+                            if (
+                                len(identity) == 64
+                                and len(lineage) == 64
+                                and lineage
+                                == str(simulation.daily_dataset_lineage_id)
+                                and source_snapshot_id == identity
+                                and batch.trade_date == expected_trade_date
+                                and batch.signal_date <= batch.trade_date
+                            ):
+                                current_daily_dataset_identity = identity
+                                current_daily_dataset_lineage = lineage
+                                current_batch_id = str(batch.id)
+                                current_source_snapshot_id = source_snapshot_id
+                                current_feature_date = batch.signal_date
                 active_recommendation_portfolios = int(
                     connection.scalar(
                         select(func.count())
@@ -667,6 +867,23 @@ class DeploymentReadinessStore:
                     or 0
                 )
                 horizon = str(version.horizon_profile)
+                health_check = _strategy_health_evidence_check(
+                    latest_health,
+                    version_id=version_id,
+                    horizon_profile=horizon,
+                    horizon_contract_sha256=str(version.horizon_contract_sha256),
+                    current_dataset_identity_sha256=current_daily_dataset_identity,
+                    expected_trade_date=expected_trade_date,
+                    now=now,
+                    max_age_seconds=max(
+                        600,
+                        int(self.settings.strategy_health_snapshot_seconds) * 2,
+                    ),
+                    current_dataset_lineage_id=current_daily_dataset_lineage,
+                    current_batch_id=current_batch_id,
+                    current_source_snapshot_id=current_source_snapshot_id,
+                    expected_feature_date=current_feature_date,
+                )
                 candidates[horizon].append(
                     {
                         "strategy_version_id": version_id,
@@ -685,6 +902,9 @@ class DeploymentReadinessStore:
                             if latest_health is not None
                             else None
                         ),
+                        "health_evidence_ready": health_check["ready"],
+                        "health_evidence_reasons": health_check["reasons"],
+                        "health_evidence": health_check,
                         "paper_stage_status": (
                             str(stage.status) if stage is not None else None
                         ),

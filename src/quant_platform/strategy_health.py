@@ -44,6 +44,8 @@ DEFAULT_HEALTH_CRITERIA = {
         "suspend_drawdown": 0.15,
         "watch_feature_drift": 0.20,
         "restrict_feature_drift": 0.35,
+        "watch_model_calibration_drift": 0.20,
+        "restrict_model_calibration_drift": 0.35,
         "watch_execution_rejection_rate": 0.10,
         "restrict_execution_rejection_rate": 0.25,
         "watch_cost_ratio": 0.35,
@@ -55,6 +57,8 @@ DEFAULT_HEALTH_CRITERIA = {
         "suspend_drawdown": 0.18,
         "watch_feature_drift": 0.20,
         "restrict_feature_drift": 0.35,
+        "watch_model_calibration_drift": 0.20,
+        "restrict_model_calibration_drift": 0.35,
         "watch_execution_rejection_rate": 0.10,
         "restrict_execution_rejection_rate": 0.25,
         "watch_cost_ratio": 0.30,
@@ -66,6 +70,8 @@ DEFAULT_HEALTH_CRITERIA = {
         "suspend_drawdown": 0.22,
         "watch_feature_drift": 0.20,
         "restrict_feature_drift": 0.35,
+        "watch_model_calibration_drift": 0.20,
+        "restrict_model_calibration_drift": 0.35,
         "watch_execution_rejection_rate": 0.10,
         "restrict_execution_rejection_rate": 0.25,
         "watch_cost_ratio": 0.25,
@@ -440,7 +446,7 @@ def cap_targets_for_health(
 def _threshold_reasons(
     evidence: Mapping[str, Any], criteria: Mapping[str, float], level: str
 ) -> list[str]:
-    names = (
+    names = [
         ("drawdown", f"{level}_drawdown"),
         ("feature_drift", f"{level}_feature_drift"),
         (
@@ -448,7 +454,14 @@ def _threshold_reasons(
             f"{level}_execution_rejection_rate",
         ),
         ("cost_ratio", f"{level}_cost_ratio"),
-    )
+    ]
+    if evidence.get("model_calibration_drift") is not None:
+        names.append(
+            (
+                "model_calibration_drift",
+                f"{level}_model_calibration_drift",
+            )
+        )
     return [
         f"{metric}_{level}_limit_breached"
         for metric, threshold in names
@@ -464,6 +477,7 @@ def _validate_criteria(criteria: Mapping[str, Any]) -> None:
     for metric in (
         "drawdown",
         "feature_drift",
+        "model_calibration_drift",
         "execution_rejection_rate",
         "cost_ratio",
     ):
@@ -476,7 +490,7 @@ def _validate_criteria(criteria: Mapping[str, Any]) -> None:
 
 
 def _normalize_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
-    required = {"data_integrity_ok", "ledger_reconciled"}
+    required = {"data_integrity_ok", "ledger_reconciled", "feature_drift"}
     missing = required.difference(evidence)
     if missing:
         raise ValueError(f"strategy health evidence is missing: {sorted(missing)}")
@@ -489,13 +503,29 @@ def _normalize_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
         "turnover",
         "cost_ratio",
         "execution_rejection_rate",
-        "model_calibration_drift",
         "feature_drift",
     ):
         number = float(evidence.get(name, 0.0))
         if not isfinite(number) or number < 0:
             raise ValueError(f"strategy health evidence {name} must be finite and non-negative")
         result[name] = number
+    model_required = evidence.get("model_calibration_required") is True
+    model_available = evidence.get("model_calibration_evidence_available") is True
+    raw_model_drift = evidence.get("model_calibration_drift")
+    if model_required and (not model_available or raw_model_drift is None):
+        raise ValueError("required model calibration evidence is unavailable")
+    if raw_model_drift is None:
+        model_drift = None
+    else:
+        model_drift = float(raw_model_drift)
+        if not isfinite(model_drift) or model_drift < 0:
+            raise ValueError(
+                "strategy health evidence model_calibration_drift must be finite "
+                "and non-negative"
+            )
+    result["model_calibration_required"] = model_required
+    result["model_calibration_evidence_available"] = model_available
+    result["model_calibration_drift"] = model_drift
     result["data_completeness"] = float(evidence.get("data_completeness", 1.0))
     if not 0 <= result["data_completeness"] <= 1:
         raise ValueError("strategy health data completeness must be in [0, 1]")

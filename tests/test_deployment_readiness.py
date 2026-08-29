@@ -156,14 +156,16 @@ def test_daily_business_check_requires_fresh_sealed_daily_data(
 
 
 @pytest.mark.no_database
-def test_horizon_readiness_accepts_paper_but_not_unhealthy_recommendation() -> None:
+def test_horizon_readiness_requires_fresh_health_for_paper_and_recommendation() -> None:
     paper = {
         "strategy_version_id": "paper-short",
         "promotion_stage": "paper",
         "signal_frequency": "day",
         "execution_frequency": "day",
         "contract_ready": True,
-        "health_status": None,
+        "health_status": "healthy",
+        "health_evidence_ready": True,
+        "health_evidence_reasons": [],
         "paper_stage_status": "active",
         "simulation_status": "active",
         "active_recommendation_portfolios": 0,
@@ -182,6 +184,7 @@ def test_horizon_readiness_accepts_paper_but_not_unhealthy_recommendation() -> N
                 "strategy_version_id": "recommendation-short",
                 "promotion_stage": "recommendation_enabled",
                 "health_status": "suspended",
+                "health_evidence_ready": True,
                 "active_recommendation_portfolios": 1,
             },
         ],
@@ -189,10 +192,18 @@ def test_horizon_readiness_accepts_paper_but_not_unhealthy_recommendation() -> N
 
     assert validating["status"] == "ok"
     assert validating["stage"] == "paper"
-    assert validating["health_status"] == "insufficient_evidence"
+    assert validating["health_status"] == "healthy"
     assert unhealthy_recommendation["status"] == "blocked"
     assert unhealthy_recommendation["candidates"][0]["blocking_reasons"] == [
         "strategy_health_suspended"
+    ]
+
+    paper["health_evidence_ready"] = False
+    paper["health_evidence_reasons"] = ["strategy_health_evidence_stale"]
+    stale = readiness_module._assess_horizon_candidates("short_1_5d", [paper])
+    assert stale["status"] == "blocked"
+    assert stale["candidates"][0]["blocking_reasons"] == [
+        "strategy_health_evidence_stale"
     ]
 
 
