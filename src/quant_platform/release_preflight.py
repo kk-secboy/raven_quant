@@ -45,6 +45,13 @@ _GPU_IMAGE_SETTINGS = {
     "RDAGENT_FINETUNE_BENCHMARK_IMAGE": _IMMUTABLE_IMAGE_REFERENCE,
     "RDAGENT_FINETUNE_GPU_PROBE_IMAGE": _IMMUTABLE_IMAGE_REFERENCE,
 }
+_SHARED_RDAGENT_RUNTIME_SERVICES = (
+    "rdagent-worker",
+    "rdagent-model-worker",
+    "rdagent-report-worker",
+    "rdagent-quant-worker",
+    "rdagent-data-science-worker",
+)
 
 
 def expected_services(context: ComposeContext) -> set[str]:
@@ -133,7 +140,7 @@ def _preloaded_image_availability(context: ComposeContext) -> tuple[bool, str]:
     try:
         configured = _deployment_environment(context)
         expected_runtime = configured["RDAGENT_RUNTIME_IMAGE_DIGEST"].lower()
-        runtime_services = ["rdagent-worker", "rdagent-data-science-worker"]
+        runtime_services = list(_SHARED_RDAGENT_RUNTIME_SERVICES)
         if "gpu" in set(getattr(context, "profiles", ())):
             runtime_services.append("rdagent-llm-finetune-worker")
         mismatched_runtime: list[str] = []

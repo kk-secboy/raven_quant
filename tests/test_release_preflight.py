@@ -386,14 +386,13 @@ def test_immutable_image_contract_is_profile_aware(
 
 
 @pytest.mark.parametrize(
-    ("data_science_runtime", "expected_valid"),
-    (("a", True), ("e", False)),
+    "mismatched_service",
+    (None, *release_preflight._SHARED_RDAGENT_RUNTIME_SERVICES),
 )
-def test_preloaded_runtime_requires_data_science_to_share_canonical_image(
+def test_preloaded_runtime_requires_every_rdagent_worker_to_share_canonical_image(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    data_science_runtime: str,
-    expected_valid: bool,
+    mismatched_service: str | None,
 ) -> None:
     for name in release_preflight._CORE_IMAGE_SETTINGS:
         monkeypatch.delenv(name, raising=False)
@@ -420,8 +419,8 @@ def test_preloaded_runtime_requires_data_science_to_share_canonical_image(
             assert args[:3] == ("inspect", "--format", "{{.Image}}")
             service = args[3].removeprefix("container-")
             return (
-                "sha256:" + data_science_runtime * 64
-                if service == "rdagent-data-science-worker"
+                "sha256:" + "e" * 64
+                if service == mismatched_service
                 else runtime_id
             )
 
@@ -443,11 +442,11 @@ def test_preloaded_runtime_requires_data_science_to_share_canonical_image(
         Context()  # type: ignore[arg-type]
     )
 
-    assert valid is expected_valid
-    if expected_valid:
+    assert valid is (mismatched_service is None)
+    if mismatched_service is None:
         assert evidence.startswith("runtime identities match")
     else:
-        assert evidence == "runtime identity mismatch: rdagent-data-science-worker"
+        assert evidence == f"runtime identity mismatch: {mismatched_service}"
 
 
 def test_dind_storage_must_be_outside_governed_market_data(
