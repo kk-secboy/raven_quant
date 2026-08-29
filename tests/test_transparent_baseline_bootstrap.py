@@ -886,7 +886,7 @@ def test_v2_optimizer_repair_accepts_only_exact_failed_production_attempts() -> 
     marker_payload = dict(wrong_marker)
     marker_payload.pop("receipt_sha256")
     wrong_marker["receipt_sha256"] = canonical_sha256(marker_payload)
-    with pytest.raises(ValueError, match="not allowlisted"):
+    with pytest.raises(ValueError, match="error is not exact"):
         validate_pre_result_repair_receipt(wrong_marker)
 
     generic_retry = deepcopy(receipt)

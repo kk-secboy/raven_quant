@@ -20,7 +20,7 @@ from quant_data.database import (
 from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
 from quant_platform.transparent_baseline_lockbox import (
-    OPTIMIZER_APPLICABILITY_FAILURE,
+    OPTIMIZER_APPLICABILITY_ERROR,
     OPTIMIZER_APPLICABILITY_REASON,
     OPTIMIZER_APPLICABILITY_REPAIR_GENERATION,
     OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS,
@@ -151,8 +151,8 @@ def register_optimizer_applicability_repair(
                 str(row.status) != "failed"
                 or str(row.job_status) != "failed"
                 or row.metrics_json is not None
-                or OPTIMIZER_APPLICABILITY_FAILURE not in str(row.error or "")
-                or OPTIMIZER_APPLICABILITY_FAILURE not in str(row.job_error or "")
+                or str(row.error or "") != OPTIMIZER_APPLICABILITY_ERROR
+                or str(row.job_error or "") != OPTIMIZER_APPLICABILITY_ERROR
             ):
                 raise ValueError(
                     "optimizer applicability repair requires failed no-metrics evidence"
@@ -169,7 +169,7 @@ def register_optimizer_applicability_repair(
                     },
                     "status": "failed",
                     "job_status": "failed",
-                    "error": f"ValueError: {OPTIMIZER_APPLICABILITY_FAILURE}",
+                    "error": OPTIMIZER_APPLICABILITY_ERROR,
                     "metrics_absent": True,
                     "result_absent": True,
                     "files": _artifact_inventory(row.artifact_path),

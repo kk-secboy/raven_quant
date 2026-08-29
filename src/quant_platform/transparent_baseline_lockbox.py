@@ -82,6 +82,7 @@ _PRE_RESULT_FAILURES = {
 OPTIMIZER_APPLICABILITY_FAILURE = (
     "optimizer requires 60 complete point-in-time return observations"
 )
+OPTIMIZER_APPLICABILITY_ERROR = f"ValueError: {OPTIMIZER_APPLICABILITY_FAILURE}"
 
 _RECIPE_HORIZONS = {
     "short_relative_strength": "short_1_5d",
@@ -275,6 +276,11 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         error = member.get("error")
         if error is not None:
             error_text = str(error)
+            if (
+                contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V2
+                and error_text != OPTIMIZER_APPLICABILITY_ERROR
+            ):
+                raise ValueError("optimizer applicability repair error is not exact")
             matches = {
                 code
                 for code, marker in failure_markers.items()
