@@ -426,13 +426,47 @@ def test_only_approved_forward_passed_version_is_verified_advice() -> None:
         forward_passed=True,
     )
 
-    card = service._horizon_card(SHORT_1_5D, now=datetime.now(UTC))
+    card = service._horizon_card(
+        SHORT_1_5D,
+        now=datetime.now(UTC),
+        freshness_requirement={
+            "status": "current",
+            "required_signal_date": "2026-08-28",
+            "reason": None,
+        },
+    )
 
     assert card["stage"] == "verified"
     assert card["stage_label"] == "已验证"
     assert card["is_investment_advice"] is True
     assert card["signals"][0]["instrument"] == "000001.SZ"
     assert card["action"] == "BUY"
+
+
+def test_stale_formal_snapshot_is_not_exposed_as_investment_advice() -> None:
+    service = _card_service(
+        version_status="approved",
+        promotion_stage="recommendation_enabled",
+        backtest_status="succeeded",
+        forward_passed=True,
+    )
+
+    card = service._horizon_card(
+        SHORT_1_5D,
+        now=datetime.now(UTC),
+        freshness_requirement={
+            "status": "current",
+            "required_signal_date": "2026-08-31",
+            "reason": None,
+        },
+    )
+
+    assert card["stage"] == "verified"
+    assert card["recommendation_freshness"]["status"] == "stale"
+    assert card["is_investment_advice"] is False
+    assert card["signals"] == []
+    assert card["action"] == "NO_ACTION"
+    assert any("最新闭市交易日" in reason for reason in card["veto_reasons"])
 
 
 def test_review_date_never_falls_back_to_weekday_guess() -> None:
@@ -452,7 +486,7 @@ def test_review_date_never_falls_back_to_weekday_guess() -> None:
     assert review["review_date_source"] == "strategy_horizon_contract"
 
 
-def test_review_date_uses_only_governed_qlib_exchange_sessions(
+def test_review_date_uses_persisted_sse_sessions_across_holiday(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -460,18 +494,13 @@ def test_review_date_uses_only_governed_qlib_exchange_sessions(
     service.data_root = tmp_path
     monkeypatch.setattr(
         advice_module,
-        "select_qlib_dataset",
-        lambda *_args, **_kwargs: {"path": str(tmp_path / "qlib")},
-    )
-    monkeypatch.setattr(
-        advice_module,
-        "load_calendar_days",
-        lambda _path: {
+        "load_trade_calendar_open_days",
+        lambda _path: [
             date(2026, 10, 9),
             # 10-12 is deliberately absent (exchange holiday).
             date(2026, 10, 13),
             date(2026, 10, 14),
-        },
+        ],
     )
 
     review = service._review_projection(
@@ -483,7 +512,92 @@ def test_review_date_uses_only_governed_qlib_exchange_sessions(
     assert review["review_date"] == "2026-10-13"
     assert review["review_date_estimate"] == "2026-10-13"
     assert review["review_date_is_exchange_calendar"] is True
-    assert review["review_date_source"] == "governed_qlib_exchange_calendar"
+    assert review["review_date_source"] == "persisted_sse_trade_calendar"
+
+
+def test_stale_member_snapshot_blocks_unified_account_trades() -> None:
+    row = SimpleNamespace(
+        id="plan-1",
+        decision_date=date(2026, 8, 31),
+        inputs_as_of=date(2026, 8, 28),
+        plan_json={
+            "net_targets": {"SH600000": {"weight": 0.08}},
+            "net_trades": {
+                "SH600000": {
+                    "side": "buy",
+                    "delta_weight": 0.08,
+                }
+            },
+            "input_evidence": {
+                "member_snapshots": {
+                    "short-v1": {"as_of_date": "2026-08-28"},
+                    "swing-v1": {"as_of_date": "2026-08-27"},
+                }
+            },
+        },
+    )
+    connection = _Connection([row])
+    service = AdviceService.__new__(AdviceService)
+    service.engine = _Engine(connection)
+    current_card = {
+        "horizon": SHORT_1_5D,
+        "stage": "verified",
+        "is_investment_advice": True,
+    }
+
+    unified = service._unified_account(
+        verified_cards=[current_card],
+        formal_cards=[current_card],
+        onboarding_required=False,
+        freshness_requirement={
+            "status": "current",
+            "required_signal_date": "2026-08-28",
+            "reason": None,
+        },
+    )
+
+    assert unified["status"] == "waiting_for_current_netting"
+    assert unified["action"] == "NO_ACTION"
+    assert unified["targets"] == []
+    assert unified["trades"] == []
+    assert unified["freshness"]["status"] == "member_snapshots_stale"
+
+
+def test_today_is_not_available_until_current_netting_plan_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = AdviceService.__new__(AdviceService)
+    service.data_root = Path("unused")
+    monkeypatch.setattr(
+        advice_module,
+        "advice_session_requirement",
+        lambda *_args, **_kwargs: {
+            "status": "current",
+            "required_signal_date": "2026-08-28",
+            "reason": None,
+        },
+    )
+    service._horizon_card = lambda horizon, **_kwargs: {
+        "horizon": horizon,
+        "stage": "verified",
+        "is_investment_advice": True,
+        "data_cutoff": "2026-08-28",
+        "signals": [],
+    }
+    service._unified_account = lambda **_kwargs: {
+        "status": "waiting_for_current_netting",
+        "action": "NO_ACTION",
+        "targets": [],
+        "trades": [],
+    }
+
+    result = service.today(
+        investor_profile={"initial_capital": 100_000},
+        now=datetime(2026, 8, 30, 8, 0, tzinfo=UTC),
+    )
+
+    assert result["advice_available"] is False
+    assert result["unified_account"]["action"] == "NO_ACTION"
 
 
 def test_unified_account_facts_override_placeholder_quantity_and_age() -> None:

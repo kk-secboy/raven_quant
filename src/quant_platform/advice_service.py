@@ -14,6 +14,7 @@ from typing import Any
 
 from sqlalchemy import case, select
 
+from quant_data.cninfo_announcements import load_trade_calendar_open_days
 from quant_data.database import (
     account_netting_plans,
     backtest_runs,
@@ -33,6 +34,11 @@ from quant_data.database import (
     strategy_versions,
 )
 
+from .advice_freshness import (
+    advice_session_requirement,
+    assess_netting_plan_freshness,
+    assess_signal_freshness,
+)
 from .data_rollover import select_qlib_dataset
 from .ops_calendar import load_calendar_days
 from .promotion import (
@@ -310,9 +316,25 @@ class AdviceService:
         self.promotions = PromotionStore(database_url)
         self.simulations = SimulationStore(database_url)
 
-    def today(self, *, investor_profile: dict[str, Any] | None = None) -> dict[str, Any]:
-        now = datetime.now(UTC)
-        cards = [self._horizon_card(horizon, now=now) for horizon in HORIZONS]
+    def today(
+        self,
+        *,
+        investor_profile: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        now = now or datetime.now(UTC)
+        freshness_requirement = advice_session_requirement(
+            self.data_root,
+            now=now,
+        )
+        cards = [
+            self._horizon_card(
+                horizon,
+                now=now,
+                freshness_requirement=freshness_requirement,
+            )
+            for horizon in HORIZONS
+        ]
         cutoffs = [
             _date_value(card.get("data_cutoff"))
             for card in cards
@@ -322,7 +344,9 @@ class AdviceService:
         onboarding_required = investor_profile is None
         unified = self._unified_account(
             verified_cards=verified,
+            formal_cards=[card for card in cards if card["stage"] == "verified"],
             onboarding_required=onboarding_required,
+            freshness_requirement=freshness_requirement,
         )
         self._attach_unified_account_facts(cards, unified)
         return {
@@ -333,7 +357,12 @@ class AdviceService:
             "investor_profile": investor_profile,
             "cards": cards,
             "unified_account": unified,
-            "advice_available": bool(verified) and not onboarding_required,
+            "freshness": freshness_requirement,
+            "advice_available": (
+                bool(verified)
+                and not onboarding_required
+                and unified.get("status") == "ready"
+            ),
             "execution_contract": {
                 "signal": "D日收盘后",
                 "earliest_fill": "D+1开盘或保守日线成交模型",
@@ -355,8 +384,9 @@ class AdviceService:
         The immutable strategy contract defines the interval in trading
         sessions.  A Monday-Friday approximation is not an exchange calendar
         (holidays and exceptional closures matter), so an exact date is only
-        exposed when the bound Qlib dataset itself contains the future review
-        session.
+        exposed when the persisted SSE calendar contains the future review
+        session.  The current Qlib dataset ends at the latest published bar
+        and therefore cannot be used to schedule a future review date.
         """
 
         result = {
@@ -371,30 +401,23 @@ class AdviceService:
             "review_date_status": "awaiting_governed_exchange_calendar",
         }
         data_root = getattr(self, "data_root", None)
-        if effective_date is None or not dataset or data_root is None:
+        if effective_date is None or data_root is None:
             return result
         try:
-            selected = select_qlib_dataset(
-                data_root,
-                anchor_name=str(dataset),
-                roll_policy="pinned",
-                lineage_id=None,
-                required_date=effective_date,
-            )
-            calendar = sorted(load_calendar_days(str(selected["path"])))
+            calendar = load_trade_calendar_open_days(data_root)
             effective_index = calendar.index(effective_date)
             review_index = effective_index + int(review_sessions)
             if review_index >= len(calendar):
                 return result
             review_date = calendar[review_index].isoformat()
-        except (FileNotFoundError, KeyError, ValueError):
+        except (OSError, RuntimeError, TypeError, ValueError):
             return result
         return {
             **result,
             "review_date": review_date,
             "review_date_estimate": review_date,
             "review_date_is_exchange_calendar": True,
-            "review_date_source": "governed_qlib_exchange_calendar",
+            "review_date_source": "persisted_sse_trade_calendar",
             "review_date_status": "scheduled",
         }
 
@@ -759,8 +782,21 @@ class AdviceService:
             "contract_version": PROMOTION_CONTRACT_VERSION,
         }
 
-    def _horizon_card(self, horizon: str, *, now: datetime) -> dict[str, Any]:
+    def _horizon_card(
+        self,
+        horizon: str,
+        *,
+        now: datetime,
+        freshness_requirement: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         meta = _HORIZON_UI[horizon]
+        freshness_requirement = freshness_requirement or advice_session_requirement(
+            getattr(self, "data_root", None),
+            now=now,
+        )
+        required_signal_date = _date_value(
+            freshness_requirement.get("required_signal_date")
+        )
         version = self._latest_version(horizon)
         if version is None:
             return {
@@ -773,6 +809,17 @@ class AdviceService:
                 "evidence": {"status": "not_started", "passed": False},
                 "backtest": {"status": "not_started"},
                 "is_investment_advice": False,
+                "recommendation_freshness": {
+                    "status": "not_authorized",
+                    "passed": False,
+                    "required_signal_date": (
+                        required_signal_date.isoformat()
+                        if required_signal_date
+                        else None
+                    ),
+                    "observed_signal_date": None,
+                    "reason": "该周期尚无可发布的正式策略",
+                },
                 "data_cutoff": None,
                 "signals": [],
                 "action": "NO_ACTION",
@@ -791,7 +838,7 @@ class AdviceService:
             backtest_status=str(backtest["status"]),
             forward_gate_passed=evidence.get("passed") is True,
         )
-        investment_authorized = (
+        governance_authorized = (
             version.get("status") == "approved"
             and promotion_stage == "recommendation_enabled"
             and stage == "verified"
@@ -816,13 +863,36 @@ class AdviceService:
                 )
                 for item in projection.get("targets") or []
             ]
-        elif investment_authorized:
+        elif governance_authorized:
             signals, data_cutoff = self._verified_signals(
                 str(version["id"]),
                 horizon=horizon,
                 review_sessions=review_sessions,
                 allow_paused=bool(version.get("activation_cutover_fallback")),
             )
+
+        if governance_authorized:
+            recommendation_freshness = assess_signal_freshness(
+                required_signal_date=required_signal_date,
+                observed_signal_date=data_cutoff,
+                requirement_reason=freshness_requirement.get("reason"),
+            )
+            if recommendation_freshness["passed"] is not True:
+                signals = []
+        else:
+            recommendation_freshness = {
+                "status": "not_authorized",
+                "passed": False,
+                "required_signal_date": (
+                    required_signal_date.isoformat() if required_signal_date else None
+                ),
+                "observed_signal_date": data_cutoff,
+                "reason": "策略尚未通过正式荐股治理门槛",
+            }
+        investment_authorized = (
+            governance_authorized
+            and recommendation_freshness["passed"] is True
+        )
 
         if not signals:
             card_action = "NO_ACTION"
@@ -833,11 +903,13 @@ class AdviceService:
         else:
             card_action = "HOLD"
         veto_reasons = []
-        if not investment_authorized:
+        if not governance_authorized:
             veto_reasons.append(
                 "前向证据未成熟，仅展示模拟验证" if stage == "simulation_validation"
                 else f"当前阶段为{stage_label}"
             )
+        elif recommendation_freshness["passed"] is not True:
+            veto_reasons.append(str(recommendation_freshness["reason"]))
         if backtest["status"] == "failed":
             veto_reasons.append("最近一次回测或执行任务失败，不能作为荐股依据")
         elif backtest["status"] == "succeeded" and version.get("status") != "approved":
@@ -846,7 +918,10 @@ class AdviceService:
             veto_reasons.append("前向门槛证据不可用，已按失败关闭原则停止荐股")
         if stage in {"restricted", "suspended", "retired"}:
             veto_reasons.append("策略健康状态禁止新增买入")
-        if not signals:
+        if not signals and (
+            not governance_authorized
+            or recommendation_freshness["passed"] is True
+        ):
             veto_reasons.append("当前没有满足成本、风险和有效性门槛的新机会")
         return {
             "horizon": horizon,
@@ -871,6 +946,7 @@ class AdviceService:
             "evidence": evidence,
             "backtest": backtest,
             "is_investment_advice": investment_authorized,
+            "recommendation_freshness": recommendation_freshness,
             "data_cutoff": data_cutoff,
             "signals": signals,
             "action": card_action if investment_authorized else "NO_ACTION",
@@ -1006,7 +1082,9 @@ class AdviceService:
         self,
         *,
         verified_cards: list[dict[str, Any]],
+        formal_cards: list[dict[str, Any]],
         onboarding_required: bool,
+        freshness_requirement: dict[str, Any],
     ) -> dict[str, Any]:
         if onboarding_required:
             return {
@@ -1016,12 +1094,33 @@ class AdviceService:
                 "targets": [],
                 "trades": [],
             }
+        if not verified_cards and formal_cards:
+            stale_horizons = [str(item["horizon"]) for item in formal_cards]
+            reasons = [
+                str(dict(item.get("recommendation_freshness") or {}).get("reason"))
+                for item in formal_cards
+                if dict(item.get("recommendation_freshness") or {}).get("reason")
+            ]
+            return {
+                "status": "waiting_for_current_recommendations",
+                "action": "NO_ACTION",
+                "reason": (
+                    "正式策略等待最新闭市交易日推荐快照："
+                    + "；".join(reasons)
+                ),
+                "verified_horizons": [],
+                "stale_horizons": stale_horizons,
+                "freshness": freshness_requirement,
+                "targets": [],
+                "trades": [],
+            }
         if not verified_cards:
             return {
                 "status": "waiting_for_verified_horizons",
                 "action": "NO_ACTION",
                 "reason": "三个周期均仍处于研究或模拟验证，全部预算保留现金",
                 "verified_horizons": [],
+                "freshness": freshness_requirement,
                 "targets": [],
                 "trades": [],
             }
@@ -1052,6 +1151,28 @@ class AdviceService:
                 "trades": [],
             }
         plan = dict(row.plan_json or {})
+        plan_freshness = assess_netting_plan_freshness(
+            required_signal_date=_date_value(
+                freshness_requirement.get("required_signal_date")
+            ),
+            inputs_as_of=row.inputs_as_of,
+            plan=plan,
+            requirement_reason=freshness_requirement.get("reason"),
+        )
+        if plan_freshness["passed"] is not True:
+            return {
+                "status": "waiting_for_current_netting",
+                "action": "NO_ACTION",
+                "reason": str(plan_freshness["reason"]),
+                "verified_horizons": verified_horizons,
+                "missing_horizons": missing_horizons,
+                "plan_id": str(row.id),
+                "decision_date": row.decision_date.isoformat(),
+                "inputs_as_of": row.inputs_as_of.isoformat(),
+                "freshness": plan_freshness,
+                "targets": [],
+                "trades": [],
+            }
         execution = self._unified_execution_facts(str(row.id))
         instrument_facts = dict(execution.get("items") or {})
         trades = [
@@ -1079,6 +1200,7 @@ class AdviceService:
             "plan_id": str(row.id),
             "decision_date": row.decision_date.isoformat(),
             "inputs_as_of": row.inputs_as_of.isoformat(),
+            "freshness": plan_freshness,
             "simulation_portfolio_id": execution.get("portfolio_id"),
             "execution_batch_id": execution.get("batch_id"),
             "holding_age_as_of": execution.get("holding_age_as_of"),
