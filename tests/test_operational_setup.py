@@ -96,7 +96,7 @@ def test_release_upgrade_drill_uses_only_isolated_candidate_image_families(
     assert set(services) == set(BUILT_APPLICATION_SERVICES) | {
         "factor-sandbox-builder"
     }
-    assert len(images) == 4
+    assert len(images) == 5
     assert all(image.endswith(":deadbeef") for image in images)
     assert all(image.startswith("quantlab-upgrade-drill-") for image in images)
     assert all(
@@ -106,7 +106,7 @@ def test_release_upgrade_drill_uses_only_isolated_candidate_image_families(
     assert services["factor-sandbox-builder"]["environment"][
         "FACTOR_SANDBOX_BASE_IMAGE"
     ] == services["worker"]["image"]
-    assert services["api"]["image"] == services["scheduler"]["image"]
+    assert services["api"]["image"] != services["scheduler"]["image"]
     assert services["worker"]["image"] == services["evaluation-worker"]["image"]
     assert services["worker"]["image"] == services["paper-worker"]["image"]
     rdagent_image = services["rdagent-worker"]["image"]
@@ -118,6 +118,18 @@ def test_release_upgrade_drill_uses_only_isolated_candidate_image_families(
             "rdagent-quant-worker",
             "rdagent-data-science-worker",
         )
+    )
+    canonical_builders = {
+        "api",
+        "scheduler",
+        "worker",
+        "rdagent-worker",
+        "web",
+    }
+    assert all("build" not in services[service] for service in canonical_builders)
+    assert all(
+        services[service]["build"] is None
+        for service in set(BUILT_APPLICATION_SERVICES) - canonical_builders
     )
     assert not any(
         image.startswith("quantlab-platform-")

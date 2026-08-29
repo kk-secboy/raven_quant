@@ -16,6 +16,7 @@ from quant_platform.release_identity import (
 pytestmark = pytest.mark.no_database
 _REAL_IMMUTABLE_IMAGE_CONFIGURATION = release_preflight._immutable_image_configuration
 _REAL_DOCKER_STORAGE_CONFIGURATION = release_preflight._docker_storage_configuration
+_REAL_PRELOADED_IMAGE_AVAILABILITY = release_preflight._preloaded_image_availability
 _REAL_RUNTIME_RELEASE_IDENTITY = release_preflight._runtime_release_identity
 
 
@@ -382,6 +383,71 @@ def test_immutable_image_contract_is_profile_aware(
     )
     assert valid is False
     assert "separately sealed" in evidence
+
+
+@pytest.mark.parametrize(
+    ("data_science_runtime", "expected_valid"),
+    (("a", True), ("e", False)),
+)
+def test_preloaded_runtime_requires_data_science_to_share_canonical_image(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    data_science_runtime: str,
+    expected_valid: bool,
+) -> None:
+    for name in release_preflight._CORE_IMAGE_SETTINGS:
+        monkeypatch.delenv(name, raising=False)
+    runtime_id = "sha256:" + "a" * 64
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        f"RDAGENT_RUNTIME_IMAGE_DIGEST={runtime_id}\n"
+        f"RDAGENT_QLIB_SANDBOX_IMAGE=registry/qlib@sha256:{'b' * 64}\n"
+        f"RDAGENT_DATA_SCIENCE_IMAGE=registry/data-science@sha256:{'c' * 64}\n"
+        f"MODEL_SANDBOX_IMAGE=registry/model@sha256:{'d' * 64}\n",
+        encoding="utf-8",
+    )
+
+    class Context:
+        profiles: tuple[str, ...] = ()
+
+        def __init__(self) -> None:
+            self.env_file = env_file
+
+        def container_id(self, service: str) -> str:
+            return f"container-{service}"
+
+        def docker(self, *args: str, **_kwargs) -> str:
+            assert args[:3] == ("inspect", "--format", "{{.Image}}")
+            service = args[3].removeprefix("container-")
+            return (
+                "sha256:" + data_science_runtime * 64
+                if service == "rdagent-data-science-worker"
+                else runtime_id
+            )
+
+        def run(self, *args: str, **_kwargs) -> str:
+            assert args[:7] == (
+                "exec",
+                "-T",
+                "rdagent-docker",
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+            )
+            return "\n".join(
+                ("sha256:" + character * 64) for character in ("b", "c", "d")
+            )
+
+    valid, evidence = _REAL_PRELOADED_IMAGE_AVAILABILITY(
+        Context()  # type: ignore[arg-type]
+    )
+
+    assert valid is expected_valid
+    if expected_valid:
+        assert evidence.startswith("runtime identities match")
+    else:
+        assert evidence == "runtime identity mismatch: rdagent-data-science-worker"
 
 
 def test_dind_storage_must_be_outside_governed_market_data(

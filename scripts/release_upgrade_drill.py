@@ -78,7 +78,8 @@ def _write_candidate_runtime_override(
     suffix: str,
 ) -> tuple[str, ...]:
     image_families = {
-        "api-runtime": ("api", "scheduler"),
+        "api-runtime": ("api",),
+        "scheduler-runtime": ("scheduler",),
         "worker-runtime": ("worker", "evaluation-worker", "paper-worker"),
         "rdagent-runtime": (
             "rdagent-worker",
@@ -89,6 +90,13 @@ def _write_candidate_runtime_override(
         ),
         "web": ("web",),
     }
+    canonical_builders = {
+        "api",
+        "scheduler",
+        "worker",
+        "rdagent-worker",
+        "web",
+    }
     images = {
         service: f"quantlab-upgrade-drill-{family}:{suffix}"
         for family, services in image_families.items()
@@ -96,10 +104,18 @@ def _write_candidate_runtime_override(
     }
     if set(images) != set(BUILT_APPLICATION_SERVICES):
         raise RuntimeError("candidate image families do not cover the built service topology")
+    if not canonical_builders <= set(images):
+        raise RuntimeError("candidate image families have no canonical builder")
     payload = {
         "services": {
             **{
-                service: {"image": image}
+                service: {
+                    "image": image,
+                    # Compose null removes the inherited build mapping.  Every
+                    # shared runtime is built exactly once, then all mirrors
+                    # start from that one immutable candidate image ID.
+                    **({"build": None} if service not in canonical_builders else {}),
+                }
                 for service, image in sorted(images.items())
             },
             # The one-shot factor builder loads this host image into the
