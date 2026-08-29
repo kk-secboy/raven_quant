@@ -54,6 +54,10 @@ from quant_platform.strategy_rule_runtime import (
     required_rule_history_sessions,
 )
 
+_COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS = frozenset(
+    {"benchmark_relative_qp", "industry_neutral_qp"}
+)
+
 
 def _load(path: str) -> pd.DataFrame:
     source = Path(path)
@@ -62,6 +66,29 @@ def _load(path: str) -> pd.DataFrame:
     if source.suffix.lower() == ".parquet":
         return pd.read_parquet(source)
     raise ValueError(f"unsupported factor artifact: {source}")
+
+
+def _portfolio_return_covariance(
+    strategy_config: dict[str, Any],
+    close_history: pd.DataFrame,
+    risk_instruments: pd.Index,
+) -> pd.DataFrame | None:
+    """Build optimizer risk only for policies that actually consume it."""
+
+    if (
+        str(strategy_config.get("portfolio_construction") or "")
+        not in _COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS
+    ):
+        return None
+    risk_returns = (
+        close_history.reindex(columns=risk_instruments)
+        .tail(61)
+        .pct_change(fill_method=None)
+        .dropna(how="any")
+    )
+    if len(risk_returns) < 60:
+        raise ValueError("recommendation optimizer requires 60 complete return observations")
+    return estimate_covariance(risk_returns)
 
 
 def _sha256_file(path: Path) -> str:
@@ -637,14 +664,11 @@ def main() -> None:
         .union(benchmark.index.astype(str))
         .union(pd.Index(previous, dtype=str))
     )
-    risk_returns = (
-        close_history.reindex(columns=risk_instruments)
-        .tail(61)
-        .pct_change(fill_method=None)
-        .dropna(how="any")
+    return_covariance = _portfolio_return_covariance(
+        config,
+        close_history,
+        risk_instruments,
     )
-    if len(risk_returns) < 60:
-        raise ValueError("recommendation optimizer requires 60 complete return observations")
     cost_model = CostModelConfig.from_mapping(config)
     policy = PortfolioPolicy(policy_config, cost_model)
     previous_snapshot = manifest.get("previous_snapshot") or {}
@@ -694,7 +718,7 @@ def main() -> None:
         benchmark_style_exposure=styles.reindex(benchmark.index).mul(
             benchmark, axis=0
         ).sum(),
-        return_covariance=estimate_covariance(risk_returns),
+        return_covariance=return_covariance,
         prices=pd.to_numeric(point_metadata["$open"], errors="coerce"),
         current_prices=pd.to_numeric(point_metadata["$close"], errors="coerce"),
         cost_basis=cost_basis,

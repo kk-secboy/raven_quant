@@ -102,6 +102,9 @@ MAX_STYLE_CROSS_SECTION_MISSING_RATE = 0.05
 STYLE_EXPOSURE_CONTRACT_VERSION = "standardized-neutral-imputation-v1"
 FORMAL_FINAL_OOS_MODE = "formal_final_oos"
 PRE_FINAL_PORTFOLIO_TRIAL_MODE = "pre_final_portfolio_trial"
+_COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS = frozenset(
+    {"benchmark_relative_qp", "industry_neutral_qp"}
+)
 PRE_FINAL_EVALUATION_MODES = frozenset(
     {PRE_FINAL_PORTFOLIO_TRIAL_MODE, *STRATEGY_RESEARCH_EVALUATION_MODES}
 )
@@ -584,6 +587,25 @@ def _qlib_cross_section(frame: pd.DataFrame, when: pd.Timestamp, column: str) ->
     ).astype(float)
 
 
+def _portfolio_return_covariance(
+    strategy_config: dict[str, Any],
+    close_matrix: pd.DataFrame,
+    risk_instruments: pd.Index,
+) -> pd.DataFrame | None:
+    """Build optimizer risk only for policies that actually consume it."""
+
+    if (
+        str(strategy_config.get("portfolio_construction") or "")
+        not in _COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS
+    ):
+        return None
+    history = close_matrix.reindex(columns=risk_instruments).tail(61)
+    returns = history.pct_change(fill_method=None).dropna(how="any")
+    if len(returns) < 60:
+        raise ValueError("optimizer requires 60 complete point-in-time return observations")
+    return estimate_covariance(returns)
+
+
 def _metadata_provider(
     memberships: pd.DataFrame,
     benchmark_weights: pd.DataFrame,
@@ -627,17 +649,18 @@ def _metadata_provider(
         if benchmark_industries.isna().any():
             raise ValueError("benchmark constituents are missing point-in-time industries")
         risk_instruments = instruments.astype(str).union(benchmark.index.astype(str))
-        history = close_matrix.loc[:market_timestamp].reindex(columns=risk_instruments).tail(61)
-        returns = history.pct_change(fill_method=None).dropna(how="any")
-        if len(returns) < 60:
-            raise ValueError("optimizer requires 60 complete point-in-time return observations")
+        return_covariance = _portfolio_return_covariance(
+            strategy_config,
+            close_matrix.loc[:market_timestamp],
+            risk_instruments,
+        )
         result = {
             "industries": industries.reindex(instruments.astype(str)),
             "benchmark_weights": benchmark,
             "benchmark_industry_weights": benchmark.groupby(benchmark_industries).sum(),
             "style_exposures": style,
             "benchmark_style_exposure": style.reindex(benchmark.index).mul(benchmark, axis=0).sum(),
-            "return_covariance": estimate_covariance(returns),
+            "return_covariance": return_covariance,
             "prices": _qlib_cross_section(
                 intraday_prices if intraday_prices is not None else execution_metadata,
                 timestamp if intraday_prices is not None else market_timestamp,
