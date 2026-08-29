@@ -184,7 +184,11 @@ def _retarget_plans(
         base = deepcopy(plan["base_config"])
         base["recipe_version"] = recipe_version
         if change_economic_rule:
-            base["topk"] = int(base["topk"]) + 1
+            # ``topk`` is compiled from the public rule IR and would be
+            # rejected before the repair guard is reached.  ``n_drop`` is a
+            # valid persisted trading-policy field, so changing it proves the
+            # repair guard itself rejects an economic change.
+            base["n_drop"] = int(base["n_drop"]) + 1
         bootstrap = base[BOOTSTRAP_CONFIG_KEY]
         bootstrap.update(
             {
