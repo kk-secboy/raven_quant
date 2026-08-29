@@ -6050,7 +6050,13 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             latest,
             triggered_at=safe_mode_state.get("triggered_at"),
         )
-        if deployment_readiness.business_loop_readiness().get("status") != "ok":
+        business_loop = deployment_readiness.business_loop_readiness()
+        # Recovery must prove that the sealed daily input is current, but it
+        # deliberately cannot require three-horizon paper lanes: safe mode
+        # itself prevents creating the simulation accounts behind those lanes.
+        # ``/api/readyz`` continues to fail closed until all lanes are active.
+        daily_data = (business_loop.get("checks") or {}).get("daily_qlib_data") or {}
+        if daily_data.get("status") != "ok":
             health_status = "degraded"
         try:
             return safe_mode.deactivate(

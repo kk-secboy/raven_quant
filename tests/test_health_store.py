@@ -316,7 +316,14 @@ def test_safe_mode_release_accepts_health_degraded_only_by_safe_mode(
     monkeypatch.setattr(
         DeploymentReadinessStore,
         "business_loop_readiness",
-        lambda _self: {"status": "ok", "checks": {}, "blockers": []},
+        lambda _self: {
+            "status": "blocked",
+            "checks": {
+                "daily_qlib_data": {"status": "ok"},
+                "three_horizon_production": {"status": "blocked"},
+            },
+            "blockers": [{"check": "three_horizon_production"}],
+        },
     )
     app = create_app(tmp_path)
     with TestClient(app) as client:
@@ -338,6 +345,59 @@ def test_safe_mode_release_accepts_health_degraded_only_by_safe_mode(
         )
     assert response.status_code == 200
     assert response.json()["active"] is False
+
+
+def test_safe_mode_release_rejects_stale_daily_data(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    data_root = tmp_path / "data"
+    _dataset(data_root, now.date().isoformat())
+    key = Fernet.generate_key().decode("ascii")
+    settings = _settings(database_url, data_root, platform_secret_key=key)
+    safe_mode = SafeModeStore(database_url)
+    safe_mode.activate(
+        reason="data quality recovery fixture",
+        source="data_quality_gate",
+        actor="system",
+    )
+    OperationalHealthStore(settings).collect_and_record(datetime.now(UTC) + timedelta(seconds=1))
+
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("DATA_ROOT", str(data_root))
+    monkeypatch.setenv("AUTH_MODE", "disabled")
+    monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
+    monkeypatch.setenv("RDAGENT_ENABLED", "false")
+    monkeypatch.setenv("PLATFORM_SECRET_KEY", key)
+    monkeypatch.setenv("TUSHARE_API_URL", "https://api.tushare.pro")
+    monkeypatch.setenv("TUSHARE_TOKEN", "test-token")
+    monkeypatch.setattr(
+        DeploymentReadinessStore,
+        "business_loop_readiness",
+        lambda _self: {
+            "status": "blocked",
+            "checks": {
+                "daily_qlib_data": {"status": "blocked"},
+                "three_horizon_production": {"status": "blocked"},
+            },
+            "blockers": [
+                {"check": "daily_qlib_data"},
+                {"check": "three_horizon_production"},
+            ],
+        },
+    )
+    app = create_app(tmp_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/platform/safe-mode/release",
+            json={
+                "actor": "recovery-operator",
+                "reason": "attempted recovery with stale daily data",
+            },
+        )
+
+    assert response.status_code == 409
+    assert safe_mode.status()["active"] is True
 
 
 def test_stale_running_job_degrades_health(database_url: str, tmp_path: Path) -> None:

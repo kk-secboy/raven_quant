@@ -81,3 +81,19 @@ def test_compose_stamps_every_stateless_runtime_with_release_identity() -> None:
         )
         assert match is not None, service
         assert "labels: *release-labels" in match.group("body"), service
+
+
+def test_every_rdagent_runtime_build_inherits_package_mirrors() -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+
+    runtime_builds = re.findall(
+        r"^  (?P<service>[a-z0-9-]+):\s*$\n(?P<body>.*?deploy/Dockerfile\.rdagent.*?)"
+        r"(?=^  [a-z0-9-]+:\s*$|\Z)",
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    assert runtime_builds
+    for service, body in runtime_builds:
+        assert "PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}" in body, service
+        assert "DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}" in body, service
