@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import date
+from threading import Barrier
 
 import pytest
 from governance_fixtures import (
@@ -11,11 +13,16 @@ from governance_fixtures import (
 )
 from sqlalchemy import func, select, update
 
+from quant_data.database import jobs as job_rows
 from quant_data.database import paper_fills, paper_orders, strategy_versions
 from quant_platform.job_store import JobStore
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
-from quant_platform.recommendation_store import RecommendationStore
+from quant_platform.recommendation_store import (
+    RecommendationStore,
+    recommendation_refresh_job_idempotency_key,
+    recommendation_refresh_job_payload,
+)
 
 
 def test_recommendation_snapshot_is_independent_of_paper_orders_and_fills(
@@ -147,19 +154,17 @@ def test_unattached_queued_snapshot_is_retryable_and_recovers_existing_job(
     assert should_enqueue is True
 
     # Model a process that committed job creation and died before attach_job.
+    dataset = {
+        "name": "snapshot",
+        "path": str(tmp_path),
+        "provenance": {"dataset_identity_sha256": DATASET_IDENTITY},
+    }
     job = JobStore(database_url).create(
         "recommendation_refresh",
-        {
-            "recommendation_portfolio_id": portfolio["id"],
-            "recommendation_snapshot_id": snapshot["id"],
-            "dataset": "snapshot",
-            "dataset_path": str(tmp_path),
-            "dataset_identity_sha256": DATASET_IDENTITY,
-            "as_of_date": as_of.isoformat(),
-        },
+        recommendation_refresh_job_payload(snapshot, dataset),
         tmp_path / "recommendation-refresh.log",
         dedupe_active_kind=False,
-        idempotency_key=f"test-recommendation-refresh:{snapshot['id']}",
+        idempotency_key=recommendation_refresh_job_idempotency_key(snapshot["id"]),
     )
     repaired, should_enqueue = store.create_snapshot(
         portfolio_id=portfolio["id"],
@@ -175,6 +180,79 @@ def test_unattached_queued_snapshot_is_retryable_and_recovers_existing_job(
     tracked = store.get(portfolio["id"])
     assert tracked["pending_snapshot"] is None
     assert tracked["latest_snapshot"]["id"] == snapshot["id"]
+
+
+def test_concurrent_snapshot_claims_create_and_attach_exactly_one_job(
+    tmp_path, database_url: str
+) -> None:
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        recipe_id="short_relative_strength",
+    )
+    seed_store = RecommendationStore(database_url)
+    with seed_store.engine.begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id == version_id)
+            .values(status="approved")
+        )
+    enable_recommendation_authority_for_test(database_url, [version_id])
+    portfolio = seed_store.create(
+        name="concurrent recommendation claim",
+        strategy_version_id=version_id,
+        dataset="snapshot",
+        hypothetical_initial_value=100_000,
+        actor="test",
+    )
+    as_of = date(2026, 7, 10)
+    dataset = {
+        "name": "snapshot",
+        "path": str(tmp_path),
+        "provenance": {"dataset_identity_sha256": DATASET_IDENTITY},
+    }
+    contenders = Barrier(2)
+
+    def enqueue() -> tuple[str, str]:
+        recommendations = RecommendationStore(database_url)
+        snapshot, should_enqueue = recommendations.create_snapshot(
+            portfolio_id=portfolio["id"],
+            as_of_date=as_of,
+            dataset="snapshot",
+            dataset_identity_sha256=DATASET_IDENTITY,
+        )
+        assert should_enqueue is True
+        contenders.wait(timeout=10)
+        job = JobStore(database_url).create(
+            "recommendation_refresh",
+            recommendation_refresh_job_payload(snapshot, dataset),
+            tmp_path / f"recommendation-refresh-{snapshot['id']}.log",
+            dedupe_active_kind=False,
+            idempotency_key=recommendation_refresh_job_idempotency_key(
+                snapshot["id"]
+            ),
+        )
+        recommendations.attach_job(snapshot["id"], job["id"])
+        return str(snapshot["id"]), str(job["id"])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [future.result() for future in [executor.submit(enqueue) for _ in range(2)]]
+
+    snapshot_ids = {item[0] for item in results}
+    job_ids = {item[1] for item in results}
+    assert len(snapshot_ids) == 1
+    assert len(job_ids) == 1
+    snapshot_id = snapshot_ids.pop()
+    job_id = job_ids.pop()
+    key = recommendation_refresh_job_idempotency_key(snapshot_id)
+    with seed_store.engine.connect() as connection:
+        persisted_jobs = connection.execute(
+            select(job_rows.c.id).where(job_rows.c.idempotency_key == key)
+        ).all()
+    assert [str(item.id) for item in persisted_jobs] == [job_id]
+    persisted = seed_store.get_snapshot(snapshot_id)
+    assert persisted["job_id"] == job_id
+    assert persisted["status"] == "running"
 
 
 def test_recommendation_result_identity_is_bound_and_cash_only_is_valid(

@@ -79,7 +79,11 @@ from .rdagent_scenarios import (
     require_ready_scenario,
     resolve_rdagent_assets,
 )
-from .recommendation_store import RecommendationStore
+from .recommendation_store import (
+    RecommendationStore,
+    recommendation_refresh_job_idempotency_key,
+    recommendation_refresh_job_payload,
+)
 from .research_asset_store import ResearchAssetStore
 from .research_automation import (
     normalize_research_schedule_payload,
@@ -602,25 +606,14 @@ class SchedulerEngine:
                     continue
                 job = self.jobs.create(
                     "recommendation_refresh",
-                    {
-                        "recommendation_portfolio_id": str(portfolio_id),
-                        "recommendation_snapshot_id": str(snapshot["id"]),
-                        "dataset": str(dataset["name"]),
-                        "dataset_path": str(dataset["path"]),
-                        "dataset_identity_sha256": str(
-                            dataset["provenance"]["dataset_identity_sha256"]
-                        ),
-                        "as_of_date": signal_date.isoformat(),
-                    },
+                    recommendation_refresh_job_payload(snapshot, dataset),
                     self.settings.data_root
                     / "platform"
                     / "logs"
                     / f"recommendation-refresh-{snapshot['id']}.log",
                     dedupe_active_kind=False,
-                    idempotency_key=(
-                        f"three-horizon-recommendation:{portfolio_id}:"
-                        f"{signal_date.isoformat()}:"
-                        f"{dataset['provenance']['dataset_identity_sha256']}"
+                    idempotency_key=recommendation_refresh_job_idempotency_key(
+                        str(snapshot["id"])
                     ),
                 )
                 self.recommendations.attach_job(str(snapshot["id"]), str(job["id"]))
@@ -3007,17 +3000,12 @@ class SchedulerEngine:
         )
         job = self.jobs.create(
             "recommendation_refresh",
-            {
-                "recommendation_portfolio_id": portfolio_id,
-                "recommendation_snapshot_id": snapshot["id"],
-                "dataset": dataset["name"],
-                "dataset_path": dataset["path"],
-                "dataset_identity_sha256": dataset["provenance"]["dataset_identity_sha256"],
-                "as_of_date": signal_date.isoformat(),
-            },
+            recommendation_refresh_job_payload(snapshot, dataset),
             log_path,
             dedupe_active_kind=False,
-            idempotency_key=f"schedule-run:{run['id']}",
+            idempotency_key=recommendation_refresh_job_idempotency_key(
+                str(snapshot["id"])
+            ),
         )
         self.recommendations.attach_job(snapshot["id"], job["id"])
         return job

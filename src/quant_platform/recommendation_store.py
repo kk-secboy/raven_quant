@@ -47,6 +47,54 @@ def _requires_job_attachment(snapshot: dict[str, Any]) -> bool:
     )
 
 
+def recommendation_refresh_job_idempotency_key(snapshot_id: str) -> str:
+    """Bind every refresh entry point to one durable job per snapshot."""
+
+    normalized = str(snapshot_id).strip()
+    if not normalized:
+        raise ValueError("recommendation refresh requires a snapshot id")
+    return f"recommendation-refresh:snapshot:{normalized}"
+
+
+def recommendation_refresh_job_payload(
+    snapshot: dict[str, Any],
+    dataset: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the worker payload from the durable snapshot identity."""
+
+    snapshot_id = str(snapshot.get("id") or "").strip()
+    portfolio_id = str(snapshot.get("portfolio_id") or "").strip()
+    snapshot_dataset = str(snapshot.get("dataset") or "").strip()
+    snapshot_identity = str(snapshot.get("dataset_identity_sha256") or "").strip()
+    selected_dataset = str(dataset.get("name") or "").strip()
+    selected_identity = str(
+        dict(dataset.get("provenance") or {}).get("dataset_identity_sha256") or ""
+    ).strip()
+    dataset_path = str(dataset.get("path") or "").strip()
+    as_of_date = snapshot.get("as_of_date")
+    if not snapshot_id or not portfolio_id or not snapshot_dataset or not dataset_path:
+        raise ValueError("recommendation refresh snapshot identity is incomplete")
+    if len(snapshot_identity) != 64:
+        raise ValueError("recommendation refresh snapshot dataset identity is invalid")
+    if (
+        selected_dataset != snapshot_dataset
+        or selected_identity != snapshot_identity
+    ):
+        raise ValueError(
+            "recommendation refresh dataset does not match the durable snapshot"
+        )
+    if not isinstance(as_of_date, date):
+        raise ValueError("recommendation refresh snapshot as_of_date is invalid")
+    return {
+        "recommendation_portfolio_id": portfolio_id,
+        "recommendation_snapshot_id": snapshot_id,
+        "dataset": snapshot_dataset,
+        "dataset_path": dataset_path,
+        "dataset_identity_sha256": snapshot_identity,
+        "as_of_date": as_of_date.isoformat(),
+    }
+
+
 def _build_account_action_plan(
     *,
     weights: dict[str, float],

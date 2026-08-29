@@ -140,7 +140,11 @@ from .rdagent_scenarios import (
     validate_feature_set_id,
 )
 from .recommendation_account_store import RecommendationAccountStore
-from .recommendation_store import RecommendationStore
+from .recommendation_store import (
+    RecommendationStore,
+    recommendation_refresh_job_idempotency_key,
+    recommendation_refresh_job_payload,
+)
 from .research_asset_store import ResearchAssetStore
 from .research_automation import (
     HORIZON_RESEARCH_SCENARIOS,
@@ -5533,16 +5537,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             return snapshot
         job = jobs.create(
             "recommendation_refresh",
-            {
-                "recommendation_portfolio_id": portfolio_id,
-                "recommendation_snapshot_id": snapshot["id"],
-                "dataset": dataset["name"],
-                "dataset_path": dataset["path"],
-                "dataset_identity_sha256": dataset["provenance"]["dataset_identity_sha256"],
-                "as_of_date": payload.as_of_date.isoformat(),
-            },
+            recommendation_refresh_job_payload(snapshot, dataset),
             platform_root / "logs" / f"recommendation-refresh-{snapshot['id']}.log",
             dedupe_active_kind=False,
+            idempotency_key=recommendation_refresh_job_idempotency_key(
+                str(snapshot["id"])
+            ),
         )
         recommendations.attach_job(snapshot["id"], job["id"])
         worker.notify()
