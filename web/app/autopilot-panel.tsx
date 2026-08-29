@@ -67,8 +67,10 @@ type AdviceEvidence = {
 type AdviceSignal = {
   instrument: string;
   action: "BUY" | "ADD" | "HOLD" | "REDUCE" | "EXIT" | "NO_ACTION";
+  account_action?: "BUY" | "ADD" | "HOLD" | "REDUCE" | "EXIT" | "NO_ACTION" | null;
   target_weight?: number | null;
-  target_quantity?: number | null;
+  target_position_quantity?: number | null;
+  trade_quantity?: number | null;
   effective_date?: string | null;
   validity_sessions?: number | null;
   review_date_estimate?: string | null;
@@ -239,6 +241,12 @@ function EvidenceSummary({ evidence }: { evidence: AdviceEvidence }) {
 }
 
 function SignalRow({ signal, simulationOnly }: { signal: AdviceSignal; simulationOnly: boolean }) {
+  const accountAction = signal.account_action ?? signal.action;
+  const tradeQuantityLabel = accountAction === "BUY" || accountAction === "ADD"
+    ? "账户可买数量"
+    : accountAction === "REDUCE" || accountAction === "EXIT"
+      ? "账户可卖数量"
+      : "账户本次交易";
   return <article className="novice-signal">
     <div className="novice-signal-main">
       <div>
@@ -250,7 +258,8 @@ function SignalRow({ signal, simulationOnly }: { signal: AdviceSignal; simulatio
     </div>
     <p>{reasonText(signal.reason)}</p>
     <div className="novice-signal-facts">
-      <span>可买数量 <strong>{signal.target_quantity == null ? "等待账户换算" : `${signal.target_quantity} 股`}</strong></span>
+      <span>账户目标持仓 <strong>{signal.target_position_quantity == null ? "等待账户换算" : `${signal.target_position_quantity} 股`}</strong></span>
+      <span>{tradeQuantityLabel} <strong>{signal.trade_quantity == null ? "等待执行计划" : `${signal.trade_quantity} 股`}</strong></span>
       <span>执行日 <strong>{signal.effective_date ?? "等待下一交易日"}</strong></span>
       <span>有效期 <strong>{signal.validity_sessions ? `${signal.validity_sessions} 个交易日` : "按策略复核"}</strong></span>
       <span>复核日 <strong>{signal.review_date_estimate ?? "等待交易日历"}{signal.review_date_is_exchange_calendar === false ? "（估算）" : ""}</strong></span>
@@ -333,11 +342,11 @@ function UnifiedAccountCard({ account }: { account: UnifiedAccount }) {
       {trades.slice(0, 8).map((trade, index) => <div key={`${recordText(trade, ["instrument"])}-${index}`}>
         <code>{recordText(trade, ["instrument"])}</code>
         <strong>{recordText(trade, ["action", "side"], "调仓")}</strong>
-        <span>{recordText(trade, ["target_quantity", "quantity", "delta_quantity", "target_weight"], "等待整手换算")}</span>
+        <span>{recordText(trade, ["trade_quantity", "quantity", "delta_quantity", "target_weight"], "等待整手换算")}</span>
       </div>)}
     </div> : targets.length ? <div className="novice-account-trades">
       {targets.slice(0, 8).map((target, index) => <div key={`${recordText(target, ["instrument"])}-${index}`}>
-        <code>{recordText(target, ["instrument"])}</code><strong>目标</strong><span>{recordText(target, ["target_weight", "weight", "target_quantity"])}</span>
+        <code>{recordText(target, ["instrument"])}</code><strong>目标</strong><span>{recordText(target, ["target_weight", "weight", "target_position_quantity"])}</span>
       </div>)}
     </div> : <div className="novice-account-empty">没有完整的三周期净额计划时，系统保持现金，不会拼凑一份建议。</div>}
     <small>同一股票会在这里合并为一次账户动作；某个周期暂停时，其预算留在现金中，不挪给其他周期。</small>

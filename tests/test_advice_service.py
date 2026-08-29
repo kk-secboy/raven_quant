@@ -13,8 +13,12 @@ from quant_platform.advice_service import (
     AdviceService,
     _project_backtest_status,
     _project_stage,
+    _remaining_trade_quantity,
 )
 from quant_platform.research_horizon import SHORT_1_5D
+from quant_platform.three_horizon_account import (
+    THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
+)
 
 pytestmark = pytest.mark.no_database
 
@@ -108,6 +112,9 @@ class _Result:
 
     def first(self) -> Any:
         return self.row
+
+    def all(self) -> list[Any]:
+        return list(self.row)
 
 
 class _Connection(AbstractContextManager["_Connection"]):
@@ -516,11 +523,23 @@ def test_review_date_uses_persisted_sse_sessions_across_holiday(
 
 
 def test_stale_member_snapshot_blocks_unified_account_trades() -> None:
+    primary = SimpleNamespace(
+        portfolio_id="primary-ledger-1",
+        account_id="allocation-1",
+    )
     row = SimpleNamespace(
         id="plan-1",
+        account_id="allocation-1",
+        allocation_artifact_id="artifact-1",
+        plan_key="key-1",
+        plan_hash="hash-1",
         decision_date=date(2026, 8, 31),
         inputs_as_of=date(2026, 8, 28),
         plan_json={
+            "account_id": "allocation-1",
+            "allocation_artifact_id": "artifact-1",
+            "plan_key": "key-1",
+            "plan_hash": "hash-1",
             "net_targets": {"SH600000": {"weight": 0.08}},
             "net_trades": {
                 "SH600000": {
@@ -529,6 +548,10 @@ def test_stale_member_snapshot_blocks_unified_account_trades() -> None:
                 }
             },
             "input_evidence": {
+                "primary_account": {
+                    "portfolio_id": "primary-ledger-1",
+                    "source_id": "allocation-1",
+                },
                 "member_snapshots": {
                     "short-v1": {"as_of_date": "2026-08-28"},
                     "swing-v1": {"as_of_date": "2026-08-27"},
@@ -536,7 +559,7 @@ def test_stale_member_snapshot_blocks_unified_account_trades() -> None:
             },
         },
     )
-    connection = _Connection([row])
+    connection = _Connection([[primary], row])
     service = AdviceService.__new__(AdviceService)
     service.engine = _Engine(connection)
     current_card = {
@@ -561,6 +584,76 @@ def test_stale_member_snapshot_blocks_unified_account_trades() -> None:
     assert unified["targets"] == []
     assert unified["trades"] == []
     assert unified["freshness"]["status"] == "member_snapshots_stale"
+
+
+def test_changed_member_health_blocks_old_netting_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = SimpleNamespace(
+        portfolio_id="primary-ledger-1",
+        account_id="allocation-1",
+    )
+    row = SimpleNamespace(
+        id="plan-1",
+        account_id="allocation-1",
+        allocation_artifact_id="artifact-1",
+        plan_key="key-1",
+        plan_hash="hash-1",
+        decision_date=date(2026, 8, 31),
+        inputs_as_of=date(2026, 8, 28),
+        plan_json={
+            "account_id": "allocation-1",
+            "allocation_artifact_id": "artifact-1",
+            "plan_key": "key-1",
+            "plan_hash": "hash-1",
+            "net_targets": {"SH600000": {"weight": 0.08}},
+            "net_trades": {"SH600000": {"side": "buy"}},
+            "input_evidence": {
+                "primary_account": {
+                    "portfolio_id": "primary-ledger-1",
+                    "source_id": "allocation-1",
+                },
+                "member_snapshots": {
+                    "short-v1": {
+                        "as_of_date": "2026-08-28",
+                        "strategy_health_gate": {"snapshot_id": "health-old"},
+                    }
+                }
+            },
+        },
+    )
+    connection = _Connection([[primary], row])
+    service = AdviceService.__new__(AdviceService)
+    service.engine = _Engine(connection)
+    monkeypatch.setattr(
+        service,
+        "_authoritative_member_health_snapshots",
+        lambda _account_id: {"short-v1": "health-current"},
+    )
+    current_card = {
+        "horizon": SHORT_1_5D,
+        "stage": "verified",
+        "is_investment_advice": True,
+    }
+
+    unified = service._unified_account(
+        verified_cards=[current_card],
+        formal_cards=[current_card],
+        onboarding_required=False,
+        freshness_requirement={
+            "status": "current",
+            "required_signal_date": "2026-08-28",
+            "reason": None,
+        },
+    )
+
+    assert unified["status"] == "waiting_for_current_netting"
+    assert unified["action"] == "NO_ACTION"
+    assert unified["freshness"]["status"] == "member_health_snapshots_stale"
+    primary_query = connection.statements[0].compile()
+    plan_query = connection.statements[1].compile()
+    assert THREE_HORIZON_PRIMARY_SIMULATION_ACTOR in primary_query.params.values()
+    assert "allocation-1" in plan_query.params.values()
 
 
 def test_today_is_not_available_until_current_netting_plan_exists(
@@ -606,7 +699,8 @@ def test_unified_account_facts_override_placeholder_quantity_and_age() -> None:
             "signals": [
                 {
                     "instrument": "SH600000",
-                    "target_quantity": None,
+                    "target_position_quantity": None,
+                    "trade_quantity": None,
                     "holding_age_sessions": None,
                 }
             ]
@@ -615,8 +709,10 @@ def test_unified_account_facts_override_placeholder_quantity_and_age() -> None:
     unified = {
         "instrument_facts": {
             "SH600000": {
-                "target_quantity": 800,
-                "target_quantity_source": "unified_account_order_plan",
+                "action": "ADD",
+                "target_position_quantity": 800,
+                "trade_quantity": 300,
+                "quantity_source": "unified_account_order_plan",
                 "holding_age_sessions": 12,
                 "holding_age_source": "simulation_position_lots_qlib_calendar",
                 "holding_age_evidence": {"status": "proven"},
@@ -627,13 +723,15 @@ def test_unified_account_facts_override_placeholder_quantity_and_age() -> None:
     AdviceService._attach_unified_account_facts(cards, unified)
 
     signal = cards[0]["signals"][0]
-    assert signal["target_quantity"] == 800
-    assert signal["target_quantity_source"] == "unified_account_order_plan"
+    assert signal["target_position_quantity"] == 800
+    assert signal["trade_quantity"] == 300
+    assert signal["account_action"] == "ADD"
+    assert signal["quantity_source"] == "unified_account_order_plan"
     assert signal["holding_age_sessions"] == 12
     assert signal["holding_age_source"] == "simulation_position_lots_qlib_calendar"
 
 
-def test_verified_signal_projects_persisted_account_target_quantity() -> None:
+def test_verified_signal_defers_quantities_until_unified_account_plan() -> None:
     snapshot = SimpleNamespace(
         id="snapshot-1",
         effective_date=date(2026, 8, 31),
@@ -645,6 +743,10 @@ def test_verified_signal_projects_persisted_account_target_quantity() -> None:
                     "instrument": "SH600000",
                     "action": "BUY",
                     "target_quantity": 600,
+                    "order_plan": [
+                        {"op": "keep", "quantity": 100},
+                        {"op": "new", "quantity": 500},
+                    ],
                 }
             ]
         },
@@ -678,8 +780,114 @@ def test_verified_signal_projects_persisted_account_target_quantity() -> None:
     )
 
     assert cutoff == "2026-08-28"
-    assert signals[0]["target_quantity"] == 600
-    assert signals[0]["target_quantity_source"] == (
-        "recommendation_account_action_plan"
-    )
+    assert signals[0]["target_position_quantity"] is None
+    assert signals[0]["trade_quantity"] is None
+    assert signals[0]["quantity_source"] == "awaiting_unified_account_order_plan"
     assert signals[0]["review_date"] is None
+
+
+def test_remaining_trade_quantity_excludes_cancelled_orders() -> None:
+    assert _remaining_trade_quantity(
+        {
+            "target_quantity": 900,
+            "filled_position": 400,
+            "order_plan": [
+                {"op": "cancel", "quantity": 300},
+                {"op": "keep", "quantity": 100},
+                {"op": "replace", "quantity": 200},
+                {"op": "new", "quantity": 200},
+            ],
+        }
+    ) == 500
+
+
+def test_blocked_order_plan_has_no_actionable_trade_quantity() -> None:
+    assert _remaining_trade_quantity(
+        {
+            "execution_state": "BLOCKED",
+            "order_plan": [{"op": "new", "quantity": 500}],
+        }
+    ) == 0
+
+
+def test_member_signal_netted_out_has_zero_account_trade() -> None:
+    cards = [
+        {
+            "signals": [
+                {
+                    "instrument": "SH600000",
+                    "action": "BUY",
+                    "target_position_quantity": None,
+                    "trade_quantity": None,
+                }
+            ]
+        }
+    ]
+
+    AdviceService._attach_unified_account_facts(
+        cards,
+        {"status": "ready", "instrument_facts": {}},
+    )
+
+    signal = cards[0]["signals"][0]
+    assert signal["action"] == "BUY"
+    assert signal["account_action"] == "NO_ACTION"
+    assert signal["target_position_quantity"] == 0
+    assert signal["trade_quantity"] == 0
+    assert signal["quantity_source"] == "unified_account_netted_out"
+
+
+def test_unified_execution_facts_requires_exact_primary_account_ledger() -> None:
+    class ResultWithAll(_Result):
+        def all(self) -> list[Any]:
+            return list(self.row)
+
+    class ConnectionWithAll(_Connection):
+        def execute(self, statement: Any) -> ResultWithAll:
+            self.statements.append(statement)
+            return ResultWithAll(self.rows.pop(0))
+
+    connection = ConnectionWithAll([[]])
+    service = AdviceService.__new__(AdviceService)
+    service.engine = _Engine(connection)
+
+    result = service._unified_execution_facts(
+        "plan-1",
+        account_id="allocation-exact",
+        portfolio_id="primary-ledger-exact",
+    )
+
+    assert result["status"] == "primary_ledger_missing"
+    compiled = connection.statements[0].compile()
+    assert "allocation-exact" in compiled.params.values()
+    assert "primary-ledger-exact" in compiled.params.values()
+    assert THREE_HORIZON_PRIMARY_SIMULATION_ACTOR in compiled.params.values()
+
+
+def test_netting_plan_seal_rejects_a_different_primary_ledger() -> None:
+    row = SimpleNamespace(
+        allocation_artifact_id="artifact-1",
+        plan_key="key-1",
+        plan_hash="hash-1",
+    )
+    plan = {
+        "account_id": "allocation-1",
+        "allocation_artifact_id": "artifact-1",
+        "plan_key": "key-1",
+        "plan_hash": "hash-1",
+        "input_evidence": {
+            "primary_account": {
+                "portfolio_id": "old-primary-ledger",
+                "source_id": "allocation-1",
+            }
+        },
+    }
+
+    error = AdviceService._validate_netting_plan_seal(
+        row,
+        plan=plan,
+        account_id="allocation-1",
+        portfolio_id="current-primary-ledger",
+    )
+
+    assert error == "统一账户净额计划未绑定当前三周期主账本"

@@ -27,6 +27,7 @@ from quant_data.database import (
     simulation_batches,
     simulation_portfolios,
     strategies,
+    strategy_allocation_members,
     strategy_allocations,
     strategy_forward_gates,
     strategy_health_snapshots,
@@ -49,8 +50,9 @@ from .promotion import (
 from .research_horizon import LEGACY_AMBIGUOUS, LONG_1_3Y, SHORT_1_5D, SWING_1_6M
 from .simulation_store import SimulationStore
 from .strategy_store import StrategyStore
+from .three_horizon_account import THREE_HORIZON_PRIMARY_SIMULATION_ACTOR
 
-ADVICE_TODAY_CONTRACT_VERSION = "three-horizon-advice-v1"
+ADVICE_TODAY_CONTRACT_VERSION = "three-horizon-advice-v2"
 HORIZONS = (SHORT_1_5D, SWING_1_6M, LONG_1_3Y)
 
 _HORIZON_UI = {
@@ -306,6 +308,24 @@ def _action(value: Any, *, previous_weight: float = 0.0, weight: float = 0.0) ->
     return "HOLD" if weight > 0 else "NO_ACTION"
 
 
+def _remaining_trade_quantity(item: dict[str, Any]) -> int:
+    """Return the still-actionable order quantity, never the target position."""
+
+    if str(item.get("execution_state") or "").upper() == "BLOCKED":
+        return 0
+    total = 0
+    for raw in item.get("order_plan") or []:
+        if not isinstance(raw, dict):
+            continue
+        order = dict(raw)
+        if str(order.get("op") or "").lower() not in {"new", "keep", "replace"}:
+            continue
+        quantity = int(order.get("quantity") or 0)
+        if quantity > 0:
+            total += quantity
+    return total
+
+
 class AdviceService:
     """Read-only product projection for simple and advanced UI modes."""
 
@@ -434,31 +454,48 @@ class AdviceService:
             return action
         return "NO_ACTION"
 
-    def _unified_execution_facts(self, plan_id: str) -> dict[str, Any]:
+    def _unified_execution_facts(
+        self,
+        plan_id: str,
+        *,
+        account_id: str,
+        portfolio_id: str,
+    ) -> dict[str, Any]:
         """Read quantities and lot ages from the one authoritative paper ledger."""
 
         with self.engine.connect() as connection:
-            portfolio = connection.execute(
+            portfolios = connection.execute(
                 select(simulation_portfolios)
-                .join(
-                    strategy_allocations,
-                    strategy_allocations.c.id == simulation_portfolios.c.source_id,
-                )
                 .where(
-                    strategy_allocations.c.status == "active",
+                    simulation_portfolios.c.id == portfolio_id,
                     simulation_portfolios.c.status == "active",
                     simulation_portfolios.c.source_type == "allocation",
+                    simulation_portfolios.c.source_id == account_id,
+                    simulation_portfolios.c.created_by
+                    == THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
                 )
-                .order_by(simulation_portfolios.c.updated_at.desc())
                 .limit(1)
-            ).first()
-            if portfolio is None:
-                return {"items": {}, "portfolio_id": None, "batch_id": None}
+            ).all()
+            if len(portfolios) != 1:
+                return {
+                    "status": "primary_ledger_missing" if not portfolios else "ambiguous",
+                    "items": {},
+                    "portfolio_id": None,
+                    "batch_id": None,
+                    "reason": (
+                        "统一模拟账户尚未建立"
+                        if not portfolios
+                        else "统一模拟账户存在多个活动主账本"
+                    ),
+                }
+            portfolio = portfolios[0]
             batch = connection.execute(
                 select(simulation_batches)
                 .where(
                     simulation_batches.c.portfolio_id == portfolio.id,
                     simulation_batches.c.account_netting_plan_id == plan_id,
+                    simulation_batches.c.created_by
+                    == THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
                 )
                 .order_by(
                     simulation_batches.c.trade_date.desc(),
@@ -493,11 +530,14 @@ class AdviceService:
                 target = item.get("target_quantity")
                 facts[instrument] = {
                     "action": self._display_account_action(item),
-                    "target_quantity": int(target) if target is not None else None,
+                    "target_position_quantity": (
+                        int(target) if target is not None else None
+                    ),
+                    "trade_quantity": _remaining_trade_quantity(item),
                     "filled_position": int(item.get("filled_position") or 0),
                     "projected_position": int(item.get("projected_position") or 0),
                     "execution_state": str(item.get("execution_state") or ""),
-                    "target_quantity_source": "unified_account_order_plan",
+                    "quantity_source": "unified_account_order_plan",
                     "holding_age_sessions": None,
                     "holding_age_source": "awaiting_authoritative_account_lots",
                 }
@@ -527,11 +567,14 @@ class AdviceService:
                     instrument,
                     {
                         "action": "HOLD",
-                        "target_quantity": int(position.get("quantity") or 0),
+                        "target_position_quantity": int(
+                            position.get("quantity") or 0
+                        ),
+                        "trade_quantity": 0,
                         "filled_position": int(position.get("quantity") or 0),
                         "projected_position": int(position.get("quantity") or 0),
                         "execution_state": "ready",
-                        "target_quantity_source": "unified_account_position_ledger",
+                        "quantity_source": "unified_account_position_ledger",
                     },
                 )
                 age = position.get("holding_age_sessions")
@@ -543,29 +586,113 @@ class AdviceService:
                 )
                 fact["holding_age_evidence"] = position.get("holding_age_evidence")
         return {
+            "status": "ready" if batch is not None else "execution_plan_missing",
             "items": facts,
             "portfolio_id": str(portfolio.id),
             "batch_id": str(batch.id) if batch is not None else None,
             "holding_age_as_of": age_as_of.isoformat() if isinstance(age_as_of, date) else None,
+            "reason": (
+                None
+                if batch is not None
+                else "最新净额计划尚未生成统一账户执行批次"
+            ),
         }
+
+    def _primary_account_binding(self) -> dict[str, Any]:
+        """Resolve the sole active three-horizon ledger and its exact allocation."""
+
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    simulation_portfolios.c.id.label("portfolio_id"),
+                    simulation_portfolios.c.source_id.label("account_id"),
+                )
+                .join(
+                    strategy_allocations,
+                    strategy_allocations.c.id == simulation_portfolios.c.source_id,
+                )
+                .where(
+                    strategy_allocations.c.status == "active",
+                    simulation_portfolios.c.status == "active",
+                    simulation_portfolios.c.source_type == "allocation",
+                    simulation_portfolios.c.created_by
+                    == THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
+                )
+                .order_by(simulation_portfolios.c.created_at)
+                .limit(2)
+            ).all()
+        if len(rows) != 1:
+            return {
+                "status": "missing" if not rows else "ambiguous",
+                "reason": (
+                    "统一模拟账户尚未绑定活动三周期配置"
+                    if not rows
+                    else "存在多个活动三周期主账本，已阻止账户建议"
+                ),
+            }
+        return {
+            "status": "ready",
+            "portfolio_id": str(rows[0].portfolio_id),
+            "account_id": str(rows[0].account_id),
+        }
+
+    @staticmethod
+    def _validate_netting_plan_seal(
+        row: Any,
+        *,
+        plan: dict[str, Any],
+        account_id: str,
+        portfolio_id: str,
+    ) -> str | None:
+        """Validate durable row bindings and the plan's primary-ledger evidence."""
+
+        bindings = (
+            ("account_id", account_id),
+            ("allocation_artifact_id", str(row.allocation_artifact_id)),
+            ("plan_key", str(row.plan_key)),
+            ("plan_hash", str(row.plan_hash)),
+        )
+        if any(str(plan.get(field) or "") != expected for field, expected in bindings):
+            return "统一账户净额计划的数据库封存字段不一致"
+        raw_evidence = plan.get("input_evidence")
+        if not isinstance(raw_evidence, dict):
+            return "统一账户净额计划缺少封存输入证据"
+        raw_primary = raw_evidence.get("primary_account")
+        if not isinstance(raw_primary, dict):
+            return "统一账户净额计划未封存三周期主账本证据"
+        primary = dict(raw_primary)
+        if (
+            str(primary.get("portfolio_id") or "") != portfolio_id
+            or str(primary.get("source_id") or "") != account_id
+        ):
+            return "统一账户净额计划未绑定当前三周期主账本"
+        return None
 
     @staticmethod
     def _attach_unified_account_facts(
         cards: list[dict[str, Any]], unified: dict[str, Any]
     ) -> None:
         facts = dict(unified.get("instrument_facts") or {})
-        if not facts:
+        if not facts and unified.get("status") != "ready":
             return
         for card in cards:
             for signal in card.get("signals") or []:
                 fact = facts.get(str(signal.get("instrument") or "").upper())
                 if not isinstance(fact, dict):
+                    if unified.get("status") == "ready":
+                        signal["account_action"] = "NO_ACTION"
+                        signal["target_position_quantity"] = 0
+                        signal["trade_quantity"] = 0
+                        signal["quantity_source"] = "unified_account_netted_out"
                     continue
-                if fact.get("target_quantity") is not None:
-                    signal["target_quantity"] = int(fact["target_quantity"])
-                    signal["target_quantity_source"] = fact.get(
-                        "target_quantity_source"
+                if fact.get("target_position_quantity") is not None:
+                    signal["target_position_quantity"] = int(
+                        fact["target_position_quantity"]
                     )
+                if fact.get("trade_quantity") is not None:
+                    signal["trade_quantity"] = int(fact["trade_quantity"])
+                signal["account_action"] = fact.get("action")
+                signal["quantity_source"] = fact.get("quantity_source")
                 if fact.get("holding_age_sessions") is not None:
                     signal["holding_age_sessions"] = int(
                         fact["holding_age_sessions"]
@@ -574,6 +701,60 @@ class AdviceService:
                     signal["holding_age_evidence"] = fact.get(
                         "holding_age_evidence"
                     )
+
+    def _authoritative_member_health_snapshots(
+        self, account_id: str
+    ) -> dict[str, str | None]:
+        """Return the latest health seal for every exact active-allocation member."""
+
+        with self.engine.connect() as connection:
+            members = connection.execute(
+                select(
+                    strategy_allocation_members.c.strategy_version_id,
+                    strategy_versions.c.status,
+                    strategy_versions.c.promotion_stage,
+                )
+                .join(
+                    strategy_versions,
+                    strategy_versions.c.id
+                    == strategy_allocation_members.c.strategy_version_id,
+                )
+                .where(strategy_allocation_members.c.allocation_id == account_id)
+                .order_by(strategy_allocation_members.c.strategy_version_id)
+            ).all()
+            result = {
+                str(member.strategy_version_id): None
+                for member in members
+            }
+            authorized = {
+                str(member.strategy_version_id)
+                for member in members
+                if str(member.status) == "approved"
+                and str(member.promotion_stage) == "recommendation_enabled"
+            }
+            if authorized:
+                health_rows = connection.execute(
+                    select(
+                        strategy_health_snapshots.c.id,
+                        strategy_health_snapshots.c.strategy_version_id,
+                    )
+                    .where(
+                        strategy_health_snapshots.c.strategy_version_id.in_(
+                            tuple(sorted(authorized))
+                        )
+                    )
+                    .order_by(
+                        strategy_health_snapshots.c.strategy_version_id,
+                        strategy_health_snapshots.c.as_of.desc(),
+                        strategy_health_snapshots.c.recorded_at.desc(),
+                        strategy_health_snapshots.c.id.desc(),
+                    )
+                ).all()
+                for row in health_rows:
+                    version_id = str(row.strategy_version_id)
+                    if result.get(version_id) is None:
+                        result[version_id] = str(row.id)
+        return result
 
     def _latest_version(self, horizon: str) -> dict[str, Any] | None:
         serving_incumbent = self.promotions.serving_incumbent_for_pending_cutover(
@@ -975,8 +1156,9 @@ class AdviceService:
             "instrument": str(item.get("instrument") or ""),
             "action": _action(item.get("action"), previous_weight=previous, weight=weight),
             "target_weight": weight,
-            "target_quantity": None,
-            "target_quantity_source": "awaiting_account_order_plan",
+            "target_position_quantity": None,
+            "trade_quantity": None,
+            "quantity_source": "awaiting_account_order_plan",
             "effective_date": effective.isoformat() if effective else None,
             "validity_sessions": _HORIZON_UI[horizon]["validity_sessions"],
             **review,
@@ -1044,7 +1226,6 @@ class AdviceService:
             weight = float(row.weight)
             previous = float(row.previous_weight)
             account_action = account_actions.get(str(row.instrument).upper()) or {}
-            target_quantity = account_action.get("target_quantity")
             signals.append(
                 {
                     "instrument": str(row.instrument),
@@ -1054,14 +1235,9 @@ class AdviceService:
                         weight=weight,
                     ),
                     "target_weight": weight,
-                    "target_quantity": (
-                        int(target_quantity) if target_quantity is not None else None
-                    ),
-                    "target_quantity_source": (
-                        "recommendation_account_action_plan"
-                        if target_quantity is not None
-                        else "awaiting_account_order_plan"
-                    ),
+                    "target_position_quantity": None,
+                    "trade_quantity": None,
+                    "quantity_source": "awaiting_unified_account_order_plan",
                     "effective_date": effective.isoformat() if effective else None,
                     "validity_sessions": _HORIZON_UI[horizon]["validity_sessions"],
                     **review,
@@ -1126,14 +1302,23 @@ class AdviceService:
             }
         verified_horizons = [str(item["horizon"]) for item in verified_cards]
         missing_horizons = [item for item in HORIZONS if item not in verified_horizons]
+        primary = self._primary_account_binding()
+        if primary["status"] != "ready":
+            return {
+                "status": "waiting_for_primary_account",
+                "action": "NO_ACTION",
+                "reason": str(primary["reason"]),
+                "verified_horizons": verified_horizons,
+                "missing_horizons": missing_horizons,
+                "targets": [],
+                "trades": [],
+            }
+        account_id = str(primary["account_id"])
+        portfolio_id = str(primary["portfolio_id"])
         with self.engine.connect() as connection:
             row = connection.execute(
                 select(account_netting_plans)
-                .join(
-                    strategy_allocations,
-                    strategy_allocations.c.id == account_netting_plans.c.account_id,
-                )
-                .where(strategy_allocations.c.status == "active")
+                .where(account_netting_plans.c.account_id == account_id)
                 .order_by(
                     account_netting_plans.c.decision_date.desc(),
                     account_netting_plans.c.created_at.desc(),
@@ -1151,6 +1336,23 @@ class AdviceService:
                 "trades": [],
             }
         plan = dict(row.plan_json or {})
+        seal_error = self._validate_netting_plan_seal(
+            row,
+            plan=plan,
+            account_id=account_id,
+            portfolio_id=portfolio_id,
+        )
+        if seal_error is not None:
+            return {
+                "status": "waiting_for_current_netting",
+                "action": "NO_ACTION",
+                "reason": seal_error,
+                "verified_horizons": verified_horizons,
+                "missing_horizons": missing_horizons,
+                "plan_id": str(row.id),
+                "targets": [],
+                "trades": [],
+            }
         plan_freshness = assess_netting_plan_freshness(
             required_signal_date=_date_value(
                 freshness_requirement.get("required_signal_date")
@@ -1159,6 +1361,20 @@ class AdviceService:
             plan=plan,
             requirement_reason=freshness_requirement.get("reason"),
         )
+        if plan_freshness["status"] == "member_health_authority_missing":
+            plan_freshness = assess_netting_plan_freshness(
+                required_signal_date=_date_value(
+                    freshness_requirement.get("required_signal_date")
+                ),
+                inputs_as_of=row.inputs_as_of,
+                plan=plan,
+                authoritative_health_snapshot_ids=(
+                    self._authoritative_member_health_snapshots(
+                        account_id
+                    )
+                ),
+                requirement_reason=freshness_requirement.get("reason"),
+            )
         if plan_freshness["passed"] is not True:
             return {
                 "status": "waiting_for_current_netting",
@@ -1173,8 +1389,52 @@ class AdviceService:
                 "targets": [],
                 "trades": [],
             }
-        execution = self._unified_execution_facts(str(row.id))
+        execution = self._unified_execution_facts(
+            str(row.id),
+            account_id=account_id,
+            portfolio_id=portfolio_id,
+        )
+        if execution.get("status") != "ready":
+            return {
+                "status": "waiting_for_account_execution",
+                "action": "NO_ACTION",
+                "reason": str(
+                    execution.get("reason")
+                    or "统一模拟账户执行证据尚未就绪"
+                ),
+                "verified_horizons": verified_horizons,
+                "missing_horizons": missing_horizons,
+                "plan_id": str(row.id),
+                "decision_date": row.decision_date.isoformat(),
+                "inputs_as_of": row.inputs_as_of.isoformat(),
+                "freshness": plan_freshness,
+                "targets": [],
+                "trades": [],
+            }
         instrument_facts = dict(execution.get("items") or {})
+        required_fact_instruments = {
+            str(instrument).upper()
+            for instrument in set(plan.get("net_targets") or {})
+            | set(plan.get("net_trades") or {})
+        }
+        missing_execution_facts = sorted(
+            required_fact_instruments - set(instrument_facts)
+        )
+        if missing_execution_facts:
+            return {
+                "status": "waiting_for_account_execution",
+                "action": "NO_ACTION",
+                "reason": "统一账户执行批次缺少净额目标明细",
+                "verified_horizons": verified_horizons,
+                "missing_horizons": missing_horizons,
+                "plan_id": str(row.id),
+                "decision_date": row.decision_date.isoformat(),
+                "inputs_as_of": row.inputs_as_of.isoformat(),
+                "freshness": plan_freshness,
+                "missing_execution_fact_instruments": missing_execution_facts,
+                "targets": [],
+                "trades": [],
+            }
         trades = [
             {
                 "instrument": instrument,

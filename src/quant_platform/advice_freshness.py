@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -125,9 +126,10 @@ def assess_netting_plan_freshness(
     required_signal_date: date | None,
     inputs_as_of: Any,
     plan: dict[str, Any],
+    authoritative_health_snapshot_ids: Mapping[str, str | None] | None = None,
     requirement_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Require current input dates for both the plan and every member snapshot."""
+    """Require current signal dates and exact member-health snapshot bindings."""
 
     plan_freshness = assess_signal_freshness(
         required_signal_date=required_signal_date,
@@ -193,10 +195,105 @@ def assess_netting_plan_freshness(
                 member: value.isoformat() for member, value in member_dates.items()
             },
         }
+    authoritative_health = {
+        str(member): str(snapshot_id).strip() if snapshot_id else None
+        for member, snapshot_id in (authoritative_health_snapshot_ids or {}).items()
+    }
+    if not authoritative_health:
+        return {
+            **plan_freshness,
+            "scope": "account_netting_plan",
+            "status": "member_health_authority_missing",
+            "passed": False,
+            "reason": "统一账户无法确认当前成员策略健康快照",
+            "member_signal_dates": {
+                member: value.isoformat() for member, value in member_dates.items()
+            },
+            "member_health_snapshot_ids": {},
+        }
+    if set(member_dates) != set(authoritative_health):
+        return {
+            **plan_freshness,
+            "scope": "account_netting_plan",
+            "status": "member_strategy_versions_stale",
+            "passed": False,
+            "reason": "统一账户净额计划的成员策略版本已变化",
+            "member_signal_dates": {
+                member: value.isoformat() for member, value in member_dates.items()
+            },
+            "member_health_snapshot_ids": authoritative_health,
+        }
+    if any(snapshot_id is None for snapshot_id in authoritative_health.values()):
+        return {
+            **plan_freshness,
+            "scope": "account_netting_plan",
+            "status": "member_health_snapshot_missing",
+            "passed": False,
+            "reason": "统一账户成员缺少当前策略健康快照",
+            "member_signal_dates": {
+                member: value.isoformat() for member, value in member_dates.items()
+            },
+            "member_health_snapshot_ids": authoritative_health,
+        }
+    planned_gates = {
+        member: dict(raw_evidence[member]).get("strategy_health_gate")
+        for member in member_dates
+    }
+    if any(not isinstance(gate, dict) for gate in planned_gates.values()):
+        return {
+            **plan_freshness,
+            "scope": "account_netting_plan",
+            "status": "member_health_evidence_invalid",
+            "passed": False,
+            "reason": "统一账户净额计划包含无效的成员策略健康证据",
+            "member_signal_dates": {
+                member: value.isoformat() for member, value in member_dates.items()
+            },
+            "member_health_snapshot_ids": authoritative_health,
+        }
+    planned_health = {
+        member: str(gate.get("snapshot_id") or "").strip()
+        for member, gate in planned_gates.items()
+        if isinstance(gate, dict)
+    }
+    if any(not snapshot_id for snapshot_id in planned_health.values()):
+        return {
+            **plan_freshness,
+            "scope": "account_netting_plan",
+            "status": "member_health_evidence_missing",
+            "passed": False,
+            "reason": "统一账户净额计划缺少成员策略健康快照证据",
+            "member_signal_dates": {
+                member: value.isoformat() for member, value in member_dates.items()
+            },
+            "member_health_snapshot_ids": authoritative_health,
+        }
+    stale_health = {
+        member: {
+            "planned": planned_health[member],
+            "current": authoritative_health[member],
+        }
+        for member in member_dates
+        if planned_health[member] != authoritative_health[member]
+    }
+    if stale_health:
+        return {
+            **plan_freshness,
+            "scope": "account_netting_plan",
+            "status": "member_health_snapshots_stale",
+            "passed": False,
+            "reason": "成员策略健康证据已更新，需重新生成统一账户净额计划",
+            "member_signal_dates": {
+                member: value.isoformat() for member, value in member_dates.items()
+            },
+            "member_health_snapshot_ids": authoritative_health,
+            "stale_member_health": stale_health,
+        }
     return {
         **plan_freshness,
         "scope": "account_netting_plan",
         "member_signal_dates": {
             member: value.isoformat() for member, value in member_dates.items()
         },
+        "member_health_snapshot_ids": authoritative_health,
     }

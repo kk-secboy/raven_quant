@@ -64,7 +64,10 @@ def test_netting_plan_rejects_stale_member_hidden_by_current_max_date() -> None:
         plan={
             "input_evidence": {
                 "member_snapshots": {
-                    "short": {"as_of_date": "2026-08-28"},
+                    "short": {
+                        "as_of_date": "2026-08-28",
+                        "strategy_health_gate": {"snapshot_id": "health-short"},
+                    },
                     "swing": {"as_of_date": "2026-08-27"},
                 }
             }
@@ -86,13 +89,72 @@ def test_netting_plan_accepts_only_current_member_evidence() -> None:
         plan={
             "input_evidence": {
                 "member_snapshots": {
-                    "short": {"as_of_date": "2026-08-28"},
-                    "swing": {"as_of_date": "2026-08-28"},
-                    "long": {"as_of_date": "2026-08-28"},
+                    "short": {
+                        "as_of_date": "2026-08-28",
+                        "strategy_health_gate": {"snapshot_id": "health-short"},
+                    },
+                    "swing": {
+                        "as_of_date": "2026-08-28",
+                        "strategy_health_gate": {"snapshot_id": "health-swing"},
+                    },
+                    "long": {
+                        "as_of_date": "2026-08-28",
+                        "strategy_health_gate": {"snapshot_id": "health-long"},
+                    },
                 }
             }
+        },
+        authoritative_health_snapshot_ids={
+            "short": "health-short",
+            "swing": "health-swing",
+            "long": "health-long",
         },
     )
 
     assert freshness["status"] == "current"
     assert freshness["passed"] is True
+
+
+def test_netting_plan_rejects_replaced_member_health_snapshot() -> None:
+    freshness = assess_netting_plan_freshness(
+        required_signal_date=date(2026, 8, 28),
+        inputs_as_of="2026-08-28",
+        plan={
+            "input_evidence": {
+                "member_snapshots": {
+                    "short": {
+                        "as_of_date": "2026-08-28",
+                        "strategy_health_gate": {"snapshot_id": "health-old"},
+                    }
+                }
+            }
+        },
+        authoritative_health_snapshot_ids={"short": "health-new"},
+    )
+
+    assert freshness["status"] == "member_health_snapshots_stale"
+    assert freshness["passed"] is False
+    assert freshness["stale_member_health"] == {
+        "short": {"planned": "health-old", "current": "health-new"}
+    }
+
+
+def test_netting_plan_rejects_malformed_member_health_evidence() -> None:
+    freshness = assess_netting_plan_freshness(
+        required_signal_date=date(2026, 8, 28),
+        inputs_as_of="2026-08-28",
+        plan={
+            "input_evidence": {
+                "member_snapshots": {
+                    "short": {
+                        "as_of_date": "2026-08-28",
+                        "strategy_health_gate": "not-a-sealed-object",
+                    }
+                }
+            }
+        },
+        authoritative_health_snapshot_ids={"short": "health-current"},
+    )
+
+    assert freshness["status"] == "member_health_evidence_invalid"
+    assert freshness["passed"] is False

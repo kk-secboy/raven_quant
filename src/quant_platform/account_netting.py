@@ -644,6 +644,7 @@ class AccountNettingStore:
                         .order_by(
                             strategy_health_snapshots.c.as_of.desc(),
                             strategy_health_snapshots.c.recorded_at.desc(),
+                            strategy_health_snapshots.c.id.desc(),
                         )
                         .limit(1)
                     ).first()
