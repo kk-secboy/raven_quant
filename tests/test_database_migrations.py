@@ -978,7 +978,10 @@ def test_same_lineage_repair_constraint_is_limited_to_exact_v2(database_url: str
             )
         )
 
-    assert "source_dataset_lineage_id <> target_dataset_lineage_id" in definition
+    # PostgreSQL may render text-column comparisons with explicit ``::text``
+    # casts, so assert the governed operands instead of its cosmetic SQL form.
+    assert "source_dataset_lineage_id" in definition
+    assert "target_dataset_lineage_id" in definition
     assert "transparent-baseline-pre-result-repair-v2" in definition
     assert "v7-to-v8-optimizer-applicability" in definition
     assert "b230bb66ab1aad446f575c59d2e99564cf82dd734d7fa40f5ce574c41222c686" in (

@@ -29,7 +29,9 @@ def test_strategy_backtest_request_accepts_an_explicit_execution_dataset() -> No
         StrategyConfigRequest(execution_slice_minutes=17)
 
 
-def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> None:
+def test_worker_persists_and_passes_minute_execution_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     class ConnectionContext:
         def __enter__(self):
             return object()
@@ -88,6 +90,20 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
         mlflow_tracking_uri="postgresql://tracking",
     )
     worker.strategies = Strategies()
+    observed_runner_binding: dict[str, object] = {}
+
+    def require_runner(*, config: dict, job_payload: dict, runner_path: Path) -> str:
+        observed_runner_binding.update(
+            config=config,
+            job_payload=job_payload,
+            runner_path=runner_path,
+        )
+        return "c" * 64
+
+    monkeypatch.setattr(
+        "quant_platform.worker.require_transparent_baseline_runner",
+        require_runner,
+    )
     execution_path = tmp_path / "qlib" / "ashare-5m"
     job = {
         "id": "job-1",
@@ -140,6 +156,12 @@ def test_worker_persists_and_passes_minute_execution_dataset(tmp_path: Path) -> 
     }
     assert manifest["factors"][0]["code_path"] == str(tmp_path / "factor.py")
     assert manifest["factors"][0]["factor_execution_mode"] == "frozen_code_recompute"
+    assert manifest["transparent_baseline_runner_sha256"] == "c" * 64
+    assert observed_runner_binding == {
+        "config": {"execution_method": "twap"},
+        "job_payload": job["payload"],
+        "runner_path": tmp_path / "scripts" / "run_multifactor_backtest.py",
+    }
 
 
 def test_worker_builds_production_qlib_order_plan_job(

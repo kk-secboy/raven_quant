@@ -148,6 +148,7 @@ from .strategy_rule_compiler import (
     validate_compiled_strategy_artifact,
 )
 from .strategy_store import StrategyStore
+from .transparent_baseline_runner import require_transparent_baseline_runner
 
 _DATABASE_RETRY_INITIAL_SECONDS = 0.5
 _DATABASE_RETRY_MAX_SECONDS = 5.0
@@ -4260,10 +4261,17 @@ class LocalJobWorker:
                     for item in version["factors"]
                 ],
             }
+            script = self.project_root / "scripts" / "run_multifactor_backtest.py"
+            runner_sha256 = require_transparent_baseline_runner(
+                config=version["config"],
+                job_payload=payload,
+                runner_path=script,
+            )
+            if runner_sha256 is not None:
+                manifest["transparent_baseline_runner_sha256"] = runner_sha256
             manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            script = self.project_root / "scripts" / "run_multifactor_backtest.py"
             command = (
                 [
                     "wsl",
