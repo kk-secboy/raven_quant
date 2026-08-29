@@ -51,6 +51,7 @@ def test_worker_persists_and_passes_minute_execution_dataset(
         def get_version(_version_id: str) -> dict:
             return {
                 "id": "version-1",
+                "strategy_rules_sha256": "d" * 64,
                 "benchmark": "SH000300",
                 "universe": "cn_all",
                 "config": {"execution_method": "twap"},
