@@ -436,6 +436,20 @@ def _seed_artifact(database_url: str) -> str:
 
 def test_build_plan_for_allocation(database_url: str, tmp_path: Path, monkeypatch) -> None:
     _qlib_doubles(monkeypatch)
+    # This test owns account-level netting arithmetic, not the production
+    # health-evidence chain.  Supply an explicit authoritative gate double;
+    # arbitrary fixture snapshots must never weaken the real fail-closed gate.
+    monkeypatch.setattr(
+        "quant_platform.account_netting.load_production_health_gate",
+        lambda _connection, version_id: {
+            "strategy_version_id": version_id,
+            "health_status": "healthy",
+            "allow_new_risk": True,
+            "ready": True,
+            "reasons": [],
+            "snapshot_id": f"health-{version_id}",
+        },
+    )
     version_ids = _two_versions(database_url, tmp_path)
     store = AllocationStore(database_url)
     allocation = _create_allocation(store, version_ids, "netting allocation")
