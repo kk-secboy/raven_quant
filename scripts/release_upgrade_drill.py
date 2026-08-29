@@ -172,9 +172,9 @@ def run_drill(project_root: Path) -> dict:
     temporary_manager = tempfile.TemporaryDirectory(prefix="quantlab-release-upgrade-drill-")
     try:
         scratch = Path(temporary_manager.name)
-        env_file = scratch / "drill.env"
-        candidate_override = scratch / "candidate-runtime.compose.json"
         backup_root = scratch / "backups"
+        env_file = backup_root / "drill.env"
+        candidate_override = scratch / "candidate-runtime.compose.json"
         data_host_path = scratch / "drill-data"
         docker_host_path = scratch / "rdagent-docker"
         registry_host_path = scratch / "rdagent-registry"
@@ -246,7 +246,14 @@ def run_drill(project_root: Path) -> dict:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         if context is not None:
-            context.run("down", "-v", "--remove-orphans", check=False)
+            context.run(
+                "--profile",
+                "sandbox-registry",
+                "down",
+                "-v",
+                "--remove-orphans",
+                check=False,
+            )
             if rollback_tags:
                 context.docker("image", "rm", "-f", *rollback_tags, check=False)
             if candidate_runtime_images:

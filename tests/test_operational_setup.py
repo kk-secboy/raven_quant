@@ -57,6 +57,8 @@ def test_release_upgrade_drill_uses_isolated_sibling_storage() -> None:
     assert 'f"RDAGENT_REGISTRY_PORT={registry_port}"' in source
     assert "rollback_tag_repository=f\"quantlab-upgrade-drill-rollback-{suffix}\"" in source
     assert "prune_rollback_images=False" in source
+    assert 'env_file = backup_root / "drill.env"' in source
+    assert '"sandbox-registry",\n                "down",' in source
     bootstrap = source.index(
         'result["bootstrap_sandbox_images"] = prepare_drill_sandbox_bootstrap('
     )
