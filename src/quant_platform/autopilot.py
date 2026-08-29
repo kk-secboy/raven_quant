@@ -163,6 +163,28 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _branch_created_at(branch: dict[str, Any]) -> datetime:
+    """Return one persisted branch timestamp as an aware UTC datetime.
+
+    ``row_dict`` deliberately serializes database datetimes for API-safe store
+    results.  Autopilot cadence checks are internal datetime arithmetic, so
+    comparing that ISO string directly with ``datetime`` raises at runtime.
+    Keep the serialization boundary intact and normalize only at the cadence
+    decision point.
+    """
+
+    value = branch.get("created_at")
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    else:
+        raise ValueError("autopilot branch created_at is invalid")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def _profile_family_multiple_testing(
     *,
     research_run_id: str,
@@ -1391,7 +1413,7 @@ class AutopilotController:
 
     def _factor_due(self, now: datetime, config: dict[str, Any]) -> bool:
         latest = self.store.latest_branch("fin_factor")
-        return latest is None or latest["created_at"] <= now - timedelta(
+        return latest is None or _branch_created_at(latest) <= now - timedelta(
             days=int(config["factor_research_interval_days"])
         )
 
@@ -1415,7 +1437,7 @@ class AutopilotController:
         # passed, one exhausted run may be challenged again after seven days,
         # rather than spinning on every publication.
         if has_admitted is None:
-            return latest["created_at"] <= now - timedelta(days=7)
+            return _branch_created_at(latest) <= now - timedelta(days=7)
         # With an incumbent, research runs once for each market-data month.
         # The first published trading-day snapshot of a new month triggers it;
         # a brief outage on that day is recovered by the next snapshot in the
@@ -1429,7 +1451,7 @@ class AutopilotController:
         except (KeyError, TypeError, ValueError):
             # Legacy rows without a frozen dataset date retain the old bounded
             # cadence until the first new monthly run creates a complete row.
-            return latest["created_at"] <= now - timedelta(
+            return _branch_created_at(latest) <= now - timedelta(
                 days=int(config["model_research_interval_days"])
             )
         return source_month < current_month
@@ -3894,7 +3916,7 @@ class AutopilotController:
             return False
         if str(latest.get("cycle_id") or "") == str(cycle["id"]):
             return False
-        return latest["created_at"] <= now - timedelta(
+        return _branch_created_at(latest) <= now - timedelta(
             days=config["quant_cooldown_days"]
         )
 

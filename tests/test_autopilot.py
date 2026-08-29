@@ -392,6 +392,21 @@ def test_model_research_runs_once_on_the_first_available_snapshot_of_a_new_month
     assert controller._model_due({"end_date": "2026-09-02"}, now, config) is True
 
 
+def test_factor_cadence_accepts_serialized_database_timestamp() -> None:
+    class Store:
+        @staticmethod
+        def latest_branch(_scenario):
+            return {"created_at": "2026-08-28T11:00:00+00:00"}
+
+    controller = AutopilotController.__new__(AutopilotController)
+    controller.store = Store()
+
+    assert controller._factor_due(
+        datetime(2026, 8, 29, 12, tzinfo=UTC),
+        normalize_autopilot_config(),
+    ) is True
+
+
 def test_full_model_score_uses_equal_three_window_mean_and_worst_window() -> None:
     def evidence(returns: dict[str, float]) -> dict:
         return {
