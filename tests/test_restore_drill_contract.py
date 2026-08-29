@@ -50,6 +50,27 @@ def test_restore_drill_seeds_the_canonical_0072_legacy_horizon() -> None:
     assert "n.performance_certified::text" in source
 
 
+def test_restore_drill_batch_sentinel_binds_immutable_dataset_contract() -> None:
+    source = SCRIPT_PATH.read_text(encoding="utf-8")
+    batch_insert = source.split("INSERT INTO quantlab.simulation_batches", 1)[1].split(
+        "INSERT INTO quantlab.simulation_positions", 1
+    )[0]
+
+    for column in (
+        "daily_dataset",
+        "daily_dataset_identity_sha256",
+        "daily_dataset_lineage_id",
+        "execution_dataset",
+        "execution_dataset_identity_sha256",
+        "execution_dataset_lineage_id",
+        "simulation_semantics_sha256",
+    ):
+        assert column in batch_insert
+    assert "f\"'restore-daily', '{sentinel}{sentinel}', '{sentinel}{sentinel}', \"" in batch_insert
+    assert "f\"'restore-minute', '{sentinel}{sentinel}', '{sentinel}{sentinel}', \"" in batch_insert
+    assert "f\"'{sentinel}{sentinel}', current_date - 1, current_date, \"" in batch_insert
+
+
 def test_restore_drill_defaults_to_v2_and_keeps_v1_available(tmp_path: Path) -> None:
     module = _load_restore_drill_module()
     parameter = inspect.signature(module.run_drill).parameters["format_version"]

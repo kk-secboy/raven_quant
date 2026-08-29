@@ -106,31 +106,25 @@ def _write_candidate_runtime_override(
         raise RuntimeError("candidate image families do not cover the built service topology")
     if not canonical_builders <= set(images):
         raise RuntimeError("candidate image families have no canonical builder")
-    payload = {
-        "services": {
-            **{
-                service: {
-                    "image": image,
-                    # Compose null removes the inherited build mapping.  Every
-                    # shared runtime is built exactly once, then all mirrors
-                    # start from that one immutable candidate image ID.
-                    **({"build": None} if service not in canonical_builders else {}),
-                }
-                for service, image in sorted(images.items())
-            },
-            # The one-shot factor builder loads this host image into the
-            # isolated DinD. It must follow the drill-only worker alias too.
-            "factor-sandbox-builder": {
-                "environment": {
-                    "FACTOR_SANDBOX_BASE_IMAGE": images["worker"],
-                }
-            },
-        }
-    }
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    # A plain JSON ``null`` does not remove an inherited Compose build mapping;
+    # it is ignored during merge.  Compose's YAML ``!reset`` tag is required so
+    # each shared image family has exactly one builder and every mirror starts
+    # from that builder's immutable image ID.
+    lines = ["services:"]
+    for service, image in sorted(images.items()):
+        lines.extend((f"  {service}:", f"    image: {json.dumps(image)}"))
+        if service not in canonical_builders:
+            lines.append("    build: !reset null")
+    # The one-shot factor builder loads this host image into the isolated DinD.
+    # It must follow the drill-only worker alias too.
+    lines.extend(
+        (
+            "  factor-sandbox-builder:",
+            "    environment:",
+            "      FACTOR_SANDBOX_BASE_IMAGE: " + json.dumps(images["worker"]),
+        )
     )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return tuple(sorted(set(images.values())))
 
 
@@ -205,7 +199,7 @@ def run_drill(project_root: Path) -> dict:
         scratch = Path(temporary_manager.name)
         backup_root = scratch / "backups"
         env_file = backup_root / "drill.env"
-        candidate_override = scratch / "candidate-runtime.compose.json"
+        candidate_override = scratch / "candidate-runtime.compose.yaml"
         data_host_path = scratch / "drill-data"
         docker_host_path = scratch / "rdagent-docker"
         registry_host_path = scratch / "rdagent-registry"

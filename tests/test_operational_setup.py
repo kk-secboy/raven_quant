@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
-import json
+import re
 import sys
 from pathlib import Path
 
@@ -87,38 +87,14 @@ def test_release_upgrade_drill_uses_only_isolated_candidate_image_families(
     tmp_path: Path,
 ) -> None:
     module = _load_release_upgrade_drill_module()
-    override = tmp_path / "candidate-runtime.compose.json"
+    override = tmp_path / "candidate-runtime.compose.yaml"
 
     images = module._write_candidate_runtime_override(override, "deadbeef")
-    payload = json.loads(override.read_text(encoding="utf-8"))
-    services = payload["services"]
+    rendered = override.read_text(encoding="utf-8")
 
-    assert set(services) == set(BUILT_APPLICATION_SERVICES) | {
-        "factor-sandbox-builder"
-    }
     assert len(images) == 5
     assert all(image.endswith(":deadbeef") for image in images)
     assert all(image.startswith("quantlab-upgrade-drill-") for image in images)
-    assert all(
-        services[service]["image"] in images
-        for service in BUILT_APPLICATION_SERVICES
-    )
-    assert services["factor-sandbox-builder"]["environment"][
-        "FACTOR_SANDBOX_BASE_IMAGE"
-    ] == services["worker"]["image"]
-    assert services["api"]["image"] != services["scheduler"]["image"]
-    assert services["worker"]["image"] == services["evaluation-worker"]["image"]
-    assert services["worker"]["image"] == services["paper-worker"]["image"]
-    rdagent_image = services["rdagent-worker"]["image"]
-    assert all(
-        services[service]["image"] == rdagent_image
-        for service in (
-            "rdagent-model-worker",
-            "rdagent-report-worker",
-            "rdagent-quant-worker",
-            "rdagent-data-science-worker",
-        )
-    )
     canonical_builders = {
         "api",
         "scheduler",
@@ -126,11 +102,23 @@ def test_release_upgrade_drill_uses_only_isolated_candidate_image_families(
         "rdagent-worker",
         "web",
     }
-    assert all("build" not in services[service] for service in canonical_builders)
-    assert all(
-        services[service]["build"] is None
-        for service in set(BUILT_APPLICATION_SERVICES) - canonical_builders
-    )
+    for service in BUILT_APPLICATION_SERVICES:
+        match = re.search(rf"(?m)^  {re.escape(service)}:\n((?:    .*\n)*)", rendered)
+        assert match is not None
+        block = match.group(1)
+        assert any(f'image: "{image}"' in block for image in images)
+        if service in canonical_builders:
+            assert "build:" not in block
+        else:
+            assert "build: !reset null" in block
+    assert (
+        "FACTOR_SANDBOX_BASE_IMAGE: "
+        '"quantlab-upgrade-drill-worker-runtime:deadbeef"'
+    ) in rendered
+    assert "quantlab-upgrade-drill-api-runtime:deadbeef" in rendered
+    assert "quantlab-upgrade-drill-scheduler-runtime:deadbeef" in rendered
+    assert rendered.count("quantlab-upgrade-drill-worker-runtime:deadbeef") == 4
+    assert rendered.count("quantlab-upgrade-drill-rdagent-runtime:deadbeef") == 5
     assert not any(
         image.startswith("quantlab-platform-")
         or image in {"quantlab-worker-runtime:v2", "quantlab-rdagent-runtime:v2"}
