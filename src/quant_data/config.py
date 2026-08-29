@@ -82,6 +82,11 @@ class Settings:
     research_cpu_budget: int = 0
     research_memory_budget_gb: int = 0
     scheduler_poll_seconds: float = 15.0
+    # A tick normally only reconciles/enqueues durable work, but production
+    # data reconciliation can legitimately take longer than two poll periods.
+    # Keep active ticks ready up to this explicit bound; a process stuck beyond
+    # it must fail closed instead of presenting an immortal heartbeat.
+    scheduler_max_tick_seconds: int = 300
     # Stamped into every stateless service by one immutable deployment.  The
     # API compares its values with the scheduler health response so a mixed
     # release/config rollout cannot be reported business-ready.
@@ -216,6 +221,9 @@ class Settings:
                 2048, max(0, int(os.getenv("RESEARCH_MEMORY_BUDGET_GB", "0")))
             ),
             scheduler_poll_seconds=max(1.0, float(os.getenv("SCHEDULER_POLL_SECONDS", "15"))),
+            scheduler_max_tick_seconds=max(
+                60, int(os.getenv("SCHEDULER_MAX_TICK_SECONDS", "300"))
+            ),
             quantlab_release_id=os.getenv("QUANTLAB_RELEASE_ID", "").strip(),
             quantlab_config_digest=os.getenv("QUANTLAB_CONFIG_DIGEST", "")
             .strip()

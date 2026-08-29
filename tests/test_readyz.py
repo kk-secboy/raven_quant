@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
-from quant_platform.api import create_app
+from quant_platform.api import _scheduler_endpoint_health_check, create_app
 from quant_platform.deployment_readiness import DeploymentReadinessStore
 from quant_platform.health_store import OperationalHealthStore
 from quant_platform.runtime_secret_store import RuntimeSecretStore
@@ -91,3 +91,31 @@ def test_readyz_is_public_and_fails_closed_when_safe_mode_engages(
     assert {item["check"] for item in blocked.json()["blockers"]} == {"safe_mode"}
     assert mixed_release.status_code == 503
     assert mixed_release.json()["checks"]["release_identity"]["status"] == "blocked"
+
+
+@pytest.mark.no_database
+def test_readyz_rejects_an_overdue_active_scheduler_tick() -> None:
+    now = datetime(2026, 8, 30, 2, 0, tzinfo=UTC)
+    body = {
+        "status": "ok",
+        "ready": True,
+        "last_tick": (now - timedelta(seconds=10)).isoformat(),
+        "tick_in_progress": True,
+        "tick_started_at": (now - timedelta(seconds=301)).isoformat(),
+        "freshness_source": "active_tick",
+        "max_active_tick_seconds": 300,
+        "release_id": "release-test-1",
+        "config_digest": "config-test-1",
+    }
+
+    scheduler = _scheduler_endpoint_health_check(
+        body,
+        response_status_code=200,
+        now=now,
+        stale_after_seconds=30,
+        max_active_tick_seconds=300,
+    )
+
+    assert scheduler["status"] == "degraded"
+    assert scheduler["active_tick_age_seconds"] == 301
+    assert scheduler["max_active_tick_seconds"] == 300

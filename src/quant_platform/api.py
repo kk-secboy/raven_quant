@@ -187,6 +187,67 @@ from .strategy_store import StrategyStore
 from .worker import LocalJobWorker
 
 
+def _scheduler_endpoint_health_check(
+    scheduler_body: dict[str, Any],
+    *,
+    response_status_code: int,
+    now: datetime,
+    stale_after_seconds: int,
+    max_active_tick_seconds: int,
+) -> dict[str, Any]:
+    """Independently validate the scheduler heartbeat returned to ``readyz``."""
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("scheduler readiness time must be timezone-aware")
+    last_tick_raw = scheduler_body.get("last_tick")
+    last_tick = datetime.fromisoformat(str(last_tick_raw))
+    if last_tick.tzinfo is None:
+        raise ValueError("scheduler last_tick must be timezone-aware")
+    scheduler_age = max(0.0, (now - last_tick).total_seconds())
+    tick_in_progress = scheduler_body.get("tick_in_progress") is True
+    tick_started_at_raw = scheduler_body.get("tick_started_at")
+    active_tick_age: float | None = None
+    if tick_in_progress:
+        tick_started_at = datetime.fromisoformat(str(tick_started_at_raw))
+        if tick_started_at.tzinfo is None:
+            raise ValueError("scheduler tick_started_at must be timezone-aware")
+        active_tick_age = max(0.0, (now - tick_started_at).total_seconds())
+    elif tick_started_at_raw is not None:
+        raise ValueError("idle scheduler must not retain tick_started_at")
+    reported_max_active_tick_seconds = int(
+        scheduler_body.get("max_active_tick_seconds") or 0
+    )
+    freshness_ready = (
+        active_tick_age <= max_active_tick_seconds
+        if active_tick_age is not None
+        else scheduler_age <= stale_after_seconds
+    )
+    ready = (
+        response_status_code == 200
+        and scheduler_body.get("status") == "ok"
+        and scheduler_body.get("ready") is True
+        and reported_max_active_tick_seconds == max_active_tick_seconds
+        and freshness_ready
+    )
+    return {
+        "status": "ok" if ready else "degraded",
+        "message": (
+            "scheduler tick is current"
+            if ready
+            else "scheduler health or tick freshness check failed"
+        ),
+        "last_tick": last_tick_raw,
+        "age_seconds": scheduler_age,
+        "stale_after_seconds": stale_after_seconds,
+        "tick_in_progress": tick_in_progress,
+        "tick_started_at": tick_started_at_raw,
+        "active_tick_age_seconds": active_tick_age,
+        "max_active_tick_seconds": max_active_tick_seconds,
+        "reported_max_active_tick_seconds": reported_max_active_tick_seconds,
+        "freshness_source": scheduler_body.get("freshness_source"),
+    }
+
+
 class BootstrapRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -3128,6 +3189,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             }
 
         stale_after_seconds = max(30, settings.scheduler_poll_seconds * 2)
+        max_active_tick_seconds = settings.scheduler_max_tick_seconds
         scheduler_check: dict[str, Any]
         scheduler_identity: dict[str, Any] = {}
         if settings.scheduler_url:
@@ -3143,36 +3205,19 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "release_id": scheduler_body.get("release_id"),
                     "config_digest": scheduler_body.get("config_digest"),
                 }
-                last_tick_raw = scheduler_body.get("last_tick")
-                last_tick = datetime.fromisoformat(str(last_tick_raw))
-                if last_tick.tzinfo is None:
-                    raise ValueError("scheduler last_tick must be timezone-aware")
-                scheduler_age = max(0.0, (datetime.now(UTC) - last_tick).total_seconds())
-                tick_in_progress = scheduler_body.get("tick_in_progress") is True
-                scheduler_ready = (
-                    scheduler_response.status_code == 200
-                    and scheduler_body.get("status") == "ok"
-                    and (tick_in_progress or scheduler_age <= stale_after_seconds)
+                scheduler_check = _scheduler_endpoint_health_check(
+                    scheduler_body,
+                    response_status_code=scheduler_response.status_code,
+                    now=datetime.now(UTC),
+                    stale_after_seconds=stale_after_seconds,
+                    max_active_tick_seconds=max_active_tick_seconds,
                 )
-                scheduler_check = {
-                    "status": "ok" if scheduler_ready else "degraded",
-                    "message": (
-                        "scheduler tick is current"
-                        if scheduler_ready
-                        else "scheduler health or tick freshness check failed"
-                    ),
-                    "last_tick": last_tick_raw,
-                    "age_seconds": scheduler_age,
-                    "stale_after_seconds": stale_after_seconds,
-                    "tick_in_progress": tick_in_progress,
-                    "tick_started_at": scheduler_body.get("tick_started_at"),
-                    "freshness_source": scheduler_body.get("freshness_source"),
-                }
             except (requests.RequestException, TypeError, ValueError):
                 scheduler_check = {
                     "status": "unavailable",
                     "message": "scheduler health endpoint is unavailable",
                     "stale_after_seconds": stale_after_seconds,
+                    "max_active_tick_seconds": max_active_tick_seconds,
                 }
         else:
             raw_components = (

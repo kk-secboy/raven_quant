@@ -89,6 +89,7 @@ def test_scheduler_health_keeps_a_long_active_tick_ready() -> None:
         },
         now=now,
         stale_after_seconds=30,
+        max_active_tick_seconds=300,
     )
 
     assert status_code == 200
@@ -96,6 +97,77 @@ def test_scheduler_health_keeps_a_long_active_tick_ready() -> None:
     assert body["message"] == "scheduler tick is in progress"
     assert body["freshness_source"] == "active_tick"
     assert body["age_seconds"] == 75
+
+
+@pytest.mark.no_database
+def test_scheduler_health_fails_closed_when_active_tick_exceeds_bound() -> None:
+    now = datetime(2026, 8, 29, 2, 0, tzinfo=UTC)
+    status_code, body = scheduler_health(
+        {
+            "last_tick": (now - timedelta(seconds=400)).isoformat(),
+            "tick_in_progress": True,
+            "tick_started_at": (now - timedelta(seconds=301)).isoformat(),
+            "last_error": None,
+            "stats": {},
+        },
+        now=now,
+        stale_after_seconds=30,
+        max_active_tick_seconds=300,
+    )
+
+    assert status_code == 503
+    assert body["ready"] is False
+    assert body["message"] == "scheduler active tick exceeded its maximum duration"
+    assert body["freshness_source"] == "active_tick"
+    assert body["age_seconds"] == 301
+    assert body["max_active_tick_seconds"] == 300
+
+
+@pytest.mark.no_database
+def test_scheduler_health_reads_tick_fields_under_one_lock() -> None:
+    now = datetime(2026, 8, 29, 2, 0, tzinfo=UTC)
+    state = {
+        "last_tick": (now - timedelta(seconds=5)).isoformat(),
+        "tick_in_progress": False,
+        "tick_started_at": None,
+        "last_error": None,
+        "stats": {},
+    }
+    lock = threading.Lock()
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+
+    def writer() -> None:
+        with lock:
+            state["tick_in_progress"] = True
+            writer_started.set()
+            assert writer_finished.wait(timeout=2)
+            state["tick_started_at"] = (now - timedelta(seconds=10)).isoformat()
+
+    writer_thread = threading.Thread(target=writer)
+    writer_thread.start()
+    assert writer_started.wait(timeout=2)
+    result: list[tuple[int, dict]] = []
+    reader_thread = threading.Thread(
+        target=lambda: result.append(
+            scheduler_health(
+                state,
+                now=now,
+                stale_after_seconds=30,
+                max_active_tick_seconds=300,
+                state_lock=lock,
+            )
+        )
+    )
+    reader_thread.start()
+    writer_finished.set()
+    writer_thread.join(timeout=2)
+    reader_thread.join(timeout=2)
+
+    assert result[0][0] == 200
+    assert result[0][1]["tick_in_progress"] is True
+    assert result[0][1]["tick_started_at"] is not None
+    assert result[0][1]["freshness_source"] == "active_tick"
 
 
 @pytest.mark.no_database
