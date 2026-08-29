@@ -2142,7 +2142,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     )
     allocations = AllocationStore(settings.database_url)
     investor_profiles = InvestorSimulationProfileStore(settings.database_url)
-    advice = AdviceService(settings.database_url)
+    advice = AdviceService(settings.database_url, data_root=settings.data_root)
     schedules = ScheduleStore(settings.database_url)
     alerts = AlertStore(settings.database_url)
     health_history = OperationalHealthStore(settings)

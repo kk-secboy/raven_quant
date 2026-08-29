@@ -7915,6 +7915,10 @@ class SimulationStore:
                 "name": account["name"],
                 "status": account["status"],
                 "strategy_version_id": str(portfolio.source_id),
+                "daily_dataset": str(portfolio.daily_dataset),
+                "daily_dataset_lineage_id": str(
+                    portfolio.daily_dataset_lineage_id
+                ),
             },
             "batch": {
                 "id": str(batch.id),

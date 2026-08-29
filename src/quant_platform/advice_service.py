@@ -8,7 +8,8 @@ only ``recommendation_enabled`` versions may produce investment advice.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import case, select
@@ -22,6 +23,7 @@ from quant_data.database import (
     recommendation_portfolios,
     recommendation_snapshots,
     row_dict,
+    simulation_batches,
     simulation_portfolios,
     strategies,
     strategy_allocations,
@@ -31,6 +33,8 @@ from quant_data.database import (
     strategy_versions,
 )
 
+from .data_rollover import select_qlib_dataset
+from .ops_calendar import load_calendar_days
 from .promotion import (
     PROMOTION_CONTRACT_VERSION,
     PromotionStore,
@@ -272,20 +276,6 @@ def _forward_gate_checks(
     }
 
 
-def _weekday_estimate(start: date | None, sessions: int) -> str | None:
-    """Return an explicitly approximate weekday date, never a claimed exchange date."""
-
-    if start is None:
-        return None
-    current = start
-    remaining = sessions
-    while remaining > 0:
-        current += timedelta(days=1)
-        if current.weekday() < 5:
-            remaining -= 1
-    return current.isoformat()
-
-
 def _date_value(value: Any) -> date | None:
     if isinstance(value, datetime):
         return value.date()
@@ -313,8 +303,9 @@ def _action(value: Any, *, previous_weight: float = 0.0, weight: float = 0.0) ->
 class AdviceService:
     """Read-only product projection for simple and advanced UI modes."""
 
-    def __init__(self, database_url: str) -> None:
+    def __init__(self, database_url: str, *, data_root: Path | None = None) -> None:
         self.engine = open_database(database_url)
+        self.data_root = data_root
         self.strategies = StrategyStore(database_url)
         self.promotions = PromotionStore(database_url)
         self.simulations = SimulationStore(database_url)
@@ -333,6 +324,7 @@ class AdviceService:
             verified_cards=verified,
             onboarding_required=onboarding_required,
         )
+        self._attach_unified_account_facts(cards, unified)
         return {
             "contract_version": ADVICE_TODAY_CONTRACT_VERSION,
             "generated_at": now.isoformat(),
@@ -350,6 +342,215 @@ class AdviceService:
             },
             "disclaimer": "系统仅运行模拟盘；历史和模拟表现不保证未来收益。",
         }
+
+    def _review_projection(
+        self,
+        *,
+        effective_date: date | None,
+        review_sessions: int,
+        dataset: str | None,
+    ) -> dict[str, Any]:
+        """Project a review date only from the governed exchange calendar.
+
+        The immutable strategy contract defines the interval in trading
+        sessions.  A Monday-Friday approximation is not an exchange calendar
+        (holidays and exceptional closures matter), so an exact date is only
+        exposed when the bound Qlib dataset itself contains the future review
+        session.
+        """
+
+        result = {
+            "review_sessions": int(review_sessions),
+            "review_date": None,
+            # Compatibility keys consumed by the current novice UI.  The old
+            # value was a weekday guess; keeping it null makes that UI say it
+            # is waiting for an exchange calendar instead of showing fiction.
+            "review_date_estimate": None,
+            "review_date_is_exchange_calendar": False,
+            "review_date_source": "strategy_horizon_contract",
+            "review_date_status": "awaiting_governed_exchange_calendar",
+        }
+        data_root = getattr(self, "data_root", None)
+        if effective_date is None or not dataset or data_root is None:
+            return result
+        try:
+            selected = select_qlib_dataset(
+                data_root,
+                anchor_name=str(dataset),
+                roll_policy="pinned",
+                lineage_id=None,
+                required_date=effective_date,
+            )
+            calendar = sorted(load_calendar_days(str(selected["path"])))
+            effective_index = calendar.index(effective_date)
+            review_index = effective_index + int(review_sessions)
+            if review_index >= len(calendar):
+                return result
+            review_date = calendar[review_index].isoformat()
+        except (FileNotFoundError, KeyError, ValueError):
+            return result
+        return {
+            **result,
+            "review_date": review_date,
+            "review_date_estimate": review_date,
+            "review_date_is_exchange_calendar": True,
+            "review_date_source": "governed_qlib_exchange_calendar",
+            "review_date_status": "scheduled",
+        }
+
+    @staticmethod
+    def _display_account_action(item: dict[str, Any]) -> str:
+        action = str(item.get("action") or "").strip().upper()
+        target = int(item.get("target_quantity") or 0)
+        filled = int(item.get("filled_position") or 0)
+        if action == "BUY":
+            return "ADD" if filled > 0 else "BUY"
+        if action in {"SELL", "REDUCE"}:
+            return "EXIT" if target <= 0 else "REDUCE"
+        if action in {"EXIT", "HOLD", "NO_ACTION"}:
+            return action
+        return "NO_ACTION"
+
+    def _unified_execution_facts(self, plan_id: str) -> dict[str, Any]:
+        """Read quantities and lot ages from the one authoritative paper ledger."""
+
+        with self.engine.connect() as connection:
+            portfolio = connection.execute(
+                select(simulation_portfolios)
+                .join(
+                    strategy_allocations,
+                    strategy_allocations.c.id == simulation_portfolios.c.source_id,
+                )
+                .where(
+                    strategy_allocations.c.status == "active",
+                    simulation_portfolios.c.status == "active",
+                    simulation_portfolios.c.source_type == "allocation",
+                )
+                .order_by(simulation_portfolios.c.updated_at.desc())
+                .limit(1)
+            ).first()
+            if portfolio is None:
+                return {"items": {}, "portfolio_id": None, "batch_id": None}
+            batch = connection.execute(
+                select(simulation_batches)
+                .where(
+                    simulation_batches.c.portfolio_id == portfolio.id,
+                    simulation_batches.c.account_netting_plan_id == plan_id,
+                )
+                .order_by(
+                    simulation_batches.c.trade_date.desc(),
+                    simulation_batches.c.created_at.desc(),
+                )
+                .limit(1)
+            ).first()
+            age_as_of = connection.scalar(
+                select(simulation_batches.c.trade_date)
+                .where(
+                    simulation_batches.c.portfolio_id == portfolio.id,
+                    simulation_batches.c.status == "succeeded",
+                )
+                .order_by(
+                    simulation_batches.c.trade_date.desc(),
+                    simulation_batches.c.created_at.desc(),
+                )
+                .limit(1)
+            )
+
+        facts: dict[str, dict[str, Any]] = {}
+        if batch is not None:
+            payload = dict(batch.target_payload_json or {})
+            actions = dict(payload.get("order_plan") or {}).get("actions") or []
+            for raw in actions:
+                if not isinstance(raw, dict):
+                    continue
+                item = dict(raw)
+                instrument = str(item.get("instrument") or "").upper()
+                if not instrument:
+                    continue
+                target = item.get("target_quantity")
+                facts[instrument] = {
+                    "action": self._display_account_action(item),
+                    "target_quantity": int(target) if target is not None else None,
+                    "filled_position": int(item.get("filled_position") or 0),
+                    "projected_position": int(item.get("projected_position") or 0),
+                    "execution_state": str(item.get("execution_state") or ""),
+                    "target_quantity_source": "unified_account_order_plan",
+                    "holding_age_sessions": None,
+                    "holding_age_source": "awaiting_authoritative_account_lots",
+                }
+
+        data_root = getattr(self, "data_root", None)
+        if data_root is not None and isinstance(age_as_of, date):
+            try:
+                selected = select_qlib_dataset(
+                    data_root,
+                    anchor_name=str(portfolio.daily_dataset),
+                    roll_policy="pinned",
+                    lineage_id=None,
+                    required_date=age_as_of,
+                )
+                positions = self.simulations.positions_with_holding_age(
+                    str(portfolio.id),
+                    calendar_days=load_calendar_days(str(selected["path"])),
+                    as_of_date=age_as_of,
+                )
+            except (FileNotFoundError, KeyError, ValueError):
+                positions = []
+            for position in positions:
+                instrument = str(position.get("instrument") or "").upper()
+                if not instrument:
+                    continue
+                fact = facts.setdefault(
+                    instrument,
+                    {
+                        "action": "HOLD",
+                        "target_quantity": int(position.get("quantity") or 0),
+                        "filled_position": int(position.get("quantity") or 0),
+                        "projected_position": int(position.get("quantity") or 0),
+                        "execution_state": "ready",
+                        "target_quantity_source": "unified_account_position_ledger",
+                    },
+                )
+                age = position.get("holding_age_sessions")
+                fact["holding_age_sessions"] = int(age) if age is not None else None
+                fact["holding_age_source"] = (
+                    "simulation_position_lots_qlib_calendar"
+                    if age is not None
+                    else "unproven_authoritative_account_lots"
+                )
+                fact["holding_age_evidence"] = position.get("holding_age_evidence")
+        return {
+            "items": facts,
+            "portfolio_id": str(portfolio.id),
+            "batch_id": str(batch.id) if batch is not None else None,
+            "holding_age_as_of": age_as_of.isoformat() if isinstance(age_as_of, date) else None,
+        }
+
+    @staticmethod
+    def _attach_unified_account_facts(
+        cards: list[dict[str, Any]], unified: dict[str, Any]
+    ) -> None:
+        facts = dict(unified.get("instrument_facts") or {})
+        if not facts:
+            return
+        for card in cards:
+            for signal in card.get("signals") or []:
+                fact = facts.get(str(signal.get("instrument") or "").upper())
+                if not isinstance(fact, dict):
+                    continue
+                if fact.get("target_quantity") is not None:
+                    signal["target_quantity"] = int(fact["target_quantity"])
+                    signal["target_quantity_source"] = fact.get(
+                        "target_quantity_source"
+                    )
+                if fact.get("holding_age_sessions") is not None:
+                    signal["holding_age_sessions"] = int(
+                        fact["holding_age_sessions"]
+                    )
+                    signal["holding_age_source"] = fact.get("holding_age_source")
+                    signal["holding_age_evidence"] = fact.get(
+                        "holding_age_evidence"
+                    )
 
     def _latest_version(self, horizon: str) -> dict[str, Any] | None:
         serving_incumbent = self.promotions.serving_incumbent_for_pending_cutover(
@@ -599,17 +800,27 @@ class AdviceService:
         )
         signals: list[dict[str, Any]] = []
         data_cutoff: str | None = None
+        review_sessions = int(
+            version.get("review_interval_sessions")
+            or _HORIZON_UI[horizon]["review_sessions"]
+        )
         if stage == "simulation_validation":
             projection = self.simulations.paper_target_for_strategy_version(str(version["id"]))
             data_cutoff = projection.get("signal_date")
             signals = [
-                self._paper_signal(item, projection=projection, horizon=horizon)
+                self._paper_signal(
+                    item,
+                    projection=projection,
+                    horizon=horizon,
+                    review_sessions=review_sessions,
+                )
                 for item in projection.get("targets") or []
             ]
         elif investment_authorized:
             signals, data_cutoff = self._verified_signals(
                 str(version["id"]),
                 horizon=horizon,
+                review_sessions=review_sessions,
                 allow_paused=bool(version.get("activation_cutover_fallback")),
             )
 
@@ -673,23 +884,28 @@ class AdviceService:
         *,
         projection: dict[str, Any],
         horizon: str,
+        review_sessions: int,
     ) -> dict[str, Any]:
         weight = float(item.get("target_weight") or item.get("weight") or 0.0)
         previous = float(item.get("previous_target_weight") or 0.0)
         effective = _date_value(projection.get("trade_date"))
+        portfolio = dict(projection.get("simulation_portfolio") or {})
+        review = self._review_projection(
+            effective_date=effective,
+            review_sessions=review_sessions,
+            dataset=str(portfolio.get("daily_dataset") or "") or None,
+        )
         return {
             "instrument": str(item.get("instrument") or ""),
             "action": _action(item.get("action"), previous_weight=previous, weight=weight),
             "target_weight": weight,
             "target_quantity": None,
+            "target_quantity_source": "awaiting_account_order_plan",
             "effective_date": effective.isoformat() if effective else None,
             "validity_sessions": _HORIZON_UI[horizon]["validity_sessions"],
-            "review_sessions": _HORIZON_UI[horizon]["review_sessions"],
-            "review_date_estimate": _weekday_estimate(
-                effective, _HORIZON_UI[horizon]["review_sessions"]
-            ),
-            "review_date_is_exchange_calendar": False,
+            **review,
             "holding_age_sessions": None,
+            "holding_age_source": "awaiting_authoritative_account_lots",
             "reason": {
                 "summary": "冻结策略目标相对上一模拟目标发生变化",
                 "signals": [str(item.get("reason") or "模拟目标变化")],
@@ -700,7 +916,12 @@ class AdviceService:
         }
 
     def _verified_signals(
-        self, version_id: str, *, horizon: str, allow_paused: bool = False
+        self,
+        version_id: str,
+        *,
+        horizon: str,
+        review_sessions: int,
+        allow_paused: bool = False,
     ) -> tuple[list[dict[str, Any]], str | None]:
         with self.engine.connect() as connection:
             snapshot = connection.execute(
@@ -730,24 +951,46 @@ class AdviceService:
                 .order_by(recommendation_holdings.c.weight.desc())
             ).all()
         effective = _date_value(snapshot.effective_date)
+        account_actions = {
+            str(item.get("instrument") or "").upper(): dict(item)
+            for item in (
+                dict(snapshot.account_actions_json or {}).get("items") or []
+            )
+            if isinstance(item, dict) and str(item.get("instrument") or "")
+        }
+        review = self._review_projection(
+            effective_date=effective,
+            review_sessions=review_sessions,
+            dataset=str(snapshot.dataset or "") or None,
+        )
         signals = []
         for row in holdings:
             weight = float(row.weight)
             previous = float(row.previous_weight)
+            account_action = account_actions.get(str(row.instrument).upper()) or {}
+            target_quantity = account_action.get("target_quantity")
             signals.append(
                 {
                     "instrument": str(row.instrument),
-                    "action": _action(row.action, previous_weight=previous, weight=weight),
+                    "action": _action(
+                        account_action.get("action") or row.action,
+                        previous_weight=previous,
+                        weight=weight,
+                    ),
                     "target_weight": weight,
-                    "target_quantity": None,
+                    "target_quantity": (
+                        int(target_quantity) if target_quantity is not None else None
+                    ),
+                    "target_quantity_source": (
+                        "recommendation_account_action_plan"
+                        if target_quantity is not None
+                        else "awaiting_account_order_plan"
+                    ),
                     "effective_date": effective.isoformat() if effective else None,
                     "validity_sessions": _HORIZON_UI[horizon]["validity_sessions"],
-                    "review_sessions": _HORIZON_UI[horizon]["review_sessions"],
-                    "review_date_estimate": _weekday_estimate(
-                        effective, _HORIZON_UI[horizon]["review_sessions"]
-                    ),
-                    "review_date_is_exchange_calendar": False,
+                    **review,
                     "holding_age_sessions": None,
+                    "holding_age_source": "awaiting_authoritative_account_lots",
                     "reason": {
                         "summary": str(row.reason),
                         "signals": [str(row.reason)],
@@ -809,12 +1052,22 @@ class AdviceService:
                 "trades": [],
             }
         plan = dict(row.plan_json or {})
+        execution = self._unified_execution_facts(str(row.id))
+        instrument_facts = dict(execution.get("items") or {})
         trades = [
-            {"instrument": instrument, **dict(value)}
+            {
+                "instrument": instrument,
+                **dict(value),
+                **dict(instrument_facts.get(str(instrument).upper()) or {}),
+            }
             for instrument, value in sorted((plan.get("net_trades") or {}).items())
         ]
         targets = [
-            {"instrument": instrument, **dict(value)}
+            {
+                "instrument": instrument,
+                **dict(value),
+                **dict(instrument_facts.get(str(instrument).upper()) or {}),
+            }
             for instrument, value in sorted((plan.get("net_targets") or {}).items())
         ]
         return {
@@ -826,9 +1079,13 @@ class AdviceService:
             "plan_id": str(row.id),
             "decision_date": row.decision_date.isoformat(),
             "inputs_as_of": row.inputs_as_of.isoformat(),
+            "simulation_portfolio_id": execution.get("portfolio_id"),
+            "execution_batch_id": execution.get("batch_id"),
+            "holding_age_as_of": execution.get("holding_age_as_of"),
             "cash_weight": float(plan.get("cash_weight") or 0.0),
             "targets": targets,
             "trades": trades,
+            "instrument_facts": instrument_facts,
             "strategy_contributions": plan.get("strategy_contributions") or {},
             "accounting_rule": "三周期先独立出目标，再在一个账户层净额化",
         }

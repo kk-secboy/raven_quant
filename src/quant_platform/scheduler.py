@@ -30,6 +30,7 @@ from quant_data.database import (
 from quant_data.execution_contract import require_daily_qlib_contract
 from quant_data.research_assets import research_report_dates_in_snapshot
 
+from .advice_alerts import UnifiedAccountAdviceAlertProjector
 from .alert_store import AlertStore
 from .autopilot import AutopilotController
 from .data_rollover import qlib_trading_date_on_or_before, select_qlib_dataset
@@ -248,6 +249,10 @@ class SchedulerEngine:
         self.research_report_backfill = ResearchReportBackfillStore(settings.database_url)
         self.schedules = ScheduleStore(settings.database_url)
         self.alerts = AlertStore(settings.database_url)
+        self.advice_alerts = UnifiedAccountAdviceAlertProjector(
+            settings.database_url,
+            alerts=self.alerts,
+        )
         self.health = OperationalHealthStore(settings)
         self.runtime_secrets = RuntimeSecretStore(
             settings.database_url, settings.platform_secret_key
@@ -3018,7 +3023,7 @@ class SchedulerEngine:
         return job
 
     def project_alerts(self) -> int:
-        created = 0
+        created = self.advice_alerts.project()
         # Safe-mode auto trigger (design 11.3): persistent degraded or
         # uncertified NAV on any active simulation account is a severe ledger
         # anomaly. Idempotent while safe mode is already active.

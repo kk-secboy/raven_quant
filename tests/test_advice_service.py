@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -432,3 +433,139 @@ def test_only_approved_forward_passed_version_is_verified_advice() -> None:
     assert card["is_investment_advice"] is True
     assert card["signals"][0]["instrument"] == "000001.SZ"
     assert card["action"] == "BUY"
+
+
+def test_review_date_never_falls_back_to_weekday_guess() -> None:
+    service = AdviceService.__new__(AdviceService)
+    service.data_root = None
+
+    review = service._review_projection(
+        effective_date=date(2026, 10, 9),
+        review_sessions=1,
+        dataset="daily-v1",
+    )
+
+    assert review["review_sessions"] == 1
+    assert review["review_date"] is None
+    assert review["review_date_estimate"] is None
+    assert review["review_date_is_exchange_calendar"] is False
+    assert review["review_date_source"] == "strategy_horizon_contract"
+
+
+def test_review_date_uses_only_governed_qlib_exchange_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = AdviceService.__new__(AdviceService)
+    service.data_root = tmp_path
+    monkeypatch.setattr(
+        advice_module,
+        "select_qlib_dataset",
+        lambda *_args, **_kwargs: {"path": str(tmp_path / "qlib")},
+    )
+    monkeypatch.setattr(
+        advice_module,
+        "load_calendar_days",
+        lambda _path: {
+            date(2026, 10, 9),
+            # 10-12 is deliberately absent (exchange holiday).
+            date(2026, 10, 13),
+            date(2026, 10, 14),
+        },
+    )
+
+    review = service._review_projection(
+        effective_date=date(2026, 10, 9),
+        review_sessions=1,
+        dataset="daily-v1",
+    )
+
+    assert review["review_date"] == "2026-10-13"
+    assert review["review_date_estimate"] == "2026-10-13"
+    assert review["review_date_is_exchange_calendar"] is True
+    assert review["review_date_source"] == "governed_qlib_exchange_calendar"
+
+
+def test_unified_account_facts_override_placeholder_quantity_and_age() -> None:
+    cards = [
+        {
+            "signals": [
+                {
+                    "instrument": "SH600000",
+                    "target_quantity": None,
+                    "holding_age_sessions": None,
+                }
+            ]
+        }
+    ]
+    unified = {
+        "instrument_facts": {
+            "SH600000": {
+                "target_quantity": 800,
+                "target_quantity_source": "unified_account_order_plan",
+                "holding_age_sessions": 12,
+                "holding_age_source": "simulation_position_lots_qlib_calendar",
+                "holding_age_evidence": {"status": "proven"},
+            }
+        }
+    }
+
+    AdviceService._attach_unified_account_facts(cards, unified)
+
+    signal = cards[0]["signals"][0]
+    assert signal["target_quantity"] == 800
+    assert signal["target_quantity_source"] == "unified_account_order_plan"
+    assert signal["holding_age_sessions"] == 12
+    assert signal["holding_age_source"] == "simulation_position_lots_qlib_calendar"
+
+
+def test_verified_signal_projects_persisted_account_target_quantity() -> None:
+    snapshot = SimpleNamespace(
+        id="snapshot-1",
+        effective_date=date(2026, 8, 31),
+        as_of_date=date(2026, 8, 28),
+        dataset="daily-v1",
+        account_actions_json={
+            "items": [
+                {
+                    "instrument": "SH600000",
+                    "action": "BUY",
+                    "target_quantity": 600,
+                }
+            ]
+        },
+    )
+    holding = SimpleNamespace(
+        instrument="SH600000",
+        weight=0.06,
+        previous_weight=0.0,
+        action="increase",
+        reason="rank and cost gate passed",
+    )
+
+    class ResultWithAll(_Result):
+        def all(self) -> list[Any]:
+            return list(self.row)
+
+    class ConnectionWithAll(_Connection):
+        def execute(self, statement: Any) -> ResultWithAll:
+            self.statements.append(statement)
+            return ResultWithAll(self.rows.pop(0))
+
+    connection = ConnectionWithAll([snapshot, [holding]])
+    service = AdviceService.__new__(AdviceService)
+    service.engine = _Engine(connection)
+    service.data_root = None
+
+    signals, cutoff = service._verified_signals(
+        "version-1",
+        horizon=SHORT_1_5D,
+        review_sessions=1,
+    )
+
+    assert cutoff == "2026-08-28"
+    assert signals[0]["target_quantity"] == 600
+    assert signals[0]["target_quantity_source"] == (
+        "recommendation_account_action_plan"
+    )
+    assert signals[0]["review_date"] is None

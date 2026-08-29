@@ -1131,6 +1131,41 @@ def test_alerts_are_idempotent_deliverable_and_acknowledgeable(
     assert delivered["delivery_attempts"] == 1
 
 
+@pytest.mark.no_database
+def test_scheduler_projects_unified_account_actions_into_existing_alert_path() -> None:
+    class Result:
+        @staticmethod
+        def all() -> list[object]:
+            return []
+
+    class Connection:
+        def __enter__(self) -> object:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        @staticmethod
+        def execute(_statement: object) -> Result:
+            return Result()
+
+    scheduler = object.__new__(SchedulerEngine)
+    scheduler.safe_mode = SimpleNamespace(
+        check_persistent_nav_anomalies=lambda: None
+    )
+    scheduler.jobs = SimpleNamespace(engine=SimpleNamespace(connect=Connection))
+    calls: list[int] = []
+
+    def project(*, limit: int = 500) -> int:
+        calls.append(limit)
+        return 3
+
+    scheduler.advice_alerts = SimpleNamespace(project=project)
+
+    assert scheduler.project_alerts() == 3
+    assert calls == [500]
+
+
 def test_empty_alert_webhook_advances_past_not_configured_rows(database_url: str) -> None:
     alerts = AlertStore(database_url)
     created = [
