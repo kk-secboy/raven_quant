@@ -351,6 +351,16 @@ class ParquetStore:
             # active inside the requested range.
             base_entry = None
             base_dir = None
+        if dataset == "fund_basic" and base_entry is not None and (
+            base_entry.get("date_field") is not None
+            or base_entry.get("date_filter_mode") is not None
+        ):
+            # fund_basic is a lifecycle master, not a point-in-time issue
+            # event.  Older snapshots clipped it by issue_date, which drops
+            # still-listed funds issued before the research window.  Never
+            # hard-link that obsolete projection into a corrected successor.
+            base_entry = None
+            base_dir = None
         if date_field is not None and base_entry is not None:
             base_min = str(base_entry.get("date_min") or "")[:10] or None
             base_max = str(base_entry.get("date_max") or "")[:10] or None
@@ -707,7 +717,11 @@ def _link_tree(source: Path, target: Path) -> None:
 def _date_field_candidates(dataset: str) -> tuple[str, ...]:
     if dataset == "trade_cal":
         return ("cal_date",)
-    if dataset == "stock_basic":
+    if dataset in {"stock_basic", "fund_basic"}:
+        # Lifecycle masters describe instruments that can remain active long
+        # after their listing/issue date.  Their selected reference generation
+        # is already bounded by snapshot_end; clipping rows to snapshot_start
+        # would remove valid pre-window constituents such as 510050.SH.
         return ()
     if dataset in {"index_member_all", "namechange"}:
         # Membership/name-state rows describe intervals. They must not be

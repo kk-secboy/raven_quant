@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import quant_data.storage as storage_module
 from quant_data.models import ProviderResult
 from quant_data.storage import ParquetStore
 
@@ -369,6 +370,99 @@ def test_bounded_memberships_do_not_reuse_incompatible_parent(tmp_path: Path) ->
     assert not (
         successor / "parquet" / "index_member_all" / "data.parquet"
     ).samefile(parent / "parquet" / "index_member_all" / "data.parquet")
+
+
+def test_fund_basic_lifecycle_master_keeps_pre_window_listing(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path / "data")
+    unit = _write_unit(
+        store,
+        "fund_basic",
+        "fund-master",
+        [
+            {
+                "ts_code": "510050.SH",
+                "market": "E",
+                "issue_date": "20041230",
+                "list_date": "20050223",
+                "delist_date": None,
+            },
+            {
+                "ts_code": "510300.SH",
+                "market": "E",
+                "issue_date": "20120504",
+                "list_date": "20120528",
+                "delist_date": None,
+            },
+        ],
+    )
+
+    snapshot = store.build_snapshot(
+        name="bounded-fund-master",
+        successful_units={"fund_basic": [unit]},
+        manifest_extra={"start_date": "2008-01-01", "end_date": "2024-12-31"},
+    )
+
+    frame = _dataset_frame(snapshot, "fund_basic")
+    entry = _manifest_entry(snapshot, "fund_basic")
+    assert set(frame["ts_code"]) == {"510050.SH", "510300.SH"}
+    assert entry["date_field"] is None
+    assert entry["date_filter_mode"] is None
+
+
+def test_fund_basic_lifecycle_master_rebuilds_obsolete_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ParquetStore(tmp_path / "data")
+    unit = _write_unit(
+        store,
+        "fund_basic",
+        "fund-master",
+        [
+            {
+                "ts_code": "510050.SH",
+                "market": "E",
+                "issue_date": "20041230",
+                "list_date": "20050223",
+                "delist_date": None,
+            },
+            {
+                "ts_code": "510300.SH",
+                "market": "E",
+                "issue_date": "20120504",
+                "list_date": "20120528",
+                "delist_date": None,
+            },
+        ],
+    )
+    current_candidates = storage_module._date_field_candidates
+    monkeypatch.setattr(
+        storage_module,
+        "_date_field_candidates",
+        lambda dataset: ("issue_date",)
+        if dataset == "fund_basic"
+        else current_candidates(dataset),
+    )
+    parent = store.build_snapshot(
+        name="obsolete-fund-parent",
+        successful_units={"fund_basic": [unit]},
+        manifest_extra={"start_date": "2008-01-01", "end_date": "2024-12-31"},
+    )
+    assert set(_dataset_frame(parent, "fund_basic")["ts_code"]) == {"510300.SH"}
+    assert _manifest_entry(parent, "fund_basic")["date_filter_mode"] == "point_date"
+
+    monkeypatch.setattr(storage_module, "_date_field_candidates", current_candidates)
+    successor = store.build_snapshot(
+        name="corrected-fund-successor",
+        successful_units={"fund_basic": [unit]},
+        manifest_extra={"start_date": "2008-01-01", "end_date": "2024-12-31"},
+        base_snapshot=parent,
+    )
+
+    frame = _dataset_frame(successor, "fund_basic")
+    entry = _manifest_entry(successor, "fund_basic")
+    assert set(frame["ts_code"]) == {"510050.SH", "510300.SH"}
+    assert entry["date_field"] is None
+    assert entry["date_filter_mode"] is None
 
 
 def test_all_null_date_like_column_falls_back_to_non_partitioned_snapshot(
