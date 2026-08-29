@@ -41,12 +41,25 @@ _QLIB_OUTPUT_VERIFY_MEMORY: dict[str, dict[str, Any]] = {}
 # reads keep returning the previous good projection, and the data worker
 # replaces it after publication.  Formal consumers continue to call
 # ``list_qlib_datasets``.
-_QLIB_DISPLAY_CATALOG_CACHE_VERSION = 2
-_QLIB_DISPLAY_CATALOG_CACHE_FILE = ".catalog-display-v2.json"
+_QLIB_DISPLAY_CATALOG_CACHE_VERSION = 3
+_QLIB_DISPLAY_CATALOG_CACHE_FILE = ".catalog-display-v3.json"
 _QLIB_DISPLAY_CATALOG_CACHE_MAX_BYTES = 5_000_000
 _QLIB_DISPLAY_CATALOG_MAX_DATASETS = 5_000
 _QLIB_DISPLAY_CATALOG_CACHE_LOCK = threading.Lock()
 _QLIB_DISPLAY_CATALOG_MEMORY: dict[str, dict[str, Any]] = {}
+_DAILY_QLIB_DISPLAY_CONTRACT_FIELDS = (
+    "frequency",
+    "field_contract_version",
+    "source_volume_unit",
+    "qlib_volume_unit",
+    "source_amount_unit",
+    "qlib_amount_unit",
+    "source_hand_size",
+    "index_volume_policy",
+    "lineage_verified",
+    "governed_etf_whitelist",
+    "execution_controls",
+)
 
 # Snapshot manifests preserve every source-unit hash and can be hundreds of
 # megabytes each.  The browser only needs snapshot identity and dataset-level
@@ -1046,6 +1059,11 @@ def _project_qlib_dataset_for_display(dataset: dict[str, Any]) -> dict[str, Any]
 
     provenance = dataset.get("provenance")
     provenance_row = provenance if isinstance(provenance, dict) else {}
+    daily_contract = {
+        key: provenance_row.get(key)
+        for key in _DAILY_QLIB_DISPLAY_CONTRACT_FIELDS
+        if key in provenance_row
+    }
     return {
         key: dataset.get(key)
         for key in (
@@ -1065,6 +1083,7 @@ def _project_qlib_dataset_for_display(dataset: dict[str, Any]) -> dict[str, Any]
     } | {
         "dataset_identity_sha256": provenance_row.get("dataset_identity_sha256"),
         "snapshot_manifest_sha256": provenance_row.get("snapshot_manifest_sha256"),
+        "daily_contract": daily_contract,
     }
 
 

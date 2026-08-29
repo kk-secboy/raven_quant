@@ -124,7 +124,7 @@ def test_daily_business_check_requires_fresh_sealed_daily_data(
         "output_files_verified": True,
         "output_verification": "verified",
         "end_date": "2026-08-31",
-        "provenance": provenance,
+        "daily_contract": provenance,
     }
     monkeypatch.setattr(
         readiness_module,

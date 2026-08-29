@@ -142,7 +142,12 @@ def _daily_qlib_business_check(
         except ValueError:
             end_date = None
             reasons.append("invalid_end_date")
-        provenance = dataset.get("provenance")
+        provenance = dataset.get("daily_contract")
+        if not isinstance(provenance, dict):
+            # Direct unit fixtures and old in-memory publishers may still
+            # provide the authoritative provenance object. Persisted browser
+            # projections use the bounded daily-contract subset.
+            provenance = dataset.get("provenance")
         if not isinstance(provenance, dict):
             provenance = {}
         if dataset.get("ready") is not True:

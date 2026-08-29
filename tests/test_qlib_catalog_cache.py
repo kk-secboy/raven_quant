@@ -192,6 +192,7 @@ def test_display_catalog_persists_only_a_bounded_browser_projection(
     assert "path" not in rows[0]
     assert "provenance" not in rows[0]
     assert rows[0]["dataset_identity_sha256"] == "a" * 64
+    assert rows[0]["daily_contract"]["frequency"] == "day"
 
     cache_path = data_root / "qlib" / services._QLIB_DISPLAY_CATALOG_CACHE_FILE
     payload = cache_path.read_text(encoding="utf-8")
