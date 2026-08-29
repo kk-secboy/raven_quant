@@ -122,7 +122,13 @@ from quant_platform.strategy_artifact_manifest import (
     validate_backtest_artifact_manifest,
 )
 from quant_platform.strategy_catalog import strategy_type_capabilities
-from quant_platform.strategy_health import COLLECTOR_ACTOR, transition_strategy_health
+from quant_platform.strategy_health import (
+    COLLECTOR_ACTOR,
+    HEALTHY,
+    RETIRED,
+    WATCH,
+    transition_strategy_health,
+)
 from quant_platform.strategy_research_admission import (
     FIN_STRATEGY_FULL_STACK_ARTIFACT_TYPE,
     FIN_STRATEGY_POLICY_ARTIFACT_TYPE,
@@ -5471,11 +5477,14 @@ class StrategyStore:
                 "strategy health snapshots must not move as_of backward within actor chain"
             )
         # Human healthy/watch is an explicit release command for the durable
-        # manual latch, including after suspended/retired.  It still cannot
-        # authorize production without a subsequent sealed collector row.
+        # manual latch after a temporary restriction or suspension.  It still
+        # cannot authorize production without a subsequent sealed collector
+        # row.  Retired remains terminal for every actor chain.
         allowed_transition = (
             health_status
             if manual_control
+            and previous_status != RETIRED
+            and health_status in {HEALTHY, WATCH}
             else transition_strategy_health(previous_status, health_status)
         )
         if allowed_transition != health_status:

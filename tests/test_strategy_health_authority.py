@@ -243,6 +243,36 @@ def test_manual_release_rejects_collector_recorded_earlier_at_same_as_of(
     assert gate["reasons"] == ["strategy_health_collector_precedes_manual_release"]
 
 
+def test_manual_release_rejects_unordered_collector_at_identical_timestamps(
+    monkeypatch,
+) -> None:
+    released_at = datetime(2026, 8, 30, 8, 0, tzinfo=UTC)
+    collector = _snapshot(
+        as_of=released_at,
+        recorded_at=released_at,
+    )
+    manual_release = {
+        **_snapshot(
+            as_of=released_at,
+            actor="risk-operator",
+            recorded_at=released_at,
+        ),
+        "id": "f" * 64,
+        "health_status": "watch",
+    }
+    connection = _Connection([manual_release, collector])
+    monkeypatch.setattr(
+        authority_module,
+        "current_paper_health_binding",
+        lambda _connection, _version_id: _binding(),
+    )
+
+    gate = load_production_health_gate(connection, "version-1", now=released_at)
+
+    assert gate["allow_new_risk"] is False
+    assert gate["reasons"] == ["strategy_health_collector_precedes_manual_release"]
+
+
 def _paper_binding_connection(*, formal_backtest_id: str = "formal-backtest-a"):
     stage = SimpleNamespace(
         promotion_stage_id="stage-a",

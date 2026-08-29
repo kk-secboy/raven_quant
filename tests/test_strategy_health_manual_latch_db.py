@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from governance_fixtures import create_strategy_version
 
 import quant_platform.strategy_health_authority as authority_module
@@ -85,3 +86,32 @@ def test_manual_health_stop_survives_collector_and_system_observations(
         released = load_production_health_gate(connection, version_id)
     assert released["ready"] is True
     assert released["allow_new_risk"] is True
+
+
+def test_manual_retirement_is_terminal(database_url: str, tmp_path: Path) -> None:
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        recipe_id="short_relative_strength",
+    )
+    store = StrategyStore(database_url)
+    observed_at = datetime(2026, 8, 30, 9, 0, tzinfo=UTC)
+    common = {
+        "criteria": {"fixture": "manual-retirement"},
+        "evidence": {"fixture": "manual-retirement"},
+        "actor": "risk-operator",
+    }
+    store.record_health_snapshot(
+        version_id,
+        as_of=observed_at,
+        health_status="retired",
+        **common,
+    )
+
+    with pytest.raises(ValueError, match="recovery must proceed"):
+        store.record_health_snapshot(
+            version_id,
+            as_of=observed_at + timedelta(minutes=1),
+            health_status="watch",
+            **common,
+        )

@@ -453,20 +453,13 @@ def load_production_health_gate(
             )
         collector_recorded = collector_recorded_at.astimezone(UTC)
         manual_recorded = manual_recorded_at.astimezone(UTC)
-        collector_order = (
-            collector_as_of.astimezone(UTC),
-            collector_recorded,
-            str(collector_values.get("id") or ""),
-        )
-        manual_order = (
-            manual_as_of.astimezone(UTC),
-            manual_recorded,
-            str(manual_values.get("id") or ""),
-        )
         # ``as_of`` can be identical to the operator release (both are
-        # second-normalized).  The durable insertion timestamp therefore also
-        # has to prove the collector was not recorded before the release.
-        if collector_recorded < manual_recorded or collector_order < manual_order:
+        # second-normalized).  A content hash is not a temporal sequence, so
+        # the durable insertion timestamp has to be strictly later as well.
+        if (
+            collector_as_of.astimezone(UTC) < manual_as_of.astimezone(UTC)
+            or collector_recorded <= manual_recorded
+        ):
             return _failure(
                 ["strategy_health_collector_precedes_manual_release"],
                 horizon_profile=str(binding["horizon_profile"]),
