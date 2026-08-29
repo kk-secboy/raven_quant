@@ -185,24 +185,57 @@ def factor_materialization_manifest_matches(
             "name",
             "features",
             "source",
+            "materialization_contract",
             "definition_sha256",
         )
     }
     completed = manifest.get("completed")
-    if manifest.get("feature_set") != frozen or not isinstance(completed, dict):
+    if (
+        manifest.get("feature_set") != frozen
+        or manifest.get("storage_mode") != "recent_only"
+        or int(manifest.get("session_limit") or 0) != 64
+        or manifest.get("requested_start") != start
+        or manifest.get("requested_end") != end
+        or manifest.get("materialized_end") != end
+        or not isinstance(completed, dict)
+    ):
         return False
     required_entry_fields = {
-        "relative_path",
-        "sha256",
         "recent_relative_path",
         "recent_sha256",
         "recent_start",
         "recent_end",
+        "recent_session_limit",
     }
     return all(
-        isinstance(completed.get(factor_id), dict)
-        and required_entry_fields.issubset(completed[factor_id])
+        _strategy_health_recent_entry_matches(
+            completed.get(factor_id),
+            required_fields=required_entry_fields,
+            expected_end=end,
+        )
         for factor_id in feature_set["features"]
+    )
+
+
+def _strategy_health_recent_entry_matches(
+    value: Any,
+    *,
+    required_fields: set[str],
+    expected_end: str,
+) -> bool:
+    if not isinstance(value, dict) or not required_fields.issubset(value):
+        return False
+    try:
+        recent_start = date.fromisoformat(str(value["recent_start"]))
+        recent_end = date.fromisoformat(str(value["recent_end"]))
+    except ValueError:
+        return False
+    return (
+        int(value["recent_session_limit"]) == 64
+        and recent_start <= recent_end
+        and recent_end.isoformat() == expected_end
+        and "relative_path" not in value
+        and "sha256" not in value
     )
 
 
@@ -379,7 +412,7 @@ class SchedulerEngine:
                 dedupe_key=f"platform:autopilot:{current.date().isoformat()}:failed",
             )
         simulation_order_plans_enqueued = self._enqueue_due_simulation_order_plans(current)
-        strategy_health_result = self.strategy_health_collector.collect_due(current)
+        strategy_health_result = self._enqueue_due_strategy_health(current)
         for failure in strategy_health_result["failures"]:
             version_id = str(failure["strategy_version_id"])
             self.alerts.create(
@@ -439,7 +472,8 @@ class SchedulerEngine:
             "alerts_delivered": delivered,
             "health_recorded": health_recorded,
             "strategy_health_scanned": int(strategy_health_result["scanned"]),
-            "strategy_health_recorded": int(strategy_health_result["recorded"]),
+            "strategy_health_recorded": 0,
+            "strategy_health_enqueued": int(strategy_health_result["enqueued"]),
             "strategy_health_failures": len(strategy_health_result["failures"]),
             "simulation_replays_enqueued": simulation_replays_enqueued,
             "simulation_order_plans_enqueued": simulation_order_plans_enqueued,
@@ -935,11 +969,44 @@ class SchedulerEngine:
                         "name",
                         "features",
                         "source",
+                        "materialization_contract",
                         "definition_sha256",
                     )
                 }
             )
         return desired_feature_sets
+
+    def _enqueue_due_strategy_health(self, now: datetime) -> dict[str, Any]:
+        """Enqueue exact health lanes; never open Qlib artifacts in the scheduler."""
+
+        pending = self.strategy_health_collector.pending_requests(now)
+        enqueued = 0
+        interval = max(
+            300, int(self.settings.strategy_health_snapshot_seconds)
+        )
+        collection_slot = int(now.timestamp()) // interval
+        for request in pending["requests"]:
+            version_id = str(request["strategy_version_id"])
+            batch_id = str(request["simulation_batch_id"])
+            job = self.jobs.create(
+                "strategy_health_collect",
+                {**request, "collection_slot": collection_slot},
+                self.settings.data_root
+                / "platform"
+                / "logs"
+                / f"strategy-health-{version_id}-{batch_id}-{collection_slot}.log",
+                dedupe_active_kind=False,
+                idempotency_key=(
+                    f"strategy-health:{version_id}:{request['promotion_stage_id']}:"
+                    f"{batch_id}:{collection_slot}"
+                ),
+                max_attempts=2,
+            )
+            enqueued += int(job["status"] in {"queued", "running"})
+        return {
+            **pending,
+            "enqueued": enqueued,
+        }
 
     def _factor_materialization_retry_plan(self, idempotency_base: str) -> dict[str, Any]:
         episode_keys = {

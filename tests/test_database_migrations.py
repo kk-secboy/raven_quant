@@ -984,7 +984,7 @@ def test_same_lineage_repair_constraint_is_limited_to_exact_v2(database_url: str
     assert "target_dataset_lineage_id" in definition
     assert "transparent-baseline-pre-result-repair-v2" in definition
     assert "v7-to-v8-optimizer-applicability" in definition
-    assert "b230bb66ab1aad446f575c59d2e99564cf82dd734d7fa40f5ce574c41222c686" in (
+    assert "fa1090deaa66ca77a045c1a872f7b6451043e116e717954533217908135c584e" in (
         definition
     )
 
@@ -1004,7 +1004,7 @@ def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
         "receipt_contract_version": "transparent-baseline-pre-result-repair-v2",
         "repair_generation": "v7-to-v8-optimizer-applicability",
         "target_runner_sha256": (
-            "b230bb66ab1aad446f575c59d2e99564cf82dd734d7fa40f5ce574c41222c686"
+            "fa1090deaa66ca77a045c1a872f7b6451043e116e717954533217908135c584e"
         ),
     }
     with engine.begin() as connection:

@@ -129,6 +129,11 @@ def build_strategy_health_feature_set(
         "name": f"Activity-health inputs for strategy {version_id}",
         "features": features,
         "source": f"strategy-version:{version_id}:{factor_set_sha256}",
+        "materialization_contract": {
+            "contract_version": "strategy-health-recent-materialization-v1",
+            "session_limit": 64,
+            "storage_mode": "recent_only",
+        },
     }
     return {
         **definition,

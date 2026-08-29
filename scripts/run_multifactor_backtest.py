@@ -88,6 +88,13 @@ from quant_platform.strategy_backtest import (
     compose_factor_scores,
     governed_score_neutralization,
 )
+from quant_platform.strategy_health_reference import (
+    STRATEGY_HEALTH_REFERENCE_NAME,
+    STRATEGY_HEALTH_REFERENCE_VERSION,
+    build_strategy_health_reference,
+    factor_reference_summary,
+    model_calibration_reference_summary,
+)
 from quant_platform.strategy_research_evaluation import (
     STRATEGY_RESEARCH_EVALUATION_MODES,
 )
@@ -117,6 +124,171 @@ GOVERNED_MODEL_ENGINES = frozenset(
         "platform_transformer",
     }
 )
+
+
+def _write_strategy_health_reference(
+    output: Path,
+    *,
+    manifest: dict[str, Any],
+    provider_provenance: dict[str, Any],
+    periods: dict[str, str],
+    signal_source: str,
+    factor_source_mode: str,
+    baseline_definition: dict[str, Any] | None,
+    baseline_raw: pd.DataFrame | None,
+    baseline_artifacts: dict[str, Any] | None,
+    challenger_entries: list[tuple[str, pd.DataFrame, float, int]],
+    formal_factor_items: list[dict[str, Any]],
+    model_feature_set: dict[str, Any] | None,
+    model_predictions: pd.DataFrame | None,
+    model_label_contract: dict[str, Any] | None,
+    qlib_data_api: Any,
+) -> dict[str, Any]:
+    """Freeze bounded formal sufficient statistics before sealing the artifact tree."""
+
+    reference_start = pd.Timestamp(periods["start"]).date()
+    reference_end = pd.Timestamp(periods["end"]).date()
+    factor_summaries: dict[str, dict[str, Any]] = {}
+    if signal_source == "model_prediction":
+        if (
+            not isinstance(model_feature_set, dict)
+            or not isinstance(model_predictions, pd.DataFrame)
+            or not isinstance(model_label_contract, dict)
+        ):
+            raise ValueError("formal model run has no strategy-health reference inputs")
+        feature_definition_sha256 = str(model_feature_set.get("definition_sha256") or "")
+        for factor_id, expression in sorted(
+            dict(model_feature_set.get("features") or {}).items()
+        ):
+            values = qlib_data_api.features(
+                qlib_data_api.instruments(str(manifest.get("universe") or "cn_all")),
+                [str(expression)],
+                start_time=periods["start"],
+                end_time=periods["end"],
+                freq="day",
+            )
+            source_sha256 = _canonical_sha256(
+                {
+                    "formal_dataset_identity_sha256": provider_provenance[
+                        "dataset_identity_sha256"
+                    ],
+                    "feature_set_definition_sha256": feature_definition_sha256,
+                    "factor_id": str(factor_id),
+                    "expression": str(expression),
+                }
+            )
+            factor_summaries[str(factor_id)] = factor_reference_summary(
+                values.iloc[:, 0],
+                factor_id=str(factor_id),
+                reference_start=reference_start,
+                reference_end=reference_end,
+                source_sha256=source_sha256,
+            )
+            del values
+        label_expression = str(model_label_contract.get("label_expression") or "")
+        label_contract_sha256 = _canonical_sha256(model_label_contract)
+        if not label_expression:
+            raise ValueError("formal model label contract has no expression")
+        label_values = qlib_data_api.features(
+            qlib_data_api.instruments(str(manifest.get("universe") or "cn_all")),
+            [label_expression],
+            start_time=periods["start"],
+            end_time=periods["end"],
+            freq="day",
+        )
+        labels_source_sha256 = _canonical_sha256(
+            {
+                "formal_dataset_identity_sha256": provider_provenance[
+                    "dataset_identity_sha256"
+                ],
+                "label_contract_sha256": label_contract_sha256,
+                "label_expression": label_expression,
+            }
+        )
+        formal_predictions_sha256 = str(
+            ((manifest.get("formal_model_artifact") or {}).get("predictions_sha256"))
+            or ""
+        )
+        calibration = model_calibration_reference_summary(
+            model_predictions,
+            label_values.iloc[:, 0],
+            label_horizon_sessions=int(
+                model_label_contract["label_horizon_sessions"]
+            ),
+            label_contract_sha256=label_contract_sha256,
+            predictions_sha256=formal_predictions_sha256,
+            labels_source_sha256=labels_source_sha256,
+        )
+        del label_values
+    else:
+        includes_baseline = factor_source_mode in {
+            "qlib_baseline",
+            "qlib_baseline_plus_challenger",
+        }
+        includes_challenger = factor_source_mode in {
+            "promoted_only",
+            "qlib_baseline_plus_challenger",
+            "qlib_challenger_replacement",
+        }
+        if includes_baseline:
+            if (
+                not isinstance(baseline_definition, dict)
+                or baseline_raw is None
+                or not isinstance(baseline_artifacts, dict)
+            ):
+                raise ValueError("formal baseline reference inputs are missing")
+            raw_artifacts = dict(baseline_artifacts.get("raw") or {})
+            for item in baseline_definition.get("factors") or []:
+                factor_id = str(item.get("id") or "")
+                artifact = dict(raw_artifacts.get(factor_id) or {})
+                factor_summaries[factor_id] = factor_reference_summary(
+                    baseline_raw[factor_id],
+                    factor_id=factor_id,
+                    reference_start=reference_start,
+                    reference_end=reference_end,
+                    source_sha256=str(artifact.get("sha256") or ""),
+                )
+        if includes_challenger:
+            formal_by_id = {
+                str(item["candidate_id"]): dict(item.get("formal_factor_artifact") or {})
+                for item in formal_factor_items
+            }
+            for candidate_id, values, _weight, _direction in challenger_entries:
+                factor_id = f"candidate__{candidate_id}"
+                factor_summaries[factor_id] = factor_reference_summary(
+                    values,
+                    factor_id=factor_id,
+                    reference_start=reference_start,
+                    reference_end=reference_end,
+                    source_sha256=str(formal_by_id[candidate_id].get("sha256") or ""),
+                )
+        calibration = None
+    reference = build_strategy_health_reference(
+        strategy_version_id=str(manifest["strategy_version_id"]),
+        formal_backtest_id=str(manifest["backtest_id"]),
+        formal_dataset_identity_sha256=str(
+            provider_provenance["dataset_identity_sha256"]
+        ),
+        formal_dataset_lineage_id=str(provider_provenance["dataset_lineage_id"]),
+        strategy_rules_sha256=str(manifest["strategy_rules_sha256"]),
+        signal_source=signal_source,
+        reference_start=reference_start,
+        reference_end=reference_end,
+        factor_summaries=factor_summaries,
+        model_calibration=calibration,
+    )
+    target = output / STRATEGY_HEALTH_REFERENCE_NAME
+    target.write_text(
+        json.dumps(reference, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "contract_version": STRATEGY_HEALTH_REFERENCE_VERSION,
+        "path": STRATEGY_HEALTH_REFERENCE_NAME,
+        "sha256": _sha256_file(target),
+        "reference_sha256": reference["reference_sha256"],
+        "factor_count": len(factor_summaries),
+    }
 
 
 def _require_promotion_dataset_identity(
@@ -958,6 +1130,9 @@ def main() -> None:
     formal_model_artifact: dict[str, Any] | None = None
     formal_model_admission: dict[str, Any] | None = None
     model_scores: pd.Series | None = None
+    model_predictions: pd.DataFrame | None = None
+    model_feature_set: dict[str, Any] | None = None
+    model_label_contract: dict[str, Any] | None = None
     additional_factors_path: Path | None = None
     if signal_source == "model_prediction":
         frozen_model = manifest.get("model_candidate")
@@ -970,6 +1145,15 @@ def main() -> None:
         feature_set = frozen_model.get("feature_set")
         if not isinstance(candidate_manifest, dict) or not isinstance(feature_set, dict):
             raise ValueError("formal model candidate manifest is incomplete")
+        model_feature_set = dict(feature_set)
+        raw_label_contract = frozen_model.get("label_contract")
+        if not isinstance(raw_label_contract, dict):
+            raise ValueError("formal model candidate has no frozen label contract")
+        model_label_contract = dict(raw_label_contract)
+        if _canonical_sha256(model_label_contract) != str(
+            frozen_model.get("label_contract_sha256") or ""
+        ):
+            raise ValueError("formal model label contract seal is invalid")
         admission_pre_final_end = (
             str(candidate_manifest.get("pre_final_end") or "")
             if evaluation_mode in PRE_FINAL_EVALUATION_MODES
@@ -2184,6 +2368,26 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
+    strategy_health_reference = _write_strategy_health_reference(
+        output,
+        manifest=manifest,
+        provider_provenance=provider_provenance,
+        periods=periods,
+        signal_source=signal_source,
+        factor_source_mode=factor_source_mode,
+        baseline_definition=(
+            dict(baseline_definition) if isinstance(baseline_definition, dict) else None
+        ),
+        baseline_raw=baseline_raw,
+        baseline_artifacts=baseline_artifacts,
+        challenger_entries=challenger_entries,
+        formal_factor_items=formal_factor_items,
+        model_feature_set=model_feature_set,
+        model_predictions=model_predictions,
+        model_label_contract=model_label_contract,
+        qlib_data_api=D,
+    )
+    metrics["provenance"]["strategy_health_reference"] = strategy_health_reference
     result = {
         "status": "ok",
         "backtest_engine": "qlib",
@@ -2205,6 +2409,9 @@ def main() -> None:
             "event_stress": str(output / "event_stress.json"),
             "capacity_curve": str(output / "capacity_curve.json"),
             "formal_validation": str(output / "formal_validation.json"),
+            "strategy_health_reference": str(
+                output / STRATEGY_HEALTH_REFERENCE_NAME
+            ),
         },
     }
     workflow_run_id = str(

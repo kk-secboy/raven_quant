@@ -22,6 +22,7 @@ from quant_data.database import (
 )
 
 from .promotion import PromotionStore
+from .simulation_store import QLIB_ORDER_PLAN_FORMAT_VERSION
 from .strategy_feature_drift_source import StrategyFeatureDriftSource
 from .strategy_health import HEALTH_WINDOWS_BY_HORIZON, assess_strategy_health
 from .strategy_store import StrategyStore
@@ -83,6 +84,22 @@ def resolve_latest_batch_binding(
     identity = str(_value(batch, "daily_dataset_identity_sha256") or "")
     lineage = str(_value(batch, "daily_dataset_lineage_id") or "")
     source_snapshot_id = str(_value(batch, "source_snapshot_id") or "")
+    target_payload = _value(batch, "target_payload_json")
+    governed_plan = (
+        target_payload.get("governed_order_plan")
+        if isinstance(target_payload, dict)
+        else None
+    )
+    formal_backtest_id = (
+        str(governed_plan.get("formal_backtest_id") or "")
+        if isinstance(governed_plan, dict)
+        else ""
+    )
+    plan_manifest_sha256 = (
+        str(governed_plan.get("manifest_sha256") or "")
+        if isinstance(governed_plan, dict)
+        else ""
+    )
     signal_date = _value(batch, "signal_date")
     if (
         len(identity) != 64
@@ -92,6 +109,15 @@ def resolve_latest_batch_binding(
         or not isinstance(signal_date, date)
         or not isinstance(trade_date, date)
         or signal_date > trade_date
+        or not isinstance(governed_plan, dict)
+        or governed_plan.get("format_version") != QLIB_ORDER_PLAN_FORMAT_VERSION
+        or governed_plan.get("promotion_stage_id") != str(lane["promotion_stage_id"])
+        or not formal_backtest_id
+        or len(plan_manifest_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in plan_manifest_sha256.lower()
+        )
     ):
         raise ValueError("latest strategy batch dataset/source lineage is invalid")
     return {
@@ -102,6 +128,8 @@ def resolve_latest_batch_binding(
         "daily_dataset_identity_sha256": identity,
         "daily_dataset_lineage_id": lineage,
         "source_snapshot_id": source_snapshot_id,
+        "formal_backtest_id": formal_backtest_id,
+        "order_plan_manifest_sha256": plan_manifest_sha256.lower(),
     }
 
 
@@ -176,34 +204,7 @@ class StrategyHealthCollector:
                 ):
                     result["skipped_not_due"] += 1
                     continue
-                evidence = self._collect_lane_evidence(
-                    lane, current, latest_batch=latest_batch
-                )
-                previous = self._latest_snapshot(version_id)
-                previous_status = (
-                    str(previous["health_status"]) if previous is not None else None
-                )
-                assessment = assess_strategy_health(
-                    str(lane["horizon_profile"]),
-                    evidence,
-                    previous_status=previous_status,
-                )
-                persisted_evidence = {
-                    **assessment["evidence"],
-                    **dict(evidence["provenance"]),
-                    "assessment_reasons": list(assessment["reasons"]),
-                    "windows_trading_days": list(
-                        assessment["windows_trading_days"]
-                    ),
-                }
-                snapshot = self.strategies.record_health_snapshot(
-                    version_id,
-                    as_of=current,
-                    health_status=str(assessment["health_status"]),
-                    criteria=dict(assessment["criteria"]),
-                    evidence=persisted_evidence,
-                    actor=COLLECTOR_ACTOR,
-                )
+                snapshot = self._collect_and_record(lane, current, latest_batch)
             except Exception as exc:  # noqa: BLE001 - isolate each active lane
                 result["failures"].append(
                     {"strategy_version_id": version_id, "error": str(exc)[:1000]}
@@ -218,6 +219,155 @@ class StrategyHealthCollector:
                 }
             )
         return result
+
+    def pending_requests(self, now: datetime | None = None) -> dict[str, Any]:
+        """Return bounded, exact lane identities for durable worker enqueueing.
+
+        This method intentionally performs only indexed metadata queries. Qlib,
+        parquet, and formal artifacts are never opened in the scheduler process.
+        """
+
+        current = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
+        requests: list[dict[str, Any]] = []
+        failures: list[dict[str, str]] = []
+        for lane in self._active_lanes():
+            version_id = str(lane["strategy_version_id"])
+            try:
+                latest_batch = self._latest_lane_batch(lane, current)
+                latest = self._latest_snapshot(version_id, actor=COLLECTOR_ACTOR)
+                if not strategy_health_collection_due(
+                    latest,
+                    latest_batch,
+                    now=current,
+                    interval_seconds=self.interval_seconds,
+                ):
+                    continue
+            except Exception as exc:  # noqa: BLE001 - isolate each active lane
+                failures.append(
+                    {"strategy_version_id": version_id, "error": str(exc)[:1000]}
+                )
+                continue
+            requests.append(
+                {
+                    "strategy_version_id": version_id,
+                    "promotion_stage_id": str(lane["promotion_stage_id"]),
+                    "simulation_batch_id": str(latest_batch["simulation_batch_id"]),
+                    "formal_backtest_id": str(latest_batch["formal_backtest_id"]),
+                    "daily_dataset_identity_sha256": str(
+                        latest_batch["daily_dataset_identity_sha256"]
+                    ),
+                    "requested_at": current.isoformat(),
+                }
+            )
+        return {
+            "contract_version": "strategy-health-collection-requests-v1",
+            "requested_at": current.isoformat(),
+            "scanned": len(requests) + len(failures),
+            "requests": requests,
+            "failures": failures,
+        }
+
+    def collect_one(
+        self,
+        *,
+        strategy_version_id: str,
+        promotion_stage_id: str,
+        simulation_batch_id: str,
+        formal_backtest_id: str,
+        daily_dataset_identity_sha256: str,
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        """Collect one exact lane in a worker, rejecting stale enqueue identities."""
+
+        current = _aware(observed_at, field="strategy health observed_at").replace(
+            microsecond=0
+        )
+        matches = [
+            lane
+            for lane in self._active_lanes()
+            if str(lane["strategy_version_id"]) == strategy_version_id
+            and str(lane["promotion_stage_id"]) == promotion_stage_id
+        ]
+        if len(matches) != 1:
+            raise ValueError("strategy health job no longer names one active lane")
+        lane = matches[0]
+        latest_batch = self._latest_lane_batch(lane, current)
+        expected = {
+            "simulation_batch_id": simulation_batch_id,
+            "formal_backtest_id": formal_backtest_id,
+            "daily_dataset_identity_sha256": daily_dataset_identity_sha256,
+        }
+        if any(str(latest_batch[key]) != value for key, value in expected.items()):
+            return {
+                "contract_version": "strategy-health-collect-result-v1",
+                "status": "superseded",
+                "strategy_version_id": strategy_version_id,
+                "promotion_stage_id": promotion_stage_id,
+                "simulation_batch_id": simulation_batch_id,
+                "observed_at": current.isoformat(),
+            }
+        latest = self._latest_snapshot(strategy_version_id, actor=COLLECTOR_ACTOR)
+        if not strategy_health_collection_due(
+            latest,
+            latest_batch,
+            now=current,
+            interval_seconds=self.interval_seconds,
+        ):
+            return {
+                "contract_version": "strategy-health-collect-result-v1",
+                "status": "not_due",
+                "strategy_version_id": strategy_version_id,
+                "promotion_stage_id": promotion_stage_id,
+                "simulation_batch_id": simulation_batch_id,
+                "observed_at": current.isoformat(),
+            }
+        snapshot = self._collect_and_record(lane, current, latest_batch)
+        return {
+            "contract_version": "strategy-health-collect-result-v1",
+            "status": "recorded",
+            "strategy_version_id": strategy_version_id,
+            "promotion_stage_id": promotion_stage_id,
+            "simulation_batch_id": simulation_batch_id,
+            "formal_backtest_id": formal_backtest_id,
+            "daily_dataset_identity_sha256": daily_dataset_identity_sha256,
+            "observed_at": current.isoformat(),
+            "snapshot_id": str(snapshot["id"]),
+            "health_status": str(snapshot["health_status"]),
+        }
+
+    def _collect_and_record(
+        self,
+        lane: dict[str, Any],
+        current: datetime,
+        latest_batch: dict[str, Any],
+    ) -> dict[str, Any]:
+        version_id = str(lane["strategy_version_id"])
+        evidence = self._collect_lane_evidence(
+            lane, current, latest_batch=latest_batch
+        )
+        previous = self._latest_snapshot(version_id)
+        previous_status = (
+            str(previous["health_status"]) if previous is not None else None
+        )
+        assessment = assess_strategy_health(
+            str(lane["horizon_profile"]),
+            evidence,
+            previous_status=previous_status,
+        )
+        persisted_evidence = {
+            **assessment["evidence"],
+            **dict(evidence["provenance"]),
+            "assessment_reasons": list(assessment["reasons"]),
+            "windows_trading_days": list(assessment["windows_trading_days"]),
+        }
+        return self.strategies.record_health_snapshot(
+            version_id,
+            as_of=current,
+            health_status=str(assessment["health_status"]),
+            criteria=dict(assessment["criteria"]),
+            evidence=persisted_evidence,
+            actor=COLLECTOR_ACTOR,
+        )
 
     def _active_lanes(self) -> list[dict[str, Any]]:
         with self.engine.connect() as connection:
@@ -321,6 +471,7 @@ class StrategyHealthCollector:
                     simulation_batches.c.daily_dataset,
                     simulation_batches.c.daily_dataset_identity_sha256,
                     simulation_batches.c.daily_dataset_lineage_id,
+                    simulation_batches.c.target_payload_json,
                 ).where(
                     simulation_batches.c.portfolio_id == portfolio_id,
                     simulation_batches.c.trade_date
@@ -364,6 +515,7 @@ class StrategyHealthCollector:
                     simulation_batches.c.daily_dataset_identity_sha256,
                     simulation_batches.c.daily_dataset_lineage_id,
                     simulation_batches.c.summary_json,
+                    simulation_batches.c.target_payload_json,
                 )
                 .where(
                     simulation_batches.c.portfolio_id == portfolio_id,
@@ -471,6 +623,7 @@ class StrategyHealthCollector:
         ledger_reconciled = bool(batches) and reconciled_batches == len(batches)
         feature = self.feature_drift.observe(
             version_id=version_id,
+            formal_backtest_id=latest_batch["formal_backtest_id"],
             current_dataset_identity_sha256=str(
                 latest_batch["daily_dataset_identity_sha256"]
             ),
@@ -487,6 +640,7 @@ class StrategyHealthCollector:
         calibration = (
             self.feature_drift.observe_model_calibration(
                 version_id=version_id,
+                formal_backtest_id=latest_batch["formal_backtest_id"],
                 current_dataset_identity_sha256=str(
                     latest_batch["daily_dataset_identity_sha256"]
                 ),
@@ -536,6 +690,10 @@ class StrategyHealthCollector:
                     "daily_dataset_lineage_id"
                 ],
                 "source_snapshot_id": latest_batch["source_snapshot_id"],
+                "formal_backtest_id": latest_batch["formal_backtest_id"],
+                "order_plan_manifest_sha256": latest_batch[
+                    "order_plan_manifest_sha256"
+                ],
                 "portfolio_anchor_dataset_identity_sha256": str(
                     lane["daily_dataset_identity_sha256"]
                 ),

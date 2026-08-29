@@ -233,7 +233,7 @@ services:
       QLIB_REPO: /opt/qlib
       QLIB_PYTHON: /usr/local/bin/python
       PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?PLATFORM_SECRET_KEY is required}
-      WORKER_JOB_KINDS: minute_research,qlib_baseline,external_factor_evaluate,information_factor_evaluate,multiface_audit,factor_library_materialize,factor_library_cluster,factor_sota_evaluate,factor_evaluate,model_evaluate,model_ensemble_evaluate,quant_bundle_evaluate,strategy_backtest,parameter_experiment
+      WORKER_JOB_KINDS: minute_research,qlib_baseline,external_factor_evaluate,information_factor_evaluate,multiface_audit,factor_library_materialize,factor_library_cluster,factor_sota_evaluate,factor_evaluate,model_evaluate,model_ensemble_evaluate,quant_bundle_evaluate,strategy_backtest,strategy_health_collect,parameter_experiment
       WORKER_CONCURRENCY: "3"
       RESEARCH_CPU_BUDGET: "24"
       RESEARCH_MEMORY_BUDGET_GB: "40"

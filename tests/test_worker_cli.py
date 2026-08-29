@@ -69,6 +69,30 @@ def test_windows_keeps_command_and_thread_limit_contract() -> None:
     assert affinity is None
 
 
+def test_strategy_health_worker_command_is_exact_and_uses_runtime_clock(tmp_path) -> None:
+    worker = object.__new__(LocalJobWorker)
+    worker.settings = SimpleNamespace(data_root=tmp_path)
+    worker.project_root = tmp_path / "project"
+    payload = {
+        "strategy_version_id": "version-a",
+        "promotion_stage_id": "stage-a",
+        "simulation_batch_id": "batch-a",
+        "formal_backtest_id": "backtest-a",
+        "daily_dataset_identity_sha256": "a" * 64,
+        "requested_at": "2026-08-30T00:00:01+00:00",
+    }
+
+    command, result_path, environment = worker._command(
+        {"id": "job-a", "kind": "strategy_health_collect", "payload": payload}
+    )
+
+    assert result_path == tmp_path / "artifacts" / "strategy-health-jobs" / "job-a" / "result.json"
+    assert environment == {}
+    assert "--formal-backtest-id" in command
+    assert command[command.index("--formal-backtest-id") + 1] == "backtest-a"
+    assert "--observed-at" not in command
+
+
 def test_cpu_affinity_pool_partitions_and_reuses_container_capacity() -> None:
     pool = _CpuAffinityPool(
         platform="linux", affinity_getter=lambda _pid: set(range(24))

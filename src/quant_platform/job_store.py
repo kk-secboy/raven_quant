@@ -54,6 +54,7 @@ RESEARCH_JOB_CPU_COST = {
     "model_ensemble_evaluate": 8,
     "quant_bundle_evaluate": 12,
     "strategy_backtest": 8,
+    "strategy_health_collect": 4,
     "parameter_experiment": 8,
 }
 
@@ -82,6 +83,7 @@ RESEARCH_JOB_MEMORY_GB = {
     "model_ensemble_evaluate": 16,
     "quant_bundle_evaluate": 20,
     "strategy_backtest": 12,
+    "strategy_health_collect": 8,
     "parameter_experiment": 12,
 }
 
@@ -190,6 +192,7 @@ AUTO_RETRY_ATTEMPTS = {
     "recommendation_refresh": 3,
     "simulation_order_plan": 3,
     "simulation_replay": 3,
+    "strategy_health_collect": 2,
 }
 
 

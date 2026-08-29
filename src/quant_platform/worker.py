@@ -153,6 +153,34 @@ from .transparent_baseline_runner import require_transparent_baseline_runner
 _DATABASE_RETRY_INITIAL_SECONDS = 0.5
 _DATABASE_RETRY_MAX_SECONDS = 5.0
 
+
+def _frozen_model_label_contract(model_signal: dict[str, Any] | None) -> tuple[dict, str] | None:
+    """Resolve the one sealed label contract shared by a model signal."""
+
+    if model_signal is None:
+        return None
+    candidates = []
+    if model_signal.get("candidate") is not None:
+        candidates.append(model_signal["candidate"])
+    for component in model_signal.get("components") or []:
+        candidate = component.get("candidate") if isinstance(component, dict) else None
+        if candidate is not None:
+            candidates.append(candidate)
+    contracts: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        admission = dict(candidate.admission_evidence_json or {})
+        for profile in (admission.get("profiles") or {}).values():
+            for cell in ((profile or {}).get("seeds") or {}).values():
+                contract = (cell or {}).get("model_label_contract")
+                digest = str((cell or {}).get("model_label_contract_sha256") or "")
+                if not isinstance(contract, dict) or model_canonical_sha256(contract) != digest:
+                    raise ValueError("model signal label contract evidence is invalid")
+                contracts[digest] = dict(contract)
+    if len(contracts) != 1:
+        raise ValueError("model signal does not have one frozen label contract")
+    digest, contract = next(iter(contracts.items()))
+    return contract, digest
+
 _LINUX_CPU_AFFINITY_EXEC = """
 import os
 import sys
@@ -847,11 +875,14 @@ class LocalJobWorker:
         job_id: str,
         result_path: Path | None,
         process,
+        *,
+        timeout_seconds: int | None = None,
     ) -> tuple[bool, int | None]:
         """Monitor one child without abandoning it during a database outage."""
 
         cancelled = False
         progress_mtime_ns: int | None = None
+        started_at = time.monotonic()
         while process.poll() is None:
             progress_mtime_ns = self._retry_transient_database(
                 lambda last_seen=progress_mtime_ns: self._sync_live_progress(
@@ -870,6 +901,19 @@ class LocalJobWorker:
                     process.kill()
                     process.wait(timeout=5)
                 break
+            if (
+                timeout_seconds is not None
+                and time.monotonic() - started_at >= timeout_seconds
+            ):
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                raise TimeoutError(
+                    f"worker subprocess exceeded {timeout_seconds} seconds"
+                )
             time.sleep(1)
         return cancelled, progress_mtime_ns
 
@@ -1048,7 +1092,12 @@ class LocalJobWorker:
                         env={**os.environ, **extra_env},
                     )
                     cancelled, progress_mtime_ns = self._monitor_process(
-                        job["id"], result_path, process
+                        job["id"],
+                        result_path,
+                        process,
+                        timeout_seconds=(
+                            900 if job["kind"] == "strategy_health_collect" else None
+                        ),
                     )
                     exit_code = int(process.returncode or 0)
             finally:
@@ -1203,6 +1252,22 @@ class LocalJobWorker:
                     result["materialization_manifest_sha256"] = hashlib.sha256(
                         result_path.read_bytes()
                     ).hexdigest()
+            if exit_code == 0 and job["kind"] == "strategy_health_collect":
+                expected = job["payload"]
+                if (
+                    not isinstance(result, dict)
+                    or result.get("contract_version")
+                    != "strategy-health-collect-result-v1"
+                    or result.get("status") not in {"recorded", "not_due", "superseded"}
+                    or result.get("strategy_version_id")
+                    != expected.get("strategy_version_id")
+                    or result.get("promotion_stage_id")
+                    != expected.get("promotion_stage_id")
+                    or result.get("simulation_batch_id")
+                    != expected.get("simulation_batch_id")
+                ):
+                    logical_error = "strategy health collection result identity is invalid"
+                    exit_code = 3
             if exit_code == 0 and job["kind"] == "factor_library_cluster":
                 if (
                     not isinstance(result, dict)
@@ -3472,6 +3537,46 @@ class LocalJobWorker:
                 result_path,
                 _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
             )
+        if job["kind"] == "strategy_health_collect":
+            required = (
+                "strategy_version_id",
+                "promotion_stage_id",
+                "simulation_batch_id",
+                "formal_backtest_id",
+                "daily_dataset_identity_sha256",
+                "requested_at",
+            )
+            if any(not str(payload.get(key) or "") for key in required):
+                raise ValueError("strategy health collection payload is incomplete")
+            output = (
+                self.settings.data_root
+                / "artifacts"
+                / "strategy-health-jobs"
+                / str(job["id"])
+            )
+            output.mkdir(parents=True, exist_ok=True)
+            result_path = output / "result.json"
+            script = self.project_root / "scripts" / "collect_strategy_health.py"
+            return (
+                [
+                    sys.executable,
+                    str(script),
+                    "--strategy-version-id",
+                    str(payload["strategy_version_id"]),
+                    "--promotion-stage-id",
+                    str(payload["promotion_stage_id"]),
+                    "--simulation-batch-id",
+                    str(payload["simulation_batch_id"]),
+                    "--formal-backtest-id",
+                    str(payload["formal_backtest_id"]),
+                    "--daily-dataset-identity-sha256",
+                    str(payload["daily_dataset_identity_sha256"]),
+                    "--output",
+                    str(result_path),
+                ],
+                result_path,
+                {},
+            )
         if job["kind"] == "factor_library_cluster":
             materialization = Path(str(payload["materialization_path"])).resolve(
                 strict=True
@@ -4136,9 +4241,11 @@ class LocalJobWorker:
             }
             with self.strategies.engine.connect() as connection:
                 model_signal = self.strategies._model_signal_evidence(connection, version["config"])
+            model_label_binding = _frozen_model_label_contract(model_signal)
             manifest = {
                 "backtest_id": payload["backtest_id"],
                 "strategy_version_id": version["id"],
+                "strategy_rules_sha256": version["strategy_rules_sha256"],
                 "dataset": payload["dataset"],
                 "execution_dataset": (
                     execution_dataset.get("name") if isinstance(execution_dataset, dict) else None
@@ -4201,6 +4308,16 @@ class LocalJobWorker:
                                 model_signal["candidate"].feature_set_definition_sha256
                             ),
                         },
+                        "label_contract": (
+                            model_label_binding[0]
+                            if model_label_binding is not None
+                            else None
+                        ),
+                        "label_contract_sha256": (
+                            model_label_binding[1]
+                            if model_label_binding is not None
+                            else None
+                        ),
                         "code_path": runtime_path(model_signal["code_path"]),
                         "training_periods": {
                             "train_start": model_signal["evaluation"].train_start.isoformat(),

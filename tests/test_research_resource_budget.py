@@ -29,6 +29,8 @@ def test_research_resource_costs_match_the_governed_queue_contract() -> None:
     assert research_job_memory_gb("rdagent_factor_report") == 8
     assert research_job_cpu_cost("rdagent_quant") == 12
     assert research_job_memory_gb("rdagent_quant") == 20
+    assert research_job_cpu_cost("strategy_health_collect") == 4
+    assert research_job_memory_gb("strategy_health_collect") == 8
     assert (
         research_job_memory_gb("qlib_baseline")
         + research_job_memory_gb("model_evaluate")
@@ -90,3 +92,20 @@ def test_evaluation_worker_keeps_host_capacity_but_not_a_48gb_ledger() -> None:
     assert 'WORKER_CONCURRENCY: "3"' in evaluation_block
     assert 'RESEARCH_CPU_BUDGET: "24"' in evaluation_block
     assert 'RESEARCH_MEMORY_BUDGET_GB: "40"' in evaluation_block
+    assert "strategy_health_collect" in evaluation_block
+
+
+def test_strategy_health_private_materialization_is_recent_only() -> None:
+    source = (
+        Path(__file__).parents[1] / "scripts" / "materialize_factor_library.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'str(feature_set["id"]).startswith("strategy-health:")' in source
+    assert '"recent_only"' in source
+    assert 'if storage_mode == "full_and_recent":' in source
+
+    collector = (
+        Path(__file__).parents[1] / "scripts" / "collect_strategy_health.py"
+    ).read_text(encoding="utf-8")
+    assert "observed_at=datetime.now(UTC)" in collector
+    assert "args.observed_at" not in collector

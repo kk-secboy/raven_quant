@@ -17,6 +17,7 @@ def _lane() -> dict:
     return {
         "daily_dataset_identity_sha256": "a" * 64,
         "daily_dataset_lineage_id": "1" * 64,
+        "promotion_stage_id": "stage-paper",
     }
 
 
@@ -30,6 +31,14 @@ def _batch(*, lineage: str = "1" * 64, trade_date: date = date(2026, 8, 28)):
         daily_dataset="daily-b",
         daily_dataset_identity_sha256="b" * 64,
         daily_dataset_lineage_id=lineage,
+        target_payload_json={
+            "governed_order_plan": {
+                "format_version": "qlib-order-plan-v1",
+                "promotion_stage_id": "stage-paper",
+                "formal_backtest_id": "formal-backtest-b",
+                "manifest_sha256": "c" * 64,
+            }
+        },
     )
 
 
@@ -43,6 +52,7 @@ def test_health_uses_latest_descendant_batch_not_portfolio_anchor() -> None:
         "daily_dataset_identity_sha256"
     ]
     assert binding["signal_date"] == date(2026, 8, 27)
+    assert binding["formal_backtest_id"] == "formal-backtest-b"
 
 
 @pytest.mark.parametrize(

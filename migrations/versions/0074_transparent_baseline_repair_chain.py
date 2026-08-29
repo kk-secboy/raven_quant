@@ -19,7 +19,7 @@ _V2_CONTRACT = "transparent-baseline-pre-result-repair-v2"
 _V2_GENERATION = "v7-to-v8-optimizer-applicability"
 _V2_TARGET_RECIPE = "qlib-rdagent-single-mainline-2026-08-30-v8"
 _V2_TARGET_RUNNER_SHA256 = (
-    "b230bb66ab1aad446f575c59d2e99564cf82dd734d7fa40f5ce574c41222c686"
+    "fa1090deaa66ca77a045c1a872f7b6451043e116e717954533217908135c584e"
 )
 _V2_SOURCE_BACKTEST_IDS = (
     "8090c21aa11546bd9d59f732975afc25",

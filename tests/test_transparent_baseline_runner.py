@@ -39,6 +39,17 @@ def test_current_transparent_v8_runner_matches_sealed_identity() -> None:
     ) == OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
 
 
+def test_repair_migration_targets_the_current_runner_identity() -> None:
+    migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "versions"
+        / "0074_transparent_baseline_repair_chain.py"
+    ).read_text(encoding="utf-8")
+
+    assert OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256 in migration
+
+
 def test_transparent_v8_runner_rejects_changed_bytes(tmp_path: Path) -> None:
     runner = tmp_path / "run_multifactor_backtest.py"
     runner.write_text("# changed runner\n", encoding="utf-8")

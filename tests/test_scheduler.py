@@ -37,9 +37,64 @@ from quant_platform.scheduler import (
 def test_strategy_health_collection_precedes_auto_promotion_in_each_tick() -> None:
     source = inspect.getsource(SchedulerEngine.tick)
 
-    assert source.index("strategy_health_collector.collect_due") < source.index(
+    assert source.index("_enqueue_due_strategy_health") < source.index(
         "_auto_promote_ready_horizons"
     )
+
+
+@pytest.mark.no_database
+def test_strategy_health_jobs_bind_batch_and_hourly_collection_slot(
+    tmp_path: Path,
+) -> None:
+    created: list[dict] = []
+
+    class JobsStub:
+        @staticmethod
+        def create(kind, payload, log_path, **kwargs):
+            created.append(
+                {
+                    "kind": kind,
+                    "payload": payload,
+                    "log_path": log_path,
+                    **kwargs,
+                }
+            )
+            return {"status": "queued"}
+
+    request = {
+        "strategy_version_id": "version-a",
+        "promotion_stage_id": "stage-a",
+        "simulation_batch_id": "batch-a",
+        "formal_backtest_id": "backtest-a",
+        "daily_dataset_identity_sha256": "a" * 64,
+        "requested_at": "2026-08-30T00:00:01+00:00",
+    }
+    scheduler = object.__new__(SchedulerEngine)
+    scheduler.settings = SimpleNamespace(
+        data_root=tmp_path,
+        strategy_health_snapshot_seconds=3600,
+    )
+    scheduler.jobs = JobsStub()
+    scheduler.strategy_health_collector = SimpleNamespace(
+        pending_requests=lambda _now: {
+            "contract_version": "strategy-health-collection-requests-v1",
+            "requested_at": request["requested_at"],
+            "scanned": 1,
+            "requests": [request],
+            "failures": [],
+        }
+    )
+
+    scheduler._enqueue_due_strategy_health(
+        datetime(2026, 8, 30, 0, 0, 1, tzinfo=UTC)
+    )
+    scheduler._enqueue_due_strategy_health(
+        datetime(2026, 8, 30, 1, 0, 1, tzinfo=UTC)
+    )
+
+    assert all(item["kind"] == "strategy_health_collect" for item in created)
+    assert all(":batch-a:" in item["idempotency_key"] for item in created)
+    assert created[0]["idempotency_key"] != created[1]["idempotency_key"]
 
 
 @pytest.mark.no_database
@@ -94,6 +149,64 @@ def test_legacy_unified_533_manifest_remains_complete_without_new_optional_field
         feature_set=feature_set,
         start="2008-01-02",
         end="2026-08-26",
+    )
+
+
+@pytest.mark.no_database
+def test_strategy_health_manifest_seals_each_recent_window_end() -> None:
+    definition = {
+        "contract_version": "strategy-health-feature-set-v1",
+        "id": "strategy-health:version-a:0123456789abcdef",
+        "name": "health-a",
+        "features": {"factor-a": "$close"},
+        "source": "strategy-version:version-a:" + "1" * 64,
+        "materialization_contract": {
+            "contract_version": "strategy-health-recent-materialization-v1",
+            "session_limit": 64,
+            "storage_mode": "recent_only",
+        },
+    }
+    feature_set = {**definition, "definition_sha256": canonical_sha256(definition)}
+    manifest = {
+        "dataset_identity_sha256": "a" * 64,
+        "feature_set_id": feature_set["id"],
+        "feature_set_definition_sha256": feature_set["definition_sha256"],
+        "feature_set": feature_set,
+        "universe": "cn_all",
+        "start": "2008-01-02",
+        "end": "2026-08-28",
+        "requested_start": "2008-01-02",
+        "requested_end": "2026-08-28",
+        "materialized_start": "2026-05-29",
+        "materialized_end": "2026-08-28",
+        "session_limit": 64,
+        "storage_mode": "recent_only",
+        "status": "complete",
+        "completed": {
+            "factor-a": {
+                "recent_relative_path": "recent/factor-a.parquet",
+                "recent_sha256": "b" * 64,
+                "recent_start": "2026-05-29",
+                "recent_end": "2026-08-28",
+                "recent_session_limit": 64,
+            }
+        },
+    }
+
+    assert factor_materialization_manifest_matches(
+        manifest,
+        dataset_identity_sha256="a" * 64,
+        feature_set=feature_set,
+        start="2008-01-02",
+        end="2026-08-28",
+    )
+    manifest["completed"]["factor-a"]["recent_end"] = "2026-08-27"
+    assert not factor_materialization_manifest_matches(
+        manifest,
+        dataset_identity_sha256="a" * 64,
+        feature_set=feature_set,
+        start="2008-01-02",
+        end="2026-08-28",
     )
 
 
