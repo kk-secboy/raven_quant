@@ -21,6 +21,7 @@ from .research_horizon import (
     canonical_sha256,
 )
 
+COLLECTOR_ACTOR = "system:strategy-health-collector"
 HEALTHY = "healthy"
 WATCH = "watch"
 RESTRICTED = "restricted"

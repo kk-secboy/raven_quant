@@ -13,6 +13,7 @@ from .universe import (
 
 DAILY_QLIB_FIELD_CONTRACT_VERSION = "daily-qlib-field-v5-governed-domestic-etf"
 QLIB_OUTPUT_MANIFEST_VERSION = "qlib-output-files-v1"
+QLIB_ORDER_PLAN_FORMAT_VERSION = "qlib-order-plan-v1"
 TUSHARE_DAILY_VOLUME_UNIT = "hand"
 QLIB_DAILY_VOLUME_UNIT = "share"
 TUSHARE_DAILY_AMOUNT_UNIT = "thousand_cny"

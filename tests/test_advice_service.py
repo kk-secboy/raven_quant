@@ -702,6 +702,61 @@ def test_today_is_not_available_until_current_netting_plan_exists(
     assert result["unified_account"]["action"] == "NO_ACTION"
 
 
+def test_platform_safe_mode_removes_executable_advice_but_retains_exit_information() -> None:
+    projection = {
+        "contract_version": "three-horizon-advice-v3",
+        "advice_available": True,
+        "cards": [
+            {
+                "horizon": SHORT_1_5D,
+                "stage": "verified",
+                "is_investment_advice": True,
+                "action": "BUY",
+                "simulation_action": None,
+                "signals": [
+                    {"instrument": "SH600000", "action": "BUY"},
+                    {"instrument": "SH600001", "action": "EXIT"},
+                ],
+                "veto_reasons": [],
+            }
+        ],
+        "unified_account": {
+            "status": "ready",
+            "action": "REBALANCE",
+            "targets": [{"instrument": "SH600000"}],
+            "trades": [
+                {"instrument": "SH600000", "side": "buy"},
+                {"instrument": "SH600001", "side": "sell"},
+            ],
+        },
+    }
+
+    gated = AdviceService._apply_platform_safe_mode(
+        projection,
+        {
+            "active": True,
+            "reason": "ledger evidence mismatch",
+            "source": "simulation_ledger",
+            "triggered_at": datetime(2026, 8, 30, 8, 0, tzinfo=UTC),
+        },
+    )
+
+    assert gated["advice_available"] is False
+    assert gated["platform_gate"]["status"] == "safe_mode"
+    assert gated["cards"][0]["is_investment_advice"] is False
+    assert gated["cards"][0]["action"] == "NO_ACTION"
+    assert gated["cards"][0]["signals"] == []
+    assert gated["cards"][0]["safe_mode_risk_exits"] == [
+        {"instrument": "SH600001", "action": "EXIT"}
+    ]
+    assert gated["unified_account"]["action"] == "NO_ACTION"
+    assert gated["unified_account"]["targets"] == []
+    assert gated["unified_account"]["trades"] == []
+    assert gated["unified_account"]["safe_mode_risk_reductions"] == [
+        {"instrument": "SH600001", "side": "sell"}
+    ]
+
+
 def test_unified_account_facts_override_placeholder_quantity_and_age() -> None:
     cards = [
         {

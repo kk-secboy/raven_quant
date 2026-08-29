@@ -20,14 +20,17 @@ from quant_data.database import (
     strategy_promotion_stages,
     strategy_versions,
 )
+from quant_data.execution_contract import QLIB_ORDER_PLAN_FORMAT_VERSION
 
 from .promotion import PromotionStore
-from .simulation_store import QLIB_ORDER_PLAN_FORMAT_VERSION
 from .strategy_feature_drift_source import StrategyFeatureDriftSource
-from .strategy_health import HEALTH_WINDOWS_BY_HORIZON, assess_strategy_health
+from .strategy_health import (
+    COLLECTOR_ACTOR,
+    HEALTH_WINDOWS_BY_HORIZON,
+    assess_strategy_health,
+)
 from .strategy_store import StrategyStore
 
-COLLECTOR_ACTOR = "system:strategy-health-collector"
 _ACTIVE_PROMOTION_STAGES = ("paper", "recommendation_enabled")
 _TERMINAL_EXECUTION_STATUSES = frozenset(
     {"filled", "partial_filled_expired", "rejected", "expired"}
@@ -345,7 +348,11 @@ class StrategyHealthCollector:
         evidence = self._collect_lane_evidence(
             lane, current, latest_batch=latest_batch
         )
-        previous = self._latest_snapshot(version_id)
+        # Manual control observations are a separate durable production latch.
+        # They must never steer or be auto-recovered by the collector's own
+        # evidence chain; only prior collector assessments define this policy
+        # transition.
+        previous = self._latest_snapshot(version_id, actor=COLLECTOR_ACTOR)
         previous_status = (
             str(previous["health_status"]) if previous is not None else None
         )

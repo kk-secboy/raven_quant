@@ -5426,7 +5426,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @app.get("/api/advice/today")
     def get_today_advice() -> dict[str, Any]:
-        return advice.today(investor_profile=investor_profiles.get_active("primary"))
+        return advice.today(
+            investor_profile=investor_profiles.get_active("primary"),
+            platform_safe_mode=safe_mode.status(),
+        )
 
     @app.api_route("/api/portfolios", methods=["GET", "POST"], status_code=410)
     @app.api_route("/api/portfolios/{legacy_path:path}", methods=["GET", "POST"], status_code=410)

@@ -8,6 +8,7 @@ only ``recommendation_enabled`` versions may produce investment advice.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -52,7 +53,7 @@ from .strategy_health_authority import load_production_health_gate
 from .strategy_store import StrategyStore
 from .three_horizon_account import THREE_HORIZON_PRIMARY_SIMULATION_ACTOR
 
-ADVICE_TODAY_CONTRACT_VERSION = "three-horizon-advice-v2"
+ADVICE_TODAY_CONTRACT_VERSION = "three-horizon-advice-v3"
 HORIZONS = (SHORT_1_5D, SWING_1_6M, LONG_1_3Y)
 
 _HORIZON_UI = {
@@ -346,6 +347,7 @@ class AdviceService:
         *,
         investor_profile: dict[str, Any] | None = None,
         now: datetime | None = None,
+        platform_safe_mode: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = now or datetime.now(UTC)
         freshness_requirement = advice_session_requirement(
@@ -374,7 +376,7 @@ class AdviceService:
             freshness_requirement=freshness_requirement,
         )
         self._attach_unified_account_facts(cards, unified)
-        return {
+        result = {
             "contract_version": ADVICE_TODAY_CONTRACT_VERSION,
             "generated_at": now.isoformat(),
             "data_cutoff": max(cutoffs).isoformat() if cutoffs else None,
@@ -395,6 +397,92 @@ class AdviceService:
                 "real_broker_orders": False,
             },
             "disclaimer": "系统仅运行模拟盘；历史和模拟表现不保证未来收益。",
+        }
+        return self._apply_platform_safe_mode(result, platform_safe_mode)
+
+    @staticmethod
+    def _apply_platform_safe_mode(
+        projection: dict[str, Any],
+        state: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Make a platform emergency stop visible and non-executable.
+
+        Existing EXIT/REDUCE observations remain available as explicitly
+        blocked risk information.  They are not presented as executable
+        advice because safe mode is reserved for data, ledger or version
+        anomalies and the simulation order path is stopped as well.
+        """
+
+        raw_state = dict(state or {})
+        triggered_at = raw_state.get("triggered_at")
+        gate = {
+            "status": "safe_mode" if raw_state.get("active") is True else "open",
+            "active": raw_state.get("active") is True,
+            "reason": str(raw_state.get("reason") or "") or None,
+            "source": str(raw_state.get("source") or "") or None,
+            "triggered_at": (
+                triggered_at.isoformat()
+                if isinstance(triggered_at, datetime)
+                else str(triggered_at or "") or None
+            ),
+        }
+        result = {**projection, "platform_gate": gate}
+        if not gate["active"]:
+            return result
+
+        reason = (
+            "平台安全模式已开启：暂停正式荐股和模拟订单；"
+            "已有减仓/退出信号仅保留为风险信息。"
+        )
+        cards: list[dict[str, Any]] = []
+        for raw_card in projection.get("cards") or []:
+            card = dict(raw_card)
+            risk_exits = [
+                dict(signal)
+                for signal in card.get("signals") or []
+                if str(signal.get("action") or "").upper() in {"REDUCE", "EXIT"}
+            ]
+            card.update(
+                {
+                    "is_investment_advice": False,
+                    "action": "NO_ACTION",
+                    "simulation_action": None,
+                    "signals": [],
+                    "safe_mode_risk_exits": risk_exits,
+                    "platform_gate": gate,
+                    "veto_reasons": [
+                        reason,
+                        *[
+                            str(item)
+                            for item in card.get("veto_reasons") or []
+                            if str(item) != reason
+                        ],
+                    ],
+                }
+            )
+            cards.append(card)
+
+        raw_unified = dict(projection.get("unified_account") or {})
+        blocked_reductions = [
+            dict(trade)
+            for trade in raw_unified.get("trades") or []
+            if str(trade.get("side") or "").lower() == "sell"
+        ]
+        unified = {
+            **raw_unified,
+            "status": "safe_mode",
+            "action": "NO_ACTION",
+            "reason": reason,
+            "targets": [],
+            "trades": [],
+            "safe_mode_risk_reductions": blocked_reductions,
+            "platform_gate": gate,
+        }
+        return {
+            **result,
+            "cards": cards,
+            "unified_account": unified,
+            "advice_available": False,
         }
 
     def _review_projection(

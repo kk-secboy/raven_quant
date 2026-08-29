@@ -97,6 +97,7 @@ type AdviceCard = {
   signals: AdviceSignal[];
   action: AdviceSignal["action"];
   simulation_action?: AdviceSignal["action"] | null;
+  safe_mode_risk_exits?: AdviceSignal[];
   veto_reasons?: string[];
 };
 type UnifiedAccount = {
@@ -110,6 +111,14 @@ type UnifiedAccount = {
   targets?: Array<Record<string, unknown>>;
   trades?: Array<Record<string, unknown>>;
   accounting_rule?: string;
+  safe_mode_risk_reductions?: Array<Record<string, unknown>>;
+};
+type PlatformGate = {
+  status: "open" | "safe_mode";
+  active: boolean;
+  reason?: string | null;
+  source?: string | null;
+  triggered_at?: string | null;
 };
 type AdviceToday = {
   generated_at: string;
@@ -118,6 +127,7 @@ type AdviceToday = {
   investor_profile?: InvestorProfile | null;
   cards: AdviceCard[];
   unified_account: UnifiedAccount;
+  platform_gate?: PlatformGate;
   advice_available: boolean;
   execution_contract: {
     signal: string;
@@ -280,6 +290,7 @@ function HorizonCard({ card }: { card: AdviceCard }) {
   const simulationOnly = !card.is_investment_advice;
   const visibleAction = card.is_investment_advice ? card.action : "NO_ACTION";
   const simulatedAction = card.stage === "simulation_validation" ? card.simulation_action : null;
+  const safeModeRiskExits = card.safe_mode_risk_exits ?? [];
   return <section className={`novice-horizon-card stage-${card.stage}`}>
     <header>
       <div>
@@ -298,6 +309,9 @@ function HorizonCard({ card }: { card: AdviceCard }) {
     </div>
     {simulatedAction && simulatedAction !== "NO_ACTION" ? <div className="novice-simulation-callout">
       模拟盘正在观察：<strong>{ACTION_LABELS[simulatedAction]}</strong>。这不是已验证荐股。
+    </div> : null}
+    {safeModeRiskExits.length ? <div className="novice-simulation-callout">
+      安全模式风险信息：{safeModeRiskExits.slice(0, 5).map((signal) => `${signal.instrument} ${ACTION_LABELS[signal.action]}`).join("、")}。仅保留提醒，当前不可执行。
     </div> : null}
     <EvidenceSummary evidence={card.evidence} />
     <div className="novice-card-meta">
@@ -485,6 +499,7 @@ function NoviceAdvicePanel({ api, onNavigate }: { api: string; onNavigate: (inde
 
   return <div className="novice-advice-page">
     {warning ? <div className="notice novice-warning">{warning}</div> : null}
+    {advice?.platform_gate?.active ? <div className="notice novice-warning">平台安全模式已开启：{advice.platform_gate.reason ?? "正式荐股和模拟订单已暂停"}。已有减仓或退出信号只作为风险信息展示。</div> : null}
     <InvestorOnboarding api={api} profile={profile} initialOpen={onboardingRequired} onSaved={load} />
     <section className={`novice-hero ${advice?.advice_available ? "verified" : "waiting"}`}>
       <div>

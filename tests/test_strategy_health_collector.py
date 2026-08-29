@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
+import quant_platform.strategy_health_collector as collector_module
 from quant_platform.strategy_health_collector import (
+    COLLECTOR_ACTOR,
+    StrategyHealthCollector,
     resolve_latest_batch_binding,
     strategy_health_collection_due,
 )
@@ -91,3 +94,53 @@ def test_new_batch_forces_health_refresh_before_periodic_interval() -> None:
         now=now,
         interval_seconds=3600,
     )
+
+
+def test_collector_transition_ignores_manual_control_snapshots(monkeypatch) -> None:
+    collector = StrategyHealthCollector.__new__(StrategyHealthCollector)
+    actor_requests: list[str | None] = []
+    captured: dict[str, object] = {}
+
+    def latest(_version_id: str, *, actor: str | None = None):
+        actor_requests.append(actor)
+        return {"health_status": "healthy"}
+
+    collector._latest_snapshot = latest
+    collector._collect_lane_evidence = lambda *_args, **_kwargs: {
+        "provenance": {"simulation_batch_id": "batch-a"}
+    }
+    collector.strategies = SimpleNamespace(
+        record_health_snapshot=lambda *args, **kwargs: {
+            "id": "snapshot-a",
+            "args": args,
+            "kwargs": kwargs,
+        }
+    )
+
+    def assess(_horizon, _evidence, *, previous_status):
+        captured["previous_status"] = previous_status
+        return {
+            "health_status": "healthy",
+            "criteria": {"watch_feature_drift": 0.2},
+            "evidence": {
+                "data_integrity_ok": True,
+                "ledger_reconciled": True,
+                "feature_drift": 0.01,
+            },
+            "reasons": ["all_activity_health_checks_passed"],
+            "windows_trading_days": [20, 60],
+        }
+
+    monkeypatch.setattr(collector_module, "assess_strategy_health", assess)
+
+    collector._collect_and_record(
+        {
+            "strategy_version_id": "version-a",
+            "horizon_profile": "short_1_5d",
+        },
+        datetime(2026, 8, 28, 8, 0, tzinfo=UTC),
+        {"simulation_batch_id": "batch-a"},
+    )
+
+    assert actor_requests == [COLLECTOR_ACTOR]
+    assert captured["previous_status"] == "healthy"

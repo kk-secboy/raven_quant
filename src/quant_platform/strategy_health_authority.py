@@ -21,6 +21,7 @@ from quant_data.database import (
     strategy_promotion_stages,
     strategy_versions,
 )
+from quant_data.execution_contract import QLIB_ORDER_PLAN_FORMAT_VERSION
 
 from .feature_drift import validate_factor_psi_observation
 from .model_calibration_drift import validate_model_calibration_observation
@@ -30,9 +31,8 @@ from .research_horizon import (
     SWING_1_6M,
     canonical_sha256,
 )
-from .strategy_health import health_allows_new_risk
+from .strategy_health import COLLECTOR_ACTOR, health_allows_new_risk
 
-COLLECTOR_ACTOR = "system:strategy-health-collector"
 LIVE_EVIDENCE_CONTRACT_VERSION = "strategy-health-live-evidence-v2"
 DEFAULT_PRODUCTION_HEALTH_MAX_AGE_SECONDS = 7200
 _PRODUCT_HORIZONS = frozenset({SHORT_1_5D, SWING_1_6M, LONG_1_3Y})
@@ -139,6 +139,7 @@ def current_paper_health_binding(
             simulation_batches.c.daily_dataset,
             simulation_batches.c.daily_dataset_identity_sha256,
             simulation_batches.c.daily_dataset_lineage_id,
+            simulation_batches.c.target_payload_json,
         ).where(
             simulation_batches.c.portfolio_id == stage.simulation_portfolio_id,
             simulation_batches.c.trade_date == nav.trade_date,
@@ -151,6 +152,22 @@ def current_paper_health_binding(
     identity = str(batch.daily_dataset_identity_sha256 or "")
     lineage = str(batch.daily_dataset_lineage_id or "")
     source_snapshot_id = str(batch.source_snapshot_id or "")
+    target_payload = batch.target_payload_json
+    governed_plan = (
+        target_payload.get("governed_order_plan")
+        if isinstance(target_payload, dict)
+        else None
+    )
+    formal_backtest_id = (
+        str(governed_plan.get("formal_backtest_id") or "")
+        if isinstance(governed_plan, dict)
+        else ""
+    )
+    order_plan_manifest_sha256 = (
+        str(governed_plan.get("manifest_sha256") or "").lower()
+        if isinstance(governed_plan, dict)
+        else ""
+    )
     if (
         len(identity) != 64
         or len(lineage) != 64
@@ -159,6 +176,16 @@ def current_paper_health_binding(
         or not isinstance(batch.signal_date, date)
         or not isinstance(batch.trade_date, date)
         or batch.signal_date > batch.trade_date
+        or not isinstance(governed_plan, dict)
+        or governed_plan.get("format_version") != QLIB_ORDER_PLAN_FORMAT_VERSION
+        or governed_plan.get("promotion_stage_id")
+        != str(stage.promotion_stage_id)
+        or not formal_backtest_id
+        or len(order_plan_manifest_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in order_plan_manifest_sha256
+        )
     ):
         raise ValueError("latest paper batch dataset/source lineage is invalid")
     return {
@@ -174,6 +201,8 @@ def current_paper_health_binding(
         "daily_dataset_identity_sha256": identity,
         "daily_dataset_lineage_id": lineage,
         "source_snapshot_id": source_snapshot_id,
+        "formal_backtest_id": formal_backtest_id,
+        "order_plan_manifest_sha256": order_plan_manifest_sha256,
     }
 
 
@@ -261,6 +290,8 @@ def validate_production_health_snapshot(
         ],
         "daily_dataset_lineage_id": binding["daily_dataset_lineage_id"],
         "source_snapshot_id": binding["source_snapshot_id"],
+        "formal_backtest_id": binding["formal_backtest_id"],
+        "order_plan_manifest_sha256": binding["order_plan_manifest_sha256"],
     }
     for field, expected in expected_pairs.items():
         if evidence.get(field) != expected:
@@ -348,9 +379,13 @@ def load_production_health_gate(
         binding = current_paper_health_binding(connection, strategy_version_id)
     except (KeyError, TypeError, ValueError) as exc:
         return _failure([str(exc)], horizon_profile=None)
-    latest = connection.execute(
+    latest_manual = connection.execute(
         select(strategy_health_snapshots)
-        .where(strategy_health_snapshots.c.strategy_version_id == strategy_version_id)
+        .where(
+            strategy_health_snapshots.c.strategy_version_id == strategy_version_id,
+            strategy_health_snapshots.c.recorded_by != COLLECTOR_ACTOR,
+            strategy_health_snapshots.c.recorded_by.not_like("system:%"),
+        )
         .order_by(
             strategy_health_snapshots.c.as_of.desc(),
             strategy_health_snapshots.c.recorded_at.desc(),
@@ -358,40 +393,84 @@ def load_production_health_gate(
         )
         .limit(1)
     ).first()
-    snapshot = latest
-    latest_values = _mapping(latest)
-    if latest_values and latest_values.get("recorded_by") != COLLECTOR_ACTOR:
-        manual_status = str(latest_values.get("health_status") or "")
+    manual_values = _mapping(latest_manual)
+    if manual_values:
+        manual_status = str(manual_values.get("health_status") or "")
         if manual_status in {"restricted", "suspended", "retired"}:
             blocked = _failure(
                 [f"manual_strategy_health_{manual_status}_blocks_new_risk"],
                 horizon_profile=str(binding["horizon_profile"]),
-                snapshot=latest,
+                snapshot=latest_manual,
             )
             blocked["health_status"] = manual_status
             blocked["observed_health_status"] = manual_status
             return blocked
-        # A manual healthy/watch observation may describe an operator review,
-        # but it can neither grant nor revoke production authority.  Resolve
-        # the newest collector row independently; absence remains fail closed.
-        snapshot = connection.execute(
-            select(strategy_health_snapshots)
-            .where(
-                strategy_health_snapshots.c.strategy_version_id
-                == strategy_version_id,
-                strategy_health_snapshots.c.recorded_by == COLLECTOR_ACTOR,
-            )
-            .order_by(
-                strategy_health_snapshots.c.as_of.desc(),
-                strategy_health_snapshots.c.recorded_at.desc(),
-                strategy_health_snapshots.c.id.desc(),
-            )
-            .limit(1)
-        ).first()
-        if snapshot is None:
+    # Manual healthy/watch is only an explicit release of the durable manual
+    # latch.  It never authorizes risk itself: a collector observation recorded
+    # at or after the release must still pass every production binding below.
+    snapshot = connection.execute(
+        select(strategy_health_snapshots)
+        .where(
+            strategy_health_snapshots.c.strategy_version_id == strategy_version_id,
+            strategy_health_snapshots.c.recorded_by == COLLECTOR_ACTOR,
+        )
+        .order_by(
+            strategy_health_snapshots.c.as_of.desc(),
+            strategy_health_snapshots.c.recorded_at.desc(),
+            strategy_health_snapshots.c.id.desc(),
+        )
+        .limit(1)
+    ).first()
+    if snapshot is None:
+        return _failure(
+            ["strategy_health_collector_evidence_missing"],
+            horizon_profile=str(binding["horizon_profile"]),
+        )
+    if manual_values and manual_status in {"healthy", "watch"}:
+        collector_values = _mapping(snapshot)
+        collector_as_of = collector_values.get("as_of")
+        collector_recorded_at = collector_values.get("recorded_at")
+        manual_as_of = manual_values.get("as_of")
+        manual_recorded_at = manual_values.get("recorded_at")
+        if (
+            not isinstance(collector_as_of, datetime)
+            or not isinstance(manual_as_of, datetime)
+            or not isinstance(collector_recorded_at, datetime)
+            or not isinstance(manual_recorded_at, datetime)
+            or collector_as_of.tzinfo is None
+            or manual_as_of.tzinfo is None
+            or collector_as_of.utcoffset() is None
+            or manual_as_of.utcoffset() is None
+            or collector_recorded_at.tzinfo is None
+            or manual_recorded_at.tzinfo is None
+            or collector_recorded_at.utcoffset() is None
+            or manual_recorded_at.utcoffset() is None
+        ):
             return _failure(
-                ["strategy_health_collector_evidence_missing"],
+                ["strategy_health_collector_precedes_manual_release"],
                 horizon_profile=str(binding["horizon_profile"]),
+                snapshot=snapshot,
+            )
+        collector_recorded = collector_recorded_at.astimezone(UTC)
+        manual_recorded = manual_recorded_at.astimezone(UTC)
+        collector_order = (
+            collector_as_of.astimezone(UTC),
+            collector_recorded,
+            str(collector_values.get("id") or ""),
+        )
+        manual_order = (
+            manual_as_of.astimezone(UTC),
+            manual_recorded,
+            str(manual_values.get("id") or ""),
+        )
+        # ``as_of`` can be identical to the operator release (both are
+        # second-normalized).  The durable insertion timestamp therefore also
+        # has to prove the collector was not recorded before the release.
+        if collector_recorded < manual_recorded or collector_order < manual_order:
+            return _failure(
+                ["strategy_health_collector_precedes_manual_release"],
+                horizon_profile=str(binding["horizon_profile"]),
+                snapshot=snapshot,
             )
     return validate_production_health_snapshot(
         snapshot,

@@ -53,6 +53,7 @@ from quant_data.database import (
     strategy_versions,
 )
 from quant_data.execution_contract import (
+    QLIB_ORDER_PLAN_FORMAT_VERSION,
     QLIB_OUTPUT_MANIFEST_VERSION,
     require_daily_qlib_contract,
     require_minute_execution_contract,
@@ -255,7 +256,6 @@ SIMULATION_SETTLEMENT_CALENDAR_BINDING_VERSION = (
     "simulation-settlement-calendar-binding-v1"
 )
 SETTLEMENT_CALENDAR_RELATIVE_PATH = "metadata/known_trading_calendar.parquet"
-QLIB_ORDER_PLAN_FORMAT_VERSION = "qlib-order-plan-v1"
 
 
 class ExecutionDataNotReadyError(ValueError):

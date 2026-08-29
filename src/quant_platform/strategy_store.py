@@ -122,7 +122,7 @@ from quant_platform.strategy_artifact_manifest import (
     validate_backtest_artifact_manifest,
 )
 from quant_platform.strategy_catalog import strategy_type_capabilities
-from quant_platform.strategy_health import transition_strategy_health
+from quant_platform.strategy_health import COLLECTOR_ACTOR, transition_strategy_health
 from quant_platform.strategy_research_admission import (
     FIN_STRATEGY_FULL_STACK_ARTIFACT_TYPE,
     FIN_STRATEGY_POLICY_ARTIFACT_TYPE,
@@ -5426,12 +5426,37 @@ class StrategyStore:
         ).first()
         if existing is not None:
             return snapshot_sha256
+        # Automatic evidence and human emergency controls share one immutable
+        # ledger, but they are independent observation chains.  A collector
+        # recovery must not be rejected because an operator latched production
+        # risk, and a later operator release must not inherit the collector's
+        # transition state.  Other system writers remain isolated by actor.
+        normalized_actor = actor.strip()
+        chain_predicates = [
+            strategy_health_snapshots.c.strategy_version_id == version_id
+        ]
+        manual_control = not normalized_actor.startswith("system:")
+        if normalized_actor == COLLECTOR_ACTOR:
+            chain_predicates.append(
+                strategy_health_snapshots.c.recorded_by == COLLECTOR_ACTOR
+            )
+        elif manual_control:
+            chain_predicates.extend(
+                [
+                    strategy_health_snapshots.c.recorded_by != COLLECTOR_ACTOR,
+                    strategy_health_snapshots.c.recorded_by.not_like("system:%"),
+                ]
+            )
+        else:
+            chain_predicates.append(
+                strategy_health_snapshots.c.recorded_by == normalized_actor
+            )
         latest_health = connection.execute(
             select(
                 strategy_health_snapshots.c.health_status,
                 strategy_health_snapshots.c.as_of,
             )
-            .where(strategy_health_snapshots.c.strategy_version_id == version_id)
+            .where(*chain_predicates)
             .order_by(
                 strategy_health_snapshots.c.as_of.desc(),
                 strategy_health_snapshots.c.recorded_at.desc(),
@@ -5442,8 +5467,17 @@ class StrategyStore:
             str(latest_health.health_status) if latest_health is not None else None
         )
         if latest_health is not None and normalized_as_of < latest_health.as_of:
-            raise ValueError("strategy health snapshots must not move as_of backward")
-        allowed_transition = transition_strategy_health(previous_status, health_status)
+            raise ValueError(
+                "strategy health snapshots must not move as_of backward within actor chain"
+            )
+        # Human healthy/watch is an explicit release command for the durable
+        # manual latch, including after suspended/retired.  It still cannot
+        # authorize production without a subsequent sealed collector row.
+        allowed_transition = (
+            health_status
+            if manual_control
+            else transition_strategy_health(previous_status, health_status)
+        )
         if allowed_transition != health_status:
             raise ValueError(
                 "strategy health recovery must proceed one state at a time: "
