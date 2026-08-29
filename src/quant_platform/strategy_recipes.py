@@ -5,11 +5,12 @@ from typing import Any
 
 from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 
-# v7 rematerializes all three transparent controls against the governed stock
-# scope/eligibility v3 contract.  The economic recipes are unchanged; the
-# version bump prevents a partially-created v6 batch from pinning bootstrap to
-# the superseded Qlib dataset.
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v7"
+# v8 fixes runner applicability: topk_equal_weight no longer asks for inputs
+# used only by covariance optimizers.  The factors, trading rules, costs,
+# dataset contract and sealed OOS windows are unchanged from v7.  A new recipe
+# version keeps the failed no-result v7 attempts immutable and opens only the
+# separately governed replacement batch.
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v8"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},

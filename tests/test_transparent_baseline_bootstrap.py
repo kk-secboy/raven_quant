@@ -38,6 +38,12 @@ from quant_platform.transparent_baseline_bootstrap import (
 from quant_platform.transparent_baseline_lockbox import (
     BOOTSTRAP_CONFIG_KEY,
     LOCKBOX_CONFIG_KEY,
+    OPTIMIZER_APPLICABILITY_REASON,
+    OPTIMIZER_APPLICABILITY_REPAIR_GENERATION,
+    OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS,
+    OPTIMIZER_APPLICABILITY_SOURCE_COMMIT,
+    OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
+    PRE_RESULT_REPAIR_CONTRACT_VERSION_V2,
     TransparentBaselineLockboxStore,
     build_joint_lockbox,
     build_lockbox_member,
@@ -45,6 +51,10 @@ from quant_platform.transparent_baseline_lockbox import (
     lockbox_member_link,
     validate_joint_lockbox,
     validate_pre_result_repair_receipt,
+)
+from quant_platform.transparent_baseline_repair import (
+    build_optimizer_applicability_receipt,
+    register_optimizer_applicability_repair,
 )
 from scripts.run_multifactor_backtest import _promotion_dataset_descriptors
 
@@ -458,6 +468,230 @@ def _prepare_repair_store_case(
     return store, target_plans, target_versions, source_members, str(event_id)
 
 
+def _prepare_optimizer_repair_store_case(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mutation: str | None = None,
+    insert_receipt: bool = True,
+) -> tuple[StrategyStore, list[dict], dict[str, str]]:
+    """Create the exact failed v7 family and a governed v8 replacement."""
+
+    from quant_platform import strategy_store as strategy_store_module
+
+    calendar = _calendar()
+    current_plans, _ = _plans(calendar)
+    source_plans, _ = _retarget_plans(
+        current_plans,
+        dataset="same-daily",
+        identity="a" * 64,
+        lineage="b" * 64,
+        recipe_version="qlib-rdagent-single-mainline-2026-08-30-v7",
+    )
+    store = StrategyStore(database_url)
+    families: dict[str, dict] = {}
+    source_versions: list[dict] = []
+    for plan in source_plans:
+        recipe_id = str(plan["recipe"]["id"])
+        family = store.create(
+            name=f"optimizer-repair:{recipe_id}",
+            description="Exact v7 optimizer-applicability failure fixture.",
+            benchmark=str(plan["recipe"]["benchmark"]),
+            universe=str(plan["recipe"]["universe"]),
+            factors=[],
+            config=plan["config"],
+            actor="test",
+            economic_hypothesis_group=f"transparent-public-control:{recipe_id}",
+        )
+        families[recipe_id] = family
+        source_versions.append(family["versions"][0])
+    TransparentBaselineLockboxStore(database_url).reserve(
+        versions=source_versions,
+        dataset="same-daily",
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+    )
+
+    backtest_ids = {
+        "short_relative_strength": "f51d7fa2f4fd463e97fd5f6990b3721c",
+        "swing_trend": "8090c21aa11546bd9d59f732975afc25",
+        "long_quality_value": "9c8a75ac646f452e8a5666bacd708936",
+    }
+    job_ids = {
+        "short_relative_strength": "3ce200c5bcec4129a12312ac04efe269",
+        "swing_trend": "1416e51e689945b9abb482967c5a7956",
+        "long_quality_value": "0e01042cbeca49b192e351438ce4a969",
+    }
+    ordered_backtest_ids = iter(
+        [backtest_ids[str(plan["recipe"]["id"])] for plan in source_plans]
+    )
+
+    class _FixedUuid:
+        def __init__(self, value: str) -> None:
+            self.hex = value
+
+    source_members: list[dict] = []
+    engine = open_database(database_url)
+    with monkeypatch.context() as local_patch:
+        local_patch.setattr(
+            strategy_store_module.uuid,
+            "uuid4",
+            lambda: _FixedUuid(next(ordered_backtest_ids)),
+        )
+        for plan, version in zip(source_plans, source_versions, strict=True):
+            recipe_id = str(plan["recipe"]["id"])
+            backtest_id = backtest_ids[recipe_id]
+            artifact = tmp_path / "optimizer-repair" / backtest_id
+            backtest = store.create_backtest(
+                version_id=str(version["id"]),
+                dataset="same-daily",
+                periods=plan["formal_periods"],
+                artifact_path=artifact,
+                trading_dates=calendar,
+                dataset_lineage_id="b" * 64,
+                dataset_identity_sha256="a" * 64,
+            )
+            assert backtest["id"] == backtest_id
+            artifact.mkdir(parents=True, exist_ok=True)
+            manifest = json.dumps(
+                {"backtest_id": backtest_id, "recipe_id": recipe_id},
+                sort_keys=True,
+            ).encode()
+            (artifact / "manifest.json").write_bytes(manifest)
+            error = (
+                "ValueError: optimizer requires 60 complete point-in-time "
+                "return observations"
+            )
+            now = datetime.now(UTC)
+            with engine.begin() as connection:
+                connection.execute(
+                    insert(jobs).values(
+                        id=job_ids[recipe_id],
+                        kind="strategy_backtest",
+                        idempotency_key=f"optimizer-repair:{backtest_id}",
+                        status="failed",
+                        payload_json={"backtest_id": backtest_id},
+                        progress_json=None,
+                        log_path=str(tmp_path / f"{backtest_id}.log"),
+                        exit_code=1,
+                        error=error,
+                        attempts=1,
+                        max_attempts=1,
+                        next_attempt_at=None,
+                        cancel_requested_at=None,
+                        created_at=now,
+                        started_at=now,
+                        finished_at=now,
+                    )
+                )
+            store.attach_job(backtest_id, job_ids[recipe_id])
+            store.mark_backtest(backtest_id, "failed", error=error)
+            source_members.append(
+                {
+                    "backtest_id": backtest_id,
+                    "strategy_version_id": str(version["id"]),
+                    "job_id": job_ids[recipe_id],
+                    "dataset": "same-daily",
+                    "periods": dict(plan["formal_periods"]),
+                    "status": "failed",
+                    "job_status": "failed",
+                    "error": error,
+                    "metrics_absent": True,
+                    "result_absent": True,
+                    "files": [
+                        {
+                            "path": "manifest.json",
+                            "bytes": len(manifest),
+                            "sha256": hashlib.sha256(manifest).hexdigest(),
+                        }
+                    ],
+                }
+            )
+
+    receipt = build_optimizer_applicability_receipt(source_members)
+    if insert_receipt:
+        with engine.begin() as connection:
+            connection.execute(
+                insert(audit_events).values(
+                    user_id=None,
+                    username="system:test",
+                    action="transparent_baseline_pre_result_repair_registered",
+                    method="INTERNAL",
+                    path="transparent-baseline/pre-result-repair",
+                    status_code=201,
+                    ip_hash=None,
+                    user_agent="pytest",
+                    details_json=receipt,
+                    created_at=datetime.now(UTC),
+                )
+            )
+    if mutation == "source_metrics":
+        first_artifact = (
+            tmp_path
+            / "optimizer-repair"
+            / backtest_ids["short_relative_strength"]
+            / "metrics.json"
+        )
+        first_artifact.write_text('{"return": 0.1}', encoding="utf-8")
+
+    target_dataset = "same-daily" if mutation != "data" else "changed-daily"
+    target_identity = "a" * 64 if mutation != "data" else "c" * 64
+    target_lineage = "b" * 64 if mutation != "data" else "d" * 64
+    target_plans, _ = _retarget_plans(
+        current_plans,
+        dataset=target_dataset,
+        identity=target_identity,
+        lineage=target_lineage,
+        recipe_version=OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
+        change_economic_rule=mutation == "economic",
+    )
+    if mutation == "oos":
+        changed = target_plans[0]
+        changed_end = (
+            date.fromisoformat(changed["formal_periods"]["end"]) + timedelta(days=1)
+        ).isoformat()
+        changed["formal_periods"]["end"] = changed_end
+        changed["base_config"][BOOTSTRAP_CONFIG_KEY]["formal_periods"][
+            "end"
+        ] = changed_end
+        changed["lockbox_member"] = build_lockbox_member(
+            config=changed["base_config"],
+            formal_periods=changed["formal_periods"],
+        )
+        target_lockbox = build_joint_lockbox(
+            dataset=target_dataset,
+            dataset_identity_sha256=target_identity,
+            dataset_lineage_id=target_lineage,
+            members=[plan["lockbox_member"] for plan in target_plans],
+        )
+        for plan in target_plans:
+            plan["config"] = _normalize_multifactor_contract(
+                {**plan["base_config"], LOCKBOX_CONFIG_KEY: target_lockbox},
+                factor_count=0,
+                creating_family=True,
+            )
+
+    target_versions: list[dict] = []
+    for plan in target_plans:
+        recipe_id = str(plan["recipe"]["id"])
+        target_versions.append(
+            store.create_version_if_absent(
+                str(families[recipe_id]["id"]),
+                benchmark=str(plan["recipe"]["benchmark"]),
+                universe=str(plan["recipe"]["universe"]),
+                factors=[],
+                config=plan["config"],
+                actor="test",
+            )
+        )
+    return store, target_versions, {
+        "dataset": target_dataset,
+        "identity": target_identity,
+        "lineage": target_lineage,
+    }
+
+
 @pytest.mark.no_database
 def test_joint_lockbox_requires_exact_three_members_and_detects_tampering() -> None:
     plans, lockbox = _plans(_calendar())
@@ -576,6 +810,92 @@ def test_pre_result_repair_receipt_is_hashed_and_contains_no_performance_artifac
     result_tamper["receipt_sha256"] = canonical_sha256(result_payload)
     with pytest.raises(ValueError, match="result artifact"):
         validate_pre_result_repair_receipt(result_tamper)
+
+
+@pytest.mark.no_database
+def test_v2_optimizer_repair_accepts_only_exact_failed_production_attempts() -> None:
+    periods = {
+        "historical_start": "2008-01-02",
+        "historical_end": "2024-01-19",
+        "start": "2024-01-22",
+        "end": "2026-02-26",
+    }
+    members = []
+    for index, backtest_id in enumerate(
+        sorted(OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS), start=1
+    ):
+        members.append(
+            {
+                "backtest_id": backtest_id,
+                "strategy_version_id": f"{index:x}" * 32,
+                "job_id": f"{index + 3:x}" * 32,
+                "dataset": "cn-20080101-20260828-v6-79a88b3",
+                "periods": periods,
+                "status": "failed",
+                "job_status": "failed",
+                "error": (
+                    "ValueError: optimizer requires 60 complete point-in-time "
+                    "return observations"
+                ),
+                "metrics_absent": True,
+                "result_absent": True,
+                "files": [
+                    {
+                        "path": "manifest.json",
+                        "bytes": 10 + index,
+                        "sha256": f"{index + 6:x}" * 64,
+                    },
+                    {
+                        "path": "baseline/composite.parquet",
+                        "bytes": 20 + index,
+                        "sha256": f"{index + 9:x}" * 64,
+                    },
+                ],
+            }
+        )
+
+    receipt = build_optimizer_applicability_receipt(members)
+    assert receipt["contract_version"] == PRE_RESULT_REPAIR_CONTRACT_VERSION_V2
+    assert receipt["repair_generation"] == OPTIMIZER_APPLICABILITY_REPAIR_GENERATION
+    assert receipt["source_release_commit"] == OPTIMIZER_APPLICABILITY_SOURCE_COMMIT
+    assert receipt["target_recipe_version"] == (
+        OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION
+    )
+    assert receipt["reason_codes"] == [OPTIMIZER_APPLICABILITY_REASON]
+
+    result = deepcopy(receipt)
+    result["members"][0]["files"].append(
+        {"path": "metrics.json", "bytes": 1, "sha256": "f" * 64}
+    )
+    result_payload = dict(result)
+    result_payload.pop("receipt_sha256")
+    result["receipt_sha256"] = canonical_sha256(result_payload)
+    with pytest.raises(ValueError, match="result artifact"):
+        validate_pre_result_repair_receipt(result)
+
+    metrics = deepcopy(receipt)
+    metrics["members"][0]["metrics_absent"] = False
+    metrics_payload = dict(metrics)
+    metrics_payload.pop("receipt_sha256")
+    metrics["receipt_sha256"] = canonical_sha256(metrics_payload)
+    with pytest.raises(ValueError, match="had a result"):
+        validate_pre_result_repair_receipt(metrics)
+
+    wrong_marker = deepcopy(receipt)
+    wrong_marker["members"][0]["error"] = "ValueError: arbitrary runner failure"
+    marker_payload = dict(wrong_marker)
+    marker_payload.pop("receipt_sha256")
+    wrong_marker["receipt_sha256"] = canonical_sha256(marker_payload)
+    with pytest.raises(ValueError, match="not allowlisted"):
+        validate_pre_result_repair_receipt(wrong_marker)
+
+    generic_retry = deepcopy(receipt)
+    generic_retry["members"][0]["backtest_id"] = "a" * 32
+    generic_payload = dict(generic_retry)
+    generic_payload.pop("receipt_sha256")
+    generic_retry["receipt_sha256"] = canonical_sha256(generic_payload)
+    with pytest.raises(ValueError, match="backtests are not allowlisted"):
+        validate_pre_result_repair_receipt(generic_retry)
 
 
 @pytest.mark.no_database
@@ -1117,6 +1437,108 @@ def test_preregistered_pre_result_repair_opens_one_append_only_target_batch(
             )
         ) == 1
         assert connection.scalar(select(func.count()).select_from(oos_vintages)) == 6
+
+
+def test_v2_optimizer_repair_opens_new_same_lineage_oos_rows(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, target_versions, target = _prepare_optimizer_repair_store_case(
+        database_url,
+        tmp_path,
+        monkeypatch,
+    )
+    result = TransparentBaselineLockboxStore(database_url).reserve(
+        versions=target_versions,
+        dataset=target["dataset"],
+        dataset_identity_sha256=target["identity"],
+        dataset_lineage_id=target["lineage"],
+    )
+
+    assert result["pre_result_repair"]["repair_generation"] == (
+        OPTIMIZER_APPLICABILITY_REPAIR_GENERATION
+    )
+    assert {item["status"] for item in result["members"]} == {"reserved"}
+    assert result["scope"].startswith("lineage:" + "b" * 64 + ":repair:")
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        vintages = connection.execute(select(oos_vintages)).all()
+        repair = connection.execute(
+            select(transparent_baseline_pre_result_repairs)
+        ).one()
+    assert len(vintages) == 6
+    assert len({str(row.scope) for row in vintages}) == 2
+    assert str(repair.source_dataset_lineage_id) == "b" * 64
+    assert str(repair.target_dataset_lineage_id) == "b" * 64
+
+
+def test_optimizer_repair_registration_helper_seals_exact_v7_ids(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, target_versions, target = _prepare_optimizer_repair_store_case(
+        database_url,
+        tmp_path,
+        monkeypatch,
+        insert_receipt=False,
+    )
+    backtest_ids = sorted(OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS)
+    registered = register_optimizer_applicability_repair(
+        database_url,
+        backtest_ids=backtest_ids,
+        actor="system:test-helper",
+    )
+    repeated = register_optimizer_applicability_repair(
+        database_url,
+        backtest_ids=backtest_ids,
+        actor="system:test-helper",
+    )
+
+    assert registered["status"] == "registered"
+    assert repeated["status"] == "already_registered"
+    assert repeated["audit_event_id"] == registered["audit_event_id"]
+    result = TransparentBaselineLockboxStore(database_url).reserve(
+        versions=target_versions,
+        dataset=target["dataset"],
+        dataset_identity_sha256=target["identity"],
+        dataset_lineage_id=target["lineage"],
+    )
+    assert result["pre_result_repair"]["source_backtest_ids"] == backtest_ids
+
+
+@pytest.mark.parametrize(
+    "mutation", ["economic", "data", "oos", "source_metrics"]
+)
+def test_v2_optimizer_repair_rejects_target_contract_changes(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    _, target_versions, target = _prepare_optimizer_repair_store_case(
+        database_url,
+        tmp_path,
+        monkeypatch,
+        mutation=mutation,
+    )
+
+    with pytest.raises(ValueError, match="exactly one valid pre-result repair receipt"):
+        TransparentBaselineLockboxStore(database_url).reserve(
+            versions=target_versions,
+            dataset=target["dataset"],
+            dataset_identity_sha256=target["identity"],
+            dataset_lineage_id=target["lineage"],
+        )
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        assert connection.scalar(
+            select(func.count()).select_from(
+                transparent_baseline_pre_result_repairs
+            )
+        ) == 0
+        assert connection.scalar(select(func.count()).select_from(oos_vintages)) == 3
 
 
 def test_pre_result_repair_receipt_registered_after_result_is_rejected(

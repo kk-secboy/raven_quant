@@ -40,8 +40,30 @@ LOCKBOX_LINK_VERSION = "transparent-baseline-joint-lockbox-link-v1"
 LOCKBOX_CONFIG_KEY = "transparent_baseline_joint_lockbox"
 BOOTSTRAP_CONFIG_KEY = "transparent_baseline_bootstrap"
 PRE_RESULT_REPAIR_ACTION = "transparent_baseline_pre_result_repair_registered"
-PRE_RESULT_REPAIR_CONTRACT_VERSION = "transparent-baseline-pre-result-repair-v1"
+PRE_RESULT_REPAIR_CONTRACT_VERSION_V1 = "transparent-baseline-pre-result-repair-v1"
+PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 = "transparent-baseline-pre-result-repair-v2"
+# Keep the historical public name pinned to v1.  Existing receipts and callers
+# must not silently acquire the wider v2 shape.
+PRE_RESULT_REPAIR_CONTRACT_VERSION = PRE_RESULT_REPAIR_CONTRACT_VERSION_V1
 PRE_RESULT_REPAIR_REGISTRY_VERSION = "transparent-baseline-pre-result-repair-registry-v1"
+OPTIMIZER_APPLICABILITY_REPAIR_GENERATION = "v7-to-v8-optimizer-applicability"
+OPTIMIZER_APPLICABILITY_REASON = "topk_equal_weight_optimizer_applicability"
+OPTIMIZER_APPLICABILITY_SOURCE_COMMIT = (
+    "79a88b3d3e2ed03b1785aa6ff6d578ff1d516860"
+)
+OPTIMIZER_APPLICABILITY_SOURCE_RECIPE_VERSION = (
+    "qlib-rdagent-single-mainline-2026-08-30-v7"
+)
+OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION = (
+    "qlib-rdagent-single-mainline-2026-08-30-v8"
+)
+OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS = frozenset(
+    {
+        "f51d7fa2f4fd463e97fd5f6990b3721c",
+        "8090c21aa11546bd9d59f732975afc25",
+        "9c8a75ac646f452e8a5666bacd708936",
+    }
+)
 
 _PRE_RESULT_REPAIR_REASON_CODES = frozenset(
     {
@@ -57,6 +79,9 @@ _PRE_RESULT_FAILURES = {
         "formal execution starts before native price-limit controls are complete"
     ),
 }
+OPTIMIZER_APPLICABILITY_FAILURE = (
+    "optimizer requires 60 complete point-in-time return observations"
+)
 
 _RECIPE_HORIZONS = {
     "short_relative_strength": "short_1_5d",
@@ -107,16 +132,18 @@ def _require_identifier(value: Any, *, field: str) -> str:
 
 
 def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
-    """Validate the one supported no-performance transparent-baseline repair.
+    """Validate an explicitly allowlisted no-performance baseline repair.
 
     This is intentionally narrower than a general retry token. It seals the
     exact prior attempts while they have no result/metrics and names the
     corrected recipe/data contracts before a replacement lockbox is opened.
+    V1 remains byte-for-byte compatible with its historical receipt shape;
+    V2 authorizes only the v7-to-v8 optimizer-applicability repair.
     """
 
     if not isinstance(value, Mapping):
         raise ValueError("transparent baseline pre-result repair receipt is required")
-    keys = {
+    common_keys = {
         "contract_version",
         "source_release_commit",
         "target_recipe_version",
@@ -127,9 +154,24 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         "members",
         "receipt_sha256",
     }
-    if set(value) != keys or value.get("contract_version") != (
-        PRE_RESULT_REPAIR_CONTRACT_VERSION
-    ):
+    contract_version = value.get("contract_version")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V1:
+        keys = common_keys
+        expected_reasons = _PRE_RESULT_REPAIR_REASON_CODES
+        failure_markers = _PRE_RESULT_FAILURES
+        repair_generation: str | None = None
+    elif contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V2:
+        keys = common_keys | {"repair_generation"}
+        expected_reasons = frozenset({OPTIMIZER_APPLICABILITY_REASON})
+        failure_markers = {
+            OPTIMIZER_APPLICABILITY_REASON: OPTIMIZER_APPLICABILITY_FAILURE
+        }
+        repair_generation = str(value.get("repair_generation") or "").strip()
+        if repair_generation != OPTIMIZER_APPLICABILITY_REPAIR_GENERATION:
+            raise ValueError("transparent baseline repair generation is not allowlisted")
+    else:
+        raise ValueError("transparent baseline pre-result repair contract is invalid")
+    if set(value) != keys:
         raise ValueError("transparent baseline pre-result repair contract is invalid")
     payload = dict(value)
     receipt_sha256 = _require_sha256(
@@ -143,6 +185,11 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
     target_recipe_version = str(value.get("target_recipe_version") or "").strip()
     if not target_recipe_version:
         raise ValueError("transparent baseline repair target recipe is required")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 and (
+        commit != OPTIMIZER_APPLICABILITY_SOURCE_COMMIT
+        or target_recipe_version != OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION
+    ):
+        raise ValueError("optimizer applicability repair source or target is not allowlisted")
     if (
         value.get("target_eligibility_contract") != ELIGIBILITY_CONTRACT_VERSION
         or value.get("target_stock_scope_contract")
@@ -152,8 +199,8 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
     reason_codes = value.get("reason_codes")
     if (
         not isinstance(reason_codes, list)
-        or set(reason_codes) != _PRE_RESULT_REPAIR_REASON_CODES
-        or len(reason_codes) != len(_PRE_RESULT_REPAIR_REASON_CODES)
+        or set(reason_codes) != expected_reasons
+        or len(reason_codes) != len(expected_reasons)
         or value.get("performance_information_used") is not False
     ):
         raise ValueError("transparent baseline repair reason or performance boundary is invalid")
@@ -221,12 +268,16 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
             or member.get("job_status") != member.get("status")
         ):
             raise ValueError("transparent baseline repair member had a result or invalid state")
+        if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 and (
+            member.get("status") != "failed"
+        ):
+            raise ValueError("optimizer applicability repair requires three failed attempts")
         error = member.get("error")
         if error is not None:
             error_text = str(error)
             matches = {
                 code
-                for code, marker in _PRE_RESULT_FAILURES.items()
+                for code, marker in failure_markers.items()
                 if marker in error_text
             }
             if len(matches) != 1 or member.get("status") != "failed":
@@ -269,12 +320,17 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
             raise ValueError("transparent baseline repair execution manifest is missing")
         member["files"] = normalized_files
         members.append(member)
-    if observed_failure_markers != _PRE_RESULT_REPAIR_REASON_CODES:
-        raise ValueError("transparent baseline repair does not cover both preregistered defects")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 and (
+        identifiers["backtest_id"] != OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS
+    ):
+        raise ValueError("optimizer applicability repair backtests are not allowlisted")
+    if observed_failure_markers != expected_reasons:
+        raise ValueError("transparent baseline repair does not cover its allowlisted defect")
     return {
         **payload,
         "source_release_commit": commit,
         "target_recipe_version": target_recipe_version,
+        **({"repair_generation": repair_generation} if repair_generation else {}),
         "reason_codes": list(reason_codes),
         "members": members,
         "receipt_sha256": receipt_sha256,
@@ -577,6 +633,34 @@ def _artifact_result_exists(artifact_path: Any) -> bool:
         return True
 
 
+def _artifact_inventory(artifact_path: Any) -> list[dict[str, Any]]:
+    try:
+        root = Path(str(artifact_path)).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("transparent baseline repair artifact root is invalid") from exc
+    if not root.is_dir():
+        raise ValueError("transparent baseline repair artifact root is missing")
+    files: list[dict[str, Any]] = []
+    try:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            files.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "bytes": path.stat().st_size,
+                    "sha256": digest.hexdigest(),
+                }
+            )
+    except OSError as exc:
+        raise ValueError("transparent baseline repair artifacts cannot be verified") from exc
+    return files
+
+
 class TransparentBaselineLockboxStore:
     """Atomically reserve/recover the three public baseline OOS vintages."""
 
@@ -585,8 +669,12 @@ class TransparentBaselineLockboxStore:
 
     @staticmethod
     def _repair_source_batches(
-        rows: Sequence[Any], *, target_batch_sha256: str
+        rows: Sequence[Any],
+        *,
+        target_batch_sha256: str,
+        superseded_source_batches: set[str] | None = None,
     ) -> dict[str, list[Any]]:
+        superseded = superseded_source_batches or set()
         batches: dict[str, list[Any]] = {}
         for row in rows:
             sealed = dict(row.sealed_candidate_set_json or {})
@@ -598,7 +686,7 @@ class TransparentBaselineLockboxStore:
             except ValueError:
                 continue
             batch = str(link["batch_sha256"])
-            if batch != target_batch_sha256:
+            if batch != target_batch_sha256 and batch not in superseded:
                 batches.setdefault(batch, []).append(row)
         return batches
 
@@ -674,7 +762,26 @@ class TransparentBaselineLockboxStore:
         if len(source_lineages) != 1 or "" in source_lineages:
             raise ValueError("transparent baseline repair source lineage is invalid")
         source_lineage = next(iter(source_lineages))
-        if source_lineage == target_dataset_lineage_id:
+        source_identities = {str(row.dataset_identity or "") for row in source_rows}
+        if len(source_identities) != 1 or "" in source_identities:
+            raise ValueError("transparent baseline repair source identity is invalid")
+        source_identity = next(iter(source_identities))
+        is_optimizer_applicability_repair = receipt["contract_version"] == (
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V2
+        )
+        if is_optimizer_applicability_repair:
+            if (
+                source_lineage != target_dataset_lineage_id
+                or source_identity != target_dataset_identity_sha256
+                or any(
+                    str(item["dataset"]) != target_dataset
+                    for item in receipt["members"]
+                )
+            ):
+                raise ValueError(
+                    "optimizer applicability repair changed the dataset or lineage"
+                )
+        elif source_lineage == target_dataset_lineage_id:
             raise ValueError("transparent baseline repair may not fabricate a fresh lineage")
 
         source_versions = cls._version_repair_rows(connection, source_version_ids)
@@ -734,6 +841,7 @@ class TransparentBaselineLockboxStore:
             target_version = target_by_recipe[recipe_id]
             expected = expected_by_recipe[recipe_id]
             recorded_periods = dict(backtest.periods_json or {})
+            source_config = dict(source_version.config_json or {})
             if (
                 str(backtest.id) != member["backtest_id"]
                 or str(backtest.job_id or "") != member["job_id"]
@@ -750,13 +858,26 @@ class TransparentBaselineLockboxStore:
                 or str(target_version.economic_hypothesis_group)
                 != str(source_version.economic_hypothesis_group)
                 or _repair_economic_config(dict(target_version.config_json or {}))
-                != _repair_economic_config(dict(source_version.config_json or {}))
+                != _repair_economic_config(source_config)
                 or str(expected["test_start"]) != member["periods"]["start"]
                 or str(expected["test_end"]) != member["periods"]["end"]
             ):
                 raise ValueError("transparent baseline repair changed an economic or OOS binding")
+            if is_optimizer_applicability_repair and source_config.get(
+                "recipe_version"
+            ) != OPTIMIZER_APPLICABILITY_SOURCE_RECIPE_VERSION:
+                raise ValueError("optimizer applicability repair source recipe changed")
             has_metrics = backtest.metrics_json is not None
             has_result = _artifact_result_exists(backtest.artifact_path)
+            declared_files = sorted(member["files"], key=lambda item: item["path"])
+            observed_files = _artifact_inventory(backtest.artifact_path)
+            observed_by_path = {item["path"]: item for item in observed_files}
+            if any(
+                observed_by_path.get(item["path"]) != item for item in declared_files
+            ):
+                raise ValueError("transparent baseline repair artifact evidence changed")
+            if member["status"] == "failed" and observed_files != declared_files:
+                raise ValueError("transparent baseline repair failure artifacts changed")
             if has_metrics or has_result:
                 if (
                     member["status"] != "running"
@@ -786,7 +907,10 @@ class TransparentBaselineLockboxStore:
                         "transparent baseline running member ended before preregistration"
                     )
 
-        if str(target_dataset or "").strip() == str(receipt["members"][0]["dataset"]):
+        if not is_optimizer_applicability_repair and (
+            str(target_dataset or "").strip()
+            == str(receipt["members"][0]["dataset"])
+        ):
             raise ValueError("transparent baseline repair target dataset was not rematerialized")
         return {
             "contract_version": PRE_RESULT_REPAIR_REGISTRY_VERSION,
@@ -799,6 +923,8 @@ class TransparentBaselineLockboxStore:
             "target_dataset_identity_sha256": target_dataset_identity_sha256,
             "target_dataset_lineage_id": target_dataset_lineage_id,
             "target_recipe_version": str(receipt["target_recipe_version"]),
+            "receipt_contract_version": str(receipt["contract_version"]),
+            "repair_generation": receipt.get("repair_generation"),
             "source_backtest_ids": sorted(item["backtest_id"] for item in members.values()),
             "target_strategy_version_ids": sorted(target_version_ids),
             "receipt_created_at": receipt_created_at.isoformat(),
@@ -860,8 +986,8 @@ class TransparentBaselineLockboxStore:
             matches.append((audit_row, receipt, verification))
         if len(matches) != 1:
             raise ValueError(
-                "overlapping transparent baseline OOS requires exactly one valid "
-                "pre-result repair receipt"
+                "transparent baseline final OOS has more than one prior batch or "
+                "requires exactly one valid pre-result repair receipt"
             )
         audit_row, receipt, verification = matches[0]
         connection.execute(
@@ -937,7 +1063,8 @@ class TransparentBaselineLockboxStore:
         if observed_links != declared_links:
             raise ValueError("joint lockbox versions do not cover all declared members")
         target_batch_sha256 = next(iter(batch_ids))
-        scope = f"lineage:{lineage}"
+        base_scope = f"lineage:{lineage}"
+        scope = base_scope
         earliest = min(item["test_start"] for item in expected)
         latest = max(item["test_end"] for item in expected)
         now = datetime.now(UTC)
@@ -945,21 +1072,8 @@ class TransparentBaselineLockboxStore:
         with self.engine.begin() as connection:
             connection.execute(
                 text("SELECT pg_advisory_xact_lock(hashtext(:oos_scope))"),
-                {"oos_scope": scope},
+                {"oos_scope": base_scope},
             )
-            scope_filter = or_(
-                oos_vintages.c.scope == scope,
-                oos_vintages.c.scope.like("dataset:%"),
-            )
-            rows = connection.execute(
-                select(oos_vintages)
-                .where(
-                    scope_filter,
-                    oos_vintages.c.test_start <= latest,
-                    oos_vintages.c.test_end >= earliest,
-                )
-                .with_for_update()
-            ).all()
             # A changed builder/eligibility contract produces a real new
             # lineage, but lineage churn is not permission to look at the same
             # final-OOS window twice. Scan all prior transparent lockboxes.
@@ -974,11 +1088,29 @@ class TransparentBaselineLockboxStore:
                 )
                 .with_for_update()
             ).all()
+            registered_repairs = connection.execute(
+                select(transparent_baseline_pre_result_repairs)
+            ).all()
+            superseded_source_batches = {
+                str(row.source_batch_sha256) for row in registered_repairs
+            }
+            existing_target_repairs = [
+                row
+                for row in registered_repairs
+                if str(row.target_batch_sha256) == target_batch_sha256
+            ]
+            if len(existing_target_repairs) > 1:
+                raise ValueError("transparent baseline repair target is duplicated")
+            if existing_target_repairs:
+                repair_registration = dict(
+                    existing_target_repairs[0].verification_json or {}
+                )
             source_batches = self._repair_source_batches(
                 all_overlapping_rows,
                 target_batch_sha256=target_batch_sha256,
+                superseded_source_batches=superseded_source_batches,
             )
-            if source_batches:
+            if source_batches and repair_registration is None:
                 if len(source_batches) != 1:
                     raise ValueError(
                         "transparent baseline final OOS already has more than one prior batch"
@@ -995,6 +1127,29 @@ class TransparentBaselineLockboxStore:
                     target_dataset_identity_sha256=identity,
                     target_dataset_lineage_id=lineage,
                 )
+            if repair_registration is not None and repair_registration.get(
+                "repair_generation"
+            ) == OPTIMIZER_APPLICABILITY_REPAIR_GENERATION:
+                # The v7 and v8 attempts intentionally share the exact dataset
+                # lineage and OOS dates. Use a repair-specific scope so v8
+                # receives new immutable one-shot rows instead of mutating or
+                # reusing the consumed v7 rows.
+                scope = f"{base_scope}:repair:{target_batch_sha256}"
+            scope_filter = oos_vintages.c.scope == scope
+            if scope == base_scope:
+                scope_filter = or_(
+                    scope_filter,
+                    oos_vintages.c.scope.like("dataset:%"),
+                )
+            rows = connection.execute(
+                select(oos_vintages)
+                .where(
+                    scope_filter,
+                    oos_vintages.c.test_start <= latest,
+                    oos_vintages.c.test_end >= earliest,
+                )
+                .with_for_update()
+            ).all()
             if rows:
                 expected_by_window = {
                     (item["test_start"], item["test_end"]): item for item in expected
