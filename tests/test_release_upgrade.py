@@ -118,6 +118,38 @@ def test_prepare_sandbox_inspects_explicit_rdagent_runtime_from_compose(
     )
 
 
+def test_prepare_sandbox_removes_loopback_tags_when_sealing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    context = FakeContext(tmp_path / ".env")
+
+    def registry_unavailable(*_args, **_kwargs) -> None:
+        raise RuntimeError("not ready")
+
+    monkeypatch.setattr(release_upgrade, "_wait_for_registry", registry_unavailable)
+
+    with pytest.raises(RuntimeError, match="not ready"):
+        release_upgrade._prepare_sandbox_images(
+            context,  # type: ignore[arg-type]
+            tmp_path,
+            "20260829T120000Z",
+            wait_timeout=45,
+        )
+
+    prefix = "127.0.0.1:55000/quantlab"
+    assert (
+        "docker",
+        "image",
+        "rm",
+        "-f",
+        f"{prefix}/worker-sandbox-base:20260829t120000z",
+        f"{prefix}/qlib-sandbox:20260829t120000z",
+        f"{prefix}/data-science-sandbox:20260829t120000z",
+        f"{prefix}/model-sandbox:20260829t120000z",
+    ) in context.calls
+
+
 @pytest.mark.parametrize(
     "payload, error",
     [
@@ -431,6 +463,49 @@ def test_release_upgrade_requires_explicit_confirmation(tmp_path: Path) -> None:
             tmp_path / "backups",
             confirmed=False,
         )
+
+
+def test_release_upgrade_rejects_an_unsafe_rollback_repository(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="lowercase Docker repository"):
+        release_upgrade.run_release_upgrade(
+            FakeContext(),  # type: ignore[arg-type]
+            tmp_path,
+            tmp_path / "backups",
+            confirmed=True,
+            rollback_tag_repository="quantlab-rollback:production",
+        )
+
+
+def test_capture_rollback_images_supports_a_drill_only_repository() -> None:
+    class RollbackContext(FakeContext):
+        def container_id(self, service: str) -> str:
+            assert service == "api"
+            return "candidate-api"
+
+        def docker(self, *args: str, **_kwargs) -> str:
+            self.calls.append(("docker", *args))
+            if args[:3] == ("inspect", "--format", "{{.Image}}"):
+                return "sha256:" + "b" * 64
+            return ""
+
+    context = RollbackContext()
+    tags = release_upgrade._capture_rollback_images(
+        context,  # type: ignore[arg-type]
+        "20260829T120000Z",
+        services=("api",),
+        repository="quantlab-upgrade-drill-rollback-deadbeef",
+    )
+
+    expected = (
+        "quantlab-upgrade-drill-rollback-deadbeef:20260829t120000z-api"
+    )
+    assert tags == {"api": expected}
+    assert (
+        "docker",
+        "tag",
+        "sha256:" + "b" * 64,
+        expected,
+    ) in context.calls
 
 
 def test_release_upgrade_stops_before_build_when_preflight_blocks(

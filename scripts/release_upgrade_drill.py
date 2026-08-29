@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import secrets
+import socket
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,11 +12,23 @@ from pathlib import Path
 from _project import PROJECT_ROOT
 
 from quant_platform.backup_restore import ComposeContext, compose_context
-from quant_platform.release_upgrade import run_release_upgrade
+from quant_platform.control_plane_lock import control_plane_locked
+from quant_platform.deployment_services import BUILT_APPLICATION_SERVICES
+from quant_platform.drill_isolation import isolated_drill_environment
+from quant_platform.release_upgrade import (
+    prepare_drill_sandbox_bootstrap,
+    run_release_upgrade,
+)
 
 
 def _stamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _available_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
 
 
 def _write_env(
@@ -24,6 +37,7 @@ def _write_env(
     data_host_path: Path,
     docker_host_path: Path,
     registry_host_path: Path,
+    registry_port: int,
 ) -> None:
     password = secrets.token_urlsafe(32)
     secret = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
@@ -39,6 +53,11 @@ def _write_env(
                 "AUTH_COOKIE_SECURE=false",
                 f"PLATFORM_SECRET_KEY={secret}",
                 "BROKER_MODE=disabled",
+                # Readiness probes only assert that an RD-Agent credential is
+                # configured.  Pin its base URL to a closed loopback port so an
+                # accidental drill job cannot contact an external LLM service.
+                "OPENAI_API_KEY=drill-not-a-real-credential",
+                "OPENAI_API_BASE=http://127.0.0.1:9",
                 "REQUESTS_PER_MINUTE=118",
                 "DOWNLOAD_WORKERS=2",
                 "LOG_MAX_SIZE=5m",
@@ -46,11 +65,42 @@ def _write_env(
                 f"QUANTLAB_DATA_HOST_PATH={data_host_path.resolve()}",
                 f"RDAGENT_DOCKER_HOST_PATH={docker_host_path.resolve()}",
                 f"RDAGENT_REGISTRY_HOST_PATH={registry_host_path.resolve()}",
+                f"RDAGENT_REGISTRY_PORT={registry_port}",
             )
         )
         + "\n",
         encoding="utf-8",
     )
+
+
+def _write_candidate_runtime_override(
+    path: Path,
+    suffix: str,
+) -> tuple[str, ...]:
+    images = {
+        service: f"quantlab-upgrade-drill-{service}:{suffix}"
+        for service in BUILT_APPLICATION_SERVICES
+    }
+    payload = {
+        "services": {
+            **{
+                service: {"image": image}
+                for service, image in sorted(images.items())
+            },
+            # The one-shot factor builder loads this host image into the
+            # isolated DinD. It must follow the drill-only worker alias too.
+            "factor-sandbox-builder": {
+                "environment": {
+                    "FACTOR_SANDBOX_BASE_IMAGE": images["worker"],
+                }
+            },
+        }
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return tuple(sorted(set(images.values())))
 
 
 def _leftovers(context: ComposeContext) -> dict[str, list[str]]:
@@ -88,21 +138,42 @@ def _leftovers(context: ComposeContext) -> dict[str, list[str]]:
     }
 
 
+def _leftover_images(context: ComposeContext, images: tuple[str, ...]) -> list[str]:
+    return [
+        image
+        for image in images
+        if context.docker(
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            image,
+            capture=True,
+            check=False,
+        )
+    ]
+
+
+@control_plane_locked
+@isolated_drill_environment
 def run_drill(project_root: Path) -> dict:
     release_id = _stamp()
+    suffix = secrets.token_hex(4)
     result = {
         "status": "failed",
         "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
-        "drill_project": f"quantlab-upgrade-drill-{secrets.token_hex(4)}",
+        "drill_project": f"quantlab-upgrade-drill-{suffix}",
         "live_trading_enabled": False,
         "cleanup": {},
     }
     context: ComposeContext | None = None
     rollback_tags: list[str] = []
+    candidate_runtime_images: tuple[str, ...] = ()
     temporary_manager = tempfile.TemporaryDirectory(prefix="quantlab-release-upgrade-drill-")
     try:
         scratch = Path(temporary_manager.name)
         env_file = scratch / "drill.env"
+        candidate_override = scratch / "candidate-runtime.compose.json"
         backup_root = scratch / "backups"
         data_host_path = scratch / "drill-data"
         docker_host_path = scratch / "rdagent-docker"
@@ -119,20 +190,41 @@ def run_drill(project_root: Path) -> dict:
             data_host_path=data_host_path,
             docker_host_path=docker_host_path,
             registry_host_path=registry_host_path,
+            registry_port=_available_loopback_port(),
         )
-        context = compose_context(
+        candidate_runtime_images = _write_candidate_runtime_override(
+            candidate_override,
+            suffix,
+        )
+        baseline_context = compose_context(
             result["drill_project"],
             env_file,
             project_root / "deploy" / "compose.yaml",
             (project_root / "deploy" / "compose.restore-drill.yaml",),
         )
-        context.run(
+        context = baseline_context
+        result["bootstrap_sandbox_images"] = prepare_drill_sandbox_bootstrap(
+            baseline_context,
+            project_root,
+            release_id,
+            wait_timeout=240,
+        )
+        baseline_context.run(
             "up",
             "-d",
             "--no-build",
             "--wait",
             "--wait-timeout",
             "240",
+        )
+        context = compose_context(
+            result["drill_project"],
+            env_file,
+            project_root / "deploy" / "compose.yaml",
+            (
+                project_root / "deploy" / "compose.restore-drill.yaml",
+                candidate_override,
+            ),
         )
         upgrade = run_release_upgrade(
             context,
@@ -142,6 +234,8 @@ def run_drill(project_root: Path) -> dict:
             retention_count=1,
             minimum_free_gb=1,
             wait_timeout=240,
+            rollback_tag_repository=f"quantlab-upgrade-drill-rollback-{suffix}",
+            prune_rollback_images=False,
         )
         result["upgrade"] = upgrade
         rollback_tags = list(upgrade.get("rollback_images", {}).values())
@@ -155,7 +249,19 @@ def run_drill(project_root: Path) -> dict:
             context.run("down", "-v", "--remove-orphans", check=False)
             if rollback_tags:
                 context.docker("image", "rm", "-f", *rollback_tags, check=False)
+            if candidate_runtime_images:
+                context.docker(
+                    "image",
+                    "rm",
+                    "-f",
+                    *candidate_runtime_images,
+                    check=False,
+                )
             result["cleanup"] = _leftovers(context)
+            result["cleanup"]["images"] = _leftover_images(
+                context,
+                (*candidate_runtime_images, *rollback_tags),
+            )
             if any(result["cleanup"].values()):
                 result["status"] = "failed"
                 result["cleanup_error"] = "isolated Compose resources remain"

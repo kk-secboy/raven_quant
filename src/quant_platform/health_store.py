@@ -31,7 +31,11 @@ def _qlib_calendar_date(value: object) -> date:
         return parsed.date()
 
 
-def safe_mode_recovery_health_status(snapshot: dict[str, Any] | None) -> str:
+def safe_mode_recovery_health_status(
+    snapshot: dict[str, Any] | None,
+    *,
+    triggered_at: datetime | str | None = None,
+) -> str:
     """Evaluate recovery health without making safe mode block its own release.
 
     The persisted overall status is necessarily ``degraded`` while safe mode is
@@ -42,6 +46,23 @@ def safe_mode_recovery_health_status(snapshot: dict[str, Any] | None) -> str:
 
     if not isinstance(snapshot, dict):
         return "missing"
+    if triggered_at is not None:
+        try:
+            observed_at = snapshot.get("recorded_at")
+            observed = (
+                observed_at
+                if isinstance(observed_at, datetime)
+                else datetime.fromisoformat(str(observed_at))
+            )
+            triggered = (
+                triggered_at
+                if isinstance(triggered_at, datetime)
+                else datetime.fromisoformat(str(triggered_at))
+            )
+            if observed.tzinfo is None or triggered.tzinfo is None or observed <= triggered:
+                return "degraded"
+        except (TypeError, ValueError):
+            return "missing"
     components = snapshot.get("components")
     if not isinstance(components, dict) or "safe_mode" not in components:
         return "missing"

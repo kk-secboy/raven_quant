@@ -439,7 +439,9 @@ class SafeModeEngageRequest(BaseModel):
 class SafeModeReleaseRequest(BaseModel):
     actor: str = Field(default="", max_length=100)
     reason: str = Field(min_length=10, max_length=1000)
-    require_health_ok: bool = False
+    # Recovery evidence is mandatory.  Literal[True] keeps older clients that
+    # send the flag working while rejecting an explicit bypass attempt.
+    require_health_ok: Literal[True] = True
 
 
 class QlibBaselineRequest(BaseModel):
@@ -6042,10 +6044,14 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.post("/api/platform/safe-mode/release")
     def release_safe_mode(payload: SafeModeReleaseRequest, request: Request) -> dict:
         actor = authenticated_actor(request, payload.actor or "local-operator")
-        health_status = None
-        if payload.require_health_ok:
-            latest = health_history.latest()
-            health_status = safe_mode_recovery_health_status(latest)
+        safe_mode_state = safe_mode.status()
+        latest = health_history.latest()
+        health_status = safe_mode_recovery_health_status(
+            latest,
+            triggered_at=safe_mode_state.get("triggered_at"),
+        )
+        if deployment_readiness.business_loop_readiness().get("status") != "ok":
+            health_status = "degraded"
         try:
             return safe_mode.deactivate(
                 actor=actor,

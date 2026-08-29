@@ -319,6 +319,12 @@ def test_manual_release_requires_actor_reason_and_restores(database_url: str) ->
         safe_mode.deactivate(actor="x", reason="reasonably long reason")
     with pytest.raises(ValueError, match="meaningful reason"):
         safe_mode.deactivate(actor="operator-b", reason="short")
+    with pytest.raises(ValueError, match="cannot be bypassed"):
+        safe_mode.deactivate(
+            actor="operator-b",
+            reason="数据已修复但调用方尝试绕过恢复健康门",
+            require_health_ok=False,
+        )
     with pytest.raises(ValueError, match="health check"):
         safe_mode.deactivate(
             actor="operator-b",
@@ -347,7 +353,12 @@ def test_manual_release_requires_actor_reason_and_restores(database_url: str) ->
             dataset_identity_sha256="a" * 64,
         )
     with pytest.raises(ValueError, match="not active"):
-        safe_mode.deactivate(actor="operator-b", reason="safe mode 已经解除过了")
+        safe_mode.deactivate(
+            actor="operator-b",
+            reason="safe mode 已经解除过了",
+            require_health_ok=True,
+            health_status="ok",
+        )
 
 
 def test_activation_is_idempotent_without_duplicate_alerts(database_url: str) -> None:

@@ -45,6 +45,9 @@ def test_restore_drill_seeds_the_canonical_0072_legacy_horizon() -> None:
     assert "promotion_stage IS NULL" in source
     assert "quantlab.recommendation_portfolios" in source
     assert "recommendation_sentinel" in source
+    assert "JOIN quantlab.simulation_batches b" in source
+    assert "(n.nav = 5000010)::text" in source
+    assert "n.performance_certified::text" in source
 
 
 def test_restore_drill_defaults_to_v2_and_keeps_v1_available(tmp_path: Path) -> None:
@@ -101,3 +104,105 @@ def test_restore_drill_uses_real_shared_images_and_a_governed_qlib_fixture() -> 
     assert 'feature.write_bytes(struct.pack("<fff", 0.0, 10.0, 10.25))' in compose
     assert '"contract_version": "restore-drill-qlib-provider-v1"' in compose
     assert "condition: service_completed_successfully" in compose
+
+
+def test_restore_drill_builds_an_isolated_candidate_schema_runtime(tmp_path: Path) -> None:
+    module = _load_restore_drill_module()
+    override = tmp_path / "candidate-runtime.compose.json"
+    image = "quantlab-restore-drill-api:test-runtime"
+
+    class CandidateContext:
+        def __init__(self) -> None:
+            self.arguments: tuple[str, ...] | None = None
+
+        def run(self, *arguments: str, **options: object) -> str:
+            self.arguments = arguments
+            assert options == {"capture": True}
+            return "0072_strategy_horizons\n"
+
+    context = CandidateContext()
+
+    module._write_candidate_runtime_override(override, image)
+    head = module._candidate_migration_head(context)
+    payload = json.loads(override.read_text(encoding="utf-8"))
+    source = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert head == "0072_strategy_horizons"
+    assert context.arguments is not None
+    assert context.arguments[:5] == ("run", "--rm", "--no-deps", "api", "python")
+    assert "ScriptDirectory.from_config" in context.arguments[-1]
+    assert payload == {
+        "services": {
+            "api": {"image": image},
+            "scheduler": {"image": image},
+        }
+    }
+    assert 'source.run("build", "api")' in source
+    assert "expected_schema_revision = _candidate_migration_head(source)" in source
+    assert "_assert_current_schema(source, expected_schema_revision)" in source
+    assert "manifest[\"schema_revision\"] != expected_schema_revision" in source
+    assert "restored_revision != expected_schema_revision" in source
+    assert "quantlab-platform-api:latest" not in source
+    assert "quantlab-platform-scheduler:latest" not in source
+
+
+def test_restore_drill_fails_before_sentinels_on_stale_source_schema() -> None:
+    module = _load_restore_drill_module()
+
+    class RevisionContext:
+        def __init__(self, revision: str) -> None:
+            self.revision = revision
+            self.arguments: tuple[str, ...] | None = None
+
+        def run(self, *arguments: str, **options: object) -> str:
+            self.arguments = arguments
+            assert options == {"capture": True}
+            return self.revision
+
+    current = RevisionContext("0072_strategy_horizons")
+    module._assert_current_schema(current, "0072_strategy_horizons")
+    assert current.arguments is not None
+    assert "SELECT version_num FROM quantlab.alembic_version;" in current.arguments
+
+    stale = RevisionContext("0071_retire_pair_writes")
+    with pytest.raises(RuntimeError, match="expected 0072_strategy_horizons"):
+        module._assert_current_schema(stale, "0072_strategy_horizons")
+
+
+def test_restore_drill_isolates_and_seals_the_target_sandbox(tmp_path: Path) -> None:
+    module = _load_restore_drill_module()
+    source = SCRIPT_PATH.read_text(encoding="utf-8")
+    env_file = tmp_path / "target.env"
+    data = tmp_path / "target-data"
+    docker = tmp_path / "target-rdagent-docker"
+    registry = tmp_path / "target-rdagent-registry"
+
+    module._write_env(
+        env_file,
+        password="test-password",
+        secret_key="test-secret",
+        data_host_path=data,
+        docker_host_path=docker,
+        registry_host_path=registry,
+        registry_port=54321,
+    )
+    rendered = dict(
+        line.split("=", 1)
+        for line in env_file.read_text(encoding="utf-8").splitlines()
+    )
+
+    assert rendered["QUANTLAB_DATA_HOST_PATH"] == str(data.resolve())
+    assert rendered["RDAGENT_DOCKER_HOST_PATH"] == str(docker.resolve())
+    assert rendered["RDAGENT_REGISTRY_HOST_PATH"] == str(registry.resolve())
+    assert rendered["RDAGENT_REGISTRY_PORT"] == "54321"
+    assert rendered["OPENAI_API_KEY"] == "restore-drill-not-a-real-credential"
+    assert rendered["OPENAI_API_BASE"] == "http://127.0.0.1:9"
+    assert "/data/quantlab-rdagent-docker" not in source
+    assert "/data/quantlab-rdagent-registry" not in source
+    assert "@control_plane_locked\n@isolated_drill_environment\ndef run_drill" in source
+    assert "prepare_drill_sandbox_bootstrap(" in source
+    assert source.index("prepare_drill_sandbox_bootstrap(", source.index("def run_drill")) < (
+        source.index("services = _assert_full_stack(target)")
+    )
+    assert "source_and_target_docker_distinct" in source
+    assert "source_and_target_registry_ports_distinct" in source

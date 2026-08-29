@@ -1,13 +1,33 @@
 from __future__ import annotations
 
+import importlib.util
+import json
+import sys
 from pathlib import Path
 
 import pytest
 
+from quant_platform import release_upgrade
+from quant_platform.deployment_services import BUILT_APPLICATION_SERVICES
 from quant_platform.worker import _failure_message
 from scripts.configure_tushare import update_env, validate_token
 
 pytestmark = pytest.mark.no_database
+
+
+def _load_release_upgrade_drill_module():
+    root = Path(__file__).resolve().parents[1]
+    script = root / "scripts" / "release_upgrade_drill.py"
+    scripts_path = str(script.parent)
+    sys.path.insert(0, scripts_path)
+    try:
+        spec = importlib.util.spec_from_file_location("release_upgrade_drill_test", script)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path.remove(scripts_path)
 
 
 def test_failure_message_extracts_actionable_tail(tmp_path: Path) -> None:
@@ -31,6 +51,118 @@ def test_release_upgrade_drill_uses_isolated_sibling_storage() -> None:
     assert 'f"QUANTLAB_DATA_HOST_PATH={data_host_path.resolve()}"' in source
     assert 'f"RDAGENT_DOCKER_HOST_PATH={docker_host_path.resolve()}"' in source
     assert 'f"RDAGENT_REGISTRY_HOST_PATH={registry_host_path.resolve()}"' in source
+    assert "@control_plane_locked\n@isolated_drill_environment\ndef run_drill" in source
+    assert '"OPENAI_API_KEY=drill-not-a-real-credential"' in source
+    assert '"OPENAI_API_BASE=http://127.0.0.1:9"' in source
+    assert 'f"RDAGENT_REGISTRY_PORT={registry_port}"' in source
+    assert "rollback_tag_repository=f\"quantlab-upgrade-drill-rollback-{suffix}\"" in source
+    assert "prune_rollback_images=False" in source
+    bootstrap = source.index(
+        'result["bootstrap_sandbox_images"] = prepare_drill_sandbox_bootstrap('
+    )
+    full_stack = source.index('        baseline_context.run(\n            "up",', bootstrap)
+    assert bootstrap < full_stack
+    assert "WORKER_JOB_KINDS" not in source
+
+    overlay = (root / "deploy" / "compose.restore-drill.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert 'root / "instruments/all.txt"' in overlay
+    assert 'root / "instruments/cn_all.txt"' in overlay
+    assert "files = (calendar, instruments, cn_instruments, feature)" in overlay
+
+    release_source = (
+        root / "src" / "quant_platform" / "release_upgrade.py"
+    ).read_text(encoding="utf-8")
+    assert "D.instruments('cn_all')" in release_source
+    assert "@control_plane_locked\ndef prepare_drill_sandbox_bootstrap" in release_source
+    assert 'context.docker("image", "rm", "-f", *host_published_tags, check=False)' in (
+        release_source
+    )
+
+
+def test_release_upgrade_drill_uses_only_unique_candidate_image_aliases(
+    tmp_path: Path,
+) -> None:
+    module = _load_release_upgrade_drill_module()
+    override = tmp_path / "candidate-runtime.compose.json"
+
+    images = module._write_candidate_runtime_override(override, "deadbeef")
+    payload = json.loads(override.read_text(encoding="utf-8"))
+    services = payload["services"]
+
+    assert set(services) == set(BUILT_APPLICATION_SERVICES) | {
+        "factor-sandbox-builder"
+    }
+    assert len(images) == len(BUILT_APPLICATION_SERVICES)
+    assert all(image.endswith(":deadbeef") for image in images)
+    assert all(image.startswith("quantlab-upgrade-drill-") for image in images)
+    assert all(
+        services[service]["image"] in images
+        for service in BUILT_APPLICATION_SERVICES
+    )
+    assert services["factor-sandbox-builder"]["environment"][
+        "FACTOR_SANDBOX_BASE_IMAGE"
+    ] == services["worker"]["image"]
+    assert not any(
+        image.startswith("quantlab-platform-")
+        or image in {"quantlab-worker-runtime:v2", "quantlab-rdagent-runtime:v2"}
+        for image in images
+    )
+
+
+def test_release_upgrade_drill_seals_sandboxes_before_full_worker_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple] = []
+
+    class Context:
+        def run(self, *arguments: str) -> None:
+            calls.append(("compose", *arguments))
+
+    def prepare(context, project_root, release_id, *, wait_timeout):
+        calls.append(
+            (
+                "seal",
+                context,
+                project_root,
+                release_id,
+                wait_timeout,
+            )
+        )
+        return {"MODEL_SANDBOX_IMAGE": "registry/model@sha256:" + "a" * 64}
+
+    monkeypatch.setattr(release_upgrade, "_prepare_sandbox_images", prepare)
+    context = Context()
+
+    result = release_upgrade.prepare_drill_sandbox_bootstrap(
+        context,  # type: ignore[arg-type]
+        tmp_path,
+        "20260829T120000Z",
+        wait_timeout=240,
+    )
+
+    assert calls == [
+        (
+            "compose",
+            "up",
+            "-d",
+            "--no-build",
+            "--wait",
+            "--wait-timeout",
+            "240",
+            "rdagent-docker",
+        ),
+        (
+            "seal",
+            context,
+            tmp_path,
+            "drill-bootstrap-20260829T120000Z",
+            240,
+        ),
+    ]
+    assert result["MODEL_SANDBOX_IMAGE"].startswith("registry/model@sha256:")
 
 
 def test_deployment_docs_require_mixed_release_convergence_before_upgrade() -> None:

@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import secrets
+import socket
 import tempfile
 import urllib.request
 from contextlib import nullcontext
@@ -23,10 +24,13 @@ from quant_platform.backup_restore import (
     load_and_verify_manifest,
     restore_backup,
 )
+from quant_platform.control_plane_lock import control_plane_locked
 from quant_platform.deployment_services import (
     CORE_RUNTIME_SERVICES,
     NON_HEALTHCHECK_SERVICES,
 )
+from quant_platform.drill_isolation import isolated_drill_environment
+from quant_platform.release_upgrade import prepare_drill_sandbox_bootstrap
 from quant_platform.research_horizon import (
     LEGACY_AMBIGUOUS,
     research_horizon_contract,
@@ -51,11 +55,21 @@ def _timestamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _available_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
 def _write_env(
     path: Path,
+    *,
     password: str,
     secret_key: str,
     data_host_path: Path,
+    docker_host_path: Path,
+    registry_host_path: Path,
+    registry_port: int,
 ) -> None:
     path.write_text(
         "\n".join(
@@ -69,10 +83,18 @@ def _write_env(
                 "AUTH_COOKIE_SECURE=false",
                 f"PLATFORM_SECRET_KEY={secret_key}",
                 "BROKER_MODE=disabled",
+                # Readiness requires an LLM credential.  The closed loopback
+                # base keeps this destructive-path drill hermetic even if a
+                # worker were to claim an unexpected research job.
+                "OPENAI_API_KEY=restore-drill-not-a-real-credential",
+                "OPENAI_API_BASE=http://127.0.0.1:9",
                 "RDAGENT_ENABLED=true",
                 "REQUESTS_PER_MINUTE=118",
                 "DOWNLOAD_WORKERS=2",
                 f"QUANTLAB_DATA_HOST_PATH={data_host_path.resolve()}",
+                f"RDAGENT_DOCKER_HOST_PATH={docker_host_path.resolve()}",
+                f"RDAGENT_REGISTRY_HOST_PATH={registry_host_path.resolve()}",
+                f"RDAGENT_REGISTRY_PORT={registry_port}",
             )
         )
         + "\n",
@@ -115,6 +137,79 @@ def _gateway_url(context: ComposeContext) -> str:
     return f"http://127.0.0.1:{port}/"
 
 
+def _candidate_migration_head(context: ComposeContext) -> str:
+    """Read the migration head from the exact candidate image under test.
+
+    Restore drills intentionally run from a small host operations environment.
+    Keeping Alembic resolution inside the freshly built API image avoids a second,
+    independently versioned migration runtime on the host.
+    """
+
+    return context.run(
+        "run",
+        "--rm",
+        "--no-deps",
+        "api",
+        "python",
+        "-c",
+        (
+            "from alembic.config import Config; "
+            "from alembic.script import ScriptDirectory; "
+            "heads=ScriptDirectory.from_config(Config('/app/alembic.ini')).get_heads(); "
+            "assert len(heads)==1, f'expected one migration head, found {heads}'; "
+            "print(heads[0])"
+        ),
+        capture=True,
+    ).splitlines()[-1]
+
+
+def _write_candidate_runtime_override(path: Path, image: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "services": {
+                    # The API owns schema migration.  The scheduler uses the same
+                    # application image, so both services exercise this checkout
+                    # instead of a mutable host ``latest`` alias.
+                    "api": {"image": image},
+                    "scheduler": {"image": image},
+                }
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _database_revision(context: ComposeContext) -> str:
+    return context.run(
+        "exec",
+        "-T",
+        "postgres",
+        "psql",
+        "-U",
+        "quantlab",
+        "-d",
+        "quantlab",
+        "-Atc",
+        "SELECT version_num FROM quantlab.alembic_version;",
+        capture=True,
+    ).strip()
+
+
+def _assert_current_schema(context: ComposeContext, expected_revision: str) -> None:
+    actual_revision = _database_revision(context)
+    if actual_revision != expected_revision:
+        raise RuntimeError(
+            "restore-drill candidate image did not migrate the source database to "
+            f"the checkout head: expected {expected_revision}, got "
+            f"{actual_revision or 'missing'}"
+        )
+
+
+@control_plane_locked
+@isolated_drill_environment
 def run_drill(
     project_root: Path,
     report_path: Path,
@@ -128,6 +223,8 @@ def run_drill(
     suffix = secrets.token_hex(4)
     source_name = f"quantlab-drill-source-{suffix}"
     target_name = f"quantlab-drill-target-{suffix}"
+    candidate_runtime_image = f"quantlab-restore-drill-api:{suffix}"
+    expected_schema_revision: str | None = None
     sentinel = secrets.token_hex(16)
     target_data_sentinel = secrets.token_hex(16)
     source_data_manifest = json.dumps(
@@ -143,6 +240,8 @@ def run_drill(
         "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "source_project": source_name,
         "target_project": target_name,
+        "candidate_runtime_image": candidate_runtime_image,
+        "expected_schema_revision": expected_schema_revision,
         "backup_format_version": format_version,
         "live_trading_supported": False,
         "checks": {},
@@ -152,8 +251,6 @@ def run_drill(
     temporary_manager: tempfile.TemporaryDirectory[str] | None = None
     try:
         for image in (
-            "quantlab-platform-api:latest",
-            "quantlab-platform-scheduler:latest",
             "quantlab-worker-runtime:v2",
             "quantlab-rdagent-runtime:v2",
             "quantlab-platform-web:latest",
@@ -169,11 +266,27 @@ def run_drill(
             scratch = Path(temporary)
             source_env = scratch / "source.env"
             target_env = scratch / "target.env"
+            candidate_override = scratch / "candidate-runtime.compose.json"
             backup_root = scratch / "backups"
             source_data = scratch / "source-data"
             target_data = scratch / "target-data"
-            source_data.mkdir()
-            target_data.mkdir()
+            source_docker = scratch / "source-rdagent-docker"
+            target_docker = scratch / "target-rdagent-docker"
+            source_registry = scratch / "source-rdagent-registry"
+            target_registry = scratch / "target-rdagent-registry"
+            for directory in (
+                source_data,
+                target_data,
+                source_docker,
+                target_docker,
+                source_registry,
+                target_registry,
+            ):
+                directory.mkdir()
+            source_registry_port = _available_loopback_port()
+            target_registry_port = _available_loopback_port()
+            while source_registry_port == target_registry_port:
+                target_registry_port = _available_loopback_port()
             password = secrets.token_urlsafe(32)
             secret_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
             runtime_secret_ciphertext = (
@@ -181,10 +294,48 @@ def run_drill(
                 .encrypt(json.dumps({"sentinel": sentinel}, separators=(",", ":")).encode("utf-8"))
                 .decode("ascii")
             )
-            _write_env(source_env, password, secret_key, source_data)
-            _write_env(target_env, password, secret_key, target_data)
-            source = compose_context(source_name, source_env, compose_file, (override_file,))
-            target = compose_context(target_name, target_env, compose_file, (override_file,))
+            _write_env(
+                source_env,
+                password=password,
+                secret_key=secret_key,
+                data_host_path=source_data,
+                docker_host_path=source_docker,
+                registry_host_path=source_registry,
+                registry_port=source_registry_port,
+            )
+            _write_env(
+                target_env,
+                password=password,
+                secret_key=secret_key,
+                data_host_path=target_data,
+                docker_host_path=target_docker,
+                registry_host_path=target_registry,
+                registry_port=target_registry_port,
+            )
+            result["checks"]["sandbox_isolation"] = {
+                "status": "passed",
+                "source_and_target_data_distinct": source_data != target_data,
+                "source_and_target_docker_distinct": source_docker != target_docker,
+                "source_and_target_registry_distinct": source_registry != target_registry,
+                "source_and_target_registry_ports_distinct": (
+                    source_registry_port != target_registry_port
+                ),
+                "registry_bind_address": "127.0.0.1",
+            }
+            _write_candidate_runtime_override(
+                candidate_override,
+                candidate_runtime_image,
+            )
+            compose_overrides = (override_file, candidate_override)
+            source = compose_context(source_name, source_env, compose_file, compose_overrides)
+            target = compose_context(target_name, target_env, compose_file, compose_overrides)
+
+            # Build the schema-owning runtime from the exact checkout under test.
+            # A unique tag avoids mutating the production ``latest`` alias and is
+            # shared by the source and restored target projects.
+            source.run("build", "api")
+            expected_schema_revision = _candidate_migration_head(source)
+            result["expected_schema_revision"] = expected_schema_revision
 
             source.run(
                 "up",
@@ -196,6 +347,12 @@ def run_drill(
                 "postgres",
                 "api",
             )
+            _assert_current_schema(source, expected_schema_revision)
+            result["checks"]["candidate_runtime"] = {
+                "status": "passed",
+                "image": candidate_runtime_image,
+                "schema_revision": expected_schema_revision,
+            }
             source.run(
                 "exec",
                 "-T",
@@ -368,6 +525,10 @@ def run_drill(
                 format_version=format_version,
             )
             manifest = load_and_verify_manifest(backup_directory)
+            if manifest["schema_revision"] != expected_schema_revision:
+                raise RuntimeError(
+                    "restore drill backup schema does not match the checkout head"
+                )
             backup_manifest_check: dict[str, Any] = {
                 "status": "passed",
                 "format_version": manifest["format_version"],
@@ -429,6 +590,10 @@ def run_drill(
                 ),
             )
             restored_revision = restore_backup(target, backup_directory, confirmed=True)
+            if restored_revision != expected_schema_revision:
+                raise RuntimeError(
+                    "restored schema does not match the checkout migration head"
+                )
             database_sentinel = target.run(
                 "exec",
                 "-T",
@@ -563,8 +728,11 @@ def run_drill(
                 "-Atc",
                 (
                     "SELECT p.name || '|' || long_leg.quantity || '|' || "
-                    "short_leg.quantity || '|' || n.status || '|' || e.reason "
+                    "short_leg.quantity || '|' || b.status || '|' || "
+                    "(n.nav = 5000010)::text || '|' || n.status || '|' || "
+                    "n.performance_certified::text || '|' || e.reason "
                     "FROM quantlab.simulation_portfolios p "
+                    "JOIN quantlab.simulation_batches b ON b.portfolio_id=p.id "
                     "JOIN quantlab.simulation_positions long_leg "
                     "ON long_leg.portfolio_id=p.id AND long_leg.position_side='long' "
                     "JOIN quantlab.simulation_positions short_leg "
@@ -576,7 +744,8 @@ def run_drill(
                 capture=True,
             ).strip()
             expected_simulation_ledger = (
-                f"Restore simulation ledger {sentinel}|1000|800|healthy|"
+                f"Restore simulation ledger {sentinel}|1000|800|succeeded|"
+                "true|healthy|true|"
                 "simulation_ledger_restore"
             )
             if simulation_ledger_sentinel != expected_simulation_ledger:
@@ -680,6 +849,15 @@ def run_drill(
                 "runtime_secret_sentinel": "matched",
             }
 
+            # A blank target DinD has no predecessor from which to inherit the
+            # immutable sandbox digests.  Use the same governed sealing path as
+            # a release before starting any evaluation or RD-Agent worker.
+            result["checks"]["sandbox_bootstrap"] = prepare_drill_sandbox_bootstrap(
+                target,
+                project_root,
+                suffix,
+                wait_timeout=240,
+            )
             services = _assert_full_stack(target)
             api_health = json.loads(
                 target.run(
@@ -725,6 +903,14 @@ def run_drill(
         for context in (target, source):
             if context is not None:
                 context.run("down", "-v", "--remove-orphans", check=False, timeout=120)
+        ComposeContext("image-cleanup", Path(), ()).docker(
+            "image",
+            "rm",
+            "-f",
+            candidate_runtime_image,
+            check=False,
+            timeout=120,
+        )
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(
             json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

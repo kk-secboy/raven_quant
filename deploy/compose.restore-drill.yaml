@@ -24,6 +24,7 @@ services:
         root = Path("/data/qlib/restore-drill-v1")
         calendar = root / "calendars/day.txt"
         instruments = root / "instruments/all.txt"
+        cn_instruments = root / "instruments/cn_all.txt"
         feature = root / "features/sh600000/close.day.bin"
         calendar.parent.mkdir(parents=True, exist_ok=True)
         instruments.parent.mkdir(parents=True, exist_ok=True)
@@ -33,8 +34,12 @@ services:
             "SH600000\t2020-01-02\t2020-01-03\n",
             encoding="utf-8",
         )
+        cn_instruments.write_text(
+            "SH600000\t2020-01-02\t2020-01-03\n",
+            encoding="utf-8",
+        )
         feature.write_bytes(struct.pack("<fff", 0.0, 10.0, 10.25))
-        files = (calendar, instruments, feature)
+        files = (calendar, instruments, cn_instruments, feature)
         manifest = {
             "contract_version": "restore-drill-qlib-provider-v1",
             "purpose": "isolated_release_and_restore_acceptance_only",

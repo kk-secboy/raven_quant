@@ -7,8 +7,8 @@ read paths, reconciliation/replay and the recovery flow keep working.
 State lives in the ``platform_safe_mode_state`` singleton row (migration
 0047). Activation may be automatic (ledger conservation failure, data
 quality gate failure, persistent degraded/uncertified NAV) or manual;
-clearing is always manual and requires an actor and a meaningful reason,
-optionally gated on a passing operational health check.
+clearing is always manual and requires an actor, a meaningful reason and a
+passing operational health check backed by fresh evidence.
 
 Activation is idempotent: while safe mode is already active, repeated
 triggers return the current state without writing duplicate alerts.
@@ -159,7 +159,7 @@ class SafeModeStore:
         *,
         actor: str,
         reason: str,
-        require_health_ok: bool = False,
+        require_health_ok: bool = True,
         health_status: str | None = None,
     ) -> dict[str, Any]:
         """Clear safe mode; always a deliberate manual action."""
@@ -168,7 +168,9 @@ class SafeModeStore:
             raise ValueError("safe-mode release requires a responsible actor")
         if len(reason.strip()) < 10:
             raise ValueError("safe-mode release requires a meaningful reason")
-        if require_health_ok and health_status != "ok":
+        if not require_health_ok:
+            raise ValueError("safe-mode recovery health check cannot be bypassed")
+        if health_status != "ok":
             raise ValueError(
                 "safe-mode release requires a passing operational health check "
                 f"(latest status: {health_status or 'missing'})"

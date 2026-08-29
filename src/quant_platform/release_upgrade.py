@@ -872,6 +872,15 @@ def _prepare_sandbox_images(
     host_qlib_repository = f"{host_registry}/quantlab/qlib-sandbox"
     host_data_science_repository = f"{host_registry}/quantlab/data-science-sandbox"
     host_model_repository = f"{host_registry}/quantlab/model-sandbox"
+    host_qlib_tag = f"{host_qlib_repository}:{release_tag}"
+    host_data_science_tag = f"{host_data_science_repository}:{release_tag}"
+    host_model_tag = f"{host_model_repository}:{release_tag}"
+    host_published_tags = (
+        host_base_tag,
+        host_qlib_tag,
+        host_data_science_tag,
+        host_model_tag,
+    )
     dind_base_repository = f"{dind_registry}/quantlab/worker-sandbox-base"
     dind_qlib_repository = f"{dind_registry}/quantlab/qlib-sandbox"
     dind_data_science_repository = f"{dind_registry}/quantlab/data-science-sandbox"
@@ -924,7 +933,7 @@ def _prepare_sandbox_images(
         qlib_image = _build_and_publish_host_image(
             context,
             context_root=project_root.resolve() / "deploy" / "qlib-sandbox",
-            host_image_tag=f"{host_qlib_repository}:{release_tag}",
+            host_image_tag=host_qlib_tag,
             host_repository=host_qlib_repository,
             dind_repository=dind_qlib_repository,
             timeout=image_timeout,
@@ -933,7 +942,7 @@ def _prepare_sandbox_images(
         data_science_image = _build_and_publish_host_image(
             context,
             context_root=project_root.resolve() / "deploy" / "data-science-sandbox",
-            host_image_tag=f"{host_data_science_repository}:{release_tag}",
+            host_image_tag=host_data_science_tag,
             host_repository=host_data_science_repository,
             dind_repository=dind_data_science_repository,
             timeout=image_timeout,
@@ -942,7 +951,7 @@ def _prepare_sandbox_images(
         model_image = _build_and_publish_host_image(
             context,
             context_root=project_root.resolve() / "deploy" / "model-sandbox",
-            host_image_tag=f"{host_model_repository}:{release_tag}",
+            host_image_tag=host_model_tag,
             host_repository=host_model_repository,
             dind_repository=dind_model_repository,
             timeout=image_timeout,
@@ -977,7 +986,7 @@ def _prepare_sandbox_images(
                         "qlib.init(provider_uri='/qlib'); "
                         "from qlib.data import D; calendar=D.calendar(freq='day'); "
                         "assert len(calendar) > 1; "
-                        "features=D.features(D.instruments('all'), ['$close'], "
+                        "features=D.features(D.instruments('cn_all'), ['$close'], "
                         "start_time=calendar[-2], end_time=calendar[-1], freq='day'); "
                         "assert not features.empty",
                     ),
@@ -1048,6 +1057,46 @@ def _prepare_sandbox_images(
             "rdagent-registry",
             check=False,
         )
+        # Runtime jobs use the independently pulled digest inside DinD.  The
+        # loopback publishing tags are no longer executable dependencies once
+        # sealing finishes; keeping them would pin one large host image set per
+        # drill/release after its temporary registry is gone.
+        context.docker("image", "rm", "-f", *host_published_tags, check=False)
+
+
+@control_plane_locked
+def prepare_drill_sandbox_bootstrap(
+    context: ComposeContext,
+    project_root: Path,
+    release_id: str,
+    *,
+    wait_timeout: int,
+) -> dict[str, Any]:
+    """Give a blank upgrade drill the same sealed sandbox contract as production.
+
+    An ordinary release inherits digest-pinned sandboxes from its predecessor.
+    A scratch drill has no predecessor, while the evaluation worker correctly
+    refuses to become healthy without a preloaded model sandbox.  Start only the
+    isolated DinD (and its drill-data seed dependency), then run the governed
+    production sealing path before any worker starts.  No health or worker queue
+    contract is relaxed.
+    """
+
+    context.run(
+        "up",
+        "-d",
+        "--no-build",
+        "--wait",
+        "--wait-timeout",
+        str(wait_timeout),
+        "rdagent-docker",
+    )
+    return _prepare_sandbox_images(
+        context,
+        project_root,
+        f"drill-bootstrap-{release_id}",
+        wait_timeout=wait_timeout,
+    )
 
 
 def _existing_storage_anchor(path: Path) -> Path:
@@ -1141,6 +1190,7 @@ def _capture_rollback_images(
     *,
     services: tuple[str, ...] = BUILT_SERVICES,
     allow_missing: frozenset[str] = frozenset(),
+    repository: str = "quantlab-rollback",
 ) -> dict[str, str]:
     tags: dict[str, str] = {}
     for service in services:
@@ -1158,7 +1208,7 @@ def _capture_rollback_images(
         ).splitlines()[0]
         if not image_id.startswith("sha256:"):
             raise RuntimeError(f"cannot resolve rollback image for {service}")
-        tag = f"quantlab-rollback:{release_id.lower()}-{service}"
+        tag = f"{repository}:{release_id.lower()}-{service}"
         context.docker("tag", image_id, tag)
         tags[service] = tag
     return tags
@@ -1745,6 +1795,8 @@ def run_release_upgrade(
     wait_timeout: int = 300,
     pull_images: bool = False,
     rollback_image_retention: int = 3,
+    rollback_tag_repository: str = "quantlab-rollback",
+    prune_rollback_images: bool = True,
     reuse_backup: Path | None = None,
     stable_release_link: Path | None = None,
 ) -> dict[str, Any]:
@@ -1756,6 +1808,8 @@ def run_release_upgrade(
         raise ValueError("wait_timeout must be at least 30 seconds")
     if rollback_image_retention < 1:
         raise ValueError("rollback_image_retention must be positive")
+    if not re.fullmatch(r"[a-z0-9]+(?:[._/-][a-z0-9]+)*", rollback_tag_repository):
+        raise ValueError("rollback_tag_repository must be a lowercase Docker repository")
 
     release_id = _stamp()
     result: dict[str, Any] = {
@@ -1862,6 +1916,7 @@ def run_release_upgrade(
                 sorted(LEGACY_EXPECTED_SERVICES.union(built_services))
             ),
             allow_missing=frozenset(INTRODUCED_SERVICES),
+            repository=rollback_tag_repository,
         )
         introduced_services = set(built_services) & INTRODUCED_SERVICES
         rollback_disabled_services = frozenset(
@@ -2105,14 +2160,17 @@ def run_release_upgrade(
             )
 
         result["status"] = "succeeded"
-        try:
-            result["pruned_rollback_images"] = _prune_rollback_images(
-                context,
-                rollback_image_retention,
-            )
-        except Exception as exc:  # cleanup must never roll back an accepted release
+        if prune_rollback_images:
+            try:
+                result["pruned_rollback_images"] = _prune_rollback_images(
+                    context,
+                    rollback_image_retention,
+                )
+            except Exception as exc:  # cleanup must never roll back an accepted release
+                result["pruned_rollback_images"] = []
+                result["cleanup_warning"] = f"{type(exc).__name__}: {exc}"
+        else:
             result["pruned_rollback_images"] = []
-            result["cleanup_warning"] = f"{type(exc).__name__}: {exc}"
         result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")
         return result
     except Exception as exc:

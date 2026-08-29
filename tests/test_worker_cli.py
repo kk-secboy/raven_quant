@@ -21,7 +21,11 @@ from quant_platform.worker import (
     _indexed_independent_evaluations,
     _requires_transformer_exclusive_lane,
 )
-from quant_platform.worker_cli import _PeriodicProbeCache, status_server
+from quant_platform.worker_cli import (
+    _PeriodicProbeCache,
+    _worker_capabilities,
+    status_server,
+)
 
 pytestmark = pytest.mark.no_database
 
@@ -315,6 +319,39 @@ def test_health_fails_when_queue_consumer_thread_is_dead() -> None:
         assert status == 200
         assert body["worker"] == "ready"
         assert body["consumer"] == {"running": True}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_model_evaluation_health_requires_a_sealed_sandbox_image() -> None:
+    capabilities = _worker_capabilities(
+        SimpleNamespace(
+            worker_job_kinds=("model_evaluate", "quant_bundle_evaluate"),
+            model_sandbox_image="",
+        )
+    )
+    server = status_server(
+        {"qlib": {"status": "ok", "ready": True}},
+        required_runtime="qlib",
+        capabilities=capabilities,
+        consumer_running=lambda: True,
+        port=0,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _request(server, "/health")
+        assert status == 503
+        assert body["runtime"] == {"status": "ok", "ready": True}
+        assert body["consumer"] == {"running": True}
+        assert body["capabilities"] == {
+            "job_kinds": ["model_evaluate", "quant_bundle_evaluate"],
+            "model_sandbox_required": True,
+            "model_sandbox_ready": False,
+            "model_sandbox_error": "immutable image digest is not configured",
+        }
     finally:
         server.shutdown()
         server.server_close()

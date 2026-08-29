@@ -250,6 +250,7 @@ def test_health_rejects_timezone_aware_qlib_calendar_timestamp(
 def test_safe_mode_recovery_health_ignores_only_safe_mode_component() -> None:
     healthy_except_safe_mode = {
         "status": "degraded",
+        "recorded_at": "2026-08-29T12:00:01+00:00",
         "components": {
             "postgresql": {"status": "ok"},
             "safe_mode": {"status": "degraded"},
@@ -257,6 +258,20 @@ def test_safe_mode_recovery_health_ignores_only_safe_mode_component() -> None:
         },
     }
     assert safe_mode_recovery_health_status(healthy_except_safe_mode) == "ok"
+    assert (
+        safe_mode_recovery_health_status(
+            healthy_except_safe_mode,
+            triggered_at="2026-08-29T12:00:00+00:00",
+        )
+        == "ok"
+    )
+    assert (
+        safe_mode_recovery_health_status(
+            healthy_except_safe_mode,
+            triggered_at="2026-08-29T12:00:01+00:00",
+        )
+        == "degraded"
+    )
 
     unhealthy_worker = {
         **healthy_except_safe_mode,
@@ -283,7 +298,9 @@ def test_safe_mode_release_accepts_health_degraded_only_by_safe_mode(
         source="data_quality_gate",
         actor="system",
     )
-    snapshot = OperationalHealthStore(settings).collect_and_record(now)
+    snapshot = OperationalHealthStore(settings).collect_and_record(
+        datetime.now(UTC) + timedelta(seconds=1)
+    )
     assert snapshot["status"] == "degraded"
     assert snapshot["components"]["safe_mode"]["status"] == "degraded"
     assert safe_mode_recovery_health_status(snapshot) == "ok"
@@ -296,14 +313,27 @@ def test_safe_mode_release_accepts_health_degraded_only_by_safe_mode(
     monkeypatch.setenv("PLATFORM_SECRET_KEY", key)
     monkeypatch.setenv("TUSHARE_API_URL", "https://api.tushare.pro")
     monkeypatch.setenv("TUSHARE_TOKEN", "test-token")
+    monkeypatch.setattr(
+        DeploymentReadinessStore,
+        "business_loop_readiness",
+        lambda _self: {"status": "ok", "checks": {}, "blockers": []},
+    )
     app = create_app(tmp_path)
     with TestClient(app) as client:
+        bypass = client.post(
+            "/api/platform/safe-mode/release",
+            json={
+                "actor": "recovery-operator",
+                "reason": "attempted recovery without the mandatory health gate",
+                "require_health_ok": False,
+            },
+        )
+        assert bypass.status_code == 422
         response = client.post(
             "/api/platform/safe-mode/release",
             json={
                 "actor": "recovery-operator",
                 "reason": "data quality gate passed and publication was verified",
-                "require_health_ok": True,
             },
         )
     assert response.status_code == 200
