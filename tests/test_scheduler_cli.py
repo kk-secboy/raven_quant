@@ -74,3 +74,44 @@ def test_scheduler_status_server_returns_503_after_tick_failure() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+@pytest.mark.no_database
+def test_scheduler_health_keeps_a_long_active_tick_ready() -> None:
+    now = datetime(2026, 8, 29, 2, 0, tzinfo=UTC)
+    status_code, body = scheduler_health(
+        {
+            "last_tick": (now - timedelta(seconds=90)).isoformat(),
+            "tick_in_progress": True,
+            "tick_started_at": (now - timedelta(seconds=75)).isoformat(),
+            "last_error": None,
+            "stats": {},
+        },
+        now=now,
+        stale_after_seconds=30,
+    )
+
+    assert status_code == 200
+    assert body["ready"] is True
+    assert body["message"] == "scheduler tick is in progress"
+    assert body["freshness_source"] == "active_tick"
+    assert body["age_seconds"] == 75
+
+
+@pytest.mark.no_database
+def test_scheduler_health_does_not_claim_readiness_before_first_tick() -> None:
+    now = datetime(2026, 8, 29, 2, 0, tzinfo=UTC)
+    status_code, body = scheduler_health(
+        {
+            "last_tick": None,
+            "tick_in_progress": True,
+            "tick_started_at": (now - timedelta(seconds=45)).isoformat(),
+            "last_error": None,
+            "stats": {},
+        },
+        now=now,
+        stale_after_seconds=30,
+    )
+
+    assert status_code == 503
+    assert body["status"] == "starting"

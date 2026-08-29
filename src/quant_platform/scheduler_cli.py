@@ -27,13 +27,28 @@ def scheduler_health(
     current = now or datetime.now(UTC)
     last_error = state.get("last_error")
     last_tick_raw = state.get("last_tick")
+    tick_in_progress = state.get("tick_in_progress") is True
+    tick_started_at_raw = state.get("tick_started_at")
     status = "ok"
     message = "scheduler tick is current"
     age_seconds: float | None = None
+    freshness_source = "last_tick"
 
     if last_error is not None:
         status = "degraded"
         message = "scheduler tick failed"
+    elif tick_in_progress and last_tick_raw:
+        try:
+            tick_started_at = datetime.fromisoformat(str(tick_started_at_raw))
+            if tick_started_at.tzinfo is None:
+                raise ValueError("tick_started_at must be timezone-aware")
+            age_seconds = max(0.0, (current - tick_started_at).total_seconds())
+        except (TypeError, ValueError):
+            status = "degraded"
+            message = "scheduler active tick timestamp is invalid"
+        else:
+            message = "scheduler tick is in progress"
+            freshness_source = "active_tick"
     elif not last_tick_raw:
         status = "starting"
         message = "scheduler has not completed its first tick"
@@ -58,6 +73,7 @@ def scheduler_health(
         "message": message,
         "age_seconds": age_seconds,
         "stale_after_seconds": max(1, stale_after_seconds),
+        "freshness_source": freshness_source,
     }
     return (200 if status == "ok" else 503), body
 
@@ -99,6 +115,8 @@ def run() -> None:
     stopped = threading.Event()
     state: dict = {
         "last_tick": None,
+        "tick_in_progress": False,
+        "tick_started_at": None,
         "last_error": None,
         "stats": {},
         "poll_seconds": settings.scheduler_poll_seconds,
@@ -119,12 +137,16 @@ def run() -> None:
     server_thread.start()
     try:
         while not stopped.is_set():
+            state["tick_in_progress"] = True
+            state["tick_started_at"] = datetime.now(UTC).isoformat(timespec="seconds")
             try:
                 state["stats"] = engine.tick()
                 state["last_error"] = None
             except Exception as exc:
                 state["last_error"] = str(exc)
-            state["last_tick"] = datetime.now(UTC).isoformat(timespec="seconds")
+            finally:
+                state["last_tick"] = datetime.now(UTC).isoformat(timespec="seconds")
+                state["tick_in_progress"] = False
             stopped.wait(settings.scheduler_poll_seconds)
     finally:
         server.shutdown()

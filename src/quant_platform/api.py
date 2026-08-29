@@ -3144,10 +3144,11 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 if last_tick.tzinfo is None:
                     raise ValueError("scheduler last_tick must be timezone-aware")
                 scheduler_age = max(0.0, (datetime.now(UTC) - last_tick).total_seconds())
+                tick_in_progress = scheduler_body.get("tick_in_progress") is True
                 scheduler_ready = (
                     scheduler_response.status_code == 200
                     and scheduler_body.get("status") == "ok"
-                    and scheduler_age <= stale_after_seconds
+                    and (tick_in_progress or scheduler_age <= stale_after_seconds)
                 )
                 scheduler_check = {
                     "status": "ok" if scheduler_ready else "degraded",
@@ -3159,6 +3160,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "last_tick": last_tick_raw,
                     "age_seconds": scheduler_age,
                     "stale_after_seconds": stale_after_seconds,
+                    "tick_in_progress": tick_in_progress,
+                    "tick_started_at": scheduler_body.get("tick_started_at"),
+                    "freshness_source": scheduler_body.get("freshness_source"),
                 }
             except (requests.RequestException, TypeError, ValueError):
                 scheduler_check = {
