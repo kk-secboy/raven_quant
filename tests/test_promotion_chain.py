@@ -45,6 +45,7 @@ from quant_data.database import (
     strategy_promotion_stages,
     strategy_versions,
 )
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.promotion import (
     ForwardGateThresholds,
     PromotionStore,
@@ -85,6 +86,7 @@ def _governed_daily_dataset() -> dict:
     dataset["end_date"] = promotion_module._now().astimezone(SHANGHAI).date().isoformat()
     dataset["provenance"]["execution_controls"] = {
         "formal_execution_requires_native_controls": True,
+        "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
         "native_complete_from": "2008-01-01",
     }
     return dataset

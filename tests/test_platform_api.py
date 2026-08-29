@@ -11,6 +11,7 @@ from governance_fixtures import governed_etf_ready_evidence
 from quant_data.checkpoint import CheckpointStore
 from quant_data.config import Settings
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_data.models import FetchSpec
 from quant_data.qlib_builder import build_qlib_output_manifest
 from quant_platform.alert_store import AlertStore
@@ -463,6 +464,7 @@ def test_api_creates_bounded_rdagent_research_run(
                 "execution_controls": {
                     "native_complete_from": "2010-01-01",
                     "formal_execution_requires_native_controls": True,
+                    "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
                 },
             }
         ),

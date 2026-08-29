@@ -169,6 +169,13 @@ def build_governed_signal(
                 industry_design = pd.get_dummies(
                     assigned.astype(str), prefix="industry", drop_first=True, dtype=float
                 )
+        # It is valid for an early OOS session to have no securities that pass
+        # the point-in-time eligibility and metadata gates.  Pandas 2.3 rejects
+        # concatenating an empty Series with two empty, zero-column frames as a
+        # mixed-dimensional operation, so represent that session as NO_ACTION
+        # and continue to later dates instead of aborting the whole backtest.
+        if ranking.empty:
+            continue
         daily_styles = (
             _style_snapshot(styles, timestamp)
             .reindex(ranking.index)

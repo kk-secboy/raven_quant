@@ -1,22 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from governance_fixtures import governed_etf_ready_evidence
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select, update
+from sqlalchemy.exc import DBAPIError
 
 from quant_data.database import (
+    audit_events,
     backtest_runs,
     jobs,
     oos_vintages,
     open_database,
     strategy_versions,
+    transparent_baseline_pre_result_repairs,
 )
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.api import StrategyConfigRequest
 from quant_platform.promotion import PromotionStore
 from quant_platform.research_horizon import research_horizon_contract
@@ -39,6 +44,7 @@ from quant_platform.transparent_baseline_lockbox import (
     canonical_sha256,
     lockbox_member_link,
     validate_joint_lockbox,
+    validate_pre_result_repair_receipt,
 )
 from scripts.run_multifactor_backtest import _promotion_dataset_descriptors
 
@@ -164,6 +170,290 @@ def _plans(calendar: list[str]) -> tuple[list[dict], dict]:
     return plans, lockbox
 
 
+def _retarget_plans(
+    plans: list[dict],
+    *,
+    dataset: str,
+    identity: str,
+    lineage: str,
+    recipe_version: str,
+    change_economic_rule: bool = False,
+) -> tuple[list[dict], dict]:
+    result = deepcopy(plans)
+    for plan in result:
+        base = deepcopy(plan["base_config"])
+        base["recipe_version"] = recipe_version
+        if change_economic_rule:
+            base["topk"] = int(base["topk"]) + 1
+        bootstrap = base[BOOTSTRAP_CONFIG_KEY]
+        bootstrap.update(
+            {
+                "recipe_version": recipe_version,
+                "recipe_sha256": canonical_sha256(
+                    {
+                        "recipe_id": plan["recipe"]["id"],
+                        "recipe_version": recipe_version,
+                    }
+                ),
+                "dataset": dataset,
+                "dataset_identity_sha256": identity,
+                "dataset_lineage_id": lineage,
+            }
+        )
+        plan["base_config"] = _normalize_multifactor_contract(
+            base,
+            factor_count=0,
+            creating_family=True,
+        )
+        plan["lockbox_member"] = build_lockbox_member(
+            config=plan["base_config"],
+            formal_periods=plan["formal_periods"],
+        )
+    lockbox = build_joint_lockbox(
+        dataset=dataset,
+        dataset_identity_sha256=identity,
+        dataset_lineage_id=lineage,
+        members=[plan["lockbox_member"] for plan in result],
+    )
+    for plan in result:
+        plan["config"] = _normalize_multifactor_contract(
+            {**plan["base_config"], LOCKBOX_CONFIG_KEY: lockbox},
+            factor_count=0,
+            creating_family=True,
+        )
+    return result, lockbox
+
+
+def _repair_receipt_payload(members: list[dict], *, target_recipe_version: str) -> dict:
+    payload = {
+        "contract_version": "transparent-baseline-pre-result-repair-v1",
+        "source_release_commit": "e" * 40,
+        "target_recipe_version": target_recipe_version,
+        "target_eligibility_contract": "cn-stock-etf-point-in-time-eligibility-v3",
+        "target_stock_scope_contract": "cn-mainland-a-share-daily-scope-v1",
+        "reason_codes": [
+            "empty_eligible_session_pandas_concat_failure",
+            "pre_2023_bse_history_outside_governed_scope",
+        ],
+        "performance_information_used": False,
+        "members": members,
+    }
+    return {**payload, "receipt_sha256": canonical_sha256(payload)}
+
+
+def _prepare_repair_store_case(
+    database_url: str,
+    tmp_path: Path,
+    *,
+    receipt_after_result: bool = False,
+    change_economic_rule: bool = False,
+) -> tuple[
+    StrategyStore,
+    list[dict],
+    list[dict],
+    list[dict],
+    str,
+]:
+    calendar = _calendar()
+    current_plans, _ = _plans(calendar)
+    source_plans, source_lockbox = _retarget_plans(
+        current_plans,
+        dataset="source-daily",
+        identity="a" * 64,
+        lineage="b" * 64,
+        recipe_version="source-recipe-v6",
+    )
+    target_recipe_version = get_strategy_recipe("short_relative_strength")["version"]
+    target_plans, _ = _retarget_plans(
+        current_plans,
+        dataset="target-daily",
+        identity="d" * 64,
+        lineage="e" * 64,
+        recipe_version=target_recipe_version,
+        change_economic_rule=change_economic_rule,
+    )
+    store = StrategyStore(database_url)
+    families: dict[str, dict] = {}
+    source_versions: list[dict] = []
+    for plan in source_plans:
+        recipe = plan["recipe"]
+        family = store.create(
+            name=f"repair-store:{recipe['id']}",
+            description="Transparent baseline pre-result repair fixture.",
+            benchmark=recipe["benchmark"],
+            universe=recipe["universe"],
+            factors=[],
+            config=plan["config"],
+            actor="test",
+            economic_hypothesis_group=f"transparent-public-control:{recipe['id']}",
+        )
+        families[str(recipe["id"])] = family
+        source_versions.append(family["versions"][0])
+    TransparentBaselineLockboxStore(database_url).reserve(
+        versions=source_versions,
+        dataset="source-daily",
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+    )
+
+    engine = open_database(database_url)
+    errors = {
+        "swing_trend": (
+            "ValueError: cannot concatenate unaligned mixed dimensional NDFrame objects"
+        ),
+        "long_quality_value": (
+            "ValueError: formal execution starts before native price-limit controls "
+            "are complete (2022-12-31)"
+        ),
+    }
+    source_members: list[dict] = []
+    source_backtests: dict[str, dict] = {}
+    for index, (plan, version) in enumerate(
+        zip(source_plans, source_versions, strict=True),
+        start=1,
+    ):
+        recipe_id = str(plan["recipe"]["id"])
+        backtest = store.create_backtest(
+            version_id=str(version["id"]),
+            dataset="source-daily",
+            periods=plan["formal_periods"],
+            artifact_path=tmp_path / "backtests",
+            trading_dates=calendar,
+            dataset_lineage_id="b" * 64,
+            dataset_identity_sha256="a" * 64,
+        )
+        source_backtests[recipe_id] = backtest
+        artifact = Path(str(backtest["artifact_path"]))
+        artifact.mkdir(parents=True, exist_ok=True)
+        manifest = json.dumps(
+            {
+                "backtest_id": backtest["id"],
+                "strategy_version_id": version["id"],
+                "dataset": "source-daily",
+                "periods": plan["formal_periods"],
+                "config": version["config"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+        (artifact / "manifest.json").write_bytes(manifest)
+        job_id = f"{index + 6:x}" * 32
+        error = errors.get(recipe_id)
+        status = "running" if error is None else "failed"
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                insert(jobs).values(
+                    id=job_id,
+                    kind="strategy_backtest",
+                    idempotency_key=f"repair-source:{job_id}",
+                    status=status,
+                    payload_json={"backtest_id": backtest["id"]},
+                    progress_json=None,
+                    log_path=str(tmp_path / f"{job_id}.log"),
+                    exit_code=(1 if error else None),
+                    error=error,
+                    attempts=1,
+                    max_attempts=1,
+                    next_attempt_at=None,
+                    cancel_requested_at=None,
+                    created_at=now,
+                    started_at=now,
+                    finished_at=(now if error else None),
+                )
+            )
+        store.attach_job(str(backtest["id"]), job_id)
+        store.mark_backtest(str(backtest["id"]), status, error=error)
+        source_members.append(
+            {
+                "backtest_id": str(backtest["id"]),
+                "strategy_version_id": str(version["id"]),
+                "job_id": job_id,
+                "dataset": "source-daily",
+                "periods": dict(plan["formal_periods"]),
+                "status": status,
+                "job_status": status,
+                "error": error,
+                "metrics_absent": True,
+                "result_absent": True,
+                "files": [
+                    {
+                        "path": "manifest.json",
+                        "bytes": len(manifest),
+                        "sha256": hashlib.sha256(manifest).hexdigest(),
+                    }
+                ],
+            }
+        )
+
+    short = source_backtests["short_relative_strength"]
+    short_artifact = Path(str(short["artifact_path"]))
+    short_result = short_artifact / "reports" / "result.json"
+    short_job_id = next(
+        item["job_id"]
+        for item in source_members
+        if item["backtest_id"] == str(short["id"])
+    )
+
+    def finish_short() -> None:
+        short_result.parent.mkdir(parents=True, exist_ok=True)
+        short_result.write_text('{"metrics":{"return":1.0}}', encoding="utf-8")
+        store.mark_backtest(str(short["id"]), "succeeded", metrics={"return": 1.0})
+        with engine.begin() as connection:
+            connection.execute(
+                update(jobs)
+                .where(jobs.c.id == short_job_id)
+                .values(
+                    status="succeeded",
+                    exit_code=0,
+                    error=None,
+                    finished_at=datetime.now(UTC),
+                )
+            )
+
+    if receipt_after_result:
+        finish_short()
+    receipt = _repair_receipt_payload(
+        source_members,
+        target_recipe_version=target_recipe_version,
+    )
+    with engine.begin() as connection:
+        event_id = connection.execute(
+            insert(audit_events)
+            .values(
+                user_id=None,
+                username="system:test",
+                action="transparent_baseline_pre_result_repair_registered",
+                method="INTERNAL",
+                path="transparent-baseline/pre-result-repair",
+                status_code=201,
+                ip_hash=None,
+                user_agent="pytest",
+                details_json=receipt,
+                created_at=datetime.now(UTC),
+            )
+            .returning(audit_events.c.id)
+        ).scalar_one()
+    if not receipt_after_result:
+        finish_short()
+
+    target_versions: list[dict] = []
+    for plan in target_plans:
+        recipe_id = str(plan["recipe"]["id"])
+        target_versions.append(
+            store.create_version_if_absent(
+                str(families[recipe_id]["id"]),
+                benchmark=str(plan["recipe"]["benchmark"]),
+                universe=str(plan["recipe"]["universe"]),
+                factors=[],
+                config=plan["config"],
+                actor="test",
+            )
+        )
+    assert source_lockbox["batch_sha256"]
+    return store, target_plans, target_versions, source_members, str(event_id)
+
+
 @pytest.mark.no_database
 def test_joint_lockbox_requires_exact_three_members_and_detects_tampering() -> None:
     plans, lockbox = _plans(_calendar())
@@ -190,6 +480,98 @@ def test_joint_lockbox_requires_exact_three_members_and_detects_tampering() -> N
     changed_recipe[BOOTSTRAP_CONFIG_KEY]["recipe_sha256"] = "f" * 64
     with pytest.raises(ValueError, match="differs from its joint-lockbox member"):
         lockbox_member_link(changed_recipe)
+
+
+@pytest.mark.no_database
+def test_pre_result_repair_receipt_is_hashed_and_contains_no_performance_artifacts() -> None:
+    periods = {
+        "historical_start": "2008-01-02",
+        "historical_end": "2021-12-31",
+        "start": "2022-01-04",
+        "end": "2025-01-03",
+    }
+    members = [
+        {
+            "backtest_id": "1" * 32,
+            "strategy_version_id": "4" * 32,
+            "job_id": "7" * 32,
+            "dataset": "source-daily",
+            "periods": periods,
+            "status": "running",
+            "job_status": "running",
+            "error": None,
+            "metrics_absent": True,
+            "result_absent": True,
+            "files": [
+                {"path": "manifest.json", "bytes": 10, "sha256": "a" * 64},
+                {
+                    "path": "baseline/composite.parquet",
+                    "bytes": 20,
+                    "sha256": "b" * 64,
+                },
+            ],
+        },
+        {
+            "backtest_id": "2" * 32,
+            "strategy_version_id": "5" * 32,
+            "job_id": "8" * 32,
+            "dataset": "source-daily",
+            "periods": periods,
+            "status": "failed",
+            "job_status": "failed",
+            "error": (
+                "ValueError: cannot concatenate unaligned mixed dimensional "
+                "NDFrame objects"
+            ),
+            "metrics_absent": True,
+            "result_absent": True,
+            "files": [{"path": "manifest.json", "bytes": 11, "sha256": "c" * 64}],
+        },
+        {
+            "backtest_id": "3" * 32,
+            "strategy_version_id": "6" * 32,
+            "job_id": "9" * 32,
+            "dataset": "source-daily",
+            "periods": periods,
+            "status": "failed",
+            "job_status": "failed",
+            "error": (
+                "ValueError: formal execution starts before native price-limit "
+                "controls are complete (2022-12-31)"
+            ),
+            "metrics_absent": True,
+            "result_absent": True,
+            "files": [{"path": "manifest.json", "bytes": 12, "sha256": "d" * 64}],
+        },
+    ]
+    payload = {
+        "contract_version": "transparent-baseline-pre-result-repair-v1",
+        "source_release_commit": "e" * 40,
+        "target_recipe_version": get_strategy_recipe(
+            "short_relative_strength"
+        )["version"],
+        "target_eligibility_contract": "cn-stock-etf-point-in-time-eligibility-v3",
+        "target_stock_scope_contract": "cn-mainland-a-share-daily-scope-v1",
+        "reason_codes": [
+            "empty_eligible_session_pandas_concat_failure",
+            "pre_2023_bse_history_outside_governed_scope",
+        ],
+        "performance_information_used": False,
+        "members": members,
+    }
+    receipt = {**payload, "receipt_sha256": canonical_sha256(payload)}
+
+    assert validate_pre_result_repair_receipt(receipt)["members"] == members
+
+    result_tamper = deepcopy(receipt)
+    result_tamper["members"][0]["files"].append(
+        {"path": "daily_returns.parquet", "bytes": 1, "sha256": "f" * 64}
+    )
+    result_payload = dict(result_tamper)
+    result_payload.pop("receipt_sha256")
+    result_tamper["receipt_sha256"] = canonical_sha256(result_payload)
+    with pytest.raises(ValueError, match="result artifact"):
+        validate_pre_result_repair_receipt(result_tamper)
 
 
 @pytest.mark.no_database
@@ -542,6 +924,251 @@ def test_joint_lockbox_allows_only_its_three_overlapping_one_shot_vintages(
         )
 
 
+def test_new_lineage_cannot_reopen_overlapping_baseline_oos_without_repair_receipt(
+    database_url: str,
+) -> None:
+    calendar = _calendar()
+    source_plans, _ = _plans(calendar)
+    store = StrategyStore(database_url)
+    families: dict[str, dict] = {}
+    source_versions = []
+    for plan in source_plans:
+        recipe_id = str(plan["recipe"]["id"])
+        family = store.create(
+            name=f"lockbox-lineage-guard:{recipe_id}",
+            description="Source transparent baseline lockbox.",
+            benchmark=str(plan["recipe"]["benchmark"]),
+            universe=str(plan["recipe"]["universe"]),
+            factors=[],
+            config=plan["config"],
+            actor="test",
+        )
+        families[recipe_id] = family
+        source_versions.append(family["versions"][0])
+    TransparentBaselineLockboxStore(database_url).reserve(
+        versions=source_versions,
+        dataset="daily-ready",
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+    )
+
+    target_plans = deepcopy(source_plans)
+    for plan in target_plans:
+        base = deepcopy(plan["base_config"])
+        base["recipe_version"] = "test-target-recipe"
+        bootstrap = base[BOOTSTRAP_CONFIG_KEY]
+        bootstrap.update(
+            {
+                "recipe_version": "test-target-recipe",
+                "recipe_sha256": "c" * 64,
+                "dataset": "daily-repaired",
+                "dataset_identity_sha256": "d" * 64,
+                "dataset_lineage_id": "e" * 64,
+            }
+        )
+        plan["base_config"] = _normalize_multifactor_contract(
+            base,
+            factor_count=0,
+            creating_family=True,
+        )
+        plan["lockbox_member"] = build_lockbox_member(
+            config=plan["base_config"],
+            formal_periods=plan["formal_periods"],
+        )
+    target_lockbox = build_joint_lockbox(
+        dataset="daily-repaired",
+        dataset_identity_sha256="d" * 64,
+        dataset_lineage_id="e" * 64,
+        members=[plan["lockbox_member"] for plan in target_plans],
+    )
+    target_versions = []
+    for plan in target_plans:
+        recipe_id = str(plan["recipe"]["id"])
+        config = _normalize_multifactor_contract(
+            {**plan["base_config"], LOCKBOX_CONFIG_KEY: target_lockbox},
+            factor_count=0,
+            creating_family=True,
+        )
+        created = store.create_version_if_absent(
+            str(families[recipe_id]["id"]),
+            benchmark=str(plan["recipe"]["benchmark"]),
+            universe=str(plan["recipe"]["universe"]),
+            factors=[],
+            config=config,
+            actor="test",
+        )
+        target_versions.append(created)
+
+    with pytest.raises(ValueError, match="exactly one valid pre-result repair receipt"):
+        TransparentBaselineLockboxStore(database_url).reserve(
+            versions=target_versions,
+            dataset="daily-repaired",
+            dataset_identity_sha256="d" * 64,
+            dataset_lineage_id="e" * 64,
+        )
+
+
+def test_preregistered_pre_result_repair_opens_one_append_only_target_batch(
+    database_url: str,
+    tmp_path: Path,
+) -> None:
+    store, target_plans, target_versions, source_members, event_id = (
+        _prepare_repair_store_case(database_url, tmp_path)
+    )
+    target_lockbox = validate_joint_lockbox(
+        target_versions[0]["config"][LOCKBOX_CONFIG_KEY]
+    )
+    lockboxes = TransparentBaselineLockboxStore(database_url)
+
+    reserved = lockboxes.reserve(
+        versions=target_versions,
+        dataset="target-daily",
+        dataset_identity_sha256="d" * 64,
+        dataset_lineage_id="e" * 64,
+    )
+    repeated = lockboxes.reserve(
+        versions=target_versions,
+        dataset="target-daily",
+        dataset_identity_sha256="d" * 64,
+        dataset_lineage_id="e" * 64,
+    )
+
+    assert reserved["batch_sha256"] == target_lockbox["batch_sha256"]
+    assert {item["status"] for item in reserved["members"]} == {"reserved"}
+    assert repeated["members"] == reserved["members"]
+    assert repeated["pre_result_repair"] == reserved["pre_result_repair"]
+    repair = reserved["pre_result_repair"]
+    assert repair["source_audit_event_id"] == int(event_id)
+    assert repair["source_backtest_ids"] == sorted(
+        item["backtest_id"] for item in source_members
+    )
+    assert len(repair["results_created_after_preregistration"]) == 1
+    assert repair["performance_information_used"] is False
+
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        registry_rows = connection.execute(
+            select(transparent_baseline_pre_result_repairs)
+        ).all()
+        vintages = connection.execute(select(oos_vintages)).all()
+    assert len(registry_rows) == 1
+    assert str(registry_rows[0].target_batch_sha256) == target_lockbox["batch_sha256"]
+    assert len(vintages) == 6
+    assert all(
+        row.consumed_at is not None
+        for row in vintages
+        if str(row.dataset_lineage_id) == "b" * 64
+    )
+    assert all(
+        row.consumed_at is None
+        for row in vintages
+        if str(row.dataset_lineage_id) == "e" * 64
+    )
+
+    with pytest.raises(DBAPIError, match="append-only"):
+        with engine.begin() as connection:
+            connection.execute(
+                update(transparent_baseline_pre_result_repairs).values(
+                    target_recipe_version="tampered"
+                )
+            )
+
+    # A third lineage would be a second look at the same OOS windows. Even a
+    # new immutable strategy version cannot turn the one repair into a retry
+    # loop, and no source/target vintage is rewritten to make room for it.
+    third_plans, _ = _retarget_plans(
+        target_plans,
+        dataset="third-daily",
+        identity="1" * 64,
+        lineage="2" * 64,
+        recipe_version=get_strategy_recipe("short_relative_strength")["version"],
+    )
+    third_versions = []
+    target_by_recipe = {
+        str(item["config"]["recipe_id"]): item for item in target_versions
+    }
+    for plan in third_plans:
+        recipe_id = str(plan["recipe"]["id"])
+        third_versions.append(
+            store.create_version_if_absent(
+                str(target_by_recipe[recipe_id]["strategy_id"]),
+                benchmark=str(plan["recipe"]["benchmark"]),
+                universe=str(plan["recipe"]["universe"]),
+                factors=[],
+                config=plan["config"],
+                actor="test",
+            )
+        )
+    with pytest.raises(ValueError, match="more than one prior batch"):
+        lockboxes.reserve(
+            versions=third_versions,
+            dataset="third-daily",
+            dataset_identity_sha256="1" * 64,
+            dataset_lineage_id="2" * 64,
+        )
+    with engine.connect() as connection:
+        assert connection.scalar(
+            select(func.count()).select_from(
+                transparent_baseline_pre_result_repairs
+            )
+        ) == 1
+        assert connection.scalar(select(func.count()).select_from(oos_vintages)) == 6
+
+
+def test_pre_result_repair_receipt_registered_after_result_is_rejected(
+    database_url: str,
+    tmp_path: Path,
+) -> None:
+    _, _, target_versions, _, _ = _prepare_repair_store_case(
+        database_url,
+        tmp_path,
+        receipt_after_result=True,
+    )
+
+    with pytest.raises(ValueError, match="exactly one valid pre-result repair receipt"):
+        TransparentBaselineLockboxStore(database_url).reserve(
+            versions=target_versions,
+            dataset="target-daily",
+            dataset_identity_sha256="d" * 64,
+            dataset_lineage_id="e" * 64,
+        )
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        assert connection.scalar(
+            select(func.count()).select_from(
+                transparent_baseline_pre_result_repairs
+            )
+        ) == 0
+        assert connection.scalar(select(func.count()).select_from(oos_vintages)) == 3
+
+
+def test_pre_result_repair_cannot_change_an_economic_rule(
+    database_url: str,
+    tmp_path: Path,
+) -> None:
+    _, _, target_versions, _, _ = _prepare_repair_store_case(
+        database_url,
+        tmp_path,
+        change_economic_rule=True,
+    )
+
+    with pytest.raises(ValueError, match="exactly one valid pre-result repair receipt"):
+        TransparentBaselineLockboxStore(database_url).reserve(
+            versions=target_versions,
+            dataset="target-daily",
+            dataset_identity_sha256="d" * 64,
+            dataset_lineage_id="e" * 64,
+        )
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        assert connection.scalar(
+            select(func.count()).select_from(
+                transparent_baseline_pre_result_repairs
+            )
+        ) == 0
+        assert connection.scalar(select(func.count()).select_from(oos_vintages)) == 3
+
+
 def test_three_daily_baseline_artifacts_load_and_attach_paper_simulations(
     database_url: str,
     tmp_path: Path,
@@ -587,6 +1214,7 @@ def test_three_daily_baseline_artifacts_load_and_attach_paper_simulations(
         "lineage_verified": True,
         "execution_controls": {
             "formal_execution_requires_native_controls": True,
+            "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
             "native_complete_from": "2008-01-01",
         },
     }

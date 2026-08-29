@@ -457,6 +457,10 @@ def test_final_out_of_sample_is_a_one_time_sealed_resource() -> None:
         "即使候选在打开前已经存在，只要未列入密封候选集合，"
         "也不能在看过结果后补入该集合或使用该 OOS 晋升",
         "只有首次打开前共同冻结且列入密封集合的候选，才可按预注册规则一起确认，不能看完后再挑赢家",
+        "旧 `oos_vintage_id` 仍保持已消费且绝不删除、回退或改写",
+        "才允许一次“非统计性前结果修复”",
+        "不能因改名、换数据目录或生成新 lineage 自动获得重跑资格",
+        "任何看过收益、净值、Sharpe、相对基准或其他绩效后提出的修复一律不得复用该窗口",
         "RD-Agent 研究环境在物理挂载和数据权限上都不能读取最终样本外区间；"
         "只有候选冻结后的独立正式任务可以读取",
         "打开结果后发生任何特征、标签、模型、参数、组合或选择规则修改，都必须形成新候选",
@@ -712,6 +716,19 @@ def test_alpha_cannot_override_hard_gates() -> None:
         "total_delta_path_utility",
     ):
         assert obsolete not in specification
+
+
+def test_governed_stock_history_excludes_unsupported_bse_and_b_shares() -> None:
+    specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
+
+    for required in (
+        "产品股票范围只包含受治理的境内 A 股和 ETF 白名单，不包含 B 股",
+        "Tushare 在 2023 年以前的北交所历史横截面和代码映射不完整",
+        "只有从 2023-01-01 起",
+        "更早的零散北交所行情只保留为原始审计数据",
+        "禁止补零、代码回填或冒充可投资历史",
+    ):
+        assert required in specification
 
 
 def test_insufficient_evidence_states_are_first_class() -> None:

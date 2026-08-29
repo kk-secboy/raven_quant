@@ -1293,6 +1293,36 @@ Index(
     strategy_versions.c.horizon_profile,
     strategy_versions.c.status,
 )
+
+# An exceptional transparent-baseline repair may reuse the same sealed
+# calendar window only when it was preregistered before any performance result
+# existed.  The source OOS rows stay consumed and immutable; this registry
+# binds the one allowed replacement lockbox to the original audit receipt.
+transparent_baseline_pre_result_repairs = Table(
+    "transparent_baseline_pre_result_repairs",
+    metadata,
+    Column("receipt_sha256", String, primary_key=True),
+    Column(
+        "source_audit_event_id",
+        BigInteger,
+        ForeignKey("quantlab.audit_events.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("source_batch_sha256", String, nullable=False, unique=True),
+    Column("target_batch_sha256", String, nullable=False, unique=True),
+    Column("source_dataset_lineage_id", String, nullable=False),
+    Column("target_dataset_lineage_id", String, nullable=False),
+    Column("target_recipe_version", String, nullable=False),
+    Column("source_backtest_ids_json", json_type, nullable=False),
+    Column("target_strategy_version_ids_json", json_type, nullable=False),
+    Column("verification_json", json_type, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)
+Index(
+    "idx_transparent_baseline_pre_result_repairs_created",
+    transparent_baseline_pre_result_repairs.c.created_at.desc(),
+)
 Index(
     "uq_strategy_versions_active_horizon",
     strategy_versions.c.horizon_profile,

@@ -5,6 +5,7 @@ import json
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from .history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from .universe import (
     GOVERNED_DAILY_ETF_WHITELIST,
     governed_daily_etf_whitelist_contract,
@@ -294,6 +295,11 @@ def require_daily_qlib_contract(provenance: dict[str, Any]) -> None:
         or etf_evidence.get("missing_symbols") not in ([], ())
     ):
         raise ValueError("daily Qlib governed ETF whitelist is incomplete or obsolete")
+    controls = provenance.get("execution_controls")
+    if not isinstance(controls, dict) or (
+        controls.get("scope_version") != GOVERNED_DAILY_STOCK_SCOPE_VERSION
+    ):
+        raise ValueError("daily Qlib dataset uses an obsolete governed stock scope")
 
 
 def require_native_daily_execution_controls(
@@ -306,6 +312,8 @@ def require_native_daily_execution_controls(
         controls.get("formal_execution_requires_native_controls") is not True
     ):
         raise ValueError("daily Qlib dataset has no governed native execution-control contract")
+    if controls.get("scope_version") != GOVERNED_DAILY_STOCK_SCOPE_VERSION:
+        raise ValueError("daily Qlib dataset has an obsolete governed stock execution scope")
     raw_boundary = str(controls.get("native_complete_from") or "")[:10]
     try:
         boundary = date.fromisoformat(raw_boundary)

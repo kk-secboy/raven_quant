@@ -19,6 +19,7 @@ from .execution_contract import (
     SIMULATION_MINUTE_SOURCE_DATASETS,
     TUSHARE_HAND_SIZE,
 )
+from .history_bounds import BSE_GOVERNED_HISTORY_START
 from .release_window import select_release_window_units, summarize_release_plan
 from .row_identity import SNAPSHOT_QUARANTINE_KEYS, semantic_provider_columns
 
@@ -51,7 +52,7 @@ UNSTABLE_PAGINATION_DATASETS = frozenset(
 # even though the daily quotes endpoint backfills those securities.  Keep that
 # audited provider gap outside the cross-dataset completeness contract instead
 # of treating unavailable history as an investable-data failure.
-DAILY_BASIC_BSE_COMPLETE_FROM = date(2023, 1, 1)
+DAILY_BASIC_BSE_COMPLETE_FROM = BSE_GOVERNED_HISTORY_START
 # A handful of isolated provider holes can be safely masked by factor/rebalance
 # eligibility, but a systematic cross-section gap must still block publication.
 DAILY_BASIC_HARD_MISSING_RATE = 0.0001

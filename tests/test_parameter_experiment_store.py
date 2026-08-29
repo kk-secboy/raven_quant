@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from governance_fixtures import create_strategy_version, governed_etf_ready_evidence
 
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_data.qlib_builder import build_qlib_output_manifest
 from quant_platform.api import create_app
 from quant_platform.parameter_experiment_store import ParameterExperimentStore
@@ -138,6 +139,7 @@ def test_api_creates_a_bounded_parameter_experiment_job(
                 "execution_controls": {
                     "native_complete_from": "2018-01-01",
                     "formal_execution_requires_native_controls": True,
+                    "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
                 },
             }
         ),
@@ -204,6 +206,7 @@ def test_parameter_experiment_rejects_research_only_execution_history(
                 "execution_controls": {
                     "native_complete_from": "2020-01-01",
                     "formal_execution_requires_native_controls": True,
+                    "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
                 },
             }
         ),

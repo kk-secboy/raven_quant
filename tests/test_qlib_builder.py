@@ -12,6 +12,10 @@ from quant_data.availability import (
     METADATA_AVAILABILITY_LAG_DAYS,
     recoverability_level,
 )
+from quant_data.history_bounds import (
+    BSE_GOVERNED_HISTORY_START,
+    GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+)
 from quant_data.qlib_builder import (
     _MAX_EXCLUDED_DAILY_UNIT_RATIO,
     DAILY_QLIB_DUCKDB_MEMORY_LIMIT,
@@ -104,6 +108,29 @@ def test_style_metadata_symbol_batches_match_full_panel_math(
                     "adj_factor": 1.0,
                 }
             )
+    for symbol, trade_date, market_cap, close in (
+        ("200001.SZ", "2024-01-02", 900_000.0, 5.0),
+        ("201872.SZ", "2024-01-02", 800_000.0, 6.0),
+        ("920001.BJ", "2022-12-30", 700_000.0, 7.0),
+        ("920001.BJ", "2023-01-03", 300_000.0, 8.0),
+    ):
+        rows.append(
+            {
+                "ts_code": symbol,
+                "trade_date": trade_date,
+                "total_mv": market_cap,
+                "circ_mv": market_cap * 0.8,
+                "pb": 2.0,
+                "pe_ttm": 10.0,
+                "turnover_rate": 1.0,
+            }
+        )
+        daily_rows.append(
+            {"ts_code": symbol, "trade_date": trade_date, "close": close}
+        )
+        factor_rows.append(
+            {"ts_code": symbol, "trade_date": trade_date, "adj_factor": 1.0}
+        )
     for dataset, frame in (
         ("daily_basic", pd.DataFrame(rows)),
         ("daily", pd.DataFrame(daily_rows)),
@@ -120,7 +147,20 @@ def test_style_metadata_symbol_batches_match_full_panel_math(
                         "netprofit_yoy": 6.0,
                         "debt_to_assets": 40.0,
                     }
-                    for symbol in ("000001.SZ", "600000.SH")
+                    for symbol in ("000001.SZ", "600000.SH", "920001.BJ")
+                ]
+            ),
+        ),
+        (
+            "stock_basic",
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": symbol,
+                        "list_date": "2020-01-02",
+                        "delist_date": None,
+                    }
+                    for symbol in ("000001.SZ", "200001.SZ", "600000.SH", "920001.BJ")
                 ]
             ),
         ),
@@ -165,12 +205,16 @@ def test_style_metadata_symbol_batches_match_full_panel_math(
         atol=1e-12,
     )
     daily_basic_batches = [symbols for dataset, symbols in calls if dataset == "daily_basic"]
-    assert daily_basic_batches == [("000001.SZ",), ("600000.SH",)]
+    assert daily_basic_batches == [("000001.SZ",), ("600000.SH",), ("920001.BJ",)]
     assert all(len(symbols) == 1 for _, symbols in calls)
     weights = pd.read_parquet(target / "full_market_weights.parquet")
     assert weights.groupby("datetime")["weight"].sum().tolist() == pytest.approx(
-        [1.0, 1.0]
+        [1.0, 1.0, 1.0]
     )
+    assert set(weights["instrument"]) == {"BJ920001", "SH600000", "SZ000001"}
+    assert pd.to_datetime(
+        weights.loc[weights["instrument"].eq("BJ920001"), "datetime"]
+    ).dt.date.min() >= BSE_GOVERNED_HISTORY_START
     assert not (target / ".style_metadata_attempt").exists()
 
 
@@ -761,6 +805,10 @@ def _write_cross_source_adjustment_snapshot(
         target.parent.mkdir(parents=True)
         pd.DataFrame(rows).to_parquet(target, index=False)
     _write_required_research_inputs(snapshot)
+    stock_basic_path = next((snapshot / "parquet" / "stock_basic").rglob("*.parquet"))
+    stock_basic = pd.read_parquet(stock_basic_path)
+    stock_basic["ts_code"] = "600000.SH"
+    stock_basic.to_parquet(stock_basic_path, index=False)
     return snapshot
 
 
@@ -993,6 +1041,10 @@ def test_accepts_tushare_unrestricted_price_limit_sentinel(tmp_path: Path) -> No
         up_limit=99999.99,
         down_limit=0.0,
     )
+    stock_basic_path = next((snapshot / "parquet" / "stock_basic").rglob("*.parquet"))
+    stock_basic = pd.read_parquet(stock_basic_path)
+    stock_basic["ts_code"] = "920690.BJ"
+    stock_basic.to_parquet(stock_basic_path, index=False)
 
     by_symbol = QlibBuilder(snapshot).build_staging(tmp_path / "staging")
     frame = pd.read_parquet(by_symbol / "BJ920690.parquet")
@@ -1010,12 +1062,26 @@ def test_missing_native_price_limits_are_research_only_unrestricted_rows(
         up_limit=11.0,
         down_limit=9.0,
     )
+    daily_path = snapshot / "parquet" / "daily" / "partition_year=2024" / "data.parquet"
+    daily = pd.read_parquet(daily_path)
+    next_session = daily.iloc[0].copy()
+    next_session["trade_date"] = "2024-01-08"
+    pd.concat([daily, next_session.to_frame().T], ignore_index=True).to_parquet(
+        daily_path, index=False
+    )
+    adj_path = snapshot / "parquet" / "adj_factor" / "partition_year=2024" / "data.parquet"
+    adjustment = pd.read_parquet(adj_path)
+    next_adjustment = adjustment.iloc[0].copy()
+    next_adjustment["trade_date"] = "2024-01-08"
+    pd.concat(
+        [adjustment, next_adjustment.to_frame().T], ignore_index=True
+    ).to_parquet(adj_path, index=False)
     limit_path = snapshot / "parquet" / "stk_limit" / "partition_year=2024" / "data.parquet"
     pd.DataFrame(
         [
             {
-                "ts_code": "000002.SZ",
-                "trade_date": "2024-01-02",
+                "ts_code": "000001.SZ",
+                "trade_date": "2024-01-08",
                 "up_limit": 11.0,
                 "down_limit": 9.0,
             }
@@ -1031,14 +1097,236 @@ def test_missing_native_price_limits_are_research_only_unrestricted_rows(
     assert frame["down_limit"].iloc[0] == 0.0
     assert coverage == {
         "source": "native_stk_limit",
+        "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+        "scope": {
+            "version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+            "security_master": "stock_basic",
+            "allowed_exchanges": ["SH", "SZ", "BJ"],
+            "excluded_b_share_code_patterns": ["20*.SZ", "900*.SH"],
+            "invalid_code_policy": "exclude_outside_frozen_a_share_code_families",
+            "bse_history_start": BSE_GOVERNED_HISTORY_START.isoformat(),
+            "historical_lifecycle_inference": {
+                "evidence_status": "verified",
+                "qualification_sources": ["daily", "daily_basic"],
+                "qualification_join": "same_ts_code_and_trade_date",
+                "lifecycle_bounds": "governed_daily_min_max",
+                "stock_basic_symbol_count": 1,
+                "inferred_symbol_count": 0,
+                "inferred_symbols_sha256": hashlib.sha256(b"[]").hexdigest(),
+                "inferred_symbols": [],
+            },
+        },
         "missing_rows": 1,
-        "total_rows": 1,
+        "total_rows": 2,
+        "raw_total_rows": 2,
+        "excluded_rows": 0,
         "first_missing_date": "2024-01-02",
         "last_missing_date": "2024-01-02",
-        "native_complete_from": "2024-01-03",
+        "native_complete_from": "2024-01-08",
         "missing_row_policy": "research_only_unrestricted_sentinel",
         "formal_execution_requires_native_controls": True,
     }
+
+
+def test_governed_stock_scope_is_shared_by_publication_controls_and_eligibility(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    daily_path = snapshot / "parquet" / "daily" / "partition_year=2024" / "data.parquet"
+    base_daily = pd.read_parquet(daily_path).iloc[0].to_dict()
+    extra_daily = [
+        {**base_daily, "ts_code": "200001.SZ"},
+        {**base_daily, "ts_code": "900901.SH"},
+        {**base_daily, "ts_code": "201872.SZ"},
+        {**base_daily, "ts_code": "600123.SH"},
+        {**base_daily, "ts_code": "300114.SZ", "trade_date": "2018-01-02"},
+        {**base_daily, "ts_code": "300114.SZ", "trade_date": "2025-02-14"},
+        {**base_daily, "ts_code": "920001.BJ", "trade_date": "2022-12-30"},
+        {**base_daily, "ts_code": "920001.BJ", "trade_date": "2023-01-03"},
+    ]
+    pd.DataFrame([base_daily, *extra_daily]).to_parquet(daily_path, index=False)
+
+    basic_path = next((snapshot / "parquet" / "daily_basic").rglob("*.parquet"))
+    daily_basic = pd.read_parquet(basic_path)
+    jointly_evidenced = [
+        row
+        for row in extra_daily
+        if row["ts_code"] != "600123.SH"
+    ]
+    pd.concat(
+        [
+            daily_basic,
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": row["ts_code"],
+                        "trade_date": row["trade_date"],
+                        "total_mv": 100_000.0,
+                    }
+                    for row in jointly_evidenced
+                ]
+            ),
+        ],
+        ignore_index=True,
+    ).to_parquet(basic_path, index=False)
+
+    adj_path = snapshot / "parquet" / "adj_factor" / "partition_year=2024" / "data.parquet"
+    pd.DataFrame(
+        [
+            {
+                "ts_code": row["ts_code"],
+                "trade_date": row["trade_date"],
+                "adj_factor": 1.0,
+            }
+            for row in [base_daily, *extra_daily]
+        ]
+    ).to_parquet(adj_path, index=False)
+    limit_path = snapshot / "parquet" / "stk_limit" / "partition_year=2024" / "data.parquet"
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": "2024-01-02",
+                "up_limit": 11.0,
+                "down_limit": 9.0,
+            },
+            {
+                "ts_code": "920001.BJ",
+                "trade_date": "2023-01-03",
+                "up_limit": 11.0,
+                "down_limit": 9.0,
+            },
+            {
+                "ts_code": "300114.SZ",
+                "trade_date": "2018-01-02",
+                "up_limit": 11.0,
+                "down_limit": 9.0,
+            },
+            {
+                "ts_code": "300114.SZ",
+                "trade_date": "2025-02-14",
+                "up_limit": 11.0,
+                "down_limit": 9.0,
+            },
+        ]
+    ).to_parquet(limit_path, index=False)
+
+    stock_basic_path = next((snapshot / "parquet" / "stock_basic").rglob("*.parquet"))
+    stock_basic = pd.read_parquet(stock_basic_path)
+    pd.concat(
+        [
+            stock_basic,
+            pd.DataFrame(
+                [
+                    {
+                        "ts_code": "200001.SZ",
+                        "list_date": "2020-01-02",
+                        "delist_date": None,
+                    },
+                    {
+                        "ts_code": "900901.SH",
+                        "list_date": "2020-01-02",
+                        "delist_date": None,
+                    },
+                    {
+                        "ts_code": "920001.BJ",
+                        "list_date": "2022-01-02",
+                        "delist_date": None,
+                    },
+                ]
+            ),
+        ],
+        ignore_index=True,
+    ).to_parquet(stock_basic_path, index=False)
+
+    builder = QlibBuilder(snapshot)
+    by_symbol = builder.build_staging(tmp_path / "staging")
+    assert {path.stem for path in by_symbol.glob("*.parquet")} == {
+        "BJ920001",
+        "SZ300114",
+        "SZ000001",
+    }
+    bj = pd.read_parquet(by_symbol / "BJ920001.parquet")
+    assert pd.to_datetime(bj["date"]).dt.date.astype(str).tolist() == ["2023-01-03"]
+
+    coverage = builder._execution_control_coverage()
+    assert coverage["scope_version"] == GOVERNED_DAILY_STOCK_SCOPE_VERSION
+    assert coverage["missing_rows"] == 0
+    assert coverage["total_rows"] == 4
+    assert coverage["raw_total_rows"] == 9
+    assert coverage["excluded_rows"] == 5
+    assert coverage["native_complete_from"] == "2018-01-02"
+    inference = coverage["scope"]["historical_lifecycle_inference"]
+    assert inference["inferred_symbol_count"] == 1
+    assert inference["inferred_symbols"] == [
+        {
+            "ts_code": "300114.SZ",
+            "first_session": "2018-01-02",
+            "last_session": "2025-02-14",
+            "daily_rows": 2,
+            "matching_daily_basic_rows": 2,
+            "source": "daily_and_daily_basic_same_session_inference",
+        }
+    ]
+
+    qlib_dir = tmp_path / "qlib"
+    (qlib_dir / "instruments").mkdir(parents=True)
+    builder._write_stock_universe(qlib_dir)
+    universe = (qlib_dir / "instruments" / "cn_all.txt").read_text(encoding="utf-8")
+    assert "BJ920001\t2023-01-03\t2023-01-03" in universe
+    assert "SZ300114\t2018-01-02\t2025-02-14" in universe
+    assert "SZ000001\t2024-01-02\t2024-01-02" in universe
+    assert all(
+        value not in universe
+        for value in ("SZ200001", "SH900901", "SZ201872", "SH600123")
+    )
+
+    style_metadata = tmp_path / "style-metadata"
+    assert builder._write_style_metadata_bounded(style_metadata) is True
+    styles = pd.read_parquet(style_metadata / "style_exposures.parquet")
+    assert "SZ300114" in set(styles["instrument"])
+    assert not {
+        "SZ200001",
+        "SH900901",
+        "SZ201872",
+        "SH600123",
+    }.intersection(styles["instrument"])
+
+    metadata = tmp_path / "metadata"
+    assert builder._write_eligibility_metadata(metadata) is True
+    eligibility = pd.read_parquet(metadata / "eligibility_matrix.parquet")
+    assert set(eligibility["instrument"]) == {
+        "BJ920001",
+        "SZ000001",
+        "SZ300114",
+    }
+    bj_eligibility = eligibility[eligibility["instrument"].eq("BJ920001")]
+    assert pd.to_datetime(bj_eligibility["datetime"]).dt.date.min() >= BSE_GOVERNED_HISTORY_START
+    eligibility_contract = json.loads(
+        (metadata / "eligibility_contract.json").read_text(encoding="utf-8")
+    )
+    assert (
+        eligibility_contract["governed_stock_scope"]["version"]
+        == GOVERNED_DAILY_STOCK_SCOPE_VERSION
+    )
+
+
+def test_native_execution_coverage_fails_closed_without_stock_master(tmp_path: Path) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+        include_research_inputs=False,
+    )
+
+    with pytest.raises(ValueError, match="requires a stock_basic security master"):
+        QlibBuilder(snapshot)._execution_control_coverage()
 
 
 def test_rejects_non_sentinel_zero_price_limit(tmp_path: Path) -> None:

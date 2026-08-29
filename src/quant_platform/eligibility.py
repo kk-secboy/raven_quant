@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-ELIGIBILITY_CONTRACT_VERSION = "cn-stock-etf-point-in-time-eligibility-v2"
+ELIGIBILITY_CONTRACT_VERSION = "cn-stock-etf-point-in-time-eligibility-v3"
 STANDARD_AUDIT_OPINIONS = frozenset(
     {
         "standard_unqualified",

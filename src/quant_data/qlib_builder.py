@@ -40,7 +40,12 @@ from .execution_contract import (
     TUSHARE_DAILY_VOLUME_UNIT,
     TUSHARE_HAND_SIZE,
 )
-from .history_bounds import PRIMARY_MARKET_HISTORY_START
+from .history_bounds import (
+    BSE_GOVERNED_HISTORY_START,
+    GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+    PRIMARY_MARKET_HISTORY_START,
+    is_governed_mainland_a_share_code,
+)
 from .path_utils import to_wsl_path as _to_wsl_path
 from .regulatory_events import (
     REGULATORY_EVENTS_RULE_VERSION,
@@ -356,6 +361,8 @@ class QlibBuilder:
         self._adjustment_boundary_cache: dict[str, Any] | None = None
         self._field_year_coverage_cache: dict[str, Any] | None = None
         self._governed_etf_cache: dict[str, Any] | None = None
+        self._execution_control_coverage_cache: dict[str, Any] | None = None
+        self._governed_stock_lifecycle_cache: dict[str, Any] | None = None
 
     @property
     def qlib_fields(self) -> tuple[str, ...]:
@@ -369,6 +376,7 @@ class QlibBuilder:
             "qlib_builder": Path(__file__).resolve(),
             "availability": module_root / "availability.py",
             "execution_contract": module_root / "execution_contract.py",
+            "history_bounds": module_root / "history_bounds.py",
             "eligibility": project_root / "quant_platform" / "eligibility.py",
             "etf_subtypes": project_root / "quant_platform" / "etf_subtypes.py",
             "market_rules": project_root / "quant_platform" / "market_rules.py",
@@ -406,6 +414,215 @@ class QlibBuilder:
             connection.close()
             raise
         return connection
+
+    def _governed_stock_row_predicate(self, alias: str) -> str:
+        """Return the one SQL predicate defining executable daily stock rows."""
+
+        symbol = f"upper(trim(CAST({alias}.ts_code AS VARCHAR)))"
+        trade_date = (
+            f"coalesce(try_cast({alias}.trade_date AS DATE), "
+            f"try_strptime(CAST({alias}.trade_date AS VARCHAR), '%Y%m%d')::DATE)"
+        )
+        bse_start = _sql_string(BSE_GOVERNED_HISTORY_START.isoformat())
+        governed_symbols = sorted(self._governed_stock_master_symbols())
+        if not governed_symbols:
+            raise ValueError("governed daily stock lifecycle master is empty")
+        symbol_values = ", ".join(_sql_string(item) for item in governed_symbols)
+        return f"""
+            {symbol} IN ({symbol_values})
+            AND {trade_date} IS NOT NULL
+            AND (
+                right({symbol}, 3) <> '.BJ'
+                OR {trade_date} >= DATE {bse_start}
+            )
+        """
+
+    def _governed_stock_scope_contract(self) -> dict[str, Any]:
+        lifecycle = self._governed_stock_lifecycle()
+        return self._stock_scope_contract(
+            {
+                "evidence_status": "verified",
+                "qualification_sources": ["daily", "daily_basic"],
+                "qualification_join": "same_ts_code_and_trade_date",
+                "lifecycle_bounds": "governed_daily_min_max",
+                "stock_basic_symbol_count": len(lifecycle["declared_symbols"]),
+                "inferred_symbol_count": len(lifecycle["inferred_lifecycles"]),
+                "inferred_symbols_sha256": lifecycle["inferred_symbols_sha256"],
+                "inferred_symbols": list(lifecycle["inferred_records"]),
+            }
+        )
+
+    @staticmethod
+    def _stock_scope_contract(
+        historical_lifecycle_inference: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+            "security_master": "stock_basic",
+            "allowed_exchanges": ["SH", "SZ", "BJ"],
+            "excluded_b_share_code_patterns": ["20*.SZ", "900*.SH"],
+            "invalid_code_policy": "exclude_outside_frozen_a_share_code_families",
+            "bse_history_start": BSE_GOVERNED_HISTORY_START.isoformat(),
+            "historical_lifecycle_inference": historical_lifecycle_inference,
+        }
+
+    @classmethod
+    def _unmaterialized_stock_scope_contract(cls) -> dict[str, Any]:
+        return cls._stock_scope_contract(
+            {
+                "evidence_status": "unavailable_no_daily_publication",
+                "qualification_sources": ["daily", "daily_basic"],
+                "qualification_join": "same_ts_code_and_trade_date",
+                "lifecycle_bounds": "governed_daily_min_max",
+                "stock_basic_symbol_count": 0,
+                "inferred_symbol_count": 0,
+                "inferred_symbols_sha256": _canonical_sha256([]),
+                "inferred_symbols": [],
+            }
+        )
+
+    def _governed_stock_lifecycle(self) -> dict[str, Any]:
+        """Build the declared plus jointly evidenced historical stock lifecycle."""
+
+        if self._governed_stock_lifecycle_cache is not None:
+            return self._governed_stock_lifecycle_cache
+        master = self._read_dataset_columns(
+            "stock_basic", {"ts_code"}, required={"ts_code"}
+        )
+        if master is None or master.empty:
+            raise ValueError(
+                "governed daily stock publication requires a stock_basic security master"
+            )
+        symbols = master["ts_code"].fillna("").astype(str).str.strip().str.upper()
+        declared = frozenset(
+            symbol
+            for symbol in symbols
+            if is_governed_mainland_a_share_code(symbol)
+        )
+        if not declared:
+            raise ValueError("stock_basic has no governed mainland A-share symbols")
+
+        daily_root = self.snapshot_path / "parquet" / "daily"
+        basic_root = self.snapshot_path / "parquet" / "daily_basic"
+        if not daily_root.exists() or not any(daily_root.rglob("*.parquet")):
+            raise ValueError("governed daily stock lifecycle requires daily evidence")
+        daily = _sql_string(str((daily_root / "**" / "*.parquet").resolve()))
+        basic_files = basic_root.exists() and any(basic_root.rglob("*.parquet"))
+        basic = _sql_string(str((basic_root / "**" / "*.parquet").resolve()))
+        basic_relation = (
+            "SELECT DISTINCT "
+            "upper(trim(CAST(ts_code AS VARCHAR))) AS ts_code, "
+            "coalesce(try_cast(trade_date AS DATE), "
+            "try_strptime(CAST(trade_date AS VARCHAR), '%Y%m%d')::DATE) AS trade_date "
+            f"FROM read_parquet({basic}, hive_partitioning=true, union_by_name=true) "
+            "WHERE ts_code IS NOT NULL"
+            if basic_files
+            else "SELECT NULL::VARCHAR AS ts_code, NULL::DATE AS trade_date WHERE FALSE"
+        )
+        close_predicate = (
+            "AND close IS NOT NULL" if "close" in self._parquet_columns("daily") else ""
+        )
+        bse_start = _sql_string(BSE_GOVERNED_HISTORY_START.isoformat())
+        connection = self._duckdb_connection()
+        try:
+            rows = connection.execute(
+                f"""
+                WITH daily_rows AS (
+                    SELECT
+                        upper(trim(CAST(ts_code AS VARCHAR))) AS ts_code,
+                        coalesce(
+                            try_cast(trade_date AS DATE),
+                            try_strptime(CAST(trade_date AS VARCHAR), '%Y%m%d')::DATE
+                        ) AS trade_date
+                    FROM read_parquet(
+                        {daily}, hive_partitioning=true, union_by_name=true
+                    )
+                    WHERE ts_code IS NOT NULL {close_predicate}
+                ),
+                daily_basic_keys AS ({basic_relation})
+                SELECT
+                    d.ts_code,
+                    min(d.trade_date) AS first_session,
+                    max(d.trade_date) AS last_session,
+                    count(*) AS daily_rows,
+                    count(*) FILTER (WHERE db.ts_code IS NOT NULL) AS matching_basic_rows
+                FROM daily_rows d
+                LEFT JOIN daily_basic_keys db
+                  ON d.ts_code = db.ts_code AND d.trade_date = db.trade_date
+                WHERE d.trade_date IS NOT NULL
+                  AND (
+                    right(d.ts_code, 3) <> '.BJ'
+                    OR d.trade_date >= DATE {bse_start}
+                  )
+                GROUP BY d.ts_code
+                ORDER BY d.ts_code
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+
+        lifecycles: dict[str, dict[str, Any]] = {}
+        inferred_lifecycles: dict[str, dict[str, Any]] = {}
+        for raw_symbol, first_session, last_session, daily_rows, matching_rows in rows:
+            symbol = str(raw_symbol or "").strip().upper()
+            if not is_governed_mainland_a_share_code(symbol):
+                continue
+            declared_by_master = symbol in declared
+            matching_count = int(matching_rows or 0)
+            if not declared_by_master and matching_count <= 0:
+                continue
+            lifecycle = {
+                "ts_code": symbol,
+                "first_session": str(first_session),
+                "last_session": str(last_session),
+                "daily_rows": int(daily_rows or 0),
+                "matching_daily_basic_rows": matching_count,
+                "source": (
+                    "stock_basic"
+                    if declared_by_master
+                    else "daily_and_daily_basic_same_session_inference"
+                ),
+            }
+            lifecycles[symbol] = lifecycle
+            if not declared_by_master:
+                inferred_lifecycles[symbol] = lifecycle
+
+        inferred_records = tuple(
+            inferred_lifecycles[symbol] for symbol in sorted(inferred_lifecycles)
+        )
+        result = {
+            "declared_symbols": declared,
+            "symbols": frozenset(set(declared).union(lifecycles)),
+            "lifecycles": lifecycles,
+            "inferred_lifecycles": inferred_lifecycles,
+            "inferred_records": inferred_records,
+            "inferred_symbols_sha256": _canonical_sha256(list(inferred_records)),
+        }
+        self._governed_stock_lifecycle_cache = result
+        return result
+
+    def _governed_stock_master_symbols(self) -> frozenset[str]:
+        return self._governed_stock_lifecycle()["symbols"]
+
+    def _filter_governed_stock_rows(
+        self, frame: pd.DataFrame, *, date_column: str = "trade_date"
+    ) -> pd.DataFrame:
+        if frame.empty or not {"ts_code", date_column}.issubset(frame.columns):
+            return frame.iloc[0:0].copy()
+        symbols = frame["ts_code"].fillna("").astype(str).str.strip().str.upper()
+        dates = pd.to_datetime(
+            frame[date_column].astype(str), format="mixed", errors="coerce"
+        )
+        selected = frame.loc[
+            symbols.isin(self._governed_stock_master_symbols())
+            & dates.notna()
+            & (
+                ~symbols.str.endswith(".BJ")
+                | dates.ge(pd.Timestamp(BSE_GOVERNED_HISTORY_START))
+            )
+        ].copy()
+        selected["ts_code"] = symbols.loc[selected.index]
+        return selected
 
     def build_staging(self, staging_path: Path) -> Path:
         daily_glob = self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet"
@@ -982,19 +1199,29 @@ class QlibBuilder:
         return hashlib.sha256(snapshot_manifest.read_bytes()).hexdigest()
 
     def _execution_control_coverage(self) -> dict[str, Any]:
+        if self._execution_control_coverage_cache is not None:
+            return json.loads(json.dumps(self._execution_control_coverage_cache))
         daily_files = list((self.snapshot_path / "parquet" / "daily").rglob("*.parquet"))
         limit_files = list((self.snapshot_path / "parquet" / "stk_limit").rglob("*.parquet"))
         if not daily_files or not limit_files:
-            return {
+            scope = self._unmaterialized_stock_scope_contract()
+            result = {
                 "source": "native_stk_limit",
+                "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+                "scope": scope,
                 "missing_rows": 0,
                 "total_rows": 0,
+                "raw_total_rows": 0,
+                "excluded_rows": 0,
                 "first_missing_date": None,
                 "last_missing_date": None,
                 "native_complete_from": None,
                 "missing_row_policy": "research_only_unrestricted_sentinel",
                 "formal_execution_requires_native_controls": True,
             }
+            self._execution_control_coverage_cache = result
+            return json.loads(json.dumps(result))
+        scope = self._governed_stock_scope_contract()
         daily = _sql_string(
             str((self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet").resolve())
         )
@@ -1003,15 +1230,20 @@ class QlibBuilder:
                 (self.snapshot_path / "parquet" / "stk_limit" / "**" / "*.parquet").resolve()
             )
         )
+        governed_predicate = self._governed_stock_row_predicate("d")
         connection = self._duckdb_connection()
         try:
             row = connection.execute(
                 f"""
-                WITH coverage AS (
+                WITH raw_coverage AS (
                     SELECT
-                        try_cast(d.trade_date AS DATE) AS trade_date,
+                        coalesce(
+                            try_cast(d.trade_date AS DATE),
+                            try_strptime(CAST(d.trade_date AS VARCHAR), '%Y%m%d')::DATE
+                        ) AS trade_date,
                         l.up_limit,
-                        l.down_limit
+                        l.down_limit,
+                        ({governed_predicate}) AS governed
                     FROM read_parquet(
                         {daily}, hive_partitioning=true, union_by_name=true
                     ) d
@@ -1020,20 +1252,44 @@ class QlibBuilder:
                     ) l
                       ON d.ts_code = l.ts_code AND d.trade_date = l.trade_date
                     WHERE d.ts_code IS NOT NULL AND d.close IS NOT NULL
+                ),
+                coverage AS (
+                    SELECT trade_date, up_limit, down_limit
+                    FROM raw_coverage
+                    WHERE governed
+                ),
+                summary AS (
+                    SELECT
+                        count(*) FILTER (
+                            WHERE up_limit IS NULL AND down_limit IS NULL
+                        ) AS missing_rows,
+                        min(trade_date) FILTER (
+                            WHERE up_limit IS NULL AND down_limit IS NULL
+                        ) AS first_missing_date,
+                        max(trade_date) FILTER (
+                            WHERE up_limit IS NULL AND down_limit IS NULL
+                        ) AS last_missing_date,
+                        count(*) AS total_rows,
+                        min(trade_date) AS first_trade_date
+                    FROM coverage
                 )
                 SELECT
-                    count(*) FILTER (
-                        WHERE up_limit IS NULL AND down_limit IS NULL
-                    ) AS missing_rows,
-                    min(trade_date) FILTER (
-                        WHERE up_limit IS NULL AND down_limit IS NULL
-                    ) AS first_missing_date,
-                    max(trade_date) FILTER (
-                        WHERE up_limit IS NULL AND down_limit IS NULL
-                    ) AS last_missing_date,
-                    count(*) AS total_rows,
-                    min(trade_date) AS first_trade_date
-                FROM coverage
+                    summary.missing_rows,
+                    summary.first_missing_date,
+                    summary.last_missing_date,
+                    summary.total_rows,
+                    summary.first_trade_date,
+                    CASE
+                        WHEN summary.last_missing_date IS NULL
+                        THEN summary.first_trade_date
+                        ELSE (
+                            SELECT min(coverage.trade_date)
+                            FROM coverage
+                            WHERE coverage.trade_date > summary.last_missing_date
+                        )
+                    END AS native_complete_from,
+                    (SELECT count(*) FROM raw_coverage) AS raw_total_rows
+                FROM summary
                 """
             ).fetchone()
         finally:
@@ -1042,22 +1298,26 @@ class QlibBuilder:
         first_missing = row[1] if row is not None else None
         last_missing = row[2] if row is not None else None
         total_rows = int(row[3] or 0) if row is not None else 0
-        first_trade = row[4] if row is not None else None
-        native_complete_from = (
-            (last_missing + timedelta(days=1)).isoformat()
-            if last_missing is not None
-            else (str(first_trade) if first_trade is not None else None)
-        )
-        return {
+        native_complete_from = row[5] if row is not None else None
+        raw_total_rows = int(row[6] or 0) if row is not None else 0
+        result = {
             "source": "native_stk_limit",
+            "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+            "scope": scope,
             "missing_rows": missing_rows,
             "total_rows": total_rows,
+            "raw_total_rows": raw_total_rows,
+            "excluded_rows": raw_total_rows - total_rows,
             "first_missing_date": str(first_missing) if first_missing is not None else None,
             "last_missing_date": str(last_missing) if last_missing is not None else None,
-            "native_complete_from": native_complete_from,
+            "native_complete_from": (
+                str(native_complete_from) if native_complete_from is not None else None
+            ),
             "missing_row_policy": "research_only_unrestricted_sentinel",
             "formal_execution_requires_native_controls": True,
         }
+        self._execution_control_coverage_cache = result
+        return json.loads(json.dumps(result))
 
     def _adjustment_boundary_evidence(self) -> dict[str, Any]:
         """Prove and freeze the BaoStock-to-primary adjustment-factor bridge.
@@ -1110,6 +1370,7 @@ class QlibBuilder:
             if "pre_close" in self._parquet_columns("daily")
             else "NULL::DOUBLE"
         )
+        governed_predicate = self._governed_stock_row_predicate("d")
         connection = self._duckdb_connection()
         try:
             rows = connection.execute(
@@ -1130,6 +1391,7 @@ class QlibBuilder:
                     ) d
                     WHERE d.ts_code IS NOT NULL
                       AND d.close IS NOT NULL
+                      AND ({governed_predicate})
                 ),
                 factor_rows AS (
                     SELECT
@@ -1321,13 +1583,17 @@ class QlibBuilder:
         daily = _sql_string(
             str((self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet").resolve())
         )
-        predicate = self._invalid_daily_units_predicate("")
+        predicate = self._invalid_daily_units_predicate("d")
+        governed_predicate = self._governed_stock_row_predicate("d")
         connection = self._duckdb_connection()
         try:
             row = connection.execute(
                 f"""
                 SELECT count(*) FILTER (WHERE {predicate}), count(*)
-                FROM read_parquet({daily}, hive_partitioning=true, union_by_name=true)
+                FROM read_parquet(
+                    {daily}, hive_partitioning=true, union_by_name=true
+                ) d
+                WHERE {governed_predicate}
                 """
             ).fetchone()
         finally:
@@ -1389,39 +1655,17 @@ class QlibBuilder:
             normalized.to_parquet(by_symbol / f"{symbol}.parquet", index=False, compression="zstd")
 
     def _write_stock_universe(self, qlib_dir: Path) -> None:
-        daily_glob = self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet"
-        masked_symbols = [
-            str(item["ts_code"])
+        masked_symbols = {
+            str(item["ts_code"]).strip().upper()
             for item in self._adjustment_boundary_evidence().get("masked_symbols")
             or []
-        ]
-        mask_predicate = ""
-        if masked_symbols:
-            mask_predicate = (
-                "AND ts_code NOT IN ("
-                + ", ".join(_sql_string(symbol) for symbol in masked_symbols)
-                + ")"
-            )
-        connection = self._duckdb_connection()
-        try:
-            rows = connection.execute(
-                f"""
-                SELECT ts_code, min(trade_date), max(trade_date)
-                FROM read_parquet(
-                    {_sql_string(str(daily_glob.resolve()))},
-                    hive_partitioning=true,
-                    union_by_name=true
-                )
-                WHERE ts_code IS NOT NULL AND trade_date IS NOT NULL
-                  {mask_predicate}
-                GROUP BY ts_code ORDER BY ts_code
-                """
-            ).fetchall()
-        finally:
-            connection.close()
-        intervals: dict[str, tuple[Any, Any]] = {}
-        for ts_code, start, end in rows:
-            intervals[str(ts_code).strip().upper()] = (start, end)
+        }
+        lifecycle = self._governed_stock_lifecycle()
+        intervals: dict[str, tuple[Any, Any]] = {
+            symbol: (item["first_session"], item["last_session"])
+            for symbol, item in lifecycle["lifecycles"].items()
+            if symbol not in masked_symbols
+        }
         etf_evidence = self._governed_etf_evidence()
         if etf_evidence["status"] == "ready":
             for item in etf_evidence["symbol_coverage"]:
@@ -1685,6 +1929,35 @@ class QlibBuilder:
             result["out_date"] = pd.to_datetime(result["out_date"])
         return result
 
+    def _filter_governed_style_rows(self, daily_basic: pd.DataFrame) -> pd.DataFrame:
+        scoped = self._filter_governed_stock_rows(daily_basic)
+        if scoped.empty:
+            return scoped
+        symbols = sorted(scoped["ts_code"].dropna().astype(str).unique())
+        daily = self._read_dataset_for_symbols(
+            "daily",
+            {"ts_code", "trade_date"},
+            symbols,
+            required={"ts_code", "trade_date"},
+        )
+        if daily is None or daily.empty:
+            return scoped.iloc[0:0].copy()
+        daily = self._filter_governed_stock_rows(daily)
+        scoped = scoped.copy()
+        daily = daily.copy()
+        scoped["__governed_trade_date"] = pd.to_datetime(
+            scoped["trade_date"], errors="coerce"
+        ).dt.normalize()
+        daily["__governed_trade_date"] = pd.to_datetime(
+            daily["trade_date"], errors="coerce"
+        ).dt.normalize()
+        keys = daily[["ts_code", "__governed_trade_date"]].drop_duplicates()
+        return scoped.merge(
+            keys,
+            on=["ts_code", "__governed_trade_date"],
+            how="inner",
+        ).drop(columns=["__governed_trade_date"])
+
     def _build_style_exposures(self, daily_basic: pd.DataFrame) -> pd.DataFrame:
         """Extended Barra-style exposure panel with a backward-compatible schema.
 
@@ -1696,8 +1969,9 @@ class QlibBuilder:
         announcement-date ASOF channel inside style_exposure_panel.
         """
 
+        governed_daily_basic = self._filter_governed_style_rows(daily_basic)
         panel = build_raw_style_panel(
-            daily_basic,
+            governed_daily_basic,
             adjusted_close=self._load_adjusted_close(),
             fina_indicator=self._load_fina_indicator(),
         )
@@ -1766,18 +2040,41 @@ class QlibBuilder:
             connection.close()
 
     def _style_symbols(self) -> list[str]:
-        root = self.snapshot_path / "parquet" / "daily_basic"
-        if not root.exists() or not any(root.rglob("*.parquet")):
+        basic_root = self.snapshot_path / "parquet" / "daily_basic"
+        daily_root = self.snapshot_path / "parquet" / "daily"
+        if (
+            not basic_root.exists()
+            or not any(basic_root.rglob("*.parquet"))
+            or not daily_root.exists()
+            or not any(daily_root.rglob("*.parquet"))
+        ):
             return []
-        glob = _sql_string(str((root / "**" / "*.parquet").resolve()))
+        basic_glob = _sql_string(str((basic_root / "**" / "*.parquet").resolve()))
+        daily_glob = _sql_string(str((daily_root / "**" / "*.parquet").resolve()))
+        governed_predicate = self._governed_stock_row_predicate("d")
+        basic_date = (
+            "coalesce(try_cast(db.trade_date AS DATE), "
+            "try_strptime(CAST(db.trade_date AS VARCHAR), '%Y%m%d')::DATE)"
+        )
+        daily_date = (
+            "coalesce(try_cast(d.trade_date AS DATE), "
+            "try_strptime(CAST(d.trade_date AS VARCHAR), '%Y%m%d')::DATE)"
+        )
         connection = self._duckdb_connection()
         try:
             return [
                 str(row[0])
                 for row in connection.execute(
-                    "SELECT DISTINCT trim(CAST(ts_code AS VARCHAR)) AS ts_code "
-                    f"FROM read_parquet({glob}, hive_partitioning=true, "
-                    "union_by_name=true) WHERE ts_code IS NOT NULL "
+                    "SELECT DISTINCT upper(trim(CAST(db.ts_code AS VARCHAR))) AS ts_code "
+                    f"FROM read_parquet({basic_glob}, hive_partitioning=true, "
+                    "union_by_name=true) db "
+                    f"INNER JOIN read_parquet({daily_glob}, hive_partitioning=true, "
+                    "union_by_name=true) d ON "
+                    "upper(trim(CAST(db.ts_code AS VARCHAR))) = "
+                    "upper(trim(CAST(d.ts_code AS VARCHAR))) "
+                    f"AND {basic_date} = {daily_date} "
+                    "WHERE db.ts_code IS NOT NULL "
+                    f"AND ({governed_predicate}) "
                     "ORDER BY ts_code"
                 ).fetchall()
                 if str(row[0] or "")
@@ -1832,6 +2129,9 @@ class QlibBuilder:
                     required=required,
                 )
                 if daily_basic is None or daily_basic.empty:
+                    continue
+                daily_basic = self._filter_governed_style_rows(daily_basic)
+                if daily_basic.empty:
                     continue
                 adjusted_close = self._load_adjusted_close(batch)
                 fina_indicator = self._load_fina_indicator(batch)
@@ -1945,6 +2245,9 @@ class QlibBuilder:
             )
         )
         if daily is None:
+            return None
+        daily = self._filter_governed_stock_rows(daily)
+        if daily.empty:
             return None
         adj_root = self.snapshot_path / "parquet" / "adj_factor"
         adj_files = sorted(adj_root.rglob("*.parquet")) if adj_root.exists() else []
@@ -2103,20 +2406,23 @@ class QlibBuilder:
         daily_glob = _sql_string(
             str((self.snapshot_path / "parquet" / "daily" / "**" / "*.parquet").resolve())
         )
+        governed_predicate = self._governed_stock_row_predicate("d")
         connection = self._duckdb_connection()
         try:
             calendar_rows = connection.execute(
-                f"SELECT DISTINCT {_as_date_sql('trade_date')} AS trade_date "
+                "SELECT DISTINCT coalesce(try_cast(d.trade_date AS DATE), "
+                "try_strptime(CAST(d.trade_date AS VARCHAR), '%Y%m%d')::DATE) AS trade_date "
                 f"FROM read_parquet({daily_glob}, hive_partitioning=true, "
-                "union_by_name=true) WHERE ts_code IS NOT NULL "
-                f"AND {_as_date_sql('trade_date')} IS NOT NULL ORDER BY trade_date"
+                "union_by_name=true) d WHERE d.ts_code IS NOT NULL "
+                f"AND ({governed_predicate}) ORDER BY trade_date"
             ).fetchall()
             symbols = [
                 str(row[0])
                 for row in connection.execute(
-                    "SELECT DISTINCT trim(CAST(ts_code AS VARCHAR)) AS ts_code "
+                    "SELECT DISTINCT trim(CAST(d.ts_code AS VARCHAR)) AS ts_code "
                     f"FROM read_parquet({daily_glob}, hive_partitioning=true, "
-                    "union_by_name=true) WHERE ts_code IS NOT NULL ORDER BY ts_code"
+                    "union_by_name=true) d WHERE d.ts_code IS NOT NULL "
+                    f"AND ({governed_predicate}) ORDER BY ts_code"
                 ).fetchall()
                 if str(row[0] or "")
             ]
@@ -2159,10 +2465,21 @@ class QlibBuilder:
         )
         if stock_basic is None or stock_basic.empty:
             return False
+        stock_basic = stock_basic.copy()
+        stock_codes = stock_basic["ts_code"].fillna("").astype(str).str.strip().str.upper()
+        stock_basic = stock_basic.loc[
+            stock_codes.map(is_governed_mainland_a_share_code)
+        ].copy()
+        stock_basic["ts_code"] = stock_codes.loc[stock_basic.index]
+        list_dates = pd.to_datetime(stock_basic["list_date"], errors="coerce")
+        bse_rows = stock_basic["ts_code"].str.endswith(".BJ")
+        list_dates.loc[bse_rows] = list_dates.loc[bse_rows].clip(
+            lower=pd.Timestamp(BSE_GOVERNED_HISTORY_START)
+        )
         listings = pd.DataFrame(
             {
                 "instrument": stock_basic["ts_code"].map(_qlib_symbol),
-                "list_date": pd.to_datetime(stock_basic["list_date"], errors="coerce"),
+                "list_date": list_dates,
                 "delist_date": pd.to_datetime(
                     stock_basic.get(
                         "delist_date", pd.Series(pd.NaT, index=stock_basic.index)
@@ -2171,6 +2488,28 @@ class QlibBuilder:
                 ),
             }
         )
+        inferred_lifecycles = self._governed_stock_lifecycle()[
+            "inferred_lifecycles"
+        ]
+        if inferred_lifecycles:
+            inferred_listings = pd.DataFrame(
+                [
+                    {
+                        "instrument": _qlib_symbol(symbol),
+                        "list_date": pd.Timestamp(item["first_session"]),
+                        # Eligibility treats delist_date as end-exclusive.  One
+                        # day after the observed daily maximum therefore keeps
+                        # the final evidenced session usable without inventing
+                        # any post-history market observation.
+                        "delist_date": (
+                            date.fromisoformat(str(item["last_session"]))
+                            + timedelta(days=1)
+                        ).isoformat(),
+                    }
+                    for symbol, item in sorted(inferred_lifecycles.items())
+                ]
+            )
+            listings = pd.concat([listings, inferred_listings], ignore_index=True)
         if etf_symbols:
             etf_listings = pd.DataFrame(
                 [
@@ -2359,6 +2698,7 @@ class QlibBuilder:
                     "financial_availability": "strictly_after_announcement_date",
                     "financial_gate_scope": "stocks_only_etfs_not_applicable",
                     "asset_types": ["stock", "etf"] if etf_symbols else ["stock"],
+                    "governed_stock_scope": self._governed_stock_scope_contract(),
                     "governed_etf_whitelist_sha256": etf_evidence[
                         "whitelist_sha256"
                     ],
@@ -2398,6 +2738,7 @@ class QlibBuilder:
             else None
         )
         if stock_daily is not None and not stock_daily.empty:
+            stock_daily = self._filter_governed_stock_rows(stock_daily)
             market_frames.append(
                 pd.DataFrame(
                     {
@@ -3097,6 +3438,7 @@ class QlibBuilder:
                 {fundamental_join}
                 {capital_flow_join}
                 WHERE d.ts_code IS NOT NULL AND d.close IS NOT NULL
+                  AND ({self._governed_stock_row_predicate("d")})
                   AND boundary_masks.ts_code IS NULL
             )
             SELECT
@@ -3734,8 +4076,9 @@ class QlibBuilder:
         self._parquet_columns_cache[dataset] = result
         return set(result)
 
-    @staticmethod
-    def _missing_market_controls_query(daily_glob: Path, adj_glob: Path, limit_glob: Path) -> str:
+    def _missing_market_controls_query(
+        self, daily_glob: Path, adj_glob: Path, limit_glob: Path
+    ) -> str:
         daily = _sql_string(str(daily_glob.resolve()))
         adj = _sql_string(str(adj_glob.resolve()))
         limits = _sql_string(str(limit_glob.resolve()))
@@ -3747,6 +4090,7 @@ class QlibBuilder:
             LEFT JOIN read_parquet({limits}, hive_partitioning=true, union_by_name=true) l
               ON d.ts_code = l.ts_code AND d.trade_date = l.trade_date
             WHERE d.ts_code IS NOT NULL AND d.close IS NOT NULL
+              AND ({self._governed_stock_row_predicate("d")})
               AND (
                 a.adj_factor IS NULL OR a.adj_factor <= 0
                 OR ((l.up_limit IS NULL) <> (l.down_limit IS NULL))

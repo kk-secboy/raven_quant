@@ -11,6 +11,7 @@ from quant_data.execution_contract import (
     require_daily_qlib_contract,
     require_native_daily_execution_controls,
 )
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_data.universe import governed_daily_etf_whitelist_contract
 from quant_platform.strategy_recipes import (
     TRANSPARENT_RESEARCH_BASELINE_IDS,
@@ -46,6 +47,7 @@ def _daily_provenance() -> dict:
         "lineage_verified": True,
         "execution_controls": {
             "formal_execution_requires_native_controls": True,
+            "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
             "native_complete_from": "2008-01-01",
         },
     }

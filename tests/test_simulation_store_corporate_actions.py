@@ -23,6 +23,7 @@ from quant_data.database import (
 from quant_data.execution_contract import (
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
 )
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.corporate_actions import corporate_actions_sha256
 from quant_platform.cost_model import COST_SCHEDULE_VERSION
 from quant_platform.portfolio_policy import POLICY_VERSION
@@ -74,6 +75,7 @@ def _daily_dataset() -> dict:
             "governed_etf_whitelist": governed_etf_ready_evidence(),
             "execution_controls": {
                 "formal_execution_requires_native_controls": True,
+                "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
                 "native_complete_from": "2008-01-01",
             },
             "lineage_verified": True,

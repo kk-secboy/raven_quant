@@ -20,6 +20,55 @@ PRIMARY_MARKET_HISTORY_DATASETS = frozenset(
     {"daily", "daily_basic", "adj_factor"}
 )
 
+# Tushare only exposes a complete, internally consistent Beijing Stock
+# Exchange cross-section from 2023 onward.  Earlier quote rows can use later
+# code mappings and do not have matching daily_basic / price-limit history, so
+# they cannot form a governed investable or model-training universe.
+BSE_GOVERNED_HISTORY_START = date(2023, 1, 1)
+GOVERNED_DAILY_STOCK_SCOPE_VERSION = "cn-mainland-a-share-daily-scope-v1"
+
+# Freeze the exchange/code families admitted by the governed A-share product.
+# ``stock_basic`` is necessary lifecycle evidence, but it is a current-only
+# provider surface and can omit absorbed or historically delisted codes.  Code
+# shape therefore remains an independent fail-closed type check when daily and
+# daily_basic jointly prove a historical security that the current master lost.
+_MAINLAND_A_SHARE_PREFIXES: dict[str, tuple[str, ...]] = {
+    "SH": ("600", "601", "603", "605", "688", "689"),
+    "SZ": ("000", "001", "002", "003", "300", "301"),
+    # Beijing common-share histories can retain either their historical code
+    # family or the later 920-series mapping.  Their usable date boundary is
+    # enforced separately by ``BSE_GOVERNED_HISTORY_START``.
+    "BJ": ("43", "83", "87", "88", "92"),
+}
+
+
+def is_mainland_b_share_code(ts_code: str) -> bool:
+    """Return whether a Tushare security code is an out-of-scope B share."""
+
+    normalized = str(ts_code).strip().upper()
+    code, separator, exchange = normalized.partition(".")
+    if not separator or len(code) != 6 or not code.isdigit():
+        return False
+    return (exchange == "SZ" and code.startswith("20")) or (
+        exchange == "SH" and code.startswith("900")
+    )
+
+
+def is_governed_mainland_a_share_code(ts_code: str) -> bool:
+    """Return whether a normalized code belongs to a governed A-share family."""
+
+    normalized = str(ts_code).strip().upper()
+    code, separator, exchange = normalized.partition(".")
+    if (
+        not separator
+        or len(code) != 6
+        or not code.isdigit()
+        or is_mainland_b_share_code(normalized)
+    ):
+        return False
+    prefixes = _MAINLAND_A_SHARE_PREFIXES.get(exchange)
+    return bool(prefixes and code.startswith(prefixes))
+
 TUSHARE_HISTORY_STARTS: dict[str, date] = {
     **{
         dataset: PRIMARY_MARKET_HISTORY_START

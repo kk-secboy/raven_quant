@@ -20,6 +20,7 @@ from quant_data.database import (
     strategy_versions,
 )
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.cost_model import COST_SCHEDULE_VERSION
 from quant_platform.job_store import (
     ORDER_PLAN_AWAITING_EXECUTION_DATA,
@@ -55,6 +56,7 @@ def _daily_dataset() -> dict:
             "lineage_verified": True,
             "execution_controls": {
                 "formal_execution_requires_native_controls": True,
+                "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
                 "native_complete_from": "2008-01-01",
             },
         },

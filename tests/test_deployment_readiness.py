@@ -12,6 +12,7 @@ from governance_fixtures import governed_etf_ready_evidence
 import quant_platform.deployment_readiness as readiness_module
 from quant_data.config import Settings
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_data.qlib_builder import build_qlib_output_manifest
 from quant_platform.alpha_spending_ledger import CAPITAL_OOS_MIN_EMBARGO_TRADING_DAYS
 from quant_platform.auth_store import AuthStore
@@ -112,6 +113,7 @@ def test_daily_business_check_requires_fresh_sealed_daily_data(
         "lineage_verified": True,
         "execution_controls": {
             "formal_execution_requires_native_controls": True,
+            "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
             "native_complete_from": "2016-01-04",
         },
     }

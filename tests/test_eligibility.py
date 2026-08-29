@@ -195,6 +195,49 @@ def test_governed_signal_cannot_select_an_ineligible_high_score() -> None:
     assert result.index.get_level_values("instrument").tolist() == ["SZ000001"]
 
 
+def test_governed_signal_skips_an_empty_eligible_day_before_later_candidates() -> None:
+    dates = pd.to_datetime(["2025-06-02", "2025-06-03"])
+    instruments = ["SH600000", "SZ000001"]
+    scores = pd.Series(
+        [4.0, 3.0, 2.0, 1.0],
+        index=pd.MultiIndex.from_product(
+            [dates, instruments], names=["datetime", "instrument"]
+        ),
+    )
+    eligibility = pd.DataFrame(
+        [
+            {
+                "datetime": timestamp,
+                "instrument": instrument,
+                "eligible": timestamp == dates[1],
+                "contract_version": ELIGIBILITY_CONTRACT_VERSION,
+            }
+            for timestamp in dates
+            for instrument in instruments
+        ]
+    )
+    memberships = pd.DataFrame(
+        {
+            "instrument": instruments,
+            "industry": ["bank", "bank"],
+            "in_date": [pd.Timestamp("2020-01-01")] * 2,
+            "out_date": [pd.NaT] * 2,
+        }
+    )
+
+    result = build_governed_signal(
+        scores,
+        topk=1,
+        eligibility_matrix=eligibility,
+        industry_memberships=memberships,
+        neutralize_industry=True,
+        metadata_availability_lag_days=0,
+    )
+
+    assert result.index.get_level_values("datetime").unique().tolist() == [dates[1]]
+    assert result.index.get_level_values("instrument").tolist() == ["SH600000"]
+
+
 def test_liquid_whitelisted_etf_can_reach_the_shared_governed_signal_path() -> None:
     dates = pd.date_range("2025-01-02", periods=80, freq="B")
     instrument = "SH510300"

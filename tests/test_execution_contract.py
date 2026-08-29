@@ -18,6 +18,7 @@ from quant_data.execution_contract import (
     require_strategy_execution_contract,
     strategy_execution_contract_hash,
 )
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 
 pytestmark = pytest.mark.no_database
 
@@ -33,6 +34,9 @@ def test_daily_contract_requires_share_volume_and_verified_lineage() -> None:
         "source_hand_size": 100,
         "index_volume_policy": "excluded_non_tradable_benchmark",
         "governed_etf_whitelist": governed_etf_ready_evidence(),
+        "execution_controls": {
+            "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+        },
         "lineage_verified": True,
     }
     require_daily_qlib_contract(valid)
@@ -43,12 +47,15 @@ def test_daily_contract_requires_share_volume_and_verified_lineage() -> None:
         require_daily_qlib_contract({**valid, "lineage_verified": False})
     with pytest.raises(ValueError, match="ETF whitelist"):
         require_daily_qlib_contract({**valid, "governed_etf_whitelist": {}})
+    with pytest.raises(ValueError, match="obsolete governed stock scope"):
+        require_daily_qlib_contract({**valid, "execution_controls": {}})
 
 
 def test_formal_daily_execution_requires_native_price_limit_boundary() -> None:
     provenance = {
         "execution_controls": {
             "formal_execution_requires_native_controls": True,
+            "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
             "native_complete_from": "2016-01-01",
         }
     }
@@ -58,6 +65,17 @@ def test_formal_daily_execution_requires_native_price_limit_boundary() -> None:
         require_native_daily_execution_controls(provenance, start="2015-12-31")
     with pytest.raises(ValueError, match="no governed native execution-control contract"):
         require_native_daily_execution_controls({}, start="2024-01-01")
+    with pytest.raises(ValueError, match="obsolete governed stock execution scope"):
+        require_native_daily_execution_controls(
+            {
+                "execution_controls": {
+                    "formal_execution_requires_native_controls": True,
+                    "scope_version": "legacy-all-daily-rows",
+                    "native_complete_from": "2016-01-01",
+                }
+            },
+            start="2024-01-01",
+        )
 
 
 def test_minute_contract_requires_version_frequency_and_verified_lineage() -> None:

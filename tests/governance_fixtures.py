@@ -17,6 +17,7 @@ from quant_data.database import (
     strategy_versions,
 )
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_data.universe import (
     GOVERNED_DAILY_ETF_WHITELIST,
     governed_daily_etf_whitelist_contract,
@@ -115,6 +116,7 @@ def write_governed_daily_qlib_dataset(
         "governed_etf_whitelist": governed_etf_ready_evidence(),
         "execution_controls": {
             "formal_execution_requires_native_controls": True,
+            "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
             "native_complete_from": normalized_sessions[0].isoformat(),
         },
         "lineage_verified": True,
@@ -765,7 +767,7 @@ def formal_backtest_metrics(
             int(version["config"].get("min_backtest_days", 504)),
         ),
         "eligibility": {
-            "contract_version": "cn-stock-etf-point-in-time-eligibility-v2",
+            "contract_version": "cn-stock-etf-point-in-time-eligibility-v3",
             "rows": 1000,
             "eligible_rows": 800,
             "regulatory_data_available": True,
