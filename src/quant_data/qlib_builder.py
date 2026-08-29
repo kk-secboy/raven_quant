@@ -22,6 +22,7 @@ from quant_platform.eligibility import (
     EligibilityPolicy,
     build_point_in_time_eligibility,
 )
+from quant_platform.etf_subtypes import SUBTYPE_EQUITY, etf_trading_gate, fund_subtype
 from quant_platform.style_exposures import STYLE_COLUMNS, standardize_panel
 
 from .availability import (
@@ -49,6 +50,10 @@ from .regulatory_events import (
 )
 from .snapshot_lineage import verify_snapshot_lineage
 from .style_exposure_panel import build_adjusted_close, build_raw_style_panel
+from .universe import (
+    GOVERNED_DAILY_ETF_WHITELIST,
+    governed_daily_etf_whitelist_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +94,25 @@ DAILY_QLIB_DUCKDB_THREADS = 8
 DAILY_QLIB_DUMP_WORKERS = 4
 DAILY_QLIB_STYLE_SYMBOL_BATCH = 128
 DAILY_QLIB_ELIGIBILITY_SYMBOL_BATCH = 128
+
+_ETF_DAILY_REQUIRED_FIELDS = frozenset(
+    {
+        "ts_code",
+        "trade_date",
+        "open",
+        "high",
+        "low",
+        "close",
+        "pre_close",
+        "pct_chg",
+        "vol",
+        "amount",
+    }
+)
+_ETF_ADJ_REQUIRED_FIELDS = frozenset({"ts_code", "trade_date", "adj_factor"})
+_ETF_BASIC_REQUIRED_FIELDS = frozenset(
+    {"ts_code", "market", "list_date", "delist_date"}
+)
 
 _ADJUSTMENT_BOUNDARY_POLICY_VERSION = "baostock-primary-adj-boundary-v1"
 _ADJUSTMENT_BOUNDARY_MAX_PRICE_ABS_ERROR = 0.051
@@ -318,12 +342,20 @@ def qlib_research_field_catalog() -> dict[str, dict[str, str]]:
 
 
 class QlibBuilder:
-    def __init__(self, snapshot_path: Path) -> None:
+    def __init__(
+        self,
+        snapshot_path: Path,
+        *,
+        require_governed_etfs: bool = False,
+    ) -> None:
         self.snapshot_path = snapshot_path.resolve()
+        self.require_governed_etfs = require_governed_etfs
         self._parquet_columns_cache: dict[str, set[str]] = {}
         self.research_feature_contract = self._research_feature_contract()
         self._daily_unit_quality_cache: dict[str, Any] | None = None
         self._adjustment_boundary_cache: dict[str, Any] | None = None
+        self._field_year_coverage_cache: dict[str, Any] | None = None
+        self._governed_etf_cache: dict[str, Any] | None = None
 
     @property
     def qlib_fields(self) -> tuple[str, ...]:
@@ -338,9 +370,12 @@ class QlibBuilder:
             "availability": module_root / "availability.py",
             "execution_contract": module_root / "execution_contract.py",
             "eligibility": project_root / "quant_platform" / "eligibility.py",
+            "etf_subtypes": project_root / "quant_platform" / "etf_subtypes.py",
+            "market_rules": project_root / "quant_platform" / "market_rules.py",
             "regulatory_events": module_root / "regulatory_events.py",
             "style_exposure_panel": module_root / "style_exposure_panel.py",
             "style_exposures": project_root / "quant_platform" / "style_exposures.py",
+            "universe": module_root / "universe.py",
         }
         contract = {
             name: _sha256_file(path) for name, path in sorted(files.items())
@@ -397,6 +432,9 @@ class QlibBuilder:
         connection = self._duckdb_connection(spill_dir=spill_dir)
         try:
             query = self._normalized_query(daily_glob, adj_glob, limit_glob)
+            etf_evidence = self._governed_etf_evidence()
+            if etf_evidence["status"] == "ready":
+                query = f"({query}) UNION ALL ({self._normalized_etf_query()})"
             invalid = connection.execute(
                 self._missing_market_controls_query(daily_glob, adj_glob, limit_glob)
             ).fetchone()[0]
@@ -445,6 +483,7 @@ class QlibBuilder:
                 index=False,
                 compression="zstd",
             )
+        self._field_year_coverage_cache = self._field_year_coverage(by_symbol)
         self._write_index_staging(by_symbol)
         shutil.rmtree(partitions)
         if not any(by_symbol.glob("*.parquet")):
@@ -545,6 +584,224 @@ class QlibBuilder:
                 units[field] = unit
         return units
 
+    def _field_year_coverage(self, staging_by_symbol: Path) -> dict[str, Any]:
+        """Measure actual non-null field coverage by calendar year and source contract.
+
+        The source snapshot can span more years than an individual field.  A
+        dataset-level start date therefore cannot prove that a factor was
+        observable throughout a research window.  This matrix is computed from
+        the normalized, point-in-time staging rows that are actually passed to
+        Qlib, not inferred from a declared schema or filled with zeroes.
+        """
+
+        root = staging_by_symbol.resolve()
+        files = sorted(root.glob("*.parquet"))
+        if not files:
+            raise ValueError("Qlib staging has no per-symbol files for field coverage")
+        fields = list(self.qlib_fields)
+        date_sql = (
+            "coalesce(try_cast(date AS DATE), "
+            "try_strptime(CAST(date AS VARCHAR), '%Y%m%d')::DATE)"
+        )
+        etf_symbols = [
+            _qlib_symbol(symbol) for symbol in GOVERNED_DAILY_ETF_WHITELIST
+        ]
+        etf_symbol_sql = ", ".join(
+            _sql_string(str(symbol)) for symbol in etf_symbols if symbol is not None
+        )
+        aggregates: list[str] = [
+            "count(*) AS observed_rows",
+            "count(*) FILTER (WHERE upper(CAST(symbol AS VARCHAR)) IN "
+            f"({etf_symbol_sql})) AS etf_rows",
+        ]
+        for index, field in enumerate(fields):
+            identifier = _sql_identifier(field)
+            aggregates.extend(
+                (
+                    f"count({identifier}) AS c{index}",
+                    f"min(session) FILTER (WHERE {identifier} IS NOT NULL) AS f{index}",
+                    f"max(session) FILTER (WHERE {identifier} IS NOT NULL) AS l{index}",
+                )
+            )
+        glob = _sql_string(str((root / "*.parquet").resolve()))
+        connection = self._duckdb_connection()
+        try:
+            rows = connection.execute(
+                "WITH staged AS ("
+                f"SELECT {date_sql} AS session, * FROM read_parquet("
+                f"{glob}, union_by_name=true)"
+                ") SELECT year(session) AS coverage_year, "
+                + ", ".join(aggregates)
+                + " FROM staged WHERE session IS NOT NULL "
+                "GROUP BY coverage_year ORDER BY coverage_year"
+            ).fetchall()
+        finally:
+            connection.close()
+        if not rows:
+            raise ValueError("Qlib staging has no dated rows for field coverage")
+
+        manifest_path = self.snapshot_path / "manifest.json"
+        snapshot_manifest = (
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest_path.is_file()
+            else {}
+        )
+        source_contracts = snapshot_manifest.get("source_contracts") or {}
+        if not isinstance(source_contracts, dict):
+            source_contracts = {}
+        primary_source = str(source_contracts.get("primary") or "primary-unlabelled")
+        legacy_source = str(source_contracts.get("legacy_market") or "") or None
+        overlap_version = (
+            str(source_contracts.get("legacy_overlap_policy_version") or "") or None
+        )
+        execution_controls = self._execution_control_coverage()
+        native_controls_from = str(execution_controls.get("native_complete_from") or "") or None
+        catalog = qlib_research_field_catalog()
+
+        etf_contract = governed_daily_etf_whitelist_contract()
+
+        def attributed_sources(
+            field: str, first: str, last: str, *, etf_rows: int
+        ) -> list[str]:
+            source_family = str((catalog.get(field) or {}).get("source") or "unknown")
+            if field in {"up_limit", "down_limit"}:
+                sources: list[str] = []
+                if not native_controls_from or first < native_controls_from:
+                    sources.append("derived-unrestricted-execution-sentinel")
+                if native_controls_from and last >= native_controls_from:
+                    sources.append(f"{primary_source}:stk_limit")
+                if etf_rows:
+                    sources.append(
+                        "governed_etf_price_limit:"
+                        + str(etf_contract["price_limit"]["version"])
+                    )
+                return sources or ["execution-control-source-unresolved"]
+            if source_family in {"daily_market", "daily_basic"}:
+                boundary = PRIMARY_MARKET_HISTORY_START.isoformat()
+                sources = []
+                if first < boundary:
+                    sources.append(legacy_source or "legacy-market-source-unverified")
+                if last >= boundary:
+                    sources.append(primary_source)
+                if etf_rows and field in _BASE_QLIB_FIELDS:
+                    sources.append(
+                        "fund_adj" if field == "factor" else "fund_daily"
+                    )
+                return sources
+            return [primary_source]
+
+        matrix: dict[str, Any] = {}
+        for field_index, field in enumerate(fields):
+            yearly: list[dict[str, Any]] = []
+            for row in rows:
+                year = int(row[0])
+                total = int(row[1])
+                etf_rows = int(row[2] or 0)
+                offset = 3 + field_index * 3
+                non_null = int(row[offset] or 0)
+                first_value = row[offset + 1]
+                last_value = row[offset + 2]
+                first = first_value.isoformat() if first_value is not None else None
+                last = last_value.isoformat() if last_value is not None else None
+                yearly.append(
+                    {
+                        "year": year,
+                        "observed_rows": total,
+                        "asset_type_rows": {
+                            "stock": total - etf_rows,
+                            "etf": etf_rows,
+                        },
+                        "non_null_rows": non_null,
+                        "coverage_ratio": round(non_null / total, 12) if total else 0.0,
+                        "first_session": first,
+                        "last_session": last,
+                        "source_contracts": (
+                            attributed_sources(
+                                field, first, last, etf_rows=etf_rows
+                            )
+                            if first is not None and last is not None
+                            else []
+                        ),
+                    }
+                )
+            covered = [item for item in yearly if item["non_null_rows"] > 0]
+            available_from = str(covered[0]["first_session"]) if covered else None
+            available_to = str(covered[-1]["last_session"]) if covered else None
+            continuous: list[dict[str, Any]] = []
+            expected_year: int | None = None
+            for item in reversed(yearly):
+                year = int(item["year"])
+                if item["non_null_rows"] <= 0 or (
+                    expected_year is not None and year != expected_year
+                ):
+                    break
+                continuous.append(item)
+                expected_year = year - 1
+            continuous_from = (
+                str(continuous[-1]["first_session"]) if continuous else None
+            )
+            source_family = str((catalog.get(field) or {}).get("source") or "unknown")
+            research_available_from = continuous_from
+            if (
+                research_available_from
+                and research_available_from < PRIMARY_MARKET_HISTORY_START.isoformat()
+                and source_family in {"daily_market", "daily_basic"}
+                and (legacy_source is None or overlap_version is None)
+            ):
+                research_available_from = PRIMARY_MARKET_HISTORY_START.isoformat()
+            matrix[field] = {
+                "source_family": source_family,
+                "available_from": available_from,
+                "available_to": available_to,
+                "continuous_from": continuous_from,
+                "research_available_from": research_available_from,
+                "years": yearly,
+            }
+        coverage = {
+            "version": "qlib-field-year-source-coverage-v1",
+            "source_attribution_policy": "normalized-staging-and-snapshot-contracts-v1",
+            "legacy_overlap_policy_version": overlap_version,
+            "primary_market_history_start": PRIMARY_MARKET_HISTORY_START.isoformat(),
+            "governed_etf_whitelist_sha256": etf_contract["whitelist_sha256"],
+            "fields": matrix,
+        }
+        return {
+            **coverage,
+            "coverage_sha256": _canonical_sha256(coverage),
+        }
+
+    def _field_year_coverage_evidence(self) -> dict[str, Any]:
+        if self._field_year_coverage_cache is not None:
+            return self._field_year_coverage_cache
+        # Direct provenance-unit tests and forensic callers can write metadata
+        # without staging.  Record that absence explicitly; active research
+        # rejects this status instead of inventing a usable date range.
+        coverage = {
+            "version": "qlib-field-year-source-coverage-v1",
+            "source_attribution_policy": "normalized-staging-and-snapshot-contracts-v1",
+            "legacy_overlap_policy_version": None,
+            "primary_market_history_start": PRIMARY_MARKET_HISTORY_START.isoformat(),
+            "governed_etf_whitelist_sha256": governed_daily_etf_whitelist_contract()[
+                "whitelist_sha256"
+            ],
+            "fields": {
+                field: {
+                    "source_family": str(
+                        (qlib_research_field_catalog().get(field) or {}).get("source")
+                        or "unknown"
+                    ),
+                    "available_from": None,
+                    "available_to": None,
+                    "continuous_from": None,
+                    "research_available_from": None,
+                    "years": [],
+                }
+                for field in self.qlib_fields
+            },
+            "evidence_status": "missing_normalized_staging",
+        }
+        return {**coverage, "coverage_sha256": _canonical_sha256(coverage)}
+
     def _write_provenance(self, qlib_dir: Path) -> None:
         snapshot_digest = self._snapshot_manifest_digest()
         snapshot_manifest = json.loads(
@@ -553,6 +810,9 @@ class QlibBuilder:
         builder_digest = self.builder_sha256()
         fields = list(self.qlib_fields)
         field_units = self._field_units()
+        field_year_coverage = self._field_year_coverage_evidence()
+        field_coverage_sha256 = str(field_year_coverage["coverage_sha256"])
+        governed_etfs = self._governed_etf_evidence()
         execution_controls = self._execution_control_coverage()
         daily_unit_quality = self._daily_unit_quality_coverage()
         adjustment_boundary = self._require_adjustment_boundary_evidence()
@@ -587,6 +847,9 @@ class QlibBuilder:
             "source_hand_size": int(TUSHARE_HAND_SIZE),
             "index_volume_policy": INDEX_VOLUME_POLICY,
             "field_units": field_units,
+            "field_coverage_sha256": field_coverage_sha256,
+            "field_year_coverage": field_year_coverage,
+            "governed_etf_whitelist": governed_etfs,
             "research_features": self.research_feature_contract,
             "eligibility_contract_version": ELIGIBILITY_CONTRACT_VERSION,
             "industry_missing_value_policy": {
@@ -637,6 +900,9 @@ class QlibBuilder:
             "source_hand_size": int(TUSHARE_HAND_SIZE),
             "index_volume_policy": INDEX_VOLUME_POLICY,
             "field_units": field_units,
+            "field_coverage_sha256": field_coverage_sha256,
+            "field_year_coverage": field_year_coverage,
+            "governed_etf_whitelist": governed_etfs,
             "research_features": self.research_feature_contract,
             "eligibility_contract_version": ELIGIBILITY_CONTRACT_VERSION,
             "industry_missing_value_policy": {
@@ -659,10 +925,21 @@ class QlibBuilder:
             json.dumps(self.research_feature_contract, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        (target.parent / "field_year_coverage.json").write_text(
+            json.dumps(field_year_coverage, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (target.parent / "governed_etf_whitelist.json").write_text(
+            json.dumps(governed_etfs, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         provenance = {
             **identity,
             "dataset_identity_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
             "dataset_contract_sha256": contract_sha256,
+            "field_coverage_sha256": field_coverage_sha256,
+            "field_year_coverage": field_year_coverage,
+            "governed_etf_whitelist": governed_etfs,
             "dataset_lineage_id": dataset_lineage_id,
             "source_lineage_id": source_lineage_id or None,
             "source_lineage_generation": snapshot_manifest.get("lineage_generation"),
@@ -1142,12 +1419,22 @@ class QlibBuilder:
             ).fetchall()
         finally:
             connection.close()
-        lines = []
+        intervals: dict[str, tuple[Any, Any]] = {}
         for ts_code, start, end in rows:
-            code, exchange = str(ts_code).split(".", 1)
+            intervals[str(ts_code).strip().upper()] = (start, end)
+        etf_evidence = self._governed_etf_evidence()
+        if etf_evidence["status"] == "ready":
+            for item in etf_evidence["symbol_coverage"]:
+                intervals[str(item["ts_code"])] = (
+                    item["first_session"],
+                    item["last_session"],
+                )
+        lines = []
+        for ts_code, (start, end) in sorted(intervals.items()):
+            code, exchange = ts_code.split(".", 1)
             lines.append(f"{exchange.upper()}{code}\t{start}\t{end}")
         if not lines:
-            raise RuntimeError("Qlib stock universe is empty")
+            raise RuntimeError("Qlib governed stock/ETF universe is empty")
         target = qlib_dir / "instruments" / "cn_all.txt"
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1835,7 +2122,27 @@ class QlibBuilder:
             ]
         finally:
             connection.close()
+        etf_evidence = self._governed_etf_evidence()
+        etf_symbols = {
+            str(symbol) for symbol in etf_evidence.get("included_symbols") or []
+        }
+        symbols = sorted(set(symbols).union(etf_symbols))
         trading_calendar = pd.DatetimeIndex([row[0] for row in calendar_rows])
+        if etf_symbols:
+            etf_calendar_source = self._read_dataset_for_symbols(
+                "fund_daily",
+                {"ts_code", "trade_date"},
+                sorted(etf_symbols),
+                required={"ts_code", "trade_date"},
+            )
+            if etf_calendar_source is None or etf_calendar_source.empty:
+                raise ValueError("governed ETF eligibility has no daily calendar evidence")
+            etf_calendar = pd.DatetimeIndex(
+                pd.to_datetime(
+                    etf_calendar_source["trade_date"], errors="coerce"
+                ).dropna()
+            )
+            trading_calendar = trading_calendar.union(etf_calendar).sort_values()
         if trading_calendar.empty or not symbols:
             raise ValueError("daily has no valid publication-horizon market rows")
         normalized_symbols = [_qlib_symbol(symbol) for symbol in symbols]
@@ -1864,6 +2171,20 @@ class QlibBuilder:
                 ),
             }
         )
+        if etf_symbols:
+            etf_listings = pd.DataFrame(
+                [
+                    {
+                        "instrument": _qlib_symbol(item["ts_code"]),
+                        "list_date": pd.to_datetime(item["list_date"], errors="coerce"),
+                        "delist_date": pd.to_datetime(
+                            item.get("delist_date"), errors="coerce"
+                        ),
+                    }
+                    for item in etf_evidence["symbol_coverage"]
+                ]
+            )
+            listings = pd.concat([listings, etf_listings], ignore_index=True)
         namechange = self._read_dataset_columns(
             "namechange",
             {"ts_code", "name", "start_date", "end_date"},
@@ -1973,6 +2294,7 @@ class QlibBuilder:
                     st_intervals=st_intervals,
                     equity_column=equity_column,
                     opinion_column=opinion_column,
+                    etf_symbols=etf_symbols,
                     has_regulatory_source=has_regulatory_source,
                     has_anns_fallback=has_anns_fallback,
                     open_days=open_days,
@@ -2035,6 +2357,11 @@ class QlibBuilder:
                         regulatory_terminal_audit
                     ),
                     "financial_availability": "strictly_after_announcement_date",
+                    "financial_gate_scope": "stocks_only_etfs_not_applicable",
+                    "asset_types": ["stock", "etf"] if etf_symbols else ["stock"],
+                    "governed_etf_whitelist_sha256": etf_evidence[
+                        "whitelist_sha256"
+                    ],
                     "delisting_availability": "effective_date_only_no_backfill",
                 },
                 ensure_ascii=False,
@@ -2053,39 +2380,97 @@ class QlibBuilder:
         st_intervals: pd.DataFrame,
         equity_column: str,
         opinion_column: str,
+        etf_symbols: set[str],
         has_regulatory_source: bool,
         has_anns_fallback: bool,
         open_days: list[date],
         regulatory_horizon: date,
         trading_calendar: pd.DatetimeIndex,
     ) -> tuple[pd.DataFrame, list[dict[str, str]]]:
-        daily = self._read_dataset_for_symbols(
-            "daily", required_daily, batch, required=required_daily
+        stock_batch = [symbol for symbol in batch if symbol not in etf_symbols]
+        etf_batch = [symbol for symbol in batch if symbol in etf_symbols]
+        market_frames: list[pd.DataFrame] = []
+        stock_daily = (
+            self._read_dataset_for_symbols(
+                "daily", required_daily, stock_batch, required=required_daily
+            )
+            if stock_batch
+            else None
         )
-        balancesheet = self._read_dataset_for_symbols(
-            "balancesheet",
-            {"ts_code", "ann_date", equity_column},
-            batch,
-            required={"ts_code", "ann_date", equity_column},
+        if stock_daily is not None and not stock_daily.empty:
+            market_frames.append(
+                pd.DataFrame(
+                    {
+                        "datetime": pd.to_datetime(
+                            stock_daily["trade_date"], errors="coerce"
+                        ),
+                        "instrument": stock_daily["ts_code"].map(_qlib_symbol),
+                        "asset_type": "stock",
+                        "amount": pd.to_numeric(
+                            stock_daily["amount"], errors="coerce"
+                        )
+                        * 1000.0,
+                        "paused": pd.to_numeric(
+                            stock_daily["vol"], errors="coerce"
+                        )
+                        .fillna(0)
+                        .le(0),
+                    }
+                )
+            )
+        etf_daily = (
+            self._read_dataset_for_symbols(
+                "fund_daily", required_daily, etf_batch, required=required_daily
+            )
+            if etf_batch
+            else None
         )
-        audit = self._read_dataset_for_symbols(
-            "fina_audit",
-            {"ts_code", "ann_date", opinion_column},
-            batch,
-            required={"ts_code", "ann_date", opinion_column},
-        )
-        if daily is None or daily.empty:
+        if etf_daily is not None and not etf_daily.empty:
+            market_frames.append(
+                pd.DataFrame(
+                    {
+                        "datetime": pd.to_datetime(
+                            etf_daily["trade_date"], errors="coerce"
+                        ),
+                        "instrument": etf_daily["ts_code"].map(_qlib_symbol),
+                        "asset_type": "etf",
+                        "amount": pd.to_numeric(
+                            etf_daily["amount"], errors="coerce"
+                        )
+                        * 1000.0,
+                        "paused": pd.to_numeric(
+                            etf_daily["vol"], errors="coerce"
+                        )
+                        .fillna(0)
+                        .le(0),
+                    }
+                )
+            )
+        if not market_frames:
             raise ValueError("eligibility symbol batch lacks daily market evidence")
+        market = pd.concat(market_frames, ignore_index=True)
+        balancesheet = (
+            self._read_dataset_for_symbols(
+                "balancesheet",
+                {"ts_code", "ann_date", equity_column},
+                stock_batch,
+                required={"ts_code", "ann_date", equity_column},
+            )
+            if stock_batch
+            else pd.DataFrame(columns=["ts_code", "ann_date", equity_column])
+        )
+        audit = (
+            self._read_dataset_for_symbols(
+                "fina_audit",
+                {"ts_code", "ann_date", opinion_column},
+                stock_batch,
+                required={"ts_code", "ann_date", opinion_column},
+            )
+            if stock_batch
+            else pd.DataFrame(columns=["ts_code", "ann_date", opinion_column])
+        )
         if balancesheet is None or audit is None:
             raise ValueError("eligibility financial source schema changed during publication")
-        market = pd.DataFrame(
-            {
-                "datetime": pd.to_datetime(daily["trade_date"], errors="coerce"),
-                "instrument": daily["ts_code"].map(_qlib_symbol),
-                "amount": pd.to_numeric(daily["amount"], errors="coerce") * 1000.0,
-                "paused": pd.to_numeric(daily["vol"], errors="coerce").fillna(0).le(0),
-            }
-        )
         instruments = set(market["instrument"].dropna().astype(str))
         suspension_columns = self._parquet_columns("suspend_d")
         suspension_date = next(
@@ -2100,10 +2485,10 @@ class QlibBuilder:
             self._read_dataset_for_symbols(
                 "suspend_d",
                 {"ts_code", suspension_date},
-                batch,
+                stock_batch,
                 required={"ts_code", suspension_date},
             )
-            if suspension_date is not None
+            if suspension_date is not None and stock_batch
             else None
         )
         suspensions = pd.DataFrame(
@@ -2213,6 +2598,312 @@ class QlibBuilder:
         regulatory = events.rename(columns={"ts_code": "instrument"}).copy()
         regulatory["instrument"] = regulatory["instrument"].map(_qlib_symbol)
         return regulatory, deferred
+
+    def _governed_etf_evidence(self) -> dict[str, Any]:
+        """Validate and describe the exact ETF subset eligible for publication."""
+
+        if self._governed_etf_cache is not None:
+            return dict(self._governed_etf_cache)
+        contract = governed_daily_etf_whitelist_contract()
+        for symbol in GOVERNED_DAILY_ETF_WHITELIST:
+            if fund_subtype(symbol) != SUBTYPE_EQUITY or etf_trading_gate(symbol) is not None:
+                raise RuntimeError(
+                    f"governed daily ETF whitelist contains an unaccepted subtype: {symbol}"
+                )
+            if not symbol.endswith(".SH"):
+                raise RuntimeError(
+                    f"governed daily ETF price-limit contract only covers SSE symbols: {symbol}"
+                )
+
+        roots = {
+            dataset: self.snapshot_path / "parquet" / dataset
+            for dataset in ("fund_daily", "fund_adj", "fund_basic")
+        }
+        available = {
+            dataset: root.is_dir() and any(root.rglob("*.parquet"))
+            for dataset, root in roots.items()
+        }
+        if not any(available.values()):
+            if self.require_governed_etfs:
+                raise RuntimeError(
+                    "governed daily ETF publication requires fund_daily, fund_adj and fund_basic"
+                )
+            evidence = {
+                **contract,
+                "status": "source_unavailable",
+                "included_symbols": [],
+                "missing_symbols": list(GOVERNED_DAILY_ETF_WHITELIST),
+                "row_count": 0,
+            }
+            self._governed_etf_cache = evidence
+            return dict(evidence)
+        missing_datasets = sorted(name for name, present in available.items() if not present)
+        if missing_datasets:
+            raise RuntimeError(
+                "governed daily ETF sources are partial; missing "
+                + ", ".join(missing_datasets)
+            )
+        required_by_dataset = {
+            "fund_daily": _ETF_DAILY_REQUIRED_FIELDS,
+            "fund_adj": _ETF_ADJ_REQUIRED_FIELDS,
+            "fund_basic": _ETF_BASIC_REQUIRED_FIELDS,
+        }
+        for dataset, required in required_by_dataset.items():
+            missing = sorted(required - self._parquet_columns(dataset))
+            if missing:
+                raise RuntimeError(
+                    f"{dataset} cannot support governed ETF publication; missing columns: "
+                    + ", ".join(missing)
+                )
+
+        whitelist_sql = ", ".join(
+            _sql_string(symbol) for symbol in GOVERNED_DAILY_ETF_WHITELIST
+        )
+        daily = _sql_string(
+            str((roots["fund_daily"] / "**" / "*.parquet").resolve())
+        )
+        factors = _sql_string(
+            str((roots["fund_adj"] / "**" / "*.parquet").resolve())
+        )
+        daily_date = (
+            "coalesce(try_cast(d.trade_date AS DATE), "
+            "try_strptime(CAST(d.trade_date AS VARCHAR), '%Y%m%d')::DATE)"
+        )
+        factor_date = (
+            "coalesce(try_cast(a.trade_date AS DATE), "
+            "try_strptime(CAST(a.trade_date AS VARCHAR), '%Y%m%d')::DATE)"
+        )
+        connection = self._duckdb_connection()
+        try:
+            duplicate_daily = int(
+                connection.execute(
+                    "SELECT count(*) FROM (SELECT upper(trim(CAST(ts_code AS VARCHAR))), "
+                    "coalesce(try_cast(trade_date AS DATE), "
+                    "try_strptime(CAST(trade_date AS VARCHAR), '%Y%m%d')::DATE), count(*) "
+                    f"FROM read_parquet({daily}, hive_partitioning=true, union_by_name=true) "
+                    f"WHERE upper(trim(CAST(ts_code AS VARCHAR))) IN ({whitelist_sql}) "
+                    "GROUP BY 1, 2 HAVING count(*) > 1)"
+                ).fetchone()[0]
+            )
+            duplicate_factors = int(
+                connection.execute(
+                    "SELECT count(*) FROM (SELECT upper(trim(CAST(ts_code AS VARCHAR))), "
+                    "coalesce(try_cast(trade_date AS DATE), "
+                    "try_strptime(CAST(trade_date AS VARCHAR), '%Y%m%d')::DATE), count(*) "
+                    f"FROM read_parquet({factors}, hive_partitioning=true, union_by_name=true) "
+                    f"WHERE upper(trim(CAST(ts_code AS VARCHAR))) IN ({whitelist_sql}) "
+                    "GROUP BY 1, 2 HAVING count(*) > 1)"
+                ).fetchone()[0]
+            )
+            invalid_market = int(
+                connection.execute(
+                    f"SELECT count(*) FROM read_parquet({daily}, hive_partitioning=true, "
+                    "union_by_name=true) d "
+                    f"WHERE upper(trim(CAST(d.ts_code AS VARCHAR))) IN ({whitelist_sql}) "
+                    f"AND ({daily_date} IS NULL OR try_cast(d.open AS DOUBLE) <= 0 "
+                    "OR try_cast(d.high AS DOUBLE) <= 0 OR try_cast(d.low AS DOUBLE) <= 0 "
+                    "OR try_cast(d.close AS DOUBLE) <= 0 "
+                    "OR try_cast(d.pre_close AS DOUBLE) <= 0 "
+                    "OR try_cast(d.high AS DOUBLE) < try_cast(d.low AS DOUBLE) "
+                    "OR try_cast(d.vol AS DOUBLE) < 0 OR try_cast(d.amount AS DOUBLE) < 0 "
+                    f"OR ({self._invalid_daily_units_predicate('d')}))"
+                ).fetchone()[0]
+            )
+            missing_factors = int(
+                connection.execute(
+                    f"SELECT count(*) FROM read_parquet({daily}, hive_partitioning=true, "
+                    f"union_by_name=true) d LEFT JOIN read_parquet({factors}, "
+                    "hive_partitioning=true, union_by_name=true) a ON "
+                    "upper(trim(CAST(d.ts_code AS VARCHAR))) = "
+                    "upper(trim(CAST(a.ts_code AS VARCHAR))) AND "
+                    f"{daily_date} = {factor_date} "
+                    f"WHERE upper(trim(CAST(d.ts_code AS VARCHAR))) IN ({whitelist_sql}) "
+                    "AND (try_cast(a.adj_factor AS DOUBLE) IS NULL "
+                    "OR try_cast(a.adj_factor AS DOUBLE) <= 0)"
+                ).fetchone()[0]
+            )
+            stats = connection.execute(
+                "SELECT upper(trim(CAST(ts_code AS VARCHAR))) AS ts_code, count(*) AS rows, "
+                "min(coalesce(try_cast(trade_date AS DATE), "
+                "try_strptime(CAST(trade_date AS VARCHAR), '%Y%m%d')::DATE)), "
+                "max(coalesce(try_cast(trade_date AS DATE), "
+                "try_strptime(CAST(trade_date AS VARCHAR), '%Y%m%d')::DATE)) "
+                f"FROM read_parquet({daily}, hive_partitioning=true, union_by_name=true) "
+                f"WHERE upper(trim(CAST(ts_code AS VARCHAR))) IN ({whitelist_sql}) "
+                "GROUP BY 1 ORDER BY 1"
+            ).fetchall()
+        finally:
+            connection.close()
+        if duplicate_daily or duplicate_factors:
+            raise RuntimeError(
+                "governed ETF sources contain duplicate symbol/session keys: "
+                f"fund_daily={duplicate_daily}, fund_adj={duplicate_factors}"
+            )
+        if invalid_market:
+            raise RuntimeError(
+                f"{invalid_market} governed ETF daily rows violate price/volume/amount fields"
+            )
+        if missing_factors:
+            raise RuntimeError(
+                f"{missing_factors} governed ETF daily rows have no positive fund_adj factor"
+            )
+
+        included_symbols = [str(row[0]) for row in stats]
+        included_set = set(included_symbols)
+        missing_symbols = sorted(set(GOVERNED_DAILY_ETF_WHITELIST) - included_set)
+        basic = self._read_dataset_columns(
+            "fund_basic",
+            {"ts_code", "market", "list_date", "delist_date"},
+            required={"ts_code", "market", "list_date", "delist_date"},
+        )
+        if basic is None:
+            raise RuntimeError("fund_basic cannot support governed ETF listing metadata")
+        basic = basic.copy()
+        basic["ts_code"] = basic["ts_code"].astype(str).str.strip().str.upper()
+        basic = basic[basic["ts_code"].isin(included_set)]
+        listing_evidence: dict[str, dict[str, str | None]] = {}
+        for symbol in included_symbols:
+            rows = basic[basic["ts_code"].eq(symbol)]
+            markets = set(rows["market"].dropna().astype(str).str.strip().str.upper())
+            list_dates = set(
+                pd.to_datetime(rows["list_date"], errors="coerce").dropna().dt.date
+            )
+            delist_dates = set(
+                pd.to_datetime(rows["delist_date"], errors="coerce").dropna().dt.date
+            )
+            if markets != {"E"} or len(list_dates) != 1 or len(delist_dates) > 1:
+                raise RuntimeError(
+                    f"fund_basic listing metadata is missing or conflicting for {symbol}"
+                )
+            listing_evidence[symbol] = {
+                "list_date": next(iter(list_dates)).isoformat(),
+                "delist_date": (
+                    next(iter(delist_dates)).isoformat() if delist_dates else None
+                ),
+            }
+        if self.require_governed_etfs and missing_symbols:
+            raise RuntimeError(
+                "governed ETF source has no fund_daily history for: "
+                + ", ".join(missing_symbols)
+            )
+        evidence = {
+            **contract,
+            "status": "ready" if included_symbols else "source_empty",
+            "included_symbols": included_symbols,
+            "missing_symbols": missing_symbols,
+            "row_count": sum(int(row[1]) for row in stats),
+            "symbol_coverage": [
+                {
+                    "ts_code": str(symbol),
+                    "rows": int(row_count),
+                    "first_session": first.isoformat(),
+                    "last_session": last.isoformat(),
+                    **listing_evidence[str(symbol)],
+                }
+                for symbol, row_count, first, last in stats
+            ],
+            "field_sources": {
+                "ohlcv_amount": "fund_daily (vol=hand, amount=thousand_cny)",
+                "factor": "fund_adj",
+                "listing": "fund_basic",
+                "stock_financial_fields": "null_not_zero",
+            },
+            "unit_contract": {
+                "source_volume_unit": TUSHARE_DAILY_VOLUME_UNIT,
+                "qlib_volume_unit": QLIB_DAILY_VOLUME_UNIT,
+                "source_amount_unit": TUSHARE_DAILY_AMOUNT_UNIT,
+                "qlib_amount_unit": QLIB_DAILY_AMOUNT_UNIT,
+                "source_hand_size": int(TUSHARE_HAND_SIZE),
+            },
+            "quality": {
+                "duplicate_daily_keys": 0,
+                "duplicate_factor_keys": 0,
+                "invalid_market_rows": 0,
+                "missing_or_nonpositive_factor_rows": 0,
+            },
+        }
+        if self.require_governed_etfs and evidence["status"] != "ready":
+            raise RuntimeError("governed ETF sources contain no publishable whitelist rows")
+        self._governed_etf_cache = evidence
+        return dict(evidence)
+
+    def _normalized_etf_query(self) -> str:
+        evidence = self._governed_etf_evidence()
+        included = [str(value) for value in evidence["included_symbols"]]
+        if not included:
+            raise RuntimeError("governed ETF normalized query requires publishable symbols")
+        whitelist_sql = ", ".join(_sql_string(symbol) for symbol in included)
+        daily = _sql_string(
+            str((self.snapshot_path / "parquet" / "fund_daily" / "**" / "*.parquet").resolve())
+        )
+        factors = _sql_string(
+            str((self.snapshot_path / "parquet" / "fund_adj" / "**" / "*.parquet").resolve())
+        )
+        daily_features = self.research_feature_contract["daily_fields"]
+        fundamental_features = self.research_feature_contract["fundamental_fields"]
+        capital_flow_features = self.research_feature_contract["capital_flow_fields"]
+        research_fields = [
+            *daily_features,
+            *(
+                target
+                for features in fundamental_features.values()
+                for target in features.values()
+            ),
+            *capital_flow_features,
+        ]
+        null_research_fields = "".join(
+            f", NULL::DOUBLE AS {field}" for field in research_fields
+        )
+        return f"""
+            WITH joined AS (
+                SELECT
+                    upper(trim(CAST(d.ts_code AS VARCHAR))) AS ts_code,
+                    d.trade_date,
+                    try_cast(d.open AS DOUBLE) AS open,
+                    try_cast(d.high AS DOUBLE) AS high,
+                    try_cast(d.low AS DOUBLE) AS low,
+                    try_cast(d.close AS DOUBLE) AS close,
+                    try_cast(d.pre_close AS DOUBLE) AS pre_close,
+                    try_cast(d.vol AS DOUBLE) AS vol,
+                    try_cast(d.amount AS DOUBLE) AS amount,
+                    try_cast(d.pct_chg AS DOUBLE) AS pct_chg,
+                    try_cast(a.adj_factor AS DOUBLE) AS adj_factor,
+                    first_value(
+                        try_cast(d.close AS DOUBLE) * try_cast(a.adj_factor AS DOUBLE)
+                    ) OVER (PARTITION BY upper(trim(CAST(d.ts_code AS VARCHAR)))
+                            ORDER BY d.trade_date) AS base_price
+                FROM read_parquet({daily}, hive_partitioning=true, union_by_name=true) d
+                JOIN read_parquet({factors}, hive_partitioning=true, union_by_name=true) a
+                  ON upper(trim(CAST(d.ts_code AS VARCHAR))) =
+                     upper(trim(CAST(a.ts_code AS VARCHAR)))
+                 AND coalesce(try_cast(d.trade_date AS DATE),
+                              try_strptime(CAST(d.trade_date AS VARCHAR), '%Y%m%d')::DATE) =
+                     coalesce(try_cast(a.trade_date AS DATE),
+                              try_strptime(CAST(a.trade_date AS VARCHAR), '%Y%m%d')::DATE)
+                WHERE upper(trim(CAST(d.ts_code AS VARCHAR))) IN ({whitelist_sql})
+            )
+            SELECT
+                trade_date AS date,
+                upper(split_part(ts_code, '.', 2) || split_part(ts_code, '.', 1)) AS symbol,
+                open * adj_factor / base_price AS open,
+                high * adj_factor / base_price AS high,
+                low * adj_factor / base_price AS low,
+                close * adj_factor / base_price AS close,
+                CASE WHEN vol > 0 AND amount IS NOT NULL
+                     THEN amount * 10.0 / vol * adj_factor / base_price
+                     ELSE close * adj_factor / base_price END AS vwap,
+                vol * {float(TUSHARE_HAND_SIZE)} * base_price / adj_factor AS volume,
+                adj_factor / base_price AS factor,
+                pct_chg / 100.0 AS change,
+                amount * 1000.0 AS amount,
+                CASE WHEN vol IS NULL OR vol <= 0 THEN 1.0 ELSE 0.0 END AS paused,
+                round(pre_close * 1.10, 3) * adj_factor / base_price AS up_limit,
+                round(pre_close * 0.90, 3) * adj_factor / base_price AS down_limit
+                {null_research_fields}
+            FROM joined
+            WHERE adj_factor > 0 AND base_price > 0
+              AND NOT ({self._invalid_daily_units_predicate("")})
+        """
 
     def _normalized_query(self, daily_glob: Path, adj_glob: Path, limit_glob: Path) -> str:
         daily = _sql_string(str(daily_glob.resolve()))

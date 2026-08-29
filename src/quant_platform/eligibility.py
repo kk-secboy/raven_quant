@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-ELIGIBILITY_CONTRACT_VERSION = "ashare-point-in-time-eligibility-v1"
+ELIGIBILITY_CONTRACT_VERSION = "cn-stock-etf-point-in-time-eligibility-v2"
 STANDARD_AUDIT_OPINIONS = frozenset(
     {
         "standard_unqualified",
@@ -38,7 +38,14 @@ def build_point_in_time_eligibility(
     policy: EligibilityPolicy | None = None,
     trading_calendar: pd.Index | pd.Series | list[Any] | tuple[Any, ...] | None = None,
 ) -> pd.DataFrame:
-    """Build one fail-closed eligibility row per observed stock and trading date."""
+    """Build one fail-closed eligibility row per observed instrument/session.
+
+    ``market.asset_type`` is optional for compatibility and defaults to
+    ``stock``.  ETF rows follow the same listing, liquidity, suspension and
+    regulatory gates, while stock-only ST, shareholder-equity and audit gates
+    are deliberately not applied to funds that do not publish company
+    financial statements.
+    """
 
     rules = policy or EligibilityPolicy()
     if rules.min_listing_trading_days < 1 or rules.liquidity_lookback_days < 2:
@@ -50,6 +57,15 @@ def build_point_in_time_eligibility(
     )
     base["datetime"] = pd.to_datetime(base["datetime"], errors="coerce").dt.normalize()
     base["instrument"] = base["instrument"].astype(str).str.upper()
+    if "asset_type" not in base.columns:
+        base["asset_type"] = "stock"
+    base["asset_type"] = base["asset_type"].astype(str).str.strip().str.lower()
+    unknown_asset_types = sorted(set(base["asset_type"]) - {"stock", "etf"})
+    if unknown_asset_types:
+        raise ValueError(
+            "eligibility market has unsupported asset types: "
+            + ", ".join(unknown_asset_types)
+        )
     base["amount"] = pd.to_numeric(base["amount"], errors="coerce")
     base["paused"] = pd.to_numeric(base["paused"], errors="coerce").fillna(1).gt(0)
     base = base.dropna(subset=["datetime", "instrument"])
@@ -112,6 +128,7 @@ def build_point_in_time_eligibility(
 
     st = _normalize_intervals(st_intervals, value_column="is_st", label="ST")
     base["is_st"] = _interval_flags(base, st, value_column="is_st")
+    base.loc[base["asset_type"].eq("etf"), "is_st"] = False
     suspension = _required_frame(
         suspensions,
         {"datetime", "instrument", "suspended"},
@@ -148,6 +165,7 @@ def build_point_in_time_eligibility(
     )
     base["positive_equity"] = pd.to_numeric(base["equity"], errors="coerce").gt(0)
     base["standard_audit_opinion"] = base["audit_opinion"].isin(STANDARD_AUDIT_OPINIONS)
+    base["financial_gate_required"] = base["asset_type"].eq("stock")
 
     regulatory_available = regulatory_events is not None
     base["regulatory_data_available"] = regulatory_available
@@ -180,8 +198,12 @@ def build_point_in_time_eligibility(
         "st": base["is_st"],
         "suspended": base["suspended"],
         "abnormal_listing": ~base["normal_listing_status"],
-        "negative_or_missing_equity": ~base["positive_equity"],
-        "nonstandard_or_missing_audit": ~base["standard_audit_opinion"],
+        "negative_or_missing_equity": (
+            base["financial_gate_required"] & ~base["positive_equity"]
+        ),
+        "nonstandard_or_missing_audit": (
+            base["financial_gate_required"] & ~base["standard_audit_opinion"]
+        ),
         "insufficient_liquidity": base["average_daily_amount_20d"].fillna(0).lt(
             rules.min_average_daily_amount
         ),
@@ -211,6 +233,7 @@ def build_point_in_time_eligibility(
     columns = [
         "datetime",
         "instrument",
+        "asset_type",
         "eligible",
         "reasons",
         "listing_trading_days",
@@ -223,6 +246,7 @@ def build_point_in_time_eligibility(
         "financial_announcement_date",
         "audit_opinion",
         "audit_announcement_date",
+        "financial_gate_required",
         "regulatory_data_available",
         "major_violation",
         "contract_version",

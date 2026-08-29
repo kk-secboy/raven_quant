@@ -3,6 +3,10 @@ from datetime import date
 import pandas as pd
 import pytest
 
+from quant_data.universe import (
+    GOVERNED_DAILY_ETF_WHITELIST,
+    governed_daily_etf_whitelist_contract,
+)
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.etf_subtypes import (
     ETF_SUBTYPE_GATE_VERSION,
@@ -11,6 +15,7 @@ from quant_platform.etf_subtypes import (
     list_etf_subtype_registry,
     validate_etf_subtype_registry,
 )
+from quant_platform.market_rules import BOARD_FUND, order_unit_rules
 from quant_platform.simulation_engine import (
     execute_atomic_pair_day,
     execute_simulation_day,
@@ -28,6 +33,30 @@ def test_registry_contract_and_version() -> None:
     for subtype in ("cross_border", "bond", "gold", "commodity", "money"):
         assert registry[subtype].accepted is False
         assert registry[subtype].pending_acceptance
+
+
+def test_daily_etf_whitelist_is_bound_to_accepted_execution_contracts() -> None:
+    contract = governed_daily_etf_whitelist_contract()
+    assert contract == governed_daily_etf_whitelist_contract()
+    assert len(contract["whitelist_sha256"]) == 64
+    assert contract["symbols"] == list(GOVERNED_DAILY_ETF_WHITELIST)
+    assert "159915.SZ" not in GOVERNED_DAILY_ETF_WHITELIST
+    assert "518880.SH" not in GOVERNED_DAILY_ETF_WHITELIST
+    costs = CostModelConfig()
+    for symbol in GOVERNED_DAILY_ETF_WHITELIST:
+        assert fund_subtype(symbol) == "equity"
+        assert etf_trading_gate(symbol) is None
+        rules = order_unit_rules(symbol, date(2026, 8, 29))
+        assert rules.board == BOARD_FUND
+        assert rules.min_lot == rules.lot_increment == 100
+        assert rules.t_plus == 1
+        breakdown = costs.estimate_breakdown(
+            side="sell",
+            gross_value=100_000.0,
+            participation=0.001,
+            asset_type="etf",
+        )
+        assert breakdown["stamp_duty"] == 0.0
 
 
 @pytest.mark.parametrize(

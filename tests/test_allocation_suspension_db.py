@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from governance_fixtures import PERIODS
+from governance_fixtures import PERIODS, enable_recommendation_authority_for_test
 from sqlalchemy import update
 from test_allocation_policy_guards_db import (
     _create_allocation,
@@ -28,7 +28,6 @@ from quant_data.database import (
     strategy_allocation_artifacts,
     strategy_allocation_members,
     strategy_allocations,
-    strategy_versions,
 )
 from quant_platform.allocation_store import AllocationStore
 from quant_platform.recommendation_store import RecommendationStore
@@ -105,15 +104,39 @@ def _three_versions(database_url: str, tmp_path: Path) -> list[str]:
     ]
     # OOS vintage seal: each candidate needs a distinct final test window.
     windows = [
-        PERIODS,
-        {**PERIODS, "test_start": date(2024, 2, 8)},
-        {**PERIODS, "test_start": date(2024, 2, 22)},
+        {
+            **PERIODS,
+            "test_start": date(2027, 3, 1),
+            "test_end": date(2028, 3, 31),
+        },
+        {
+            **PERIODS,
+            "test_start": date(2025, 2, 3),
+            "test_end": date(2027, 2, 26),
+        },
+        {
+            **PERIODS,
+            "test_start": date(2022, 1, 10),
+            "test_end": date(2025, 1, 31),
+        },
     ]
+    recipe_ids = (
+        "short_relative_strength",
+        "swing_trend",
+        "long_quality_value",
+    )
     return [
         _approve_version(
-            database_url, tmp_path, suffix=f"m{index}", returns=returns, periods=window
+            database_url,
+            tmp_path,
+            suffix=f"m{index}",
+            returns=returns,
+            periods=window,
+            recipe_id=recipe_id,
         )
-        for index, (returns, window) in enumerate(zip(series, windows, strict=True))
+        for index, (returns, window, recipe_id) in enumerate(
+            zip(series, windows, recipe_ids, strict=True)
+        )
     ]
 
 
@@ -150,13 +173,7 @@ def _enable_recommendations(database_url: str, version_ids: list[str]) -> None:
     tests exercise suspension, not the forward gate (production must pass
     PromotionStore.promote)."""
 
-    engine = open_database(database_url)
-    with engine.begin() as connection:
-        connection.execute(
-            update(strategy_versions)
-            .where(strategy_versions.c.id.in_(version_ids))
-            .values(promotion_stage="recommendation_enabled")
-        )
+    enable_recommendation_authority_for_test(database_url, version_ids)
 
 
 def _activate(database_url: str, allocation_id: str) -> None:

@@ -1,6 +1,54 @@
 import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
+import {
+  factorSourceSelectionIsValid,
+  recipeUsesQlibBaseline,
+  visibleStrategyCreationRecipes,
+} from "../app/strategy-recipe-policy.mjs";
+
+test("strategy creation exposes only governed recipes and binds transparent baselines", () => {
+  const ids = [
+    "short_relative_strength",
+    "swing_trend",
+    "long_quality_value",
+    "index_enhancement",
+    "full_market_multifactor",
+    "minute_mean_reversion",
+    "pair_trading",
+  ];
+  const recipes = ids.map((id) => ({
+    id,
+    config_overrides: { factor_source_mode: "qlib_baseline" },
+  }));
+
+  assert.deepEqual(
+    visibleStrategyCreationRecipes(recipes).map((recipe) => recipe.id),
+    ids.slice(0, 5),
+  );
+  for (const id of ids.slice(0, 3)) {
+    const recipe = recipes.find((item) => item.id === id);
+    assert.equal(recipeUsesQlibBaseline(recipe), true);
+    assert.equal(factorSourceSelectionIsValid(recipe, "qlib_baseline", 0, 0), true);
+  }
+  assert.equal(
+    recipeUsesQlibBaseline(recipes.find((recipe) => recipe.id === "minute_mean_reversion")),
+    false,
+  );
+  assert.equal(
+    recipeUsesQlibBaseline(recipes.find((recipe) => recipe.id === "pair_trading")),
+    false,
+  );
+  assert.equal(
+    factorSourceSelectionIsValid(
+      recipes.find((recipe) => recipe.id === "minute_mean_reversion"),
+      "qlib_baseline",
+      0,
+      0,
+    ),
+    false,
+  );
+});
 
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -75,6 +123,34 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.doesNotMatch(allSource, /\/api\/research-programs|\/api\/research-campaigns/);
 
   const autopilot = sourceByName["autopilot-panel.tsx"];
+  assert.match(autopilot, /\/api\/advice\/today/);
+  assert.match(autopilot, /\/api\/investor-profile/);
+  assert.match(autopilot, /short_1_5d/);
+  assert.match(autopilot, /swing_1_6m/);
+  assert.match(autopilot, /long_1_3y/);
+  assert.match(autopilot, /BUY/);
+  assert.match(autopilot, /ADD/);
+  assert.match(autopilot, /HOLD/);
+  assert.match(autopilot, /REDUCE/);
+  assert.match(autopilot, /EXIT/);
+  assert.match(autopilot, /NO_ACTION/);
+  assert.match(autopilot, /is_investment_advice/);
+  assert.match(autopilot, /const visibleAction = card\.is_investment_advice \? card\.action : "NO_ACTION"/);
+  assert.match(autopilot, /simulationOnly = !card\.is_investment_advice/);
+  assert.match(autopilot, /仅供隔离模拟验证，不是荐股/);
+  assert.match(autopilot, /今天的正式动作/);
+  assert.match(autopilot, /统一账户建议/);
+  assert.match(autopilot, /main_board/);
+  assert.match(autopilot, /star_market/);
+  assert.match(autopilot, /chi_next/);
+  assert.match(autopilot, /beijing_exchange/);
+  assert.match(autopilot, /etf/);
+  assert.match(autopilot, /initial_capital/);
+  assert.match(autopilot, /advancedMode/);
+  assert.match(sourceByName["page.tsx"], /今日选股与账户操作/);
+  assert.match(sourceByName["page.tsx"], /今日建议/);
+  assert.match(sourceByName["page.tsx"], /打开高级管理/);
+  assert.match(sourceByName["page.tsx"], /advancedMode=\{advancedMode\}/);
   assert.match(autopilot, /\/api\/autopilot/);
   assert.match(autopilot, /current_stage/);
   assert.match(autopilot, /next_action/);
@@ -122,6 +198,26 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(sourceByName["rdagent-panel.tsx"], /\/api\/rdagent\/status/);
   assert.match(sourceByName["rdagent-panel.tsx"], /fin_model/);
   assert.match(sourceByName["rdagent-panel.tsx"], /fin_quant/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /fin_strategy/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /研究周期（必选）/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /短线 · 1～5 个交易日/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /中线 · 1～6 个月/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /长线 · 1～3 年以上/);
+  assert.equal(
+    sourceByName["rdagent-panel.tsx"].match(
+      /requiresResearchHorizon \? \{ horizon: researchHorizon \} : \{\}/g,
+    )?.length,
+    2,
+    "immediate and scheduled fin_strategy requests must both bind the selected horizon",
+  );
+  assert.match(
+    sourceByName["rdagent-panel.tsx"],
+    /requiresResearchHorizon && !researchHorizon/,
+  );
+  assert.match(
+    sourceByName["rdagent-panel.tsx"],
+    /HORIZON_RESEARCH_SCENARIOS = new Set<ScenarioId>\(\[[\s\S]{0,120}"fin_factor",[\s\S]{0,80}"fin_model",[\s\S]{0,80}"fin_quant",[\s\S]{0,80}"fin_strategy",[\s\S]{0,20}\]\)/,
+  );
   assert.match(sourceByName["rdagent-panel.tsx"], /fin_factor_report/);
   assert.match(sourceByName["rdagent-panel.tsx"], /general_model/);
   assert.match(sourceByName["rdagent-panel.tsx"], /data_science/);
@@ -129,12 +225,32 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(sourceByName["rdagent-panel.tsx"], /状态未知 · 正在恢复/);
   assert.match(sourceByName["rdagent-panel.tsx"], /!runtimeOperational \|\| !selectedScenario\.ready/);
   assert.doesNotMatch(sourceByName["rdagent-panel.tsx"], /Docker 不可用|LLM 未配置/);
-  assert.match(sourceByName["backtest-panel.tsx"], /full_market_multifactor|文档策略配方/);
-  assert.match(sourceByName["backtest-panel.tsx"], /industry_neutral_qp/);
-  assert.match(sourceByName["backtest-panel.tsx"], /execution_dataset/);
-  assert.match(sourceByName["backtest-panel.tsx"], /执行契约哈希/);
-  assert.match(sourceByName["backtest-panel.tsx"], /预最终历史 \/ 最终 OOS/);
-  assert.match(sourceByName["rdagent-panel.tsx"], /2021-01-11/);
+  const backtest = sourceByName["backtest-panel.tsx"];
+  assert.match(backtest, /visibleStrategyCreationRecipes/);
+  assert.match(backtest, /recipeUsesQlibBaseline/);
+  assert.match(backtest, /factorSourceSelectionIsValid/);
+  assert.match(backtest, /factorSourceMode === "qlib_baseline"[\s\S]{0,40}\? \[\]/);
+  assert.match(backtest, /\.\.\.\(recipe\?\.config_overrides \?\? \{\}\)/);
+  assert.match(backtest, /recipe_id: recipe\?\.id \?\? "custom"/);
+  assert.match(backtest, /recipe_version: recipe\?\.version \?\? "custom"/);
+  assert.match(backtest, /isQlibBaselineRecipe && factorSourceMode !== "qlib_baseline"/);
+  assert.match(backtest, /固定 Qlib 基线/);
+  assert.match(backtest, /不需要 RD-Agent 因子/);
+  assert.match(backtest, /必须先完成回测才能审批/);
+  assert.match(backtest, /\/api\/strategy-versions\/\$\{selectedVersion\}\/approve/);
+  assert.doesNotMatch(backtest, /\/api\/advice|recommendation-portfolios|pair-portfolios/);
+  assert.match(backtest, /full_market_multifactor|文档策略配方/);
+  assert.match(backtest, /industry_neutral_qp/);
+  assert.match(backtest, /execution_dataset/);
+  assert.match(backtest, /执行契约哈希/);
+  assert.match(backtest, /预最终历史 \/ 最终 OOS/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /最终 OOS 只开放一次/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /官方 RDLoop \/ Trace（只读）/);
+  assert.match(sourceByName["rdagent-panel.tsx"], /Hypothesis 与 Feedback/);
+  assert.doesNotMatch(
+    sourceByName["rdagent-panel.tsx"],
+    /2021-01-11|人工批准 \/ 模拟盘|正式回测后仍需人工批准/,
+  );
   assert.match(
     sourceByName["strategy-defaults-panel.tsx"],
     /min_pre_final_history_days/,

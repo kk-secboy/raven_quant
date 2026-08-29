@@ -146,6 +146,11 @@ def test_reservation_is_idempotent_but_overlapping_window_is_rejected(
     assert repeated["id"] == first["id"]
     assert first["hypothesis_count"] == 1
     assert first["batch_alpha"] == "0.025"
+    store.settle_batch(
+        first["id"],
+        failed=True,
+        failure_reason="settle the first reservation before testing overlap precedence",
+    )
     with pytest.raises(ValueError, match="overlaps"):
         _reserve(store, key="another-bundle-same-window", bundle="c" * 64)
 

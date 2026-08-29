@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from qlib_test_doubles import qlib_workflow_identity
 
+import quant_platform.strategy_store as strategy_store_module
 from quant_platform.factor_autopilot import (
     canonical_sha256,
     factor_sota_admission_path,
@@ -25,8 +26,12 @@ from quant_platform.factor_library_store import (
     validate_factor_definition_immutability,
     validate_sota_roll_forward,
 )
+from quant_platform.research_automation import build_multi_profile_consensus
 from quant_platform.research_store import FactorGatePolicy
-from quant_platform.strategy_store import _validate_governed_factor_evaluation
+from quant_platform.strategy_store import (
+    _validate_governed_factor_evaluation,
+    _validate_governed_profile_consensus,
+)
 from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
 pytestmark = pytest.mark.no_database
@@ -45,6 +50,109 @@ def test_factor_sota_dual_path_never_repairs_a_hard_gate_failure() -> None:
 
     weak["robust_10y"]["hard_status"] = "failed"
     assert factor_sota_admission_path("incremental_pending", weak) is None
+
+
+def test_strategy_consensus_preserves_robust_stress_profile_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = {
+        "id": "candidate-a",
+        "code_sha256": "a" * 64,
+        "values_sha256": "b" * 64,
+    }
+
+    def evaluation(profile_id: str, *, gate_status: str) -> dict:
+        suffix = {"recent_3y": "1", "robust_10y": "2", "balanced_5y": "3"}[
+            profile_id
+        ]
+        valid_start = {
+            "recent_3y": "2022-01-03",
+            "balanced_5y": "2020-01-02",
+            "robust_10y": "2015-01-05",
+        }[profile_id]
+        train_end = {
+            "recent_3y": "2021-12-31",
+            "balanced_5y": "2019-12-31",
+            "robust_10y": "2015-01-02",
+        }[profile_id]
+        return {
+            "id": suffix * 32,
+            "factor_candidate_id": candidate["id"],
+            "dataset_identity_sha256": "d" * 64,
+            "train_start": "2010-01-04",
+            "train_end": train_end,
+            "valid_start": valid_start,
+            "valid_end": "2024-12-20",
+            "test_start": "2025-01-02",
+            "test_end": "2025-12-31",
+            "candidate_code_sha256": candidate["code_sha256"],
+            "candidate_values_sha256": candidate["values_sha256"],
+            "evidence_sha256": suffix * 64,
+            "metrics_sha256": suffix * 64,
+            "gate_status": gate_status,
+            "metrics_json": {
+                "research_profile": {"id": profile_id},
+                "direction": "original",
+                "coverage_gate_passed": True,
+                "cost_adjusted_return": 0.03,
+            },
+        }
+
+    evaluations = {
+        "recent_3y": evaluation("recent_3y", gate_status="passed"),
+        "balanced_5y": evaluation("balanced_5y", gate_status="passed"),
+        "robust_10y": evaluation("robust_10y", gate_status="failed"),
+    }
+    sealed = build_multi_profile_consensus(
+        {
+            **candidate,
+            "profile_evaluations": [
+                {**item, "metrics": dict(item["metrics_json"])}
+                for item in evaluations.values()
+            ],
+        }
+    )
+    assert sealed is not None
+    gate_requirements: dict[str, bool] = {}
+
+    def validate_evaluation(
+        evaluation_row: dict,
+        candidate_row: dict,
+        *,
+        expected_profile_id: str | None,
+        require_gate_passed: bool,
+    ) -> dict:
+        assert candidate_row == candidate
+        assert evaluation_row["id"] == evaluations[expected_profile_id]["id"]
+        gate_requirements[str(expected_profile_id)] = require_gate_passed
+        return {"hard_status": "passed", "effect_status": "passed"}
+
+    monkeypatch.setattr(
+        strategy_store_module,
+        "_validate_governed_factor_evaluation",
+        validate_evaluation,
+    )
+
+    _validate_governed_profile_consensus(candidate, evaluations, sealed)
+
+    assert gate_requirements == {
+        "balanced_5y": True,
+        "recent_3y": True,
+        "robust_10y": False,
+    }
+
+    invalid_robust = {
+        **evaluations,
+        "robust_10y": {
+            **evaluations["robust_10y"],
+            "metrics_json": {
+                **evaluations["robust_10y"]["metrics_json"],
+                "cost_adjusted_return": -0.01,
+            },
+        },
+    }
+    with pytest.raises(ValueError, match="no longer satisfies governed admission"):
+        _validate_governed_profile_consensus(candidate, invalid_robust, sealed)
 
 
 def _roll_forward_inputs() -> tuple[dict, list[dict], list[dict]]:

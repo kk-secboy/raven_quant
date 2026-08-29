@@ -49,6 +49,23 @@ def _finite_metrics(values: dict[str, Any]) -> dict[str, float]:
     return metrics
 
 
+def qlib_workflow_tracking_uri() -> str:
+    """Resolve the configured tracker, with a durable local fallback for offline workers."""
+
+    configured = os.getenv("MLFLOW_TRACKING_URI", "").strip()
+    if configured:
+        return configured
+    artifact_root = os.getenv("_MLFLOW_SERVER_ARTIFACT_ROOT", "").strip()
+    if not artifact_root or "://" in artifact_root:
+        raise ValueError(
+            "MLFLOW_TRACKING_URI is required when the Qlib artifact backend is not local"
+        )
+    root = Path(artifact_root)
+    if not root.is_absolute():
+        raise ValueError("Qlib Workflow/Recorder local artifact root must be absolute")
+    return str(root / "tracking")
+
+
 @dataclass(frozen=True)
 class QlibRecorderIdentity:
     adapter_version: str
@@ -200,6 +217,11 @@ class QlibWorkflowRun(AbstractContextManager["QlibWorkflowRun"]):
         if self.identity is None:
             raise RuntimeError("Qlib Workflow/Recorder identity is unavailable")
         return self.identity.to_dict()
+
+    def get_recorder(self) -> Any:
+        """Return the active Qlib recorder for governed record templates."""
+
+        return self._require_active().get_recorder()
 
     def log_params(self, values: dict[str, Any]) -> None:
         recorder = self._require_active()

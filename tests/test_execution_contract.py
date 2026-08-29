@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 import pytest
+from governance_fixtures import governed_etf_ready_evidence
 
 from quant_data.execution_contract import (
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
@@ -31,6 +32,7 @@ def test_daily_contract_requires_share_volume_and_verified_lineage() -> None:
         "qlib_amount_unit": "cny",
         "source_hand_size": 100,
         "index_volume_policy": "excluded_non_tradable_benchmark",
+        "governed_etf_whitelist": governed_etf_ready_evidence(),
         "lineage_verified": True,
     }
     require_daily_qlib_contract(valid)
@@ -39,6 +41,8 @@ def test_daily_contract_requires_share_volume_and_verified_lineage() -> None:
         require_daily_qlib_contract({**valid, "field_contract_version": "v1"})
     with pytest.raises(ValueError, match="lineage is not verified"):
         require_daily_qlib_contract({**valid, "lineage_verified": False})
+    with pytest.raises(ValueError, match="ETF whitelist"):
+        require_daily_qlib_contract({**valid, "governed_etf_whitelist": {}})
 
 
 def test_formal_daily_execution_requires_native_price_limit_boundary() -> None:

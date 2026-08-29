@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from quant_data.qlib_builder import build_qlib_output_manifest
 from quant_platform.data_rollover import (
     next_qlib_trading_date,
     qlib_trading_date_on_or_before,
@@ -89,6 +90,7 @@ def _qlib(
         "dataset_lineage_id": lineage_id,
         "lineage_verified": verified,
     }
+    provenance["output_manifest"] = build_qlib_output_manifest(path)
     (path / "metadata" / "provenance.json").write_text(
         json.dumps(provenance), encoding="utf-8"
     )

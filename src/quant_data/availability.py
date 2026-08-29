@@ -85,6 +85,8 @@ AVAILABILITY_POLICIES: dict[str, AvailabilityPolicy] = {
     # Trade-date-derived market fields are known after that session closes.
     "daily": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
     "adj_factor": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
+    "fund_daily": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
+    "fund_adj": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
     "daily_basic": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
     "moneyflow": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),
     "index_dailybasic": AvailabilityPolicy(SAME_TRADE_DATE_AFTER_CLOSE, ("trade_date",)),

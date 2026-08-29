@@ -48,7 +48,7 @@ from .corpus_nlp import (
 from .corpus_nlp import DEFAULT_WORKERS as CORPUS_DEFAULT_WORKERS
 from .corpus_nlp import default_factors_dir as corpus_factors_dir
 from .cost_model import CostModelConfig
-from .data_rollover import qlib_trading_date_on_or_before, select_qlib_dataset
+from .data_rollover import qlib_trading_date_on_or_before
 from .execution_algorithms import execution_time_slots
 from .external_factor_evaluation import import_external_evaluations
 from .factor_autopilot import canonical_sha256 as factor_sota_sha256
@@ -63,8 +63,13 @@ from .factor_evaluation_recovery import (
 )
 from .factor_library_store import FactorLibraryStore
 from .feature_set_registry import get_feature_set, register_feature_set
+from .horizon_review import resolve_financial_review_trigger
 from .job_store import (
     MAX_NUMERICAL_THREADS_PER_JOB,
+    ORDER_PLAN_AWAITING_EXECUTION_DATA,
+    ORDER_PLAN_EXECUTION_TRADE_DATE_KEY,
+    ORDER_PLAN_MATERIALIZATION_STATUS_KEY,
+    ORDER_PLAN_MATERIALIZED,
     JobStore,
     research_job_cpu_cost,
 )
@@ -74,12 +79,16 @@ from .market_overview import MarketOverviewService
 from .market_permission import MarketPermissionStore
 from .model_artifact_store import ModelArtifactStore
 from .model_recompute import GOVERNED_MODEL_ENGINES
+from .model_research_governance import canonical_sha256 as model_canonical_sha256
 from .news_flash_factors import FACTOR_NAMES as NEWS_FLASH_FACTOR_NAMES
 from .news_flash_factors import default_factors_dir as news_flash_factors_dir
+from .ops_calendar import load_calendar_days
+from .paper_policy_state import bind_current_paper_holdings
 from .parameter_experiment_store import ParameterExperimentStore
 from .parameter_experiments import merge_admitted_trial_ledgers
 from .promotion import PromotionStore
 from .rdagent_candidate_store import RDAGentCandidateStore
+from .rdagent_dataset_view import isolate_rdagent_periods
 from .rdagent_runtime import (
     probe_rdagent,
     rdagent_command,
@@ -90,6 +99,10 @@ from .recommendation_account_store import RecommendationAccountStore
 from .recommendation_store import RecommendationStore
 from .report_rc_factors import FACTOR_NAMES as REPORT_RC_FACTOR_NAMES
 from .report_rc_factors import default_factors_dir as report_rc_factors_dir
+from .research_label_binding import (
+    resolve_research_label_binding,
+    validate_research_label_binding,
+)
 from .research_store import ResearchStore
 from .research_tournament import (
     RESEARCH_SCREENING_MARKERS,
@@ -107,7 +120,33 @@ from .services import (
     resolve_snapshot_dataset,
     resolve_snapshot_manifest,
 )
-from .simulation_store import SimulationStore
+from .simulation_store import (
+    ExecutionDataNotReadyError,
+    SimulationStore,
+    build_settlement_calendar_binding,
+    validate_settlement_calendar_binding,
+)
+from .strategy_research_admission import (
+    FIN_STRATEGY_FULL_STACK_ARTIFACT_TYPE,
+    FIN_STRATEGY_POLICY_ARTIFACT_TYPE,
+    FIN_STRATEGY_WINNER_ARTIFACT_TYPE,
+    build_fin_strategy_capital_oos_reservation,
+    build_fin_strategy_winner_artifact,
+)
+from .strategy_research_evaluation import (
+    STRATEGY_FULL_STACK_MODE,
+    STRATEGY_POLICY_ONLY_MODE,
+    STRATEGY_RESEARCH_EVALUATION_MODES,
+    build_public_strategy_control_config,
+    build_strategy_research_competition_plan,
+    build_strategy_stage_artifact_from_parameter_experiment,
+    derive_strategy_research_competition_periods,
+    strategy_score_grid_contract,
+)
+from .strategy_rule_compiler import (
+    materialize_strategy_candidate_config,
+    validate_compiled_strategy_artifact,
+)
 from .strategy_store import StrategyStore
 
 _DATABASE_RETRY_INITIAL_SECONDS = 0.5
@@ -346,6 +385,36 @@ def _require_supported_simulation_execution(
         raise ValueError(
             "pair simulation execution is retired; historical ledgers are read-only"
         )
+
+
+def _bind_daily_simulation_settlement_calendar(
+    manifest: dict[str, Any], execution_dataset: dict[str, Any]
+) -> dict[str, Any]:
+    """Re-verify the batch calendar against the exact worker-side dataset."""
+
+    result = dict(manifest)
+    if str(result.get("execution_frequency") or "") != "day":
+        return result
+    settlement_trade_date = date.fromisoformat(str(result["trade_date"]))
+    provenance = dict(execution_dataset.get("provenance") or {})
+    persisted = validate_settlement_calendar_binding(
+        result.get("settlement_calendar_binding"),
+        trade_date=settlement_trade_date,
+        dataset_identity_sha256=str(
+            provenance.get("dataset_identity_sha256") or ""
+        ),
+        dataset_lineage_id=str(provenance.get("dataset_lineage_id") or ""),
+    )
+    observed = build_settlement_calendar_binding(
+        execution_dataset,
+        trade_date=settlement_trade_date,
+    )
+    if observed != persisted:
+        raise ValueError(
+            "daily simulation settlement calendar changed after batch binding"
+        )
+    result["settlement_calendar_binding"] = observed
+    return result
 
 
 class LocalJobWorker:
@@ -645,6 +714,133 @@ class LocalJobWorker:
             ),
         )
 
+    def _settle_fin_strategy_formal_research(
+        self,
+        job: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Close fin_strategy research at rejection or isolated paper admission.
+
+        A successful Qlib process is not itself approval.  The persistent
+        capital receipt and the complete StrategyStore hard gate are checked
+        only after the backtest row is durably marked succeeded.
+        """
+
+        payload = dict(job.get("payload") or {})
+        run_id = str(payload.get("fin_strategy_research_run_id") or "")
+        if not run_id:
+            return None
+        backtest_id = str(payload.get("backtest_id") or "")
+        version_id = str(payload.get("strategy_version_id") or "")
+        if not backtest_id or not version_id:
+            raise ValueError("fin_strategy formal settlement identity is incomplete")
+        backtest = self.strategies.get_backtest(backtest_id)
+        metrics = dict(backtest.get("metrics") or {})
+        receipt = metrics.get("capital_oos_receipt")
+        recorded_binding = (backtest.get("periods") or {}).get(
+            "fin_strategy_formal_admission"
+        )
+        admission = (
+            recorded_binding.get("admission")
+            if isinstance(recorded_binding, dict)
+            else None
+        )
+        if (
+            str(backtest.get("status") or "") != "succeeded"
+            or not isinstance(receipt, dict)
+            or not isinstance(admission, dict)
+            or str(admission.get("admission_sha256") or "")
+            != str(payload.get("fin_strategy_formal_admission_sha256") or "")
+            or str(admission.get("governed_winner_artifact_sha256") or "")
+            != str(
+                payload.get("fin_strategy_governed_winner_artifact_sha256") or ""
+            )
+        ):
+            raise ValueError("fin_strategy formal settlement evidence changed")
+        run = self.research.get_run(run_id)
+        runtime = dict(run.get("runtime") or {})
+        settlement: dict[str, Any] = {
+            "strategy_version_id": version_id,
+            "backtest_id": backtest_id,
+            "capital_oos_batch_id": str(receipt.get("batch_id") or ""),
+            "capital_oos_passed": receipt.get("passed") is True,
+            "recommendation_enabled": False,
+        }
+        if receipt.get("passed") is not True:
+            settlement.update(
+                {
+                    "status": "research_rejected",
+                    "reason": "formal_capital_oos_gate_failed",
+                    "promotion_stage": None,
+                }
+            )
+            runtime["fin_strategy_formal_settlement"] = settlement
+            if str(run.get("status") or "") in {"queued", "running", "evaluating"}:
+                self.research.mark_run(
+                    run_id,
+                    "succeeded",
+                    runtime={
+                        **runtime,
+                        "negative_result": "formal_capital_oos_gate_failed",
+                    },
+                    actor="strategy-formal-oos-worker",
+                )
+            return settlement
+        try:
+            approved = self.strategies.approve(
+                version_id,
+                actor="system:strategy-research",
+                reason=(
+                    "Automatic paper admission after the governed fin_strategy "
+                    "research gates and sealed capital OOS passed"
+                ),
+            )
+        except ValueError as exc:
+            message = str(exc)
+            expected_rejection = message.startswith("strategy risk gate failed:")
+            settlement.update(
+                {
+                    "status": (
+                        "research_rejected" if expected_rejection else "settlement_failed"
+                    ),
+                    "reason": message,
+                    "promotion_stage": None,
+                }
+            )
+            runtime["fin_strategy_formal_settlement"] = settlement
+            if str(run.get("status") or "") in {"queued", "running", "evaluating"}:
+                self.research.mark_run(
+                    run_id,
+                    "succeeded" if expected_rejection else "failed",
+                    runtime=runtime,
+                    error=None if expected_rejection else message,
+                    actor="strategy-formal-oos-worker",
+                )
+            return settlement
+        stage = self.promotions.current_stage(version_id)
+        settlement.update(
+            {
+                "status": "paper_validating",
+                "promotion_stage": str(approved.get("promotion_stage") or "paper"),
+                "paper_stage_id": str((stage or {}).get("id") or "") or None,
+                "paper_portfolio_id": str(
+                    (stage or {}).get("simulation_portfolio_id") or ""
+                )
+                or None,
+                "forward_evidence_reset": True,
+            }
+        )
+        runtime["fin_strategy_formal_settlement"] = settlement
+        if str(run.get("status") or "") in {"queued", "running", "evaluating"}:
+            self.research.mark_run(
+                run_id,
+                "succeeded",
+                runtime=runtime,
+                actor="strategy-formal-oos-worker",
+            )
+        result["fin_strategy_formal_settlement"] = settlement
+        return settlement
+
     def _monitor_process(
         self,
         job_id: str,
@@ -675,6 +871,58 @@ class LocalJobWorker:
                 break
             time.sleep(1)
         return cancelled, progress_mtime_ns
+
+    def _settle_simulation_order_plan(
+        self,
+        job: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a sealed plan even when its D+1 execution data is not published."""
+
+        portfolio_id = str(job["payload"]["simulation_portfolio_id"])
+        manifest_sha256 = str(result["order_plan_manifest_sha256"])
+        try:
+            batch, created = self.simulations.create_batch_from_order_plan(
+                portfolio_id,
+                order_plan_manifest_sha256=manifest_sha256,
+                data_root=self.settings.data_root,
+                actor=str(job["payload"].get("actor") or "simulation-order-plan-worker"),
+            )
+        except ExecutionDataNotReadyError as exc:
+            result.update(
+                {
+                    ORDER_PLAN_MATERIALIZATION_STATUS_KEY: (
+                        ORDER_PLAN_AWAITING_EXECUTION_DATA
+                    ),
+                    ORDER_PLAN_EXECUTION_TRADE_DATE_KEY: exc.trade_date.isoformat(),
+                    "simulation_batch_id": None,
+                    "simulation_batch_created": False,
+                }
+            )
+        else:
+            if created:
+                self.store.create(
+                    "simulation_replay",
+                    {"simulation_batch_id": batch["id"]},
+                    self.settings.data_root
+                    / "platform"
+                    / "logs"
+                    / f"simulation-replay-{batch['id']}.log",
+                    dedupe_active_kind=False,
+                    idempotency_key=f"simulation-replay:{batch['id']}",
+                )
+            result.update(
+                {
+                    ORDER_PLAN_MATERIALIZATION_STATUS_KEY: ORDER_PLAN_MATERIALIZED,
+                    ORDER_PLAN_EXECUTION_TRADE_DATE_KEY: str(batch["trade_date"]),
+                    "simulation_batch_id": batch["id"],
+                    "simulation_batch_created": created,
+                }
+            )
+        self._retry_transient_database(
+            lambda: self.store.finish(job["id"], exit_code=0, result=result)
+        )
+        return result
 
     def _run(self, job: dict) -> None:
         affinity_reservation: tuple[int, ...] | None = None
@@ -746,7 +994,8 @@ class LocalJobWorker:
                         str(value) for value in affinity
                     )
         except ValueError as exc:
-            self._cpu_affinity_pool.release(affinity_reservation)
+            if affinity_reservation is not None:
+                self._cpu_affinity_pool.release(affinity_reservation)
             affinity_reservation = None
             error_message = str(exc)
             if job["kind"] == "quant_bundle_evaluate":
@@ -802,7 +1051,8 @@ class LocalJobWorker:
                     )
                     exit_code = int(process.returncode or 0)
             finally:
-                self._cpu_affinity_pool.release(affinity_reservation)
+                if affinity_reservation is not None:
+                    self._cpu_affinity_pool.release(affinity_reservation)
                 affinity_reservation = None
             if cancelled:
                 cancellation_error = "Cancelled by operator"
@@ -994,10 +1244,7 @@ class LocalJobWorker:
                 elif job["payload"].get("require_ready", True) and not result["ok"]:
                     logical_error = "one or more governed data faces are not ready"
                     exit_code = 3
-            if exit_code == 0 and job["kind"] in {
-                "strategy_backtest",
-                "pair_backtest",
-            }:
+            if exit_code == 0 and job["kind"] == "strategy_backtest":
                 try:
                     if not isinstance(result, dict) or not isinstance(result.get("metrics"), dict):
                         raise ValueError("strategy backtest result is missing metrics")
@@ -1013,6 +1260,11 @@ class LocalJobWorker:
                     if not isinstance(result, dict):
                         raise ValueError("parameter experiment result is missing")
                     self.parameter_experiments.apply_result(str(parameter_experiment_id), result)
+                    strategy_settlement = self._settle_fin_strategy_experiment(
+                        job, result
+                    )
+                    if strategy_settlement is not None:
+                        result["strategy_research_settlement"] = strategy_settlement
                 except (KeyError, TypeError, ValueError) as exc:
                     logical_error = str(exc)
                     exit_code = 3
@@ -1210,9 +1462,42 @@ class LocalJobWorker:
                                 "evaluating",
                                 runtime={**runtime, "quant_bundles": bundles},
                             )
+                        elif scenario.id == "fin_strategy":
+                            strategy_archive = self._archive_fin_strategy_artifacts(
+                                research_run_id,
+                                job,
+                                result or {},
+                                sanitized_result_artifact_id=str(
+                                    archive["sanitized_result_artifact_id"]
+                                ),
+                                sanitized_result_sha256=str(
+                                    archive["sanitized_result_sha256"]
+                                ),
+                            )
+                            competition_jobs = (
+                                self._queue_fin_strategy_policy_evaluations(
+                                    research_run_id,
+                                    job,
+                                    result or {},
+                                    strategy_archive,
+                                )
+                            )
+                            self.research.mark_run(
+                                research_run_id,
+                                "evaluating",
+                                runtime={
+                                    **runtime,
+                                    **strategy_archive,
+                                    "strategy_policy_evaluation_jobs": competition_jobs,
+                                },
+                            )
+                            # Publish the complete preregistered branch set before
+                            # any policy worker may settle and attempt run-level
+                            # winner reconciliation.
+                            self.notify()
                         elif scenario.factor_output:
                             candidates = self._import_rdagent_candidates(
-                                research_run_id, result or {}
+                                research_run_id, job, result or {}
                             )
                             if scenario.id == "fin_factor_report":
                                 for asset_id in job["payload"].get("asset_ids") or []:
@@ -1373,6 +1658,12 @@ class LocalJobWorker:
                         "succeeded",
                         metrics=result["metrics"],
                     )
+                    formal_settlement = self._settle_fin_strategy_formal_research(
+                        job,
+                        result,
+                    )
+                    if formal_settlement is not None:
+                        result["fin_strategy_formal_settlement"] = formal_settlement
                 else:
                     self.strategies.mark_backtest(
                         backtest_id,
@@ -1410,33 +1701,12 @@ class LocalJobWorker:
                         recommendation_snapshot_id, logical_error or process_error
                     )
             if simulation_order_plan_portfolio_id and exit_code == 0 and result:
-                batch, created = self.simulations.create_batch_from_order_plan(
-                    str(simulation_order_plan_portfolio_id),
-                    order_plan_manifest_sha256=str(result["order_plan_manifest_sha256"]),
-                    data_root=self.settings.data_root,
-                    actor=str(job["payload"].get("actor") or "simulation-order-plan-worker"),
-                )
-                if created:
-                    self.store.create(
-                        "simulation_replay",
-                        {"simulation_batch_id": batch["id"]},
-                        self.settings.data_root
-                        / "platform"
-                        / "logs"
-                        / f"simulation-replay-{batch['id']}.log",
-                        dedupe_active_kind=False,
-                        idempotency_key=f"simulation-replay:{batch['id']}",
-                    )
-                result["simulation_batch_id"] = batch["id"]
-                result["simulation_batch_created"] = created
-                self._retry_transient_database(
-                    lambda: self.store.finish(job["id"], exit_code=0, result=result)
-                )
+                self._settle_simulation_order_plan(job, result)
             elif simulation_batch_id and exit_code == 0 and result:
                 if result_path is None:
                     raise ValueError("simulation replay result path is missing")
                 bars = pd.read_parquet(result_path.parent / result["minute_bars_file"])
-                batch = self.simulations.process_batch(
+                self.simulations.process_batch(
                     simulation_batch_id,
                     minute_bars=bars,
                     closing_prices=result["closing_prices"],
@@ -1855,7 +2125,7 @@ class LocalJobWorker:
         if len(set(asset_ids)) != len(asset_ids):
             raise ValueError("research asset acquisition result contains duplicate assets")
 
-        imported: list[dict[str, str]] = []
+        imported: list[dict[str, object]] = []
         for asset_id in asset_ids:
             registered = self.rdagent_candidates.import_manifest(
                 self.settings.data_root
@@ -1865,14 +2135,14 @@ class LocalJobWorker:
                 / "manifest.json",
                 actor="research-asset-worker",
             )
-            imported.append(
-                {
-                    "asset_id": asset_id,
-                    "content_sha256": str(registered["content_sha256"]),
-                    "manifest_sha256": str(registered["manifest_sha256"]),
-                    "size_bytes": int(registered.get("size_bytes") or 0),
-                }
-            )
+            imported_asset: dict[str, object] = {
+                "asset_id": asset_id,
+                "content_sha256": str(registered["content_sha256"]),
+                "manifest_sha256": str(registered["manifest_sha256"]),
+            }
+            if registered.get("size_bytes") is not None:
+                imported_asset["size_bytes"] = int(registered["size_bytes"])
+            imported.append(imported_asset)
 
         failed = int(raw_result.get("failed") or 0)
         blocked = int(raw_result.get("blocked") or 0)
@@ -2580,6 +2850,15 @@ class LocalJobWorker:
                 asset_ids=list(payload.get("asset_ids") or []),
                 asset_manifest_sha256=dict(payload.get("asset_manifest_sha256") or {}),
                 feature_set=payload.get("feature_set"),
+                strategy_horizon_profile=(
+                    payload.get("strategy_horizon_profile")
+                    or payload.get("horizon_profile")
+                ),
+                incumbent_strategy_version_id=(
+                    str(payload["incumbent_strategy"]["id"])
+                    if isinstance(payload.get("incumbent_strategy"), dict)
+                    else None
+                ),
             )
             if scenario.id == "fin_quant":
                 baseline = self._freeze_fin_quant_baseline(payload)
@@ -2824,6 +3103,20 @@ class LocalJobWorker:
                     item["baseline_prediction_runtime"] = runtime_baseline
                 candidates.append(item)
             feature_set = _frozen_evaluation_feature_set(payload)
+            quant_label_binding = (
+                resolve_research_label_binding(payload)
+                if job["kind"] == "quant_bundle_evaluate"
+                else None
+            )
+            if quant_label_binding is not None and any(
+                candidate.get("research_label_binding") != quant_label_binding
+                or candidate.get("research_label_binding_sha256")
+                != quant_label_binding["binding_sha256"]
+                for candidate in candidates
+            ):
+                raise ValueError(
+                    "quant evaluation candidate labels differ from the research window"
+                )
             manifest = {
                 "research_run_id": payload["research_run_id"],
                 "candidates": candidates,
@@ -2837,6 +3130,38 @@ class LocalJobWorker:
                 "feature_set": feature_set,
                 **(
                     {
+                        "research_window_contract": payload[
+                            "research_window_contract"
+                        ],
+                        "research_window_contract_sha256": payload[
+                            "research_window_contract_sha256"
+                        ],
+                        "label_horizon_sessions": payload[
+                            "label_horizon_sessions"
+                        ],
+                    }
+                    if job["kind"] == "model_evaluate"
+                    else {}
+                ),
+                **(
+                    {
+                        "horizon_profile": quant_label_binding[
+                            "horizon_profile"
+                        ],
+                        "periods": quant_label_binding["periods"],
+                        "research_window_contract": quant_label_binding[
+                            "research_window_contract"
+                        ],
+                        "research_window_contract_sha256": quant_label_binding[
+                            "research_window_contract_sha256"
+                        ],
+                        "label_horizon_sessions": quant_label_binding[
+                            "label_horizon_sessions"
+                        ],
+                        "research_label_binding": quant_label_binding,
+                        "research_label_binding_sha256": quant_label_binding[
+                            "binding_sha256"
+                        ],
                         "baseline_prediction_champion": payload[
                             "baseline_prediction_champion"
                         ],
@@ -2853,7 +3178,27 @@ class LocalJobWorker:
                         **RESEARCH_SCREENING_MARKERS,
                     }
                     if job["kind"] == "quant_bundle_evaluate"
-                    else {}
+                    and quant_label_binding is not None
+                    else (
+                        {
+                            "baseline_prediction_champion": payload[
+                                "baseline_prediction_champion"
+                            ],
+                            "research_tournament_id": payload[
+                                "research_tournament_id"
+                            ],
+                            "parent_research_tournament_id": payload[
+                                "parent_research_tournament_id"
+                            ],
+                            "research_tournament_manifest_sha256": payload[
+                                "research_tournament_manifest_sha256"
+                            ],
+                            "research_trial_ids": payload["research_trial_ids"],
+                            **RESEARCH_SCREENING_MARKERS,
+                        }
+                        if job["kind"] == "quant_bundle_evaluate"
+                        else {}
+                    )
                 ),
                 "dataset_identity_sha256": payload["dataset_identity_sha256"],
                 "evaluation_profiles": payload.get("evaluation_profiles") or [],
@@ -2919,6 +3264,16 @@ class LocalJobWorker:
             def runtime_path(value: str) -> str:
                 return _to_wsl_path(Path(value)) if is_wsl else str(value)
 
+            label_binding = resolve_research_label_binding(payload)
+            if label_binding is not None and any(
+                int(item.get("label_horizon_days") or 0)
+                != int(label_binding["label_horizon_sessions"])
+                for item in payload.get("candidates") or []
+            ):
+                raise ValueError(
+                    "factor evaluation candidate labels differ from the research window"
+                )
+
             promoted = self.research.list_candidates(status="promoted", limit=500)
             library_comparisons: list[dict[str, str]] = []
             materialization_root = (
@@ -2961,6 +3316,26 @@ class LocalJobWorker:
                 "dataset_identity_sha256": payload["dataset_identity_sha256"],
                 "periods": payload["periods"],
                 "evaluation_profiles": payload.get("evaluation_profiles") or [],
+                **(
+                    {
+                        "horizon_profile": label_binding["horizon_profile"],
+                        "research_window_contract": label_binding[
+                            "research_window_contract"
+                        ],
+                        "research_window_contract_sha256": label_binding[
+                            "research_window_contract_sha256"
+                        ],
+                        "label_horizon_sessions": label_binding[
+                            "label_horizon_sessions"
+                        ],
+                        "research_label_binding": label_binding,
+                        "research_label_binding_sha256": label_binding[
+                            "binding_sha256"
+                        ],
+                    }
+                    if label_binding is not None
+                    else {}
+                ),
                 "universe": payload.get("universe", "cn_all"),
                 "min_daily_instruments": int(payload.get("min_daily_instruments", 50)),
                 "comparison_values": library_comparisons + [
@@ -3472,6 +3847,26 @@ class LocalJobWorker:
                     connection, version["config"]
                 )
             governance = experiment["periods"].get("governance") or {}
+            strategy_evaluation_mode = payload.get("strategy_evaluation_mode")
+            if strategy_evaluation_mode is not None:
+                if (
+                    strategy_evaluation_mode not in STRATEGY_RESEARCH_EVALUATION_MODES
+                    or governance.get("mode") != strategy_evaluation_mode
+                    or governance.get("final_oos_opened") is not False
+                    or payload.get("strategy_competition_plan_sha256")
+                    != governance.get("plan_sha256")
+                    or payload.get("strategy_competition_stage")
+                    != governance.get("stage")
+                    or payload.get("dataset_identity_sha256")
+                    != governance.get("dataset_identity_sha256")
+                ):
+                    raise ValueError(
+                        "fin_strategy parameter experiment governance changed"
+                    )
+                if model_signal is not None:
+                    raise ValueError(
+                        "fin_strategy rule comparison currently requires its frozen factor grid"
+                    )
             if model_signal is not None:
                 if (
                     governance.get("mode") != "model_portfolio_pre_final"
@@ -3504,12 +3899,14 @@ class LocalJobWorker:
                 "periods": experiment["periods"],
                 "parameter_grid": experiment["parameter_grid"],
                 "evaluation_mode": (
-                    "pre_final_portfolio_trial" if model_signal is not None else None
+                    "pre_final_portfolio_trial"
+                    if model_signal is not None
+                    else strategy_evaluation_mode
                 ),
                 "pre_final_cutoff": (
                     str(model_signal["candidate"].pre_final_end)
                     if model_signal is not None
-                    else None
+                    else governance.get("pre_final_cutoff")
                 ),
                 "historical_validation_periods": (
                     {
@@ -3517,7 +3914,7 @@ class LocalJobWorker:
                         "end": model_signal["evaluation"].train_end.isoformat(),
                     }
                     if model_signal is not None
-                    else None
+                    else governance.get("historical_validation_periods")
                 ),
                 "strategy_trial_count": (
                     int(admitted_multiple_testing["trial_count"])
@@ -3879,72 +4276,6 @@ class LocalJobWorker:
                 result_path,
                 _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
             )
-        if job["kind"] == "pair_backtest":
-            output = self.settings.data_root / "artifacts" / "backtests" / payload["backtest_id"]
-            output.mkdir(parents=True, exist_ok=True)
-            manifest_path = output / "manifest.json"
-            result_path = output / "result.json"
-            version = self.strategies.get_version(payload["strategy_version_id"])
-            if version.get("strategy_type") != "pair" or not version.get("pair"):
-                raise ValueError("pair backtest job requires a pair strategy version")
-            is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
-
-            def runtime_path(value: str) -> str:
-                return _to_wsl_path(Path(value)) if is_wsl else str(Path(value))
-
-            manifest = {
-                "backtest_id": payload["backtest_id"],
-                "strategy_version_id": version["id"],
-                "dataset": payload["dataset"],
-                "execution_snapshot": payload["execution_snapshot"],
-                "execution_contract_hash": version["execution_contract_hash"],
-                "periods": payload["periods"],
-                "config": version["config"],
-                "pair": {
-                    key: version["pair"][key]
-                    for key in ("leg_y", "leg_x", "asset_class", "shorting_mode")
-                },
-                "daily_provenance": payload["daily_provenance"],
-                "minute_dataset": payload["minute_dataset"],
-                "shortability_dataset": payload["shortability_dataset"],
-            }
-            manifest_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            script = self.project_root / "scripts" / "run_pair_backtest.py"
-            command = (
-                [
-                    "wsl",
-                    "-d",
-                    self.settings.qlib_wsl_distro,
-                    "--exec",
-                    self.settings.qlib_python,
-                    _to_wsl_path(script),
-                ]
-                if is_wsl
-                else [self.settings.qlib_python, str(script)]
-            )
-            command.extend(
-                [
-                    "--provider-uri",
-                    runtime_path(payload["dataset_path"]),
-                    "--minute-path",
-                    runtime_path(payload["minute_dataset"]["dataset_path"]),
-                    "--shortability-path",
-                    runtime_path(payload["shortability_dataset"]["dataset_path"]),
-                    "--manifest",
-                    runtime_path(str(manifest_path)),
-                    "--output",
-                    runtime_path(str(output)),
-                    "--tracking-uri",
-                    self.settings.mlflow_tracking_uri,
-                ]
-            )
-            return (
-                command,
-                result_path,
-                _qlib_workflow_environment(self.settings, is_wsl=is_wsl),
-            )
         if job["kind"] == "simulation_order_plan":
             portfolio = self.simulations.get(payload["simulation_portfolio_id"])
             if (
@@ -3977,7 +4308,7 @@ class LocalJobWorker:
             datasets = {
                 item["name"]: item
                 for item in list_qlib_datasets(self.settings.data_root)
-                if item.get("ready")
+                if item.get("ready") and item.get("reproducible")
             }
             anchor = datasets.get(portfolio["daily_dataset"])
             if anchor is None:
@@ -3994,14 +4325,32 @@ class LocalJobWorker:
                     "bound account snapshot"
                 )
             local_today = datetime.now(UTC).astimezone(ZoneInfo("Asia/Shanghai")).date()
-            anchor_date = qlib_trading_date_on_or_before(anchor, local_today)
-            dataset = select_qlib_dataset(
-                self.settings.data_root,
-                anchor_name=str(portfolio["daily_dataset"]),
-                roll_policy=str(portfolio.get("daily_roll_policy") or "pinned"),
-                lineage_id=portfolio.get("daily_dataset_lineage_id"),
-                required_date=anchor_date,
+            frozen_identity = str(payload.get("dataset_identity_sha256") or "")
+            dataset = next(
+                (
+                    item
+                    for item in datasets.values()
+                    if str(
+                        dict(item.get("provenance") or {}).get(
+                            "dataset_identity_sha256"
+                        )
+                        or ""
+                    )
+                    == frozen_identity
+                    and str(
+                        dict(item.get("provenance") or {}).get("dataset_lineage_id")
+                        or ""
+                    )
+                    == str(portfolio.get("daily_dataset_lineage_id") or "")
+                    and dict(item.get("provenance") or {}).get("lineage_verified")
+                    is True
+                ),
+                None,
             )
+            if dataset is None:
+                raise ValueError(
+                    "paper order-plan frozen Qlib dataset is unavailable or unverified"
+                )
             provenance = dict(dataset.get("provenance") or {})
             signal_date = date.fromisoformat(str(payload["signal_date"]))
             if str(payload.get("dataset_identity_sha256") or "") != str(
@@ -4018,6 +4367,10 @@ class LocalJobWorker:
             promotion_stage = self.promotions.require_paper_signal(
                 str(version["id"]),
                 portfolio_id=str(portfolio["id"]),
+                signal_date=signal_date,
+            )
+            self.simulations.require_order_plan_predecessor_settled(
+                str(portfolio["id"]),
                 signal_date=signal_date,
             )
             if (
@@ -4070,18 +4423,66 @@ class LocalJobWorker:
                     signal_at=signal_timestamp,
                 )[0]
                 execution_not_before = first_slot.isoformat()
-            positions = self.simulations.rows(portfolio["id"], "positions")
+            strategy_config = dict(version.get("config") or {})
+            horizon_profile = str(
+                version.get("horizon_profile")
+                or strategy_config.get("horizon_profile")
+                or "legacy_ambiguous"
+            )
+            requires_complete_holding_age = (
+                horizon_profile in {"short_1_5d", "swing_1_6m", "long_1_3y"}
+                or strategy_config.get("max_holding_sessions") is not None
+                or strategy_config.get("thesis_min_holding_sessions") is not None
+            )
+            positions = self.simulations.positions_with_holding_age(
+                str(portfolio["id"]),
+                calendar_days=load_calendar_days(str(dataset["path"])),
+                as_of_date=signal_date,
+                require_complete_age=requires_complete_holding_age,
+            )
             nav = float(portfolio["nav"])
             previous_holdings = [
                 {
                     "instrument": str(item["instrument"]),
                     "weight": max(0.0, float(item.get("market_value") or 0.0)) / nav,
+                    "average_cost": float(item["average_cost"]),
+                    "holding_age_sessions": (
+                        int(item["holding_age_sessions"])
+                        if item.get("holding_age_sessions") is not None
+                        else None
+                    ),
                 }
                 for item in positions
                 if nav > 0
                 and str(item.get("position_side") or "long") == "long"
                 and float(item.get("market_value") or 0.0) > 0
             ]
+            previous_snapshot = None
+            if horizon_profile in {"short_1_5d", "swing_1_6m", "long_1_3y"}:
+                previous_snapshot = self.simulations.latest_paper_previous_snapshot(
+                    str(portfolio["id"]),
+                    promotion_stage_id=str(promotion_stage["id"]),
+                    before_signal_date=signal_date,
+                )
+                previous_snapshot = bind_current_paper_holdings(
+                    previous_snapshot,
+                    previous_holdings,
+                )
+            previous_signal_date = (
+                date.fromisoformat(str(previous_snapshot["as_of_date"])[:10])
+                if previous_snapshot and previous_snapshot.get("as_of_date")
+                else None
+            )
+            financial_review_trigger = (
+                resolve_financial_review_trigger(
+                    data_root=self.settings.data_root,
+                    dataset_provenance=provenance,
+                    previous_signal_date=previous_signal_date,
+                    signal_date=signal_date,
+                )
+                if horizon_profile == "long_1_3y"
+                else None
+            )
             strategy_risk_state = self.allocations.strategy_risk_state(str(version["id"]))
             required_nav_date = qlib_trading_date_on_or_before(
                 dataset,
@@ -4104,9 +4505,13 @@ class LocalJobWorker:
             if str(version["config"].get("signal_source") or "factor_score") == (
                 "model_prediction"
             ):
-                model_artifact = self.model_artifacts.require_for_inference(
-                    str(version["id"]),
-                    dataset_identity_sha256=str(provenance["dataset_identity_sha256"]),
+                frozen_model_binding = payload.get("model_artifact_binding")
+                if not isinstance(frozen_model_binding, dict):
+                    raise ValueError(
+                        "model paper order-plan has no frozen ModelArtifact binding"
+                    )
+                model_artifact = self.model_artifacts.get(
+                    str(frozen_model_binding.get("id") or "")
                 )
                 expected_model_binding = {
                     "id": str(model_artifact["id"]),
@@ -4116,9 +4521,13 @@ class LocalJobWorker:
                         model_artifact["dataset_identity_sha256"]
                     ),
                 }
-                if payload.get("model_artifact_binding") != expected_model_binding:
+                if (
+                    frozen_model_binding != expected_model_binding
+                    or str(model_artifact.get("strategy_version_id") or "")
+                    != str(version["id"])
+                ):
                     raise ValueError(
-                        "paper order-plan job changed its active ModelArtifact binding"
+                        "paper order-plan job changed its frozen ModelArtifact binding"
                     )
             elif payload.get("model_artifact_binding") is not None:
                 raise ValueError(
@@ -4162,7 +4571,18 @@ class LocalJobWorker:
                 "portfolio_drawdown": account_risk_state["portfolio_drawdown"],
                 "daily_return": account_risk_state["daily_return"],
                 "previous_holdings": previous_holdings,
-                "previous_snapshot": None,
+                "holding_age_sessions": {
+                    str(item["instrument"]): int(item["holding_age_sessions"])
+                    for item in previous_holdings
+                    if item.get("holding_age_sessions") is not None
+                },
+                "holding_age_evidence": {
+                    str(item["instrument"]): dict(item["holding_age_evidence"])
+                    for item in positions
+                    if item.get("holding_age_evidence") is not None
+                },
+                "previous_snapshot": previous_snapshot,
+                "financial_review_trigger": financial_review_trigger,
                 "signal_dataset": (
                     {
                         "name": signal_dataset["name"],
@@ -4288,7 +4708,58 @@ class LocalJobWorker:
                     dataset_identity_sha256=str(payload["dataset_identity_sha256"]),
                 )
 
-            latest_snapshot = portfolio.get("latest_snapshot") or {}
+            snapshot_history = [
+                item
+                for item in portfolio.get("snapshots") or []
+                if isinstance(item, dict)
+                and item.get("status") == "succeeded"
+                and str(item.get("id") or "")
+                != str(payload.get("recommendation_snapshot_id") or "")
+            ]
+            latest_snapshot = snapshot_history[0] if snapshot_history else {}
+            if not latest_snapshot:
+                fallback_snapshot = portfolio.get("latest_snapshot") or {}
+                if fallback_snapshot.get("status") in {None, "succeeded"}:
+                    latest_snapshot = fallback_snapshot
+            latest_snapshot_payload = dict(latest_snapshot.get("snapshot") or {})
+            previous_position_state = dict(
+                latest_snapshot_payload.get("position_state") or {}
+            )
+            dataset_provenance_path = (
+                Path(payload["dataset_path"]) / "metadata" / "provenance.json"
+            )
+            try:
+                dataset_provenance = json.loads(
+                    dataset_provenance_path.read_text(encoding="utf-8")
+                )
+            except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "recommendation refresh has no immutable dataset provenance"
+                ) from exc
+            if str(dataset_provenance.get("dataset_identity_sha256") or "") != str(
+                payload["dataset_identity_sha256"]
+            ):
+                raise ValueError("recommendation refresh changed its dataset identity")
+            horizon_profile = str(
+                version.get("horizon_profile")
+                or version.get("config", {}).get("horizon_profile")
+                or "legacy_ambiguous"
+            )
+            previous_signal_date = (
+                date.fromisoformat(str(latest_snapshot["as_of_date"])[:10])
+                if latest_snapshot and latest_snapshot.get("as_of_date")
+                else None
+            )
+            financial_review_trigger = (
+                resolve_financial_review_trigger(
+                    data_root=self.settings.data_root,
+                    dataset_provenance=dataset_provenance,
+                    previous_signal_date=previous_signal_date,
+                    signal_date=recommendation_date,
+                )
+                if horizon_profile == "long_1_3y"
+                else None
+            )
             manifest = {
                 "portfolio_id": portfolio["id"],
                 "strategy_version_id": version["id"],
@@ -4321,10 +4792,12 @@ class LocalJobWorker:
                         "as_of_date": str(latest_snapshot["as_of_date"]),
                         "effective_date": str(latest_snapshot.get("effective_date") or ""),
                         "holdings": latest_snapshot.get("holdings") or [],
+                        "position_state": previous_position_state,
                     }
                     if latest_snapshot
                     else None
                 ),
+                "financial_review_trigger": financial_review_trigger,
                 "factors": [
                     {
                         "candidate_id": item["factor_candidate_id"],
@@ -4378,6 +4851,10 @@ class LocalJobWorker:
             minute_dataset = datasets.get(manifest["execution_dataset"])
             if minute_dataset is None:
                 raise ValueError("simulation execution Qlib dataset is unavailable")
+            manifest = _bind_daily_simulation_settlement_calendar(
+                manifest,
+                minute_dataset,
+            )
             pair_plan = manifest.get("governed_pair_plan")
             shortability_dataset = None
             if manifest.get("execution_adapter") == "pair":
@@ -4680,29 +5157,50 @@ class LocalJobWorker:
         steps = payload.get("pipeline_steps")
         return isinstance(steps, list) and int(payload.get("pipeline_next_index", 0)) < len(steps)
 
-    def _import_rdagent_candidates(self, run_id: str, result: dict) -> list[dict]:
+    def _import_rdagent_candidates(
+        self, run_id: str, job: dict, result: dict
+    ) -> list[dict]:
         imported = []
+        payload = dict(job.get("payload") or {})
+        label_binding = resolve_research_label_binding(payload)
         source_candidates = result.get("candidates", [])
         for item in source_candidates:
             variables = dict(item.get("variables") or {})
             if item.get("hypothesis") is not None:
                 variables["hypothesis"] = item["hypothesis"]
-            candidate = self.research.add_candidate(
-                    run_id,
-                    name=str(item["name"]),
-                    description=str(item.get("description") or ""),
-                    formulation=item.get("formulation"),
-                    variables=variables,
-                    source_iteration=item.get("source_iteration"),
-                    code_path=_local_artifact_path(item.get("code_path")),
-                    values_path=_local_artifact_path(item.get("values_path")),
-                    code_sha256=item.get("code_sha256"),
-                    rdagent_decision=item.get("rdagent_decision"),
-                    rdagent_feedback=item.get("rdagent_feedback"),
-                    experiment_family_id=str(item.get("experiment_family_id") or run_id),
-                    label_horizon_days=int(item.get("label_horizon_days") or 1),
-                    experiment_count=len(source_candidates),
+            if label_binding is not None:
+                variables.update(
+                    {
+                        "horizon_profile": label_binding["horizon_profile"],
+                        "research_label_binding": label_binding,
+                        "research_label_binding_sha256": label_binding[
+                            "binding_sha256"
+                        ],
+                        "rdagent_reported_label_horizon_days": item.get(
+                            "label_horizon_days"
+                        ),
+                    }
                 )
+            candidate = self.research.add_candidate(
+                run_id,
+                name=str(item["name"]),
+                description=str(item.get("description") or ""),
+                formulation=item.get("formulation"),
+                variables=variables,
+                source_iteration=item.get("source_iteration"),
+                code_path=_local_artifact_path(item.get("code_path")),
+                values_path=_local_artifact_path(item.get("values_path")),
+                code_sha256=item.get("code_sha256"),
+                rdagent_decision=item.get("rdagent_decision"),
+                rdagent_feedback=item.get("rdagent_feedback"),
+                experiment_family_id=str(item.get("experiment_family_id") or run_id),
+                label_horizon_days=(
+                    int(label_binding["label_horizon_sessions"])
+                    if label_binding is not None
+                    else int(item.get("label_horizon_days") or 1)
+                ),
+                experiment_count=len(source_candidates),
+            )
             formulation = str(item.get("formulation") or "").strip()
             if formulation:
                 try:
@@ -4722,6 +5220,1215 @@ class LocalJobWorker:
                     pass
             imported.append(candidate)
         return imported
+
+    def _archive_fin_strategy_artifacts(
+        self,
+        run_id: str,
+        job: dict,
+        result: dict,
+        *,
+        sanitized_result_artifact_id: str,
+        sanitized_result_sha256: str,
+    ) -> dict[str, object]:
+        """Seal research-only strategy proposals without creating production state."""
+
+        payload = dict(job.get("payload") or {})
+        feature_set = payload.get("feature_set")
+        if not isinstance(feature_set, dict) or not isinstance(
+            feature_set.get("features"), dict
+        ):
+            raise ValueError("fin_strategy archive has no governed feature set")
+        feature_ids = set(feature_set["features"])
+        if not feature_ids:
+            raise ValueError("fin_strategy archive feature set is empty")
+        feature_set_id = str(feature_set.get("id") or "")
+        feature_set_sha256 = str(feature_set.get("definition_sha256") or "")
+        dataset_identity_sha256 = str(payload.get("dataset_identity_sha256") or "")
+        if (
+            not feature_set_id
+            or not re.fullmatch(r"[0-9a-f]{64}", feature_set_sha256)
+            or not re.fullmatch(r"[0-9a-f]{64}", dataset_identity_sha256)
+        ):
+            raise ValueError("fin_strategy archive input identities are invalid")
+        horizon = str(
+            payload.get("strategy_horizon_profile")
+            or payload.get("horizon_profile")
+            or ""
+        )
+        if horizon not in {"short_1_5d", "swing_1_6m", "long_1_3y"}:
+            raise ValueError("fin_strategy archive has no governed horizon")
+        incumbent = payload.get("incumbent_strategy")
+        if incumbent is not None and (
+            not isinstance(incumbent, dict)
+            or incumbent.get("horizon_profile") != horizon
+            or not re.fullmatch(r"[0-9a-f]{32}", str(incumbent.get("id") or ""))
+        ):
+            raise ValueError("fin_strategy archive incumbent binding is invalid")
+        incumbent_id = str(incumbent["id"]) if isinstance(incumbent, dict) else None
+        periods = payload.get("periods")
+        if not isinstance(periods, dict):
+            raise ValueError("fin_strategy archive has no governed research periods")
+        expected_periods = isolate_rdagent_periods(periods)
+        source_artifacts = result.get("strategy_proposals")
+        if (
+            not isinstance(source_artifacts, list)
+            or not source_artifacts
+            or len(source_artifacts) > int(payload.get("loop_n") or 0)
+        ):
+            raise ValueError("fin_strategy produced an invalid proposal count")
+
+        artifact_root = (self.settings.data_root / "artifacts" / "rdagent").resolve()
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        root = (artifact_root / run_id).resolve()
+        if not root.is_relative_to(artifact_root):
+            raise ValueError("fin_strategy run identity escapes its governed artifact root")
+        root.mkdir(parents=True, exist_ok=True)
+        strategy_root = root / "strategy-proposals"
+        strategy_root.mkdir(parents=True, exist_ok=True)
+        if not strategy_root.resolve(strict=True).is_relative_to(root):
+            raise ValueError("fin_strategy archive directory escapes its governed run root")
+
+        def write_immutable_json(path: Path, value: object) -> Path:
+            encoded = (
+                json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+            ).encode("utf-8")
+            unresolved = path.resolve(strict=False)
+            if not unresolved.is_relative_to(root):
+                raise ValueError("fin_strategy artifact path escapes its governed run root")
+            if path.exists() or path.is_symlink():
+                if path.is_symlink() or path.read_bytes() != encoded:
+                    raise ValueError("fin_strategy immutable artifact already changed")
+            else:
+                with path.open("xb") as destination:
+                    destination.write(encoded)
+            resolved = path.resolve(strict=True)
+            if not resolved.is_relative_to(root) or not resolved.is_file():
+                raise ValueError("fin_strategy artifact is not a governed regular file")
+            return resolved
+
+        archived: list[dict[str, object]] = []
+        semantic_hashes: set[str] = set()
+        for index, raw_artifact in enumerate(source_artifacts, start=1):
+            artifact = validate_compiled_strategy_artifact(
+                raw_artifact,
+                allowed_factor_ids=feature_ids,
+            )
+            proposal = artifact["strategy_proposal"]
+            data_contract = proposal["data_contract"]
+            candidate = artifact["strategy_spec_candidate"]
+            if (
+                artifact["delivery_status"] != "research_only"
+                or proposal["delivery_status"] != "research_only"
+                or candidate.get("delivery_status") != "research_only"
+                or candidate.get("capital_eligible") is not False
+                or candidate.get("simulation_eligible") is not False
+                or candidate.get("required_next_gate")
+                != "formal_rolling_oos_backtest"
+            ):
+                raise ValueError("fin_strategy artifact exceeded research-only authority")
+            if (
+                proposal["horizon"] != horizon
+                or proposal["parent_strategy_version_id"] != incumbent_id
+                or data_contract["dataset_snapshot_id"] != dataset_identity_sha256
+                or data_contract["feature_set_id"] != feature_set_id
+                or data_contract["feature_set_definition_sha256"]
+                != feature_set_sha256
+                or data_contract["research_periods"] != expected_periods
+            ):
+                raise ValueError("fin_strategy artifact input binding disagrees with its job")
+            artifact_sha256 = str(artifact["artifact_sha256"])
+            if artifact_sha256 in semantic_hashes:
+                raise ValueError("fin_strategy returned a duplicate compiled artifact")
+            semantic_hashes.add(artifact_sha256)
+
+            proposal_path = write_immutable_json(
+                strategy_root / f"{index:03d}-proposal-{artifact['proposal_sha256']}.json",
+                proposal,
+            )
+            proposal_row = self.rdagent_candidates.register_run_artifact(
+                research_run_id=run_id,
+                artifact_type="fin_strategy_proposal",
+                storage_path=proposal_path,
+                producer="rdagent_strategy",
+                actor="worker",
+                contract_version="strategy-proposal-v1",
+                source_iteration=index,
+                metadata={
+                    "scenario": "fin_strategy",
+                    "delivery_status": "research_only",
+                    "capital_eligible": False,
+                    "simulation_eligible": False,
+                    "recommendation_eligible": False,
+                    "horizon": horizon,
+                    "proposal_sha256": artifact["proposal_sha256"],
+                    "dataset_identity_sha256": dataset_identity_sha256,
+                    "feature_set_id": feature_set_id,
+                    "feature_set_definition_sha256": feature_set_sha256,
+                    "parent_strategy_version_id": incumbent_id,
+                },
+            )
+            compiled_path = write_immutable_json(
+                strategy_root / f"{index:03d}-compiled-{artifact_sha256}.json",
+                artifact,
+            )
+            compiled_row = self.rdagent_candidates.register_run_artifact(
+                research_run_id=run_id,
+                artifact_type="fin_strategy_compiled_artifact",
+                storage_path=compiled_path,
+                producer="quantlab_strategy_rule_compiler",
+                actor="worker",
+                contract_version="compiled-strategy-proposal-v1",
+                source_iteration=index,
+                metadata={
+                    "scenario": "fin_strategy",
+                    "delivery_status": "research_only",
+                    "capital_eligible": False,
+                    "simulation_eligible": False,
+                    "recommendation_eligible": False,
+                    "horizon": horizon,
+                    "artifact_sha256": artifact_sha256,
+                    "rules_sha256": artifact["rules_sha256"],
+                    "dataset_identity_sha256": dataset_identity_sha256,
+                    "feature_set_id": feature_set_id,
+                    "feature_set_definition_sha256": feature_set_sha256,
+                    "parent_strategy_version_id": incumbent_id,
+                },
+            )
+            strategy_version = LocalJobWorker._materialize_fin_strategy_candidate(
+                self,
+                artifact,
+                compiled_artifact_id=str(compiled_row["id"]),
+                allowed_factor_ids=feature_ids,
+            )
+            archived.append(
+                {
+                    "source_iteration": index,
+                    "horizon": horizon,
+                    "proposal_sha256": str(artifact["proposal_sha256"]),
+                    "artifact_sha256": artifact_sha256,
+                    "rules_sha256": str(artifact["rules_sha256"]),
+                    "proposal_artifact_id": str(proposal_row["id"]),
+                    "proposal_content_sha256": str(proposal_row["content_sha256"]),
+                    "compiled_artifact_id": str(compiled_row["id"]),
+                    "compiled_content_sha256": str(compiled_row["content_sha256"]),
+                    "strategy_version_id": str(strategy_version["id"]),
+                    "strategy_id": str(strategy_version["strategy_id"]),
+                    "strategy_lifecycle": "research_candidate",
+                }
+            )
+
+        audit = {
+            "contract_version": "fin-strategy-research-audit-v1",
+            "scenario": "fin_strategy",
+            "delivery_status": "research_only",
+            "capital_eligible": False,
+            "simulation_eligible": False,
+            "recommendation_eligible": False,
+            "horizon": horizon,
+            "parent_strategy_version_id": incumbent_id,
+            "dataset_identity_sha256": dataset_identity_sha256,
+            "feature_set_id": feature_set_id,
+            "feature_set_definition_sha256": feature_set_sha256,
+            "sanitized_result_artifact_id": sanitized_result_artifact_id,
+            "sanitized_result_sha256": sanitized_result_sha256,
+            "artifacts": archived,
+        }
+        audit_path = write_immutable_json(root / "fin-strategy-audit.json", audit)
+        audit_row = self.rdagent_candidates.register_run_artifact(
+            research_run_id=run_id,
+            artifact_type="fin_strategy_audit_manifest",
+            storage_path=audit_path,
+            producer="quantlab_worker",
+            actor="worker",
+            contract_version="fin-strategy-research-audit-v1",
+            metadata={
+                "scenario": "fin_strategy",
+                "delivery_status": "research_only",
+                "capital_eligible": False,
+                "horizon": horizon,
+                "proposal_count": len(archived),
+            },
+        )
+        return {
+            "strategy_research_status": "compiled_research_only",
+            "strategy_horizon_profile": horizon,
+            "strategy_proposal_count": len(archived),
+            "strategy_proposal_artifacts": archived,
+            "strategy_audit_artifact_id": str(audit_row["id"]),
+            "capital_eligible": False,
+            "simulation_eligible": False,
+            "recommendation_eligible": False,
+        }
+
+    def _materialize_fin_strategy_candidate(
+        self,
+        artifact: dict[str, Any],
+        *,
+        compiled_artifact_id: str,
+        allowed_factor_ids: set[str],
+    ) -> dict[str, Any]:
+        """Create one inert StrategyVersion from a sealed fin_strategy artifact.
+
+        The existing StrategyStore remains the sole strategy registry and lifecycle
+        authority.  This write creates only a draft research candidate; it does not
+        approve, simulate, promote, or expose recommendations.
+        """
+
+        existing = self.strategies.find_version_by_source_artifact(compiled_artifact_id)
+        if existing is not None:
+            if (
+                existing["config"].get("strategy_research_artifact_sha256")
+                != artifact["artifact_sha256"]
+                or existing.get("status") != "draft"
+            ):
+                raise ValueError("compiled strategy artifact already maps to another state")
+            return existing
+
+        proposal = artifact["strategy_proposal"]
+        config = materialize_strategy_candidate_config(
+            artifact,
+            source_research_artifact_id=compiled_artifact_id,
+            allowed_factor_ids=allowed_factor_ids,
+        )
+        benchmark = str(proposal["evaluation_contract"]["benchmark"])
+        parent_id = proposal["parent_strategy_version_id"]
+        try:
+            if parent_id is not None:
+                parent = self.strategies.get_version(str(parent_id))
+                if parent["horizon_profile"] != proposal["horizon"]:
+                    raise ValueError("strategy research parent horizon changed")
+                return self.strategies.create_version(
+                    str(parent["strategy_id"]),
+                    benchmark=benchmark,
+                    universe=str(parent["universe"]),
+                    factors=[],
+                    config=config,
+                    actor="system:strategy-research",
+                )
+
+            from .strategy_recipes import get_strategy_recipe
+
+            recipe = get_strategy_recipe(str(proposal["baseline_recipe_id"]))
+            name = f"{str(proposal['name'])[:109]} [{str(artifact['artifact_sha256'])[:8]}]"
+            family = self.strategies.create(
+                name=name,
+                description=str(proposal["description"]),
+                benchmark=benchmark,
+                universe=str(recipe["universe"]),
+                factors=[],
+                config=config,
+                actor="system:strategy-research",
+                economic_hypothesis_group=(
+                    f"fin-strategy:{str(artifact['proposal_sha256'])[:64]}"
+                ),
+                hypothesis_group_cap=0.70,
+            )
+            return dict(family["versions"][0])
+        except ValueError as exc:
+            # The partial unique index on source_research_artifact_id makes
+            # concurrent/retried materialization idempotent.  Only swallow a
+            # conflict when the exact sealed artifact is now present.
+            existing = self.strategies.find_version_by_source_artifact(
+                compiled_artifact_id
+            )
+            if existing is None:
+                raise
+            if (
+                existing["config"].get("strategy_research_artifact_sha256")
+                != artifact["artifact_sha256"]
+                or existing.get("status") != "draft"
+            ):
+                raise ValueError(
+                    "compiled strategy artifact materialization conflict is not idempotent"
+                ) from exc
+            return existing
+
+    def _queue_fin_strategy_policy_evaluations(
+        self,
+        run_id: str,
+        job: dict[str, Any],
+        result: dict[str, Any],
+        strategy_archive: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Pre-register and queue the policy-only stage for each compiled proposal."""
+
+        payload = dict(job.get("payload") or {})
+        dataset_name = str(payload.get("dataset") or "")
+        dataset_path = Path(str(payload.get("dataset_path") or ""))
+        dataset_identity = str(payload.get("dataset_identity_sha256") or "")
+        source_artifacts = result.get("strategy_proposals") or []
+        archived = strategy_archive.get("strategy_proposal_artifacts") or []
+        if (
+            not dataset_name
+            or not dataset_path.is_dir()
+            or not re.fullmatch(r"[0-9a-f]{64}", dataset_identity)
+            or len(source_artifacts) != len(archived)
+        ):
+            raise ValueError("fin_strategy competition inputs are incomplete")
+        dataset = {
+            "name": dataset_name,
+            "path": str(dataset_path),
+            "lineage_id": str(payload.get("dataset_lineage_id") or ""),
+            "provenance": {"dataset_identity_sha256": dataset_identity},
+        }
+        queued: list[dict[str, Any]] = []
+        for raw_artifact, archived_item in zip(
+            source_artifacts, archived, strict=True
+        ):
+            artifact = validate_compiled_strategy_artifact(raw_artifact)
+            version = self.strategies.get_version(
+                str(archived_item["strategy_version_id"])
+            )
+            candidate_config = dict(version["config"])
+            baseline_config = build_public_strategy_control_config(candidate_config)
+            evaluation_contract = artifact["strategy_proposal"][
+                "evaluation_contract"
+            ]
+            periods = derive_strategy_research_competition_periods(
+                artifact["strategy_proposal"]["data_contract"][
+                    "research_periods"
+                ],
+                dataset_path=dataset_path,
+                purge_sessions=int(candidate_config["outer_purge_days"]),
+                minimum_oos_observations=int(
+                    evaluation_contract["minimum_oos_observations"]
+                ),
+            )
+            score_contract = strategy_score_grid_contract(baseline_config)
+            plan = build_strategy_research_competition_plan(
+                research_run_id=run_id,
+                compiled_artifact_id=str(archived_item["compiled_artifact_id"]),
+                compiled_artifact_sha256=str(artifact["artifact_sha256"]),
+                baseline_config=baseline_config,
+                candidate_config=candidate_config,
+                dataset=dataset_name,
+                dataset_identity_sha256=dataset_identity,
+                score_inputs_sha256=str(score_contract["contract_sha256"]),
+                periods=periods,
+                benchmark=str(version["benchmark"]),
+                universe=str(version["universe"]),
+                seed=0,
+                preregistered_candidate_count=2 * len(archived),
+            )
+            encoded = (
+                json.dumps(plan, ensure_ascii=False, sort_keys=True, indent=2)
+                + "\n"
+            ).encode("utf-8")
+            content_sha256 = hashlib.sha256(encoded).hexdigest()
+            plan_root = (
+                self.settings.data_root
+                / "artifacts"
+                / "rdagent"
+                / run_id
+                / "strategy-proposals"
+            ).resolve()
+            plan_root.mkdir(parents=True, exist_ok=True)
+            plan_path = (
+                plan_root / f"competition-plan-{plan['plan_sha256']}.json"
+            ).resolve()
+            if not plan_path.is_relative_to(plan_root):
+                raise ValueError("fin_strategy competition plan escapes its run root")
+            if plan_path.exists() or plan_path.is_symlink():
+                if plan_path.is_symlink() or plan_path.read_bytes() != encoded:
+                    raise ValueError("fin_strategy competition plan changed")
+            else:
+                with plan_path.open("xb") as destination:
+                    destination.write(encoded)
+            plan_artifact = self.rdagent_candidates.find_run_artifact(
+                research_run_id=run_id,
+                artifact_type="fin_strategy_competition_plan",
+                content_sha256=content_sha256,
+                verify=True,
+            )
+            if plan_artifact is None:
+                plan_artifact = self.rdagent_candidates.register_run_artifact(
+                    research_run_id=run_id,
+                    artifact_type="fin_strategy_competition_plan",
+                    storage_path=plan_path,
+                    producer="quantlab_strategy_evaluation",
+                    actor="worker",
+                    contract_version="fin-strategy-fair-competition-v1",
+                    source_iteration=int(archived_item["source_iteration"]),
+                    metadata={
+                        "delivery_status": "research_only",
+                        "capital_eligible": False,
+                        "strategy_version_id": version["id"],
+                        "compiled_artifact_id": archived_item[
+                            "compiled_artifact_id"
+                        ],
+                        "plan_sha256": plan["plan_sha256"],
+                    },
+                )
+            prepared = self.parameter_experiments.ensure_strategy_research_competition(
+                strategy_version=version,
+                plan=plan,
+                stage="policy_only",
+                dataset=dataset,
+                artifact_root=(
+                    self.settings.data_root
+                    / "artifacts"
+                    / "parameter-experiments"
+                ),
+                created_by="system:strategy-research",
+            )
+            job_payload = {
+                **prepared["job_payload"],
+                "research_run_id": run_id,
+                "dataset_lineage_id": str(payload.get("dataset_lineage_id") or ""),
+                "strategy_competition_plan_artifact_id": plan_artifact["id"],
+                "strategy_competition_plan_path": str(plan_path),
+                "strategy_competition_plan_content_sha256": content_sha256,
+            }
+            evaluation_job = self.store.create(
+                "parameter_experiment",
+                job_payload,
+                (
+                    self.settings.data_root
+                    / "platform"
+                    / "logs"
+                    / (
+                        "fin-strategy-policy-"
+                        f"{run_id}-{str(version['id'])[:8]}.log"
+                    )
+                ),
+                dedupe_active_kind=False,
+                idempotency_key=(
+                    f"fin-strategy:{plan['plan_sha256']}:policy_only"
+                ),
+            )
+            self.parameter_experiments.attach_job(
+                str(prepared["experiment"]["id"]), str(evaluation_job["id"])
+            )
+            queued.append(
+                {
+                    "strategy_version_id": str(version["id"]),
+                    "plan_artifact_id": str(plan_artifact["id"]),
+                    "plan_sha256": str(plan["plan_sha256"]),
+                    "parameter_experiment_id": str(
+                        prepared["experiment"]["id"]
+                    ),
+                    "job_id": str(evaluation_job["id"]),
+                }
+            )
+        return queued
+
+    def _load_fin_strategy_json_artifact(
+        self,
+        *,
+        artifact_id: str,
+        expected_run_id: str,
+        expected_type: str,
+        expected_path: str,
+        expected_content_sha256: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Load one registered fin_strategy JSON artifact by every frozen identity."""
+
+        artifact = self.rdagent_candidates.get_run_artifact(
+            artifact_id, verify=True
+        )
+        path = Path(str(artifact.get("storage_path") or "")).resolve()
+        if (
+            str(artifact.get("research_run_id") or "") != expected_run_id
+            or str(artifact.get("artifact_type") or "") != expected_type
+            or path != Path(expected_path).resolve()
+            or str(artifact.get("content_sha256") or "")
+            != expected_content_sha256
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_content_sha256)
+            or not path.is_file()
+        ):
+            raise ValueError("fin_strategy registered artifact identity changed")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("fin_strategy registered artifact is invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise ValueError("fin_strategy registered artifact must be an object")
+        return artifact, value
+
+    def _write_fin_strategy_stage_artifact(
+        self,
+        *,
+        run_id: str,
+        stage: str,
+        strategy_version_id: str,
+        source_iteration: int | None,
+        value: dict[str, Any],
+    ) -> dict[str, Any]:
+        encoded = (
+            json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+        content_sha256 = hashlib.sha256(encoded).hexdigest()
+        root = (
+            self.settings.data_root
+            / "artifacts"
+            / "rdagent"
+            / run_id
+            / "strategy-proposals"
+        ).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        path = (root / f"{stage}-evaluation-{content_sha256}.json").resolve()
+        if not path.is_relative_to(root):
+            raise ValueError("fin_strategy evaluation artifact escapes its run root")
+        if path.exists() or path.is_symlink():
+            if path.is_symlink() or path.read_bytes() != encoded:
+                raise ValueError("fin_strategy evaluation artifact changed")
+        else:
+            with path.open("xb") as destination:
+                destination.write(encoded)
+        artifact_type = f"fin_strategy_{stage}_evaluation"
+        registered = self.rdagent_candidates.find_run_artifact(
+            research_run_id=run_id,
+            artifact_type=artifact_type,
+            content_sha256=content_sha256,
+            verify=True,
+        )
+        if registered is None:
+            registered = self.rdagent_candidates.register_run_artifact(
+                research_run_id=run_id,
+                artifact_type=artifact_type,
+                storage_path=path,
+                producer="quantlab_strategy_evaluation",
+                actor="worker",
+                contract_version="fin-strategy-evaluation-artifact-v1",
+                source_iteration=source_iteration,
+                metadata={
+                    "delivery_status": "research_only",
+                    "capital_eligible": False,
+                    "strategy_version_id": strategy_version_id,
+                    "plan_sha256": value["evidence"]["plan_sha256"],
+                    "stage": stage,
+                    "gate_passed": value["evidence"]["gate_passed"],
+                    "parameter_experiment_id": value[
+                        "parameter_experiment_id"
+                    ],
+                },
+            )
+        return {
+            "artifact_id": str(registered["id"]),
+            "artifact_path": str(path),
+            "content_sha256": content_sha256,
+            "artifact_sha256": str(value["artifact_sha256"]),
+            "evidence_sha256": str(value["evidence"]["evidence_sha256"]),
+            "gate_passed": bool(value["evidence"]["gate_passed"]),
+        }
+
+    def _queue_fin_strategy_full_stack_evaluation(
+        self,
+        *,
+        run_id: str,
+        plan: dict[str, Any],
+        plan_artifact: dict[str, Any],
+        plan_path: str,
+        plan_content_sha256: str,
+        version: dict[str, Any],
+        dataset: dict[str, Any],
+        policy_evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        prepared = self.parameter_experiments.ensure_strategy_research_competition(
+            strategy_version=version,
+            plan=plan,
+            stage="full_stack",
+            dataset=dataset,
+            artifact_root=(
+                self.settings.data_root / "artifacts" / "parameter-experiments"
+            ),
+            created_by="system:strategy-research",
+        )
+        job_payload = {
+            **prepared["job_payload"],
+            "research_run_id": run_id,
+            "dataset_lineage_id": str(dataset.get("lineage_id") or ""),
+            "strategy_competition_plan_artifact_id": str(plan_artifact["id"]),
+            "strategy_competition_plan_path": plan_path,
+            "strategy_competition_plan_content_sha256": plan_content_sha256,
+            "strategy_policy_evidence_artifact_id": policy_evidence[
+                "artifact_id"
+            ],
+            "strategy_policy_evidence_path": policy_evidence["artifact_path"],
+            "strategy_policy_evidence_content_sha256": policy_evidence[
+                "content_sha256"
+            ],
+        }
+        evaluation_job = self.store.create(
+            "parameter_experiment",
+            job_payload,
+            self.settings.data_root
+            / "platform"
+            / "logs"
+            / f"fin-strategy-full-{run_id}-{str(version['id'])[:8]}.log",
+            dedupe_active_kind=False,
+            idempotency_key=(f"fin-strategy:{plan['plan_sha256']}:full_stack"),
+        )
+        self.parameter_experiments.attach_job(
+            str(prepared["experiment"]["id"]), str(evaluation_job["id"])
+        )
+        self.notify()
+        return {
+            "strategy_version_id": str(version["id"]),
+            "parameter_experiment_id": str(prepared["experiment"]["id"]),
+            "job_id": str(evaluation_job["id"]),
+            "stage": "full_stack",
+        }
+
+    @staticmethod
+    def _fin_strategy_artifact_metadata(artifact: dict[str, Any]) -> dict[str, Any]:
+        manifest = artifact.get("manifest_json")
+        metadata = manifest.get("metadata") if isinstance(manifest, dict) else None
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def _read_fin_strategy_registered_artifact(
+        self,
+        artifact: dict[str, Any],
+        *,
+        run_id: str,
+        artifact_type: str,
+    ) -> dict[str, Any]:
+        _, value = self._load_fin_strategy_json_artifact(
+            artifact_id=str(artifact["id"]),
+            expected_run_id=run_id,
+            expected_type=artifact_type,
+            expected_path=str(artifact["storage_path"]),
+            expected_content_sha256=str(artifact["content_sha256"]),
+        )
+        return value
+
+    def _write_fin_strategy_winner_artifact(
+        self,
+        *,
+        run_id: str,
+        value: dict[str, Any],
+    ) -> dict[str, Any]:
+        encoded = (
+            json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+        content_sha256 = hashlib.sha256(encoded).hexdigest()
+        root = (
+            self.settings.data_root
+            / "artifacts"
+            / "rdagent"
+            / run_id
+            / "strategy-proposals"
+        ).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        path = (root / f"governed-winner-{content_sha256}.json").resolve()
+        if not path.is_relative_to(root):
+            raise ValueError("fin_strategy winner artifact escapes its run root")
+        if path.exists() or path.is_symlink():
+            if path.is_symlink() or path.read_bytes() != encoded:
+                raise ValueError("fin_strategy winner artifact changed")
+        else:
+            with path.open("xb") as destination:
+                destination.write(encoded)
+        registered = self.rdagent_candidates.find_run_artifact(
+            research_run_id=run_id,
+            artifact_type=FIN_STRATEGY_WINNER_ARTIFACT_TYPE,
+            content_sha256=content_sha256,
+            verify=True,
+        )
+        if registered is None:
+            try:
+                registered = self.rdagent_candidates.register_run_artifact(
+                    research_run_id=run_id,
+                    artifact_type=FIN_STRATEGY_WINNER_ARTIFACT_TYPE,
+                    storage_path=path,
+                    producer="quantlab_strategy_evaluation",
+                    actor="worker",
+                    contract_version="fin-strategy-governed-winner-v1",
+                    metadata={
+                        "delivery_status": value["delivery_status"],
+                        "capital_eligible": False,
+                        "winner_strategy_version_id": value[
+                            "winner_strategy_version_id"
+                        ],
+                        "all_branches_settled": True,
+                        "artifact_sha256": value["artifact_sha256"],
+                    },
+                )
+            except ValueError:
+                registered = self.rdagent_candidates.find_run_artifact(
+                    research_run_id=run_id,
+                    artifact_type=FIN_STRATEGY_WINNER_ARTIFACT_TYPE,
+                    content_sha256=content_sha256,
+                    verify=True,
+                )
+                if registered is None:
+                    raise
+        return {
+            "artifact_id": str(registered["id"]),
+            "artifact_path": str(path),
+            "content_sha256": content_sha256,
+            "artifact_sha256": str(value["artifact_sha256"]),
+            "winner_strategy_version_id": value["winner_strategy_version_id"],
+        }
+
+    def _fin_strategy_branch_outcomes(
+        self,
+        *,
+        run_id: str,
+        expected_version_ids: list[str],
+    ) -> list[dict[str, Any]] | None:
+        artifacts = self.rdagent_candidates.list_run_artifacts(
+            run_id,
+            artifact_types=(
+                FIN_STRATEGY_POLICY_ARTIFACT_TYPE,
+                FIN_STRATEGY_FULL_STACK_ARTIFACT_TYPE,
+            ),
+            verify=True,
+        )
+        indexed: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for artifact in artifacts:
+            metadata = self._fin_strategy_artifact_metadata(artifact)
+            version_id = str(metadata.get("strategy_version_id") or "")
+            artifact_type = str(artifact.get("artifact_type") or "")
+            if version_id not in expected_version_ids:
+                raise ValueError(
+                    "fin_strategy evaluation artifact is outside the preregistered run"
+                )
+            indexed.setdefault((version_id, artifact_type), []).append(artifact)
+        outcomes: list[dict[str, Any]] = []
+        for version_id in expected_version_ids:
+            policy_rows = indexed.get(
+                (version_id, FIN_STRATEGY_POLICY_ARTIFACT_TYPE), []
+            )
+            full_rows = indexed.get(
+                (version_id, FIN_STRATEGY_FULL_STACK_ARTIFACT_TYPE), []
+            )
+            if len(policy_rows) > 1 or len(full_rows) > 1:
+                raise ValueError("fin_strategy branch has duplicate evaluation evidence")
+            if not policy_rows:
+                return None
+            policy = self._read_fin_strategy_registered_artifact(
+                policy_rows[0],
+                run_id=run_id,
+                artifact_type=FIN_STRATEGY_POLICY_ARTIFACT_TYPE,
+            )
+            policy_evidence = policy.get("evidence")
+            if not isinstance(policy_evidence, dict):
+                raise ValueError("fin_strategy policy evidence is missing")
+            outcome: dict[str, Any] = {
+                "strategy_version_id": version_id,
+                "plan_sha256": str(policy_evidence.get("plan_sha256") or ""),
+                "policy_evidence_sha256": str(
+                    policy_evidence.get("evidence_sha256") or ""
+                ),
+                "full_stack_evidence_sha256": "",
+            }
+            if policy_evidence.get("gate_passed") is not True:
+                if full_rows:
+                    raise ValueError(
+                        "fin_strategy policy-rejected branch has full-stack evidence"
+                    )
+                outcome["status"] = "policy_rejected"
+                outcomes.append(outcome)
+                continue
+            if not full_rows:
+                return None
+            full = self._read_fin_strategy_registered_artifact(
+                full_rows[0],
+                run_id=run_id,
+                artifact_type=FIN_STRATEGY_FULL_STACK_ARTIFACT_TYPE,
+            )
+            full_evidence = full.get("evidence")
+            if (
+                not isinstance(full_evidence, dict)
+                or full_evidence.get("plan_sha256") != outcome["plan_sha256"]
+                or full_evidence.get("prerequisite_evidence_sha256")
+                != outcome["policy_evidence_sha256"]
+            ):
+                raise ValueError("fin_strategy full-stack prerequisite changed")
+            outcome["full_stack_evidence_sha256"] = str(
+                full_evidence.get("evidence_sha256") or ""
+            )
+            if full_evidence.get("gate_passed") is not True:
+                outcome["status"] = "full_stack_rejected"
+                outcomes.append(outcome)
+                continue
+            bootstrap = full_evidence.get("paired_block_bootstrap")
+            alpha = full_evidence.get("alpha_spending")
+            pbo = full_evidence.get("pbo")
+            if not all(isinstance(item, dict) for item in (bootstrap, alpha, pbo)):
+                raise ValueError("fin_strategy full-stack ranking evidence is missing")
+            outcome.update(
+                {
+                    "status": "eligible",
+                    "observed_mean_difference": float(
+                        bootstrap["observed_mean_difference"]
+                    ),
+                    "adjusted_p_value": float(
+                        alpha["holm_equivalent_adjusted_p_value"]
+                    ),
+                    "pbo": float(pbo["pbo"]),
+                }
+            )
+            outcomes.append(outcome)
+        return outcomes
+
+    def _queue_fin_strategy_formal_oos(
+        self,
+        *,
+        run_id: str,
+        version_id: str,
+        dataset_path: str,
+        dataset_lineage_id: str,
+        dataset_identity_sha256: str,
+    ) -> dict[str, Any]:
+        binding = self.strategies.require_fin_strategy_formal_admission(version_id)
+        admission = dict(binding["admission"])
+        if (
+            str(admission.get("research_run_id") or "") != run_id
+            or str(admission.get("dataset_identity_sha256") or "")
+            != dataset_identity_sha256
+        ):
+            raise ValueError("fin_strategy winner formal admission changed")
+        calendar = sorted(load_calendar_days(dataset_path))
+        reservation = build_fin_strategy_capital_oos_reservation(
+            admission,
+            dataset_lineage_id=dataset_lineage_id,
+            trading_dates=calendar,
+        )
+        batch = self.capital_oos.reserve_batch(**reservation)
+        link = self.capital_oos.vintage_link_contract(str(batch["id"]))
+        existing = self.strategies.list_backtests(version_id=version_id, limit=2)
+        if len(existing) > 1:
+            raise ValueError("fin_strategy winner has more than one formal backtest")
+        if str(batch.get("status") or "") == "settled" and not existing:
+            raise ValueError(
+                "settled fin_strategy capital OOS has no immutable formal backtest"
+            )
+        backtest: dict[str, Any]
+        if existing:
+            backtest = existing[0]
+            recorded = backtest.get("periods") or {}
+            if (
+                str(backtest.get("dataset") or "") != str(admission["dataset"])
+                or any(
+                    str(recorded.get(key) or "") != str(value)
+                    for key, value in admission["formal_periods"].items()
+                )
+                or recorded.get("fin_strategy_formal_admission") != binding
+            ):
+                raise ValueError("existing fin_strategy formal backtest binding changed")
+        else:
+            try:
+                backtest = self.strategies.create_backtest(
+                    version_id=version_id,
+                    dataset=str(admission["dataset"]),
+                    periods=dict(admission["formal_periods"]),
+                    artifact_path=(
+                        self.settings.data_root / "artifacts" / "backtests"
+                    ),
+                    execution_dataset=None,
+                    trading_dates=calendar,
+                    dataset_lineage_id=dataset_lineage_id,
+                    dataset_identity_sha256=dataset_identity_sha256,
+                    capital_oos_alpha_batch_id=str(
+                        link["capital_oos_alpha_batch_id"]
+                    ),
+                    capital_oos_sealed_candidate_set_patch=dict(
+                        link["sealed_candidate_set_patch"]
+                    ),
+                    capital_oos_dataset_identity_sha256=str(
+                        link["capital_oos_dataset_identity_sha256"]
+                    ),
+                )
+            except ValueError:
+                existing = self.strategies.list_backtests(
+                    version_id=version_id, limit=2
+                )
+                if len(existing) != 1:
+                    self.capital_oos.settle_batch(
+                        str(batch["id"]),
+                        failed=True,
+                        failure_reason="fin_strategy formal backtest could not be created",
+                        supporting_evidence={
+                            "research_run_id": run_id,
+                            "strategy_version_id": version_id,
+                            "stage": "formal_oos_queue",
+                        },
+                    )
+                    raise
+                backtest = existing[0]
+        job_id = str(backtest.get("job_id") or "")
+        if not job_id and str(backtest.get("status") or "") == "queued":
+            job_payload = {
+                "research_run_id": run_id,
+                "fin_strategy_research_run_id": run_id,
+                "fin_strategy_formal_admission_sha256": str(
+                    admission["admission_sha256"]
+                ),
+                "fin_strategy_governed_winner_artifact_sha256": str(
+                    admission["governed_winner_artifact_sha256"]
+                ),
+                "backtest_id": str(backtest["id"]),
+                "strategy_version_id": version_id,
+                "dataset": str(admission["dataset"]),
+                "dataset_path": dataset_path,
+                "dataset_identity_sha256": dataset_identity_sha256,
+                "dataset_lineage_id": dataset_lineage_id,
+                "execution_dataset": None,
+                "periods": dict(backtest["periods"]),
+                "capital_oos_batch_id": str(batch["id"]),
+            }
+            formal_job = self.store.create(
+                "strategy_backtest",
+                job_payload,
+                self.settings.data_root
+                / "platform"
+                / "logs"
+                / f"fin-strategy-formal-oos-{str(backtest['id'])}.log",
+                dedupe_active_kind=False,
+                idempotency_key=(
+                    "fin-strategy-formal-oos:"
+                    + str(admission["admission_sha256"])
+                ),
+                max_attempts=1,
+            )
+            self.strategies.attach_job(str(backtest["id"]), str(formal_job["id"]))
+            job_id = str(formal_job["id"])
+            self.notify()
+        return {
+            "strategy_version_id": version_id,
+            "backtest_id": str(backtest["id"]),
+            "backtest_status": str(backtest.get("status") or ""),
+            "job_id": job_id or None,
+            "capital_oos_batch_id": str(batch["id"]),
+            "formal_admission_sha256": str(admission["admission_sha256"]),
+        }
+
+    def _reconcile_fin_strategy_competition(
+        self,
+        *,
+        run_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        run = self.research.get_run(run_id)
+        runtime = dict(run.get("runtime") or {})
+        preregistered = runtime.get("strategy_policy_evaluation_jobs")
+        if not isinstance(preregistered, list) or not preregistered:
+            return {"status": "waiting_for_preregistration"}
+        expected = [
+            str(item.get("strategy_version_id") or "")
+            for item in preregistered
+            if isinstance(item, dict)
+        ]
+        if (
+            not expected
+            or len(expected) != len(set(expected))
+            or any(not item for item in expected)
+        ):
+            raise ValueError("fin_strategy preregistered branch set is invalid")
+        outcomes = self._fin_strategy_branch_outcomes(
+            run_id=run_id,
+            expected_version_ids=expected,
+        )
+        if outcomes is None:
+            return {"status": "waiting_for_branches"}
+        winner_value = build_fin_strategy_winner_artifact(
+            research_run_id=run_id,
+            branch_outcomes=outcomes,
+        )
+        winner_artifact = self._write_fin_strategy_winner_artifact(
+            run_id=run_id,
+            value=winner_value,
+        )
+        winner_id = winner_value["winner_strategy_version_id"]
+        decision = {
+            "status": "winner_selected" if winner_id else "research_rejected",
+            "branch_count": len(outcomes),
+            "eligible_count": len(winner_value["eligible_ranking"]),
+            **winner_artifact,
+        }
+        current = self.research.get_run(run_id)
+        current_runtime = dict(current.get("runtime") or {})
+        current_runtime["strategy_governed_winner"] = decision
+        if not winner_id:
+            if str(current.get("status") or "") in {"queued", "running", "evaluating"}:
+                self.research.mark_run(
+                    run_id,
+                    "succeeded",
+                    runtime={
+                        **current_runtime,
+                        "negative_result": "no_strategy_branch_passed_all_research_gates",
+                    },
+                    actor="strategy-evaluation-worker",
+                )
+            return decision
+        formal = self._queue_fin_strategy_formal_oos(
+            run_id=run_id,
+            version_id=str(winner_id),
+            dataset_path=str(payload.get("dataset_path") or ""),
+            dataset_lineage_id=str(payload.get("dataset_lineage_id") or ""),
+            dataset_identity_sha256=str(
+                payload.get("dataset_identity_sha256") or ""
+            ),
+        )
+        decision["formal_oos"] = formal
+        current = self.research.get_run(run_id)
+        if str(current.get("status") or "") in {"queued", "running", "evaluating"}:
+            current_runtime = dict(current.get("runtime") or {})
+            current_runtime["strategy_governed_winner"] = decision
+            self.research.mark_run(
+                run_id,
+                "evaluating",
+                runtime=current_runtime,
+                actor="strategy-evaluation-worker",
+            )
+        return decision
+
+    def _settle_fin_strategy_experiment(
+        self, job: dict[str, Any], result: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Advance the preregistered policy/full-stack strategy competition."""
+
+        payload = dict(job.get("payload") or {})
+        mode = str(payload.get("strategy_evaluation_mode") or "")
+        if mode not in STRATEGY_RESEARCH_EVALUATION_MODES:
+            return None
+        stage = str(payload.get("strategy_competition_stage") or "")
+        if stage not in {"policy_only", "full_stack"}:
+            raise ValueError("fin_strategy evaluation stage is invalid")
+        expected_mode = {
+            "policy_only": STRATEGY_POLICY_ONLY_MODE,
+            "full_stack": STRATEGY_FULL_STACK_MODE,
+        }[stage]
+        if mode != expected_mode:
+            raise ValueError("fin_strategy evaluation mode differs from its stage")
+        run_id = str(payload.get("research_run_id") or "")
+        version_id = str(payload.get("strategy_version_id") or "")
+        experiment_id = str(payload.get("parameter_experiment_id") or "")
+        if not run_id or not version_id or not experiment_id:
+            raise ValueError("fin_strategy evaluation identity is incomplete")
+        plan_artifact, plan = self._load_fin_strategy_json_artifact(
+            artifact_id=str(
+                payload.get("strategy_competition_plan_artifact_id") or ""
+            ),
+            expected_run_id=run_id,
+            expected_type="fin_strategy_competition_plan",
+            expected_path=str(payload.get("strategy_competition_plan_path") or ""),
+            expected_content_sha256=str(
+                payload.get("strategy_competition_plan_content_sha256") or ""
+            ),
+        )
+        if (
+            str(plan.get("research_run_id") or "") != run_id
+            or str(plan.get("plan_sha256") or "")
+            != str(payload.get("strategy_competition_plan_sha256") or "")
+        ):
+            raise ValueError("fin_strategy competition plan binding changed")
+        prerequisite: dict[str, Any] | None = None
+        if stage == "full_stack":
+            _, policy_artifact = self._load_fin_strategy_json_artifact(
+                artifact_id=str(
+                    payload.get("strategy_policy_evidence_artifact_id") or ""
+                ),
+                expected_run_id=run_id,
+                expected_type="fin_strategy_policy_only_evaluation",
+                expected_path=str(
+                    payload.get("strategy_policy_evidence_path") or ""
+                ),
+                expected_content_sha256=str(
+                    payload.get("strategy_policy_evidence_content_sha256") or ""
+                ),
+            )
+            prerequisite_value = policy_artifact.get("evidence")
+            if not isinstance(prerequisite_value, dict):
+                raise ValueError("fin_strategy policy prerequisite is incomplete")
+            prerequisite = prerequisite_value
+        experiment = self.parameter_experiments.get(experiment_id)
+        experiment_periods = experiment.get("periods")
+        experiment_governance = (
+            experiment_periods.get("governance")
+            if isinstance(experiment_periods, dict)
+            else None
+        )
+        if (
+            str(experiment.get("strategy_version_id") or "") != version_id
+            or str(experiment.get("dataset") or "")
+            != str(payload.get("dataset") or "")
+            or not isinstance(experiment_governance, dict)
+            or experiment_governance.get("plan_sha256")
+            != plan.get("plan_sha256")
+            or experiment_governance.get("research_run_id") != run_id
+            or experiment_governance.get("stage") != stage
+            or experiment_governance.get("mode") != mode
+        ):
+            raise ValueError("fin_strategy experiment binding changed")
+        artifact = build_strategy_stage_artifact_from_parameter_experiment(
+            plan,
+            stage_name=stage,
+            experiment_result=result,
+            artifact_root=Path(str(experiment["artifact_path"])),
+            prerequisite_evidence=prerequisite,
+        )
+        source_iteration = (
+            (plan_artifact.get("manifest_json") or {}).get("source_iteration")
+            if isinstance(plan_artifact.get("manifest_json"), dict)
+            else None
+        )
+        evidence = self._write_fin_strategy_stage_artifact(
+            run_id=run_id,
+            stage=stage,
+            strategy_version_id=version_id,
+            source_iteration=(
+                int(source_iteration) if source_iteration is not None else None
+            ),
+            value=artifact,
+        )
+        settlement: dict[str, Any] = {
+            "stage": stage,
+            "strategy_version_id": version_id,
+            **evidence,
+        }
+        if stage == "policy_only" and evidence["gate_passed"]:
+            version = self.strategies.get_version(version_id)
+            dataset = {
+                "name": str(payload["dataset"]),
+                "path": str(payload["dataset_path"]),
+                "lineage_id": str(payload.get("dataset_lineage_id") or ""),
+                "provenance": {
+                    "dataset_identity_sha256": str(
+                        payload["dataset_identity_sha256"]
+                    )
+                },
+            }
+            settlement["next_job"] = self._queue_fin_strategy_full_stack_evaluation(
+                run_id=run_id,
+                plan=plan,
+                plan_artifact=plan_artifact,
+                plan_path=str(payload["strategy_competition_plan_path"]),
+                plan_content_sha256=str(
+                    payload["strategy_competition_plan_content_sha256"]
+                ),
+                version=version,
+                dataset=dataset,
+                policy_evidence=evidence,
+            )
+        elif stage == "full_stack" and evidence["gate_passed"]:
+            # The next step is intentionally one distinct, capital-bound final
+            # OOS job.  Its queueing helper also preregisters alpha spending;
+            # no historical experiment can directly activate recommendations.
+            settlement["next_gate"] = "formal_final_oos_once"
+        else:
+            settlement["next_gate"] = "research_rejected"
+        current = self.research.get_run(run_id)
+        if str(current.get("status") or "") in {"queued", "running", "evaluating"}:
+            runtime = dict(current.get("runtime") or {})
+            outcomes = dict(runtime.get("strategy_evaluation_outcomes") or {})
+            outcomes[version_id] = settlement
+            runtime["strategy_evaluation_outcomes"] = outcomes
+            self.research.mark_run(
+                run_id,
+                "evaluating",
+                runtime=runtime,
+                actor="strategy-evaluation-worker",
+            )
+        settlement["competition_reconciliation"] = (
+            self._reconcile_fin_strategy_competition(
+                run_id=run_id,
+                payload=payload,
+            )
+        )
+        return settlement
 
     def _archive_rdagent_lab_artifacts(
         self,
@@ -5418,6 +7125,9 @@ class LocalJobWorker:
             final_oos_start=final_oos_start,
             final_oos_end=final_oos_end,
         )
+        label_binding = resolve_research_label_binding(payload)
+        if label_binding is not None:
+            self._require_prediction_label_matches_binding(frozen, label_binding)
         if (
             str(champion.get("kind") or "") != str(frozen["kind"])
             or str(champion.get("candidate_id") or "")
@@ -5436,10 +7146,70 @@ class LocalJobWorker:
         )
         return frozen
 
+    @staticmethod
+    def _require_prediction_label_matches_binding(
+        frozen_prediction: dict[str, Any], label_binding: dict[str, Any]
+    ) -> None:
+        """Reject a fin_quant incumbent evaluated on another return horizon."""
+
+        grids: list[dict[str, Any]] = []
+        if frozen_prediction.get("kind") == "model":
+            grids.append(dict(frozen_prediction.get("profiles") or {}))
+        elif frozen_prediction.get("kind") == "ensemble":
+            grids.extend(
+                dict(component.get("profiles") or {})
+                for component in frozen_prediction.get("components") or []
+                if isinstance(component, dict)
+            )
+        if not grids:
+            raise ValueError("fin_quant incumbent has no frozen model label grid")
+        expected_fields = {
+            "horizon_profile": label_binding["horizon_profile"],
+            "legacy": False,
+            "allowed_label_horizons_sessions": label_binding[
+                "allowed_label_horizons_sessions"
+            ],
+            "label_horizon_sessions": label_binding["label_horizon_sessions"],
+            "label_reference_offset_sessions": label_binding[
+                "label_reference_offset_sessions"
+            ],
+            "label_expression": label_binding["label_expression"],
+            "purge_sessions": label_binding["purge_sessions"],
+            "embargo_sessions": label_binding["embargo_sessions"],
+            "research_window_contract_sha256": label_binding[
+                "research_window_contract_sha256"
+            ],
+        }
+        observed = 0
+        for profiles in grids:
+            for profile in profiles.values():
+                if not isinstance(profile, dict):
+                    raise ValueError("fin_quant incumbent model profile is malformed")
+                for cell in (profile.get("seeds") or {}).values():
+                    if not isinstance(cell, dict):
+                        raise ValueError("fin_quant incumbent model seed is malformed")
+                    contract = cell.get("model_label_contract")
+                    digest = str(cell.get("model_label_contract_sha256") or "")
+                    if (
+                        not isinstance(contract, dict)
+                        or model_canonical_sha256(contract) != digest
+                        or any(
+                            contract.get(key) != value
+                            for key, value in expected_fields.items()
+                        )
+                    ):
+                        raise ValueError(
+                            "fin_quant incumbent prediction uses another label horizon"
+                        )
+                    observed += 1
+        if observed == 0:
+            raise ValueError("fin_quant incumbent has no frozen model label evidence")
+
     def _queue_quant_bundle_evaluation(self, job: dict, result: dict) -> int:
         payload = job["payload"]
         feature_set = payload.get("feature_set") or {}
         periods = payload.get("periods") or {}
+        label_binding = resolve_research_label_binding(payload)
         baseline = self._freeze_fin_quant_baseline(payload)
         eligible: list[dict] = []
         preregistration_candidates: list[dict[str, Any]] = []
@@ -5559,6 +7329,11 @@ class LocalJobWorker:
                 metadata={
                     "experiment_family_id": bundle["experiment_family_id"],
                     "feature_set_id": feature_set["id"],
+                    "research_label_binding_sha256": (
+                        label_binding["binding_sha256"]
+                        if label_binding is not None
+                        else None
+                    ),
                 },
             )
             governed = self.rdagent_candidates.create_joint_quant_bundle_candidate(
@@ -5576,6 +7351,7 @@ class LocalJobWorker:
                 pre_final_end=date.fromisoformat(str(periods["valid_end"])),
                 final_oos_start=date.fromisoformat(str(periods["test_start"])),
                 final_oos_end=date.fromisoformat(str(periods["test_end"])),
+                research_label_binding=label_binding,
                 source_iteration=bundle.get("source_iteration"),
                 rdagent_decision=bundle.get("rdagent_decision"),
                 rdagent_feedback=bundle.get("rdagent_feedback"),
@@ -5590,6 +7366,12 @@ class LocalJobWorker:
                     "experiment_family_id": str(bundle["experiment_family_id"]),
                     "feature_set_id": str(feature_set["id"]),
                     "baseline_prediction_champion": baseline,
+                    "research_label_binding": label_binding,
+                    "research_label_binding_sha256": (
+                        label_binding["binding_sha256"]
+                        if label_binding is not None
+                        else None
+                    ),
                     "factors": [
                         {
                             **factor,
@@ -5624,6 +7406,11 @@ class LocalJobWorker:
                     ),
                     "baseline_prediction_champion_sha256": str(
                         baseline["evidence_sha256"]
+                    ),
+                    "research_label_binding_sha256": (
+                        label_binding["binding_sha256"]
+                        if label_binding is not None
+                        else None
                     ),
                 }
             )
@@ -5663,6 +7450,27 @@ class LocalJobWorker:
                 "feature_set_id": feature_set["id"],
                 "feature_set_definition_sha256": feature_set["definition_sha256"],
                 "feature_set": feature_set,
+                **(
+                    {
+                        "horizon_profile": label_binding["horizon_profile"],
+                        "periods": label_binding["periods"],
+                        "research_window_contract": label_binding[
+                            "research_window_contract"
+                        ],
+                        "research_window_contract_sha256": label_binding[
+                            "research_window_contract_sha256"
+                        ],
+                        "label_horizon_sessions": label_binding[
+                            "label_horizon_sessions"
+                        ],
+                        "research_label_binding": label_binding,
+                        "research_label_binding_sha256": label_binding[
+                            "binding_sha256"
+                        ],
+                    }
+                    if label_binding is not None
+                    else {}
+                ),
                 "baseline_prediction_champion": baseline,
                 "candidates": eligible,
                 "research_tournament_id": str(quant_tournament["id"]),
@@ -5688,6 +7496,20 @@ class LocalJobWorker:
         self, job: dict, result: dict
     ) -> list[dict]:
         payload = job["payload"]
+        label_binding = resolve_research_label_binding(payload)
+        if label_binding is not None:
+            if (
+                result.get("research_label_binding") != label_binding
+                or result.get("research_label_binding_sha256")
+                != label_binding["binding_sha256"]
+                or any(
+                    candidate.get("research_label_binding") != label_binding
+                    or candidate.get("research_label_binding_sha256")
+                    != label_binding["binding_sha256"]
+                    for candidate in payload.get("candidates") or []
+                )
+            ):
+                raise ValueError("quant evaluator label binding changed after enqueue")
         by_id = _indexed_independent_evaluations(job, result)
         tournament_id = str(payload.get("research_tournament_id") or "")
         parent_tournament_id = str(
@@ -5730,6 +7552,11 @@ class LocalJobWorker:
             or receipt.get("not_capital_confirmation") is not True
             or receipt.get("cross_cycle_fwer_claimed") is not False
             or receipt.get("final_oos_opened") is not False
+            or (
+                label_binding is not None
+                and receipt.get("research_label_binding_sha256")
+                != label_binding["binding_sha256"]
+            )
         ):
             raise ValueError("quant evaluator research-ledger receipt is invalid")
         run_multiple = result.get("multiple_testing")
@@ -6243,6 +8070,7 @@ class LocalJobWorker:
 
     def _queue_factor_evaluation(self, job: dict, candidates: list[dict]) -> None:
         payload = job["payload"]
+        label_binding = resolve_research_label_binding(payload)
         eligible: list[dict] = []
         for item in candidates:
             if not (
@@ -6262,6 +8090,21 @@ class LocalJobWorker:
                 (item.get("variables") or {}).get("required_fields")
                 or ["open", "close", "high", "low", "volume", "factor"]
             )
+            if label_binding is not None:
+                variables = dict(item.get("variables") or {})
+                if (
+                    int(item.get("label_horizon_days") or 0)
+                    != int(label_binding["label_horizon_sessions"])
+                    or variables.get("research_label_binding_sha256")
+                    != label_binding["binding_sha256"]
+                    or validate_research_label_binding(
+                        variables.get("research_label_binding") or {}
+                    )
+                    != label_binding
+                ):
+                    raise ValueError(
+                        "factor candidate label differs from its verified research window"
+                    )
             eligible.append(
                 {
                     "id": item["id"],
@@ -6299,6 +8142,26 @@ class LocalJobWorker:
                 "periods": payload["periods"],
                 "evaluation_profiles": payload.get("evaluation_profiles") or [],
                 "candidates": eligible,
+                **(
+                    {
+                        "horizon_profile": label_binding["horizon_profile"],
+                        "research_window_contract": label_binding[
+                            "research_window_contract"
+                        ],
+                        "research_window_contract_sha256": label_binding[
+                            "research_window_contract_sha256"
+                        ],
+                        "label_horizon_sessions": label_binding[
+                            "label_horizon_sessions"
+                        ],
+                        "research_label_binding": label_binding,
+                        "research_label_binding_sha256": label_binding[
+                            "binding_sha256"
+                        ],
+                    }
+                    if label_binding is not None
+                    else {}
+                ),
                 "cost_model": CostModelConfig.from_mapping(payload.get("cost_model")).to_dict(),
                 "cost_reference_order_value": float(
                     payload.get("cost_reference_order_value", 100_000.0)

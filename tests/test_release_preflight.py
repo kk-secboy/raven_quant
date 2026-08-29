@@ -8,10 +8,15 @@ from types import SimpleNamespace
 import pytest
 
 from quant_platform import release_preflight
+from quant_platform.release_identity import (
+    release_identity_environment,
+    release_identity_labels,
+)
 
 pytestmark = pytest.mark.no_database
 _REAL_IMMUTABLE_IMAGE_CONFIGURATION = release_preflight._immutable_image_configuration
 _REAL_DOCKER_STORAGE_CONFIGURATION = release_preflight._docker_storage_configuration
+_REAL_RUNTIME_RELEASE_IDENTITY = release_preflight._runtime_release_identity
 
 
 @pytest.fixture(autouse=True)
@@ -30,6 +35,14 @@ def _configured_immutable_images(monkeypatch: pytest.MonkeyPatch) -> None:
         release_preflight,
         "_docker_storage_configuration",
         lambda _context: (True, "test storage is isolated"),
+    )
+    monkeypatch.setattr(
+        release_preflight,
+        "_runtime_release_identity",
+        lambda _context, services: (
+            True,
+            f"{len(set(services) - {'postgres'})} services share the test release",
+        ),
     )
 
 
@@ -279,7 +292,7 @@ def test_deployed_0058_database_upgrades_to_current_head() -> None:
         "0058_simulation_benchmark",
     )
 
-    assert code_revision == "0071_retire_pair_writes"
+    assert code_revision == _expected_migration_head(project_root)
     assert state == "upgrade_required"
     assert compatible is True
 
@@ -408,3 +421,125 @@ def test_unknown_database_revision_fails_closed() -> None:
     assert code_revision == _expected_migration_head(project_root)
     assert state == "unknown_database_revision"
     assert compatible is False
+
+
+class _IdentityContext:
+    def __init__(
+        self,
+        env_file: Path,
+        identity: dict[str, str],
+        *,
+        missing_labels: bool = False,
+        mismatched_service: str | None = None,
+    ) -> None:
+        self.env_file = env_file
+        self.identity = identity
+        self.missing_labels = missing_labels
+        self.mismatched_service = mismatched_service
+        self.inspected: list[str] = []
+
+    def container_id(self, service: str) -> str:
+        return f"container-{service}"
+
+    def docker(self, *args: str, **_kwargs) -> str:
+        assert args[0] == "inspect"
+        service = args[1].removeprefix("container-")
+        self.inspected.append(service)
+        labels = {} if self.missing_labels else release_identity_labels(self.identity)
+        environment = dict(self.identity)
+        if service == self.mismatched_service:
+            labels["quantlab.config-digest"] = "f" * 64
+            environment["QUANTLAB_RELEASE_ALIAS_OF"] = "wrong-canonical"
+        return json.dumps(
+            [
+                {
+                    "Config": {
+                        "Env": [f"{key}={value}" for key, value in environment.items()],
+                        "Labels": labels,
+                    }
+                }
+            ]
+        )
+
+
+def _write_identity_environment(path: Path, identity: dict[str, str]) -> None:
+    path.write_text(
+        "POSTGRES_PASSWORD=test\n"
+        + "".join(f"{key}={value}\n" for key, value in identity.items()),
+        encoding="utf-8",
+    )
+
+
+def test_runtime_release_identity_verifies_env_and_labels_for_every_stateless_service(
+    tmp_path: Path,
+) -> None:
+    identity = release_identity_environment("release-001", "a" * 64)
+    env_file = tmp_path / ".env"
+    _write_identity_environment(env_file, identity)
+    context = _IdentityContext(env_file, identity)
+
+    valid, evidence = _REAL_RUNTIME_RELEASE_IDENTITY(
+        context,  # type: ignore[arg-type]
+        {"postgres", "api", "gateway"},
+    )
+
+    assert valid is True
+    assert "release-001 as canonical aliasing release-001" in evidence
+    assert context.inspected == ["api", "gateway"]
+
+
+def test_runtime_release_identity_rejects_old_containers_without_labels(
+    tmp_path: Path,
+) -> None:
+    identity = release_identity_environment("release-001", "a" * 64)
+    env_file = tmp_path / ".env"
+    _write_identity_environment(env_file, identity)
+
+    valid, evidence = _REAL_RUNTIME_RELEASE_IDENTITY(
+        _IdentityContext(env_file, identity, missing_labels=True),  # type: ignore[arg-type]
+        {"postgres", "api"},
+    )
+
+    assert valid is False
+    assert "api:label:quantlab.release" in evidence
+    assert "api:label:quantlab.alias-of" in evidence
+
+
+def test_runtime_release_identity_rejects_any_service_env_or_label_mismatch(
+    tmp_path: Path,
+) -> None:
+    identity = release_identity_environment("release-001", "a" * 64)
+    env_file = tmp_path / ".env"
+    _write_identity_environment(env_file, identity)
+
+    valid, evidence = _REAL_RUNTIME_RELEASE_IDENTITY(
+        _IdentityContext(  # type: ignore[arg-type]
+            env_file,
+            identity,
+            mismatched_service="gateway",
+        ),
+        {"postgres", "api", "gateway"},
+    )
+
+    assert valid is False
+    assert "gateway:env:QUANTLAB_RELEASE_ALIAS_OF" in evidence
+    assert "gateway:label:quantlab.config-digest" in evidence
+
+
+def test_runtime_release_identity_rejects_invalid_canonical_alias_contract(
+    tmp_path: Path,
+) -> None:
+    identity = release_identity_environment("release-001", "a" * 64)
+    identity["QUANTLAB_RELEASE_ALIAS_OF"] = "different-release"
+    env_file = tmp_path / ".env"
+    _write_identity_environment(env_file, identity)
+    context = _IdentityContext(env_file, identity)
+
+    valid, evidence = _REAL_RUNTIME_RELEASE_IDENTITY(
+        context,  # type: ignore[arg-type]
+        {"postgres", "api"},
+    )
+
+    assert valid is False
+    assert "canonical release must alias itself" in evidence
+    assert context.inspected == []

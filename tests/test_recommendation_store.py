@@ -4,7 +4,11 @@ from copy import deepcopy
 from datetime import date
 
 import pytest
-from governance_fixtures import DATASET_IDENTITY, create_strategy_version
+from governance_fixtures import (
+    DATASET_IDENTITY,
+    create_strategy_version,
+    enable_recommendation_authority_for_test,
+)
 from sqlalchemy import func, select, update
 
 from quant_data.database import paper_fills, paper_orders, strategy_versions
@@ -16,7 +20,11 @@ from quant_platform.recommendation_store import RecommendationStore
 def test_recommendation_snapshot_is_independent_of_paper_orders_and_fills(
     tmp_path, database_url: str
 ) -> None:
-    version_id = create_strategy_version(database_url, tmp_path)
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        recipe_id="short_relative_strength",
+    )
     store = RecommendationStore(database_url)
     with store.engine.begin() as connection:
         connection.execute(
@@ -28,6 +36,7 @@ def test_recommendation_snapshot_is_independent_of_paper_orders_and_fills(
             connection.scalar(select(func.count()).select_from(paper_orders)),
             connection.scalar(select(func.count()).select_from(paper_fills)),
         )
+    enable_recommendation_authority_for_test(database_url, [version_id])
     portfolio = store.create(
         name="governed recommendations",
         strategy_version_id=version_id,
@@ -93,7 +102,11 @@ def test_recommendation_snapshot_is_independent_of_paper_orders_and_fills(
 def test_recommendation_result_identity_is_bound_and_cash_only_is_valid(
     tmp_path, database_url: str
 ) -> None:
-    version_id = create_strategy_version(database_url, tmp_path)
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        recipe_id="short_relative_strength",
+    )
     store = RecommendationStore(database_url)
     with store.engine.begin() as connection:
         connection.execute(
@@ -101,6 +114,7 @@ def test_recommendation_result_identity_is_bound_and_cash_only_is_valid(
             .where(strategy_versions.c.id == version_id)
             .values(status="approved")
         )
+    enable_recommendation_authority_for_test(database_url, [version_id])
     portfolio = store.create(
         name="cash recommendation",
         strategy_version_id=version_id,

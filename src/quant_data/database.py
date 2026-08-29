@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -28,6 +29,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import NullPool
 
 metadata = MetaData(schema="quantlab")
 json_type = JSON().with_variant(JSONB, "postgresql")
@@ -1128,6 +1130,29 @@ strategy_versions = Table(
         nullable=False,
         server_default="legacy-unversioned",
     ),
+    # Explicit product/research horizon. Older versions are migrated to the
+    # canonical legacy_ambiguous contract; signal_period is never treated as
+    # evidence of a prediction or holding horizon.
+    Column("horizon_profile", String, nullable=False),
+    Column("label_horizons_json", json_type, nullable=False),
+    Column("decision_interval_sessions", Integer),
+    Column("review_interval_sessions", Integer),
+    Column("holding_min_sessions", Integer),
+    Column("holding_target_sessions", Integer),
+    Column("holding_max_sessions", Integer),
+    Column("execution_lag_sessions", Integer),
+    Column("purge_sessions", Integer),
+    Column("embargo_sessions", Integer),
+    Column("sealed_oos_required", Boolean, nullable=False),
+    Column("sealed_oos_sessions", Integer),
+    Column("horizon_contract_json", json_type, nullable=False),
+    Column("horizon_contract_sha256", String, nullable=False),
+    Column(
+        "source_research_artifact_id",
+        String,
+        ForeignKey("quantlab.research_run_artifacts.id", ondelete="RESTRICT"),
+    ),
+    Column("strategy_rules_sha256", String),
     Column("qlib_version", String),
     Column("qlib_commit", String),
     Column("rdagent_version", String),
@@ -1138,13 +1163,113 @@ strategy_versions = Table(
     # Design 6.11 promotion stage: NULL = candidate (pre-gate) or legacy
     # ungated; "paper" is set automatically when the formal hard gate approves
     # the version; "recommendation_enabled" requires the forward evidence gate
-    # plus human approval. Only "paper" blocks standalone recommendations.
+    # and the atomic auto-promotion transaction. Every other marker blocks
+    # standalone recommendations.
     Column("promotion_stage", String),
     Column("created_by", String, nullable=False),
     Column("approved_by", String),
     Column("approval_reason", Text),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("approved_at", DateTime(timezone=True)),
+    CheckConstraint(
+        "horizon_profile IN "
+        "('short_1_5d', 'swing_1_6m', 'long_1_3y', 'legacy_ambiguous')",
+        name="ck_strategy_versions_horizon_profile",
+    ),
+    CheckConstraint(
+        "(jsonb_typeof(label_horizons_json) = 'array' "
+        "AND jsonb_typeof(horizon_contract_json) = 'object' "
+        "AND horizon_contract_json ?& ARRAY["
+        "'horizon_profile','label_horizons_sessions','decision_interval_sessions',"
+        "'review_interval_sessions','holding_min_sessions','holding_target_sessions',"
+        "'holding_max_sessions','execution_lag_sessions','purge_sessions',"
+        "'embargo_sessions','sealed_oos_required','sealed_oos_sessions',"
+        "'contract_version'] "
+        "AND (horizon_contract_json - ARRAY["
+        "'horizon_profile','label_horizons_sessions','decision_interval_sessions',"
+        "'review_interval_sessions','holding_min_sessions','holding_target_sessions',"
+        "'holding_max_sessions','execution_lag_sessions','purge_sessions',"
+        "'embargo_sessions','sealed_oos_required','sealed_oos_sessions',"
+        "'contract_version']) = '{}'::jsonb "
+        "AND horizon_contract_json ->> 'horizon_profile' = horizon_profile "
+        "AND horizon_contract_json ->> 'contract_version' = 'research-horizon-v1' "
+        "AND horizon_contract_json -> 'label_horizons_sessions' = label_horizons_json "
+        "AND (horizon_contract_json ->> 'decision_interval_sessions')::integer "
+        "IS NOT DISTINCT FROM decision_interval_sessions "
+        "AND (horizon_contract_json ->> 'review_interval_sessions')::integer "
+        "IS NOT DISTINCT FROM review_interval_sessions "
+        "AND (horizon_contract_json ->> 'holding_min_sessions')::integer "
+        "IS NOT DISTINCT FROM holding_min_sessions "
+        "AND (horizon_contract_json ->> 'holding_target_sessions')::integer "
+        "IS NOT DISTINCT FROM holding_target_sessions "
+        "AND (horizon_contract_json ->> 'holding_max_sessions')::integer "
+        "IS NOT DISTINCT FROM holding_max_sessions "
+        "AND (horizon_contract_json ->> 'execution_lag_sessions')::integer "
+        "IS NOT DISTINCT FROM execution_lag_sessions "
+        "AND (horizon_contract_json ->> 'purge_sessions')::integer "
+        "IS NOT DISTINCT FROM purge_sessions "
+        "AND (horizon_contract_json ->> 'embargo_sessions')::integer "
+        "IS NOT DISTINCT FROM embargo_sessions "
+        "AND (horizon_contract_json ->> 'sealed_oos_required')::boolean "
+        "IS NOT DISTINCT FROM sealed_oos_required "
+        "AND (horizon_contract_json ->> 'sealed_oos_sessions')::integer "
+        "IS NOT DISTINCT FROM sealed_oos_sessions "
+        "AND CASE horizon_profile "
+        "WHEN 'short_1_5d' THEN horizon_contract_sha256 = "
+        "'a895312d55f19ffaf35e90c4bd7003af337c94e18b61e27b4ee62a584860e1e9' "
+        "WHEN 'swing_1_6m' THEN horizon_contract_sha256 = "
+        "'cfc3d9ea05de009af3b4e283f83e9e840c45a0d3913f3cb938c34882b76b16f0' "
+        "WHEN 'long_1_3y' THEN horizon_contract_sha256 = "
+        "'0e9eae6438b44f8a4234a53f55999d4880dd0917772fb74351bd02f770f11879' "
+        "WHEN 'legacy_ambiguous' THEN horizon_contract_sha256 = "
+        "'6fb5cd40086f2e46850ba2d6b15e5ca7ec95191f4e42436639c7155cdecf3324' "
+        "ELSE false END) IS TRUE",
+        name="ck_strategy_versions_horizon_identity",
+    ),
+    CheckConstraint(
+        "((horizon_profile = 'legacy_ambiguous' "
+        "AND label_horizons_json = '[]'::jsonb "
+        "AND decision_interval_sessions IS NULL "
+        "AND review_interval_sessions IS NULL "
+        "AND holding_min_sessions IS NULL "
+        "AND holding_target_sessions IS NULL "
+        "AND holding_max_sessions IS NULL "
+        "AND execution_lag_sessions IS NULL "
+        "AND purge_sessions IS NULL AND embargo_sessions IS NULL "
+        "AND sealed_oos_required = false AND sealed_oos_sessions IS NULL) OR "
+        "(horizon_profile = 'short_1_5d' "
+        "AND label_horizons_json = '[1,2,3,5]'::jsonb "
+        "AND decision_interval_sessions = 1 AND review_interval_sessions = 1 "
+        "AND holding_min_sessions = 1 AND holding_target_sessions = 3 "
+        "AND holding_max_sessions = 5 AND execution_lag_sessions = 1 "
+        "AND purge_sessions = 6 AND embargo_sessions = 6 "
+        "AND sealed_oos_required = true AND sealed_oos_sessions = 252) OR "
+        "(horizon_profile = 'swing_1_6m' "
+        "AND label_horizons_json = '[21,63,126]'::jsonb "
+        "AND decision_interval_sessions = 5 AND review_interval_sessions = 5 "
+        "AND holding_min_sessions = 21 AND holding_target_sessions = 63 "
+        "AND holding_max_sessions = 126 AND execution_lag_sessions = 1 "
+        "AND purge_sessions = 127 AND embargo_sessions = 127 "
+        "AND sealed_oos_required = true AND sealed_oos_sessions = 504) OR "
+        "(horizon_profile = 'long_1_3y' "
+        "AND label_horizons_json = '[63,126,252]'::jsonb "
+        "AND decision_interval_sessions = 21 AND review_interval_sessions = 21 "
+        "AND holding_min_sessions = 252 AND holding_target_sessions = 504 "
+        "AND holding_max_sessions = 756 AND execution_lag_sessions = 1 "
+        "AND purge_sessions = 253 AND embargo_sessions = 253 "
+        "AND sealed_oos_required = true AND sealed_oos_sessions = 756)) IS TRUE",
+        name="ck_strategy_versions_horizon_values",
+    ),
+    CheckConstraint(
+        "((horizon_profile = 'legacy_ambiguous') OR "
+        "strategy_rules_sha256 ~ '^[0-9a-f]{64}$') IS TRUE",
+        name="ck_strategy_versions_rule_identity",
+    ),
+    CheckConstraint(
+        "(horizon_profile <> 'legacy_ambiguous' OR "
+        "promotion_stage IS DISTINCT FROM 'recommendation_enabled') IS TRUE",
+        name="ck_strategy_versions_legacy_authority",
+    ),
 )
 Index(
     "uq_strategy_versions_number",
@@ -1156,7 +1281,32 @@ Index(
     "uq_strategy_versions_approved",
     strategy_versions.c.strategy_id,
     unique=True,
-    postgresql_where=strategy_versions.c.status == "approved",
+    # Historical approval only starts an isolated paper-validation version.
+    # The incumbent stays live until the forward gate atomically promotes the
+    # challenger, so uniqueness applies only to recommendation authority.
+    postgresql_where=text(
+        "status = 'approved' AND promotion_stage = 'recommendation_enabled'"
+    ),
+)
+Index(
+    "idx_strategy_versions_horizon_status",
+    strategy_versions.c.horizon_profile,
+    strategy_versions.c.status,
+)
+Index(
+    "uq_strategy_versions_active_horizon",
+    strategy_versions.c.horizon_profile,
+    unique=True,
+    postgresql_where=text(
+        "status = 'approved' AND promotion_stage = 'recommendation_enabled' "
+        "AND horizon_profile <> 'legacy_ambiguous'"
+    ),
+)
+Index(
+    "uq_strategy_versions_source_research_artifact",
+    strategy_versions.c.source_research_artifact_id,
+    unique=True,
+    postgresql_where=strategy_versions.c.source_research_artifact_id.is_not(None),
 )
 
 strategy_factors = Table(
@@ -4168,6 +4318,58 @@ runtime_secrets = Table(
     Column("updated_by", String, ForeignKey("quantlab.users.id", ondelete="SET NULL")),
 )
 
+# Versioned investor-owned paper-account input. No capital default is allowed:
+# the first active profile must record an explicit user choice and explicit
+# market permissions before account simulation can be enabled.
+investor_simulation_profiles = Table(
+    "investor_simulation_profiles",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("profile_key", String, nullable=False),
+    Column("version", Integer, nullable=False),
+    Column("status", String, nullable=False),
+    Column("supersedes_id", String, ForeignKey("quantlab.investor_simulation_profiles.id")),
+    Column("initial_capital", Numeric(20, 6), nullable=False),
+    Column("risk_profile", String, nullable=False),
+    Column("min_cash_weight", Float, nullable=False),
+    Column("max_gross_exposure", Float, nullable=False),
+    Column("market_permissions_json", json_type, nullable=False),
+    Column("content_sha256", String, nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_by", String, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "profile_key", "version", name="uq_investor_simulation_profile_version"
+    ),
+    CheckConstraint(
+        "status IN ('draft', 'active', 'retired')",
+        name="ck_investor_simulation_profile_status",
+    ),
+    CheckConstraint(
+        "initial_capital > 0 AND min_cash_weight >= 0 AND min_cash_weight < 1 "
+        "AND max_gross_exposure > 0 AND max_gross_exposure <= 1 "
+        "AND min_cash_weight + max_gross_exposure <= 1",
+        name="ck_investor_simulation_profile_risk_values",
+    ),
+    CheckConstraint(
+        "length(trim(profile_key)) > 0 AND length(trim(risk_profile)) > 0 "
+        "AND jsonb_typeof(market_permissions_json) = 'object' "
+        "AND content_sha256 ~ '^[0-9a-f]{64}$'",
+        name="ck_investor_simulation_profile_identity",
+    ),
+)
+Index(
+    "uq_investor_simulation_profile_active",
+    investor_simulation_profiles.c.profile_key,
+    unique=True,
+    postgresql_where=investor_simulation_profiles.c.status == "active",
+)
+Index(
+    "idx_investor_simulation_profiles_updated",
+    investor_simulation_profiles.c.updated_at.desc(),
+)
+
 platform_configs = Table(
     "platform_configs",
     metadata,
@@ -4197,6 +4399,12 @@ Index(
 def open_database(database_url: str) -> Engine:
     if not database_url.startswith(("postgresql://", "postgresql+psycopg://")):
         raise ValueError("DATABASE_URL must point to PostgreSQL")
+    if os.getenv("QUANTLAB_DATABASE_DISABLE_POOL", "").strip() == "1":
+        # One-shot maintenance commands and the integration-test harness create
+        # many short-lived Store instances. NullPool makes each context-managed
+        # connection close at the server boundary and avoids retaining hundreds
+        # of idle sessions. Long-running services keep the bounded pool below.
+        return create_engine(database_url, pool_pre_ping=True, poolclass=NullPool)
     engine = create_engine(database_url, pool_pre_ping=True, pool_size=5, max_overflow=10)
     return engine
 
@@ -4213,14 +4421,72 @@ strategy_forward_gates = Table(
         primary_key=True,
     ),
     Column("min_forward_calendar_days", Integer, nullable=False),
+    Column("min_forward_trading_days", Integer, nullable=False),
     Column("min_decision_batches", Integer, nullable=False),
     Column("min_completed_cycles", Integer, nullable=False),
+    Column("min_closed_round_trips", Integer, nullable=False),
+    Column("min_review_events", Integer, nullable=False),
+    Column("min_financial_report_reviews", Integer, nullable=False),
     Column("min_data_completeness", Float, nullable=False),
     Column("min_reconciliation_rate", Float, nullable=False),
     Column("max_cost_deviation", Float, nullable=False),
+    Column("criteria_json", json_type, nullable=False),
+    Column("criteria_sha256", String, nullable=False),
     Column("registered_by", String, nullable=False),
     Column("registered_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "(jsonb_typeof(criteria_json) = 'object' "
+        "AND criteria_json ?& ARRAY['contract_version','horizon_profile',"
+        "'horizon_contract_sha256','thresholds'] "
+        "AND (criteria_json - ARRAY['contract_version','horizon_profile',"
+        "'horizon_contract_sha256','thresholds']) = '{}'::jsonb "
+        "AND criteria_json ->> 'contract_version' = 'strategy-forward-gate-v2' "
+        "AND criteria_json ->> 'horizon_profile' IN "
+        "('short_1_5d','swing_1_6m','long_1_3y','legacy_ambiguous') "
+        "AND criteria_json ->> 'horizon_contract_sha256' ~ '^[0-9a-f]{64}$' "
+        "AND jsonb_typeof(criteria_json -> 'thresholds') = 'object' "
+        "AND (criteria_json -> 'thresholds') ?& ARRAY["
+        "'min_forward_calendar_days','min_forward_trading_days',"
+        "'min_decision_batches','min_completed_cycles','min_closed_round_trips',"
+        "'min_review_events','min_financial_report_reviews',"
+        "'min_data_completeness','min_reconciliation_rate','max_cost_deviation'] "
+        "AND ((criteria_json -> 'thresholds') - ARRAY["
+        "'min_forward_calendar_days','min_forward_trading_days',"
+        "'min_decision_batches','min_completed_cycles','min_closed_round_trips',"
+        "'min_review_events','min_financial_report_reviews',"
+        "'min_data_completeness','min_reconciliation_rate','max_cost_deviation']) "
+        "= '{}'::jsonb "
+        "AND (criteria_json -> 'thresholds' ->> 'min_forward_calendar_days')::integer "
+        "IS NOT DISTINCT FROM min_forward_calendar_days "
+        "AND (criteria_json -> 'thresholds' ->> 'min_forward_trading_days')::integer "
+        "IS NOT DISTINCT FROM min_forward_trading_days "
+        "AND (criteria_json -> 'thresholds' ->> 'min_decision_batches')::integer "
+        "IS NOT DISTINCT FROM min_decision_batches "
+        "AND (criteria_json -> 'thresholds' ->> 'min_completed_cycles')::integer "
+        "IS NOT DISTINCT FROM min_completed_cycles "
+        "AND (criteria_json -> 'thresholds' ->> 'min_closed_round_trips')::integer "
+        "IS NOT DISTINCT FROM min_closed_round_trips "
+        "AND (criteria_json -> 'thresholds' ->> 'min_review_events')::integer "
+        "IS NOT DISTINCT FROM min_review_events "
+        "AND (criteria_json -> 'thresholds' ->> 'min_financial_report_reviews')::integer "
+        "IS NOT DISTINCT FROM min_financial_report_reviews "
+        "AND (criteria_json -> 'thresholds' ->> 'min_data_completeness')::double precision "
+        "IS NOT DISTINCT FROM min_data_completeness "
+        "AND (criteria_json -> 'thresholds' ->> 'min_reconciliation_rate')::double precision "
+        "IS NOT DISTINCT FROM min_reconciliation_rate "
+        "AND (criteria_json -> 'thresholds' ->> 'max_cost_deviation')::double precision "
+        "IS NOT DISTINCT FROM max_cost_deviation "
+        "AND min_forward_calendar_days >= 0 "
+        "AND min_forward_trading_days >= 0 AND min_closed_round_trips >= 0 "
+        "AND min_decision_batches >= 0 AND min_completed_cycles >= 0 "
+        "AND min_review_events >= 0 AND min_financial_report_reviews >= 0 "
+        "AND min_data_completeness >= 0 AND min_data_completeness <= 1 "
+        "AND min_reconciliation_rate >= 0 AND min_reconciliation_rate <= 1 "
+        "AND max_cost_deviation >= 0 "
+        "AND criteria_sha256 ~ '^[0-9a-f]{64}$') IS TRUE",
+        name="ck_strategy_forward_gate_criteria",
+    ),
 )
 
 # Design 9.5: each isolated forward paper stage owns its simulation account,
@@ -4259,6 +4525,60 @@ Index(
     "idx_strategy_promotion_stages_version",
     strategy_promotion_stages.c.strategy_version_id,
     strategy_promotion_stages.c.status,
+)
+
+# Point-in-time health evidence is append-only. Migration 0072 installs the
+# database UPDATE/DELETE guard; projections may select the newest row but must
+# never rewrite history.
+strategy_health_snapshots = Table(
+    "strategy_health_snapshots",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column(
+        "strategy_version_id",
+        String,
+        ForeignKey("quantlab.strategy_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("horizon_profile", String, nullable=False),
+    Column("as_of", DateTime(timezone=True), nullable=False),
+    Column("health_status", String, nullable=False),
+    Column("criteria_json", json_type, nullable=False),
+    Column("criteria_sha256", String, nullable=False),
+    Column("evidence_json", json_type, nullable=False),
+    Column("evidence_sha256", String, nullable=False),
+    Column("snapshot_sha256", String, nullable=False),
+    Column("recorded_by", String, nullable=False),
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "strategy_version_id",
+        "as_of",
+        "snapshot_sha256",
+        name="uq_strategy_health_snapshot_identity",
+    ),
+    CheckConstraint(
+        "horizon_profile IN "
+        "('short_1_5d', 'swing_1_6m', 'long_1_3y', 'legacy_ambiguous')",
+        name="ck_strategy_health_horizon_profile",
+    ),
+    CheckConstraint(
+        "health_status IN "
+        "('healthy', 'watch', 'restricted', 'suspended', 'retired')",
+        name="ck_strategy_health_status",
+    ),
+    CheckConstraint(
+        "jsonb_typeof(criteria_json) = 'object' "
+        "AND jsonb_typeof(evidence_json) = 'object' "
+        "AND criteria_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND evidence_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND snapshot_sha256 ~ '^[0-9a-f]{64}$'",
+        name="ck_strategy_health_seals",
+    ),
+)
+Index(
+    "idx_strategy_health_version_as_of",
+    strategy_health_snapshots.c.strategy_version_id,
+    strategy_health_snapshots.c.as_of.desc(),
 )
 
 

@@ -50,14 +50,36 @@ def test_public_rdagent_status_keeps_safe_credential_readiness_boolean() -> None
     assert public["llm_credentials_configured"] is True
     assert "credential" not in str(public.get("blockers") or []).lower()
 
+
+def test_public_rdagent_trace_text_redacts_credential_shaped_content() -> None:
+    from quant_platform.api import _public_rdagent_run
+
+    public = _public_rdagent_run(
+        {
+            "kind": "factor",
+            "trace_view": {
+                "status": "recorded",
+                "loops": [
+                    {
+                        "loop_id": 1,
+                        "hypothesis": {"text": "api_key=sk-not-for-the-browser"},
+                    }
+                ],
+            },
+        }
+    )
+
+    assert public["trace_view"]["loops"][0]["hypothesis"]["text"] == "[redacted]"
+
 pytestmark = pytest.mark.no_database
 
 
-def test_registry_contains_exactly_the_seven_public_scenarios() -> None:
+def test_registry_contains_exactly_the_governed_public_scenarios() -> None:
     assert set(SCENARIOS) == {
         "fin_factor",
         "fin_model",
         "fin_quant",
+        "fin_strategy",
         "fin_factor_report",
         "general_model",
         "data_science",
@@ -73,6 +95,9 @@ def test_registry_keeps_capital_and_lab_boundaries_explicit() -> None:
         "fin_factor_report",
     }
     assert all(not item.capital_eligible for item in SCENARIOS.values() if item.category == "lab")
+    assert SCENARIOS["fin_strategy"].capital_eligible is False
+    assert SCENARIOS["fin_strategy"].requires_feature_set is True
+    assert SCENARIOS["fin_factor"].requires_feature_set is True
 
 
 def test_scenario_catalog_has_the_public_api_contract(tmp_path: Path) -> None:
@@ -104,6 +129,7 @@ def test_scenarios_have_bounded_physical_queues() -> None:
     assert SCENARIOS["fin_factor"].job_kind == RDAGENT_LEGACY_FACTOR_JOB_KIND
     assert SCENARIOS["fin_model"].job_kind == RDAGENT_MODEL_JOB_KIND
     assert SCENARIOS["fin_quant"].job_kind == RDAGENT_QUANT_JOB_KIND
+    assert SCENARIOS["fin_strategy"].job_kind == RDAGENT_GENERIC_JOB_KIND
     assert SCENARIOS["fin_factor_report"].job_kind == RDAGENT_REPORT_JOB_KIND
     assert SCENARIOS["general_model"].job_kind == RDAGENT_GENERIC_JOB_KIND
     assert SCENARIOS["data_science"].job_kind == RDAGENT_DATA_SCIENCE_JOB_KIND
@@ -113,8 +139,83 @@ def test_scenarios_have_bounded_physical_queues() -> None:
 def test_public_run_request_defaults_to_factor_and_forbids_raw_execution_fields() -> None:
     fields = api.RDAgentRunRequest.model_fields
     assert fields["scenario"].default == "fin_factor"
-    assert {"asset_ids", "feature_set_id"} <= set(fields)
+    assert {
+        "asset_ids",
+        "feature_set_id",
+        "horizon",
+        "incumbent_strategy_version_id",
+    } <= set(fields)
     assert not ({"command", "environment", "path", "cwd"} & set(fields))
+
+
+def test_active_quant_research_requires_one_horizon_and_freezes_period_policy() -> None:
+    expected = {
+        "short": (252, 20),
+        "swing": (504, 127),
+        "long": (756, 253),
+    }
+    for scenario in ("fin_factor", "fin_model", "fin_quant", "fin_strategy"):
+        base = {
+            "objective": "Research one governed quant component without producing advice.",
+            "scenario": scenario,
+            "dataset": "daily-v1",
+            "feature_set_id": "governed-baseline",
+        }
+        with pytest.raises(ValueError, match="explicit short, swing, or long horizon"):
+            api.RDAgentRunRequest.model_validate(base)
+        for horizon, (oos_days, embargo_days) in expected.items():
+            request = api.RDAgentRunRequest.model_validate(
+                {
+                    **base,
+                    "horizon": horizon,
+                    **(
+                        {"incumbent_strategy_version_id": "a" * 32}
+                        if scenario == "fin_strategy"
+                        else {}
+                    ),
+                }
+            )
+            assert request.period_policy.test_trading_days == oos_days
+            assert request.period_policy.embargo_trading_days == embargo_days
+
+    with pytest.raises(ValueError, match="weaker than its frozen horizon contract"):
+        api.RDAgentRunRequest.model_validate(
+            {
+                "objective": "Research a governed long-horizon model candidate.",
+                "scenario": "fin_model",
+                "dataset": "daily-v1",
+                "feature_set_id": "governed-baseline",
+                "horizon": "long",
+                "period_policy": {
+                    "test_trading_days": 756,
+                    "embargo_trading_days": 252,
+                },
+            }
+        )
+
+
+def test_only_strategy_research_accepts_an_incumbent_binding() -> None:
+    request = api.RDAgentRunRequest.model_validate(
+        {
+            "objective": "Research a governed factor using the frozen feature library.",
+            "scenario": "fin_factor",
+            "dataset": "daily-v1",
+            "feature_set_id": "governed-baseline",
+            "horizon": "short",
+        }
+    )
+    assert request.horizon == "short"
+    with pytest.raises(ValueError, match="accepted only by fin_strategy"):
+        api.RDAgentRunRequest.model_validate(
+            {
+                "objective": "Research a governed factor using the frozen feature library.",
+                "scenario": "fin_factor",
+                "dataset": "daily-v1",
+                "feature_set_id": "governed-baseline",
+                "horizon": "short",
+                "incumbent_strategy_version_id": "a" * 32,
+            }
+        )
 
 
 def test_research_asset_acquisition_api_accepts_only_governed_inputs() -> None:
@@ -175,16 +276,17 @@ def test_general_model_handoff_accepts_only_governed_ids_and_recipe() -> None:
 @pytest.mark.no_database
 def test_model_capital_scenarios_reject_noncanonical_embargo() -> None:
     for scenario in ("fin_model", "fin_quant"):
-        with pytest.raises(ValueError, match="20-trading-day final-OOS embargo"):
+        with pytest.raises(ValueError, match="weaker than its frozen horizon contract"):
             api.RDAgentRunRequest.model_validate(
                 {
                     "objective": "Research a governed model without changing the final OOS.",
                     "scenario": scenario,
                     "dataset": "daily-v1",
                     "feature_set_id": "governed-baseline",
+                    "horizon": "swing",
                     "period_policy": {
-                        "test_trading_days": 252,
-                        "embargo_trading_days": 21,
+                        "test_trading_days": 504,
+                        "embargo_trading_days": 20,
                     },
                 }
             )
@@ -365,9 +467,114 @@ def test_worker_closes_model_quant_and_generic_audit_chains() -> None:
         "_queue_quant_bundle_evaluation",
         "_import_quant_bundle_evaluation_artifact",
         "_archive_rdagent_run_evidence",
+        "_archive_fin_strategy_artifacts",
         "_archive_rdagent_lab_artifacts",
     ):
         assert marker in source
+
+
+def test_official_trace_projection_is_read_only_and_bounded() -> None:
+    bridge_path = Path(__file__).parents[1] / "scripts" / "rdagent_bridge.py"
+    spec = importlib.util.spec_from_file_location("rdagent_bridge_trace_view", bridge_path)
+    assert spec and spec.loader
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+
+    loops = bridge._trace_loop_projection(
+        {
+            2: {
+                "hypothesis": {
+                    "hypothesis": "Short-term relative strength survives costs.",
+                    "reason": "Test the economic claim on the frozen window.",
+                    "action": "factor",
+                },
+                "tasks": [
+                    {
+                        "name": "strength_5d",
+                        "description": "Five-session relative strength.",
+                        "code_path": "/secret/workspace/factor.py",
+                    }
+                ],
+                "codes": {"strength_5d": "raise RuntimeError('must not leak')"},
+                "feedback": {
+                    "decision": True,
+                    "reason": "net improvement",
+                    "hypothesis_evaluation": "accepted after cost check",
+                },
+                "implementation_feedback": [
+                    {"decision": True, "feedback": "implementation is reproducible"}
+                ],
+            }
+        }
+    )
+
+    assert loops == [
+        {
+            "loop_id": 2,
+            "hypothesis": {
+                "text": "Short-term relative strength survives costs.",
+                "reason": "Test the economic claim on the frozen window.",
+                "action": "factor",
+            },
+            "tasks": [
+                {
+                    "kind": "factor",
+                    "name": "strength_5d",
+                    "description": "Five-session relative strength.",
+                }
+            ],
+            "feedback": {
+                "recorded": True,
+                "decision": True,
+                "reason": "net improvement",
+                "hypothesis_evaluation": "accepted after cost check",
+            },
+            "implementation_feedback": [
+                {"decision": True, "feedback": "implementation is reproducible"}
+            ],
+        }
+    ]
+    assert "secret" not in str(loops)
+    assert "RuntimeError" not in str(loops)
+
+
+def test_api_trace_view_reads_only_the_verified_sanitized_artifact(tmp_path: Path) -> None:
+    from quant_platform.api import _rdagent_trace_view
+
+    artifact_path = tmp_path / "sanitized-result.json"
+    artifact_path.write_text(
+        '{"trace_contract_version":"rdagent-trace-web-v1",'
+        '"trace_summary":{"message_count":3},'
+        '"trace_loops":[{"loop_id":1,"hypothesis":{},"tasks":[],'
+        '"feedback":{},"implementation_feedback":[]}]}',
+        encoding="utf-8",
+    )
+
+    class VerifiedStore:
+        def get_run_artifact(self, artifact_id: str, *, verify: bool = False) -> dict:
+            assert artifact_id == "artifact-1"
+            assert verify is True
+            return {
+                "research_run_id": "run-1",
+                "storage_path": str(artifact_path),
+            }
+
+    view = _rdagent_trace_view(
+        VerifiedStore(),  # type: ignore[arg-type]
+        research_run_id="run-1",
+        scenario_id="fin_factor",
+        run_artifacts=[
+            {
+                "id": "artifact-1",
+                "artifact_type": "fin_factor_sanitized_result",
+                "status": "recorded",
+            }
+        ],
+    )
+
+    assert view["status"] == "recorded"
+    assert view["contract_version"] == "rdagent-trace-web-v1"
+    assert view["loops"][0]["loop_id"] == 1
 
 
 def test_data_science_and_finetune_use_explicit_isolated_runtime_contracts() -> None:
@@ -453,3 +660,121 @@ def test_quant_exporter_accumulates_alternating_accepted_factor_model_rounds(
     assert [item["source_iteration"] for item in bundles] == [1, 2]
     assert [len(item["factors"]) for item in bundles] == [1, 2]
     assert bundles[1]["model"]["code_sha256"] == model["code_sha256"]
+    coverage = bridge._fin_quant_arm_coverage(rounds)
+    assert coverage["complete"] is True
+    assert coverage["single_arm"] is False
+    assert bundles[0]["arm_coverage"] == {"factor": True, "model": True}
+
+
+def test_quant_exporter_rejects_based_counterpart_as_arm_coverage(
+    tmp_path: Path,
+) -> None:
+    bridge_path = Path(__file__).parents[1] / "scripts" / "rdagent_bridge.py"
+    spec = importlib.util.spec_from_file_location("rdagent_bridge_single_arm", bridge_path)
+    assert spec and spec.loader
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    factor_code = "def calculate(data):\n    return data\n"
+    model_code = "class Net:\n    pass\n"
+    rounds = {
+        0: {
+            "hypothesis": {"action": "factor"},
+            "feedback": {"decision": True},
+            "runner_snapshot": {
+                "kind": "factor",
+                "artifacts": [
+                    {
+                        "name": "factor_a",
+                        "code": factor_code,
+                        "code_sha256": bridge._sha256(factor_code),
+                    }
+                ],
+                "based_artifacts": [
+                    {
+                        "kind": "model",
+                        "name": "based_model",
+                        "model_type": "Tabular",
+                        "code": model_code,
+                        "code_sha256": bridge._sha256(model_code),
+                    }
+                ],
+                "base_features": {"BASE": "$close"},
+            },
+        }
+    }
+    code_root = tmp_path / "code"
+    values_root = tmp_path / "values"
+    code_root.mkdir()
+    values_root.mkdir()
+
+    assert bridge._materialize_quant_bundles(
+        rounds,
+        code_root=code_root,
+        values_root=values_root,
+        feature_set_id="governed-baseline",
+        feature_set_sha256="a" * 64,
+    ) == []
+    coverage = bridge._fin_quant_arm_coverage(rounds)
+    assert coverage["complete"] is False
+    assert coverage["single_arm"] is True
+    assert coverage["accepted_arms"] == ["factor"]
+    assert coverage["based_artifacts_count_as_arm_coverage"] is False
+
+
+def test_quant_exporter_does_not_count_an_empty_current_factor_arm(
+    tmp_path: Path,
+) -> None:
+    bridge_path = Path(__file__).parents[1] / "scripts" / "rdagent_bridge.py"
+    spec = importlib.util.spec_from_file_location("rdagent_bridge_empty_arm", bridge_path)
+    assert spec and spec.loader
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    factor_code = "def calculate(data):\n    return data\n"
+    model_code = "class Net:\n    pass\n"
+    rounds = {
+        0: {
+            "feedback": {"decision": True},
+            "runner_snapshot": {
+                "kind": "factor",
+                "artifacts": [],
+                "based_artifacts": [
+                    {
+                        "kind": "factor",
+                        "name": "based_factor",
+                        "code": factor_code,
+                        "code_sha256": bridge._sha256(factor_code),
+                    }
+                ],
+            },
+        },
+        1: {
+            "feedback": {"decision": True},
+            "runner_snapshot": {
+                "kind": "model",
+                "artifacts": [
+                    {
+                        "name": "current_model",
+                        "model_type": "Tabular",
+                        "code": model_code,
+                        "code_sha256": bridge._sha256(model_code),
+                    }
+                ],
+                "based_artifacts": [],
+            },
+        },
+    }
+    code_root = tmp_path / "code"
+    values_root = tmp_path / "values"
+    code_root.mkdir()
+    values_root.mkdir()
+
+    assert bridge._materialize_quant_bundles(
+        rounds,
+        code_root=code_root,
+        values_root=values_root,
+        feature_set_id="governed-baseline",
+        feature_set_sha256="a" * 64,
+    ) == []
+    coverage = bridge._fin_quant_arm_coverage(rounds)
+    assert coverage["accepted_arms"] == ["model"]
+    assert coverage["single_arm"] is True

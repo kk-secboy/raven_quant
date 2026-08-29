@@ -12,7 +12,13 @@ CORE_BASELINE_RECIPE_IDS = frozenset(
     {"index_enhancement", "full_market_multifactor"}
 )
 QLIB_BASELINE_RECIPE_IDS = frozenset(
-    {*CORE_BASELINE_RECIPE_IDS, "swing_trend", "minute_mean_reversion"}
+    {
+        *CORE_BASELINE_RECIPE_IDS,
+        "short_relative_strength",
+        "swing_trend",
+        "long_quality_value",
+        "minute_mean_reversion",
+    }
 )
 FACTOR_SOURCE_PROMOTED_ONLY = "promoted_only"
 FACTOR_SOURCE_QLIB_BASELINE = "qlib_baseline"

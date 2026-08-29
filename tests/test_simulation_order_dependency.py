@@ -93,7 +93,10 @@ def _engine(*, model_ready: bool) -> SchedulerEngine:
             "daily_dataset": "daily-v1",
             "daily_roll_policy": "latest_compatible",
             "daily_dataset_lineage_id": "l" * 64,
-        }
+        },
+        require_order_plan_predecessor_settled=lambda *_args, **_kwargs: {
+            "ready": True
+        },
     )
     engine.strategies = SimpleNamespace(
         get_version=lambda _version_id: {

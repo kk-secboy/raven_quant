@@ -11,7 +11,6 @@ from .history_bounds import (
 )
 from .models import FetchSpec
 
-
 # Production probe: one exact survey day returned a full first page and 82
 # further rows at offset=400.  Legacy requests omitted limit/offset, so 400 is
 # both the provider page size and the only row count that cannot prove that the

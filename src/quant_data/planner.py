@@ -265,11 +265,12 @@ class BootstrapPlanner:
             FetchSpec(
                 dataset="fund_basic",
                 api_name="fund_basic",
-                scope={"market": "E"},
-                params={"market": "E"},
-                allow_empty=False,
+                scope={"market": "E", "status": status},
+                params={"market": "E", "status": status},
+                allow_empty=status != "L",
                 max_attempts=max_attempts,
             )
+            for status in ("L", "I", "D")
         ]
         for source in SHENWAN_CLASSIFICATION_SOURCES:
             for level in ("L1", "L2", "L3"):

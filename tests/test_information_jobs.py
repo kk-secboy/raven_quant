@@ -21,10 +21,18 @@ from quant_platform.worker import LocalJobWorker
 pytestmark = pytest.mark.no_database
 
 
+class _ResearchFixture:
+    def list_candidates(self, *, status: str, limit: int):
+        assert status == "promoted"
+        assert limit == 500
+        return []
+
+
 def _worker(tmp_path: Path) -> LocalJobWorker:
     worker = object.__new__(LocalJobWorker)
     worker.settings = Settings(api_url="", token="", data_root=tmp_path / "data")
     worker.project_root = tmp_path
+    worker.research = _ResearchFixture()
     return worker
 
 
@@ -384,7 +392,7 @@ def test_worker_binds_information_evaluation_to_registered_artifact_sha(
         "label_horizon_days": 1,
     }
 
-    class FakeResearch:
+    class FakeResearch(_ResearchFixture):
         def find_candidate(self, *, name: str, values_sha256: str):
             assert name == "announcement_tone"
             assert values_sha256 == "c" * 64
@@ -438,7 +446,7 @@ def test_worker_rejects_information_evaluation_when_registered_sha_is_missing(
         encoding="utf-8",
     )
 
-    class EmptyResearch:
+    class EmptyResearch(_ResearchFixture):
         def find_candidate(self, *, name: str, values_sha256: str):
             return None
 
@@ -473,7 +481,7 @@ def test_worker_skips_unchanged_information_factor_with_existing_outcome(
         encoding="utf-8",
     )
 
-    class EvaluatedResearch:
+    class EvaluatedResearch(_ResearchFixture):
         def find_candidate(self, *, name: str, values_sha256: str):
             return {
                 "id": "evaluated",
@@ -526,7 +534,7 @@ def test_worker_reevaluates_unchanged_information_factor_on_new_dataset_identity
         encoding="utf-8",
     )
 
-    class PreviouslyEvaluatedResearch:
+    class PreviouslyEvaluatedResearch(_ResearchFixture):
         def find_candidate(self, *, name: str, values_sha256: str):
             return {
                 "id": "evaluated-on-old-dataset",

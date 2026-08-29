@@ -72,6 +72,7 @@ from quant_platform.corpus_nlp import PROMPT_VERSION as CORPUS_PROMPT_VERSION
 from quant_platform.event_market_response import LABEL_SCHEMA_VERSION
 from quant_platform.qlib_factor_baseline import FACTOR_SOURCE_QLIB_BASELINE
 
+from .advice_service import AdviceService
 from .alert_store import AlertStore
 from .allocation_store import AllocationStore
 from .auth_policy import ROLE_PERMISSIONS, has_permission, permission_for
@@ -108,6 +109,7 @@ from .information_schedule import (
     normalize_information_factor_refresh_payload,
     normalize_information_schedule_payload,
 )
+from .investor_profile import InvestorSimulationProfileStore
 from .job_store import (
     EVALUATION_STATUS_COUNTS_KEY,
     JobStore,
@@ -141,11 +143,20 @@ from .recommendation_account_store import RecommendationAccountStore
 from .recommendation_store import RecommendationStore
 from .research_asset_store import ResearchAssetStore
 from .research_automation import (
+    HORIZON_RESEARCH_SCENARIOS,
     normalize_research_period_policy,
     normalize_research_schedule_payload,
     resolve_research_periods,
+    resolve_research_window_contract,
 )
 from .research_campaign_store import ResearchCampaignStore
+from .research_horizon import (
+    LEGACY_AMBIGUOUS,
+    LONG_1_3Y,
+    SHORT_1_5D,
+    SWING_1_6M,
+    research_horizon_contract,
+)
 from .research_program_store import ResearchProgramStore
 from .research_report_backfill import ResearchReportBackfillStore
 from .research_store import ResearchStore
@@ -167,6 +178,7 @@ from .services import (
 )
 from .simulation_store import SimulationStore
 from .strategy_recipes import RECIPE_VERSION, get_strategy_recipe, list_strategy_recipes
+from .strategy_rule_compiler import validate_strategy_rule_binding
 from .strategy_store import StrategyStore
 from .worker import LocalJobWorker
 
@@ -525,7 +537,7 @@ class ResearchPeriodPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     test_trading_days: int = Field(default=252, ge=252, le=1260)
-    embargo_trading_days: int = Field(default=20, ge=20, le=63)
+    embargo_trading_days: int = Field(default=20, ge=6, le=253)
 
     @model_validator(mode="after")
     def validate_policy(self) -> ResearchPeriodPolicy:
@@ -585,6 +597,10 @@ class RDAgentRunRequest(BaseModel):
     dataset: str | None = None
     asset_ids: list[str] = Field(default_factory=list, max_length=20)
     feature_set_id: str | None = None
+    horizon: Literal["short", "swing", "long"] | None = None
+    incumbent_strategy_version_id: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{32}$"
+    )
     loop_n: int = Field(default=1, ge=1, le=20)
     duration: str = "30m"
     requested_by: str = Field(default="local-operator", min_length=2, max_length=100)
@@ -595,12 +611,42 @@ class RDAgentRunRequest(BaseModel):
         validate_duration(self.duration)
         scenario = get_rdagent_scenario(self.scenario)
         self.scenario = scenario.id
-        if (
-            scenario.id in {"fin_model", "fin_quant"}
-            and self.period_policy.embargo_trading_days != 20
-        ):
+        if scenario.id in HORIZON_RESEARCH_SCENARIOS:
+            if self.horizon is None:
+                raise ValueError(
+                    f"{scenario.id} requires an explicit short, swing, or long horizon"
+                )
+            required_period_policy = {
+                # The 1-5 day label contract needs six sessions of local
+                # purge, but every capital-facing final OOS also inherits the
+                # platform-wide 20-session unopened embargo.
+                "short": (252, 20),
+                "swing": (504, 127),
+                "long": (756, 253),
+            }[self.horizon]
+            required_oos, required_embargo = required_period_policy
+            if "period_policy" not in self.model_fields_set:
+                self.period_policy = ResearchPeriodPolicy(
+                    test_trading_days=required_oos,
+                    embargo_trading_days=required_embargo,
+                )
+            elif (
+                self.period_policy.test_trading_days < required_oos
+                or self.period_policy.embargo_trading_days < required_embargo
+            ):
+                raise ValueError(
+                    f"{scenario.id} period policy is weaker than its frozen horizon contract"
+                )
+            if (
+                scenario.id != "fin_strategy"
+                and self.incumbent_strategy_version_id is not None
+            ):
+                raise ValueError(
+                    "incumbent_strategy_version_id is accepted only by fin_strategy"
+                )
+        elif self.horizon is not None or self.incumbent_strategy_version_id is not None:
             raise ValueError(
-                f"{scenario.id} currently requires the governed 20-trading-day final-OOS embargo"
+                "horizon is accepted only by active horizon research scenarios"
             )
         self.asset_ids = [validate_asset_id(value) for value in self.asset_ids]
         if len(set(self.asset_ids)) != len(self.asset_ids):
@@ -674,6 +720,10 @@ _PUBLIC_WINDOWS_PATH = re.compile(r"(?i)(?:^|\s)[a-z]:[\\/]")
 _PUBLIC_UNIX_PATH = re.compile(
     r"(?:^|\s)/(?:app|data|etc|home|mnt|opt|root|run|srv|tmp|usr|var)(?:/|\b)"
 )
+_PUBLIC_SECRET_TEXT = re.compile(
+    r"(?i)(?:sk-[A-Za-z0-9_-]{12,}|"
+    r"(?:api[_ -]?key|authorization|password|secret|token)\s*[:=]\s*\S+)"
+)
 
 
 def _public_string(value: str) -> str:
@@ -684,6 +734,7 @@ def _public_string(value: str) -> str:
         or value.startswith(("\\\\", "file:"))
         or _PUBLIC_WINDOWS_PATH.search(value)
         or _PUBLIC_UNIX_PATH.search(value)
+        or _PUBLIC_SECRET_TEXT.search(value)
     ):
         return "[redacted]"
     return value
@@ -716,22 +767,32 @@ def _sanitize_public_value(value: Any) -> Any:
         "stderr",
         "stdout",
     }
+    safe_boolean_readiness_keys = {
+        "credentials_configured",
+        "llm_credentials_configured",
+    }
     if isinstance(value, dict):
         return {
             str(key): _sanitize_public_value(item)
             for key, item in value.items()
             if str(key).lower() not in hidden_keys
             and not str(key).lower().endswith(("_path", "_paths", "_url", "_uri"))
-            and not any(
-                token in str(key).lower()
-                for token in (
-                    "api_key",
-                    "authorization",
-                    "cookie",
-                    "credential",
-                    "password",
-                    "secret",
-                    "token",
+            and (
+                (
+                    str(key).lower() in safe_boolean_readiness_keys
+                    and isinstance(item, bool)
+                )
+                or not any(
+                    token in str(key).lower()
+                    for token in (
+                        "api_key",
+                        "authorization",
+                        "cookie",
+                        "credential",
+                        "password",
+                        "secret",
+                        "token",
+                    )
                 )
             )
         }
@@ -747,6 +808,50 @@ def _public_rdagent_run(run: dict[str, Any]) -> dict[str, Any]:
     result["error"] = "research run failed" if run.get("error") else None
     result["scenario"] = scenario_from_research_run(result)
     return result
+
+
+def _rdagent_trace_view(
+    store: RDAGentCandidateStore,
+    *,
+    research_run_id: str,
+    scenario_id: str,
+    run_artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Read the immutable, path-free Loop/Hypothesis/Feedback projection."""
+
+    artifact_type = f"{scenario_id}_sanitized_result"
+    candidate = next(
+        (
+            item
+            for item in run_artifacts
+            if item.get("artifact_type") == artifact_type
+            and item.get("status") == "recorded"
+        ),
+        None,
+    )
+    if candidate is None:
+        return {"status": "unavailable", "contract_version": None, "loops": []}
+    try:
+        artifact = store.get_run_artifact(str(candidate["id"]), verify=True)
+        if str(artifact.get("research_run_id") or "") != research_run_id:
+            raise ValueError("trace artifact belongs to another research run")
+        payload = json.loads(Path(str(artifact["storage_path"])).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("trace projection envelope must be an object")
+        contract_version = str(payload.get("trace_contract_version") or "")
+        loops = payload.get("trace_loops")
+        if contract_version != "rdagent-trace-web-v1" or not isinstance(loops, list):
+            return {"status": "legacy_summary_only", "contract_version": None, "loops": []}
+        if any(not isinstance(item, dict) for item in loops[:20]):
+            raise ValueError("trace projection contains an invalid loop")
+        return {
+            "status": "recorded",
+            "contract_version": contract_version,
+            "loops": loops[:20],
+            "summary": payload.get("trace_summary") or {},
+        }
+    except (KeyError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return {"status": "unavailable", "contract_version": None, "loops": []}
 
 
 def _public_rdagent_status(status: dict[str, Any]) -> dict[str, Any]:
@@ -987,7 +1092,9 @@ class StrategyConfigRequest(BaseModel):
     recipe_id: Literal[
         "custom",
         "index_enhancement",
+        "short_relative_strength",
         "swing_trend",
+        "long_quality_value",
         "full_market_multifactor",
         "minute_mean_reversion",
     ] = "custom"
@@ -1033,18 +1140,65 @@ class StrategyConfigRequest(BaseModel):
     model_component_families: list[str] | None = Field(
         default=None, min_length=2, max_length=3
     )
+    horizon_profile: Literal[
+        "short_1_5d", "swing_1_6m", "long_1_3y", "legacy_ambiguous"
+    ] = LEGACY_AMBIGUOUS
+    source_research_artifact_id: str | None = Field(
+        default=None, min_length=1, max_length=128
+    )
+    strategy_research_proposal_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    strategy_research_artifact_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    parent_strategy_version_id: str | None = Field(
+        default=None, min_length=1, max_length=128
+    )
+    strategy_research_data_contract: dict[str, Any] | None = None
+    strategy_evaluation_contract: dict[str, Any] | None = None
+    strategy_rule_ir: dict[str, Any] | None = None
+    strategy_rules_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    strategy_rule_policy_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     signal_frequency: Literal["day", "1min", "5min", "15min", "30min", "60min"] = "day"
     signal_period: int = Field(default=1, ge=1, le=1260)
     execution_frequency: Literal["day", "1min", "5min", "15min", "30min", "60min"] = "day"
     execution_lag_bars: Literal[1] = 1
     execution_contract_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     rebalance_frequency: Literal["bar", "day", "week", "month"] = "day"
+    lot_size: Literal[100] = 100
+    min_listing_days: int = Field(default=0, ge=0, le=2520)
+    entry_score_min_percentile: float = Field(default=0.0, ge=0.0, le=1.0)
+    score_drop_exit_percentile: float | None = Field(default=None, ge=0.0, le=1.0)
+    extension_guard_max_return_5d: float | None = Field(
+        default=None, ge=0.0, le=5.0
+    )
+    max_holding_sessions: int | None = Field(default=None, ge=1, le=756)
+    market_trend_lookback_sessions: int | None = Field(
+        default=None, ge=2, le=756
+    )
+    market_trend_benchmark: str | None = Field(default=None, min_length=2, max_length=32)
+    valuation_regime_max_percentile: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    trend_break_lookback_sessions: int | None = Field(default=None, ge=2, le=756)
+    thesis_min_holding_sessions: int | None = Field(default=None, ge=1, le=756)
+    thesis_break_score_percentile: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    thesis_review_frequency: Literal["month"] | None = None
+    cash_when_no_edge: bool = False
     topk: int = Field(default=50, ge=5, le=500)
     n_drop: int = Field(default=5, ge=0, le=100)
     max_position_weight: float = Field(default=0.02, gt=0, le=0.20)
     max_daily_turnover: float = Field(default=0.15, gt=0, le=1.0)
     max_daily_loss: float = Field(default=0.03, gt=0, le=0.20)
     stop_loss: float = Field(default=0.07, gt=0, le=0.50)
+    profit_taking_mode: Literal["threshold", "rule_only", "thesis_only"] = "threshold"
     take_profit_partial: float = Field(default=0.12, gt=0, le=2.0)
     take_profit_partial_fraction: float = Field(default=0.50, gt=0, lt=1.0)
     take_profit: float = Field(default=0.20, gt=0, le=5.0)
@@ -1060,6 +1214,7 @@ class StrategyConfigRequest(BaseModel):
     portfolio_construction: Literal[
         "topk_equal_weight", "benchmark_relative_qp", "industry_neutral_qp"
     ] = "topk_equal_weight"
+    industry_relative_rank: bool = False
     optimizer_alpha_weight: float = Field(default=0.05, ge=0, le=10.0)
     optimizer_tracking_penalty: float = Field(default=1.0, ge=0, le=100.0)
     optimizer_turnover_penalty: float = Field(default=0.10, ge=0, le=100.0)
@@ -1089,8 +1244,8 @@ class StrategyConfigRequest(BaseModel):
     outer_train_days: int = Field(default=252, ge=60, le=2520)
     outer_validation_days: int = Field(default=42, ge=10, le=504)
     outer_test_days: int = Field(default=42, ge=10, le=504)
-    outer_purge_days: int = Field(default=5, ge=1, le=126)
-    outer_embargo_days: int = Field(default=5, ge=1, le=126)
+    outer_purge_days: int | None = Field(default=None, ge=1, le=756)
+    outer_embargo_days: int | None = Field(default=None, ge=1, le=756)
     minimum_outer_test_excess_return: float = Field(default=0.0, ge=-1.0, le=5.0)
     minimum_outer_test_pass_rate: float = Field(default=0.60, ge=0.50, le=1.0)
     # A production recommendation must be supported by a full pre-final
@@ -1101,11 +1256,10 @@ class StrategyConfigRequest(BaseModel):
     event_count: int = Field(default=5, ge=1, le=20)
     max_event_underperformance: float = Field(default=0.05, ge=0, le=0.50)
     min_event_stress_pass_rate: float = Field(default=0.60, ge=0, le=1)
-    min_backtest_days: int = Field(default=252, ge=252, le=2520)
-    # Account capital and capacity stress notionals are different contracts.
-    # The personal deployment starts paper evidence with the user's 100k
-    # account while retaining larger capacity curves for scalability tests.
-    paper_initial_cash: float = Field(default=100_000, ge=100_000, le=10_000_000_000)
+    min_backtest_days: int | None = Field(default=None, ge=252, le=2520)
+    # Legacy compatibility only. New horizon paper accounts resolve their
+    # principal from the active investor profile; capacity remains research-only.
+    paper_initial_cash: float = Field(default=100_000, gt=0, le=10_000_000_000)
     capacity_notional: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
     capacity_curve_notionals: list[float] = Field(
         default_factory=lambda: [5_000_000, 20_000_000, 100_000_000],
@@ -1141,6 +1295,38 @@ class StrategyConfigRequest(BaseModel):
 
     @model_validator(mode="after")
     def valid_dropout(self) -> StrategyConfigRequest:
+        horizon = research_horizon_contract(self.horizon_profile)
+        if self.horizon_profile == LEGACY_AMBIGUOUS:
+            self.outer_purge_days = self.outer_purge_days or 5
+            self.outer_embargo_days = self.outer_embargo_days or 5
+            self.min_backtest_days = self.min_backtest_days or 252
+        else:
+            assert horizon.purge_sessions is not None
+            assert horizon.embargo_sessions is not None
+            assert horizon.sealed_oos_sessions is not None
+            self.outer_purge_days = self.outer_purge_days or horizon.purge_sessions
+            self.outer_embargo_days = self.outer_embargo_days or horizon.embargo_sessions
+            self.min_backtest_days = self.min_backtest_days or horizon.sealed_oos_sessions
+            if self.outer_purge_days < horizon.purge_sessions:
+                raise ValueError("outer purge is shorter than the sealed horizon contract")
+            if self.outer_embargo_days < horizon.embargo_sessions:
+                raise ValueError("outer embargo is shorter than the sealed horizon contract")
+            if self.min_backtest_days < horizon.sealed_oos_sessions:
+                raise ValueError("backtest period is shorter than the sealed horizon OOS")
+        research_binding = (
+            self.strategy_research_proposal_sha256,
+            self.strategy_research_artifact_sha256,
+            self.strategy_research_data_contract,
+            self.strategy_evaluation_contract,
+        )
+        if self.source_research_artifact_id is not None and any(
+            value is None for value in research_binding
+        ):
+            raise ValueError("strategy research artifact binding is incomplete")
+        if self.source_research_artifact_id is None and any(
+            value is not None for value in (*research_binding, self.parent_strategy_version_id)
+        ):
+            raise ValueError("strategy research metadata requires a source artifact")
         if self.signal_source == "model_prediction":
             if self.factor_source_mode not in {
                 "promoted_only",
@@ -1193,7 +1379,12 @@ class StrategyConfigRequest(BaseModel):
             and self.optimizer_turnover_penalty == 0
         ):
             raise ValueError("optimizer objective must contain a positive weight")
-        if self.take_profit_partial >= self.take_profit:
+        if self.profit_taking_mode == "thesis_only" and self.horizon_profile != "long_1_3y":
+            raise ValueError("thesis-only profit taking is reserved for long_1_3y")
+        if (
+            self.profit_taking_mode == "threshold"
+            and self.take_profit_partial >= self.take_profit
+        ):
             raise ValueError("take_profit_partial must be below take_profit")
         if self.max_drawdown_reduce >= self.max_drawdown_liquidate:
             raise ValueError("max_drawdown_reduce must be below max_drawdown_liquidate")
@@ -1217,6 +1408,7 @@ class StrategyConfigRequest(BaseModel):
         if self.execution_slice_minutes % 5:
             raise ValueError("execution_slice_minutes must be a multiple of five")
         CostModelConfig.from_mapping(self.model_dump())
+        validate_strategy_rule_binding(self.model_dump())
         config = self.model_dump(exclude={"execution_contract_hash"})
         expected_contract_hash = strategy_execution_contract_hash(config)
         if (
@@ -1413,101 +1605,6 @@ class ParameterExperimentRequest(BaseModel):
         return self
 
 
-class ResearchCampaignCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(min_length=3, max_length=150)
-    objective: str = Field(min_length=10, max_length=2000)
-    dataset: str
-    recipe_id: Literal["index_enhancement", "swing_trend", "full_market_multifactor"] = (
-        "index_enhancement"
-    )
-    benchmark: str | None = None
-    universe: str | None = None
-    loop_n: int = Field(default=2, ge=1, le=20)
-    duration: str = "1h"
-    period_policy: ResearchPeriodPolicy = Field(default_factory=ResearchPeriodPolicy)
-    max_factors: int = Field(default=5, ge=1, le=20)
-    parameter_grid: dict[str, list[int | float]] = Field(
-        default_factory=lambda: {
-            "n_drop": [5, 10],
-            "max_daily_turnover": [0.15, 0.20, 0.25],
-            "max_volume_participation": [0.005, 0.01],
-        }
-    )
-    max_trials: int = Field(default=27, ge=1, le=81)
-    strategy_config: StrategyConfigRequest | None = None
-    hypothetical_initial_value: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
-    timezone: str = "Asia/Shanghai"
-    recommendation_run_time: time = time(15, 30)
-    misfire_grace_seconds: int = Field(default=1800, ge=60, le=86400)
-    actor: str = Field(default="local-operator", min_length=2, max_length=100)
-
-    @model_validator(mode="after")
-    def validate_campaign(self) -> ResearchCampaignCreateRequest:
-        validate_duration(self.duration)
-        if self.recommendation_run_time < time(15, 10):
-            raise ValueError("recommendation refresh must run after the A-share close")
-        try:
-            ZoneInfo(self.timezone)
-        except ZoneInfoNotFoundError as exc:
-            raise ValueError("timezone is not available") from exc
-        return self
-
-
-class ResearchCampaignStatusRequest(BaseModel):
-    status: Literal["paused", "running", "cancelled"]
-    actor: str = Field(default="local-operator", min_length=2, max_length=100)
-
-
-class ResearchProgramCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(min_length=3, max_length=100)
-    dataset: str
-    recipe_id: Literal["index_enhancement", "swing_trend", "full_market_multifactor"] = (
-        "index_enhancement"
-    )
-    objective: str | None = Field(default=None, min_length=10, max_length=2000)
-    benchmark: str | None = None
-    universe: str | None = None
-    test_trading_days: int = Field(default=252, ge=252, le=1260)
-    max_active_campaigns: int = Field(default=1, ge=1, le=3)
-    loop_n: int = Field(default=2, ge=1, le=20)
-    duration: str = "1h"
-    max_factors: int = Field(default=5, ge=1, le=20)
-    parameter_grid: dict[str, list[int | float]] = Field(
-        default_factory=lambda: {
-            "n_drop": [5, 10],
-            "max_daily_turnover": [0.15, 0.20, 0.25],
-            "max_volume_participation": [0.005, 0.01],
-        }
-    )
-    max_trials: int = Field(default=27, ge=1, le=81)
-    strategy_config: StrategyConfigRequest | None = None
-    hypothetical_initial_value: float = Field(default=5_000_000, ge=100_000, le=10_000_000_000)
-    timezone: str = "Asia/Shanghai"
-    recommendation_run_time: time = time(15, 30)
-    misfire_grace_seconds: int = Field(default=1800, ge=60, le=86400)
-    actor: str = Field(default="local-operator", min_length=2, max_length=100)
-
-    @model_validator(mode="after")
-    def validate_program(self) -> ResearchProgramCreateRequest:
-        validate_duration(self.duration)
-        if self.recommendation_run_time < time(15, 10):
-            raise ValueError("recommendation refresh must run after the A-share close")
-        try:
-            ZoneInfo(self.timezone)
-        except ZoneInfoNotFoundError as exc:
-            raise ValueError("timezone is not available") from exc
-        return self
-
-
-class ResearchProgramStatusRequest(BaseModel):
-    status: Literal["active", "paused", "cancelled"]
-    actor: str = Field(default="local-operator", min_length=2, max_length=100)
-
-
 class StrategyApprovalRequest(BaseModel):
     actor: str = Field(min_length=2, max_length=100)
     reason: str = Field(min_length=10, max_length=2000)
@@ -1537,7 +1634,7 @@ class StrategyAllocationMemberRequest(BaseModel):
 class StrategyAllocationCreateRequest(BaseModel):
     name: str = Field(min_length=3, max_length=150)
     dataset: str
-    total_capital: float = Field(default=5_000_000, ge=500_000, le=10_000_000_000)
+    total_capital: float = Field(gt=0, le=10_000_000_000)
     allocation_method: Literal["risk_parity", "inverse_volatility", "fixed"] = "risk_parity"
     lookback_days: int = Field(default=252, ge=60, le=1260)
     target_volatility: float = Field(default=0.15, gt=0, le=0.50)
@@ -1586,8 +1683,7 @@ class RecommendationPortfolioCreateRequest(BaseModel):
     dataset: str
     dataset_roll_policy: Literal["pinned", "latest_compatible"] = "latest_compatible"
     construction_notional: float = Field(
-        default=5_000_000,
-        ge=100_000,
+        gt=0,
         validation_alias=AliasChoices("construction_notional", "hypothetical_initial_value"),
     )
     actor: str = Field(default="local-operator", min_length=2, max_length=100)
@@ -1606,6 +1702,42 @@ class ActiveRecommendationAccountRequest(BaseModel):
     reason: str = Field(min_length=10, max_length=2000)
 
 
+class InvestorMarketPermissionsRequest(BaseModel):
+    """Explicit first-run market permissions; no permission is inferred."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    main_board: bool
+    star_market: bool
+    chi_next: bool
+    beijing_exchange: bool
+    etf: bool
+
+
+class InvestorSimulationProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    initial_capital: float = Field(gt=0, le=10_000_000_000)
+    risk_profile: Literal["conservative", "balanced", "aggressive", "custom"] = (
+        "balanced"
+    )
+    min_cash_weight: float = Field(default=0.10, ge=0, lt=1)
+    max_gross_exposure: float = Field(default=0.90, gt=0, le=1)
+    market_permissions: InvestorMarketPermissionsRequest
+    actor: str = Field(default="local-operator", min_length=2, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_risk_profile(self) -> InvestorSimulationProfileRequest:
+        if self.min_cash_weight + self.max_gross_exposure > 1.0 + 1e-12:
+            raise ValueError("minimum cash plus maximum exposure cannot exceed 100%")
+        if self.risk_profile == "balanced" and (
+            abs(self.min_cash_weight - 0.10) > 1e-12
+            or abs(self.max_gross_exposure - 0.90) > 1e-12
+        ):
+            raise ValueError("balanced profile freezes 10% cash and 90% maximum exposure")
+        return self
+
+
 class SimulationPortfolioCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1613,14 +1745,14 @@ class SimulationPortfolioCreateRequest(BaseModel):
     recommendation_portfolio_id: str | None = None
     source_type: Literal["recommendation", "strategy_version", "allocation"] | None = None
     source_id: str | None = None
-    execution_dataset: str
-    execution_frequency: Literal["1min", "5min"] = "5min"
+    execution_dataset: str | None = None
+    execution_frequency: Literal["day", "1min", "5min"] = "day"
     execution_adapter: Literal["long_only", "pair"] | None = None
     execution_contract_hash: str | None = Field(default=None, min_length=64, max_length=64)
     daily_roll_policy: Literal["pinned", "latest_compatible"] = "latest_compatible"
     execution_roll_policy: Literal["pinned", "latest_compatible"] = "latest_compatible"
-    initial_cash: float = Field(ge=100_000)
-    execution_algorithm: Literal["twap", "vwap", "next_bar"] | None = None
+    initial_cash: float = Field(gt=0)
+    execution_algorithm: Literal["open", "twap", "vwap", "next_bar"] | None = None
     slice_minutes: int | None = Field(default=None, ge=5, le=30, multiple_of=5)
     max_slices: int | None = Field(default=None, ge=1, le=64)
     max_participation: float | None = Field(default=None, gt=0, le=0.20)
@@ -1636,6 +1768,11 @@ class SimulationPortfolioCreateRequest(BaseModel):
                 raise ValueError("recommendation source identifiers disagree")
         elif not self.source_type or not self.source_id:
             raise ValueError("simulation source_type and source_id are required")
+        if self.execution_frequency == "day":
+            if self.execution_algorithm not in {None, "open"}:
+                raise ValueError("daily simulation supports only next-session-open execution")
+        elif not self.execution_dataset:
+            raise ValueError("minute simulation requires an execution_dataset")
         return self
 
 
@@ -2002,6 +2139,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         parameter_experiments=parameter_experiments,
     )
     allocations = AllocationStore(settings.database_url)
+    investor_profiles = InvestorSimulationProfileStore(settings.database_url)
+    advice = AdviceService(settings.database_url)
     schedules = ScheduleStore(settings.database_url)
     alerts = AlertStore(settings.database_url)
     health_history = OperationalHealthStore(settings)
@@ -2220,7 +2359,14 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        nonlocal data_task_projection, data_task_projection_checked_at
         data_tasks.sync_catalog()
+        with data_task_projection_lock:
+            if data_task_projection is None:
+                data_task_projection = data_tasks.catalog_shell()
+                # Keep the shell immediately visible, but force the first
+                # request/startup warm-up to launch the full aggregate refresh.
+                data_task_projection_checked_at = 0.0
         factor_library.sync_builtin_library()
         for sota in factor_library.list_sota(limit=200):
             register_feature_set(factor_library.sota_feature_set(str(sota["id"])))
@@ -2281,6 +2427,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
     public_api_paths = {
         "/api/health",
+        "/api/readyz",
         "/api/auth/state",
         "/api/auth/bootstrap",
         "/api/auth/login",
@@ -2642,6 +2789,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         *,
         periods: ResearchPeriods | dict[str, Any] | None,
         period_policy: ResearchPeriodPolicy | dict[str, Any] | None,
+        horizon_profile: str | None = None,
+        feature_set: dict[str, Any] | None = None,
     ) -> tuple[dict[str, str], dict[str, Any]]:
         raw_periods = periods.model_dump(mode="json") if isinstance(periods, BaseModel) else periods
         raw_policy = (
@@ -2650,11 +2799,21 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             else period_policy
         )
         try:
-            resolved, evidence = resolve_research_periods(
-                read_research_calendar(dataset),
-                periods=raw_periods,
-                period_policy=raw_policy,
-            )
+            if horizon_profile is None:
+                resolved, evidence = resolve_research_periods(
+                    read_research_calendar(dataset),
+                    periods=raw_periods,
+                    period_policy=raw_policy,
+                )
+            else:
+                resolved, evidence = resolve_research_window_contract(
+                    dataset,
+                    read_research_calendar(dataset),
+                    periods=raw_periods,
+                    period_policy=raw_policy,
+                    horizon_profile=horizon_profile,
+                    feature_set=feature_set,
+                )
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
         require_research_calendar(dataset, resolved)
@@ -2930,6 +3089,210 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "runtime_secret_storage": "ok",
             "runtime_secret_records": int(secret_storage["record_count"]),
         }
+
+    @app.get("/api/readyz")
+    def business_readiness(response: Response) -> dict[str, Any]:
+        """Fail closed unless the durable business loop is currently operable."""
+
+        try:
+            latest_health = health_history.latest()
+        except Exception:  # noqa: BLE001 - readiness must return 503, not leak DB errors
+            latest_health = None
+        if latest_health is None:
+            operational_check: dict[str, Any] = {
+                "status": "missing",
+                "message": "no durable operational health snapshot",
+                "blocking_components": ["operational_health"],
+            }
+        else:
+            components = latest_health.get("components")
+            component_map = components if isinstance(components, dict) else {}
+            blocking_components = sorted(
+                str(name)
+                for name, component in component_map.items()
+                if not isinstance(component, dict)
+                or component.get("status") not in {"ok", "not_applicable"}
+            )
+            operational_check = {
+                "status": str(latest_health.get("status") or "missing"),
+                "message": "durable operational health snapshot",
+                "recorded_at": latest_health.get("recorded_at"),
+                "age_seconds": latest_health.get("age_seconds"),
+                "blocking_components": blocking_components,
+            }
+
+        stale_after_seconds = max(30, settings.scheduler_poll_seconds * 2)
+        scheduler_check: dict[str, Any]
+        scheduler_identity: dict[str, Any] = {}
+        if settings.scheduler_url:
+            try:
+                scheduler_response = requests.get(
+                    f"{settings.scheduler_url}/health",
+                    timeout=5,
+                )
+                scheduler_body = scheduler_response.json()
+                if not isinstance(scheduler_body, dict):
+                    raise ValueError("scheduler health body must be an object")
+                scheduler_identity = {
+                    "release_id": scheduler_body.get("release_id"),
+                    "config_digest": scheduler_body.get("config_digest"),
+                }
+                last_tick_raw = scheduler_body.get("last_tick")
+                last_tick = datetime.fromisoformat(str(last_tick_raw))
+                if last_tick.tzinfo is None:
+                    raise ValueError("scheduler last_tick must be timezone-aware")
+                scheduler_age = max(0.0, (datetime.now(UTC) - last_tick).total_seconds())
+                scheduler_ready = (
+                    scheduler_response.status_code == 200
+                    and scheduler_body.get("status") == "ok"
+                    and scheduler_age <= stale_after_seconds
+                )
+                scheduler_check = {
+                    "status": "ok" if scheduler_ready else "degraded",
+                    "message": (
+                        "scheduler tick is current"
+                        if scheduler_ready
+                        else "scheduler health or tick freshness check failed"
+                    ),
+                    "last_tick": last_tick_raw,
+                    "age_seconds": scheduler_age,
+                    "stale_after_seconds": stale_after_seconds,
+                }
+            except (requests.RequestException, TypeError, ValueError):
+                scheduler_check = {
+                    "status": "unavailable",
+                    "message": "scheduler health endpoint is unavailable",
+                    "stale_after_seconds": stale_after_seconds,
+                }
+        else:
+            raw_components = (
+                latest_health.get("components", {}) if isinstance(latest_health, dict) else {}
+            )
+            component_map = raw_components if isinstance(raw_components, dict) else {}
+            scheduler_component = (
+                component_map.get("scheduler_heartbeat")
+                or component_map.get("scheduler")
+                or {}
+            )
+            if isinstance(scheduler_component, dict):
+                scheduler_details = scheduler_component.get("details")
+                details = scheduler_details if isinstance(scheduler_details, dict) else {}
+                scheduler_identity = {
+                    "release_id": scheduler_component.get("release_id")
+                    or details.get("release_id"),
+                    "config_digest": scheduler_component.get("config_digest")
+                    or details.get("config_digest"),
+                }
+            scheduler_ready = (
+                operational_check["status"] == "ok"
+                and isinstance(scheduler_component, dict)
+                and scheduler_component.get("status") == "ok"
+            )
+            scheduler_check = {
+                "status": "ok" if scheduler_ready else "unavailable",
+                "message": (
+                    "scheduler proven by fresh durable health snapshot"
+                    if scheduler_ready
+                    else "scheduler URL is unconfigured and no fresh heartbeat is available"
+                ),
+                "source": "durable_health_snapshot",
+            }
+
+        expected_release = settings.quantlab_release_id
+        expected_config = settings.quantlab_config_digest
+        observed_release = str(scheduler_identity.get("release_id") or "")
+        observed_config = str(scheduler_identity.get("config_digest") or "")
+        release_ready = bool(
+            expected_release
+            and expected_config
+            and observed_release == expected_release
+            and observed_config == expected_config
+        )
+        release_check = {
+            "status": "ok" if release_ready else "blocked",
+            "message": (
+                "API and scheduler use the same immutable release and configuration"
+                if release_ready
+                else "release/config identity is missing or differs across services"
+            ),
+            "api_release_id": expected_release or None,
+            "scheduler_release_id": observed_release or None,
+            "api_config_digest": expected_config or None,
+            "scheduler_config_digest": observed_config or None,
+        }
+
+        try:
+            safe_mode_state = safe_mode.status()
+            safe_mode_active = bool(safe_mode_state.get("active"))
+            safe_mode_check = {
+                "status": "blocked" if safe_mode_active else "ok",
+                "message": "safe mode is active" if safe_mode_active else "safe mode is off",
+                "active": safe_mode_active,
+            }
+        except Exception:  # noqa: BLE001 - readiness must fail closed on unreadable state
+            safe_mode_check = {
+                "status": "unavailable",
+                "message": "safe-mode state is unavailable",
+                "active": None,
+            }
+
+        try:
+            secret_storage = runtime_secrets.health()
+            secret_check = {
+                "status": str(secret_storage.get("status") or "unavailable"),
+                "message": str(secret_storage.get("message") or "runtime secret storage"),
+            }
+        except Exception:  # noqa: BLE001 - readiness must fail closed on unreadable state
+            secret_check = {
+                "status": "unavailable",
+                "message": "runtime secret storage is unavailable",
+            }
+
+        try:
+            business_loop = deployment_readiness.business_loop_readiness()
+            business_checks = business_loop.get("checks")
+            if not isinstance(business_checks, dict) or not all(
+                isinstance(item, dict) for item in business_checks.values()
+            ):
+                raise ValueError("business readiness checks must be an object")
+        except Exception as exc:  # noqa: BLE001 - readiness must fail closed
+            business_checks = {
+                "business_loop": {
+                    "status": "unavailable",
+                    "message": (
+                        "business-loop readiness is unavailable: " + str(exc)[:400]
+                    ),
+                }
+            }
+
+        checks = {
+            "operational_health": operational_check,
+            "scheduler": scheduler_check,
+            "release_identity": release_check,
+            "safe_mode": safe_mode_check,
+            "runtime_secret_storage": secret_check,
+            **business_checks,
+        }
+        blockers = [
+            {
+                "check": name,
+                "status": str(check.get("status") or "unavailable"),
+                "message": str(check.get("message") or name),
+            }
+            for name, check in checks.items()
+            if not isinstance(check, dict) or check.get("status") != "ok"
+        ]
+        ready = not blockers
+        response.status_code = 200 if ready else 503
+        response.headers["Cache-Control"] = "no-store"
+        return _sanitize_public_value(
+            {
+                "status": "ready" if ready else "not_ready",
+                "ready": ready,
+                "blockers": blockers,
+                "checks": checks,
+            }
+        )
 
     @app.get("/api/settings")
     def runtime_settings_status() -> dict:
@@ -3710,7 +4073,14 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(404, "research run not found") from exc
         run["candidates"] = research.list_candidates(run_id=run_id)
         run["events"] = research.list_events(run_id)
-        run.update(rdagent_candidates.run_audit_summary(run_id))
+        audit = rdagent_candidates.run_audit_summary(run_id)
+        run.update(audit)
+        run["trace_view"] = _rdagent_trace_view(
+            rdagent_candidates,
+            research_run_id=run_id,
+            scenario_id=scenario_from_research_run(run),
+            run_artifacts=list(audit.get("run_artifacts") or []),
+        )
         run["asset_consumptions"] = research_assets.list_consumptions(research_run_id=run_id)
         return _public_rdagent_run(run)
 
@@ -3875,6 +4245,48 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             expected_runtime_identity = expected_rdagent_runtime_identity(runtime, scenario.id)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+        research_horizon_profile = (
+            {
+                "short": SHORT_1_5D,
+                "swing": SWING_1_6M,
+                "long": LONG_1_3Y,
+            }[str(payload.horizon)]
+            if scenario.id in HORIZON_RESEARCH_SCENARIOS
+            else None
+        )
+        strategy_horizon_profile = (
+            research_horizon_profile if scenario.id == "fin_strategy" else None
+        )
+        incumbent_binding: dict[str, Any] | None = None
+        if payload.incumbent_strategy_version_id is not None:
+            try:
+                incumbent = strategies.get_version(payload.incumbent_strategy_version_id)
+            except KeyError as exc:
+                raise HTTPException(409, "incumbent strategy version was not found") from exc
+            if incumbent.get("horizon_profile") != research_horizon_profile:
+                raise HTTPException(
+                    409,
+                    "incumbent strategy version belongs to a different horizon",
+                )
+            if incumbent.get("status") != "approved" or incumbent.get(
+                "promotion_stage"
+            ) not in {"paper", "recommendation_enabled"}:
+                raise HTTPException(
+                    409,
+                    "incumbent strategy version is not an active governed strategy",
+                )
+            incumbent_binding = {
+                "id": str(incumbent["id"]),
+                "strategy_id": str(incumbent["strategy_id"]),
+                "version": int(incumbent["version"]),
+                "status": str(incumbent["status"]),
+                "promotion_stage": incumbent.get("promotion_stage"),
+                "horizon_profile": str(incumbent["horizon_profile"]),
+                "horizon_contract_sha256": str(
+                    incumbent["horizon_contract_sha256"]
+                ),
+                "strategy_rules_sha256": incumbent.get("strategy_rules_sha256"),
+            }
         dataset: dict[str, Any] | None = None
         periods: dict[str, str] | None = None
         period_resolution: dict[str, Any] | None = None
@@ -3888,6 +4300,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     dataset,
                     periods=None,
                     period_policy=payload.period_policy,
+                    horizon_profile=research_horizon_profile,
+                    feature_set=(
+                        get_feature_set(str(payload.feature_set_id))
+                        if scenario.requires_feature_set
+                        else None
+                    ),
                 )
             assets = resolve_rdagent_assets(
                 settings,
@@ -3929,6 +4347,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "asset_selection_mode": "automatic" if auto_selected_assets else "explicit",
             "feature_set": feature_set,
             "expected_rdagent_runtime": expected_runtime_identity,
+            "strategy_horizon_profile": strategy_horizon_profile,
+            "horizon_profile": research_horizon_profile,
+            "incumbent_strategy": incumbent_binding,
         }
         if dataset is not None and periods is not None and period_resolution is not None:
             config.update(
@@ -3936,6 +4357,15 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "periods": periods,
                     "evaluation_profiles": period_resolution["evaluation_profiles"],
                     "period_resolution": period_resolution,
+                    "research_window_contract": period_resolution.get(
+                        "research_window_contract"
+                    ),
+                    "research_window_contract_sha256": period_resolution.get(
+                        "research_window_contract_sha256"
+                    ),
+                    "label_horizon_sessions": max(
+                        period_resolution.get("label_horizons_sessions") or []
+                    ),
                     "dataset_path": dataset["path"],
                 }
             )
@@ -3980,10 +4410,28 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 period_resolution["evaluation_profiles"] if period_resolution else []
             ),
             "period_resolution": period_resolution,
+            "research_window_contract": (
+                period_resolution.get("research_window_contract")
+                if period_resolution
+                else None
+            ),
+            "research_window_contract_sha256": (
+                period_resolution.get("research_window_contract_sha256")
+                if period_resolution
+                else None
+            ),
             "asset_ids": resolved_asset_ids,
             "asset_manifest_sha256": assets["manifest_sha256"],
             "feature_set": feature_set,
             "expected_rdagent_runtime": expected_runtime_identity,
+            "strategy_horizon_profile": strategy_horizon_profile,
+            "horizon_profile": research_horizon_profile,
+            "label_horizon_sessions": (
+                max(period_resolution.get("label_horizons_sessions") or [])
+                if period_resolution
+                else None
+            ),
+            "incumbent_strategy": incumbent_binding,
         }
         try:
             job = jobs.create(
@@ -4012,11 +4460,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(404, "research program not found") from exc
 
-    @app.post("/api/research-programs", status_code=201)
-    def create_research_program(
-        payload: ResearchProgramCreateRequest, request: Request
-    ) -> dict[str, Any]:
-        del payload, request
+    @app.post("/api/research-programs")
+    def create_research_program(request: Request) -> dict[str, Any]:
+        del request
         raise HTTPException(
             410,
             "legacy research programs are retired; use /api/autopilot",
@@ -4025,10 +4471,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.post("/api/research-programs/{program_id}/status")
     def set_research_program_status(
         program_id: str,
-        payload: ResearchProgramStatusRequest,
         request: Request,
     ) -> dict[str, Any]:
-        del program_id, payload, request
+        del program_id, request
         raise HTTPException(410, "legacy research programs are read-only")
 
     @app.post("/api/research-programs/{program_id}/check-now")
@@ -4049,11 +4494,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(404, "research campaign not found") from exc
 
-    @app.post("/api/research-campaigns", status_code=202)
-    def create_research_campaign(
-        payload: ResearchCampaignCreateRequest, request: Request
-    ) -> dict[str, Any]:
-        del payload, request
+    @app.post("/api/research-campaigns")
+    def create_research_campaign(request: Request) -> dict[str, Any]:
+        del request
         raise HTTPException(
             410,
             "legacy research campaigns are retired; use /api/autopilot",
@@ -4062,10 +4505,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     @app.post("/api/research-campaigns/{campaign_id}/status")
     def set_research_campaign_status(
         campaign_id: str,
-        payload: ResearchCampaignStatusRequest,
         request: Request,
     ) -> dict[str, Any]:
-        del campaign_id, payload, request
+        del campaign_id, request
         raise HTTPException(410, "legacy research campaigns are read-only")
 
     @app.post("/api/research-campaigns/{campaign_id}/retry")
@@ -4494,9 +4936,14 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 artifact_path=artifact_root,
                 trading_dates=trading_dates,
                 dataset_lineage_id=dataset.get("lineage_id"),
+                dataset_identity_sha256=(dataset.get("provenance") or {}).get(
+                    "dataset_identity_sha256"
+                ),
             )
         except KeyError as exc:
             raise HTTPException(404, "strategy version not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         log_path = platform_root / "logs" / f"strategy-backtest-{backtest['id']}.log"
         try:
             job = jobs.create(
@@ -4686,7 +5133,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         payload: StrategyPromotionRequest,
         request: Request,
     ) -> dict[str, Any]:
-        """Human approval after the immutable forward-paper gate passes."""
+        """Recovery action using the same immutable gate as auto-promotion."""
 
         try:
             return promotions.promote(
@@ -4893,6 +5340,38 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(404, "strategy allocation risk event not found") from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/investor-profile")
+    def get_investor_profile() -> dict[str, Any]:
+        active = investor_profiles.get_active("primary")
+        return {
+            "configured": active is not None,
+            "profile": active,
+            "required_before_simulation": active is None,
+        }
+
+    @app.put("/api/investor-profile")
+    def put_investor_profile(
+        payload: InvestorSimulationProfileRequest, request: Request
+    ) -> dict[str, Any]:
+        try:
+            profile = investor_profiles.create_version(
+                profile_key="primary",
+                initial_capital=payload.initial_capital,
+                risk_profile=payload.risk_profile,
+                min_cash_weight=payload.min_cash_weight,
+                max_gross_exposure=payload.max_gross_exposure,
+                market_permissions=payload.market_permissions.model_dump(),
+                actor=authenticated_actor(request, payload.actor),
+                activate=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"configured": True, "profile": profile}
+
+    @app.get("/api/advice/today")
+    def get_today_advice() -> dict[str, Any]:
+        return advice.today(investor_profile=investor_profiles.get_active("primary"))
 
     @app.api_route("/api/portfolios", methods=["GET", "POST"], status_code=410)
     @app.api_route("/api/portfolios/{legacy_path:path}", methods=["GET", "POST"], status_code=410)
@@ -5114,7 +5593,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             daily_dataset_name, purpose="simulation daily data", frequency="day"
         )
         execution = require_qlib_dataset(
-            payload.execution_dataset,
+            payload.execution_dataset or daily_dataset_name,
             purpose="simulation execution data",
             frequency=payload.execution_frequency,
         )
@@ -5131,6 +5610,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     key: value
                     for key, value in {
                         "execution_algorithm": payload.execution_algorithm,
+                        "execution_frequency": payload.execution_frequency,
                         "slice_minutes": payload.slice_minutes,
                         "max_slices": payload.max_slices,
                         "max_participation": payload.max_participation,
@@ -5194,9 +5674,33 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "paper signal must use the latest currently available governed "
                     f"trading day {current_available_date.isoformat()}"
                 )
+            current_provenance = dict(current_dataset.get("provenance") or {})
+            dataset_identity_sha256 = str(
+                current_provenance.get("dataset_identity_sha256") or ""
+            )
+            model_artifact_binding: dict[str, str] | None = None
+            if str(
+                version.get("config", {}).get("signal_source") or "factor_score"
+            ) == "model_prediction":
+                model_artifact = model_artifacts.require_for_inference(
+                    str(version["id"]),
+                    dataset_identity_sha256=dataset_identity_sha256,
+                )
+                model_artifact_binding = {
+                    "id": str(model_artifact["id"]),
+                    "artifact_sha256": str(model_artifact["artifact_sha256"]),
+                    "checkpoint_sha256": str(model_artifact["checkpoint_sha256"]),
+                    "dataset_identity_sha256": str(
+                        model_artifact["dataset_identity_sha256"]
+                    ),
+                }
             promotion_stage = promotions.require_paper_signal(
                 str(version["id"]),
                 portfolio_id=portfolio_id,
+                signal_date=payload.signal_date,
+            )
+            simulations.require_order_plan_predecessor_settled(
+                portfolio_id,
                 signal_date=payload.signal_date,
             )
         except KeyError as exc:
@@ -5219,6 +5723,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 ),
                 "promotion_stage_id": promotion_stage["id"],
                 "promotion_stage_opened_at": promotion_stage["opened_at"],
+                "dataset_identity_sha256": dataset_identity_sha256,
+                "model_artifact_binding": model_artifact_binding,
                 "actor": actor,
             },
             platform_root / "logs" / f"simulation-order-plan-{portfolio_id}.log",
@@ -5412,6 +5918,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                         dataset,
                         periods=research_payload.get("periods"),
                         period_policy=research_payload.get("period_policy"),
+                        horizon_profile=research_payload.get("horizon_profile"),
+                        feature_set=research_payload.get("feature_set"),
                     )
                 if research_payload["asset_ids"] or not scenario.auto_select_assets:
                     resolve_rdagent_assets(

@@ -1,17 +1,25 @@
 import json
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
+from governance_fixtures import governed_etf_ready_evidence
 
 from quant_data.checkpoint import CheckpointStore
 from quant_data.config import Settings
+from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_data.models import FetchSpec
+from quant_data.qlib_builder import build_qlib_output_manifest
 from quant_platform.alert_store import AlertStore
 from quant_platform.api import create_app
+from quant_platform.factor_library import compile_qlib_expression
+from quant_platform.feature_set_registry import get_feature_set
 from quant_platform.job_store import JobStore
+from quant_platform.research_horizon import canonical_sha256
+from quant_platform.upstream_versions import RDAGENT_COMMIT
 from quant_platform.worker import LocalJobWorker
 
 
@@ -44,6 +52,11 @@ def test_api_reports_live_work_unit_activity(
     app = create_app(tmp_path)
     with TestClient(app) as client:
         overview = client.get("/api/overview")
+        for _attempt in range(100):
+            if overview.json()["running_work_units"] == 1:
+                break
+            time.sleep(0.02)
+            overview = client.get("/api/overview")
 
     assert overview.status_code == 200
     assert overview.json()["running_work_units"] == 1
@@ -74,11 +87,14 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
         "runtime_secret_storage": "ok",
         "runtime_secret_records": 0,
     }
-    assert overview.json()["credentials_configured"] is False
-    assert overview.json()["readiness_percent"] < 100
-    assert overview.json()["actionable_tasks"] > overview.json()["ready_tasks"]
-    assert overview.json()["legacy_download_coverage"] == overview.json()["coverage"]
-    assert overview.json()["running_work_units"] == 0
+    assert overview.status_code == 200, overview.text
+    overview_payload = overview.json()
+    assert "credentials_configured" in overview_payload, overview_payload
+    assert overview_payload["credentials_configured"] is False
+    assert overview_payload["readiness_percent"] < 100
+    assert overview_payload["actionable_tasks"] > overview_payload["ready_tasks"]
+    assert overview_payload["legacy_download_coverage"] == overview_payload["coverage"]
+    assert overview_payload["running_work_units"] == 0
     assert readiness.status_code == 200
     assert readiness.json()["profiles"][0]["status"] == "blocked"
     assert any(item["name"] == "daily" for item in datasets.json())
@@ -101,6 +117,7 @@ def test_api_reports_empty_local_state(tmp_path: Path, monkeypatch, database_url
         json={
             "name": "missing dataset allocation",
             "dataset": "missing",
+            "total_capital": 1_000_000,
             "members": [
                 {"strategy_version_id": "version-a"},
                 {"strategy_version_id": "version-b"},
@@ -376,32 +393,114 @@ def test_api_creates_bounded_rdagent_research_run(
         "SH600000\t2010-01-01\t2026-07-10\n", encoding="utf-8"
     )
     (dataset / "metadata").mkdir()
+    feature_set = get_feature_set("governed-baseline")
+    required_fields = sorted(
+        {
+            field
+            for expression in feature_set["features"].values()
+            for field in compile_qlib_expression(str(expression)).required_fields
+        }
+    )
+    field_year_coverage = {
+        "version": "qlib-field-year-source-coverage-v1",
+        "source_attribution_policy": "normalized-staging-and-snapshot-contracts-v1",
+        "legacy_overlap_policy_version": "overlap-v1",
+        "primary_market_history_start": "2010-01-01",
+        "fields": {
+            field: {
+                "source_family": "test",
+                "available_from": "2010-01-01",
+                "available_to": "2026-07-10",
+                "continuous_from": "2010-01-01",
+                "research_available_from": "2010-01-01",
+                "years": [
+                    {
+                        "year": 2010,
+                        "observed_rows": 1,
+                        "non_null_rows": 1,
+                        "coverage_ratio": 1.0,
+                        "first_session": "2010-01-01",
+                        "last_session": "2026-07-10",
+                        "source_contracts": ["test-source"],
+                    }
+                ],
+            }
+            for field in required_fields
+        },
+    }
+    field_coverage_sha256 = canonical_sha256(field_year_coverage)
+    field_year_coverage = {
+        **field_year_coverage,
+        "coverage_sha256": field_coverage_sha256,
+    }
     (dataset / "metadata" / "provenance.json").write_text(
         json.dumps(
-                {
-                    "frequency": "day",
-                    "dataset_identity_sha256": "a" * 64,
-                    "snapshot_manifest_sha256": "b" * 64,
-                    "qlib_builder_sha256": "c" * 64,
-                    "dataset_lineage_id": "lineage-research",
-                    "field_contract_version": "daily-qlib-field-v3-cny-amount",
-                    "source_volume_unit": "hand",
-                    "qlib_volume_unit": "share",
-                    "source_amount_unit": "thousand_cny",
-                    "qlib_amount_unit": "cny",
-                    "source_hand_size": 100,
-                    "index_volume_policy": "excluded_non_tradable_benchmark",
-                    "lineage_verified": True,
-                }
+            {
+                "frequency": "day",
+                "dataset_identity_sha256": "a" * 64,
+                "snapshot_manifest_sha256": "b" * 64,
+                "qlib_builder_sha256": "c" * 64,
+                "dataset_lineage_id": "d" * 64,
+                "source_lineage_id": "e" * 64,
+                "dataset_contract_sha256": "f" * 64,
+                "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+                "fields": required_fields,
+                "field_units": {field: "normalized" for field in required_fields},
+                "research_features": {"version": "pit-research-features-v1"},
+                "field_coverage_sha256": field_coverage_sha256,
+                "field_year_coverage": field_year_coverage,
+                "source_start_date": "2010-01-01",
+                "source_end_date": "2026-07-10",
+                "source_volume_unit": "hand",
+                "qlib_volume_unit": "share",
+                "source_amount_unit": "thousand_cny",
+                "qlib_amount_unit": "cny",
+                "source_hand_size": 100,
+                "index_volume_policy": "excluded_non_tradable_benchmark",
+                "governed_etf_whitelist": governed_etf_ready_evidence(),
+                "lineage_verified": True,
+                "output_manifest": build_qlib_output_manifest(dataset),
+                "execution_controls": {
+                    "native_complete_from": "2010-01-01",
+                    "formal_execution_requires_native_controls": True,
+                },
+            }
         ),
         encoding="utf-8",
     )
     monkeypatch.setenv("DATA_ROOT", str(data_root))
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
+    monkeypatch.setenv(
+        "RDAGENT_QLIB_SANDBOX_IMAGE",
+        "registry.example/rdagent-qlib@sha256:" + "1" * 64,
+    )
+    runtime_identity = {
+        "name": "rdagent",
+        "version": "test-runtime",
+        "commit": RDAGENT_COMMIT,
+        "commit_evidence": ["repository"],
+        "source_tree_sha256": "2" * 64,
+        "runtime_image_digest": "sha256:" + "3" * 64,
+        "repository_dirty": False,
+        "production_reproducible": True,
+    }
+    runtime = {
+        **runtime_identity,
+        "status": "ok",
+        "llm_credentials_configured": True,
+        "docker_available": True,
+        "qlib_sandbox_preloaded": True,
+        "qlib_smoke_passed": True,
+        "evaluation_worker": {
+            "ready": True,
+            "job_kinds": ["factor_evaluate"],
+        },
+        "runtime_identity": runtime_identity,
+    }
     monkeypatch.setattr(
         "quant_platform.api.probe_rdagent",
-        lambda _settings, _root: {"status": "ok", "ready": True, "blockers": []},
+        lambda _settings, _root: runtime,
     )
     app = create_app(tmp_path)
     with TestClient(app) as client:
@@ -409,7 +508,10 @@ def test_api_creates_bounded_rdagent_research_run(
             "/api/rdagent/runs",
             json={
                 "objective": "Find low-turnover quality factors for CSI 300 enhancement.",
+                "scenario": "fin_factor",
                 "dataset": "research-snapshot",
+                "feature_set_id": "governed-baseline",
+                "horizon": "short",
                 "loop_n": 1,
                 "duration": "30m",
             },
@@ -424,7 +526,10 @@ def test_api_creates_bounded_rdagent_research_run(
                 "trading_days_only": True,
                 "payload": {
                     "objective": "Find low-turnover quality factors for CSI 300 enhancement.",
+                    "scenario": "fin_factor",
                     "dataset": "research-snapshot",
+                    "feature_set_id": "governed-baseline",
+                    "horizon": "short",
                     "loop_n": 1,
                     "duration": "30m",
                     "requested_by": "untrusted-payload-actor",
@@ -445,6 +550,7 @@ def test_api_creates_bounded_rdagent_research_run(
             },
         )
         programs = client.get("/api/research-programs").json()
+        retired_campaign_without_payload = client.post("/api/research-campaigns")
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
     assert response.json()["budget"] == {"loop_n": 1, "duration": "30m"}
@@ -452,10 +558,13 @@ def test_api_creates_bounded_rdagent_research_run(
     assert scheduled.status_code == 201
     assert scheduled.json()["kind"] == "rdagent_research"
     assert scheduled.json()["payload"]["requested_by"] == "local-admin"
-    assert program.status_code == 201
-    assert program.json()["dataset_lineage_id"] == "lineage-research"
-    assert program.json()["min_new_trading_days"] == 252
-    assert programs[0]["id"] == program.json()["id"]
+    assert program.status_code == 410
+    assert "legacy research programs are retired" in program.json()["detail"]
+    assert programs == []
+    assert retired_campaign_without_payload.status_code == 410
+    assert "legacy research campaigns are retired" in (
+        retired_campaign_without_payload.json()["detail"]
+    )
 
 
 def test_api_manages_schedules_and_alert_acknowledgement(
@@ -520,7 +629,9 @@ def test_api_manages_schedules_and_alert_acknowledgement(
         )
     assert created.status_code == 201
     assert complete.status_code == 201
-    assert {item["kind"] for item in schedules} == {"incremental_sync", "data_pipeline"}
+    assert {"incremental_sync", "data_pipeline"} <= {
+        item["kind"] for item in schedules
+    }
     assert rejected.status_code == 422
     assert acknowledged.status_code == 200
     assert acknowledged.json()["status"] == "acknowledged"

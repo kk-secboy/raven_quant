@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -23,11 +24,164 @@ class FakeContext:
 
     def run(self, *args: str, **_kwargs) -> str:
         self.calls.append(args)
+        if args == ("config", "--format", "json"):
+            return json.dumps(
+                {
+                    "services": {
+                        service: {"image": f"quantlab-test-{service}:latest"}
+                        for service in release_upgrade.BUILT_SERVICES
+                    }
+                }
+            )
         return ""
 
     def docker(self, *args: str, **_kwargs) -> str:
         self.calls.append(("docker", *args))
+        if args[:4] == ("image", "inspect", "--format", "{{.Id}}"):
+            return "sha256:" + "a" * 64
         return ""
+
+
+def test_configured_service_images_use_final_rendered_compose_images() -> None:
+    class RenderedConfigContext(FakeContext):
+        def run(self, *args: str, **_kwargs) -> str:
+            self.calls.append(args)
+            return json.dumps(
+                {
+                    "services": {
+                        "worker": {"image": "quantlab-worker-runtime:v2"},
+                        "rdagent-worker": {
+                            "image": "quantlab-rdagent-runtime:v2"
+                        },
+                    }
+                }
+            )
+
+    context = RenderedConfigContext()
+
+    images = release_upgrade._configured_service_images(
+        context,  # type: ignore[arg-type]
+        "worker",
+        "rdagent-worker",
+    )
+
+    assert images == {
+        "worker": "quantlab-worker-runtime:v2",
+        "rdagent-worker": "quantlab-rdagent-runtime:v2",
+    }
+    assert images["rdagent-worker"] != "quantlab-test-rdagent-worker:latest"
+    assert context.calls == [("config", "--format", "json")]
+
+
+def test_prepare_sandbox_inspects_explicit_rdagent_runtime_from_compose(
+    tmp_path: Path,
+) -> None:
+    class RenderedConfigContext(FakeContext):
+        def run(self, *args: str, **_kwargs) -> str:
+            self.calls.append(args)
+            assert args == ("config", "--format", "json")
+            return json.dumps(
+                {
+                    "services": {
+                        "worker": {"image": "quantlab-worker-runtime:v2"},
+                        "rdagent-worker": {
+                            "image": "quantlab-rdagent-runtime:v2"
+                        },
+                    }
+                }
+            )
+
+        def docker(self, *args: str, **_kwargs) -> str:
+            self.calls.append(("docker", *args))
+            return "not-an-image-id"
+
+    context = RenderedConfigContext(tmp_path / ".env")
+
+    with pytest.raises(RuntimeError, match="runtime has no immutable image ID"):
+        release_upgrade._prepare_sandbox_images(
+            context,  # type: ignore[arg-type]
+            tmp_path,
+            "20260829T120000Z",
+            wait_timeout=45,
+        )
+
+    assert (
+        "docker",
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}}",
+        "quantlab-rdagent-runtime:v2",
+    ) in context.calls
+    assert not any(
+        "quantlab-test-rdagent-worker:latest" in call for call in context.calls
+    )
+
+
+@pytest.mark.parametrize(
+    "payload, error",
+    [
+        ("not-json", "not valid JSON"),
+        (json.dumps([]), "must be a JSON object"),
+        (json.dumps({}), "has no services object"),
+        (
+            json.dumps({"services": {"rdagent-worker": {"image": ""}}}),
+            "has no valid image",
+        ),
+    ],
+)
+def test_configured_service_images_fail_closed(
+    payload: str,
+    error: str,
+) -> None:
+    class RenderedConfigContext(FakeContext):
+        def run(self, *args: str, **_kwargs) -> str:
+            self.calls.append(args)
+            return payload
+
+    with pytest.raises(RuntimeError, match=error):
+        release_upgrade._configured_service_images(
+            RenderedConfigContext(),  # type: ignore[arg-type]
+            "rdagent-worker",
+        )
+
+
+def test_restore_built_image_aliases_recovers_shared_mutable_tag() -> None:
+    image_id = "sha256:" + "a" * 64
+
+    class AliasContext(FakeContext):
+        def __init__(self) -> None:
+            super().__init__()
+            self.images = {
+                "quantlab-rollback:test-worker": image_id,
+                "quantlab-rollback:test-rdagent": image_id,
+                "quantlab-rdagent-runtime:v2": "sha256:" + "b" * 64,
+            }
+
+        def docker(self, *args: str, **_kwargs) -> str:
+            self.calls.append(("docker", *args))
+            if args[:4] == ("image", "inspect", "--format", "{{.Id}}"):
+                return self.images[args[4]]
+            if args[0] == "tag":
+                self.images[args[2]] = self.images[args[1]]
+                return ""
+            return ""
+
+    context = AliasContext()
+    restored = release_upgrade._restore_built_image_aliases(
+        context,  # type: ignore[arg-type]
+        {
+            "rdagent-worker": "quantlab-rdagent-runtime:v2",
+            "rdagent-data-science-worker": "quantlab-rdagent-runtime:v2",
+        },
+        {
+            "rdagent-worker": "quantlab-rollback:test-rdagent",
+            "rdagent-data-science-worker": "quantlab-rollback:test-worker",
+        },
+    )
+
+    assert restored == ["quantlab-rdagent-runtime:v2"]
+    assert context.images["quantlab-rdagent-runtime:v2"] == image_id
 
 
 def _gate(status: str = "ready", migration_state: str = "upgrade_required") -> dict:
@@ -212,6 +366,26 @@ def test_gateway_smoke_requires_running_gateway_and_healthy_api() -> None:
     }
 
 
+@pytest.mark.skipif(os.name != "posix", reason="production symlink switch is POSIX-only")
+def test_stable_release_link_switch_is_atomic_and_verified(tmp_path: Path) -> None:
+    old_release = tmp_path / "old-release"
+    new_release = tmp_path / "new-release"
+    old_release.mkdir()
+    new_release.mkdir()
+    stable = tmp_path / "quantlab"
+    stable.symlink_to(old_release, target_is_directory=True)
+
+    result = release_upgrade._switch_stable_release_link(stable, new_release)
+
+    assert result == {
+        "status": "pass",
+        "path": str(stable.absolute()),
+        "target": str(new_release.resolve()),
+    }
+    assert stable.is_symlink()
+    assert stable.resolve() == new_release.resolve()
+
+
 def _rollback_contract_fixture(
     tmp_path: Path,
 ) -> tuple[
@@ -328,6 +502,8 @@ def test_release_upgrade_builds_backs_up_and_accepts_current_schema(
 
     def create(*_args, **kwargs) -> Path:
         assert kwargs["restart_services"] is False
+        assert kwargs["format_version"] == 2
+        assert kwargs["minimum_free_gb"] == 20.0
         return backup
 
     monkeypatch.setattr(release_upgrade, "create_backup", create)
@@ -353,6 +529,11 @@ def test_release_upgrade_builds_backs_up_and_accepts_current_schema(
         "_gateway_smoke",
         lambda _context: {"status": "pass", "api_status": "ok"},
     )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_release_identity_acceptance",
+        lambda *_args: {"status": "pass", "evidence": "all services match"},
+    )
 
     result = release_upgrade.run_release_upgrade(
         context,  # type: ignore[arg-type]
@@ -365,7 +546,7 @@ def test_release_upgrade_builds_backs_up_and_accepts_current_schema(
     assert result["status"] == "succeeded"
     assert result["backup_directory"] == str(backup)
     assert result["cutover_at"] == cutover_at
-    assert result["checks"]["post_upgrade_acceptance"] == {
+    assert result["checks"]["post_activation_acceptance"] == {
         "status": "pass",
         "ignored_blockers": ["durable_work_idle"],
         "blocking_checks": [],
@@ -381,20 +562,17 @@ def test_release_upgrade_builds_backs_up_and_accepts_current_schema(
         if call[:3] == ("up", "-d", "--remove-orphans")
         and "api" in call
     )
-    scheduler_start = next(
+    activation_start = next(
         index
         for index, call in enumerate(context.calls)
-        if call[:3] == ("up", "-d", "--no-deps") and call[-1] == "scheduler"
-    )
-    gateway_start = next(
-        index
-        for index, call in enumerate(context.calls)
-        if call[:3] == ("up", "-d", "--no-deps") and call[-1] == "gateway"
+        if call[:3] == ("up", "-d", "--no-deps")
+        and "scheduler" in call
+        and "gateway" in call
     )
     final_assessment = max(
         index for index, call in enumerate(context.calls) if call == ("assess_release",)
     )
-    assert core_start < scheduler_start < final_assessment < gateway_start
+    assert core_start < activation_start < final_assessment
     assert "scheduler" not in context.calls[core_start]
     assert "gateway" not in context.calls[core_start]
 
@@ -503,6 +681,11 @@ def test_release_upgrade_reuses_exact_live_backup_without_creating_an_archive(
         "_gateway_smoke",
         lambda _context: {"status": "pass", "api_status": "ok"},
     )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_release_identity_acceptance",
+        lambda *_args: {"status": "pass", "evidence": "all services match"},
+    )
 
     result = release_upgrade.run_release_upgrade(
         context,  # type: ignore[arg-type]
@@ -536,6 +719,30 @@ def test_reusable_backup_must_be_inside_backup_root(monkeypatch, tmp_path: Path)
             FakeContext(tmp_path / "current.env"),  # type: ignore[arg-type]
             backup_root,
             outside,
+            contract,
+        )
+
+
+def test_reusable_release_backup_rejects_control_plane_v2(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context = FakeContext(tmp_path / "deploy.env")
+    contract, _rollback_context = _rollback_contract_fixture(tmp_path)
+    backup_root = tmp_path / "backups"
+    backup = backup_root / "quantlab-v2"
+    backup.mkdir(parents=True)
+    monkeypatch.setattr(
+        release_upgrade,
+        "load_and_verify_manifest",
+        lambda *_args, **_kwargs: {"format_version": 2},
+    )
+
+    with pytest.raises(ValueError, match="only a full v1 backup"):
+        release_upgrade._validate_reusable_backup(
+            context,  # type: ignore[arg-type]
+            backup_root,
+            backup,
             contract,
         )
 
@@ -755,6 +962,73 @@ def test_release_environment_update_preserves_unrelated_secrets(tmp_path: Path) 
     assert "MODEL_SANDBOX_IMAGE=registry/model@sha256:" + "b" * 64 in content
 
 
+def test_supported_release_stamps_complete_canonical_identity(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "POSTGRES_PASSWORD=keep-me\n"
+        "QUANTLAB_RELEASE_ID=obsolete\n"
+        "export QUANTLAB_RELEASE_ID=duplicate-obsolete\n"
+        "QUANTLAB_RELEASE_KIND=alias\n"
+        "QUANTLAB_RELEASE_ALIAS_OF=another-release\n",
+        encoding="utf-8",
+    )
+    compose_file = tmp_path / "compose.yaml"
+    compose_file.write_text("services: {}\n", encoding="utf-8")
+
+    class ReleaseContext:
+        project_name = "quantlab-test"
+        profiles: tuple[str, ...] = ()
+        compose_files = (compose_file,)
+
+        def __init__(self) -> None:
+            self.env_file = env_file
+
+    context = ReleaseContext()
+    identity = release_upgrade._stamp_release_identity(  # type: ignore[arg-type]
+        context,
+        "20260829T120000Z",
+    )
+
+    assert identity == {
+        "QUANTLAB_RELEASE_ID": "20260829t120000z",
+        "QUANTLAB_CONFIG_DIGEST": release_upgrade._release_configuration_digest(
+            context  # type: ignore[arg-type]
+        ),
+        "QUANTLAB_RELEASE_KIND": "canonical",
+        "QUANTLAB_RELEASE_ALIAS_OF": "20260829t120000z",
+        "QUANTLAB_CANONICAL_BASELINE": "true",
+    }
+    content = env_file.read_text(encoding="utf-8")
+    assert content.count("QUANTLAB_RELEASE_ID=20260829t120000z") == 1
+    assert "duplicate-obsolete" not in content
+    assert "POSTGRES_PASSWORD=keep-me" in content
+    assert all(content.count(f"{key}={value}") == 1 for key, value in identity.items())
+
+
+def test_final_release_identity_acceptance_is_fail_closed_for_any_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[set[str] | frozenset[str]] = []
+
+    def reject(_context, services):
+        observed.append(services)
+        return False, "gateway:label:quantlab.release"
+
+    monkeypatch.setattr(release_upgrade, "_runtime_release_identity", reject)
+    services = {"postgres", "api", "gateway"}
+
+    assessment = release_upgrade._release_identity_acceptance(
+        FakeContext(),  # type: ignore[arg-type]
+        services,
+    )
+
+    assert assessment == {
+        "status": "block",
+        "evidence": "gateway:label:quantlab.release",
+    }
+    assert observed == [services]
+
+
 def test_governed_sandboxes_are_network_free_and_reuse_pinned_worker() -> None:
     root = Path(__file__).resolve().parents[1]
 
@@ -874,7 +1148,7 @@ def test_dind_smoke_runs_with_network_disabled() -> None:
     assert ("--network", "none") == context.calls[0][6:8]
 
 
-def test_rollback_contract_persists_old_compose_env_and_external_override(
+def test_rollback_contract_persists_compose_without_copying_plaintext_env(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -962,10 +1236,17 @@ def test_rollback_contract_persists_old_compose_env_and_external_override(
         old_compose.read_bytes(),
         external_override.read_bytes(),
     ]
+    contract_root = rollback_context.compose_files[0].parent
     manifest = json.loads(
-        (rollback_context.env_file.parent / "manifest.json").read_text(encoding="utf-8")
+        (contract_root / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["working_directory"] == str(old_deploy.resolve())
+    assert manifest["env_source"] == str(external_env.resolve())
+    assert manifest["env_snapshot"] is None
+    assert not (contract_root / "environment.env").exists()
+    assert "POSTGRES_PASSWORD=old" not in "".join(
+        item.read_text(encoding="utf-8") for item in contract_root.iterdir()
+    )
     assert len(manifest["compose_files"]) == 2
     assert all(len(item["sha256"]) == 64 for item in manifest["compose_files"])
 
@@ -1264,7 +1545,6 @@ def test_release_upgrade_restores_backup_and_old_images_on_failed_acceptance(
         [
             _gate(),
             _gate(),
-            _gate(migration_state="current"),
             _blocked_gate("services_healthy"),
         ]
     )
@@ -1341,7 +1621,98 @@ def test_release_upgrade_restores_backup_and_old_images_on_failed_acceptance(
 
     assert result["status"] == "rolled_back"
     assert rollbacks == [backup]
-    assert "post-upgrade release acceptance" in result["error"]
+    assert "post-upgrade core release acceptance" in result["error"]
+
+
+def test_post_commit_activation_failure_stops_writers_without_database_rollback(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    context = FakeContext(tmp_path / "deploy.env")
+    rollback_contract, rollback_context = _rollback_contract_fixture(tmp_path)
+    gates = iter(
+        [
+            _gate(),
+            _gate(),
+            _gate(migration_state="current"),
+            _blocked_gate("services_healthy"),
+        ]
+    )
+    backup = tmp_path / "backups" / "quantlab-test"
+    monkeypatch.setattr(
+        release_upgrade,
+        "assess_release",
+        lambda *_args, **_kwargs: next(gates),
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_capture_rollback_compose_contract",
+        lambda *_args, **_kwargs: rollback_contract,
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_persist_rollback_compose_contract",
+        lambda *_args, **_kwargs: rollback_context,
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_capture_rollback_images",
+        lambda *_args, **_kwargs: {"api": "quantlab-rollback:test-api"},
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_capture_service_storage",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_assess_backup_capacity",
+        lambda *_args, **_kwargs: {"status": "pass"},
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "create_backup",
+        lambda *_args, **_kwargs: backup,
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_prepare_sandbox_images",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_record_cutover",
+        lambda _context: "2026-08-29T08:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_post_cutover_durable_state",
+        lambda *_args: _durable_state(),
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_release_identity_acceptance",
+        lambda *_args: {"status": "pass", "evidence": "matched"},
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_restore_previous_release",
+        lambda *_args, **_kwargs: pytest.fail(
+            "database rollback is forbidden after activation commit"
+        ),
+    )
+
+    result = release_upgrade.run_release_upgrade(
+        context,  # type: ignore[arg-type]
+        tmp_path,
+        tmp_path / "backups",
+        confirmed=True,
+        wait_timeout=45,
+    )
+
+    assert result["status"] == "activation_failed"
+    assert result["activation_fail_closed"]["rollback_permitted"] is False
+    assert ("stop", "scheduler", "gateway") in context.calls
 
 
 def test_rollback_image_pruning_keeps_newest_release_sets() -> None:
@@ -1374,7 +1745,37 @@ def test_rollback_image_pruning_keeps_newest_release_sets() -> None:
     assert ("docker", "image", "rm", "-f", *removed) in context.calls
 
 
-def test_backup_capacity_requires_full_data_copy_plus_headroom(
+def test_control_plane_backup_capacity_excludes_immutable_data_and_keeps_headroom(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class CapacityContext(FakeContext):
+        def run(self, *args: str, **_kwargs) -> str:
+            self.calls.append(args)
+            if "SELECT pg_database_size" in " ".join(args):
+                return str(2 * 1024**3)
+            return ""
+
+    disk_usage = type("Usage", (), {"free": 21 * 1024**3})()
+    monkeypatch.setattr(release_upgrade.shutil, "disk_usage", lambda _path: disk_usage)
+    backup_root = tmp_path / "backups"
+    context = CapacityContext()
+
+    result = release_upgrade._assess_backup_capacity(
+        context,  # type: ignore[arg-type]
+        backup_root,
+        minimum_free_gb=20.0,
+        format_version=2,
+    )
+
+    assert result["status"] == "block"
+    assert "database upper bound 2.0 GiB" in result["evidence"]
+    assert "immutable /data not copied" in result["evidence"]
+    assert "required 22.0 GiB" in result["evidence"]
+    assert not any(call and call[0] == "docker" for call in context.calls)
+
+
+def test_full_v1_backup_capacity_keeps_the_full_data_upper_bound(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -1389,17 +1790,16 @@ def test_backup_capacity_requires_full_data_copy_plus_headroom(
 
     disk_usage = type("Usage", (), {"free": 110 * 1024**3})()
     monkeypatch.setattr(release_upgrade.shutil, "disk_usage", lambda _path: disk_usage)
-    backup_root = tmp_path / "backups"
 
     result = release_upgrade._assess_backup_capacity(
         CapacityContext(),  # type: ignore[arg-type]
-        backup_root,
+        tmp_path / "backups",
         minimum_free_gb=20.0,
+        format_version=1,
     )
 
     assert result["status"] == "block"
-    assert "source /data/quantlab" in result["evidence"]
-    assert "data upper bound 100.0 GiB" in result["evidence"]
+    assert "full /data upper bound 100.0 GiB" in result["evidence"]
     assert "required 120.0 GiB" in result["evidence"]
 
 

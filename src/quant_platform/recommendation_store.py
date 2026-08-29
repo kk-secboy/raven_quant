@@ -140,17 +140,24 @@ class RecommendationStore:
     def _assert_v2_strategy(self, version: dict[str, Any]) -> None:
         if version.get("is_legacy"):
             raise ValueError("legacy strategy versions cannot generate recommendations")
-        if version["status"] != "approved" or version.get("strategy_type") != "multifactor":
+        if version.get("strategy_type") != "multifactor":
             raise ValueError("recommendations require an approved multifactor strategy")
-        # Design 6.11: only an explicit human promotion after the immutable
-        # forward gate opens this path.  NULL/unknown legacy markers fail
-        # closed; they must not bypass the paper stage merely because they
-        # predate this state machine.
+        if version.get("horizon_profile") == "legacy_ambiguous":
+            raise ValueError(
+                "strategy versions without an explicit governed horizon cannot "
+                "generate recommendations"
+            )
+        if version["status"] != "approved":
+            raise ValueError("recommendations require an approved multifactor strategy")
+        # Design 6.11: only the atomic promotion transaction after the
+        # immutable forward gate opens this path. Automatic and recovery
+        # callers use the same gate; NULL/unknown legacy markers fail closed
+        # and cannot bypass paper merely because they predate this state machine.
         if version.get("promotion_stage") != "recommendation_enabled":
             raise ValueError(
                 "strategy version has not passed the paper stage; standalone "
                 "recommendations require recommendation_enabled "
-                "(forward evidence gate plus human approval)"
+                "(all sealed historical and forward gates)"
             )
         evaluation_ids = [item.get("factor_evaluation_id") for item in version["factors"]]
         with self.engine.connect() as connection:
@@ -183,8 +190,11 @@ class RecommendationStore:
     ) -> dict[str, Any]:
         version = self.strategies.get_version(strategy_version_id)
         self._assert_v2_strategy(version)
-        if hypothetical_initial_value < 100_000:
-            raise ValueError("hypothetical initial value must be at least 100000")
+        if (
+            not isfinite(float(hypothetical_initial_value))
+            or float(hypothetical_initial_value) <= 0
+        ):
+            raise ValueError("construction notional must be positive")
         if not name.strip() or not dataset.strip() or not actor.strip():
             raise ValueError("name, dataset and actor are required")
         if recommendation_scope not in {"standalone", "allocation_member"}:
@@ -351,14 +361,14 @@ class RecommendationStore:
             ).first()
         if promoted_stage is None or promoted_stage.promoted_at is None:
             raise ValueError(
-                "recommendation snapshot requires a human-promoted paper stage"
+                "recommendation snapshot requires a promoted paper stage"
             )
         promoted_date = promoted_stage.promoted_at.astimezone(
             ZoneInfo("Asia/Shanghai")
         ).date()
         if as_of_date <= promoted_date:
             raise ValueError(
-                "recommendation snapshot must be from a trading day after human promotion"
+                "recommendation snapshot must be from a trading day after promotion"
             )
         if as_of_date > current_date:
             raise ValueError("recommendation snapshot cannot use a future date")
@@ -375,6 +385,10 @@ class RecommendationStore:
         if len(dataset_identity_sha256) != 64:
             raise ValueError("recommendation snapshot requires immutable dataset identity")
         version = self.strategies.get_version(portfolio["strategy_version_id"])
+        # Re-check authority on every refresh. A portfolio created before a
+        # migration or later suspension must not keep publishing merely
+        # because its durable container row is still active.
+        self._assert_v2_strategy(version)
         cost_model = CostModelConfig.from_mapping(version["config"])
         snapshot_id = uuid.uuid4().hex
         now = _now()

@@ -80,7 +80,12 @@ class OperationalHealthStore:
         current = now or _now()
         components: dict[str, dict[str, Any]] = {
             "postgresql": {"status": "ok", "message": "control-plane connection ready"},
-            "scheduler": {"status": "ok", "message": "health collection tick completed"},
+            "scheduler": {
+                "status": "ok",
+                "message": "health collection tick completed",
+                "release_id": self.settings.quantlab_release_id or None,
+                "config_digest": self.settings.quantlab_config_digest or None,
+            },
         }
         components["qlib_worker"] = self._probe_service(
             self.settings.qlib_worker_url,

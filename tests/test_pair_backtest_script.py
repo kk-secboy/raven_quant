@@ -16,6 +16,15 @@ def _script_module():
     return module
 
 
+@pytest.mark.no_database
+def test_pair_script_is_explicitly_offline_research_only() -> None:
+    source = (Path(__file__).parents[1] / "scripts" / "run_pair_backtest.py").read_text(
+        encoding="utf-8"
+    )
+    assert "offline research-only" in source
+    assert "cannot create a paper account" in source
+
+
 def test_parquet_pair_readers_filter_and_normalize_real_provider_fields(tmp_path: Path) -> None:
     script = _script_module()
     minute_path = tmp_path / "minute" / "year=2024"

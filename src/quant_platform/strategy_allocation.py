@@ -10,6 +10,8 @@ from scipy.optimize import minimize
 from .risk_math import COVARIANCE_MODEL_VERSION, estimate_covariance
 from .upstream_versions import QLIB_COMMIT, upstream_runtime_identity
 
+SINGLE_MEMBER_FIXED_COVARIANCE_VERSION = "single-member-sample-variance-v1"
+
 
 def _load_qlib_portfolio_optimizer() -> type[Any]:
     try:
@@ -81,8 +83,12 @@ def analyze_strategy_allocation(
     if not 0 < max_strategy_weight <= 1:
         raise ValueError("max strategy weight must be between 0 and 1")
     frame = returns.copy().replace([np.inf, -np.inf], np.nan).dropna(how="any")
-    if frame.shape[1] < 2:
-        raise ValueError("a strategy allocation requires at least two return series")
+    if frame.shape[1] < 1:
+        raise ValueError("a strategy allocation requires at least one return series")
+    if frame.shape[1] == 1 and method != "fixed":
+        raise ValueError(
+            "a single-member strategy allocation is only valid for a fixed cash-reserve policy"
+        )
     if len(frame) < lookback_days:
         raise ValueError(
             f"strategy return overlap has {len(frame)} days; {lookback_days} are required"
@@ -107,26 +113,40 @@ def analyze_strategy_allocation(
         for row in range(len(columns))
         for column in range(row + 1, len(columns))
     ]
-    highest_correlation = max(pairwise)
+    highest_correlation = max(pairwise) if pairwise else 0.0
     if highest_correlation > max_pairwise_correlation + 1e-12:
         raise ValueError(
             f"strategy correlation {highest_correlation:.4f} exceeds {max_pairwise_correlation:.4f}"
         )
     identity_fn = runtime_identity or upstream_runtime_identity
-    covariance_frame = estimate_covariance(
-        frame,
-        estimator_factory=risk_estimator_factory,
-        runtime_identity=identity_fn,
-    )
+    single_member = len(columns) == 1
+    if single_member:
+        covariance_frame = pd.DataFrame(
+            [[float(frame.iloc[:, 0].var(ddof=1))]],
+            index=columns,
+            columns=columns,
+        )
+        covariance_model_version = SINGLE_MEMBER_FIXED_COVARIANCE_VERSION
+    else:
+        covariance_frame = estimate_covariance(
+            frame,
+            estimator_factory=risk_estimator_factory,
+            runtime_identity=identity_fn,
+        )
+        covariance_model_version = COVARIANCE_MODEL_VERSION
     covariance = covariance_frame.to_numpy(dtype=float) * 252.0
-    qlib_runtime = identity_fn("qlib")
-    if qlib_runtime.get("commit") != QLIB_COMMIT:
+    qlib_runtime = identity_fn("qlib") if not single_member else None
+    if qlib_runtime is not None and qlib_runtime.get("commit") != QLIB_COMMIT:
         raise RuntimeError("Qlib optimizer is not running from the validated commit")
     solver: dict[str, Any] = {
         "success": True,
-        "engine": "qlib.contrib.strategy.optimizer.PortfolioOptimizer",
-        "qlib_version": qlib_runtime["version"],
-        "qlib_commit": qlib_runtime["commit"],
+        "engine": (
+            "project_fixed_single_member_cash_reserve"
+            if single_member
+            else "qlib.contrib.strategy.optimizer.PortfolioOptimizer"
+        ),
+        "qlib_version": qlib_runtime["version"] if qlib_runtime is not None else None,
+        "qlib_commit": qlib_runtime["commit"] if qlib_runtime is not None else None,
         "constraint_wrapper": "project_max_member_weight_v2_waterfill",
         "maximum_risk_budget_error": None,
         "risk_budget_tolerance": None,
@@ -164,14 +184,28 @@ def analyze_strategy_allocation(
     else:
         if fixed_weights is None or set(fixed_weights) != set(columns):
             raise ValueError("fixed allocation requires one weight for every strategy")
-        base_weights = _capped(
-            np.array([fixed_weights[column] for column in columns], dtype=float),
-            max_strategy_weight,
+        base_weights = np.array(
+            [fixed_weights[column] for column in columns], dtype=float
         )
+        if (
+            not np.isfinite(base_weights).all()
+            or (base_weights <= 0).any()
+            or float(base_weights.sum()) > 1.0 + 1e-12
+            or (base_weights > max_strategy_weight + 1e-12).any()
+        ):
+            raise ValueError(
+                "fixed allocation weights must be positive, total at most one, "
+                "and respect the member cap"
+            )
         solver.update(
             {
-                "engine": "project_fixed_weight_constraint_wrapper",
-                "constraint_wrapper": "project_max_member_weight_v2_waterfill",
+                "engine": (
+                    "project_fixed_single_member_cash_reserve"
+                    if single_member
+                    else "project_fixed_weight_constraint_wrapper"
+                ),
+                "constraint_wrapper": "validate_fixed_weight_and_cash_reserve_v1",
+                "fixed_exposure_mass": float(base_weights.sum()),
             }
         )
     portfolio_variance = float(base_weights @ covariance @ base_weights)
@@ -207,7 +241,7 @@ def analyze_strategy_allocation(
         "portfolio_volatility": portfolio_volatility,
         "target_volatility": target_volatility,
         "exposure_scale": exposure_scale,
-        "covariance_model_version": COVARIANCE_MODEL_VERSION,
+        "covariance_model_version": covariance_model_version,
         "solver": solver,
         "cash_weight": 1.0 - float(target_weights.sum()),
         "members": {

@@ -1,22 +1,50 @@
 import json
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
+from governance_fixtures import governed_etf_ready_evidence
 
 from quant_data.config import Settings
 from quant_data.coverage_data import DEFAULT_COVERAGE_BUNDLES, OPTIONAL_COVERAGE_BUNDLES
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_data.qlib_builder import build_qlib_output_manifest
 from quant_platform.alert_store import AlertStore
+from quant_platform.factor_library import compile_qlib_expression
+from quant_platform.feature_set_registry import get_feature_set
 from quant_platform.job_store import JobStore
+from quant_platform.research_horizon import canonical_sha256
 from quant_platform.research_store import ResearchStore
 from quant_platform.schedule_store import ScheduleStore
 from quant_platform.scheduler import AUTOMATED_DATA_BUNDLES, SchedulerEngine
 
 
+@pytest.mark.no_database
+def test_research_report_backfill_waits_for_missing_data_volume(tmp_path: Path) -> None:
+    class BackfillStub:
+        reconciled = False
+
+        def reconcile(self) -> None:
+            self.reconciled = True
+
+    backfill = BackfillStub()
+    scheduler = object.__new__(SchedulerEngine)
+    scheduler.settings = SimpleNamespace(
+        data_root=tmp_path / "not-mounted",
+        research_asset_auto_enabled=True,
+        research_asset_auto_hour=0,
+        research_asset_auto_minute=0,
+    )
+    scheduler.research_report_backfill = backfill
+
+    assert scheduler._enqueue_research_report_backfill(datetime.now(UTC)) == 0
+    assert backfill.reconciled is True
+
+
+@pytest.mark.no_database
 def test_automatic_pipeline_includes_default_coverage_but_not_optional_specialties() -> None:
     assert DEFAULT_COVERAGE_BUNDLES <= set(AUTOMATED_DATA_BUNDLES)
     assert OPTIONAL_COVERAGE_BUNDLES.isdisjoint(AUTOMATED_DATA_BUNDLES)
@@ -74,6 +102,7 @@ def _write_qlib_dataset(
                         "qlib_amount_unit": "cny",
                         "source_hand_size": 100,
                         "index_volume_policy": "excluded_non_tradable_benchmark",
+                        "governed_etf_whitelist": governed_etf_ready_evidence(),
                     }
                     if frequency == "day"
                     else {}
@@ -825,16 +854,77 @@ def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
     (dataset / "instruments" / "cn_all.txt").write_text(
         "SH600000\t2010-01-01\t2025-01-02\n", encoding="utf-8"
     )
+    feature_set = get_feature_set("governed-baseline")
+    required_fields = sorted(
+        {
+            field
+            for expression in feature_set["features"].values()
+            for field in compile_qlib_expression(str(expression)).required_fields
+        }
+    )
+    field_year_coverage = {
+        "version": "qlib-field-year-source-coverage-v1",
+        "source_attribution_policy": "normalized-staging-and-snapshot-contracts-v1",
+        "legacy_overlap_policy_version": "overlap-v1",
+        "primary_market_history_start": "2010-01-01",
+        "fields": {
+            field: {
+                "source_family": "test",
+                "available_from": "2010-01-01",
+                "available_to": "2025-01-02",
+                "continuous_from": "2010-01-01",
+                "research_available_from": "2010-01-01",
+                "years": [
+                    {
+                        "year": 2010,
+                        "observed_rows": 1,
+                        "non_null_rows": 1,
+                        "coverage_ratio": 1.0,
+                        "first_session": "2010-01-01",
+                        "last_session": "2025-01-02",
+                        "source_contracts": ["test-source"],
+                    }
+                ],
+            }
+            for field in required_fields
+        },
+    }
+    field_coverage_sha256 = canonical_sha256(field_year_coverage)
+    field_year_coverage = {
+        **field_year_coverage,
+        "coverage_sha256": field_coverage_sha256,
+    }
     (dataset / "metadata" / "provenance.json").write_text(
         json.dumps(
             {
                 "frequency": "day",
                 "dataset_identity_sha256": "a" * 64,
                 "snapshot_manifest_sha256": "b" * 64,
+                "qlib_builder_sha256": "c" * 64,
                 "dataset_lineage_id": "c" * 64,
                 "source_lineage_id": "d" * 64,
+                "dataset_contract_sha256": "f" * 64,
+                "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+                "fields": required_fields,
+                "field_units": {field: "normalized" for field in required_fields},
+                "research_features": {"version": "pit-research-features-v1"},
+                "field_coverage_sha256": field_coverage_sha256,
+                "field_year_coverage": field_year_coverage,
+                "source_start_date": "2010-01-01",
+                "source_end_date": "2025-01-02",
+                "source_volume_unit": "hand",
+                "qlib_volume_unit": "share",
+                "source_amount_unit": "thousand_cny",
+                "qlib_amount_unit": "cny",
+                "source_hand_size": 100,
+                "index_volume_policy": "excluded_non_tradable_benchmark",
+                "governed_etf_whitelist": governed_etf_ready_evidence(),
                 "lineage_verified": True,
                 "output_manifest": build_qlib_output_manifest(dataset),
+                "execution_controls": {
+                    "native_complete_from": "2010-01-01",
+                    "formal_execution_requires_native_controls": True,
+                },
             }
         ),
         encoding="utf-8",
@@ -857,7 +947,10 @@ def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
     store = ScheduleStore(database_url)
     research_payload = {
         "objective": "Research a low-turnover quality factor for CSI 300 enhancement.",
+        "scenario": "fin_factor",
         "dataset": "cn-research",
+        "feature_set_id": "governed-baseline",
+        "horizon": "short",
         "loop_n": 2,
         "duration": "1h",
         "requested_by": "research-scheduler",
@@ -888,7 +981,11 @@ def test_scheduler_enqueues_bounded_rdagent_research_with_qlib_provenance(
     job = JobStore(database_url).get(schedule_run["job_id"])
     assert job["kind"] == "rdagent_factor"
     assert job["payload"]["loop_n"] == 2
-    research_run = ResearchStore(database_url).list_runs()[0]
+    research_run = next(
+        item
+        for item in ResearchStore(database_url).list_runs()
+        if item["id"] == job["payload"]["research_run_id"]
+    )
     assert research_run["status"] == "queued"
     assert research_run["job_id"] == job["id"]
 
@@ -913,6 +1010,39 @@ def test_expired_schedule_run_lease_is_reclaimed(database_url: str) -> None:
     assert store.claim_run(now=current + timedelta(minutes=1, seconds=30)) is None
     reclaimed = store.claim_run(now=current + timedelta(minutes=2, seconds=1))
     assert reclaimed and reclaimed["id"] == claimed["id"]
+    assert reclaimed["attempts"] == 2
+
+
+def test_waiting_schedule_run_is_persisted_and_reclaimed_after_retry_at(
+    database_url: str,
+) -> None:
+    current = datetime(2025, 1, 2, 7, 29, tzinfo=UTC)
+    store = ScheduleStore(database_url)
+    store.create(
+        name="dependency recovery",
+        kind="incremental_sync",
+        timezone="Asia/Shanghai",
+        run_time=time(15, 30),
+        trading_days_only=True,
+        payload={"profile": "core"},
+        misfire_grace_seconds=1800,
+        actor="operator",
+        now=current,
+    )
+    store.materialize_due(current + timedelta(minutes=1))
+    claimed = store.claim_run(now=current + timedelta(minutes=1), lease_seconds=60)
+    assert claimed is not None
+    retry_at = current + timedelta(minutes=3)
+    store.wait_run(claimed["id"], message="waiting for data", retry_at=retry_at)
+
+    waiting = store.get_run(claimed["id"])
+    assert waiting["status"] == "waiting"
+    assert waiting["message"] == "waiting for data"
+    assert waiting["finished_at"] is None
+    assert store.claim_run(now=retry_at - timedelta(seconds=1)) is None
+    reclaimed = store.claim_run(now=retry_at + timedelta(seconds=1))
+    assert reclaimed is not None
+    assert reclaimed["id"] == claimed["id"]
     assert reclaimed["attempts"] == 2
 
 

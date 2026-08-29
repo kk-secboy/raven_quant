@@ -25,6 +25,7 @@ from .rdagent_scenarios import (
     resolve_rdagent_assets,
     validate_feature_set_id,
 )
+from .research_horizon import LONG_1_3Y, SHORT_1_5D, SWING_1_6M
 from .upstream_versions import (
     RDAGENT_COMMIT,
     require_upstream_runtime_identity,
@@ -694,6 +695,8 @@ def rdagent_command(
     asset_ids: list[str] | None = None,
     asset_manifest_sha256: dict[str, str] | None = None,
     feature_set: dict[str, Any] | None = None,
+    strategy_horizon_profile: str | None = None,
+    incumbent_strategy_version_id: str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     scenario_spec = get_rdagent_scenario(scenario)
     duration = validate_duration_limit(duration, settings.rdagent_max_duration)
@@ -701,6 +704,15 @@ def rdagent_command(
         raise ValueError(f"loop_n must be between 1 and {settings.rdagent_max_loops}")
     if not settings.rdagent_enabled:
         raise ValueError("RD-Agent execution is disabled")
+    if scenario_spec.id == "fin_strategy":
+        if strategy_horizon_profile not in {SHORT_1_5D, SWING_1_6M, LONG_1_3Y}:
+            raise ValueError("fin_strategy requires one governed strategy horizon")
+        if incumbent_strategy_version_id is not None and not re.fullmatch(
+            r"[0-9a-f]{32}", incumbent_strategy_version_id
+        ):
+            raise ValueError("fin_strategy incumbent strategy version identity is invalid")
+    elif strategy_horizon_profile is not None or incumbent_strategy_version_id is not None:
+        raise ValueError("strategy horizon bindings are accepted only by fin_strategy")
     runtime_root = _shared_runtime_root(settings, trace_path)
     is_wsl = os.name == "nt" and settings.rdagent_command.startswith("/")
     trace_arg = _to_wsl_path(trace_path) if is_wsl else str(trace_path)
@@ -808,6 +820,8 @@ def rdagent_command(
         "BRIDGE": bridge_arg,
         "RESULT_PATH": result_arg,
         "QUANTLAB_RESEARCH_OBJECTIVE": objective,
+        "QUANTLAB_STRATEGY_HORIZON": strategy_horizon_profile or "",
+        "QUANTLAB_STRATEGY_PARENT_VERSION_ID": incumbent_strategy_version_id or "",
         "RDAGENT_QLIB_SANDBOX_IMAGE": settings.rdagent_qlib_sandbox_image,
         "RDAGENT_DATA_SCIENCE_IMAGE": settings.rdagent_data_science_image,
         "RDAGENT_FINETUNE_IMAGE": settings.rdagent_finetune_image,
@@ -859,6 +873,17 @@ def rdagent_command(
                 "RD-Agent source Qlib dataset provenance is missing or invalid"
             ) from exc
         verify_qlib_output_manifest(dataset_path, dataset_provenance)
+        dataset_snapshot_id = str(
+            dataset_provenance.get("dataset_identity_sha256")
+            or hashlib.sha256(
+                json.dumps(
+                    dataset_provenance,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        )
         research_dataset_path = prepare_rdagent_dataset_view(
             dataset_path,
             trace_path.parent / "research-dataset",
@@ -868,12 +893,6 @@ def rdagent_command(
         qlib_home_host_str = _runtime_path(qlib_home_host, is_wsl=is_wsl)
         dataset_host_str = _runtime_path(research_dataset_path, is_wsl=is_wsl)
         runtime_root_str = _runtime_path(runtime_root, is_wsl=is_wsl)
-        prefix = {
-            "fin_factor": "QLIB_FACTOR",
-            "fin_factor_report": "QLIB_FACTOR",
-            "fin_model": "QLIB_MODEL",
-            "fin_quant": "QLIB_QUANT",
-        }[scenario_spec.id]
         period_names = (
             "train_start",
             "train_end",
@@ -882,8 +901,14 @@ def rdagent_command(
             "test_start",
             "test_end",
         )
-        for name in period_names:
-            env[f"{prefix}_{name.upper()}"] = rdagent_periods[name]
+        # The official quant loop constructs factor and model runners from their
+        # own settings classes.  Supplying only QLIB_QUANT_* therefore lets the
+        # component runners silently fall back to upstream dates.  Bind all
+        # three official settings groups to the same isolated, pre-final view;
+        # the runner validates the effective YAML environment again at execute.
+        for prefix in ("QLIB_FACTOR", "QLIB_MODEL", "QLIB_QUANT"):
+            for name in period_names:
+                env[f"{prefix}_{name.upper()}"] = rdagent_periods[name]
         env.update(
             {
                 # Never depend on the upstream conda/default execution mode.
@@ -916,6 +941,7 @@ def rdagent_command(
                 "QLIB_QUANT_MODEL_RUNNER": (
                     "quant_platform.rdagent_runner.QuantLabModelRunner"
                 ),
+                "QUANTLAB_DATASET_SNAPSHOT_ID": dataset_snapshot_id,
                 # The pinned factor coder lazily creates daily_pv.h5. Give
                 # every research run its own source-data directories so a
                 # later/earlier cutoff cannot reuse another run's panel.

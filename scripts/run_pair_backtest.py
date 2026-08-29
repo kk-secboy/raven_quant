@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Run a governed cointegration/Kalman pair backtest with minute execution evidence."""
+"""Run an offline research-only pair study with minute execution evidence.
+
+This command is not registered with the production scheduler or worker and its
+output cannot create a paper account, recommendation, order, or promotion.
+"""
 
 from __future__ import annotations
 

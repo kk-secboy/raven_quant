@@ -50,6 +50,7 @@ from .model_research_governance import (
 from .model_research_governance import (
     validate_quant_bundle_evidence as _validate_quant_bundle_evidence,
 )
+from .research_label_binding import validate_research_label_binding
 
 RESEARCH_ASSET_CONTRACT_VERSION = "research-asset-v1"
 RUN_ARTIFACT_CONTRACT_VERSION = "research-run-artifact-v1"
@@ -937,6 +938,62 @@ class RDAGentCandidateStore:
             self._verify_artifact_row(row)
         return row_dict(row)
 
+    def find_run_artifact(
+        self,
+        *,
+        research_run_id: str,
+        artifact_type: str,
+        content_sha256: str,
+        verify: bool = False,
+    ) -> dict[str, Any] | None:
+        """Find an immutable run artifact by its database uniqueness identity."""
+
+        with self.engine.connect() as connection:
+            artifact_id = connection.scalar(
+                select(research_run_artifacts.c.id).where(
+                    research_run_artifacts.c.research_run_id == research_run_id,
+                    research_run_artifacts.c.artifact_type == artifact_type,
+                    research_run_artifacts.c.content_sha256 == content_sha256,
+                )
+            )
+        if artifact_id is None:
+            return None
+        return self.get_run_artifact(str(artifact_id), verify=verify)
+
+    def list_run_artifacts(
+        self,
+        research_run_id: str,
+        *,
+        artifact_types: Sequence[str] = (),
+        verify: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List the immutable artifacts for one run in deterministic order."""
+
+        run_id = str(research_run_id or "").strip()
+        if not run_id:
+            raise ValueError("research run id is required")
+        normalized_types = tuple(
+            sorted({str(value).strip() for value in artifact_types if str(value).strip()})
+        )
+        statement = (
+            select(research_run_artifacts.c.id)
+            .where(research_run_artifacts.c.research_run_id == run_id)
+            .order_by(
+                research_run_artifacts.c.created_at,
+                research_run_artifacts.c.id,
+            )
+        )
+        if normalized_types:
+            statement = statement.where(
+                research_run_artifacts.c.artifact_type.in_(normalized_types)
+            )
+        with self.engine.connect() as connection:
+            identifiers = [str(value) for value in connection.scalars(statement)]
+        return [
+            self.get_run_artifact(identifier, verify=verify)
+            for identifier in identifiers
+        ]
+
     def invalidate_run_artifact(
         self, artifact_id: str, *, reason: str, actor: str
     ) -> dict[str, Any]:
@@ -1188,6 +1245,8 @@ class RDAGentCandidateStore:
                         "execution_evidence_sha256",
                         "execution_environment_sha256",
                         "coverage",
+                        "model_label_contract",
+                        "model_label_contract_sha256",
                     )
                     if key in cell
                 }
@@ -2295,6 +2354,7 @@ class RDAGentCandidateStore:
         pre_final_end: date,
         final_oos_start: date,
         final_oos_end: date,
+        research_label_binding: Mapping[str, Any] | None = None,
         source_iteration: int | None = None,
         rdagent_decision: bool | None = None,
         rdagent_feedback: str | None = None,
@@ -2316,6 +2376,24 @@ class RDAGentCandidateStore:
         if not pre_final_end < final_oos_start <= final_oos_end:
             raise ValueError("joint quant proposal final OOS boundary is invalid")
         family_id = _nonempty(experiment_family_id, "experiment family id")
+        label_binding = (
+            validate_research_label_binding(research_label_binding)
+            if research_label_binding is not None
+            else None
+        )
+        if label_binding is not None and (
+            label_binding["dataset_name"] != dataset_name
+            or label_binding["dataset_identity_sha256"] != identity
+            or label_binding["feature_set_id"] != features["id"]
+            or label_binding["feature_set_sha256"] != feature_sha
+            or label_binding["periods"]["valid_end"] != pre_final_end.isoformat()
+            or label_binding["periods"]["test_start"] != final_oos_start.isoformat()
+            or label_binding["periods"]["test_end"] != final_oos_end.isoformat()
+        ):
+            raise ValueError("joint quant label binding differs from its frozen inputs")
+        label_horizon_days = int(
+            label_binding["label_horizon_sessions"] if label_binding is not None else 1
+        )
         baseline_input = dict(baseline_prediction_champion or {})
         baseline = self.freeze_quant_baseline_prediction(
             candidate_kind=str(baseline_input.get("kind") or ""),
@@ -2397,11 +2475,23 @@ class RDAGentCandidateStore:
                         variables_json={
                             "source": "rdagent_fin_quant_joint_proposal",
                             "bundle_id": bundle_id,
+                            **(
+                                {
+                                    "horizon_profile": label_binding[
+                                        "horizon_profile"
+                                    ],
+                                    "research_label_binding_sha256": label_binding[
+                                        "binding_sha256"
+                                    ],
+                                }
+                                if label_binding is not None
+                                else {}
+                            ),
                         },
                         status="awaiting_evaluation",
                         source_iteration=source_iteration,
                         experiment_family_id=family_id,
-                        label_horizon_days=1,
+                        label_horizon_days=label_horizon_days,
                         experiment_count=len(factors),
                         code_path=str(code_path),
                         values_path=str(values_path) if values_path else None,
@@ -2447,6 +2537,12 @@ class RDAGentCandidateStore:
                 "pre_final_end": pre_final_end.isoformat(),
                 "final_oos_start": final_oos_start.isoformat(),
                 "final_oos_end": final_oos_end.isoformat(),
+                "research_label_binding": label_binding,
+                "research_label_binding_sha256": (
+                    label_binding["binding_sha256"]
+                    if label_binding is not None
+                    else None
+                ),
                 "feature_set_definition_sha256": feature_sha,
                 "base_features_manifest_sha256": canonical_sha256(base_features),
                 "bundle_artifact_id": bundle_artifact_id,
@@ -2536,6 +2632,22 @@ class RDAGentCandidateStore:
                 joint_proposal = (
                     manifest.get("contract_version") == "quant-bundle-joint-proposal-v1"
                 )
+                label_binding = manifest.get("research_label_binding")
+                if label_binding is not None:
+                    validated_label_binding = validate_research_label_binding(
+                        label_binding
+                    )
+                    if (
+                        manifest.get("research_label_binding_sha256")
+                        != validated_label_binding["binding_sha256"]
+                        or validated_label_binding["dataset_name"]
+                        != str(row.dataset)
+                        or validated_label_binding["dataset_identity_sha256"]
+                        != str(row.dataset_identity_sha256)
+                    ):
+                        raise ValueError("quant bundle label binding is invalid")
+                else:
+                    validated_label_binding = None
                 if bool(row.model_candidate_id) == bool(
                     row.model_ensemble_candidate_id
                 ):
@@ -2662,6 +2774,15 @@ class RDAGentCandidateStore:
                     if (
                         (not joint_proposal and str(factor.status) != "promoted")
                         or (joint_proposal and str(factor.status) != "awaiting_evaluation")
+                        or (
+                            validated_label_binding is not None
+                            and int(factor.label_horizon_days or 0)
+                            != int(
+                                validated_label_binding[
+                                    "label_horizon_sessions"
+                                ]
+                            )
+                        )
                         or frozen.get("code_sha256") != str(factor.code_sha256)
                         or frozen.get("values_sha256") != str(factor.values_sha256)
                         or (
@@ -2935,6 +3056,21 @@ class RDAGentCandidateStore:
                 raise ValueError("quant evaluation result artifact is unreadable") from exc
             if not isinstance(envelope, dict) or envelope.get("status") != "ok":
                 raise ValueError("quant evaluation batch did not complete successfully")
+            composition = dict(candidate.bundle_manifest_json or {})
+            frozen_label_binding = composition.get("research_label_binding")
+            if frozen_label_binding is not None:
+                validated_label_binding = validate_research_label_binding(
+                    frozen_label_binding
+                )
+                if (
+                    composition.get("research_label_binding_sha256")
+                    != validated_label_binding["binding_sha256"]
+                    or envelope.get("research_label_binding")
+                    != validated_label_binding
+                    or envelope.get("research_label_binding_sha256")
+                    != validated_label_binding["binding_sha256"]
+                ):
+                    raise ValueError("quant result used another research label")
             ledger_receipt = dict(envelope.get("research_trial_ledger_receipt") or {})
             ledger_receipt_sha256 = canonical_sha256(
                 {
@@ -2952,6 +3088,11 @@ class RDAGentCandidateStore:
                 or ledger_receipt.get("not_capital_confirmation") is not True
                 or ledger_receipt.get("cross_cycle_fwer_claimed") is not False
                 or ledger_receipt.get("final_oos_opened") is not False
+                or (
+                    frozen_label_binding is not None
+                    and ledger_receipt.get("research_label_binding_sha256")
+                    != validated_label_binding["binding_sha256"]
+                )
                 or quant_bundle_candidate_id
                 not in dict(ledger_receipt.get("candidate_statuses") or {})
             ):
@@ -3003,9 +3144,25 @@ class RDAGentCandidateStore:
                     or str(validated.get("id") or "") != quant_bundle_candidate_id
                     or validated.get("feature_set_definition_sha256")
                     != str(candidate.feature_set_definition_sha256)
+                    or (
+                        frozen_label_binding is not None
+                        and (
+                            validated.get("research_label_binding_sha256")
+                            != validated_label_binding["binding_sha256"]
+                            or validated.get("research_window_contract_sha256")
+                            != validated_label_binding[
+                                "research_window_contract_sha256"
+                            ]
+                            or int(validated.get("label_horizon_sessions") or 0)
+                            != int(
+                                validated_label_binding[
+                                    "label_horizon_sessions"
+                                ]
+                            )
+                        )
+                    )
                 ):
                     raise ValueError("quant result identity or immutable hash is invalid")
-                composition = dict(candidate.bundle_manifest_json or {})
                 frozen_baseline = dict(
                     composition.get("baseline_prediction_champion") or {}
                 )

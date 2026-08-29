@@ -6,7 +6,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from governance_fixtures import PERIODS, create_strategy_version
+from governance_fixtures import (
+    PERIODS,
+    enable_recommendation_authority_for_test,
+)
 from qlib_test_doubles import (
     QlibPortfolioOptimizer,
     QlibRiskEstimator,
@@ -46,16 +49,32 @@ def _two_versions(database_url: str, tmp_path: Path) -> list[str]:
     dates = pd.bdate_range("2024-01-02", periods=160)
     first = pd.Series(np.sin(np.arange(len(dates)) / 5) * 0.01, index=dates)
     second = pd.Series(np.cos(np.arange(len(dates)) / 7) * 0.012, index=dates)
-    # The OOS vintage seal rejects a second candidate consuming the same final
-    # test window; shift the second version's window (same pattern as
-    # tests/test_strategy_allocation_recommendations.py).
-    second_window = {**PERIODS, "test_start": date(2024, 2, 8)}
-    return [
-        _approve_version(database_url, tmp_path, suffix="one", returns=first),
+    # The OOS vintage seal rejects even partially overlapping final windows.
+    # Give these independently researched fixtures genuinely disjoint OOS
+    # vintages instead of bypassing the production lockbox.
+    first_window = {**PERIODS, "test_end": date(2023, 1, 10)}
+    second_window = {**PERIODS, "test_start": date(2023, 1, 11)}
+    version_ids = [
         _approve_version(
-            database_url, tmp_path, suffix="two", returns=second, periods=second_window
+            database_url,
+            tmp_path,
+            suffix="one",
+            returns=first,
+            periods=first_window,
+        ),
+        _approve_version(
+            database_url,
+            tmp_path,
+            suffix="two",
+            returns=second,
+            periods=second_window,
+            recipe_id="swing_trend",
         ),
     ]
+    # Allocation guard tests start at recommendation authority; the separate
+    # promotion-chain suite owns the horizon forward-evidence transition.
+    enable_recommendation_authority_for_test(database_url, version_ids)
+    return version_ids
 
 
 def _create_allocation(
@@ -87,6 +106,35 @@ def test_next_decision_date_calendar() -> None:
     assert next_decision_date(date(2026, 12, 15), "monthly") == date(2027, 1, 15)
     with pytest.raises(ValueError, match="unknown decision frequency"):
         next_decision_date(date(2026, 7, 21), "daily")
+
+
+def test_single_verified_horizon_allocation_reserves_other_sleeves_as_cash(
+    database_url: str, tmp_path: Path
+) -> None:
+    version_id = _two_versions(database_url, tmp_path)[0]
+    allocation = _create_allocation(
+        AllocationStore(database_url),
+        [version_id],
+        "single verified short horizon",
+        allocation_method="fixed",
+        fixed_weights={version_id: 0.18},
+        max_strategy_weight=0.40,
+        member_specs=[
+            {
+                "strategy_version_id": version_id,
+                "role": "core",
+                "risk_budget": 0.20,
+                "member_cap": 0.18,
+            }
+        ],
+    )
+
+    assert len(allocation["members"]) == 1
+    assert allocation["members"][0]["target_weight"] == pytest.approx(0.18)
+    assert float(allocation["cash_reserve"]) == pytest.approx(820_000)
+    assert allocation["analysis"]["core_satellite"][
+        "core_share_of_invested"
+    ] == pytest.approx(1.0)
 
 
 def test_single_active_allocation_guard(
@@ -137,17 +185,44 @@ def test_single_active_allocation_guard(
             )
 
 
+def test_allocation_cannot_materialize_recommendations_for_paper_member(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    _qlib_doubles(monkeypatch)
+    version_ids = _two_versions(database_url, tmp_path)
+    store = AllocationStore(database_url)
+    allocation = _create_allocation(
+        store,
+        version_ids,
+        "paper member must not bypass forward gate",
+    )
+    with open_database(database_url).begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id == version_ids[0])
+            .values(promotion_stage="paper")
+        )
+
+    with pytest.raises(ValueError, match="immutable forward gate"):
+        store.approve(
+            allocation["id"],
+            actor="allocation-approver",
+            reason="A paper-only member must never create a recommendation portfolio.",
+        )
+
+
 def test_single_active_recommendation_sender_guard(
     database_url: str, tmp_path: Path
 ) -> None:
-    version_id = create_strategy_version(database_url, tmp_path)
+    dates = pd.bdate_range("2024-01-02", periods=160)
+    version_id = _approve_version(
+        database_url,
+        tmp_path,
+        suffix="standalone-sender",
+        returns=pd.Series(np.sin(np.arange(len(dates)) / 5) * 0.01, index=dates),
+    )
     store = RecommendationStore(database_url)
-    with store.engine.begin() as connection:
-        connection.execute(
-            update(strategy_versions)
-            .where(strategy_versions.c.id == version_id)
-            .values(status="approved")
-        )
+    enable_recommendation_authority_for_test(database_url, [version_id])
     first = store.create(
         name="sender one",
         strategy_version_id=version_id,

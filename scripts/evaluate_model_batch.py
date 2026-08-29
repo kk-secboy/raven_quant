@@ -112,6 +112,12 @@ def main() -> None:
                 "periods": periods,
                 "seed": seed,
                 "dataset_identity_sha256": dataset_identity,
+                "research_window_contract": manifest.get("research_window_contract"),
+                "research_window_contract_sha256": manifest.get(
+                    "research_window_contract_sha256"
+                ),
+                "label_horizon_sessions": _candidate.get("label_horizon_sessions")
+                or manifest.get("label_horizon_sessions"),
                 "universe": manifest.get("universe", "cn_all"),
                 "benchmark": manifest.get("benchmark", "SH000300"),
                 "account": manifest.get("account", 100_000_000),
@@ -194,6 +200,10 @@ def main() -> None:
                     ],
                     "coverage": coverage,
                     "resource_policy": screen_result["resource_policy"],
+                    "model_label_contract": screen_result["model_label_contract"],
+                    "model_label_contract_sha256": screen_result[
+                        "model_label_contract_sha256"
+                    ],
                     "execution_evidence_sha256": screen_execution["evidence_sha256"],
                     "execution_environment_sha256": screen_execution[
                         "execution_environment_sha256"
@@ -298,6 +308,10 @@ def main() -> None:
             "periods": screening_periods,
             "metrics": screening_result["metrics"],
             "resource_policy": screening_result["resource_policy"],
+            "model_label_contract": screening_result["model_label_contract"],
+            "model_label_contract_sha256": screening_result[
+                "model_label_contract_sha256"
+            ],
             "execution_evidence_sha256": screening_execution["evidence_sha256"],
             "execution_environment_sha256": screening_execution[
                 "execution_environment_sha256"
@@ -367,6 +381,10 @@ def main() -> None:
                         ],
                         "coverage": coverage,
                         "resource_policy": result["resource_policy"],
+                        "model_label_contract": result["model_label_contract"],
+                        "model_label_contract_sha256": result[
+                            "model_label_contract_sha256"
+                        ],
                     }
                     execution_environments.add(
                         str(execution_evidence["execution_environment_sha256"])

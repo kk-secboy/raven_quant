@@ -16,6 +16,9 @@ from quant_data.database import (
 
 ACTIVE_CAMPAIGN_STATUSES = ("queued", "running", "awaiting_approval")
 TERMINAL_CAMPAIGN_STATUSES = ("succeeded", "failed", "cancelled")
+LEGACY_READ_ONLY_ERROR = (
+    "legacy research campaigns are read-only; use the governed ResearchCampaign API"
+)
 
 
 def _now() -> datetime:
@@ -23,7 +26,7 @@ def _now() -> datetime:
 
 
 class ResearchCampaignStore:
-    """Durable control-plane state for restart-safe autonomous research."""
+    """Read-only access to retired autonomous-research campaign history."""
 
     def __init__(self, database_url: str) -> None:
         self.engine = open_database(database_url)
@@ -42,6 +45,7 @@ class ResearchCampaignStore:
         research_program_id: str | None = None,
         dataset_identity_sha256: str | None = None,
     ) -> dict[str, Any]:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         campaign_id = uuid.uuid4().hex
         current = _now()
         try:
@@ -168,6 +172,7 @@ class ResearchCampaignStore:
         now: datetime | None = None,
         lease_seconds: int = 120,
     ) -> dict[str, Any] | None:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         current = now or _now()
         with self.engine.begin() as connection:
             row = connection.execute(
@@ -213,6 +218,7 @@ class ResearchCampaignStore:
         delay_seconds: int = 0,
         error: str | None = None,
     ) -> dict[str, Any]:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         current = _now()
         with self.engine.begin() as connection:
             row = connection.execute(
@@ -269,6 +275,7 @@ class ResearchCampaignStore:
         seconds: int = 30,
         reason: str | None = None,
     ) -> None:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         current = _now()
         with self.engine.begin() as connection:
             result = connection.execute(
@@ -292,15 +299,10 @@ class ResearchCampaignStore:
                 )
 
     def fail(self, campaign_id: str, error: str) -> dict[str, Any]:
-        return self.transition(
-            campaign_id,
-            status="failed",
-            event_type="campaign.failed",
-            payload={"error": error},
-            error=error,
-        )
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
 
     def retry(self, campaign_id: str, *, actor: str) -> dict[str, Any]:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         current = _now()
         with self.engine.begin() as connection:
             row = connection.execute(
@@ -334,6 +336,7 @@ class ResearchCampaignStore:
         return self.get(campaign_id)
 
     def set_status(self, campaign_id: str, status: str, *, actor: str) -> dict[str, Any]:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         if status not in {"paused", "running", "cancelled"}:
             raise ValueError("campaign status must be paused, running, or cancelled")
         current = _now()

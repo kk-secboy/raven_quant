@@ -9,7 +9,7 @@ from scipy.optimize import linprog
 
 from .cost_model import CN_COST_SCHEDULE_BOOK
 from .factor_evaluator import normalize_series
-from .factor_library import ECONOMIC_FAMILIES
+from .factor_library import ECONOMIC_FAMILIES, compile_qlib_expression
 from .feature_set_registry import get_feature_set
 from .model_research_governance import MODEL_LABEL_HORIZON_TRADING_DAYS
 from .rdagent_runtime import validate_duration, validate_duration_limit
@@ -17,6 +17,17 @@ from .rdagent_scenarios import (
     get_rdagent_scenario,
     validate_asset_id,
     validate_feature_set_id,
+)
+from .research_horizon import (
+    LEGACY_AMBIGUOUS,
+    LONG_1_3Y,
+    SHORT_1_5D,
+    SWING_1_6M,
+    research_horizon_contract,
+)
+from .research_window import (
+    build_research_window_contract,
+    resolve_required_field_coverage,
 )
 
 RESEARCH_PERIOD_KEYS = (
@@ -56,6 +67,30 @@ RESEARCH_EVALUATION_PROFILES = (
 MINIMUM_PROFILE_TRAINING_DAYS = 252
 MULTI_PROFILE_CONSENSUS_VERSION = "multi-profile-consensus-v1"
 ROLLING_PERIOD_RESOLUTION_VERSION = "rolling_multi_profile_qlib_calendar_v2"
+HORIZON_PERIOD_RESOLUTION_VERSION = "rolling_three_horizon_qlib_calendar_v1"
+HORIZON_RESEARCH_SCENARIOS = frozenset(
+    {"fin_factor", "fin_model", "fin_quant", "fin_strategy"}
+)
+
+_HORIZON_ALIASES = {
+    "short": SHORT_1_5D,
+    "swing": SWING_1_6M,
+    "long": LONG_1_3Y,
+    SHORT_1_5D: SHORT_1_5D,
+    SWING_1_6M: SWING_1_6M,
+    LONG_1_3Y: LONG_1_3Y,
+    LEGACY_AMBIGUOUS: LEGACY_AMBIGUOUS,
+}
+
+
+def normalize_research_horizon_profile(value: Any = None) -> str:
+    """Normalize user labels without inferring a horizon for old research."""
+
+    raw = str(value or LEGACY_AMBIGUOUS).strip().lower()
+    try:
+        return _HORIZON_ALIASES[raw]
+    except KeyError as exc:
+        raise ValueError(f"unsupported research horizon profile: {value}") from exc
 
 
 def _first_governed_cost_trading_day(calendar_days: list[str]) -> tuple[int, str, str]:
@@ -74,6 +109,8 @@ def required_multi_profile_trading_days(
     *,
     test_trading_days: int = DEFAULT_RESEARCH_PERIOD_POLICY["test_trading_days"],
     embargo_trading_days: int = DEFAULT_RESEARCH_PERIOD_POLICY["embargo_trading_days"],
+    purge_trading_days: int = MODEL_LABEL_HORIZON_TRADING_DAYS,
+    label_maturity_trading_days: int = 0,
 ) -> int:
     """Return the minimum calendar coverage required by the governed profiles."""
 
@@ -82,17 +119,22 @@ def required_multi_profile_trading_days(
     )
     return (
         MINIMUM_PROFILE_TRAINING_DAYS
-        + MODEL_LABEL_HORIZON_TRADING_DAYS
+        + int(purge_trading_days)
         + longest_validation
         + int(embargo_trading_days)
         + int(test_trading_days)
+        + int(label_maturity_trading_days)
     )
 
 
 DEFAULT_REQUIRED_RESEARCH_TRADING_DAYS = required_multi_profile_trading_days()
 
 
-def normalize_research_period_policy(value: Any = None) -> dict[str, int]:
+def normalize_research_period_policy(
+    value: Any = None,
+    *,
+    horizon_profile: str | None = None,
+) -> dict[str, int]:
     """Normalize the platform-owned rolling-window policy.
 
     The policy is deliberately expressed in trading days.  Calendar dates are
@@ -106,16 +148,48 @@ def normalize_research_period_policy(value: Any = None) -> dict[str, int]:
         raw = value
     else:
         raise ValueError("rdagent_research period_policy must be an object")
+    profile = normalize_research_horizon_profile(horizon_profile)
+    horizon = research_horizon_contract(profile)
+    defaults = dict(DEFAULT_RESEARCH_PERIOD_POLICY)
+    if profile != LEGACY_AMBIGUOUS:
+        defaults = {
+            "test_trading_days": int(horizon.sealed_oos_sessions or 0),
+            # The horizon contract is the modelling minimum.  A capital-facing
+            # final OOS also enters the shared alpha-spending ledger, whose
+            # immutable contract requires at least the platform default
+            # 20-session embargo.  Freeze the stricter value before research so
+            # a short-horizon winner cannot become impossible to preregister.
+            "embargo_trading_days": max(
+                int(horizon.embargo_sessions or 0),
+                int(DEFAULT_RESEARCH_PERIOD_POLICY["embargo_trading_days"]),
+            ),
+        }
     policy: dict[str, int] = {}
-    for key, default in DEFAULT_RESEARCH_PERIOD_POLICY.items():
+    for key, default in defaults.items():
         try:
             policy[key] = int(raw.get(key, default))
         except (TypeError, ValueError) as exc:
             raise ValueError(f"rdagent_research {key} must be an integer") from exc
-    if policy["test_trading_days"] < 252:
-        raise ValueError("rdagent_research requires at least 252 final-test trading days")
-    if not 20 <= policy["embargo_trading_days"] <= 63:
-        raise ValueError("rdagent_research embargo must contain 20 to 63 trading days")
+    minimum_test = 252 if profile == LEGACY_AMBIGUOUS else int(horizon.sealed_oos_sessions or 0)
+    minimum_embargo = (
+        6
+        if profile == LEGACY_AMBIGUOUS
+        else max(
+            int(horizon.embargo_sessions or 0),
+            int(DEFAULT_RESEARCH_PERIOD_POLICY["embargo_trading_days"]),
+        )
+    )
+    if policy["test_trading_days"] < minimum_test:
+        raise ValueError(
+            f"rdagent_research {profile} requires at least {minimum_test} final-test trading days"
+        )
+    if profile == LEGACY_AMBIGUOUS:
+        if not 6 <= policy["embargo_trading_days"] <= 253:
+            raise ValueError("rdagent_research embargo must contain 6 to 253 trading days")
+    elif policy["embargo_trading_days"] < minimum_embargo:
+        raise ValueError(
+            f"rdagent_research {profile} requires at least {minimum_embargo} embargo trading days"
+        )
     return policy
 
 
@@ -161,6 +235,15 @@ def normalize_research_schedule_payload(
     """
 
     scenario = get_rdagent_scenario(str(payload.get("scenario") or "fin_factor"))
+    horizon_profile = normalize_research_horizon_profile(
+        payload.get("horizon_profile")
+        or payload.get("strategy_horizon_profile")
+        or payload.get("horizon")
+    )
+    if scenario.id in HORIZON_RESEARCH_SCENARIOS and horizon_profile == LEGACY_AMBIGUOUS:
+        raise ValueError(
+            f"rdagent_research {scenario.id} requires an explicit horizon profile"
+        )
     objective = str(payload.get("objective") or "").strip()
     dataset = str(payload.get("dataset") or "").strip()
     requested_by = str(payload.get("requested_by") or "scheduler").strip()
@@ -223,6 +306,7 @@ def normalize_research_schedule_payload(
         "requested_by": requested_by,
         "asset_ids": asset_ids,
         "feature_set": feature_set,
+        "horizon_profile": horizon_profile,
     }
     if not scenario.requires_dataset:
         return normalized
@@ -231,7 +315,10 @@ def normalize_research_schedule_payload(
         normalized["periods"] = normalize_explicit_research_periods(payload.get("periods"))
     else:
         normalized["period_mode"] = "rolling"
-        normalized["period_policy"] = normalize_research_period_policy(payload.get("period_policy"))
+        normalized["period_policy"] = normalize_research_period_policy(
+            payload.get("period_policy"),
+            horizon_profile=horizon_profile,
+        )
     return normalized
 
 
@@ -273,6 +360,8 @@ def derive_multi_profile_research_periods(
     *,
     test_days: int,
     embargo_days: int,
+    purge_days: int = MODEL_LABEL_HORIZON_TRADING_DAYS,
+    label_maturity_days: int = 0,
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
     """Build one discovery window and three pre-final evaluation profiles.
 
@@ -280,12 +369,14 @@ def derive_multi_profile_research_periods(
     history changes, so comparing profiles cannot select on final-test results.
     """
 
-    if min(test_days, embargo_days) < 1:
-        raise ValueError("research final-test and embargo lengths must be positive")
+    if min(test_days, embargo_days, purge_days) < 1 or label_maturity_days < 0:
+        raise ValueError("research final-test, purge, embargo, and maturity lengths are invalid")
     ordered = sorted(dict.fromkeys(calendar_days))
     required = required_multi_profile_trading_days(
         test_trading_days=test_days,
         embargo_trading_days=embargo_days,
+        purge_trading_days=purge_days,
+        label_maturity_trading_days=label_maturity_days,
     )
     if len(ordered) < required:
         raise ValueError(
@@ -293,7 +384,8 @@ def derive_multi_profile_research_periods(
             f"requires {required}"
         )
     selected = ordered[-required:]
-    test_start_index = len(selected) - test_days
+    test_end_index = len(selected) - label_maturity_days - 1
+    test_start_index = test_end_index - test_days + 1
     valid_end_index = test_start_index - embargo_days - 1
     _, first_cost_trading_day, cost_effective_from = _first_governed_cost_trading_day(
         ordered
@@ -318,7 +410,7 @@ def derive_multi_profile_research_periods(
                 f"{spec['id']} has no validation trading day covered by the "
                 "authoritative CN cost schedule"
             )
-        train_end_index = valid_start_index - MODEL_LABEL_HORIZON_TRADING_DAYS - 1
+        train_end_index = valid_start_index - purge_days - 1
         effective_training_days = train_end_index + 1
         if effective_training_days < MINIMUM_PROFILE_TRAINING_DAYS:
             raise ValueError(
@@ -333,7 +425,7 @@ def derive_multi_profile_research_periods(
             "valid_start": selected[valid_start_index],
             "valid_end": selected[valid_end_index],
             "test_start": selected[test_start_index],
-            "test_end": selected[-1],
+            "test_end": selected[test_end_index],
         }
         profiles.append(
             {
@@ -374,6 +466,7 @@ def resolve_research_periods(
     *,
     periods: Any = None,
     period_policy: Any = None,
+    horizon_profile: str | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     """Resolve explicit dates or derive rolling dates and return audit metadata."""
 
@@ -386,6 +479,20 @@ def resolve_research_periods(
         raise ValueError("Qlib trading calendar contains an invalid ISO date") from exc
     if parsed != sorted(set(parsed)):
         raise ValueError("Qlib trading calendar must contain unique ordered dates")
+
+    profile = normalize_research_horizon_profile(horizon_profile)
+    horizon = research_horizon_contract(profile)
+    labels = (
+        (MODEL_LABEL_HORIZON_TRADING_DAYS,)
+        if profile == LEGACY_AMBIGUOUS
+        else horizon.label_horizons_sessions
+    )
+    purge_days = (
+        MODEL_LABEL_HORIZON_TRADING_DAYS
+        if profile == LEGACY_AMBIGUOUS
+        else int(horizon.purge_sessions or 0)
+    )
+    maturity_days = 0 if profile == LEGACY_AMBIGUOUS else max(labels)
 
     if periods is not None:
         resolved = normalize_explicit_research_periods(periods)
@@ -406,17 +513,68 @@ def resolve_research_periods(
                 "periods": resolved,
             }
         ]
+        indices = {day: index for index, day in enumerate(ordered)}
+        missing = [value for value in resolved.values() if value not in indices]
+        if missing:
+            raise ValueError("explicit research periods must use Qlib trading sessions")
+        purge_gap = indices[resolved["valid_start"]] - indices[resolved["train_end"]] - 1
+        embargo_gap = indices[resolved["test_start"]] - indices[resolved["valid_end"]] - 1
+        maturity_tail = len(ordered) - indices[resolved["test_end"]] - 1
+        if profile != LEGACY_AMBIGUOUS and purge_gap < purge_days:
+            raise ValueError(
+                f"explicit {profile} research requires at least {purge_days} purge sessions"
+            )
+        required_embargo = max(
+            int(horizon.embargo_sessions or 0),
+            int(DEFAULT_RESEARCH_PERIOD_POLICY["embargo_trading_days"]),
+        )
+        if profile != LEGACY_AMBIGUOUS and embargo_gap < required_embargo:
+            raise ValueError(
+                f"explicit {profile} research requires at least "
+                f"{required_embargo} embargo sessions"
+            )
+        if profile != LEGACY_AMBIGUOUS and maturity_tail < maturity_days:
+            raise ValueError(
+                f"explicit {profile} research requires {maturity_days} post-OOS "
+                "sessions for label maturity"
+            )
+        effective_embargo_days = embargo_gap
+        effective_maturity_days = maturity_tail if profile != LEGACY_AMBIGUOUS else 0
     else:
-        policy = normalize_research_period_policy(period_policy)
+        policy = normalize_research_period_policy(
+            period_policy,
+            horizon_profile=profile,
+        )
         resolved, profiles = derive_multi_profile_research_periods(
             ordered,
             test_days=policy["test_trading_days"],
             embargo_days=policy["embargo_trading_days"],
+            purge_days=purge_days,
+            label_maturity_days=maturity_days,
         )
-        mode = ROLLING_PERIOD_RESOLUTION_VERSION
+        mode = (
+            ROLLING_PERIOD_RESOLUTION_VERSION
+            if profile == LEGACY_AMBIGUOUS
+            else HORIZON_PERIOD_RESOLUTION_VERSION
+        )
+        effective_embargo_days = policy["embargo_trading_days"]
+        effective_maturity_days = maturity_days
+    latest_mature_label_sessions: dict[str, str] = {}
+    for label in labels:
+        if len(ordered) <= label:
+            raise ValueError(f"Qlib calendar cannot mature the {label}-session label")
+        latest_mature_label_sessions[str(label)] = ordered[-label - 1]
     return resolved, {
         "mode": mode,
         "policy": policy,
+        "horizon_profile": profile,
+        "horizon_contract_sha256": horizon.sha256,
+        "label_horizons_sessions": list(labels),
+        "purge_trading_days": purge_days,
+        "embargo_trading_days": effective_embargo_days,
+        "label_maturity_enforced": profile != LEGACY_AMBIGUOUS,
+        "label_maturity_tail_trading_days": effective_maturity_days,
+        "latest_mature_label_sessions": latest_mature_label_sessions,
         "calendar_start": ordered[0],
         "calendar_end": ordered[-1],
         "calendar_trading_days": len(ordered),
@@ -425,6 +583,83 @@ def resolve_research_periods(
         ),
         "evaluation_profiles": profiles,
     }
+
+
+def resolve_research_window_contract(
+    dataset: dict[str, Any],
+    calendar_days: list[str],
+    *,
+    periods: Any = None,
+    period_policy: Any = None,
+    horizon_profile: str | None = None,
+    feature_set: dict[str, Any] | None = None,
+    universe: str = "cn_all_governed_ashare_and_etf",
+    random_seed: int = 42,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Resolve dates and freeze the complete first-class research contract."""
+
+    profile = normalize_research_horizon_profile(horizon_profile)
+    effective_calendar = list(calendar_days)
+    field_evidence: dict[str, Any] | None = None
+    if profile != LEGACY_AMBIGUOUS:
+        features = (feature_set or {}).get("features")
+        if not isinstance(features, dict) or not features:
+            raise ValueError("active horizon research requires a governed feature set")
+        required_fields = sorted(
+            {
+                field
+                for expression in features.values()
+                for field in compile_qlib_expression(str(expression)).required_fields
+            }
+        )
+        ordered_calendar = sorted(
+            dict.fromkeys(
+                str(day).strip() for day in calendar_days if str(day).strip()
+            )
+        )
+        if not ordered_calendar:
+            raise ValueError("Qlib trading calendar is empty")
+        provenance = dataset.get("provenance") or {}
+        if not isinstance(provenance, dict):
+            raise ValueError("dataset provenance must be an object")
+        field_evidence = resolve_required_field_coverage(
+            provenance,
+            required_fields,
+            data_cutoff_session=ordered_calendar[-1],
+        )
+        effective_start = str(field_evidence["effective_field_start_session"])
+        effective_calendar = [day for day in ordered_calendar if day >= effective_start]
+        if not effective_calendar:
+            raise ValueError("dataset has no trading sessions after field availability begins")
+        if periods is not None:
+            explicit = normalize_explicit_research_periods(periods)
+            if explicit["train_start"] < effective_calendar[0]:
+                raise ValueError(
+                    "explicit research begins before all selected factor fields are available"
+                )
+    resolved, evidence = resolve_research_periods(
+        effective_calendar,
+        periods=periods,
+        period_policy=period_policy,
+        horizon_profile=profile,
+    )
+    contract = build_research_window_contract(
+        dataset=dataset,
+        calendar_days=effective_calendar,
+        periods=resolved,
+        period_resolution=evidence,
+        horizon_profile=str(evidence["horizon_profile"]),
+        feature_set=feature_set,
+        universe=universe,
+        random_seed=random_seed,
+    )
+    evidence = {
+        **evidence,
+        **({"required_field_coverage": field_evidence} if field_evidence else {}),
+        "research_window_contract": contract.to_dict(),
+        "research_window_contract_sha256": contract.sha256,
+    }
+    return resolved, evidence
 
 
 def build_multi_profile_consensus(candidate: dict[str, Any]) -> dict[str, Any] | None:

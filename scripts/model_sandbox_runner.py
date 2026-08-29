@@ -13,10 +13,20 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+sys.path.insert(0, "/work")
+
+from quant_platform.qlib_workflow import (  # noqa: E402
+    qlib_workflow_run,
+    qlib_workflow_tracking_uri,
+)
+
 MODEL_LABEL_HORIZON_TRADING_DAYS = 2
 MODEL_FINAL_OOS_EMBARGO_TRADING_DAYS = 5
+LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS = 1
+MODEL_LABEL_CONTRACT_VERSION = "model-label-contract-v1"
 MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v3-cpu-tournament"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
+HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
 GOVERNED_MODEL_ENGINES = {
     "ridge_baseline",
     "lightgbm_baseline",
@@ -60,6 +70,79 @@ def canonical_sha256(value: Any) -> str:
             "utf-8"
         )
     ).hexdigest()
+
+
+def legacy_model_label_contract() -> dict[str, Any]:
+    return {
+        "contract_version": MODEL_LABEL_CONTRACT_VERSION,
+        "horizon_profile": "legacy_ambiguous",
+        "legacy": True,
+        "allowed_label_horizons_sessions": [LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS],
+        "label_horizon_sessions": LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS,
+        "label_reference_offset_sessions": MODEL_LABEL_HORIZON_TRADING_DAYS,
+        "label_expression": "Ref($close,-2)/Ref($close,-1)-1",
+        "purge_sessions": MODEL_LABEL_HORIZON_TRADING_DAYS,
+        "embargo_sessions": MODEL_FINAL_OOS_EMBARGO_TRADING_DAYS,
+        "research_window_contract_sha256": None,
+    }
+
+
+def resolve_manifest_label_contract(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Verify the platform-resolved label contract inside the isolated runner."""
+
+    raw = manifest.get("model_label_contract")
+    if raw is None:
+        return legacy_model_label_contract()
+    if not isinstance(raw, dict):
+        raise ValueError("model label contract must be an object")
+    expected_sha256 = str(manifest.get("model_label_contract_sha256") or "").lower()
+    if len(expected_sha256) != 64 or canonical_sha256(raw) != expected_sha256:
+        raise ValueError("model label contract digest is invalid")
+    if raw.get("contract_version") != MODEL_LABEL_CONTRACT_VERSION:
+        raise ValueError("model label contract version is invalid")
+    if raw.get("legacy") is True:
+        expected = legacy_model_label_contract()
+        expected["research_window_contract_sha256"] = raw.get(
+            "research_window_contract_sha256"
+        )
+        if raw != expected:
+            raise ValueError("legacy model label contract changed historical behavior")
+        return dict(raw)
+    window = manifest.get("research_window_contract")
+    window_sha256 = str(manifest.get("research_window_contract_sha256") or "").lower()
+    if (
+        not isinstance(window, dict)
+        or window.get("contract_version") != "research-window-v1"
+        or len(window_sha256) != 64
+        or canonical_sha256(window) != window_sha256
+        or raw.get("research_window_contract_sha256") != window_sha256
+    ):
+        raise ValueError("active model label contract has no valid research window")
+    if window.get("label_maturity_enforced") is not True:
+        raise ValueError("active model labels require enforced maturity")
+    try:
+        allowed = [int(item) for item in window["label_horizons_sessions"]]
+        selected = int(raw["label_horizon_sessions"])
+        reference_offset = int(raw["label_reference_offset_sessions"])
+        purge = int(raw["purge_sessions"])
+        embargo = int(raw["embargo_sessions"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("active model label contract is incomplete") from exc
+    if raw.get("allowed_label_horizons_sessions") != allowed or selected not in allowed:
+        raise ValueError("active model label is outside the research window")
+    expected_expression = f"Ref($close,-{selected + 1})/Ref($close,-1)-1"
+    if reference_offset != selected + 1 or raw.get("label_expression") != expected_expression:
+        raise ValueError("active model label expression is inconsistent")
+    if (
+        purge != int(window.get("purge_sessions") or 0)
+        or embargo != int(window.get("embargo_sessions") or 0)
+        or purge < reference_offset
+        or embargo < reference_offset
+    ):
+        raise ValueError("active model label isolation is inconsistent")
+    if raw.get("horizon_profile") != window.get("horizon_profile"):
+        raise ValueError("active model label horizon profile is inconsistent")
+    return dict(raw)
 
 
 def checkpoint_filename(model_engine: str) -> str:
@@ -123,6 +206,17 @@ def main() -> None:
         raise ValueError("Ridge and LightGBM are restricted to the tabular lane")
     if model_engine in {"platform_gru", "platform_transformer"} and model_type != "TimeSeries":
         raise ValueError("GRU and Transformer are restricted to the sequence lane")
+    label_contract = resolve_manifest_label_contract(manifest)
+    label_expression = str(label_contract["label_expression"])
+    label_purge_sessions = int(label_contract["purge_sessions"])
+    label_embargo_sessions = int(label_contract["embargo_sessions"])
+    data_contract_version = (
+        MODEL_DATA_CONTRACT_VERSION
+        if label_contract["legacy"] is True
+        else HORIZON_MODEL_DATA_CONTRACT_VERSION
+    )
+    if resource_policy.get("data_contract_version") != data_contract_version:
+        raise ValueError("model resource policy changed the label data contract")
     features = manifest["feature_set"]["features"]
     if not isinstance(features, dict) or not 1 <= len(features) <= 512:
         raise ValueError("governed feature set is invalid")
@@ -142,12 +236,12 @@ def main() -> None:
         )
     except KeyError as exc:
         raise ValueError("model periods are outside the governed trading calendar") from exc
-    if train_valid_gap < MODEL_LABEL_HORIZON_TRADING_DAYS:
+    if train_valid_gap < label_purge_sessions:
         raise ValueError(
             "model train/validation boundary does not purge the forward label horizon"
         )
     fit_valid_end_position = (
-        positions[periods["valid_end"]] - MODEL_LABEL_HORIZON_TRADING_DAYS
+        positions[periods["valid_end"]] - label_purge_sessions
     )
     if fit_valid_end_position < positions[periods["valid_start"]]:
         raise ValueError("model validation window is shorter than its label purge")
@@ -156,7 +250,7 @@ def main() -> None:
         valid_test_gap = (
             positions[periods["test_start"]] - positions[periods["valid_end"]] - 1
         )
-        if valid_test_gap < MODEL_FINAL_OOS_EMBARGO_TRADING_DAYS:
+        if valid_test_gap < label_embargo_sessions:
             raise ValueError("model validation/final-OOS embargo is too short")
     prediction_segment = str(manifest.get("prediction_segment") or "valid")
     if prediction_segment not in {"valid", "test"}:
@@ -191,7 +285,6 @@ def main() -> None:
     from qlib.contrib.model.pytorch_general_nn import GeneralPTNN
     from qlib.data.dataset import DatasetH, TSDatasetH
     from qlib.data.dataset.handler import DataHandlerLP
-    from qlib.workflow import R
     from qlib.workflow.record_temp import PortAnaRecord
 
     seed = int(manifest["seed"])
@@ -233,7 +326,7 @@ def main() -> None:
         "kwargs": {
             "config": {
                 "feature": [expressions, names],
-                "label": [["Ref($close, -2)/Ref($close, -1)-1"], ["LABEL0"]],
+                "label": [[label_expression], ["LABEL0"]],
             }
         },
     }
@@ -289,7 +382,7 @@ def main() -> None:
         "test": (prediction_start, prediction_end),
     }
     model_data_contract = {
-        "contract_version": MODEL_DATA_CONTRACT_VERSION,
+        "contract_version": data_contract_version,
         "feature_normalization": {
             "class": "RobustZScoreNorm",
             "fit_start_time": periods["train_start"],
@@ -297,13 +390,26 @@ def main() -> None:
             "clip_outlier": True,
         },
         "missing_values": {"class": "Fillna", "value": 0.0},
-        "label": "Ref($close,-2)/Ref($close,-1)-1",
+        "label": label_expression,
         "label_normalization": "CSZScoreNorm",
-        "train_validation_label_purge_sessions": MODEL_LABEL_HORIZON_TRADING_DAYS,
-        "validation_final_oos_embargo_sessions": MODEL_FINAL_OOS_EMBARGO_TRADING_DAYS,
+        "train_validation_label_purge_sessions": label_purge_sessions,
+        "validation_final_oos_embargo_sessions": label_embargo_sessions,
         "sequence_length": 20 if model_type == "TimeSeries" else None,
         "universe": manifest.get("universe", "cn_all"),
     }
+    if label_contract["legacy"] is not True:
+        model_data_contract.update(
+            {
+                "label_horizon_sessions": label_contract["label_horizon_sessions"],
+                "label_reference_offset_sessions": label_contract[
+                    "label_reference_offset_sessions"
+                ],
+                "research_window_contract_sha256": label_contract[
+                    "research_window_contract_sha256"
+                ],
+                "model_label_contract_sha256": canonical_sha256(label_contract),
+            }
+        )
     model_data_contract_sha256 = canonical_sha256(model_data_contract)
     expected_data_contract_sha256 = str(
         manifest.get("model_data_contract_sha256") or ""
@@ -445,6 +551,11 @@ def main() -> None:
         raise ValueError("model engine is not governed")
     output = Path("/work/output")
     output.mkdir(parents=True, exist_ok=True)
+    workflow_root = output / "qlib-workflow"
+    workflow_artifact_root = workflow_root / "artifacts"
+    workflow_artifact_root.mkdir(parents=True, exist_ok=True)
+    os.environ["_MLFLOW_SERVER_ARTIFACT_ROOT"] = str(workflow_artifact_root)
+    os.environ.pop("MLFLOW_TRACKING_URI", None)
     checkpoint_format = MODEL_CHECKPOINT_FORMATS[model_engine]
     if inference_only:
         checkpoint = _require_inference_checkpoint(manifest, model_engine=model_engine)
@@ -557,9 +668,16 @@ def main() -> None:
             "close_cost": float(manifest.get("close_cost", 0.0015)),
             "min_cost": float(manifest.get("min_cost", 5.0)),
         }
-        with R.start(experiment_name="quantlab-independent-model"):
-            recorder = R.get_recorder()
-            recorder.log_params(**{"candidate_id": manifest["candidate_id"], "seed": seed})
+        with qlib_workflow_run(
+            run_kind="independent-model",
+            run_id=f"{manifest['candidate_id']}-seed-{seed}",
+            tracking_uri=qlib_workflow_tracking_uri(),
+            dataset_identity_sha256=str(manifest["dataset_identity_sha256"]),
+        ) as workflow:
+            recorder = workflow.get_recorder()
+            workflow.log_params(
+                {"candidate_id": manifest["candidate_id"], "seed": seed}
+            )
             record = PortAnaRecord(
                 recorder,
                 config={
@@ -584,6 +702,7 @@ def main() -> None:
             )
             record.generate()
             report = recorder.load_object("portfolio_analysis/report_normal_1day.pkl")
+            workflow_identity = workflow.identity_dict()
         excess = report["return"] - report["bench"] - report["cost"]
         risk = risk_analysis(excess, freq="day")["risk"]
         metrics = {
@@ -612,6 +731,8 @@ def main() -> None:
         "resource_policy": resource_policy,
         "model_data_contract": model_data_contract,
         "model_data_contract_sha256": model_data_contract_sha256,
+        "model_label_contract": label_contract,
+        "model_label_contract_sha256": canonical_sha256(label_contract),
         "metrics": metrics,
         "periods": periods,
         "prediction_segment": prediction_segment,
@@ -628,6 +749,11 @@ def main() -> None:
         "checkpoint_reused": inference_only,
         "feature_set_definition_sha256": manifest["feature_set"]["definition_sha256"],
         "dataset_identity_sha256": manifest["dataset_identity_sha256"],
+        **(
+            {"qlib_workflow": workflow_identity}
+            if not inference_only and not live_retrain
+            else {}
+        ),
         "final_oos_opened": bool(manifest.get("final_oos_opened")),
     }
     if not inference_only and not live_retrain:

@@ -2,6 +2,8 @@
 
 Six versioned policies plan how one final account target is released:
 
+- ``daily_open``: the next trading session's open for end-of-day strategies.
+  It produces one explicit 09:30 slot and never presents daily data as TWAP/VWAP.
 - ``next_bar_baseline`` / ``twap_execution`` / ``vwap_execution``: intraday
   slicing via :func:`build_execution_slices`.
 - ``participation_capped_slicing``: explicit volume-participation policy via
@@ -41,6 +43,7 @@ PRICE_TICK = 0.01
 
 # Canonical design-draft 6.5 policy ids per internal algorithm name.
 EXECUTION_POLICY_IDS = {
+    "open": "daily_open",
     "next_bar": "next_bar_baseline",
     "twap": "twap_execution",
     "vwap": "vwap_execution",
@@ -49,6 +52,7 @@ EXECUTION_POLICY_IDS = {
     "multi_day_transition": "multi_day_transition",
 }
 _POLICY_ID_ALIASES = {
+    "daily_open": "open",
     "next_bar_baseline": "next_bar",
     "twap_execution": "twap",
     "vwap_execution": "vwap",
@@ -81,10 +85,16 @@ def normalize_execution_policy(config: dict[str, Any] | None = None) -> dict[str
     if slot_volumes is not None:
         _validate_slot_volumes(slot_volumes)
     execution_frequency = str(
-        raw.get("execution_frequency") or raw.get("frequency") or "5min"
+        raw.get("execution_frequency")
+        or raw.get("frequency")
+        or ("day" if algorithm == "open" else "5min")
     ).strip()
-    if execution_frequency not in {"1min", "5min"}:
-        raise ValueError("execution_frequency must be 1min or 5min")
+    if execution_frequency not in {"day", "1min", "5min"}:
+        raise ValueError("execution_frequency must be day, 1min, or 5min")
+    if algorithm == "open" and execution_frequency != "day":
+        raise ValueError("daily-open execution requires day frequency")
+    if algorithm != "open" and execution_frequency == "day":
+        raise ValueError("day frequency is only supported by daily-open execution")
     # wait_cancel_replace knobs: check cadence reuses execution_frequency.
     wait_checks = int(raw.get("wait_checks", 6))
     if not 1 <= wait_checks <= 64:
@@ -182,7 +192,7 @@ def build_execution_slices(
 ) -> list[dict[str, Any]]:
     normalized = normalize_execution_policy(policy)
     algorithm = str(normalized["execution_algorithm"])
-    if algorithm not in {"next_bar", "twap", "vwap"}:
+    if algorithm not in {"open", "next_bar", "twap", "vwap"}:
         raise ValueError(
             f"{algorithm} is planned via its dedicated planner "
             "(plan_participation_capped_slices / plan_wait_cancel_replace / "
@@ -196,7 +206,10 @@ def build_execution_slices(
         instrument=instrument,
     )
 
-    if algorithm == "next_bar":
+    if algorithm == "open":
+        slots = [datetime.combine(trade_date, time(9, 30), ASHARE_TIMEZONE)]
+        weights = [1.0]
+    elif algorithm == "next_bar":
         slots = [
             _next_bar_slot(
                 trade_date,
@@ -270,6 +283,8 @@ def execution_time_slots(
         ]
     if algorithm in {"wait_cancel_replace", "multi_day_transition"}:
         raise ValueError(f"{algorithm} has no single-day intraday slot schedule")
+    if algorithm == "open":
+        return [datetime.combine(trade_date, time(9, 30), ASHARE_TIMEZONE)]
     if algorithm == "next_bar":
         return [
             _next_bar_slot(

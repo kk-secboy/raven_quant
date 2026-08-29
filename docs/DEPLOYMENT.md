@@ -115,7 +115,8 @@ docker compose --env-file deploy\.env -f deploy\compose.yaml logs -f api schedul
 
 ## 6. 备份与恢复
 
-协调备份会在确认持久任务空闲后保存 PostgreSQL 和数据卷，并保留最新 14 份：
+手工完整备份仍使用 v1：它会协调停止写入服务，保存 PostgreSQL 和完整数据卷，适合
+离线迁移及恢复演练：
 
 ```powershell
 .\scripts\backup.ps1 -BackupRoot E:\quantlab-backups -RetentionCount 14
@@ -124,8 +125,26 @@ docker compose --env-file deploy\.env -f deploy\compose.yaml logs -f api schedul
 Linux：
 
 ```bash
-python scripts/backup.py --backup-root /opt/quantlab-backups --retention-count 14
+python scripts/backup.py \
+  --backup-root /opt/quantlab-backups \
+  --retention-count 14 \
+  --format-version 1
 ```
+
+生产每日定时备份使用 v2 控制面格式，只保存 PostgreSQL custom dump、脱敏部署配置和
+不可变数据 manifest 清单；它明确不复制或恢复 `/data`。首次安装或发布 systemd 单元后，
+以 root 从当前受控 release 执行：
+
+```bash
+sh /opt/quantlab/scripts/install_backup_service.sh /opt/quantlab
+```
+
+安装器创建稳定的 `/opt/quantlab-ops/venv`，按
+`deploy/backup-ops-requirements.txt` 安装固定依赖，并启用持久 timer。定时任务使用专用
+`backup_preflight.py`，只检查部署配置、Compose/PostgreSQL、备份目录边界、数据库大小及
+10 GiB 保留空间；它不依赖业务 readiness、策略是否已进入 paper 或 release 根盘的
+20 GiB 门槛。v2 恢复只替换数据库，现有 `/data` 保持原样；不可变数据必须由独立存储
+和 manifest 清单另行保障。
 
 将完成的备份目录复制到独立存储，并单独保存正确的 `PLATFORM_SECRET_KEY`。恢复属于
 破坏性操作，必须显式确认；工具在停止写入服务前验证清单、校验和与密钥指纹：
@@ -163,9 +182,41 @@ python scripts/restore.py \
 受支持的升级工具；它会构建镜像、协调备份、迁移、健康检查，并在失败时恢复之前的
 数据和镜像：
 
+若预检报告旧容器来自多个 release/config 合同，不得删除卷、换 Compose project name
+或直接覆盖数据库来“重跑”。先从待发布候选代码调用基线收敛器，但显式指向当前
+`/opt/quantlab` 的受保护配置。第一次只做 dry-run；只有队列为空、回滚配置等价检查
+通过时，才执行确认收敛：
+
+```bash
+CURRENT=$(readlink -f /opt/quantlab)
+PY=/opt/quantlab-ops/venv/bin/python
+
+$PY scripts/canonicalize_release_baseline.py \
+  --project-name quantlab-platform \
+  --env-file "$CURRENT/deploy/.env" \
+  --compose-file "$CURRENT/deploy/compose.yaml" \
+  --receipt-root /opt/quantlab-backups/canonical-baselines \
+  --release-id canonical-pre-upgrade \
+  --wait-timeout 900
+
+$PY scripts/canonicalize_release_baseline.py \
+  --project-name quantlab-platform \
+  --env-file "$CURRENT/deploy/.env" \
+  --compose-file "$CURRENT/deploy/compose.yaml" \
+  --receipt-root /opt/quantlab-backups/canonical-baselines \
+  --release-id canonical-pre-upgrade \
+  --wait-timeout 900 \
+  --confirm-convergence
+```
+
+收敛只按当前镜像重建无状态服务并留下回滚 receipt；它不迁移 PostgreSQL、不覆盖
+`/data`、不清安全模式。随后把当前 `.env` 以 `0600` 权限复制进由正式提交生成的
+不可变候选 release，再执行候选的预检、备份预检和升级。
+
 ```powershell
 .\.venv\Scripts\python.exe scripts\release_upgrade.py `
   --backup-root E:\quantlab-backups `
+  --stable-release-link /opt/quantlab `
   --confirm-upgrade
 ```
 
@@ -176,8 +227,10 @@ python scripts/restore.py \
 ```
 
 不要对已有安装直接运行无预检的 `docker compose up --build`，也不要通过删除卷、
-回退 Alembic 版本或覆盖数据库来制造“成功”。自动回滚失败时保持服务停止，保存日志
-和预检报告，再从已验证备份恢复。
+`docker compose down -v`、更换 production project name、回退 Alembic 版本或覆盖数据库
+来制造“成功”。正式升级不得使用 `--pull`、`--reuse-backup` 或 `--skip-stable-link`。
+自动回滚失败时保持服务停止，保存日志和预检报告，再从已验证备份恢复。成功验收后
+才由工具原子切换 `/opt/quantlab`；旧 release 和回滚镜像先保留，不再运行但也不立即删除。
 
 ## 8. 常见排障
 

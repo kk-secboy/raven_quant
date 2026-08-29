@@ -1609,7 +1609,14 @@ def _value_positions(
             )
     return {
         "market_value": market_value,
-        "market_date": min(market_dates) if market_dates else None,
+        # A fully cash account is still valued on this trading session.  This
+        # lets an explicit empty target produce a certified daily decision/NAV
+        # while a non-empty but unpriced position remains fail-closed below.
+        "market_date": (
+            min(market_dates)
+            if market_dates
+            else (trade_date if not state else None)
+        ),
         "has_stale_prices": stale,
         "events": events,
     }

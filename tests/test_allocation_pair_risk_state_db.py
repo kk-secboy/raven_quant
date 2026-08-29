@@ -24,7 +24,7 @@ from quant_platform.pair_trading import PairTradingConfig
 from quant_platform.strategy_store import StrategyStore
 
 
-def test_pair_member_reads_allocation_reduction_and_liquidation_state(
+def test_pair_member_risk_state_is_readable_but_cannot_reactivate(
     database_url: str,
     tmp_path: Path,
 ) -> None:
@@ -150,10 +150,11 @@ def test_pair_member_reads_allocation_reduction_and_liquidation_state(
         "allocation_ids_requiring_reactivation"
     ] == [allocation_id]
 
-    allocations.set_status(allocation_id, "active", actor="allocation-risk-owner")
+    with pytest.raises(ValueError, match="pair allocations are retired"):
+        allocations.set_status(allocation_id, "active", actor="allocation-risk-owner")
     assert allocations.strategy_risk_state(version_id)[
         "risk_exposure_override"
-    ] == 1.0
+    ] == pytest.approx(0.5)
 
     with engine.begin() as connection:
         connection.execute(
@@ -196,8 +197,9 @@ def test_pair_member_reads_allocation_reduction_and_liquidation_state(
     assert allocations.strategy_risk_state(version_id)[
         "risk_exposure_override"
     ] == 0.0
-    allocations.set_status(allocation_id, "active", actor="allocation-risk-owner")
-    restored = allocations.strategy_risk_state(version_id)
-    assert restored["state"] == "active"
-    assert restored["allow_new_risk"] is True
-    assert restored["risk_exposure_override"] == 1.0
+    with pytest.raises(ValueError, match="pair allocations are retired"):
+        allocations.set_status(allocation_id, "active", actor="allocation-risk-owner")
+    retired = allocations.strategy_risk_state(version_id)
+    assert retired["state"] == "liquidation"
+    assert retired["allow_new_risk"] is False
+    assert retired["risk_exposure_override"] == 0.0

@@ -144,7 +144,7 @@ def verify_downloads(
     missing_planned_datasets = sorted(effective_required - observed_datasets)
     if missing_planned_datasets:
         errors.append(
-            "required snapshot datasets have no active release-window plan: "
+            "required snapshot datasets have no active plan in the release window: "
             + ", ".join(missing_planned_datasets)
         )
 

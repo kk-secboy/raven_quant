@@ -5,33 +5,42 @@ import json
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
-from governance_fixtures import DATASET_IDENTITY, create_strategy_version
+from governance_fixtures import (
+    DATASET_IDENTITY,
+    create_strategy_version,
+    enable_recommendation_authority_for_test,
+    governed_etf_ready_evidence,
+    write_governed_daily_qlib_dataset,
+)
 from qlib_test_doubles import qlib_workflow_identity
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import insert, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from quant_data.database import (
     backtest_runs,
-    recommendation_snapshots,
     simulation_batches,
     simulation_nav,
-    simulation_orders,
     simulation_portfolios,
+    strategy_promotion_stages,
     strategy_versions,
 )
 from quant_data.execution_contract import (
+    DAILY_QLIB_FIELD_CONTRACT_VERSION,
     MINUTE_EXECUTION_CONTRACT_VERSION,
     MINUTE_SOURCE_UNIT_CONTRACTS,
 )
 from quant_platform.api import create_app
 from quant_platform.cost_model import COST_SCHEDULE_VERSION
 from quant_platform.pair_trading import PairTradingConfig
+from quant_platform.paper_policy_state import seal_paper_policy_state
 from quant_platform.portfolio_policy import POLICY_VERSION
+from quant_platform.promotion import PromotionStore
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.recommendation_store import RecommendationStore
 from quant_platform.simulation_store import SimulationStore
@@ -108,18 +117,25 @@ def test_forward_batch_binds_immutable_daily_and_execution_descendants(
 def _daily_dataset() -> dict:
     return {
         "name": "snapshot",
+        "start_date": "2008-01-01",
+        "end_date": "2026-08-31",
         "provenance": {
             "frequency": "day",
             "dataset_identity_sha256": DATASET_IDENTITY,
             "dataset_lineage_id": "b" * 64,
             "source_lineage_id": SOURCE_LINEAGE,
-            "field_contract_version": "daily-qlib-field-v3-cny-amount",
+            "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
             "source_volume_unit": "hand",
             "qlib_volume_unit": "share",
             "source_amount_unit": "thousand_cny",
             "qlib_amount_unit": "cny",
             "source_hand_size": 100,
             "index_volume_policy": "excluded_non_tradable_benchmark",
+            "governed_etf_whitelist": governed_etf_ready_evidence(),
+            "execution_controls": {
+                "formal_execution_requires_native_controls": True,
+                "native_complete_from": "2008-01-01",
+            },
             "lineage_verified": True,
         },
     }
@@ -172,7 +188,10 @@ def _benchmark_evidence(
     payload = {
         "contract_version": "simulation-benchmark-evidence-v1",
         "instrument": "SH000300",
-        "baseline_date": "2026-07-10",
+        # This fixture uses create_order_plan_batch without an explicit signal
+        # date, so the immutable batch contract binds the signal baseline to
+        # TRADE_DATE.  Benchmark evidence must match that persisted identity.
+        "baseline_date": TRADE_DATE.isoformat(),
         "baseline_close": baseline_close,
         "trade_date": TRADE_DATE.isoformat(),
         "close": close,
@@ -208,33 +227,21 @@ def _bars() -> pd.DataFrame:
     )
 
 
-def _create_batch(database_url: str, tmp_path) -> tuple[SimulationStore, dict, dict]:
-    version_id = create_strategy_version(
+def _create_batch(
+    database_url: str,
+    tmp_path,
+    *,
+    signal_date: date | None = None,
+) -> tuple[SimulationStore, dict, dict]:
+    version_id = _approved_source_version(
         database_url,
         tmp_path,
-        config_overrides={
-            "execution_frequency": "5min",
-            "execution_method": "twap",
-        },
-    )
-    recommendations = RecommendationStore(database_url)
-    with recommendations.engine.begin() as connection:
-        connection.execute(
-            update(strategy_versions)
-            .where(strategy_versions.c.id == version_id)
-            .values(status="approved")
-        )
-    recommendation = recommendations.create(
-        name="simulation target",
-        strategy_version_id=version_id,
-        dataset="snapshot",
-        hypothetical_initial_value=1_000_000,
-        actor="test",
     )
     simulation_store = SimulationStore(database_url)
     simulation = simulation_store.create(
         name="transactional simulation",
-        recommendation_portfolio_id=recommendation["id"],
+        source_type="strategy_version",
+        source_id=version_id,
         daily_dataset=_daily_dataset(),
         execution_dataset=_execution_dataset(),
         initial_cash=1_000_000,
@@ -243,43 +250,35 @@ def _create_batch(database_url: str, tmp_path) -> tuple[SimulationStore, dict, d
         actor="test",
     )
     simulation_store.set_status(simulation["id"], "active")
-    snapshot, _ = recommendations.create_snapshot(
-        portfolio_id=recommendation["id"],
-        as_of_date=date(2026, 7, 10),
-        dataset="snapshot",
-        dataset_identity_sha256=DATASET_IDENTITY,
+    batch, created = simulation_store.create_order_plan_batch(
+        simulation["id"],
+        trade_date=TRADE_DATE,
+        actions=_default_order_plan_actions(),
+        target_version="fixture-target-v1",
+        actor="test",
+        signal_date=signal_date,
     )
-    recommendations.apply_result(
-        snapshot["id"],
-        {
-            "status": "ok",
-            "portfolio_id": recommendation["id"],
-            "strategy_version_id": version_id,
-            "dataset": "snapshot",
-            "dataset_identity_sha256": DATASET_IDENTITY,
-            "as_of_date": "2026-07-10",
-            "effective_date": TRADE_DATE.isoformat(),
-            "policy_version": POLICY_VERSION,
-            "backtest_engine_version": QLIB_ENGINE_VERSION,
-            "cost_model": snapshot["cost_model"],
-            "cash_weight": 0.999,
-            "reference_prices": {"SH600000": 10.0},
-            "holdings": [
-                {
-                    "instrument": "SH600000",
-                    "weight": 0.001,
-                    "previous_weight": 0.0,
-                    "weight_change": 0.001,
-                    "action": "increase",
-                    "reason": "governed target",
-                }
-            ],
-        },
-    )
-    batch, created = simulation_store.create_batch_for_snapshot(snapshot["id"])
     assert created is True
     assert batch is not None
     return simulation_store, simulation, batch
+
+
+def _default_order_plan_actions() -> list[dict]:
+    return [
+        {
+            "instrument": "SH600000",
+            "action": "BUY",
+            "order_plan": [
+                {
+                    "op": "new",
+                    "instrument": "SH600000",
+                    "side": "buy",
+                    "quantity": 100,
+                    "limit_price": 10.0,
+                }
+            ],
+        }
+    ]
 
 
 def _approved_source_version(
@@ -336,6 +335,173 @@ def _approved_source_version(
     return version_id
 
 
+def _create_pinned_paper_simulation(
+    database_url: str,
+    tmp_path,
+    *,
+    frequency: str = "5min",
+    config_overrides: dict | None = None,
+    initial_cash: float = 1_000_000,
+) -> tuple[str, SimulationStore, dict, dict]:
+    """Create a genuine gated paper lane while keeping its test datasets pinned.
+
+    Production paper accounts normally roll to verified descendants.  These
+    simulation mechanics tests deliberately pin tiny immutable descriptors, but
+    still exercise the same forward gate, isolated promotion stage, and account
+    ownership required by the Qlib order-plan ingestion path.
+    """
+
+    version_id = _approved_source_version(
+        database_url,
+        tmp_path,
+        frequency=frequency,
+        config_overrides=config_overrides,
+    )
+    promotion = PromotionStore(database_url)
+    with promotion.engine.begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id == version_id)
+            .values(promotion_stage="paper")
+        )
+    stage = promotion.prepare_paper_stage(version_id, actor="test-forward-gate")
+    opened_at = datetime.fromisoformat("2026-07-01T00:00:00+00:00")
+    with promotion.engine.begin() as connection:
+        connection.execute(
+            update(strategy_promotion_stages)
+            .where(strategy_promotion_stages.c.id == stage["id"])
+            .values(opened_at=opened_at)
+        )
+
+    store = SimulationStore(database_url)
+    simulation = store.create(
+        name=f"pinned paper {version_id[:8]}",
+        source_type="strategy_version",
+        source_id=version_id,
+        promotion_stage_id=stage["id"],
+        daily_dataset=_daily_dataset(),
+        execution_dataset=_execution_dataset(frequency),
+        initial_cash=initial_cash,
+        execution_policy={},
+        cost_schedule_version=COST_SCHEDULE_VERSION,
+        actor="test-forward-gate",
+    )
+    with store.engine.begin() as connection:
+        attached = connection.execute(
+            update(strategy_promotion_stages)
+            .where(
+                strategy_promotion_stages.c.id == stage["id"],
+                strategy_promotion_stages.c.status == "awaiting_simulation",
+                strategy_promotion_stages.c.simulation_portfolio_id.is_(None),
+            )
+            .values(
+                simulation_portfolio_id=simulation["id"],
+                status="active",
+                source_contract_hash=simulation["execution_contract_hash"],
+                initial_cash=initial_cash,
+            )
+        )
+        assert attached.rowcount == 1
+        connection.execute(
+            update(simulation_portfolios)
+            .where(simulation_portfolios.c.id == simulation["id"])
+            .values(status="active")
+        )
+    return (
+        version_id,
+        store,
+        store.get(simulation["id"]),
+        {
+            **stage,
+            "opened_at": opened_at.isoformat(),
+            "status": "active",
+            "simulation_portfolio_id": simulation["id"],
+        },
+    )
+
+
+def _create_recommendation_batch(
+    database_url: str, tmp_path
+) -> tuple[SimulationStore, dict, dict, Path]:
+    """Create one legal short-horizon daily recommendation account and batch."""
+
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        recipe_id="short_relative_strength",
+    )
+    recommendations = RecommendationStore(database_url)
+    with recommendations.engine.begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id == version_id)
+            .values(status="approved")
+        )
+    enable_recommendation_authority_for_test(database_url, [version_id])
+    recommendation = recommendations.create(
+        name="daily simulation target",
+        strategy_version_id=version_id,
+        dataset="snapshot",
+        hypothetical_initial_value=1_000_000,
+        actor="test",
+    )
+    simulation_store = SimulationStore(database_url)
+    simulation = simulation_store.create(
+        name="daily recommendation simulation",
+        recommendation_portfolio_id=recommendation["id"],
+        daily_dataset=_daily_dataset(),
+        execution_dataset=_daily_dataset(),
+        initial_cash=1_000_000,
+        execution_policy={"execution_algorithm": "open"},
+        cost_schedule_version=COST_SCHEDULE_VERSION,
+        actor="test",
+    )
+    simulation_store.set_status(simulation["id"], "active")
+    snapshot, _ = recommendations.create_snapshot(
+        portfolio_id=recommendation["id"],
+        as_of_date=date(2026, 7, 10),
+        dataset="snapshot",
+        dataset_identity_sha256=DATASET_IDENTITY,
+    )
+    recommendations.apply_result(
+        snapshot["id"],
+        {
+            "status": "ok",
+            "portfolio_id": recommendation["id"],
+            "strategy_version_id": version_id,
+            "dataset": "snapshot",
+            "dataset_identity_sha256": DATASET_IDENTITY,
+            "as_of_date": "2026-07-10",
+            "effective_date": TRADE_DATE.isoformat(),
+            "policy_version": POLICY_VERSION,
+            "backtest_engine_version": QLIB_ENGINE_VERSION,
+            "cost_model": snapshot["cost_model"],
+            "cash_weight": 0.999,
+            "reference_prices": {"SH600000": 10.0},
+            "holdings": [
+                {
+                    "instrument": "SH600000",
+                    "weight": 0.001,
+                    "previous_weight": 0.0,
+                    "weight_change": 0.001,
+                    "action": "increase",
+                    "reason": "governed target",
+                }
+            ],
+        },
+    )
+    data_root = write_governed_daily_qlib_dataset(
+        tmp_path / "daily-recommendation-data",
+        sessions=[date(2026, 7, 10), TRADE_DATE, date(2026, 7, 14)],
+    )
+    batch, created = simulation_store.create_batch_for_snapshot(
+        snapshot["id"], data_root=data_root
+    )
+    assert created is True
+    assert batch is not None
+    return simulation_store, simulation, batch, data_root
+
+
 def _write_qlib_order_plan(
     tmp_path,
     *,
@@ -346,13 +512,37 @@ def _write_qlib_order_plan(
     trade_date: date = TRADE_DATE,
     signal_at: datetime | None = None,
     execution_not_before: datetime | None = None,
+    promotion_stage: dict | None = None,
 ) -> str:
+    prior_signal_date = (
+        pd.Timestamp(signal_date) - pd.offsets.BusinessDay(1)
+    ).date()
+    write_governed_daily_qlib_dataset(
+        tmp_path / "data",
+        sessions=[prior_signal_date, signal_date],
+    )
     normalized_weights = dict(
         sorted((target_weights or {"SH600000": 0.001}).items())
     )
-    targets = {"target_weights": normalized_weights}
+    normalized_targets = {"target_weights": normalized_weights}
+    targets = {
+        **normalized_targets,
+        "paper_policy_state": seal_paper_policy_state(
+            {
+                "take_profit_stages": {},
+                "holding_age_sessions": {},
+                "execution": {},
+            }
+        ),
+    }
     target_bytes = json.dumps(
         targets, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    normalized_target_bytes = json.dumps(
+        normalized_targets,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
     ).encode()
     manifest = {
         "format_version": "qlib-order-plan-v1",
@@ -370,9 +560,12 @@ def _write_qlib_order_plan(
             "dataset_lineage_id": "b" * 64,
         },
         "target_weights_file_sha256": hashlib.sha256(target_bytes).hexdigest(),
-        "target_weights_sha256": hashlib.sha256(target_bytes).hexdigest(),
+        "target_weights_sha256": hashlib.sha256(normalized_target_bytes).hexdigest(),
         "qlib_workflow": qlib_workflow_identity(),
     }
+    if promotion_stage is not None:
+        manifest["promotion_stage_id"] = str(promotion_stage["id"])
+        manifest["promotion_stage_opened_at"] = str(promotion_stage["opened_at"])
     if signal_at is not None or execution_not_before is not None:
         manifest["signal_at"] = signal_at.isoformat() if signal_at else None
         manifest["execution_not_before"] = (
@@ -406,7 +599,13 @@ def test_simulation_batch_is_idempotent_and_books_auditable_nav(
     database_url: str, tmp_path
 ) -> None:
     store, simulation, batch = _create_batch(database_url, tmp_path)
-    repeated, created = store.create_batch_for_snapshot(batch["recommendation_snapshot_id"])
+    repeated, created = store.create_order_plan_batch(
+        simulation["id"],
+        trade_date=TRADE_DATE,
+        actions=_default_order_plan_actions(),
+        target_version="fixture-target-v1",
+        actor="test",
+    )
     assert created is False
     assert repeated["id"] == batch["id"]
 
@@ -521,14 +720,14 @@ def test_certified_nav_review_is_four_eyes_and_database_immutable(
     )
     nav = store.rows(simulation["id"], "nav")[0]
     assert nav["nav_scope"] == "member_ledger"
-    assert nav["produced_by"] == "recommendation-worker"
+    assert nav["produced_by"] == batch["created_by"]
     assert nav["reviewed_at"] is None
 
     with pytest.raises(ValueError, match="must differ"):
         store.review_nav(
             simulation["id"],
             TRADE_DATE,
-            actor="recommendation-worker",
+            actor=str(batch["created_by"]),
             evidence_sha256="a" * 64,
             note="Producer cannot approve the NAV that it created.",
         )
@@ -603,22 +802,40 @@ def test_uncertified_nav_cannot_be_reviewed(database_url: str, tmp_path) -> None
 def test_recommendation_snapshot_queues_every_active_simulation_account(
     database_url: str, tmp_path
 ) -> None:
-    store, first, first_batch = _create_batch(database_url, tmp_path)
-    second_execution = _execution_dataset()
-    second_execution["name"] = "snapshot-5min-secondary"
+    store, first, first_batch, data_root = _create_recommendation_batch(
+        database_url, tmp_path
+    )
+    second_execution = _daily_dataset()
+    second_execution["name"] = "snapshot-secondary"
+    second_execution["provenance"] = {
+        **second_execution["provenance"],
+        "dataset_identity_sha256": "c" * 64,
+        "dataset_lineage_id": "d" * 64,
+    }
+    write_governed_daily_qlib_dataset(
+        data_root,
+        sessions=[date(2026, 7, 10), TRADE_DATE, date(2026, 7, 14)],
+        name=second_execution["name"],
+        dataset_identity_sha256=second_execution["provenance"][
+            "dataset_identity_sha256"
+        ],
+        dataset_lineage_id=second_execution["provenance"]["dataset_lineage_id"],
+    )
     second = store.create(
         name="second execution account",
         recommendation_portfolio_id=first["source_id"],
         daily_dataset=_daily_dataset(),
         execution_dataset=second_execution,
         initial_cash=2_000_000,
-        execution_policy={"execution_algorithm": "twap"},
+        execution_policy={"execution_algorithm": "open"},
         cost_schedule_version=COST_SCHEDULE_VERSION,
         actor="test",
     )
     store.set_status(second["id"], "active")
 
-    batches = store.create_batches_for_snapshot(first_batch["recommendation_snapshot_id"])
+    batches = store.create_batches_for_snapshot(
+        first_batch["recommendation_snapshot_id"], data_root=data_root
+    )
 
     assert len(batches) == 2
     assert {item[0]["portfolio_id"] for item in batches} == {first["id"], second["id"]}
@@ -644,7 +861,10 @@ def test_simulation_rejects_mismatched_execution_lineage_before_booking(
             execution_evidence=evidence,
         )
     assert store.get_batch(batch["id"])["status"] == "queued"
-    assert store.rows(simulation["id"], "orders") == []
+    orders = store.rows(simulation["id"], "orders")
+    assert len(orders) == 1
+    assert orders[0]["status"] == "planned"
+    assert store.rows(simulation["id"], "fills") == []
 
 
 def test_simulation_booking_rolls_back_all_ledger_writes_on_nav_conflict(
@@ -680,40 +900,20 @@ def test_simulation_booking_rolls_back_all_ledger_writes_on_nav_conflict(
             ),
         )
     assert store.get_batch(batch["id"])["status"] == "queued"
-    with store.engine.connect() as connection:
-        assert (
-            connection.scalar(
-                select(func.count())
-                .select_from(simulation_orders)
-                .where(simulation_orders.c.batch_id == batch["id"])
-            )
-            == 0
-        )
-        assert (
-            connection.scalar(
-                select(func.count())
-                .select_from(recommendation_snapshots)
-                .where(recommendation_snapshots.c.id == batch["recommendation_snapshot_id"])
-            )
-            == 1
-        )
+    orders = store.rows(simulation["id"], "orders")
+    assert len(orders) == 1
+    assert orders[0]["status"] == "planned"
+    assert orders[0]["filled_quantity"] == 0
+    assert store.rows(simulation["id"], "fills") == []
 
 
 def test_approved_strategy_source_accepts_only_immutable_qlib_order_plans(
     database_url: str, tmp_path
 ) -> None:
-    version_id = _approved_source_version(database_url, tmp_path, frequency="1min")
-    store = SimulationStore(database_url)
-    simulation = store.create(
-        name="approved strategy 1min simulation",
-        source_type="strategy_version",
-        source_id=version_id,
-        daily_dataset=_daily_dataset(),
-        execution_dataset=_execution_dataset("1min"),
-        initial_cash=1_000_000,
-        execution_policy={"execution_algorithm": "twap"},
-        cost_schedule_version=COST_SCHEDULE_VERSION,
-        actor="test",
+    version_id, store, simulation, stage = _create_pinned_paper_simulation(
+        database_url,
+        tmp_path,
+        frequency="1min",
     )
     assert simulation["source_type"] == "strategy_version"
     assert simulation["source_id"] == version_id
@@ -724,11 +924,11 @@ def test_approved_strategy_source_accepts_only_immutable_qlib_order_plans(
                 strategy_versions.c.id == version_id
             )
         )
-    store.set_status(simulation["id"], "active")
     manifest_sha256 = _write_qlib_order_plan(
         tmp_path,
         version_id=version_id,
         execution_contract_hash=simulation["execution_contract_hash"],
+        promotion_stage=stage,
     )
     batch, created = store.create_batch_from_order_plan(
         simulation["id"],
@@ -771,7 +971,7 @@ def test_approved_strategy_source_accepts_only_immutable_qlib_order_plans(
 def test_minute_order_plan_persists_and_executes_the_strict_next_bar(
     database_url: str, tmp_path
 ) -> None:
-    version_id = _approved_source_version(
+    version_id, store, simulation, stage = _create_pinned_paper_simulation(
         database_url,
         tmp_path,
         config_overrides={
@@ -782,19 +982,6 @@ def test_minute_order_plan_persists_and_executes_the_strict_next_bar(
             "rebalance_frequency": "bar",
         },
     )
-    store = SimulationStore(database_url)
-    simulation = store.create(
-        name="strict minute next-bar simulation",
-        source_type="strategy_version",
-        source_id=version_id,
-        daily_dataset=_daily_dataset(),
-        execution_dataset=_execution_dataset(),
-        initial_cash=1_000_000,
-        execution_policy={},
-        cost_schedule_version=COST_SCHEDULE_VERSION,
-        actor="test",
-    )
-    store.set_status(simulation["id"], "active")
     signal_at = datetime.fromisoformat("2026-07-13T10:05:00+08:00")
     next_bar = datetime.fromisoformat("2026-07-13T10:10:00+08:00")
     same_bar_manifest = _write_qlib_order_plan(
@@ -805,6 +992,7 @@ def test_minute_order_plan_persists_and_executes_the_strict_next_bar(
         trade_date=TRADE_DATE,
         signal_at=signal_at,
         execution_not_before=signal_at,
+        promotion_stage=stage,
     )
     with pytest.raises(ValueError, match="same-bar execution is forbidden"):
         store.create_batch_from_order_plan(
@@ -822,6 +1010,7 @@ def test_minute_order_plan_persists_and_executes_the_strict_next_bar(
         trade_date=TRADE_DATE,
         signal_at=signal_at,
         execution_not_before=next_bar,
+        promotion_stage=stage,
     )
     batch, created = store.create_batch_from_order_plan(
         simulation["id"],
@@ -873,24 +1062,15 @@ def test_minute_order_plan_persists_and_executes_the_strict_next_bar(
 def test_long_only_order_plan_and_execution_semantics_fail_closed_on_tampering(
     database_url: str, tmp_path
 ) -> None:
-    version_id = _approved_source_version(database_url, tmp_path)
-    store = SimulationStore(database_url)
-    simulation = store.create(
-        name="tamper guarded strategy simulation",
-        source_type="strategy_version",
-        source_id=version_id,
-        daily_dataset=_daily_dataset(),
-        execution_dataset=_execution_dataset(),
-        initial_cash=1_000_000,
-        execution_policy={},
-        cost_schedule_version=COST_SCHEDULE_VERSION,
-        actor="test",
+    version_id, store, simulation, stage = _create_pinned_paper_simulation(
+        database_url,
+        tmp_path,
     )
-    store.set_status(simulation["id"], "active")
     manifest_sha256 = _write_qlib_order_plan(
         tmp_path,
         version_id=version_id,
         execution_contract_hash=simulation["execution_contract_hash"],
+        promotion_stage=stage,
     )
     batch, _ = store.create_batch_from_order_plan(
         simulation["id"],
@@ -950,7 +1130,7 @@ def test_long_only_order_plan_and_execution_semantics_fail_closed_on_tampering(
 def test_process_batch_uses_full_cost_parameters_from_approved_source_contract(
     database_url: str, tmp_path
 ) -> None:
-    version_id = _approved_source_version(
+    version_id, store, simulation, stage = _create_pinned_paper_simulation(
         database_url,
         tmp_path,
         config_overrides={
@@ -963,24 +1143,12 @@ def test_process_batch_uses_full_cost_parameters_from_approved_source_contract(
             "min_commission": 0.0,
         },
     )
-    store = SimulationStore(database_url)
-    simulation = store.create(
-        name="governed cost strategy simulation",
-        source_type="strategy_version",
-        source_id=version_id,
-        daily_dataset=_daily_dataset(),
-        execution_dataset=_execution_dataset(),
-        initial_cash=1_000_000,
-        execution_policy={},
-        cost_schedule_version=COST_SCHEDULE_VERSION,
-        actor="test",
-    )
     assert simulation["execution_policy"]["cost_model"]["buy_commission_rate"] == 0.01
-    store.set_status(simulation["id"], "active")
     manifest_sha256 = _write_qlib_order_plan(
         tmp_path,
         version_id=version_id,
         execution_contract_hash=simulation["execution_contract_hash"],
+        promotion_stage=stage,
     )
     batch, _ = store.create_batch_from_order_plan(
         simulation["id"],
@@ -1052,20 +1220,14 @@ def test_order_plan_artifact_tampering_is_rejected_before_batch_creation(
 def test_api_queues_qlib_order_plan_generation_without_client_targets(
     database_url: str, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    version_id = _approved_source_version(database_url, tmp_path)
-    store = SimulationStore(database_url)
-    simulation = store.create(
-        name="API order plan generation simulation",
-        source_type="strategy_version",
-        source_id=version_id,
-        daily_dataset=_daily_dataset(),
-        execution_dataset=_execution_dataset(),
-        initial_cash=1_000_000,
-        execution_policy={},
-        cost_schedule_version=COST_SCHEDULE_VERSION,
-        actor="test",
+    _version_id, _store, simulation, _stage = _create_pinned_paper_simulation(
+        database_url,
+        tmp_path,
     )
-    store.set_status(simulation["id"], "active")
+    write_governed_daily_qlib_dataset(
+        tmp_path / "data",
+        sessions=[date(2026, 7, 9), date(2026, 7, 10)],
+    )
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
@@ -1111,8 +1273,7 @@ def test_legacy_or_changed_source_contract_cannot_be_activated(database_url: str
         store.set_status(simulation["id"], "active")
 
 
-def test_pair_simulation_creation_is_persistent_shadow_only(database_url: str, tmp_path) -> None:
-
+def test_pair_simulation_writes_are_retired(database_url: str, tmp_path) -> None:
     strategies = StrategyStore(database_url)
     created = strategies.create_pair(
         name="research only pair simulation",
@@ -1140,28 +1301,25 @@ def test_pair_simulation_creation_is_persistent_shadow_only(database_url: str, t
             .values(status="approved")
         )
     store = SimulationStore(database_url)
-    simulation = store.create(
-        name="research only pair simulation ledger",
-        source_type="strategy_version",
-        source_id=version["id"],
-        daily_dataset=_daily_dataset(),
-        execution_dataset=_execution_dataset("1min"),
-        initial_cash=PairTradingConfig().initial_capital,
-        execution_policy={
-            "execution_algorithm": "vwap",
-            "slice_minutes": 5,
-            "max_slices": 1,
-            "max_participation": 0.01,
-            "volume_profile": [{"time": "10:00", "weight": 1.0}],
-        },
-        cost_schedule_version=COST_SCHEDULE_VERSION,
-        actor="simulation-operator",
-        execution_adapter="pair",
-    )
-    assert simulation["simulation_mode"] == "shadow_pair"
-    assert simulation["synthetic_short_exposure"] is True
-    assert simulation["financing_enabled"] is False
-    assert simulation["real_trading_eligible"] is False
+    with pytest.raises(ValueError, match="pair simulation writes are retired"):
+        store.create(
+            name="research only pair simulation ledger",
+            source_type="strategy_version",
+            source_id=version["id"],
+            daily_dataset=_daily_dataset(),
+            execution_dataset=_execution_dataset("1min"),
+            initial_cash=PairTradingConfig().initial_capital,
+            execution_policy={
+                "execution_algorithm": "vwap",
+                "slice_minutes": 5,
+                "max_slices": 1,
+                "max_participation": 0.01,
+                "volume_profile": [{"time": "10:00", "weight": 1.0}],
+            },
+            cost_schedule_version=COST_SCHEDULE_VERSION,
+            actor="simulation-operator",
+            execution_adapter="pair",
+        )
 
 
 def test_simulation_api_exposes_ledger_and_retires_hypothetical_performance(
@@ -1177,6 +1335,25 @@ def test_simulation_api_exposes_ledger_and_retires_hypothetical_performance(
             simulation["execution_contract_hash"],
             simulation["execution_policy"]["simulation_semantics_sha256"],
         ),
+    )
+    retired_version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        recipe_id="short_relative_strength",
+    )
+    with store.engine.begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id == retired_version_id)
+            .values(status="approved")
+        )
+    enable_recommendation_authority_for_test(database_url, [retired_version_id])
+    retired_portfolio = RecommendationStore(database_url).create(
+        name="retired hypothetical performance fixture",
+        strategy_version_id=retired_version_id,
+        dataset="snapshot",
+        hypothetical_initial_value=1_000_000,
+        actor="test",
     )
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
@@ -1197,7 +1374,7 @@ def test_simulation_api_exposes_ledger_and_retires_hypothetical_performance(
         activated = client.post(f"/api/simulation-portfolios/{simulation['id']}/activate")
         retired = client.get(
             "/api/recommendation-portfolios/"
-            f"{simulation['recommendation_portfolio_id']}/hypothetical-performance"
+            f"{retired_portfolio['id']}/hypothetical-performance"
         )
     assert listed.status_code == 200
     assert listed.json()[0]["id"] == simulation["id"]

@@ -33,6 +33,18 @@ def test_release_upgrade_drill_uses_isolated_sibling_storage() -> None:
     assert 'f"RDAGENT_REGISTRY_HOST_PATH={registry_host_path.resolve()}"' in source
 
 
+def test_deployment_docs_require_mixed_release_convergence_before_upgrade() -> None:
+    root = Path(__file__).resolve().parents[1]
+    deployment = (root / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+
+    assert "scripts/canonicalize_release_baseline.py" in deployment
+    assert "--confirm-convergence" in deployment
+    assert "--stable-release-link /opt/quantlab" in deployment
+    assert "docker compose down -v" in deployment
+    for forbidden_flag in ("--pull", "--reuse-backup", "--skip-stable-link"):
+        assert forbidden_flag in deployment
+
+
 def test_tushare_configuration_is_validated_and_written_atomically(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -191,9 +203,30 @@ def test_systemd_backup_timer_is_persistent_and_fail_closed() -> None:
     timer = (root / "deploy" / "systemd" / "quantlab-backup.timer").read_text(encoding="utf-8")
 
     assert service.index("ExecStartPre=") < service.index("ExecStart=")
-    assert "scripts/release_preflight.py" in service
+    assert "/opt/quantlab-ops/venv/bin/python" in service
+    assert "scripts/backup_preflight.py" in service
+    assert "scripts/release_preflight.py" not in service
     assert "scripts/backup.py" in service
     assert "--retention-count 14" in service
+    assert "--format-version 2" in service
+    assert "--minimum-free-gb 10" in service
     assert "OnCalendar=*-*-* 03:20:00 Asia/Shanghai" in timer
     assert "Persistent=true" in timer
     assert "RandomizedDelaySec=10m" in timer
+
+
+def test_backup_service_has_a_versioned_host_ops_installer() -> None:
+    root = Path(__file__).resolve().parents[1]
+    installer = (root / "scripts" / "install_backup_service.sh").read_text(
+        encoding="utf-8"
+    )
+    requirements = (
+        root / "deploy" / "backup-ops-requirements.txt"
+    ).read_text(encoding="utf-8")
+
+    assert 'ops_root=${QUANTLAB_OPS_ROOT:-/opt/quantlab-ops}' in installer
+    assert '"$python_bin" -m venv "$ops_root/venv"' in installer
+    assert "backup-ops-requirements.txt" in installer
+    assert "systemctl enable --now quantlab-backup.timer" in installer
+    assert "cryptography==" in requirements
+    assert "python-dotenv==" in requirements

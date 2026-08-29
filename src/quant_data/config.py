@@ -82,6 +82,11 @@ class Settings:
     research_cpu_budget: int = 0
     research_memory_budget_gb: int = 0
     scheduler_poll_seconds: float = 15.0
+    # Stamped into every stateless service by one immutable deployment.  The
+    # API compares its values with the scheduler health response so a mixed
+    # release/config rollout cannot be reported business-ready.
+    quantlab_release_id: str = ""
+    quantlab_config_digest: str = ""
     health_snapshot_seconds: int = 300
     data_freshness_max_days: int = 7
     stale_job_hours: int = 6
@@ -211,6 +216,10 @@ class Settings:
                 2048, max(0, int(os.getenv("RESEARCH_MEMORY_BUDGET_GB", "0")))
             ),
             scheduler_poll_seconds=max(1.0, float(os.getenv("SCHEDULER_POLL_SECONDS", "15"))),
+            quantlab_release_id=os.getenv("QUANTLAB_RELEASE_ID", "").strip(),
+            quantlab_config_digest=os.getenv("QUANTLAB_CONFIG_DIGEST", "")
+            .strip()
+            .lower(),
             health_snapshot_seconds=max(60, int(os.getenv("HEALTH_SNAPSHOT_SECONDS", "300"))),
             data_freshness_max_days=max(1, int(os.getenv("DATA_FRESHNESS_MAX_DAYS", "7"))),
             stale_job_hours=max(1, int(os.getenv("STALE_JOB_HOURS", "6"))),

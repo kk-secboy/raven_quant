@@ -42,7 +42,12 @@ from quant_platform.model_research_governance import (
     validate_quant_bundle_evidence,
     verify_model_prediction_artifact,
 )
+from quant_platform.qlib_workflow import (
+    qlib_workflow_run,
+    qlib_workflow_tracking_uri,
+)
 from quant_platform.rdagent_dataset_view import prepare_rdagent_dataset_view
+from quant_platform.research_label_binding import validate_research_label_binding
 
 
 class UnsupportedQuantBaseline(ValueError):
@@ -834,6 +839,11 @@ def _execute_single_model_cell(
         "periods": periods,
         "seed": seed,
         "dataset_identity_sha256": manifest["dataset_identity_sha256"],
+        "research_window_contract": manifest.get("research_window_contract"),
+        "research_window_contract_sha256": manifest.get(
+            "research_window_contract_sha256"
+        ),
+        "label_horizon_sessions": manifest.get("label_horizon_sessions"),
         "universe": manifest.get("universe", "cn_all"),
         "benchmark": manifest.get("benchmark", "SH000300"),
         "account": manifest.get("account", 100_000_000),
@@ -952,17 +962,19 @@ def _evaluate_equal_rank_portfolio(
     import qlib
     from qlib.contrib.evaluate import risk_analysis
     from qlib.data import D
-    from qlib.workflow import R
     from qlib.workflow.record_temp import PortAnaRecord
 
     provider_value = str(view.resolve())
     if _QLIB_PROVIDER != provider_value:
         qlib.init(provider_uri=provider_value, region="cn")
         _QLIB_PROVIDER = provider_value
+    label_horizon_sessions = int(manifest.get("label_horizon_sessions") or 1)
     labels = _normalized_labels(
         D.features(
             instruments=str(manifest.get("universe") or "cn_all"),
-            fields=["Ref($close, -2)/Ref($close, -1)-1"],
+            fields=[
+                f"Ref($close, -{label_horizon_sessions + 1})/Ref($close, -1)-1"
+            ],
             start_time=periods["valid_start"],
             end_time=periods["valid_end"],
             freq="day",
@@ -981,8 +993,13 @@ def _evaluate_equal_rank_portfolio(
         lambda frame: frame["score"].corr(frame["label"], method="spearman"),
         include_groups=False,
     )
-    with R.start(experiment_name=experiment_name):
-        recorder = R.get_recorder()
+    with qlib_workflow_run(
+        run_kind="quant-bundle-portfolio",
+        run_id=experiment_name,
+        tracking_uri=qlib_workflow_tracking_uri(),
+        dataset_identity_sha256=str(manifest["dataset_identity_sha256"]),
+    ) as workflow:
+        recorder = workflow.get_recorder()
         record = PortAnaRecord(
             recorder,
             config={
@@ -1357,6 +1374,33 @@ def main() -> None:
     args = parser.parse_args()
     provider = Path(args.provider_uri).resolve()
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    raw_label_binding = manifest.get("research_label_binding")
+    label_binding = (
+        validate_research_label_binding(raw_label_binding)
+        if raw_label_binding is not None
+        else None
+    )
+    if label_binding is not None:
+        if (
+            manifest.get("research_label_binding_sha256")
+            != label_binding["binding_sha256"]
+            or manifest.get("research_window_contract")
+            != label_binding["research_window_contract"]
+            or manifest.get("research_window_contract_sha256")
+            != label_binding["research_window_contract_sha256"]
+            or manifest.get("dataset_identity_sha256")
+            != label_binding["dataset_identity_sha256"]
+            or manifest.get("periods") != label_binding["periods"]
+            or int(manifest.get("label_horizon_sessions") or 0)
+            != int(label_binding["label_horizon_sessions"])
+            or any(
+                candidate.get("research_label_binding") != label_binding
+                or candidate.get("research_label_binding_sha256")
+                != label_binding["binding_sha256"]
+                for candidate in manifest.get("candidates") or []
+            )
+        ):
+            raise ValueError("quant evaluation label binding changed in transit")
     provenance = json.loads((provider / "metadata" / "provenance.json").read_text(encoding="utf-8"))
     verify_qlib_output_manifest(provider, provenance)
     if provenance.get("dataset_identity_sha256") != manifest.get("dataset_identity_sha256"):
@@ -1477,6 +1521,22 @@ def main() -> None:
                 "contract_version": QUANT_BUNDLE_CONTRACT_VERSION,
                 "id": candidate["id"],
                 "dataset_identity_sha256": manifest["dataset_identity_sha256"],
+                **(
+                    {
+                        "horizon_profile": label_binding["horizon_profile"],
+                        "label_horizon_sessions": label_binding[
+                            "label_horizon_sessions"
+                        ],
+                        "research_label_binding_sha256": label_binding[
+                            "binding_sha256"
+                        ],
+                        "research_window_contract_sha256": label_binding[
+                            "research_window_contract_sha256"
+                        ],
+                    }
+                    if label_binding is not None
+                    else {}
+                ),
                 "feature_set_definition_sha256": feature_set["definition_sha256"],
                 "experiment_family_id": candidate["experiment_family_id"],
                 "baseline_prediction_champion": baseline,
@@ -1785,6 +1845,9 @@ def main() -> None:
         "not_capital_confirmation": True,
         "cross_cycle_fwer_claimed": False,
         "final_oos_opened": False,
+        "research_label_binding_sha256": (
+            label_binding["binding_sha256"] if label_binding is not None else None
+        ),
     }
     receipt["evidence_sha256"] = canonical_sha256(receipt)
     result = {
@@ -1798,6 +1861,16 @@ def main() -> None:
         "final_oos_opened": False,
         "resource_blocked_count": sum(
             item.get("status") == "resource_blocked" for item in evaluations
+        ),
+        **(
+            {
+                "research_label_binding": label_binding,
+                "research_label_binding_sha256": label_binding[
+                    "binding_sha256"
+                ],
+            }
+            if label_binding is not None
+            else {}
         ),
     }
     output.parent.mkdir(parents=True, exist_ok=True)

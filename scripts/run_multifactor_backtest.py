@@ -8,6 +8,7 @@ import hashlib
 import json
 import shutil
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -82,7 +83,18 @@ from quant_platform.statistical_validation import (
     paired_moving_block_bootstrap,
 )
 from quant_platform.strategy_artifact_manifest import write_backtest_artifact_manifest
-from quant_platform.strategy_backtest import build_governed_signal, compose_factor_scores
+from quant_platform.strategy_backtest import (
+    build_governed_signal,
+    compose_factor_scores,
+    governed_score_neutralization,
+)
+from quant_platform.strategy_research_evaluation import (
+    STRATEGY_RESEARCH_EVALUATION_MODES,
+)
+from quant_platform.strategy_rule_runtime import (
+    apply_strategy_rule_alpha_weights,
+    build_strategy_rule_runtime_metadata,
+)
 from quant_platform.upstream_versions import upstream_runtime_identity
 
 GOVERNED_STYLE_COLUMNS = ("size", "value", "growth", "volatility")
@@ -90,6 +102,9 @@ MAX_STYLE_CROSS_SECTION_MISSING_RATE = 0.05
 STYLE_EXPOSURE_CONTRACT_VERSION = "standardized-neutral-imputation-v1"
 FORMAL_FINAL_OOS_MODE = "formal_final_oos"
 PRE_FINAL_PORTFOLIO_TRIAL_MODE = "pre_final_portfolio_trial"
+PRE_FINAL_EVALUATION_MODES = frozenset(
+    {PRE_FINAL_PORTFOLIO_TRIAL_MODE, *STRATEGY_RESEARCH_EVALUATION_MODES}
+)
 GOVERNED_MODEL_ENGINES = frozenset(
     {
         "rdagent_pytorch",
@@ -101,9 +116,92 @@ GOVERNED_MODEL_ENGINES = frozenset(
 )
 
 
+def _require_promotion_dataset_identity(
+    provenance: dict[str, Any], *, label: str
+) -> None:
+    """Reject a formally usable dataset that paper simulation cannot bind."""
+
+    for field in (
+        "dataset_identity_sha256",
+        "dataset_lineage_id",
+        "source_lineage_id",
+    ):
+        value = str(provenance.get(field) or "").strip().lower()
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError(f"{label} dataset provenance {field} must be a SHA-256 digest")
+
+
+def _promotion_dataset_descriptors(
+    *,
+    daily_dataset_name: str,
+    daily_provenance: dict[str, Any],
+    execution_method: str,
+    execution_frequency: str,
+    formal_execution_start: str,
+    execution_dataset_name: str | None = None,
+    execution_provenance: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Freeze the exact Qlib datasets consumed by promotion and paper replay.
+
+    A daily next-open strategy executes from the same native daily Qlib
+    dataset used for scoring.  It therefore needs a real daily execution
+    descriptor, not ``null`` and not a fabricated minute descriptor.  Minute
+    strategies keep their independently sealed minute execution dataset.
+    """
+
+    normalized_daily_name = str(daily_dataset_name or "").strip()
+    if not normalized_daily_name:
+        raise ValueError("formal backtest daily dataset name is required")
+    require_daily_qlib_contract(daily_provenance)
+    require_native_daily_execution_controls(
+        daily_provenance,
+        start=formal_execution_start,
+    )
+    _require_promotion_dataset_identity(daily_provenance, label="daily")
+    daily = {
+        "name": normalized_daily_name,
+        "provenance": deepcopy(daily_provenance),
+    }
+
+    method = str(execution_method or "").strip().lower()
+    frequency = str(execution_frequency or "").strip().lower()
+    if method == "open":
+        if frequency != "day":
+            raise ValueError("daily open execution requires a day execution frequency")
+        if execution_dataset_name is not None or execution_provenance is not None:
+            raise ValueError(
+                "daily open execution must reuse the daily Qlib dataset, not a minute dataset"
+            )
+        return {"daily": daily, "execution": deepcopy(daily)}
+
+    if method not in {"twap", "vwap", "next_bar"} or frequency not in {
+        "1min",
+        "5min",
+    }:
+        raise ValueError("formal execution dataset descriptor contract is unsupported")
+    normalized_execution_name = str(execution_dataset_name or "").strip()
+    if not normalized_execution_name or not isinstance(execution_provenance, dict):
+        raise ValueError("minute execution requires an independently sealed Qlib dataset")
+    if normalized_execution_name == normalized_daily_name:
+        raise ValueError("minute execution dataset must be distinct from the daily dataset")
+    require_minute_execution_contract(execution_provenance, frequency=frequency)
+    _require_promotion_dataset_identity(execution_provenance, label="execution")
+    if str(execution_provenance.get("source_lineage_id") or "") != str(
+        daily_provenance.get("source_lineage_id") or ""
+    ):
+        raise ValueError("daily and execution datasets must share one verified source lineage")
+    return {
+        "daily": daily,
+        "execution": {
+            "name": normalized_execution_name,
+            "provenance": deepcopy(execution_provenance),
+        },
+    }
+
+
 def _evaluation_mode(manifest: dict[str, Any]) -> str:
     mode = str(manifest.get("evaluation_mode") or FORMAL_FINAL_OOS_MODE)
-    if mode not in {FORMAL_FINAL_OOS_MODE, PRE_FINAL_PORTFOLIO_TRIAL_MODE}:
+    if mode not in {FORMAL_FINAL_OOS_MODE, *PRE_FINAL_EVALUATION_MODES}:
         raise ValueError("unsupported governed backtest evaluation mode")
     return mode
 
@@ -493,6 +591,7 @@ def _metadata_provider(
     execution_metadata: pd.DataFrame,
     close_history: pd.DataFrame,
     *,
+    strategy_config: dict[str, Any],
     open_field: str = "$open",
     close_field: str = "$close",
     intraday_prices: pd.DataFrame | None = None,
@@ -532,7 +631,7 @@ def _metadata_provider(
         returns = history.pct_change(fill_method=None).dropna(how="any")
         if len(returns) < 60:
             raise ValueError("optimizer requires 60 complete point-in-time return observations")
-        return {
+        result = {
             "industries": industries.reindex(instruments.astype(str)),
             "benchmark_weights": benchmark,
             "benchmark_industry_weights": benchmark.groupby(benchmark_industries).sum(),
@@ -558,6 +657,18 @@ def _metadata_provider(
                 ).reindex(instruments.astype(str))
             ),
         }
+        result.update(
+            build_strategy_rule_runtime_metadata(
+                strategy_config,
+                instruments=instruments,
+                close_history=close_matrix.loc[:market_timestamp],
+                benchmark_weights=benchmark,
+                value_exposures=(
+                    style["value"] if "value" in style.columns else None
+                ),
+            )
+        )
+        return result
 
     return provide
 
@@ -838,7 +949,7 @@ def main() -> None:
             raise ValueError("formal model candidate manifest is incomplete")
         admission_pre_final_end = (
             str(candidate_manifest.get("pre_final_end") or "")
-            if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+            if evaluation_mode in PRE_FINAL_EVALUATION_MODES
             else historical_periods["end"]
         )
         formal_model_admission = validate_model_formal_admission_binding(
@@ -887,7 +998,7 @@ def main() -> None:
             historical_periods=historical_periods,
             pre_final_cutoff=(
                 str(manifest.get("pre_final_cutoff") or "")
-                if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+                if evaluation_mode in PRE_FINAL_EVALUATION_MODES
                 else None
             ),
         )
@@ -899,7 +1010,7 @@ def main() -> None:
             "test_start": periods["start"],
             "test_end": periods["end"],
         }
-        if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE:
+        if evaluation_mode in PRE_FINAL_EVALUATION_MODES:
             execution_model_periods = _pre_final_execution_periods(
                 model_periods,
                 periods,
@@ -1088,6 +1199,11 @@ def main() -> None:
             "computed_by": "qlib.data.D.features",
             "artifacts": baseline_artifacts,
         }
+        baseline_scores = apply_strategy_rule_alpha_weights(
+            baseline_normalized,
+            baseline_scores,
+            config,
+        )
     if signal_source == "model_prediction":
         if model_scores is None:
             raise ValueError("formal model strategy produced no final-OOS scores")
@@ -1195,10 +1311,9 @@ def main() -> None:
         signal_scores: pd.Series | None = None,
     ) -> pd.Series:
         scenario_policy_config = PortfolioPolicyConfig.from_mapping(scenario_config)
-        neutralize_baseline = scenario_config.get("portfolio_construction") in {
-            "benchmark_relative_qp",
-            "industry_neutral_qp",
-        }
+        neutralize_industry, neutralize_styles = governed_score_neutralization(
+            scenario_config
+        )
         return build_governed_signal(
             scores if signal_scores is None else signal_scores,
             topk=scenario_policy_config.topk,
@@ -1213,8 +1328,8 @@ def main() -> None:
             max_industry_deviation=scenario_policy_config.max_industry_deviation,
             min_average_daily_amount=float(scenario_config.get("min_average_daily_amount", 0.0)),
             liquidity_lookback_days=int(scenario_config.get("liquidity_lookback_days", 20)),
-            neutralize_industry=neutralize_baseline,
-            neutralize_style_columns=("size",) if neutralize_baseline else (),
+            neutralize_industry=neutralize_industry,
+            neutralize_style_columns=neutralize_styles,
         )
 
     governed_signal = governed_for(config)
@@ -1229,6 +1344,7 @@ def main() -> None:
         style_exposures,
         execution_metadata,
         close_history,
+        strategy_config=config,
         open_field=open_field,
         close_field=close_field,
         intraday_prices=intraday_prices,
@@ -1330,7 +1446,7 @@ def main() -> None:
     history_calendar = pre_final_calendar[
         pre_final_calendar <= pd.Timestamp(historical_periods["end"])
     ]
-    if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE:
+    if evaluation_mode in PRE_FINAL_EVALUATION_MODES:
         pre_final_history = {
             "status": "not_applicable_pre_final_portfolio_trial",
             "scope": "selection_only",
@@ -1757,7 +1873,7 @@ def main() -> None:
         "paired_block_bootstrap": paired_bootstrap,
         "multiple_testing": multiple_testing,
     }
-    if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE:
+    if evaluation_mode in PRE_FINAL_EVALUATION_MODES:
         # Selection evidence is useful for ranking the two frozen construction
         # policies, but is never promotion evidence and cannot satisfy approve().
         formal_validation["status"] = "not_applicable_pre_final_only"
@@ -1791,13 +1907,13 @@ def main() -> None:
         "evaluation_mode": evaluation_mode,
         "evaluation_scope": (
             "pre_final_only"
-            if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+            if evaluation_mode in PRE_FINAL_EVALUATION_MODES
             else "final_oos_once"
         ),
         "final_oos_opened": evaluation_mode == FORMAL_FINAL_OOS_MODE,
         **(
             {"capital_eligible": False}
-            if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+            if evaluation_mode in PRE_FINAL_EVALUATION_MODES
             else {}
         ),
         "execution_model": {
@@ -1843,14 +1959,14 @@ def main() -> None:
             "evaluation_mode": evaluation_mode,
             "evaluation_scope": (
                 "pre_final_only"
-                if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+                if evaluation_mode in PRE_FINAL_EVALUATION_MODES
                 else "final_oos_once"
             ),
             "final_oos_opened": evaluation_mode == FORMAL_FINAL_OOS_MODE,
             "dataset_identity_sha256": provider_provenance.get("dataset_identity_sha256"),
             "pre_final_cutoff": (
                 str(manifest.get("pre_final_cutoff") or "")
-                if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+                if evaluation_mode in PRE_FINAL_EVALUATION_MODES
                 else None
             ),
             "formal_model_admission_binding_sha256": (
@@ -1986,6 +2102,7 @@ def main() -> None:
         },
     }
     qlib_report.reset_index().to_parquet(output / "daily_returns.parquet", index=False)
+    scores.to_frame(name="score").to_parquet(output / "score_grid.parquet")
     governed_signal.to_frame().to_parquet(output / "governed_signal.parquet")
     qlib_report.to_parquet(output / "qlib_portfolio_report.parquet")
     pd.to_pickle(qlib_positions, output / "qlib_positions.pkl")
@@ -2025,19 +2142,20 @@ def main() -> None:
     # Dataset descriptors consumed by the promotion chain: after the formal
     # hard gate approves the version, the isolated paper simulation account is
     # created from these verbatim dataset provenance records (design 6.11).
+    dataset_descriptors = _promotion_dataset_descriptors(
+        daily_dataset_name=str(manifest["dataset"]),
+        daily_provenance=provider_provenance,
+        execution_method=execution_method,
+        execution_frequency=configured_execution_frequency,
+        formal_execution_start=str(periods["start"]),
+        execution_dataset_name=(
+            str(manifest["execution_dataset"]) if minute_execution else None
+        ),
+        execution_provenance=(execution_provenance if minute_execution else None),
+    )
     (output / "datasets.json").write_text(
         json.dumps(
-            {
-                "daily": {"name": manifest["dataset"], "provenance": provider_provenance},
-                "execution": (
-                    {
-                        "name": manifest["execution_dataset"],
-                        "provenance": execution_provenance,
-                    }
-                    if minute_execution
-                    else None
-                ),
-            },
+            dataset_descriptors,
             ensure_ascii=False,
             indent=2,
         ),
@@ -2053,6 +2171,7 @@ def main() -> None:
         "benchmark": manifest["benchmark"],
         "artifacts": {
             "daily_returns": str(output / "daily_returns.parquet"),
+            "score_grid": str(output / "score_grid.parquet"),
             "governed_signal": str(output / "governed_signal.parquet"),
             "qlib_portfolio_report": str(output / "qlib_portfolio_report.parquet"),
             "qlib_positions": str(output / "qlib_positions.pkl"),
@@ -2075,7 +2194,7 @@ def main() -> None:
     with qlib_workflow_run(
         run_kind=(
             "portfolio-experiment-trial"
-            if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+            if evaluation_mode in PRE_FINAL_EVALUATION_MODES
             else "formal-backtest"
         ),
         run_id=workflow_run_id,

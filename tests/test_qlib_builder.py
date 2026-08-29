@@ -23,6 +23,10 @@ from quant_data.qlib_builder import (
     verify_qlib_output_manifest,
 )
 from quant_data.snapshot_lineage import make_lineage_id
+from quant_data.universe import (
+    GOVERNED_DAILY_ETF_WHITELIST,
+    governed_daily_etf_whitelist_contract,
+)
 
 pytestmark = pytest.mark.no_database
 
@@ -275,6 +279,207 @@ def _write_required_research_inputs(snapshot: Path) -> None:
         target = root / "partition_year=2024"
         target.mkdir(parents=True, exist_ok=True)
         pd.DataFrame([row]).to_parquet(target / "research.parquet")
+
+
+def _write_governed_etf_inputs(snapshot: Path, *, include_factor: bool = True) -> None:
+    fixtures = {
+        "fund_daily": pd.DataFrame(
+            [
+                {
+                    "ts_code": "510300.SH",
+                    "trade_date": "2024-01-02",
+                    "open": 4.0,
+                    "high": 4.1,
+                    "low": 3.9,
+                    "close": 4.0,
+                    "pre_close": 4.0,
+                    "change": 0.0,
+                    "pct_chg": 0.0,
+                    "vol": 100.0,
+                    "amount": 40.0,
+                },
+                {
+                    "ts_code": "510300.SH",
+                    "trade_date": "2024-01-03",
+                    "open": 4.2,
+                    "high": 4.4,
+                    "low": 4.1,
+                    "close": 4.4,
+                    "pre_close": 4.0,
+                    "change": 0.4,
+                    "pct_chg": 10.0,
+                    "vol": 100.0,
+                    "amount": 44.0,
+                },
+                # fund_daily can also contain LOFs/non-whitelisted funds.  They
+                # must never enter the Qlib investable surface by prefix alone.
+                {
+                    "ts_code": "160105.SZ",
+                    "trade_date": "2024-01-02",
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "pre_close": 1.0,
+                    "change": 0.0,
+                    "pct_chg": 0.0,
+                    "vol": 100.0,
+                    "amount": 10.0,
+                },
+            ]
+        ),
+        "fund_basic": pd.DataFrame(
+            [
+                {
+                    "ts_code": "510300.SH",
+                    "market": "E",
+                    "list_date": "20120528",
+                    "delist_date": None,
+                }
+            ]
+        ),
+    }
+    if include_factor:
+        fixtures["fund_adj"] = pd.DataFrame(
+            [
+                {
+                    "ts_code": "510300.SH",
+                    "trade_date": "2024-01-02",
+                    "adj_factor": 1.0,
+                },
+                {
+                    "ts_code": "510300.SH",
+                    "trade_date": "2024-01-03",
+                    "adj_factor": 2.0,
+                },
+                {
+                    "ts_code": "160105.SZ",
+                    "trade_date": "2024-01-02",
+                    "adj_factor": 1.0,
+                },
+            ]
+        )
+    for dataset, frame in fixtures.items():
+        root = snapshot / "parquet" / dataset / "partition_year=2024"
+        root.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(root / "data.parquet", index=False)
+
+
+def test_governed_etf_staging_is_whitelist_only_and_keeps_financials_null(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path, ts_code="000001.SZ", up_limit=11.0, down_limit=9.0
+    )
+    _write_governed_etf_inputs(snapshot)
+
+    builder = QlibBuilder(snapshot)
+    by_symbol = builder.build_staging(tmp_path / "staging")
+
+    etf = pd.read_parquet(by_symbol / "SH510300.parquet")
+    assert not (by_symbol / "SZ160105.parquet").exists()
+    assert etf["close"].tolist() == pytest.approx([1.0, 2.2])
+    assert etf["volume"].tolist() == pytest.approx([40_000.0, 20_000.0])
+    assert etf["amount"].tolist() == pytest.approx([40_000.0, 44_000.0])
+    assert etf["up_limit"].tolist() == pytest.approx([1.1, 2.2])
+    assert etf["down_limit"].tolist() == pytest.approx([0.9, 1.8])
+    assert etf["fund_roe"].isna().all()
+    evidence = builder._governed_etf_evidence()
+    assert evidence["included_symbols"] == ["510300.SH"]
+    assert len(evidence["whitelist_sha256"]) == 64
+    assert evidence["whitelist_sha256"] == governed_daily_etf_whitelist_contract()[
+        "whitelist_sha256"
+    ]
+    coverage = builder._field_year_coverage_evidence()
+    close_year = coverage["fields"]["close"]["years"][0]
+    assert close_year["asset_type_rows"]["etf"] == 2
+    assert "fund_daily" in close_year["source_contracts"]
+    factor_year = coverage["fields"]["factor"]["years"][0]
+    assert "fund_adj" in factor_year["source_contracts"]
+    limit_year = coverage["fields"]["up_limit"]["years"][0]
+    assert any(
+        source.startswith("governed_etf_price_limit:")
+        for source in limit_year["source_contracts"]
+    )
+
+    qlib_dir = tmp_path / "qlib"
+    (qlib_dir / "instruments").mkdir(parents=True)
+    builder._write_stock_universe(qlib_dir)
+    universe = (qlib_dir / "instruments" / "cn_all.txt").read_text(encoding="utf-8")
+    assert "SH510300\t2024-01-02\t2024-01-03" in universe
+    assert "SZ160105" not in universe
+
+
+def test_governed_etf_source_fails_closed_without_matching_fund_adj(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path, ts_code="000001.SZ", up_limit=11.0, down_limit=9.0
+    )
+    _write_governed_etf_inputs(snapshot, include_factor=False)
+
+    with pytest.raises(RuntimeError, match="sources are partial; missing fund_adj"):
+        QlibBuilder(snapshot).build_staging(tmp_path / "staging")
+
+
+def test_production_etf_contract_requires_every_whitelisted_symbol(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path, ts_code="000001.SZ", up_limit=11.0, down_limit=9.0
+    )
+    _write_governed_etf_inputs(snapshot)
+
+    with pytest.raises(RuntimeError, match="no fund_daily history"):
+        QlibBuilder(snapshot, require_governed_etfs=True).build_staging(
+            tmp_path / "staging"
+        )
+
+
+def test_complete_production_etf_whitelist_builds_under_strict_contract(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path, ts_code="000001.SZ", up_limit=11.0, down_limit=9.0
+    )
+    _write_governed_etf_inputs(snapshot)
+    for dataset in ("fund_daily", "fund_adj", "fund_basic"):
+        path = next((snapshot / "parquet" / dataset).rglob("*.parquet"))
+        source = pd.read_parquet(path)
+        template = source[source["ts_code"].eq("510300.SH")]
+        rows = [template.assign(ts_code=symbol) for symbol in GOVERNED_DAILY_ETF_WHITELIST]
+        if dataset == "fund_daily":
+            rows.append(source[source["ts_code"].eq("160105.SZ")])
+        pd.concat(rows, ignore_index=True).to_parquet(path, index=False)
+
+    builder = QlibBuilder(snapshot, require_governed_etfs=True)
+    by_symbol = builder.build_staging(tmp_path / "staging")
+
+    assert builder._governed_etf_evidence()["missing_symbols"] == []
+    assert all(
+        (by_symbol / f"SH{symbol.split('.', 1)[0]}.parquet").is_file()
+        for symbol in GOVERNED_DAILY_ETF_WHITELIST
+    )
+
+
+def test_etf_eligibility_skips_stock_financial_and_st_gates(tmp_path: Path) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path, ts_code="000001.SZ", up_limit=11.0, down_limit=9.0
+    )
+    _write_governed_etf_inputs(snapshot)
+    target = tmp_path / "metadata"
+
+    assert QlibBuilder(snapshot)._write_eligibility_metadata(target) is True
+
+    matrix = pd.read_parquet(target / "eligibility_matrix.parquet")
+    etf = matrix[matrix["instrument"].eq("SH510300")]
+    assert set(etf["asset_type"]) == {"etf"}
+    assert not etf["financial_gate_required"].any()
+    assert etf["equity"].isna().all()
+    reasons = [reason for raw in etf["reasons"] for reason in json.loads(raw)]
+    assert "negative_or_missing_equity" not in reasons
+    assert "nonstandard_or_missing_audit" not in reasons
+    assert "st" not in reasons
 
 
 def test_eligibility_metadata_reads_full_history_in_bounded_symbol_batches(
@@ -1461,12 +1666,74 @@ def test_writes_reproducible_qlib_dataset_provenance(tmp_path: Path) -> None:
     assert provenance["dataset_lineage_id"] is None
     assert provenance["adjustment_boundary"]["status"] == "not_applicable"
     assert len(provenance["adjustment_boundary"]["evidence_sha256"]) == 64
+    assert len(provenance["field_coverage_sha256"]) == 64
+    assert provenance["field_year_coverage"]["evidence_status"] == (
+        "missing_normalized_staging"
+    )
     assert provenance["output_manifest"]["version"] == "qlib-output-files-v1"
     assert [item["path"] for item in provenance["output_manifest"]["files"]] == [
         "metadata/adjustment_boundary.json",
+        "metadata/field_year_coverage.json",
+        "metadata/governed_etf_whitelist.json",
         "metadata/research_feature_contract.json"
     ]
     verify_qlib_output_manifest(qlib_dir, provenance)
+
+
+def test_field_year_coverage_uses_actual_rows_and_governs_legacy_transition(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    manifest_path = snapshot / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "source_contracts": {
+                    "primary": "tushare-compatible",
+                    "legacy_market": "baostock-0.9.3",
+                    "legacy_overlap_policy_version": "overlap-v1",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    builder = QlibBuilder(snapshot)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    rows = []
+    for year in range(2008, 2017):
+        session = f"{year}-01-04"
+        row = {"date": session, "symbol": "SH600000"}
+        row.update({field: 1.0 for field in builder.qlib_fields})
+        rows.append(row)
+    pd.DataFrame(rows).to_parquet(staging / "SH600000.parquet", index=False)
+
+    admitted = builder._field_year_coverage(staging)
+
+    close = admitted["fields"]["close"]
+    assert close["available_from"] == "2008-01-04"
+    assert close["research_available_from"] == "2008-01-04"
+    assert close["years"][0]["source_contracts"] == ["baostock-0.9.3"]
+    assert close["years"][-1]["source_contracts"] == ["tushare-compatible"]
+    assert len(admitted["coverage_sha256"]) == 64
+
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "source_contracts": {
+                    "primary": "tushare-compatible",
+                    "legacy_market": "baostock-0.9.3",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    unverified = QlibBuilder(snapshot)._field_year_coverage(staging)
+    assert unverified["fields"]["close"]["available_from"] == "2008-01-04"
+    assert unverified["fields"]["close"]["research_available_from"] == (
+        "2016-01-01"
+    )
 
 
 def test_qlib_output_manifest_rejects_changed_or_unsealed_files(tmp_path: Path) -> None:

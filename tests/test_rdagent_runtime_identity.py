@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from quant_data.config import Settings
+from quant_platform.feature_set_registry import get_feature_set
 from quant_platform.rdagent_runtime import (
     rdagent_command,
     require_rdagent_runtime_identity,
@@ -171,7 +172,7 @@ def test_runtime_command_forwards_repository_for_bridge_verification(
         encoding="utf-8",
     )
 
-    _, environment = rdagent_command(
+    command, environment = rdagent_command(
         settings,
         project_root=Path(__file__).parents[1],
         trace_path=tmp_path / "trace",
@@ -188,12 +189,25 @@ def test_runtime_command_forwards_repository_for_bridge_verification(
             "test_end": "2024-12-31",
         },
         objective="Generate an auditable Qlib challenger factor.",
+        feature_set=get_feature_set("governed-baseline"),
     )
 
     assert environment["RDAGENT_COMMIT"] == RDAGENT_COMMIT
+    assert command[command.index("--feature-set-id") + 1] == "governed-baseline"
+    assert command[command.index("--feature-set-sha256") + 1] == get_feature_set(
+        "governed-baseline"
+    )["definition_sha256"]
+    assert "--base-features" in command
     assert environment["RDAGENT_REPO"] == str(repository)
     assert environment["QLIB_FACTOR_TEST_END"] == "2022-12-31"
     assert environment["QLIB_FACTOR_TEST_END"] < "2023-01-01"
+    for prefix in ("QLIB_FACTOR", "QLIB_MODEL", "QLIB_QUANT"):
+        assert environment[f"{prefix}_TRAIN_START"] == "2020-01-01"
+        assert environment[f"{prefix}_TRAIN_END"] == "2021-12-31"
+        assert environment[f"{prefix}_VALID_START"] == "2022-01-01"
+        assert environment[f"{prefix}_VALID_END"] == "2022-08-06"
+        assert environment[f"{prefix}_TEST_START"] == "2022-08-12"
+        assert environment[f"{prefix}_TEST_END"] == "2022-12-31"
     assert environment["MODEL_COSTEER_ENV_TYPE"] == "docker"
     assert environment["QLIB_DOCKER_NETWORK"] == "none"
     assert environment["QLIB_DOCKER_ENABLE_GPU"] == "false"
@@ -257,3 +271,51 @@ def test_runtime_command_forwards_repository_for_bridge_verification(
         research_dataset / "instruments" / "cn_all.txt"
     ).read_bytes()
     assert (research_dataset / "features" / "sh600000" / "close.day.bin").stat().st_size == 20
+
+    strategy_command, strategy_environment = rdagent_command(
+        settings,
+        project_root=Path(__file__).parents[1],
+        trace_path=tmp_path / "strategy-run" / "trace",
+        result_path=tmp_path / "strategy-run" / "result.json",
+        dataset_path=dataset,
+        loop_n=2,
+        duration="1h",
+        periods={
+            "train_start": "2020-01-01",
+            "train_end": "2021-12-31",
+            "valid_start": "2022-01-01",
+            "valid_end": "2022-12-31",
+            "test_start": "2023-01-01",
+            "test_end": "2024-12-31",
+        },
+        objective="Research one governed long-horizon strategy challenger.",
+        scenario="fin_strategy",
+        feature_set=get_feature_set("governed-baseline"),
+        strategy_horizon_profile="long_1_3y",
+        incumbent_strategy_version_id="a" * 32,
+    )
+    assert "quant_platform.rdagent_strategy" not in strategy_command
+    assert strategy_environment["QUANTLAB_STRATEGY_HORIZON"] == "long_1_3y"
+    assert strategy_environment["QUANTLAB_STRATEGY_PARENT_VERSION_ID"] == "a" * 32
+
+    with pytest.raises(ValueError, match="accepted only by fin_strategy"):
+        rdagent_command(
+            settings,
+            project_root=Path(__file__).parents[1],
+            trace_path=tmp_path / "invalid-run" / "trace",
+            result_path=tmp_path / "invalid-run" / "result.json",
+            dataset_path=dataset,
+            loop_n=1,
+            duration="1h",
+            periods={
+                "train_start": "2020-01-01",
+                "train_end": "2021-12-31",
+                "valid_start": "2022-01-01",
+                "valid_end": "2022-12-31",
+                "test_start": "2023-01-01",
+                "test_end": "2024-12-31",
+            },
+            objective="Research a governed factor.",
+            feature_set=get_feature_set("governed-baseline"),
+            strategy_horizon_profile="short_1_5d",
+        )

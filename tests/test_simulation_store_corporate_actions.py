@@ -4,7 +4,13 @@ from datetime import date
 
 import pandas as pd
 import pytest
-from governance_fixtures import DATASET_IDENTITY, create_strategy_version
+from governance_fixtures import (
+    DATASET_IDENTITY,
+    create_strategy_version,
+    enable_recommendation_authority_for_test,
+    governed_etf_ready_evidence,
+    write_governed_daily_qlib_dataset,
+)
 from sqlalchemy import select, update
 
 from quant_data.database import (
@@ -15,19 +21,19 @@ from quant_data.database import (
     strategy_versions,
 )
 from quant_data.execution_contract import (
-    MINUTE_EXECUTION_CONTRACT_VERSION,
-    MINUTE_SOURCE_UNIT_CONTRACTS,
+    DAILY_QLIB_FIELD_CONTRACT_VERSION,
 )
 from quant_platform.corporate_actions import corporate_actions_sha256
 from quant_platform.cost_model import COST_SCHEDULE_VERSION
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.recommendation_store import RecommendationStore
-from quant_platform.simulation_store import SimulationStore
+from quant_platform.simulation_store import (
+    SimulationStore,
+    build_settlement_calendar_evidence,
+)
 
 SOURCE_LINEAGE = "9" * 64
-EXECUTION_IDENTITY = "d" * 64
-EXECUTION_LINEAGE = "e" * 64
 
 DAY_BUY = date(2026, 7, 13)
 DAY_EX = date(2026, 7, 14)
@@ -51,36 +57,24 @@ ACTION = {
 def _daily_dataset() -> dict:
     return {
         "name": "snapshot",
+        "start_date": "2008-01-01",
+        "end_date": "2026-08-31",
         "provenance": {
             "frequency": "day",
             "dataset_identity_sha256": DATASET_IDENTITY,
             "dataset_lineage_id": "b" * 64,
             "source_lineage_id": SOURCE_LINEAGE,
-            "field_contract_version": "daily-qlib-field-v3-cny-amount",
+            "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
             "source_volume_unit": "hand",
             "qlib_volume_unit": "share",
             "source_amount_unit": "thousand_cny",
             "qlib_amount_unit": "cny",
             "source_hand_size": 100,
             "index_volume_policy": "excluded_non_tradable_benchmark",
-            "lineage_verified": True,
-        },
-    }
-
-
-def _execution_dataset() -> dict:
-    return {
-        "name": "snapshot-5min",
-        "provenance": {
-            "frequency": "5min",
-            "dataset_identity_sha256": EXECUTION_IDENTITY,
-            "dataset_lineage_id": EXECUTION_LINEAGE,
-            "source_lineage_id": SOURCE_LINEAGE,
-            "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
-            "fields": ["vwap", "volume", "paused", "up_limit", "down_limit"],
-            "source_datasets": ["ashare_5m"],
-            "source_unit_contracts": {
-                "ashare_5m": MINUTE_SOURCE_UNIT_CONTRACTS["ashare_5m"]
+            "governed_etf_whitelist": governed_etf_ready_evidence(),
+            "execution_controls": {
+                "formal_execution_requires_native_controls": True,
+                "native_complete_from": "2008-01-01",
             },
             "lineage_verified": True,
         },
@@ -93,17 +87,24 @@ def _evidence(
     actions: list[dict] | None,
     trade_date: date,
     simulation_semantics_sha256: str,
+    settlement_binding: dict,
 ) -> dict:
+    next_trade_date = date.fromisoformat(settlement_binding["next_trade_date"])
     evidence = {
         "batch_id": batch_id,
-        "dataset_identity_sha256": EXECUTION_IDENTITY,
-        "dataset_lineage_id": EXECUTION_LINEAGE,
-        "execution_contract_version": MINUTE_EXECUTION_CONTRACT_VERSION,
+        "dataset_identity_sha256": DATASET_IDENTITY,
+        "dataset_lineage_id": "b" * 64,
+        "execution_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
         "execution_contract_hash": contract_hash,
         "simulation_semantics_sha256": simulation_semantics_sha256,
-        "next_trade_date": (
-            pd.Timestamp(trade_date) + pd.offsets.BusinessDay(1)
-        ).date().isoformat(),
+        "next_trade_date": next_trade_date.isoformat(),
+        "settlement_calendar_evidence": build_settlement_calendar_evidence(
+            trade_date=trade_date,
+            next_trade_date=next_trade_date,
+            dataset_identity_sha256=DATASET_IDENTITY,
+            dataset_lineage_id="b" * 64,
+            calendar_file_sha256=settlement_binding["calendar_file_sha256"],
+        ),
     }
     if actions is not None:
         evidence["corporate_actions_sha256"] = corporate_actions_sha256(actions)
@@ -115,11 +116,10 @@ def _bars(day: date) -> pd.DataFrame:
 
 
 def _instrument_bars(instrument: str, day: date) -> pd.DataFrame:
-    # 两个切片时点：100 股以上目标会拆成 10:00 / 10:20 两个 TWAP 切片。
     return pd.DataFrame(
         [
             {
-                "datetime": f"{day.isoformat()} {slot}",
+                "datetime": f"{day.isoformat()} 09:30:00",
                 "instrument": instrument,
                 "close": 10.0,
                 "vwap": 10.0,
@@ -128,7 +128,6 @@ def _instrument_bars(instrument: str, day: date) -> pd.DataFrame:
                 "up_limit": 11.0,
                 "down_limit": 9.0,
             }
-            for slot in ("10:00:00", "10:20:00")
         ]
     )
 
@@ -143,7 +142,7 @@ def _setup(database_url: str, tmp_path):
     version_id = create_strategy_version(
         database_url,
         tmp_path,
-        config_overrides={"execution_frequency": "5min", "execution_method": "twap"},
+        recipe_id="short_relative_strength",
     )
     recommendations = RecommendationStore(database_url)
     with recommendations.engine.begin() as connection:
@@ -152,6 +151,7 @@ def _setup(database_url: str, tmp_path):
             .where(strategy_versions.c.id == version_id)
             .values(status="approved")
         )
+    enable_recommendation_authority_for_test(database_url, [version_id])
     recommendation = recommendations.create(
         name="corporate action target",
         strategy_version_id=version_id,
@@ -164,14 +164,27 @@ def _setup(database_url: str, tmp_path):
         name="corporate action simulation",
         recommendation_portfolio_id=recommendation["id"],
         daily_dataset=_daily_dataset(),
-        execution_dataset=_execution_dataset(),
+        execution_dataset=_daily_dataset(),
         initial_cash=1_000_000,
-        execution_policy={"execution_algorithm": "twap"},
+        execution_policy={"execution_algorithm": "open"},
         cost_schedule_version=COST_SCHEDULE_VERSION,
         actor="test",
     )
     store.set_status(simulation["id"], "active")
-    return store, recommendations, recommendation, simulation, version_id
+    data_root = write_governed_daily_qlib_dataset(
+        tmp_path / "daily-corporate-action-data",
+        sessions=[
+            date(2026, 7, 10),
+            DAY_BUY,
+            DAY_EX,
+            DAY_SELL,
+            date(2026, 7, 16),
+            date(2026, 7, 17),
+            DAY_PAY,
+            date(2026, 7, 21),
+        ],
+    )
+    return store, recommendations, recommendation, simulation, version_id, data_root
 
 
 def _make_batch(
@@ -183,6 +196,7 @@ def _make_batch(
     as_of: date,
     effective: date,
     holdings: list[dict],
+    data_root,
 ) -> dict:
     snapshot, _ = recommendations.create_snapshot(
         portfolio_id=recommendation_id,
@@ -210,7 +224,9 @@ def _make_batch(
             "holdings": holdings,
         },
     )
-    batch, created = store.create_batch_for_snapshot(snapshot["id"])
+    batch, created = store.create_batch_for_snapshot(
+        snapshot["id"], data_root=data_root
+    )
     assert created is True
     return batch
 
@@ -229,7 +245,7 @@ def _holding(weight: float) -> list[dict]:
 
 
 def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
-    store, recommendations, recommendation, simulation, version_id = _setup(
+    store, recommendations, recommendation, simulation, version_id, data_root = _setup(
         database_url, tmp_path
     )
     contract_hash = simulation["execution_contract_hash"]
@@ -242,6 +258,7 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
         version_id=version_id,
         as_of=date(2026, 7, 10),
         effective=DAY_BUY,
+        data_root=data_root,
         holdings=[
             {
                 "instrument": "SH600000",
@@ -263,6 +280,7 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
             [],
             DAY_BUY,
             batch["simulation_semantics_sha256"],
+            store.execution_manifest(batch["id"])["settlement_calendar_binding"],
         ),
         corporate_actions=[],
     )
@@ -279,6 +297,7 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
         as_of=DAY_BUY,
         effective=DAY_EX,
         holdings=_holding(0.001),
+        data_root=data_root,
     )
     actions = [dict(ACTION)]
     completed = store.process_batch(
@@ -291,6 +310,7 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
             actions,
             DAY_EX,
             batch_ex["simulation_semantics_sha256"],
+            store.execution_manifest(batch_ex["id"])["settlement_calendar_binding"],
         ),
         corporate_actions=actions,
     )
@@ -353,6 +373,7 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
         as_of=DAY_EX,
         effective=DAY_SELL,
         holdings=[],
+        data_root=data_root,
     )
     completed = store.process_batch(
         batch_sell["id"],
@@ -364,6 +385,7 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
             [],
             DAY_SELL,
             batch_sell["simulation_semantics_sha256"],
+            store.execution_manifest(batch_sell["id"])["settlement_calendar_binding"],
         ),
         corporate_actions=[],
     )
@@ -391,6 +413,7 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
         as_of=date(2026, 7, 17),
         effective=DAY_PAY,
         holdings=[],
+        data_root=data_root,
     )
     nav_before = store.rows(simulation["id"], "nav")[-1]["nav"]
     completed = store.process_batch(
@@ -403,6 +426,7 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
             actions,
             DAY_PAY,
             batch_pay["simulation_semantics_sha256"],
+            store.execution_manifest(batch_pay["id"])["settlement_calendar_binding"],
         ),
         corporate_actions=actions,
     )
@@ -429,7 +453,7 @@ def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
 
 
 def test_corporate_actions_evidence_mismatch_fails_closed(database_url: str, tmp_path) -> None:
-    store, recommendations, recommendation, simulation, version_id = _setup(
+    store, recommendations, recommendation, simulation, version_id, data_root = _setup(
         database_url, tmp_path
     )
     batch = _make_batch(
@@ -440,6 +464,7 @@ def test_corporate_actions_evidence_mismatch_fails_closed(database_url: str, tmp
         as_of=date(2026, 7, 10),
         effective=DAY_BUY,
         holdings=_holding(0.001),
+        data_root=data_root,
     )
     with pytest.raises(ValueError, match="corporate actions"):
         store.process_batch(
@@ -452,6 +477,7 @@ def test_corporate_actions_evidence_mismatch_fails_closed(database_url: str, tmp
                 [],
                 DAY_BUY,
                 batch["simulation_semantics_sha256"],
+                store.execution_manifest(batch["id"])["settlement_calendar_binding"],
             ),
             corporate_actions=[dict(ACTION)],  # 与证据哈希（空列表）不一致
         )

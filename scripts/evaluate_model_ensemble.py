@@ -26,6 +26,10 @@ from quant_platform.model_research_governance import (
     require_model_metric_gate,
     verify_model_prediction_artifact,
 )
+from quant_platform.qlib_workflow import (
+    qlib_workflow_run,
+    qlib_workflow_tracking_uri,
+)
 
 
 def _finite(value: Any) -> float:
@@ -115,7 +119,6 @@ def main() -> None:
     import qlib
     from qlib.contrib.evaluate import risk_analysis
     from qlib.data import D
-    from qlib.workflow import R
     from qlib.workflow.record_temp import PortAnaRecord
 
     qlib.init(provider_uri=str(provider), region="cn")
@@ -253,10 +256,15 @@ def main() -> None:
                         ),
                         include_groups=False,
                     )
-                    with R.start(experiment_name="quantlab-independent-model-ensemble"):
-                        recorder = R.get_recorder()
-                        recorder.log_params(
-                            **{"ensemble_id": ensemble_id, "profile": profile_id, "seed": seed}
+                    with qlib_workflow_run(
+                        run_kind="independent-model-ensemble",
+                        run_id=f"{ensemble_id}-{profile_id}-seed-{seed}",
+                        tracking_uri=qlib_workflow_tracking_uri(),
+                        dataset_identity_sha256=identity,
+                    ) as workflow:
+                        recorder = workflow.get_recorder()
+                        workflow.log_params(
+                            {"ensemble_id": ensemble_id, "profile": profile_id, "seed": seed}
                         )
                         record = PortAnaRecord(
                             recorder,
@@ -297,6 +305,7 @@ def main() -> None:
                         report = recorder.load_object(
                             "portfolio_analysis/report_normal_1day.pkl"
                         )
+                        workflow_identity = workflow.identity_dict()
                     excess = report["return"] - report["bench"] - report["cost"]
                     risk = risk_analysis(excess, freq="day")["risk"]
                     metrics = {
@@ -374,6 +383,7 @@ def main() -> None:
                         "member_prediction_artifacts": member_artifacts,
                         "pairwise_prediction_correlations": current_pairwise,
                         "execution_environment_sha256": environment_sha,
+                        "qlib_workflow": workflow_identity,
                         "final_oos_opened": False,
                     }
                     if profile_id == "recent_3y":

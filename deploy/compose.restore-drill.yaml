@@ -4,8 +4,55 @@ services:
   scheduler:
     image: quantlab-platform-scheduler:latest
   worker:
-    image: quantlab-platform-worker:latest
+    image: quantlab-worker-runtime:v2
   rdagent-worker:
-    image: quantlab-platform-rdagent-worker:latest
+    image: quantlab-rdagent-runtime:v2
   web:
     image: quantlab-platform-web:latest
+  qlib-drill-seed:
+    image: quantlab-worker-runtime:v2
+    restart: "no"
+    command:
+      - python
+      - -c
+      - |
+        import hashlib
+        import json
+        import struct
+        from pathlib import Path
+
+        root = Path("/data/qlib/restore-drill-v1")
+        calendar = root / "calendars/day.txt"
+        instruments = root / "instruments/all.txt"
+        feature = root / "features/sh600000/close.day.bin"
+        calendar.parent.mkdir(parents=True, exist_ok=True)
+        instruments.parent.mkdir(parents=True, exist_ok=True)
+        feature.parent.mkdir(parents=True, exist_ok=True)
+        calendar.write_text("2020-01-02\n2020-01-03\n", encoding="utf-8")
+        instruments.write_text(
+            "SH600000\t2020-01-02\t2020-01-03\n",
+            encoding="utf-8",
+        )
+        feature.write_bytes(struct.pack("<fff", 0.0, 10.0, 10.25))
+        files = (calendar, instruments, feature)
+        manifest = {
+            "contract_version": "restore-drill-qlib-provider-v1",
+            "purpose": "isolated_release_and_restore_acceptance_only",
+            "files": {
+                str(path.relative_to(root)): {
+                    "bytes": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+                for path in files
+            },
+        }
+        (root / "manifest.json").write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+    volumes:
+      - ${QUANTLAB_DATA_HOST_PATH:-/data/quantlab}:/data
+  rdagent-docker:
+    depends_on:
+      qlib-drill-seed:
+        condition: service_completed_successfully

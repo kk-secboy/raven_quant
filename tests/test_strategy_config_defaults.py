@@ -9,6 +9,9 @@ from quant_platform.api import (
     StrategyConfigRequest,
     _rebind_strategy_execution_contract,
 )
+from quant_platform.strategy_artifact_manifest import (
+    write_backtest_artifact_manifest,
+)
 from quant_platform.strategy_store import (
     _canonical_sha256,
     _multifactor_manifest_failures,
@@ -201,6 +204,7 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
     }
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    artifact_manifest = write_backtest_artifact_manifest(tmp_path)
     metrics = {
         "formal_validation": {
             "pre_final_history": {
@@ -209,6 +213,9 @@ def test_strategy_approval_verifies_manifest_against_immutable_version(tmp_path:
             }
         },
         "provenance": {
+            "artifact_manifest_version": artifact_manifest["version"],
+            "artifact_manifest_sha256": artifact_manifest["sha256"],
+            "artifact_manifest_file_count": artifact_manifest["file_count"],
             "execution_manifest_sha256": _sha256_file(manifest_path),
             "strategy_config_sha256": _canonical_sha256(config),
             "factor_code_sha256": {"factor-1": code_sha256},

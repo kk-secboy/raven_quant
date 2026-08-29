@@ -9,7 +9,12 @@ from quant_data.database import (
     strategy_allocation_events,
     strategy_allocation_members,
     strategy_allocations,
+    strategy_health_snapshots,
+    strategy_versions,
 )
+
+from .research_horizon import LONG_1_3Y, SHORT_1_5D, SWING_1_6M
+from .strategy_health import health_allows_new_risk
 
 MEMBER_DRAWDOWN_RULE = "max_member_drawdown"
 PAUSE_NEW_RISK_STATE = "pause_new_risk"
@@ -38,6 +43,7 @@ def compose_strategy_risk_state(
     member_event_ids: list[int] | None = None,
     member_allocation_ids: list[str] | None = None,
     allocation_gates: list[dict[str, Any]] | None = None,
+    strategy_health_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Merge member and allocation gates using the most restrictive exposure."""
 
@@ -65,8 +71,15 @@ def compose_strategy_risk_state(
     else:
         allocation_state = ACTIVE_STATE
     member_state = PAUSE_NEW_RISK_STATE if member_ids else ACTIVE_STATE
+    health_gate = dict(strategy_health_gate or {})
+    health_status = str(health_gate.get("health_status") or "") or None
+    health_allows_risk = (
+        health_allows_new_risk(health_status) if health_gate else True
+    )
     if allocation_state != ACTIVE_STATE:
         state = allocation_state
+    elif not health_allows_risk:
+        state = f"strategy_health_{health_status or 'missing'}"
     else:
         state = member_state
     allocation_event_ids = sorted(
@@ -93,12 +106,12 @@ def compose_strategy_risk_state(
             if item.get("requires_reactivation") and item.get("allocation_id")
         }
     )
-    return {
+    result = {
         "strategy_version_id": normalized_id,
         "state": state,
         "member_risk_state": member_state,
         "allocation_risk_state": allocation_state,
-        "allow_new_risk": not member_ids and override >= 1.0,
+        "allow_new_risk": not member_ids and override >= 1.0 and health_allows_risk,
         "risk_exposure_override": override,
         "event_ids": sorted({*member_ids, *allocation_event_ids}),
         "member_event_ids": member_ids,
@@ -113,6 +126,10 @@ def compose_strategy_risk_state(
             "allocation_gate_requires_explicit_active_state": bool(reactivation_ids),
         },
     }
+    if health_gate:
+        result["strategy_health_gate"] = health_gate
+        result["recovery"]["strategy_health_must_allow_new_risk"] = not health_allows_risk
+    return result
 
 
 def event_matches_strategy_version(
@@ -263,12 +280,73 @@ def load_strategy_risk_state(
         load_allocation_risk_state(connection, str(allocation_id))
         for allocation_id in allocation_ids
     ]
+    health_gate = load_strategy_health_gate(connection, normalized_id)
     return compose_strategy_risk_state(
         normalized_id,
         member_event_ids=[int(item.id) for item in matching],
         member_allocation_ids=[str(item.allocation_id) for item in matching],
         allocation_gates=gates,
+        strategy_health_gate=health_gate,
     )
+
+
+def load_strategy_health_gate(
+    connection: Any,
+    strategy_version_id: str,
+) -> dict[str, Any] | None:
+    """Resolve the latest append-only activity-health gate.
+
+    Legacy versions are outside the new contract.  A promoted explicit-horizon
+    version without a health snapshot fails closed until the first assessment
+    is durably recorded.
+    """
+
+    version = connection.execute(
+        select(
+            strategy_versions.c.horizon_profile,
+            strategy_versions.c.promotion_stage,
+        ).where(strategy_versions.c.id == strategy_version_id)
+    ).first()
+    if version is None:
+        raise KeyError(strategy_version_id)
+    horizon = str(version.horizon_profile or "legacy_ambiguous")
+    if horizon not in {SHORT_1_5D, SWING_1_6M, LONG_1_3Y}:
+        return None
+    snapshot = connection.execute(
+        select(
+            strategy_health_snapshots.c.id,
+            strategy_health_snapshots.c.health_status,
+            strategy_health_snapshots.c.as_of,
+            strategy_health_snapshots.c.snapshot_sha256,
+        )
+        .where(strategy_health_snapshots.c.strategy_version_id == strategy_version_id)
+        .order_by(
+            strategy_health_snapshots.c.as_of.desc(),
+            strategy_health_snapshots.c.recorded_at.desc(),
+        )
+        .limit(1)
+    ).first()
+    if snapshot is None:
+        return {
+            "health_status": "missing",
+            "allow_new_risk": False,
+            "reason": "explicit-horizon strategy has no durable health snapshot",
+            "horizon_profile": horizon,
+        }
+    status = str(snapshot.health_status)
+    return {
+        "health_status": status,
+        "allow_new_risk": health_allows_new_risk(status),
+        "reason": (
+            "latest activity-health state allows new risk"
+            if health_allows_new_risk(status)
+            else "latest activity-health state blocks new risk but permits reductions"
+        ),
+        "horizon_profile": horizon,
+        "snapshot_id": str(snapshot.id),
+        "snapshot_sha256": str(snapshot.snapshot_sha256),
+        "as_of": snapshot.as_of.isoformat(),
+    }
 
 
 def load_member_risk_state(connection: Any, strategy_version_id: str) -> dict[str, Any]:

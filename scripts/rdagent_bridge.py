@@ -155,6 +155,55 @@ def _runtime_identity() -> dict[str, Any]:
     }
 
 
+def _costeer_knowledge_status() -> dict[str, Any]:
+    raw = str(os.getenv("QUANTLAB_COSTEER_KNOWLEDGE_STATUS_JSON") or "").strip()
+    if not raw:
+        raise RuntimeError("CoSTEER knowledge status was not recorded by the governed launcher")
+    try:
+        status = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("CoSTEER knowledge status is invalid") from exc
+    if not isinstance(status, dict) or status.get("contract_version") != (
+        "costeer-knowledge-status-v1"
+    ):
+        raise RuntimeError("CoSTEER knowledge status contract drifted")
+    if status.get("status") not in {
+        "embedding_retrieval_configured",
+        "degraded_empty_retrieval",
+    }:
+        raise RuntimeError("CoSTEER knowledge status value is unsupported")
+    if not isinstance(status.get("embedding_retrieval_configured"), bool):
+        raise RuntimeError("CoSTEER knowledge status readiness is invalid")
+    if not isinstance(status.get("costeer_used"), bool) or not isinstance(
+        status.get("empty_knowledge_forced"), bool
+    ):
+        raise RuntimeError("CoSTEER knowledge use status is invalid")
+    return status
+
+
+def _strategy_feature_ids(args: argparse.Namespace) -> set[str] | None:
+    if args.scenario != "fin_strategy":
+        return None
+    if not args.base_features or not args.feature_set_id or not args.feature_set_sha256:
+        raise RuntimeError("fin_strategy export requires its governed feature-set evidence")
+    root = Path(args.base_features).expanduser().resolve(strict=True)
+    try:
+        base_factors = json.loads((root / "base_factors.json").read_text(encoding="utf-8"))
+        definition = json.loads((root / "definition.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("fin_strategy staged feature set is unreadable") from exc
+    from quant_platform.feature_set_registry import resolve_feature_set
+
+    expected = resolve_feature_set(args.feature_set_id, definition)
+    if (
+        expected["definition_sha256"] != args.feature_set_sha256
+        or definition != expected
+        or base_factors != expected["features"]
+    ):
+        raise RuntimeError("fin_strategy staged feature-set evidence disagrees")
+    return set(expected["features"])
+
+
 def _is_complete_qlib_provider(provider: Path, *, data_root: Path) -> bool:
     """Return whether *provider* is a safe, structurally complete Qlib tree.
 
@@ -542,6 +591,73 @@ def _loop_id(tag: str) -> int | None:
     return None
 
 
+def _trace_text(value: Any, *, limit: int = 2_000) -> str:
+    """Project human-readable Trace text without exporting code or paths."""
+
+    text = str(value or "").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _trace_loop_projection(rounds: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build the read-only Web view from official RDLoop Trace messages."""
+
+    projected: list[dict[str, Any]] = []
+    for loop_id, item in sorted(rounds.items())[:20]:
+        hypothesis = item.get("hypothesis")
+        hypothesis = hypothesis if isinstance(hypothesis, dict) else {}
+        feedback = item.get("feedback")
+        feedback = feedback if isinstance(feedback, dict) else {}
+        tasks: list[dict[str, str]] = []
+        for kind, source in (
+            ("factor", item.get("tasks")),
+            ("model", item.get("model_tasks")),
+        ):
+            for task in source if isinstance(source, list) else []:
+                if not isinstance(task, dict):
+                    continue
+                tasks.append(
+                    {
+                        "kind": kind,
+                        "name": _trace_text(task.get("name"), limit=200),
+                        "description": _trace_text(
+                            task.get("description"), limit=1_000
+                        ),
+                    }
+                )
+        implementation_feedback: list[dict[str, Any]] = []
+        raw_implementation = item.get("implementation_feedback")
+        for decision in raw_implementation if isinstance(raw_implementation, list) else []:
+            if not isinstance(decision, dict):
+                continue
+            implementation_feedback.append(
+                {
+                    "decision": bool(decision.get("decision")),
+                    "feedback": _trace_text(decision.get("feedback")),
+                }
+            )
+        projected.append(
+            {
+                "loop_id": int(loop_id),
+                "hypothesis": {
+                    "text": _trace_text(hypothesis.get("hypothesis")),
+                    "reason": _trace_text(hypothesis.get("reason")),
+                    "action": _trace_text(hypothesis.get("action"), limit=100),
+                },
+                "tasks": tasks[:20],
+                "feedback": {
+                    "recorded": bool(feedback),
+                    "decision": bool(feedback.get("decision")),
+                    "reason": _trace_text(feedback.get("reason")),
+                    "hypothesis_evaluation": _trace_text(
+                        feedback.get("hypothesis_evaluation")
+                    ),
+                },
+                "implementation_feedback": implementation_feedback[:20],
+            }
+        )
+    return projected
+
+
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -706,6 +822,54 @@ def _export_workspace_sources(content: Any, root: Path, loop_id: int) -> int:
     return exported
 
 
+def _fin_quant_arm_coverage(rounds: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    arms = {
+        "factor": {
+            "proposed_rounds": [],
+            "executable_rounds": [],
+            "accepted_executable_rounds": [],
+        },
+        "model": {
+            "proposed_rounds": [],
+            "executable_rounds": [],
+            "accepted_executable_rounds": [],
+        },
+    }
+    for loop_id, round_item in sorted(rounds.items()):
+        hypothesis = round_item.get("hypothesis") or {}
+        action = hypothesis.get("action")
+        if action in arms:
+            arms[action]["proposed_rounds"].append(loop_id)
+        snapshot = round_item.get("runner_snapshot")
+        if not isinstance(snapshot, dict) or snapshot.get("kind") not in arms:
+            continue
+        kind = str(snapshot["kind"])
+        artifacts = snapshot.get("artifacts")
+        executable = isinstance(artifacts, list) and bool(artifacts)
+        if executable:
+            arms[kind]["executable_rounds"].append(loop_id)
+            if (round_item.get("feedback") or {}).get("decision") is True:
+                arms[kind]["accepted_executable_rounds"].append(loop_id)
+    accepted_arms = [
+        name for name, values in arms.items() if values["accepted_executable_rounds"]
+    ]
+    result_arms = {
+        name: {
+            **values,
+            "accepted_in_this_run": bool(values["accepted_executable_rounds"]),
+        }
+        for name, values in arms.items()
+    }
+    return {
+        "contract_version": "fin-quant-arm-coverage-v1",
+        "arms": result_arms,
+        "complete": len(accepted_arms) == 2,
+        "single_arm": len(accepted_arms) == 1,
+        "accepted_arms": accepted_arms,
+        "based_artifacts_count_as_arm_coverage": False,
+    }
+
+
 def _materialize_quant_bundles(
     rounds: dict[int, dict[str, Any]],
     *,
@@ -718,6 +882,7 @@ def _materialize_quant_bundles(
 
     accepted_factors: dict[str, dict[str, Any]] = {}
     accepted_model: dict[str, Any] | None = None
+    accepted_run_arms: set[str] = set()
     bundles: list[dict[str, Any]] = []
     for loop_id, round_item in sorted(rounds.items()):
         snapshot = round_item.get("runner_snapshot")
@@ -733,16 +898,25 @@ def _materialize_quant_bundles(
             elif based.get("kind") == "model" and accepted_model is None:
                 accepted_model = dict(based)
         if kind == "factor":
-            for factor in snapshot.get("artifacts") or []:
+            artifacts = list(snapshot.get("artifacts") or [])
+            if not artifacts:
+                continue
+            for factor in artifacts:
                 accepted_factors[str(factor["name"])] = dict(factor)
+            accepted_run_arms.add("factor")
         elif kind == "model":
             artifacts = list(snapshot.get("artifacts") or [])
             if len(artifacts) != 1:
                 continue
             accepted_model = dict(artifacts[0])
+            accepted_run_arms.add("model")
         else:
             continue
-        if not accepted_factors or accepted_model is None:
+        if (
+            not accepted_factors
+            or accepted_model is None
+            or accepted_run_arms != {"factor", "model"}
+        ):
             continue
 
         materialized_factors: list[dict[str, Any]] = []
@@ -814,6 +988,8 @@ def _materialize_quant_bundles(
                 "rdagent_decision": True,
                 "rdagent_feedback": feedback.get("hypothesis_evaluation")
                 or feedback.get("reason"),
+                "arm_coverage": {"factor": True, "model": True},
+                "single_arm": False,
             }
         )
     return bundles
@@ -835,9 +1011,52 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
     rounds: dict[int, dict[str, Any]] = {}
     tag_counts: dict[str, int] = {}
     general_model_outputs: list[dict[str, Any]] = []
+    strategy_proposals: list[dict[str, Any]] = []
+    strategy_proposal_hashes: set[str] = set()
+    strategy_feature_ids = _strategy_feature_ids(args)
+    expected_strategy_horizon = str(
+        os.getenv("QUANTLAB_STRATEGY_HORIZON") or ""
+    ).strip()
+    expected_strategy_parent = str(
+        os.getenv("QUANTLAB_STRATEGY_PARENT_VERSION_ID") or ""
+    ).strip() or None
+    if args.scenario == "fin_strategy" and expected_strategy_horizon not in {
+        "short_1_5d",
+        "swing_1_6m",
+        "long_1_3y",
+    }:
+        raise RuntimeError("fin_strategy export has no governed horizon binding")
     for message in FileStorage(trace).iter_msg():
         tag_counts[message.tag] = tag_counts.get(message.tag, 0) + 1
         content = message.content
+        if args.scenario == "fin_strategy" and message.tag.endswith(
+            "strategy compiled artifact"
+        ):
+            from quant_platform.strategy_rule_compiler import (
+                validate_compiled_strategy_artifact,
+            )
+
+            artifact = validate_compiled_strategy_artifact(
+                content,
+                allowed_factor_ids=strategy_feature_ids,
+            )
+            data_contract = artifact["strategy_proposal"]["data_contract"]
+            if (
+                data_contract["feature_set_id"] != args.feature_set_id
+                or data_contract["feature_set_definition_sha256"]
+                != args.feature_set_sha256
+                or data_contract["dataset_snapshot_id"]
+                != str(os.getenv("QUANTLAB_DATASET_SNAPSHOT_ID") or "")
+                or artifact["strategy_proposal"]["horizon"]
+                != expected_strategy_horizon
+                or artifact["strategy_proposal"]["parent_strategy_version_id"]
+                != expected_strategy_parent
+            ):
+                raise RuntimeError("fin_strategy artifact input binding disagrees")
+            artifact_sha256 = str(artifact["artifact_sha256"])
+            if artifact_sha256 not in strategy_proposal_hashes:
+                strategy_proposal_hashes.add(artifact_sha256)
+                strategy_proposals.append(artifact)
         if args.scenario == "general_model" and message.tag.endswith(
             "developed_experiment"
         ):
@@ -1039,6 +1258,9 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
 
+    fin_quant_coverage = (
+        _fin_quant_arm_coverage(rounds) if args.scenario == "fin_quant" else None
+    )
     quant_bundles = (
         _materialize_quant_bundles(
             rounds,
@@ -1050,6 +1272,15 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
         if args.scenario == "fin_quant"
         else []
     )
+    costeer_knowledge = _costeer_knowledge_status()
+    if args.scenario == "fin_strategy" and not strategy_proposals:
+        raise RuntimeError("fin_strategy produced no governed strategy proposal")
+    if args.scenario == "fin_strategy" and (
+        costeer_knowledge["costeer_used"] is not False
+        or costeer_knowledge.get("strategy_codegen_used") is not False
+        or costeer_knowledge.get("strategy_compiler") != "deterministic_allowlist"
+    ):
+        raise RuntimeError("fin_strategy execution boundary disagrees")
 
     result = {
         "status": "ok",
@@ -1057,6 +1288,8 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
         "rdagent_runtime": _runtime_identity(),
         "trace_path": str(trace),
         "rounds": len(rounds),
+        "trace_contract_version": "rdagent-trace-web-v1",
+        "trace_loops": _trace_loop_projection(rounds),
         "trace_summary": {
             "message_count": sum(tag_counts.values()),
             "tag_counts": dict(sorted(tag_counts.items())),
@@ -1073,6 +1306,10 @@ def export_trace(args: argparse.Namespace) -> dict[str, Any]:
         "candidates": candidates,
         "model_candidates": model_candidates,
         "quant_bundles": quant_bundles,
+        "fin_quant_coverage": fin_quant_coverage,
+        "single_arm": bool(fin_quant_coverage and fin_quant_coverage["single_arm"]),
+        "costeer_knowledge": costeer_knowledge,
+        "strategy_proposals": strategy_proposals,
         "lab_outputs": general_model_outputs,
     }
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1093,6 +1330,7 @@ def main() -> None:
     export_parser.add_argument("--asset-id", action="append", default=[])
     export_parser.add_argument("--feature-set-id")
     export_parser.add_argument("--feature-set-sha256")
+    export_parser.add_argument("--base-features")
     args = parser.parse_args()
     result = probe(args) if args.command == "probe" else export_trace(args)
     print(json.dumps(result, ensure_ascii=False))

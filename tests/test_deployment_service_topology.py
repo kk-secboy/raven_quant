@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+from quant_platform.backup_restore import WRITER_SERVICES
+from quant_platform.deployment_services import (
+    BUILT_APPLICATION_SERVICES,
+    CORE_RUNTIME_SERVICES,
+    OPTIONAL_PROFILE_SERVICES,
+)
+from quant_platform.release_identity import RELEASE_IDENTITY_ENV_TO_LABEL
+from quant_platform.release_preflight import EXPECTED_SERVICES
+from quant_platform.release_upgrade import BUILT_SERVICES
+
+pytestmark = pytest.mark.no_database
+
+
+def _compose_services() -> set[str]:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+    body = text.split("services:\n", 1)[1]
+    return set(re.findall(r"^  ([a-z0-9-]+):\s*$", body, flags=re.MULTILINE))
+
+
+def test_release_topology_covers_every_long_running_default_service() -> None:
+    compose = _compose_services()
+
+    assert EXPECTED_SERVICES == set(CORE_RUNTIME_SERVICES)
+    assert set(CORE_RUNTIME_SERVICES) <= compose
+    assert {
+        "evaluation-worker",
+        "paper-worker",
+        "rdagent-model-worker",
+        "rdagent-report-worker",
+        "rdagent-quant-worker",
+    } <= EXPECTED_SERVICES
+
+
+def test_build_and_backup_topologies_cover_all_writer_aliases() -> None:
+    assert BUILT_SERVICES == BUILT_APPLICATION_SERVICES
+    assert {
+        "evaluation-worker",
+        "paper-worker",
+        "rdagent-model-worker",
+        "rdagent-report-worker",
+        "rdagent-quant-worker",
+    } <= set(BUILT_SERVICES)
+    assert {
+        "evaluation-worker",
+        "paper-worker",
+        "rdagent-model-worker",
+        "rdagent-report-worker",
+        "rdagent-quant-worker",
+    } <= set(WRITER_SERVICES)
+
+
+def test_compose_stamps_every_stateless_runtime_with_release_identity() -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+
+    assert "x-release-environment: &release-environment" in text
+    assert text.count("<<: *release-environment") == 12
+    assert text.count("environment: *release-environment") == 2
+    assert "x-release-labels: &release-labels" in text
+    assert text.count("labels: *release-labels") == 14
+    for variable, label in RELEASE_IDENTITY_ENV_TO_LABEL.items():
+        assert f"  {variable}: ${{{variable}:-}}" in text
+        assert f"  {label}: ${{{variable}:-}}" in text
+
+    stateless = set(CORE_RUNTIME_SERVICES).union(
+        *OPTIONAL_PROFILE_SERVICES.values()
+    ) - {"postgres"}
+    for service in stateless:
+        match = re.search(
+            rf"^  {re.escape(service)}:\s*$\n(?P<body>.*?)(?=^  [a-z0-9-]+:\s*$|\Z)",
+            text,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None, service
+        assert "labels: *release-labels" in match.group("body"), service

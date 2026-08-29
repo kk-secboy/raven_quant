@@ -35,7 +35,9 @@ def test_recover_interrupted_requeues_with_warmup_without_resetting_attempts(
     assert recovered["started_at"] is None
     assert recovered["finished_at"] is None
     assert recovered["next_attempt_at"] is not None
-    assert recovered["next_attempt_at"] >= before + timedelta(seconds=119)
+    assert datetime.fromisoformat(recovered["next_attempt_at"]) >= (
+        before + timedelta(seconds=119)
+    )
     assert store.claim_next(("data_qlib",)) is None
 
 

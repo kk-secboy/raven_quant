@@ -7,10 +7,13 @@ from pathlib import Path
 
 import pytest
 from cryptography.fernet import Fernet
+from governance_fixtures import governed_etf_ready_evidence
 
+import quant_platform.deployment_readiness as readiness_module
 from quant_data.config import Settings
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_data.qlib_builder import build_qlib_output_manifest
+from quant_platform.alpha_spending_ledger import CAPITAL_OOS_MIN_EMBARGO_TRADING_DAYS
 from quant_platform.auth_store import AuthStore
 from quant_platform.data_automation import DEFAULT_STRATEGY_MINUTE_SYMBOLS
 from quant_platform.data_task_store import DataTaskStore
@@ -23,11 +26,172 @@ from quant_platform.job_store import JobStore
 from quant_platform.model_research_governance import (
     MODEL_LABEL_HORIZON_TRADING_DAYS,
 )
+from quant_platform.research_automation import (
+    DEFAULT_RESEARCH_PERIOD_POLICY,
+    MINIMUM_PROFILE_TRAINING_DAYS,
+    RESEARCH_EVALUATION_PROFILES,
+)
 from quant_platform.runtime_secret_store import RuntimeSecretStore
 from quant_platform.schedule_store import ScheduleStore
 from quant_platform.scheduler import AUTOMATED_DATA_BUNDLES
+from quant_platform.services import refresh_qlib_display_catalog
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.no_database
+def test_governed_schedule_suite_cardinality_matches_all_five_kinds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Row:
+        def __init__(self, kind: str) -> None:
+            self.id = f"schedule-{kind}"
+            self.kind = kind
+
+    for validator in (
+        "_is_governed_suite_data_pipeline",
+        "_is_governed_information_pipeline",
+        "_is_governed_information_factor_refresh",
+        "_is_governed_ashare_5m_sync",
+        "_is_governed_auxiliary_data_pipeline",
+    ):
+        monkeypatch.setattr(
+            readiness_module,
+            validator,
+            lambda *_args, **_kwargs: True,
+        )
+    rows = [
+        Row(kind)
+        for kind in sorted(readiness_module._GOVERNED_DATA_SCHEDULE_SUITE_KINDS)
+    ]
+
+    ready, governed = readiness_module._governed_schedule_suite_state(
+        rows,
+        data_root=tmp_path,
+        reproducible_dataset_names=set(),
+    )
+
+    assert ready is True
+    assert set(governed) == readiness_module._GOVERNED_DATA_SCHEDULE_SUITE_KINDS
+    assert all(len(ids) == 1 for ids in governed.values())
+
+
+@pytest.mark.no_database
+def test_latest_closed_trading_day_excludes_an_unfinished_session() -> None:
+    open_days = [date(2026, 8, 28), date(2026, 8, 31)]
+
+    before_close = readiness_module._latest_closed_trading_day(
+        open_days,
+        now=datetime(2026, 8, 31, 6, 59, tzinfo=UTC),
+    )
+    after_close = readiness_module._latest_closed_trading_day(
+        open_days,
+        now=datetime(2026, 8, 31, 7, 1, tzinfo=UTC),
+    )
+
+    assert before_close == date(2026, 8, 28)
+    assert after_close == date(2026, 8, 31)
+
+
+@pytest.mark.no_database
+def test_daily_business_check_requires_fresh_sealed_daily_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provenance = {
+        "frequency": "day",
+        "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+        "source_volume_unit": "hand",
+        "qlib_volume_unit": "share",
+        "source_amount_unit": "thousand_cny",
+        "qlib_amount_unit": "cny",
+        "source_hand_size": 100,
+        "index_volume_policy": "excluded_non_tradable_benchmark",
+        "governed_etf_whitelist": governed_etf_ready_evidence(),
+        "lineage_verified": True,
+        "execution_controls": {
+            "formal_execution_requires_native_controls": True,
+            "native_complete_from": "2016-01-04",
+        },
+    }
+    dataset = {
+        "name": "daily-production",
+        "frequency": "day",
+        "ready": True,
+        "reproducible": True,
+        "lineage_verified": True,
+        "output_files_verified": True,
+        "output_verification": "verified",
+        "end_date": "2026-08-31",
+        "provenance": provenance,
+    }
+    monkeypatch.setattr(
+        readiness_module,
+        "load_trade_calendar_open_days",
+        lambda _root: [date(2026, 8, 28), date(2026, 8, 31)],
+    )
+    monkeypatch.setattr(
+        readiness_module,
+        "list_qlib_datasets_for_display",
+        lambda _root: [dataset],
+    )
+
+    fresh = readiness_module._daily_qlib_business_check(
+        tmp_path,
+        now=datetime(2026, 8, 31, 8, 0, tzinfo=UTC),
+    )
+    dataset["end_date"] = "2026-08-28"
+    stale = readiness_module._daily_qlib_business_check(
+        tmp_path,
+        now=datetime(2026, 8, 31, 8, 0, tzinfo=UTC),
+    )
+
+    assert fresh["status"] == "ok"
+    assert fresh["expected_end_date"] == "2026-08-31"
+    assert stale["status"] == "blocked"
+    assert stale["datasets"][0]["reasons"] == ["stale"]
+
+
+@pytest.mark.no_database
+def test_horizon_readiness_accepts_paper_but_not_unhealthy_recommendation() -> None:
+    paper = {
+        "strategy_version_id": "paper-short",
+        "promotion_stage": "paper",
+        "signal_frequency": "day",
+        "execution_frequency": "day",
+        "contract_ready": True,
+        "health_status": None,
+        "paper_stage_status": "active",
+        "simulation_status": "active",
+        "active_recommendation_portfolios": 0,
+    }
+
+    validating = readiness_module._assess_horizon_candidates(
+        "short_1_5d",
+        [paper],
+    )
+    unhealthy_recommendation = readiness_module._assess_horizon_candidates(
+        "short_1_5d",
+        [
+            paper,
+            {
+                **paper,
+                "strategy_version_id": "recommendation-short",
+                "promotion_stage": "recommendation_enabled",
+                "health_status": "suspended",
+                "active_recommendation_portfolios": 1,
+            },
+        ],
+    )
+
+    assert validating["status"] == "ok"
+    assert validating["stage"] == "paper"
+    assert validating["health_status"] == "insufficient_evidence"
+    assert unhealthy_recommendation["status"] == "blocked"
+    assert unhealthy_recommendation["candidates"][0]["blocking_reasons"] == [
+        "strategy_health_suspended"
+    ]
 
 
 def _settings(monkeypatch, database_url: str, data_root: Path, *, auth_mode: str) -> Settings:
@@ -72,11 +236,13 @@ def _qlib_dataset(
                 "qlib_amount_unit": "cny",
                 "source_hand_size": 100,
                 "index_volume_policy": "excluded_non_tradable_benchmark",
+                "governed_etf_whitelist": governed_etf_ready_evidence(),
                 "output_manifest": build_qlib_output_manifest(target),
             }
         ),
         encoding="utf-8",
     )
+    refresh_qlib_display_catalog(data_root)
 
 
 def test_empty_deployment_is_fail_closed(tmp_path: Path, monkeypatch, database_url: str) -> None:
@@ -102,8 +268,19 @@ def test_empty_deployment_is_fail_closed(tmp_path: Path, monkeypatch, database_u
 
 
 def test_research_dataset_threshold_matches_multi_profile_contract() -> None:
+    assert (
+        DEFAULT_RESEARCH_PERIOD_POLICY["embargo_trading_days"]
+        == CAPITAL_OOS_MIN_EMBARGO_TRADING_DAYS
+    )
     assert RESEARCH_MINIMUM_TRADING_DAYS == (
-        252 + MODEL_LABEL_HORIZON_TRADING_DAYS + 2520 + 5 + 252
+        MINIMUM_PROFILE_TRAINING_DAYS
+        + MODEL_LABEL_HORIZON_TRADING_DAYS
+        + max(
+            int(profile["validation_trading_days"])
+            for profile in RESEARCH_EVALUATION_PROFILES
+        )
+        + CAPITAL_OOS_MIN_EMBARGO_TRADING_DAYS
+        + DEFAULT_RESEARCH_PERIOD_POLICY["test_trading_days"]
     )
 
 

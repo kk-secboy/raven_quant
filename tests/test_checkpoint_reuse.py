@@ -8,9 +8,9 @@ import pytest
 from quant_data.checkpoint import CheckpointStore
 from quant_data.cli import (
     _activate_stk_surv_plan,
-    _rehydrate_durable_pagination_specs,
     _reconcile_range_plan,
     _reconcile_stk_surv_plan,
+    _rehydrate_durable_pagination_specs,
 )
 from quant_data.execution_data import MINUTE_FIELDS, NEWS_FIELDS
 from quant_data.models import FetchSpec, UnitResult

@@ -26,6 +26,14 @@ from quant_platform.qlib_workflow import (
     require_qlib_workflow_identity,
 )
 from quant_platform.statistical_validation import deflated_sharpe_probability
+from quant_platform.strategy_research_evaluation import (
+    STRATEGY_RESEARCH_EVALUATION_MODES,
+)
+
+PRE_FINAL_PORTFOLIO_TRIAL_MODE = "pre_final_portfolio_trial"
+PRE_FINAL_EVALUATION_MODES = frozenset(
+    {PRE_FINAL_PORTFOLIO_TRIAL_MODE, *STRATEGY_RESEARCH_EVALUATION_MODES}
+)
 
 
 def _canonical_sha256(value: Any) -> str:
@@ -50,7 +58,7 @@ def _read_completed_result(
             return None
         if provenance.get("strategy_config_sha256") != _canonical_sha256(config):
             return None
-        if evaluation_mode == "pre_final_portfolio_trial" and (
+        if evaluation_mode in PRE_FINAL_EVALUATION_MODES and (
             provenance.get("evaluation_mode") != evaluation_mode
             or provenance.get("evaluation_scope") != "pre_final_only"
             or provenance.get("final_oos_opened") is not False
@@ -244,7 +252,7 @@ def _admitted_trial_sharpes(manifest: dict[str, Any]) -> list[float]:
 def _validate_portfolio_trial_comparability(
     manifest: dict[str, Any], trial_results: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
-    if manifest.get("evaluation_mode") != "pre_final_portfolio_trial":
+    if manifest.get("evaluation_mode") != PRE_FINAL_PORTFOLIO_TRIAL_MODE:
         return None
     specs = {int(item["trial_index"]): item for item in manifest.get("trials") or []}
     combined = []
@@ -268,16 +276,22 @@ def main() -> None:
     args = parser.parse_args()
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     evaluation_mode = manifest.get("evaluation_mode")
-    if manifest.get("model_signal") is not None and evaluation_mode != (
-        "pre_final_portfolio_trial"
+    if (
+        manifest.get("model_signal") is not None
+        and evaluation_mode != PRE_FINAL_PORTFOLIO_TRIAL_MODE
     ):
         raise ValueError("model parameter experiments must be explicitly pre-final only")
-    if evaluation_mode == "pre_final_portfolio_trial":
+    if evaluation_mode in PRE_FINAL_EVALUATION_MODES:
         cutoff = str(manifest.get("pre_final_cutoff") or "")
         governance = (manifest.get("periods") or {}).get("governance") or {}
+        expected_governance_mode = (
+            "model_portfolio_pre_final"
+            if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE
+            else evaluation_mode
+        )
         if (
             not cutoff
-            or governance.get("mode") != "model_portfolio_pre_final"
+            or governance.get("mode") != expected_governance_mode
             or governance.get("final_oos_opened") is not False
             or any(
                 str((manifest.get("periods") or {}).get(segment, {}).get("end") or "")

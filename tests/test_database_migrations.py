@@ -1,6 +1,18 @@
+import pytest
 from sqlalchemy import inspect, text
+from sqlalchemy.pool import NullPool
 
 from quant_data.database import open_database
+
+
+@pytest.mark.no_database
+def test_one_shot_database_mode_does_not_retain_idle_connections(monkeypatch) -> None:
+    monkeypatch.setenv("QUANTLAB_DATABASE_DISABLE_POOL", "1")
+    engine = open_database("postgresql+psycopg://user:password@127.0.0.1/example")
+    try:
+        assert isinstance(engine.pool, NullPool)
+    finally:
+        engine.dispose()
 
 
 def test_work_units_page_group_index_matches_runtime_lookup(database_url: str) -> None:
@@ -41,6 +53,8 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "account_netting_plans",
         "strategy_forward_gates",
         "strategy_promotion_stages",
+        "strategy_health_snapshots",
+        "investor_simulation_profiles",
         "jobs",
         "research_runs",
         "factor_candidates",
@@ -155,7 +169,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0071_retire_pair_writes"
+    assert revision == "0072_strategy_horizons"
     assert "capital_oos_alpha_batch_id" in {
         column["name"]
         for column in inspector.get_columns("oos_vintages", schema="quantlab")
@@ -387,11 +401,17 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
     }
     assert {
         "min_forward_calendar_days",
+        "min_forward_trading_days",
         "min_decision_batches",
         "min_completed_cycles",
+        "min_closed_round_trips",
+        "min_review_events",
+        "min_financial_report_reviews",
         "min_data_completeness",
         "min_reconciliation_rate",
         "max_cost_deviation",
+        "criteria_json",
+        "criteria_sha256",
     } <= {
         column["name"]
         for column in inspector.get_columns("strategy_forward_gates", schema="quantlab")
@@ -627,7 +647,95 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "qlib_commit",
         "rdagent_version",
         "rdagent_commit",
+        "horizon_profile",
+        "label_horizons_json",
+        "decision_interval_sessions",
+        "review_interval_sessions",
+        "holding_min_sessions",
+        "holding_target_sessions",
+        "holding_max_sessions",
+        "execution_lag_sessions",
+        "purge_sessions",
+        "embargo_sessions",
+        "sealed_oos_required",
+        "sealed_oos_sessions",
+        "horizon_contract_json",
+        "horizon_contract_sha256",
+        "source_research_artifact_id",
+        "strategy_rules_sha256",
     } <= strategy_version_columns
+    strategy_version_indexes = {
+        item["name"]: item
+        for item in inspector.get_indexes("strategy_versions", schema="quantlab")
+    }
+    active_horizon_index = strategy_version_indexes[
+        "uq_strategy_versions_active_horizon"
+    ]
+    assert active_horizon_index["unique"] is True
+    assert "recommendation_enabled" in str(
+        active_horizon_index.get("dialect_options") or {}
+    )
+    assert "legacy_ambiguous" in str(
+        active_horizon_index.get("dialect_options") or {}
+    )
+    approved_family_index = strategy_version_indexes[
+        "uq_strategy_versions_approved"
+    ]
+    assert approved_family_index["unique"] is True
+    approved_family_predicate = str(
+        approved_family_index.get("dialect_options") or {}
+    )
+    assert "recommendation_enabled" in approved_family_predicate
+    assert "promotion_stage" in approved_family_predicate
+    source_artifact_index = strategy_version_indexes[
+        "uq_strategy_versions_source_research_artifact"
+    ]
+    assert source_artifact_index["unique"] is True
+    assert "source_research_artifact_id" in str(
+        source_artifact_index.get("dialect_options") or {}
+    )
+    assert {
+        "strategy_version_id",
+        "horizon_profile",
+        "as_of",
+        "health_status",
+        "criteria_json",
+        "criteria_sha256",
+        "evidence_json",
+        "evidence_sha256",
+        "snapshot_sha256",
+        "recorded_by",
+        "recorded_at",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns(
+            "strategy_health_snapshots", schema="quantlab"
+        )
+    }
+    investor_columns = {
+        column["name"]: column
+        for column in inspector.get_columns(
+            "investor_simulation_profiles", schema="quantlab"
+        )
+    }
+    assert {
+        "id",
+        "profile_key",
+        "version",
+        "status",
+        "supersedes_id",
+        "initial_capital",
+        "risk_profile",
+        "min_cash_weight",
+        "max_gross_exposure",
+        "market_permissions_json",
+        "content_sha256",
+        "created_by",
+        "created_at",
+        "updated_by",
+        "updated_at",
+    } <= set(investor_columns)
+    assert investor_columns["initial_capital"]["default"] is None
     assert {
         "execution_dataset",
         "is_legacy",

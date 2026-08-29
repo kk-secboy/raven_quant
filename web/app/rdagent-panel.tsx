@@ -8,10 +8,20 @@ type ScenarioId =
   | "fin_factor"
   | "fin_model"
   | "fin_quant"
+  | "fin_strategy"
   | "fin_factor_report"
   | "general_model"
   | "data_science"
   | "llm_finetune";
+
+type StrategyHorizon = "short" | "swing" | "long";
+
+const HORIZON_RESEARCH_SCENARIOS = new Set<ScenarioId>([
+  "fin_factor",
+  "fin_model",
+  "fin_quant",
+  "fin_strategy",
+]);
 
 type Runtime = {
   status: string;
@@ -174,6 +184,19 @@ type ResearchRun = {
   error?: string | null;
 };
 
+type TraceLoop = {
+  loop_id: number;
+  hypothesis: { text: string; reason: string; action: string };
+  tasks: Array<{ kind: string; name: string; description: string }>;
+  feedback: {
+    recorded: boolean;
+    decision: boolean;
+    reason: string;
+    hypothesis_evaluation: string;
+  };
+  implementation_feedback: Array<{ decision: boolean; feedback: string }>;
+};
+
 type ResearchRunDetail = ResearchRun & {
   candidates: Array<{ id: string; name: string; status: string }>;
   assets: ResearchAsset[];
@@ -191,6 +214,11 @@ type ResearchRunDetail = ResearchRun & {
   model_evaluations: ModelEvaluation[];
   quant_bundle_candidates: QuantBundle[];
   quant_bundle_evaluations: QuantEvaluation[];
+  trace_view?: {
+    status: "recorded" | "legacy_summary_only" | "unavailable";
+    contract_version?: string | null;
+    loops: TraceLoop[];
+  };
 };
 
 type ResearchSchedule = {
@@ -217,6 +245,7 @@ const fallbackScenarios: Scenario[] = [
   { id: "fin_factor", label: "因子研究", description: "自主提出、实现并迭代因子", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: false, capital_eligible: true, gpu_required: false },
   { id: "fin_model", label: "模型研究", description: "固定受治理特征集，研究预测模型", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: false, requires_feature_set: true, capital_eligible: true, gpu_required: false },
   { id: "fin_quant", label: "联合研究", description: "把因子集与预测模型作为完整组合迭代", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: false, requires_feature_set: true, capital_eligible: true, gpu_required: false },
+  { id: "fin_strategy", label: "策略规则研究", description: "按长中短周期研究入场、退出、持有与风控规则", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: false, requires_feature_set: true, capital_eligible: false, gpu_required: false },
   { id: "fin_factor_report", label: "研报因子", description: "从已验证研报 PDF 中提取因子", category: "quant", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: true, requires_assets: true, capital_eligible: true, gpu_required: false },
   { id: "general_model", label: "论文模型实现", description: "从 arXiv 或手工 PDF 实现模型代码", category: "lab", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: false, requires_assets: true, capital_eligible: false, gpu_required: false },
   { id: "data_science", label: "数据科学", description: "隔离运行通用数据科学实验", category: "lab", ready: false, blockers: ["正在读取运行时状态"], requires_dataset: false, requires_assets: true, capital_eligible: false, gpu_required: false },
@@ -275,6 +304,14 @@ function RunAudit({
       <span>联合评估 {detail.quant_bundle_evaluations?.length ?? 0}</span>
     </div>
 
+    {!!detail.trace_view?.loops?.length && <section><h4>官方 RDLoop / Trace（只读）</h4><small>这里按原始循环顺序展示 Hypothesis 与 Feedback；研究 SOTA 不等于生产策略。</small>{detail.trace_view.loops.map((loop) => <div className="trace-loop" key={`trace-loop-${loop.loop_id}`}>
+      <div className="audit-row"><b>Loop {loop.loop_id}</b><span>{loop.hypothesis.action || "未标注动作"}</span><code>{loop.feedback.recorded ? loop.feedback.decision ? "accepted" : "rejected" : "no-feedback"}</code><em>{loop.tasks.length} 个任务</em></div>
+      <strong>Hypothesis</strong><p>{loop.hypothesis.text || "未记录假设文本"}</p>
+      {loop.hypothesis.reason && <small>依据：{loop.hypothesis.reason}</small>}
+      {!!loop.tasks.length && <small>Experiment：{loop.tasks.map((task) => `${task.kind} · ${task.name}`).join("；")}</small>}
+      {loop.feedback.recorded && <><strong>Feedback</strong><p>{loop.feedback.hypothesis_evaluation || loop.feedback.reason || "已记录决策，但没有文本反馈。"}</p></>}
+    </div>)}</section>}
+
     {!!detail.assets?.length && <section><h4>输入资料与来源关系</h4>{detail.assets.map((asset) => <div className="audit-row" key={asset.id}>
       <b>{asset.asset_type}</b><span>{asset.asset_key}</span><code>{shortHash(asset.manifest_sha256)}</code><em>{asset.status}</em>
     </div>)}{detail.asset_links?.map((link) => <small key={link.id}>{link.asset_id} · {link.relationship}</small>)}{detail.asset_consumptions?.map((item) => <small key={item.id}>{item.asset_id} · {item.selection_mode} · {item.status} · {shortHash(item.asset_manifest_sha256)}</small>)}</section>}
@@ -312,6 +349,7 @@ export function RDAgentPanel({ api }: { api: string }) {
   const [researchAssets, setResearchAssets] = useState<ResearchAsset[]>([]);
   const [assetAcquisitions, setAssetAcquisitions] = useState<ResearchAssetAcquisition[]>([]);
   const [scenarioId, setScenarioId] = useState<ScenarioId>("fin_factor");
+  const [researchHorizon, setResearchHorizon] = useState<StrategyHorizon | "">("");
   const [recipeId, setRecipeId] = useState("index_enhancement");
   const [dataset, setDataset] = useState("");
   const [featureSetId, setFeatureSetId] = useState("governed-baseline");
@@ -394,6 +432,7 @@ export function RDAgentPanel({ api }: { api: string }) {
   usePolling(load, 8000);
 
   const selectedScenario = scenarios.find((item) => item.id === scenarioId) ?? fallbackScenarios[0];
+  const requiresResearchHorizon = HORIZON_RESEARCH_SCENARIOS.has(scenarioId);
   const runtimeStatusOk = runtimeLoadState === "ready" && runtime?.status === "ok";
   const runtimeFieldsKnown = typeof runtime?.docker_available === "boolean" && typeof runtime?.llm_credentials_configured === "boolean";
   const runtimeUnknown = runtimeLoadState === "error" || (runtimeLoadState === "ready" && (!runtimeStatusOk || !runtimeFieldsKnown));
@@ -446,6 +485,7 @@ export function RDAgentPanel({ api }: { api: string }) {
         duration,
         asset_ids: parsedAssetIds,
         feature_set_id: selectedScenario.requires_feature_set ? featureSetId : undefined,
+        ...(requiresResearchHorizon ? { horizon: researchHorizon } : {}),
       }),
     });
     const body = await response.json();
@@ -477,6 +517,7 @@ export function RDAgentPanel({ api }: { api: string }) {
           duration,
           asset_ids: parsedAssetIds,
           feature_set_id: selectedScenario.requires_feature_set ? featureSetId : undefined,
+          ...(requiresResearchHorizon ? { horizon: researchHorizon } : {}),
           requested_by: "research-scheduler",
         },
         misfire_grace_seconds: 1800,
@@ -585,14 +626,16 @@ export function RDAgentPanel({ api }: { api: string }) {
     }
   }
 
-  const submitBlocked = !runtimeOperational || !selectedScenario.ready || !coverageReady || !featureSetReady || activeScenario || objective.length < 10 || (explicitAssetsRequired && parsedAssetIds.length === 0);
+  const governedResearchPath = selectedScenario.capital_eligible || selectedScenario.id === "fin_strategy";
+  const governedNextStage = selectedScenario.id === "fin_strategy" ? "规则竞赛 / 隔离模拟盘" : selectedScenario.capital_eligible ? "受治理候选 / 策略评估" : "实验室归档";
+  const submitBlocked = !runtimeOperational || !selectedScenario.ready || !coverageReady || !featureSetReady || activeScenario || objective.length < 10 || (requiresResearchHorizon && !researchHorizon) || (explicitAssetsRequired && parsedAssetIds.length === 0);
 
   return <>
     {message && <div className="notice">{message}</div>}
 
     <section className="scenario-panel">
       <div className="panel-heading"><div><p className="eyebrow">RD-AGENT RESEARCH CENTER</p><h2>选择研究场景</h2></div><button className="inline-action" type="button" onClick={runHealthCheck}>运行环境诊断</button></div>
-      <div className="scenario-grid">{scenarios.map((item) => <button type="button" key={item.id} className={`scenario-card ${scenarioId === item.id ? "selected" : ""}`} onClick={() => { setScenarioId(item.id); setAssetIds(""); }}>
+      <div className="scenario-grid">{scenarios.map((item) => <button type="button" key={item.id} className={`scenario-card ${scenarioId === item.id ? "selected" : ""}`} onClick={() => { setScenarioId(item.id); setResearchHorizon(""); setAssetIds(""); }}>
         <span>{item.category === "quant" ? "量化主线" : "研究实验室"}</span><strong>{item.label}</strong><small>{item.description}</small><em className={runtimeLoadState === "loading" || runtimeUnknown ? "checking" : runtimeOperational && item.ready ? "ready" : "blocked"}>{runtimeLoadState === "loading" ? "正在检查" : runtimeUnknown ? "正在恢复" : runtimeOperational && item.ready ? "可运行" : "能力未满足"}</em>
       </button>)}</div>
     </section>
@@ -629,7 +672,7 @@ export function RDAgentPanel({ api }: { api: string }) {
           <div><i className={!selectedScenario.requires_dataset ? "pass" : datasetsLoadState === "loading" ? "pending" : datasetsLoadState === "error" ? "block" : coverageReady ? "pass" : "block"} /><span>输入契约</span><strong>{!selectedScenario.requires_dataset ? "无需行情数据" : datasetsLoadState === "loading" ? "正在读取" : datasetsLoadState === "error" ? "读取失败" : coverageReady ? "满足" : "数据覆盖不足"}</strong></div>
         </div>
         {selectedScenario.blockers.length ? <div className="blocker-box"><b>当前阻断</b>{selectedScenario.blockers.map((item) => <span key={item}>{item}</span>)}</div> : null}
-        <div className="pipeline"><span>受控输入</span><i>→</i><span>RD-Agent 实验</span><i>→</i><span>不可变制品</span><i>→</i><span>独立 Qlib 门禁</span><i>→</i><span>{selectedScenario.capital_eligible ? "人工批准 / 模拟盘" : "实验室归档"}</span></div>
+        <div className="pipeline"><span>受控输入</span><i>→</i><span>RD-Agent 实验</span><i>→</i><span>不可变制品</span><i>→</i><span>独立 Qlib 门禁</span><i>→</i><span>{governedNextStage}</span></div>
       </article>
 
       <form className="agent-form" onSubmit={startRun}>
@@ -639,6 +682,7 @@ export function RDAgentPanel({ api }: { api: string }) {
         <label>研究目标<textarea value={objective} minLength={10} maxLength={2000} onChange={(event) => setObjective(event.target.value)} /></label>
         {selectedScenario.requires_dataset && <label>Qlib 数据集<select value={dataset} onChange={(event) => setDataset(event.target.value)}>{datasets.map((item) => <option key={item.name} value={item.name}>{item.name} · {item.instruments} 标的 · {item.trading_days} 日</option>)}</select></label>}
         {selectedScenario.requires_feature_set && <label>冻结特征集<select value={featureSetId} disabled={!featureSets.length} onChange={(event) => setFeatureSetId(event.target.value)}>{!featureSets.length && <option value="">未加载到受治理特征集</option>}{featureSets.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.feature_count} 特征 · {shortHash(item.definition_sha256)}</option>)}</select></label>}
+        {requiresResearchHorizon && <label>研究周期（必选）<select required value={researchHorizon} onChange={(event) => setResearchHorizon(event.target.value as StrategyHorizon)}><option value="" disabled>请选择长、中或短线</option><option value="short">短线 · 1～5 个交易日</option><option value="swing">中线 · 1～6 个月</option><option value="long">长线 · 1～3 年以上</option></select></label>}
         {selectedScenario.requires_assets && <label>受治理资料（可多选；研报和论文不选时由服务端自动挑选未消费资料）<select multiple value={parsedAssetIds} onChange={(event) => setAssetIds(Array.from(event.currentTarget.selectedOptions, (option) => option.value).join(","))}>{selectableAssets.map((item) => <option key={item.id} value={item.id}>{item.title || item.asset_key} · {item.asset_type}{item.consumption ? ` · 已用于 ${item.consumption.scenario}` : ""}</option>)}</select></label>}
         {selectedScenario.requires_assets && parsedAssetIds.length > 0 && selectedScenario.auto_select_assets && <button className="inline-action" type="button" onClick={() => setAssetIds("")}>清空选择，改用自动筛选</button>}
         {selectedScenario.requires_assets && !selectableAssets.length && <small className="period-warning">当前没有匹配该场景的已登记资料，请先在“研究资料采集与台账”中采集。</small>}
@@ -649,8 +693,8 @@ export function RDAgentPanel({ api }: { api: string }) {
     </section>
 
     <section className="period-panel">
-      <div className="panel-heading"><div><p className="eyebrow">GOVERNANCE BOUNDARY</p><h2>{selectedScenario.capital_eligible ? "独立验证与资本边界" : "实验室隔离边界"}</h2></div><span className={selectedScenario.capital_eligible ? "coverage-ok" : "coverage-bad"}>{selectedScenario.capital_eligible ? "可进入独立门禁" : "禁止直接进入投资链"}</span></div>
-      {selectedScenario.capital_eligible ? <><div className="period-grid"><div><strong>近期窗口</strong><span>捕捉当前市场结构</span></div><div><strong>均衡窗口</strong><span>验证跨阶段稳定性</span></div><div><strong>稳健窗口</strong><span>长期压力验证</span></div></div><p className="period-warning">历史治理起始日 2021-01-11。RD-Agent 内部成绩仅供研究反馈；最终 OOS 只开放一次，正式回测后仍需人工批准和模拟盘。</p></> : <p className="period-warning">该场景的代码、评分或 checkpoint 只归档为实验制品。general_model 的实现可在运行审计中显式提交到 fin_model 独立门禁；其他实验室产物不能进入投资链。</p>}
+      <div className="panel-heading"><div><p className="eyebrow">GOVERNANCE BOUNDARY</p><h2>{governedResearchPath ? "独立验证与资本边界" : "实验室隔离边界"}</h2></div><span className={governedResearchPath ? "coverage-ok" : "coverage-bad"}>{governedResearchPath ? "可进入独立门禁" : "禁止直接进入投资链"}</span></div>
+      {governedResearchPath ? <><div className="period-grid"><div><strong>近期窗口</strong><span>捕捉当前市场结构</span></div><div><strong>均衡窗口</strong><span>验证跨阶段稳定性</span></div><div><strong>稳健窗口</strong><span>长期压力验证</span></div></div><p className="period-warning">RD-Agent 内部成绩只作研究反馈；最终 OOS 只开放一次。因子和模型必须进入完整策略评估，策略规则还要通过同条件竞赛、正式回测和隔离前向模拟；满足本周期全部证据门后才由系统自动晋级。</p></> : <p className="period-warning">该场景的代码、评分或 checkpoint 只归档为实验制品。general_model 的实现可在运行审计中显式提交到 fin_model 独立门禁；其他实验室产物不能进入投资链。</p>}
     </section>
 
     <details className="research-automation">

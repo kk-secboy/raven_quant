@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import insert, or_, select, update
+from sqlalchemy import insert, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
     allocation_schedule_groups,
     open_database,
     recommendation_portfolios,
+    research_campaigns,
     row_dict,
     schedule_runs,
     schedules,
@@ -34,6 +37,61 @@ ACTIVE_SCHEDULE_KINDS = (
     "preopen_check",
     "intraday_execution_check",
 )
+
+LEGACY_RESEARCH_SCHEDULE_ERROR = (
+    "legacy research campaign schedules are read-only and cannot run"
+)
+LEGACY_RESEARCH_SCHEDULE_SUSPENSION = (
+    "legacy research campaign orchestration retired"
+)
+LEGACY_RESEARCH_RETIREMENT_LOCK_KEY = 5_493_926_868_930_645_317
+
+
+def _is_legacy_research_schedule(
+    *,
+    payload: dict[str, Any] | None,
+    created_by: str | None,
+    suspension_reason: str | None = None,
+) -> bool:
+    """Identify schedules owned by the retired campaign control plane.
+
+    Old campaign schedules used either (and, over time, sometimes both) of
+    these durable ownership markers.  The kind alone is insufficient because
+    ``recommendation_refresh`` remains a supported production schedule kind.
+    """
+
+    return (
+        "research_campaign_id" in dict(payload or {})
+        or str(created_by or "").startswith("research-campaign:")
+        or str(suspension_reason or "") == LEGACY_RESEARCH_SCHEDULE_SUSPENSION
+    )
+
+
+def _legacy_research_schedule_predicate() -> Any:
+    """Return the PostgreSQL predicate used by scheduler claim paths."""
+
+    return or_(
+        schedules.c.created_by.like("research-campaign:%"),
+        schedules.c.payload_json.op("?")("research_campaign_id").is_(True),
+        (
+            schedules.c.suspension_reason
+            == LEGACY_RESEARCH_SCHEDULE_SUSPENSION
+        ).is_(True),
+    )
+
+
+def _require_nonlegacy_research_schedule(
+    *,
+    payload: dict[str, Any] | None,
+    created_by: str | None,
+    suspension_reason: str | None = None,
+) -> None:
+    if _is_legacy_research_schedule(
+        payload=payload,
+        created_by=created_by,
+        suspension_reason=suspension_reason,
+    ):
+        raise ValueError(LEGACY_RESEARCH_SCHEDULE_ERROR)
 
 
 def _now() -> datetime:
@@ -197,6 +255,7 @@ class ScheduleStore:
             raise ValueError("unsupported schedule kind")
         if not name.strip() or not actor.strip():
             raise ValueError("schedule name and actor are required")
+        _require_nonlegacy_research_schedule(payload=payload, created_by=actor)
         if misfire_grace_seconds < 60:
             raise ValueError("misfire grace must be at least 60 seconds")
         recommendation_portfolio_id = (
@@ -276,27 +335,41 @@ class ScheduleStore:
 
         if kind not in ACTIVE_SCHEDULE_KINDS:
             raise ValueError("unsupported schedule kind")
+        _require_nonlegacy_research_schedule(payload=payload, created_by=actor)
         current = now or _now()
         existing = self.get_by_name(name)
         if existing is None:
-            created = self.create(
-                name=name,
-                kind=kind,
-                timezone=timezone,
-                run_time=run_time,
-                trading_days_only=trading_days_only,
-                payload=payload,
-                misfire_grace_seconds=misfire_grace_seconds,
-                actor=actor,
-                now=current,
-            )
-            return (
-                created
-                if enabled
-                else self.set_status(str(created["id"]), "paused", now=current)
-            )
+            try:
+                created = self.create(
+                    name=name,
+                    kind=kind,
+                    timezone=timezone,
+                    run_time=run_time,
+                    trading_days_only=trading_days_only,
+                    payload=payload,
+                    misfire_grace_seconds=misfire_grace_seconds,
+                    actor=actor,
+                    now=current,
+                )
+            except ValueError:
+                # A second scheduler may have won the unique-name insert.
+                # Continue only by validating/updating that exact managed row.
+                existing = self.get_by_name(name)
+                if existing is None:
+                    raise
+            else:
+                return (
+                    created
+                    if enabled
+                    else self.set_status(str(created["id"]), "paused", now=current)
+                )
         if existing["kind"] != kind:
             raise ValueError(f"managed schedule {name!r} has an incompatible kind")
+        _require_nonlegacy_research_schedule(
+            payload=existing["payload"],
+            created_by=existing["created_by"],
+            suspension_reason=existing.get("suspension_reason"),
+        )
         effective_status = "active" if enabled else "paused"
         unchanged = (
             existing["timezone"] == timezone
@@ -338,11 +411,22 @@ class ScheduleStore:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         current = now or _now()
-        schedule = self.get(schedule_id)
-        if schedule["kind"] not in ACTIVE_SCHEDULE_KINDS:
-            raise ValueError("legacy schedules cannot be triggered")
         run_id = uuid.uuid4().hex
         with self.engine.begin() as connection:
+            schedule = connection.execute(
+                select(schedules)
+                .where(schedules.c.id == schedule_id)
+                .with_for_update()
+            ).first()
+            if schedule is None:
+                raise KeyError(schedule_id)
+            _require_nonlegacy_research_schedule(
+                payload=schedule.payload_json,
+                created_by=schedule.created_by,
+                suspension_reason=schedule.suspension_reason,
+            )
+            if schedule.kind not in ACTIVE_SCHEDULE_KINDS:
+                raise ValueError("legacy schedules cannot be triggered")
             connection.execute(
                 insert(schedule_runs).values(
                     id=run_id,
@@ -382,6 +466,11 @@ class ScheduleStore:
                 raise KeyError(schedule_id)
             if row.kind not in ACTIVE_SCHEDULE_KINDS:
                 raise ValueError("legacy schedules are read-only and cannot be reactivated")
+            _require_nonlegacy_research_schedule(
+                payload=row.payload_json,
+                created_by=row.created_by,
+                suspension_reason=row.suspension_reason,
+            )
             suspension = row.suspension_reason
             effective = status if suspension is None else "paused"
             values: dict[str, Any] = {
@@ -550,6 +639,11 @@ class ScheduleStore:
             if status == "active":
                 self._require_long_only_allocation(connection, allocation_id)
             for member in group["members"]:
+                _require_nonlegacy_research_schedule(
+                    payload=member["payload"],
+                    created_by=member["created_by"],
+                    suspension_reason=member.get("suspension_reason"),
+                )
                 values = {
                     "status": status,
                     "desired_status": status,
@@ -574,6 +668,7 @@ class ScheduleStore:
                 .where(
                     schedules.c.status == "active",
                     schedules.c.kind.in_(ACTIVE_SCHEDULE_KINDS),
+                    ~_legacy_research_schedule_predicate(),
                     schedules.c.next_run_at <= current,
                 )
                 .order_by(schedules.c.next_run_at)
@@ -631,10 +726,11 @@ class ScheduleStore:
                 .join(schedules, schedules.c.id == schedule_runs.c.schedule_id)
                 .where(
                     schedules.c.kind.in_(ACTIVE_SCHEDULE_KINDS),
+                    ~_legacy_research_schedule_predicate(),
                     or_(
                         schedule_runs.c.status == "pending",
                         (
-                            (schedule_runs.c.status == "running")
+                            (schedule_runs.c.status.in_(("running", "waiting")))
                             & (schedule_runs.c.lease_until < current)
                         ),
                     ),
@@ -657,6 +753,104 @@ class ScheduleStore:
             )
             run_id = str(row.id)
         return self.get_run(run_id)
+
+    @contextmanager
+    def dispatch_guard(
+        self,
+        run_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> Iterator[bool]:
+        """Serialize dispatch with the one-time legacy retirement cutover.
+
+        Claiming and dispatching necessarily span different transactions: the
+        scheduler performs validation before it creates a durable job.  A
+        shared transaction-level advisory lock lets independent schedulers
+        dispatch normal work concurrently while the retirement path takes the
+        matching exclusive lock.  Re-reading ownership after acquiring the
+        lock closes the claimed-run/in-memory-payload race.
+        """
+
+        current = now or _now()
+        with self.engine.begin() as connection:
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock_shared(:lock_key)"),
+                {"lock_key": LEGACY_RESEARCH_RETIREMENT_LOCK_KEY},
+            )
+            row = connection.execute(
+                select(
+                    schedule_runs.c.status,
+                    schedule_runs.c.schedule_id,
+                    schedules.c.payload_json,
+                    schedules.c.created_by,
+                    schedules.c.suspension_reason,
+                )
+                .join(schedules, schedules.c.id == schedule_runs.c.schedule_id)
+                .where(schedule_runs.c.id == run_id)
+            ).first()
+            if row is None:
+                raise KeyError(run_id)
+            campaign_owned = connection.execute(
+                select(research_campaigns.c.id)
+                .where(research_campaigns.c.paper_schedule_id == row.schedule_id)
+                .limit(1)
+            ).first()
+            legacy_owned = campaign_owned is not None or _is_legacy_research_schedule(
+                payload=row.payload_json,
+                created_by=row.created_by,
+                suspension_reason=row.suspension_reason,
+            )
+            if legacy_owned:
+                if str(row.status) == "running":
+                    connection.execute(
+                        update(schedule_runs)
+                        .where(
+                            schedule_runs.c.id == run_id,
+                            schedule_runs.c.status == "running",
+                        )
+                        .values(
+                            status="skipped",
+                            lease_until=None,
+                            message=(
+                                "legacy research campaign schedule retired before dispatch"
+                            ),
+                            finished_at=current,
+                        )
+                    )
+                yield False
+                return
+            if str(row.status) != "running":
+                yield False
+                return
+            yield True
+
+    def wait_run(
+        self,
+        run_id: str,
+        *,
+        message: str,
+        retry_at: datetime,
+    ) -> None:
+        """Persist a transient dependency wait without consuming the daily slot."""
+
+        if retry_at.tzinfo is None:
+            raise ValueError("schedule retry_at must be timezone-aware")
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(schedule_runs)
+                .where(
+                    schedule_runs.c.id == run_id,
+                    schedule_runs.c.status == "running",
+                )
+                .values(
+                    status="waiting",
+                    message=message,
+                    lease_until=retry_at,
+                    finished_at=None,
+                )
+            )
+            if not result.rowcount:
+                raise KeyError(run_id)
 
     def finish_run(
         self,

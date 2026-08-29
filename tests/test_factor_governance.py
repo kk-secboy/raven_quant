@@ -445,6 +445,15 @@ def test_reactivated_research_run_clears_terminal_state(
     assert failed["finished_at"] is not None
     assert failed["error"] == "first attempt failed"
 
+    with pytest.raises(ValueError, match="requeued explicitly"):
+        store.mark_run(run["id"], "running")
+    store.requeue_run(run["id"], actor="research-operator")
+    queued = store.get_run(run["id"])
+    assert queued["status"] == "queued"
+    assert queued["started_at"] is None
+    assert queued["finished_at"] is None
+    assert queued["error"] is None
+
     store.mark_run(run["id"], "running", error="must not leak")
     running = store.get_run(run["id"])
     assert running["status"] == "running"

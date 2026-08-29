@@ -11,7 +11,11 @@ from qlib_test_doubles import (
 
 from quant_platform.allocation_store import AllocationStore
 from quant_platform.risk_math import COVARIANCE_MODEL_VERSION
-from quant_platform.strategy_allocation import _capped, analyze_strategy_allocation
+from quant_platform.strategy_allocation import (
+    SINGLE_MEMBER_FIXED_COVARIANCE_VERSION,
+    _capped,
+    analyze_strategy_allocation,
+)
 
 pytestmark = pytest.mark.no_database
 
@@ -131,3 +135,48 @@ def test_risk_parity_maps_governed_member_budgets_from_qlib_solution() -> None:
     assert analysis["members"]["core"]["risk_budget"] == pytest.approx(0.80)
     assert analysis["members"]["satellite"]["risk_budget"] == pytest.approx(0.20)
     assert analysis["members"]["core"]["risk_contribution"] == pytest.approx(0.80, abs=0.02)
+
+
+def test_single_verified_horizon_keeps_unverified_sleeves_in_cash() -> None:
+    random = np.random.default_rng(29)
+    returns = pd.DataFrame(
+        {"short": random.normal(0.0002, 0.01, size=252)},
+        index=pd.bdate_range("2025-01-02", periods=252),
+    )
+
+    analysis = analyze_strategy_allocation(
+        returns,
+        method="fixed",
+        lookback_days=252,
+        target_volatility=0.50,
+        max_pairwise_correlation=0.90,
+        max_strategy_weight=0.40,
+        fixed_weights={"short": 0.18},
+        risk_budgets={"short": 0.20},
+    )
+
+    assert analysis["members"]["short"]["target_weight"] == pytest.approx(0.18)
+    assert analysis["cash_weight"] == pytest.approx(0.82)
+    assert analysis["highest_pairwise_correlation"] == pytest.approx(0.0)
+    assert (
+        analysis["covariance_model_version"]
+        == SINGLE_MEMBER_FIXED_COVARIANCE_VERSION
+    )
+    assert analysis["solver"]["engine"] == "project_fixed_single_member_cash_reserve"
+
+
+def test_single_member_non_fixed_allocation_is_rejected() -> None:
+    returns = pd.DataFrame(
+        {"short": np.linspace(-0.01, 0.01, 252)},
+        index=pd.bdate_range("2025-01-02", periods=252),
+    )
+
+    with pytest.raises(ValueError, match="single-member.*fixed cash-reserve"):
+        analyze_strategy_allocation(
+            returns,
+            method="risk_parity",
+            lookback_days=252,
+            target_volatility=0.20,
+            max_pairwise_correlation=0.90,
+            max_strategy_weight=0.90,
+        )

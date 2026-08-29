@@ -186,6 +186,7 @@ def test_model_admission_validator_requires_fixed_independent_grid() -> None:
         )
 
 
+@pytest.mark.no_database
 def test_quant_bundle_validator_requires_all_three_ablations() -> None:
     periods = {
         "train_start": "2015-01-05",

@@ -34,6 +34,7 @@ from quant_data.database import (
     strategies,
     strategy_events,
     strategy_factors,
+    strategy_health_snapshots,
     strategy_pairs,
     strategy_versions,
 )
@@ -104,6 +105,16 @@ from quant_platform.qlib_factor_baseline import (
     bind_factor_source_config,
 )
 from quant_platform.qlib_workflow import require_qlib_workflow_identity
+from quant_platform.research_horizon import (
+    LEGACY_AMBIGUOUS,
+    horizon_columns_from_config,
+    normalize_horizon_config,
+    require_horizon_row,
+    require_label_horizon,
+)
+from quant_platform.research_horizon import (
+    canonical_sha256 as horizon_canonical_sha256,
+)
 from quant_platform.research_store import FactorGatePolicy
 from quant_platform.statistical_validation import DEFLATED_SHARPE_METHOD_VERSION
 from quant_platform.strategy_artifact_manifest import (
@@ -111,6 +122,22 @@ from quant_platform.strategy_artifact_manifest import (
     validate_backtest_artifact_manifest,
 )
 from quant_platform.strategy_catalog import strategy_type_capabilities
+from quant_platform.strategy_health import transition_strategy_health
+from quant_platform.strategy_research_admission import (
+    FIN_STRATEGY_FULL_STACK_ARTIFACT_TYPE,
+    FIN_STRATEGY_POLICY_ARTIFACT_TYPE,
+    FIN_STRATEGY_WINNER_ARTIFACT_TYPE,
+    build_fin_strategy_formal_admission,
+    validate_fin_strategy_formal_admission,
+)
+from quant_platform.strategy_rule_compiler import (
+    validate_compiled_strategy_artifact,
+    validate_strategy_rule_binding,
+)
+from quant_platform.transparent_baseline_lockbox import (
+    baseline_oos_sealed_member_set,
+    validate_lockbox_link,
+)
 from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
 
@@ -176,10 +203,14 @@ def _validate_governed_factor_evaluation(
 
     candidate_id = str(candidate["id"])
     policy = FactorGatePolicy()
+    if evaluation.get("evaluator_version") != policy.version:
+        raise ValueError(
+            "external frozen-value factors remain research-only until a formal "
+            "point-in-time availability and final-OOS publication contract is implemented"
+        )
     if (
         str(evaluation.get("factor_candidate_id") or "") != candidate_id
         or evaluation.get("is_legacy") is True
-        or evaluation.get("evaluator_version") != policy.version
         or evaluation.get("candidate_code_sha256") != candidate.get("code_sha256")
         or evaluation.get("candidate_values_sha256") != candidate.get("values_sha256")
         or evaluation.get("recomputed_values_sha256") != candidate.get("values_sha256")
@@ -298,6 +329,13 @@ def _validate_governed_factor_evaluation(
         "policy_sha256": evaluation.get("policy_sha256"),
     }
     if (
+        evaluation.get("final_test_key") is not None
+        or evaluation.get("final_test_consumed_at") is not None
+    ):
+        raise ValueError(
+            f"promoted factor {candidate_id} final OOS has already been consumed"
+        )
+    if (
         _canonical_sha256(evaluation_evidence) != evaluation.get("evidence_sha256")
         or evaluation.get("execution_contract_hash") != evaluation.get("evidence_sha256")
         or evaluation.get("qlib_commit") != QLIB_COMMIT
@@ -306,11 +344,59 @@ def _validate_governed_factor_evaluation(
         or evaluation.get("execution_frequency") != "day"
         or evaluation.get("signal_horizon")
         != f"{int(candidate.get('label_horizon_days') or 1)}d"
-        or evaluation.get("final_test_key") is not None
-        or evaluation.get("final_test_consumed_at") is not None
     ):
         raise ValueError(f"promoted factor {candidate_id} evaluation seal is invalid")
     return layers
+
+
+def _validate_governed_profile_consensus(
+    candidate: dict[str, Any],
+    evaluations_by_profile: Mapping[str, dict[str, Any]],
+    consensus: dict[str, Any],
+) -> None:
+    """Rebuild one sealed three-profile admission from its governed rows.
+
+    The official consensus contract deliberately treats ``robust_10y`` as a
+    stress profile: its full factor gate may fail, provided its hard evidence,
+    coverage, non-negative cost-adjusted return and direction agreement still
+    pass. Strategy publication must preserve that exact contract instead of
+    silently strengthening it to three fully-passed gates or trusting the
+    persisted consensus JSON without recomputation.
+    """
+
+    from quant_platform.research_automation import build_multi_profile_consensus
+
+    expected_profile_ids = {"recent_3y", "balanced_5y", "robust_10y"}
+    if set(evaluations_by_profile) != expected_profile_ids:
+        raise ValueError(
+            f"promoted factor {candidate['id']} consensus evaluations are incomplete"
+        )
+    normalized_evaluations: list[dict[str, Any]] = []
+    for profile_id in sorted(expected_profile_ids):
+        evaluation = evaluations_by_profile[profile_id]
+        _validate_governed_factor_evaluation(
+            evaluation,
+            candidate,
+            expected_profile_id=profile_id,
+            require_gate_passed=profile_id != "robust_10y",
+        )
+        normalized_evaluations.append(
+            {
+                **evaluation,
+                "metrics": dict(evaluation.get("metrics_json") or {}),
+            }
+        )
+    rebuilt = build_multi_profile_consensus(
+        {
+            **candidate,
+            "profile_evaluations": normalized_evaluations,
+        }
+    )
+    if rebuilt != consensus:
+        raise ValueError(
+            f"promoted factor {candidate['id']} profile consensus no longer "
+            "satisfies governed admission"
+        )
 
 
 def _version_contract_columns(config: dict[str, Any], *, strategy_type: str) -> dict[str, Any]:
@@ -343,6 +429,9 @@ def _version_contract_columns(config: dict[str, Any], *, strategy_type: str) -> 
         "qlib_commit": QLIB_COMMIT,
         "rdagent_version": f"0.0.dev0+g{RDAGENT_COMMIT}",
         "rdagent_commit": RDAGENT_COMMIT,
+        "source_research_artifact_id": config.get("source_research_artifact_id"),
+        "strategy_rules_sha256": config.get("strategy_rules_sha256"),
+        **horizon_columns_from_config(config),
     }
 
 
@@ -385,6 +474,31 @@ def _normalize_multifactor_contract(
     normalized.setdefault("execution_days", 1)
     normalized.setdefault("execution_slice_minutes", 20)
     normalized.setdefault("max_execution_slices", 24)
+    normalized = normalize_horizon_config(normalized)
+    if normalized["horizon_profile"] != LEGACY_AMBIGUOUS:
+        horizon = normalized["horizon_contract"]
+        normalized.setdefault("outer_purge_days", horizon["purge_sessions"])
+        normalized.setdefault("outer_embargo_days", horizon["embargo_sessions"])
+        normalized.setdefault("min_backtest_days", horizon["sealed_oos_sessions"])
+        if normalized["signal_frequency"] != "day":
+            raise ValueError("short/swing/long horizon profiles require daily signals")
+        if int(normalized["execution_lag_bars"]) != int(
+            horizon["execution_lag_sessions"]
+        ):
+            raise ValueError("execution lag differs from the selected horizon profile")
+        if int(normalized.get("outer_purge_days") or 0) < int(
+            horizon["purge_sessions"]
+        ):
+            raise ValueError("outer purge is shorter than the selected horizon contract")
+        if int(normalized.get("outer_embargo_days") or 0) < int(
+            horizon["embargo_sessions"]
+        ):
+            raise ValueError("outer embargo is shorter than the selected horizon contract")
+        if int(normalized.get("min_backtest_days") or 0) < int(
+            horizon["sealed_oos_sessions"]
+        ):
+            raise ValueError("formal backtest is shorter than the selected sealed OOS")
+        validate_strategy_rule_binding(normalized)
     normalized["execution_contract_hash"] = strategy_execution_contract_hash(normalized)
     require_strategy_execution_contract(normalized)
     return normalized
@@ -396,6 +510,143 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _require_strategy_source_artifact(
+    connection: Any,
+    config: Mapping[str, Any],
+    *,
+    expected_strategy_id: str | None,
+) -> dict[str, Any] | None:
+    """Verify a compiled fin_strategy artifact at the database write boundary."""
+
+    source_id = str(config.get("source_research_artifact_id") or "").strip()
+    if not source_id:
+        return None
+    row = connection.execute(
+        select(research_run_artifacts)
+        .where(research_run_artifacts.c.id == source_id)
+        .with_for_update()
+    ).first()
+    if row is None:
+        raise ValueError("strategy research source artifact does not exist")
+    manifest = dict(row.manifest_json or {})
+    path = Path(str(row.storage_path))
+    if (
+        str(row.status) != "recorded"
+        or str(row.artifact_type) != "fin_strategy_compiled_artifact"
+        or str(row.contract_version) != "compiled-strategy-proposal-v1"
+        or bool(row.capital_eligible)
+        or _canonical_sha256(manifest) != str(row.manifest_sha256)
+        or manifest.get("id") != source_id
+        or manifest.get("artifact_type") != "fin_strategy_compiled_artifact"
+        or not path.is_file()
+        or path.is_symlink()
+        or path.stat().st_size != int(row.size_bytes)
+        or _sha256_file(path) != str(row.content_sha256)
+    ):
+        raise ValueError("strategy research source artifact is not intact")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("strategy research source artifact is unreadable") from exc
+    candidate = raw.get("strategy_spec_candidate") if isinstance(raw, dict) else None
+    rule_ir = candidate.get("rule_ir") if isinstance(candidate, dict) else None
+    alpha = (
+        (((rule_ir or {}).get("slots") or {}).get("alpha_rank") or {}).get(
+            "components"
+        )
+        if isinstance(rule_ir, dict)
+        else None
+    )
+    weights = None
+    if isinstance(alpha, list):
+        weights = next(
+            (
+                ((item.get("parameters") or {}).get("weights"))
+                for item in alpha
+                if isinstance(item, dict)
+                and item.get("component") == "weighted_factor_rank"
+            ),
+            None,
+        )
+    allowed_factor_ids = set(weights) if isinstance(weights, dict) else None
+    artifact = validate_compiled_strategy_artifact(
+        raw,
+        allowed_factor_ids=allowed_factor_ids,
+    )
+    proposal = artifact["strategy_proposal"]
+    candidate = artifact["strategy_spec_candidate"]
+    policy = candidate["execution_policy"]
+    expected_values = {
+        "horizon_profile": candidate["horizon"],
+        "recipe_id": proposal["baseline_recipe_id"],
+        "recipe_version": proposal["baseline_recipe_version"],
+        "strategy_rule_ir": candidate["rule_ir"],
+        "strategy_rules_sha256": artifact["rules_sha256"],
+        "strategy_rule_policy_sha256": policy["policy_sha256"],
+        "strategy_research_proposal_sha256": artifact["proposal_sha256"],
+        "strategy_research_artifact_sha256": artifact["artifact_sha256"],
+        "parent_strategy_version_id": proposal["parent_strategy_version_id"],
+        "strategy_research_data_contract": proposal["data_contract"],
+        "strategy_evaluation_contract": proposal["evaluation_contract"],
+    }
+    if any(config.get(key) != value for key, value in expected_values.items()):
+        raise ValueError("StrategySpec differs from its compiled research artifact")
+    parent_id = proposal["parent_strategy_version_id"]
+    if parent_id is None:
+        if expected_strategy_id is not None:
+            raise ValueError("a new family version requires a parent strategy version")
+    else:
+        parent = connection.execute(
+            select(strategy_versions).where(strategy_versions.c.id == str(parent_id))
+        ).first()
+        if (
+            parent is None
+            or str(parent.horizon_profile) != str(candidate["horizon"])
+            or (
+                expected_strategy_id is not None
+                and str(parent.strategy_id) != expected_strategy_id
+            )
+        ):
+            raise ValueError("strategy research parent binding is invalid")
+        if expected_strategy_id is None:
+            raise ValueError("a proposal with a parent must create a family version")
+    return artifact
+
+
+def _verified_research_run_artifact_payload(
+    row: Any,
+    *,
+    expected_type: str,
+) -> dict[str, Any]:
+    """Read one immutable JSON run artifact through its database seal."""
+
+    manifest = dict(row.manifest_json or {})
+    path = Path(str(row.storage_path))
+    if (
+        str(row.status) != "recorded"
+        or str(row.artifact_type) != expected_type
+        or bool(row.capital_eligible)
+        or _canonical_sha256(manifest) != str(row.manifest_sha256)
+        or manifest.get("id") != str(row.id)
+        or manifest.get("research_run_id") != str(row.research_run_id)
+        or manifest.get("artifact_type") != expected_type
+        or manifest.get("content_sha256") != str(row.content_sha256)
+        or int(manifest.get("size_bytes") or -1) != int(row.size_bytes)
+        or not path.is_file()
+        or path.is_symlink()
+        or path.stat().st_size != int(row.size_bytes)
+        or _sha256_file(path) != str(row.content_sha256)
+    ):
+        raise ValueError(f"{expected_type} run artifact is not intact")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{expected_type} run artifact is unreadable") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{expected_type} run artifact must be a JSON object")
+    return payload
 
 
 def _scenario_artifact_failures(scenarios: dict[str, Any], artifact_root: Path) -> list[str]:
@@ -1402,6 +1653,7 @@ class StrategyStore:
                     )
                 ).all()
                 bound_evidence = {str(row.id): row_dict(row) for row in consensus_rows}
+                evaluations_by_profile: dict[str, dict[str, Any]] = {}
                 for profile_id in sorted(expected_profile_ids):
                     profile_evaluation = bound_evidence.get(str(consensus_ids[profile_id]))
                     if (
@@ -1414,12 +1666,12 @@ class StrategyStore:
                             f"promoted factor {candidate_id} consensus evaluations "
                             "changed or are missing"
                         )
-                    _validate_governed_factor_evaluation(
-                        profile_evaluation,
-                        candidate_data,
-                        expected_profile_id=profile_id,
-                        require_gate_passed=True,
-                    )
+                    evaluations_by_profile[profile_id] = profile_evaluation
+                _validate_governed_profile_consensus(
+                    candidate_data,
+                    evaluations_by_profile,
+                    dict(consensus),
+                )
                 expected_promotion_evidence = _canonical_sha256(
                     {
                         "version": "factor-promotion-evidence-v2-profile-consensus",
@@ -1463,8 +1715,24 @@ class StrategyStore:
             evidence[candidate_id] = {
                 "id": str(evaluation.id),
                 "direction": -1 if evaluation.metrics_json.get("direction") == "inverted" else 1,
+                "label_horizon_sessions": int(candidate.label_horizon_days or 0),
             }
         return evidence
+
+    @staticmethod
+    def _require_factor_horizon_compatibility(
+        config: Mapping[str, Any], evidence: Mapping[str, Mapping[str, Any]]
+    ) -> None:
+        profile = str(config.get("horizon_profile") or LEGACY_AMBIGUOUS)
+        if profile == LEGACY_AMBIGUOUS:
+            return
+        for candidate_id, item in evidence.items():
+            try:
+                require_label_horizon(profile, int(item["label_horizon_sessions"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"factor {candidate_id} label horizon is incompatible with {profile}: {exc}"
+                ) from exc
 
     @staticmethod
     def _bundle_factor_evidence(
@@ -2228,6 +2496,11 @@ class StrategyStore:
         now = _now()
         try:
             with self.engine.begin() as connection:
+                _require_strategy_source_artifact(
+                    connection,
+                    config,
+                    expected_strategy_id=None,
+                )
                 model_evidence = self._model_signal_evidence(
                     connection,
                     config,
@@ -2263,6 +2536,7 @@ class StrategyStore:
                     evaluation_evidence: dict[str, dict[str, Any]] = {}
                 else:
                     evaluation_evidence = self._factor_evidence(connection, factors)
+                    self._require_factor_horizon_compatibility(config, evaluation_evidence)
                 connection.execute(
                     insert(strategies).values(
                         id=strategy_id,
@@ -2326,6 +2600,57 @@ class StrategyStore:
         config: dict[str, Any],
         actor: str,
     ) -> dict[str, Any]:
+        """Create a new immutable version even when its inputs match an older one."""
+
+        return self._create_version(
+            strategy_id,
+            benchmark=benchmark,
+            universe=universe,
+            factors=factors,
+            config=config,
+            actor=actor,
+            reuse_exact=False,
+        )
+
+    def create_version_if_absent(
+        self,
+        strategy_id: str,
+        *,
+        benchmark: str,
+        universe: str,
+        factors: list[dict[str, Any]],
+        config: dict[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        """Create once per exact normalized version contract under the family lock.
+
+        This is deliberately separate from :meth:`create_version`: operator and
+        research calls retain the established append-a-version behavior. Managed
+        release reconciliation can opt into deterministic idempotence without a
+        check-then-create race between two scheduler processes.
+        """
+
+        return self._create_version(
+            strategy_id,
+            benchmark=benchmark,
+            universe=universe,
+            factors=factors,
+            config=config,
+            actor=actor,
+            reuse_exact=True,
+        )
+
+    def _create_version(
+        self,
+        strategy_id: str,
+        *,
+        benchmark: str,
+        universe: str,
+        factors: list[dict[str, Any]],
+        config: dict[str, Any],
+        actor: str,
+        reuse_exact: bool,
+    ) -> dict[str, Any]:
         joint_bundle_requested = config.get("quant_bundle_candidate_id") is not None
         if joint_bundle_requested and factors:
             raise ValueError(
@@ -2339,7 +2664,12 @@ class StrategyStore:
         )
         if len({item["candidate_id"] for item in factors}) != len(factors):
             raise ValueError("factor candidates must be unique within a strategy version")
-        total_weight = sum(abs(float(item["weight"])) for item in factors)
+        weight_inputs = (
+            sorted(factors, key=lambda item: str(item["candidate_id"]))
+            if reuse_exact
+            else factors
+        )
+        total_weight = sum(abs(float(item["weight"])) for item in weight_inputs)
         if factors and total_weight <= 0:
             raise ValueError("factor weights must not all be zero")
         version_id = uuid.uuid4().hex
@@ -2351,6 +2681,11 @@ class StrategyStore:
                 ).first()
                 if strategy is None:
                     raise KeyError(strategy_id)
+                _require_strategy_source_artifact(
+                    connection,
+                    config,
+                    expected_strategy_id=strategy_id,
+                )
                 family_type = connection.scalar(
                     select(strategy_versions.c.strategy_type)
                     .where(strategy_versions.c.strategy_id == strategy_id)
@@ -2393,55 +2728,122 @@ class StrategyStore:
                     evaluation_evidence: dict[str, dict[str, Any]] = {}
                 else:
                     evaluation_evidence = self._factor_evidence(connection, factors)
-                latest = connection.scalar(
-                    select(func.max(strategy_versions.c.version)).where(
-                        strategy_versions.c.strategy_id == strategy_id
+                    self._require_factor_horizon_compatibility(config, evaluation_evidence)
+                expected_factors = sorted(
+                    (
+                        str(item["candidate_id"]),
+                        str(evaluation_evidence[item["candidate_id"]]["id"]),
+                        float(item["weight"]) / total_weight,
+                        int(evaluation_evidence[item["candidate_id"]]["direction"]),
                     )
-                )
-                version_number = int(latest or 0) + 1
-                connection.execute(
-                    insert(strategy_versions).values(
-                        id=version_id,
-                        strategy_id=strategy_id,
-                        version=version_number,
-                        status="draft",
-                        strategy_type="multifactor",
-                        **_version_contract_columns(config, strategy_type="multifactor"),
-                        benchmark=benchmark,
-                        universe=universe,
-                        config_json=config,
-                        created_by=actor,
-                        created_at=now,
-                    )
-                )
-                factor_rows = [
-                    {
-                        "strategy_version_id": version_id,
-                        "factor_candidate_id": item["candidate_id"],
-                        "factor_evaluation_id": evaluation_evidence[item["candidate_id"]]["id"],
-                        "weight": float(item["weight"]) / total_weight,
-                        "direction": evaluation_evidence[item["candidate_id"]]["direction"],
-                        "created_at": now,
-                    }
                     for item in factors
-                ]
-                if factor_rows:
-                    connection.execute(insert(strategy_factors), factor_rows)
-                connection.execute(
-                    update(strategies).where(strategies.c.id == strategy_id).values(updated_at=now)
                 )
-                self._event(
-                    connection,
-                    strategy_id=strategy_id,
-                    version_id=version_id,
-                    event_type="strategy.version_created",
-                    actor=actor,
-                    payload={
-                        "version": version_number,
-                        "benchmark": benchmark,
-                        "universe": universe,
-                    },
-                )
+                existing_version_id: str | None = None
+                if reuse_exact:
+                    expected_config_sha256 = _canonical_sha256(config)
+                    candidates = connection.execute(
+                        select(
+                            strategy_versions.c.id,
+                            strategy_versions.c.config_json,
+                        ).where(
+                            strategy_versions.c.strategy_id == strategy_id,
+                            strategy_versions.c.strategy_type == "multifactor",
+                            strategy_versions.c.benchmark == benchmark,
+                            strategy_versions.c.universe == universe,
+                        )
+                    ).all()
+                    exact: list[str] = []
+                    for candidate in candidates:
+                        if _canonical_sha256(
+                            dict(candidate.config_json or {})
+                        ) != expected_config_sha256:
+                            continue
+                        stored_factors = sorted(
+                            (
+                                str(row.factor_candidate_id),
+                                str(row.factor_evaluation_id),
+                                float(row.weight),
+                                int(row.direction),
+                            )
+                            for row in connection.execute(
+                                select(
+                                    strategy_factors.c.factor_candidate_id,
+                                    strategy_factors.c.factor_evaluation_id,
+                                    strategy_factors.c.weight,
+                                    strategy_factors.c.direction,
+                                ).where(
+                                    strategy_factors.c.strategy_version_id
+                                    == str(candidate.id)
+                                )
+                            )
+                        )
+                        if stored_factors == expected_factors:
+                            exact.append(str(candidate.id))
+                    if len(exact) > 1:
+                        raise ValueError(
+                            "strategy family contains duplicate exact immutable versions"
+                        )
+                    if exact:
+                        existing_version_id = exact[0]
+                        version_id = existing_version_id
+                if existing_version_id is None:
+                    latest = connection.scalar(
+                        select(func.max(strategy_versions.c.version)).where(
+                            strategy_versions.c.strategy_id == strategy_id
+                        )
+                    )
+                    version_number = int(latest or 0) + 1
+                    connection.execute(
+                        insert(strategy_versions).values(
+                            id=version_id,
+                            strategy_id=strategy_id,
+                            version=version_number,
+                            status="draft",
+                            strategy_type="multifactor",
+                            **_version_contract_columns(config, strategy_type="multifactor"),
+                            benchmark=benchmark,
+                            universe=universe,
+                            config_json=config,
+                            created_by=actor,
+                            created_at=now,
+                        )
+                    )
+                    factor_rows = [
+                        {
+                            "strategy_version_id": version_id,
+                            "factor_candidate_id": item["candidate_id"],
+                            "factor_evaluation_id": evaluation_evidence[item["candidate_id"]][
+                                "id"
+                            ],
+                            "weight": float(item["weight"]) / total_weight,
+                            "direction": evaluation_evidence[item["candidate_id"]][
+                                "direction"
+                            ],
+                            "created_at": now,
+                        }
+                        for item in factors
+                    ]
+                    if factor_rows:
+                        connection.execute(insert(strategy_factors), factor_rows)
+                    connection.execute(
+                        update(strategies)
+                        .where(strategies.c.id == strategy_id)
+                        .values(updated_at=now)
+                    )
+                    self._event(
+                        connection,
+                        strategy_id=strategy_id,
+                        version_id=version_id,
+                        event_type="strategy.version_created",
+                        actor=actor,
+                        payload={
+                            "version": version_number,
+                            "benchmark": benchmark,
+                            "universe": universe,
+                        },
+                    )
+                # The family row remains locked until this transaction exits,
+                # so a concurrent idempotent caller observes the exact row.
         except IntegrityError as exc:
             raise ValueError("strategy version creation conflicted with another request") from exc
         return self.get_version(version_id)
@@ -2717,7 +3119,9 @@ class StrategyStore:
             ).first()
             model_evidence = self._model_signal_evidence(connection, dict(row.config_json or {}))
         result = row_dict(row)
+        require_horizon_row(result)
         result["config"] = result.pop("config_json")
+        result["horizon_contract"] = dict(result["horizon_contract_json"])
         result["factors"] = [row_dict(item) for item in factor_rows]
         result["pair"] = row_dict(pair_row) if pair_row else None
         result["capabilities"] = strategy_type_capabilities(result["strategy_type"])
@@ -3119,6 +3523,165 @@ class StrategyStore:
             },
         }
 
+    def _require_fin_strategy_formal_admission(
+        self,
+        connection: Any,
+        version: Mapping[str, Any],
+        *,
+        allow_approved_paper: bool = False,
+    ) -> dict[str, Any]:
+        """Resolve the one passed policy/full-stack path for a draft version.
+
+        Research-run artifacts remain explicitly non-capital. This binding is
+        only permission to preregister and consume one CapitalOOSAlphaLedger
+        window; it is not historical approval or recommendation authority.
+        """
+
+        config = dict(version.get("config") or version.get("config_json") or {})
+        source_id = str(
+            version.get("source_research_artifact_id")
+            or config.get("source_research_artifact_id")
+            or ""
+        )
+        if not source_id:
+            raise ValueError("fin_strategy formal admission has no compiled source")
+        parent_id = config.get("parent_strategy_version_id")
+        compiled = _require_strategy_source_artifact(
+            connection,
+            config,
+            expected_strategy_id=(
+                str(version.get("strategy_id") or "") if parent_id is not None else None
+            ),
+        )
+        if compiled is None:
+            raise ValueError("fin_strategy formal admission has no compiled source")
+        source_row = connection.execute(
+            select(research_run_artifacts)
+            .where(research_run_artifacts.c.id == source_id)
+            .with_for_update()
+        ).one()
+        research_run_id = str(source_row.research_run_id)
+        artifact_types = (
+            "fin_strategy_competition_plan",
+            FIN_STRATEGY_POLICY_ARTIFACT_TYPE,
+            FIN_STRATEGY_FULL_STACK_ARTIFACT_TYPE,
+            FIN_STRATEGY_WINNER_ARTIFACT_TYPE,
+        )
+        rows = connection.execute(
+            select(research_run_artifacts)
+            .where(
+                research_run_artifacts.c.research_run_id == research_run_id,
+                research_run_artifacts.c.artifact_type.in_(artifact_types),
+            )
+            .order_by(research_run_artifacts.c.created_at, research_run_artifacts.c.id)
+            .with_for_update()
+        ).all()
+        parsed: dict[str, list[tuple[Any, dict[str, Any]]]] = {
+            artifact_type: [] for artifact_type in artifact_types
+        }
+        for row in rows:
+            artifact_type = str(row.artifact_type)
+            parsed[artifact_type].append(
+                (
+                    row,
+                    _verified_research_run_artifact_payload(
+                        row,
+                        expected_type=artifact_type,
+                    ),
+                )
+            )
+
+        version_value = dict(version)
+        version_value["config"] = config
+        version_value["status"] = str(version.get("status") or "")
+        version_value["promotion_stage"] = version.get("promotion_stage")
+        winners = parsed[FIN_STRATEGY_WINNER_ARTIFACT_TYPE]
+        if len(winners) != 1:
+            raise ValueError(
+                "fin_strategy formal OOS requires one governed run winner decision"
+            )
+        winner_row, winner_payload = winners[0]
+        matches: list[dict[str, Any]] = []
+        for plan_row, plan in parsed["fin_strategy_competition_plan"]:
+            if (
+                plan.get("compiled_artifact_id") != source_id
+                or plan.get("compiled_artifact_sha256")
+                != config.get("strategy_research_artifact_sha256")
+            ):
+                continue
+            plan_sha256 = str(plan.get("plan_sha256") or "")
+            policies = [
+                (row, payload)
+                for row, payload in parsed[FIN_STRATEGY_POLICY_ARTIFACT_TYPE]
+                if ((payload.get("evidence") or {}).get("plan_sha256") == plan_sha256)
+            ]
+            full_stacks = [
+                (row, payload)
+                for row, payload in parsed[FIN_STRATEGY_FULL_STACK_ARTIFACT_TYPE]
+                if ((payload.get("evidence") or {}).get("plan_sha256") == plan_sha256)
+            ]
+            for policy_row, policy in policies:
+                for full_row, full_stack in full_stacks:
+                    try:
+                        admission = build_fin_strategy_formal_admission(
+                            strategy_version=version_value,
+                            compiled_artifact=compiled,
+                            competition_plan=plan,
+                            policy_evaluation_artifact=policy,
+                            full_stack_evaluation_artifact=full_stack,
+                            governed_winner_artifact=winner_payload,
+                            allow_approved_paper=allow_approved_paper,
+                        )
+                    except ValueError:
+                        continue
+                    binding = {
+                        "contract_version": "fin-strategy-formal-admission-binding-v1",
+                        "admission": admission,
+                        "compiled_artifact": {
+                            "id": source_id,
+                            "content_sha256": str(source_row.content_sha256),
+                            "manifest_sha256": str(source_row.manifest_sha256),
+                        },
+                        "competition_plan_artifact": {
+                            "id": str(plan_row.id),
+                            "content_sha256": str(plan_row.content_sha256),
+                            "manifest_sha256": str(plan_row.manifest_sha256),
+                        },
+                        "policy_evaluation_artifact": {
+                            "id": str(policy_row.id),
+                            "content_sha256": str(policy_row.content_sha256),
+                            "manifest_sha256": str(policy_row.manifest_sha256),
+                        },
+                        "full_stack_evaluation_artifact": {
+                            "id": str(full_row.id),
+                            "content_sha256": str(full_row.content_sha256),
+                            "manifest_sha256": str(full_row.manifest_sha256),
+                        },
+                        "governed_winner_artifact": {
+                            "id": str(winner_row.id),
+                            "content_sha256": str(winner_row.content_sha256),
+                            "manifest_sha256": str(winner_row.manifest_sha256),
+                        },
+                    }
+                    binding["binding_sha256"] = _canonical_sha256(binding)
+                    matches.append(binding)
+        unique = {str(item["binding_sha256"]): item for item in matches}
+        if len(unique) != 1:
+            raise ValueError(
+                "fin_strategy formal OOS requires exactly one sealed passed "
+                "policy-only/full-stack admission path"
+            )
+        return next(iter(unique.values()))
+
+    def require_fin_strategy_formal_admission(
+        self, version_id: str
+    ) -> dict[str, Any]:
+        """Public read/lock boundary used before reserving the capital OOS."""
+
+        version = self.get_version(version_id)
+        with self.engine.begin() as connection:
+            return self._require_fin_strategy_formal_admission(connection, version)
+
     def create_backtest(
         self,
         *,
@@ -3129,11 +3692,19 @@ class StrategyStore:
         execution_dataset: str | None = None,
         trading_dates: Sequence[date | str] | None = None,
         dataset_lineage_id: str | None = None,
+        dataset_identity_sha256: str | None = None,
         capital_oos_alpha_batch_id: str | None = None,
         capital_oos_sealed_candidate_set_patch: Mapping[str, Any] | None = None,
         capital_oos_dataset_identity_sha256: str | None = None,
     ) -> dict[str, Any]:
         version = self.get_version(version_id)
+        is_fin_strategy_candidate = bool(
+            str(
+                version.get("source_research_artifact_id")
+                or version.get("config", {}).get("source_research_artifact_id")
+                or ""
+            ).strip()
+        )
         capital_values_present = (
             capital_oos_alpha_batch_id is not None,
             capital_oos_sealed_candidate_set_patch is not None,
@@ -3142,6 +3713,11 @@ class StrategyStore:
         if any(capital_values_present) and not all(capital_values_present):
             raise ValueError(
                 "capital OOS backtest requires batch, sealed patch, and dataset identity"
+            )
+        if is_fin_strategy_candidate and not all(capital_values_present):
+            raise ValueError(
+                "fin_strategy formal OOS requires a preregistered "
+                "CapitalOOSAlphaLedger batch"
             )
         capital_batch_id: str | None = None
         capital_dataset_identity: str | None = None
@@ -3186,6 +3762,37 @@ class StrategyStore:
             artifact_path / backtest_id if artifact_path.name == "backtests" else artifact_path
         )
         with self.engine.begin() as connection:
+            # Serialise the one-shot formal-test boundary per frozen version.
+            # Without this lock two completion workers could both observe no
+            # prior row before either inserts, opening the sealed OOS twice.
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:identity))"),
+                {"identity": f"strategy-final-backtest:{version_id}"},
+            )
+            fin_strategy_admission: dict[str, Any] | None = None
+            if is_fin_strategy_candidate:
+                fin_strategy_admission = self._require_fin_strategy_formal_admission(
+                    connection,
+                    version,
+                )
+                admission = validate_fin_strategy_formal_admission(
+                    fin_strategy_admission["admission"]
+                )
+                expected_periods = dict(admission["formal_periods"])
+                supplied_identity = str(dataset_identity_sha256 or "").strip().lower()
+                if (
+                    admission["dataset"] != dataset
+                    or supplied_identity != admission["dataset_identity_sha256"]
+                    or any(
+                        str(periods.get(key) or "") != value
+                        for key, value in expected_periods.items()
+                    )
+                ):
+                    raise ValueError(
+                        "fin_strategy formal OOS differs from its sealed "
+                        "admission dataset or window"
+                    )
+                recorded_periods["fin_strategy_formal_admission"] = fin_strategy_admission
             if version.get("strategy_type") == "multifactor":
                 model_evidence = self._model_signal_evidence(connection, version["config"])
                 prior = connection.execute(
@@ -3411,26 +4018,7 @@ class StrategyStore:
                     }
                     dataset_identities = set()
                 else:
-                    baseline_definition_sha256 = str(
-                        version["config"].get("baseline_definition_sha256") or ""
-                    )
-                    if not _is_sha256(baseline_definition_sha256):
-                        raise ValueError(
-                            "baseline final tests require an immutable baseline definition"
-                        )
-                    strategy_spec = {
-                        "strategy_type": "multifactor",
-                        "benchmark": version["benchmark"],
-                        "universe": version["universe"],
-                        "config_sha256": _canonical_sha256(version["config"]),
-                        "baseline_definition_sha256": baseline_definition_sha256,
-                    }
-                    sealed_member_set = {
-                        "candidate_ids": [],
-                        "baseline_definition_sha256": baseline_definition_sha256,
-                        "strategy_spec_sha256": _canonical_sha256(strategy_spec),
-                        "model_signal": model_identity,
-                    }
+                    sealed_member_set = baseline_oos_sealed_member_set(version)
                     # Baseline-only versions have no factor evaluation carrying
                     # a snapshot identity. This value is audit-only; stable scope
                     # below, never the snapshot name, controls OOS reuse.
@@ -3716,7 +4304,50 @@ class StrategyStore:
             ),
             None,
         )
-        if any(item is not row for item in overlapping_rows):
+        lockbox_raw = sealed_member_set.get("transparent_baseline_lockbox")
+        lockbox = validate_lockbox_link(lockbox_raw) if lockbox_raw is not None else None
+        if lockbox is not None:
+            # The three public control windows are allowed to overlap only
+            # after all three exact members have been atomically preregistered.
+            # No call through create_backtest may create a missing member row.
+            batch_rows = []
+            for candidate in connection.execute(
+                select(oos_vintages).where(oos_vintages.c.scope == scope).with_for_update()
+            ).all():
+                candidate_members = dict(candidate.sealed_candidate_set_json or {})
+                candidate_link = candidate_members.get(
+                    "transparent_baseline_lockbox"
+                )
+                if not isinstance(candidate_link, Mapping):
+                    continue
+                try:
+                    normalized_link = validate_lockbox_link(candidate_link)
+                except ValueError:
+                    continue
+                if normalized_link["batch_sha256"] == lockbox["batch_sha256"]:
+                    batch_rows.append((candidate, normalized_link))
+            observed_members = {
+                item[1]["member_sha256"] for item in batch_rows
+            }
+            if (
+                row is None
+                or len(batch_rows) != 3
+                or observed_members != set(lockbox["member_sha256s"])
+                or any(
+                    validate_lockbox_link(
+                        dict(item.sealed_candidate_set_json or {}).get(
+                            "transparent_baseline_lockbox"
+                        )
+                    )["batch_sha256"]
+                    != lockbox["batch_sha256"]
+                    for item in overlapping_rows
+                )
+            ):
+                raise ValueError(
+                    "transparent baseline final OOS was not atomically preregistered "
+                    "in its complete three-member joint lockbox"
+                )
+        elif any(item is not row for item in overlapping_rows):
             raise ValueError(
                 "final test window overlaps a reserved or consumed OOS vintage "
                 "in the same research scope"
@@ -4012,6 +4643,8 @@ class StrategyStore:
             raise ValueError("pair strategy risk gate failed: " + "; ".join(failures))
         now = _now()
         with self.engine.begin() as connection:
+            # Pair execution is retained only as an offline/read-only legacy
+            # lane and keeps its original single-approved-version semantics.
             connection.execute(
                 update(strategy_versions)
                 .where(
@@ -4065,15 +4698,36 @@ class StrategyStore:
         if backtests[0].get("is_legacy"):
             raise ValueError("legacy backtests cannot approve a new strategy")
         config = version["config"]
+        fin_strategy_admission_binding: dict[str, Any] | None = None
+        source_research_artifact_id = str(
+            version.get("source_research_artifact_id")
+            or config.get("source_research_artifact_id")
+            or ""
+        ).strip()
+        if source_research_artifact_id:
+            with self.engine.begin() as connection:
+                fin_strategy_admission_binding = (
+                    self._require_fin_strategy_formal_admission(connection, version)
+                )
+            recorded_admission = (backtests[0].get("periods") or {}).get(
+                "fin_strategy_formal_admission"
+            )
+            if recorded_admission != fin_strategy_admission_binding:
+                raise ValueError(
+                    "fin_strategy formal backtest is not bound to its passed "
+                    "policy-only/full-stack evidence"
+                )
         # Autopilot strategies are capital-facing only after the single fresh
         # final OOS is both settled in the persistent alpha ledger and bound
         # back to this exact immutable artifact.  ``approve`` is deliberately
         # a second authority boundary: callers cannot bypass the Autopilot
         # completion service by invoking StrategyStore directly.
-        if (
+        requires_capital_oos_receipt = (
             config.get("autopilot_completion_contract_version")
             == "autopilot-completion-v1"
-        ):
+            or bool(source_research_artifact_id)
+        )
+        if requires_capital_oos_receipt:
             try:
                 receipt = require_capital_oos_receipt(
                     metrics.get("capital_oos_receipt"),
@@ -4135,7 +4789,7 @@ class StrategyStore:
                     )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(
-                    "autopilot strategy requires a settled passing capital OOS receipt: "
+                    "governed strategy requires a settled passing capital OOS receipt: "
                     + str(exc)
                 ) from exc
         if version.get("strategy_type") == "pair":
@@ -4553,6 +5207,17 @@ class StrategyStore:
             ).first()
             if locked_version is None:
                 raise KeyError(version_id)
+            if fin_strategy_admission_binding is not None:
+                locked_value = row_dict(locked_version)
+                locked_value["config"] = dict(locked_version.config_json or {})
+                fresh_admission = self._require_fin_strategy_formal_admission(
+                    connection,
+                    locked_value,
+                )
+                if fresh_admission != fin_strategy_admission_binding:
+                    raise ValueError(
+                        "fin_strategy admission evidence changed during approval"
+                    )
             activated_model_artifact_id: str | None = None
             if prepared_model_artifact is not None:
                 locked_backtest = connection.execute(
@@ -4630,14 +5295,6 @@ class StrategyStore:
                 activated_model_artifact_id = str(artifact.id)
             connection.execute(
                 update(strategy_versions)
-                .where(
-                    strategy_versions.c.strategy_id == version["strategy_id"],
-                    strategy_versions.c.status == "approved",
-                )
-                .values(status="retired")
-            )
-            connection.execute(
-                update(strategy_versions)
                 .where(strategy_versions.c.id == version_id)
                 .values(
                     status="approved",
@@ -4685,6 +5342,217 @@ class StrategyStore:
         except Exception as exc:  # noqa: BLE001 - approval is already committed
             promotion.record_paper_stage_failure(version_id, actor=actor, error=str(exc))
         return self.get_version(version_id)
+
+    @staticmethod
+    def append_health_snapshot_in_transaction(
+        connection: Any,
+        version_id: str,
+        *,
+        as_of: datetime,
+        health_status: str,
+        criteria: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        actor: str,
+        recorded_at: datetime | None = None,
+    ) -> str:
+        """Append one sealed health observation using the caller's transaction.
+
+        The strategy-version row is locked here, so promotion can create the
+        first health observation and switch recommendation authority atomically.
+        Exact content-addressed retries return the existing id.
+        """
+
+        allowed = {
+            "healthy",
+            "watch",
+            "restricted",
+            "suspended",
+            "retired",
+        }
+        if health_status not in allowed:
+            raise ValueError(f"unsupported strategy health status: {health_status}")
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise ValueError("strategy health as_of must be timezone-aware")
+        if len(actor.strip()) < 2:
+            raise ValueError("a responsible health-snapshot actor is required")
+        criteria_json = dict(criteria)
+        evidence_json = dict(evidence)
+        if not criteria_json:
+            raise ValueError("strategy health criteria must not be empty")
+        normalized_as_of = as_of.astimezone(UTC).replace(microsecond=0)
+        version = connection.execute(
+            select(strategy_versions)
+            .where(strategy_versions.c.id == version_id)
+            .with_for_update()
+        ).first()
+        if version is None:
+            raise KeyError(version_id)
+        version_row = row_dict(version)
+        horizon = require_horizon_row(version_row)
+        criteria_sha256 = horizon_canonical_sha256(criteria_json)
+        evidence_sha256 = horizon_canonical_sha256(evidence_json)
+        snapshot = {
+            "contract_version": "strategy-health-snapshot-v1",
+            "strategy_version_id": version_id,
+            "horizon_profile": horizon.horizon_profile,
+            "horizon_contract_sha256": horizon.sha256,
+            "as_of": normalized_as_of.isoformat(),
+            "health_status": health_status,
+            "criteria_json": criteria_json,
+            "criteria_sha256": criteria_sha256,
+            "evidence_json": evidence_json,
+            "evidence_sha256": evidence_sha256,
+            "recorded_by": actor.strip(),
+        }
+        snapshot_sha256 = horizon_canonical_sha256(snapshot)
+        values = {
+            "id": snapshot_sha256,
+            "strategy_version_id": version_id,
+            "horizon_profile": horizon.horizon_profile,
+            "as_of": normalized_as_of,
+            "health_status": health_status,
+            "criteria_json": criteria_json,
+            "criteria_sha256": criteria_sha256,
+            "evidence_json": evidence_json,
+            "evidence_sha256": evidence_sha256,
+            "snapshot_sha256": snapshot_sha256,
+            "recorded_by": actor.strip(),
+            "recorded_at": recorded_at or _now(),
+        }
+        existing = connection.execute(
+            select(strategy_health_snapshots.c.id).where(
+                strategy_health_snapshots.c.id == snapshot_sha256
+            )
+        ).first()
+        if existing is not None:
+            return snapshot_sha256
+        latest_health = connection.execute(
+            select(
+                strategy_health_snapshots.c.health_status,
+                strategy_health_snapshots.c.as_of,
+            )
+            .where(strategy_health_snapshots.c.strategy_version_id == version_id)
+            .order_by(
+                strategy_health_snapshots.c.as_of.desc(),
+                strategy_health_snapshots.c.recorded_at.desc(),
+            )
+            .limit(1)
+        ).first()
+        previous_status = (
+            str(latest_health.health_status) if latest_health is not None else None
+        )
+        if latest_health is not None and normalized_as_of < latest_health.as_of:
+            raise ValueError("strategy health snapshots must not move as_of backward")
+        allowed_transition = transition_strategy_health(previous_status, health_status)
+        if allowed_transition != health_status:
+            raise ValueError(
+                "strategy health recovery must proceed one state at a time: "
+                f"{previous_status} -> {allowed_transition}"
+            )
+        connection.execute(insert(strategy_health_snapshots).values(**values))
+        return snapshot_sha256
+
+    def record_health_snapshot(
+        self,
+        version_id: str,
+        *,
+        as_of: datetime,
+        health_status: str,
+        criteria: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        """Append one sealed point-in-time strategy health assessment."""
+
+        with self.engine.begin() as connection:
+            snapshot_sha256 = self.append_health_snapshot_in_transaction(
+                connection,
+                version_id,
+                as_of=as_of,
+                health_status=health_status,
+                criteria=criteria,
+                evidence=evidence,
+                actor=actor,
+            )
+        return self.get_health_snapshot(snapshot_sha256)
+
+    def get_health_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(strategy_health_snapshots).where(
+                    strategy_health_snapshots.c.id == snapshot_id
+                )
+            ).first()
+        if row is None:
+            raise KeyError(snapshot_id)
+        result = row_dict(row)
+        criteria = dict(result.get("criteria_json") or {})
+        evidence = dict(result.get("evidence_json") or {})
+        if (
+            horizon_canonical_sha256(criteria) != result.get("criteria_sha256")
+            or horizon_canonical_sha256(evidence) != result.get("evidence_sha256")
+        ):
+            raise ValueError("strategy health snapshot evidence seal is invalid")
+        with self.engine.connect() as connection:
+            version = connection.execute(
+                select(strategy_versions).where(
+                    strategy_versions.c.id == result["strategy_version_id"]
+                )
+            ).first()
+        if version is None:
+            raise ValueError("strategy health snapshot references a missing strategy version")
+        horizon = require_horizon_row(row_dict(version))
+        snapshot = {
+            "contract_version": "strategy-health-snapshot-v1",
+            "strategy_version_id": result["strategy_version_id"],
+            "horizon_profile": result["horizon_profile"],
+            "horizon_contract_sha256": horizon.sha256,
+            "as_of": result["as_of"],
+            "health_status": result["health_status"],
+            "criteria_json": criteria,
+            "criteria_sha256": result["criteria_sha256"],
+            "evidence_json": evidence,
+            "evidence_sha256": result["evidence_sha256"],
+            "recorded_by": result["recorded_by"],
+        }
+        if horizon_canonical_sha256(snapshot) != result.get("snapshot_sha256"):
+            raise ValueError("strategy health snapshot content seal is invalid")
+        result["criteria"] = criteria
+        result["evidence"] = evidence
+        return result
+
+    def find_version_by_source_artifact(
+        self, source_research_artifact_id: str
+    ) -> dict[str, Any] | None:
+        """Return the one governed draft materialized from a compiled research artifact."""
+
+        source_id = str(source_research_artifact_id or "").strip()
+        if not source_id:
+            raise ValueError("source research artifact id is required")
+        with self.engine.connect() as connection:
+            version_id = connection.scalar(
+                select(strategy_versions.c.id).where(
+                    strategy_versions.c.source_research_artifact_id == source_id
+                )
+            )
+        return self.get_version(str(version_id)) if version_id else None
+
+    def list_health_snapshots(
+        self, version_id: str, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("health snapshot limit must be between 1 and 1000")
+        with self.engine.connect() as connection:
+            ids = connection.execute(
+                select(strategy_health_snapshots.c.id)
+                .where(strategy_health_snapshots.c.strategy_version_id == version_id)
+                .order_by(
+                    strategy_health_snapshots.c.as_of.desc(),
+                    strategy_health_snapshots.c.recorded_at.desc(),
+                )
+                .limit(limit)
+            ).scalars().all()
+        return [self.get_health_snapshot(str(snapshot_id)) for snapshot_id in ids]
 
     @staticmethod
     def _event(

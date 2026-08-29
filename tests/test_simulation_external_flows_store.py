@@ -154,7 +154,12 @@ def test_process_batch_applies_open_deposit_without_manufacturing_return(
 def test_performance_summary_reports_twr_recovery_and_xirr(
     database_url: str, tmp_path
 ) -> None:
-    store, simulation, batch = _create_batch(database_url, tmp_path)
+    inception_date = TRADE_DATE - timedelta(days=3)
+    store, simulation, batch = _create_batch(
+        database_url,
+        tmp_path,
+        signal_date=inception_date,
+    )
     store.process_batch(
         batch["id"],
         minute_bars=_bars(),
@@ -186,15 +191,11 @@ def test_performance_summary_reports_twr_recovery_and_xirr(
     )
     assert unitized["max_drawdown"] < 0.0
     assert unitized["recovery_trading_days"] is None
-    assert summary["statistics"]["inception_date"] == (
-        TRADE_DATE - timedelta(days=3)
-    ).isoformat()
+    assert summary["statistics"]["inception_date"] == inception_date.isoformat()
     xirr_result = summary["xirr"]
-    # The first signal date is the persisted economic baseline before the
-    # first trade-date return; starting at the NAV date would drop that period.
-    assert summary["xirr_inception_date"] == (
-        TRADE_DATE - timedelta(days=3)
-    ).isoformat()
+    # The explicitly persisted signal date is the economic baseline before
+    # the first trade-date return; starting at NAV would erase that interval.
+    assert summary["xirr_inception_date"] == inception_date.isoformat()
     assert xirr_result["status"] == "ok"
     assert xirr_result["rate"] < 0.0
     assert summary["cny_nav_latest"] > 0.0

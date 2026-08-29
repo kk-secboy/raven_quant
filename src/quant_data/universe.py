@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -15,6 +17,64 @@ ETF_UNIVERSES: dict[str, tuple[str, ...]] = {
     "gold": ("518880.SH", "159934.SZ"),
     "bond": ("511010.SH", "511260.SH", "511360.SH"),
 }
+
+# Production daily research/recommendation whitelist.  This is intentionally
+# narrower than ``ETF_UNIVERSES``: the latter is an acquisition universe that
+# also contains gold and bond funds whose subtype trading contracts have not
+# been accepted.  Only the long-established SSE equity ETFs below share the
+# already-governed 100-unit, T+1 and 10% price-limit contract.
+GOVERNED_DAILY_ETF_WHITELIST_VERSION = "cn-equity-etf-daily-2026-08-29-v1"
+GOVERNED_DAILY_ETF_PRICE_LIMIT_VERSION = "sse-equity-etf-10pct-round-0.001-v1"
+GOVERNED_DAILY_ETF_WHITELIST: tuple[str, ...] = (
+    "510050.SH",
+    "510300.SH",
+    "510500.SH",
+    "512010.SH",
+    "512100.SH",
+    "512170.SH",
+    "512660.SH",
+    "512690.SH",
+    "512880.SH",
+)
+
+
+def governed_daily_etf_whitelist_contract() -> dict[str, Any]:
+    """Return the one canonical ETF publication whitelist and its digest.
+
+    The digest binds both membership and the execution assumptions used to
+    derive daily price-limit fields.  Adding a code therefore requires a new
+    version and an explicit rules review; a broad prefix match can never
+    silently expand the investable universe.
+    """
+
+    contract: dict[str, Any] = {
+        "version": GOVERNED_DAILY_ETF_WHITELIST_VERSION,
+        "symbols": list(GOVERNED_DAILY_ETF_WHITELIST),
+        "asset_type": "etf",
+        "accepted_subtype": "equity",
+        "market_scope": "domestic_sse_only",
+        "source_datasets": ["fund_daily", "fund_adj", "fund_basic"],
+        "source_availability": "after_same_session_close",
+        "price_limit": {
+            "version": GOVERNED_DAILY_ETF_PRICE_LIMIT_VERSION,
+            "ratio": 0.10,
+            "tick_cny": 0.001,
+            "rounding": "half_up",
+            "source": (
+                "SSE trading rules: stock and fund daily price limits are 10%; "
+                "limit price equals prior close times (1 plus/minus ratio), "
+                "rounded to the minimum price unit"
+            ),
+        },
+        "order_unit": 100,
+        "turnaround": "T+1_conservative",
+        "stamp_duty": "zero_for_etf_secondary_market",
+    }
+    canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        **contract,
+        "whitelist_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
 
 FUTURE_ROOTS = ("IF", "IC", "IM", "IH")
 

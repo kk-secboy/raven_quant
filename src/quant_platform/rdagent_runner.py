@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Mapping
+from datetime import date
+from typing import Any
 
 from rdagent.core.conf import RD_AGENT_SETTINGS
 from rdagent.scenarios.qlib.developer.factor_runner import (
@@ -18,6 +22,14 @@ _GOVERNED_MARKET = "market: &market cn_all"
 _BENCHMARK_ANCHOR = "benchmark: &benchmark SH000300"
 _INSTRUMENT_ANCHOR = "instruments: *market"
 _CSI300_PATTERN = re.compile(r"\bcsi300\b", flags=re.IGNORECASE)
+_PERIOD_NAMES = (
+    "train_start",
+    "train_end",
+    "valid_start",
+    "valid_end",
+    "test_start",
+    "test_end",
+)
 
 _FACTOR_CONFIGS = frozenset(
     {
@@ -32,6 +44,100 @@ _MODEL_CONFIGS = frozenset(
         "conf_sota_factors_model.yaml",
     }
 )
+
+
+def _validate_template_period_contract(name: str, source: str) -> None:
+    missing = [
+        period
+        for period in _PERIOD_NAMES
+        if re.search(r"{{\s*" + re.escape(period) + r"\b", source) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            f"RD-Agent Qlib template {name} omits governed periods: {missing}"
+        )
+
+
+def _expected_period_environment(prefix: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for name in _PERIOD_NAMES:
+        value = str(os.getenv(f"{prefix}_{name.upper()}") or "").strip()
+        try:
+            date.fromisoformat(value)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"governed RD-Agent period {prefix}_{name.upper()} is missing or invalid"
+            ) from exc
+        result[name] = value
+    ordered = [result[name] for name in _PERIOD_NAMES]
+    if ordered != sorted(ordered):
+        raise RuntimeError(f"governed RD-Agent periods for {prefix} are not ordered")
+    if prefix != "QLIB_QUANT":
+        quant = {
+            name: str(os.getenv(f"QLIB_QUANT_{name.upper()}") or "").strip()
+            for name in _PERIOD_NAMES
+        }
+        if result != quant:
+            raise RuntimeError(
+                f"governed RD-Agent periods for {prefix} disagree with QLIB_QUANT"
+            )
+    return result
+
+
+def _validate_qlib_run_environment(run_env: Any, *, prefix: str) -> None:
+    if not isinstance(run_env, Mapping):
+        raise RuntimeError("RD-Agent Qlib run environment must be an object")
+    expected = _expected_period_environment(prefix)
+    actual = {name: str(run_env.get(name) or "") for name in _PERIOD_NAMES}
+    if actual != expected:
+        raise RuntimeError(
+            f"RD-Agent Qlib effective dates disagree with governed {prefix} dates: "
+            f"expected={expected}, got={actual}"
+        )
+
+
+class _GovernedQlibFBWorkspace(QlibFBWorkspace):
+    """Pickle-safe execute guard for official RD-Agent Qlib workspaces."""
+
+    def execute(
+        self,
+        qlib_config_name: str = "conf.yaml",
+        run_env: dict[str, Any] | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        prefix = str(getattr(self, "_quantlab_execute_guard", ""))
+        expected_configs = getattr(self, "_quantlab_expected_configs", frozenset())
+        if not prefix or not isinstance(expected_configs, frozenset):
+            raise RuntimeError("governed RD-Agent Qlib execute guard is incomplete")
+        if qlib_config_name not in expected_configs:
+            raise RuntimeError(
+                f"RD-Agent requested an unreviewed Qlib template: {qlib_config_name}"
+            )
+        source = self.file_dict.get(qlib_config_name)
+        if not isinstance(source, str):
+            raise RuntimeError(f"RD-Agent Qlib template {qlib_config_name} is unavailable")
+        _validate_template_period_contract(qlib_config_name, source)
+        _validate_qlib_run_environment(run_env, prefix=prefix)
+        return super().execute(qlib_config_name, run_env, *args, **kwargs)
+
+
+def _install_execute_guard(
+    workspace: QlibFBWorkspace,
+    *,
+    prefix: str,
+    expected_configs: frozenset[str],
+) -> None:
+    guarded = getattr(workspace, "_quantlab_execute_guard", None)
+    if guarded == prefix:
+        return
+    if guarded is not None:
+        raise RuntimeError("RD-Agent Qlib workspace was reused across governed runner types")
+    if type(workspace) is not QlibFBWorkspace:
+        raise RuntimeError("RD-Agent Qlib workspace class contract drifted")
+    workspace.__class__ = _GovernedQlibFBWorkspace
+    workspace._quantlab_execute_guard = prefix  # type: ignore[attr-defined]
+    workspace._quantlab_expected_configs = expected_configs  # type: ignore[attr-defined]
 
 
 def _govern_experiment_market(
@@ -83,6 +189,7 @@ def _govern_experiment_market(
             raise RuntimeError(f"RD-Agent Qlib template {name} benchmark anchor drifted")
         if governed.count(_INSTRUMENT_ANCHOR) != 1:
             raise RuntimeError(f"RD-Agent Qlib template {name} instrument anchor drifted")
+        _validate_template_period_contract(name, governed)
         updates[name] = governed
 
     # QlibFBWorkspace.execute reads the physical workspace, so update both its
@@ -93,10 +200,20 @@ def _govern_experiment_market(
 class QuantLabFactorRunner(UpstreamQlibFactorRunner):
     def develop(self, exp: QlibFactorExperiment) -> QlibFactorExperiment:
         _govern_experiment_market(exp, _FACTOR_CONFIGS)
+        _install_execute_guard(
+            exp.experiment_workspace,
+            prefix="QLIB_FACTOR",
+            expected_configs=_FACTOR_CONFIGS,
+        )
         return super().develop(exp)
 
 
 class QuantLabModelRunner(UpstreamQlibModelRunner):
     def develop(self, exp: QlibModelExperiment) -> QlibModelExperiment:
         _govern_experiment_market(exp, _MODEL_CONFIGS)
+        _install_execute_guard(
+            exp.experiment_workspace,
+            prefix="QLIB_MODEL",
+            expected_configs=_MODEL_CONFIGS,
+        )
         return super().develop(exp)

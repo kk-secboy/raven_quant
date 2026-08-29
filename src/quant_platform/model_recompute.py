@@ -11,11 +11,17 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .model_research_governance import canonical_sha256, file_sha256, is_sha256
+from .model_research_governance import (
+    canonical_sha256,
+    file_sha256,
+    is_sha256,
+    resolve_model_label_contract,
+)
 
 MODEL_RECOMPUTE_EXECUTOR_VERSION = "model-recompute-docker-v3-cpu-tournament"
 MODEL_RESOURCE_POLICY_VERSION = "model-resource-policy-v3-cpu-tournament"
 MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v1-train-window-normalized"
+HORIZON_MODEL_DATA_CONTRACT_VERSION = "model-data-contract-v2-horizon-label"
 MODEL_TEMPLATE_FILENAME = "platform_model_templates.py"
 MODEL_RESOURCE_STAGES = frozenset(
     {"screening", "full_validation", "production_refit", "inference"}
@@ -166,6 +172,7 @@ def governed_model_resource_policy(
     stage: str,
     requested_timeout_seconds: int,
     seed: int | None = None,
+    data_contract_version: str = MODEL_DATA_CONTRACT_VERSION,
 ) -> dict[str, Any]:
     """Freeze a reproducible compute budget without changing date segments.
 
@@ -290,7 +297,7 @@ def governed_model_resource_policy(
             "effective_seed": effective_seed,
             "allowed_seeds": list(allowed_seeds),
         },
-        "data_contract_version": MODEL_DATA_CONTRACT_VERSION,
+        "data_contract_version": data_contract_version,
         "limits": {
             "timeout_seconds": timeout_seconds,
             "cpu_count": 4,
@@ -391,6 +398,19 @@ def execute_model_candidate(
     expected_code_sha256 = str(manifest.get("code_sha256") or "").lower()
     if not is_sha256(expected_code_sha256) or file_sha256(code_path) != expected_code_sha256:
         raise ValueError("model candidate code hash is invalid")
+    label_contract = resolve_model_label_contract(
+        research_window_contract=manifest.get("research_window_contract"),
+        research_window_contract_sha256=manifest.get(
+            "research_window_contract_sha256"
+        ),
+        label_horizon_sessions=manifest.get("label_horizon_sessions"),
+    )
+    label_contract_sha256 = canonical_sha256(label_contract)
+    data_contract_version = (
+        MODEL_DATA_CONTRACT_VERSION
+        if label_contract["legacy"] is True
+        else HORIZON_MODEL_DATA_CONTRACT_VERSION
+    )
     if sum(bool(value) for value in (allow_final_oos, allow_inference, allow_live_retrain)) > 1:
         raise ValueError("model execution authorizations are mutually exclusive")
     model_engine = str(manifest.get("model_engine") or "rdagent_pytorch")
@@ -459,9 +479,20 @@ def execute_model_candidate(
     runner_sha256 = file_sha256(runner_path)
     executor_source_sha256 = file_sha256(Path(__file__).resolve())
     template_source = Path(__file__).resolve().with_name("model_templates.py")
-    if not template_source.is_file():
-        raise ValueError("governed model templates are unavailable")
+    workflow_adapter_source = Path(__file__).resolve().with_name("qlib_workflow.py")
+    upstream_versions_source = Path(__file__).resolve().with_name("upstream_versions.py")
+    if not all(
+        path.is_file()
+        for path in (
+            template_source,
+            workflow_adapter_source,
+            upstream_versions_source,
+        )
+    ):
+        raise ValueError("governed model runtime dependencies are unavailable")
     template_sha256 = file_sha256(template_source)
+    workflow_adapter_sha256 = file_sha256(workflow_adapter_source)
+    upstream_versions_sha256 = file_sha256(upstream_versions_source)
     resource_policy = governed_model_resource_policy(
         model_type=str(manifest.get("model_type") or ""),
         model_engine=model_engine,
@@ -469,6 +500,7 @@ def execute_model_candidate(
         stage=str(manifest.get("resource_stage") or "full_validation"),
         requested_timeout_seconds=timeout_seconds,
         seed=manifest.get("seed"),
+        data_contract_version=data_contract_version,
     )
     effective_timeout_seconds = int(resource_policy["limits"]["timeout_seconds"])
     execution_environment = {
@@ -478,6 +510,8 @@ def execute_model_candidate(
         "executor_source_sha256": executor_source_sha256,
         "runner_sha256": runner_sha256,
         "model_template_sha256": template_sha256,
+        "qlib_workflow_adapter_sha256": workflow_adapter_sha256,
+        "upstream_versions_sha256": upstream_versions_sha256,
         "sandbox_image": image,
         "sandbox_image_id": image_id,
     }
@@ -486,6 +520,11 @@ def execute_model_candidate(
     shutil.copy2(code_path, workspace / "model.py")
     shutil.copy2(runner_path, workspace / "runner.py")
     shutil.copy2(template_source, workspace / MODEL_TEMPLATE_FILENAME)
+    sandbox_package = workspace / "quant_platform"
+    sandbox_package.mkdir()
+    (sandbox_package / "__init__.py").touch()
+    shutil.copy2(workflow_adapter_source, sandbox_package / "qlib_workflow.py")
+    shutil.copy2(upstream_versions_source, sandbox_package / "upstream_versions.py")
     runtime_checkpoint: Path | None = None
     if allow_inference:
         checkpoint_format = str(source_checkpoint_format)
@@ -518,6 +557,8 @@ def execute_model_candidate(
         "contract_version": "model-sandbox-input-v1",
         "provider_uri": "/qlib",
         "resource_policy": resource_policy,
+        "model_label_contract": label_contract,
+        "model_label_contract_sha256": label_contract_sha256,
         "execution_environment": execution_environment,
         "execution_environment_sha256": execution_environment_sha256,
     }
@@ -525,7 +566,15 @@ def execute_model_candidate(
         json.dumps(runtime_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     workspace.chmod(0o777)
-    readonly_names = ["model.py", "runner.py", MODEL_TEMPLATE_FILENAME, "manifest.json"]
+    readonly_names = [
+        "model.py",
+        "runner.py",
+        MODEL_TEMPLATE_FILENAME,
+        "manifest.json",
+        "quant_platform/__init__.py",
+        "quant_platform/qlib_workflow.py",
+        "quant_platform/upstream_versions.py",
+    ]
     if runtime_checkpoint is not None:
         readonly_names.append(runtime_checkpoint.name)
     for name in readonly_names:
@@ -609,10 +658,15 @@ def execute_model_candidate(
         raise ValueError("independent model recomputation changed its resource policy")
     data_contract = result.get("model_data_contract") or {}
     if (
-        data_contract.get("contract_version") != MODEL_DATA_CONTRACT_VERSION
+        data_contract.get("contract_version") != data_contract_version
         or result.get("model_data_contract_sha256") != canonical_sha256(data_contract)
     ):
         raise ValueError("independent model recomputation data contract is invalid")
+    if (
+        result.get("model_label_contract") != label_contract
+        or result.get("model_label_contract_sha256") != label_contract_sha256
+    ):
+        raise ValueError("independent model recomputation changed its label contract")
     model_spec = result.get("model_spec") or {}
     if result.get("model_spec_sha256") != canonical_sha256(model_spec):
         raise ValueError("independent model recomputation model specification is invalid")
@@ -675,6 +729,10 @@ def execute_model_candidate(
         "runner_sha256": runner_sha256,
         "model_template_sha256": template_sha256,
         "model_data_contract_sha256": result["model_data_contract_sha256"],
+        "model_label_contract_sha256": label_contract_sha256,
+        "research_window_contract_sha256": label_contract[
+            "research_window_contract_sha256"
+        ],
         "model_spec_sha256": result["model_spec_sha256"],
         "execution_environment": execution_environment,
         "execution_environment_sha256": execution_environment_sha256,

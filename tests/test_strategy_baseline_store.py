@@ -99,7 +99,56 @@ def test_core_family_starts_without_rdagent_and_challenger_is_a_new_version(
     assert store.get_version(baseline["id"])["factors"] == []
 
 
-def test_strategy_accepts_the_verified_multi_profile_promotion_hash(
+def test_exact_version_create_is_atomic_order_independent_and_opt_in(
+    database_url: str,
+    tmp_path: Path,
+) -> None:
+    store = StrategyStore(database_url)
+    family = _create_baseline_strategy(database_url)
+    first_factor = create_promoted_factor(database_url, tmp_path)
+    second_factor = create_promoted_factor(database_url, tmp_path)
+    config = _core_config(
+        mode=FACTOR_SOURCE_QLIB_BASELINE_PLUS_CHALLENGER,
+        challenger_weight=0.30,
+    )
+    factors = [
+        {"candidate_id": first_factor["id"], "weight": 0.40},
+        {"candidate_id": second_factor["id"], "weight": 0.60},
+    ]
+
+    created = store.create_version_if_absent(
+        family["id"],
+        benchmark="SH000300",
+        universe="cn_all",
+        factors=factors,
+        config=config,
+        actor="managed-reconcile-a",
+    )
+    reused = store.create_version_if_absent(
+        family["id"],
+        benchmark="SH000300",
+        universe="cn_all",
+        factors=list(reversed(factors)),
+        config=config,
+        actor="managed-reconcile-b",
+    )
+    appended = store.create_version(
+        family["id"],
+        benchmark="SH000300",
+        universe="cn_all",
+        factors=list(reversed(factors)),
+        config=config,
+        actor="ordinary-research",
+    )
+
+    assert reused["id"] == created["id"]
+    assert reused["factors"] == created["factors"]
+    assert appended["id"] != created["id"]
+    assert appended["version"] == created["version"] + 1
+    assert len(store.get(family["id"])["versions"]) == 3
+
+
+def test_strategy_rejects_one_evaluation_forged_as_three_profile_consensus(
     database_url: str, tmp_path: Path
 ) -> None:
     factor = create_promoted_factor(database_url, tmp_path)
@@ -143,19 +192,18 @@ def test_strategy_accepts_the_verified_multi_profile_promotion_hash(
 
     store = StrategyStore(database_url)
     family = _create_baseline_strategy(database_url)
-    version = store.create_version(
-        family["id"],
-        benchmark="SH000300",
-        universe="cn_all",
-        factors=[{"candidate_id": factor["id"], "weight": 1.0}],
-        config=_core_config(
-            mode=FACTOR_SOURCE_QLIB_BASELINE_PLUS_CHALLENGER,
-            challenger_weight=0.30,
-        ),
-        actor="test",
-    )
-
-    assert version["factors"][0]["factor_candidate_id"] == factor["id"]
+    with pytest.raises(ValueError, match="profile identity changed"):
+        store.create_version(
+            family["id"],
+            benchmark="SH000300",
+            universe="cn_all",
+            factors=[{"candidate_id": factor["id"], "weight": 1.0}],
+            config=_core_config(
+                mode=FACTOR_SOURCE_QLIB_BASELINE_PLUS_CHALLENGER,
+                challenger_weight=0.30,
+            ),
+            actor="test",
+        )
 
 
 def test_external_frozen_values_are_explicitly_research_only(
@@ -262,7 +310,7 @@ def test_swing_family_starts_from_qlib_baseline_before_rdagent_challengers(
     assert version["factor_source_mode"] == FACTOR_SOURCE_QLIB_BASELINE
     assert version["factors"] == []
     assert version["config"]["baseline_definition"]["frequency"] == "day"
-    assert len(version["config"]["baseline_definition"]["factors"]) == 5
+    assert len(version["config"]["baseline_definition"]["factors"]) == 6
 
 
 def test_baseline_approval_validates_expression_artifacts_hashes_and_recorder(

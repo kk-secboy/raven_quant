@@ -195,7 +195,7 @@ def test_build_staging_bounds_duckdb_resources_to_staging_volume(
     assert f"SET memory_limit='{MINUTE_QLIB_DUCKDB_MEMORY_LIMIT}'" in executed
     assert f"SET threads={MINUTE_QLIB_DUCKDB_THREADS}" in executed
     assert f"SET temp_directory='{spill.as_posix()}'" in [
-        statement.replace("\\\\", "/") for statement in executed
+        statement.replace("\\", "/") for statement in executed
     ]
     assert not spill.exists()
 

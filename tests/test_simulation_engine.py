@@ -1,10 +1,20 @@
+import hashlib
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.simulation_engine import execute_atomic_pair_day, execute_simulation_day
+from quant_platform.simulation_store import (
+    SimulationStore,
+    build_settlement_calendar_binding,
+    build_settlement_calendar_evidence,
+    validate_settlement_calendar_binding,
+    validate_settlement_calendar_evidence,
+)
+from quant_platform.worker import _bind_daily_simulation_settlement_calendar
 
 pytestmark = pytest.mark.no_database
 
@@ -105,6 +115,139 @@ def test_t_plus_one_unlocks_and_full_liquidation_may_sell_odd_lot() -> None:
     assert result["orders"][0]["side"] == "sell"
     assert result["orders"][0]["filled_quantity"] == 105
     assert "SH600000" not in result["positions"]
+    assert result["nav_row"]["market_date"] == date(2025, 1, 3)
+    assert result["nav_row"]["performance_certified"] is True
+
+
+def test_explicit_empty_target_books_a_certified_all_cash_decision() -> None:
+    result = _run(
+        target_weights={},
+        positions={},
+        minute_bars=_bars().iloc[0:0],
+        closing_prices={},
+    )
+
+    assert result["orders"] == []
+    assert result["fills"] == []
+    assert result["cash_flows"] == []
+    assert result["cash"] == pytest.approx(100_000.0)
+    assert result["nav"] == pytest.approx(100_000.0)
+    assert result["conservation"]["cash_difference"] == pytest.approx(0.0)
+    assert result["nav_row"]["market_date"] == date(2025, 1, 3)
+    assert result["nav_row"]["status"] == "healthy"
+    assert result["nav_row"]["performance_certified"] is True
+
+
+def test_long_only_target_contract_distinguishes_empty_from_missing() -> None:
+    assert SimulationStore._normalize_target_payload(
+        {"target_weights": {}}, adapter="long_only"
+    ) == {"target_weights": {}}
+    with pytest.raises(ValueError, match="requires target_weights"):
+        SimulationStore._normalize_target_payload({}, adapter="long_only")
+
+
+def test_settlement_calendar_evidence_is_bound_to_execution_lineage() -> None:
+    evidence = build_settlement_calendar_evidence(
+        trade_date=date(2025, 1, 3),
+        next_trade_date=date(2025, 1, 6),
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+        calendar_file_sha256="c" * 64,
+    )
+
+    assert validate_settlement_calendar_evidence(
+        evidence,
+        trade_date=date(2025, 1, 3),
+        next_trade_date=date(2025, 1, 6),
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+        calendar_file_sha256="c" * 64,
+    ) == evidence
+    with pytest.raises(ValueError, match="does not match the bound dataset"):
+        validate_settlement_calendar_evidence(
+            evidence,
+            trade_date=date(2025, 1, 3),
+            next_trade_date=date(2025, 1, 6),
+            dataset_identity_sha256="d" * 64,
+            dataset_lineage_id="b" * 64,
+            calendar_file_sha256="c" * 64,
+        )
+    self_signed_tamper = build_settlement_calendar_evidence(
+        trade_date=date(2025, 1, 3),
+        next_trade_date=date(2025, 1, 6),
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+        calendar_file_sha256="e" * 64,
+    )
+    with pytest.raises(ValueError, match="does not match the bound dataset"):
+        validate_settlement_calendar_evidence(
+            self_signed_tamper,
+            trade_date=date(2025, 1, 3),
+            next_trade_date=date(2025, 1, 6),
+            dataset_identity_sha256="a" * 64,
+            dataset_lineage_id="b" * 64,
+            calendar_file_sha256="c" * 64,
+        )
+
+
+def test_settlement_calendar_binding_is_derived_from_sealed_dataset(
+    tmp_path: Path,
+) -> None:
+    provider = tmp_path / "qlib"
+    calendar = provider / "metadata" / "known_trading_calendar.parquet"
+    calendar.parent.mkdir(parents=True)
+    pd.DataFrame({"date": pd.to_datetime(["2025-01-03", "2025-01-06"])}).to_parquet(
+        calendar,
+        index=False,
+    )
+    calendar_hash = hashlib.sha256(calendar.read_bytes()).hexdigest()
+    dataset = {
+        "path": str(provider),
+        "output_files_verified": True,
+        "provenance": {
+            "dataset_identity_sha256": "a" * 64,
+            "dataset_lineage_id": "b" * 64,
+            "output_manifest": {
+                "version": "qlib-output-files-v1",
+                "files": [
+                    {
+                        "path": "metadata/known_trading_calendar.parquet",
+                        "bytes": calendar.stat().st_size,
+                        "sha256": calendar_hash,
+                    }
+                ],
+            },
+        },
+    }
+
+    binding = build_settlement_calendar_binding(
+        dataset,
+        trade_date=date(2025, 1, 3),
+    )
+
+    assert binding["calendar_file_sha256"] == calendar_hash
+    assert binding["next_trade_date"] == "2025-01-06"
+    assert validate_settlement_calendar_binding(
+        binding,
+        trade_date=date(2025, 1, 3),
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+    ) == binding
+    worker_manifest = _bind_daily_simulation_settlement_calendar(
+        {
+            "execution_frequency": "day",
+            "trade_date": "2025-01-03",
+            "settlement_calendar_binding": binding,
+        },
+        dataset,
+    )
+    assert worker_manifest["settlement_calendar_binding"] == binding
+    calendar.write_bytes(calendar.read_bytes() + b"tampered")
+    with pytest.raises(ValueError, match="sealed output manifest"):
+        build_settlement_calendar_binding(
+            dataset,
+            trade_date=date(2025, 1, 3),
+        )
 
 
 def test_same_day_buy_cannot_be_sold_and_creates_auditable_rejection() -> None:

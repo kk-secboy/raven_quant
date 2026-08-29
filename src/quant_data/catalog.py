@@ -175,11 +175,25 @@ ETF_DAILY: tuple[DatasetDefinition, ...] = (
     DatasetDefinition(
         "fund_daily",
         "fund_daily",
+        (
+            "ts_code",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "change",
+            "pct_chg",
+            "vol",
+            "amount",
+        ),
         primary_key=("ts_code", "trade_date"),
     ),
     DatasetDefinition(
         "fund_adj",
         "fund_adj",
+        ("ts_code", "trade_date", "adj_factor"),
         primary_key=("ts_code", "trade_date"),
     ),
 )

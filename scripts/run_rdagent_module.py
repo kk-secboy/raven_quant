@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import os
 import sys
 from typing import Any
@@ -15,6 +16,21 @@ def _embedding_is_configured(env: dict[str, str]) -> bool:
         str(env.get("EMBEDDING_OPENAI_API_KEY") or "").strip()
         or str(env.get("EMBEDDING_AZURE_API_BASE") or "").strip()
     )
+
+
+def _costeer_knowledge_status(env: dict[str, str], *, module: str) -> dict[str, Any]:
+    configured = _embedding_is_configured(env)
+    strategy_compiler = module == "quant_platform.rdagent_strategy"
+    return {
+        "contract_version": "costeer-knowledge-status-v1",
+        "status": "embedding_retrieval_configured" if configured else "degraded_empty_retrieval",
+        "embedding_retrieval_configured": configured,
+        "retrieval_mode": "embedding_rag" if configured else "typed_empty_knowledge",
+        "costeer_used": not strategy_compiler,
+        "empty_knowledge_forced": not configured and not strategy_compiler,
+        "strategy_codegen_used": False if strategy_compiler else None,
+        "strategy_compiler": "deterministic_allowlist" if strategy_compiler else None,
+    }
 
 
 def _disable_optional_costeer_embeddings() -> None:
@@ -84,12 +100,21 @@ def _enable_qlib_file_tracking_compatibility() -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or not argv[1].startswith("rdagent.app."):
-        raise SystemExit("usage: run_rdagent_module.py RDAGENT_MODULE [ARGS...]")
+    if len(argv) < 2 or not (
+        argv[1].startswith("rdagent.app.")
+        or argv[1] == "quant_platform.rdagent_strategy"
+    ):
+        raise SystemExit("usage: run_rdagent_module.py ALLOWLISTED_RDAGENT_MODULE [ARGS...]")
     module = argv[1]
-    _enable_qlib_file_tracking_compatibility()
-    if not _embedding_is_configured(dict(os.environ)):
-        _disable_optional_costeer_embeddings()
+    os.environ["QUANTLAB_COSTEER_KNOWLEDGE_STATUS_JSON"] = json.dumps(
+        _costeer_knowledge_status(dict(os.environ), module=module),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if module != "quant_platform.rdagent_strategy":
+        _enable_qlib_file_tracking_compatibility()
+        if not _embedding_is_configured(dict(os.environ)):
+            _disable_optional_costeer_embeddings()
     target = importlib.import_module(module)
     entry = getattr(target, "main", None)
     if not callable(entry):

@@ -40,14 +40,20 @@ from quant_data.database import (
     open_database,
     recommendation_holdings,
     recommendation_snapshots,
+    simulation_batches,
     strategy_allocation_artifacts,
     strategy_allocation_members,
     strategy_allocations,
+    strategy_health_snapshots,
+    strategy_versions,
 )
 
-NETTING_PLAN_VERSION = "account-netting-plan-v2-finite-inputs"
-DEFAULT_EXECUTION_POLICY = "next_bar"
-EXECUTION_POLICIES = (DEFAULT_EXECUTION_POLICY, "twap", "vwap")
+from .research_horizon import LONG_1_3Y, SHORT_1_5D, SWING_1_6M
+from .strategy_health import cap_targets_for_health
+
+NETTING_PLAN_VERSION = "account-netting-plan-v5-primary-ledger-capital"
+DEFAULT_EXECUTION_POLICY = "open"
+EXECUTION_POLICIES = (DEFAULT_EXECUTION_POLICY, "next_bar", "twap", "vwap")
 
 _TOLERANCE = 1e-9
 
@@ -155,6 +161,9 @@ def build_account_netting_plan(
     execution_policy: str = DEFAULT_EXECUTION_POLICY,
     tranche_index: int = 0,
     max_instrument_weight: float | None = None,
+    industry_memberships: dict[str, str] | None = None,
+    max_industry_weight: float | None = None,
+    input_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the account-level netted target plan (pure; no I/O).
 
@@ -165,7 +174,9 @@ def build_account_netting_plan(
     current sleeve weights; without it every target is a fresh buy.
     ``max_instrument_weight`` (the account hard constraint applied after
     netting, e.g. ``PortfolioPolicyConfig.max_position_weight``) clamps net
-    targets, the overflow moving to cash.
+    targets, the overflow moving to cash.  ``max_industry_weight`` applies to
+    the unified account after member netting. Missing industry metadata fails
+    closed for the affected target rather than silently bypassing the cap.
     """
 
     if execution_policy not in EXECUTION_POLICIES:
@@ -189,6 +200,19 @@ def build_account_netting_plan(
         not isfinite(normalized_cap) or not 0 < normalized_cap <= 1
     ):
         raise ValueError("max instrument weight must be finite and in (0, 1]")
+    normalized_industry_cap = (
+        None if max_industry_weight is None else float(max_industry_weight)
+    )
+    if normalized_industry_cap is not None and (
+        not isfinite(normalized_industry_cap)
+        or not 0 < normalized_industry_cap <= 1
+    ):
+        raise ValueError("max industry weight must be finite and in (0, 1]")
+    industries = {
+        str(instrument): str(industry).strip()
+        for instrument, industry in (industry_memberships or {}).items()
+        if str(industry).strip()
+    }
     target_books = {str(member): values for member, values in member_targets.items()}
     current_books = {
         str(member): values for member, values in (member_current_weights or {}).items()
@@ -205,6 +229,8 @@ def build_account_netting_plan(
     demands: dict[str, dict[str, float]] = {}
     account_current: dict[str, float] = {}
     net_targets: dict[str, float] = {}
+    normalized_member_targets: dict[str, dict[str, float]] = {}
+    normalized_member_current_weights: dict[str, dict[str, float]] = {}
     for member, budget in budgets.items():
         raw_targets = target_books.get(member) or {}
         targets = {
@@ -219,6 +245,7 @@ def build_account_netting_plan(
             raise ValueError("long-only member targets must be finite and non-negative")
         if sum(targets.values()) > 1.0 + 1e-6:
             raise ValueError(f"member {member} targets exceed the member sleeve")
+        normalized_member_targets[member] = targets
         raw_current = current_books.get(member) or {}
         sleeve_current = {
             str(key): float(value)
@@ -235,6 +262,7 @@ def build_account_netting_plan(
             )
         if sum(sleeve_current.values()) > 1.0 + 1e-6:
             raise ValueError(f"member {member} current weights exceed the member sleeve")
+        normalized_member_current_weights[member] = sleeve_current
         for instrument in sorted(set(targets) | set(sleeve_current)):
             target = targets.get(instrument, 0.0)
             current = sleeve_current.get(instrument, 0.0)
@@ -261,20 +289,71 @@ def build_account_netting_plan(
         if weight > _TOLERANCE:
             clamped_targets[instrument] = weight
 
+    industry_clamps: dict[str, Any] = {}
+    industry_exposure: dict[str, float] = {}
+    if normalized_industry_cap is not None:
+        missing_industry = [
+            instrument for instrument in clamped_targets if instrument not in industries
+        ]
+        for instrument in missing_industry:
+            raw_weight = clamped_targets.pop(instrument)
+            industry_clamps[instrument] = {
+                "industry": None,
+                "raw_weight": raw_weight,
+                "clamped_weight": 0.0,
+                "reason": "missing_industry_membership_blocks_target",
+            }
+        industry_groups: dict[str, list[str]] = {}
+        for instrument in clamped_targets:
+            industry_groups.setdefault(industries[instrument], []).append(instrument)
+        for industry, instruments in sorted(industry_groups.items()):
+            raw_exposure = sum(clamped_targets[item] for item in instruments)
+            if raw_exposure > normalized_industry_cap + _TOLERANCE:
+                scale = normalized_industry_cap / raw_exposure
+                for instrument in instruments:
+                    raw_weight = clamped_targets[instrument]
+                    clamped_targets[instrument] = raw_weight * scale
+                    industry_clamps[instrument] = {
+                        "industry": industry,
+                        "raw_weight": raw_weight,
+                        "clamped_weight": clamped_targets[instrument],
+                        "reason": "account_industry_weight_cap",
+                    }
+            industry_exposure[industry] = sum(
+                clamped_targets[item] for item in instruments
+            )
+
     net_trades: dict[str, float] = {}
     for instrument in sorted(set(clamped_targets) | set(account_current)):
         trade = clamped_targets.get(instrument, 0.0) - account_current.get(instrument, 0.0)
         if abs(trade) > _TOLERANCE:
             net_trades[instrument] = trade
-    # Clamping re-scales the post-net attribution on the winning side so the
-    # recorded contributions stay consistent with the constrained plan.
-    for instrument in clamps:
+    # Account constraints re-scale the post-net attribution on the winning
+    # side so every instrument's virtual contributions still reconcile exactly
+    # to the unified account trade. A sign-changing constraint adjustment is
+    # explicit instead of being silently attributed to an unrelated sleeve.
+    for instrument in set(clamps) | set(industry_clamps):
         raw_delta = contributions.get(instrument, {}).get("net_delta", 0.0)
-        if abs(raw_delta) > _TOLERANCE:
-            factor = net_trades.get(instrument, 0.0) / raw_delta
-            for member_entry in contributions[instrument]["members"].values():
+        constrained_delta = net_trades.get(instrument, 0.0)
+        member_entries = contributions.setdefault(
+            instrument, {"net_delta": 0.0, "members": {}}
+        )["members"]
+        if (
+            abs(raw_delta) > _TOLERANCE
+            and raw_delta * constrained_delta >= 0
+        ):
+            factor = constrained_delta / raw_delta
+            for member_entry in member_entries.values():
                 member_entry["net_contribution"] *= factor
-            contributions[instrument]["net_delta"] = net_trades.get(instrument, 0.0)
+        else:
+            for member_entry in member_entries.values():
+                member_entry["net_contribution"] = 0.0
+            if abs(constrained_delta) > _TOLERANCE:
+                member_entries["__account_constraint__"] = {
+                    "gross_delta": 0.0,
+                    "net_contribution": constrained_delta,
+                }
+        contributions[instrument]["net_delta"] = constrained_delta
 
     cash_weight = 1.0 - sum(clamped_targets.values())
     key = plan_idempotency_key(
@@ -297,6 +376,8 @@ def build_account_netting_plan(
         "tranche_index": int(tranche_index),
         "total_capital": capital,
         "member_budgets": budgets,
+        "member_targets": normalized_member_targets,
+        "member_current_weights": normalized_member_current_weights,
         "net_targets": {
             instrument: {
                 "weight": weight,
@@ -316,17 +397,36 @@ def build_account_netting_plan(
         "strategy_contributions": contributions,
         "constraint_clamps": clamps,
         "max_instrument_weight": normalized_cap,
+        "industry_memberships": {
+            instrument: industries[instrument]
+            for instrument in sorted(clamped_targets)
+            if instrument in industries
+        },
+        "industry_exposure": industry_exposure,
+        "industry_constraint_clamps": industry_clamps,
+        "max_industry_weight": normalized_industry_cap,
+        "input_evidence": dict(input_evidence or {}),
     }
     plan["plan_hash"] = _canonical_hash(
         {
             "plan_version": NETTING_PLAN_VERSION,
             "plan_key": key,
             "member_budgets": budgets,
+            "member_targets": normalized_member_targets,
+            "member_current_weights": normalized_member_current_weights,
+            "total_capital": capital,
             "net_targets": clamped_targets,
             "net_trades": net_trades,
             "cash_weight": cash_weight,
             "strategy_contributions": contributions,
+            "constraint_clamps": clamps,
+            "industry_memberships": industries,
+            "industry_exposure": industry_exposure,
+            "industry_constraint_clamps": industry_clamps,
+            "max_instrument_weight": normalized_cap,
+            "max_industry_weight": normalized_industry_cap,
             "execution_policy": execution_policy,
+            "input_evidence": dict(input_evidence or {}),
         }
     )
     return plan
@@ -400,6 +500,9 @@ class AccountNettingStore:
         tranche_index: int = 0,
         member_current_weights: dict[str, dict[str, float]] | None = None,
         max_instrument_weight: float | None = None,
+        max_gross_exposure: float = 1.0,
+        max_industry_weight: float | None = None,
+        primary_account: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Assemble plan inputs from the ledger and persist the netted plan.
 
@@ -446,26 +549,57 @@ class AccountNettingStore:
                 )
                 for member in members
             }
+            horizons = {
+                str(row.id): str(row.horizon_profile or "legacy_ambiguous")
+                for row in connection.execute(
+                    select(
+                        strategy_versions.c.id,
+                        strategy_versions.c.horizon_profile,
+                    ).where(strategy_versions.c.id.in_(tuple(budgets)))
+                )
+            }
+            gross_limit = float(max_gross_exposure)
+            if not isfinite(gross_limit) or not 0 < gross_limit <= 1:
+                raise ValueError("maximum gross exposure must be finite and in (0, 1]")
+            budget_mass = sum(budgets.values())
+            if budget_mass > gross_limit + _TOLERANCE:
+                scale = gross_limit / budget_mass
+                budgets = {member: weight * scale for member, weight in budgets.items()}
             targets: dict[str, dict[str, float]] = {}
+            snapshot_evidence: dict[str, dict[str, Any]] = {}
+            industry_observations: dict[str, tuple[date, str]] = {}
             missing: list[str] = []
             for version_id, budget in budgets.items():
                 portfolio_id = portfolio_by_member.get(version_id)
-                snapshot = None
+                member_snapshots: list[Any] = []
                 if portfolio_id:
-                    snapshot = connection.execute(
-                        select(recommendation_snapshots)
-                        .where(
-                            recommendation_snapshots.c.portfolio_id == portfolio_id,
-                            recommendation_snapshots.c.status == "succeeded",
-                        )
-                        .order_by(recommendation_snapshots.c.created_at.desc())
-                        .limit(1)
-                    ).first()
+                    member_snapshots = list(
+                        connection.execute(
+                            select(recommendation_snapshots)
+                            .where(
+                                recommendation_snapshots.c.portfolio_id == portfolio_id,
+                                recommendation_snapshots.c.status == "succeeded",
+                            )
+                            .order_by(recommendation_snapshots.c.created_at.desc())
+                            .limit(2)
+                        ).all()
+                    )
+                snapshot = member_snapshots[0] if member_snapshots else None
                 if snapshot is None:
                     if budget > _TOLERANCE:
                         missing.append(version_id)
                     targets[version_id] = {}
                     continue
+                snapshot_evidence[version_id] = {
+                    "snapshot_id": str(snapshot.id),
+                    "as_of_date": snapshot.as_of_date.isoformat(),
+                    "effective_date": (
+                        snapshot.effective_date.isoformat()
+                        if snapshot.effective_date is not None
+                        else snapshot.as_of_date.isoformat()
+                    ),
+                    "dataset_identity_sha256": str(snapshot.dataset_identity_sha256),
+                }
                 holdings = connection.execute(
                     select(
                         recommendation_holdings.c.instrument,
@@ -475,25 +609,225 @@ class AccountNettingStore:
                 targets[version_id] = {
                     str(row.instrument): float(row.weight) for row in holdings
                 }
+                payload = dict(snapshot.snapshot_json or {})
+                snapshot_industries = {
+                    str(instrument): str(industry)
+                    for instrument, industry in (
+                        payload.get("industry_memberships") or {}
+                    ).items()
+                    if str(industry).strip()
+                }
+                for item in payload.get("holdings") or []:
+                    if isinstance(item, dict) and item.get("industry"):
+                        snapshot_industries.setdefault(
+                            str(item.get("instrument") or ""),
+                            str(item["industry"]),
+                        )
+                for instrument, industry in snapshot_industries.items():
+                    observed = industry_observations.get(instrument)
+                    if observed is None or snapshot.as_of_date >= observed[0]:
+                        industry_observations[instrument] = (
+                            snapshot.as_of_date,
+                            industry,
+                        )
+
+                if horizons.get(version_id) in {
+                    SHORT_1_5D,
+                    SWING_1_6M,
+                    LONG_1_3Y,
+                }:
+                    health = connection.execute(
+                        select(strategy_health_snapshots)
+                        .where(
+                            strategy_health_snapshots.c.strategy_version_id == version_id
+                        )
+                        .order_by(
+                            strategy_health_snapshots.c.as_of.desc(),
+                            strategy_health_snapshots.c.recorded_at.desc(),
+                        )
+                        .limit(1)
+                    ).first()
+                    health_status = str(health.health_status) if health is not None else None
+                    previous_targets: dict[str, float] = {}
+                    if len(member_snapshots) > 1:
+                        previous_holdings = connection.execute(
+                            select(
+                                recommendation_holdings.c.instrument,
+                                recommendation_holdings.c.weight,
+                            ).where(
+                                recommendation_holdings.c.snapshot_id
+                                == member_snapshots[1].id
+                            )
+                        ).all()
+                        previous_targets = {
+                            str(row.instrument): float(row.weight)
+                            for row in previous_holdings
+                        }
+                    targets[version_id], health_gate = cap_targets_for_health(
+                        targets[version_id],
+                        previous_targets,
+                        health_status,
+                    )
+                    health_gate["snapshot_id"] = (
+                        str(health.id) if health is not None else None
+                    )
+                    snapshot_evidence[version_id]["strategy_health_gate"] = health_gate
             if missing:
                 raise ValueError(
                     "budgeted allocation members have no succeeded recommendation "
                     f"snapshot: {sorted(missing)}"
                 )
+            decision_date = max(
+                date.fromisoformat(value["effective_date"])
+                for value in snapshot_evidence.values()
+            )
+            inputs_as_of = max(
+                date.fromisoformat(value["as_of_date"])
+                for value in snapshot_evidence.values()
+            )
+            if decision_date > artifact.valid_until:
+                raise ValueError("allocation artifact expired before the latest member target")
+            continuity_evidence: dict[str, Any] | None = None
+            if member_current_weights is None and primary_account is not None:
+                primary_id = str(primary_account.get("portfolio_id") or "").strip()
+                if not primary_id:
+                    raise ValueError("primary account capital evidence requires a portfolio id")
+                prior = connection.execute(
+                    select(account_netting_plans, simulation_batches.c.id.label("batch_id"))
+                    .select_from(
+                        simulation_batches.join(
+                            account_netting_plans,
+                            account_netting_plans.c.id
+                            == simulation_batches.c.account_netting_plan_id,
+                        )
+                    )
+                    .where(
+                        simulation_batches.c.portfolio_id == primary_id,
+                        simulation_batches.c.status == "succeeded",
+                        account_netting_plans.c.inputs_as_of <= inputs_as_of,
+                    )
+                    .order_by(
+                        simulation_batches.c.trade_date.desc(),
+                        simulation_batches.c.created_at.desc(),
+                    )
+                    .limit(1)
+                ).first()
+                if prior is not None:
+                    prior_targets = dict(
+                        dict(prior.plan_json or {}).get("member_targets") or {}
+                    )
+                    if any(not isinstance(value, dict) for value in prior_targets.values()):
+                        raise ValueError(
+                            "prior primary-account plan has invalid durable member targets"
+                        )
+                    member_current_weights = {
+                        str(member): {
+                            str(instrument): float(weight)
+                            for instrument, weight in dict(prior_targets.get(member) or {}).items()
+                        }
+                        for member in budgets
+                    }
+                    continuity_evidence = {
+                        "portfolio_id": primary_id,
+                        "prior_plan_id": str(prior.id),
+                        "prior_batch_id": str(prior.batch_id),
+                        "prior_allocation_id": str(prior.account_id),
+                        "carried_members": sorted(set(prior_targets).intersection(budgets)),
+                    }
+            if member_current_weights is None:
+                prior = connection.execute(
+                    select(account_netting_plans)
+                    .where(
+                        account_netting_plans.c.account_id == str(allocation.id),
+                        account_netting_plans.c.inputs_as_of < inputs_as_of,
+                    )
+                    .order_by(
+                        account_netting_plans.c.inputs_as_of.desc(),
+                        account_netting_plans.c.created_at.desc(),
+                    )
+                    .limit(1)
+                ).first()
+                if prior is not None:
+                    prior_targets = dict(
+                        dict(prior.plan_json or {}).get("member_targets") or {}
+                    )
+                    if set(prior_targets) != set(budgets) or any(
+                        not isinstance(value, dict)
+                        for value in prior_targets.values()
+                    ):
+                        raise ValueError(
+                            "prior account plan has no complete durable member targets"
+                        )
+                    member_current_weights = {
+                        str(member): {
+                            str(instrument): float(weight)
+                            for instrument, weight in values.items()
+                        }
+                        for member, values in prior_targets.items()
+                    }
+        account_capital = float(allocation.total_capital)
+        primary_evidence: dict[str, Any] | None = None
+        if primary_account is not None:
+            primary_id = str(primary_account.get("portfolio_id") or "").strip()
+            primary_source = str(primary_account.get("source_id") or "").strip()
+            account_capital = float(primary_account.get("nav") or 0.0)
+            if (
+                not primary_id
+                or primary_source != str(allocation.id)
+                or not isfinite(account_capital)
+                or account_capital <= 0
+            ):
+                raise ValueError(
+                    "primary account capital evidence does not match the active allocation"
+                )
+            primary_evidence = {
+                "portfolio_id": primary_id,
+                "source_id": primary_source,
+                "nav": account_capital,
+                "updated_at": str(primary_account.get("updated_at") or ""),
+            }
+        capital_identity = _canonical_hash(
+            primary_evidence
+            or {
+                "allocation_id": str(allocation.id),
+                "total_capital": account_capital,
+            }
+        )[:16]
         return self.create_plan(
             actor=actor,
             account_id=str(allocation.id),
             allocation_artifact_id=str(artifact.id),
-            decision_date=artifact.decision_date,
-            inputs_as_of=artifact.inputs_as_of,
+            decision_date=decision_date,
+            inputs_as_of=inputs_as_of,
             policy_version=(
-                f"allocation:{allocation.allocation_method}/{allocation.decision_frequency}"
+                f"allocation:{allocation.allocation_method}/{allocation.decision_frequency}:"
+                f"gross<={gross_limit:.6f}:"
+                f"instrument<={float(max_instrument_weight or 1.0):.6f}:"
+                f"industry<={float(max_industry_weight or 1.0):.6f}:"
+                f"capital={capital_identity}:"
+                f"{NETTING_PLAN_VERSION}"
             ),
             member_budgets=budgets,
             member_targets=targets,
             member_current_weights=member_current_weights,
-            total_capital=float(allocation.total_capital),
+            total_capital=account_capital,
             execution_policy=execution_policy,
             tranche_index=tranche_index,
             max_instrument_weight=max_instrument_weight,
+            industry_memberships={
+                instrument: value[1]
+                for instrument, value in industry_observations.items()
+            },
+            max_industry_weight=max_industry_weight,
+            input_evidence={
+                "member_snapshots": snapshot_evidence,
+                "allocation_artifact_inputs_as_of": artifact.inputs_as_of.isoformat(),
+                "max_gross_exposure": gross_limit,
+                "primary_account": primary_evidence,
+                "allocation_continuity": continuity_evidence,
+                "industry_membership_as_of": {
+                    instrument: observed[0].isoformat()
+                    for instrument, observed in industry_observations.items()
+                },
+            },
         )

@@ -138,7 +138,7 @@ export function FactorLibraryPanel({ api }: { api: string }) {
     </section>
 
     <section className="factor-intro">
-      <div><p className="eyebrow">GOVERNED FACTOR REGISTRY</p><h2>因子不是代码仓库，而是可审计的研究资产</h2><p>RD-Agent 的“实现通过”只代表代码可运行。平台会用 Qlib 独立复算、全库去重、三窗口和增量消融；合格因子可进入研究 SOTA，但策略发布和模拟盘仍需人工批准。</p></div>
+      <div><p className="eyebrow">GOVERNED FACTOR REGISTRY</p><h2>因子不是代码仓库，而是可审计的研究资产</h2><p>RD-Agent 的“实现通过”只代表代码可运行。平台会用 Qlib 独立复算、全库去重、三窗口和增量消融；合格因子只能进入研究 SOTA，还要随模型和买卖规则完成策略评估、正式 OOS 与前向模拟，满足全部证据门后才会自动晋级。</p></div>
       <div className="factor-flow"><span>候选</span><i>→</i><span>Qlib复算</span><i>→</i><span>家族去重</span><i>→</i><span>研究SOTA</span></div>
     </section>
 

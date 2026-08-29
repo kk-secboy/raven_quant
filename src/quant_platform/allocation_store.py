@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
@@ -41,6 +41,7 @@ from .member_risk_gate import (
 )
 from .risk_math import COVARIANCE_MODEL_VERSION
 from .strategy_allocation import (
+    SINGLE_MEMBER_FIXED_COVARIANCE_VERSION,
     analyze_strategy_allocation,
     renormalize_budgets_for_suspended,
 )
@@ -56,6 +57,8 @@ def _decimal(value: Any) -> Decimal:
 
 
 DECISION_FREQUENCIES = frozenset({"weekly", "monthly"})
+THREE_HORIZON_PRIMARY_SIMULATION_ACTOR = "three-horizon-account"
+THREE_HORIZON_ALLOCATION_CUTOVER_LOCK_KEY = 7_215_083_172_040_012
 
 
 def next_decision_date(decision_date: date, frequency: str) -> date:
@@ -104,6 +107,55 @@ class AllocationStore:
         if retired_pair is not None:
             raise ValueError(
                 "pair allocations are retired; historical allocation evidence is read-only"
+            )
+
+    @staticmethod
+    def _require_recommendation_enabled_members(
+        connection: Any, allocation_id: str
+    ) -> None:
+        """Fail closed unless every capital member passed its forward gate.
+
+        ``RecommendationStore.create`` applies the same authority check, but
+        allocation activation materializes its member portfolios inside one
+        transaction.  Keeping the guard here prevents that internal path from
+        turning a five-day paper ledger into a recommendation and bypassing
+        the horizon-specific 90-day/12-month/3-year evidence gates.
+        """
+
+        blocked = connection.execute(
+            select(
+                strategy_versions.c.id,
+                strategy_versions.c.status,
+                strategy_versions.c.promotion_stage,
+            )
+            .join(
+                strategy_allocation_members,
+                strategy_allocation_members.c.strategy_version_id
+                == strategy_versions.c.id,
+            )
+            .where(
+                strategy_allocation_members.c.allocation_id == allocation_id,
+                (
+                    strategy_versions.c.status.is_distinct_from("approved")
+                    | strategy_versions.c.promotion_stage.is_distinct_from(
+                        "recommendation_enabled"
+                    )
+                ),
+            )
+            .order_by(strategy_versions.c.id)
+        ).all()
+        if blocked:
+            details = [
+                {
+                    "strategy_version_id": str(row.id),
+                    "status": str(row.status),
+                    "promotion_stage": str(row.promotion_stage),
+                }
+                for row in blocked
+            ]
+            raise ValueError(
+                "allocation recommendation activation requires every member to pass "
+                f"its immutable forward gate: {details}"
             )
 
     @staticmethod
@@ -156,18 +208,29 @@ class AllocationStore:
         actor: str,
         member_specs: list[dict[str, Any]] | None = None,
         decision_frequency: str = "monthly",
+        dataset_lineage_id: str | None = None,
     ) -> dict[str, Any]:
         version_ids = list(
             dict.fromkeys(item.strip() for item in strategy_version_ids if item.strip())
         )
-        if len(version_ids) < 2 or len(version_ids) > 10:
-            raise ValueError("a strategy allocation requires 2 to 10 unique strategy versions")
+        if len(version_ids) < 1 or len(version_ids) > 10:
+            raise ValueError("a strategy allocation requires 1 to 10 unique strategy versions")
+        if len(version_ids) == 1 and allocation_method != "fixed":
+            raise ValueError(
+                "a single-member allocation requires a fixed cash-reserve policy"
+            )
         if decision_frequency not in DECISION_FREQUENCIES:
             raise ValueError("allocation decision frequency must be weekly or monthly")
         if not name.strip() or not dataset.strip() or not actor.strip():
             raise ValueError("name, dataset and actor are required")
-        if total_capital < 500_000:
-            raise ValueError("strategy allocation capital must be at least 500000")
+        normalized_lineage = str(dataset_lineage_id or "").strip().lower()
+        if normalized_lineage and (
+            len(normalized_lineage) != 64
+            or any(character not in "0123456789abcdef" for character in normalized_lineage)
+        ):
+            raise ValueError("allocation dataset lineage must be a lowercase SHA-256")
+        if not np.isfinite(float(total_capital)) or float(total_capital) <= 0:
+            raise ValueError("strategy allocation capital must be positive")
         if not 0 < max_member_drawdown < max_drawdown_reduce < max_drawdown_liquidate <= 0.50:
             raise ValueError("member, reduction and liquidation drawdowns must be increasing")
         supplied = {
@@ -224,14 +287,17 @@ class AllocationStore:
                         ],
                     }
                 )
-                backtest_row = connection.execute(
-                    select(backtest_runs)
-                    .where(
-                        backtest_runs.c.strategy_version_id == version_id,
-                        backtest_runs.c.status == "succeeded",
-                        backtest_runs.c.dataset == dataset,
-                        backtest_runs.c.is_legacy.is_(False),
+                backtest_query = select(backtest_runs).where(
+                    backtest_runs.c.strategy_version_id == version_id,
+                    backtest_runs.c.status == "succeeded",
+                    backtest_runs.c.is_legacy.is_(False),
+                )
+                if not normalized_lineage:
+                    backtest_query = backtest_query.where(
+                        backtest_runs.c.dataset == dataset
                     )
+                backtest_row = connection.execute(
+                    backtest_query
                     .order_by(backtest_runs.c.finished_at.desc())
                     .limit(1)
                 ).first()
@@ -240,6 +306,24 @@ class AllocationStore:
                         f"strategy version {version_id} has no formal {dataset} backtest"
                     )
                 backtest = row_dict(backtest_row)
+                if normalized_lineage:
+                    metrics = dict(backtest.get("metrics_json") or {})
+                    receipt = metrics.get("capital_oos_receipt")
+                    provenance = metrics.get("provenance")
+                    formal_lineage = str(
+                        (receipt or {}).get("dataset_lineage_id")
+                        if isinstance(receipt, dict)
+                        else ""
+                    ) or str(
+                        (provenance or {}).get("dataset_lineage_id")
+                        if isinstance(provenance, dict)
+                        else ""
+                    )
+                    if formal_lineage.lower() != normalized_lineage:
+                        raise ValueError(
+                            f"strategy version {version_id} formal backtest lineage "
+                            "does not match the current allocation dataset"
+                        )
                 strategy_name = connection.execute(
                     select(strategies.c.name).where(strategies.c.id == version["strategy_id"])
                 ).scalar_one()
@@ -271,6 +355,8 @@ class AllocationStore:
             },
         )
         analysis = self._apply_member_governance(analysis, governance, max_strategy_weight)
+        if normalized_lineage:
+            analysis["allocation_dataset_lineage_id"] = normalized_lineage
         shadow_members = sorted(
             version_id
             for version_id, item in governance.items()
@@ -393,11 +479,19 @@ class AllocationStore:
             for version_id, weight in unscaled.items()
             if governance[version_id]["role"] == "satellite"
         )
-        if core_weight < 0.70 - 1e-9 or satellite_weight > 0.30 + 1e-9:
+        invested_weight = core_weight + satellite_weight
+        if invested_weight <= 0:
+            raise ValueError("allocation must contain positive governed exposure")
+        core_share = core_weight / invested_weight
+        satellite_share = satellite_weight / invested_weight
+        if core_share < 0.70 - 1e-9 or satellite_share > 0.30 + 1e-9:
             raise ValueError("allocation must keep at least 70% core and at most 30% satellite")
         analysis["core_satellite"] = {
             "core_weight": core_weight,
             "satellite_weight": satellite_weight,
+            "invested_weight": invested_weight,
+            "core_share_of_invested": core_share,
+            "satellite_share_of_invested": satellite_share,
             "members": governance,
         }
         analysis["solver"]["allocation_governance_wrapper"] = (
@@ -742,6 +836,14 @@ class AllocationStore:
             raise ValueError("actor and a meaningful approval reason are required")
         now = _now()
         with self.engine.begin() as connection:
+            # SimulationStore's prepare/rebind transactions take this same
+            # transaction-scoped lock before touching portfolio/allocation
+            # rows. That gives the cross-store saga one lock order even when
+            # an approval arrives outside ThreeHorizonAccountService.tick.
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": THREE_HORIZON_ALLOCATION_CUTOVER_LOCK_KEY},
+            )
             allocation = connection.execute(
                 select(strategy_allocations)
                 .where(strategy_allocations.c.id == allocation_id)
@@ -753,9 +855,18 @@ class AllocationStore:
                 raise ValueError("legacy paper-backed allocations are read-only")
             if allocation.status != "draft":
                 raise ValueError("only draft strategy allocations may be approved")
-            self._assert_single_active_allocation(connection, allocation_id)
+            automatic_activation = actor.strip() == "system:auto-promotion"
+            if not automatic_activation:
+                # The single-active-account contract is the outer authority
+                # boundary.  Report it before inspecting a challenger's
+                # simulation evidence; auto-promotion is the sole path that
+                # may atomically replace the incumbent below.
+                self._assert_single_active_allocation(connection, allocation_id)
             analysis = dict(allocation.analysis_json or {})
-            if analysis.get("covariance_model_version") != COVARIANCE_MODEL_VERSION:
+            if analysis.get("covariance_model_version") not in {
+                COVARIANCE_MODEL_VERSION,
+                SINGLE_MEMBER_FIXED_COVARIANCE_VERSION,
+            }:
                 raise ValueError("allocation covariance evidence is obsolete")
             if allocation.allocation_method == "risk_parity":
                 solver = analysis.get("solver") or {}
@@ -779,18 +890,26 @@ class AllocationStore:
                 )
             ).all()
             self._require_long_only_members(connection, allocation_id)
+            self._require_recommendation_enabled_members(connection, allocation_id)
             certified_evidence: dict[str, Any] = {}
             member_by_version = {
                 str(member.strategy_version_id): member for member in members
             }
             for member in members:
                 evidence = self._certified_simulation_evidence(
-                    connection, str(member.strategy_version_id)
+                    connection,
+                    str(member.strategy_version_id),
+                    require_independent_review=not automatic_activation,
                 )
                 if evidence is None:
+                    evidence_kind = (
+                        "forward-gate-certified"
+                        if automatic_activation
+                        else "independently reviewed and certified"
+                    )
                     raise ValueError(
-                        "allocation approval requires five independently reviewed and "
-                        "certified simulation NAV days "
+                        f"allocation approval requires five {evidence_kind} "
+                        "simulation NAV days "
                         f"for strategy {member.strategy_version_id}"
                     )
                 evidence["target_weight"] = float(member.target_weight)
@@ -819,7 +938,11 @@ class AllocationStore:
             combined_peak = max(combined_nav)
             analysis["approval_simulation_nav"] = {
                 "performance_certified": True,
-                "review_status": "independently_reviewed",
+                "review_status": (
+                    "forward_gate_certified"
+                    if automatic_activation
+                    else "independently_reviewed"
+                ),
                 "reviewed_days": len(aligned_dates),
                 "period_start": aligned_dates[0],
                 "period_end": aligned_dates[-1],
@@ -827,14 +950,58 @@ class AllocationStore:
                 "drawdown": combined_nav[-1] / combined_peak - 1.0,
                 "evidence_sha256": _canonical_hash(certified_evidence),
             }
+            active_incumbents = connection.execute(
+                select(strategy_allocations)
+                .where(
+                    strategy_allocations.c.status == "active",
+                    strategy_allocations.c.id != allocation_id,
+                )
+                .with_for_update()
+            ).all()
+            if active_incumbents and actor.strip() != "system:auto-promotion":
+                raise ValueError(
+                    f"strategy allocation {active_incumbents[0].name!r} is already active; "
+                    "pause it before activating another one"
+                )
+            for incumbent in active_incumbents:
+                incumbent_portfolios = self._portfolio_ids(connection, str(incumbent.id))
+                connection.execute(
+                    update(recommendation_portfolios)
+                    .where(recommendation_portfolios.c.id.in_(incumbent_portfolios))
+                    .values(status="paused", risk_exposure_override=0.0, updated_at=now)
+                )
+                connection.execute(
+                    update(simulation_portfolios)
+                    .where(
+                        (simulation_portfolios.c.source_type == "allocation")
+                        & (simulation_portfolios.c.source_id == incumbent.id)
+                    )
+                    .values(status="paused", updated_at=now)
+                )
+                connection.execute(
+                    update(strategy_allocations)
+                    .where(strategy_allocations.c.id == incumbent.id)
+                    .values(status="paused", updated_at=now)
+                )
+                self._event(
+                    connection,
+                    str(incumbent.id),
+                    event_type="allocation.replaced",
+                    severity="info",
+                    rule="three_horizon_atomic_replacement",
+                    details={
+                        "actor": actor.strip(),
+                        "replacement_allocation_id": allocation_id,
+                    },
+                )
             for member in members:
                 version = self.strategies.get_version(str(member.strategy_version_id))
                 strategy_name = connection.execute(
                     select(strategies.c.name).where(strategies.c.id == version["strategy_id"])
                 ).scalar_one()
                 initial_value = _decimal(allocation.total_capital) * _decimal(member.target_weight)
-                if initial_value < Decimal("100000"):
-                    raise ValueError(f"allocated value for {strategy_name} is below 100000")
+                if initial_value <= 0:
+                    raise ValueError(f"allocated value for {strategy_name} must be positive")
                 if version.get("strategy_type") == "pair":
                     continue
                 portfolio_id = uuid.uuid4().hex
@@ -880,14 +1047,21 @@ class AllocationStore:
                 allocation_id,
                 event_type="allocation.approved",
                 severity="info",
-                rule="explicit_human_approval",
+                rule=(
+                    "automatic_three_horizon_activation"
+                    if actor.strip() == "system:auto-promotion"
+                    else "explicit_human_approval"
+                ),
                 details={"actor": actor.strip(), "reason": reason.strip()},
             )
         return self.get(allocation_id)
 
     @staticmethod
     def _certified_simulation_evidence(
-        connection: Any, strategy_version_id: str
+        connection: Any,
+        strategy_version_id: str,
+        *,
+        require_independent_review: bool = True,
     ) -> dict[str, Any] | None:
         simulations = connection.execute(
             select(simulation_portfolios)
@@ -904,8 +1078,13 @@ class AllocationStore:
                 .where(
                     simulation_nav.c.portfolio_id == simulation.id,
                     simulation_nav.c.performance_certified.is_(True),
-                    simulation_nav.c.reviewed_at.is_not(None),
+                    simulation_nav.c.has_stale_prices.is_(False),
                     simulation_nav.c.nav_scope == "member_ledger",
+                    *(
+                        (simulation_nav.c.reviewed_at.is_not(None),)
+                        if require_independent_review
+                        else ()
+                    ),
                 )
                 .order_by(simulation_nav.c.trade_date.desc())
                 .limit(5)
@@ -919,18 +1098,40 @@ class AllocationStore:
                     "last_trade_date": rows[0].trade_date.isoformat(),
                     "reviewed_days": 5,
                     "latest_nav": float(rows[0].nav),
-                    "review_audit_sha256": _canonical_hash(
-                        {
-                            row.trade_date.isoformat(): {
-                                "reviewed_by": str(row.reviewed_by),
-                                "reviewed_at": row.reviewed_at.isoformat(),
-                                "review_evidence_sha256": str(
-                                    row.review_evidence_sha256
-                                ),
-                                "review_note": str(row.review_note),
+                    "evidence_mode": (
+                        "independently_reviewed"
+                        if require_independent_review
+                        else "forward_gate_certified"
+                    ),
+                    "review_audit_sha256": (
+                        _canonical_hash(
+                            {
+                                row.trade_date.isoformat(): {
+                                    "reviewed_by": str(row.reviewed_by),
+                                    "reviewed_at": row.reviewed_at.isoformat(),
+                                    "review_evidence_sha256": str(
+                                        row.review_evidence_sha256
+                                    ),
+                                    "review_note": str(row.review_note),
+                                }
+                                for row in reversed(rows)
                             }
-                            for row in reversed(rows)
-                        }
+                        )
+                        if require_independent_review
+                        else _canonical_hash(
+                            {
+                                row.trade_date.isoformat(): {
+                                    "nav": float(row.nav),
+                                    "status": str(row.status),
+                                    "performance_certified": bool(
+                                        row.performance_certified
+                                    ),
+                                    "has_stale_prices": bool(row.has_stale_prices),
+                                    "produced_by": str(row.produced_by),
+                                }
+                                for row in reversed(rows)
+                            }
+                        )
                     ),
                     "nav_rows": [
                         {
@@ -938,12 +1139,22 @@ class AllocationStore:
                             "nav": float(row.nav),
                             "daily_return": float(row.daily_return),
                             "drawdown": float(row.drawdown),
-                            "reviewed_by": str(row.reviewed_by),
-                            "reviewed_at": row.reviewed_at.isoformat(),
-                            "review_evidence_sha256": str(
-                                row.review_evidence_sha256
+                            "reviewed_by": (
+                                str(row.reviewed_by) if row.reviewed_by else None
                             ),
-                            "review_note": str(row.review_note),
+                            "reviewed_at": (
+                                row.reviewed_at.isoformat()
+                                if row.reviewed_at is not None
+                                else None
+                            ),
+                            "review_evidence_sha256": (
+                                str(row.review_evidence_sha256)
+                                if row.review_evidence_sha256
+                                else None
+                            ),
+                            "review_note": (
+                                str(row.review_note) if row.review_note else None
+                            ),
                         }
                         for row in reversed(rows)
                     ],
@@ -968,6 +1179,7 @@ class AllocationStore:
                 raise ValueError("draft strategy allocations cannot be operated")
             if status == "active":
                 self._require_long_only_members(connection, allocation_id)
+                self._require_recommendation_enabled_members(connection, allocation_id)
                 unresolved = connection.execute(
                     select(strategy_allocation_events.c.id)
                     .where(
@@ -1345,6 +1557,8 @@ class AllocationStore:
                 simulation_portfolios.c.source_type == "allocation",
                 simulation_portfolios.c.source_id == allocation.id,
                 simulation_portfolios.c.status.in_(["active", "paused"]),
+                simulation_portfolios.c.created_by
+                != THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
             )
         ).all()
         total_capital = _decimal(allocation.total_capital)

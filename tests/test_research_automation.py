@@ -31,6 +31,8 @@ def _payload() -> dict:
     return {
         "objective": "Research a low-turnover quality factor for CSI 300 enhancement.",
         "dataset": "cn-research",
+        "feature_set_id": "governed-baseline",
+        "horizon": "short",
         "loop_n": 2,
         "duration": "1h",
         "requested_by": "research-scheduler",
@@ -54,6 +56,7 @@ def test_research_schedule_payload_is_normalized() -> None:
     assert normalized["loop_n"] == 2
     assert normalized["duration"] == "1h"
     assert normalized["periods"]["test_end"] == "2025-01-02"
+    assert normalized["horizon_profile"] == "short_1_5d"
 
 
 @pytest.mark.no_database
@@ -114,6 +117,7 @@ def test_research_schedule_rejects_unbounded_or_overlapping_requests() -> None:
             "asset_ids": ["report-a", "report-b", "report-c"],
         }
     )
+    payload.pop("horizon")
     with pytest.raises(ValueError, match="one report per loop"):
         normalize_research_schedule_payload(
             payload,
@@ -335,7 +339,7 @@ def test_factor_and_model_use_the_same_cost_covered_rolling_window_contract() ->
         day += timedelta(days=1)
     resolutions = []
     for scenario, feature_set_id in (
-        ("fin_factor", None),
+        ("fin_factor", "governed-baseline"),
         ("fin_model", "governed-baseline"),
     ):
         payload = {
@@ -346,6 +350,7 @@ def test_factor_and_model_use_the_same_cost_covered_rolling_window_contract() ->
             "duration": "30m",
             "requested_by": "test-scheduler",
             "period_mode": "rolling",
+            "horizon": "swing",
         }
         if feature_set_id is not None:
             payload["feature_set_id"] = feature_set_id
@@ -354,6 +359,7 @@ def test_factor_and_model_use_the_same_cost_covered_rolling_window_contract() ->
             resolve_research_periods(
                 calendar,
                 period_policy=normalized["period_policy"],
+                horizon_profile=normalized["horizon_profile"],
             )
         )
 
@@ -363,7 +369,8 @@ def test_factor_and_model_use_the_same_cost_covered_rolling_window_contract() ->
         for item in resolutions[0][1]["evaluation_profiles"]
         if item["id"] == "robust_10y"
     )
-    assert robust["periods"]["valid_start"] == "2015-08-03"
+    assert resolutions[0][1]["horizon_profile"] == "swing_1_6m"
+    assert robust["periods"]["valid_start"] < robust["periods"]["valid_end"]
 
 
 @pytest.mark.no_database

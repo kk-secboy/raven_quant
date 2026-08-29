@@ -14,7 +14,6 @@ from quant_data.database import (
     strategy_allocation_artifacts,
     strategy_allocation_members,
     strategy_allocations,
-    strategy_versions,
 )
 from quant_platform.account_netting import (
     NETTING_PLAN_VERSION,
@@ -27,6 +26,10 @@ from quant_platform.allocation_store import AllocationStore
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.recommendation_store import RecommendationStore
+from quant_platform.three_horizon_account import (
+    HORIZON_WEIGHTS,
+    _active_horizon_fixed_weights,
+)
 
 ARTIFACT = "artifact-1"
 DECISION = date(2026, 7, 20)
@@ -72,6 +75,28 @@ def test_same_direction_demands_add_up() -> None:
     # 同向无抵消：净贡献等于毛需求
     assert contributions["m1"]["net_contribution"] == pytest.approx(0.10)
     assert contributions["m2"]["net_contribution"] == pytest.approx(0.05)
+
+
+@pytest.mark.no_database
+def test_progressive_horizon_plan_attributes_inherited_reduction_to_old_sleeve() -> None:
+    plan = _plan(
+        member_budgets={"short": 0.20, "swing": 0.40},
+        member_targets={
+            "short": {"SH600000": 0.50},
+            "swing": {"SH600001": 1.0},
+        },
+        member_current_weights={
+            "short": {"SH600000": 1.0},
+            "swing": {},
+        },
+        total_capital=800_000.0,
+    )
+
+    assert plan["net_trades"]["SH600000"]["side"] == "sell"
+    assert plan["strategy_contributions"]["SH600000"]["members"]["short"][
+        "net_contribution"
+    ] == pytest.approx(-0.10)
+    assert plan["net_trades"]["SH600001"]["side"] == "buy"
 
 
 @pytest.mark.no_database
@@ -134,6 +159,141 @@ def test_account_hard_constraint_clamps_net_target_into_cash() -> None:
     contributions = plan["strategy_contributions"]["SH600000"]["members"]
     total = sum(item["net_contribution"] for item in contributions.values())
     assert total == pytest.approx(0.15)
+
+
+@pytest.mark.no_database
+def test_account_industry_cap_is_applied_after_cross_strategy_netting() -> None:
+    plan = _plan(
+        member_targets={
+            "m1": {"A": 0.40, "B": 0.20},
+            "m2": {"A": 0.20, "C": 0.20},
+        },
+        industry_memberships={"A": "bank", "B": "bank", "C": "technology"},
+        max_industry_weight=0.25,
+    )
+
+    bank_weight = sum(
+        target["weight"]
+        for instrument, target in plan["net_targets"].items()
+        if plan["industry_memberships"].get(instrument) == "bank"
+    )
+    assert bank_weight == pytest.approx(0.25)
+    assert plan["industry_exposure"]["bank"] == pytest.approx(0.25)
+    assert plan["industry_exposure"]["technology"] == pytest.approx(0.10)
+    assert plan["cash_weight"] == pytest.approx(0.65)
+    assert {
+        item["reason"] for item in plan["industry_constraint_clamps"].values()
+    } == {"account_industry_weight_cap"}
+    for instrument, trade in plan["net_trades"].items():
+        attributed = sum(
+            item["net_contribution"]
+            for item in plan["strategy_contributions"][instrument]["members"].values()
+        )
+        assert attributed == pytest.approx(trade["delta_weight"])
+
+
+@pytest.mark.no_database
+def test_missing_industry_metadata_fails_closed_with_explanation() -> None:
+    plan = _plan(
+        member_targets={"m1": {"UNKNOWN": 0.20}, "m2": {}},
+        industry_memberships={},
+        max_industry_weight=0.25,
+    )
+
+    assert plan["net_targets"] == {}
+    assert plan["cash_weight"] == pytest.approx(1.0)
+    assert plan["industry_constraint_clamps"]["UNKNOWN"] == {
+        "industry": None,
+        "raw_weight": pytest.approx(0.10),
+        "clamped_weight": 0.0,
+        "reason": "missing_industry_membership_blocks_target",
+    }
+
+
+@pytest.mark.no_database
+def test_three_horizon_default_is_20_40_40_of_investable_capital() -> None:
+    assert HORIZON_WEIGHTS == {
+        "short_1_5d": 0.20,
+        "swing_1_6m": 0.40,
+        "long_1_3y": 0.40,
+    }
+    # Balanced account: sleeves consume 90% gross and preserve 10% cash.
+    budgets = {key: value * 0.90 for key, value in HORIZON_WEIGHTS.items()}
+    plan = build_account_netting_plan(
+        account_id="primary",
+        allocation_artifact_id=ARTIFACT,
+        decision_date=DECISION,
+        inputs_as_of=AS_OF,
+        policy_version="three-horizon-balanced",
+        member_budgets=budgets,
+        member_targets={key: {f"{index:06d}.SZ": 1.0} for index, key in enumerate(budgets)},
+        total_capital=100_000,
+        execution_policy="open",
+    )
+    assert sum(item["weight"] for item in plan["net_targets"].values()) == pytest.approx(0.90)
+    assert plan["cash_weight"] == pytest.approx(0.10)
+    assert plan["execution_policy"] == "open"
+    assert plan["member_targets"] == {
+        key: {f"{index:06d}.SZ": 1.0}
+        for index, key in enumerate(budgets)
+    }
+
+
+@pytest.mark.no_database
+def test_verified_horizons_do_not_redistribute_missing_sleeve_budgets() -> None:
+    short_only = _active_horizon_fixed_weights(
+        {"short_1_5d": "short-version"}, max_gross_exposure=0.90
+    )
+    short_and_swing = _active_horizon_fixed_weights(
+        {
+            "short_1_5d": "short-version",
+            "swing_1_6m": "swing-version",
+        },
+        max_gross_exposure=0.90,
+    )
+
+    assert short_only == {"short-version": pytest.approx(0.18)}
+    assert short_and_swing == {
+        "short-version": pytest.approx(0.18),
+        "swing-version": pytest.approx(0.36),
+    }
+    assert 1.0 - sum(short_only.values()) == pytest.approx(0.82)
+    assert 1.0 - sum(short_and_swing.values()) == pytest.approx(0.46)
+
+
+@pytest.mark.no_database
+def test_member_target_transition_preserves_exit_attribution_conservation() -> None:
+    budgets = {"short": 0.18, "swing": 0.36, "long": 0.36}
+    previous = {
+        "short": {"SH600000": 1.0},
+        "swing": {"SH600000": 0.5},
+        "long": {"SH600001": 1.0},
+    }
+    targets = {
+        "short": {},
+        "swing": {"SH600000": 1.0},
+        "long": {"SH600001": 1.0},
+    }
+    plan = build_account_netting_plan(
+        account_id="primary",
+        allocation_artifact_id=ARTIFACT,
+        decision_date=DECISION,
+        inputs_as_of=AS_OF,
+        policy_version="three-horizon-transition",
+        member_budgets=budgets,
+        member_targets=targets,
+        member_current_weights=previous,
+        total_capital=100_000,
+        execution_policy="open",
+    )
+
+    contribution = plan["strategy_contributions"]["SH600000"]
+    assert contribution["members"]["short"]["gross_delta"] == pytest.approx(-0.18)
+    assert contribution["members"]["swing"]["gross_delta"] == pytest.approx(0.18)
+    assert contribution["net_delta"] == pytest.approx(0.0)
+    assert sum(
+        item["net_contribution"] for item in contribution["members"].values()
+    ) == pytest.approx(plan["net_trades"].get("SH600000", {}).get("delta_weight", 0.0))
 
 
 @pytest.mark.no_database
@@ -279,16 +439,8 @@ def test_build_plan_for_allocation(database_url: str, tmp_path: Path, monkeypatc
     version_ids = _two_versions(database_url, tmp_path)
     store = AllocationStore(database_url)
     allocation = _create_allocation(store, version_ids, "netting allocation")
-    # Fixture shortcut: real approval sets promotion_stage="paper"; this test
-    # exercises netting, not the forward gate, so it marks the versions
-    # enabled directly (production must pass PromotionStore.promote).
-    engine = open_database(database_url)
-    with engine.begin() as connection:
-        connection.execute(
-            update(strategy_versions)
-            .where(strategy_versions.c.id.in_(version_ids))
-            .values(promotion_stage="recommendation_enabled")
-        )
+    # _two_versions advances both the version projection and its durable
+    # promotion-stage evidence; production reaches this only through the gate.
     recommendations = RecommendationStore(database_url)
     engine = open_database(database_url)
     targets = [
@@ -364,7 +516,7 @@ def test_build_plan_for_allocation(database_url: str, tmp_path: Path, monkeypatc
     assert plan["net_targets"]["SH600001"]["weight"] == pytest.approx(
         budgets[version_ids[0]] * 0.10
     )
-    assert plan["execution_policy"] == "next_bar"
+    assert plan["execution_policy"] == "open"
     assert plan["total_capital"] == pytest.approx(1_000_000.0)
     assert plan["cash_weight"] == pytest.approx(
         1.0 - expected - budgets[version_ids[0]] * 0.10
@@ -377,3 +529,27 @@ def test_build_plan_for_allocation(database_url: str, tmp_path: Path, monkeypatc
     replay = netting.build_plan_for_allocation(allocation["id"], actor="netting-operator")
     assert replay["idempotent_replay"] is True
     assert replay["id"] == plan["id"]
+
+    live_nav = 800_000.0
+    primary = {
+        "portfolio_id": "persistent-primary-ledger",
+        "source_id": allocation["id"],
+        "nav": live_nav,
+        "updated_at": "2026-07-21T16:00:00+08:00",
+    }
+    live_plan = netting.build_plan_for_allocation(
+        allocation["id"],
+        actor="netting-operator",
+        primary_account=primary,
+        max_gross_exposure=0.90,
+    )
+    assert live_plan["total_capital"] == pytest.approx(live_nav)
+    assert live_plan["input_evidence"]["primary_account"]["portfolio_id"] == (
+        "persistent-primary-ledger"
+    )
+    assert live_plan["net_targets"]["SH600000"]["target_value"] == pytest.approx(
+        live_nav * live_plan["net_targets"]["SH600000"]["weight"]
+    )
+    assert sum(
+        item["target_value"] for item in live_plan["net_targets"].values()
+    ) <= live_nav * 0.90 + 1e-6

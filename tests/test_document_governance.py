@@ -27,6 +27,8 @@ CONTROLLED_DOCUMENTS = {
     Path("docs/information-pipeline-operations.md"),
     Path("docs/legacy-market-backfill.md"),
     Path("docs/pit-nlp-gap-report.md"),
+    Path("docs/financial-correctness-audit-2026-08-25.md"),
+    Path("docs/qlib-rdagent-capability-audit-2026-08-25.md"),
     Path(MARKDOWN_NAME),
     Path(DOCX_NAME),
 }
@@ -50,6 +52,7 @@ UNESCAPED_PIPE = re.compile(r"(?<!\\)\|")
 IGNORED_ARTIFACT_PARTS = {
     ".git",
     ".codex_tmp",
+    ".codex-tmp",
     ".venv",
     ".pytest-tmp",
     ".worktrees",
@@ -159,8 +162,12 @@ def test_controlled_product_documents_match_the_whitelist() -> None:
 def test_readme_declares_the_document_and_technical_authorities() -> None:
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     assert "是产品、策略和风险基准，Qlib/RD-Agent 是技术基准" in readme
-    assert "Tushare 不可变快照" in readme
-    assert "统一模拟交易" in readme
+    assert "不可变快照" in readme
+    assert "三周期账户净额" in readme
+    assert "`fin_strategy`" in readme
+    assert "满足各周期真实前向门后由系统原子自动晋级" in readme
+    assert "旧 `/api/research-programs` 与 `/api/research-campaigns` 只保留历史 GET 查询" in readme
+    assert "Loop、Hypothesis、Feedback 和 Trace 摘要" in readme
     assert "本 README 只提供项目入口和" in readme
     assert "不定义另一套产品方案" in readme
     assert "根目录同名 DOCX 仅保留为 3.0 定稿发布快照" in readme
@@ -168,160 +175,68 @@ def test_readme_declares_the_document_and_technical_authorities() -> None:
     assert f"`{DOCX_BACKUP_NAME}` 仅保留为冻结的历史原稿" in readme
 
 
+def test_public_product_copy_does_not_restore_manual_strategy_promotion() -> None:
+    sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            PROJECT_ROOT / "README.md",
+            PROJECT_ROOT / "docs" / "design-gap-analysis.md",
+            PROJECT_ROOT / "web" / "app" / "factor-library-panel.tsx",
+            PROJECT_ROOT / "web" / "app" / "rdagent-panel.tsx",
+        )
+    )
+    for obsolete in (
+        "人工批准 / 模拟盘",
+        "正式回测后仍需人工批准",
+        "策略发布和模拟盘仍需人工批准",
+        "证据门 + 人工批准",
+    ):
+        assert obsolete not in sources
+
+
 def test_authoritative_markdown_contains_the_current_contract() -> None:
     specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
     required_contracts = (
-        "面向个人或 1—5 人小团队的中低频量化研究、回测、模拟投资、推荐与提醒系统",
-        "四条正确性主线",
-        "三个唯一权威",
-        "系统可以得出“没有可靠机会”“继续持有”“等待执行”或“停止推荐”",
-        "为了保持有信号而降低验证标准，属于错误实现",
-        "不连接券商写接口，不提交、修改或撤销真实委托",
-        "券商只读不是当前依赖",
-        "Tushare 是行情、财务、成分和研究数值的生产主源",
-        "只发布一份账户目标；单个策略信号不能直接改模拟持仓",
-        "Qlib 内部账户状态不能代替持久模拟账户",
-        "项目只实现一个轻量、确定性的 `ExecutionCore`，不是事件溯源平台",
-        "`ExecutionCore(account_snapshot, market_event, order_intent, rule_config) → fills + "
-        "state_delta + reason`",
-        "两种适配器都只能把同一 `state_delta` 应用一次",
-        "Qlib 未改造的默认执行器只作探索对照",
-        "正式 Qlib 工作流只能使用调用 `ExecutionCore` 的自定义 Executor/Exchange 适配器",
-        "`effective_at`：经济事实属于哪个日期或区间",
-        "`available_at`：市场参与者最早何时能够知道",
-        "`ingested_at`：平台何时实际取得并通过检查",
-        "`native_history`（上游原生历史版本）、`reconstructed`（依据当时公告重建）、"
-        "`current_only`（只有当前修订）或 "
-        "`unavailable`",
-        "只有前两类可以作为正式历史证据",
-        "股票池必须包含历史退市证券",
-        "| A 股日线 `vol` | 手 | 股，乘以 100 |",
-        "| A 股日线 `amount` | 千元 | 人民币元，乘以 1,000 |",
-        "| `adj_factor` | 复权因子 | 原始因子永久保存，研究计算必须固定锚点和快照 |",
-        "`adjusted_price(t, b) = raw_price(t) × adj_factor(t) / adj_factor(b)`",
-        "不能只输出 `NO_ACTION` 后让旧计划无限继续",
-        "需要避免相邻信息传播时使用 embargo",
-        "人工确认可以决定是否继续观察，但不能覆盖已经失败的硬门",
-        "最终样本外是一次性资源，而不是每个候选都能重复领取的区间",
-        "试验台账",
-        "股票数量不是时间独立样本数",
-        "分钟 Bar 数不是独立投资决策数",
-        "重复交叉验证折、随机种子和 Monte Carlo 路径不产生新的市场证据",
-        "不能把同一天数千只股票当作数千个独立日期",
-        "时间序列相关性可使用 HAC 标准误或时间区块 Bootstrap",
-        "候选相对基线的差异应在相同时间区间做成对比较",
-        "例如探索阶段的 FDR，或最终少量候选的 Holm 校正",
-        "DSR、PBO 等只在前提成立时作为诊断",
-        "未经样本外校准的排名分数不得展示成“上涨概率 80%”或“预期收益 10%”",
-        "`sealed_candidate_set_id/hash`",
-        "不能看完后再挑赢家",
-        "RD-Agent 研究环境在物理挂载和数据权限上都不能读取最终样本外区间",
-        "账户人民币 NAV 用于账本对账",
-        "只有实际转入或转出被评价账户的资产才是外部现金流",
-        "最大回撤和恢复期基于单位化表现曲线，不基于人民币余额",
-        "XIRR 只作为个人资金体验的资金加权补充，不作为策略 Alpha 的主要证据",
-        "样本不足时标记“证据不足”，不能通过降低门槛晋升",
-        "证据不足时继续处于 `paper`",
-        "历史验证门和前向证据门不能相互替代",
-        "执行算法检查完成率与 Implementation Shortfall",
-        "当日买入何时可卖、卖出款何时可继续交易、法定交收何时完成、现金何时可取；"
-        "四者不得混成一个 T+N 字段",
-        "退市不统一假设为现金结算",
-        "成本只计算一次",
-        "每项经济成本只能在“成交价格影响”或“现金费用”中出现一次",
-        "若基金净值、市场价格或收益序列已经内含管理费用，不得再次从账户扣除同一费用",
-        "成本和税费是带生效日期的运行配置，不在设计稿中永久写死",
-        "系统唯一采用**交易日会计**",
-        "卖出回款不得同时出现在现金、在途现金和应收款中",
-        "`NAV = Σ互斥现金余额 + Σ(经济持仓数量 × 估值价格) + 公司行动应收 - "
-        "应付款及已确认税费负债`",
-        "重复处理同一事件不得再次改变现金、证券或费用",
-        "闲置现金只按账户实际可获得的配置收益计息",
-        "不能把研究无风险利率当作账户实际收益",
-        "`economic_hypothesis_id` 与 `economic_hypothesis_group`",
-        "过滤器属于硬门，不能被高分覆盖",
-        "`StrategySpec`",
-        "`ModelArtifact`",
-        "`AccountAllocationPolicy`",
-        "`AllocationArtifact`",
-        "`ExecutionPolicy`",
-        "`catalog_role`",
-        "`implementation_tier`",
-        "`capital_eligible_strategy`",
-        "`controlled_custom` 只允许承载尚未评审的新策略草案",
-        "`stock_pair_stat_arb` 是明确例外：当前只承诺离线统计研究",
-        "`NewStrategyProposal`",
-        "`ResearchBrief`",
-        "`ExperimentLedger`",
-        "RD-Agent 永远不能修改当前运行版本、最终样本外、成本、风险硬门、个人约束或模拟账本",
-        "多个近似版本、频率或模型共享同一 `economic_hypothesis_group`，统一进入试验计数和资本上限",
-        "主晋升路径为 `research → candidate → paper → recommendation_enabled`",
-        "`paper → recommendation_enabled` 必须同时满足前向证据门和人工批准",
-        "`rejected`、`paused` 或 `retired`",
-        "个人系统只保留两个不可自动越过的人工作业点",
-        "`paper → recommendation_enabled` 不能只靠人工点击",
-        "固定 60 日只能是某个策略配置，不是跨策略通用数学门",
-        "系统同一时刻只能有一个 `active_recommendation_account_id`",
-        "`forward_paper` 永远不能成为主动推荐账户",
-        "禁止不同策略在同一账户自买自卖",
-        "对普通 Alpha 调整应用 no-trade band",
-        "硬约束优先于 Alpha",
-        "`projected_position = filled_position + 有效未完成买单 - 有效未完成卖单`",
-        "逐笔生成 `keep/cancel/replace/new` 计划",
-        "`NO_ACTION` 不能删除上一有效目标",
-        "所有风险指标必须标记 `risk_scope=selected_account_only`",
-        "券商只读同步不属于首版，未来如增加也必须默认关闭，并在技术上拒绝所有写接口",
-        "`buy_sell`、`sell_only`、`disabled` 或 `unknown`",
-        "初始资金是账户配置，不固定为 500 万元",
-        "50 万、100 万、500 万等只可作为容量测试档位",
-        "`planned → open → partially_filled → filled | cancelled | expired | rejected`",
-        "多策略净额合并后只能创建账户级综合模拟订单",
-        "`strategy_id` 不得作为创建多份订单的幂等键",
-        "任务重试不得重复创建订单、成交、费用或公司行动",
-        "只消费账户级最终综合建议，不直接消费 RD-Agent 输出或单策略信号",
-        "`forward_paper`：只使用运行当时真实取得的数据向前运行",
-        "历史分钟数据盘后补齐不能回写并美化当天的前向模拟成交或提醒",
-        "旧、新自然时间、成交事件和表现不得拼接用于晋升，也不得修改旧阶段 NAV",
-        "提醒必须明确标识“低频目标执行点”还是“已批准分钟策略信号”",
-        "连续相同的 `HOLD`、`NO_ACTION` 或 `WAIT` 不重复推送",
-        "数据库事务、唯一任务键和短租约足以防止同一任务重复运行",
-        "唯一任务键和幂等重跑",
-        "触发 `safe_mode`，停止新建议和新模拟订单",
-        "系统代码中不提供券商写入入口",
-        "只备份但从不验证恢复不算通过",
+        "1.2 三周期策略研究与持续荐股定稿",
+        "这是唯一生产主线，不另建第二套 Agent、策略仓库、数据库或生命周期",
+        "`short_1_5d`",
+        "`swing_1_6m`",
+        "`long_1_3y`",
+        "至少 90 个交易日、60 次有效决策、30 个完整闭环",
+        "至少 12 个月、24 次周度复核、6 个完整波段",
+        "至少 3 年、36 次月度复核、12 次财报复核",
+        "通过不可变决定自动晋级，不需要人工挑选",
+        "短线约 90 个交易日、中线约 12 个月、长线约 3 年后才可能分别出现“已验证荐股”",
+        "`fin_strategy`",
+        "`StrategyProposal`",
+        "确定性编译",
+        "`strategy-rule-ir-v1`",
+        "`SOTA` 只表示官方研究 Trace 中的当前最好实验",
+        "旧 `research_program/research_campaign` 记录只保留 `legacy_readonly` 历史查询",
+        "创建、状态修改、重试和调度入口一律返回 410",
+        "日常推荐只执行编译后的规则 IR，绝不运行 LLM 代码",
+        "`research_sota → research_candidate → governed_evaluation_winner → "
+        "paper_validating → recommendation_enabled`",
+        "`system:auto-promotion`",
+        "D 日完整收盘数据 → D+1 开盘或保守日线成交模型",
+        "没有合格股票时输出现金/`NO_ACTION`",
+        "初始资金是首次使用时必填的账户配置",
+        "也没有 10 万或 50 万元硬下限",
         "系统能力验收不要求策略盈利",
-        "正确地输出“候选不合格”“证据不足”或 `NO_ACTION` 也属于通过",
-        "当前项目实现是否符合本文，应由代码、配置和验收测试逐项证明",
-        "本文定稿不等于当前代码已经完成",
+        "这仍不构成收益保证",
+        "当前没有盘中数据接口",
+        "生产发布没有 QMT 或任何券商网关例外",
     )
     for contract in required_contracts:
         assert contract in specification
 
-    assert (
-        "已冻结的目标设计；不代表当前代码已经实现，也不代表任何策略已经具有可投资价值"
-        in specification
-    )
-    assert "本文冻结为个人投资者或 1—5 人小团队量化平台 v1.1 目标设计" in specification
     for obsolete in (
-        "本 Markdown 是 4.15 审阅整改后架构与产品基准",
-        "以下清单是 4.15",
-        "人民币 500 万元",
-        "成交额 0.03%，单笔最低 5 元",
-        "每月最后一个交易日 18:00",
-        "`simulation_promotion_firewall_version`",
-        "`system_capability_complete`",
-        "`no_trade_band_utility`",
-        "`baseline_account_target_weight`",
-        "`decision_intent_set`",
-        "`joint_resampling_group_hash`",
-        "`champion_lockbox_assessment`",
-        "`certification_forward`",
-        "`fully_certified`",
-        "Qlib 与 RD-Agent 决定技术实现基准",
-        "ETF 核心和股票核心分别至少有一个策略完成正式回测",
-        "在隔离 `certification_forward` 完成连续 60 个交易日",
-        "N_eff = min(N_unique, N_acf, N_nonoverlap)",
-        "禁止把 0.95 或 20% 当作跨研究程序通用门",
+        "证据门 + 人工批准",
+        "人工模板设计确认",
+        "人工推荐批准",
+        "默认关闭的 QMT 沙箱插件是唯一例外",
+        "本项目个人 paper 账户首轮默认使用 10 万元",
+        "## 15. v1.1",
     ):
         assert obsolete not in specification
 
@@ -351,10 +266,10 @@ def test_design_status_and_four_correctness_lines_do_not_overclaim_implementatio
     assert "正确地输出“候选不合格”“证据不足”或 `NO_ACTION` 也属于通过" in acceptance
     assert "这仍不构成收益保证" in acceptance
 
-    closing = specification.partition("## 15. v1.1 策略扩展定稿与变更边界")[2]
+    closing = specification.partition("## 15. v1.2 三周期策略研究与持续荐股定稿")[2]
     for disclaimer in (
-        "设计完整不等于所有策略已经实现、通过证据门、适合个人或具有正收益",
-        "也不要求它们同时参与推荐",
+        "设计完整不等于策略已经通过证据门、适合个人或具有正收益",
+        "自动晋级不代表保证盈利",
         "本文定稿不等于当前代码已经完成",
         "当前项目实现是否符合本文，应由代码、配置和验收测试逐项证明",
     ):
@@ -373,7 +288,7 @@ def test_current_body_contains_core_contracts_not_only_acceptance_lists() -> Non
         "`AccountAllocationPolicy`",
         "`AllocationArtifact`",
         "`ExecutionPolicy`",
-        "`NewStrategyProposal`",
+        "`StrategyProposal`",
         "`ResearchBrief`",
         "`ExperimentLedger`",
         "`economic_hypothesis_group`",
@@ -388,7 +303,8 @@ def test_current_body_contains_core_contracts_not_only_acceptance_lists() -> Non
         "`native_history`（上游原生历史版本）、`reconstructed`（依据当时公告重建）、"
         "`current_only`（只有当前修订）或 "
         "`unavailable`",
-        "research → candidate → paper → recommendation_enabled",
+        "research_sota → research_candidate → governed_evaluation_winner → "
+        "paper_validating → recommendation_enabled",
         "`forward_paper`",
         "`main_paper`",
         "`manual_shadow`",
@@ -415,12 +331,12 @@ def test_current_body_contains_core_contracts_not_only_acceptance_lists() -> Non
 def test_document_version_and_frozen_status_are_consistent() -> None:
     specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
     assert re.search(
-        r"^\| 版本 \| 1\.1 策略扩展定稿 \|$",
+        r"^\| 版本 \| 1\.2 三周期策略研究与持续荐股定稿 \|$",
         specification,
         re.MULTILINE,
     )
     assert re.search(
-        r"^\| 日期 \| 2026-07-17 \|$",
+        r"^\| 日期 \| 2026-08-29 \|$",
         specification,
         re.MULTILINE,
     )
@@ -430,8 +346,8 @@ def test_document_version_and_frozen_status_are_consistent() -> None:
         specification,
         re.MULTILINE,
     )
-    closing = specification.partition("## 15. v1.1 策略扩展定稿与变更边界")[2]
-    assert "本文冻结为个人投资者或 1—5 人小团队量化平台 v1.1 目标设计" in closing
+    closing = specification.partition("## 15. v1.2 三周期策略研究与持续荐股定稿")[2]
+    assert "本文冻结为个人投资者或 1—5 人小团队量化平台 v1.2 目标设计" in closing
     assert (
         "只有产品范围变化，或发现会改变数据、回测、模拟账本、投资证据、"
         "账户动作或非实盘边界的原则性错误时，才升级为后续设计版本"
@@ -480,7 +396,8 @@ def test_quantitative_formula_and_state_invariants_are_explicit() -> None:
         "ExecutionCore(account_snapshot, market_event, order_intent, rule_config) → fills + "
         "state_delta + reason",
         "planned → open → partially_filled → filled | cancelled | expired | rejected",
-        "research → candidate → paper → recommendation_enabled",
+        "research_sota → research_candidate → governed_evaluation_winner → "
+        "paper_validating → recommendation_enabled",
         "资格 → 去重 → 方向/环境 → 排名/预测 → 入场时机 → 退出状态 → 策略内组合风险 → "
         "执行要求",
         "按冻结日历生成或读取 AllocationArtifact → 将其中预算应用一次 → 各 StrategySpec "
@@ -708,7 +625,7 @@ def test_core_contracts_are_synchronized_between_body_and_acceptance() -> None:
     synchronized_contracts = (
         "ExecutionCore",
         "state_delta",
-        "NewStrategyProposal",
+        "StrategyProposal",
         "StrategySpec",
         "ModelArtifact",
         "AllocationArtifact",
@@ -736,12 +653,12 @@ def test_paper_isolation_and_promotion_have_no_shadow_path() -> None:
     specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
 
     for required in (
-        "`paper`：正式硬门通过后自动创建独立隔离模拟账户，允许展示该实验账户的模拟数量，"
+        "`paper_validating`：自动创建独立隔离模拟账户，允许展示实验账户模拟数量，"
         "但不参与用户综合推荐，也不输出个人主账户数量建议",
         "`recommendation_enabled`：允许参与唯一账户综合建议和主模拟账户；仍不具备实盘交易权限",
-        "`paper → recommendation_enabled` 不能只靠人工点击",
-        "任何硬门不足都继续留在隔离模拟",
-        "证据不足时继续处于 `paper`",
+        "通过历史门、密封 OOS、独立复算和本周期全部前向门后自动晋级",
+        "自动晋级不是放松门槛",
+        "证据不足时继续处于模拟验证",
         "历史验证门和前向证据门不能相互替代",
         "`forward_paper` 永远不能成为主动推荐账户",
         "`forward_paper`：只使用运行当时真实取得的数据向前运行；"
@@ -754,7 +671,8 @@ def test_paper_isolation_and_promotion_have_no_shadow_path() -> None:
         "例行 `ModelArtifact` 切换若超出预注册日历或改变模型配方，必须先形成新 `StrategySpec`，"
         "不能借“refit”绕过重置",
         "主模拟账户的归因不能代替各策略独立 `forward_paper` 的晋升证据",
-        "证据不足时链路正确停在 `paper`",
+        "证据不足时链路正确停在 `paper_validating`，人工不能覆盖失败门",
+        "任一因子、模型、规则、数据合同或执行合同实质变化都形成新版本并从零累计前向证据",
     ):
         assert required in specification
 
@@ -779,7 +697,7 @@ def test_alpha_cannot_override_hard_gates() -> None:
         "不能用高 Alpha 分数覆盖权限、不可交易、现金、容量或风险门",
         "硬资格、现金、容量和风险门不能被 Alpha 分数覆盖",
         "过滤器属于硬门，不能被高分覆盖",
-        "人工确认可以决定是否继续观察，但不能覆盖已经失败的硬门",
+        "人工不能覆盖失败门",
         "普通现金账户只能向现金缩放风险；未经策略和个人政策明确批准，"
         "不得为达到目标波动率自动加杠杆",
         "执行策略只能在上层最终账户目标和硬风险边界内工作。它不得自行增加目标仓位、"
@@ -803,7 +721,7 @@ def test_insufficient_evidence_states_are_first_class() -> None:
         "样本不足时标记“证据不足”，不能通过降低门槛晋升",
         "主要结果的置信区间或明确的“证据不足”",
         "样本不足、时间未对齐或分母为零时输出“未定义/证据不足”，不得输出无穷大或伪精确数值",
-        "证据不足时继续处于 `paper`",
+        "证据不足时继续处于模拟验证",
         "证据不足时只显示“观察/已过期”，不输出伪精确分时点",
         "未经样本外校准的排名分数不得展示成“上涨概率 80%”或“预期收益 10%”",
         "若分母小于等于零、外部现金流时点不明确或账本未对平，"
@@ -866,7 +784,7 @@ def test_risk_and_drawdown_semantics_are_enforced() -> None:
         "止损、止盈和波动率缩放不能承诺最大损失",
         "实际外部入金/出金不会制造收益或回撤，未实际划出的计划用款不进入外部流",
         "不同频率没有新信号时沿用其上一有效目标，而不是每天重新调仓",
-        "状态不变时不重复调仓或推送",
+        "连续相同的 `HOLD`、`NO_ACTION` 或 `WAIT` 不重复推送",
         "佣金、税费、滑点和冲击已经进入换仓成本，不能又重复塞入 no-trade band",
         "所有风险指标必须标记 `risk_scope=selected_account_only`",
         "未导入的其他券商账户、基金、现金、房产、负债和未来收入不在计算范围内，"
@@ -892,7 +810,7 @@ def test_account_actions_and_execution_states_are_synchronized_across_surfaces()
     definitions = specification.partition("### 8.4 推荐动作与执行状态")[2].partition(
         "### 8.5 推荐内容"
     )[0]
-    reminders = specification.partition("## 10. 月度、周度、日度与分时提醒")[2].partition(
+    reminders = specification.partition("## 10. 长线、中线、短线的盘后提醒")[2].partition(
         "## 11. 最小工程与运行保障"
     )[0]
     acceptance = specification.partition("### 12.4 模拟盘与推荐测试")[2].partition(
@@ -919,20 +837,13 @@ def test_intraday_governance_and_fixed_stage_order_are_explicit() -> None:
     specification = (PROJECT_ROOT / MARKDOWN_NAME).read_text(encoding="utf-8")
 
     for required in (
-        "不把独立分钟 Alpha 作为低频主系统可用的前置条件",
-        "分时能力只服务已经批准的中低频目标",
-        "主推荐账户在没有已通过完整证据门的独立分钟策略时，不提供分钟 Alpha",
-        "“分时买卖点”默认含义仍是对已有中低频目标进行 1min/5min 执行检查",
-        "分时检查只能在具备盘中实时分钟权限、完整 Bar、可接受延迟和数据质量时启用。"
-        "盘后更新的历史分钟数据只能做回放，不能冒充实时提醒数据",
-        "提醒必须明确标识“低频目标执行点”还是“已批准分钟策略信号”",
-        "它不能借用低频策略成绩",
-        "盘中：分别处理待执行低频目标、独立 `forward_paper` 分钟研究账户，以及已进入 "
-        "`recommendation_enabled` 的分钟策略冻结白名单",
-        "不得每分钟重估风险，也不得扫描或临时研究未批准的全市场候选",
-        "实时分钟数据缺失或延迟超限时分时提醒关闭或降级",
-        "获批分钟目标在完整 Bar 后仍经过账户分配检查、净额和硬约束，未批准候选不会被盘中扫描",
-        "默认不能重新选股或反转低频目标",
+        "当前没有盘中数据接口，不提供盘中异动、分钟 Alpha 或分时执行点",
+        "历史分钟数据只能离线回放，不能改变此产品边界",
+        "当前没有盘中调度",
+        "D 日完整收盘数据 → D+1 开盘或保守日线成交模型",
+        "不能显示“盘中异动”“实时埋伏”或分钟买卖点",
+        "盘后分钟数据将来可以用于可选成交质量复算",
+        "没有实时分钟数据时，盘中提醒和调度必须完全关闭",
     ):
         assert required in specification
 
@@ -940,7 +851,7 @@ def test_intraday_governance_and_fixed_stage_order_are_explicit() -> None:
         "`intraday_execution_reminder_required`",
         "`independent_intraday_alpha_required`",
         "`stock_intraday_candidate_cap`",
-        "Tushare 实时分钟接口",
+        "默认关闭的 QMT 沙箱插件是唯一例外",
     ):
         assert obsolete not in specification
 
@@ -993,8 +904,8 @@ def test_retained_documents_do_not_reactivate_retired_execution_paths() -> None:
                 for negation in ("不恢复", "不得", "不作为", "禁止")
             )
 
-    assert "QMT 仅作为默认关闭的可选插件" in text
-    assert "页面、调度和模拟任务不得向 QMT 或任何券商网关发单" in text
+    assert "生产发布不打包 QMT 或任何券商网关" in text
+    assert "生产发布没有 QMT 或任何券商网关例外" in text
     for paragraph in re.split(r"\n\s*\n", text):
         if "发单" in paragraph or ("券商" in paragraph and "订单" in paragraph):
             assert any(

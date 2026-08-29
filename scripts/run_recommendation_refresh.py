@@ -7,8 +7,10 @@ import argparse
 import hashlib
 import json
 import sys
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -24,11 +26,15 @@ from quant_data.execution_contract import (
 from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.eligibility import eligibility_statistics
+from quant_platform.horizon_review import validate_financial_review_trigger
+from quant_platform.paper_policy_state import seal_paper_policy_state
 from quant_platform.portfolio_policy import (
     PortfolioPolicy,
     PortfolioPolicyConfig,
     is_rebalance_due,
+    rebalance_period_key,
 )
+from quant_platform.promotion import build_horizon_review_evidence
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.qlib_factor_baseline import (
     FACTOR_SOURCE_PROMOTED_ONLY,
@@ -37,7 +43,16 @@ from quant_platform.qlib_factor_baseline import (
 )
 from quant_platform.qlib_workflow import qlib_workflow_run
 from quant_platform.risk_math import estimate_covariance
-from quant_platform.strategy_backtest import build_governed_signal, compose_factor_scores
+from quant_platform.strategy_backtest import (
+    build_governed_signal,
+    compose_factor_scores,
+    governed_score_neutralization,
+)
+from quant_platform.strategy_rule_runtime import (
+    apply_strategy_rule_alpha_weights,
+    build_strategy_rule_runtime_metadata,
+    required_rule_history_sessions,
+)
 
 
 def _load(path: str) -> pd.DataFrame:
@@ -125,6 +140,104 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _financial_review_for_signal(
+    manifest: dict[str, Any], signal_date: date
+) -> dict[str, Any] | None:
+    raw = manifest.get("financial_review_trigger")
+    if raw is None:
+        return None
+    horizon = str((manifest.get("config") or {}).get("horizon_profile") or "")
+    if horizon != "long_1_3y" or not isinstance(raw, dict):
+        raise ValueError("financial review trigger is only valid for a long strategy")
+    return validate_financial_review_trigger(
+        raw,
+        expected_signal_date=signal_date,
+        expected_dataset_identity_sha256=str(
+            manifest.get("dataset_identity_sha256") or ""
+        ),
+    )
+
+
+def _review_completed_at(signal_date: date) -> datetime:
+    return datetime.combine(
+        signal_date,
+        time(15, 0),
+        tzinfo=ZoneInfo("Asia/Shanghai"),
+    ).astimezone(UTC)
+
+
+def _horizon_review_for_order_plan(
+    *,
+    manifest: dict[str, Any],
+    result: dict[str, Any],
+    dataset_provenance: dict[str, Any],
+) -> dict[str, Any] | None:
+    config = dict(manifest.get("config") or {})
+    horizon = str(config.get("horizon_profile") or "")
+    if horizon not in {"swing_1_6m", "long_1_3y"}:
+        return None
+    signal_date = date.fromisoformat(
+        str(manifest.get("signal_date") or result.get("as_of_date") or "")
+    )
+    dataset_identity = str(dataset_provenance.get("dataset_identity_sha256") or "")
+    if dataset_identity != str(manifest.get("dataset_identity_sha256") or ""):
+        raise ValueError("horizon review changed its immutable dataset binding")
+    rebalance_due = bool((result.get("risk_summary") or {}).get("rebalance_due"))
+    financial = _financial_review_for_signal(manifest, signal_date)
+    completed_at = _review_completed_at(signal_date)
+    strategy_version_id = str(manifest.get("strategy_version_id") or "")
+    if financial is not None:
+        if not rebalance_due:
+            raise ValueError(
+                "financial review evidence requires an executed rebalance decision"
+            )
+        source_event_sha256 = str(financial["source_event_sha256"])
+        event_id = (
+            f"{strategy_version_id}:financial:{financial['report_period']}:"
+            f"{signal_date.isoformat()}:{source_event_sha256}"
+        )
+        return build_horizon_review_evidence(
+            event_id=event_id,
+            review_type="financial_report_review",
+            horizon_profile=horizon,
+            completed_at=completed_at,
+            strategy_version_id=strategy_version_id,
+            signal_date=signal_date,
+            dataset_identity_sha256=dataset_identity,
+            trigger_source=str(financial["trigger_source"]),
+            trigger_effective_date=date.fromisoformat(
+                str(financial["trigger_effective_date"])
+            ),
+            report_period=str(financial["report_period"]),
+            announcement_date=date.fromisoformat(str(financial["announcement_date"])),
+            previous_signal_date=date.fromisoformat(
+                str(financial["previous_signal_date"])
+            ),
+            source_datasets=[str(item) for item in financial["source_datasets"]],
+            source_event_count=int(financial["source_event_count"]),
+            source_event_sha256=source_event_sha256,
+        )
+    if not rebalance_due:
+        return None
+    frequency = "week" if horizon == "swing_1_6m" else "month"
+    period = "-".join(str(item) for item in rebalance_period_key(signal_date, frequency))
+    event_id = (
+        f"{strategy_version_id}:scheduled:{horizon}:{period}:"
+        f"{dataset_identity}"
+    )
+    return build_horizon_review_evidence(
+        event_id=event_id,
+        review_type="scheduled_review",
+        horizon_profile=horizon,
+        completed_at=completed_at,
+        strategy_version_id=strategy_version_id,
+        signal_date=signal_date,
+        dataset_identity_sha256=dataset_identity,
+        trigger_source=f"rebalance_calendar:{frequency}",
+        trigger_effective_date=signal_date,
+    )
+
+
 def _write_qlib_order_plan(
     *,
     manifest: dict[str, Any],
@@ -133,19 +246,24 @@ def _write_qlib_order_plan(
     order_plan_root: Path,
     tracking_uri: str,
 ) -> dict[str, Any]:
-    target_payload = {
-        "target_weights": dict(
-            sorted(
-                (
-                    str(item["instrument"]).upper(),
-                    float(item["weight"]),
-                )
-                for item in result["holdings"]
+    target_weights = dict(
+        sorted(
+            (
+                str(item["instrument"]).upper(),
+                float(item["weight"]),
             )
+            for item in result["holdings"]
         )
+    )
+    target_payload = {
+        "target_weights": target_weights,
+        "paper_policy_state": seal_paper_policy_state(result["position_state"]),
     }
     target_bytes = _canonical_bytes(target_payload)
     target_file_sha256 = _sha256_bytes(target_bytes)
+    target_weights_sha256 = _sha256_bytes(
+        _canonical_bytes({"target_weights": target_weights})
+    )
     signal_at = manifest.get("signal_at")
     signal_date = str(manifest.get("signal_date") or result["as_of_date"])
     plan = {
@@ -168,7 +286,7 @@ def _write_qlib_order_plan(
             "dataset_lineage_id": dataset_provenance["dataset_lineage_id"],
         },
         "target_weights_file_sha256": target_file_sha256,
-        "target_weights_sha256": _sha256_bytes(target_bytes),
+        "target_weights_sha256": target_weights_sha256,
     }
     if signal_at is not None:
         plan["signal_at"] = str(signal_at)
@@ -190,6 +308,13 @@ def _write_qlib_order_plan(
                 "predictions_sha256"
             ),
         }
+    horizon_review = _horizon_review_for_order_plan(
+        manifest=manifest,
+        result=result,
+        dataset_provenance=dataset_provenance,
+    )
+    if horizon_review is not None:
+        plan["horizon_review"] = horizon_review
     run_id = str(manifest["order_plan_job_id"])
     with qlib_workflow_run(
         run_kind="simulation-order-plan",
@@ -377,8 +502,13 @@ def main() -> None:
             end_time=as_of.isoformat(),
             freq=str(baseline_definition.get("frequency") or "day"),
         )
-        _, _, baseline = normalize_qlib_baseline_values(
+        _, normalized_baseline, baseline = normalize_qlib_baseline_values(
             baseline_values, baseline_definition
+        )
+        baseline = apply_strategy_rule_alpha_weights(
+            normalized_baseline,
+            baseline,
+            config,
         )
         scores = combine_factor_sources(
             mode=str(config.get("factor_source_mode") or ""),
@@ -407,7 +537,10 @@ def main() -> None:
         )
     market_as_of = as_of.normalize()
     instruments = sorted(set(scores.index.get_level_values("instrument")))
-    lookback = (as_of - pd.Timedelta(days=60)).date().isoformat()
+    required_history = required_rule_history_sessions(config)
+    lookback = (
+        as_of - pd.Timedelta(days=required_history * 2 + 30)
+    ).date().isoformat()
     # $amount is CNY yuan under the v3 daily field contract.
     liquidity = D.features(
         instruments, ["$amount"], start_time=lookback, end_time=as_of.date().isoformat(), freq="day"
@@ -462,10 +595,7 @@ def main() -> None:
         "regulatory_data_available"
     ]:
         raise ValueError("strategy requires regulatory events but no reliable source is available")
-    neutralize_baseline = config.get("portfolio_construction") in {
-        "benchmark_relative_qp",
-        "industry_neutral_qp",
-    }
+    neutralize_industry, neutralize_styles = governed_score_neutralization(config)
     policy_config = PortfolioPolicyConfig.from_mapping(config)
     governed = build_governed_signal(
         scores.loc[(slice(lookback, as_of), slice(None))],
@@ -481,8 +611,8 @@ def main() -> None:
         max_industry_deviation=policy_config.max_industry_deviation,
         min_average_daily_amount=float(config.get("min_average_daily_amount", 0.0)),
         liquidity_lookback_days=int(config.get("liquidity_lookback_days", 20)),
-        neutralize_industry=neutralize_baseline,
-        neutralize_style_columns=("size",) if neutralize_baseline else (),
+        neutralize_industry=neutralize_industry,
+        neutralize_style_columns=neutralize_styles,
     )
     signal = governed.xs(as_of, level="datetime")
     # Read-side availability guard (design draft 3.3): industry membership and
@@ -523,7 +653,37 @@ def main() -> None:
         previous_snapshot.get("as_of_date"),
         str(config.get("rebalance_frequency", "day")),
     )
+    financial_review_trigger = _financial_review_for_signal(
+        manifest, as_of.date()
+    )
+    if financial_review_trigger is not None:
+        # A newly PIT-effective filing is an actual long-horizon decision, not
+        # a daily synthetic review.  The immutable source interval above proves
+        # why this otherwise off-cadence recalculation is due.
+        rebalance_due = True
     construction_notional = float(manifest["construction_notional"])
+    previous_position_state = dict(previous_snapshot.get("position_state") or {})
+    runtime_rule_metadata = build_strategy_rule_runtime_metadata(
+        config,
+        instruments=signal.index,
+        close_history=close_history.loc[:market_as_of],
+        benchmark_weights=benchmark,
+        value_exposures=(styles["value"] if "value" in styles.columns else None),
+    )
+    previous_holding_rows = {
+        str(item["instrument"]): item
+        for item in manifest.get("previous_holdings") or []
+        if isinstance(item, dict) and item.get("instrument")
+    }
+    cost_basis = {
+        instrument: float(item["average_cost"])
+        for instrument, item in previous_holding_rows.items()
+        if item.get("average_cost") is not None
+    }
+    take_profit_stages = {
+        instrument: int(item.get("take_profit_stage") or 0)
+        for instrument, item in previous_holding_rows.items()
+    }
     decision = policy.decide(
         signal,
         previous,
@@ -537,6 +697,16 @@ def main() -> None:
         return_covariance=estimate_covariance(risk_returns),
         prices=pd.to_numeric(point_metadata["$open"], errors="coerce"),
         current_prices=pd.to_numeric(point_metadata["$close"], errors="coerce"),
+        cost_basis=cost_basis,
+        take_profit_stages=(
+            previous_position_state.get("take_profit_stages") or take_profit_stages
+        ),
+        execution_state=previous_position_state.get("execution") or {},
+        holding_age_sessions=(
+            previous_position_state.get("holding_age_sessions")
+            or manifest.get("holding_age_sessions")
+            or {}
+        ),
         portfolio_drawdown=float(manifest["portfolio_drawdown"]),
         daily_return=float(manifest["daily_return"]),
         # $amount is CNY yuan under the v3 daily field contract.
@@ -547,6 +717,7 @@ def main() -> None:
         risk_exposure=float(manifest.get("risk_exposure", 1.0)),
         allow_new_risk=bool(manifest.get("allow_new_risk", True)),
         rebalance_due=rebalance_due,
+        **runtime_rule_metadata,
     )
     if signal_frequency == "day":
         effective_date = _next_known_trading_date(args.provider_uri, market_as_of)
@@ -583,6 +754,7 @@ def main() -> None:
             "execution_contract_hash": config["execution_contract_hash"],
             "rebalance_frequency": config.get("rebalance_frequency", "day"),
             "rebalance_due": rebalance_due,
+            "financial_review_trigger": financial_review_trigger,
             "member_risk_state": dict(manifest.get("member_risk_state") or {}),
             "account_risk_state": dict(manifest.get("account_risk_state") or {}),
             "eligibility": eligibility_evidence,
@@ -593,14 +765,37 @@ def main() -> None:
             str(instrument): float(price)
             for instrument, price in reference_prices.items()
         },
+        "industry_memberships": {
+            str(instrument): str(industries.loc[instrument])
+            for instrument in decision.target_weights
+            if instrument in industries.index
+        },
         "holdings": [
             {
                 "instrument": instrument,
                 "weight": weight,
+                "industry": (
+                    str(industries.loc[instrument])
+                    if instrument in industries.index
+                    else None
+                ),
                 "previous_weight": changes.get(instrument, {}).get("previous_weight", weight),
                 "weight_change": changes.get(instrument, {}).get("weight_change", 0.0),
                 "action": changes.get(instrument, {}).get("action", "hold"),
                 "reason": changes.get(instrument, {}).get("reason", "unchanged target"),
+                "average_cost": cost_basis.get(
+                    instrument, float(reference_prices[instrument])
+                ),
+                "take_profit_stage": int(
+                    decision.position_state.get("take_profit_stages", {}).get(
+                        instrument, 0
+                    )
+                ),
+                "holding_age_sessions": int(
+                    decision.position_state.get("holding_age_sessions", {}).get(
+                        instrument, 0
+                    )
+                ),
             }
             for instrument, weight in decision.target_weights.items()
         ],

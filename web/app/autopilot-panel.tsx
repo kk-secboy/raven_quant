@@ -36,6 +36,148 @@ type SimulationPortfolio = {
   position_count?: number;
 };
 
+type MarketPermissions = {
+  main_board: boolean;
+  star_market: boolean;
+  chi_next: boolean;
+  beijing_exchange: boolean;
+  etf: boolean;
+};
+type InvestorProfile = {
+  id: string;
+  version: number;
+  initial_capital: string | number;
+  risk_profile: string;
+  min_cash_weight: number;
+  max_gross_exposure: number;
+  market_permissions: MarketPermissions;
+};
+type InvestorProfileResponse = {
+  configured: boolean;
+  profile: InvestorProfile | null;
+  required_before_simulation?: boolean;
+};
+type EvidenceCheck = { observed: number; threshold: number; passed: boolean };
+type AdviceEvidence = {
+  status: string;
+  passed: boolean;
+  reasons?: string[];
+  checks?: Record<string, EvidenceCheck>;
+};
+type AdviceSignal = {
+  instrument: string;
+  action: "BUY" | "ADD" | "HOLD" | "REDUCE" | "EXIT" | "NO_ACTION";
+  target_weight?: number | null;
+  target_quantity?: number | null;
+  effective_date?: string | null;
+  validity_sessions?: number | null;
+  review_date_estimate?: string | null;
+  review_date_is_exchange_calendar?: boolean;
+  holding_age_sessions?: number | null;
+  reason?: { summary?: string; signals?: string[] } | string | null;
+  risks?: string[];
+  invalidation?: string[];
+  evidence_state?: string;
+};
+type AdviceCard = {
+  horizon: "short_1_5d" | "swing_1_6m" | "long_1_3y";
+  title: string;
+  holding: string;
+  research_cadence: string;
+  stage: "research" | "backtest" | "simulation_validation" | "verified" | "restricted" | "suspended" | "retired";
+  stage_label: string;
+  strategy?: { id: string; name: string; version: number } | null;
+  health: string;
+  evidence: AdviceEvidence;
+  is_investment_advice: boolean;
+  data_cutoff?: string | null;
+  signals: AdviceSignal[];
+  action: AdviceSignal["action"];
+  simulation_action?: AdviceSignal["action"] | null;
+  veto_reasons?: string[];
+};
+type UnifiedAccount = {
+  status: string;
+  action: string;
+  reason?: string;
+  decision_date?: string;
+  inputs_as_of?: string;
+  cash_weight?: number;
+  verified_horizons?: string[];
+  targets?: Array<Record<string, unknown>>;
+  trades?: Array<Record<string, unknown>>;
+  accounting_rule?: string;
+};
+type AdviceToday = {
+  generated_at: string;
+  data_cutoff?: string | null;
+  onboarding_required: boolean;
+  investor_profile?: InvestorProfile | null;
+  cards: AdviceCard[];
+  unified_account: UnifiedAccount;
+  advice_available: boolean;
+  execution_contract: {
+    signal: string;
+    earliest_fill: string;
+    intraday_claims: false;
+    real_broker_orders: false;
+  };
+  disclaimer: string;
+};
+
+const EMPTY_PERMISSIONS: MarketPermissions = {
+  main_board: false,
+  star_market: false,
+  chi_next: false,
+  beijing_exchange: false,
+  etf: false,
+};
+const ACTION_LABELS: Record<string, string> = {
+  BUY: "买入",
+  ADD: "加仓",
+  HOLD: "持有",
+  REDUCE: "减仓",
+  EXIT: "退出",
+  NO_ACTION: "不操作",
+  REBALANCE: "按净额调仓",
+};
+const HORIZON_WEIGHTS: Record<AdviceCard["horizon"], string> = {
+  short_1_5d: "20% 预算",
+  swing_1_6m: "40% 预算",
+  long_1_3y: "40% 预算",
+};
+const EVIDENCE_LABELS: Record<string, string> = {
+  forward_trading_days: "前向交易日",
+  decision_batches: "有效决策",
+  completed_cycles: "完整交易闭环",
+  review_events: "定期复核",
+  financial_report_reviews: "财报复核",
+  data_completeness: "数据完整度",
+  reconciliation_rate: "账实一致率",
+};
+
+function money(value: string | number | null | undefined) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "—";
+  return new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 0 }).format(amount);
+}
+
+function reasonText(reason: AdviceSignal["reason"]) {
+  if (typeof reason === "string") return reason;
+  return reason?.summary || reason?.signals?.[0] || "策略规则满足，但暂时没有更详细的解释。";
+}
+
+function evidenceProgress(evidence: AdviceEvidence) {
+  if (evidence.passed) return 100;
+  const checks = Object.entries(evidence.checks ?? {}).filter(([name, check]) =>
+    name in EVIDENCE_LABELS && Number(check.threshold) > 0,
+  );
+  if (!checks.length) return 0;
+  return Math.round(Math.min(...checks.map(([, check]) =>
+    Math.min(1, Math.max(0, Number(check.observed) / Number(check.threshold))),
+  )) * 100);
+}
+
 async function jsonResponse<T>(request: Promise<Response>): Promise<T> {
   const response = await request;
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -79,7 +221,298 @@ function pct(value?: number | null) {
   return value == null ? "—" : `${(value * 100).toFixed(2)}%`;
 }
 
+function EvidenceSummary({ evidence }: { evidence: AdviceEvidence }) {
+  const checks = Object.entries(evidence.checks ?? {}).filter(([name]) => name in EVIDENCE_LABELS);
+  const progress = evidenceProgress(evidence);
+  return <div className="novice-evidence">
+    <div className="novice-evidence-head">
+      <span>证据成熟度</span>
+      <strong>{evidence.passed ? "门槛已通过" : `${progress}%`}</strong>
+    </div>
+    <div className="novice-evidence-track" aria-label={`证据成熟度 ${progress}%`}><i style={{ width: `${progress}%` }} /></div>
+    {checks.length ? <div className="novice-evidence-checks">
+      {checks.slice(0, 5).map(([name, check]) => <span className={check.passed ? "passed" : ""} key={name}>
+        {EVIDENCE_LABELS[name]} {Number(check.observed).toLocaleString("zh-CN")}/{Number(check.threshold).toLocaleString("zh-CN")}
+      </span>)}
+    </div> : <small>{evidence.reasons?.[0] ?? "等待策略进入隔离模拟盘后开始累计。"}</small>}
+  </div>;
+}
+
+function SignalRow({ signal, simulationOnly }: { signal: AdviceSignal; simulationOnly: boolean }) {
+  return <article className="novice-signal">
+    <div className="novice-signal-main">
+      <div>
+        <code>{signal.instrument}</code>
+        <span className={`novice-action action-${signal.action.toLowerCase()}`}>{simulationOnly ? "模拟" : ""}{ACTION_LABELS[signal.action]}</span>
+      </div>
+      <strong>{pct(signal.target_weight)}</strong>
+      <small>目标仓位</small>
+    </div>
+    <p>{reasonText(signal.reason)}</p>
+    <div className="novice-signal-facts">
+      <span>可买数量 <strong>{signal.target_quantity == null ? "等待账户换算" : `${signal.target_quantity} 股`}</strong></span>
+      <span>执行日 <strong>{signal.effective_date ?? "等待下一交易日"}</strong></span>
+      <span>有效期 <strong>{signal.validity_sessions ? `${signal.validity_sessions} 个交易日` : "按策略复核"}</strong></span>
+      <span>复核日 <strong>{signal.review_date_estimate ?? "等待交易日历"}{signal.review_date_is_exchange_calendar === false ? "（估算）" : ""}</strong></span>
+    </div>
+    <div className="novice-signal-guardrails">
+      <span><b>主要风险</b>{signal.risks?.[0] ?? "市场变化可能使信号失效"}</span>
+      <span><b>失效条件</b>{signal.invalidation?.[0] ?? "策略规则或交易资格失效"}</span>
+    </div>
+    {simulationOnly ? <div className="simulation-boundary">仅供隔离模拟验证，不是荐股，也不会进入统一账户。</div> : null}
+  </article>;
+}
+
+function HorizonCard({ card }: { card: AdviceCard }) {
+  const simulationOnly = !card.is_investment_advice;
+  const visibleAction = card.is_investment_advice ? card.action : "NO_ACTION";
+  const simulatedAction = card.stage === "simulation_validation" ? card.simulation_action : null;
+  return <section className={`novice-horizon-card stage-${card.stage}`}>
+    <header>
+      <div>
+        <p className="eyebrow">{card.horizon.replaceAll("_", " · ")}</p>
+        <h3>{card.title}<span>{card.holding}</span></h3>
+      </div>
+      <span className={`novice-stage stage-${card.stage}`}>{card.stage_label}</span>
+    </header>
+    <div className="novice-card-decision">
+      <div>
+        <span>今天的正式动作</span>
+        <strong className={`decision-${visibleAction.toLowerCase()}`}>{ACTION_LABELS[visibleAction]}</strong>
+      </div>
+      <div><span>资金预算</span><strong>{HORIZON_WEIGHTS[card.horizon]}</strong></div>
+      <div><span>策略</span><strong>{card.strategy ? `${card.strategy.name} · v${card.strategy.version}` : "尚未产生"}</strong></div>
+    </div>
+    {simulatedAction && simulatedAction !== "NO_ACTION" ? <div className="novice-simulation-callout">
+      模拟盘正在观察：<strong>{ACTION_LABELS[simulatedAction]}</strong>。这不是已验证荐股。
+    </div> : null}
+    <EvidenceSummary evidence={card.evidence} />
+    <div className="novice-card-meta">
+      <span>数据截止 <strong>{card.data_cutoff ?? "等待完整收盘数据"}</strong></span>
+      <span>研究频率 <strong>{card.research_cadence}</strong></span>
+    </div>
+    {card.signals.length ? <div className="novice-signals">
+      <div className="novice-signals-title">
+        <strong>{card.is_investment_advice ? "当前股票与操作" : "模拟验证中的观察对象"}</strong>
+        <span>{card.signals.length} 只</span>
+      </div>
+      {card.signals.slice(0, 5).map((signal, index) => <SignalRow key={`${signal.instrument}-${index}`} signal={signal} simulationOnly={simulationOnly} />)}
+      {card.signals.length > 5 ? <small className="novice-more">其余 {card.signals.length - 5} 只请到模拟账本查看。</small> : null}
+    </div> : <div className="novice-no-action">
+      <strong>当前没有需要操作的股票</strong>
+      <span>{card.veto_reasons?.[0] ?? "没有股票同时满足收益、成本、风险和交易资格门槛，资金保留为现金。"}</span>
+    </div>}
+  </section>;
+}
+
+function recordText(record: Record<string, unknown>, keys: string[], fallback = "—") {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" || typeof value === "number") return String(value);
+  }
+  return fallback;
+}
+
+function UnifiedAccountCard({ account }: { account: UnifiedAccount }) {
+  const trades = account.trades ?? [];
+  const targets = account.targets ?? [];
+  const ready = account.status === "ready";
+  return <section className={`novice-account-card ${ready ? "ready" : "waiting"}`}>
+    <div className="novice-account-heading">
+      <div><p className="eyebrow">ONE ACCOUNT · THREE HORIZONS</p><h3>统一账户建议</h3></div>
+      <span className={`novice-action account-action-${account.action.toLowerCase()}`}>{ACTION_LABELS[account.action] ?? account.action}</span>
+    </div>
+    <p>{account.reason ?? account.accounting_rule ?? "三周期先独立形成目标，再在账户层合并同一股票的买卖。"}</p>
+    <div className="novice-account-metrics">
+      <span>短 / 中 / 长预算<strong>20% / 40% / 40%</strong></span>
+      <span>最低现金<strong>{account.cash_weight == null ? "10%" : pct(account.cash_weight)}</strong></span>
+      <span>数据截止<strong>{account.inputs_as_of ?? "等待三周期验证"}</strong></span>
+      <span>执行日<strong>{account.decision_date ?? "尚未生成"}</strong></span>
+    </div>
+    {trades.length ? <div className="novice-account-trades">
+      {trades.slice(0, 8).map((trade, index) => <div key={`${recordText(trade, ["instrument"])}-${index}`}>
+        <code>{recordText(trade, ["instrument"])}</code>
+        <strong>{recordText(trade, ["action", "side"], "调仓")}</strong>
+        <span>{recordText(trade, ["target_quantity", "quantity", "delta_quantity", "target_weight"], "等待整手换算")}</span>
+      </div>)}
+    </div> : targets.length ? <div className="novice-account-trades">
+      {targets.slice(0, 8).map((target, index) => <div key={`${recordText(target, ["instrument"])}-${index}`}>
+        <code>{recordText(target, ["instrument"])}</code><strong>目标</strong><span>{recordText(target, ["target_weight", "weight", "target_quantity"])}</span>
+      </div>)}
+    </div> : <div className="novice-account-empty">没有完整的三周期净额计划时，系统保持现金，不会拼凑一份建议。</div>}
+    <small>同一股票会在这里合并为一次账户动作；某个周期暂停时，其预算留在现金中，不挪给其他周期。</small>
+  </section>;
+}
+
+function InvestorOnboarding({
+  api,
+  profile,
+  initialOpen,
+  onSaved,
+}: {
+  api: string;
+  profile: InvestorProfile | null;
+  initialOpen: boolean;
+  onSaved: () => Promise<void>;
+}) {
+  const [open, setOpen] = useState(initialOpen);
+  const [capital, setCapital] = useState(profile ? String(profile.initial_capital) : "");
+  const [permissions, setPermissions] = useState<MarketPermissions>(profile?.market_permissions ?? EMPTY_PERMISSIONS);
+  const [confirmed, setConfirmed] = useState(Boolean(profile));
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+
+  async function save() {
+    const amount = Number(capital);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setMessage("请填写大于 0 的模拟本金；系统没有 50 万元起步限制。");
+      return;
+    }
+    if (!confirmed) {
+      setMessage("请逐项确认证券权限。未勾选的市场会明确记录为无权限。");
+      return;
+    }
+    setBusy(true);
+    setMessage("");
+    try {
+      const response = await apiFetch(`${api}/api/investor-profile`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          initial_capital: amount,
+          risk_profile: "balanced",
+          min_cash_weight: 0.10,
+          max_gross_exposure: 0.90,
+          market_permissions: permissions,
+          actor: "web-investor-onboarding",
+        }),
+      });
+      const body = await response.json() as { detail?: string | { message?: string } };
+      if (!response.ok) {
+        const detail = typeof body.detail === "string" ? body.detail : body.detail?.message;
+        throw new Error(detail ?? "模拟账户设置保存失败");
+      }
+      await onSaved();
+      setOpen(false);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "模拟账户设置保存失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!open && profile) return <section className="novice-profile-summary">
+    <div><span>模拟本金</span><strong>{money(profile.initial_capital)}</strong></div>
+    <div><span>风险档位</span><strong>平衡型 · 至少 10% 现金</strong></div>
+    <div><span>已允许市场</span><strong>{Object.values(profile.market_permissions).filter(Boolean).length} / 5</strong></div>
+    <button type="button" onClick={() => { setCapital(String(profile.initial_capital)); setPermissions(profile.market_permissions); setConfirmed(true); setOpen(true); }}>修改模拟设置</button>
+  </section>;
+
+  const permissionOptions: Array<[keyof MarketPermissions, string, string]> = [
+    ["main_board", "沪深主板", "普通 A 股权限"],
+    ["star_market", "科创板", "需要券商另行开通"],
+    ["chi_next", "创业板", "需要券商另行开通"],
+    ["beijing_exchange", "北交所", "需要券商另行开通"],
+    ["etf", "境内 ETF", "仅使用规则验证白名单"],
+  ];
+  return <section className="novice-onboarding">
+    <div className="novice-onboarding-copy">
+      <span className="status-chip">首次使用 · 必填</span>
+      <h2>先建立你的隔离模拟账户</h2>
+      <p>只填写模拟本金和你真实拥有的证券权限。这里不会连接券商，也不会下真实订单；资金不足买 100 股时会保留现金并说明原因。</p>
+      <div><span>默认分配</span><strong>短线 20% · 中线 40% · 长线 40%</strong></div>
+      <div><span>平衡型边界</span><strong>不融资、不做空 · 最大总暴露 90%</strong></div>
+    </div>
+    <div className="novice-onboarding-form">
+      <label>模拟本金（人民币）<input inputMode="decimal" min="0.01" step="0.01" type="number" placeholder="例如 100000" value={capital} onChange={(event) => setCapital(event.target.value)} /></label>
+      <fieldset>
+        <legend>你已经开通哪些证券权限？</legend>
+        {permissionOptions.map(([key, label, hint]) => <label className="permission-choice" key={key}>
+          <input type="checkbox" checked={permissions[key]} onChange={(event) => setPermissions({ ...permissions, [key]: event.target.checked })} />
+          <span><strong>{label}</strong><small>{hint}</small></span>
+        </label>)}
+      </fieldset>
+      <label className="permissions-confirm"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>我已逐项确认；未勾选的市场表示无权限。</span></label>
+      {message ? <div className="novice-form-error">{message}</div> : null}
+      <div className="novice-onboarding-actions">
+        {profile ? <button type="button" className="action-button action-ghost" onClick={() => setOpen(false)}>取消</button> : null}
+        <button type="button" className="action-button action-primary" disabled={busy} onClick={() => void save()}>{busy ? "正在保存…" : "保存并开始模拟"}</button>
+      </div>
+    </div>
+  </section>;
+}
+
+function NoviceAdvicePanel({ api, onNavigate }: { api: string; onNavigate: (index: number) => void }) {
+  const [advice, setAdvice] = useState<AdviceToday | null>(null);
+  const [profileState, setProfileState] = useState<InvestorProfileResponse | null>(null);
+  const [loadState, setLoadState] = useState<"loading" | "ready" | "error">("loading");
+  const [warning, setWarning] = useState("");
+
+  const load = useCallback(async () => {
+    const [adviceResult, profileResult] = await Promise.allSettled([
+      jsonResponse<AdviceToday>(apiFetch(`${api}/api/advice/today`, { cache: "no-store" })),
+      jsonResponse<InvestorProfileResponse>(apiFetch(`${api}/api/investor-profile`, { cache: "no-store" })),
+    ]);
+    if (adviceResult.status === "fulfilled") setAdvice(adviceResult.value);
+    if (profileResult.status === "fulfilled") setProfileState(profileResult.value);
+    if (adviceResult.status === "rejected" && profileResult.status === "rejected") {
+      setLoadState("error");
+      setWarning("暂时无法读取今日结果。系统不会用旧信号冒充今天的荐股。");
+    } else {
+      setLoadState("ready");
+      setWarning(adviceResult.status === "rejected" ? "今日策略结果暂不可用；已停止展示任何正式动作。" : "");
+    }
+  }, [api]);
+  usePolling(load, 15_000);
+
+  const profile = profileState ? profileState.profile : advice?.investor_profile ?? null;
+  const onboardingRequired = profileState ? !profileState.configured : advice?.onboarding_required ?? false;
+
+  if (loadState === "loading" && !advice && !profileState) return <div className="novice-loading"><i /><strong>正在核对今天的数据、策略证据和模拟账户</strong><span>在核对完成前不会显示买入或卖出动作。</span></div>;
+
+  return <div className="novice-advice-page">
+    {warning ? <div className="notice novice-warning">{warning}</div> : null}
+    <InvestorOnboarding api={api} profile={profile} initialOpen={onboardingRequired} onSaved={load} />
+    <section className={`novice-hero ${advice?.advice_available ? "verified" : "waiting"}`}>
+      <div>
+        <span className="status-chip">TODAY · AFTER CLOSE</span>
+        <h2>{onboardingRequired ? "完成设置后开始三周期模拟" : advice?.advice_available ? "今天的账户动作已经生成" : "今天没有正式荐股，系统继续验证"}</h2>
+        <p>{advice?.advice_available ? "只有通过严格前向门槛的周期才会进入下方统一账户。" : "研究、回测或模拟中的信号不会冒充荐股；没有合格机会时，正确答案就是持有现金。"}</p>
+      </div>
+      <div className="novice-hero-facts">
+        <span>数据截止<strong>{advice?.data_cutoff ?? "等待最新完整交易日"}</strong></span>
+        <span>信号时间<strong>{advice?.execution_contract.signal ?? "D 日收盘后"}</strong></span>
+        <span>最早执行<strong>{advice?.execution_contract.earliest_fill ?? "D+1 开盘"}</strong></span>
+      </div>
+    </section>
+
+    <div className="novice-horizon-grid">
+      {advice?.cards?.map((card) => <HorizonCard card={card} key={card.horizon} />)}
+      {!advice?.cards?.length ? <div className="novice-results-unavailable">今日结果不可用，正式动作统一为“不操作”。</div> : null}
+    </div>
+
+    <UnifiedAccountCard account={advice?.unified_account ?? { status: "unavailable", action: "NO_ACTION", reason: "今日结果不可用，账户保持现金和原持仓。" }} />
+
+    <section className="novice-boundary-note">
+      <div><strong>你只需要看两件事</strong><span>每个周期是否“已验证”，以及统一账户最终让你买、卖还是不操作。</span></div>
+      <div><strong>短线也不是盘中追涨</strong><span>目前只使用完整收盘数据，D 日盘后计算，最早 D+1 执行。</span></div>
+      <button className="action-button action-secondary" type="button" onClick={() => onNavigate(8)}>打开模拟账本</button>
+    </section>
+    <p className="novice-disclaimer">{advice?.disclaimer ?? "系统仅运行模拟盘；历史和模拟表现不保证未来收益。"}</p>
+  </div>;
+}
+
 export function AutopilotPanel({
+  api, onNavigate, onOpenAdvanced, advancedMode = false,
+}: {
+  api: string; onNavigate: (index: number) => void; onOpenAdvanced: (index: number) => void; advancedMode?: boolean;
+}) {
+  return advancedMode
+    ? <AdvancedAutopilotPanel api={api} onNavigate={onNavigate} onOpenAdvanced={onOpenAdvanced} />
+    : <NoviceAdvicePanel api={api} onNavigate={onNavigate} />;
+}
+
+function AdvancedAutopilotPanel({
   api, onNavigate, onOpenAdvanced,
 }: {
   api: string; onNavigate: (index: number) => void; onOpenAdvanced: (index: number) => void;

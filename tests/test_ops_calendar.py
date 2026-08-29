@@ -6,9 +6,14 @@ from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 
+import pandas as pd
 import pytest
-from governance_fixtures import create_strategy_version
+from governance_fixtures import (
+    enable_recommendation_authority_for_test,
+    governed_etf_ready_evidence,
+)
 from sqlalchemy import insert, update
+from test_strategy_allocation_recommendations import _approve_version
 
 from quant_data.config import Settings
 from quant_data.database import (
@@ -17,8 +22,9 @@ from quant_data.database import (
     simulation_nav,
     simulation_orders,
     simulation_portfolios,
-    strategy_versions,
 )
+from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
+from quant_data.qlib_builder import build_qlib_output_manifest
 from quant_platform.alert_store import AlertStore
 from quant_platform.job_store import JobStore
 from quant_platform.ops_calendar import (
@@ -52,6 +58,10 @@ def _settings(database_url: str, tmp_path: Path) -> Settings:
         data_root=tmp_path / "data",
         database_url=database_url,
         embedded_worker=False,
+        # Managed fin_strategy cadence has dedicated scheduler tests.  Keep
+        # these operations-calendar assertions scoped to the schedule they
+        # explicitly create.
+        rdagent_enabled=False,
     )
 
 
@@ -66,11 +76,22 @@ def _seed_qlib_dataset(data_root: Path, name: str, days: list[date]) -> None:
     )
     (path / "instruments" / "cn_all.txt").write_text("SH600000\n", encoding="utf-8")
     provenance = {
+        "frequency": "day",
         "snapshot_name": name,
         "snapshot_manifest_sha256": "a" * 64,
         "dataset_identity_sha256": hashlib.sha256(name.encode()).hexdigest(),
         "dataset_lineage_id": "b" * 64,
+        "source_lineage_id": "c" * 64,
         "lineage_verified": True,
+        "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+        "source_volume_unit": "hand",
+        "qlib_volume_unit": "share",
+        "source_amount_unit": "thousand_cny",
+        "qlib_amount_unit": "cny",
+        "source_hand_size": 100,
+        "index_volume_policy": "excluded_non_tradable_benchmark",
+        "governed_etf_whitelist": governed_etf_ready_evidence(),
+        "output_manifest": build_qlib_output_manifest(path),
     }
     (path / "metadata" / "provenance.json").write_text(
         json.dumps(provenance), encoding="utf-8"
@@ -466,7 +487,7 @@ def test_monthly_decision_day_scheduler_first_trading_day_only(
     assert "not the first trading day" in runs[0]["message"]
 
 
-def test_monthly_decision_day_scheduler_fails_closed_without_dataset(
+def test_monthly_decision_day_scheduler_waits_without_dataset(
     database_url: str, tmp_path: Path
 ) -> None:
     store = ScheduleStore(database_url)
@@ -486,10 +507,11 @@ def test_monthly_decision_day_scheduler_fails_closed_without_dataset(
     engine.tick(datetime(2025, 2, 3, 1, 1, tzinfo=UTC))
 
     run = store.list_runs()[0]
-    assert run["status"] == "failed"
-    assert "no ready and reproducible Qlib dataset" in run["message"]
+    assert run["status"] == "waiting"
+    assert run["finished_at"] is None
+    assert "governed operations calendar is not ready" in run["message"]
     alerts = AlertStore(database_url).list()
-    assert any(item["category"] == "schedule_failure" for item in alerts)
+    assert not any(item["category"] == "schedule_failure" for item in alerts)
 
 
 def test_preopen_check_scheduler_trading_day_gate_and_builder(
@@ -529,7 +551,11 @@ def test_preopen_check_scheduler_trading_day_gate_and_builder(
     assert report["anomalies"] == []
     assert Path(report["artifact_path"]).is_file()
     run_task(settings, "preopen_check", date(2025, 2, 3))
-    alerts = AlertStore(database_url).list()
+    alerts = [
+        item
+        for item in AlertStore(database_url).list()
+        if item["category"] == "preopen_check"
+    ]
     assert len(alerts) == 1
     assert alerts[0]["category"] == "preopen_check"
 
@@ -560,14 +586,14 @@ def test_worker_command_dispatches_ops_kinds(database_url: str, tmp_path: Path) 
 
 
 def _create_portfolio(database_url: str, tmp_path: Path) -> dict:
-    version_id = create_strategy_version(database_url, tmp_path)
-    engine = open_database(database_url)
-    with engine.begin() as connection:
-        connection.execute(
-            update(strategy_versions)
-            .where(strategy_versions.c.id == version_id)
-            .values(status="approved")
-        )
+    dates = pd.bdate_range("2024-01-02", periods=160)
+    version_id = _approve_version(
+        database_url,
+        tmp_path,
+        suffix="ops-calendar",
+        returns=pd.Series(0.001, index=dates),
+    )
+    enable_recommendation_authority_for_test(database_url, [version_id])
     store = RecommendationStore(database_url)
     return store.create(
         name="gated recommendations",
@@ -779,7 +805,8 @@ def test_recommendation_refresh_blocked_until_reconciled_then_recovers(
     assert day2["processed"] == 1
     assert len(jobs.list()) == 1  # no new recommendation job
     run = ScheduleStore(database_url).list_runs()[0]
-    assert run["status"] == "skipped"
+    assert run["status"] == "waiting"
+    assert run["finished_at"] is None
     assert "reconciliation gate blocked" in run["message"]
     blocking = [
         item
@@ -795,8 +822,36 @@ def test_recommendation_refresh_blocked_until_reconciled_then_recovers(
     snapshots = engine.recommendations.get(portfolio["id"])["snapshots"]
     assert {str(item["as_of_date"]) for item in snapshots} == {"2025-02-03"}
 
-    # Day 3: batch reconciled, NAV healthy/certified/fresh -> gate passes again.
+    # Repairing the dependency inside the one-hour slot reclaims the same
+    # durable run; the day is not lost just because the 17:00 attempt was early.
     engine_db = open_database(database_url)
+    with engine_db.begin() as connection:
+        connection.execute(
+            update(simulation_batches)
+            .where(simulation_batches.c.id == "batch-gate-1")
+            .values(status="succeeded")
+        )
+        connection.execute(
+            update(simulation_nav)
+            .where(
+                simulation_nav.c.portfolio_id == "sim-gate-1",
+                simulation_nav.c.trade_date == date(2025, 2, 4),
+            )
+            .values(
+                status="healthy",
+                performance_certified=True,
+                has_stale_prices=False,
+            )
+        )
+    retried = engine.tick(datetime(2025, 2, 4, 9, 3, tzinfo=UTC))
+    assert retried["processed"] == 1
+    assert len(jobs.list()) == 2
+    recovered_run = ScheduleStore(database_url).list_runs()[0]
+    assert recovered_run["id"] == run["id"]
+    assert recovered_run["status"] == "enqueued"
+    assert recovered_run["attempts"] == 2
+
+    # Day 3: batch reconciled, NAV healthy/certified/fresh -> gate passes again.
     now = datetime(2025, 2, 5, 12, 0, tzinfo=UTC)
     with engine_db.begin() as connection:
         connection.execute(
@@ -836,7 +891,7 @@ def test_recommendation_refresh_blocked_until_reconciled_then_recovers(
         )
     day3 = engine.tick(datetime(2025, 2, 5, 9, 1, tzinfo=UTC))
     assert day3["processed"] == 1
-    assert len(jobs.list()) == 2  # the refresh is enqueued again
+    assert len(jobs.list()) == 3  # the next day's refresh is enqueued again
     assert ScheduleStore(database_url).list_runs()[0]["status"] == "enqueued"
     # The blocking alert dedupes per (portfolio, date): re-ticking day 2's slot
     # never creates a second alert.

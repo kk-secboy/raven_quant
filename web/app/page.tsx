@@ -71,12 +71,12 @@ type RetentionPlan = {
 
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8765";
 const navGroups = [
-  { label: "日常运行", items: [{ index: 0, label: "自动驾驶" }, { index: 11, label: "行情总览" }, { index: 8, label: "统一模拟盘" }] },
+  { label: "日常运行", items: [{ index: 0, label: "策略运行总览" }, { index: 11, label: "行情总览" }, { index: 8, label: "统一模拟盘" }] },
   { label: "研究治理", items: [{ index: 1, label: "数据快照" }, { index: 3, label: "RD-Agent 研究中心" }, { index: 5, label: "因子库与准入" }, { index: 2, label: "模型竞赛与试验" }, { index: 6, label: "Qlib 回测与审批" }, { index: 12, label: "核心 / 卫星分配" }] },
   { label: "审计与系统", items: [{ index: 9, label: "任务、告警与历史" }, { index: 10, label: "系统设置" }] },
 ];
 const simpleNavGroups = [
-  { label: "日常使用", items: [{ index: 0, label: "自动驾驶" }, { index: 11, label: "行情总览" }, { index: 8, label: "模拟盘" }] },
+  { label: "日常使用", items: [{ index: 0, label: "今日建议" }, { index: 11, label: "行情总览" }, { index: 8, label: "模拟账本" }] },
   { label: "需要处理", items: [{ index: 9, label: "异常" }] },
 ];
 const headings: Record<number, [string, string]> = {
@@ -229,6 +229,9 @@ export default function Home() {
     },
     [dataTasks],
   );
+  const activeHeading = !advancedMode && activeNav === 0
+    ? ["THREE HORIZONS / ONE ACCOUNT", "今日选股与账户操作"]
+    : headings[activeNav];
 
   function liveRunningUnits(task: DataTask) {
     const scoped = Number(
@@ -338,13 +341,13 @@ export default function Home() {
 
       <section className="workspace">
         <header className="topbar">
-          <div><p className="eyebrow">{headings[activeNav]?.[0]}</p><h1>{headings[activeNav]?.[1]}</h1></div>
+          <div><p className="eyebrow">{activeHeading?.[0]}</p><h1>{activeHeading?.[1]}</h1></div>
           <div className="top-actions"><span className="system-live"><i />受控研究工作台</span><span className="account-chip"><b>{auth.user?.display_name}</b><small>{auth.user?.role}</small></span>{activeNav === 1 ? <button onClick={() => void refreshVisible()}>刷新概况</button> : null}{auth.status === "authenticated" && <button onClick={logout}>退出</button>}</div>
         </header>
 
         {message && <div className="notice">{message}</div>}
 
-        {activeNav === 0 ? <AutopilotPanel api={API} onNavigate={navigateTo} onOpenAdvanced={(index) => { setAdvancedMode(true); navigateTo(index); }} /> : activeNav === 1 ? (
+        {activeNav === 0 ? <AutopilotPanel api={API} advancedMode={advancedMode} onNavigate={navigateTo} onOpenAdvanced={(index) => { setAdvancedMode(true); navigateTo(index); }} /> : activeNav === 1 ? (
           <div className="data-center-page">
             <div className="page-tabs" role="tablist" aria-label="数据中心页面">
               {[['overview', '运行概况'], ['catalog', '数据目录'], ['create', '新建任务'], ['runs', '运行记录'], ['storage', '存储与版本']].map(([value, label]) => <button role="tab" aria-selected={dataView === value} className={dataView === value ? "active" : ""} onClick={() => setDataView(value)} key={value}>{label}{value === "runs" && overview?.active_jobs ? <i>{overview.active_jobs}</i> : null}</button>)}

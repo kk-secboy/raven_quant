@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import timedelta
 
 import numpy as np
@@ -10,6 +10,25 @@ from quant_data.availability import METADATA_AVAILABILITY_LAG_DAYS
 
 from .eligibility import ELIGIBILITY_CONTRACT_VERSION
 from .factor_evaluator import normalize_series
+
+
+def governed_score_neutralization(
+    config: Mapping[str, object],
+) -> tuple[bool, tuple[str, ...]]:
+    """Resolve score neutralization once for research and daily publication.
+
+    ``industry_relative_rank`` makes an otherwise unconstrained transparent
+    strategy compare candidates with their point-in-time industry peers.  The
+    benchmark-relative optimizers retain their existing industry and size
+    neutralization contract.
+    """
+
+    benchmark_relative = config.get("portfolio_construction") in {
+        "benchmark_relative_qp",
+        "industry_neutral_qp",
+    }
+    neutralize_industry = benchmark_relative or config.get("industry_relative_rank") is True
+    return neutralize_industry, ("size",) if benchmark_relative else ()
 
 
 def compose_factor_scores(

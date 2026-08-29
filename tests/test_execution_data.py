@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
+from governance_fixtures import governed_etf_ready_evidence
 
 import quant_data.cli as cli_module
 from quant_data.checkpoint import CheckpointStore
@@ -419,6 +420,7 @@ def test_execution_data_api_and_worker_commands(
                 "qlib_amount_unit": "cny",
                 "source_hand_size": 100,
                     "index_volume_policy": "excluded_non_tradable_benchmark",
+                    "governed_etf_whitelist": governed_etf_ready_evidence(),
                     "lineage_verified": True,
                     "output_manifest": build_qlib_output_manifest(daily_dataset),
                 }

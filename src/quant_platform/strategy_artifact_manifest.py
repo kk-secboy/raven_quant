@@ -5,7 +5,6 @@ import json
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-
 STRATEGY_BACKTEST_ARTIFACT_MANIFEST_VERSION = (
     "strategy-backtest-artifact-manifest-v1"
 )

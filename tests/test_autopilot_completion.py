@@ -599,8 +599,8 @@ def test_long_only_config_rejects_financing_and_impossible_qp() -> None:
         config["model_drift_policy"]
     )
     assert resolve_paper_initial_cash(config) == 5_000_000
-    with pytest.raises(ValueError, match="caller paper cash differs"):
-        resolve_paper_initial_cash(config, requested_initial_cash=100_000)
+    # Personal paper principal is independent from the research capacity scale.
+    assert resolve_paper_initial_cash(config, requested_initial_cash=100_000) == 100_000
     changed = dict(config)
     changed["topk"] = 50
     with pytest.raises(ValueError, match="capital execution contract is inconsistent"):

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, date, datetime, timedelta
 
+import pandas as pd
 import pytest
-from governance_fixtures import DATASET_IDENTITY, create_strategy_version
-from sqlalchemy import update
+from governance_fixtures import (
+    DATASET_IDENTITY,
+    enable_recommendation_authority_for_test,
+)
+from test_strategy_allocation_recommendations import _approve_version
 
-from quant_data.database import strategy_versions
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.recommendation_actions import (
@@ -340,14 +344,15 @@ def test_plan_account_actions_sorts_and_vectors() -> None:
 
 
 def _make_pending_snapshot(database_url: str, tmp_path):
-    version_id = create_strategy_version(database_url, tmp_path)
+    dates = pd.bdate_range("2024-01-02", periods=160)
+    version_id = _approve_version(
+        database_url,
+        tmp_path,
+        suffix=f"recommendation-action-{uuid.uuid4().hex}",
+        returns=pd.Series(0.001, index=dates),
+    )
+    enable_recommendation_authority_for_test(database_url, [version_id])
     recommendations = RecommendationStore(database_url)
-    with recommendations.engine.begin() as connection:
-        connection.execute(
-            update(strategy_versions)
-            .where(strategy_versions.c.id == version_id)
-            .values(status="approved")
-        )
     portfolio = recommendations.create(
         name="two-dim action target",
         strategy_version_id=version_id,
@@ -501,29 +506,9 @@ def test_apply_result_does_not_publish_when_account_action_planning_fails(
 def test_attach_account_actions_requires_succeeded_snapshot(
     database_url: str, tmp_path
 ) -> None:
-    version_id = create_strategy_version(database_url, tmp_path)
-    recommendations = RecommendationStore(database_url)
-    with recommendations.engine.begin() as connection:
-        connection.execute(
-            update(strategy_versions)
-            .where(strategy_versions.c.id == version_id)
-            .values(status="approved")
-        )
-    portfolio = recommendations.create(
-        name="two-dim action gate",
-        strategy_version_id=version_id,
-        dataset="snapshot",
-        hypothetical_initial_value=1_000_000,
-        actor="test",
-    )
-    snapshot, _ = recommendations.create_snapshot(
-        portfolio_id=portfolio["id"],
-        as_of_date=date(2026, 7, 10),
-        dataset="snapshot",
-        dataset_identity_sha256=DATASET_IDENTITY,
-    )
+    recommendations, snapshot_id, _result = _make_pending_snapshot(database_url, tmp_path)
     with pytest.raises(ValueError, match="succeeded"):
-        recommendations.attach_account_actions(snapshot["id"], account_state={})
+        recommendations.attach_account_actions(snapshot_id, account_state={})
 
 
 def test_attach_account_actions_requires_price_for_target_quantity(

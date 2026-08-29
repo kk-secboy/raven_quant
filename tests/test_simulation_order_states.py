@@ -10,11 +10,15 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
-from governance_fixtures import PERIODS, create_strategy_version
-from sqlalchemy import insert, select, update
+from governance_fixtures import (
+    PERIODS,
+    create_strategy_version,
+)
+from sqlalchemy import insert, select
 from test_simulation_store import (
     COST_SCHEDULE_VERSION,
     TRADE_DATE,
+    _approved_source_version,
     _daily_dataset,
     _execution_dataset,
     _execution_evidence,
@@ -26,12 +30,10 @@ from quant_data.database import (
     strategy_allocation_artifacts,
     strategy_allocation_members,
     strategy_allocations,
-    strategy_versions,
 )
 from quant_platform.account_netting import AccountNettingStore
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.recommendation_actions import plan_instrument_action
-from quant_platform.recommendation_store import RecommendationStore
 from quant_platform.simulation_engine import execute_simulation_day
 from quant_platform.simulation_order_state import (
     STATUS_CANCELLED,
@@ -223,29 +225,12 @@ def test_engine_execution_window_skips_slices() -> None:
 
 
 def _create_simulation(database_url: str, tmp_path) -> tuple[SimulationStore, dict]:
-    version_id = create_strategy_version(
-        database_url,
-        tmp_path,
-        config_overrides={"execution_frequency": "5min", "execution_method": "twap"},
-    )
-    recommendations = RecommendationStore(database_url)
-    with recommendations.engine.begin() as connection:
-        connection.execute(
-            update(strategy_versions)
-            .where(strategy_versions.c.id == version_id)
-            .values(status="approved")
-        )
-    recommendation = recommendations.create(
-        name="order-plan target",
-        strategy_version_id=version_id,
-        dataset="snapshot",
-        hypothetical_initial_value=1_000_000,
-        actor="test",
-    )
+    version_id = _approved_source_version(database_url, tmp_path)
     store = SimulationStore(database_url)
     simulation = store.create(
         name="order-plan simulation",
-        recommendation_portfolio_id=recommendation["id"],
+        source_type="strategy_version",
+        source_id=version_id,
         daily_dataset=_daily_dataset(),
         execution_dataset=_execution_dataset(),
         initial_cash=1_000_000,

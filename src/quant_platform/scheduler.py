@@ -13,10 +13,11 @@ from quant_data.cninfo_announcements import load_trade_calendar_open_days
 from quant_data.config import Settings
 from quant_data.coverage_data import COVERAGE_BUNDLES, DEFAULT_COVERAGE_BUNDLES
 from quant_data.database import (
-    backtest_runs,
     jobs,
     model_artifacts,
+    recommendation_portfolios,
     recommendation_snapshots,
+    research_runs,
     simulation_batches,
     simulation_nav,
     simulation_portfolios,
@@ -28,9 +29,17 @@ from quant_data.research_assets import research_report_dates_in_snapshot
 
 from .alert_store import AlertStore
 from .autopilot import AutopilotController
-from .cost_model import COST_SCHEDULE_VERSION
 from .data_rollover import qlib_trading_date_on_or_before, select_qlib_dataset
 from .feature_set_registry import get_feature_set
+from .fin_strategy_schedule import (
+    canonical_sha256 as fin_strategy_schedule_sha256,
+)
+from .fin_strategy_schedule import (
+    managed_fin_strategy_due_event,
+    reconcile_managed_fin_strategy_schedules,
+    select_latest_reproducible_daily_dataset,
+    validate_managed_fin_strategy_payload,
+)
 from .health_store import OperationalHealthStore
 from .information_schedule import (
     STRUCTURED_INFORMATION_STARTS,
@@ -40,7 +49,14 @@ from .information_schedule import (
     normalize_information_schedule_payload,
     resolve_information_evaluation_dataset,
 )
-from .job_store import JobStore, research_asset_acquisition_idempotency_key
+from .job_store import (
+    ORDER_PLAN_CANCELLED,
+    ORDER_PLAN_EXECUTION_TRADE_DATE_KEY,
+    ORDER_PLAN_FAILED,
+    ORDER_PLAN_SUPERSEDED,
+    JobStore,
+    research_asset_acquisition_idempotency_key,
+)
 from .model_artifact_store import ModelArtifactStore
 from .model_drift import build_persistent_drift_evidence
 from .model_research_governance import canonical_sha256
@@ -61,15 +77,22 @@ from .rdagent_scenarios import (
 )
 from .recommendation_store import RecommendationStore
 from .research_asset_store import ResearchAssetStore
-from .research_automation import normalize_research_schedule_payload, resolve_research_periods
+from .research_automation import (
+    normalize_research_schedule_payload,
+    resolve_research_window_contract,
+)
 from .research_report_backfill import ResearchReportBackfillStore
 from .research_store import ResearchStore
 from .runtime_secret_store import RuntimeSecretStore
-from .safe_mode import SafeModeStore
+from .safe_mode import SafeModeActiveError, SafeModeStore
 from .schedule_store import ScheduleStore
-from .services import list_qlib_datasets, resolve_snapshot_dataset
-from .simulation_store import SimulationStore
+from .services import list_qlib_datasets
+from .simulation_store import ExecutionDataNotReadyError, SimulationStore
 from .strategy_store import StrategyStore
+from .three_horizon_account import ThreeHorizonAccountService
+from .transparent_baseline_bootstrap import (
+    reconcile as reconcile_transparent_baselines,
+)
 
 AUTOMATED_DATA_BUNDLES = (
     "cn_extended_daily",
@@ -81,7 +104,6 @@ AUTOMATED_DATA_BUNDLES = (
     "us_market",
     "global_markets",
     "cn_institutional",
-    "strategy_specialty",
     *sorted(DEFAULT_COVERAGE_BUNDLES),
 )
 
@@ -150,18 +172,11 @@ def model_refresh_decision(
         ),
     }
 
-PAIR_MINUTE_SOURCE_NAMES = (
-    "etf_minute_bars",
-    "a_share_minute_bars",
-    "liquid_stocks_1m",
-    "etf_1m",
-)
-PAIR_SHORTABILITY_SOURCE_NAMES = (
-    "margin_eligibility",
-    "cn_margin_eligibility",
-)
-
 FACTOR_LIBRARY_MIN_FREE_BYTES = 300 * 1024**3
+
+
+class ScheduleRunWaiting(RuntimeError):
+    """A durable schedule dependency may become ready before its slot deadline."""
 
 
 def _download_runtime_limits(payload: dict[str, Any]) -> dict[str, int]:
@@ -179,19 +194,6 @@ def _download_runtime_limits(payload: dict[str, Any]) -> dict[str, int]:
         "download_workers": workers,
         "requests_per_minute": requests_per_minute,
     }
-
-
-def _try_resolve_snapshot_dataset(
-    data_root: Path, *, snapshot_name: str, dataset_name: str
-) -> dict[str, Any] | None:
-    try:
-        return resolve_snapshot_dataset(
-            data_root,
-            snapshot_name=snapshot_name,
-            dataset_name=dataset_name,
-        )
-    except (FileNotFoundError, KeyError, OSError, ValueError):
-        return None
 
 
 def _latest_lineage_coverage_date(
@@ -252,9 +254,15 @@ class SchedulerEngine:
         self.promotions = PromotionStore(settings.database_url)
         self.safe_mode = SafeModeStore(settings.database_url)
         self.autopilot = AutopilotController(settings)
+        self.three_horizon_account = ThreeHorizonAccountService(settings)
+        self._last_fin_strategy_schedule_reconcile_at: datetime | None = None
+        self._last_transparent_baseline_reconcile_at: datetime | None = None
 
     def tick(self, now: datetime | None = None) -> dict[str, int]:
         current = now or datetime.now(UTC)
+        fin_strategy_schedules_reconciled = (
+            self._reconcile_default_fin_strategy_schedules(current)
+        )
         research_asset_jobs_enqueued = self._enqueue_daily_research_assets(current)
         research_report_backfill_enqueued = self._enqueue_research_report_backfill(current)
         model_refits_enqueued = self._enqueue_due_model_refits(current)
@@ -283,6 +291,30 @@ class SchedulerEngine:
                 dedupe_key=f"platform:autopilot:{current.date().isoformat()}:failed",
             )
         simulation_order_plans_enqueued = self._enqueue_due_simulation_order_plans(current)
+        auto_promotions = self._auto_promote_ready_horizons(current)
+        strategies_auto_promoted = len(auto_promotions)
+        try:
+            three_horizon_result = self.three_horizon_account.tick(now=current)
+        except Exception as exc:  # fail closed without stopping paper evidence
+            three_horizon_result = {"status": "blocked", "reason": str(exc)}
+            self.alerts.create(
+                source_type="platform",
+                source_id="three-horizon-account",
+                severity="critical",
+                category="three_horizon_account_blocked",
+                title="三周期统一模拟账户未能推进",
+                message=str(exc),
+                dedupe_key=(
+                    "platform:three-horizon-account:"
+                    f"{current.astimezone(ZoneInfo('Asia/Shanghai')).date()}:blocked"
+                ),
+            )
+        self._settle_activation_cutovers(three_horizon_result, now=current)
+        horizon_recommendations_enqueued = self._enqueue_due_horizon_recommendations(current)
+        (
+            transparent_baseline_reconciles,
+            transparent_baseline_reconcile_failures,
+        ) = self._reconcile_transparent_baselines(current)
         # Pair trading requires short sales and borrow-cost assumptions.  The
         # single Autopilot capital line is deliberately long-only, so legacy
         # pair records remain readable but are never scheduled or traded.
@@ -305,6 +337,16 @@ class SchedulerEngine:
             "health_recorded": health_recorded,
             "simulation_replays_enqueued": simulation_replays_enqueued,
             "simulation_order_plans_enqueued": simulation_order_plans_enqueued,
+            "strategies_auto_promoted": strategies_auto_promoted,
+            "horizon_recommendations_enqueued": horizon_recommendations_enqueued,
+            "fin_strategy_schedules_reconciled": fin_strategy_schedules_reconciled,
+            "transparent_baseline_reconciles": transparent_baseline_reconciles,
+            "transparent_baseline_reconcile_failures": (
+                transparent_baseline_reconcile_failures
+            ),
+            "three_horizon_account_advanced": int(
+                bool(three_horizon_result.get("advanced"))
+            ),
             "pair_shadow_batches_materialized": pair_shadow_batches_materialized,
             "pair_shadow_backtests_enqueued": pair_shadow_backtests_enqueued,
             "pair_shadow_accounts_created": pair_shadow_accounts_created,
@@ -318,6 +360,266 @@ class SchedulerEngine:
             "autopilot_branches_enqueued": int(autopilot_result.get("branches", 0)),
             "autopilot_failures": int(autopilot_result.get("failed", 0)),
         }
+
+    def _reconcile_default_fin_strategy_schedules(self, now: datetime) -> int:
+        """Reconcile managed research hourly without delaying other tick lanes."""
+
+        previous = self._last_fin_strategy_schedule_reconcile_at
+        if previous is not None and now - previous < timedelta(hours=1):
+            return 0
+        self._last_fin_strategy_schedule_reconcile_at = now
+        try:
+            records = reconcile_managed_fin_strategy_schedules(
+                self.schedules,
+                enabled=bool(self.settings.rdagent_enabled),
+                now=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate the research lane
+            self.alerts.create(
+                source_type="platform",
+                source_id="managed-fin-strategy-schedules",
+                severity="warning",
+                category="managed_fin_strategy_schedule_reconcile_failed",
+                title="三周期策略研究调度未能完成核对",
+                message=str(exc),
+                dedupe_key=(
+                    "platform:managed-fin-strategy-schedules:"
+                    f"{now.astimezone(ZoneInfo('Asia/Shanghai')).date()}:failed"
+                ),
+            )
+            return 0
+        return len(records)
+
+    def _reconcile_transparent_baselines(self, now: datetime) -> tuple[int, int]:
+        """Periodically advance baseline bootstrap after daily lanes are queued."""
+
+        previous = self._last_transparent_baseline_reconcile_at
+        if previous is not None and now - previous < timedelta(minutes=30):
+            return 0, 0
+        self._last_transparent_baseline_reconcile_at = now
+        try:
+            result = reconcile_transparent_baselines(self.settings)
+        except Exception as exc:  # noqa: BLE001 - isolate baseline research
+            result = {"status": "failed", "errors": [str(exc)]}
+        if result.get("status") == "failed":
+            errors = [str(item) for item in result.get("errors") or []]
+            for member in result.get("members") or []:
+                errors.extend(str(item) for item in member.get("errors") or [])
+            self.alerts.create(
+                source_type="platform",
+                source_id="transparent-baseline-bootstrap",
+                severity="warning",
+                category="transparent_baseline_reconcile_waiting",
+                title="三周期透明基线仍在等待合规数据或回测",
+                message="; ".join(errors[:3]) or "transparent baseline reconcile failed closed",
+                dedupe_key=(
+                    "platform:transparent-baseline-bootstrap:"
+                    f"{now.astimezone(ZoneInfo('Asia/Shanghai')).date()}:waiting"
+                ),
+            )
+            return 1, 1
+        return 1, 0
+
+    def _auto_promote_ready_horizons(self, now: datetime) -> list[dict[str, Any]]:
+        """Advance paper strategies only through their immutable horizon gates."""
+
+        with self.jobs.engine.connect() as connection:
+            version_ids = connection.scalars(
+                select(strategy_versions.c.id)
+                .where(
+                    strategy_versions.c.status == "approved",
+                    strategy_versions.c.promotion_stage == "paper",
+                    strategy_versions.c.horizon_profile.in_(
+                        ("short_1_5d", "swing_1_6m", "long_1_3y")
+                    ),
+                )
+                .order_by(strategy_versions.c.approved_at)
+                .limit(100)
+            ).all()
+        promoted: list[dict[str, Any]] = []
+        for version_id in version_ids:
+            try:
+                result = self.promotions.auto_promote_if_ready(str(version_id))
+                if result.get("promoted"):
+                    promoted.append(result)
+            except (KeyError, ValueError) as exc:
+                self.alerts.create(
+                    source_type="strategy_version",
+                    source_id=str(version_id),
+                    severity="warning",
+                    category="auto_promotion_retry",
+                    title="策略自动晋级等待重试",
+                    message=str(exc),
+                    dedupe_key=(
+                        f"strategy:{version_id}:auto-promotion:"
+                        f"{now.astimezone(ZoneInfo('Asia/Shanghai')).date()}"
+                    ),
+                )
+        return promoted
+
+    def _settle_activation_cutovers(
+        self, account_result: dict[str, Any], *, now: datetime
+    ) -> None:
+        """Complete or roll back the event-backed promotion/account saga."""
+
+        pending = self.promotions.pending_activation_cutovers()
+        if not pending:
+            return
+        status = str(account_result.get("status") or "blocked")
+        if status in {"ready", "no_action"}:
+            active_versions = set(
+                str(value)
+                for value in dict(account_result.get("strategy_version_ids") or {}).values()
+            )
+            for cutover in pending:
+                if cutover["strategy_version_id"] not in active_versions:
+                    continue
+                try:
+                    self.promotions.complete_activation_cutover(
+                        cutover["strategy_version_id"],
+                        activation_token=cutover["activation_token"],
+                        account_evidence=account_result,
+                    )
+                except (KeyError, ValueError) as exc:
+                    self.alerts.create(
+                        source_type="strategy_version",
+                        source_id=cutover["strategy_version_id"],
+                        severity="critical",
+                        category="activation_cutover_completion_failed",
+                        title="策略与统一账户切换尚未确认",
+                        message=str(exc),
+                        dedupe_key=(
+                            f"strategy:{cutover['strategy_version_id']}:cutover-complete:"
+                            f"{now.date().isoformat()}"
+                        ),
+                    )
+            return
+
+        # Onboarding and missing allocation/member evidence are normal
+        # asynchronous pre-activation states. No unified order plan can be
+        # created yet, and AdviceService continues to project the replaced
+        # incumbent. All other account failures are hard cutover failures.
+        if status in {
+            "onboarding_required",
+            "waiting_for_allocation_evidence",
+            "waiting_for_member_targets",
+            "waiting_for_verified_horizons",
+        }:
+            return
+        reason = str(account_result.get("reason") or status)
+        for cutover in pending:
+            try:
+                self.promotions.rollback_activation_cutover(
+                    cutover["strategy_version_id"],
+                    activation_token=cutover["activation_token"],
+                    reason=f"Three-horizon account cutover failed: {reason}",
+                )
+            except (KeyError, ValueError) as exc:
+                self.alerts.create(
+                    source_type="strategy_version",
+                    source_id=cutover["strategy_version_id"],
+                    severity="critical",
+                    category="activation_cutover_rollback_failed",
+                    title="策略与统一账户切换回滚失败",
+                    message=str(exc),
+                    dedupe_key=(
+                        f"strategy:{cutover['strategy_version_id']}:cutover-rollback:"
+                        f"{now.date().isoformat()}"
+                    ),
+                )
+
+    def _enqueue_due_horizon_recommendations(self, now: datetime) -> int:
+        """Refresh each verified sleeve from the latest complete daily snapshot."""
+
+        if self.safe_mode.status().get("active"):
+            return 0
+        local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        with self.jobs.engine.connect() as connection:
+            portfolio_ids = connection.scalars(
+                select(recommendation_portfolios.c.id)
+                .join(
+                    strategy_versions,
+                    strategy_versions.c.id
+                    == recommendation_portfolios.c.strategy_version_id,
+                )
+                .where(
+                    recommendation_portfolios.c.status == "active",
+                    recommendation_portfolios.c.recommendation_scope
+                    == "allocation_member",
+                    strategy_versions.c.status == "approved",
+                    strategy_versions.c.promotion_stage == "recommendation_enabled",
+                    strategy_versions.c.horizon_profile.in_(
+                        ("short_1_5d", "swing_1_6m", "long_1_3y")
+                    ),
+                )
+                .order_by(recommendation_portfolios.c.created_at)
+            ).all()
+        enqueued = 0
+        for portfolio_id in portfolio_ids:
+            try:
+                portfolio = self.recommendations.get(str(portfolio_id))
+                dataset = select_qlib_dataset(
+                    self.settings.data_root,
+                    anchor_name=str(portfolio["dataset"]),
+                    roll_policy=str(portfolio.get("dataset_roll_policy") or "pinned"),
+                    lineage_id=portfolio.get("dataset_lineage_id"),
+                    required_date=local_date,
+                )
+                signal_date = qlib_trading_date_on_or_before(dataset, local_date)
+                latest = portfolio.get("latest_snapshot") or {}
+                if str(latest.get("as_of_date") or "") == signal_date.isoformat():
+                    continue
+                self.promotions.require_recommendation_signal(
+                    str(portfolio["strategy_version_id"]), signal_date=signal_date, now=now
+                )
+                gate = evaluate_recommendation_gate(
+                    self.simulations,
+                    portfolio,
+                    signal_date,
+                    load_calendar_days(dataset["path"]),
+                )
+                if not gate["passed"]:
+                    continue
+                snapshot, created = self.recommendations.create_snapshot(
+                    portfolio_id=str(portfolio_id),
+                    as_of_date=signal_date,
+                    dataset=str(dataset["name"]),
+                    dataset_identity_sha256=str(
+                        dataset["provenance"]["dataset_identity_sha256"]
+                    ),
+                    dataset_lineage_id=dataset.get("lineage_id"),
+                )
+                if not created:
+                    continue
+                job = self.jobs.create(
+                    "recommendation_refresh",
+                    {
+                        "recommendation_portfolio_id": str(portfolio_id),
+                        "recommendation_snapshot_id": str(snapshot["id"]),
+                        "dataset": str(dataset["name"]),
+                        "dataset_path": str(dataset["path"]),
+                        "dataset_identity_sha256": str(
+                            dataset["provenance"]["dataset_identity_sha256"]
+                        ),
+                        "as_of_date": signal_date.isoformat(),
+                    },
+                    self.settings.data_root
+                    / "platform"
+                    / "logs"
+                    / f"recommendation-refresh-{snapshot['id']}.log",
+                    dedupe_active_kind=False,
+                    idempotency_key=(
+                        f"three-horizon-recommendation:{portfolio_id}:"
+                        f"{signal_date.isoformat()}:"
+                        f"{dataset['provenance']['dataset_identity_sha256']}"
+                    ),
+                )
+                self.recommendations.attach_job(str(snapshot["id"]), str(job["id"]))
+                enqueued += int(job["status"] in {"queued", "running"})
+            except (KeyError, OSError, ValueError):
+                # Waiting datasets/stages are retried from the same durable state.
+                continue
+        return enqueued
 
     def _enqueue_due_factor_library_materialization(self, now: datetime) -> int:
         """Materialize the governed factor library once for every sealed daily dataset.
@@ -518,6 +820,10 @@ class SchedulerEngine:
                     signal_date=signal_date,
                     now=now,
                 )
+                self.simulations.require_order_plan_predecessor_settled(
+                    str(portfolio_id),
+                    signal_date=signal_date,
+                )
                 job = self.jobs.create(
                     "simulation_order_plan",
                     {
@@ -549,369 +855,88 @@ class SchedulerEngine:
                 continue
         return enqueued
 
-    def _ensure_approved_pair_shadow_accounts(self, now: datetime) -> int:
-        """Create the isolated account automatically after pair research approval."""
+    def _materialize_awaiting_simulation_order_plans(self, local_date: date) -> int:
+        """Freeze D+1 descendants for sealed plans without regenerating D signals."""
 
-        datasets = {
-            item["name"]: item
-            for item in list_qlib_datasets(self.settings.data_root)
-            if item.get("ready") and item.get("reproducible")
-        }
-        with self.jobs.engine.connect() as connection:
-            version_ids = connection.scalars(
-                select(strategy_versions.c.id)
-                .where(
-                    strategy_versions.c.strategy_type == "pair",
-                    strategy_versions.c.status == "approved",
-                    strategy_versions.c.is_legacy.is_(False),
-                )
-                .order_by(strategy_versions.c.created_at)
-                .limit(100)
-            ).all()
-            existing_sources = set(
-                connection.scalars(
-                    select(simulation_portfolios.c.source_id).where(
-                        simulation_portfolios.c.source_type == "strategy_version",
-                        simulation_portfolios.c.execution_adapter == "pair",
-                    )
-                ).all()
-            )
-        created = 0
-        for raw_version_id in version_ids:
-            version_id = str(raw_version_id)
-            if version_id in {str(value) for value in existing_sources}:
-                continue
+        materialized = 0
+        for job in self.jobs.awaiting_simulation_order_plans(limit=100):
+            progress = dict(job.get("progress") or {})
             try:
-                version = self.strategies.get_version(version_id)
-                formal = next(
-                    (
-                        item
-                        for item in self.strategies.list_backtests(version_id)
-                        if item.get("status") == "succeeded" and not item.get("is_legacy")
-                    ),
-                    None,
+                trade_date = date.fromisoformat(
+                    str(progress[ORDER_PLAN_EXECUTION_TRADE_DATE_KEY])
                 )
-                if formal is None:
-                    continue
-                daily = datasets.get(str(formal["dataset"]))
-                if daily is None:
-                    continue
-                manifest = json.loads(
-                    (Path(str(formal["artifact_path"])) / "manifest.json").read_text(
-                        encoding="utf-8"
-                    )
-                )
-                snapshot_name = str(manifest.get("execution_snapshot") or "")
-                minute_name = str(
-                    dict(manifest.get("minute_dataset") or {}).get("dataset_name") or ""
-                )
-                daily_source = str(
-                    dict(daily.get("provenance") or {}).get("source_lineage_id") or ""
-                )
-                execution = next(
-                    (
-                        item
-                        for item in datasets.values()
-                        if item.get("frequency") == "1min"
-                        and str(
-                            dict(item.get("provenance") or {}).get("source_lineage_id") or ""
-                        )
-                        == daily_source
-                        and str(
-                            dict(item.get("provenance") or {}).get("snapshot_name") or ""
-                        )
-                        == snapshot_name
-                        and minute_name
-                        in set(
-                            dict(item.get("provenance") or {}).get("source_datasets") or []
-                        )
-                    ),
-                    None,
-                )
-                if execution is None:
-                    continue
-                portfolio = self.simulations.create(
-                    name=f"配对影子模拟-{version_id[:8]}",
-                    source_type="strategy_version",
-                    source_id=version_id,
-                    daily_dataset=daily,
-                    execution_dataset=execution,
-                    initial_cash=float(
-                        dict(version.get("config") or {}).get("initial_capital") or 5_000_000
-                    ),
-                    execution_policy={
-                        "execution_algorithm": "vwap",
-                        "slice_minutes": 5,
-                        "max_slices": 24,
-                        "max_participation": float(
-                            dict(version.get("config") or {}).get(
-                                "max_volume_participation", 0.01
-                            )
-                        ),
-                    },
-                    cost_schedule_version=str(
-                        dict(version.get("config") or {}).get(
-                            "cost_schedule_version", COST_SCHEDULE_VERSION
-                        )
-                    ),
-                    actor="autopilot-shadow-pair",
-                    execution_adapter="pair",
-                    daily_roll_policy="latest_compatible",
-                    execution_roll_policy="latest_compatible",
-                )
-                self.simulations.set_status(portfolio["id"], "active")
-                created += 1
-            except (
-                FileNotFoundError,
-                KeyError,
-                OSError,
-                TypeError,
-                ValueError,
-                json.JSONDecodeError,
-            ):
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "awaiting simulation order-plan has no valid execution trade date"
+                ) from exc
+            if trade_date > local_date:
                 continue
-        return created
-
-    def _enqueue_due_pair_shadow_backtests(self, now: datetime) -> int:
-        """Extend each active pair shadow source through the latest governed day."""
-
-        local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
-        datasets = {
-            item["name"]: item
-            for item in list_qlib_datasets(self.settings.data_root)
-            if item.get("ready") and item.get("reproducible")
-        }
-        with self.jobs.engine.connect() as connection:
-            accounts = connection.execute(
-                select(
-                    simulation_portfolios.c.source_id,
-                    simulation_portfolios.c.daily_dataset,
-                    simulation_portfolios.c.daily_dataset_lineage_id,
-                    simulation_portfolios.c.execution_dataset,
-                    simulation_portfolios.c.execution_dataset_lineage_id,
-                )
-                .where(
-                    simulation_portfolios.c.status == "active",
-                    simulation_portfolios.c.source_type == "strategy_version",
-                    simulation_portfolios.c.execution_adapter == "pair",
-                )
-                .order_by(simulation_portfolios.c.created_at)
-                .limit(100)
-            ).all()
-        enqueued = 0
-        seen_versions: set[str] = set()
-        for account in accounts:
-            version_id = str(account.source_id)
-            if version_id in seen_versions:
-                continue
-            seen_versions.add(version_id)
+            payload = dict(job.get("payload") or {})
+            manifest_sha256 = str(progress.get("order_plan_manifest_sha256") or "")
             try:
-                required_date = _latest_lineage_coverage_date(
-                    datasets,
-                    lineage_id=str(account.daily_dataset_lineage_id),
-                    as_of=local_date,
-                )
-                if required_date is None:
-                    continue
-                daily = select_qlib_dataset(
-                    self.settings.data_root,
-                    anchor_name=str(account.daily_dataset),
-                    roll_policy="latest_compatible",
-                    lineage_id=str(account.daily_dataset_lineage_id),
-                    required_date=required_date,
-                )
-                trade_date = qlib_trading_date_on_or_before(daily, local_date)
-                execution = select_qlib_dataset(
-                    self.settings.data_root,
-                    anchor_name=str(account.execution_dataset),
-                    roll_policy="latest_compatible",
-                    lineage_id=str(account.execution_dataset_lineage_id),
-                    required_date=trade_date,
-                )
-                execution_provenance = dict(execution.get("provenance") or {})
-                snapshot_name = str(execution_provenance.get("snapshot_name") or "")
-                source_names = set(execution_provenance.get("source_datasets") or [])
-                minute_name = next(
-                    (name for name in PAIR_MINUTE_SOURCE_NAMES if name in source_names),
-                    None,
-                )
-                if not snapshot_name or minute_name is None:
-                    continue
-                minute = resolve_snapshot_dataset(
-                    self.settings.data_root,
-                    snapshot_name=snapshot_name,
-                    dataset_name=minute_name,
-                )
-                shortability = next(
-                    (
-                        resolved
-                        for name in PAIR_SHORTABILITY_SOURCE_NAMES
-                        if (
-                            resolved := _try_resolve_snapshot_dataset(
-                            self.settings.data_root,
-                            snapshot_name=snapshot_name,
-                            dataset_name=name,
-                        )
-                        ) is not None
-                    ),
-                    None,
-                )
-                if shortability is None:
-                    continue
-                backtests = self.strategies.list_backtests(version_id)
-                latest_start: date | None = None
-                already_covered = False
-                already_active = False
-                for item in backtests:
-                    periods = dict(item.get("periods") or {})
-                    try:
-                        item_start = date.fromisoformat(str(periods.get("start") or ""))
-                        item_end = date.fromisoformat(str(periods.get("end") or ""))
-                    except ValueError:
-                        continue
-                    latest_start = min(latest_start, item_start) if latest_start else item_start
-                    if item_end >= trade_date and item.get("status") == "succeeded":
-                        already_covered = True
-                    if item_end >= trade_date and item.get("status") in {"queued", "running"}:
-                        already_active = True
-                if already_covered or already_active:
-                    continue
-                daily_start = date.fromisoformat(str(daily["start_date"]))
-                start = max(
-                    daily_start,
-                    latest_start or (trade_date - timedelta(days=4 * 365)),
-                )
-                if start >= trade_date:
-                    continue
-                execution_dataset = (
-                    f"{snapshot_name}/{minute_name}"
-                    f"+{shortability['dataset_name']}"
-                )
-                backtest = self.strategies.create_backtest(
-                    version_id=version_id,
-                    dataset=str(daily["name"]),
-                    execution_dataset=execution_dataset,
-                    periods={"start": start.isoformat(), "end": trade_date.isoformat()},
-                    artifact_path=self.settings.data_root / "artifacts" / "backtests",
-                    dataset_lineage_id=str(
-                        dict(daily.get("provenance") or {}).get("dataset_lineage_id") or ""
-                    ),
-                )
-                job = self.jobs.create(
-                    "pair_backtest",
-                    {
-                        "backtest_id": backtest["id"],
-                        "strategy_version_id": version_id,
-                        "dataset": str(daily["name"]),
-                        "dataset_path": str(daily["path"]),
-                        "daily_provenance": dict(daily.get("provenance") or {}),
-                        "execution_snapshot": snapshot_name,
-                        "minute_dataset": minute,
-                        "shortability_dataset": shortability,
-                        "periods": backtest["periods"],
-                    },
-                    self.settings.data_root
-                    / "platform"
-                    / "logs"
-                    / f"pair-shadow-backtest-{version_id}-{trade_date}.log",
-                    dedupe_active_kind=False,
-                    idempotency_key=f"pair-shadow-backtest:{version_id}:{trade_date}:{snapshot_name}",
-                )
-                self.strategies.attach_job(backtest["id"], job["id"])
-                enqueued += int(job["status"] in {"queued", "running"})
-            except (KeyError, OSError, TypeError, ValueError):
-                continue
-        return enqueued
-
-    def _materialize_due_pair_shadow_batches(self, now: datetime) -> int:
-        """Create one governed shadow-pair ledger day for each active account.
-
-        The immutable pair backtest owns the targets.  This scheduler only
-        selects the latest available governed day; the normal replay worker
-        still enforces minute bars, dated shortability, costs and atomic legs.
-        """
-
-        local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
-        datasets = {
-            item["name"]: item
-            for item in list_qlib_datasets(self.settings.data_root)
-            if item.get("ready") and item.get("reproducible")
-        }
-        with self.jobs.engine.connect() as connection:
-            accounts = connection.execute(
-                select(
-                    simulation_portfolios.c.id,
-                    simulation_portfolios.c.source_id,
-                    simulation_portfolios.c.daily_dataset,
-                    simulation_portfolios.c.daily_dataset_lineage_id,
-                )
-                .where(
-                    simulation_portfolios.c.status == "active",
-                    simulation_portfolios.c.source_type == "strategy_version",
-                    simulation_portfolios.c.execution_adapter == "pair",
-                )
-                .order_by(simulation_portfolios.c.created_at)
-                .limit(100)
-            ).all()
-        created = 0
-        for account in accounts:
-            try:
-                anchor = datasets.get(str(account.daily_dataset))
-                if anchor is None:
-                    continue
-                required_date = _latest_lineage_coverage_date(
-                    datasets,
-                    lineage_id=str(account.daily_dataset_lineage_id),
-                    as_of=local_date,
-                )
-                if required_date is None:
-                    continue
-                current_daily = select_qlib_dataset(
-                    self.settings.data_root,
-                    anchor_name=str(account.daily_dataset),
-                    roll_policy="latest_compatible",
-                    lineage_id=str(account.daily_dataset_lineage_id),
-                    required_date=required_date,
-                )
-                trade_date = qlib_trading_date_on_or_before(current_daily, local_date)
-                with self.jobs.engine.connect() as connection:
-                    candidates = connection.execute(
-                        select(backtest_runs.c.id, backtest_runs.c.periods_json)
-                        .where(
-                            backtest_runs.c.strategy_version_id == account.source_id,
-                            backtest_runs.c.status == "succeeded",
-                            backtest_runs.c.is_legacy.is_(False),
-                        )
-                        .order_by(backtest_runs.c.finished_at.desc())
-                        .limit(20)
-                    ).all()
-                backtest_id = next(
-                    (
-                        str(item.id)
-                        for item in candidates
-                        if date.fromisoformat(
-                            str(dict(item.periods_json or {}).get("end") or "1900-01-01")
-                        )
-                        >= trade_date
-                    ),
-                    None,
-                )
-                if backtest_id is None:
-                    continue
-                _, inserted = self.simulations.create_pair_batch_from_backtest(
-                    str(account.id),
-                    backtest_id=str(backtest_id),
-                    trade_date=trade_date,
+                batch, created = self.simulations.create_batch_from_order_plan(
+                    str(payload["simulation_portfolio_id"]),
+                    order_plan_manifest_sha256=manifest_sha256,
                     data_root=self.settings.data_root,
-                    actor="autopilot-shadow-pair",
+                    actor=str(payload.get("actor") or "simulation-order-plan-scheduler"),
                 )
-                created += int(inserted)
-            except (KeyError, OSError, TypeError, ValueError):
-                # A newly approved shadow account may be waiting for today's
-                # backtest artifact or shortability snapshot.  The next tick
-                # retries the same immutable date and idempotency key.
+            except ExecutionDataNotReadyError:
                 continue
-        return created
+            except SafeModeActiveError:
+                # Safe mode is a platform-wide transient.  Keep the immutable
+                # plan awaiting so release resumes the exact same artifact.
+                continue
+            except (KeyError, ValueError) as exc:
+                reason = str(exc)
+                if isinstance(exc, KeyError) or "portfolio is not active" in reason:
+                    terminal_status = ORDER_PLAN_CANCELLED
+                elif any(
+                    marker in reason
+                    for marker in (
+                        "not bound to an active gated promotion stage",
+                        "outside its genuine forward promotion period",
+                    )
+                ):
+                    terminal_status = ORDER_PLAN_SUPERSEDED
+                else:
+                    terminal_status = ORDER_PLAN_FAILED
+                self.jobs.terminate_simulation_order_plan_materialization(
+                    str(job["id"]),
+                    order_plan_manifest_sha256=manifest_sha256,
+                    materialization_status=terminal_status,
+                    reason=reason,
+                )
+                if terminal_status == ORDER_PLAN_FAILED:
+                    self.alerts.create(
+                        source_type="simulation_order_plan",
+                        source_id=str(job["id"]),
+                        severity="critical",
+                        category="paper_batch_materialization_failed",
+                        title="模拟盘订单计划无法物化",
+                        message=(
+                            "不可变订单计划无法绑定执行数据；已隔离该计划，"
+                            "需恢复证据后按原冻结数据重试。"
+                        ),
+                        dedupe_key=f"paper-batch-materialization:{job['id']}",
+                        details={
+                            "job_id": str(job["id"]),
+                            "portfolio_id": str(
+                                payload.get("simulation_portfolio_id") or ""
+                            ),
+                            "order_plan_manifest_sha256": manifest_sha256,
+                            "reason": reason,
+                            "recovery": "retry_frozen_simulation_order_plan",
+                        },
+                    )
+                continue
+            self.jobs.complete_simulation_order_plan_materialization(
+                str(job["id"]),
+                order_plan_manifest_sha256=manifest_sha256,
+                simulation_batch_id=str(batch["id"]),
+                batch_created=created,
+            )
+            materialized += 1
+        return materialized
 
     def _enqueue_research_report_backfill(self, now: datetime) -> int:
         """Resume the selected three-year PDF backlog without starving live data."""
@@ -925,7 +950,14 @@ class SchedulerEngine:
             self.settings.research_asset_auto_minute,
         ):
             return 0
-        if shutil.disk_usage(self.settings.data_root).free < 300 * 1024**3:
+        try:
+            free_bytes = shutil.disk_usage(self.settings.data_root).free
+        except OSError:
+            # The data volume may not be mounted yet during startup.  This
+            # optional backlog lane must wait without aborting health checks,
+            # alert delivery, or the other durable scheduler lanes.
+            return 0
+        if free_bytes < 300 * 1024**3:
             return 0
         with self.jobs.engine.connect() as connection:
             active_live = connection.scalar(
@@ -1277,6 +1309,7 @@ class SchedulerEngine:
         """Bind due forward batches only after immutable execution data exists."""
 
         local_date = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        self._materialize_awaiting_simulation_order_plans(local_date)
         with self.jobs.engine.connect() as connection:
             snapshot_ids = connection.scalars(
                 select(recommendation_snapshots.c.id)
@@ -1364,6 +1397,15 @@ class SchedulerEngine:
         return self.settings.alert_webhook_url
 
     def _process_run(self, run: dict[str, Any], now: datetime) -> None:
+        # Claim and enqueue are intentionally separate durable operations.  A
+        # shared cutover lock plus a fresh ownership read prevents an already
+        # claimed legacy run from creating a job after retirement has returned.
+        with self.schedules.dispatch_guard(str(run["id"]), now=now) as dispatchable:
+            if not dispatchable:
+                return
+            self._process_run_guarded(run, now)
+
+    def _process_run_guarded(self, run: dict[str, Any], now: datetime) -> None:
         scheduled_for = datetime.fromisoformat(run["scheduled_for"])
         delay = (now - scheduled_for).total_seconds()
         payload = dict(run.get("payload") or {})
@@ -1480,6 +1522,18 @@ class SchedulerEngine:
                     return
             else:
                 raise ValueError(f"unsupported schedule kind: {run['kind']}")
+        except ScheduleRunWaiting as exc:
+            deadline = scheduled_for + timedelta(
+                seconds=int(run["misfire_grace_seconds"])
+            )
+            retry_delay = max(30, min(300, self.settings.scheduler_poll_seconds * 4))
+            retry_at = min(deadline, now + timedelta(seconds=retry_delay))
+            self.schedules.wait_run(
+                run["id"],
+                message=f"waiting for dependency: {exc}",
+                retry_at=retry_at,
+            )
+            return
         except Exception as exc:
             self.schedules.finish_run(run["id"], "failed", message=str(exc), now=now)
             self.alerts.create(
@@ -2204,45 +2258,205 @@ class SchedulerEngine:
             idempotency_key=pipeline_id,
         )
 
+    def _managed_fin_strategy_incumbent(
+        self, horizon_profile: str
+    ) -> dict[str, Any] | None:
+        with self.jobs.engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    strategy_versions.c.id,
+                    strategy_versions.c.status,
+                    strategy_versions.c.promotion_stage,
+                    strategy_versions.c.horizon_profile,
+                    strategy_versions.c.approved_at,
+                    strategy_versions.c.created_at,
+                    strategy_versions.c.version,
+                ).where(
+                    strategy_versions.c.status == "approved",
+                    strategy_versions.c.horizon_profile == horizon_profile,
+                    strategy_versions.c.promotion_stage.in_(
+                        ("paper", "recommendation_enabled")
+                    ),
+                )
+            ).all()
+        if not rows:
+            return None
+        row = max(
+            rows,
+            key=lambda item: (
+                int(str(item.promotion_stage) == "recommendation_enabled"),
+                item.approved_at or item.created_at,
+                int(item.version),
+            ),
+        )
+        return {
+            "id": str(row.id),
+            "status": str(row.status),
+            "promotion_stage": str(row.promotion_stage),
+            "horizon_profile": str(row.horizon_profile),
+            "version": int(row.version),
+        }
+
+    def _existing_managed_fin_strategy_run(
+        self, run_sha256: str
+    ) -> dict[str, Any] | None:
+        with self.jobs.engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    research_runs.c.id,
+                    research_runs.c.job_id,
+                    research_runs.c.status,
+                    research_runs.c.config_json,
+                )
+                .where(research_runs.c.kind == "strategy")
+                .order_by(research_runs.c.created_at.desc())
+                .limit(1000)
+            ).all()
+        matches = [
+            item
+            for item in rows
+            if dict(item.config_json or {})
+            .get("managed_fin_strategy_run", {})
+            .get("run_sha256")
+            == run_sha256
+        ]
+        if len(matches) > 1:
+            raise ValueError("managed fin_strategy run identity is not unique")
+        if not matches:
+            return None
+        item = matches[0]
+        return {
+            "id": str(item.id),
+            "job_id": str(item.job_id) if item.job_id else None,
+            "status": str(item.status),
+        }
+
     def _enqueue_research(
         self,
         run: dict[str, Any],
         scheduled_for: datetime,
     ) -> dict[str, Any] | None:
+        managed = validate_managed_fin_strategy_payload(run["payload"])
         payload = normalize_research_schedule_payload(
             run["payload"],
             max_loops=self.settings.rdagent_max_loops,
             max_duration=self.settings.rdagent_max_duration,
         )
         scenario = get_rdagent_scenario(payload["scenario"])
-        runtime = probe_rdagent(self.settings, Path(__file__).resolve().parents[2])
-        require_ready_scenario(runtime, self.settings, scenario.id)
-        expected_runtime_identity = expected_rdagent_runtime_identity(runtime, scenario.id)
         dataset: dict[str, Any] | None = None
         periods: dict[str, str] | None = None
         period_resolution: dict[str, Any] | None = None
+        calendar: list[str] = []
+        local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
+        cadence_event: dict[str, Any] | None = None
         if scenario.requires_dataset:
-            datasets = {item["name"]: item for item in list_qlib_datasets(self.settings.data_root)}
-            dataset = datasets.get(payload["dataset"])
+            available = list_qlib_datasets(self.settings.data_root)
+            if managed is not None:
+                try:
+                    dataset = select_latest_reproducible_daily_dataset(available)
+                except ValueError as exc:
+                    raise ScheduleRunWaiting(str(exc)) from exc
+            else:
+                datasets = {item["name"]: item for item in available}
+                dataset = datasets.get(payload["dataset"])
             if not dataset or not dataset["ready"] or not dataset.get("reproducible"):
-                raise ValueError("scheduled RD-Agent research Qlib dataset is not reproducible")
-            calendar = (
-                (Path(dataset["path"]) / "calendars" / "day.txt")
-                .read_text(encoding="utf-8")
-                .splitlines()
+                raise ScheduleRunWaiting(
+                    "scheduled RD-Agent research Qlib dataset is not yet reproducible"
+                )
+            try:
+                calendar = (
+                    (Path(dataset["path"]) / "calendars" / "day.txt")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                )
+                periods, period_resolution = resolve_research_window_contract(
+                    dataset,
+                    calendar,
+                    periods=payload.get("periods"),
+                    period_policy=payload.get("period_policy"),
+                    horizon_profile=payload.get("horizon_profile"),
+                    feature_set=payload.get("feature_set"),
+                )
+            except (FileNotFoundError, OSError) as exc:
+                raise ScheduleRunWaiting(
+                    "scheduled RD-Agent dataset calendar is still publishing"
+                ) from exc
+            except ValueError as exc:
+                transient_markers = (
+                    "field-year coverage",
+                    "normalized staging evidence",
+                    "coverage ends before the data cutoff",
+                    "trading calendar is empty",
+                )
+                if any(marker in str(exc) for marker in transient_markers):
+                    raise ScheduleRunWaiting(str(exc)) from exc
+                raise
+            provenance = dict(dataset.get("provenance") or {})
+            dataset_identity = str(provenance.get("dataset_identity_sha256") or "")
+            dataset_lineage = str(
+                dataset.get("lineage_id")
+                or provenance.get("dataset_lineage_id")
+                or ""
             )
-            periods, period_resolution = resolve_research_periods(
-                calendar,
-                periods=payload.get("periods"),
-                period_policy=payload.get("period_policy"),
-            )
-            period_resolution["dataset_identity_sha256"] = dataset["provenance"][
-                "dataset_identity_sha256"
-            ]
+            period_resolution["dataset_identity_sha256"] = dataset_identity
+            period_resolution["dataset_lineage_id"] = dataset_lineage
             if dataset.get("start_date") and periods["train_start"] < dataset["start_date"]:
                 raise ValueError("scheduled RD-Agent training window starts before the dataset")
             if dataset.get("end_date") and periods["test_end"] > dataset["end_date"]:
                 raise ValueError("scheduled RD-Agent test window ends after the dataset")
+            if managed is not None:
+                try:
+                    exchange_days = load_trade_calendar_open_days(
+                        self.settings.data_root
+                    )
+                    cadence_event = managed_fin_strategy_due_event(
+                        managed,
+                        scheduled_date=local_date,
+                        trading_days=sorted(exchange_days),
+                    )
+                except (FileNotFoundError, ValueError) as exc:
+                    raise ScheduleRunWaiting(str(exc)) from exc
+                if not cadence_event["due"]:
+                    self.schedules.finish_run(
+                        run["id"],
+                        "skipped",
+                        message=str(cadence_event["reason"]),
+                    )
+                    return None
+                if local_date.isoformat() not in set(calendar):
+                    raise ScheduleRunWaiting(
+                        "latest reproducible daily Qlib has not published the schedule session"
+                    )
+            elif run["trading_days_only"] and local_date.isoformat() not in set(calendar):
+                self.schedules.finish_run(
+                    run["id"], "skipped", message="not a Qlib trading day"
+                )
+                return None
+        elif run["trading_days_only"]:
+            raise ValueError("scheduled RD-Agent lab scenarios must disable trading_days_only")
+
+        incumbent_strategy: dict[str, Any] | None = None
+        if managed is not None:
+            incumbent_strategy = self._managed_fin_strategy_incumbent(
+                str(managed["horizon_profile"])
+            )
+            if incumbent_strategy is None:
+                raise ScheduleRunWaiting(
+                    "managed fin_strategy is waiting for an approved paper or active incumbent"
+                )
+
+        try:
+            runtime = probe_rdagent(
+                self.settings, Path(__file__).resolve().parents[2]
+            )
+            require_ready_scenario(runtime, self.settings, scenario.id)
+        except (OSError, RuntimeError, ValueError) as exc:
+            if managed is not None:
+                raise ScheduleRunWaiting(
+                    f"managed fin_strategy runtime is not ready: {exc}"
+                ) from exc
+            raise
+        expected_runtime_identity = expected_rdagent_runtime_identity(runtime, scenario.id)
         auto_selected_assets = not payload["asset_ids"] and scenario.auto_select_assets
         assets = resolve_rdagent_assets(
             self.settings,
@@ -2269,21 +2483,62 @@ class SchedulerEngine:
                     / "manifest.json",
                     actor=payload["requested_by"],
                 )
-        if scenario.requires_dataset and run["trading_days_only"]:
-            local_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date().isoformat()
-            if local_date not in set(calendar):
-                self.schedules.finish_run(run["id"], "skipped", message="not a Qlib trading day")
-                return None
-        elif run["trading_days_only"]:
-            raise ValueError("scheduled RD-Agent lab scenarios must disable trading_days_only")
         artifact_root = self.settings.data_root / "artifacts" / "rdagent"
+        dataset_name = str(dataset["name"]) if dataset is not None else f"lab:{scenario.id}"
+        dataset_binding = (
+            {
+                "contract_version": "scheduled-research-dataset-binding-v1",
+                "name": dataset_name,
+                "identity_sha256": str(
+                    dict(dataset.get("provenance") or {}).get(
+                        "dataset_identity_sha256"
+                    )
+                    or ""
+                ),
+                "lineage_id": str(
+                    dataset.get("lineage_id")
+                    or dict(dataset.get("provenance") or {}).get(
+                        "dataset_lineage_id"
+                    )
+                    or ""
+                ),
+                "start_date": str(dataset.get("start_date") or ""),
+                "end_date": str(dataset.get("end_date") or ""),
+            }
+            if dataset is not None
+            else None
+        )
+        managed_run: dict[str, Any] | None = None
+        if managed is not None:
+            managed_run = {
+                "contract_version": "managed-fin-strategy-run-v1",
+                "schedule_contract_sha256": managed["contract_sha256"],
+                "calendar_event": cadence_event["event"],
+                "scheduled_session": local_date.isoformat(),
+                "dataset_binding": dataset_binding,
+                "research_window_contract_sha256": period_resolution[
+                    "research_window_contract_sha256"
+                ],
+                "feature_set_definition_sha256": payload["feature_set"][
+                    "definition_sha256"
+                ],
+                "incumbent_strategy_version_id": incumbent_strategy["id"],
+                "runtime_identity_sha256": fin_strategy_schedule_sha256(
+                    expected_runtime_identity
+                ),
+            }
+            managed_run["run_sha256"] = fin_strategy_schedule_sha256(managed_run)
         config: dict[str, Any] = {
             "scenario": scenario.id,
             "asset_ids": resolved_asset_ids,
             "asset_manifest_sha256": assets["manifest_sha256"],
             "asset_selection_mode": "automatic" if auto_selected_assets else "explicit",
             "feature_set": payload["feature_set"],
+            "horizon_profile": payload["horizon_profile"],
             "expected_rdagent_runtime": expected_runtime_identity,
+            "dataset_binding": dataset_binding,
+            "incumbent_strategy": incumbent_strategy,
+            "managed_fin_strategy_run": managed_run,
         }
         if dataset is not None and periods is not None and period_resolution is not None:
             config.update(
@@ -2291,14 +2546,40 @@ class SchedulerEngine:
                     "periods": periods,
                     "evaluation_profiles": period_resolution["evaluation_profiles"],
                     "period_resolution": period_resolution,
+                    "research_window_contract": period_resolution[
+                        "research_window_contract"
+                    ],
+                    "research_window_contract_sha256": period_resolution[
+                        "research_window_contract_sha256"
+                    ],
                     "dataset_path": dataset["path"],
                 }
             )
+        if managed_run is not None:
+            existing = self._existing_managed_fin_strategy_run(
+                str(managed_run["run_sha256"])
+            )
+            if existing is not None:
+                if existing["job_id"]:
+                    return self.jobs.get(str(existing["job_id"]))
+                if existing["status"] in {"queued", "running", "evaluating"}:
+                    raise ScheduleRunWaiting(
+                        "the exact managed fin_strategy run is still attaching its job"
+                    )
+                self.schedules.finish_run(
+                    run["id"],
+                    "skipped",
+                    message=(
+                        "the exact managed fin_strategy event is already terminal: "
+                        f"{existing['status']}"
+                    ),
+                )
+                return None
         try:
             research_run = self.research.create_run(
                 kind=scenario.research_kind,
                 objective=payload["objective"],
-                dataset=payload["dataset"] or f"lab:{scenario.id}",
+                dataset=dataset_name,
                 requested_by=payload["requested_by"],
                 budget={"loop_n": payload["loop_n"], "duration": payload["duration"]},
                 config=config,
@@ -2307,6 +2588,10 @@ class SchedulerEngine:
         except ValueError as exc:
             if f"active {scenario.research_kind} research run" not in str(exc):
                 raise
+            if managed is not None:
+                raise ScheduleRunWaiting(
+                    f"a bounded {scenario.id} research run is already active"
+                ) from exc
             self.schedules.finish_run(
                 run["id"],
                 "skipped",
@@ -2341,12 +2626,15 @@ class SchedulerEngine:
                 {
                     "scenario": scenario.id,
                     "research_run_id": research_run["id"],
-                    "dataset": payload["dataset"] or None,
+                    "dataset": dataset_name if dataset is not None else None,
                     "dataset_path": dataset["path"] if dataset else None,
                     "dataset_identity_sha256": (
-                        dataset["provenance"]["dataset_identity_sha256"] if dataset else None
+                        dataset_binding["identity_sha256"] if dataset_binding else None
                     ),
-                    "dataset_lineage_id": (dataset.get("lineage_id") if dataset else None),
+                    "dataset_lineage_id": (
+                        dataset_binding["lineage_id"] if dataset_binding else None
+                    ),
+                    "dataset_binding": dataset_binding,
                     "objective": payload["objective"],
                     "loop_n": payload["loop_n"],
                     "duration": payload["duration"],
@@ -2355,17 +2643,41 @@ class SchedulerEngine:
                         period_resolution["evaluation_profiles"] if period_resolution else []
                     ),
                     "period_resolution": period_resolution,
+                    "research_window_contract": (
+                        period_resolution["research_window_contract"]
+                        if period_resolution
+                        else None
+                    ),
+                    "research_window_contract_sha256": (
+                        period_resolution["research_window_contract_sha256"]
+                        if period_resolution
+                        else None
+                    ),
+                    "label_horizon_sessions": (
+                        max(period_resolution.get("label_horizons_sessions") or [])
+                        if period_resolution
+                        else None
+                    ),
                     "asset_ids": resolved_asset_ids,
                     "asset_manifest_sha256": assets["manifest_sha256"],
                     "feature_set": payload["feature_set"],
+                    "horizon_profile": payload["horizon_profile"],
+                    "incumbent_strategy": incumbent_strategy,
+                    "managed_fin_strategy_run": managed_run,
                     "expected_rdagent_runtime": expected_runtime_identity,
                 },
                 log_path,
                 dedupe_active_kind=False,
-                idempotency_key=f"schedule-run:{run['id']}",
+                idempotency_key=(
+                    f"managed-fin-strategy:{managed_run['run_sha256']}"
+                    if managed_run is not None
+                    else f"schedule-run:{run['id']}"
+                ),
             )
         except Exception as exc:
-            self.research.mark_run(research_run["id"], "failed", actor="scheduler", error=str(exc))
+            self.research.mark_run(
+                research_run["id"], "failed", actor="scheduler", error=str(exc)
+            )
             raise
         self.research.attach_job(research_run["id"], job["id"])
         return job
@@ -2394,11 +2706,16 @@ class SchedulerEngine:
                 )
                 return None
         else:
-            dataset = select_ops_dataset(
-                self.settings.data_root,
-                str(run["payload"].get("dataset") or "") or None,
-            )
-            calendar_days = load_calendar_days(dataset["path"])
+            try:
+                dataset = select_ops_dataset(
+                    self.settings.data_root,
+                    str(run["payload"].get("dataset") or "") or None,
+                )
+                calendar_days = load_calendar_days(dataset["path"])
+            except (FileNotFoundError, ValueError) as exc:
+                raise ScheduleRunWaiting(
+                    "governed operations calendar is not ready"
+                ) from exc
             if kind == "monthly_decision_day":
                 if local_date not in calendar_days:
                     self.schedules.finish_run(
@@ -2480,14 +2797,26 @@ class SchedulerEngine:
                 message=f"recommendation portfolio is {portfolio['status']}",
             )
             return None
-        dataset = select_qlib_dataset(
-            self.settings.data_root,
-            anchor_name=portfolio["dataset"],
-            roll_policy=str(portfolio.get("dataset_roll_policy") or "pinned"),
-            lineage_id=portfolio.get("dataset_lineage_id"),
-            required_date=signal_date,
-        )
-        calendar_days = load_calendar_days(dataset["path"])
+        try:
+            dataset = select_qlib_dataset(
+                self.settings.data_root,
+                anchor_name=portfolio["dataset"],
+                roll_policy=str(portfolio.get("dataset_roll_policy") or "pinned"),
+                lineage_id=portfolio.get("dataset_lineage_id"),
+                required_date=signal_date,
+            )
+            calendar_days = load_calendar_days(dataset["path"])
+        except (FileNotFoundError, ValueError) as exc:
+            transient_markers = (
+                "not ready and reproducible",
+                "does not cover the requested signal date",
+                "no verified latest-compatible Qlib descendant covers",
+                "calendar is unavailable",
+                "calendar is empty",
+            )
+            if any(marker in str(exc) for marker in transient_markers):
+                raise ScheduleRunWaiting(str(exc)) from exc
+            raise
         if run["trading_days_only"]:
             if signal_date not in calendar_days:
                 self.schedules.finish_run(
@@ -2506,11 +2835,6 @@ class SchedulerEngine:
         if not gate["passed"]:
             latest_snapshot = portfolio.get("latest_snapshot") or {}
             message = "; ".join(gate["reasons"])
-            self.schedules.finish_run(
-                run["id"],
-                "skipped",
-                message=f"reconciliation gate blocked: {message}",
-            )
             self.alerts.create(
                 source_type="recommendation_portfolio",
                 source_id=portfolio_id,
@@ -2534,7 +2858,7 @@ class SchedulerEngine:
                     },
                 },
             )
-            return None
+            raise ScheduleRunWaiting(f"reconciliation gate blocked: {message}")
         snapshot, created = self.recommendations.create_snapshot(
             portfolio_id=portfolio_id,
             as_of_date=signal_date,

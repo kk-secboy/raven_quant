@@ -3913,7 +3913,10 @@ def _build_qlib(
             "research-assets snapshots are isolated PDF acquisition sources and "
             "cannot be normalized into a Qlib market dataset"
         )
-    builder = QlibBuilder(snapshot_path)
+    # Production Qlib artifacts must carry the governed domestic-equity ETF
+    # whitelist.  Direct QlibBuilder construction remains usable for isolated
+    # forensic/unit fixtures that intentionally contain only A-share inputs.
+    builder = QlibBuilder(snapshot_path, require_governed_etfs=True)
     staging = context.settings.data_root / "qlib_staging" / snapshot_path.name
     output = context.settings.data_root / "qlib" / snapshot_path.name
     if not staging_only and output.exists():

@@ -13,7 +13,7 @@ from .catalog import ALL_DEFINITIONS
 from .reference_data import select_current_reference_units
 
 RELEASE_WINDOW_SELECTOR_VERSION = (
-    "release-window-selector-v5-source-history-stk-surv-fina-audit-pagination-bound"
+    "release-window-selector-v6-governed-etf-daily-publication"
 )
 QLIB_DAILY_REQUIRED_DATASETS = frozenset(
     {"stock_basic", "trade_cal", "daily", "adj_factor", "daily_basic", "stk_limit"}
@@ -26,6 +26,9 @@ QLIB_RESEARCH_REQUIRED_DATASETS = frozenset(
         "index_weight",
         "balancesheet",
         "fina_audit",
+        "fund_adj",
+        "fund_basic",
+        "fund_daily",
         "namechange",
         "index_member_all",
     }

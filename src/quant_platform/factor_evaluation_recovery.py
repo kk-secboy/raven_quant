@@ -10,6 +10,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Protocol
 
+from .research_label_binding import validate_research_label_binding
+
 _JOB_ID = re.compile(r"[0-9a-f]{32}")
 _PATH_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -272,6 +274,28 @@ def validate_factor_evaluation_result_contract(
         or len(set(candidate_ids)) != len(candidate_ids)
     ):
         raise RecoverySafetyError("factor evaluation job candidate identities are invalid")
+    raw_label_binding = payload.get("research_label_binding")
+    label_binding: dict[str, Any] | None = None
+    if raw_label_binding is not None:
+        try:
+            label_binding = validate_research_label_binding(raw_label_binding)
+        except ValueError as exc:
+            raise RecoverySafetyError("factor evaluation label binding is invalid") from exc
+        if (
+            payload.get("research_label_binding_sha256")
+            != label_binding["binding_sha256"]
+            or result.get("research_label_binding") != label_binding
+            or result.get("research_label_binding_sha256")
+            != label_binding["binding_sha256"]
+            or any(
+                int(item.get("label_horizon_days") or 0)
+                != int(label_binding["label_horizon_sessions"])
+                for item in candidates
+            )
+        ):
+            raise RecoverySafetyError(
+                "factor evaluation label binding changed between job and result"
+            )
     profiles = payload.get("evaluation_profiles")
     frozen_profiles: dict[str, dict[str, str]] = {}
     profile_by_periods: dict[tuple[str, ...], str] = {}
@@ -350,6 +374,21 @@ def validate_factor_evaluation_result_contract(
                 or not isinstance(item.get("recompute_evidence"), dict)
             ):
                 raise RecoverySafetyError("successful factor evaluation evidence is incomplete")
+            if label_binding is not None:
+                recompute = item["recompute_evidence"]
+                if (
+                    int(recompute.get("label_horizon_days") or 0)
+                    != int(label_binding["label_horizon_sessions"])
+                    or recompute.get("research_label_binding_sha256")
+                    != label_binding["binding_sha256"]
+                    or recompute.get("research_window_contract_sha256")
+                    != label_binding["research_window_contract_sha256"]
+                    or recompute.get("horizon_profile")
+                    != label_binding["horizon_profile"]
+                ):
+                    raise RecoverySafetyError(
+                        "successful factor evaluation used another label contract"
+                    )
             succeeded += 1
         else:
             failed += 1

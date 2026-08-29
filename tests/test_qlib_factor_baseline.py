@@ -10,6 +10,7 @@ from quant_platform.qlib_factor_baseline import (
     FACTOR_SOURCE_QLIB_BASELINE,
     FACTOR_SOURCE_QLIB_BASELINE_PLUS_CHALLENGER,
     QLIB_BASELINE_RECIPE_IDS,
+    bind_factor_source_config,
     canonical_sha256,
     combine_factor_sources,
     core_baseline_definition,
@@ -67,9 +68,46 @@ def test_swing_recipe_is_a_governed_daily_qlib_baseline_family() -> None:
         "amount_expansion",
         "bollinger_bandwidth_20",
         "financial_quality",
+        "industry_relative_strength_3m",
     ]
     assert "EMA(" in definition["factors"][1]["qlib_expression"]
     assert sum(item["weight"] for item in definition["factors"]) == pytest.approx(1.0)
+
+
+def test_short_and_long_research_recipes_use_the_existing_qlib_baseline_path() -> None:
+    short = core_baseline_definition("short_relative_strength")
+    long = core_baseline_definition("long_quality_value")
+
+    assert {"short_relative_strength", "long_quality_value"}.issubset(
+        QLIB_BASELINE_RECIPE_IDS
+    )
+    assert short["frequency"] == "day"
+    assert long["frequency"] == "day"
+    assert [item["id"] for item in short["factors"]] == [
+        "relative_strength_5d",
+        "amount_expansion_5d",
+        "close_location_5d",
+        "extension_penalty_5d",
+    ]
+    assert [item["id"] for item in long["factors"]] == [
+        "capital_efficiency",
+        "cash_profit_quality",
+        "earnings_value",
+        "durable_growth",
+        "balance_sheet_resilience",
+        "earnings_stability",
+    ]
+    for recipe_id in ("short_relative_strength", "long_quality_value"):
+        bound = bind_factor_source_config(
+            {
+                "recipe_id": recipe_id,
+                "factor_source_mode": FACTOR_SOURCE_QLIB_BASELINE,
+                "challenger_weight": 0.0,
+            },
+            factor_count=0,
+            creating_family=True,
+        )
+        assert bound["baseline_definition"]["frequency"] == "day"
 
 
 def test_qlib_baseline_values_are_winsorized_zscored_and_composed() -> None:

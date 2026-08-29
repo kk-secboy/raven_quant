@@ -1,11 +1,13 @@
 [Unit]
-Description=QuantLab coordinated PostgreSQL and data backup
+Description=QuantLab bounded control-plane backup
 Documentation=file:/opt/quantlab/docs/DEPLOYMENT.md
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
 ConditionPathExists=/opt/quantlab/deploy/.env
-ConditionPathExists=/opt/quantlab/.venv/bin/python
+ConditionPathExists=/opt/quantlab-ops/venv/bin/python
+ConditionPathExists=/opt/quantlab/scripts/backup_preflight.py
+ConditionPathExists=/opt/quantlab/scripts/backup.py
 
 [Service]
 Type=oneshot
@@ -13,8 +15,8 @@ User=root
 Group=root
 WorkingDirectory=/opt/quantlab
 Environment=PYTHONUNBUFFERED=1
-ExecStartPre=/opt/quantlab/.venv/bin/python /opt/quantlab/scripts/release_preflight.py --minimum-free-gb 20 --report /opt/quantlab/artifacts/scheduled-backup-preflight.json
-ExecStart=/opt/quantlab/.venv/bin/python /opt/quantlab/scripts/backup.py --backup-root /opt/quantlab-backups --retention-count 14
+ExecStartPre=/opt/quantlab-ops/venv/bin/python /opt/quantlab/scripts/backup_preflight.py --backup-root /opt/quantlab-backups --minimum-free-gb 10 --report /var/lib/quantlab-ops/scheduled-backup-preflight.json
+ExecStart=/opt/quantlab-ops/venv/bin/python /opt/quantlab/scripts/backup.py --backup-root /opt/quantlab-backups --retention-count 14 --format-version 2 --minimum-free-gb 10
 TimeoutStartSec=6h
 Nice=10
 IOSchedulingClass=best-effort

@@ -3,6 +3,11 @@
 import { FormEvent, useMemo, useRef, useState } from "react";
 import { apiFetch } from "./api-client";
 import { ParameterExperimentPanel } from "./parameter-experiment-panel";
+import {
+  factorSourceSelectionIsValid,
+  recipeUsesQlibBaseline,
+  visibleStrategyCreationRecipes,
+} from "./strategy-recipe-policy.mjs";
 import { usePolling } from "./use-polling";
 
 type Factor = { id: string; name: string; description: string; status: string };
@@ -209,7 +214,7 @@ export function BacktestPanel({ api }: { api: string }) {
         label: "策略配方",
         request: jsonResponse<{ recipes: StrategyRecipe[] }>(
           apiFetch(`${api}/api/strategy-recipes`, { cache: "no-store" }),
-        ).then((body) => setRecipes(body.recipes.filter((item) => item.category === "multifactor"))),
+        ).then((body) => setRecipes(visibleStrategyCreationRecipes(body.recipes))),
       },
     ];
     const results = await Promise.allSettled(resources.map((item) => item.request));
@@ -240,6 +245,7 @@ export function BacktestPanel({ api }: { api: string }) {
     ? executionDataset
     : minuteExecutionDatasets[0]?.name ?? "";
   const active = useMemo(() => backtests.some((item) => ["queued", "running"].includes(item.status)), [backtests]);
+  const selectedRecipe = recipes.find((item) => item.id === recipeId);
   const riskConfigurationValid = takeProfitPartial < takeProfit
     && maxDrawdownReduce < maxDrawdownLiquidate
     && maxIndustryWeight >= maxPositionWeight
@@ -247,22 +253,14 @@ export function BacktestPanel({ api }: { api: string }) {
     && maxSizeDeviation >= 0
     && (!["benchmark_relative_qp", "industry_neutral_qp"].includes(portfolioConstruction) || topk * maxPositionWeight >= 1)
     && optimizerAlphaWeight + optimizerTrackingPenalty + optimizerTurnoverPenalty > 0;
-  const isCoreBaselineRecipe = ["index_enhancement", "full_market_multifactor"].includes(recipeId);
+  const isQlibBaselineRecipe = recipeUsesQlibBaseline(selectedRecipe);
   const factorSelectionRequired = factorSourceMode !== "qlib_baseline";
-  const factorSourceValid = (
-    (!isCoreBaselineRecipe && factorSourceMode === "promoted_only")
-    || (isCoreBaselineRecipe && factorSourceMode === "qlib_baseline")
-    || (
-      isCoreBaselineRecipe
-      && factorSourceMode === "qlib_baseline_plus_challenger"
-      && challengerWeight > 0
-      && challengerWeight < 1
-    )
-    || (
-      isCoreBaselineRecipe
-      && factorSourceMode === "qlib_challenger_replacement"
-    )
-  ) && (!factorSelectionRequired || Object.keys(selectedFactors).length > 0);
+  const factorSourceValid = factorSourceSelectionIsValid(
+    selectedRecipe,
+    factorSourceMode,
+    challengerWeight,
+    Object.keys(selectedFactors).length,
+  );
 
   function toggleFactor(factorId: string) {
     const next = { ...selectedFactors };
@@ -280,7 +278,7 @@ export function BacktestPanel({ api }: { api: string }) {
     if (!recipe) return;
     const merged = { ...serverDefaults, ...recipe.config_overrides } as Record<string, number | string>;
     applyVisibleConfig(merged);
-    if (["index_enhancement", "full_market_multifactor"].includes(recipe.id)) {
+    if (recipeUsesQlibBaseline(recipe)) {
       setSelectedFactors({});
     }
     setName(recipe.name);
@@ -405,7 +403,6 @@ export function BacktestPanel({ api }: { api: string }) {
     ? metrics.rolling as RollingReport : null;
   const eventStress = typeof metrics.event_stress === "object" && metrics.event_stress !== null
     ? metrics.event_stress as EventStressReport : null;
-  const selectedRecipe = recipes.find((item) => item.id === recipeId);
   return <>
     {loadMessage && <div className="notice">{loadMessage}</div>}
     {message && <div className="notice">{message}</div>}
@@ -420,8 +417,8 @@ export function BacktestPanel({ api }: { api: string }) {
         {selectedRecipe && <div className="execution-note"><b>不可变配方基线 · {selectedRecipe.name}</b><span>{selectedRecipe.description}</span>{selectedRecipe.factor_guidance.map((item) => <span key={item}>{item}</span>)}</div>}
         <div className="form-row"><label>策略名称<input value={name} onChange={(event) => setName(event.target.value)} /></label><label>基准<input value="沪深300 · SH000300" disabled /></label></div>
         <label>策略说明<textarea value={description} onChange={(event) => setDescription(event.target.value)} /></label>
-        {isCoreBaselineRecipe && <div className="execution-note"><b>Qlib 六因子正式基线</b><span>v1 必须先独立运行固定 20/10/20/20/10/20 基线；RD-Agent 候选只能在新版本中显式增强或替换。</span><label>信号来源<select value={factorSourceMode} onChange={(event) => setFactorSourceMode(event.target.value)}><option value="qlib_baseline">固定 Qlib 基线</option><option value="qlib_baseline_plus_challenger">基线 + RD-Agent 挑战者</option><option value="qlib_challenger_replacement">RD-Agent 挑战者替换</option></select></label>{factorSourceMode === "qlib_baseline_plus_challenger" && <label>挑战者权重（%）<input type="number" min="1" max="99" step="1" value={challengerWeight * 100} onChange={(event) => setChallengerWeight(Number(event.target.value) / 100)} /></label>}</div>}
-        <div className="factor-picker"><span>{factorSelectionRequired ? "选择已晋级挑战者因子" : "固定基线无需 RD-Agent 因子"}</span>{factorSelectionRequired && factors.map((item) => <label key={item.id}><input type="checkbox" checked={item.id in selectedFactors} onChange={() => toggleFactor(item.id)} /><b>{item.name}</b><small>{item.description}</small>{item.id in selectedFactors ? <input type="number" step="0.1" value={selectedFactors[item.id]} onChange={(event) => setSelectedFactors({ ...selectedFactors, [item.id]: Number(event.target.value) })} /> : null}</label>)}{factorSelectionRequired && !factors.length && <div className="empty compact">因子库中还没有已晋级因子。先完成 RD-Agent → Qlib → 人工晋级。</div>}{!factorSelectionRequired && <div className="empty compact">正式回测会直接调用 Qlib D.features 复算六个表达式，并固化数值制品、SHA256 与 Recorder 身份。</div>}</div>
+        {isQlibBaselineRecipe && <div className="execution-note"><b>不可变 Qlib 正式基线 · {selectedRecipe?.name}</b><span>v1 必须先独立运行配方内置基线，不需要 RD-Agent 因子；挑战者只能在新版本中显式增强或替换。</span><label>信号来源<select value={factorSourceMode} onChange={(event) => setFactorSourceMode(event.target.value)}><option value="qlib_baseline">固定 Qlib 基线</option><option value="qlib_baseline_plus_challenger">基线 + RD-Agent 挑战者</option><option value="qlib_challenger_replacement">RD-Agent 挑战者替换</option></select></label>{factorSourceMode === "qlib_baseline_plus_challenger" && <label>挑战者权重（%）<input type="number" min="1" max="99" step="1" value={challengerWeight * 100} onChange={(event) => setChallengerWeight(Number(event.target.value) / 100)} /></label>}</div>}
+        <div className="factor-picker"><span>{factorSelectionRequired ? "选择已晋级挑战者因子" : "固定基线无需 RD-Agent 因子"}</span>{factorSelectionRequired && factors.map((item) => <label key={item.id}><input type="checkbox" checked={item.id in selectedFactors} onChange={() => toggleFactor(item.id)} /><b>{item.name}</b><small>{item.description}</small>{item.id in selectedFactors ? <input type="number" step="0.1" value={selectedFactors[item.id]} onChange={(event) => setSelectedFactors({ ...selectedFactors, [item.id]: Number(event.target.value) })} /> : null}</label>)}{factorSelectionRequired && !factors.length && <div className="empty compact">因子库中还没有已晋级因子。先完成 RD-Agent → Qlib → 人工晋级。</div>}{!factorSelectionRequired && <div className="empty compact">正式回测会直接调用 Qlib D.features 复算配方内置表达式，并固化数值制品、SHA256 与 Recorder 身份。</div>}</div>
         <details className="advanced-options strategy-risk-options">
           <summary>风控与容量参数（使用系统默认值，可展开修改）</summary>
           <div className="execution-note"><b>默认风控模板</b><span>比例直接按百分数填写，例如 7 = 7%</span><span>已审批版本不会被修改；调整参数会创建新的不可变策略版本</span></div>
@@ -464,7 +461,7 @@ export function BacktestPanel({ api }: { api: string }) {
           </div>
         </details>
         {!riskConfigurationValid && <div className="notice">参数无效：请检查止盈/回撤阈值、行业与单票上限；基准相对优化还要求持仓数 × 单票上限不低于 100%，且目标函数至少有一个正权重。</div>}
-        <button className="primary" disabled={!riskConfigurationValid || !factorSourceValid || (isCoreBaselineRecipe && factorSourceMode !== "qlib_baseline") || name.length < 3 || description.length < 10}>创建策略 v1</button>
+        <button className="primary" disabled={!riskConfigurationValid || !factorSourceValid || (isQlibBaselineRecipe && factorSourceMode !== "qlib_baseline") || name.length < 3 || description.length < 10}>创建策略 v1</button>
         <button type="button" onClick={createNextVersion} disabled={!riskConfigurationValid || !factorSourceValid || !current}>基于当前参数创建 vNext</button>
       </form>
 

@@ -4,7 +4,7 @@ import hashlib
 import json
 import uuid
 from collections import Counter
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,13 @@ from quant_platform.jsonb_safety import normalize_jsonb_document
 
 EVALUATION_STATUS_COUNTS_KEY = "_quantlab_evaluation_status_counts"
 MAX_NUMERICAL_THREADS_PER_JOB = 8
+ORDER_PLAN_MATERIALIZATION_STATUS_KEY = "simulation_batch_materialization_status"
+ORDER_PLAN_EXECUTION_TRADE_DATE_KEY = "simulation_batch_execution_trade_date"
+ORDER_PLAN_AWAITING_EXECUTION_DATA = "awaiting_execution_data"
+ORDER_PLAN_MATERIALIZED = "materialized"
+ORDER_PLAN_CANCELLED = "cancelled"
+ORDER_PLAN_SUPERSEDED = "superseded"
+ORDER_PLAN_FAILED = "failed"
 
 # Global heavy-work CPU tokens.  This is deliberately independent of Docker's
 # per-container ceiling: several individually capped containers can still
@@ -182,6 +189,7 @@ AUTO_RETRY_ATTEMPTS = {
     "model_refit": 3,
     "recommendation_refresh": 3,
     "simulation_order_plan": 3,
+    "simulation_replay": 3,
 }
 
 
@@ -446,6 +454,146 @@ class JobStore:
                 return
             raise KeyError(job_id)
 
+    def awaiting_simulation_order_plans(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return successful immutable plans still waiting for their D+1 dataset."""
+
+        statement = (
+            select(
+                jobs.c.id,
+                jobs.c.payload_json,
+                jobs.c.progress_json,
+                jobs.c.created_at,
+            )
+            .where(
+                jobs.c.kind == "simulation_order_plan",
+                jobs.c.status == "succeeded",
+                jobs.c.progress_json[ORDER_PLAN_MATERIALIZATION_STATUS_KEY].as_string()
+                == ORDER_PLAN_AWAITING_EXECUTION_DATA,
+            )
+            .order_by(jobs.c.created_at)
+            .limit(limit)
+        )
+        with self.engine.connect() as connection:
+            return [self._decode(row_dict(row)) for row in connection.execute(statement)]
+
+    def complete_simulation_order_plan_materialization(
+        self,
+        job_id: str,
+        *,
+        order_plan_manifest_sha256: str,
+        simulation_batch_id: str,
+        batch_created: bool,
+    ) -> bool:
+        """Atomically settle one deferred plan after its idempotent batch exists."""
+
+        with self.engine.begin() as connection:
+            row = connection.execute(
+                select(jobs)
+                .where(jobs.c.id == job_id)
+                .with_for_update()
+            ).first()
+            if row is None:
+                raise KeyError(job_id)
+            if str(row.kind) != "simulation_order_plan" or str(row.status) != "succeeded":
+                raise ValueError(
+                    "deferred order-plan materialization requires a successful plan job"
+                )
+            progress = dict(row.progress_json or {})
+            if (
+                str(progress.get("order_plan_manifest_sha256") or "")
+                != order_plan_manifest_sha256
+            ):
+                raise ValueError(
+                    "deferred order-plan materialization changed its immutable manifest"
+                )
+            current_status = str(
+                progress.get(ORDER_PLAN_MATERIALIZATION_STATUS_KEY) or ""
+            )
+            if current_status == ORDER_PLAN_MATERIALIZED:
+                if str(progress.get("simulation_batch_id") or "") != simulation_batch_id:
+                    raise ValueError(
+                        "deferred order-plan materialization is bound to another batch"
+                    )
+                return False
+            if current_status != ORDER_PLAN_AWAITING_EXECUTION_DATA:
+                raise ValueError("order-plan job is not awaiting execution data")
+            progress.update(
+                {
+                    ORDER_PLAN_MATERIALIZATION_STATUS_KEY: ORDER_PLAN_MATERIALIZED,
+                    "simulation_batch_id": simulation_batch_id,
+                    "simulation_batch_created": bool(batch_created),
+                }
+            )
+            connection.execute(
+                update(jobs)
+                .where(jobs.c.id == job_id)
+                .values(progress_json=normalize_jsonb_document(progress))
+            )
+        return True
+
+    def terminate_simulation_order_plan_materialization(
+        self,
+        job_id: str,
+        *,
+        order_plan_manifest_sha256: str,
+        materialization_status: str,
+        reason: str,
+    ) -> bool:
+        """Persist a domain terminal without leaving a poison awaiting row."""
+
+        if materialization_status not in {
+            ORDER_PLAN_CANCELLED,
+            ORDER_PLAN_SUPERSEDED,
+            ORDER_PLAN_FAILED,
+        }:
+            raise ValueError("order-plan materialization terminal status is invalid")
+        normalized_reason = str(reason or "")[:2_000]
+        with self.engine.begin() as connection:
+            row = connection.execute(
+                select(jobs).where(jobs.c.id == job_id).with_for_update()
+            ).first()
+            if row is None:
+                raise KeyError(job_id)
+            progress = dict(row.progress_json or {})
+            if (
+                str(row.kind) != "simulation_order_plan"
+                or str(progress.get("order_plan_manifest_sha256") or "")
+                != order_plan_manifest_sha256
+            ):
+                raise ValueError(
+                    "order-plan materialization terminal changed its immutable identity"
+                )
+            current = str(progress.get(ORDER_PLAN_MATERIALIZATION_STATUS_KEY) or "")
+            if current == materialization_status:
+                return False
+            if current != ORDER_PLAN_AWAITING_EXECUTION_DATA:
+                raise ValueError("order-plan materialization is no longer awaiting")
+            progress.update(
+                {
+                    ORDER_PLAN_MATERIALIZATION_STATUS_KEY: materialization_status,
+                    "simulation_batch_materialization_reason": normalized_reason,
+                }
+            )
+            job_status = (
+                materialization_status
+                if materialization_status in {ORDER_PLAN_CANCELLED, ORDER_PLAN_FAILED}
+                else "succeeded"
+            )
+            connection.execute(
+                update(jobs)
+                .where(jobs.c.id == job_id)
+                .values(
+                    status=job_status,
+                    progress_json=normalize_jsonb_document(progress),
+                    error=(
+                        normalized_reason
+                        if materialization_status == ORDER_PLAN_FAILED
+                        else None
+                    ),
+                )
+            )
+        return True
+
     def finish_or_retry(
         self,
         job_id: str,
@@ -505,10 +653,75 @@ class JobStore:
     def retry(self, job_id: str) -> dict[str, Any]:
         with self.engine.begin() as connection:
             row = connection.execute(
-                select(jobs.c.status).where(jobs.c.id == job_id).with_for_update()
+                select(jobs).where(jobs.c.id == job_id).with_for_update()
             ).first()
             if row is None:
                 raise KeyError(job_id)
+            progress = dict(row.progress_json or {})
+            if str(row.kind) == "simulation_order_plan":
+                materialization_status = str(
+                    progress.get(ORDER_PLAN_MATERIALIZATION_STATUS_KEY) or ""
+                )
+                if materialization_status == ORDER_PLAN_SUPERSEDED:
+                    raise ValueError("superseded simulation order plans cannot be retried")
+                raw_manifest_sha256 = progress.get("order_plan_manifest_sha256")
+                if raw_manifest_sha256 is not None:
+                    manifest_sha256 = str(raw_manifest_sha256).strip().lower()
+                    if len(manifest_sha256) != 64 or any(
+                        character not in "0123456789abcdef"
+                        for character in manifest_sha256
+                    ):
+                        raise ValueError(
+                            "sealed simulation order-plan manifest identity is invalid"
+                        )
+                    if materialization_status not in {
+                        ORDER_PLAN_FAILED,
+                        ORDER_PLAN_CANCELLED,
+                        ORDER_PLAN_AWAITING_EXECUTION_DATA,
+                    }:
+                        raise ValueError(
+                            "sealed simulation order plan has no recoverable "
+                            "materialization terminal"
+                        )
+                    try:
+                        date.fromisoformat(
+                            str(progress[ORDER_PLAN_EXECUTION_TRADE_DATE_KEY])
+                        )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ValueError(
+                            "sealed simulation order plan has no recoverable execution date"
+                        ) from exc
+                    if row.status not in {"failed", "cancelled"}:
+                        raise ValueError(
+                            "only failed or cancelled jobs may be retried"
+                        )
+                    # The governed signal artifact already exists.  Requeueing
+                    # the subprocess would recompute an old D signal against a
+                    # newer publication and can never be a frozen recovery.
+                    # Preserve every result/evidence field and hand the exact
+                    # manifest back to Scheduler's D+1 materializer instead.
+                    progress[ORDER_PLAN_MATERIALIZATION_STATUS_KEY] = (
+                        ORDER_PLAN_AWAITING_EXECUTION_DATA
+                    )
+                    connection.execute(
+                        update(jobs)
+                        .where(jobs.c.id == job_id)
+                        .values(
+                            status="succeeded",
+                            progress_json=normalize_jsonb_document(progress),
+                            exit_code=0,
+                            error=None,
+                            cancel_requested_at=None,
+                            next_attempt_at=None,
+                        )
+                    )
+                    return self._decode(
+                        row_dict(
+                            connection.execute(
+                                select(jobs).where(jobs.c.id == job_id)
+                            ).one()
+                        )
+                    )
             if row.status not in {"failed", "cancelled"}:
                 raise ValueError("only failed or cancelled jobs may be retried")
             connection.execute(

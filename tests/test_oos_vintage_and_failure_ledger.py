@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -17,10 +17,16 @@ from governance_fixtures import (
     passing_factor_metrics,
 )
 from qlib_test_doubles import qlib_workflow_identity
-from sqlalchemy import select
+from sqlalchemy import insert, select
 
 from quant_data.config import Settings
-from quant_data.database import oos_vintages, open_database, row_dict
+from quant_data.database import (
+    oos_vintages,
+    open_database,
+    research_campaigns,
+    research_programs,
+    row_dict,
+)
 from quant_platform.api import StrategyConfigRequest
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.job_store import JobStore
@@ -28,8 +34,6 @@ from quant_platform.research_automation import (
     rank_factor_candidates,
     rank_multi_profile_candidates,
 )
-from quant_platform.research_campaign_store import ResearchCampaignStore
-from quant_platform.research_program_store import ResearchProgramStore
 from quant_platform.research_store import ResearchStore
 from quant_platform.strategy_store import StrategyStore
 from quant_platform.worker import LocalJobWorker
@@ -248,23 +252,17 @@ def test_same_candidate_new_version_rejected_after_consumption(
         version_id=version_id, dataset="snapshot", periods=FINAL_PERIODS, artifact_path=tmp_path
     )
     version = store.get_version(version_id)
-    frozen = store.create_version(
-        str(version["strategy_id"]),
-        benchmark=version["benchmark"],
-        universe=version["universe"],
-        factors=[
-            {"candidate_id": item["factor_candidate_id"], "weight": item["weight"]}
-            for item in version["factors"]
-        ],
-        config=version["config"],
-        actor="test",
-    )
     with pytest.raises(ValueError, match="already been consumed"):
-        store.create_backtest(
-            version_id=frozen["id"],
-            dataset="snapshot",
-            periods=FINAL_PERIODS,
-            artifact_path=tmp_path,
+        store.create_version(
+            str(version["strategy_id"]),
+            benchmark=version["benchmark"],
+            universe=version["universe"],
+            factors=[
+                {"candidate_id": item["factor_candidate_id"], "weight": item["weight"]}
+                for item in version["factors"]
+            ],
+            config=version["config"],
+            actor="test",
         )
 
 
@@ -273,38 +271,56 @@ def test_program_scope_binds_vintage_across_renamed_campaigns(
 ) -> None:
     """A second campaign (new name/lineage) under the same program cannot reopen."""
 
-    programs = ResearchProgramStore(database_url)
-    campaigns = ResearchCampaignStore(database_url)
-    program = programs.create(
-        name=f"program-{uuid.uuid4().hex}",
-        recipe_id="recipe",
-        objective="governed research",
-        benchmark="SH000300",
-        universe="cn_all",
-        dataset_lineage_id="lineage",
-        config={},
-        min_new_trading_days=1,
-        max_active_campaigns=2,
-        actor="test",
-    )
+    program_id = uuid.uuid4().hex
+    current = datetime.now(UTC)
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(research_programs).values(
+                id=program_id,
+                name=f"program-{program_id}",
+                status="cancelled",
+                recipe_id="recipe",
+                objective="governed research history",
+                benchmark="SH000300",
+                universe="cn_all",
+                dataset_lineage_id="a" * 64,
+                config_json={},
+                min_new_trading_days=1,
+                max_active_campaigns=2,
+                next_check_at=current,
+                created_by="legacy-fixture",
+                created_at=current,
+                updated_at=current,
+            )
+        )
     candidate_a = create_promoted_factor(database_url, tmp_path)
-    campaign_a = campaigns.create(
-        name=f"campaign-alpha-{uuid.uuid4().hex}",
-        objective="first campaign",
-        dataset="snapshot",
-        benchmark="SH000300",
-        universe="cn_all",
-        recipe_id="recipe",
-        config={},
-        actor="test",
-        research_program_id=program["id"],
-        dataset_identity_sha256=DATASET_IDENTITY,
-    )
-    campaigns.transition(
-        campaign_a["id"],
-        event_type="test.link",
-        links={"research_run_id": str(candidate_a["research_run_id"])},
-    )
+    campaign_a_id = uuid.uuid4().hex
+    with engine.begin() as connection:
+        connection.execute(
+            insert(research_campaigns).values(
+                id=campaign_a_id,
+                name=f"campaign-alpha-{campaign_a_id}",
+                status="cancelled",
+                stage="research",
+                objective="first campaign history",
+                dataset="snapshot",
+                benchmark="SH000300",
+                universe="cn_all",
+                recipe_id="recipe",
+                research_program_id=program_id,
+                dataset_identity_sha256=DATASET_IDENTITY,
+                config_json={},
+                state_json={},
+                research_run_id=str(candidate_a["research_run_id"]),
+                attempts=1,
+                next_action_at=current,
+                created_by="legacy-fixture",
+                created_at=current,
+                updated_at=current,
+                finished_at=current,
+            )
+        )
     version_a = _version_for_candidate(database_url, str(candidate_a["id"]))
     strategies = StrategyStore(database_url)
     strategies.create_backtest(
@@ -312,36 +328,41 @@ def test_program_scope_binds_vintage_across_renamed_campaigns(
     )
     rows = _vintage_rows(database_url)
     assert len(rows) == 1
-    assert rows[0]["scope"] == f"program:{program['id']}"
+    assert rows[0]["scope"] == f"program:{program_id}"
 
     candidate_b = create_promoted_factor(database_url, tmp_path)
-    campaign_b = campaigns.create(
-        name=f"campaign-beta-{uuid.uuid4().hex}",
-        objective="renamed successor campaign",
-        dataset="snapshot",
-        benchmark="SH000300",
-        universe="cn_all",
-        recipe_id="recipe",
-        config={},
-        actor="test",
-        research_program_id=program["id"],
-        dataset_identity_sha256="b" * 64,
-    )
-    campaigns.transition(
-        campaign_b["id"],
-        event_type="test.link",
-        links={"research_run_id": str(candidate_b["research_run_id"])},
-    )
+    campaign_b_id = uuid.uuid4().hex
+    with engine.begin() as connection:
+        connection.execute(
+            insert(research_campaigns).values(
+                id=campaign_b_id,
+                name=f"campaign-beta-{campaign_b_id}",
+                status="cancelled",
+                stage="research",
+                objective="renamed successor campaign history",
+                dataset="snapshot",
+                benchmark="SH000300",
+                universe="cn_all",
+                recipe_id="recipe",
+                research_program_id=program_id,
+                dataset_identity_sha256="b" * 64,
+                config_json={},
+                state_json={},
+                research_run_id=str(candidate_b["research_run_id"]),
+                attempts=1,
+                next_action_at=current,
+                created_by="legacy-fixture",
+                created_at=current,
+                updated_at=current,
+                finished_at=current,
+            )
+        )
     version_b = _version_for_candidate(database_url, str(candidate_b["id"]))
-    overlapping_periods = {
-        "start": date(2022, 1, 3).isoformat(),
-        "end": PERIODS["test_end"].isoformat(),
-    }
-    with pytest.raises(ValueError, match="overlaps a reserved or consumed OOS vintage"):
+    with pytest.raises(ValueError, match="sealed candidate set"):
         strategies.create_backtest(
             version_id=version_b,
             dataset="snapshot",
-            periods=overlapping_periods,
+            periods=FINAL_PERIODS,
             artifact_path=tmp_path,
         )
     assert len(_vintage_rows(database_url)) == 1
@@ -507,10 +528,13 @@ def test_worker_import_ledgers_failed_evaluations(
             "research_run_id": run["id"],
             "dataset": "snapshot",
             "dataset_identity_sha256": DATASET_IDENTITY,
+            "candidates": [{"id": candidate["id"]}],
             "periods": {key: value.isoformat() for key, value in PERIODS.items()},
         }
     }
     result = {
+        "status": "ok",
+        "qlib_workflow": qlib_workflow_identity(),
         "evaluations": [
             {
                 "candidate_id": candidate["id"],

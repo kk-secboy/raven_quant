@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import insert, or_, select, text, update
 
 from quant_data.database import (
     autopilot_branches,
@@ -11,13 +11,19 @@ from quant_data.database import (
     jobs,
     open_database,
     parameter_experiments,
+    research_campaign_events,
     research_campaigns,
+    research_program_events,
     research_programs,
     research_runs,
+    schedule_runs,
+    schedules,
 )
 
-from .research_campaign_store import ResearchCampaignStore
-from .research_program_store import ResearchProgramStore
+from .schedule_store import (
+    LEGACY_RESEARCH_RETIREMENT_LOCK_KEY,
+    LEGACY_RESEARCH_SCHEDULE_SUSPENSION,
+)
 
 _ACTIVE_JOB_STATUSES = frozenset({"queued", "running"})
 _PROTECTED_JOB_KINDS = frozenset(
@@ -45,8 +51,6 @@ _PROTECTED_JOB_PREFIXES = (
     "supplemental_",
     "tushare_",
 )
-
-
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -95,82 +99,159 @@ class LegacyResearchRetirement:
 
     def __init__(self, database_url: str) -> None:
         self.engine = open_database(database_url)
-        self.campaigns = ResearchCampaignStore(database_url)
-        self.programs = ResearchProgramStore(database_url)
 
-    def plan(self) -> dict[str, Any]:
-        with self.engine.connect() as connection:
-            campaigns = connection.execute(
-                select(research_campaigns).where(
-                    research_campaigns.c.status.in_(("queued", "running", "awaiting_approval"))
+    @staticmethod
+    def _plan(connection: Any) -> dict[str, Any]:
+        # Scan every historical campaign for durable ownership links.  A
+        # succeeded campaign is immutable history, but a schedule or orphaned
+        # job it created must not remain a live write path after the cutover.
+        all_campaigns = connection.execute(select(research_campaigns)).all()
+        campaign_ids = {str(item.id) for item in all_campaigns}
+        active_campaigns = [
+            item
+            for item in all_campaigns
+            if str(item.status) in {"queued", "running", "awaiting_approval"}
+        ]
+        programs = connection.execute(
+            select(research_programs).where(
+                research_programs.c.status.in_(("active", "paused"))
+            )
+        ).all()
+        autopilot_job_ids = {
+            str(item)
+            for item in connection.scalars(
+                select(autopilot_branches.c.job_id).where(
+                    autopilot_branches.c.job_id.is_not(None)
                 )
-            ).all()
-            programs = connection.execute(
-                select(research_programs).where(
-                    research_programs.c.status.in_(("active", "paused"))
-                )
-            ).all()
-            autopilot_job_ids = {
+            )
+        }
+        candidate_job_ids: set[str] = set()
+        experiment_ids: set[str] = set()
+        backtest_ids: set[str] = set()
+        research_run_ids: set[str] = set()
+        paper_schedule_ids: set[str] = set()
+        for campaign in all_campaigns:
+            candidate_job_ids.update(_job_ids(campaign.state_json or {}))
+            if campaign.parameter_experiment_id:
+                experiment_ids.add(str(campaign.parameter_experiment_id))
+            if campaign.backtest_id:
+                backtest_ids.add(str(campaign.backtest_id))
+            if campaign.research_run_id:
+                research_run_ids.add(str(campaign.research_run_id))
+            if campaign.paper_schedule_id:
+                paper_schedule_ids.add(str(campaign.paper_schedule_id))
+        if research_run_ids:
+            candidate_job_ids.update(
                 str(item)
                 for item in connection.scalars(
-                    select(autopilot_branches.c.job_id).where(
-                        autopilot_branches.c.job_id.is_not(None)
+                    select(research_runs.c.job_id).where(
+                        research_runs.c.id.in_(sorted(research_run_ids)),
+                        research_runs.c.job_id.is_not(None),
                     )
                 )
+            )
+        if experiment_ids:
+            candidate_job_ids.update(
+                str(item)
+                for item in connection.scalars(
+                    select(parameter_experiments.c.job_id).where(
+                        parameter_experiments.c.id.in_(sorted(experiment_ids)),
+                        parameter_experiments.c.job_id.is_not(None),
+                    )
+                )
+            )
+        if backtest_ids:
+            candidate_job_ids.update(
+                str(item)
+                for item in connection.scalars(
+                    select(backtest_runs.c.job_id).where(
+                        backtest_runs.c.id.in_(sorted(backtest_ids)),
+                        backtest_runs.c.job_id.is_not(None),
+                    )
+                )
+            )
+        if campaign_ids:
+            candidate_job_ids.update(
+                str(item)
+                for item in connection.scalars(
+                    select(jobs.c.id).where(
+                        jobs.c.payload_json["research_campaign_id"]
+                        .as_string()
+                        .in_(sorted(campaign_ids))
+                    )
+                )
+            )
+        schedule_ownership = [
+            schedules.c.created_by.like("research-campaign:%"),
+            schedules.c.payload_json.op("?")("research_campaign_id").is_(True),
+        ]
+        if paper_schedule_ids:
+            schedule_ownership.append(schedules.c.id.in_(sorted(paper_schedule_ids)))
+        legacy_schedule_ids = sorted(
+            str(item)
+            for item in connection.scalars(
+                select(schedules.c.id).where(or_(*schedule_ownership))
+            )
+        )
+        legacy_schedule_run_ids: list[str] = []
+        if legacy_schedule_ids:
+            legacy_schedule_run_ids = sorted(
+                str(item)
+                for item in connection.scalars(
+                    select(schedule_runs.c.id).where(
+                        schedule_runs.c.schedule_id.in_(legacy_schedule_ids)
+                    )
+                )
+            )
+            candidate_job_ids.update(
+                str(item)
+                for item in connection.scalars(
+                    select(schedule_runs.c.job_id).where(
+                        schedule_runs.c.schedule_id.in_(legacy_schedule_ids),
+                        schedule_runs.c.job_id.is_not(None),
+                    )
+                )
+            )
+        if legacy_schedule_run_ids:
+            schedule_idempotency_keys = [
+                f"schedule-run:{item}" for item in legacy_schedule_run_ids
+            ]
+            candidate_job_ids.update(
+                str(item)
+                for item in connection.scalars(
+                    select(jobs.c.id).where(
+                        or_(
+                            jobs.c.idempotency_key.in_(schedule_idempotency_keys),
+                            jobs.c.payload_json["schedule_run_id"]
+                            .as_string()
+                            .in_(legacy_schedule_run_ids),
+                        )
+                    )
+                )
+            )
+        active_jobs = {
+            str(row.id): {
+                "id": str(row.id),
+                "kind": str(row.kind),
+                "status": str(row.status),
             }
-            candidate_job_ids: set[str] = set()
-            experiment_ids: set[str] = set()
-            backtest_ids: set[str] = set()
-            for campaign in campaigns:
-                candidate_job_ids.update(_job_ids(campaign.state_json or {}))
-                if campaign.parameter_experiment_id:
-                    experiment_ids.add(str(campaign.parameter_experiment_id))
-                if campaign.backtest_id:
-                    backtest_ids.add(str(campaign.backtest_id))
-                if campaign.research_run_id:
-                    run = connection.execute(
-                        select(research_runs.c.job_id).where(
-                            research_runs.c.id == campaign.research_run_id
-                        )
-                    ).first()
-                    if run and run.job_id:
-                        candidate_job_ids.add(str(run.job_id))
-            if experiment_ids:
-                candidate_job_ids.update(
-                    str(item)
-                    for item in connection.scalars(
-                        select(parameter_experiments.c.job_id).where(
-                            parameter_experiments.c.id.in_(sorted(experiment_ids)),
-                            parameter_experiments.c.job_id.is_not(None),
-                        )
-                    )
+            for row in connection.execute(
+                select(jobs).where(
+                    jobs.c.id.in_(sorted(candidate_job_ids))
+                    if candidate_job_ids
+                    else False,
+                    jobs.c.status.in_(tuple(_ACTIVE_JOB_STATUSES)),
                 )
-            if backtest_ids:
-                candidate_job_ids.update(
-                    str(item)
-                    for item in connection.scalars(
-                        select(backtest_runs.c.job_id).where(
-                            backtest_runs.c.id.in_(sorted(backtest_ids)),
-                            backtest_runs.c.job_id.is_not(None),
-                        )
-                    )
-                )
-            active_jobs = {
-                str(row.id): {"id": str(row.id), "kind": str(row.kind), "status": str(row.status)}
-                for row in connection.execute(
-                    select(jobs).where(
-                        jobs.c.id.in_(sorted(candidate_job_ids)) if candidate_job_ids else False,
-                        jobs.c.status.in_(tuple(_ACTIVE_JOB_STATUSES)),
-                    )
-                )
-            }
+            )
+        }
         exclusive, shared, protected = _classify_jobs(
             active_jobs,
             autopilot_job_ids=autopilot_job_ids,
         )
         return {
-            "campaign_ids": [str(item.id) for item in campaigns],
+            "campaign_ids": [str(item.id) for item in active_campaigns],
             "program_ids": [str(item.id) for item in programs],
+            "legacy_schedule_ids": legacy_schedule_ids,
             "exclusive_job_ids": exclusive,
             "shared_autopilot_job_ids": shared,
             "protected_job_ids": protected,
@@ -181,62 +262,194 @@ class LegacyResearchRetirement:
             "safe_to_apply": not shared,
         }
 
-    def _cancel_exclusive_job(self, job_id: str) -> bool:
+    def plan(self) -> dict[str, Any]:
+        with self.engine.connect() as connection:
+            return self._plan(connection)
+
+    @staticmethod
+    def _cancel_exclusive_job(connection: Any, job_id: str, *, current: datetime) -> bool:
         """Atomically recheck Autopilot ownership before requesting cancel."""
 
+        row = connection.execute(
+            select(jobs.c.kind, jobs.c.status, jobs.c.cancel_requested_at)
+            .where(jobs.c.id == job_id)
+            .with_for_update()
+        ).first()
+        if row is None or str(row.status) not in _ACTIVE_JOB_STATUSES:
+            return False
+        if _is_protected_job_kind(str(row.kind)):
+            return False
+        shared = connection.execute(
+            select(autopilot_branches.c.id)
+            .where(autopilot_branches.c.job_id == job_id)
+            .limit(1)
+        ).first()
+        if shared is not None:
+            raise ValueError(
+                "legacy retirement blocked: a job is also owned by the new Autopilot"
+            )
+        if str(row.status) == "running" and row.cancel_requested_at is not None:
+            return False
+        values: dict[str, Any] = {
+            "cancel_requested_at": row.cancel_requested_at or current
+        }
+        if str(row.status) == "queued":
+            values.update(
+                status="cancelled",
+                error="Cancelled by single-Autopilot legacy retirement",
+                finished_at=current,
+            )
+        connection.execute(update(jobs).where(jobs.c.id == job_id).values(**values))
+        return True
+
+    @staticmethod
+    def _disable_legacy_schedule(
+        connection: Any, schedule_id: str, *, current: datetime
+    ) -> bool:
+        row = connection.execute(
+            select(
+                schedules.c.status,
+                schedules.c.desired_status,
+                schedules.c.suspension_reason,
+            )
+            .where(schedules.c.id == schedule_id)
+            .with_for_update()
+        ).first()
+        if row is None:
+            return False
+        if (
+            str(row.status) == "paused"
+            and str(row.desired_status) == "paused"
+            and row.suspension_reason == LEGACY_RESEARCH_SCHEDULE_SUSPENSION
+        ):
+            return False
+        connection.execute(
+            update(schedules)
+            .where(schedules.c.id == schedule_id)
+            .values(
+                status="paused",
+                desired_status="paused",
+                suspension_reason=LEGACY_RESEARCH_SCHEDULE_SUSPENSION,
+                updated_at=current,
+            )
+        )
+        return True
+
+    @staticmethod
+    def _retire_campaign(
+        connection: Any, campaign_id: str, *, actor: str, current: datetime
+    ) -> bool:
+        """Privileged one-time retirement outside the public read-only Store."""
+
+        row = connection.execute(
+            select(research_campaigns.c.status)
+            .where(research_campaigns.c.id == campaign_id)
+            .with_for_update()
+        ).first()
+        if row is None or str(row.status) not in {
+            "queued",
+            "running",
+            "awaiting_approval",
+        }:
+            return False
+        connection.execute(
+            update(research_campaigns)
+            .where(research_campaigns.c.id == campaign_id)
+            .values(
+                status="cancelled",
+                lease_until=None,
+                next_action_at=current,
+                updated_at=current,
+                finished_at=current,
+            )
+        )
+        connection.execute(
+            insert(research_campaign_events).values(
+                campaign_id=campaign_id,
+                event_type="campaign.cancelled",
+                actor=actor,
+                payload_json={"previous_status": str(row.status)},
+                created_at=current,
+            )
+        )
+        return True
+
+    @staticmethod
+    def _retire_program(
+        connection: Any, program_id: str, *, actor: str, current: datetime
+    ) -> bool:
+        """Privileged one-time retirement outside the public read-only Store."""
+
+        row = connection.execute(
+            select(research_programs.c.status)
+            .where(research_programs.c.id == program_id)
+            .with_for_update()
+        ).first()
+        if row is None or str(row.status) not in {"active", "paused"}:
+            return False
+        connection.execute(
+            update(research_programs)
+            .where(research_programs.c.id == program_id)
+            .values(
+                status="cancelled",
+                lease_until=None,
+                next_check_at=current,
+                updated_at=current,
+            )
+        )
+        connection.execute(
+            insert(research_program_events).values(
+                program_id=program_id,
+                event_type="program.cancelled",
+                actor=actor,
+                payload_json={"previous_status": str(row.status)},
+                created_at=current,
+            )
+        )
+        return True
+
+    def apply(self, *, actor: str = "single-autopilot-migration") -> dict[str, Any]:
         with self.engine.begin() as connection:
-            row = connection.execute(
-                select(jobs.c.kind, jobs.c.status)
-                .where(jobs.c.id == job_id)
-                .with_for_update()
-            ).first()
-            if row is None or str(row.status) not in _ACTIVE_JOB_STATUSES:
-                return False
-            if _is_protected_job_kind(str(row.kind)):
-                return False
-            shared = connection.execute(
-                select(autopilot_branches.c.id)
-                .where(autopilot_branches.c.job_id == job_id)
-                .limit(1)
-            ).first()
-            if shared is not None:
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": LEGACY_RESEARCH_RETIREMENT_LOCK_KEY},
+            )
+            plan = self._plan(connection)
+            if not plan["safe_to_apply"]:
                 raise ValueError(
                     "legacy retirement blocked: a job is also owned by the new Autopilot"
                 )
             current = _now()
-            values: dict[str, Any] = {"cancel_requested_at": current}
-            if str(row.status) == "queued":
-                values.update(
-                    status="cancelled",
-                    error="Cancelled by single-Autopilot legacy retirement",
-                    finished_at=current,
+            cancelled_jobs = [
+                job_id
+                for job_id in plan["exclusive_job_ids"]
+                if self._cancel_exclusive_job(connection, job_id, current=current)
+            ]
+            disabled_schedules = [
+                schedule_id
+                for schedule_id in plan["legacy_schedule_ids"]
+                if self._disable_legacy_schedule(
+                    connection, schedule_id, current=current
                 )
-            connection.execute(
-                update(jobs).where(jobs.c.id == job_id).values(**values)
-            )
-        return True
-
-    def apply(self, *, actor: str = "single-autopilot-migration") -> dict[str, Any]:
-        plan = self.plan()
-        if not plan["safe_to_apply"]:
-            raise ValueError(
-                "legacy retirement blocked: a job is also owned by the new Autopilot"
-            )
-        cancelled_jobs: list[str] = []
-        for job_id in plan["exclusive_job_ids"]:
-            if self._cancel_exclusive_job(job_id):
-                cancelled_jobs.append(job_id)
-        retired_campaigns: list[str] = []
-        for campaign_id in plan["campaign_ids"]:
-            self.campaigns.set_status(campaign_id, "cancelled", actor=actor)
-            retired_campaigns.append(campaign_id)
-        retired_programs: list[str] = []
-        for program_id in plan["program_ids"]:
-            self.programs.set_status(program_id, "cancelled", actor=actor)
-            retired_programs.append(program_id)
+            ]
+            retired_campaigns = [
+                campaign_id
+                for campaign_id in plan["campaign_ids"]
+                if self._retire_campaign(
+                    connection, campaign_id, actor=actor, current=current
+                )
+            ]
+            retired_programs = [
+                program_id
+                for program_id in plan["program_ids"]
+                if self._retire_program(
+                    connection, program_id, actor=actor, current=current
+                )
+            ]
         return {
             **plan,
             "cancelled_job_ids": cancelled_jobs,
+            "disabled_schedule_ids": disabled_schedules,
             "retired_campaign_ids": retired_campaigns,
             "retired_program_ids": retired_programs,
             "applied": True,

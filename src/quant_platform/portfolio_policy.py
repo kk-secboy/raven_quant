@@ -57,6 +57,7 @@ class PortfolioPolicyConfig:
     max_volatility_deviation: float = 0.30
     max_daily_loss: float = 0.03
     stop_loss: float = 0.07
+    profit_taking_mode: str = "threshold"
     take_profit_partial: float = 0.12
     take_profit_partial_fraction: float = 0.50
     take_profit: float = 0.20
@@ -71,6 +72,17 @@ class PortfolioPolicyConfig:
     optimizer_turnover_penalty: float = 0.10
     target_volatility: float | None = None
     rebalance_frequency: str = "day"
+    entry_score_min_percentile: float = 0.0
+    score_drop_exit_percentile: float | None = None
+    extension_guard_max_return_5d: float | None = None
+    max_holding_sessions: int | None = None
+    market_trend_lookback_sessions: int | None = None
+    valuation_regime_max_percentile: float | None = None
+    trend_break_lookback_sessions: int | None = None
+    thesis_min_holding_sessions: int | None = None
+    thesis_break_score_percentile: float | None = None
+    thesis_review_frequency: str | None = None
+    cash_when_no_edge: bool = False
 
     @classmethod
     def from_mapping(cls, values: dict[str, Any]) -> PortfolioPolicyConfig:
@@ -83,7 +95,12 @@ class PortfolioPolicyConfig:
             raise ValueError("position and turnover limits are invalid")
         if not 0 < self.stop_loss < 1 or not 0 < self.max_daily_loss < 1:
             raise ValueError("loss limits are invalid")
-        if not 0 < self.take_profit_partial < self.take_profit:
+        if self.profit_taking_mode not in {"threshold", "rule_only", "thesis_only"}:
+            raise ValueError("profit-taking mode is invalid")
+        if (
+            self.profit_taking_mode == "threshold"
+            and not 0 < self.take_profit_partial < self.take_profit
+        ):
             raise ValueError("take-profit thresholds are invalid")
         if not 0 < self.take_profit_partial_fraction < 1:
             raise ValueError("partial take-profit fraction is invalid")
@@ -112,6 +129,34 @@ class PortfolioPolicyConfig:
             raise ValueError("asset class limits must be between zero and one")
         if self.target_volatility is not None and not 0 < self.target_volatility <= 0.50:
             raise ValueError("target volatility must be between zero and 0.50")
+        if not 0.0 <= self.entry_score_min_percentile <= 1.0:
+            raise ValueError("entry score percentile must be within [0, 1]")
+        for name, value in (
+            ("score-drop exit percentile", self.score_drop_exit_percentile),
+            ("valuation regime percentile", self.valuation_regime_max_percentile),
+            ("thesis-break score percentile", self.thesis_break_score_percentile),
+        ):
+            if value is not None and not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be within [0, 1]")
+        if (
+            self.extension_guard_max_return_5d is not None
+            and not 0.0 < self.extension_guard_max_return_5d <= 1.0
+        ):
+            raise ValueError("extension guard return must be within (0, 1]")
+        for name, value in (
+            ("maximum holding", self.max_holding_sessions),
+            ("market-trend lookback", self.market_trend_lookback_sessions),
+            ("trend-break lookback", self.trend_break_lookback_sessions),
+            ("thesis minimum holding", self.thesis_min_holding_sessions),
+        ):
+            if value is not None and (isinstance(value, bool) or value < 1):
+                raise ValueError(f"{name} sessions must be positive")
+        if self.thesis_review_frequency not in {None, "month", "quarter"}:
+            raise ValueError("thesis review frequency must be month or quarter")
+        if (self.thesis_min_holding_sessions is None) != (
+            self.thesis_break_score_percentile is None
+        ):
+            raise ValueError("thesis-break holding and score rules must be configured together")
         rebalance_period_key("2026-01-01", self.rebalance_frequency)
 
 
@@ -164,6 +209,11 @@ class PortfolioPolicy:
         cost_basis: pd.Series | dict[str, float] | None = None,
         take_profit_stages: dict[str, int] | None = None,
         execution_state: dict[str, Any] | None = None,
+        holding_age_sessions: dict[str, int] | None = None,
+        five_day_returns: pd.Series | None = None,
+        trend_intact: pd.Series | None = None,
+        valuation_percentiles: pd.Series | None = None,
+        market_regime_allows_entries: bool | None = None,
         portfolio_drawdown: float = 0.0,
         daily_return: float = 0.0,
         rebalance_due: bool = True,
@@ -212,11 +262,55 @@ class PortfolioPolicy:
         )
         basis.index = basis.index.astype(str)
         stages = {str(key): int(value) for key, value in (take_profit_stages or {}).items()}
+        ages = {
+            str(key): int(value) for key, value in (holding_age_sessions or {}).items()
+        }
+        if any(value < 0 for value in ages.values()):
+            raise ValueError("holding ages must be non-negative trading sessions")
+        previous_instruments = set(previous[previous > 0].index)
+        if self.config.max_holding_sessions is not None and ages and not (
+            previous_instruments <= set(ages)
+        ):
+            raise ValueError("maximum-holding policy requires complete holding-age state")
         risk_events: list[dict[str, Any]] = []
+        score_percentiles = signal.rank(method="average", pct=True)
+        new_entry_eligible = score_percentiles >= self.config.entry_score_min_percentile
+        if self.config.extension_guard_max_return_5d is not None:
+            if five_day_returns is None:
+                raise ValueError("extension guard requires point-in-time five-day returns")
+            extension = pd.to_numeric(five_day_returns, errors="coerce")
+            extension.index = extension.index.astype(str)
+            aligned_extension = extension.reindex(signal.index)
+            if aligned_extension.isna().any():
+                raise ValueError("extension guard five-day returns are incomplete")
+            new_entry_eligible &= (
+                aligned_extension <= self.config.extension_guard_max_return_5d
+            )
+        if self.config.market_trend_lookback_sessions is not None:
+            if market_regime_allows_entries is None:
+                raise ValueError("market-trend rule requires point-in-time regime evidence")
+            if not market_regime_allows_entries:
+                new_entry_eligible[:] = False
+        if self.config.valuation_regime_max_percentile is not None:
+            if valuation_percentiles is None:
+                raise ValueError("valuation-regime rule requires point-in-time percentiles")
+            valuation = pd.to_numeric(valuation_percentiles, errors="coerce")
+            valuation.index = valuation.index.astype(str)
+            aligned_valuation = valuation.reindex(signal.index)
+            if aligned_valuation.isna().any():
+                raise ValueError("valuation-regime percentiles are incomplete")
+            new_entry_eligible &= (
+                aligned_valuation <= self.config.valuation_regime_max_percentile
+            )
         keep_count = min(len(signal), self.config.topk + self.config.n_drop)
         ranked = signal.sort_values(ascending=False)
         retained = [item for item in ranked.index[:keep_count] if item in previous.index]
-        candidates = list(dict.fromkeys([*retained, *ranked.index]))
+        eligible_ranked = [
+            item
+            for item in ranked.index
+            if bool(new_entry_eligible[item]) or item in previous_instruments
+        ]
+        candidates = list(dict.fromkeys([*retained, *eligible_ranked]))
         if industries is not None:
             industry_by_instrument = industries.astype(str)
             assumed_weight = min(
@@ -240,16 +334,15 @@ class PortfolioPolicy:
                 counts[industry] = counts.get(industry, 0) + 1
                 if len(selected) == self.config.topk:
                     break
-            if len(selected) < min(self.config.topk, len(signal)):
+            if len(selected) < min(self.config.topk, len(candidates)):
                 raise ValueError("industry constraints leave too few eligible instruments")
         else:
             selected = candidates[: self.config.topk]
         selected_scores = ranked.reindex(selected).dropna()
-        if selected_scores.empty:
-            raise ValueError("policy has no eligible instruments")
-
         target_volatility_evidence: dict[str, float] = {}
-        if self.config.portfolio_construction in {
+        if selected_scores.empty:
+            target = pd.Series(dtype=float)
+        elif self.config.portfolio_construction in {
             "benchmark_relative_qp",
             "industry_neutral_qp",
         }:
@@ -364,7 +457,10 @@ class PortfolioPolicy:
                             "stop_loss", position_return, self.config.stop_loss, "exit", instrument
                         )
                     )
-                elif position_return >= self.config.take_profit:
+                elif (
+                    self.config.profit_taking_mode == "threshold"
+                    and position_return >= self.config.take_profit
+                ):
                     target[instrument] = 0.0
                     risk_events.append(
                         self._risk_event(
@@ -375,7 +471,10 @@ class PortfolioPolicy:
                             instrument,
                         )
                     )
-                elif position_return >= self.config.take_profit_partial:
+                elif (
+                    self.config.profit_taking_mode == "threshold"
+                    and position_return >= self.config.take_profit_partial
+                ):
                     if stages.get(instrument, 0) < 1:
                         target[instrument] = min(
                             target[instrument],
@@ -393,6 +492,75 @@ class PortfolioPolicy:
                         )
                     else:
                         target[instrument] = min(target[instrument], previous[instrument])
+        if self.config.score_drop_exit_percentile is not None:
+            for instrument in previous_instruments:
+                percentile = float(score_percentiles.get(instrument, 0.0))
+                if percentile < self.config.score_drop_exit_percentile:
+                    target[instrument] = 0.0
+                    risk_events.append(
+                        self._risk_event(
+                            "score_drop_exit",
+                            percentile,
+                            self.config.score_drop_exit_percentile,
+                            "exit",
+                            instrument,
+                        )
+                    )
+        if self.config.max_holding_sessions is not None:
+            for instrument in previous_instruments:
+                age = ages.get(instrument, 0)
+                if age >= self.config.max_holding_sessions:
+                    target[instrument] = 0.0
+                    risk_events.append(
+                        self._risk_event(
+                            "max_holding_sessions",
+                            float(age),
+                            float(self.config.max_holding_sessions),
+                            "exit",
+                            instrument,
+                        )
+                    )
+        if self.config.trend_break_lookback_sessions is not None:
+            if trend_intact is None:
+                raise ValueError("trend-break rule requires point-in-time trend evidence")
+            trends = trend_intact.reindex(pd.Index(previous_instruments, dtype=str))
+            if trends.isna().any():
+                raise ValueError("trend-break evidence is incomplete")
+            for instrument, intact in trends.items():
+                if not bool(intact):
+                    target[instrument] = 0.0
+                    risk_events.append(
+                        self._risk_event(
+                            "trend_break",
+                            0.0,
+                            1.0,
+                            "exit",
+                            str(instrument),
+                        )
+                    )
+        # A long-horizon thesis is reviewed only on its governed monthly or
+        # newly PIT-effective financial-report decision.  Daily refreshes may
+        # still enforce hard account/risk controls, but must not silently turn
+        # the quality/value thesis proxy into a daily trading rule.
+        if self.config.thesis_min_holding_sessions is not None and rebalance_due:
+            assert self.config.thesis_break_score_percentile is not None
+            for instrument in previous_instruments:
+                age = ages.get(instrument, 0)
+                percentile = float(score_percentiles.get(instrument, 0.0))
+                if (
+                    age >= self.config.thesis_min_holding_sessions
+                    and percentile < self.config.thesis_break_score_percentile
+                ):
+                    target[instrument] = 0.0
+                    risk_events.append(
+                        self._risk_event(
+                            "quant_quality_value_thesis_break_proxy",
+                            percentile,
+                            self.config.thesis_break_score_percentile,
+                            "exit",
+                            instrument,
+                        )
+                    )
         if normalized_daily_return <= -self.config.max_daily_loss:
             target = pd.concat([target, previous], axis=1).min(axis=1)
             risk_events.append(
@@ -580,6 +748,14 @@ class PortfolioPolicy:
                     "remaining_days": max(1, next_remaining),
                     "method": self.config.execution_method,
                 }
+        next_holding_ages = {
+            str(instrument): (
+                ages.get(str(instrument), 0) + 1
+                if str(instrument) in previous_instruments
+                else 0
+            )
+            for instrument in target[target > 0].index
+        }
         changes = [
             {
                 "instrument": instrument,
@@ -617,6 +793,7 @@ class PortfolioPolicy:
             position_state={
                 "take_profit_stages": stages,
                 "execution": next_execution_state,
+                "holding_age_sessions": next_holding_ages,
                 "constraint_benchmark_scale": constraint_scale,
                 "discrete_constraint_validation": discrete_validation,
                 **(

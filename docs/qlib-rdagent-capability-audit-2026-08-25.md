@@ -50,7 +50,7 @@
 | `data_science` | 已接入隔离队列 | 与投资链保持隔离是正确的 |
 | `llm_finetune` | 代码入口已接入、服务器无 GPU | 不应为了“功能全”用 CPU 慢速兜底 |
 | `health_check` | 已接入诊断 | 平台 readiness 仍是生产标准 |
-| `ui/server_ui` | 未独立部署 | trace 已并入 QuantLab，避免多一套无鉴权 UI |
+| `ui/server_ui` | 未独立部署 | 高级页从验签后的不可变制品只读投影真实 Loop/Hypothesis/Feedback 和 Trace 摘要；原始 pickle、代码、路径与凭据不开放，避免多一套控制面 |
 
 结论：七个官方主要 CLI 入口已经封装，但“能手工启动”不等于“自动驾驶会合理轮换”。
 下一步是把 `fin_model`、`fin_quant`、`fin_factor_report` 作为有预算、低频率的挑战者
@@ -60,7 +60,12 @@
 
 第一版自动驾驶采用一条主线：
 
-`33项数据更新 → 冻结Qlib数据集 → fin_factor持续研究 → 独立复算/去重/SOTA → 参数实验 → 正式回测 → 人工确认 → 模拟盘`
+现行唯一主线已收口为：
+
+`受治理数据 → fin_factor/fin_model/fin_quant/fin_strategy → 独立复算与样本外验证 → 隔离模拟盘 → 三周期严格前向门 → 自动晋级 → 每日长中短选股与统一账户净额`
+
+官方 RDLoop/Trace 中的 SOTA 只表示研究反馈，不是生产 Champion；`StrategyProposal`
+必须经白名单规则 IR 确定性编译、同条件 Qlib 比较和平台门禁，LLM 不能直接荐股。
 
 高级能力按计划轮换：
 

@@ -6,6 +6,20 @@ x-logging: &default-logging
     max-size: ${LOG_MAX_SIZE:-20m}
     max-file: ${LOG_MAX_FILES:-5}
 
+x-release-environment: &release-environment
+  QUANTLAB_RELEASE_ID: ${QUANTLAB_RELEASE_ID:-}
+  QUANTLAB_CONFIG_DIGEST: ${QUANTLAB_CONFIG_DIGEST:-}
+  QUANTLAB_RELEASE_KIND: ${QUANTLAB_RELEASE_KIND:-}
+  QUANTLAB_RELEASE_ALIAS_OF: ${QUANTLAB_RELEASE_ALIAS_OF:-}
+  QUANTLAB_CANONICAL_BASELINE: ${QUANTLAB_CANONICAL_BASELINE:-}
+
+x-release-labels: &release-labels
+  quantlab.release: ${QUANTLAB_RELEASE_ID:-}
+  quantlab.config-digest: ${QUANTLAB_CONFIG_DIGEST:-}
+  quantlab.release-kind: ${QUANTLAB_RELEASE_KIND:-}
+  quantlab.alias-of: ${QUANTLAB_RELEASE_ALIAS_OF:-}
+  quantlab.canonical-baseline: ${QUANTLAB_CANONICAL_BASELINE:-}
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -35,7 +49,9 @@ services:
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
     restart: unless-stopped
     logging: *default-logging
+    labels: *release-labels
     environment:
+      <<: *release-environment
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       DATA_ROOT: /data
       RUN_EMBEDDED_WORKER: "false"
@@ -86,8 +102,10 @@ services:
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
     restart: unless-stopped
     logging: *default-logging
+    labels: *release-labels
     command: ["quant-scheduler"]
     environment:
+      <<: *release-environment
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       DATA_ROOT: /data
       TUSHARE_API_URL: ${TUSHARE_API_URL:-}
@@ -147,7 +165,9 @@ services:
     mem_limit: 32g
     pids_limit: 512
     logging: *default-logging
+    labels: *release-labels
     environment:
+      <<: *release-environment
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       MLFLOW_TRACKING_URI: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab?options=-csearch_path%3Dpublic
       _MLFLOW_SERVER_ARTIFACT_ROOT: /data/artifacts/mlflow
@@ -200,7 +220,9 @@ services:
     cpus: "24.0"
     mem_limit: 48g
     logging: *default-logging
+    labels: *release-labels
     environment:
+      <<: *release-environment
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       MLFLOW_TRACKING_URI: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab?options=-csearch_path%3Dpublic
       _MLFLOW_SERVER_ARTIFACT_ROOT: /data/artifacts/mlflow
@@ -245,7 +267,9 @@ services:
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
     restart: unless-stopped
     logging: *default-logging
+    labels: *release-labels
     environment:
+      <<: *release-environment
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       MLFLOW_TRACKING_URI: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab?options=-csearch_path%3Dpublic
       _MLFLOW_SERVER_ARTIFACT_ROOT: /data/artifacts/mlflow
@@ -280,7 +304,9 @@ services:
     privileged: true
     restart: unless-stopped
     logging: *default-logging
+    labels: *release-labels
     environment:
+      <<: *release-environment
       DOCKER_TLS_CERTDIR: ""
     command:
       - --host=tcp://0.0.0.0:2375
@@ -355,7 +381,9 @@ services:
     cpus: "8.0"
     mem_limit: 12g
     logging: *default-logging
+    labels: *release-labels
     environment:
+      <<: *release-environment
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       DATA_ROOT: /data
       DOCKER_HOST: tcp://rdagent-docker:2375
@@ -400,7 +428,9 @@ services:
     cpus: "8.0"
     mem_limit: 16g
     logging: *default-logging
+    labels: *release-labels
     environment:
+      <<: *release-environment
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       DATA_ROOT: /data
       DOCKER_HOST: tcp://rdagent-docker:2375
@@ -439,7 +469,9 @@ services:
     cpus: "4.0"
     mem_limit: 8g
     logging: *default-logging
+    labels: *release-labels
     environment:
+      <<: *release-environment
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       DATA_ROOT: /data
       DOCKER_HOST: tcp://rdagent-docker:2375
@@ -480,7 +512,9 @@ services:
     cpus: "12.0"
     mem_limit: 20g
     logging: *default-logging
+    labels: *release-labels
     environment:
+      <<: *release-environment
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       DATA_ROOT: /data
       DOCKER_HOST: tcp://rdagent-docker:2375
@@ -524,7 +558,9 @@ services:
     cpus: "8.0"
     mem_limit: 16g
     logging: *default-logging
+    labels: *release-labels
     environment:
+      <<: *release-environment
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       DATA_ROOT: /data
       DOCKER_HOST: tcp://rdagent-docker:2375
@@ -565,8 +601,10 @@ services:
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-deb.debian.org/debian}
     restart: unless-stopped
     logging: *default-logging
+    labels: *release-labels
     gpus: all
     environment:
+      <<: *release-environment
       DATABASE_URL: postgresql+psycopg://quantlab:${POSTGRES_PASSWORD}@postgres:5432/quantlab
       DATA_ROOT: /data
       # The GPU profile intentionally uses the host daemon. Unlike the regular
@@ -610,6 +648,8 @@ services:
       dockerfile: deploy/Dockerfile.web
     restart: unless-stopped
     logging: *default-logging
+    labels: *release-labels
+    environment: *release-environment
     depends_on:
       api:
         condition: service_healthy
@@ -624,6 +664,8 @@ services:
     image: caddy:2.10-alpine
     restart: unless-stopped
     logging: *default-logging
+    labels: *release-labels
+    environment: *release-environment
     ports:
       - "${HTTP_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-38080}:8080"
     volumes:

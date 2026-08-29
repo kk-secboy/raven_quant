@@ -8,7 +8,7 @@ model_challenger / research_admission) and an ``implementation_tier``
 permission gates are met, and must remain visible by name, role and status
 instead of silently disappearing from the design.
 
-This registry is the code-level source of truth for that contract. The four
+This registry is the code-level source of truth for that contract. The six
 implemented Qlib recipes live in ``strategy_recipes``; this module links them
 to their design templates and registers every other template with its current
 implementation status so consumers can query the full catalog
@@ -164,6 +164,16 @@ _CATALOG: tuple[dict[str, Any], ...] = (
         "recipe_id": None,
     },
     {
+        "template_id": "short_relative_strength",
+        "name": "1至5日短线相对强弱透明基线",
+        "catalog_role": "baseline",
+        "implementation_tier": "foundation",
+        "implementation_status": "implemented",
+        "blocked_reason": None,
+        "parent_template_id": None,
+        "recipe_id": "short_relative_strength",
+    },
+    {
         "template_id": "swing_trend",
         "name": "复合波段趋势",
         "catalog_role": "alpha_template",
@@ -182,6 +192,16 @@ _CATALOG: tuple[dict[str, Any], ...] = (
         "blocked_reason": None,
         "parent_template_id": None,
         "recipe_id": None,
+    },
+    {
+        "template_id": "long_quality_value",
+        "name": "1至3年质量价值透明基线",
+        "catalog_role": "baseline",
+        "implementation_tier": "foundation",
+        "implementation_status": "implemented",
+        "blocked_reason": None,
+        "parent_template_id": "personal_stock_core",
+        "recipe_id": "long_quality_value",
     },
     {
         "template_id": "weekly_tactical_overlay",

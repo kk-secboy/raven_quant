@@ -10,6 +10,7 @@ from sqlalchemy import update
 from quant_data.config import Settings
 from quant_data.database import jobs
 from quant_platform.api import create_app
+from quant_platform.deployment_readiness import DeploymentReadinessStore
 from quant_platform.health_store import (
     OperationalHealthStore,
     safe_mode_recovery_health_status,
@@ -69,6 +70,122 @@ def test_health_history_records_fresh_data_and_api_exposes_it(
     assert response.status_code == 200
     assert response.json()["latest"]["id"] == snapshot["id"]
     assert len(response.json()["history"]) == 1
+
+
+def _configure_readyz_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    database_url: str,
+    data_root: Path,
+    platform_secret_key: str,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("DATA_ROOT", str(data_root))
+    monkeypatch.setenv("AUTH_MODE", "required")
+    monkeypatch.setenv("RUN_EMBEDDED_WORKER", "true")
+    monkeypatch.setenv("RDAGENT_ENABLED", "false")
+    monkeypatch.setenv("PLATFORM_SECRET_KEY", platform_secret_key)
+    monkeypatch.setenv("TUSHARE_API_URL", "https://api.tushare.pro")
+    monkeypatch.setenv("TUSHARE_TOKEN", "test-token")
+    monkeypatch.setenv("HEALTH_SNAPSHOT_SECONDS", "60")
+    monkeypatch.setenv("QUANTLAB_RELEASE_ID", "release-test-1")
+    monkeypatch.setenv("QUANTLAB_CONFIG_DIGEST", "config-test-1")
+    monkeypatch.delenv("SCHEDULER_URL", raising=False)
+
+
+def test_readyz_is_public_and_requires_current_business_health(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    data_root = tmp_path / "data"
+    _dataset(data_root, now.date().isoformat())
+    key = Fernet.generate_key().decode("ascii")
+    settings = _settings(
+        database_url,
+        data_root,
+        health_snapshot_seconds=60,
+        platform_secret_key=key,
+        quantlab_release_id="release-test-1",
+        quantlab_config_digest="config-test-1",
+    )
+    OperationalHealthStore(settings).collect_and_record(now)
+    _configure_readyz_environment(
+        monkeypatch,
+        database_url=database_url,
+        data_root=data_root,
+        platform_secret_key=key,
+    )
+    monkeypatch.setattr(
+        DeploymentReadinessStore,
+        "business_loop_readiness",
+        lambda _self: {
+            "status": "ok",
+            "checks": {
+                "daily_qlib_data": {"status": "ok", "message": "fresh"},
+                "three_horizon_production": {
+                    "status": "ok",
+                    "message": "paper lanes active",
+                },
+            },
+            "blockers": [],
+        },
+    )
+
+    with TestClient(create_app(tmp_path)) as client:
+        ready = client.get("/api/readyz")
+        SafeModeStore(database_url).activate(
+            reason="readiness regression fixture",
+            source="manual",
+            actor="test",
+        )
+        blocked = client.get("/api/readyz")
+
+    assert ready.status_code == 200
+    assert ready.headers["cache-control"] == "no-store"
+    assert ready.json()["status"] == "ready"
+    assert ready.json()["checks"]["scheduler"]["source"] == (
+        "durable_health_snapshot"
+    )
+    assert blocked.status_code == 503
+    assert blocked.json()["status"] == "not_ready"
+    assert blocked.json()["checks"]["safe_mode"] == {
+        "status": "blocked",
+        "message": "safe mode is active",
+        "active": True,
+    }
+
+
+def test_readyz_rejects_a_stale_scheduler_heartbeat(
+    database_url: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded_at = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=3)
+    data_root = tmp_path / "data"
+    _dataset(data_root, recorded_at.date().isoformat())
+    key = Fernet.generate_key().decode("ascii")
+    settings = _settings(
+        database_url,
+        data_root,
+        health_snapshot_seconds=60,
+        platform_secret_key=key,
+    )
+    OperationalHealthStore(settings).collect_and_record(recorded_at)
+    _configure_readyz_environment(
+        monkeypatch,
+        database_url=database_url,
+        data_root=data_root,
+        platform_secret_key=key,
+    )
+
+    with TestClient(create_app(tmp_path)) as client:
+        response = client.get("/api/readyz")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["ready"] is False
+    assert "scheduler_heartbeat" in body["checks"]["operational_health"][
+        "blocking_components"
+    ]
+    assert body["checks"]["scheduler"]["status"] == "unavailable"
 
 
 def test_health_accepts_intraday_qlib_calendar_timestamp(

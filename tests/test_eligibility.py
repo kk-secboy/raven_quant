@@ -4,11 +4,33 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from quant_platform.eligibility import EligibilityPolicy, build_point_in_time_eligibility
+from quant_platform.eligibility import (
+    ELIGIBILITY_CONTRACT_VERSION,
+    EligibilityPolicy,
+    build_point_in_time_eligibility,
+)
 from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
-from quant_platform.strategy_backtest import build_governed_signal
+from quant_platform.strategy_backtest import (
+    build_governed_signal,
+    governed_score_neutralization,
+)
 
 pytestmark = pytest.mark.no_database
+
+
+def test_score_neutralization_contract_is_shared_by_recipe_mode() -> None:
+    assert governed_score_neutralization(
+        {"portfolio_construction": "topk_equal_weight"}
+    ) == (False, ())
+    assert governed_score_neutralization(
+        {
+            "portfolio_construction": "topk_equal_weight",
+            "industry_relative_rank": True,
+        }
+    ) == (True, ())
+    assert governed_score_neutralization(
+        {"portfolio_construction": "benchmark_relative_qp"}
+    ) == (True, ("size",))
 
 
 def _inputs():
@@ -159,18 +181,69 @@ def test_governed_signal_cannot_select_an_ineligible_high_score() -> None:
                 "datetime": timestamp,
                 "instrument": "SH600000",
                 "eligible": False,
-                "contract_version": "ashare-point-in-time-eligibility-v1",
+                "contract_version": ELIGIBILITY_CONTRACT_VERSION,
             },
             {
                 "datetime": timestamp,
                 "instrument": "SZ000001",
                 "eligible": True,
-                "contract_version": "ashare-point-in-time-eligibility-v1",
+                "contract_version": ELIGIBILITY_CONTRACT_VERSION,
             },
         ]
     )
     result = build_governed_signal(scores, topk=1, eligibility_matrix=eligibility)
     assert result.index.get_level_values("instrument").tolist() == ["SZ000001"]
+
+
+def test_liquid_whitelisted_etf_can_reach_the_shared_governed_signal_path() -> None:
+    dates = pd.date_range("2025-01-02", periods=80, freq="B")
+    instrument = "SH510300"
+    matrix = build_point_in_time_eligibility(
+        market=pd.DataFrame(
+            {
+                "datetime": dates,
+                "instrument": instrument,
+                "asset_type": "etf",
+                "amount": 700_000_000.0,
+                "paused": False,
+            }
+        ),
+        listings=pd.DataFrame(
+            [
+                {
+                    "instrument": instrument,
+                    "list_date": "2012-05-28",
+                    "delist_date": None,
+                }
+            ]
+        ),
+        st_intervals=pd.DataFrame(
+            columns=["instrument", "start_date", "end_date", "is_st"]
+        ),
+        suspensions=pd.DataFrame(
+            columns=["datetime", "instrument", "suspended"]
+        ),
+        financials=pd.DataFrame(
+            columns=["instrument", "announcement_date", "equity"]
+        ),
+        audits=pd.DataFrame(
+            columns=["instrument", "announcement_date", "audit_opinion"]
+        ),
+        regulatory_events=None,
+        trading_calendar=dates,
+    )
+    latest = matrix[matrix["datetime"].eq(dates[-1])]
+    assert latest.iloc[0]["eligible"]
+    assert not latest.iloc[0]["financial_gate_required"]
+
+    scores = pd.Series(
+        [1.0],
+        index=pd.MultiIndex.from_tuples(
+            [(dates[-1], instrument)], names=["datetime", "instrument"]
+        ),
+    )
+    selected = build_governed_signal(scores, topk=1, eligibility_matrix=matrix)
+    assert selected.index.get_level_values("instrument").tolist() == [instrument]
 
 
 def test_governed_signal_keeps_ndrop_candidates_visible_to_portfolio_policy() -> None:

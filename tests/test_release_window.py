@@ -227,7 +227,7 @@ def test_selector_keeps_unfinished_canonical_fina_audit_instead_of_legacy() -> N
         "canonical-1000",
     ]
     assert selected.report()["selector_version"] == (
-        "release-window-selector-v5-source-history-stk-surv-fina-audit-pagination-bound"
+        "release-window-selector-v6-governed-etf-daily-publication"
     )
     assert summarize_release_plan(selected.rows) == [
         {
@@ -444,7 +444,7 @@ def test_selector_keeps_baostock_legacy_rows_but_retires_pre2016_primary_units()
         "primary-current",
     ]
     assert selected.report()["selector_version"] == (
-        "release-window-selector-v5-source-history-stk-surv-fina-audit-pagination-bound"
+        "release-window-selector-v6-governed-etf-daily-publication"
     )
 
 

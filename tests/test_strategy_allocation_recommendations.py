@@ -12,7 +12,9 @@ import pytest
 from governance_fixtures import (
     PERIODS,
     create_strategy_version,
+    enable_recommendation_authority_for_test,
     formal_backtest_metrics,
+    governed_etf_ready_evidence,
 )
 from qlib_test_doubles import (
     QlibPortfolioOptimizer,
@@ -50,10 +52,15 @@ def _approve_version(
     suffix: str,
     returns: pd.Series,
     periods: dict | None = None,
+    recipe_id: str = "short_relative_strength",
 ) -> str:
     periods = periods or PERIODS
     version_id = create_strategy_version(
-        database_url, tmp_path, dataset="allocation-data", periods=periods
+        database_url,
+        tmp_path,
+        dataset="allocation-data",
+        periods=periods,
+        recipe_id=recipe_id,
     )
     strategies = StrategyStore(database_url)
     version = strategies.get_version(version_id)
@@ -126,6 +133,7 @@ def _daily_dataset() -> dict:
             "qlib_amount_unit": "cny",
             "source_hand_size": 100,
             "index_volume_policy": "excluded_non_tradable_benchmark",
+            "governed_etf_whitelist": governed_etf_ready_evidence(),
             "lineage_verified": True,
         },
     }
@@ -182,7 +190,12 @@ def test_allocation_uses_recommendation_ledgers_and_propagates_risk(
             periods=first_window,
         ),
         _approve_version(
-            database_url, tmp_path, suffix="two", returns=second, periods=second_window
+            database_url,
+            tmp_path,
+            suffix="two",
+            returns=second,
+            periods=second_window,
+            recipe_id="swing_trend",
         ),
     ]
     store = AllocationStore(database_url)
@@ -342,6 +355,9 @@ def test_allocation_uses_recommendation_ledgers_and_propagates_risk(
                         created_at=now,
                     )
                 )
+    # This test exercises allocation/NAV plumbing rather than the natural-time
+    # forward gate.  Keep both authority projections internally consistent.
+    enable_recommendation_authority_for_test(database_url, version_ids)
     with pytest.raises(ValueError, match="independently reviewed"):
         store.approve(
             allocation["id"],

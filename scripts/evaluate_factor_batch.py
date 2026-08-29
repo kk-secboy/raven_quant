@@ -30,6 +30,7 @@ from quant_platform.factor_recompute import (
     validate_factor_prefix_invariance,
 )
 from quant_platform.qlib_workflow import qlib_workflow_run
+from quant_platform.research_label_binding import validate_research_label_binding
 from quant_platform.statistical_validation import benjamini_hochberg
 
 
@@ -141,6 +142,32 @@ def main() -> None:
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     candidates = manifest["candidates"]
     periods = manifest["periods"]
+    raw_label_binding = manifest.get("research_label_binding")
+    label_binding = (
+        validate_research_label_binding(raw_label_binding)
+        if raw_label_binding is not None
+        else None
+    )
+    if label_binding is not None:
+        if (
+            manifest.get("research_label_binding_sha256")
+            != label_binding["binding_sha256"]
+            or manifest.get("research_window_contract")
+            != label_binding["research_window_contract"]
+            or manifest.get("research_window_contract_sha256")
+            != label_binding["research_window_contract_sha256"]
+            or manifest.get("dataset_identity_sha256")
+            != label_binding["dataset_identity_sha256"]
+            or periods != label_binding["periods"]
+            or int(manifest.get("label_horizon_sessions") or 0)
+            != int(label_binding["label_horizon_sessions"])
+            or any(
+                int(item.get("label_horizon_days") or 0)
+                != int(label_binding["label_horizon_sessions"])
+                for item in candidates
+            )
+        ):
+            raise ValueError("factor evaluation label binding changed in transit")
     profiles = manifest.get("evaluation_profiles") or [
         {
             "id": "explicit",
@@ -295,7 +322,21 @@ def main() -> None:
                 }
             )
             label_horizon_days = int(item["label_horizon_days"])
+            if label_binding is not None:
+                label_horizon_days = int(label_binding["label_horizon_sessions"])
             recompute_evidence["label_horizon_days"] = label_horizon_days
+            if label_binding is not None:
+                recompute_evidence.update(
+                    {
+                        "research_label_binding_sha256": label_binding[
+                            "binding_sha256"
+                        ],
+                        "research_window_contract_sha256": label_binding[
+                            "research_window_contract_sha256"
+                        ],
+                        "horizon_profile": label_binding["horizon_profile"],
+                    }
+                )
             if label_horizon_days not in labels_by_horizon:
                 labels_by_horizon[label_horizon_days] = D.features(
                     D.instruments(str(manifest.get("universe") or "cn_all")),
@@ -410,7 +451,20 @@ def main() -> None:
             if item.get("status") == "ok":
                 item["metrics"]["bh_q_value"] = q_value
                 item["metrics"]["experiment_count"] = declared
-    result = {"status": "ok", "evaluations": evaluations}
+    result = {
+        "status": "ok",
+        "evaluations": evaluations,
+        **(
+            {
+                "research_label_binding": label_binding,
+                "research_label_binding_sha256": label_binding[
+                    "binding_sha256"
+                ],
+            }
+            if label_binding is not None
+            else {}
+        ),
+    }
     output.parent.mkdir(parents=True, exist_ok=True)
     with qlib_workflow_run(
         run_kind="factor-evaluation",

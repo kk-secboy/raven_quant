@@ -789,6 +789,70 @@ class DataTaskStore:
                 )
             self._bind_pipeline_jobs(connection, now)
 
+    def catalog_shell(self) -> list[dict[str, Any]]:
+        """Return a cheap cold-start projection without scanning work units.
+
+        The full ``list`` projection groups a potentially multi-million-row
+        work-unit ledger.  A fresh API process may not have the disk cache yet,
+        but the novice-facing task center must still show the governed catalog
+        immediately while that aggregate refresh runs in the background.
+        """
+
+        with self.engine.connect() as connection:
+            rows = [
+                row_dict(row)
+                for row in connection.execute(
+                    select(data_tasks).order_by(
+                        data_tasks.c.phase,
+                        data_tasks.c.sort_order,
+                    )
+                )
+            ]
+        status_by_key = {
+            str(row["task_key"]): str(row["status"])
+            for row in rows
+        }
+        for row in rows:
+            dependencies = list(row.pop("depends_on_json") or [])
+            row["depends_on"] = dependencies
+            row["config"] = row.pop("config_json")
+            row["coverage"] = 100.0 if row["status"] == "succeeded" else 0.0
+            row["rows"] = 0
+            row["unit_stats"] = {
+                "planned": 0,
+                "succeeded": 0,
+                "pending": 0,
+                "running": 0,
+                "retry_waiting": 0,
+                "terminal_failed": 0,
+                "rate_limited": 0,
+                "superseded": 0,
+                "rows": 0,
+                "next_retry_at": None,
+            }
+            dependencies_satisfied = all(
+                status_by_key.get(key) == "succeeded" for key in dependencies
+            )
+            row["dependencies_satisfied"] = dependencies_satisfied
+            status = str(row["status"])
+            if not dependencies_satisfied and status not in {
+                "queued",
+                "running",
+                "succeeded",
+            }:
+                phase = "blocked_prerequisite"
+            else:
+                phase = {
+                    "queued": "queued",
+                    "running": "planning",
+                    "failed": "terminal_failure",
+                    "succeeded": "verified",
+                    "partial": "partial",
+                }.get(status, "ready_to_start")
+            row["execution_phase"] = phase
+            row["projection_status"] = "catalog_shell"
+        return rows
+
     @staticmethod
     def _bind_pipeline_jobs(connection, now: datetime) -> None:
         structured_information_kinds = (

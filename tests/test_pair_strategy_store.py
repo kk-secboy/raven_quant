@@ -146,8 +146,8 @@ def test_recommendation_portfolio_rejects_pair_research_version(
 
 
 def test_allocation_rejects_pair_as_core_member(database_url: str, tmp_path) -> None:
-    # Pair strategies may enter a virtual allocation only as tightly capped
-    # shadow satellites; they can never become the capital core.
+    # Pair strategies remain readable for offline research, but the retired
+    # production branch cannot enter any Autopilot capital allocation.
     from sqlalchemy import update
 
     from quant_data.database import strategy_versions
@@ -173,7 +173,7 @@ def test_allocation_rejects_pair_as_core_member(database_url: str, tmp_path) -> 
             .where(strategy_versions.c.id.in_([first, second]))
             .values(status="approved")
         )
-    with pytest.raises(ValueError, match="only be satellite"):
+    with pytest.raises(ValueError, match="pair allocations are retired"):
         AllocationStore(database_url).create(
             name="invalid-pair-allocation",
             strategy_version_ids=[first, second],

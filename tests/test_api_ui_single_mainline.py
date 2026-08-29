@@ -25,6 +25,9 @@ RDAGENT_PANEL_SOURCE = (ROOT / "web" / "app" / "rdagent-panel.tsx").read_text(
 QLIB_PANEL_SOURCE = (ROOT / "web" / "app" / "qlib-panel.tsx").read_text(
     encoding="utf-8"
 )
+RDAGENT_BRIDGE_SOURCE = (ROOT / "scripts" / "rdagent_bridge.py").read_text(
+    encoding="utf-8"
+)
 
 
 def _class_block(source: str, class_name: str) -> str:
@@ -49,6 +52,20 @@ def test_runtime_status_recovers_without_serving_two_layers_of_stale_failure() -
     )
 
 
+def test_advanced_web_reads_a_sanitized_official_trace_projection() -> None:
+    assert '"trace_contract_version": "rdagent-trace-web-v1"' in RDAGENT_BRIDGE_SOURCE
+    assert '"trace_loops": _trace_loop_projection(rounds)' in RDAGENT_BRIDGE_SOURCE
+    for forbidden in ('"code":', '"code_path":', '"workspace_path":'):
+        projection = RDAGENT_BRIDGE_SOURCE.split(
+            "def _trace_loop_projection", 1
+        )[1].split("def _sha256", 1)[0]
+        assert forbidden not in projection
+    assert "def _rdagent_trace_view(" in API_SOURCE
+    assert "官方 RDLoop / Trace（只读）" in RDAGENT_PANEL_SOURCE
+    assert "Hypothesis" in RDAGENT_PANEL_SOURCE
+    assert "Feedback" in RDAGENT_PANEL_SOURCE
+
+
 def test_autopilot_trial_history_is_unified_and_does_not_require_a_tournament() -> None:
     assert 'raise HTTPException(404, "autopilot cycle not found")' in API_SOURCE
     assert "AutopilotTrialAuditService" in API_SOURCE
@@ -62,6 +79,38 @@ def test_legacy_http_execution_surfaces_stay_retired() -> None:
     assert '"replacement": "/api/recommendation-portfolios"' in API_SOURCE
     assert '"/api/broker' not in API_SOURCE
     assert '"/api/pair-portfolios' not in API_SOURCE
+
+
+def test_legacy_research_programs_and_campaigns_are_read_only() -> None:
+    for retired_schema in (
+        "ResearchProgramCreateRequest",
+        "ResearchProgramStatusRequest",
+        "ResearchCampaignCreateRequest",
+        "ResearchCampaignStatusRequest",
+    ):
+        assert retired_schema not in API_SOURCE
+    for route, replacement in (
+        ("/api/research-programs", "/api/autopilot"),
+        ("/api/research-campaigns", "/api/autopilot"),
+    ):
+        assert f'@app.get("{route}")' in API_SOURCE
+        write_block = API_SOURCE.split(f'@app.post("{route}"', 1)[1].split(
+            "@app.", 1
+        )[0]
+        assert "HTTPException(" in write_block
+        assert "410" in write_block
+        assert replacement in write_block
+
+    for function_name in (
+        "set_research_program_status",
+        "check_research_program_now",
+        "set_research_campaign_status",
+        "retry_research_campaign",
+    ):
+        block = API_SOURCE.split(f"def {function_name}", 1)[1].split("@app.", 1)[0]
+        assert "HTTPException(410" in block
+        assert "legacy_research_programs." not in block
+        assert "legacy_research_campaigns." not in block
 
 
 def test_real_broker_gateway_is_not_a_production_build_capability() -> None:
@@ -99,7 +148,10 @@ def test_unified_simulation_has_only_governed_sources_and_two_adapters() -> None
         in SIMULATION_SOURCE
     )
     assert 'SIMULATION_EXECUTION_ADAPTERS = frozenset({"long_only", "pair"})' in SIMULATION_SOURCE
-    assert 'SIMULATION_EXECUTION_FREQUENCIES = frozenset({"1min", "5min"})' in SIMULATION_SOURCE
+    assert (
+        'SIMULATION_EXECUTION_FREQUENCIES = frozenset({"day", "1min", "5min"})'
+        in SIMULATION_SOURCE
+    )
     for marker in ("quant_broker_gateway", "broker_order_outbox", "pair_paper_orders", "requests."):
         assert marker not in SIMULATION_SOURCE
 
@@ -157,6 +209,15 @@ def test_pair_shadow_is_not_part_of_the_automatic_capital_line() -> None:
         "pair_shadow_batches_materialized = 0",
     ):
         assert marker in tick
+    for retired_implementation in (
+        "def _ensure_approved_pair_shadow_accounts",
+        "def _enqueue_due_pair_shadow_backtests",
+        "def _materialize_due_pair_shadow_batches",
+        'self.jobs.create(\n                    "pair_backtest"',
+    ):
+        assert retired_implementation not in SCHEDULER_SOURCE
+    assert 'if job["kind"] == "pair_backtest":\n            output =' not in WORKER_SOURCE
+    assert "scripts/run_pair_backtest.py" not in WORKER_SOURCE
 
 
 def test_long_only_replay_api_accepts_only_an_immutable_order_plan_identity() -> None:

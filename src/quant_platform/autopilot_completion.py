@@ -343,6 +343,7 @@ def build_long_only_strategy_config(
         "max_daily_turnover": 0.15,
         "max_daily_loss": 0.03,
         "stop_loss": 0.07,
+        "profit_taking_mode": "threshold",
         "take_profit_partial": 0.12,
         "take_profit_partial_fraction": 0.50,
         "take_profit": 0.20,
@@ -457,8 +458,10 @@ def build_long_only_strategy_config(
         raise ValueError("industry limit must not be below the single-position limit")
     if construction != "topk_equal_weight" and topk * max_position_weight < 1.0:
         raise ValueError("QP portfolio position limits cannot form a fully invested portfolio")
-    if float(config.get("take_profit_partial") or 0.0) >= float(
-        config.get("take_profit") or 0.0
+    if (
+        str(config.get("profit_taking_mode") or "threshold") == "threshold"
+        and float(config.get("take_profit_partial") or 0.0)
+        >= float(config.get("take_profit") or 0.0)
     ):
         raise ValueError("partial take-profit must be below final take-profit")
     if float(config.get("max_drawdown_reduce") or 0.0) >= float(

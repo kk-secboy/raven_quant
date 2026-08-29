@@ -11,13 +11,14 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from sqlalchemy import delete, func, insert, or_, select, update
+from sqlalchemy import delete, func, insert, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
     account_netting_plans,
     backtest_runs,
+    jobs,
     open_database,
     recommendation_holdings,
     recommendation_portfolios,
@@ -52,8 +53,10 @@ from quant_data.database import (
     strategy_versions,
 )
 from quant_data.execution_contract import (
+    QLIB_OUTPUT_MANIFEST_VERSION,
     require_daily_qlib_contract,
     require_minute_execution_contract,
+    require_native_daily_execution_controls,
     require_next_bar_execution,
     require_strategy_execution_contract,
 )
@@ -63,6 +66,7 @@ from .account_risk_state import (
     RISK_SCOPE,
     ledger_policy_risk_inputs,
 )
+from .allocation_store import THREE_HORIZON_ALLOCATION_CUTOVER_LOCK_KEY
 from .corporate_actions import corporate_actions_sha256
 from .cost_model import (
     KNOWN_COST_SCHEDULE_VERSIONS,
@@ -74,6 +78,10 @@ from .execution_algorithms import execution_time_slots, normalize_execution_poli
 from .member_risk_gate import (
     load_allocation_risk_state,
     load_strategy_risk_state,
+)
+from .paper_policy_state import (
+    previous_snapshot_from_paper_batch,
+    validate_paper_policy_state,
 )
 from .qlib_workflow import require_qlib_workflow_identity
 from .safe_mode import SafeModeStore
@@ -107,6 +115,8 @@ LEDGER_INTEGRITY_ERROR_MARKERS = (
     "cash flows do not reconcile",
     "would create negative cash",
 )
+
+ALLOCATION_SOURCE_REBIND_VERSION = "simulation-allocation-source-rebind-v1"
 
 
 def _now() -> datetime:
@@ -235,10 +245,132 @@ def _benchmark_chain_day(
 
 SIMULATION_SOURCE_TYPES = frozenset({"recommendation", "strategy_version", "allocation"})
 SIMULATION_EXECUTION_ADAPTERS = frozenset({"long_only", "pair"})
-SIMULATION_EXECUTION_FREQUENCIES = frozenset({"1min", "5min"})
+SIMULATION_EXECUTION_FREQUENCIES = frozenset({"day", "1min", "5min"})
 SIMULATION_EXECUTION_SEMANTICS_VERSION = "simulation-execution-semantics-v1"
 SIMULATION_BENCHMARK_EVIDENCE_VERSION = "simulation-benchmark-evidence-v1"
+SIMULATION_SETTLEMENT_CALENDAR_EVIDENCE_VERSION = (
+    "simulation-settlement-calendar-evidence-v1"
+)
+SIMULATION_SETTLEMENT_CALENDAR_BINDING_VERSION = (
+    "simulation-settlement-calendar-binding-v1"
+)
+SETTLEMENT_CALENDAR_RELATIVE_PATH = "metadata/known_trading_calendar.parquet"
 QLIB_ORDER_PLAN_FORMAT_VERSION = "qlib-order-plan-v1"
+
+
+class ExecutionDataNotReadyError(ValueError):
+    """The sealed signal exists, but its immutable execution day does not yet."""
+
+    def __init__(self, trade_date: date) -> None:
+        self.trade_date = trade_date
+        super().__init__(
+            "governed execution data is awaiting publication for "
+            f"{trade_date.isoformat()}"
+        )
+
+
+def _annotate_position_holding_ages(
+    positions: list[dict[str, Any]],
+    lots: list[dict[str, Any]],
+    *,
+    calendar_days: set[date],
+    as_of_date: date,
+    require_complete_age: bool,
+) -> list[dict[str, Any]]:
+    """Project durable lot acquisition dates into Qlib trading-session ages.
+
+    This is deliberately a pure read-side projection.  Re-running a paper
+    order-plan after a worker restart therefore derives the same age from the
+    simulation ledger instead of trusting ephemeral policy state.  A live
+    position is proven only when its positive lots account for the full
+    position quantity and every lot has an acquisition date covered by the
+    selected daily Qlib calendar.
+    """
+
+    normalized_calendar = sorted(set(calendar_days))
+    if as_of_date not in normalized_calendar:
+        raise ValueError(
+            "paper holding-age projection requires the signal date in the "
+            "bound Qlib trading calendar"
+        )
+    calendar_index = {day: index for index, day in enumerate(normalized_calendar)}
+    lots_by_instrument: dict[str, list[dict[str, Any]]] = {}
+    for raw_lot in lots:
+        lot = dict(raw_lot)
+        instrument = str(lot.get("instrument") or "")
+        if instrument and int(lot.get("quantity") or 0) > 0:
+            lots_by_instrument.setdefault(instrument, []).append(lot)
+
+    projected: list[dict[str, Any]] = []
+    incomplete: list[str] = []
+    for raw_position in positions:
+        position = dict(raw_position)
+        instrument = str(position.get("instrument") or "")
+        quantity = int(position.get("quantity") or 0)
+        is_live_long = (
+            str(position.get("position_side") or "long") == "long" and quantity > 0
+        )
+        if not is_live_long:
+            projected.append(position)
+            continue
+
+        instrument_lots = lots_by_instrument.get(instrument, [])
+        reasons: list[str] = []
+        if not instrument_lots:
+            reasons.append("no_position_lots")
+        elif sum(int(item.get("quantity") or 0) for item in instrument_lots) != quantity:
+            reasons.append("lot_quantity_mismatch")
+
+        acquired_dates: list[date] = []
+        for lot in instrument_lots:
+            acquired_at = lot.get("acquired_at")
+            if isinstance(acquired_at, datetime):
+                acquired_at = acquired_at.date()
+            elif isinstance(acquired_at, str):
+                try:
+                    acquired_at = date.fromisoformat(acquired_at)
+                except ValueError:
+                    acquired_at = None
+            if not isinstance(acquired_at, date):
+                reasons.append("acquired_at_unknown")
+                continue
+            if acquired_at > as_of_date:
+                reasons.append("acquired_after_signal_date")
+            elif acquired_at not in calendar_index:
+                reasons.append("acquired_at_outside_qlib_calendar")
+            acquired_dates.append(acquired_at)
+
+        earliest = min(acquired_dates) if acquired_dates else None
+        if reasons or earliest is None or earliest not in calendar_index:
+            evidence = {
+                "status": "unproven",
+                "calendar": "qlib_day",
+                "as_of_date": as_of_date.isoformat(),
+                "earliest_acquired_at": earliest.isoformat() if earliest else None,
+                "reasons": sorted(set(reasons or ["acquired_at_unproven"])),
+            }
+            position["holding_age_sessions"] = None
+            position["holding_age_evidence"] = evidence
+            incomplete.append(f"{instrument}({','.join(evidence['reasons'])})")
+        else:
+            age = calendar_index[as_of_date] - calendar_index[earliest]
+            position["holding_age_sessions"] = age
+            position["holding_age_evidence"] = {
+                "status": "proven",
+                "calendar": "qlib_day",
+                "as_of_date": as_of_date.isoformat(),
+                "earliest_acquired_at": earliest.isoformat(),
+                "lot_count": len(instrument_lots),
+                "position_quantity": quantity,
+            }
+        projected.append(position)
+
+    if require_complete_age and incomplete:
+        raise ValueError(
+            "active holding-age exit policy cannot prove simulation lot acquisition "
+            "dates from the bound Qlib calendar: " + "; ".join(sorted(incomplete))
+        )
+    return projected
 PAPER_TARGET_PROJECTION_VERSION = "paper-target-projection-v1"
 VWAP_PROFILE_METHOD = "qlib-historical-average-volume-v1"
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -256,6 +388,276 @@ def _canonical_hash(payload: dict[str, Any]) -> str:
 def _is_sha256(value: Any) -> bool:
     text = str(value or "").lower()
     return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+def build_settlement_calendar_evidence(
+    *,
+    trade_date: date,
+    next_trade_date: date,
+    dataset_identity_sha256: str,
+    dataset_lineage_id: str,
+    calendar_file_sha256: str,
+) -> dict[str, Any]:
+    """Seal the next-session decision to one immutable execution dataset."""
+
+    identity = str(dataset_identity_sha256 or "").strip().lower()
+    lineage = str(dataset_lineage_id or "").strip().lower()
+    calendar_hash = str(calendar_file_sha256 or "").strip().lower()
+    if not _is_sha256(identity) or not _is_sha256(lineage):
+        raise ValueError("settlement calendar evidence requires sealed dataset lineage")
+    if not _is_sha256(calendar_hash):
+        raise ValueError("settlement calendar evidence requires a sealed calendar file")
+    if not trade_date < next_trade_date <= trade_date + timedelta(days=31):
+        raise ValueError("settlement calendar next session is outside its horizon")
+    payload = {
+        "contract_version": SIMULATION_SETTLEMENT_CALENDAR_EVIDENCE_VERSION,
+        "calendar_path": SETTLEMENT_CALENDAR_RELATIVE_PATH,
+        "calendar_file_sha256": calendar_hash,
+        "dataset_identity_sha256": identity,
+        "dataset_lineage_id": lineage,
+        "trade_date": trade_date.isoformat(),
+        "next_trade_date": next_trade_date.isoformat(),
+    }
+    return {**payload, "evidence_sha256": _canonical_hash(payload)}
+
+
+def validate_settlement_calendar_binding(
+    value: Any,
+    *,
+    trade_date: date,
+    dataset_identity_sha256: str,
+    dataset_lineage_id: str,
+) -> dict[str, Any]:
+    """Validate the batch-persisted calendar identity independently of replay."""
+
+    if not isinstance(value, dict):
+        raise ValueError("daily simulation batch has no settlement calendar binding")
+    identity = str(dataset_identity_sha256 or "").strip().lower()
+    lineage = str(dataset_lineage_id or "").strip().lower()
+    calendar_hash = str(value.get("calendar_file_sha256") or "").strip().lower()
+    calendar_bytes = value.get("calendar_file_bytes")
+    try:
+        bound_trade_date = date.fromisoformat(str(value.get("trade_date") or ""))
+        next_trade_date = date.fromisoformat(
+            str(value.get("next_trade_date") or "")
+        )
+    except ValueError as exc:
+        raise ValueError("daily settlement calendar binding dates are invalid") from exc
+    if (
+        not _is_sha256(identity)
+        or not _is_sha256(lineage)
+        or not _is_sha256(calendar_hash)
+        or isinstance(calendar_bytes, bool)
+        or not isinstance(calendar_bytes, int)
+        or calendar_bytes < 1
+        or bound_trade_date != trade_date
+        or not trade_date < next_trade_date <= trade_date + timedelta(days=31)
+    ):
+        raise ValueError("daily settlement calendar binding identity is invalid")
+    payload = {
+        "contract_version": SIMULATION_SETTLEMENT_CALENDAR_BINDING_VERSION,
+        "calendar_path": SETTLEMENT_CALENDAR_RELATIVE_PATH,
+        "calendar_file_sha256": calendar_hash,
+        "calendar_file_bytes": calendar_bytes,
+        "dataset_identity_sha256": identity,
+        "dataset_lineage_id": lineage,
+        "trade_date": trade_date.isoformat(),
+        "next_trade_date": next_trade_date.isoformat(),
+    }
+    expected = {**payload, "binding_sha256": _canonical_hash(payload)}
+    if value != expected:
+        raise ValueError("daily settlement calendar binding does not match its dataset")
+    return expected
+
+
+def build_settlement_calendar_binding(
+    dataset: dict[str, Any], *, trade_date: date
+) -> dict[str, Any]:
+    """Resolve and verify the calendar hash from one sealed Qlib dataset."""
+
+    if not isinstance(dataset, dict) or dataset.get("output_files_verified") is not True:
+        raise ValueError("daily settlement dataset outputs are not independently verified")
+    provider = Path(str(dataset.get("path") or ""))
+    provenance = dict(dataset.get("provenance") or {})
+    output_manifest = provenance.get("output_manifest")
+    if (
+        not isinstance(output_manifest, dict)
+        or output_manifest.get("version") != QLIB_OUTPUT_MANIFEST_VERSION
+        or not isinstance(output_manifest.get("files"), list)
+    ):
+        raise ValueError("daily settlement dataset has no sealed output manifest")
+    entries = [
+        item
+        for item in output_manifest["files"]
+        if isinstance(item, dict)
+        and item.get("path") == SETTLEMENT_CALENDAR_RELATIVE_PATH
+    ]
+    if len(entries) != 1:
+        raise ValueError("daily settlement dataset has no unique sealed calendar")
+    entry = entries[0]
+    calendar_bytes = entry.get("bytes")
+    calendar_hash = str(entry.get("sha256") or "").strip().lower()
+    calendar_path = provider / Path(SETTLEMENT_CALENDAR_RELATIVE_PATH)
+    if (
+        isinstance(calendar_bytes, bool)
+        or not isinstance(calendar_bytes, int)
+        or calendar_bytes < 1
+        or not _is_sha256(calendar_hash)
+        or not calendar_path.is_file()
+        or calendar_path.stat().st_size != calendar_bytes
+        or _sha256_file(calendar_path) != calendar_hash
+    ):
+        raise ValueError("daily settlement calendar does not match the sealed output manifest")
+    try:
+        frame = pd.read_parquet(calendar_path)
+    except Exception as exc:
+        raise ValueError("daily settlement calendar cannot be read") from exc
+    if (
+        calendar_path.stat().st_size != calendar_bytes
+        or _sha256_file(calendar_path) != calendar_hash
+    ):
+        raise ValueError("daily settlement calendar changed while being bound")
+    if "date" not in frame.columns or frame.empty:
+        raise ValueError("daily settlement calendar has no sessions")
+    timestamps = pd.to_datetime(frame["date"], errors="coerce")
+    if timestamps.isna().any():
+        raise ValueError("daily settlement calendar contains invalid sessions")
+    sessions = [value.date() for value in timestamps]
+    if sessions != sorted(set(sessions)) or trade_date not in sessions:
+        raise ValueError("daily settlement calendar sessions are not governed")
+    later_sessions = [value for value in sessions if value > trade_date]
+    if not later_sessions:
+        raise ValueError("daily settlement calendar has no next session")
+    next_trade_date = later_sessions[0]
+    if next_trade_date > trade_date + timedelta(days=31):
+        raise ValueError("daily settlement calendar next session is outside its horizon")
+    payload = {
+        "contract_version": SIMULATION_SETTLEMENT_CALENDAR_BINDING_VERSION,
+        "calendar_path": SETTLEMENT_CALENDAR_RELATIVE_PATH,
+        "calendar_file_sha256": calendar_hash,
+        "calendar_file_bytes": calendar_bytes,
+        "dataset_identity_sha256": str(
+            provenance.get("dataset_identity_sha256") or ""
+        ).lower(),
+        "dataset_lineage_id": str(provenance.get("dataset_lineage_id") or "").lower(),
+        "trade_date": trade_date.isoformat(),
+        "next_trade_date": next_trade_date.isoformat(),
+    }
+    return validate_settlement_calendar_binding(
+        {**payload, "binding_sha256": _canonical_hash(payload)},
+        trade_date=trade_date,
+        dataset_identity_sha256=payload["dataset_identity_sha256"],
+        dataset_lineage_id=payload["dataset_lineage_id"],
+    )
+
+
+def validate_settlement_calendar_evidence(
+    value: Any,
+    *,
+    trade_date: date,
+    next_trade_date: date,
+    dataset_identity_sha256: str,
+    dataset_lineage_id: str,
+    calendar_file_sha256: str,
+) -> dict[str, Any]:
+    """Reject settlement dates not sealed to the batch execution snapshot."""
+
+    if not isinstance(value, dict):
+        raise ValueError("simulation execution evidence has no settlement calendar proof")
+    expected = build_settlement_calendar_evidence(
+        trade_date=trade_date,
+        next_trade_date=next_trade_date,
+        dataset_identity_sha256=dataset_identity_sha256,
+        dataset_lineage_id=dataset_lineage_id,
+        calendar_file_sha256=calendar_file_sha256,
+    )
+    if value != expected:
+        raise ValueError(
+            "simulation settlement calendar evidence does not match the bound dataset"
+        )
+    return expected
+
+
+def build_allocation_source_rebind_event(
+    *,
+    portfolio_id: str,
+    old_allocation_id: str,
+    new_allocation_id: str,
+    actor: str,
+    old_execution_contract_hash: str,
+    new_execution_contract_hash: str,
+    old_simulation_semantics_sha256: str,
+    new_simulation_semantics_sha256: str,
+) -> dict[str, Any]:
+    """Seal one in-place allocation-source replacement for the primary ledger."""
+
+    identifiers = {
+        "portfolio_id": str(portfolio_id).strip(),
+        "old_allocation_id": str(old_allocation_id).strip(),
+        "new_allocation_id": str(new_allocation_id).strip(),
+        "actor": str(actor).strip(),
+    }
+    if any(not value for value in identifiers.values()):
+        raise ValueError("allocation source replacement identifiers are required")
+    if identifiers["old_allocation_id"] == identifiers["new_allocation_id"]:
+        raise ValueError("allocation source replacement requires a new allocation")
+    hashes = {
+        "old_execution_contract_hash": str(old_execution_contract_hash).lower(),
+        "new_execution_contract_hash": str(new_execution_contract_hash).lower(),
+        "old_simulation_semantics_sha256": str(
+            old_simulation_semantics_sha256
+        ).lower(),
+        "new_simulation_semantics_sha256": str(
+            new_simulation_semantics_sha256
+        ).lower(),
+    }
+    if any(not _is_sha256(value) for value in hashes.values()):
+        raise ValueError("allocation source replacement requires sealed contracts")
+    payload = {
+        "contract_version": ALLOCATION_SOURCE_REBIND_VERSION,
+        **identifiers,
+        **hashes,
+        "ledger_action": "in_place_source_rebind",
+        "ledger_rows_copied": False,
+    }
+    return {**payload, "event_sha256": _canonical_hash(payload)}
+
+
+def validate_allocation_source_rebind_event(
+    value: dict[str, Any],
+    *,
+    portfolio_id: str,
+    old_allocation_id: str,
+    new_allocation_id: str,
+) -> dict[str, Any]:
+    """Validate a persisted cutover event before treating a retry as complete."""
+
+    if not isinstance(value, dict):
+        raise ValueError("allocation source replacement event must be an object")
+    payload = dict(value)
+    event_sha256 = str(payload.pop("event_sha256", "")).lower()
+    if not _is_sha256(event_sha256) or event_sha256 != _canonical_hash(payload):
+        raise ValueError("allocation source replacement event seal is invalid")
+    if (
+        payload.get("contract_version") != ALLOCATION_SOURCE_REBIND_VERSION
+        or str(payload.get("portfolio_id") or "") != str(portfolio_id)
+        or str(payload.get("old_allocation_id") or "") != str(old_allocation_id)
+        or str(payload.get("new_allocation_id") or "") != str(new_allocation_id)
+        or not str(payload.get("actor") or "").strip()
+        or payload.get("ledger_action") != "in_place_source_rebind"
+        or payload.get("ledger_rows_copied") is not False
+        or any(
+            not _is_sha256(payload.get(field))
+            for field in (
+                "old_execution_contract_hash",
+                "new_execution_contract_hash",
+                "old_simulation_semantics_sha256",
+                "new_simulation_semantics_sha256",
+            )
+        )
+    ):
+        raise ValueError("allocation source replacement event identity is invalid")
+    return {**payload, "event_sha256": event_sha256}
 
 
 def _sha256_file(path: Path) -> str:
@@ -1161,13 +1563,18 @@ class SimulationStore:
             return normalize_execution_policy(provided)
         config = dict(source.get("config") or {})
         method = str(source.get("execution_method") or "").lower()
-        if method not in {"twap", "vwap", "next_bar"}:
+        if method not in {"open", "twap", "vwap", "next_bar"}:
             raise ValueError(
-                "long-only simulation requires a minute execution method in its "
+                "long-only simulation requires a governed execution method in its "
                 "approved source contract"
             )
         governed = {
             "execution_algorithm": method,
+            "execution_frequency": str(
+                source.get("execution_frequency")
+                or config.get("execution_frequency")
+                or ("day" if method == "open" else "5min")
+            ),
             "slice_minutes": int(config.get("execution_slice_minutes") or 20),
             "max_slices": int(config.get("max_execution_slices") or 24),
             "max_participation": float(config.get("max_volume_participation") or 0.0),
@@ -1175,6 +1582,7 @@ class SimulationStore:
         }
         aliases = {
             "execution_algorithm": "execution_algorithm",
+            "execution_frequency": "execution_frequency",
             "slice_minutes": "slice_minutes",
             "max_slices": "max_slices",
             "max_participation": "max_participation",
@@ -1250,7 +1658,11 @@ class SimulationStore:
                 execution_provenance["dataset_lineage_id"]
             ),
             execution_field_contract_version=str(
-                execution_provenance["execution_contract_version"]
+                execution_provenance[
+                    "field_contract_version"
+                    if frequency == "day"
+                    else "execution_contract_version"
+                ]
             ),
             execution_engine_version=SIMULATION_ENGINE_VERSION,
             execution_policy=bound,
@@ -1278,8 +1690,8 @@ class SimulationStore:
         promotion_stage_id: str | None = None,
     ) -> dict[str, Any]:
         self.safe_mode.assert_inactive(action="simulation account creation")
-        if initial_cash < 100_000:
-            raise ValueError("simulation initial cash must be at least 100000")
+        if not isfinite(float(initial_cash)) or float(initial_cash) <= 0:
+            raise ValueError("simulation initial cash must be positive")
         if cost_schedule_version not in KNOWN_COST_SCHEDULE_VERSIONS:
             raise ValueError("simulation cost schedule version is unavailable")
         daily_provenance = dict(daily_dataset.get("provenance") or {})
@@ -1287,16 +1699,23 @@ class SimulationStore:
         require_daily_qlib_contract(daily_provenance)
         execution_frequency = str(execution_provenance.get("frequency") or "")
         if execution_frequency not in SIMULATION_EXECUTION_FREQUENCIES:
-            raise ValueError("simulation execution frequency must be 1min or 5min")
-        require_minute_execution_contract(
-            execution_provenance,
-            frequency=execution_frequency,
-            simulation_eligible=True,
-        )
+            raise ValueError("simulation execution frequency must be day, 1min, or 5min")
+        if execution_frequency == "day":
+            require_daily_qlib_contract(execution_provenance)
+            require_native_daily_execution_controls(
+                execution_provenance,
+                start=str(execution_dataset.get("end_date") or date.today().isoformat()),
+            )
+        else:
+            require_minute_execution_contract(
+                execution_provenance,
+                frequency=execution_frequency,
+                simulation_eligible=True,
+            )
         daily_source = str(daily_provenance.get("source_lineage_id") or "")
         execution_source = str(execution_provenance.get("source_lineage_id") or "")
         if len(daily_source) != 64 or daily_source != execution_source:
-            raise ValueError("daily and minute datasets must share one verified source lineage")
+            raise ValueError("daily and execution datasets must share one verified source lineage")
         required_hashes = {
             "daily identity": daily_provenance.get("dataset_identity_sha256"),
             "daily lineage": daily_provenance.get("dataset_lineage_id"),
@@ -1427,7 +1846,9 @@ class SimulationStore:
                         ],
                         execution_dataset_lineage_id=execution_provenance["dataset_lineage_id"],
                         execution_field_contract_version=execution_provenance[
-                            "execution_contract_version"
+                            "field_contract_version"
+                            if execution_frequency == "day"
+                            else "execution_contract_version"
                         ],
                         execution_engine_version=SIMULATION_ENGINE_VERSION,
                         cost_schedule_version=source_cost_model.version,
@@ -2211,6 +2632,598 @@ class SimulationStore:
             raise ValueError("simulation execution semantics failed immutable verification")
         return source
 
+    @staticmethod
+    def _allocation_dataset_lineage(allocation: Any) -> str:
+        lineage = str(
+            dict(allocation.analysis_json or {}).get("allocation_dataset_lineage_id")
+            or ""
+        ).lower()
+        if lineage and not _is_sha256(lineage):
+            raise ValueError("allocation dataset lineage evidence is invalid")
+        return lineage
+
+    @staticmethod
+    def _validated_allocation_rebind_datasets(
+        daily_dataset: dict[str, Any] | None,
+        execution_dataset: dict[str, Any] | None,
+    ) -> dict[str, str] | None:
+        if daily_dataset is None and execution_dataset is None:
+            return None
+        if daily_dataset is None or execution_dataset is None:
+            raise ValueError(
+                "allocation source replacement requires both daily and execution datasets"
+            )
+        daily_provenance = dict(daily_dataset.get("provenance") or {})
+        execution_provenance = dict(execution_dataset.get("provenance") or {})
+        require_daily_qlib_contract(daily_provenance)
+        execution_frequency = str(execution_provenance.get("frequency") or "")
+        if execution_frequency == "day":
+            require_daily_qlib_contract(execution_provenance)
+            require_native_daily_execution_controls(
+                execution_provenance,
+                start=str(execution_dataset.get("end_date") or date.today().isoformat()),
+            )
+            execution_field_contract = str(
+                execution_provenance.get("field_contract_version") or ""
+            )
+        else:
+            require_minute_execution_contract(
+                execution_provenance,
+                frequency=execution_frequency,
+                simulation_eligible=True,
+            )
+            execution_field_contract = str(
+                execution_provenance.get("execution_contract_version") or ""
+            )
+        daily_source = str(daily_provenance.get("source_lineage_id") or "")
+        execution_source = str(execution_provenance.get("source_lineage_id") or "")
+        if not _is_sha256(daily_source) or daily_source != execution_source:
+            raise ValueError(
+                "allocation replacement datasets must share one verified source lineage"
+            )
+        bindings = {
+            "daily_dataset": str(daily_dataset.get("name") or ""),
+            "daily_dataset_identity_sha256": str(
+                daily_provenance.get("dataset_identity_sha256") or ""
+            ),
+            "daily_dataset_lineage_id": str(
+                daily_provenance.get("dataset_lineage_id") or ""
+            ),
+            "daily_field_contract_version": str(
+                daily_provenance.get("field_contract_version") or ""
+            ),
+            "execution_dataset": str(execution_dataset.get("name") or ""),
+            "execution_dataset_identity_sha256": str(
+                execution_provenance.get("dataset_identity_sha256") or ""
+            ),
+            "execution_dataset_lineage_id": str(
+                execution_provenance.get("dataset_lineage_id") or ""
+            ),
+            "execution_field_contract_version": execution_field_contract,
+            "execution_frequency": execution_frequency,
+        }
+        required_hashes = (
+            "daily_dataset_identity_sha256",
+            "daily_dataset_lineage_id",
+            "execution_dataset_identity_sha256",
+            "execution_dataset_lineage_id",
+        )
+        if (
+            not bindings["daily_dataset"]
+            or not bindings["execution_dataset"]
+            or any(not _is_sha256(bindings[field]) for field in required_hashes)
+        ):
+            raise ValueError(
+                "allocation replacement datasets require immutable identities and lineages"
+            )
+        return bindings
+
+    @staticmethod
+    def _require_allocation_rebind_quiescent(
+        connection: Any, portfolio_id: str
+    ) -> None:
+        queued_batches = connection.scalars(
+            select(simulation_batches.c.id)
+            .where(
+                simulation_batches.c.portfolio_id == portfolio_id,
+                simulation_batches.c.status == "queued",
+            )
+            .limit(5)
+        ).all()
+        working_orders = connection.scalars(
+            select(simulation_orders.c.id)
+            .select_from(
+                simulation_orders.join(
+                    simulation_batches,
+                    simulation_batches.c.id == simulation_orders.c.batch_id,
+                )
+            )
+            .where(
+                simulation_batches.c.portfolio_id == portfolio_id,
+                simulation_orders.c.status.in_(OPEN_STATUSES),
+            )
+            .limit(5)
+        ).all()
+        if queued_batches or working_orders:
+            raise ValueError(
+                "three-horizon account cutover is waiting for all queued batches "
+                "and working orders to settle"
+            )
+
+    def prepare_allocation_source_replacement(
+        self,
+        portfolio_id: str,
+        *,
+        old_allocation_id: str,
+        new_allocation_id: str,
+        actor: str,
+        daily_dataset: dict[str, Any] | None = None,
+        execution_dataset: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Pause one quiescent primary ledger before AllocationStore replacement.
+
+        Locking the portfolio before inspecting batches/orders serializes this
+        preflight with every order-plan writer.  Once paused, no execution can
+        start while AllocationStore atomically replaces the allocation version.
+        """
+
+        self.safe_mode.assert_inactive(action="simulation allocation source replacement")
+        responsible = str(actor).strip()
+        if len(responsible) < 2:
+            raise ValueError("a responsible allocation cutover actor is required")
+        old_id = str(old_allocation_id).strip()
+        new_id = str(new_allocation_id).strip()
+        if not old_id or not new_id or old_id == new_id:
+            raise ValueError("allocation cutover requires distinct old and new sources")
+        replacement_bindings = self._validated_allocation_rebind_datasets(
+            daily_dataset, execution_dataset
+        )
+        with self.engine.begin() as connection:
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": THREE_HORIZON_ALLOCATION_CUTOVER_LOCK_KEY},
+            )
+            portfolio = connection.execute(
+                select(simulation_portfolios)
+                .where(simulation_portfolios.c.id == portfolio_id)
+                .with_for_update()
+            ).first()
+            if portfolio is None:
+                raise KeyError(portfolio_id)
+            if str(portfolio.source_type) != "allocation":
+                raise ValueError("only an allocation simulation may replace its source")
+            allocations = connection.execute(
+                select(strategy_allocations)
+                .where(strategy_allocations.c.id.in_([old_id, new_id]))
+                .order_by(strategy_allocations.c.id)
+                .with_for_update()
+            ).all()
+            by_id = {str(item.id): item for item in allocations}
+            if set(by_id) != {old_id, new_id}:
+                raise ValueError("allocation cutover source versions are unavailable")
+            if str(portfolio.source_id) == new_id:
+                self._require_current_source_contract(connection, portfolio)
+                return self._portfolio_dict(portfolio)
+            if (
+                str(portfolio.source_id) != old_id
+                or str(by_id[old_id].status) != "active"
+                or str(by_id[new_id].status) != "draft"
+            ):
+                raise ValueError(
+                    "allocation cutover preflight does not match the serving source states"
+                )
+            if (
+                abs(float(by_id[old_id].total_capital) - float(by_id[new_id].total_capital))
+                > 1e-6
+                or abs(float(portfolio.initial_cash) - float(by_id[new_id].total_capital))
+                > 1e-6
+            ):
+                raise ValueError(
+                    "allocation source replacement cannot change account principal"
+                )
+            old_lineage = self._allocation_dataset_lineage(by_id[old_id])
+            new_lineage = self._allocation_dataset_lineage(by_id[new_id])
+            account_lineage = str(portfolio.daily_dataset_lineage_id)
+            if old_lineage and old_lineage != account_lineage:
+                raise ValueError(
+                    "serving allocation no longer matches the primary account dataset lineage"
+                )
+            if new_lineage != account_lineage:
+                if replacement_bindings is None:
+                    raise ValueError(
+                        "allocation dataset-lineage rollover requires a verified "
+                        "replacement dataset"
+                    )
+                if (
+                    replacement_bindings["daily_dataset_lineage_id"] != new_lineage
+                    or replacement_bindings["execution_dataset_lineage_id"] != new_lineage
+                    or replacement_bindings["daily_dataset"] != str(by_id[new_id].dataset)
+                ):
+                    raise ValueError(
+                        "replacement allocation and dataset-lineage evidence do not match"
+                    )
+            self._require_current_source_contract(connection, portfolio)
+            self._require_allocation_rebind_quiescent(connection, str(portfolio.id))
+            connection.execute(
+                update(simulation_portfolios)
+                .where(simulation_portfolios.c.id == portfolio.id)
+                .values(status="paused", updated_at=_now())
+            )
+        return self.get(portfolio_id)
+
+    def abort_allocation_source_replacement(
+        self,
+        portfolio_id: str,
+        *,
+        old_allocation_id: str,
+        new_allocation_id: str,
+    ) -> dict[str, Any]:
+        """Restore the old service when allocation approval did not commit."""
+
+        old_id = str(old_allocation_id).strip()
+        new_id = str(new_allocation_id).strip()
+        with self.engine.begin() as connection:
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": THREE_HORIZON_ALLOCATION_CUTOVER_LOCK_KEY},
+            )
+            portfolio = connection.execute(
+                select(simulation_portfolios)
+                .where(simulation_portfolios.c.id == portfolio_id)
+                .with_for_update()
+            ).first()
+            if portfolio is None:
+                raise KeyError(portfolio_id)
+            if str(portfolio.source_id) == new_id:
+                return self._portfolio_dict(portfolio)
+            old = connection.execute(
+                select(strategy_allocations)
+                .where(strategy_allocations.c.id == old_id)
+                .with_for_update()
+            ).first()
+            new = connection.execute(
+                select(strategy_allocations)
+                .where(strategy_allocations.c.id == new_id)
+                .with_for_update()
+            ).first()
+            if (
+                str(portfolio.source_type) != "allocation"
+                or str(portfolio.source_id) != old_id
+                or old is None
+                or str(old.status) != "active"
+                or new is None
+                or str(new.status) != "draft"
+            ):
+                raise ValueError(
+                    "the previous three-horizon account can no longer be resumed safely"
+                )
+            self._require_current_source_contract(connection, portfolio)
+            self._require_allocation_rebind_quiescent(connection, str(portfolio.id))
+            connection.execute(
+                update(simulation_portfolios)
+                .where(simulation_portfolios.c.id == portfolio.id)
+                .values(status="active", updated_at=_now())
+            )
+        return self.get(portfolio_id)
+
+    def replace_allocation_source(
+        self,
+        portfolio_id: str,
+        *,
+        old_allocation_id: str,
+        new_allocation_id: str,
+        actor: str,
+        daily_dataset: dict[str, Any] | None = None,
+        execution_dataset: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Rebind one allocation ledger in place without copying financial rows."""
+
+        self.safe_mode.assert_inactive(action="simulation allocation source replacement")
+        responsible = str(actor).strip()
+        if len(responsible) < 2:
+            raise ValueError("a responsible allocation cutover actor is required")
+        old_id = str(old_allocation_id).strip()
+        new_id = str(new_allocation_id).strip()
+        if not old_id or not new_id or old_id == new_id:
+            raise ValueError("allocation cutover requires distinct old and new sources")
+        replacement_bindings = self._validated_allocation_rebind_datasets(
+            daily_dataset, execution_dataset
+        )
+        try:
+            with self.engine.begin() as connection:
+                connection.execute(
+                    text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                    {"lock_key": THREE_HORIZON_ALLOCATION_CUTOVER_LOCK_KEY},
+                )
+                portfolio = connection.execute(
+                    select(simulation_portfolios)
+                    .where(simulation_portfolios.c.id == portfolio_id)
+                    .with_for_update()
+                ).first()
+                if portfolio is None:
+                    raise KeyError(portfolio_id)
+                if str(portfolio.source_type) != "allocation":
+                    raise ValueError("only an allocation simulation may replace its source")
+                if str(portfolio.source_id) == new_id:
+                    self._require_current_source_contract(connection, portfolio)
+                    if replacement_bindings is not None and any(
+                        str(getattr(portfolio, field)) != str(value)
+                        for field, value in replacement_bindings.items()
+                        if field != "execution_frequency"
+                    ):
+                        raise ValueError(
+                            "completed allocation cutover does not match its replacement dataset"
+                        )
+                    prior_event = connection.execute(
+                        select(simulation_events.c.details_json).where(
+                            simulation_events.c.portfolio_id == portfolio.id,
+                            simulation_events.c.event_type
+                            == "allocation_source_rebound",
+                        )
+                    ).all()
+                    governed_retry = False
+                    for row in prior_event:
+                        try:
+                            validate_allocation_source_rebind_event(
+                                dict(row.details_json or {}),
+                                portfolio_id=str(portfolio.id),
+                                old_allocation_id=old_id,
+                                new_allocation_id=new_id,
+                            )
+                        except ValueError:
+                            continue
+                        governed_retry = True
+                        break
+                    if not governed_retry:
+                        raise ValueError(
+                            "allocation source already changed without a governed cutover event"
+                        )
+                    if str(portfolio.status) != "active":
+                        connection.execute(
+                            update(simulation_portfolios)
+                            .where(simulation_portfolios.c.id == portfolio.id)
+                            .values(status="active", updated_at=_now())
+                        )
+                    replayed = self._portfolio_dict(portfolio)
+                    replayed["status"] = "active"
+                    return replayed
+
+                allocations = connection.execute(
+                    select(strategy_allocations)
+                    .where(strategy_allocations.c.id.in_([old_id, new_id]))
+                    .order_by(strategy_allocations.c.id)
+                    .with_for_update()
+                ).all()
+                by_id = {str(item.id): item for item in allocations}
+                if set(by_id) != {old_id, new_id}:
+                    raise ValueError("allocation cutover source versions are unavailable")
+                old = by_id[old_id]
+                new = by_id[new_id]
+                if (
+                    str(portfolio.source_id) != old_id
+                    or str(portfolio.status) != "paused"
+                    or str(old.status) != "paused"
+                    or str(new.status) != "active"
+                ):
+                    raise ValueError(
+                        "allocation source replacement is outside its safe paused cutover"
+                    )
+                self._require_allocation_rebind_quiescent(connection, str(portfolio.id))
+                if (
+                    abs(float(old.total_capital) - float(new.total_capital)) > 1e-6
+                    or abs(float(portfolio.initial_cash) - float(new.total_capital)) > 1e-6
+                ):
+                    raise ValueError(
+                        "allocation source replacement cannot change account principal"
+                    )
+                old_lineage = self._allocation_dataset_lineage(old)
+                new_lineage = self._allocation_dataset_lineage(new)
+                if old_lineage and old_lineage != str(
+                    portfolio.daily_dataset_lineage_id
+                ):
+                    raise ValueError(
+                        "serving allocation no longer matches the primary account dataset lineage"
+                    )
+                if replacement_bindings is not None:
+                    if (
+                        replacement_bindings["daily_dataset_lineage_id"] != new_lineage
+                        or replacement_bindings["execution_dataset_lineage_id"] != new_lineage
+                        or replacement_bindings["daily_dataset"] != str(new.dataset)
+                        or replacement_bindings["execution_frequency"]
+                        != str(portfolio.execution_frequency)
+                    ):
+                        raise ValueError(
+                            "replacement allocation and dataset evidence do not match"
+                        )
+                elif new_lineage:
+                    if new_lineage not in {
+                        str(portfolio.daily_dataset_lineage_id),
+                        str(portfolio.execution_dataset_lineage_id),
+                    } or str(portfolio.daily_dataset_lineage_id) != str(
+                        portfolio.execution_dataset_lineage_id
+                    ):
+                        raise ValueError(
+                            "allocation dataset-lineage rollover requires verified datasets"
+                        )
+                elif not (
+                    str(old.dataset)
+                    == str(new.dataset)
+                    == str(portfolio.daily_dataset)
+                ):
+                    raise ValueError(
+                        "allocation source replacement has no lineage proof for dataset rollover"
+                    )
+                target_execution_dataset = (
+                    replacement_bindings["execution_dataset"]
+                    if replacement_bindings is not None
+                    else str(portfolio.execution_dataset)
+                )
+                conflict = connection.execute(
+                    select(simulation_portfolios.c.id).where(
+                        simulation_portfolios.c.source_type == "allocation",
+                        simulation_portfolios.c.source_id == new_id,
+                        simulation_portfolios.c.execution_dataset
+                        == target_execution_dataset,
+                        simulation_portfolios.c.id != portfolio.id,
+                    )
+                ).first()
+                if conflict is not None:
+                    raise ValueError(
+                        "replacement allocation already owns another simulation ledger"
+                    )
+                source = self._resolve_source(connection, "allocation", new_id)
+                if replacement_bindings is not None and str(source.get("dataset") or "") != str(
+                    replacement_bindings["daily_dataset"]
+                ):
+                    raise ValueError(
+                        "replacement dataset does not match the active allocation source"
+                    )
+                benchmark = str(source.get("benchmark") or "").strip().upper()
+                if not benchmark or benchmark != str(portfolio.benchmark or "").upper():
+                    raise ValueError(
+                        "allocation source replacement changed the account benchmark"
+                    )
+                new_contract_hash = str(source.get("execution_contract_hash") or "")
+                if not _is_sha256(new_contract_hash):
+                    raise ValueError("replacement allocation has no sealed execution contract")
+                cost_model = CostModelConfig.from_mapping(source.get("config"))
+                if cost_model.version != str(portfolio.cost_schedule_version):
+                    raise ValueError(
+                        "replacement allocation changed the account cost schedule"
+                    )
+                current_policy = dict(portfolio.execution_policy_json or {})
+                old_semantics_sha256 = str(
+                    current_policy.get("simulation_semantics_sha256") or ""
+                )
+                normalized_policy = self._governed_execution_policy(
+                    source,
+                    current_policy,
+                    adapter=str(portfolio.execution_adapter),
+                )
+                if (
+                    normalized_policy.get("execution_algorithm")
+                    != str(portfolio.execution_algorithm)
+                    or normalized_policy.get("execution_frequency")
+                    != str(portfolio.execution_frequency)
+                ):
+                    raise ValueError(
+                        "replacement allocation changed the account execution policy"
+                    )
+                bound_daily_dataset = daily_dataset or {
+                    "name": str(portfolio.daily_dataset),
+                    "provenance": {
+                        "dataset_identity_sha256": str(
+                            portfolio.daily_dataset_identity_sha256
+                        ),
+                        "dataset_lineage_id": str(
+                            portfolio.daily_dataset_lineage_id
+                        ),
+                    },
+                }
+                bound_execution_dataset = execution_dataset or {
+                    "name": str(portfolio.execution_dataset),
+                    "provenance": {
+                        "dataset_identity_sha256": str(
+                            portfolio.execution_dataset_identity_sha256
+                        ),
+                        "dataset_lineage_id": str(
+                            portfolio.execution_dataset_lineage_id
+                        ),
+                        "field_contract_version": str(
+                            portfolio.execution_field_contract_version
+                        ),
+                        "execution_contract_version": str(
+                            portfolio.execution_field_contract_version
+                        ),
+                    },
+                }
+                rebound_policy = self._bind_execution_semantics(
+                    source=source,
+                    source_type="allocation",
+                    source_id=new_id,
+                    adapter=str(portfolio.execution_adapter),
+                    frequency=str(portfolio.execution_frequency),
+                    daily_dataset=bound_daily_dataset,
+                    execution_dataset=bound_execution_dataset,
+                    policy=normalized_policy,
+                    cost_model=cost_model,
+                )
+                event = build_allocation_source_rebind_event(
+                    portfolio_id=str(portfolio.id),
+                    old_allocation_id=old_id,
+                    new_allocation_id=new_id,
+                    actor=responsible,
+                    old_execution_contract_hash=str(
+                        portfolio.execution_contract_hash
+                    ),
+                    new_execution_contract_hash=new_contract_hash,
+                    old_simulation_semantics_sha256=old_semantics_sha256,
+                    new_simulation_semantics_sha256=str(
+                        rebound_policy["simulation_semantics_sha256"]
+                    ),
+                )
+                now = _now()
+                dataset_updates = (
+                    {
+                        field: value
+                        for field, value in replacement_bindings.items()
+                        if field != "execution_frequency"
+                    }
+                    if replacement_bindings is not None
+                    else {}
+                )
+                connection.execute(
+                    update(simulation_portfolios)
+                    .where(simulation_portfolios.c.id == portfolio.id)
+                    .values(
+                        source_id=new_id,
+                        status="active",
+                        benchmark=benchmark,
+                        execution_contract_hash=new_contract_hash,
+                        execution_policy_json=rebound_policy,
+                        **dataset_updates,
+                        updated_at=now,
+                    )
+                )
+                connection.execute(
+                    pg_insert(simulation_events)
+                    .values(
+                        id=event["event_sha256"],
+                        portfolio_id=portfolio.id,
+                        batch_id=None,
+                        trade_date=now.astimezone(SHANGHAI_TIMEZONE).date(),
+                        severity="info",
+                        event_type="allocation_source_rebound",
+                        instrument=None,
+                        reason=(
+                            "progressive_horizon_activation_preserved_primary_ledger"
+                        ),
+                        details_json=event,
+                        created_at=now,
+                    )
+                    .on_conflict_do_nothing(index_elements=[simulation_events.c.id])
+                )
+                stored_event = connection.scalar(
+                    select(simulation_events.c.details_json).where(
+                        simulation_events.c.id == event["event_sha256"]
+                    )
+                )
+                if dict(stored_event or {}) != event:
+                    raise ValueError(
+                        "allocation source replacement event identity was reused"
+                    )
+                rebound = connection.execute(
+                    select(simulation_portfolios).where(
+                        simulation_portfolios.c.id == portfolio.id
+                    )
+                ).one()
+                self._require_current_source_contract(connection, rebound)
+        except IntegrityError as exc:
+            raise ValueError(
+                "allocation source replacement conflicts with another simulation ledger"
+            ) from exc
+        return self.get(portfolio_id)
+
     def set_status(self, portfolio_id: str, status: str) -> dict[str, Any]:
         if status not in {"active", "paused"}:
             raise ValueError("simulation status must be active or paused")
@@ -2265,6 +3278,85 @@ class SimulationStore:
                 portfolio.execution_dataset_lineage_id
             ),
         }
+
+    @classmethod
+    def _account_order_plan_dataset_bindings(
+        cls,
+        *,
+        portfolio: Any,
+        signal_date: date,
+        trade_date: date,
+        data_root: Path | None,
+    ) -> dict[str, str]:
+        bindings = cls._portfolio_batch_dataset_bindings(portfolio)
+        daily_roll = str(portfolio.daily_roll_policy or "pinned")
+        execution_roll = str(portfolio.execution_roll_policy or "pinned")
+        if daily_roll == "pinned" and execution_roll == "pinned":
+            return bindings
+        if data_root is None:
+            raise ValueError(
+                "latest-compatible account order plan is waiting for governed datasets"
+            )
+        from .data_rollover import next_qlib_trading_date, select_qlib_dataset
+
+        daily = select_qlib_dataset(
+            data_root,
+            anchor_name=str(portfolio.daily_dataset),
+            roll_policy=daily_roll,
+            lineage_id=str(portfolio.daily_dataset_lineage_id),
+            required_date=signal_date,
+        )
+        execution = select_qlib_dataset(
+            data_root,
+            anchor_name=str(portfolio.execution_dataset),
+            roll_policy=execution_roll,
+            lineage_id=str(portfolio.execution_dataset_lineage_id),
+            required_date=trade_date,
+        )
+        # The replay contract settles T+1 cash on the following Qlib session.
+        # Do not freeze a batch until that calendar evidence is already present.
+        next_qlib_trading_date(execution, trade_date)
+        daily_provenance = dict(daily.get("provenance") or {})
+        execution_provenance = dict(execution.get("provenance") or {})
+        require_daily_qlib_contract(daily_provenance)
+        if str(portfolio.execution_frequency) == "day":
+            require_daily_qlib_contract(execution_provenance)
+        else:
+            require_minute_execution_contract(
+                execution_provenance,
+                frequency=str(portfolio.execution_frequency),
+                simulation_eligible=True,
+            )
+        if str(daily_provenance.get("source_lineage_id") or "") != str(
+            execution_provenance.get("source_lineage_id") or ""
+        ):
+            raise ValueError(
+                "account daily and execution datasets do not share source lineage"
+            )
+        resolved = {
+            "daily_dataset": str(daily["name"]),
+            "daily_dataset_identity_sha256": str(
+                daily_provenance["dataset_identity_sha256"]
+            ),
+            "daily_dataset_lineage_id": str(daily_provenance["dataset_lineage_id"]),
+            "execution_dataset": str(execution["name"]),
+            "execution_dataset_identity_sha256": str(
+                execution_provenance["dataset_identity_sha256"]
+            ),
+            "execution_dataset_lineage_id": str(
+                execution_provenance["dataset_lineage_id"]
+            ),
+        }
+        if (
+            resolved["daily_dataset_lineage_id"]
+            != str(portfolio.daily_dataset_lineage_id)
+            or resolved["execution_dataset_lineage_id"]
+            != str(portfolio.execution_dataset_lineage_id)
+        ):
+            raise ValueError(
+                "latest-compatible account datasets are outside the primary ledger lineage"
+            )
+        return resolved
 
     @staticmethod
     def _batch_simulation_semantics_sha256(
@@ -2458,13 +3550,21 @@ class SimulationStore:
         if execution_roll == "latest_compatible":
             from .data_rollover import select_qlib_dataset
 
-            execution = select_qlib_dataset(
-                data_root,
-                anchor_name=str(portfolio.execution_dataset),
-                roll_policy=execution_roll,
-                lineage_id=str(portfolio.execution_dataset_lineage_id),
-                required_date=trade_date,
-            )
+            try:
+                execution = select_qlib_dataset(
+                    data_root,
+                    anchor_name=str(portfolio.execution_dataset),
+                    roll_policy=execution_roll,
+                    lineage_id=str(portfolio.execution_dataset_lineage_id),
+                    required_date=trade_date,
+                )
+            except ValueError as exc:
+                if str(exc) == (
+                    "no verified latest-compatible Qlib descendant covers the "
+                    "requested date"
+                ):
+                    raise ExecutionDataNotReadyError(trade_date) from exc
+                raise
             execution_provenance = dict(execution.get("provenance") or {})
             selected_daily = datasets.get(bindings["daily_dataset"])
             daily_source_lineage = str(
@@ -2592,6 +3692,59 @@ class SimulationStore:
                     trade_date=snapshot.effective_date,
                     data_root=data_root,
                 )
+                target_payload = None
+                if str(portfolio.execution_frequency) == "day":
+                    if data_root is None:
+                        raise ValueError(
+                            "daily recommendation simulation requires the sealed "
+                            "execution calendar dataset"
+                        )
+                    from .services import list_qlib_datasets
+
+                    execution_datasets = {
+                        str(item["name"]): item
+                        for item in list_qlib_datasets(Path(data_root))
+                    }
+                    execution_dataset = execution_datasets.get(
+                        dataset_bindings["execution_dataset"]
+                    )
+                    if (
+                        execution_dataset is None
+                        or execution_dataset.get("ready") is not True
+                        or execution_dataset.get("reproducible") is not True
+                    ):
+                        raise ValueError(
+                            "daily recommendation execution dataset is not ready or reproducible"
+                        )
+                    execution_provenance = dict(
+                        execution_dataset.get("provenance") or {}
+                    )
+                    require_daily_qlib_contract(execution_provenance)
+                    require_native_daily_execution_controls(
+                        execution_provenance,
+                        start=snapshot.effective_date,
+                    )
+                    settlement_binding = build_settlement_calendar_binding(
+                        execution_dataset,
+                        trade_date=snapshot.effective_date,
+                    )
+                    validate_settlement_calendar_binding(
+                        settlement_binding,
+                        trade_date=snapshot.effective_date,
+                        dataset_identity_sha256=dataset_bindings[
+                            "execution_dataset_identity_sha256"
+                        ],
+                        dataset_lineage_id=dataset_bindings[
+                            "execution_dataset_lineage_id"
+                        ],
+                    )
+                    target_payload = {
+                        "governed_order_plan": {
+                            "format_version": "recommendation-snapshot-daily-v1",
+                            "source_snapshot_id": str(snapshot.id),
+                            "settlement_calendar_binding": settlement_binding,
+                        }
+                    }
                 simulation_semantics_sha256 = (
                     self._batch_simulation_semantics_sha256(
                         portfolio, dataset_bindings
@@ -2605,7 +3758,7 @@ class SimulationStore:
                         portfolio_id=portfolio.id,
                         recommendation_snapshot_id=snapshot_id,
                         source_snapshot_id=snapshot_id,
-                        target_payload_json=None,
+                        target_payload_json=target_payload,
                         execution_adapter=portfolio.execution_adapter,
                         execution_contract_hash=portfolio.execution_contract_hash,
                         **dataset_bindings,
@@ -2665,6 +3818,137 @@ class SimulationStore:
             "Qlib order-plan artifact or the recommendation snapshot path"
         )
 
+    def order_plan_predecessor_state(
+        self,
+        portfolio_id: str,
+        *,
+        signal_date: date,
+    ) -> dict[str, Any]:
+        """Prove the prior sealed plan has a certified ledger day for this account."""
+
+        with self.engine.connect() as connection:
+            portfolio_exists = connection.scalar(
+                select(simulation_portfolios.c.id).where(
+                    simulation_portfolios.c.id == portfolio_id
+                )
+            )
+            if portfolio_exists is None:
+                raise KeyError(portfolio_id)
+            prior = connection.execute(
+                select(
+                    jobs.c.id,
+                    jobs.c.status,
+                    jobs.c.payload_json,
+                    jobs.c.progress_json,
+                    jobs.c.created_at,
+                )
+                .where(
+                    jobs.c.kind == "simulation_order_plan",
+                    jobs.c.payload_json["simulation_portfolio_id"].as_string()
+                    == portfolio_id,
+                    jobs.c.payload_json["signal_date"].as_string()
+                    < signal_date.isoformat(),
+                )
+                .order_by(
+                    jobs.c.payload_json["signal_date"].as_string().desc(),
+                    jobs.c.created_at.desc(),
+                )
+                .limit(1)
+            ).first()
+            if prior is None:
+                return {
+                    "ready": True,
+                    "status": "first_plan",
+                    "portfolio_id": portfolio_id,
+                    "signal_date": signal_date.isoformat(),
+                }
+            prior_payload = dict(prior.payload_json or {})
+            prior_progress = dict(prior.progress_json or {})
+            prior_signal_date = str(prior_payload.get("signal_date") or "")
+            base = {
+                "ready": False,
+                "portfolio_id": portfolio_id,
+                "signal_date": signal_date.isoformat(),
+                "predecessor_job_id": str(prior.id),
+                "predecessor_signal_date": prior_signal_date,
+            }
+            if str(prior.status) != "succeeded":
+                return {
+                    **base,
+                    "status": "predecessor_plan_not_succeeded",
+                    "predecessor_job_status": str(prior.status),
+                    "recovery": "retry_frozen_simulation_order_plan",
+                }
+            batch_id = str(prior_progress.get("simulation_batch_id") or "")
+            if not batch_id:
+                return {
+                    **base,
+                    "status": str(
+                        prior_progress.get("simulation_batch_materialization_status")
+                        or "predecessor_batch_not_materialized"
+                    ),
+                }
+            batch = connection.execute(
+                select(simulation_batches).where(simulation_batches.c.id == batch_id)
+            ).first()
+            if (
+                batch is None
+                or str(batch.portfolio_id) != portfolio_id
+                or batch.signal_date.isoformat() != prior_signal_date
+                or batch.trade_date > signal_date
+            ):
+                return {**base, "status": "predecessor_batch_identity_invalid"}
+            if str(batch.status) != "succeeded":
+                return {
+                    **base,
+                    "status": "predecessor_batch_not_succeeded",
+                    "predecessor_batch_id": batch_id,
+                    "predecessor_batch_status": str(batch.status),
+                }
+            nav = connection.execute(
+                select(simulation_nav).where(
+                    simulation_nav.c.portfolio_id == portfolio_id,
+                    simulation_nav.c.trade_date == batch.trade_date,
+                )
+            ).first()
+            if (
+                nav is None
+                or not bool(nav.performance_certified)
+                or bool(nav.has_stale_prices)
+                or str(nav.status) != "healthy"
+                or nav.market_date != batch.trade_date
+            ):
+                return {
+                    **base,
+                    "status": "predecessor_nav_not_certified",
+                    "predecessor_batch_id": batch_id,
+                    "predecessor_trade_date": batch.trade_date.isoformat(),
+                }
+            return {
+                **base,
+                "ready": True,
+                "status": "predecessor_settled",
+                "predecessor_batch_id": batch_id,
+                "predecessor_trade_date": batch.trade_date.isoformat(),
+            }
+
+    def require_order_plan_predecessor_settled(
+        self,
+        portfolio_id: str,
+        *,
+        signal_date: date,
+    ) -> dict[str, Any]:
+        state = self.order_plan_predecessor_state(
+            portfolio_id,
+            signal_date=signal_date,
+        )
+        if not bool(state["ready"]):
+            raise ValueError(
+                "paper order-plan is waiting for its account predecessor: "
+                f"{state['status']}"
+            )
+        return state
+
     def create_batch_from_order_plan(
         self,
         portfolio_id: str,
@@ -2709,6 +3993,10 @@ class SimulationStore:
         normalized_targets = self._normalize_target_payload(
             target_payload, adapter="long_only"
         )
+        raw_policy_state = target_payload.get("paper_policy_state")
+        if not isinstance(raw_policy_state, dict):
+            raise ValueError("Qlib paper order-plan has no sealed policy state")
+        policy_state = validate_paper_policy_state(raw_policy_state)
         target_weights_sha256 = _canonical_hash(normalized_targets)
         if manifest.get("target_weights_sha256") != target_weights_sha256:
             raise ValueError("Qlib order-plan normalized targets do not match its manifest")
@@ -2837,6 +4125,50 @@ class SimulationStore:
                 trade_date=trade_date,
                 data_root=Path(data_root),
             )
+            settlement_calendar_binding = None
+            if str(portfolio.execution_frequency) == "day":
+                from .services import list_qlib_datasets
+
+                execution_datasets = {
+                    str(item["name"]): item
+                    for item in list_qlib_datasets(Path(data_root))
+                }
+                execution_dataset = execution_datasets.get(
+                    dataset_bindings["execution_dataset"]
+                )
+                if execution_dataset is None:
+                    raise ValueError(
+                        "daily paper execution dataset disappeared before batch binding"
+                    )
+                settlement_calendar_binding = build_settlement_calendar_binding(
+                    execution_dataset,
+                    trade_date=trade_date,
+                )
+                validate_settlement_calendar_binding(
+                    settlement_calendar_binding,
+                    trade_date=trade_date,
+                    dataset_identity_sha256=dataset_bindings[
+                        "execution_dataset_identity_sha256"
+                    ],
+                    dataset_lineage_id=dataset_bindings[
+                        "execution_dataset_lineage_id"
+                    ],
+                )
+            horizon_review = manifest.get("horizon_review")
+            if horizon_review is not None:
+                if (
+                    not isinstance(horizon_review, dict)
+                    or str(horizon_review.get("strategy_version_id") or "")
+                    != str(version.id)
+                    or str(horizon_review.get("signal_date") or "")
+                    != signal_date.isoformat()
+                    or str(horizon_review.get("dataset_identity_sha256") or "")
+                    != source_snapshot_id
+                    or len(str(horizon_review.get("evidence_sha256") or "")) != 64
+                ):
+                    raise ValueError(
+                        "Qlib order-plan horizon review does not match its paper batch"
+                    )
             plan = {
                 "format_version": QLIB_ORDER_PLAN_FORMAT_VERSION,
                 "manifest_sha256": manifest_sha256,
@@ -2858,8 +4190,13 @@ class SimulationStore:
                     manifest.get("qlib_workflow")
                 ),
             }
+            if horizon_review is not None:
+                plan["horizon_review"] = dict(horizon_review)
+            if settlement_calendar_binding is not None:
+                plan["settlement_calendar_binding"] = settlement_calendar_binding
             payload = {
                 **normalized_targets,
+                "paper_policy_state": policy_state,
                 "governed_order_plan": plan,
             }
             batch_id = uuid.uuid4().hex
@@ -2933,6 +4270,7 @@ class SimulationStore:
         not_before: datetime | None = None,
         not_after: datetime | None = None,
         signal_date: date | None = None,
+        data_root: Path | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Commit a keep/cancel/replace/new order plan and queue its execution batch.
 
@@ -3020,6 +4358,25 @@ class SimulationStore:
                     raise ValueError(
                         "account netting plan does not match the simulation account"
                     )
+                primary_evidence = dict(
+                    dict(plan_row.plan_json or {}).get("input_evidence") or {}
+                ).get("primary_account")
+                if primary_evidence is not None:
+                    if not isinstance(primary_evidence, dict):
+                        raise ValueError("account netting primary-capital evidence is invalid")
+                    expected_nav = float(primary_evidence.get("nav") or 0.0)
+                    if (
+                        str(primary_evidence.get("portfolio_id") or "")
+                        != str(portfolio.id)
+                        or str(primary_evidence.get("source_id") or "")
+                        != str(portfolio.source_id)
+                        or not isfinite(expected_nav)
+                        or expected_nav <= 0
+                        or abs(expected_nav - float(portfolio.nav)) > 1e-6
+                    ):
+                        raise ValueError(
+                            "account NAV changed after netting; rebuild the order plan"
+                        )
                 contributions = {
                     str(instrument): entry
                     for instrument, entry in (
@@ -3051,7 +4408,12 @@ class SimulationStore:
             cost_model = CostScheduleBook.from_mapping(
                 dict(portfolio.execution_policy_json or {}).get("cost_model")
             ).as_of(trade_date)
-            dataset_bindings = self._portfolio_batch_dataset_bindings(portfolio)
+            dataset_bindings = self._account_order_plan_dataset_bindings(
+                portfolio=portfolio,
+                signal_date=normalized_signal_date,
+                trade_date=trade_date,
+                data_root=data_root,
+            )
             batch_id = uuid.uuid4().hex
             connection.execute(
                 insert(simulation_batches).values(
@@ -3785,7 +5147,7 @@ class SimulationStore:
         payload = dict(target_payload or {})
         if adapter == "long_only":
             values = payload.get("target_weights")
-            if not isinstance(values, dict) or not values:
+            if not isinstance(values, dict):
                 raise ValueError("long-only simulation requires target_weights")
             targets = {str(key).upper(): float(value) for key, value in values.items()}
             if any(not isfinite(value) or value < 0 for value in targets.values()):
@@ -4142,6 +5504,7 @@ class SimulationStore:
         portfolio: Any,
         batch: Any,
         execution_evidence: dict[str, Any],
+        requires_volume_profile: bool,
     ) -> dict[str, Any]:
         stored = dict(portfolio.execution_policy_json or {})
         stored["simulation_semantics_sha256"] = str(
@@ -4158,6 +5521,19 @@ class SimulationStore:
             return stored
         if stored.get("volume_profile_method") != VWAP_PROFILE_METHOD:
             raise ValueError("simulation VWAP profile method is not governed")
+        if not requires_volume_profile:
+            if any(
+                execution_evidence.get(field) is not None
+                for field in (
+                    "execution_volume_profile",
+                    "execution_volume_profile_evidence",
+                    "execution_volume_profile_sha256",
+                )
+            ):
+                raise ValueError(
+                    "empty VWAP simulation cannot accept execution volume-profile evidence"
+                )
+            return stored
         lookback_days = int(stored.get("volume_profile_lookback_days") or 0)
         profile = execution_evidence.get("execution_volume_profile")
         evidence = execution_evidence.get("execution_volume_profile_evidence")
@@ -4407,6 +5783,37 @@ class SimulationStore:
                     "simulation next trading session evidence is outside its "
                     "settlement horizon"
                 )
+            batch_target_payload = dict(batch.target_payload_json or {})
+            if str(portfolio.execution_frequency) == "day":
+                governed_plan = batch_target_payload.get("governed_order_plan")
+                if not isinstance(governed_plan, dict):
+                    raise ValueError(
+                        "daily simulation batch has no governed settlement binding"
+                    )
+                settlement_binding = validate_settlement_calendar_binding(
+                    governed_plan.get("settlement_calendar_binding"),
+                    trade_date=batch.trade_date,
+                    dataset_identity_sha256=str(
+                        batch.execution_dataset_identity_sha256
+                    ),
+                    dataset_lineage_id=str(batch.execution_dataset_lineage_id),
+                )
+                if next_trade_date.isoformat() != settlement_binding["next_trade_date"]:
+                    raise ValueError(
+                        "simulation next trading session differs from its batch binding"
+                    )
+                validate_settlement_calendar_evidence(
+                    execution_evidence.get("settlement_calendar_evidence"),
+                    trade_date=batch.trade_date,
+                    next_trade_date=next_trade_date,
+                    dataset_identity_sha256=str(
+                        batch.execution_dataset_identity_sha256
+                    ),
+                    dataset_lineage_id=str(batch.execution_dataset_lineage_id),
+                    calendar_file_sha256=str(
+                        settlement_binding["calendar_file_sha256"]
+                    ),
+                )
             normalized_actions = [dict(item) for item in (corporate_actions or [])]
             if corporate_actions is not None:
                 # 公司行动与行情一样属于不可变执行输入：必须与证据哈希绑定。
@@ -4474,7 +5881,7 @@ class SimulationStore:
                     raise ValueError(
                         "simulation execution evidence does not match order-plan timing"
                     )
-            target_payload = dict(batch.target_payload_json or {})
+            target_payload = dict(batch_target_payload)
             order_plan_mode = False
             working_orders: dict[str, Any] = {}
             if batch.recommendation_snapshot_id:
@@ -4650,6 +6057,20 @@ class SimulationStore:
                 portfolio=portfolio,
                 batch=batch,
                 execution_evidence=execution_evidence,
+                requires_volume_profile=(
+                    str(portfolio.execution_adapter) == "pair"
+                    or any(
+                        int(position.get("quantity") or 0) != 0
+                        for position in position_state.values()
+                    )
+                    or any(
+                        float(weight) > 0
+                        for weight in dict(
+                            target_payload.get("target_weights") or {}
+                        ).values()
+                    )
+                    or bool(working_orders)
+                ),
             )
             cost_schedule = CostScheduleBook.from_mapping(
                 dict(portfolio.execution_policy_json or {}).get("cost_model")
@@ -6172,6 +7593,70 @@ class SimulationStore:
             ).first()
         return self._batch_dict(row) if row is not None else None
 
+    def latest_paper_previous_snapshot(
+        self,
+        portfolio_id: str,
+        *,
+        promotion_stage_id: str,
+        before_signal_date: date,
+    ) -> dict[str, Any] | None:
+        """Read the last successful policy state from the active paper lane.
+
+        The stage and portfolio are checked in the same read transaction as
+        the batch selection.  A latest successful row with a malformed or
+        missing state is an integrity error; it never silently falls back to
+        an older batch and changes cadence after a restart.
+        """
+
+        with self.engine.connect() as connection:
+            portfolio = connection.execute(
+                select(simulation_portfolios).where(
+                    simulation_portfolios.c.id == portfolio_id,
+                    simulation_portfolios.c.status == "active",
+                    simulation_portfolios.c.source_type == "strategy_version",
+                    simulation_portfolios.c.execution_adapter == "long_only",
+                    simulation_portfolios.c.promotion_stage_id == promotion_stage_id,
+                )
+            ).first()
+            if portfolio is None:
+                raise ValueError(
+                    "paper policy state requires the active stage-owned account"
+                )
+            stage = connection.execute(
+                select(strategy_promotion_stages.c.id).where(
+                    strategy_promotion_stages.c.id == promotion_stage_id,
+                    strategy_promotion_stages.c.strategy_version_id
+                    == portfolio.source_id,
+                    strategy_promotion_stages.c.simulation_portfolio_id
+                    == portfolio.id,
+                    strategy_promotion_stages.c.status == "active",
+                )
+            ).first()
+            if stage is None:
+                raise ValueError(
+                    "paper policy state is not bound to the active promotion stage"
+                )
+            batch = connection.execute(
+                select(simulation_batches)
+                .where(
+                    simulation_batches.c.portfolio_id == portfolio.id,
+                    simulation_batches.c.status == "succeeded",
+                    simulation_batches.c.signal_date < before_signal_date,
+                )
+                .order_by(
+                    simulation_batches.c.signal_date.desc(),
+                    simulation_batches.c.created_at.desc(),
+                )
+                .limit(1)
+            ).first()
+        if batch is None:
+            return None
+        return previous_snapshot_from_paper_batch(
+            self._batch_dict(batch),
+            expected_portfolio_id=str(portfolio.id),
+            expected_promotion_stage_id=promotion_stage_id,
+        )
+
     def current_autopilot_paper_target(self) -> dict[str, Any]:
         """Return the one read-only daily target projection for Autopilot.
 
@@ -6264,6 +7749,83 @@ class SimulationStore:
             }
         return self._paper_target_projection_from_batches(
             portfolio=portfolio,
+            account=account,
+            paper_stage_opened_at=selected._mapping["_paper_stage_opened_at"],
+            batches=batches,
+        )
+
+    def paper_target_for_strategy_version(self, version_id: str) -> dict[str, Any]:
+        """Return the latest governed target for one horizon's paper account.
+
+        Unlike ``current_autopilot_paper_target`` this selector is explicit and
+        therefore supports three simultaneously validating horizon accounts.
+        It remains a read-only simulation projection and never confers
+        recommendation permission.
+        """
+
+        with self.engine.connect() as connection:
+            selected = connection.execute(
+                select(
+                    simulation_portfolios,
+                    strategy_promotion_stages.c.status.label("_paper_stage_status"),
+                    strategy_promotion_stages.c.opened_at.label("_paper_stage_opened_at"),
+                )
+                .join(
+                    strategy_promotion_stages,
+                    strategy_promotion_stages.c.id
+                    == simulation_portfolios.c.promotion_stage_id,
+                )
+                .where(
+                    simulation_portfolios.c.status == "active",
+                    simulation_portfolios.c.source_type == "strategy_version",
+                    simulation_portfolios.c.source_id == version_id,
+                    simulation_portfolios.c.execution_adapter == "long_only",
+                    strategy_promotion_stages.c.status == "active",
+                )
+                .order_by(simulation_portfolios.c.updated_at.desc())
+                .limit(1)
+            ).first()
+            if selected is None:
+                return {
+                    "contract_version": PAPER_TARGET_PROJECTION_VERSION,
+                    "status": "waiting_for_paper_account",
+                    "mode": "paper_only",
+                    "recommendation_enabled": False,
+                    "real_trading_eligible": False,
+                    "simulation_portfolio": None,
+                    "signal_date": None,
+                    "trade_date": None,
+                    "targets": [],
+                }
+            batches = connection.execute(
+                select(simulation_batches)
+                .where(simulation_batches.c.portfolio_id == selected.id)
+                .order_by(
+                    simulation_batches.c.trade_date.desc(),
+                    simulation_batches.c.created_at.desc(),
+                )
+            ).all()
+
+        account = self._portfolio_dict(selected)
+        if not batches:
+            return {
+                "contract_version": PAPER_TARGET_PROJECTION_VERSION,
+                "status": "waiting_for_order_plan",
+                "mode": "paper_only",
+                "recommendation_enabled": False,
+                "real_trading_eligible": False,
+                "simulation_portfolio": {
+                    "id": account["id"],
+                    "name": account["name"],
+                    "status": account["status"],
+                    "strategy_version_id": version_id,
+                },
+                "signal_date": None,
+                "trade_date": None,
+                "targets": [],
+            }
+        return self._paper_target_projection_from_batches(
+            portfolio=selected,
             account=account,
             paper_stage_opened_at=selected._mapping["_paper_stage_opened_at"],
             batches=batches,
@@ -6578,6 +8140,9 @@ class SimulationStore:
                     simulation_portfolios.c.id == batch.portfolio_id
                 )
             ).one()
+            payload = dict(batch.target_payload_json or {})
+            governed_pair_plan = payload.get("governed_pair_plan")
+            governed_order_plan = payload.get("governed_order_plan")
             snapshot = None
             if batch.recommendation_snapshot_id:
                 snapshot = connection.execute(
@@ -6594,8 +8159,6 @@ class SimulationStore:
                     )
                 )
             else:
-                payload = dict(batch.target_payload_json or {})
-                governed_pair_plan = payload.get("governed_pair_plan")
                 target_instruments = set(payload.get("target_weights") or {})
                 target_instruments.update(
                     str(item.get("instrument"))
@@ -6611,6 +8174,20 @@ class SimulationStore:
                         simulation_positions.c.portfolio_id == portfolio.id
                     )
                 )
+            )
+        settlement_calendar_binding = (
+            governed_order_plan.get("settlement_calendar_binding")
+            if isinstance(governed_order_plan, dict)
+            else None
+        )
+        if str(portfolio.execution_frequency) == "day":
+            settlement_calendar_binding = validate_settlement_calendar_binding(
+                settlement_calendar_binding,
+                trade_date=batch.trade_date,
+                dataset_identity_sha256=str(
+                    batch.execution_dataset_identity_sha256
+                ),
+                dataset_lineage_id=str(batch.execution_dataset_lineage_id),
             )
         return {
             "batch_id": str(batch.id),
@@ -6649,7 +8226,57 @@ class SimulationStore:
             "execution_contract_hash": str(portfolio.execution_contract_hash),
             "instruments": sorted(target_instruments | held_instruments),
             "governed_pair_plan": governed_pair_plan,
+            "settlement_calendar_binding": settlement_calendar_binding,
         }
+
+    def positions_with_holding_age(
+        self,
+        portfolio_id: str,
+        *,
+        calendar_days: set[date],
+        as_of_date: date,
+        require_complete_age: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return current positions with ledger-proven Qlib-session ages.
+
+        Position and lot rows are read through one store operation; no age is
+        written back, so retries remain deterministic and cannot double-count
+        a session.  ``require_complete_age`` is used by bounded-holding and
+        thesis-exit policies to fail closed for legacy or incomplete lot data.
+        """
+
+        with self.engine.connect() as connection:
+            positions = [
+                row_dict(row)
+                for row in connection.execute(
+                    select(simulation_positions)
+                    .where(simulation_positions.c.portfolio_id == portfolio_id)
+                    .order_by(simulation_positions.c.instrument)
+                )
+            ]
+            lots = [
+                row_dict(row)
+                for row in connection.execute(
+                    select(simulation_position_lots)
+                    .where(simulation_position_lots.c.portfolio_id == portfolio_id)
+                    .order_by(
+                        simulation_position_lots.c.instrument,
+                        simulation_position_lots.c.lot_key,
+                    )
+                )
+            ]
+        projected = _annotate_position_holding_ages(
+            positions,
+            lots,
+            calendar_days=calendar_days,
+            as_of_date=as_of_date,
+            require_complete_age=require_complete_age,
+        )
+        for row in projected:
+            row["free_sellable_quantity"] = int(
+                row["available_quantity"]
+            ) - int(row["frozen_quantity"])
+        return projected
 
     def rows(
         self,

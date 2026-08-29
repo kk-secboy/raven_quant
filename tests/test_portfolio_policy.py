@@ -402,6 +402,54 @@ def test_policy_applies_position_and_portfolio_risk_rules() -> None:
     }
 
 
+def test_long_thesis_mode_does_not_apply_mechanical_profit_taking() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=1.0,
+            profit_taking_mode="thesis_only",
+        )
+    )
+
+    decision = policy.decide(
+        pd.Series({"quality_value": 1.0}),
+        {"quality_value": 1.0},
+        current_prices=pd.Series({"quality_value": 25.0}),
+        cost_basis={"quality_value": 10.0},
+    )
+
+    assert decision.target_weights == {"quality_value": pytest.approx(1.0)}
+    assert not {"take_profit", "take_profit_partial"}.intersection(
+        item["rule"] for item in decision.risk_events
+    )
+
+
+def test_rule_only_mode_does_not_apply_mechanical_profit_taking() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=1.0,
+            profit_taking_mode="rule_only",
+        )
+    )
+
+    decision = policy.decide(
+        pd.Series({"swing": 1.0}),
+        {"swing": 1.0},
+        current_prices=pd.Series({"swing": 25.0}),
+        cost_basis={"swing": 10.0},
+    )
+
+    assert decision.target_weights == {"swing": pytest.approx(1.0)}
+    assert not {"take_profit", "take_profit_partial"}.intersection(
+        item["rule"] for item in decision.risk_events
+    )
+
+
 def test_policy_execution_plan_reaches_target_on_configured_day() -> None:
     scores = pd.Series({"one": 2.0, "two": 1.0})
     policy = PortfolioPolicy(

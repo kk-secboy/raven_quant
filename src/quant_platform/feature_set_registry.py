@@ -13,6 +13,12 @@ from .factor_library import (
 # same immutable definitions as the unified library.
 RDAGENT_ALPHA20: dict[str, str] = feature_expression_map("alpha20")
 
+TRANSPARENT_STRATEGY_RECIPE_IDS = (
+    "short_relative_strength",
+    "swing_trend",
+    "long_quality_value",
+)
+
 
 def _record(
     feature_set_id: str,
@@ -80,6 +86,58 @@ FEATURE_SETS: dict[str, dict[str, Any]] = {
 }
 
 
+def transparent_strategy_feature_set(recipe_id: str) -> dict[str, Any]:
+    """Return the minimal, versioned feature grid owned by one public recipe.
+
+    Importing the recipe lazily avoids making the general factor registry a
+    second strategy registry.  The identifier includes the recipe version, and
+    the immutable digest also includes the full recipe digest, so a material
+    recipe change can never silently reuse an older research feature identity.
+    """
+
+    if recipe_id not in TRANSPARENT_STRATEGY_RECIPE_IDS:
+        raise ValueError("unknown transparent strategy recipe")
+    from .strategy_recipes import get_strategy_recipe
+
+    recipe = get_strategy_recipe(recipe_id)
+    factors = list(recipe.get("factor_baseline") or [])
+    features = {
+        str(item["id"]): str(item["qlib_expression"])
+        for item in factors
+        if str(item.get("id") or "").strip()
+        and str(item.get("qlib_expression") or "").strip()
+    }
+    if len(features) != len(factors) or not features:
+        raise ValueError("transparent strategy recipe has an incomplete feature grid")
+    recipe_sha256 = canonical_sha256(recipe)
+    feature_set_id = (
+        f"transparent-fin-strategy:{recipe_id}:{recipe['version']}"
+    )
+    definition = _record(
+        feature_set_id,
+        f"Transparent fin_strategy grid for {recipe_id}",
+        features,
+        source=f"strategy-recipe:{recipe_id}:{recipe_sha256}",
+        contract_version="transparent-fin-strategy-feature-set-v1",
+    )
+    existing = FEATURE_SETS.get(feature_set_id)
+    if existing is not None and existing != definition:
+        raise ValueError("transparent strategy feature identity changed in place")
+    FEATURE_SETS[feature_set_id] = definition
+    return get_feature_set(feature_set_id)
+
+
+def transparent_strategy_feature_set_id(recipe_id: str) -> str:
+    return str(transparent_strategy_feature_set(recipe_id)["id"])
+
+
+def _load_transparent_feature_set(feature_set_id: str) -> None:
+    for recipe_id in TRANSPARENT_STRATEGY_RECIPE_IDS:
+        candidate = transparent_strategy_feature_set(recipe_id)
+        if candidate["id"] == feature_set_id:
+            return
+
+
 def register_feature_set(definition: dict[str, Any]) -> dict[str, Any]:
     """Register an immutable feature set assembled from governed DB records."""
 
@@ -117,6 +175,10 @@ def resolve_feature_set(
 
 
 def get_feature_set(feature_set_id: str) -> dict[str, Any]:
+    if feature_set_id not in FEATURE_SETS and feature_set_id.startswith(
+        "transparent-fin-strategy:"
+    ):
+        _load_transparent_feature_set(feature_set_id)
     try:
         item = FEATURE_SETS[feature_set_id]
     except KeyError as exc:
@@ -128,6 +190,8 @@ def get_feature_set(feature_set_id: str) -> dict[str, Any]:
 
 
 def list_feature_sets() -> list[dict[str, Any]]:
+    for recipe_id in TRANSPARENT_STRATEGY_RECIPE_IDS:
+        transparent_strategy_feature_set(recipe_id)
     return [
         {
             "id": item["id"],

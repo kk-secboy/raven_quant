@@ -56,6 +56,7 @@ def create_qlib_policy_strategy(
             self._day_open_value: float | None = None
             self._value_date: Any = None
             self._execution_state: dict[str, Any] = {}
+            self._holding_age_sessions: dict[str, int] = {}
             self._t1_locked: dict[str, dict[Any, float]] = {}
             self._last_rebalance_signal_time: Any = None
 
@@ -127,6 +128,7 @@ def create_qlib_policy_strategy(
                     "cost_basis": self._cost_basis,
                     "take_profit_stages": self._take_profit_stages,
                     "execution_state": self._execution_state,
+                    "holding_age_sessions": self._holding_age_sessions,
                     "portfolio_drawdown": drawdown,
                     "daily_return": daily_return,
                     "rebalance_due": is_rebalance_due(
@@ -143,6 +145,12 @@ def create_qlib_policy_strategy(
                 decision.position_state.get("take_profit_stages") or {}
             )
             self._execution_state = dict(decision.position_state.get("execution") or {})
+            self._holding_age_sessions = {
+                str(key): int(value)
+                for key, value in (
+                    decision.position_state.get("holding_age_sessions") or {}
+                ).items()
+            }
             self._high_water_mark = peak
             trade_date = trade_start_time.date()
             for instrument in list(self._t1_locked):

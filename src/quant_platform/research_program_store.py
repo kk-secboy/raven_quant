@@ -25,6 +25,9 @@ _FINAL_OOS_STAGES = {
     "recommendation_schedule",
     "complete",
 }
+LEGACY_READ_ONLY_ERROR = (
+    "legacy research programs are read-only; use the governed ResearchCampaign API"
+)
 
 
 def _now() -> datetime:
@@ -32,7 +35,7 @@ def _now() -> datetime:
 
 
 class ResearchProgramStore:
-    """Durable policies that launch campaigns when a compatible Qlib dataset advances."""
+    """Read-only access to retired research-program history."""
 
     def __init__(self, database_url: str) -> None:
         self.engine = open_database(database_url)
@@ -51,6 +54,7 @@ class ResearchProgramStore:
         max_active_campaigns: int,
         actor: str,
     ) -> dict[str, Any]:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         if min_new_trading_days < 1:
             raise ValueError("min_new_trading_days must be positive")
         if max_active_campaigns < 1:
@@ -128,6 +132,7 @@ class ResearchProgramStore:
         now: datetime | None = None,
         lease_seconds: int = 120,
     ) -> dict[str, Any] | None:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         current = now or _now()
         with self.engine.begin() as connection:
             row = connection.execute(
@@ -164,6 +169,7 @@ class ResearchProgramStore:
         message: str,
         delay_seconds: int,
     ) -> dict[str, Any]:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         current = _now()
         values: dict[str, Any] = {
             "last_message": message,
@@ -190,6 +196,8 @@ class ResearchProgramStore:
         delay_seconds: int,
     ) -> dict[str, Any]:
         """Release the lease and retain an immutable controller-failure record."""
+
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
 
         current = _now()
         message = f"自动检查失败：{error}"
@@ -223,6 +231,7 @@ class ResearchProgramStore:
         campaign_id: str,
         dataset: dict[str, Any],
     ) -> dict[str, Any]:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         current = _now()
         identity = str((dataset.get("provenance") or {})["dataset_identity_sha256"])
         with self.engine.begin() as connection:
@@ -262,6 +271,7 @@ class ResearchProgramStore:
         *,
         campaign: dict[str, Any],
     ) -> dict[str, Any]:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         if campaign.get("status") != "succeeded":
             raise ValueError("only succeeded campaigns can be recorded")
         version_id = str((campaign.get("state") or {}).get("preferred_version_id") or "")
@@ -436,6 +446,7 @@ class ResearchProgramStore:
         return [windows[key] for key in sorted(windows)]
 
     def set_status(self, program_id: str, status: str, *, actor: str) -> dict[str, Any]:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         if status not in {"active", "paused", "cancelled"}:
             raise ValueError("program status must be active, paused, or cancelled")
         current = _now()
@@ -469,6 +480,7 @@ class ResearchProgramStore:
         return self.get(program_id)
 
     def check_now(self, program_id: str, *, actor: str) -> dict[str, Any]:
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
         current = _now()
         with self.engine.begin() as connection:
             row = connection.execute(
@@ -502,6 +514,8 @@ class ResearchProgramStore:
         actor: str,
     ) -> dict[str, Any]:
         """Move a research policy to a compatible immutable lineage with audit."""
+
+        raise RuntimeError(LEGACY_READ_ONLY_ERROR)
 
         new_lineage_id = str(dataset.get("lineage_id") or "")
         provenance = dataset.get("provenance") or {}

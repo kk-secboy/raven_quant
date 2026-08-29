@@ -46,6 +46,17 @@ def main() -> None:
         help="Refresh base images during the build; requires registry connectivity",
     )
     parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--stable-release-link",
+        type=Path,
+        default=Path("/opt/quantlab"),
+        help="Atomically switch this operational symlink only after acceptance.",
+    )
+    parser.add_argument(
+        "--skip-stable-link",
+        action="store_true",
+        help="Do not switch the operational symlink (intended only for drills).",
+    )
     args = parser.parse_args()
 
     context = compose_context(
@@ -65,6 +76,9 @@ def main() -> None:
         pull_images=args.pull,
         rollback_image_retention=args.rollback_image_retention,
         reuse_backup=args.reuse_backup,
+        stable_release_link=(
+            None if args.skip_stable_link else args.stable_release_link
+        ),
     )
     output = json.dumps(result, ensure_ascii=False, indent=2)
     report = args.report

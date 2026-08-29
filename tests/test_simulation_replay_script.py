@@ -18,6 +18,137 @@ def _script_module():
     return module
 
 
+def test_daily_settlement_uses_sealed_known_calendar_beyond_market_bars(
+    tmp_path: Path,
+) -> None:
+    script = _script_module()
+    provider = tmp_path / "qlib"
+    (provider / "metadata").mkdir(parents=True)
+    (provider / "calendars").mkdir()
+    # Market-bar calendar is deliberately sealed only through execution day.
+    (provider / "calendars" / "day.txt").write_text(
+        "2026-08-27\n2026-08-28\n", encoding="utf-8"
+    )
+    pd.DataFrame(
+        {"date": pd.to_datetime(["2026-08-27", "2026-08-28", "2026-08-31"])}
+    ).to_parquet(
+        provider / "metadata" / "known_trading_calendar.parquet",
+        index=False,
+    )
+    calendar_path = provider / "metadata" / "known_trading_calendar.parquet"
+
+    next_date, evidence = script._next_settlement_session(
+        provider,
+        trade_date="2026-08-28",
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+        expected_calendar_file_sha256=script._sha256_file(calendar_path),
+        expected_calendar_file_bytes=calendar_path.stat().st_size,
+        expected_next_trade_date="2026-08-31",
+    )
+
+    assert next_date == "2026-08-31"
+    assert evidence["trade_date"] == "2026-08-28"
+    assert evidence["next_trade_date"] == "2026-08-31"
+    assert evidence["dataset_identity_sha256"] == "a" * 64
+    assert evidence["dataset_lineage_id"] == "b" * 64
+    assert evidence["calendar_file_sha256"] == script._sha256_file(
+        provider / "metadata" / "known_trading_calendar.parquet"
+    )
+    with pytest.raises(ValueError, match="hash differs from batch binding"):
+        script._next_settlement_session(
+            provider,
+            trade_date="2026-08-28",
+            dataset_identity_sha256="a" * 64,
+            dataset_lineage_id="b" * 64,
+            expected_calendar_file_sha256="f" * 64,
+            expected_calendar_file_bytes=calendar_path.stat().st_size,
+            expected_next_trade_date="2026-08-31",
+        )
+    with pytest.raises(ValueError, match="next session differs from batch binding"):
+        script._next_settlement_session(
+            provider,
+            trade_date="2026-08-28",
+            dataset_identity_sha256="a" * 64,
+            dataset_lineage_id="b" * 64,
+            expected_calendar_file_sha256=script._sha256_file(calendar_path),
+            expected_calendar_file_bytes=calendar_path.stat().st_size,
+            expected_next_trade_date="2026-09-01",
+        )
+
+
+def test_daily_settlement_calendar_fails_closed_when_execution_day_is_absent(
+    tmp_path: Path,
+) -> None:
+    script = _script_module()
+    provider = tmp_path / "qlib"
+    (provider / "metadata").mkdir(parents=True)
+    pd.DataFrame(
+        {"date": pd.to_datetime(["2026-08-27", "2026-08-31"])}
+    ).to_parquet(
+        provider / "metadata" / "known_trading_calendar.parquet",
+        index=False,
+    )
+    calendar_path = provider / "metadata" / "known_trading_calendar.parquet"
+
+    with pytest.raises(ValueError, match="does not contain the execution session"):
+        script._next_settlement_session(
+            provider,
+            trade_date="2026-08-28",
+            dataset_identity_sha256="a" * 64,
+            dataset_lineage_id="b" * 64,
+            expected_calendar_file_sha256=script._sha256_file(calendar_path),
+            expected_calendar_file_bytes=calendar_path.stat().st_size,
+            expected_next_trade_date="2026-08-31",
+        )
+
+
+def test_daily_settlement_calendar_fails_closed_if_file_changes_while_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = _script_module()
+    provider = tmp_path / "qlib"
+    (provider / "metadata").mkdir(parents=True)
+    pd.DataFrame(
+        {"date": pd.to_datetime(["2026-08-28", "2026-08-31"])}
+    ).to_parquet(
+        provider / "metadata" / "known_trading_calendar.parquet",
+        index=False,
+    )
+    calendar_path = provider / "metadata" / "known_trading_calendar.parquet"
+    observed_hashes = iter(["a" * 64, "b" * 64])
+    monkeypatch.setattr(script, "_sha256_file", lambda _path: next(observed_hashes))
+
+    with pytest.raises(ValueError, match="changed while being read"):
+        script._next_settlement_session(
+            provider,
+            trade_date="2026-08-28",
+            dataset_identity_sha256="c" * 64,
+            dataset_lineage_id="d" * 64,
+            expected_calendar_file_sha256="a" * 64,
+            expected_calendar_file_bytes=calendar_path.stat().st_size,
+            expected_next_trade_date="2026-08-31",
+        )
+
+
+def test_empty_execution_bars_keep_the_engine_contract() -> None:
+    script = _script_module()
+
+    values = script._empty_execution_bars()
+
+    assert values.empty
+    assert set(values.columns) == {
+        "datetime",
+        "instrument",
+        "close",
+        "vwap",
+        "volume",
+        "paused",
+        "up_limit",
+        "down_limit",
+    }
+
+
 def test_pair_replay_loads_only_dated_tushare_shortability_rows(
     tmp_path: Path,
 ) -> None:

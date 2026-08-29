@@ -86,6 +86,7 @@ _SCENARIOS = (
         True,
         capital_eligible=True,
         factor_output=True,
+        requires_feature_set=True,
     ),
     RDAgentScenario(
         "fin_model",
@@ -103,6 +104,15 @@ _SCENARIOS = (
         "fin_quant",
         True,
         capital_eligible=True,
+        requires_feature_set=True,
+    ),
+    RDAgentScenario(
+        "fin_strategy",
+        "Strategy proposal research",
+        "quant",
+        "fin_strategy",
+        True,
+        capital_eligible=False,
         requires_feature_set=True,
     ),
     RDAgentScenario(
@@ -156,6 +166,10 @@ _DESCRIPTIONS = {
     "fin_factor": "Propose and iterate factors before independent platform evaluation.",
     "fin_model": "Research models on a locked feature set before independent evaluation.",
     "fin_quant": "Jointly research factors and models before independent ablation evaluation.",
+    "fin_strategy": (
+        "Generate governed research-only StrategyProposal JSON and compile it through the "
+        "deterministic strategy-rule allowlist; no proposal is capital or simulation eligible."
+    ),
     "fin_factor_report": "Extract factors from verified report PDFs for independent evaluation.",
     "general_model": "Implement a model from one verified paper PDF for research only.",
     "data_science": "Run a general data-science experiment on an explicit governed dataset.",

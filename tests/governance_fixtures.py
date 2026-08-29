@@ -3,12 +3,24 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import date
+from copy import deepcopy
+from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pandas as pd
 from qlib_test_doubles import qlib_workflow_identity
+from sqlalchemy import select, update
 
+from quant_data.database import (
+    open_database,
+    strategy_promotion_stages,
+    strategy_versions,
+)
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
+from quant_data.universe import (
+    GOVERNED_DAILY_ETF_WHITELIST,
+    governed_daily_etf_whitelist_contract,
+)
 from quant_platform.api import StrategyConfigRequest
 from quant_platform.cost_model import CostModelConfig
 from quant_platform.formal_validation import (
@@ -22,9 +34,100 @@ from quant_platform.qlib_backtest import (
 )
 from quant_platform.research_store import ResearchStore
 from quant_platform.strategy_artifact_manifest import write_backtest_artifact_manifest
+from quant_platform.strategy_recipes import get_strategy_recipe
 from quant_platform.strategy_store import StrategyStore
 
 DATASET_IDENTITY = "a" * 64
+
+
+def governed_etf_ready_evidence() -> dict:
+    return {
+        **governed_daily_etf_whitelist_contract(),
+        "status": "ready",
+        "included_symbols": list(GOVERNED_DAILY_ETF_WHITELIST),
+        "missing_symbols": [],
+        "row_count": 1,
+    }
+
+
+def write_governed_daily_qlib_dataset(
+    data_root: Path,
+    *,
+    sessions: list[date],
+    name: str = "snapshot",
+    dataset_identity_sha256: str = DATASET_IDENTITY,
+    dataset_lineage_id: str = "b" * 64,
+    source_lineage_id: str = "9" * 64,
+) -> Path:
+    """Publish the smallest sealed daily-Qlib fixture accepted by production readers."""
+
+    normalized_sessions = sorted(set(sessions))
+    if len(normalized_sessions) < 2:
+        raise ValueError("daily Qlib fixture requires at least two trading sessions")
+    provider = data_root / "qlib" / name
+    calendar_path = provider / "calendars" / "day.txt"
+    instruments_path = provider / "instruments" / "cn_all.txt"
+    known_calendar_path = provider / "metadata" / "known_trading_calendar.parquet"
+    for directory in (
+        calendar_path.parent,
+        instruments_path.parent,
+        provider / "features",
+        known_calendar_path.parent,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    calendar_path.write_text(
+        "\n".join(item.isoformat() for item in normalized_sessions) + "\n",
+        encoding="utf-8",
+    )
+    instruments_path.write_text(
+        "SH600000\t"
+        f"{normalized_sessions[0].isoformat()}\t{normalized_sessions[-1].isoformat()}\n",
+        encoding="utf-8",
+    )
+    pd.DataFrame({"date": pd.to_datetime(normalized_sessions)}).to_parquet(
+        known_calendar_path,
+        index=False,
+    )
+
+    output_files = []
+    for path in (calendar_path, instruments_path, known_calendar_path):
+        payload = path.read_bytes()
+        output_files.append(
+            {
+                "path": path.relative_to(provider).as_posix(),
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+    provenance = {
+        "frequency": "day",
+        "dataset_identity_sha256": dataset_identity_sha256,
+        "dataset_lineage_id": dataset_lineage_id,
+        "source_lineage_id": source_lineage_id,
+        "snapshot_manifest_sha256": "f" * 64,
+        "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+        "source_volume_unit": "hand",
+        "qlib_volume_unit": "share",
+        "source_amount_unit": "thousand_cny",
+        "qlib_amount_unit": "cny",
+        "source_hand_size": 100,
+        "index_volume_policy": "excluded_non_tradable_benchmark",
+        "governed_etf_whitelist": governed_etf_ready_evidence(),
+        "execution_controls": {
+            "formal_execution_requires_native_controls": True,
+            "native_complete_from": normalized_sessions[0].isoformat(),
+        },
+        "lineage_verified": True,
+        "output_manifest": {
+            "version": "qlib-output-files-v1",
+            "files": output_files,
+        },
+    }
+    (provider / "metadata" / "provenance.json").write_text(
+        json.dumps(provenance, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return data_root
 PERIODS = {
     "train_start": date(2008, 1, 1),
     "train_end": date(2017, 12, 31),
@@ -33,6 +136,89 @@ PERIODS = {
     "test_start": date(2021, 1, 11),
     "test_end": date(2026, 7, 10),
 }
+
+
+def enable_recommendation_authority_for_test(
+    database_url: str,
+    version_ids: list[str],
+    *,
+    promoted_at: datetime | None = None,
+) -> None:
+    """Advance test fixtures through the durable forward-gate projections.
+
+    Production uses ``PromotionStore.promote``.  Tests focused on downstream
+    allocation/recommendation mechanics may bypass the natural-time gate, but
+    must still update the append-only promotion-stage evidence, the
+    denormalized strategy-version projection, and a governed healthy snapshot.
+    """
+
+    expected = {str(item) for item in version_ids}
+    if not expected:
+        raise ValueError("at least one strategy version is required")
+    moment = promoted_at or datetime(2020, 1, 1, tzinfo=UTC)
+    with open_database(database_url).connect() as connection:
+        rows = connection.execute(
+            select(
+                strategy_versions.c.id,
+                strategy_versions.c.status,
+                strategy_versions.c.horizon_profile,
+            ).where(strategy_versions.c.id.in_(expected))
+        ).all()
+    observed_versions = {str(row.id): row for row in rows}
+    if set(observed_versions) != expected:
+        raise KeyError("test recommendation authority references a missing strategy version")
+    invalid = [
+        version_id
+        for version_id, row in observed_versions.items()
+        if str(row.status) != "approved"
+        or str(row.horizon_profile) == "legacy_ambiguous"
+    ]
+    if invalid:
+        raise ValueError(
+            "test recommendation authority requires approved explicit-horizon versions: "
+            + ", ".join(sorted(invalid))
+        )
+    # Downstream recommendation/simulation tests may approve a synthetic
+    # version without running the natural-time paper gate.  They still need a
+    # durable promotion-stage row before the authority projection can move.
+    from quant_platform.promotion import PromotionStore
+
+    promotion = PromotionStore(database_url)
+    for version_id in sorted(expected):
+        promotion.prepare_paper_stage(version_id, actor="test-forward-gate")
+    with open_database(database_url).begin() as connection:
+        connection.execute(
+            update(strategy_versions)
+            .where(strategy_versions.c.id.in_(expected))
+            .values(promotion_stage="recommendation_enabled")
+        )
+        connection.execute(
+            update(strategy_promotion_stages)
+            .where(strategy_promotion_stages.c.strategy_version_id.in_(expected))
+            .values(promoted_at=moment)
+        )
+        observed = set(
+            connection.scalars(
+                select(strategy_promotion_stages.c.strategy_version_id).where(
+                    strategy_promotion_stages.c.strategy_version_id.in_(expected),
+                    strategy_promotion_stages.c.promoted_at.is_not(None),
+                )
+            ).all()
+        )
+        if observed != expected:
+            raise RuntimeError(
+                "test fixture has no prepared promotion stage for every strategy version"
+            )
+    strategies = StrategyStore(database_url)
+    for version_id in sorted(expected):
+        strategies.record_health_snapshot(
+            version_id=version_id,
+            as_of=moment,
+            health_status="healthy",
+            criteria={"fixture": "forward-gate-authority"},
+            evidence={"status": "passed", "fixture_only": True},
+            actor="test-forward-gate",
+        )
 
 
 def passing_factor_metrics() -> dict:
@@ -65,6 +251,7 @@ def create_promoted_factor(
     dataset: str = "snapshot",
     dataset_identity: str = DATASET_IDENTITY,
     periods: dict | None = None,
+    label_horizon_days: int = 1,
 ) -> dict:
     periods = periods or PERIODS
     suffix = uuid.uuid4().hex
@@ -94,6 +281,7 @@ def create_promoted_factor(
         code_sha256=hashlib.sha256(code_path.read_bytes()).hexdigest(),
         rdagent_decision=True,
         rdagent_feedback="ok",
+        label_horizon_days=label_horizon_days,
     )
     metrics = passing_factor_metrics()
     artifact = tmp_path / f"evaluation-{suffix}.json"
@@ -129,7 +317,7 @@ def create_promoted_factor(
             "root_filesystem_read_only": True,
             "capabilities_dropped": "ALL",
             "no_new_privileges": True,
-            "label_horizon_days": 1,
+            "label_horizon_days": label_horizon_days,
             "code_sha256": hashlib.sha256(code_path.read_bytes()).hexdigest(),
             "dataset_identity_sha256": dataset_identity,
             "provider_input_sha256": "1" * 64,
@@ -168,13 +356,20 @@ def create_strategy_version(
     dataset_identity: str = DATASET_IDENTITY,
     config_overrides: dict | None = None,
     periods: dict | None = None,
+    recipe_id: str | None = None,
 ) -> str:
+    label_horizon_days = {
+        "short_relative_strength": 1,
+        "swing_trend": 21,
+        "long_quality_value": 63,
+    }.get(recipe_id, 1)
     factor = create_promoted_factor(
         database_url,
         tmp_path,
         dataset=dataset,
         dataset_identity=dataset_identity,
         periods=periods,
+        label_horizon_days=label_horizon_days,
     )
     config = {
         "topk": 50,
@@ -196,6 +391,22 @@ def create_strategy_version(
         "min_commission": 5.0,
     }
     config.update(CostModelConfig().to_dict())
+    if recipe_id is not None:
+        recipe = get_strategy_recipe(recipe_id)
+        config.update(deepcopy(recipe["config_overrides"]))
+        # These fixtures bind a promoted factor candidate, rather than the
+        # recipe's frozen Qlib baseline feature set.  Keep the real horizon,
+        # rule IR and execution policy while making that source explicit.
+        config["factor_source_mode"] = "promoted_only"
+        config["challenger_weight"] = 1.0
+        config["min_backtest_days"] = max(
+            int(config.get("min_backtest_days") or 0),
+            {
+                "short_relative_strength": 252,
+                "swing_trend": 504,
+                "long_quality_value": 756,
+            }[recipe_id],
+        )
     config.update(config_overrides or {})
     if config.get("execution_method") in {"twap", "vwap", "next_bar"}:
         config.setdefault("execution_frequency", "5min")
@@ -413,7 +624,9 @@ def formal_backtest_metrics(
                 "minimum_trading_days": int(
                     version["config"].get("min_pre_final_history_days", 2520)
                 ),
-                "embargo_trading_days": 5,
+                "embargo_trading_days": int(
+                    version["config"].get("outer_embargo_days", 5)
+                ),
                 "minimum_embargo_trading_days": int(
                     version["config"].get("outer_embargo_days", 5)
                 ),
@@ -547,9 +760,12 @@ def formal_backtest_metrics(
             ],
             "passed": True,
         },
-        "trading_days": 600,
+        "trading_days": max(
+            600,
+            int(version["config"].get("min_backtest_days", 504)),
+        ),
         "eligibility": {
-            "contract_version": "ashare-point-in-time-eligibility-v1",
+            "contract_version": "cn-stock-etf-point-in-time-eligibility-v2",
             "rows": 1000,
             "eligible_rows": 800,
             "regulatory_data_available": True,
@@ -566,6 +782,7 @@ def formal_backtest_metrics(
             "qlib_amount_unit": "cny",
             "source_hand_size": 100,
             "index_volume_policy": "excluded_non_tradable_benchmark",
+            "governed_etf_whitelist": governed_etf_ready_evidence(),
             "lineage_verified": True,
             "source_lineage_id": "9" * 64,
             "strategy_config_sha256": config_hash,

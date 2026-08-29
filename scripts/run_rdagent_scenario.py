@@ -324,7 +324,7 @@ def _run_streaming_redacted(command: list[str], *, timeout: int, env: dict[str, 
 
 
 def _verify_feature_set(args: argparse.Namespace) -> str | None:
-    if args.scenario not in {"fin_model", "fin_quant"}:
+    if args.scenario not in {"fin_factor", "fin_model", "fin_quant", "fin_strategy"}:
         if args.feature_set_id or args.feature_set_sha256 or args.base_features:
             raise ValueError(f"{args.scenario} does not accept a governed feature set")
         return None
@@ -365,7 +365,7 @@ def _scenario_command(args: argparse.Namespace) -> list[str]:
             configured_name="RDAGENT_DATA_SCIENCE_IMAGE",
             runtime_name="DS_DOCKER_IMAGE",
         )
-    if scenario.id in {"fin_factor", "fin_model", "fin_quant"} and assets:
+    if scenario.id in {"fin_factor", "fin_model", "fin_quant", "fin_strategy"} and assets:
         raise ValueError(f"{scenario.id} does not accept document/data assets")
     if scenario.id == "fin_factor":
         return [
@@ -376,6 +376,8 @@ def _scenario_command(args: argparse.Namespace) -> list[str]:
             str(args.loop_n),
             "--all_duration",
             args.duration,
+            "--base_features_path",
+            str(base_features),
         ]
     if scenario.id in {"fin_model", "fin_quant"}:
         module = {
@@ -386,6 +388,18 @@ def _scenario_command(args: argparse.Namespace) -> list[str]:
             sys.executable,
             governed_module_runner,
             module,
+            "--loop_n",
+            str(args.loop_n),
+            "--all_duration",
+            args.duration,
+            "--base_features_path",
+            str(base_features),
+        ]
+    if scenario.id == "fin_strategy":
+        return [
+            sys.executable,
+            governed_module_runner,
+            "quant_platform.rdagent_strategy",
             "--loop_n",
             str(args.loop_n),
             "--all_duration",
@@ -484,6 +498,36 @@ def run(args: argparse.Namespace) -> None:
     _normalize_openai_compatible_model(env)
     env["LOG_TRACE_PATH"] = args.trace
     env["QUANTLAB_RDAGENT_SCENARIO"] = args.scenario
+    embeddings_configured = bool(
+        str(env.get("EMBEDDING_OPENAI_API_KEY") or "").strip()
+        or str(env.get("EMBEDDING_AZURE_API_BASE") or "").strip()
+    )
+    env["QUANTLAB_COSTEER_KNOWLEDGE_STATUS_JSON"] = json.dumps(
+        {
+            "contract_version": "costeer-knowledge-status-v1",
+            "status": (
+                "embedding_retrieval_configured"
+                if embeddings_configured
+                else "degraded_empty_retrieval"
+            ),
+            "embedding_retrieval_configured": embeddings_configured,
+            "retrieval_mode": (
+                "embedding_rag" if embeddings_configured else "typed_empty_knowledge"
+            ),
+            "costeer_used": args.scenario != "fin_strategy",
+            "empty_knowledge_forced": (
+                not embeddings_configured
+                and args.scenario
+                in {"fin_factor", "fin_model", "fin_quant", "fin_factor_report"}
+            ),
+            "strategy_codegen_used": False if args.scenario == "fin_strategy" else None,
+            "strategy_compiler": (
+                "deterministic_allowlist" if args.scenario == "fin_strategy" else None
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     command = _scenario_command(args)
     if args.scenario == "llm_finetune":
         _verify_finetune_staging()
@@ -514,6 +558,8 @@ def run(args: argparse.Namespace) -> None:
         export.extend(["--feature-set-id", args.feature_set_id])
     if args.feature_set_sha256:
         export.extend(["--feature-set-sha256", args.feature_set_sha256])
+    if args.base_features:
+        export.extend(["--base-features", args.base_features])
     _run_streaming_redacted(export, env=env, timeout=300)
 
 

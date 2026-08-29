@@ -280,6 +280,11 @@ def test_research_reference_skips_unsupported_pre_2016_disclosure_periods(
         for source in ("SW2014", "SW2021")
         for level in ("L1", "L2", "L3")
     }
+    fund_basic = checkpoint.dataset_units("fund_basic")
+    assert {
+        (str(row["params_json"]["market"]), str(row["params_json"]["status"]))
+        for row in fund_basic
+    } == {("E", status) for status in ("L", "I", "D")}
 
 
 def test_industry_members_use_supported_l3_current_and_historical_partitions(

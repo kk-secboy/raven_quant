@@ -1,3 +1,5 @@
+"""Offline statistical pair research; never a production execution adapter."""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace

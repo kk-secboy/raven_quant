@@ -13,22 +13,23 @@ from typing import Any
 from dotenv import dotenv_values
 
 from .backup_restore import ComposeContext
+from .deployment_services import (
+    CORE_RUNTIME_SERVICES,
+    NON_HEALTHCHECK_SERVICES,
+    OPTIONAL_PROFILE_SERVICES,
+)
+from .release_identity import (
+    RELEASE_IDENTITY_ENV_KEYS,
+    STATEFUL_RELEASE_IDENTITY_EXEMPT,
+    normalized_release_identity,
+    release_identity_labels,
+)
 
-LEGACY_EXPECTED_SERVICES = {
-    "postgres",
-    "api",
-    "scheduler",
-    "worker",
-    "rdagent-docker",
-    "rdagent-worker",
-    "web",
-    "gateway",
-}
-EXPECTED_SERVICES = LEGACY_EXPECTED_SERVICES | {"rdagent-data-science-worker"}
-OPTIONAL_PROFILE_SERVICES = {
-    "gpu": {"rdagent-llm-finetune-worker"},
-}
-NON_HEALTHCHECK_SERVICES = {"web", "gateway"}
+# Compatibility names remain public for release tooling and tests, but both now
+# describe the complete long-running topology.  The former eight-service list
+# caused mixed releases by silently ignoring five active worker aliases.
+LEGACY_EXPECTED_SERVICES = set(CORE_RUNTIME_SERVICES)
+EXPECTED_SERVICES = set(CORE_RUNTIME_SERVICES)
 HEALTHCHECK_SERVICES = EXPECTED_SERVICES - NON_HEALTHCHECK_SERVICES
 
 _RUNTIME_IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -334,6 +335,55 @@ def _docker_project_services(
     return services, ids_by_service
 
 
+def _runtime_release_identity(
+    context: ComposeContext,
+    services: Collection[str],
+) -> tuple[bool, str]:
+    configured = dotenv_values(context.env_file)
+    try:
+        expected_environment = normalized_release_identity(
+            {key: configured.get(key) for key in RELEASE_IDENTITY_ENV_KEYS}
+        )
+        expected_labels = release_identity_labels(expected_environment)
+    except ValueError as exc:
+        return False, f"release identity is invalid in deployment environment: {exc}"
+    mismatches: list[str] = []
+    inspected = 0
+    for service in sorted(set(services) - STATEFUL_RELEASE_IDENTITY_EXEMPT):
+        container_id = context.container_id(service)
+        if not container_id:
+            mismatches.append(f"{service}:missing")
+            continue
+        inspection = json.loads(context.docker("inspect", container_id, capture=True))[0]
+        entries = inspection.get("Config", {}).get("Env") or []
+        environment = {
+            str(item).split("=", 1)[0]: str(item).split("=", 1)[1]
+            for item in entries
+            if "=" in str(item)
+        }
+        labels = {
+            str(key): str(value)
+            for key, value in (inspection.get("Config", {}).get("Labels") or {}).items()
+        }
+        inspected += 1
+        for variable, expected in expected_environment.items():
+            if environment.get(variable) != expected:
+                mismatches.append(f"{service}:env:{variable}")
+        for label, expected in expected_labels.items():
+            if labels.get(label) != expected:
+                mismatches.append(f"{service}:label:{label}")
+    if mismatches:
+        return False, "mixed or unstamped services: " + ", ".join(mismatches)
+    return (
+        True,
+        f"{inspected} stateless services share release "
+        f"{expected_environment['QUANTLAB_RELEASE_ID']} as "
+        f"{expected_environment['QUANTLAB_RELEASE_KIND']} aliasing "
+        f"{expected_environment['QUANTLAB_RELEASE_ALIAS_OF']} and config "
+        f"{expected_environment['QUANTLAB_CONFIG_DIGEST']}",
+    )
+
+
 def assess_release(
     context: ComposeContext,
     project_root: Path,
@@ -578,6 +628,30 @@ def assess_release(
                 else service_error
             ),
             "Restore every current service before introducing a new release.",
+        )
+    )
+
+    if require_immutable_images and services_ready:
+        try:
+            release_identity_valid, release_identity_evidence = (
+                _runtime_release_identity(context, required)
+            )
+        except Exception as exc:
+            release_identity_valid = False
+            release_identity_evidence = str(exc)[:500]
+    elif require_immutable_images:
+        release_identity_valid = False
+        release_identity_evidence = "service health must pass before identity inspection"
+    else:
+        release_identity_valid = True
+        release_identity_evidence = "release identity will be stamped during this upgrade"
+    checks.append(
+        _check(
+            "release_identity",
+            "One immutable release and configuration across stateless services",
+            release_identity_valid,
+            release_identity_evidence,
+            "Recreate every default-profile service from one release Compose contract.",
         )
     )
 

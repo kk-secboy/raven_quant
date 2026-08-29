@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from governance_fixtures import create_strategy_version
+from governance_fixtures import create_strategy_version, governed_etf_ready_evidence
 
+from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
+from quant_data.qlib_builder import build_qlib_output_manifest
 from quant_platform.api import create_app
 from quant_platform.parameter_experiment_store import ParameterExperimentStore
 
@@ -116,20 +118,28 @@ def test_api_creates_a_bounded_parameter_experiment_job(
     )
     (dataset / "metadata" / "provenance.json").write_text(
         json.dumps(
-                {
-                    "frequency": "day",
-                    "dataset_identity_sha256": "a" * 64,
-                    "snapshot_manifest_sha256": "b" * 64,
-                    "qlib_builder_sha256": "c" * 64,
-                    "field_contract_version": "daily-qlib-field-v3-cny-amount",
-                    "source_volume_unit": "hand",
-                    "qlib_volume_unit": "share",
-                    "source_amount_unit": "thousand_cny",
-                    "qlib_amount_unit": "cny",
-                    "source_hand_size": 100,
-                    "index_volume_policy": "excluded_non_tradable_benchmark",
-                    "lineage_verified": True,
-                }
+            {
+                "frequency": "day",
+                "dataset_identity_sha256": "a" * 64,
+                "dataset_lineage_id": "d" * 64,
+                "source_lineage_id": "e" * 64,
+                "snapshot_manifest_sha256": "b" * 64,
+                "qlib_builder_sha256": "c" * 64,
+                "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+                "source_volume_unit": "hand",
+                "qlib_volume_unit": "share",
+                "source_amount_unit": "thousand_cny",
+                "qlib_amount_unit": "cny",
+                "source_hand_size": 100,
+                "index_volume_policy": "excluded_non_tradable_benchmark",
+                "governed_etf_whitelist": governed_etf_ready_evidence(),
+                "lineage_verified": True,
+                "output_manifest": build_qlib_output_manifest(dataset),
+                "execution_controls": {
+                    "native_complete_from": "2018-01-01",
+                    "formal_execution_requires_native_controls": True,
+                },
+            }
         ),
         encoding="utf-8",
     )
@@ -177,16 +187,20 @@ def test_parameter_experiment_rejects_research_only_execution_history(
             {
                 "frequency": "day",
                 "dataset_identity_sha256": "a" * 64,
+                "dataset_lineage_id": "d" * 64,
+                "source_lineage_id": "e" * 64,
                 "snapshot_manifest_sha256": "b" * 64,
                 "qlib_builder_sha256": "c" * 64,
-                "field_contract_version": "daily-qlib-field-v3-cny-amount",
+                "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
                 "source_volume_unit": "hand",
                 "qlib_volume_unit": "share",
                 "source_amount_unit": "thousand_cny",
                 "qlib_amount_unit": "cny",
                 "source_hand_size": 100,
                 "index_volume_policy": "excluded_non_tradable_benchmark",
+                "governed_etf_whitelist": governed_etf_ready_evidence(),
                 "lineage_verified": True,
+                "output_manifest": build_qlib_output_manifest(dataset),
                 "execution_controls": {
                     "native_complete_from": "2020-01-01",
                     "formal_execution_requires_native_controls": True,
@@ -213,6 +227,6 @@ def test_parameter_experiment_rejects_research_only_execution_history(
 
     assert response.status_code == 409
     assert response.json()["detail"] == (
-        "parameter experiment starts before native execution controls are complete "
-        "(2020-01-01)"
+        "parameter experiment: formal execution starts before native price-limit "
+        "controls are complete (2020-01-01)"
     )

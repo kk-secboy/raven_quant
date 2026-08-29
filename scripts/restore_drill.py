@@ -15,31 +15,36 @@ from _project import PROJECT_ROOT
 from cryptography.fernet import Fernet
 
 from quant_platform.backup_restore import (
+    CONTROL_PLANE_BACKUP_FORMAT_VERSION,
+    FULL_BACKUP_FORMAT_VERSION,
     ComposeContext,
     compose_context,
     create_backup,
     load_and_verify_manifest,
     restore_backup,
 )
+from quant_platform.deployment_services import (
+    CORE_RUNTIME_SERVICES,
+    NON_HEALTHCHECK_SERVICES,
+)
+from quant_platform.research_horizon import (
+    LEGACY_AMBIGUOUS,
+    research_horizon_contract,
+)
 
-EXPECTED_SERVICES = {
-    "postgres",
-    "api",
-    "scheduler",
-    "worker",
-    "rdagent-docker",
-    "rdagent-worker",
-    "web",
-    "gateway",
-}
-HEALTHCHECK_SERVICES = {
-    "postgres",
-    "api",
-    "scheduler",
-    "worker",
-    "rdagent-docker",
-    "rdagent-worker",
-}
+EXPECTED_SERVICES = set(CORE_RUNTIME_SERVICES)
+HEALTHCHECK_SERVICES = EXPECTED_SERVICES - NON_HEALTHCHECK_SERVICES
+LEGACY_HORIZON = research_horizon_contract(LEGACY_AMBIGUOUS)
+LEGACY_HORIZON_JSON = json.dumps(
+    LEGACY_HORIZON.to_dict(),
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+)
+SUPPORTED_BACKUP_FORMATS = (
+    FULL_BACKUP_FORMAT_VERSION,
+    CONTROL_PLANE_BACKUP_FORMAT_VERSION,
+)
 
 
 def _timestamp() -> str:
@@ -110,18 +115,35 @@ def _gateway_url(context: ComposeContext) -> str:
     return f"http://127.0.0.1:{port}/"
 
 
-def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
+def run_drill(
+    project_root: Path,
+    report_path: Path,
+    *,
+    format_version: int = CONTROL_PLANE_BACKUP_FORMAT_VERSION,
+) -> dict[str, Any]:
+    if format_version not in SUPPORTED_BACKUP_FORMATS:
+        raise ValueError("restore drill backup format must be 1 or 2")
     compose_file = project_root / "deploy" / "compose.yaml"
     override_file = project_root / "deploy" / "compose.restore-drill.yaml"
     suffix = secrets.token_hex(4)
     source_name = f"quantlab-drill-source-{suffix}"
     target_name = f"quantlab-drill-target-{suffix}"
     sentinel = secrets.token_hex(16)
+    target_data_sentinel = secrets.token_hex(16)
+    source_data_manifest = json.dumps(
+        {
+            "contract_version": "restore-drill-data-v1",
+            "sentinel": sentinel,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     result: dict[str, Any] = {
         "status": "failed",
         "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "source_project": source_name,
         "target_project": target_name,
+        "backup_format_version": format_version,
         "live_trading_supported": False,
         "checks": {},
     }
@@ -132,8 +154,8 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
         for image in (
             "quantlab-platform-api:latest",
             "quantlab-platform-scheduler:latest",
-            "quantlab-platform-worker:latest",
-            "quantlab-platform-rdagent-worker:latest",
+            "quantlab-worker-runtime:v2",
+            "quantlab-rdagent-runtime:v2",
             "quantlab-platform-web:latest",
         ):
             subprocess_result = ComposeContext("image-check", Path(), ()).docker(
@@ -231,15 +253,33 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                     f"'restore-pair-strategy-{sentinel}', 'Restore pair strategy {sentinel}', "
                     "'restore drill pair strategy', 'active', 'restore-drill', now(), now());"
                     "INSERT INTO quantlab.strategy_versions "
-                    "(id, strategy_id, version, status, strategy_type, benchmark, universe, "
+                    "(id, is_legacy, strategy_id, version, status, strategy_type, "
+                    "benchmark, universe, "
                     "config_json, signal_frequency, signal_horizon, execution_frequency, "
-                    "execution_contract_hash, created_by, approved_by, approval_reason, "
+                    "execution_contract_hash, horizon_profile, label_horizons_json, "
+                    "decision_interval_sessions, review_interval_sessions, "
+                    "holding_min_sessions, holding_target_sessions, holding_max_sessions, "
+                    "execution_lag_sessions, purge_sessions, embargo_sessions, "
+                    "sealed_oos_required, sealed_oos_sessions, horizon_contract_json, "
+                    "horizon_contract_sha256, created_by, approved_by, approval_reason, "
                     "created_at, approved_at) "
                     "VALUES ("
-                    f"'restore-pair-version-{sentinel}', 'restore-pair-strategy-{sentinel}', "
+                    f"'restore-pair-version-{sentinel}', true, "
+                    f"'restore-pair-strategy-{sentinel}', "
                     "1, 'approved', 'pair', 'SH000300', 'cn_all', '{}'::jsonb, "
                     f"'day', '1d', '5min', '{sentinel}{sentinel}', "
+                    f"'{LEGACY_AMBIGUOUS}', '[]'::jsonb, "
+                    "null, null, null, null, null, null, null, null, false, null, "
+                    f"'{LEGACY_HORIZON_JSON}'::jsonb, '{LEGACY_HORIZON.sha256}', "
                     "'restore-drill', 'restore-reviewer', 'restore drill approval', now(), now());"
+                    "INSERT INTO quantlab.recommendation_portfolios "
+                    "(id, name, strategy_version_id, dataset, status, base_currency, "
+                    "hypothetical_initial_value, risk_exposure_override, "
+                    "recommendation_scope, created_by, created_at, updated_at) VALUES ("
+                    f"'restore-recommendation-{sentinel}', "
+                    f"'Restore recommendation {sentinel}', "
+                    f"'restore-pair-version-{sentinel}', 'restore-drill', 'paused', "
+                    "'CNY', 500000, 0, 'standalone', 'restore-drill', now(), now());"
                     "INSERT INTO quantlab.strategy_pairs "
                     "(strategy_version_id, leg_y, leg_x, asset_class, shorting_mode, created_at) "
                     f"VALUES ('restore-pair-version-{sentinel}', 'SH510300', 'SZ159919', "
@@ -315,21 +355,55 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                 "-c",
                 (
                     "from pathlib import Path; "
-                    "p=Path('/data/restore-drill/sentinel.txt'); "
-                    f"p.parent.mkdir(parents=True, exist_ok=True); p.write_text('{sentinel}')"
+                    "p=Path('/data/restore-drill/source-sentinel.txt'); "
+                    f"p.parent.mkdir(parents=True, exist_ok=True); p.write_text('{sentinel}'); "
+                    "m=p.parent/'manifest.json'; "
+                    f"m.write_text({source_data_manifest!r})"
                 ),
             )
-            backup_directory = create_backup(source, backup_root, retention_count=1)
+            backup_directory = create_backup(
+                source,
+                backup_root,
+                retention_count=1,
+                format_version=format_version,
+            )
             manifest = load_and_verify_manifest(backup_directory)
-            result["checks"]["backup_manifest"] = {
+            backup_manifest_check: dict[str, Any] = {
                 "status": "passed",
+                "format_version": manifest["format_version"],
                 "schema_revision": manifest["schema_revision"],
                 "database_bytes": manifest["database"]["bytes"],
-                "data_bytes": manifest["data_volume"]["bytes"],
                 "platform_secret_key_fingerprint": (
                     "present" if manifest.get("platform_secret_key_sha256") else "missing"
                 ),
             }
+            if format_version == FULL_BACKUP_FORMAT_VERSION:
+                backup_manifest_check["data_archive"] = {
+                    "bytes": manifest["data_volume"]["bytes"],
+                    "uncompressed_bytes": manifest["data_volume"]["uncompressed_bytes"],
+                }
+            else:
+                immutable = manifest["immutable_data"]
+                if int(immutable["inventory_entries"]) < 1:
+                    raise RuntimeError("v2 backup did not inventory the governed data manifest")
+                if immutable["inventory_truncated"] is not False:
+                    raise RuntimeError("v2 backup immutable-data inventory was truncated")
+                backup_manifest_check.update(
+                    {
+                        "backup_scope": manifest["backup_scope"],
+                        "control_plane_bytes": manifest["control_plane"]["bytes"],
+                        "immutable_data_copied": manifest["immutable_data_copied"],
+                        "immutable_data_restore": manifest["immutable_data_restore"],
+                        "immutable_inventory": {
+                            "member": immutable["inventory_member"],
+                            "sha256": immutable["inventory_sha256"],
+                            "entries": immutable["inventory_entries"],
+                            "truncated": immutable["inventory_truncated"],
+                            "restore_action": immutable["restore_action"],
+                        },
+                    }
+                )
+            result["checks"]["backup_manifest"] = backup_manifest_check
 
             target.run(
                 "up",
@@ -339,6 +413,20 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                 "--wait-timeout",
                 "120",
                 "postgres",
+            )
+            target.run(
+                "run",
+                "--rm",
+                "--no-deps",
+                "api",
+                "python",
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "p=Path('/data/restore-drill/target-sentinel.txt'); "
+                    "p.parent.mkdir(parents=True, exist_ok=True); "
+                    f"p.write_text('{target_data_sentinel}')"
+                ),
             )
             restored_revision = restore_backup(target, backup_directory, confirmed=True)
             database_sentinel = target.run(
@@ -418,6 +506,51 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
             ).strip()
             if schedule_state_sentinel != "active|paused|portfolio:paused":
                 raise RuntimeError("schedule intent and suspension state did not survive restore")
+            strategy_horizon_sentinel = target.run(
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-U",
+                "quantlab",
+                "-d",
+                "quantlab",
+                "-Atc",
+                (
+                    "SELECT horizon_profile || '|' || horizon_contract_sha256 || '|' || "
+                    "is_legacy::text || '|' || (promotion_stage IS NULL)::text "
+                    "FROM quantlab.strategy_versions "
+                    f"WHERE id='restore-pair-version-{sentinel}';"
+                ),
+                capture=True,
+            ).strip()
+            expected_strategy_horizon = (
+                f"{LEGACY_AMBIGUOUS}|{LEGACY_HORIZON.sha256}|true|true"
+            )
+            if strategy_horizon_sentinel != expected_strategy_horizon:
+                raise RuntimeError("0072 strategy horizon evidence did not survive restore")
+            recommendation_sentinel = target.run(
+                "exec",
+                "-T",
+                "postgres",
+                "psql",
+                "-U",
+                "quantlab",
+                "-d",
+                "quantlab",
+                "-Atc",
+                (
+                    "SELECT strategy_version_id || '|' || status || '|' || "
+                    "recommendation_scope FROM quantlab.recommendation_portfolios "
+                    f"WHERE id='restore-recommendation-{sentinel}';"
+                ),
+                capture=True,
+            ).strip()
+            expected_recommendation = (
+                f"restore-pair-version-{sentinel}|paused|standalone"
+            )
+            if recommendation_sentinel != expected_recommendation:
+                raise RuntimeError("recommendation state did not survive restore")
             simulation_ledger_sentinel = target.run(
                 "exec",
                 "-T",
@@ -466,7 +599,7 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                     capture=True,
                 )
             )
-            data_sentinel = target.run(
+            source_data_sentinel = target.run(
                 "run",
                 "--rm",
                 "--no-deps",
@@ -475,12 +608,45 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                 "-c",
                 (
                     "from pathlib import Path; "
-                    "print(Path('/data/restore-drill/sentinel.txt').read_text())"
+                    "p=Path('/data/restore-drill/source-sentinel.txt'); "
+                    "print(p.read_text() if p.is_file() else 'MISSING')"
                 ),
                 capture=True,
             ).splitlines()[-1]
-            if data_sentinel != sentinel:
-                raise RuntimeError("/data sentinel did not survive restore")
+            restored_target_data_sentinel = target.run(
+                "run",
+                "--rm",
+                "--no-deps",
+                "api",
+                "python",
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "p=Path('/data/restore-drill/target-sentinel.txt'); "
+                    "print(p.read_text() if p.is_file() else 'MISSING')"
+                ),
+                capture=True,
+            ).splitlines()[-1]
+            if format_version == CONTROL_PLANE_BACKUP_FORMAT_VERSION:
+                if source_data_sentinel != "MISSING":
+                    raise RuntimeError("v2 restore copied the source immutable-data sentinel")
+                if restored_target_data_sentinel != target_data_sentinel:
+                    raise RuntimeError("v2 restore did not preserve the target data volume")
+                data_restore_evidence = {
+                    "contract": "preserve_existing_data_volume",
+                    "source_data_sentinel": "not_copied",
+                    "target_data_sentinel": "preserved",
+                }
+            else:
+                if source_data_sentinel != sentinel:
+                    raise RuntimeError("v1 restore did not restore the source data volume")
+                if restored_target_data_sentinel != "MISSING":
+                    raise RuntimeError("v1 restore did not replace the target data volume")
+                data_restore_evidence = {
+                    "contract": "replace_data_volume",
+                    "source_data_sentinel": "restored",
+                    "target_data_sentinel": "replaced",
+                }
             runtime_secret_sentinel = target.run(
                 "run",
                 "--rm",
@@ -507,8 +673,10 @@ def run_drill(project_root: Path, report_path: Path) -> dict[str, Any]:
                 "strategy_allocation_sentinel": "matched",
                 "risk_lifecycle_sentinel": "matched",
                 "schedule_state_sentinel": "matched",
+                "strategy_horizon_sentinel": "matched",
+                "recommendation_sentinel": "matched",
                 "simulation_ledger_sentinel": "matched",
-                "data_sentinel": "matched",
+                "data_restore": data_restore_evidence,
                 "runtime_secret_sentinel": "matched",
             }
 
@@ -571,6 +739,13 @@ def main() -> None:
         description="Exercise QuantLab backup and restore in two disposable Compose projects"
     )
     parser.add_argument(
+        "--format-version",
+        type=int,
+        choices=SUPPORTED_BACKUP_FORMATS,
+        default=CONTROL_PLANE_BACKUP_FORMAT_VERSION,
+        help="2 preserves target immutable /data; 1 exercises the legacy full restore",
+    )
+    parser.add_argument(
         "--report",
         type=Path,
         default=(
@@ -578,7 +753,11 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
-    result = run_drill(PROJECT_ROOT, args.report.resolve())
+    result = run_drill(
+        PROJECT_ROOT,
+        args.report.resolve(),
+        format_version=args.format_version,
+    )
     print(json.dumps({"status": result["status"], "report": str(args.report.resolve())}))
 
 

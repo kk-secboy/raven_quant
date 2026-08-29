@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract one immutable 1/5-minute execution day for transactional simulation booking."""
+"""Extract one immutable execution session for transactional simulation booking."""
 
 from __future__ import annotations
 
@@ -15,7 +15,11 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from quant_data.execution_contract import require_minute_execution_contract
+from quant_data.execution_contract import (
+    require_daily_qlib_contract,
+    require_minute_execution_contract,
+    require_native_daily_execution_controls,
+)
 from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.corporate_actions import (
     corporate_actions_sha256,
@@ -26,8 +30,11 @@ from quant_platform.execution_algorithms import (
     normalize_execution_policy,
 )
 from quant_platform.simulation_store import (
+    SETTLEMENT_CALENDAR_RELATIVE_PATH,
     SIMULATION_BENCHMARK_EVIDENCE_VERSION,
     VWAP_PROFILE_METHOD,
+    build_settlement_calendar_evidence,
+    validate_settlement_calendar_binding,
 )
 
 
@@ -37,6 +44,93 @@ def _canonical_sha256(value: Any) -> str:
             value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _next_settlement_session(
+    provider: Path,
+    *,
+    trade_date: str,
+    dataset_identity_sha256: str,
+    dataset_lineage_id: str,
+    expected_calendar_file_sha256: str,
+    expected_calendar_file_bytes: int,
+    expected_next_trade_date: str,
+) -> tuple[str, dict[str, Any]]:
+    """Resolve D+1 settlement from the sealed source snapshot calendar."""
+
+    source = provider / Path(SETTLEMENT_CALENDAR_RELATIVE_PATH)
+    if not source.is_file():
+        raise ValueError(
+            "execution dataset has no sealed known trading calendar for settlement"
+        )
+    if source.stat().st_size != expected_calendar_file_bytes:
+        raise ValueError("settlement trading calendar size differs from batch binding")
+    calendar_file_sha256 = _sha256_file(source)
+    if calendar_file_sha256 != expected_calendar_file_sha256:
+        raise ValueError("settlement trading calendar hash differs from batch binding")
+    try:
+        frame = pd.read_parquet(source)
+    except Exception as exc:
+        raise ValueError("settlement trading calendar cannot be read") from exc
+    if _sha256_file(source) != calendar_file_sha256:
+        raise ValueError("settlement trading calendar changed while being read")
+    if "date" not in frame.columns or frame.empty:
+        raise ValueError("settlement trading calendar has no date sessions")
+    timestamps = pd.to_datetime(frame["date"], errors="coerce")
+    if timestamps.isna().any():
+        raise ValueError("settlement trading calendar contains invalid dates")
+    sessions = [value.date() for value in timestamps]
+    if sessions != sorted(set(sessions)):
+        raise ValueError(
+            "settlement trading calendar must contain unique ordered sessions"
+        )
+    try:
+        execution_session = pd.Timestamp(trade_date).date()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("simulation trade date is invalid") from exc
+    if execution_session not in sessions:
+        raise ValueError(
+            "settlement trading calendar does not contain the execution session"
+        )
+    later_sessions = [value for value in sessions if value > execution_session]
+    if not later_sessions:
+        raise ValueError("settlement trading calendar has no next trading session")
+    next_session = later_sessions[0]
+    if next_session.isoformat() != expected_next_trade_date:
+        raise ValueError("settlement next session differs from batch binding")
+    evidence = build_settlement_calendar_evidence(
+        trade_date=execution_session,
+        next_trade_date=next_session,
+        dataset_identity_sha256=dataset_identity_sha256,
+        dataset_lineage_id=dataset_lineage_id,
+        calendar_file_sha256=calendar_file_sha256,
+    )
+    return next_session.isoformat(), evidence
+
+
+def _empty_execution_bars() -> pd.DataFrame:
+    """Return the engine's governed bar schema for an all-cash decision."""
+
+    return pd.DataFrame(
+        {
+            "datetime": pd.Series(dtype="datetime64[ns]"),
+            "instrument": pd.Series(dtype="object"),
+            "close": pd.Series(dtype="float64"),
+            "vwap": pd.Series(dtype="float64"),
+            "volume": pd.Series(dtype="float64"),
+            "paused": pd.Series(dtype="float64"),
+            "up_limit": pd.Series(dtype="float64"),
+            "down_limit": pd.Series(dtype="float64"),
+        }
+    )
 
 
 def _sql_string(value: str) -> str:
@@ -350,42 +444,70 @@ def main() -> None:
         (provider / "metadata" / "provenance.json").read_text(encoding="utf-8")
     )
     execution_frequency = str(manifest["execution_frequency"])
-    require_minute_execution_contract(provenance, frequency=execution_frequency)
+    trade_date = str(manifest["trade_date"])
+    if execution_frequency == "day":
+        require_daily_qlib_contract(provenance)
+        require_native_daily_execution_controls(provenance, start=trade_date)
+    else:
+        require_minute_execution_contract(provenance, frequency=execution_frequency)
     verify_qlib_output_manifest(provider, provenance)
     pair_plan = manifest.get("governed_pair_plan")
     if manifest.get("execution_adapter") == "pair" and not isinstance(pair_plan, dict):
         raise ValueError("pair replay requires a governed immutable pair plan")
     instruments = [str(value) for value in manifest.get("instruments") or []]
-    if not instruments:
-        raise ValueError("simulation batch has no target or held instruments")
-    trade_date = str(manifest["trade_date"])
+    if manifest.get("execution_adapter") == "pair" and not instruments:
+        raise ValueError("pair simulation batch has no target or held instruments")
+    settlement_calendar_evidence = None
+    if execution_frequency == "day":
+        settlement_calendar_binding = validate_settlement_calendar_binding(
+            manifest.get("settlement_calendar_binding"),
+            trade_date=pd.Timestamp(trade_date).date(),
+            dataset_identity_sha256=str(provenance["dataset_identity_sha256"]),
+            dataset_lineage_id=str(provenance["dataset_lineage_id"]),
+        )
+        next_trade_date, settlement_calendar_evidence = _next_settlement_session(
+            provider,
+            trade_date=trade_date,
+            dataset_identity_sha256=str(provenance["dataset_identity_sha256"]),
+            dataset_lineage_id=str(provenance["dataset_lineage_id"]),
+            expected_calendar_file_sha256=str(
+                settlement_calendar_binding["calendar_file_sha256"]
+            ),
+            expected_calendar_file_bytes=int(
+                settlement_calendar_binding["calendar_file_bytes"]
+            ),
+            expected_next_trade_date=str(
+                settlement_calendar_binding["next_trade_date"]
+            ),
+        )
     import qlib
     from qlib.constant import REG_CN
     from qlib.data import D
 
     qlib.init(provider_uri=str(provider), region=REG_CN)
-    calendar_end = (
-        pd.Timestamp(trade_date) + pd.Timedelta(days=31)
-    ).strftime("%Y-%m-%d")
-    daily_calendar = pd.to_datetime(
-        D.calendar(
-            start_time=trade_date,
-            end_time=calendar_end,
-            freq="day",
+    if execution_frequency != "day":
+        calendar_end = (
+            pd.Timestamp(trade_date) + pd.Timedelta(days=31)
+        ).strftime("%Y-%m-%d")
+        daily_calendar = pd.to_datetime(
+            D.calendar(
+                start_time=trade_date,
+                end_time=calendar_end,
+                freq="day",
+            )
         )
-    )
-    later_sessions = sorted(
-        {
-            value.date()
-            for value in daily_calendar
-            if value.date() > pd.Timestamp(trade_date).date()
-        }
-    )
-    if not later_sessions:
-        raise ValueError(
-            "bound Qlib calendar has no next trading session for cash settlement"
+        later_sessions = sorted(
+            {
+                value.date()
+                for value in daily_calendar
+                if value.date() > pd.Timestamp(trade_date).date()
+            }
         )
-    next_trade_date = later_sessions[0].isoformat()
+        if not later_sessions:
+            raise ValueError(
+                "bound Qlib calendar has no next trading session for cash settlement"
+            )
+        next_trade_date = later_sessions[0].isoformat()
     execution_policy = dict(manifest.get("execution_policy") or {})
     normalized_policy = normalize_execution_policy(execution_policy)
     normalized_policy.update(
@@ -402,7 +524,7 @@ def main() -> None:
     execution_volume_profile = None
     execution_volume_profile_evidence = None
     execution_volume_profile_sha256 = None
-    if normalized_policy["execution_algorithm"] == "vwap":
+    if normalized_policy["execution_algorithm"] == "vwap" and instruments:
         (
             execution_volume_profile,
             execution_volume_profile_evidence,
@@ -428,45 +550,83 @@ def main() -> None:
         dataset_identity_sha256=str(provenance["dataset_identity_sha256"]),
         dataset_lineage_id=str(provenance["dataset_lineage_id"]),
     )
-    fields = ["$close", "$vwap", "$volume", "$paused", "$up_limit", "$down_limit"]
-    values = D.features(
-        instruments,
-        fields,
-        start_time=f"{trade_date} 00:00:00",
-        end_time=f"{trade_date} 23:59:59",
-        freq=execution_frequency,
-    ).reset_index()
-    values.rename(
-        columns={
-            "$close": "close",
-            "$vwap": "vwap",
-            "$volume": "volume",
-            "$paused": "paused",
-            "$up_limit": "up_limit",
-            "$down_limit": "down_limit",
-        },
-        inplace=True,
+    daily_open_execution = execution_frequency == "day"
+    fields = (
+        ["$open", "$close", "$volume", "$paused", "$up_limit", "$down_limit"]
+        if daily_open_execution
+        else ["$close", "$vwap", "$volume", "$paused", "$up_limit", "$down_limit"]
     )
-    if "datetime" not in values or "instrument" not in values:
-        raise ValueError("Qlib minute result has no datetime/instrument index")
-    values["datetime"] = pd.to_datetime(values["datetime"], errors="coerce")
-    for field in ("close", "vwap", "volume", "paused", "up_limit", "down_limit"):
-        values[field] = pd.to_numeric(values[field], errors="coerce")
-    values = values.dropna(
-        subset=["datetime", "instrument", "close", "vwap", "volume"]
-    )
-    values = values[values["datetime"].dt.date == pd.Timestamp(trade_date).date()]
-    if values.empty:
-        raise ValueError(
-            f"simulation execution day has no {execution_frequency} bars"
+    if instruments:
+        values = D.features(
+            instruments,
+            fields,
+            start_time=f"{trade_date} 00:00:00",
+            end_time=f"{trade_date} 23:59:59",
+            freq=execution_frequency,
+        ).reset_index()
+        values.rename(
+            columns={
+                "$open": "open",
+                "$close": "close",
+                "$vwap": "vwap",
+                "$volume": "volume",
+                "$paused": "paused",
+                "$up_limit": "up_limit",
+                "$down_limit": "down_limit",
+            },
+            inplace=True,
         )
+        if "datetime" not in values or "instrument" not in values:
+            raise ValueError("Qlib minute result has no datetime/instrument index")
+        values["datetime"] = pd.to_datetime(values["datetime"], errors="coerce")
+        for field in (
+            "open",
+            "close",
+            "vwap",
+            "volume",
+            "paused",
+            "up_limit",
+            "down_limit",
+        ):
+            if field not in values:
+                continue
+            values[field] = pd.to_numeric(values[field], errors="coerce")
+        price_fields = (
+            ["open", "close"] if daily_open_execution else ["close", "vwap"]
+        )
+        values = values.dropna(
+            subset=["datetime", "instrument", *price_fields, "volume"]
+        )
+        values = values[
+            values["datetime"].dt.date == pd.Timestamp(trade_date).date()
+        ]
+        if values.empty:
+            raise ValueError(
+                f"simulation execution day has no {execution_frequency} bars"
+            )
+        if daily_open_execution:
+            # One daily bar can support only a conservative next-session-open fill.
+            # The engine consumes this explicit 09:30 pseudo-bar; NAV still uses
+            # the retained actual close in ``execution_close`` below.
+            values["execution_close"] = values["close"]
+            values["close"] = values["open"]
+            values["vwap"] = values["open"]
+            values["datetime"] = values["datetime"].dt.normalize() + pd.Timedelta(
+                hours=9, minutes=30
+            )
+    else:
+        values = _empty_execution_bars()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     bars_path = output.parent / "minute_bars.parquet"
     values.to_parquet(bars_path, index=False, compression="zstd")
     closing_prices = {
         str(instrument): {
-            "price": float(group.sort_values("datetime").iloc[-1]["close"]),
+            "price": float(
+                group.sort_values("datetime").iloc[-1][
+                    "execution_close" if daily_open_execution else "close"
+                ]
+            ),
             "market_date": trade_date,
         }
         for instrument, group in values.groupby("instrument")
@@ -477,13 +637,19 @@ def main() -> None:
         "batch_id": manifest["batch_id"],
         "dataset_identity_sha256": provenance["dataset_identity_sha256"],
         "dataset_lineage_id": provenance["dataset_lineage_id"],
-        "execution_contract_version": provenance["execution_contract_version"],
+        "execution_contract_version": provenance[
+            "field_contract_version"
+            if daily_open_execution
+            else "execution_contract_version"
+        ],
         "execution_contract_hash": manifest["execution_contract_hash"],
         "next_trade_date": next_trade_date,
         "benchmark_evidence": benchmark_evidence,
         "minute_bars_file": bars_path.name,
         "closing_prices": closing_prices,
     }
+    if settlement_calendar_evidence is not None:
+        result["settlement_calendar_evidence"] = settlement_calendar_evidence
     if execution_volume_profile is not None:
         result.update(
             {

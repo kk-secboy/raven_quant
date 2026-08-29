@@ -10,6 +10,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .research_horizon import (
+    LEGACY_AMBIGUOUS,
+    require_label_horizon,
+    research_horizon_contract,
+)
 from .statistical_validation import (
     holm_bonferroni,
     paired_moving_block_bootstrap,
@@ -28,6 +33,8 @@ REQUIRED_QUANT_ABLATIONS = ("factor_only", "model_only", "joint")
 PRIMARY_MODEL_PROFILE = "recent_3y"
 PRIMARY_MODEL_SEED = 11
 MODEL_LABEL_HORIZON_TRADING_DAYS = 2
+LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS = 1
+MODEL_LABEL_CONTRACT_VERSION = "model-label-contract-v1"
 MODEL_REFIT_POLICY_VERSION = "rolling-primary-model-profile-v2"
 # The governed 3031-day research contract leaves 2016 training days for the
 # primary 3-year validation profile (plus 5 embargo and 252 sealed final-OOS
@@ -79,6 +86,88 @@ def canonical_sha256(value: Any) -> str:
 
 
 MODEL_REFIT_POLICY_SHA256 = canonical_sha256(MODEL_REFIT_POLICY)
+
+
+def resolve_model_label_contract(
+    *,
+    research_window_contract: Mapping[str, Any] | None = None,
+    research_window_contract_sha256: str | None = None,
+    label_horizon_sessions: int | None = None,
+) -> dict[str, Any]:
+    """Resolve one executable forward-return label from a research window.
+
+    Product horizons describe a set of labels.  One model run must select one
+    member explicitly; absent a choice, active horizons use their longest
+    predictive label.  Old runs retain the historical next-session-to-following-
+    session return and are marked legacy rather than reinterpreted.
+    """
+
+    if research_window_contract is None:
+        if label_horizon_sessions not in {None, LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS}:
+            raise ValueError("legacy model research supports only its one-session label")
+        return {
+            "contract_version": MODEL_LABEL_CONTRACT_VERSION,
+            "horizon_profile": LEGACY_AMBIGUOUS,
+            "legacy": True,
+            "allowed_label_horizons_sessions": [
+                LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS
+            ],
+            "label_horizon_sessions": LEGACY_MODEL_PREDICTION_HORIZON_SESSIONS,
+            "label_reference_offset_sessions": MODEL_LABEL_HORIZON_TRADING_DAYS,
+            "label_expression": "Ref($close,-2)/Ref($close,-1)-1",
+            "purge_sessions": MODEL_LABEL_HORIZON_TRADING_DAYS,
+            "embargo_sessions": 5,
+            "research_window_contract_sha256": None,
+        }
+    if not isinstance(research_window_contract, Mapping):
+        raise ValueError("research window contract must be an object")
+    expected_window_sha256 = str(research_window_contract_sha256 or "").lower()
+    if (
+        len(expected_window_sha256) != 64
+        or canonical_sha256(dict(research_window_contract)) != expected_window_sha256
+    ):
+        raise ValueError("research window contract digest is missing or invalid")
+    profile = str(research_window_contract.get("horizon_profile") or "")
+    if research_window_contract.get("contract_version") != "research-window-v1":
+        raise ValueError("research window contract version is invalid")
+    if profile == LEGACY_AMBIGUOUS:
+        legacy = resolve_model_label_contract(label_horizon_sessions=label_horizon_sessions)
+        return {
+            **legacy,
+            "research_window_contract_sha256": expected_window_sha256,
+        }
+    horizon = research_horizon_contract(profile)
+    if research_window_contract.get("horizon_contract_sha256") != horizon.sha256:
+        raise ValueError("research window horizon digest is invalid")
+    raw_labels = research_window_contract.get("label_horizons_sessions") or []
+    try:
+        allowed = tuple(int(item) for item in raw_labels)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("research window label horizons are invalid") from exc
+    if allowed != horizon.label_horizons_sessions:
+        raise ValueError("research window labels differ from the horizon contract")
+    selected = int(label_horizon_sessions) if label_horizon_sessions is not None else max(allowed)
+    require_label_horizon(profile, selected)
+    purge = int(research_window_contract.get("purge_sessions") or 0)
+    embargo = int(research_window_contract.get("embargo_sessions") or 0)
+    if purge < int(horizon.purge_sessions or 0):
+        raise ValueError("research window model purge is weaker than the horizon contract")
+    if embargo < int(horizon.embargo_sessions or 0):
+        raise ValueError("research window model embargo is weaker than the horizon contract")
+    if research_window_contract.get("label_maturity_enforced") is not True:
+        raise ValueError("active model research requires enforced label maturity")
+    return {
+        "contract_version": MODEL_LABEL_CONTRACT_VERSION,
+        "horizon_profile": profile,
+        "legacy": False,
+        "allowed_label_horizons_sessions": list(allowed),
+        "label_horizon_sessions": selected,
+        "label_reference_offset_sessions": selected + 1,
+        "label_expression": f"Ref($close,-{selected + 1})/Ref($close,-1)-1",
+        "purge_sessions": purge,
+        "embargo_sessions": embargo,
+        "research_window_contract_sha256": expected_window_sha256,
+    }
 
 
 def file_sha256(path: Path) -> str:
@@ -695,7 +784,11 @@ def validate_quant_bundle_evidence(
                     raise ValueError(
                         f"quant ablation {name}/{profile_name}/{seed} evidence is incomplete"
                     )
-                if baseline.get("kind") == "ensemble" and name == "factor_only":
+                if (
+                    isinstance(baseline, Mapping)
+                    and baseline.get("kind") == "ensemble"
+                    and name == "factor_only"
+                ):
                     member_artifacts = seed_result.get("member_artifacts")
                     baseline_components = baseline.get("components") or []
                     expected_member_ids = {

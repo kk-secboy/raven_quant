@@ -15,30 +15,33 @@ from pathlib import Path
 from typing import Any
 
 from .backup_restore import (
+    CONTROL_PLANE_BACKUP_FORMAT_VERSION,
+    FULL_BACKUP_FORMAT_VERSION,
     WRITER_SERVICES,
     ComposeContext,
     _platform_secret_key_fingerprint,
+    assess_control_plane_backup_capacity,
     create_backup,
     load_and_verify_manifest,
     restore_backup,
 )
+from .control_plane_lock import control_plane_locked
+from .deployment_services import (
+    BUILT_APPLICATION_SERVICES,
+    PROFILE_BUILT_SERVICES,
+)
+from .release_identity import (
+    RELEASE_IDENTITY_ENV_KEYS,
+    release_identity_environment,
+)
 from .release_preflight import (
     LEGACY_EXPECTED_SERVICES,
+    _runtime_release_identity,
     assess_release,
     expected_services,
 )
 
-BUILT_SERVICES = (
-    "api",
-    "scheduler",
-    "worker",
-    "rdagent-worker",
-    "rdagent-data-science-worker",
-    "web",
-)
-PROFILE_BUILT_SERVICES = {
-    "gpu": ("rdagent-llm-finetune-worker",),
-}
+BUILT_SERVICES = BUILT_APPLICATION_SERVICES
 INTRODUCED_SERVICES = {
     "rdagent-data-science-worker",
     "rdagent-llm-finetune-worker",
@@ -281,7 +284,14 @@ def _persist_rollback_compose_contract(
     *,
     directory_name: str = "rollback-compose-contract",
 ) -> ComposeContext:
-    """Persist the old Compose/env bytes while preserving its project directory."""
+    """Persist the old Compose bytes without copying plaintext release secrets.
+
+    The original environment file remains the rollback authority.  It was
+    already required to be a regular, trusted file by
+    :func:`_capture_rollback_compose_contract`; binding its path and digest in
+    this manifest gives us an exact rollback contract without silently adding
+    credentials to an otherwise sanitized backup directory.
+    """
 
     if not re.fullmatch(r"rollback-compose-contract(?:-[0-9a-z]+)?", directory_name):
         raise ValueError("rollback Compose contract directory name is invalid")
@@ -289,9 +299,10 @@ def _persist_rollback_compose_contract(
     if not _inside_path(root, backup_directory.resolve()):
         raise RuntimeError("rollback Compose contract target escapes the backup")
     root.mkdir(mode=0o700)
-    env_target = root / "environment.env"
-    _atomic_replace(env_target, contract.env_content)
-    env_target.chmod(0o600)
+    if contract.env_source.is_symlink() or not contract.env_source.is_file():
+        raise RuntimeError("rollback Compose environment is no longer available")
+    if contract.env_source.read_bytes() != contract.env_content:
+        raise RuntimeError("rollback Compose environment changed after capture")
     compose_targets: list[Path] = []
     compose_entries: list[dict[str, str]] = []
     for index, (source, content) in enumerate(
@@ -314,7 +325,7 @@ def _persist_rollback_compose_contract(
         "project_name": contract.project_name,
         "working_directory": str(contract.working_directory),
         "env_source": str(contract.env_source),
-        "env_snapshot": env_target.name,
+        "env_snapshot": None,
         "env_sha256": hashlib.sha256(contract.env_content).hexdigest(),
         "profiles": list(contract.profiles),
         "compose_files": compose_entries,
@@ -328,11 +339,11 @@ def _persist_rollback_compose_contract(
     for target, content in zip(compose_targets, contract.compose_contents, strict=True):
         if target.read_bytes() != content:
             raise RuntimeError("persisted rollback Compose file failed verification")
-    if env_target.read_bytes() != contract.env_content:
+    if contract.env_source.read_bytes() != contract.env_content:
         raise RuntimeError("persisted rollback environment failed verification")
     rollback = ComposeContext(
         project_name=contract.project_name,
-        env_file=env_target,
+        env_file=contract.env_source,
         compose_files=tuple(compose_targets),
         profiles=contract.profiles,
         project_directory=contract.working_directory,
@@ -418,8 +429,7 @@ def _verify_reuse_contract_source(
     contract_root = (backup_directory / "rollback-compose-contract").resolve()
     if not contract_root.is_dir():
         raise RuntimeError("reusable backup has no rollback Compose contract")
-    sources = (contract.env_source, *contract.compose_sources)
-    if any(not _inside_path(source, contract_root) for source in sources):
+    if any(not _inside_path(source, contract_root) for source in contract.compose_sources):
         raise RuntimeError(
             "running services are not owned by the reusable backup rollback contract"
         )
@@ -428,9 +438,28 @@ def _verify_reuse_contract_source(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError("reusable backup rollback contract is invalid") from exc
-    env_target = (contract_root / str(manifest.get("env_snapshot") or "")).resolve()
-    if env_target != contract.env_source.resolve():
-        raise RuntimeError("reusable backup rollback environment does not match")
+    env_snapshot = str(manifest.get("env_snapshot") or "").strip()
+    if env_snapshot:
+        # Accept already-created legacy rollback contracts, while new releases
+        # never copy the plaintext environment into the backup.
+        env_target = (contract_root / env_snapshot).resolve()
+        if env_target != contract.env_source.resolve():
+            raise RuntimeError("reusable backup rollback environment does not match")
+    else:
+        try:
+            expected_env = Path(str(manifest["env_source"])).expanduser().resolve()
+        except (KeyError, OSError, RuntimeError) as exc:
+            raise RuntimeError(
+                "reusable backup rollback environment source is invalid"
+            ) from exc
+        if expected_env != contract.env_source.resolve():
+            raise RuntimeError("reusable backup rollback environment does not match")
+    if (
+        contract.env_source.is_symlink()
+        or not contract.env_source.is_file()
+        or contract.env_source.read_bytes() != contract.env_content
+    ):
+        raise RuntimeError("reusable backup rollback environment changed after capture")
     if hashlib.sha256(contract.env_content).hexdigest() != manifest.get("env_sha256"):
         raise RuntimeError("reusable backup rollback environment checksum mismatch")
     entries = manifest.get("compose_files") or []
@@ -473,6 +502,8 @@ def _validate_reusable_backup(
         candidate,
         use_verification_receipt=True,
     )
+    if manifest.get("format_version") != FULL_BACKUP_FORMAT_VERSION:
+        raise ValueError("only a full v1 backup can be reused for an exact release snapshot")
     if manifest.get("project_name") != context.project_name:
         raise ValueError("reusable backup belongs to another Compose project")
     expected_secret = str(manifest.get("platform_secret_key_sha256") or "")
@@ -565,21 +596,68 @@ def _atomic_replace(path: Path, content: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _environment_assignment_key(line: str) -> str | None:
+    candidate = line.lstrip()
+    if not candidate or candidate.startswith("#"):
+        return None
+    if candidate.startswith("export "):
+        candidate = candidate.removeprefix("export ").lstrip()
+    if "=" not in candidate:
+        return None
+    return candidate.split("=", 1)[0].strip() or None
+
+
 def _update_environment(path: Path, values: dict[str, str]) -> None:
     original = path.read_text(encoding="utf-8-sig")
-    remaining = dict(values)
     output: list[str] = []
     for line in original.splitlines():
-        key = line.split("=", 1)[0].strip() if "=" in line else ""
-        if key in remaining and not line.lstrip().startswith("#"):
-            output.append(f"{key}={remaining.pop(key)}")
-        else:
+        if _environment_assignment_key(line) not in values:
             output.append(line)
-    if remaining:
-        if output and output[-1]:
-            output.append("")
-        output.extend(f"{key}={value}" for key, value in sorted(remaining.items()))
+    output.extend(f"{key}={value}" for key, value in sorted(values.items()))
     _atomic_replace(path, ("\n".join(output) + "\n").encode("utf-8"))
+
+
+def _release_configuration_digest(context: ComposeContext) -> str:
+    """Hash the release configuration without recursively hashing its stamp."""
+
+    environment_lines: list[str] = []
+    for line in context.env_file.read_text(encoding="utf-8-sig").splitlines():
+        key = _environment_assignment_key(line)
+        if key not in RELEASE_IDENTITY_ENV_KEYS:
+            environment_lines.append(line)
+    compose_files = tuple(
+        Path(item).resolve() for item in getattr(context, "compose_files", ())
+    )
+    identity = {
+        "contract_version": "quantlab-release-config-v1",
+        "project_name": context.project_name,
+        "profiles": sorted(str(item) for item in getattr(context, "profiles", ())),
+        "environment_sha256": hashlib.sha256(
+            ("\n".join(environment_lines) + "\n").encode("utf-8")
+        ).hexdigest(),
+        "compose": [
+            {
+                "name": item.name,
+                "sha256": hashlib.sha256(item.read_bytes()).hexdigest(),
+            }
+            for item in compose_files
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _stamp_release_identity(
+    context: ComposeContext,
+    release_id: str,
+) -> dict[str, str]:
+    identity = release_identity_environment(
+        release_id.lower(),
+        _release_configuration_digest(context),
+    )
+    _update_environment(context.env_file, identity)
+    return identity
 
 
 def _repo_digest(raw: str, repository: str) -> str:
@@ -715,6 +793,45 @@ def _qlib_provider_candidates(calendars: list[str]) -> list[str]:
     ]
 
 
+def _configured_service_images(
+    context: ComposeContext,
+    *service_names: str,
+) -> dict[str, str]:
+    """Resolve service images from the final Compose model used for deployment."""
+
+    try:
+        payload = json.loads(
+            context.run("config", "--format", "json", capture=True)
+        )
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("rendered Compose configuration is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("rendered Compose configuration must be a JSON object")
+    services = payload.get("services")
+    if not isinstance(services, dict):
+        raise RuntimeError("rendered Compose configuration has no services object")
+
+    resolved: dict[str, str] = {}
+    for service_name in service_names:
+        service = services.get(service_name)
+        if not isinstance(service, dict):
+            raise RuntimeError(
+                f"rendered Compose configuration has no {service_name!r} service"
+            )
+        image = service.get("image")
+        if (
+            not isinstance(image, str)
+            or not image
+            or image != image.strip()
+            or any(character.isspace() for character in image)
+        ):
+            raise RuntimeError(
+                f"rendered Compose service {service_name!r} has no valid image"
+            )
+        resolved[service_name] = image
+    return resolved
+
+
 def _prepare_sandbox_images(
     context: ComposeContext,
     project_root: Path,
@@ -733,7 +850,12 @@ def _prepare_sandbox_images(
     host_registry = f"127.0.0.1:{port}"
     dind_registry = "rdagent-registry:5000"
     release_tag = release_id.lower()
-    runtime_source = f"{context.project_name}-rdagent-worker:latest"
+    configured_images = _configured_service_images(
+        context,
+        "worker",
+        "rdagent-worker",
+    )
+    runtime_source = configured_images["rdagent-worker"]
     runtime_image_id = context.docker(
         "image",
         "inspect",
@@ -765,7 +887,7 @@ def _prepare_sandbox_images(
     )
     try:
         _wait_for_registry(port, min(wait_timeout, 120))
-        sandbox_base_source = "quantlab-worker-runtime:v2"
+        sandbox_base_source = configured_images["worker"]
         sandbox_base_image_id = context.docker(
             "image",
             "inspect",
@@ -943,39 +1065,57 @@ def _assess_backup_capacity(
     backup_root: Path,
     *,
     minimum_free_gb: float,
+    format_version: int = CONTROL_PLANE_BACKUP_FORMAT_VERSION,
 ) -> dict[str, Any]:
-    """Fail closed unless the target can hold a worst-case full data copy.
+    """Fail closed unless the target can hold the selected backup and headroom."""
 
-    The backup writer creates the new archive before retention removes an old
-    generation. Gzip ratios are data dependent, so planning from a nominal
-    fixed headroom can fill the filesystem. Use the uncompressed governed data
-    mount size as the conservative upper bound and retain the requested
-    operational headroom in addition to it.
-    """
-
-    try:
-        source = context.data_volume()
-        raw = context.docker(
-            "run",
-            "--rm",
-            "--volume",
-            f"{source}:/source:ro",
-            "postgres:16-alpine",
-            "du",
-            "-sk",
-            "/source",
-            capture=True,
+    if format_version == CONTROL_PLANE_BACKUP_FORMAT_VERSION:
+        control_plane = assess_control_plane_backup_capacity(
+            context,
+            backup_root,
+            minimum_free_gb=minimum_free_gb,
         )
-        source_kib = int(raw.splitlines()[-1].split()[0])
-        source_bytes = source_kib * 1024
+        return {
+            **control_plane,
+            "id": "backup_capacity",
+            "title": "Control-plane backup target capacity",
+            "remediation": (
+                None
+                if control_plane["status"] == "pass"
+                else "Choose a backup root with space for the database snapshot, "
+                "bounded control archive, and release headroom."
+            ),
+        }
+    try:
+        if minimum_free_gb < 0:
+            raise ValueError("minimum_free_gb must not be negative")
         anchor = _existing_storage_anchor(backup_root)
         free_bytes = shutil.disk_usage(anchor).free
-        required_bytes = source_bytes + int(minimum_free_gb * _GIB)
+        if format_version == FULL_BACKUP_FORMAT_VERSION:
+            source = context.data_volume()
+            raw = context.docker(
+                "run",
+                "--rm",
+                "--volume",
+                f"{source}:/source:ro",
+                "postgres:16-alpine",
+                "du",
+                "-sk",
+                "/source",
+                capture=True,
+            )
+            source_kib = int(raw.splitlines()[-1].split()[0])
+            payload_upper_bound = source_kib * 1024
+            payload_label = (
+                f"full /data upper bound {payload_upper_bound / _GIB:.1f} GiB"
+            )
+        else:
+            raise ValueError("unsupported backup format")
+        required_bytes = payload_upper_bound + int(minimum_free_gb * _GIB)
         passed = free_bytes >= required_bytes
         evidence = (
-            f"source {source}; target {backup_root.resolve()}; "
-            f"free {free_bytes / _GIB:.1f} GiB; "
-            f"data upper bound {source_bytes / _GIB:.1f} GiB; retained headroom "
+            f"format v{format_version}; target {backup_root.resolve()}; "
+            f"free {free_bytes / _GIB:.1f} GiB; {payload_label}; retained headroom "
             f"{minimum_free_gb:.1f} GiB; required {required_bytes / _GIB:.1f} GiB"
         )
     except Exception as exc:
@@ -989,8 +1129,8 @@ def _assess_backup_capacity(
         "remediation": (
             None
             if passed
-            else "Choose a backup root with space for one full uncompressed data "
-            "generation plus release headroom."
+            else "Choose a backup root with space for the selected backup payload "
+            "plus release headroom."
         ),
     }
 
@@ -1022,6 +1162,60 @@ def _capture_rollback_images(
         context.docker("tag", image_id, tag)
         tags[service] = tag
     return tags
+
+
+def _restore_built_image_aliases(
+    context: ComposeContext,
+    configured_images: dict[str, str],
+    rollback_tags: dict[str, str],
+) -> list[str]:
+    """Restore mutable Compose image aliases after an uncommitted build.
+
+    Compose builds may retag ``image:`` references before any container or
+    database mutation happens.  A release that then blocks must put those
+    aliases back, otherwise a later operator command could start unaccepted
+    code even though this release reported ``blocked``.
+    """
+
+    targets: dict[str, tuple[str, str]] = {}
+    for service, image in configured_images.items():
+        rollback_tag = rollback_tags.get(service)
+        if rollback_tag is None or "@sha256:" in image:
+            continue
+        raw = context.docker(
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            rollback_tag,
+            capture=True,
+        ).splitlines()
+        image_id = raw[0].strip().lower() if raw else ""
+        if not _IMAGE_ID.fullmatch(image_id):
+            raise RuntimeError(f"rollback image for {service} has no immutable image ID")
+        previous = targets.get(image)
+        if previous is not None and previous[1] != image_id:
+            raise RuntimeError(
+                f"shared Compose image {image!r} had inconsistent rollback images"
+            )
+        targets[image] = (rollback_tag, image_id)
+
+    restored: list[str] = []
+    for image, (rollback_tag, expected_id) in sorted(targets.items()):
+        context.docker("tag", rollback_tag, image)
+        raw = context.docker(
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            image,
+            capture=True,
+        ).splitlines()
+        actual_id = raw[0].strip().lower() if raw else ""
+        if actual_id != expected_id:
+            raise RuntimeError(f"failed to restore mutable Compose image alias {image!r}")
+        restored.append(image)
+    return restored
 
 
 def _capture_service_storage(
@@ -1492,6 +1686,54 @@ def _gateway_smoke(context: ComposeContext) -> dict[str, Any]:
     }
 
 
+def _release_identity_acceptance(
+    context: ComposeContext,
+    services: set[str] | frozenset[str],
+) -> dict[str, str]:
+    valid, evidence = _runtime_release_identity(context, services)
+    return {
+        "status": "pass" if valid else "block",
+        "evidence": evidence,
+    }
+
+
+def _switch_stable_release_link(stable_link: Path, project_root: Path) -> dict[str, str]:
+    """Atomically point the operational stable path at an accepted release."""
+
+    target = project_root.expanduser().resolve(strict=True)
+    if not target.is_dir():
+        raise RuntimeError("accepted release target is not a directory")
+    link = stable_link.expanduser().absolute()
+    if link == target:
+        raise RuntimeError("stable release link must not equal the release directory")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(link) and not link.is_symlink():
+        raise RuntimeError("stable release path exists and is not a symbolic link")
+    temporary = link.parent / f".{link.name}.next-{os.getpid()}"
+    if os.path.lexists(temporary):
+        raise RuntimeError("stale stable-release switch path exists")
+    try:
+        os.symlink(target, temporary, target_is_directory=True)
+        os.replace(temporary, link)
+        if link.resolve(strict=True) != target:
+            raise RuntimeError("stable release link verification failed")
+        if os.name == "posix":
+            directory_fd = os.open(link.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if os.path.lexists(temporary):
+            temporary.unlink()
+    return {
+        "status": "pass",
+        "path": str(link),
+        "target": str(target),
+    }
+
+
+@control_plane_locked
 def run_release_upgrade(
     context: ComposeContext,
     project_root: Path,
@@ -1504,6 +1746,7 @@ def run_release_upgrade(
     pull_images: bool = False,
     rollback_image_retention: int = 3,
     reuse_backup: Path | None = None,
+    stable_release_link: Path | None = None,
 ) -> dict[str, Any]:
     if not confirmed:
         raise ValueError("release upgrade requires --confirm-upgrade")
@@ -1539,6 +1782,21 @@ def run_release_upgrade(
     environment_before: bytes | None = None
     environment_changed = False
     state_mutated = False
+    release_committed = False
+    configured_build_images: dict[str, str] = {}
+    build_aliases_dirty = False
+
+    def restore_uncommitted_build_aliases() -> None:
+        nonlocal build_aliases_dirty
+        if not build_aliases_dirty:
+            return
+        result["restored_build_image_aliases"] = _restore_built_image_aliases(
+            context,
+            configured_build_images,
+            rollback_tags,
+        )
+        build_aliases_dirty = False
+
     try:
         initial = assess_release(
             context,
@@ -1558,6 +1816,7 @@ def run_release_upgrade(
                 context,
                 backup_root,
                 minimum_free_gb=minimum_free_gb,
+                format_version=CONTROL_PLANE_BACKUP_FORMAT_VERSION,
             )
             if reuse_backup is None
             else {
@@ -1610,9 +1869,13 @@ def run_release_upgrade(
         )
         result["rollback_images"] = rollback_tags
         result["rollback_disabled_services"] = sorted(rollback_disabled_services)
+        configured_build_images = _configured_service_images(context, *built_services)
         build_arguments = ["build"]
         if pull_images:
             build_arguments.append("--pull")
+        # A partially successful Compose build can already overwrite mutable
+        # aliases, even when the command subsequently fails.
+        build_aliases_dirty = True
         context.run(*build_arguments, *built_services)
 
         final_gate = assess_release(
@@ -1625,6 +1888,7 @@ def run_release_upgrade(
         )
         result["checks"]["post_build_preflight"] = final_gate
         if final_gate["status"] != "ready":
+            restore_uncommitted_build_aliases()
             result["status"] = "blocked"
             result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")
             return result
@@ -1633,6 +1897,7 @@ def run_release_upgrade(
                 context,
                 backup_root,
                 minimum_free_gb=minimum_free_gb,
+                format_version=CONTROL_PLANE_BACKUP_FORMAT_VERSION,
             )
             if reuse_backup is None
             else {
@@ -1644,6 +1909,7 @@ def run_release_upgrade(
             post_build_backup_capacity
         )
         if post_build_backup_capacity["status"] != "pass":
+            restore_uncommitted_build_aliases()
             result["status"] = "blocked"
             result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")
             return result
@@ -1654,6 +1920,8 @@ def run_release_upgrade(
                 backup_root,
                 retention_count=retention_count,
                 restart_services=False,
+                format_version=CONTROL_PLANE_BACKUP_FORMAT_VERSION,
+                minimum_free_gb=minimum_free_gb,
             )
             state_mutated = True
             rollback_base_context = _persist_rollback_compose_contract(
@@ -1739,6 +2007,16 @@ def run_release_upgrade(
             release_id,
             wait_timeout=wait_timeout,
         )
+        release_identity = _stamp_release_identity(context, release_id)
+        result["release_identity"] = {
+            "release_id": release_identity["QUANTLAB_RELEASE_ID"],
+            "config_digest": release_identity["QUANTLAB_CONFIG_DIGEST"],
+            "release_kind": release_identity["QUANTLAB_RELEASE_KIND"],
+            "alias_of": release_identity["QUANTLAB_RELEASE_ALIAS_OF"],
+            "canonical_baseline": (
+                release_identity["QUANTLAB_CANONICAL_BASELINE"] == "true"
+            ),
+        }
         environment_changed = True
         release_services = expected_services(context)
         core_services = tuple(
@@ -1766,36 +2044,26 @@ def run_release_upgrade(
         ):
             raise RuntimeError("post-upgrade core release acceptance did not pass")
 
-        # The scheduler is the first component allowed to create new durable
-        # work.  Gateway remains stopped so no external request can race the
-        # final service and provenance checks.
-        context.run(
-            "up",
-            "-d",
-            "--no-deps",
-            "--wait",
-            "--wait-timeout",
-            str(wait_timeout),
-            "scheduler",
-        )
-        # Keep the externally exposed gateway closed until every database,
-        # image, service and durable-work provenance check has passed. Otherwise
-        # a request accepted during this window could be lost by rollback.
-        acceptance = assess_release(
-            context,
-            project_root,
-            minimum_free_gb=minimum_free_gb,
-            required_services=release_services.difference({"gateway"}),
-        )
-        result["checks"]["post_upgrade_preflight"] = acceptance
+        # Perform every rollback-capable check while scheduler and gateway are
+        # still stopped.  No accepted durable write may race a database rollback.
         durable_state = _post_cutover_durable_state(context, cutover_at)
-        post_start_acceptance = _post_start_acceptance(
-            acceptance,
+        pre_activation_acceptance = _post_start_acceptance(
+            core_acceptance,
             durable_state,
         )
-        result["checks"]["post_upgrade_acceptance"] = post_start_acceptance
-        if post_start_acceptance["status"] != "pass":
-            raise RuntimeError("post-upgrade release acceptance did not pass")
+        result["checks"]["pre_activation_acceptance"] = pre_activation_acceptance
+        if pre_activation_acceptance["status"] != "pass":
+            raise RuntimeError("pre-activation release acceptance did not pass")
+        core_identity = _release_identity_acceptance(context, set(core_services))
+        result["checks"]["pre_activation_release_identity"] = core_identity
+        if core_identity["status"] != "pass":
+            raise RuntimeError("pre-activation release identity did not pass")
+
+        # This is the commit boundary.  Starting scheduler or gateway can create
+        # durable work; failures after this point are fail-closed activation
+        # failures and must never restore the old database snapshot.
+        release_committed = True
+        build_aliases_dirty = False
 
         context.run(
             "up",
@@ -1804,9 +2072,37 @@ def run_release_upgrade(
             "--wait",
             "--wait-timeout",
             str(wait_timeout),
+            "scheduler",
             "gateway",
         )
+        acceptance = assess_release(
+            context,
+            project_root,
+            minimum_free_gb=minimum_free_gb,
+            required_services=release_services,
+        )
+        result["checks"]["post_activation_preflight"] = acceptance
+        activated_durable_state = _post_cutover_durable_state(context, cutover_at)
+        post_activation_acceptance = _post_start_acceptance(
+            acceptance,
+            activated_durable_state,
+        )
+        result["checks"]["post_activation_acceptance"] = post_activation_acceptance
+        if post_activation_acceptance["status"] != "pass":
+            raise RuntimeError("post-activation release acceptance did not pass")
+        final_identity = _release_identity_acceptance(
+            context,
+            release_services,
+        )
+        result["checks"]["final_release_identity"] = final_identity
+        if final_identity["status"] != "pass":
+            raise RuntimeError("final all-service release identity did not pass")
         result["checks"]["gateway_smoke"] = _gateway_smoke(context)
+        if stable_release_link is not None:
+            result["stable_release_link"] = _switch_stable_release_link(
+                stable_release_link,
+                project_root,
+            )
 
         result["status"] = "succeeded"
         try:
@@ -1821,6 +2117,28 @@ def run_release_upgrade(
         return result
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
+        if release_committed:
+            build_aliases_dirty = False
+            stop = context.run(
+                "stop",
+                "scheduler",
+                "gateway",
+                check=False,
+            )
+            result["activation_fail_closed"] = {
+                "stopped_services": ["gateway", "scheduler"],
+                "command_output": stop,
+                "rollback_permitted": False,
+            }
+            result["status"] = "activation_failed"
+            result["completed_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+            return result
+        try:
+            restore_uncommitted_build_aliases()
+        except Exception as alias_exc:
+            result["image_alias_restore_error"] = (
+                f"{type(alias_exc).__name__}: {alias_exc}"
+            )
         if environment_changed and environment_before is not None:
             try:
                 _atomic_replace(context.env_file, environment_before)

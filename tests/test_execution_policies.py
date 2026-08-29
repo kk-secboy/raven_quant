@@ -61,6 +61,36 @@ def test_normalize_maps_canonical_policy_ids_and_validates_new_knobs() -> None:
         )
 
 
+def test_daily_open_is_one_next_session_open_slot() -> None:
+    policy = {"execution_algorithm": "daily_open", "execution_frequency": "day"}
+    normalized = normalize_execution_policy(policy)
+    assert normalized["execution_algorithm"] == "open"
+    assert normalized["execution_policy_id"] == "daily_open"
+    assert [
+        slot.strftime("%Y-%m-%d %H:%M")
+        for slot in execution_time_slots(trade_date=TRADE_DATE, policy=policy)
+    ] == ["2026-07-13 09:30"]
+    slices = build_execution_slices(
+        quantity=1_000,
+        side="buy",
+        trade_date=TRADE_DATE,
+        policy=policy,
+        signal_at=datetime(2026, 7, 10, 15, 0),
+        instrument="SH600000",
+    )
+    assert len(slices) == 1
+    assert slices[0]["quantity"] == 1_000
+    assert slices[0]["scheduled_for"].endswith("09:30:00+08:00")
+    with pytest.raises(ValueError, match="daily-open"):
+        normalize_execution_policy(
+            {"execution_algorithm": "open", "execution_frequency": "5min"}
+        )
+    with pytest.raises(ValueError, match="only supported"):
+        normalize_execution_policy(
+            {"execution_algorithm": "twap", "execution_frequency": "day"}
+        )
+
+
 def test_participation_capped_slicing_is_deterministic_and_respects_the_cap() -> None:
     policy = _participation_policy()
     first = plan_participation_capped_slices(

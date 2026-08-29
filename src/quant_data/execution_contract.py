@@ -5,7 +5,12 @@ import json
 from datetime import date, datetime, timedelta
 from typing import Any
 
-DAILY_QLIB_FIELD_CONTRACT_VERSION = "daily-qlib-field-v4-legacy-adj-rebase"
+from .universe import (
+    GOVERNED_DAILY_ETF_WHITELIST,
+    governed_daily_etf_whitelist_contract,
+)
+
+DAILY_QLIB_FIELD_CONTRACT_VERSION = "daily-qlib-field-v5-governed-domestic-etf"
 QLIB_OUTPUT_MANIFEST_VERSION = "qlib-output-files-v1"
 TUSHARE_DAILY_VOLUME_UNIT = "hand"
 QLIB_DAILY_VOLUME_UNIT = "share"
@@ -27,7 +32,8 @@ MINUTE_VWAP_RELATIVE_TOLERANCE = 0.05
 MINUTE_AMOUNT_ROUNDING_TOLERANCE_CNY = 1.0
 MINUTE_PRICE_TICK_TOLERANCE_CNY = 0.01
 
-STRATEGY_EXECUTION_CONTRACT_VERSION = "qlib-strategy-execution-v1"
+STRATEGY_EXECUTION_CONTRACT_VERSION = "qlib-strategy-execution-v2-rule-bound"
+LEGACY_STRATEGY_EXECUTION_CONTRACT_VERSION = "qlib-strategy-execution-v1"
 NATIVE_STRATEGY_FREQUENCIES = frozenset({"day", "1min", "5min"})
 QLIB_RESAMPLED_FREQUENCIES = frozenset({"15min", "30min", "60min"})
 SUPPORTED_STRATEGY_FREQUENCIES = frozenset(
@@ -145,8 +151,12 @@ def build_strategy_execution_contract(config: dict[str, Any]) -> dict[str, Any]:
                 "minute signal execution frequency must be equal to or finer than the signal"
             )
 
-    return {
-        "version": STRATEGY_EXECUTION_CONTRACT_VERSION,
+    contract = {
+        "version": (
+            STRATEGY_EXECUTION_CONTRACT_VERSION
+            if config.get("strategy_rules_sha256")
+            else LEGACY_STRATEGY_EXECUTION_CONTRACT_VERSION
+        ),
         "signal": {
             "frequency": signal_frequency,
             "period_bars": signal_period,
@@ -202,6 +212,13 @@ def build_strategy_execution_contract(config: dict[str, Any]) -> dict[str, Any]:
         },
         "market_rules": "cn-ashare-t1-limits-fees-v1",
     }
+    if config.get("strategy_rules_sha256"):
+        contract["strategy_rules"] = {
+            "horizon_profile": config.get("horizon_profile"),
+            "rules_sha256": config.get("strategy_rules_sha256"),
+            "policy_sha256": config.get("strategy_rule_policy_sha256"),
+        }
+    return contract
 
 
 def strategy_execution_contract_hash(config: dict[str, Any]) -> str:
@@ -263,6 +280,20 @@ def require_daily_qlib_contract(provenance: dict[str, Any]) -> None:
         raise ValueError("daily Qlib dataset volume/amount units are missing or invalid")
     if provenance.get("lineage_verified") is not True:
         raise ValueError("daily Qlib dataset lineage is not verified")
+    etf_evidence = provenance.get("governed_etf_whitelist")
+    expected_etf = governed_daily_etf_whitelist_contract()
+    if not isinstance(etf_evidence, dict):
+        raise ValueError("daily Qlib dataset has no governed ETF whitelist evidence")
+    if (
+        etf_evidence.get("version") != expected_etf["version"]
+        or etf_evidence.get("whitelist_sha256")
+        != expected_etf["whitelist_sha256"]
+        or etf_evidence.get("status") != "ready"
+        or set(etf_evidence.get("included_symbols") or [])
+        != set(GOVERNED_DAILY_ETF_WHITELIST)
+        or etf_evidence.get("missing_symbols") not in ([], ())
+    ):
+        raise ValueError("daily Qlib governed ETF whitelist is incomplete or obsolete")
 
 
 def require_native_daily_execution_controls(

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import distinct, func, select, text
 
+from quant_data.cninfo_announcements import load_trade_calendar_open_days
 from quant_data.config import Settings
 from quant_data.database import (
     alerts,
@@ -23,8 +25,14 @@ from quant_data.database import (
     strategy_allocation_members,
     strategy_allocation_nav,
     strategy_allocations,
+    strategy_health_snapshots,
+    strategy_promotion_stages,
     strategy_versions,
     users,
+)
+from quant_data.execution_contract import (
+    require_daily_qlib_contract,
+    require_native_daily_execution_controls,
 )
 
 from .data_task_store import DataTaskStore
@@ -64,6 +72,206 @@ _GOVERNED_DATA_SCHEDULE_SUITE_KINDS = frozenset(
         "auxiliary_data_pipeline",
     }
 )
+_PRODUCT_HORIZONS = ("short_1_5d", "swing_1_6m", "long_1_3y")
+_OPERABLE_PROMOTION_STAGES = frozenset({"paper", "recommendation_enabled"})
+_NON_BLOCKING_PAPER_HEALTH = frozenset(
+    {"healthy", "watch", "insufficient_evidence"}
+)
+_NON_BLOCKING_RECOMMENDATION_HEALTH = frozenset({"healthy", "watch"})
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_DAILY_CLOSE = time(15, 0)
+
+
+def _latest_closed_trading_day(
+    open_days: list[date],
+    *,
+    now: datetime,
+) -> date:
+    """Return the last exchange-open day whose daily bar may be complete.
+
+    The persisted SSE calendar is authoritative.  On an open day before the
+    15:00 close, today's unfinished bar is deliberately excluded.
+    """
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("business-readiness time must be timezone-aware")
+    local = now.astimezone(_SHANGHAI)
+    cutoff = local.date()
+    if local.timetz().replace(tzinfo=None) < _DAILY_CLOSE:
+        cutoff -= timedelta(days=1)
+    eligible = [value for value in open_days if value <= cutoff]
+    if not eligible:
+        raise ValueError("trade calendar has no closed trading day")
+    return max(eligible)
+
+
+def _daily_qlib_business_check(
+    data_root: Path,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    """Check the publisher projection used by the daily production loop.
+
+    This endpoint must remain bounded, so it reads the worker-published Qlib
+    catalog projection.  The projection itself records the strict sealed-file
+    verification result; an unsealed or unverifiable dataset never qualifies.
+    """
+
+    try:
+        open_days = load_trade_calendar_open_days(data_root)
+        expected = _latest_closed_trading_day(open_days, now=now)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return {
+            "status": "blocked",
+            "message": "the persisted exchange calendar is unavailable or incomplete",
+            "reason": str(exc)[:500],
+            "expected_end_date": None,
+            "eligible_datasets": [],
+        }
+
+    eligible: list[dict[str, Any]] = []
+    observed: list[dict[str, Any]] = []
+    for dataset in list_qlib_datasets_for_display(data_root):
+        if str(dataset.get("frequency") or "") != "day":
+            continue
+        name = str(dataset.get("name") or "")
+        end_text = str(dataset.get("end_date") or "")[:10]
+        reasons: list[str] = []
+        try:
+            end_date = date.fromisoformat(end_text)
+        except ValueError:
+            end_date = None
+            reasons.append("invalid_end_date")
+        provenance = dataset.get("provenance")
+        if not isinstance(provenance, dict):
+            provenance = {}
+        if dataset.get("ready") is not True:
+            reasons.append("not_ready")
+        if dataset.get("reproducible") is not True:
+            reasons.append("not_reproducible")
+        if dataset.get("lineage_verified") is not True:
+            reasons.append("lineage_unverified")
+        if dataset.get("output_files_verified") is not True:
+            reasons.append("sealed_outputs_unverified")
+        try:
+            require_daily_qlib_contract(provenance)
+            require_native_daily_execution_controls(provenance, start=expected)
+        except (TypeError, ValueError) as exc:
+            reasons.append(f"daily_contract:{exc}")
+        if end_date is None or end_date < expected:
+            reasons.append("stale")
+        evidence = {
+            "name": name,
+            "end_date": end_text or None,
+            "output_verification": dataset.get("output_verification"),
+            "reasons": reasons,
+        }
+        observed.append(evidence)
+        if not reasons:
+            eligible.append(evidence)
+    latest_observed = max(
+        (str(item.get("end_date") or "") for item in observed),
+        default=None,
+    )
+    ready = bool(eligible)
+    return {
+        "status": "ok" if ready else "blocked",
+        "message": (
+            "a sealed daily Qlib dataset covers the latest closed trading day"
+            if ready
+            else "no sealed daily Qlib dataset covers the latest closed trading day"
+        ),
+        "expected_end_date": expected.isoformat(),
+        "latest_observed_end_date": latest_observed,
+        "eligible_datasets": [item["name"] for item in eligible],
+        "datasets": observed,
+    }
+
+
+def _assess_horizon_candidates(
+    horizon: str,
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Choose the authoritative runnable lane for one product horizon.
+
+    A verified recommendation version is authoritative when present and may
+    not silently fall back to an older paper candidate.  Before its evidence
+    matures, an active isolated paper account is a valid production lane.
+    """
+
+    recommendation = [
+        item
+        for item in candidates
+        if item.get("promotion_stage") == "recommendation_enabled"
+    ]
+    pool = recommendation or [
+        item for item in candidates if item.get("promotion_stage") == "paper"
+    ]
+    evaluated: list[dict[str, Any]] = []
+    for raw in pool:
+        item = dict(raw)
+        stage = str(item.get("promotion_stage") or "")
+        raw_health = item.get("health_status")
+        health = (
+            str(raw_health)
+            if raw_health
+            else "insufficient_evidence"
+            if stage == "paper"
+            else "missing"
+        )
+        contract_ready = bool(item.get("contract_ready"))
+        daily_execution = (
+            item.get("signal_frequency") == "day"
+            and item.get("execution_frequency") == "day"
+        )
+        if stage == "recommendation_enabled":
+            runner_ready = int(item.get("active_recommendation_portfolios") or 0) > 0
+            health_ready = health in _NON_BLOCKING_RECOMMENDATION_HEALTH
+            runner = "daily_recommendation_refresh"
+        else:
+            runner_ready = (
+                item.get("paper_stage_status") == "active"
+                and item.get("simulation_status") == "active"
+            )
+            health_ready = health in _NON_BLOCKING_PAPER_HEALTH
+            runner = "daily_isolated_paper_order_plan"
+        blockers = []
+        if not contract_ready:
+            blockers.append("strategy_contract_invalid")
+        if not daily_execution:
+            blockers.append("daily_execution_contract_missing")
+        if not runner_ready:
+            blockers.append("production_runner_unavailable")
+        if not health_ready:
+            blockers.append(f"strategy_health_{health}")
+        item.update(
+            {
+                "health_status": health,
+                "runner": runner,
+                "runner_ready": runner_ready,
+                "blocking_reasons": blockers,
+                "operable": not blockers,
+            }
+        )
+        evaluated.append(item)
+    # Database callers provide newest-first candidates, matching AdviceService.
+    # Do not hide a broken current version by falling back to stale evidence.
+    authoritative = evaluated[0] if evaluated else None
+    selected = authoritative if authoritative and authoritative["operable"] else None
+    return {
+        "horizon": horizon,
+        "status": "ok" if selected is not None else "blocked",
+        "stage": selected.get("promotion_stage") if selected else None,
+        "strategy_version_id": selected.get("strategy_version_id") if selected else None,
+        "health_status": selected.get("health_status") if selected else None,
+        "runner": selected.get("runner") if selected else None,
+        "message": (
+            "horizon has an operable governed production lane"
+            if selected is not None
+            else "horizon has no operable governed production lane"
+        ),
+        "candidates": evaluated,
+    }
 
 
 def _is_governed_incremental_sync(row: Any) -> bool:
@@ -242,7 +450,7 @@ def _governed_schedule_suite_state(
         if accepted:
             governed[row.kind].append(str(row.id))
     ready = (
-        len(rows) == 4
+        len(rows) == len(_GOVERNED_DATA_SCHEDULE_SUITE_KINDS)
         and set(by_kind) == _GOVERNED_DATA_SCHEDULE_SUITE_KINDS
         and all(len(by_kind[kind]) == 1 for kind in _GOVERNED_DATA_SCHEDULE_SUITE_KINDS)
         and all(len(governed[kind]) == 1 for kind in _GOVERNED_DATA_SCHEDULE_SUITE_KINDS)
@@ -328,6 +536,178 @@ class DeploymentReadinessStore:
             "highest_ready_profile": highest_ready,
             "live_trading_supported": False,
             "profiles": profiles,
+        }
+
+    def business_loop_readiness(self, now: datetime | None = None) -> dict[str, Any]:
+        """Return the bounded checks that gate the user-facing daily loop.
+
+        This is intentionally narrower than :meth:`assess`: a paper-validating
+        horizon is operational even though it has not accumulated enough time
+        to publish verified advice.  Conversely, fresh processes alone are not
+        enough when daily data or one of the three product lanes is missing.
+        """
+
+        current = now or _now()
+        try:
+            daily_data = _daily_qlib_business_check(
+                self.settings.data_root,
+                now=current,
+            )
+        except Exception as exc:  # noqa: BLE001 - readiness must fail closed
+            daily_data = {
+                "status": "unavailable",
+                "message": "daily Qlib readiness could not be evaluated",
+                "reason": str(exc)[:500],
+            }
+        try:
+            horizons = self._horizon_production_check()
+        except Exception as exc:  # noqa: BLE001 - readiness must fail closed
+            horizons = {
+                "status": "unavailable",
+                "message": "three-horizon production readiness could not be evaluated",
+                "reason": str(exc)[:500],
+                "required_horizons": list(_PRODUCT_HORIZONS),
+                "horizons": {},
+            }
+        checks = {
+            "daily_qlib_data": daily_data,
+            "three_horizon_production": horizons,
+        }
+        blockers = [
+            {
+                "check": name,
+                "status": str(check.get("status") or "unavailable"),
+                "message": str(check.get("message") or name),
+            }
+            for name, check in checks.items()
+            if check.get("status") != "ok"
+        ]
+        return {
+            "status": "ok" if not blockers else "blocked",
+            "checks": checks,
+            "blockers": blockers,
+        }
+
+    def _horizon_production_check(self) -> dict[str, Any]:
+        def sealed_sha256(value: Any) -> bool:
+            text_value = str(value or "")
+            return len(text_value) == 64 and all(
+                character in "0123456789abcdef" for character in text_value
+            )
+
+        candidates: dict[str, list[dict[str, Any]]] = {
+            horizon: [] for horizon in _PRODUCT_HORIZONS
+        }
+        with self.engine.connect() as connection:
+            versions = connection.execute(
+                select(
+                    strategy_versions.c.id,
+                    strategy_versions.c.horizon_profile,
+                    strategy_versions.c.promotion_stage,
+                    strategy_versions.c.signal_frequency,
+                    strategy_versions.c.execution_frequency,
+                    strategy_versions.c.execution_contract_hash,
+                    strategy_versions.c.horizon_contract_sha256,
+                    strategy_versions.c.strategy_rules_sha256,
+                    strategy_versions.c.approved_at,
+                )
+                .where(
+                    strategy_versions.c.status == "approved",
+                    strategy_versions.c.is_legacy.is_(False),
+                    strategy_versions.c.horizon_profile.in_(_PRODUCT_HORIZONS),
+                    strategy_versions.c.promotion_stage.in_(_OPERABLE_PROMOTION_STAGES),
+                )
+                .order_by(strategy_versions.c.approved_at.desc())
+            ).all()
+            for version in versions:
+                version_id = str(version.id)
+                latest_health = connection.execute(
+                    select(strategy_health_snapshots.c.health_status)
+                    .where(
+                        strategy_health_snapshots.c.strategy_version_id == version_id
+                    )
+                    .order_by(
+                        strategy_health_snapshots.c.as_of.desc(),
+                        strategy_health_snapshots.c.recorded_at.desc(),
+                    )
+                    .limit(1)
+                ).first()
+                stage = connection.execute(
+                    select(
+                        strategy_promotion_stages.c.status,
+                        strategy_promotion_stages.c.simulation_portfolio_id,
+                    )
+                    .where(
+                        strategy_promotion_stages.c.strategy_version_id == version_id
+                    )
+                    .order_by(strategy_promotion_stages.c.stage_index.desc())
+                    .limit(1)
+                ).first()
+                simulation_status = None
+                if stage is not None and stage.simulation_portfolio_id is not None:
+                    simulation_status = connection.scalar(
+                        select(simulation_portfolios.c.status).where(
+                            simulation_portfolios.c.id == stage.simulation_portfolio_id
+                        )
+                    )
+                active_recommendation_portfolios = int(
+                    connection.scalar(
+                        select(func.count())
+                        .select_from(recommendation_portfolios)
+                        .where(
+                            recommendation_portfolios.c.strategy_version_id == version_id,
+                            recommendation_portfolios.c.status == "active",
+                        )
+                    )
+                    or 0
+                )
+                horizon = str(version.horizon_profile)
+                candidates[horizon].append(
+                    {
+                        "strategy_version_id": version_id,
+                        "promotion_stage": str(version.promotion_stage),
+                        "signal_frequency": str(version.signal_frequency),
+                        "execution_frequency": str(version.execution_frequency),
+                        "contract_ready": all(
+                            (
+                                sealed_sha256(version.execution_contract_hash),
+                                sealed_sha256(version.horizon_contract_sha256),
+                                sealed_sha256(version.strategy_rules_sha256),
+                            )
+                        ),
+                        "health_status": (
+                            str(latest_health.health_status)
+                            if latest_health is not None
+                            else None
+                        ),
+                        "paper_stage_status": (
+                            str(stage.status) if stage is not None else None
+                        ),
+                        "simulation_status": (
+                            str(simulation_status) if simulation_status is not None else None
+                        ),
+                        "active_recommendation_portfolios": (
+                            active_recommendation_portfolios
+                        ),
+                    }
+                )
+        lanes = {
+            horizon: _assess_horizon_candidates(horizon, candidates[horizon])
+            for horizon in _PRODUCT_HORIZONS
+        }
+        missing_or_blocked = [
+            horizon for horizon, lane in lanes.items() if lane["status"] != "ok"
+        ]
+        return {
+            "status": "ok" if not missing_or_blocked else "blocked",
+            "message": (
+                "all three product horizons have an operable production lane"
+                if not missing_or_blocked
+                else "one or more product horizons have no operable production lane"
+            ),
+            "required_horizons": list(_PRODUCT_HORIZONS),
+            "blocked_horizons": missing_or_blocked,
+            "horizons": lanes,
         }
 
     def _recommendation_checks(self) -> list[dict[str, Any]]:

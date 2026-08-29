@@ -143,6 +143,7 @@ def test_scheduler_queues_tushare_and_arxiv_as_independent_jobs(
     ]
 
 
+@pytest.mark.no_database
 def test_worker_imports_partial_assets_and_does_not_retry_blocked_quota(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
