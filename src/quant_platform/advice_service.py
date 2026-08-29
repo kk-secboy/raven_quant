@@ -30,7 +30,6 @@ from quant_data.database import (
     strategy_allocation_members,
     strategy_allocations,
     strategy_forward_gates,
-    strategy_health_snapshots,
     strategy_promotion_stages,
     strategy_versions,
 )
@@ -49,6 +48,7 @@ from .promotion import (
 )
 from .research_horizon import LEGACY_AMBIGUOUS, LONG_1_3Y, SHORT_1_5D, SWING_1_6M
 from .simulation_store import SimulationStore
+from .strategy_health_authority import load_production_health_gate
 from .strategy_store import StrategyStore
 from .three_horizon_account import THREE_HORIZON_PRIMARY_SIMULATION_ACTOR
 
@@ -80,9 +80,14 @@ _HORIZON_UI = {
 }
 
 _HEALTH_PHASE = {
+    "healthy": "verified",
+    "watch": "verified",
     "restricted": "restricted",
     "suspended": "suspended",
     "retired": "retired",
+    "missing": "restricted",
+    "invalid": "restricted",
+    "insufficient_evidence": "restricted",
     # Compatibility projections for pre-0072 health evidence remain
     # conservative until a current snapshot replaces them.
     "degraded": "restricted",
@@ -145,7 +150,7 @@ def _project_stage(
     if promotion == "recommendation_enabled":
         if not forward_gate_passed:
             return "restricted", "受限"
-        stage = _HEALTH_PHASE.get(health_status, "verified")
+        stage = _HEALTH_PHASE.get(health_status, "restricted")
         return stage, {
             "verified": "已验证",
             "restricted": "受限",
@@ -726,38 +731,19 @@ class AdviceService:
             result: dict[str, dict[str, Any] | None] = {
                 str(member.strategy_version_id): None for member in members
             }
-            authorized = {
-                str(member.strategy_version_id)
-                for member in members
-                if str(member.status) == "approved"
-                and str(member.promotion_stage) == "recommendation_enabled"
-            }
-            if authorized:
-                health_rows = connection.execute(
-                    select(
-                        strategy_health_snapshots.c.id,
-                        strategy_health_snapshots.c.strategy_version_id,
-                        strategy_health_snapshots.c.as_of,
-                    )
-                    .where(
-                        strategy_health_snapshots.c.strategy_version_id.in_(
-                            tuple(sorted(authorized))
-                        )
-                    )
-                    .order_by(
-                        strategy_health_snapshots.c.strategy_version_id,
-                        strategy_health_snapshots.c.as_of.desc(),
-                        strategy_health_snapshots.c.recorded_at.desc(),
-                        strategy_health_snapshots.c.id.desc(),
-                    )
-                ).all()
-                for row in health_rows:
-                    version_id = str(row.strategy_version_id)
-                    if result.get(version_id) is None:
-                        result[version_id] = {
-                            "snapshot_id": str(row.id),
-                            "as_of": row.as_of.isoformat(),
-                        }
+            for member in members:
+                version_id = str(member.strategy_version_id)
+                if (
+                    str(member.status) != "approved"
+                    or str(member.promotion_stage) != "recommendation_enabled"
+                ):
+                    continue
+                gate = load_production_health_gate(connection, version_id)
+                if gate.get("ready") is True:
+                    result[version_id] = {
+                        "snapshot_id": str(gate["snapshot_id"]),
+                        "as_of": str(gate["as_of"]),
+                    }
         return result
 
     def _latest_version(self, horizon: str) -> dict[str, Any] | None:
@@ -843,16 +829,7 @@ class AdviceService:
 
     def _latest_health(self, version_id: str) -> dict[str, Any] | None:
         with self.engine.connect() as connection:
-            row = connection.execute(
-                select(strategy_health_snapshots)
-                .where(strategy_health_snapshots.c.strategy_version_id == version_id)
-                .order_by(
-                    strategy_health_snapshots.c.as_of.desc(),
-                    strategy_health_snapshots.c.recorded_at.desc(),
-                )
-                .limit(1)
-            ).first()
-        return row_dict(row) if row is not None else None
+            return load_production_health_gate(connection, version_id)
 
     def _forward_evidence(self, version: dict[str, Any]) -> dict[str, Any]:
         if version.get("promotion_stage") not in {"paper", "recommendation_enabled"}:

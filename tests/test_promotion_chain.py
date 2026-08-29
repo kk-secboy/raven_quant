@@ -33,6 +33,7 @@ from test_strategy_allocation_recommendations import (
 import quant_platform.promotion as promotion_module
 import quant_platform.risk_math as risk_math
 import quant_platform.strategy_allocation as strategy_allocation
+import quant_platform.strategy_health_authority as health_authority_module
 from quant_data.database import (
     backtest_runs,
     open_database,
@@ -46,6 +47,7 @@ from quant_data.database import (
     strategy_versions,
 )
 from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
+from quant_platform.member_risk_gate import load_strategy_risk_state
 from quant_platform.promotion import (
     ForwardGateThresholds,
     PromotionStore,
@@ -55,6 +57,7 @@ from quant_platform.promotion import (
 from quant_platform.recommendation_store import RecommendationStore
 from quant_platform.research_horizon import SHORT_1_5D, canonical_sha256
 from quant_platform.simulation_store import SimulationStore
+from quant_platform.strategy_health_collector import StrategyHealthCollector
 from quant_platform.strategy_store import StrategyStore
 
 ACTOR = "promotion-operator"
@@ -546,6 +549,76 @@ def _seed_evidence(
             )
 
 
+def _record_collector_authority(
+    database_url: str,
+    version_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> str:
+    """Seal the exact current paper batch as collector evidence for promotion tests."""
+
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        stage = connection.execute(
+            select(strategy_promotion_stages).where(
+                strategy_promotion_stages.c.strategy_version_id == version_id,
+                strategy_promotion_stages.c.status == "active",
+            )
+        ).one()
+        portfolio = connection.execute(
+            select(simulation_portfolios).where(
+                simulation_portfolios.c.id == stage.simulation_portfolio_id
+            )
+        ).one()
+        batch = connection.execute(
+            select(simulation_batches)
+            .where(
+                simulation_batches.c.portfolio_id == portfolio.id,
+                simulation_batches.c.status == "succeeded",
+            )
+            .order_by(simulation_batches.c.trade_date.desc())
+            .limit(1)
+        ).one()
+    observation = {
+        "observation_sha256": "8" * 64,
+        "feature_drift": 0.01,
+    }
+    monkeypatch.setattr(
+        health_authority_module,
+        "validate_factor_psi_observation",
+        lambda value, **_kwargs: dict(value),
+    )
+    evidence = {
+        "contract_version": "strategy-health-live-evidence-v2",
+        "strategy_version_id": version_id,
+        "simulation_portfolio_id": str(portfolio.id),
+        "promotion_stage_id": str(stage.id),
+        "evidence_trade_date": batch.trade_date.isoformat(),
+        "feature_signal_date": batch.signal_date.isoformat(),
+        "simulation_batch_id": str(batch.id),
+        "daily_dataset": str(batch.daily_dataset),
+        "daily_dataset_identity_sha256": str(
+            batch.daily_dataset_identity_sha256
+        ),
+        "daily_dataset_lineage_id": str(batch.daily_dataset_lineage_id),
+        "source_snapshot_id": str(batch.source_snapshot_id),
+        "feature_drift_current_end": batch.signal_date.isoformat(),
+        "feature_drift_evidence_available": True,
+        "feature_drift": 0.01,
+        "feature_drift_observation_sha256": observation["observation_sha256"],
+        "feature_drift_observation": observation,
+        "model_calibration_required": False,
+    }
+    snapshot = StrategyStore(database_url).record_health_snapshot(
+        version_id,
+        as_of=datetime.now(UTC),
+        health_status="healthy",
+        criteria={"fixture": "sealed-live-collector-authority"},
+        evidence=evidence,
+        actor="system:strategy-health-collector",
+    )
+    return str(snapshot["id"])
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle state machine and automatic paper opening
 # ---------------------------------------------------------------------------
@@ -801,6 +874,7 @@ def test_new_paper_candidate_does_not_pause_recommendation_incumbent(
         succeeded=90,
         valid_round_trips=30,
     )
+    _record_collector_authority(database_url, incumbent, monkeypatch)
     promotion.promote(
         incumbent,
         actor="system:auto-promotion",
@@ -862,6 +936,7 @@ def test_same_family_paper_candidate_keeps_incumbent_until_final_promotion(
         succeeded=90,
         valid_round_trips=30,
     )
+    _record_collector_authority(database_url, incumbent, monkeypatch)
     promotion.promote(
         incumbent,
         actor="system:auto-promotion",
@@ -897,6 +972,7 @@ def test_same_family_paper_candidate_keeps_incumbent_until_final_promotion(
         succeeded=90,
         valid_round_trips=30,
     )
+    _record_collector_authority(database_url, challenger, monkeypatch)
     promoted = promotion.promote(
         challenger,
         actor="system:auto-promotion",
@@ -1427,6 +1503,7 @@ def test_same_day_t_plus_one_fill_blocks_forward_promotion(
                 )
             )
 
+
     evaluation = promotion.evaluate_forward_gate(version_id)
 
     assert evaluation["passed"] is False
@@ -1570,6 +1647,7 @@ def test_gate_subitems_and_atomic_promotion(
 
     # Scheduler and recovery callers enter the same atomic transaction after
     # the frozen forward gate passes; no second identity can replace evidence.
+    _record_collector_authority(database_url, version_id, monkeypatch)
     result = promotion.promote(
         version_id,
         actor="system:auto-promotion",
@@ -1588,6 +1666,145 @@ def test_gate_subitems_and_atomic_promotion(
         ).one()
     assert str(health.strategy_version_id) == version_id
     assert str(health.health_status) == result["initial_health_status"]
+
+
+def test_arbitrary_healthy_snapshot_cannot_authorize_risk_or_promotion(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    version_id, promotion, stage = _gated_paper_version(
+        database_url, tmp_path, monkeypatch
+    )
+    _seed_evidence(
+        promotion,
+        stage["simulation_portfolio_id"],
+        nav_days=90,
+        succeeded=90,
+        valid_round_trips=30,
+    )
+    assert promotion.evaluate_forward_gate(version_id)["passed"] is True
+    observed_at = datetime.now(UTC)
+    strategies = StrategyStore(database_url)
+    strategies.record_health_snapshot(
+        version_id,
+        as_of=observed_at,
+        health_status="healthy",
+        criteria={"fixture": "arbitrary-healthy"},
+        evidence={"fixture": "not-live-collector-evidence"},
+        actor="system:auto-promotion",
+    )
+
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        risk = load_strategy_risk_state(connection, version_id)
+    assert risk["allow_new_risk"] is False
+    assert risk["strategy_health_gate"]["health_status"] == "missing"
+    assert "strategy_health_collector_evidence_missing" in risk[
+        "strategy_health_gate"
+    ]["reasons"]
+    strategies.record_health_snapshot(
+        version_id,
+        as_of=observed_at + timedelta(seconds=1),
+        health_status="restricted",
+        criteria={"manual_gate": "operator-risk-stop"},
+        evidence={"reason": "manual production risk restriction"},
+        actor="risk-operator",
+    )
+    with engine.connect() as connection:
+        manual_restriction = load_strategy_risk_state(connection, version_id)
+    assert manual_restriction["allow_new_risk"] is False
+    assert manual_restriction["strategy_health_gate"]["health_status"] == "restricted"
+    assert "manual_strategy_health_restricted_blocks_new_risk" in manual_restriction[
+        "strategy_health_gate"
+    ]["reasons"]
+    with pytest.raises(ValueError, match="sealed collector health"):
+        promotion.promote(
+            version_id,
+            actor="system:auto-promotion",
+            reason="A non-collector healthy row must never authorize promotion.",
+        )
+
+
+def test_real_collector_snapshot_authorizes_risk_and_is_reused_by_promotion(
+    database_url: str, tmp_path: Path, monkeypatch
+) -> None:
+    version_id, promotion, stage = _gated_paper_version(
+        database_url, tmp_path, monkeypatch
+    )
+    portfolio_id = stage["simulation_portfolio_id"]
+    _seed_evidence(
+        promotion,
+        portfolio_id,
+        nav_days=90,
+        succeeded=90,
+        valid_round_trips=30,
+        fee=0.00226,
+        gross=1.0,
+    )
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            update(simulation_nav)
+            .where(simulation_nav.c.portfolio_id == portfolio_id)
+            .values(status="healthy")
+        )
+        signal_date = connection.scalar(
+            select(simulation_batches.c.signal_date)
+            .where(
+                simulation_batches.c.portfolio_id == portfolio_id,
+                simulation_batches.c.status == "succeeded",
+            )
+            .order_by(simulation_batches.c.trade_date.desc())
+            .limit(1)
+        )
+    observation = {
+        "observation_sha256": "8" * 64,
+        "feature_drift": 0.01,
+    }
+
+    class FeatureDrift:
+        @staticmethod
+        def observe(**_kwargs) -> dict:
+            return {
+                **observation,
+                "observed_at": datetime.now(UTC).isoformat(),
+                "current_end": signal_date.isoformat(),
+            }
+
+    monkeypatch.setattr(
+        health_authority_module,
+        "validate_factor_psi_observation",
+        lambda value, **_kwargs: dict(value),
+    )
+    collector = StrategyHealthCollector.__new__(StrategyHealthCollector)
+    collector.database_url = database_url
+    collector.engine = engine
+    collector.interval_seconds = 300
+    collector.strategies = StrategyStore(database_url)
+    collector.feature_drift = FeatureDrift()
+    collected = collector.collect_due(datetime.now(UTC))
+
+    assert collected["recorded"] == 1
+    assert collected["failures"] == []
+    collector_snapshot_id = collected["snapshots"][0]["snapshot_id"]
+    with engine.connect() as connection:
+        risk = load_strategy_risk_state(connection, version_id)
+    assert risk["allow_new_risk"] is True, risk["strategy_health_gate"]
+    assert risk["strategy_health_gate"]["snapshot_id"] == collector_snapshot_id
+
+    result = promotion.promote(
+        version_id,
+        actor="system:auto-promotion",
+        reason="Promote only with the fresh sealed collector observation.",
+    )
+    assert result["initial_health_snapshot_id"] == collector_snapshot_id
+    with engine.connect() as connection:
+        snapshots = connection.execute(
+            select(strategy_health_snapshots).where(
+                strategy_health_snapshots.c.strategy_version_id == version_id
+            )
+        ).all()
+    assert len(snapshots) == 1
+    assert str(snapshots[0].recorded_by) == "system:strategy-health-collector"
 
 
 def test_cost_deviation_subitem(database_url: str, tmp_path: Path, monkeypatch) -> None:
@@ -1697,6 +1914,7 @@ def test_paper_version_cannot_create_standalone_recommendation(
         fee=0.0,
         gross=1000.0,
     )
+    _record_collector_authority(database_url, version_id, monkeypatch)
     promotion.promote(
         version_id,
         actor="allocation-risk-owner",

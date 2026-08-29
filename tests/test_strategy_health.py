@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 
 import pytest
 
 from quant_platform.member_risk_gate import compose_strategy_risk_state
-from quant_platform.promotion import _initial_promotion_health
 from quant_platform.research_horizon import canonical_sha256
 from quant_platform.strategy_health import (
     HEALTH_WINDOWS_BY_HORIZON,
@@ -294,46 +292,3 @@ def test_health_gate_composes_with_existing_risk_state_without_blocking_exits() 
     assert state["allow_new_risk"] is False
     assert state["risk_exposure_override"] == 1.0
     assert state["strategy_health_gate"]["snapshot_id"] == "health-1"
-
-
-def test_passing_forward_gate_bootstraps_healthy_or_watch_activity_health() -> None:
-    version = SimpleNamespace(id="version-a", horizon_profile="short_1_5d")
-    evaluation = {
-        "passed": True,
-        "contract_version": "promotion-chain-v1",
-        "criteria_sha256": "a" * 64,
-        "criteria_json": {
-            "thresholds": {
-                "min_data_completeness": 0.99,
-                "min_reconciliation_rate": 0.99,
-                "max_cost_deviation": 0.02,
-            }
-        },
-        "stage_id": "stage-a",
-        "evidence": {
-            "data_completeness": 1.0,
-            "reconciliation_rate": 1.0,
-            "cost_deviation": 0.005,
-            "ungoverned_batches": 0,
-            "invalid_round_trip_fills": 0,
-            "forward_trading_days": 90,
-            "decision_batches": 60,
-            "review_events": 60,
-            "closed_round_trips": 30,
-            "financial_report_reviews": 0,
-        },
-    }
-
-    status, criteria, evidence = _initial_promotion_health(version, evaluation)
-    assert status == "healthy"
-    assert criteria["source_forward_gate_criteria_sha256"] == "a" * 64
-    assert evidence["data_integrity_ok"] is True
-    assert evidence["ledger_reconciled"] is True
-
-    evaluation["evidence"] = {
-        **evaluation["evidence"],
-        "data_completeness": 0.995,
-    }
-    status, _criteria, evidence = _initial_promotion_health(version, evaluation)
-    assert status == "watch"
-    assert evidence["initial_health_status"] == "watch"

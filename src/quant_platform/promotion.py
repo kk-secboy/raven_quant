@@ -58,7 +58,6 @@ from quant_data.database import (
     strategy_allocations,
     strategy_events,
     strategy_forward_gates,
-    strategy_health_snapshots,
     strategy_promotion_stages,
     strategy_versions,
 )
@@ -77,6 +76,7 @@ from quant_platform.simulation_store import (
     QLIB_ORDER_PLAN_FORMAT_VERSION,
     SimulationStore,
 )
+from quant_platform.strategy_health_authority import load_production_health_gate
 
 PROMOTION_CONTRACT_VERSION = "promotion-chain-v1"
 FORWARD_GATE_CRITERIA_VERSION = "strategy-forward-gate-v2"
@@ -636,103 +636,6 @@ def _require_forward_gate_criteria(version: Any, gate: Any) -> dict[str, Any]:
     ):
         raise ValueError("forward evidence gate criteria seal is invalid")
     return expected
-
-
-def _initial_promotion_health(
-    version: Any,
-    evaluation: dict[str, Any],
-) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    """Derive the first activity-health observation from the sealed paper gate."""
-
-    evidence = dict(evaluation.get("evidence") or {})
-    criteria = dict(evaluation.get("criteria_json") or {})
-    if not evidence or not criteria or not evaluation.get("passed"):
-        raise ValueError("initial strategy health requires a passing sealed forward gate")
-    thresholds = dict(criteria.get("thresholds") or {})
-    min_completeness = float(thresholds["min_data_completeness"])
-    min_reconciliation = float(thresholds["min_reconciliation_rate"])
-    max_cost_deviation = float(thresholds["max_cost_deviation"])
-    data_completeness = float(evidence["data_completeness"])
-    reconciliation_rate = float(evidence["reconciliation_rate"])
-    cost_deviation = float(evidence["cost_deviation"])
-    ungoverned_batches = int(evidence.get("ungoverned_batches") or 0)
-    invalid_lifecycle_batches = int(
-        evidence.get("invalid_lifecycle_batches") or 0
-    )
-    invalid_round_trip_fills = int(evidence.get("invalid_round_trip_fills") or 0)
-    data_integrity_ok = data_completeness >= min_completeness
-    ledger_reconciled = reconciliation_rate >= min_reconciliation
-    if (
-        not data_integrity_ok
-        or not ledger_reconciled
-        or cost_deviation > max_cost_deviation
-    ):
-        raise ValueError("passing forward evidence is inconsistent with initial health")
-    perfect_cost = (
-        cost_deviation <= max_cost_deviation / 2.0
-        if max_cost_deviation > 0
-        else cost_deviation == 0
-    )
-    health_status = (
-        "healthy"
-        if data_completeness >= 1.0
-        and reconciliation_rate >= 1.0
-        and perfect_cost
-        and ungoverned_batches == 0
-        and invalid_lifecycle_batches == 0
-        and int(evidence.get("duplicate_decision_batches") or 0) == 0
-        and invalid_round_trip_fills == 0
-        else "watch"
-    )
-    health_criteria = {
-        "contract_version": "promotion-initial-health-v1",
-        "source_forward_gate_contract_version": str(
-            evaluation.get("contract_version") or PROMOTION_CONTRACT_VERSION
-        ),
-        "source_forward_gate_criteria_sha256": str(
-            evaluation.get("criteria_sha256") or ""
-        ),
-        "min_data_completeness": min_completeness,
-        "min_reconciliation_rate": min_reconciliation,
-        "max_cost_deviation": max_cost_deviation,
-        "healthy_requires_perfect_completeness": True,
-        "healthy_requires_perfect_reconciliation": True,
-        "healthy_max_cost_deviation": max_cost_deviation / 2.0,
-        "healthy_requires_zero_ungoverned_batches": True,
-        "healthy_requires_zero_invalid_lifecycle_batches": True,
-        "healthy_requires_zero_duplicate_decision_batches": True,
-        "healthy_requires_zero_invalid_round_trip_fills": True,
-    }
-    health_evidence = {
-        "contract_version": "promotion-initial-health-evidence-v1",
-        "source": "sealed_forward_paper_gate",
-        "strategy_version_id": str(version.id),
-        "horizon_profile": str(version.horizon_profile),
-        "forward_gate_stage_id": str(evaluation.get("stage_id") or ""),
-        "forward_gate_criteria_sha256": str(
-            evaluation.get("criteria_sha256") or ""
-        ),
-        "data_integrity_ok": data_integrity_ok,
-        "ledger_reconciled": ledger_reconciled,
-        "data_completeness": data_completeness,
-        "reconciliation_rate": reconciliation_rate,
-        "cost_deviation": cost_deviation,
-        "ungoverned_batches": ungoverned_batches,
-        "invalid_lifecycle_batches": invalid_lifecycle_batches,
-        "duplicate_decision_batches": int(
-            evidence.get("duplicate_decision_batches") or 0
-        ),
-        "invalid_round_trip_fills": invalid_round_trip_fills,
-        "forward_trading_days": int(evidence.get("forward_trading_days") or 0),
-        "decision_batches": int(evidence.get("decision_batches") or 0),
-        "review_events": int(evidence.get("review_events") or 0),
-        "closed_round_trips": int(evidence.get("closed_round_trips") or 0),
-        "financial_report_reviews": int(
-            evidence.get("financial_report_reviews") or 0
-        ),
-        "initial_health_status": health_status,
-    }
-    return health_status, health_criteria, health_evidence
 
 
 class PromotionStore:
@@ -1704,43 +1607,18 @@ class PromotionStore:
                     "paper evidence changed during promotion; evaluate the forward gate again"
                 )
             now = _now()
-            latest_health = connection.execute(
-                select(strategy_health_snapshots)
-                .where(strategy_health_snapshots.c.strategy_version_id == version_id)
-                .order_by(
-                    strategy_health_snapshots.c.as_of.desc(),
-                    strategy_health_snapshots.c.recorded_at.desc(),
-                )
-                .limit(1)
-            ).first()
-            if latest_health is not None:
-                previous_health_status = str(latest_health.health_status)
-                if previous_health_status not in {"healthy", "watch"}:
-                    raise ValueError(
-                        "paper strategy health does not allow recommendation activation: "
-                        f"{previous_health_status}"
-                    )
-            health_status, health_criteria, health_evidence = _initial_promotion_health(
-                version, evaluation
+            health_gate = load_production_health_gate(
+                connection,
+                version_id,
+                now=now,
             )
-            # Local import avoids making StrategyStore's approval-time
-            # PromotionStore import a module-level cycle. A fresh activation
-            # observation is always appended, even when paper monitoring has
-            # older healthy/watch evidence.
-            from quant_platform.strategy_store import StrategyStore
-
-            initial_health_snapshot_id = (
-                StrategyStore.append_health_snapshot_in_transaction(
-                    connection,
-                    version_id,
-                    as_of=now,
-                    health_status=health_status,
-                    criteria=health_criteria,
-                    evidence=health_evidence,
-                    actor=actor.strip(),
-                    recorded_at=now,
+            if health_gate.get("allow_new_risk") is not True:
+                raise ValueError(
+                    "sealed collector health does not allow recommendation activation: "
+                    + str(health_gate.get("reason") or "missing live health evidence")
                 )
-            )
+            initial_health_snapshot_id = str(health_gate["snapshot_id"])
+            health_status = str(health_gate["health_status"])
             incumbents = connection.execute(
                 select(strategy_versions)
                 .where(

@@ -1,3 +1,4 @@
+import inspect
 import json
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -30,6 +31,15 @@ from quant_platform.scheduler import (
     SchedulerEngine,
     factor_materialization_manifest_matches,
 )
+
+
+@pytest.mark.no_database
+def test_strategy_health_collection_precedes_auto_promotion_in_each_tick() -> None:
+    source = inspect.getsource(SchedulerEngine.tick)
+
+    assert source.index("strategy_health_collector.collect_due") < source.index(
+        "_auto_promote_ready_horizons"
+    )
 
 
 @pytest.mark.no_database

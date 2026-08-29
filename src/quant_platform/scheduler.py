@@ -379,6 +379,21 @@ class SchedulerEngine:
                 dedupe_key=f"platform:autopilot:{current.date().isoformat()}:failed",
             )
         simulation_order_plans_enqueued = self._enqueue_due_simulation_order_plans(current)
+        strategy_health_result = self.strategy_health_collector.collect_due(current)
+        for failure in strategy_health_result["failures"]:
+            version_id = str(failure["strategy_version_id"])
+            self.alerts.create(
+                source_type="strategy_version",
+                source_id=version_id,
+                severity="warning",
+                category="strategy_health_collection_failed",
+                title="策略健康证据尚未就绪",
+                message=str(failure["error"]),
+                dedupe_key=(
+                    "strategy-health-collector:"
+                    f"{version_id}:{current.astimezone(ZoneInfo('Asia/Shanghai')).date()}"
+                ),
+            )
         auto_promotions = self._auto_promote_ready_horizons(current)
         strategies_auto_promoted = len(auto_promotions)
         try:
@@ -410,21 +425,6 @@ class SchedulerEngine:
         pair_shadow_backtests_enqueued = 0
         pair_shadow_batches_materialized = 0
         simulation_replays_enqueued = self._enqueue_due_simulation_replays(current)
-        strategy_health_result = self.strategy_health_collector.collect_due(current)
-        for failure in strategy_health_result["failures"]:
-            version_id = str(failure["strategy_version_id"])
-            self.alerts.create(
-                source_type="strategy_version",
-                source_id=version_id,
-                severity="warning",
-                category="strategy_health_collection_failed",
-                title="策略健康证据尚未就绪",
-                message=str(failure["error"]),
-                dedupe_key=(
-                    "strategy-health-collector:"
-                    f"{version_id}:{current.astimezone(ZoneInfo('Asia/Shanghai')).date()}"
-                ),
-            )
         projected = self.project_alerts()
         health_recorded = 0
         if self.health.due(current):

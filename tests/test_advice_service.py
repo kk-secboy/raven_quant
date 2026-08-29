@@ -383,6 +383,7 @@ def test_failed_backtest_blocks_even_recommendation_enabled_version() -> None:
         ("restricted", "restricted", "受限"),
         ("suspended", "suspended", "暂停"),
         ("retired", "retired", "已退役"),
+        ("invalid", "restricted", "受限"),
     ),
 )
 def test_current_health_state_blocks_verified_advice(

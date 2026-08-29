@@ -9,12 +9,11 @@ from quant_data.database import (
     strategy_allocation_events,
     strategy_allocation_members,
     strategy_allocations,
-    strategy_health_snapshots,
     strategy_versions,
 )
 
 from .research_horizon import LONG_1_3Y, SHORT_1_5D, SWING_1_6M
-from .strategy_health import health_allows_new_risk
+from .strategy_health_authority import load_production_health_gate
 
 MEMBER_DRAWDOWN_RULE = "max_member_drawdown"
 PAUSE_NEW_RISK_STATE = "pause_new_risk"
@@ -74,12 +73,17 @@ def compose_strategy_risk_state(
     health_gate = dict(strategy_health_gate or {})
     health_status = str(health_gate.get("health_status") or "") or None
     health_allows_risk = (
-        health_allows_new_risk(health_status) if health_gate else True
+        bool(health_gate.get("allow_new_risk")) if health_gate else True
     )
     if allocation_state != ACTIVE_STATE:
         state = allocation_state
     elif not health_allows_risk:
-        state = f"strategy_health_{health_status or 'missing'}"
+        gate_state = (
+            health_status
+            if health_gate.get("ready", True) is True
+            else "invalid"
+        )
+        state = f"strategy_health_{gate_state or 'missing'}"
     else:
         state = member_state
     allocation_event_ids = sorted(
@@ -312,41 +316,7 @@ def load_strategy_health_gate(
     horizon = str(version.horizon_profile or "legacy_ambiguous")
     if horizon not in {SHORT_1_5D, SWING_1_6M, LONG_1_3Y}:
         return None
-    snapshot = connection.execute(
-        select(
-            strategy_health_snapshots.c.id,
-            strategy_health_snapshots.c.health_status,
-            strategy_health_snapshots.c.as_of,
-            strategy_health_snapshots.c.snapshot_sha256,
-        )
-        .where(strategy_health_snapshots.c.strategy_version_id == strategy_version_id)
-        .order_by(
-            strategy_health_snapshots.c.as_of.desc(),
-            strategy_health_snapshots.c.recorded_at.desc(),
-        )
-        .limit(1)
-    ).first()
-    if snapshot is None:
-        return {
-            "health_status": "missing",
-            "allow_new_risk": False,
-            "reason": "explicit-horizon strategy has no durable health snapshot",
-            "horizon_profile": horizon,
-        }
-    status = str(snapshot.health_status)
-    return {
-        "health_status": status,
-        "allow_new_risk": health_allows_new_risk(status),
-        "reason": (
-            "latest activity-health state allows new risk"
-            if health_allows_new_risk(status)
-            else "latest activity-health state blocks new risk but permits reductions"
-        ),
-        "horizon_profile": horizon,
-        "snapshot_id": str(snapshot.id),
-        "snapshot_sha256": str(snapshot.snapshot_sha256),
-        "as_of": snapshot.as_of.isoformat(),
-    }
+    return load_production_health_gate(connection, strategy_version_id)
 
 
 def load_member_risk_state(connection: Any, strategy_version_id: str) -> dict[str, Any]:

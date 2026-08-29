@@ -44,12 +44,12 @@ from quant_data.database import (
     strategy_allocation_artifacts,
     strategy_allocation_members,
     strategy_allocations,
-    strategy_health_snapshots,
     strategy_versions,
 )
 
 from .research_horizon import LONG_1_3Y, SHORT_1_5D, SWING_1_6M
 from .strategy_health import cap_targets_for_health
+from .strategy_health_authority import load_production_health_gate
 
 NETTING_PLAN_VERSION = "account-netting-plan-v5-primary-ledger-capital"
 DEFAULT_EXECUTION_POLICY = "open"
@@ -636,19 +636,8 @@ class AccountNettingStore:
                     SWING_1_6M,
                     LONG_1_3Y,
                 }:
-                    health = connection.execute(
-                        select(strategy_health_snapshots)
-                        .where(
-                            strategy_health_snapshots.c.strategy_version_id == version_id
-                        )
-                        .order_by(
-                            strategy_health_snapshots.c.as_of.desc(),
-                            strategy_health_snapshots.c.recorded_at.desc(),
-                            strategy_health_snapshots.c.id.desc(),
-                        )
-                        .limit(1)
-                    ).first()
-                    health_status = str(health.health_status) if health is not None else None
+                    authority = load_production_health_gate(connection, version_id)
+                    health_status = str(authority.get("health_status") or "invalid")
                     previous_targets: dict[str, float] = {}
                     if len(member_snapshots) > 1:
                         previous_holdings = connection.execute(
@@ -664,17 +653,12 @@ class AccountNettingStore:
                             str(row.instrument): float(row.weight)
                             for row in previous_holdings
                         }
-                    targets[version_id], health_gate = cap_targets_for_health(
+                    targets[version_id], health_cap = cap_targets_for_health(
                         targets[version_id],
                         previous_targets,
                         health_status,
                     )
-                    health_gate["snapshot_id"] = (
-                        str(health.id) if health is not None else None
-                    )
-                    health_gate["as_of"] = (
-                        health.as_of.isoformat() if health is not None else None
-                    )
+                    health_gate = {**health_cap, **authority}
                     snapshot_evidence[version_id]["strategy_health_gate"] = health_gate
             if missing:
                 raise ValueError(
