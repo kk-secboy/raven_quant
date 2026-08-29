@@ -1,8 +1,16 @@
+from datetime import UTC, datetime
+
 import pytest
-from sqlalchemy import inspect, text
+from alembic import command
+from sqlalchemy import insert, inspect, text
 from sqlalchemy.pool import NullPool
 
-from quant_data.database import open_database
+from quant_data.database import (
+    audit_events,
+    open_database,
+    transparent_baseline_pre_result_repairs,
+)
+from quant_platform.db_cli import alembic_config
 
 
 @pytest.mark.no_database
@@ -175,6 +183,8 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         column["name"]
         for column in inspector.get_columns("oos_vintages", schema="quantlab")
     }
+
+
     assert {
         "economic_hypothesis_group",
         "hypothesis_group_cap",
@@ -954,3 +964,85 @@ def test_0045_retires_legacy_approved_pair_versions(database_url: str) -> None:
     assert retired == "retired"
     assert family == "retired"
     assert audit is not None and audit[1] == "migration-0045"
+
+
+def test_same_lineage_repair_constraint_is_limited_to_exact_v2(database_url: str) -> None:
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        definition = connection.scalar(
+            text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conname = 'ck_transparent_baseline_repair_distinct_target' "
+                "AND conrelid = "
+                "'quantlab.transparent_baseline_pre_result_repairs'::regclass"
+            )
+        )
+
+    assert "source_dataset_lineage_id <> target_dataset_lineage_id" in definition
+    assert "transparent-baseline-pre-result-repair-v2" in definition
+    assert "v7-to-v8-optimizer-applicability" in definition
+    assert "b230bb66ab1aad446f575c59d2e99564cf82dd734d7fa40f5ce574c41222c686" in (
+        definition
+    )
+
+
+def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
+    database_url: str,
+) -> None:
+    engine = open_database(database_url)
+    source_ids = sorted(
+        [
+            "f51d7fa2f4fd463e97fd5f6990b3721c",
+            "8090c21aa11546bd9d59f732975afc25",
+            "9c8a75ac646f452e8a5666bacd708936",
+        ]
+    )
+    verification = {
+        "receipt_contract_version": "transparent-baseline-pre-result-repair-v2",
+        "repair_generation": "v7-to-v8-optimizer-applicability",
+        "target_runner_sha256": (
+            "b230bb66ab1aad446f575c59d2e99564cf82dd734d7fa40f5ce574c41222c686"
+        ),
+    }
+    with engine.begin() as connection:
+        audit_id = connection.execute(
+            insert(audit_events)
+            .values(
+                user_id=None,
+                username="system:migration-test",
+                action="transparent_baseline_pre_result_repair_registered",
+                method="INTERNAL",
+                path="transparent-baseline/pre-result-repair",
+                status_code=201,
+                ip_hash=None,
+                user_agent="pytest",
+                details_json={},
+                created_at=datetime.now(UTC),
+            )
+            .returning(audit_events.c.id)
+        ).scalar_one()
+        connection.execute(
+            insert(transparent_baseline_pre_result_repairs).values(
+                receipt_sha256="d" * 64,
+                source_audit_event_id=audit_id,
+                source_batch_sha256="a" * 64,
+                target_batch_sha256="b" * 64,
+                source_dataset_lineage_id="c" * 64,
+                target_dataset_lineage_id="c" * 64,
+                target_recipe_version="qlib-rdagent-single-mainline-2026-08-30-v8",
+                source_backtest_ids_json=source_ids,
+                target_strategy_version_ids_json=["1" * 32, "2" * 32, "3" * 32],
+                verification_json=verification,
+                created_at=datetime.now(UTC),
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="append-only same-lineage v2"):
+        command.downgrade(
+            alembic_config(database_url), "0073_baseline_pre_result_repair"
+        )
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM quantlab.alembic_version")
+        ) == "0074_baseline_repair_chain"

@@ -616,7 +616,10 @@ def test_changed_member_health_blocks_old_netting_plan(
                 "member_snapshots": {
                     "short-v1": {
                         "as_of_date": "2026-08-28",
-                        "strategy_health_gate": {"snapshot_id": "health-old"},
+                        "strategy_health_gate": {
+                            "snapshot_id": "health-old",
+                            "as_of": "2026-08-28T08:00:00+00:00",
+                        },
                     }
                 }
             },
@@ -628,7 +631,12 @@ def test_changed_member_health_blocks_old_netting_plan(
     monkeypatch.setattr(
         service,
         "_authoritative_member_health_snapshots",
-        lambda _account_id: {"short-v1": "health-current"},
+        lambda _account_id: {
+            "short-v1": {
+                "snapshot_id": "health-current",
+                "as_of": "2026-08-28T08:00:00+00:00",
+            }
+        },
     )
     current_card = {
         "horizon": SHORT_1_5D,
@@ -710,6 +718,7 @@ def test_unified_account_facts_override_placeholder_quantity_and_age() -> None:
         "instrument_facts": {
             "SH600000": {
                 "action": "ADD",
+                "execution_state": "READY",
                 "target_position_quantity": 800,
                 "trade_quantity": 300,
                 "quantity_source": "unified_account_order_plan",
@@ -726,6 +735,7 @@ def test_unified_account_facts_override_placeholder_quantity_and_age() -> None:
     assert signal["target_position_quantity"] == 800
     assert signal["trade_quantity"] == 300
     assert signal["account_action"] == "ADD"
+    assert signal["execution_state"] == "READY"
     assert signal["quantity_source"] == "unified_account_order_plan"
     assert signal["holding_age_sessions"] == 12
     assert signal["holding_age_source"] == "simulation_position_lots_qlib_calendar"
@@ -805,6 +815,15 @@ def test_blocked_order_plan_has_no_actionable_trade_quantity() -> None:
     assert _remaining_trade_quantity(
         {
             "execution_state": "BLOCKED",
+            "order_plan": [{"op": "new", "quantity": 500}],
+        }
+    ) == 0
+
+
+def test_waiting_order_plan_has_no_actionable_trade_quantity() -> None:
+    assert _remaining_trade_quantity(
+        {
+            "execution_state": "WAIT",
             "order_plan": [{"op": "new", "quantity": 500}],
         }
     ) == 0

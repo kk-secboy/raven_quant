@@ -71,6 +71,7 @@ type AdviceSignal = {
   target_weight?: number | null;
   target_position_quantity?: number | null;
   trade_quantity?: number | null;
+  execution_state?: string | null;
   effective_date?: string | null;
   validity_sessions?: number | null;
   review_date_estimate?: string | null;
@@ -242,7 +243,10 @@ function EvidenceSummary({ evidence }: { evidence: AdviceEvidence }) {
 
 function SignalRow({ signal, simulationOnly }: { signal: AdviceSignal; simulationOnly: boolean }) {
   const accountAction = signal.account_action ?? signal.action;
-  const tradeQuantityLabel = accountAction === "BUY" || accountAction === "ADD"
+  const executionWaiting = signal.execution_state === "WAIT" || signal.execution_state === "BLOCKED";
+  const tradeQuantityLabel = executionWaiting
+    ? "账户当前不可执行"
+    : accountAction === "BUY" || accountAction === "ADD"
     ? "账户可买数量"
     : accountAction === "REDUCE" || accountAction === "EXIT"
       ? "账户可卖数量"
@@ -259,7 +263,7 @@ function SignalRow({ signal, simulationOnly }: { signal: AdviceSignal; simulatio
     <p>{reasonText(signal.reason)}</p>
     <div className="novice-signal-facts">
       <span>账户目标持仓 <strong>{signal.target_position_quantity == null ? "等待账户换算" : `${signal.target_position_quantity} 股`}</strong></span>
-      <span>{tradeQuantityLabel} <strong>{signal.trade_quantity == null ? "等待执行计划" : `${signal.trade_quantity} 股`}</strong></span>
+      <span>{tradeQuantityLabel} <strong>{executionWaiting ? "0 股（等待条件）" : signal.trade_quantity == null ? "等待执行计划" : `${signal.trade_quantity} 股`}</strong></span>
       <span>执行日 <strong>{signal.effective_date ?? "等待下一交易日"}</strong></span>
       <span>有效期 <strong>{signal.validity_sessions ? `${signal.validity_sessions} 个交易日` : "按策略复核"}</strong></span>
       <span>复核日 <strong>{signal.review_date_estimate ?? "等待交易日历"}{signal.review_date_is_exchange_calendar === false ? "（估算）" : ""}</strong></span>

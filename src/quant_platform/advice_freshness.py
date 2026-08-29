@@ -126,7 +126,7 @@ def assess_netting_plan_freshness(
     required_signal_date: date | None,
     inputs_as_of: Any,
     plan: dict[str, Any],
-    authoritative_health_snapshot_ids: Mapping[str, str | None] | None = None,
+    authoritative_health_snapshots: Mapping[str, Mapping[str, Any] | None] | None = None,
     requirement_reason: str | None = None,
 ) -> dict[str, Any]:
     """Require current signal dates and exact member-health snapshot bindings."""
@@ -195,11 +195,8 @@ def assess_netting_plan_freshness(
                 member: value.isoformat() for member, value in member_dates.items()
             },
         }
-    authoritative_health = {
-        str(member): str(snapshot_id).strip() if snapshot_id else None
-        for member, snapshot_id in (authoritative_health_snapshot_ids or {}).items()
-    }
-    if not authoritative_health:
+    raw_authoritative_health = dict(authoritative_health_snapshots or {})
+    if not raw_authoritative_health:
         return {
             **plan_freshness,
             "scope": "account_netting_plan",
@@ -211,7 +208,7 @@ def assess_netting_plan_freshness(
             },
             "member_health_snapshot_ids": {},
         }
-    if set(member_dates) != set(authoritative_health):
+    if set(member_dates) != set(raw_authoritative_health):
         return {
             **plan_freshness,
             "scope": "account_netting_plan",
@@ -221,9 +218,9 @@ def assess_netting_plan_freshness(
             "member_signal_dates": {
                 member: value.isoformat() for member, value in member_dates.items()
             },
-            "member_health_snapshot_ids": authoritative_health,
+            "member_health_snapshot_ids": {},
         }
-    if any(snapshot_id is None for snapshot_id in authoritative_health.values()):
+    if any(value is None for value in raw_authoritative_health.values()):
         return {
             **plan_freshness,
             "scope": "account_netting_plan",
@@ -233,7 +230,66 @@ def assess_netting_plan_freshness(
             "member_signal_dates": {
                 member: value.isoformat() for member, value in member_dates.items()
             },
-            "member_health_snapshot_ids": authoritative_health,
+            "member_health_snapshot_ids": {
+                member: None for member in raw_authoritative_health
+            },
+        }
+    authoritative_health: dict[str, dict[str, Any]] = {}
+    for member, raw in raw_authoritative_health.items():
+        if not isinstance(raw, Mapping):
+            return {
+                **plan_freshness,
+                "scope": "account_netting_plan",
+                "status": "member_health_authority_invalid",
+                "passed": False,
+                "reason": "统一账户成员健康权威证据无效",
+                "member_signal_dates": {
+                    key: value.isoformat() for key, value in member_dates.items()
+                },
+                "member_health_snapshot_ids": {},
+            }
+        snapshot_id = str(raw.get("snapshot_id") or "").strip()
+        health_as_of = _date_value(raw.get("as_of"))
+        if not snapshot_id or health_as_of is None:
+            return {
+                **plan_freshness,
+                "scope": "account_netting_plan",
+                "status": "member_health_authority_invalid",
+                "passed": False,
+                "reason": "统一账户成员健康权威证据缺少快照或日期",
+                "member_signal_dates": {
+                    key: value.isoformat() for key, value in member_dates.items()
+                },
+                "member_health_snapshot_ids": {},
+            }
+        authoritative_health[str(member)] = {
+            "snapshot_id": snapshot_id,
+            "as_of": health_as_of,
+        }
+    stale_health_dates = {
+        member: {
+            "health_as_of": authoritative_health[member]["as_of"].isoformat(),
+            "required_as_of": member_dates[member].isoformat(),
+        }
+        for member in member_dates
+        if authoritative_health[member]["as_of"] < member_dates[member]
+    }
+    authoritative_ids = {
+        member: str(value["snapshot_id"])
+        for member, value in authoritative_health.items()
+    }
+    if stale_health_dates:
+        return {
+            **plan_freshness,
+            "scope": "account_netting_plan",
+            "status": "member_health_dates_stale",
+            "passed": False,
+            "reason": "统一账户成员策略健康快照早于对应推荐信号日",
+            "member_signal_dates": {
+                member: value.isoformat() for member, value in member_dates.items()
+            },
+            "member_health_snapshot_ids": authoritative_ids,
+            "stale_member_health_dates": stale_health_dates,
         }
     planned_gates = {
         member: dict(raw_evidence[member]).get("strategy_health_gate")
@@ -252,11 +308,17 @@ def assess_netting_plan_freshness(
             "member_health_snapshot_ids": authoritative_health,
         }
     planned_health = {
-        member: str(gate.get("snapshot_id") or "").strip()
+        member: {
+            "snapshot_id": str(gate.get("snapshot_id") or "").strip(),
+            "as_of": _date_value(gate.get("as_of")),
+        }
         for member, gate in planned_gates.items()
         if isinstance(gate, dict)
     }
-    if any(not snapshot_id for snapshot_id in planned_health.values()):
+    if any(
+        not value["snapshot_id"] or value["as_of"] is None
+        for value in planned_health.values()
+    ):
         return {
             **plan_freshness,
             "scope": "account_netting_plan",
@@ -266,12 +328,18 @@ def assess_netting_plan_freshness(
             "member_signal_dates": {
                 member: value.isoformat() for member, value in member_dates.items()
             },
-            "member_health_snapshot_ids": authoritative_health,
+            "member_health_snapshot_ids": authoritative_ids,
         }
     stale_health = {
         member: {
-            "planned": planned_health[member],
-            "current": authoritative_health[member],
+            "planned": {
+                "snapshot_id": planned_health[member]["snapshot_id"],
+                "as_of": planned_health[member]["as_of"].isoformat(),
+            },
+            "current": {
+                "snapshot_id": authoritative_health[member]["snapshot_id"],
+                "as_of": authoritative_health[member]["as_of"].isoformat(),
+            },
         }
         for member in member_dates
         if planned_health[member] != authoritative_health[member]
@@ -286,7 +354,7 @@ def assess_netting_plan_freshness(
             "member_signal_dates": {
                 member: value.isoformat() for member, value in member_dates.items()
             },
-            "member_health_snapshot_ids": authoritative_health,
+            "member_health_snapshot_ids": authoritative_ids,
             "stale_member_health": stale_health,
         }
     return {
@@ -295,5 +363,5 @@ def assess_netting_plan_freshness(
         "member_signal_dates": {
             member: value.isoformat() for member, value in member_dates.items()
         },
-        "member_health_snapshot_ids": authoritative_health,
+        "member_health_snapshot_ids": authoritative_ids,
     }

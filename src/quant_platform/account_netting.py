@@ -672,6 +672,9 @@ class AccountNettingStore:
                     health_gate["snapshot_id"] = (
                         str(health.id) if health is not None else None
                     )
+                    health_gate["as_of"] = (
+                        health.as_of.isoformat() if health is not None else None
+                    )
                     snapshot_evidence[version_id]["strategy_health_gate"] = health_gate
             if missing:
                 raise ValueError(

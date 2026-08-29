@@ -34,6 +34,11 @@ from quant_data.database import (
 from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
 from quant_platform.strategy_recipes import TRANSPARENT_RESEARCH_BASELINE_IDS
+from quant_platform.transparent_baseline_runner import (
+    OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
+    OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
+    TRANSPARENT_BASELINE_RUNNER_FIELD,
+)
 
 LOCKBOX_CONTRACT_VERSION = "transparent-baseline-joint-lockbox-v1"
 LOCKBOX_LINK_VERSION = "transparent-baseline-joint-lockbox-link-v1"
@@ -53,9 +58,6 @@ OPTIMIZER_APPLICABILITY_SOURCE_COMMIT = (
 )
 OPTIMIZER_APPLICABILITY_SOURCE_RECIPE_VERSION = (
     "qlib-rdagent-single-mainline-2026-08-30-v7"
-)
-OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION = (
-    "qlib-rdagent-single-mainline-2026-08-30-v8"
 )
 OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS = frozenset(
     {
@@ -102,6 +104,7 @@ _MEMBER_KEYS = {
     "test_start",
     "test_end",
 }
+_V8_MEMBER_KEYS = _MEMBER_KEYS | {TRANSPARENT_BASELINE_RUNNER_FIELD}
 
 
 def canonical_sha256(value: Any) -> str:
@@ -162,7 +165,10 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         failure_markers = _PRE_RESULT_FAILURES
         repair_generation: str | None = None
     elif contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V2:
-        keys = common_keys | {"repair_generation"}
+        keys = common_keys | {
+            "repair_generation",
+            TRANSPARENT_BASELINE_RUNNER_FIELD,
+        }
         expected_reasons = frozenset({OPTIMIZER_APPLICABILITY_REASON})
         failure_markers = {
             OPTIMIZER_APPLICABILITY_REASON: OPTIMIZER_APPLICABILITY_FAILURE
@@ -189,6 +195,11 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
     if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 and (
         commit != OPTIMIZER_APPLICABILITY_SOURCE_COMMIT
         or target_recipe_version != OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION
+        or _require_sha256(
+            value.get(TRANSPARENT_BASELINE_RUNNER_FIELD),
+            field=TRANSPARENT_BASELINE_RUNNER_FIELD,
+        )
+        != OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
     ):
         raise ValueError("optimizer applicability repair source or target is not allowlisted")
     if (
@@ -344,8 +355,6 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
 
 
 def _normalize_member(raw: Mapping[str, Any]) -> dict[str, str]:
-    if set(raw) != _MEMBER_KEYS:
-        raise ValueError("transparent baseline lockbox member fields are invalid")
     recipe_id = str(raw.get("recipe_id") or "").strip()
     if recipe_id not in _RECIPE_HORIZONS:
         raise ValueError("transparent baseline lockbox contains an unknown recipe")
@@ -355,6 +364,13 @@ def _normalize_member(raw: Mapping[str, Any]) -> dict[str, str]:
     recipe_version = str(raw.get("recipe_version") or "").strip()
     if not recipe_version:
         raise ValueError("transparent baseline lockbox recipe version is required")
+    expected_keys = (
+        _V8_MEMBER_KEYS
+        if recipe_version == OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION
+        else _MEMBER_KEYS
+    )
+    if set(raw) != expected_keys:
+        raise ValueError("transparent baseline lockbox member fields are invalid")
     try:
         historical_start = date.fromisoformat(str(raw["historical_start"]))
         historical_end = date.fromisoformat(str(raw["historical_end"]))
@@ -364,7 +380,7 @@ def _normalize_member(raw: Mapping[str, Any]) -> dict[str, str]:
         raise ValueError("transparent baseline lockbox periods are invalid") from exc
     if not historical_start <= historical_end < test_start <= test_end:
         raise ValueError("transparent baseline lockbox periods are not ordered")
-    return {
+    member = {
         "recipe_id": recipe_id,
         "recipe_version": recipe_version,
         "recipe_sha256": _require_sha256(
@@ -387,6 +403,17 @@ def _normalize_member(raw: Mapping[str, Any]) -> dict[str, str]:
         "test_start": test_start.isoformat(),
         "test_end": test_end.isoformat(),
     }
+    if recipe_version == OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION:
+        member[TRANSPARENT_BASELINE_RUNNER_FIELD] = _require_sha256(
+            raw.get(TRANSPARENT_BASELINE_RUNNER_FIELD),
+            field=TRANSPARENT_BASELINE_RUNNER_FIELD,
+        )
+        if (
+            member[TRANSPARENT_BASELINE_RUNNER_FIELD]
+            != OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
+        ):
+            raise ValueError("transparent v8 lockbox runner identity changed")
+    return member
 
 
 def build_joint_lockbox(
@@ -473,8 +500,7 @@ def build_lockbox_member(
         raise ValueError("transparent baseline formal periods are invalid") from exc
     if dict(bootstrap.get("formal_periods") or {}) != periods:
         raise ValueError("transparent baseline formal periods differ from its bootstrap")
-    return _normalize_member(
-        {
+    raw_member = {
             "recipe_id": config.get("recipe_id"),
             "recipe_version": config.get("recipe_version"),
             "recipe_sha256": bootstrap.get("recipe_sha256"),
@@ -490,8 +516,11 @@ def build_lockbox_member(
             "historical_end": periods["historical_end"],
             "test_start": periods["start"],
             "test_end": periods["end"],
-        }
-    )
+    }
+    runner_sha256 = bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+    if runner_sha256 is not None:
+        raw_member[TRANSPARENT_BASELINE_RUNNER_FIELD] = runner_sha256
+    return _normalize_member(raw_member)
 
 
 def lockbox_member_link(config: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -527,6 +556,10 @@ def lockbox_member_link(config: Mapping[str, Any]) -> dict[str, Any] | None:
             "start": member["test_start"],
             "end": member["test_end"],
         }
+        or (
+            member.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+            != bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+        )
     ):
         raise ValueError("strategy config differs from its joint-lockbox member")
     member_hashes = sorted(canonical_sha256(item) for item in lockbox["members"])
@@ -873,6 +906,14 @@ class TransparentBaselineLockboxStore:
                 "recipe_version"
             ) != OPTIMIZER_APPLICABILITY_SOURCE_RECIPE_VERSION:
                 raise ValueError("optimizer applicability repair source recipe changed")
+            target_bootstrap = dict(
+                dict(target_version.config_json or {}).get(BOOTSTRAP_CONFIG_KEY) or {}
+            )
+            if is_optimizer_applicability_repair and (
+                target_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+                != receipt[TRANSPARENT_BASELINE_RUNNER_FIELD]
+            ):
+                raise ValueError("optimizer applicability target runner changed")
             has_metrics = backtest.metrics_json is not None
             has_result = _artifact_result_exists(backtest.artifact_path)
             declared_files = sorted(member["files"], key=lambda item: item["path"])
@@ -931,6 +972,9 @@ class TransparentBaselineLockboxStore:
             "target_recipe_version": str(receipt["target_recipe_version"]),
             "receipt_contract_version": str(receipt["contract_version"]),
             "repair_generation": receipt.get("repair_generation"),
+            TRANSPARENT_BASELINE_RUNNER_FIELD: receipt.get(
+                TRANSPARENT_BASELINE_RUNNER_FIELD
+            ),
             "source_backtest_ids": sorted(item["backtest_id"] for item in members.values()),
             "target_strategy_version_ids": sorted(target_version_ids),
             "receipt_created_at": receipt_created_at.isoformat(),

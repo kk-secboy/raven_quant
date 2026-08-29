@@ -27,8 +27,10 @@ from quant_platform.transparent_baseline_lockbox import (
     OPTIMIZER_APPLICABILITY_SOURCE_COMMIT,
     OPTIMIZER_APPLICABILITY_SOURCE_RECIPE_VERSION,
     OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
+    OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
     PRE_RESULT_REPAIR_ACTION,
     PRE_RESULT_REPAIR_CONTRACT_VERSION_V2,
+    TRANSPARENT_BASELINE_RUNNER_FIELD,
     canonical_sha256,
     validate_pre_result_repair_receipt,
 )
@@ -80,6 +82,7 @@ def build_optimizer_applicability_receipt(
         "repair_generation": OPTIMIZER_APPLICABILITY_REPAIR_GENERATION,
         "source_release_commit": source_release_commit,
         "target_recipe_version": target_recipe_version,
+        TRANSPARENT_BASELINE_RUNNER_FIELD: OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
         "target_eligibility_contract": ELIGIBILITY_CONTRACT_VERSION,
         "target_stock_scope_contract": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
         "reason_codes": [OPTIMIZER_APPLICABILITY_REASON],

@@ -29,6 +29,11 @@ from quant_platform.transparent_baseline_lockbox import (
     canonical_sha256,
     lockbox_member_link,
 )
+from quant_platform.transparent_baseline_runner import (
+    TRANSPARENT_BASELINE_JOB_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_RUNNER_FIELD,
+    target_runner_for_recipe,
+)
 
 BOOTSTRAP_CONTRACT_VERSION = "transparent-baseline-bootstrap-v1"
 RECONCILE_RESULT_VERSION = "transparent-baseline-reconcile-v1"
@@ -185,7 +190,7 @@ def _plan_member(
         "min_backtest_days": int(horizon.sealed_oos_sessions or 0),
     }
     config = _validated_recipe_config(raw_config)
-    config[BOOTSTRAP_CONFIG_KEY] = {
+    bootstrap = {
         "contract_version": BOOTSTRAP_CONTRACT_VERSION,
         "recipe_id": recipe["id"],
         "recipe_version": recipe["version"],
@@ -199,6 +204,10 @@ def _plan_member(
         "research_window_contract": dict(research_window),
         "research_window_contract_sha256": research_window_sha256,
     }
+    target_runner_sha256 = target_runner_for_recipe(recipe["id"], recipe["version"])
+    if target_runner_sha256 is not None:
+        bootstrap[TRANSPARENT_BASELINE_RUNNER_FIELD] = target_runner_sha256
+    config[BOOTSTRAP_CONFIG_KEY] = bootstrap
     normalized = _normalize_multifactor_contract(
         config,
         factor_count=0,
@@ -459,6 +468,12 @@ class TransparentBaselineBootstrapService:
                 "execution_dataset": None,
                 "periods": dict(backtest["periods"]),
             }
+            bootstrap = dict(
+                dict(version.get("config") or {}).get(BOOTSTRAP_CONFIG_KEY) or {}
+            )
+            target_runner_sha256 = bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+            if target_runner_sha256 is not None:
+                payload[TRANSPARENT_BASELINE_JOB_RUNNER_FIELD] = target_runner_sha256
             job = self.jobs.create(
                 "strategy_backtest",
                 payload,

@@ -43,6 +43,7 @@ from quant_platform.transparent_baseline_lockbox import (
     OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS,
     OPTIMIZER_APPLICABILITY_SOURCE_COMMIT,
     OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
+    OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
     PRE_RESULT_REPAIR_CONTRACT_VERSION_V2,
     TransparentBaselineLockboxStore,
     build_joint_lockbox,
@@ -55,6 +56,10 @@ from quant_platform.transparent_baseline_lockbox import (
 from quant_platform.transparent_baseline_repair import (
     build_optimizer_applicability_receipt,
     register_optimizer_applicability_repair,
+)
+from quant_platform.transparent_baseline_runner import (
+    TRANSPARENT_BASELINE_RUNNER_FIELD,
+    target_runner_for_recipe,
 )
 from scripts.run_multifactor_backtest import _promotion_dataset_descriptors
 
@@ -132,6 +137,11 @@ def _base_plan(calendar: list[str], recipe_id: str) -> dict:
         "research_window_contract": window,
         "research_window_contract_sha256": canonical_sha256(window),
     }
+    target_runner_sha256 = target_runner_for_recipe(recipe["id"], recipe["version"])
+    if target_runner_sha256 is not None:
+        raw[BOOTSTRAP_CONFIG_KEY][TRANSPARENT_BASELINE_RUNNER_FIELD] = (
+            target_runner_sha256
+        )
     base = _normalize_multifactor_contract(
         raw,
         factor_count=0,
@@ -214,6 +224,13 @@ def _retarget_plans(
                 "dataset_lineage_id": lineage,
             }
         )
+        target_runner_sha256 = target_runner_for_recipe(
+            plan["recipe"]["id"], recipe_version
+        )
+        if target_runner_sha256 is None:
+            bootstrap.pop(TRANSPARENT_BASELINE_RUNNER_FIELD, None)
+        else:
+            bootstrap[TRANSPARENT_BASELINE_RUNNER_FIELD] = target_runner_sha256
         plan["base_config"] = _normalize_multifactor_contract(
             base,
             factor_count=0,
@@ -861,6 +878,9 @@ def test_v2_optimizer_repair_accepts_only_exact_failed_production_attempts() -> 
     assert receipt["target_recipe_version"] == (
         OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION
     )
+    assert receipt[TRANSPARENT_BASELINE_RUNNER_FIELD] == (
+        OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
+    )
     assert receipt["reason_codes"] == [OPTIMIZER_APPLICABILITY_REASON]
 
     result = deepcopy(receipt)
@@ -896,6 +916,14 @@ def test_v2_optimizer_repair_accepts_only_exact_failed_production_attempts() -> 
     generic_retry["receipt_sha256"] = canonical_sha256(generic_payload)
     with pytest.raises(ValueError, match="backtests are not allowlisted"):
         validate_pre_result_repair_receipt(generic_retry)
+
+    wrong_runner = deepcopy(receipt)
+    wrong_runner[TRANSPARENT_BASELINE_RUNNER_FIELD] = "f" * 64
+    runner_payload = dict(wrong_runner)
+    runner_payload.pop("receipt_sha256")
+    wrong_runner["receipt_sha256"] = canonical_sha256(runner_payload)
+    with pytest.raises(ValueError, match="source or target is not allowlisted"):
+        validate_pre_result_repair_receipt(wrong_runner)
 
 
 @pytest.mark.no_database

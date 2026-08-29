@@ -311,7 +311,7 @@ def _action(value: Any, *, previous_weight: float = 0.0, weight: float = 0.0) ->
 def _remaining_trade_quantity(item: dict[str, Any]) -> int:
     """Return the still-actionable order quantity, never the target position."""
 
-    if str(item.get("execution_state") or "").upper() == "BLOCKED":
+    if str(item.get("execution_state") or "").upper() in {"BLOCKED", "WAIT"}:
         return 0
     total = 0
     for raw in item.get("order_plan") or []:
@@ -692,6 +692,7 @@ class AdviceService:
                 if fact.get("trade_quantity") is not None:
                     signal["trade_quantity"] = int(fact["trade_quantity"])
                 signal["account_action"] = fact.get("action")
+                signal["execution_state"] = fact.get("execution_state")
                 signal["quantity_source"] = fact.get("quantity_source")
                 if fact.get("holding_age_sessions") is not None:
                     signal["holding_age_sessions"] = int(
@@ -704,7 +705,7 @@ class AdviceService:
 
     def _authoritative_member_health_snapshots(
         self, account_id: str
-    ) -> dict[str, str | None]:
+    ) -> dict[str, dict[str, Any] | None]:
         """Return the latest health seal for every exact active-allocation member."""
 
         with self.engine.connect() as connection:
@@ -722,9 +723,8 @@ class AdviceService:
                 .where(strategy_allocation_members.c.allocation_id == account_id)
                 .order_by(strategy_allocation_members.c.strategy_version_id)
             ).all()
-            result = {
-                str(member.strategy_version_id): None
-                for member in members
+            result: dict[str, dict[str, Any] | None] = {
+                str(member.strategy_version_id): None for member in members
             }
             authorized = {
                 str(member.strategy_version_id)
@@ -737,6 +737,7 @@ class AdviceService:
                     select(
                         strategy_health_snapshots.c.id,
                         strategy_health_snapshots.c.strategy_version_id,
+                        strategy_health_snapshots.c.as_of,
                     )
                     .where(
                         strategy_health_snapshots.c.strategy_version_id.in_(
@@ -753,7 +754,10 @@ class AdviceService:
                 for row in health_rows:
                     version_id = str(row.strategy_version_id)
                     if result.get(version_id) is None:
-                        result[version_id] = str(row.id)
+                        result[version_id] = {
+                            "snapshot_id": str(row.id),
+                            "as_of": row.as_of.isoformat(),
+                        }
         return result
 
     def _latest_version(self, horizon: str) -> dict[str, Any] | None:
@@ -1368,7 +1372,7 @@ class AdviceService:
                 ),
                 inputs_as_of=row.inputs_as_of,
                 plan=plan,
-                authoritative_health_snapshot_ids=(
+                authoritative_health_snapshots=(
                     self._authoritative_member_health_snapshots(
                         account_id
                     )

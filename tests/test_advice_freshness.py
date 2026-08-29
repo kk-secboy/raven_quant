@@ -66,7 +66,10 @@ def test_netting_plan_rejects_stale_member_hidden_by_current_max_date() -> None:
                 "member_snapshots": {
                     "short": {
                         "as_of_date": "2026-08-28",
-                        "strategy_health_gate": {"snapshot_id": "health-short"},
+                        "strategy_health_gate": {
+                            "snapshot_id": "health-short",
+                            "as_of": "2026-08-28T08:00:00+00:00",
+                        },
                     },
                     "swing": {"as_of_date": "2026-08-27"},
                 }
@@ -91,23 +94,32 @@ def test_netting_plan_accepts_only_current_member_evidence() -> None:
                 "member_snapshots": {
                     "short": {
                         "as_of_date": "2026-08-28",
-                        "strategy_health_gate": {"snapshot_id": "health-short"},
+                        "strategy_health_gate": {
+                            "snapshot_id": "health-short",
+                            "as_of": "2026-08-28T08:00:00+00:00",
+                        },
                     },
                     "swing": {
                         "as_of_date": "2026-08-28",
-                        "strategy_health_gate": {"snapshot_id": "health-swing"},
+                        "strategy_health_gate": {
+                            "snapshot_id": "health-swing",
+                            "as_of": "2026-08-28T08:00:00+00:00",
+                        },
                     },
                     "long": {
                         "as_of_date": "2026-08-28",
-                        "strategy_health_gate": {"snapshot_id": "health-long"},
+                        "strategy_health_gate": {
+                            "snapshot_id": "health-long",
+                            "as_of": "2026-08-28T08:00:00+00:00",
+                        },
                     },
                 }
             }
         },
-        authoritative_health_snapshot_ids={
-            "short": "health-short",
-            "swing": "health-swing",
-            "long": "health-long",
+        authoritative_health_snapshots={
+            "short": {"snapshot_id": "health-short", "as_of": "2026-08-28"},
+            "swing": {"snapshot_id": "health-swing", "as_of": "2026-08-28"},
+            "long": {"snapshot_id": "health-long", "as_of": "2026-08-28"},
         },
     )
 
@@ -124,18 +136,56 @@ def test_netting_plan_rejects_replaced_member_health_snapshot() -> None:
                 "member_snapshots": {
                     "short": {
                         "as_of_date": "2026-08-28",
-                        "strategy_health_gate": {"snapshot_id": "health-old"},
+                        "strategy_health_gate": {
+                            "snapshot_id": "health-old",
+                            "as_of": "2026-08-28T08:00:00+00:00",
+                        },
                     }
                 }
             }
         },
-        authoritative_health_snapshot_ids={"short": "health-new"},
+        authoritative_health_snapshots={
+            "short": {"snapshot_id": "health-new", "as_of": "2026-08-28"}
+        },
     )
 
     assert freshness["status"] == "member_health_snapshots_stale"
     assert freshness["passed"] is False
     assert freshness["stale_member_health"] == {
-        "short": {"planned": "health-old", "current": "health-new"}
+        "short": {
+            "planned": {"snapshot_id": "health-old", "as_of": "2026-08-28"},
+            "current": {"snapshot_id": "health-new", "as_of": "2026-08-28"},
+        }
+    }
+
+
+def test_netting_plan_rejects_health_snapshot_older_than_member_signal() -> None:
+    freshness = assess_netting_plan_freshness(
+        required_signal_date=date(2026, 8, 28),
+        inputs_as_of="2026-08-28",
+        plan={
+            "input_evidence": {
+                "member_snapshots": {
+                    "short": {
+                        "as_of_date": "2026-08-28",
+                        "strategy_health_gate": {
+                            "snapshot_id": "health-old",
+                            "as_of": "2026-08-27T08:00:00+00:00",
+                        },
+                    }
+                }
+            }
+        },
+        authoritative_health_snapshots={
+            "short": {"snapshot_id": "health-old", "as_of": "2026-08-27"}
+        },
+    )
+
+    assert freshness["status"] == "member_health_dates_stale"
+    assert freshness["passed"] is False
+    assert freshness["stale_member_health_dates"]["short"] == {
+        "health_as_of": "2026-08-27",
+        "required_as_of": "2026-08-28",
     }
 
 
@@ -153,7 +203,9 @@ def test_netting_plan_rejects_malformed_member_health_evidence() -> None:
                 }
             }
         },
-        authoritative_health_snapshot_ids={"short": "health-current"},
+        authoritative_health_snapshots={
+            "short": {"snapshot_id": "health-current", "as_of": "2026-08-28"}
+        },
     )
 
     assert freshness["status"] == "member_health_evidence_invalid"
