@@ -1597,6 +1597,7 @@ def test_v3_packaging_repair_opens_and_consumes_a_new_exact_chain_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from quant_platform import strategy_store as strategy_store_module
+    from quant_platform import transparent_baseline_repair as repair_module
 
     source_by_recipe = {
         "short_relative_strength": "1ca979f22a0d4e2981e6e5c5e478f583",
@@ -1692,14 +1693,36 @@ def test_v3_packaging_repair_opens_and_consumes_a_new_exact_chain_scope(
                 error=CANONICAL_LF_PACKAGING_ERROR,
             )
 
-    registered = register_canonical_lf_packaging_repair(
-        database_url,
-        backtest_ids=list(source_by_recipe.values()),
-        actor="system:test-v3",
-        source_runner_observed_sha256=(
-            CANONICAL_LF_PACKAGING_SOURCE_OBSERVED_RUNNER_SHA256
-        ),
+    # This exercises the historical v8-to-v9 receipt after the repository has
+    # advanced to the v11 runner.  The current project runner must not be
+    # rebound to the sealed v9 identity (and is explicitly rejected by the
+    # packaging-repair unit tests), so inject only the archived v9 digest at an
+    # explicit historical path for this database lifecycle fixture.
+    historical_v9_runner = tmp_path / "historical-v9-run_multifactor_backtest.py"
+    historical_v9_runner.write_text("archived v9 runner fixture\n", encoding="utf-8")
+    expected_v9_runner_sha256 = target_runner_for_recipe(
+        "short_relative_strength", CANONICAL_LF_PACKAGING_TARGET_RECIPE_VERSION
     )
+    real_file_sha256 = repair_module._file_sha256
+    with monkeypatch.context() as repair_patch:
+        repair_patch.setattr(
+            repair_module,
+            "_file_sha256",
+            lambda path: (
+                expected_v9_runner_sha256
+                if Path(path).resolve() == historical_v9_runner.resolve()
+                else real_file_sha256(Path(path))
+            ),
+        )
+        registered = register_canonical_lf_packaging_repair(
+            database_url,
+            backtest_ids=list(source_by_recipe.values()),
+            actor="system:test-v3",
+            source_runner_observed_sha256=(
+                CANONICAL_LF_PACKAGING_SOURCE_OBSERVED_RUNNER_SHA256
+            ),
+            target_runner_path=historical_v9_runner,
+        )
     assert registered["status"] == "registered"
     assert all(member["files"] == [] for member in registered["receipt"]["members"])
 

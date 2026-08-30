@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 from governance_fixtures import (
     DATASET_IDENTITY,
+    allow_strategy_new_risk_for_test,
     create_strategy_version,
     enable_recommendation_authority_for_test,
     governed_etf_ready_evidence,
@@ -655,7 +656,7 @@ def test_simulation_batch_is_idempotent_and_books_auditable_nav(
 
 
 def test_later_recommendation_cannot_rewrite_historical_snapshot_orders_fills_or_nav(
-    database_url: str, tmp_path
+    database_url: str, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Appending a later decision leaves the completed historical chain immutable.
 
@@ -667,6 +668,10 @@ def test_later_recommendation_cannot_rewrite_historical_snapshot_orders_fills_or
     or certified NAV.
     """
 
+    # This regression isolates immutable recommendation/order/fill/NAV history.
+    # Production-health authority has its own binding tests; open only that
+    # documented test seam so a synthetic recommendation version may add risk.
+    allow_strategy_new_risk_for_test(monkeypatch)
     store, simulation, batch, _data_root = _create_recommendation_batch(
         database_url, tmp_path
     )
