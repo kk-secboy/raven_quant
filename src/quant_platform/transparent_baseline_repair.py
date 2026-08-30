@@ -43,6 +43,7 @@ from quant_platform.transparent_baseline_lockbox import (
     PRE_RESULT_REPAIR_CONTRACT_VERSION_V2,
     PRE_RESULT_REPAIR_CONTRACT_VERSION_V3,
     PRE_RESULT_REPAIR_CONTRACT_VERSION_V4,
+    PRE_RESULT_REPAIR_CONTRACT_VERSION_V5,
     RUNTIME_ALIGNMENT_BENCHMARK_REASON,
     RUNTIME_ALIGNMENT_CONTRACT_VERSION,
     RUNTIME_ALIGNMENT_INDUSTRY_REASON,
@@ -57,7 +58,28 @@ from quant_platform.transparent_baseline_lockbox import (
     RUNTIME_ALIGNMENT_TARGET_BUNDLE_SHA256,
     RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION,
     RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256,
+    RUNTIME_INPUT_SCOPE_CONTRACT_VERSION,
+    RUNTIME_INPUT_SCOPE_REPAIR_GENERATION,
+    RUNTIME_INPUT_SCOPE_SOURCE_ARTIFACT_INVENTORIES_SHA256,
+    RUNTIME_INPUT_SCOPE_SOURCE_BACKTEST_IDS,
+    RUNTIME_INPUT_SCOPE_SOURCE_BATCH_SHA256,
+    RUNTIME_INPUT_SCOPE_SOURCE_BINDINGS,
+    RUNTIME_INPUT_SCOPE_SOURCE_BUNDLE_SHA256,
+    RUNTIME_INPUT_SCOPE_SOURCE_COMMIT,
+    RUNTIME_INPUT_SCOPE_SOURCE_DATASET,
+    RUNTIME_INPUT_SCOPE_SOURCE_DATASET_IDENTITY_SHA256,
+    RUNTIME_INPUT_SCOPE_SOURCE_DATASET_LINEAGE_ID,
+    RUNTIME_INPUT_SCOPE_SOURCE_RECIPE_VERSION,
+    RUNTIME_INPUT_SCOPE_SOURCE_RUNNER_SHA256,
+    RUNTIME_INPUT_SCOPE_TARGET_BUNDLE_SHA256,
+    RUNTIME_INPUT_SCOPE_TARGET_CHANGE_CODES,
+    RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION,
+    RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256,
+    RUNTIME_INPUT_SCOPE_TOPK_BENCHMARK_REASON,
+    RUNTIME_INPUT_SCOPE_TREND_REASON,
+    RUNTIME_INPUT_SCOPE_VALUATION_REASON,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
     canonical_sha256,
     validate_pre_result_repair_receipt,
 )
@@ -198,6 +220,63 @@ def build_runtime_alignment_receipt(
         "performance_information_used": False,
         "members": list(members),
     }
+    receipt = {**payload, "receipt_sha256": canonical_sha256(payload)}
+    return validate_pre_result_repair_receipt(receipt)
+
+
+def build_runtime_input_scope_receipt(
+    members: Sequence[dict[str, Any]],
+    *,
+    source_release_commit: str = RUNTIME_INPUT_SCOPE_SOURCE_COMMIT,
+    target_recipe_version: str = RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION,
+) -> dict[str, Any]:
+    """Build the exact v10-to-v11 no-performance input-scope receipt."""
+
+    inventories = sorted(
+        (
+            {
+                "backtest_id": str(member.get("backtest_id") or ""),
+                "artifact_inventory_sha256": canonical_sha256(
+                    list(member.get("files") or [])
+                ),
+            }
+            for member in members
+        ),
+        key=lambda item: item["backtest_id"],
+    )
+    payload = {
+        "contract_version": PRE_RESULT_REPAIR_CONTRACT_VERSION_V5,
+        "repair_generation": RUNTIME_INPUT_SCOPE_REPAIR_GENERATION,
+        "source_release_commit": source_release_commit,
+        "target_recipe_version": target_recipe_version,
+        "source_batch_sha256": RUNTIME_INPUT_SCOPE_SOURCE_BATCH_SHA256,
+        "source_dataset_identity_sha256": (
+            RUNTIME_INPUT_SCOPE_SOURCE_DATASET_IDENTITY_SHA256
+        ),
+        "source_dataset_lineage_id": RUNTIME_INPUT_SCOPE_SOURCE_DATASET_LINEAGE_ID,
+        "source_runner_sha256": RUNTIME_INPUT_SCOPE_SOURCE_RUNNER_SHA256,
+        TRANSPARENT_BASELINE_RUNNER_FIELD: RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256,
+        "source_runtime_bundle_sha256": RUNTIME_INPUT_SCOPE_SOURCE_BUNDLE_SHA256,
+        "target_runtime_bundle_sha256": RUNTIME_INPUT_SCOPE_TARGET_BUNDLE_SHA256,
+        "runtime_contract_version": RUNTIME_INPUT_SCOPE_CONTRACT_VERSION,
+        "source_artifact_inventories_sha256": canonical_sha256(inventories),
+        "target_change_codes": list(RUNTIME_INPUT_SCOPE_TARGET_CHANGE_CODES),
+        "target_eligibility_contract": ELIGIBILITY_CONTRACT_VERSION,
+        "target_stock_scope_contract": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+        "reason_codes": sorted(
+            [
+                RUNTIME_INPUT_SCOPE_TOPK_BENCHMARK_REASON,
+                RUNTIME_INPUT_SCOPE_TREND_REASON,
+                RUNTIME_INPUT_SCOPE_VALUATION_REASON,
+            ]
+        ),
+        "performance_information_used": False,
+        "members": list(members),
+    }
+    if payload["source_artifact_inventories_sha256"] != (
+        RUNTIME_INPUT_SCOPE_SOURCE_ARTIFACT_INVENTORIES_SHA256
+    ):
+        raise ValueError("runtime input-scope aggregate artifact inventory changed")
     receipt = {**payload, "receipt_sha256": canonical_sha256(payload)}
     return validate_pre_result_repair_receipt(receipt)
 
@@ -686,6 +765,200 @@ def register_runtime_alignment_repair(
                 status_code=201,
                 ip_hash=None,
                 user_agent="register_transparent_baseline_runtime_repair.py",
+                details_json=receipt,
+                created_at=datetime.now(UTC),
+            )
+            .returning(audit_events.c.id)
+        ).scalar_one()
+    return {
+        "status": "registered",
+        "audit_event_id": int(event_id),
+        "receipt": receipt,
+    }
+
+
+def register_runtime_input_scope_repair(
+    database_url: str,
+    *,
+    backtest_ids: Sequence[str],
+    actor: str,
+    source_runtime_root: Path,
+    target_runner_path: Path | None = None,
+    source_release_commit: str = RUNTIME_INPUT_SCOPE_SOURCE_COMMIT,
+    target_recipe_version: str = RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION,
+) -> dict[str, Any]:
+    """Register only the exact three v10 input-scope failures."""
+
+    normalized_ids = [str(value or "").strip().lower() for value in backtest_ids]
+    if len(normalized_ids) != 3 or set(normalized_ids) != (
+        RUNTIME_INPUT_SCOPE_SOURCE_BACKTEST_IDS
+    ):
+        raise ValueError("runtime input-scope repair requires the exact three v10 backtests")
+    username = str(actor or "").strip()
+    if not username:
+        raise ValueError("transparent baseline repair actor is required")
+    governed_source_root = source_runtime_root.resolve()
+    source_runner = governed_source_root / "scripts" / "run_multifactor_backtest.py"
+    if _file_sha256(source_runner) != RUNTIME_INPUT_SCOPE_SOURCE_RUNNER_SHA256:
+        raise ValueError("runtime input-scope source runner bytes changed or are not sealed")
+    if runtime_alignment_bundle_sha256(governed_source_root) != (
+        RUNTIME_INPUT_SCOPE_SOURCE_BUNDLE_SHA256
+    ):
+        raise ValueError("runtime input-scope source bundle changed or is not sealed")
+    governed_target_runner = (
+        target_runner_path
+        if target_runner_path is not None
+        else Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run_multifactor_backtest.py"
+    )
+    if _file_sha256(governed_target_runner) != RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256:
+        raise ValueError("runtime input-scope target runner bytes changed or are not sealed")
+    if runtime_alignment_bundle_sha256(governed_target_runner.parents[1]) != (
+        RUNTIME_INPUT_SCOPE_TARGET_BUNDLE_SHA256
+    ):
+        raise ValueError("runtime input-scope target bundle changed or is not sealed")
+    if governed_source_root == governed_target_runner.parents[1].resolve():
+        raise ValueError("runtime input-scope source and target roots must be distinct")
+
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        rows = connection.execute(
+            select(
+                backtest_runs.c.id,
+                backtest_runs.c.strategy_version_id,
+                backtest_runs.c.job_id,
+                backtest_runs.c.dataset,
+                backtest_runs.c.periods_json,
+                backtest_runs.c.status,
+                backtest_runs.c.metrics_json,
+                backtest_runs.c.artifact_path,
+                backtest_runs.c.error,
+                jobs.c.status.label("job_status"),
+                jobs.c.error.label("job_error"),
+                jobs.c.payload_json.label("job_payload_json"),
+                strategy_versions.c.config_json,
+            )
+            .join(jobs, jobs.c.id == backtest_runs.c.job_id)
+            .join(
+                strategy_versions,
+                strategy_versions.c.id == backtest_runs.c.strategy_version_id,
+            )
+            .where(backtest_runs.c.id.in_(normalized_ids))
+            .with_for_update()
+        ).all()
+        if len(rows) != 3:
+            raise ValueError("runtime input-scope repair backtests are incomplete")
+
+        members: list[dict[str, Any]] = []
+        for row in rows:
+            source = RUNTIME_INPUT_SCOPE_SOURCE_BINDINGS.get(str(row.id))
+            if source is None:
+                raise ValueError("runtime input-scope source binding is unknown")
+            config = dict(row.config_json or {})
+            bootstrap = dict(config.get("transparent_baseline_bootstrap") or {})
+            periods = {
+                key: str(dict(row.periods_json or {})[key])
+                for key in ("historical_start", "historical_end", "start", "end")
+            }
+            job_payload = dict(row.job_payload_json or {})
+            if (
+                config.get("recipe_version")
+                != RUNTIME_INPUT_SCOPE_SOURCE_RECIPE_VERSION
+                or bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+                != RUNTIME_INPUT_SCOPE_SOURCE_RUNNER_SHA256
+                or bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
+                != RUNTIME_INPUT_SCOPE_SOURCE_BUNDLE_SHA256
+                or bootstrap.get("dataset") != RUNTIME_INPUT_SCOPE_SOURCE_DATASET
+                or bootstrap.get("dataset_identity_sha256")
+                != RUNTIME_INPUT_SCOPE_SOURCE_DATASET_IDENTITY_SHA256
+                or bootstrap.get("dataset_lineage_id")
+                != RUNTIME_INPUT_SCOPE_SOURCE_DATASET_LINEAGE_ID
+                or str(row.strategy_version_id) != source["strategy_version_id"]
+                or str(row.job_id) != source["job_id"]
+                or str(row.dataset) != RUNTIME_INPUT_SCOPE_SOURCE_DATASET
+                or periods != source["periods"]
+            ):
+                raise ValueError("runtime input-scope source contract changed")
+            if (
+                str(job_payload.get("backtest_id") or "") != str(row.id)
+                or str(job_payload.get("strategy_version_id") or "")
+                != str(row.strategy_version_id)
+                or str(job_payload.get("dataset") or "") != str(row.dataset)
+                or dict(job_payload.get("periods") or {}) != periods
+                or job_payload.get("transparent_baseline_runner_sha256")
+                != RUNTIME_INPUT_SCOPE_SOURCE_RUNNER_SHA256
+                or job_payload.get(TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD)
+                != RUNTIME_INPUT_SCOPE_SOURCE_BUNDLE_SHA256
+            ):
+                raise ValueError("runtime input-scope source job binding changed")
+            if (
+                str(row.status) != "failed"
+                or str(row.job_status) != "failed"
+                or row.metrics_json is not None
+                or str(row.error or "") != source["error"]
+                or str(row.job_error or "") != source["error"]
+            ):
+                raise ValueError(
+                    "runtime input-scope repair requires exact failed no-metrics evidence"
+                )
+            root = Path(str(row.artifact_path or "")).resolve()
+            if any(root.rglob("result.json")):
+                raise ValueError("runtime input-scope source already has a result")
+            files = _artifact_inventory(root)
+            if canonical_sha256(files) != source["artifact_inventory_sha256"]:
+                raise ValueError("runtime input-scope artifact inventory changed")
+            members.append(
+                {
+                    "backtest_id": str(row.id),
+                    "strategy_version_id": str(row.strategy_version_id),
+                    "job_id": str(row.job_id),
+                    "dataset": str(row.dataset),
+                    "periods": periods,
+                    "status": "failed",
+                    "job_status": "failed",
+                    "error": str(source["error"]),
+                    "metrics_absent": True,
+                    "result_absent": True,
+                    "files": files,
+                }
+            )
+        members.sort(key=lambda item: item["backtest_id"])
+        receipt = build_runtime_input_scope_receipt(
+            members,
+            source_release_commit=source_release_commit,
+            target_recipe_version=target_recipe_version,
+        )
+
+        for audit_row in connection.execute(
+            select(audit_events).where(audit_events.c.action == PRE_RESULT_REPAIR_ACTION)
+        ).all():
+            details = dict(audit_row.details_json or {})
+            if details.get("receipt_sha256") == receipt["receipt_sha256"]:
+                return {
+                    "status": "already_registered",
+                    "audit_event_id": int(audit_row.id),
+                    "receipt": receipt,
+                }
+            raw_members = details.get("members")
+            if isinstance(raw_members, list) and {
+                str(item.get("backtest_id") or "")
+                for item in raw_members
+                if isinstance(item, dict)
+            } == set(normalized_ids):
+                raise ValueError("v10 backtests already have a different repair receipt")
+
+        event_id = connection.execute(
+            insert(audit_events)
+            .values(
+                user_id=None,
+                username=username,
+                action=PRE_RESULT_REPAIR_ACTION,
+                method="INTERNAL",
+                path="transparent-baseline/pre-result-repair",
+                status_code=201,
+                ip_hash=None,
+                user_agent="register_transparent_baseline_input_scope_repair.py",
                 details_json=receipt,
                 created_at=datetime.now(UTC),
             )

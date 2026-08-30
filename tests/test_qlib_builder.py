@@ -2434,6 +2434,108 @@ def test_financial_restatement_applies_only_after_the_new_announcement(
     assert _fund_roe(rebuilt) == pytest.approx([10.0, 10.0, 10.0, 99.0])
 
 
+def test_appending_future_market_and_restatement_rows_preserves_historical_features(
+    tmp_path: Path,
+) -> None:
+    """A later snapshot extension must be a strict prefix extension for old dates.
+
+    This exercises the actual Qlib staging join, including adjusted market data,
+    price limits, daily descriptors, and announcement-date financial revisions.
+    It is intentionally stronger than checking one fundamental column: every
+    emitted historical feature must remain byte-for-value equivalent after the
+    source snapshot gains a later session and a later-announced restatement.
+    """
+
+    snapshot = tmp_path / "snapshot"
+    _write_revision_fixture(
+        snapshot,
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-01",
+                "end_date": "2023-12-31",
+                "roe": 10.0,
+            }
+        ],
+        daily_days=("2024-01-02", "2024-01-03", "2024-01-04"),
+    )
+    before_path = QlibBuilder(snapshot).build_staging(tmp_path / "staging-before")
+    before = pd.read_parquet(before_path / "SZ000001.parquet")
+
+    future_market_rows = {
+        "daily": {
+            "ts_code": "000001.SZ",
+            "trade_date": "2024-01-08",
+            "open": 50.0,
+            "high": 55.0,
+            "low": 45.0,
+            "close": 50.0,
+            "vol": 100.0,
+            "amount": 500.0,
+            "pct_chg": 400.0,
+        },
+        "adj_factor": {
+            "ts_code": "000001.SZ",
+            "trade_date": "2024-01-08",
+            "adj_factor": 1.0,
+        },
+        "stk_limit": {
+            "ts_code": "000001.SZ",
+            "trade_date": "2024-01-08",
+            "up_limit": 55.0,
+            "down_limit": 45.0,
+        },
+        "daily_basic": {
+            "ts_code": "000001.SZ",
+            "trade_date": "2024-01-08",
+            "total_mv": 100_000.0,
+        },
+    }
+    for dataset, row in future_market_rows.items():
+        target = snapshot / "parquet" / dataset / "partition_year=2024"
+        pd.DataFrame([row]).to_parquet(target / "future.parquet", index=False)
+    pd.DataFrame(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "ann_date": "2024-01-05",
+                "end_date": "2023-12-31",
+                "roe": 99.0,
+            }
+        ]
+    ).to_parquet(
+        snapshot
+        / "parquet"
+        / "fina_indicator"
+        / "partition_year=2024"
+        / "future.parquet",
+        index=False,
+    )
+
+    after_path = QlibBuilder(snapshot).build_staging(tmp_path / "staging-after")
+    after = pd.read_parquet(after_path / "SZ000001.parquet")
+    after_dates = pd.to_datetime(after["date"])
+    historical_after = after.loc[after_dates.le(pd.Timestamp("2024-01-04"))]
+
+    pd.testing.assert_frame_equal(
+        before.reset_index(drop=True),
+        historical_after.reset_index(drop=True),
+        check_exact=True,
+    )
+    before_factor = before["close"].pct_change(fill_method=None).rolling(2).mean()
+    after_factor = after["close"].pct_change(fill_method=None).rolling(2).mean()
+    pd.testing.assert_series_equal(
+        before_factor.reset_index(drop=True),
+        after_factor.iloc[: len(before_factor)].reset_index(drop=True),
+        check_exact=True,
+    )
+    assert after_dates.max() == pd.Timestamp("2024-01-08")
+    assert after.loc[after_dates.eq(pd.Timestamp("2024-01-08")), "close"].item() != before[
+        "close"
+    ].iloc[-1]
+    assert after.loc[after_dates.eq(pd.Timestamp("2024-01-08")), "fund_roe"].item() == 99.0
+
+
 def test_research_contract_admits_only_evidence_grade_recoverability(
     tmp_path: Path,
 ) -> None:

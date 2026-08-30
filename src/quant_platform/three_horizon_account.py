@@ -258,7 +258,7 @@ class ThreeHorizonAccountService:
                 "advanced": False,
             }
         try:
-            batch = self._materialize_order_plan(
+            materialized = self._materialize_order_plan(
                 allocation=allocation,
                 simulation=simulation,
                 plan=plan,
@@ -274,7 +274,7 @@ class ThreeHorizonAccountService:
                 "advanced": False,
             }
         return {
-            "status": "ready" if batch is not None else "no_action",
+            "status": "ready",
             "contract_version": THREE_HORIZON_ACCOUNT_VERSION,
             "allocation_id": str(allocation["id"]),
             "simulation_portfolio_id": str(simulation["id"]),
@@ -286,8 +286,11 @@ class ThreeHorizonAccountService:
                 for horizon in missing
             ),
             "member_snapshot_evidence": member_snapshot_evidence,
-            "order_batch": batch,
-            "advanced": batch is not None,
+            "order_batch": materialized["batch"],
+            "decision_event": materialized["decision_event"],
+            "valuation_batch": materialized["valuation_batch"],
+            "decision_kind": materialized["kind"],
+            "advanced": materialized["created"],
         }
 
     def _active_versions(self) -> dict[str, str]:
@@ -623,7 +626,7 @@ class ThreeHorizonAccountService:
         plan: dict[str, Any],
         investor_profile: dict[str, Any],
         now: datetime,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         trade_date = date.fromisoformat(str(plan["decision_date"]))
         prices, snapshot_evidence = self._latest_snapshot_payloads(str(allocation["id"]))
         positions = {
@@ -639,16 +642,25 @@ class ThreeHorizonAccountService:
         inputs: list[dict[str, Any]] = []
         limit_prices: dict[str, float] = {}
         permission_blocks: dict[str, dict[str, Any]] = {}
+        decision_metadata: dict[str, dict[str, Any]] = {}
         for instrument in sorted(instruments):
             position = positions.get(instrument) or {}
             price = prices.get(instrument) or float(position.get("market_price") or 0.0)
             target = dict((plan.get("net_targets") or {}).get(instrument) or {})
+            raw_target_value = float(target.get("target_value") or 0.0)
+            filled_position = int(position.get("quantity") or 0)
             if price <= 0:
+                decision_metadata[instrument] = {
+                    "account_target_value": raw_target_value,
+                    "reference_price": None,
+                    "raw_target_quantity": None,
+                    "lot_adjusted_target_quantity": None,
+                }
                 inputs.append(
                     {
                         "instrument": instrument,
                         "target_quantity": None,
-                        "filled_position": int(position.get("quantity") or 0),
+                        "filled_position": filled_position,
                         "sellable_quantity": int(position.get("available_quantity") or 0),
                         "open_orders": open_orders.get(instrument, []),
                         "hard_blocked_reason": "fresh_reference_price_unavailable",
@@ -656,9 +668,22 @@ class ThreeHorizonAccountService:
                 )
                 continue
             rules = order_unit_rules(instrument, trade_date)
-            raw_quantity = int(float(target.get("target_value") or 0.0) / price)
+            raw_quantity = int(raw_target_value / price)
             target_quantity = lot_floor(raw_quantity, rules) if raw_quantity > 0 else 0
-            filled_position = int(position.get("quantity") or 0)
+            decision_metadata[instrument] = {
+                "account_target_value": raw_target_value,
+                "reference_price": price,
+                "raw_target_quantity": raw_quantity,
+                "lot_adjusted_target_quantity": target_quantity,
+                "minimum_order_quantity": rules.min_lot,
+                "order_quantity_increment": rules.lot_increment,
+                "order_unit_rule_version": rules.rule_version,
+                "target_below_minimum_order_lot": (
+                    raw_target_value > 0
+                    and target_quantity == 0
+                    and filled_position == 0
+                ),
+            }
             if target_quantity > filled_position:
                 permission = investor_profile_permission(
                     investor_profile,
@@ -685,30 +710,62 @@ class ThreeHorizonAccountService:
             )
         actions = plan_account_actions(inputs, now=now)
         for action in actions:
+            metadata = decision_metadata.get(str(action["instrument"])) or {}
+            action.update(metadata)
+            if metadata.get("target_below_minimum_order_lot") is True:
+                action["notes"] = list(
+                    dict.fromkeys(
+                        [*list(action.get("notes") or []), "new_buy_below_min_lot"]
+                    )
+                )
             permission = permission_blocks.get(str(action["instrument"]))
             if permission is not None:
                 action["new_risk_blocked"] = True
                 action["new_risk_blocked_reason"] = permission["reason"]
                 action["investor_permission_key"] = permission["permission_key"]
-        actionable = any(
-            item["order_plan"] or item["action"] in {"BUY", "SELL", "EXIT"}
-            for item in actions
-        )
-        if not actionable:
-            return None
         zone = ZoneInfo("Asia/Shanghai")
-        batch, _created = self.simulations.create_order_plan_batch(
+        common = {
+            "trade_date": trade_date,
+            "signal_date": date.fromisoformat(str(plan["inputs_as_of"])),
+            "actions": actions,
+            "target_version": f"three-horizon-netting:{plan['plan_hash']}",
+            "actor": THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
+            "account_netting_plan_id": str(plan["id"]),
+            "limit_prices": limit_prices,
+            "not_before": datetime.combine(trade_date, time(9, 30), zone),
+            "not_after": datetime.combine(trade_date, time(15, 0), zone),
+        }
+        if any(item["order_plan"] for item in actions):
+            batch, created = self.simulations.create_order_plan_batch(
+                str(simulation["id"]),
+                **common,
+                data_root=self.settings.data_root,
+            )
+            return {
+                "kind": "execution_batch",
+                "created": created,
+                "batch": batch,
+                "decision_event": None,
+                "valuation_batch": None,
+                "member_snapshot_evidence": snapshot_evidence,
+            }
+        decision, created = self.simulations.record_account_order_plan_decision(
             str(simulation["id"]),
-            trade_date=trade_date,
-            signal_date=date.fromisoformat(str(plan["inputs_as_of"])),
-            actions=actions,
-            target_version=f"three-horizon-netting:{plan['plan_hash']}",
-            actor=THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
-            account_netting_plan_id=str(plan["id"]),
-            limit_prices=limit_prices,
-            not_before=datetime.combine(trade_date, time(9, 30), zone),
-            not_after=datetime.combine(trade_date, time(15, 0), zone),
-            data_root=self.settings.data_root,
+            **common,
         )
-        batch["member_snapshot_evidence"] = snapshot_evidence
-        return batch
+        valuation_batch, valuation_created = (
+            self.simulations.create_account_decision_valuation_batch(
+                str(simulation["id"]),
+                decision_event_sha256=str(decision["event_sha256"]),
+                actor=THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
+                data_root=self.settings.data_root,
+            )
+        )
+        return {
+            "kind": "decision_only",
+            "created": created or valuation_created,
+            "batch": None,
+            "decision_event": decision,
+            "valuation_batch": valuation_batch,
+            "member_snapshot_evidence": snapshot_evidence,
+        }

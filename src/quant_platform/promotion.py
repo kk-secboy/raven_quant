@@ -324,11 +324,16 @@ def forward_gate_thresholds_for_horizon(profile: str) -> ForwardGateThresholds:
     if profile == LONG_1_3Y:
         return ForwardGateThresholds(
             min_forward_calendar_days=0,
-            min_forward_trading_days=756,
+            # Three years of live operation is a useful maturity badge, but
+            # it is too slow to be the first recommendation gate.  The
+            # historical sealed OOS contract remains 756 sessions; the live
+            # gate requires roughly one exchange year plus monthly and PIT
+            # financial-report reviews.
+            min_forward_trading_days=252,
             min_decision_batches=0,
             min_completed_cycles=0,
-            min_review_events=36,
-            min_financial_report_reviews=12,
+            min_review_events=12,
+            min_financial_report_reviews=4,
         )
     if profile == LEGACY_AMBIGUOUS:
         return ForwardGateThresholds()
@@ -708,11 +713,6 @@ class PromotionStore:
                     strategy_forward_gates.c.strategy_version_id == version_id
                 )
             ).first()
-            existing_stage = connection.execute(
-                select(strategy_promotion_stages.c.id)
-                .where(strategy_promotion_stages.c.strategy_version_id == version_id)
-                .limit(1)
-            ).first()
             if existing is not None:
                 immutable_values = {
                     key: values[key]
@@ -741,27 +741,25 @@ class PromotionStore:
                         "criteria_json": criteria,
                         "criteria_sha256": _canonical_sha256(criteria),
                     }
-                if existing_stage is not None:
-                    raise ValueError(
-                        "the forward gate is immutable after the first paper stage opens"
-                    )
-            elif existing_stage is not None:
+                raise ValueError(
+                    "the forward gate is immutable once registered; use a new "
+                    "StrategyVersion for different criteria"
+                )
+            existing_stage = connection.execute(
+                select(strategy_promotion_stages.c.id)
+                .where(strategy_promotion_stages.c.strategy_version_id == version_id)
+                .limit(1)
+            ).first()
+            if existing_stage is not None:
                 raise ValueError(
                     "a paper stage exists without a pre-registered forward gate"
                 )
 
-            if existing is None:
-                connection.execute(
-                    insert(strategy_forward_gates).values(
-                        strategy_version_id=version_id, registered_at=now, **values
-                    )
+            connection.execute(
+                insert(strategy_forward_gates).values(
+                    strategy_version_id=version_id, registered_at=now, **values
                 )
-            else:
-                connection.execute(
-                    update(strategy_forward_gates)
-                    .where(strategy_forward_gates.c.strategy_version_id == version_id)
-                    .values(**values)
-                )
+            )
         return {
             "strategy_version_id": version_id,
             **asdict(gate),

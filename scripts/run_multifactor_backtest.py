@@ -100,13 +100,18 @@ from quant_platform.strategy_research_evaluation import (
 )
 from quant_platform.strategy_rule_runtime import (
     apply_strategy_rule_alpha_weights,
+    build_portfolio_policy_runtime_metadata,
     build_strategy_rule_runtime_metadata,
+    load_market_trend_close_history,
+)
+from quant_platform.strategy_rule_runtime import (
+    latest_governed_style_cross_section as _latest_style_cross_section,
+)
+from quant_platform.strategy_rule_runtime import (
+    load_governed_style_exposures as _load_governed_style_exposures,
 )
 from quant_platform.upstream_versions import upstream_runtime_identity
 
-GOVERNED_STYLE_COLUMNS = ("size", "value", "growth", "volatility")
-MAX_STYLE_CROSS_SECTION_MISSING_RATE = 0.05
-STYLE_EXPOSURE_CONTRACT_VERSION = "standardized-neutral-imputation-v1"
 FORMAL_FINAL_OOS_MODE = "formal_final_oos"
 PRE_FINAL_PORTFOLIO_TRIAL_MODE = "pre_final_portfolio_trial"
 _COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS = frozenset(
@@ -675,74 +680,6 @@ def _latest_cross_section(frame: pd.DataFrame, when: pd.Timestamp, column: str) 
     return result.astype(float)
 
 
-def _latest_style_cross_section(frame: pd.DataFrame, when: pd.Timestamp) -> pd.DataFrame:
-    values = frame.copy()
-    values["datetime"] = pd.to_datetime(values["datetime"], errors="coerce")
-    values = values[values["datetime"] <= when]
-    if values.empty:
-        raise ValueError(f"point-in-time styles have no values at {when.date()}")
-    values = values[values["datetime"] == values["datetime"].max()]
-    result = values.set_index(values["instrument"].astype(str)).drop(
-        columns=["datetime", "instrument"]
-    )
-    if result.index.has_duplicates:
-        raise ValueError("point-in-time style exposures are duplicated")
-    result = result.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    missing_rates = result.isna().mean()
-    systemic = missing_rates[missing_rates > MAX_STYLE_CROSS_SECTION_MISSING_RATE]
-    if not systemic.empty:
-        details = ", ".join(f"{column}={rate:.2%}" for column, rate in systemic.items())
-        raise ValueError(
-            "point-in-time standardized style exposure missing rate exceeds "
-            f"{MAX_STYLE_CROSS_SECTION_MISSING_RATE:.0%}: {details}"
-        )
-    # The builder writes cross-sectionally standardized exposures. Zero is the
-    # neutral exposure, so sparse missing descriptors are conservatively
-    # imputed to neutral only after the per-date systemic-missing gate above.
-    result = result.fillna(0.0)
-    if not np.isfinite(result.to_numpy(dtype=float)).all():
-        raise ValueError("point-in-time style exposures are not finite")
-    return result.astype(float)
-
-
-def _load_governed_style_exposures(
-    provider_uri: str | Path,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    path = Path(provider_uri) / "metadata" / "style_exposures.parquet"
-    if not path.is_file():
-        raise ValueError("constrained backtest requires standardized point-in-time style metadata")
-    required = ["instrument", "datetime", *GOVERNED_STYLE_COLUMNS]
-    try:
-        frame = pd.read_parquet(path, columns=required)
-    except (KeyError, ValueError) as exc:
-        raise ValueError(
-            "standardized style metadata is missing governed exposure columns"
-        ) from exc
-    frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
-    if frame[["instrument", "datetime"]].isna().any().any():
-        raise ValueError("standardized style metadata contains invalid identity fields")
-    frame["instrument"] = frame["instrument"].astype(str)
-    if frame.duplicated(["datetime", "instrument"]).any():
-        raise ValueError("standardized style metadata contains duplicate instrument dates")
-    frame[list(GOVERNED_STYLE_COLUMNS)] = (
-        frame[list(GOVERNED_STYLE_COLUMNS)]
-        .apply(pd.to_numeric, errors="coerce")
-        .replace([np.inf, -np.inf], np.nan)
-    )
-    missing_counts = {column: int(frame[column].isna().sum()) for column in GOVERNED_STYLE_COLUMNS}
-    return frame, {
-        "contract_version": STYLE_EXPOSURE_CONTRACT_VERSION,
-        "source": "qlib_builder_standardized_style_exposures",
-        "path": str(path),
-        "sha256": _sha256_file(path),
-        "columns": list(GOVERNED_STYLE_COLUMNS),
-        "rows": int(len(frame)),
-        "missing_counts": missing_counts,
-        "max_cross_section_missing_rate": MAX_STYLE_CROSS_SECTION_MISSING_RATE,
-        "missing_imputation": "zero_standardized_neutral_exposure",
-    }
-
-
 def _qlib_cross_section(frame: pd.DataFrame, when: pd.Timestamp, column: str) -> pd.Series:
     values = frame.copy()
     dates = pd.to_datetime(values.index.get_level_values("datetime")).tz_localize(None)
@@ -785,36 +722,17 @@ def _market_trend_close_history(
     start_time: str,
     end_time: str,
 ) -> pd.DataFrame | None:
-    """Load the exact index series named by the compiled market-trend rule."""
-
-    lookback = int(strategy_config.get("market_trend_lookback_sessions") or 0)
-    if not lookback:
-        return None
-    benchmark = str(strategy_config.get("market_trend_benchmark") or "").strip()
-    if not benchmark:
-        raise ValueError("market-trend rule requires a bound benchmark instrument")
-    values = data_api.features(
-        [benchmark],
-        ["$close"],
+    return load_market_trend_close_history(
+        data_api,
+        config=strategy_config,
         start_time=start_time,
         end_time=end_time,
-        freq="day",
     )
-    if values.empty or "$close" not in values.columns:
-        raise ValueError("Qlib has no bound market-trend benchmark close history")
-    try:
-        closes = values["$close"].unstack("instrument").sort_index()
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("Qlib market-trend benchmark history is malformed") from exc
-    closes.columns = closes.columns.astype(str)
-    if closes.columns.has_duplicates or list(closes.columns) != [benchmark]:
-        raise ValueError("Qlib market-trend history differs from the bound benchmark")
-    return closes
 
 
 def _metadata_provider(
     memberships: pd.DataFrame,
-    benchmark_weights: pd.DataFrame,
+    benchmark_weights: pd.DataFrame | None,
     styles: pd.DataFrame,
     execution_metadata: pd.DataFrame,
     close_history: pd.DataFrame,
@@ -846,28 +764,47 @@ def _metadata_provider(
             .drop_duplicates("instrument", keep="last")
         )
         industries = active.set_index(active["instrument"].astype(str))["industry"].astype(str)
-        benchmark = _latest_cross_section(
-            filter_available("index_weight", benchmark_weights, market_timestamp),
+        raw_style = _latest_style_cross_section(
+            styles,
             market_timestamp,
-            "weight",
+            preserve_missing=True,
         )
-        style = _latest_style_cross_section(styles, market_timestamp)
-        benchmark_industries = industries.reindex(benchmark.index)
-        if benchmark_industries.isna().any():
-            raise ValueError("benchmark constituents are missing point-in-time industries")
-        risk_instruments = instruments.astype(str).union(benchmark.index.astype(str))
+        constrained = (
+            str(strategy_config.get("portfolio_construction") or "")
+            in _COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS
+        )
+        benchmark = (
+            _latest_cross_section(
+                filter_available("index_weight", benchmark_weights, market_timestamp),
+                market_timestamp,
+                "weight",
+            )
+            if constrained and benchmark_weights is not None
+            else None
+        )
+        style = (
+            _latest_style_cross_section(styles, market_timestamp)
+            if constrained
+            else raw_style
+        )
+        risk_instruments = instruments.astype(str)
+        if constrained and benchmark is not None:
+            risk_instruments = risk_instruments.union(benchmark.index.astype(str))
         return_covariance = _portfolio_return_covariance(
             strategy_config,
             close_matrix.loc[:market_timestamp],
             risk_instruments,
         )
+        portfolio_metadata = build_portfolio_policy_runtime_metadata(
+            strategy_config,
+            instruments=instruments,
+            industries=industries,
+            benchmark_weights=benchmark,
+            style_exposures=style,
+            return_covariance=return_covariance,
+        )
         result = {
-            "industries": industries.reindex(instruments.astype(str)),
-            "benchmark_weights": benchmark,
-            "benchmark_industry_weights": benchmark.groupby(benchmark_industries).sum(),
-            "style_exposures": style,
-            "benchmark_style_exposure": style.reindex(benchmark.index).mul(benchmark, axis=0).sum(),
-            "return_covariance": return_covariance,
+            **portfolio_metadata,
             "prices": _qlib_cross_section(
                 intraday_prices if intraday_prices is not None else execution_metadata,
                 timestamp if intraday_prices is not None else market_timestamp,
@@ -892,14 +829,13 @@ def _metadata_provider(
                 strategy_config,
                 instruments=instruments,
                 close_history=close_matrix.loc[:market_timestamp],
-                benchmark_weights=benchmark,
                 benchmark_close_history=(
                     benchmark_close_history.loc[:market_timestamp]
                     if benchmark_close_history is not None
                     else None
                 ),
                 value_exposures=(
-                    style["value"] if "value" in style.columns else None
+                    raw_style["value"] if "value" in raw_style.columns else None
                 ),
             )
         )
@@ -1531,13 +1467,17 @@ def main() -> None:
     industry_cap_enabled = float(manifest["config"].get("max_industry_weight", 1.0)) < 1.0
     if industry_cap_enabled and industry_memberships is None:
         raise ValueError("industry-constrained backtest requires point-in-time industry metadata")
+    constrained = (
+        str(config.get("portfolio_construction") or "")
+        in _COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS
+    )
     if config.get("portfolio_construction") == "industry_neutral_qp":
         target_weight_path = Path(args.provider_uri) / "metadata" / "full_market_weights.parquet"
         benchmark_weights = (
             pd.read_parquet(target_weight_path) if target_weight_path.exists() else None
         )
         target_weight_label = "full-market float-cap"
-    else:
+    elif constrained:
         target_weight_path = Path(args.provider_uri) / "metadata" / "benchmark_weights.parquet"
         benchmark_weights = (
             pd.read_parquet(target_weight_path) if target_weight_path.exists() else None
@@ -1547,8 +1487,11 @@ def main() -> None:
                 benchmark_weights["benchmark"] == manifest["benchmark"]
             ].drop(columns=["benchmark"])
         target_weight_label = "index benchmark"
+    else:
+        benchmark_weights = None
+        target_weight_label = "unused reporting benchmark"
     style_exposures, style_exposure_evidence = _load_governed_style_exposures(args.provider_uri)
-    if benchmark_weights is None or benchmark_weights.empty:
+    if constrained and (benchmark_weights is None or benchmark_weights.empty):
         raise ValueError(f"constrained backtest requires historical {target_weight_label} weights")
     if style_exposures.empty:
         raise ValueError("index-enhancement backtest requires point-in-time style exposures")

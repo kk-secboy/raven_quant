@@ -103,6 +103,128 @@ class StrategyFeatureDriftSource:
             candidate_expressions=expressions,
         )
 
+    def current_challenger_artifact_binding(
+        self,
+        version_id: str,
+        *,
+        current_dataset_identity_sha256: str,
+        signal_date: date,
+    ) -> dict[str, Any] | None:
+        """Seal current-dataset challenger values for paper/recommendation inference.
+
+        Research ``factor_candidates.values_path`` files are immutable evidence for
+        the research dataset, not rolling production inputs.  Active challenger
+        strategies therefore consume only the already-governed strategy-health
+        materialization for the exact current daily publication.  Pure public
+        baselines have no challenger dependency and return ``None``.
+        """
+
+        identity = _sha256(
+            current_dataset_identity_sha256,
+            field="current dataset identity",
+        )
+        feature_set = self.feature_set(version_id)
+        factor_contract = dict(feature_set.get("factor_contract") or {})
+        sources = factor_contract.get("sources")
+        if not isinstance(sources, dict):
+            raise ValueError("strategy challenger feature contract is missing")
+        challenger_sources = {
+            str(source.get("factor_candidate_id") or ""): factor_id
+            for factor_id, source in sources.items()
+            if isinstance(source, dict)
+            and source.get("source") == "governed_factor_definition"
+        }
+        if not challenger_sources:
+            return None
+        if "" in challenger_sources:
+            raise ValueError("strategy challenger feature identity is invalid")
+
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(strategy_versions.c.config_json).where(
+                    strategy_versions.c.id == version_id
+                )
+            ).first()
+        if row is None:
+            raise KeyError(version_id)
+        config = dict(row.config_json or {})
+        try:
+            minimum_finite = max(1, int(config.get("min_daily_instruments") or 50))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("strategy minimum daily instrument coverage is invalid") from exc
+
+        materialization = self._current_materialization(
+            current_dataset_identity_sha256=identity,
+            feature_set=feature_set,
+        )
+        manifest = dict(materialization["manifest"])
+        expected_end = signal_date.isoformat()
+        if (
+            manifest.get("requested_end") != expected_end
+            or manifest.get("materialized_end") != expected_end
+        ):
+            raise ValueError(
+                "strategy factor materialization does not reach the current signal date"
+            )
+
+        artifacts: list[dict[str, Any]] = []
+        for candidate_id in sorted(challenger_sources):
+            factor_id = str(challenger_sources[candidate_id])
+            entry = (manifest.get("completed") or {}).get(factor_id)
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"strategy factor materialization is missing {factor_id}"
+                )
+            path = _artifact_path(
+                Path(materialization["root"]), entry.get("recent_relative_path")
+            )
+            digest = _sha256(entry.get("recent_sha256"), field="materialized factor")
+            if sha256_file(path) != digest:
+                raise ValueError(f"materialized factor changed: {factor_id}")
+            values = pd.read_parquet(path)
+            if (
+                not isinstance(values, pd.DataFrame)
+                or values.shape[1] != 1
+                or not isinstance(values.index, pd.MultiIndex)
+                or values.index.nlevels != 2
+                or list(values.index.names) != ["datetime", "instrument"]
+                or values.index.has_duplicates
+            ):
+                raise ValueError(f"materialized factor index is invalid: {factor_id}")
+            dates = pd.DatetimeIndex(
+                pd.to_datetime(
+                    values.index.get_level_values("datetime"), errors="raise"
+                )
+            ).tz_localize(None).normalize()
+            current = pd.to_numeric(values.iloc[:, 0], errors="coerce").loc[
+                dates == pd.Timestamp(signal_date)
+            ]
+            finite = int(np.isfinite(current.to_numpy(dtype=float)).sum())
+            if finite < minimum_finite:
+                raise ValueError(
+                    "strategy factor materialization has insufficient current-day "
+                    f"coverage: {factor_id}={finite} < {minimum_finite}"
+                )
+            artifacts.append(
+                {
+                    "candidate_id": candidate_id,
+                    "factor_id": factor_id,
+                    "artifact_path": str(path),
+                    "artifact_sha256": digest,
+                    "finite_instruments": finite,
+                }
+            )
+        return {
+            "contract_version": "strategy-challenger-live-binding-v1",
+            "strategy_version_id": version_id,
+            "dataset_identity_sha256": identity,
+            "signal_date": expected_end,
+            "feature_set_id": feature_set["id"],
+            "feature_set_definition_sha256": feature_set["definition_sha256"],
+            "materialization_manifest_sha256": materialization["manifest_sha256"],
+            "factors": artifacts,
+        }
+
     def _model_feature_set(self, version: dict[str, Any]) -> dict[str, Any]:
         config = dict(version["config"])
         candidate_ids = [

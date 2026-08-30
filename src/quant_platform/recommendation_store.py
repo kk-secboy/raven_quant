@@ -59,6 +59,9 @@ def recommendation_refresh_job_idempotency_key(snapshot_id: str) -> str:
 def recommendation_refresh_job_payload(
     snapshot: dict[str, Any],
     dataset: dict[str, Any],
+    *,
+    model_artifact_binding: dict[str, Any] | None = None,
+    factor_materialization_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the worker payload from the durable snapshot identity."""
 
@@ -92,6 +95,8 @@ def recommendation_refresh_job_payload(
         "dataset_path": dataset_path,
         "dataset_identity_sha256": snapshot_identity,
         "as_of_date": as_of_date.isoformat(),
+        "model_artifact_binding": model_artifact_binding,
+        "factor_materialization_binding": factor_materialization_binding,
     }
 
 

@@ -8,10 +8,29 @@ from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConf
 from quant_platform.strategy_recipes import get_strategy_recipe
 from quant_platform.strategy_rule_runtime import (
     apply_strategy_rule_alpha_weights,
+    build_portfolio_policy_runtime_metadata,
     build_strategy_rule_runtime_metadata,
     required_rule_history_sessions,
 )
+from scripts.run_multifactor_backtest import (
+    _latest_style_cross_section as _backtest_latest_style_cross_section,
+)
+from scripts.run_multifactor_backtest import (
+    _load_governed_style_exposures as _backtest_load_governed_style_exposures,
+)
 from scripts.run_multifactor_backtest import _market_trend_close_history
+from scripts.run_recommendation_refresh import (
+    _latest_style_cross_section as _recommendation_latest_style_cross_section,
+)
+from scripts.run_recommendation_refresh import (
+    _load_governed_style_exposures as _recommendation_load_governed_style_exposures,
+)
+from scripts.run_recommendation_refresh import (
+    _market_trend_close_history as _recommendation_market_trend_close_history,
+)
+from scripts.run_recommendation_refresh import (
+    _recommendation_rule_runtime_metadata,
+)
 
 pytestmark = pytest.mark.no_database
 
@@ -60,6 +79,175 @@ def test_runner_loads_the_exact_compiled_market_trend_benchmark() -> None:
             "freq": "day",
         }
     ]
+
+
+def test_backtest_and_recommendation_load_the_same_bound_market_benchmark() -> None:
+    backtest_api = _FakeQlibDataApi()
+    recommendation_api = _FakeQlibDataApi()
+    config = {
+        "market_trend_lookback_sessions": 20,
+        "market_trend_benchmark": "SH000300",
+    }
+
+    backtest = _market_trend_close_history(
+        backtest_api,
+        strategy_config=config,
+        start_time="2025-01-01",
+        end_time="2026-01-31",
+    )
+    recommendation = _recommendation_market_trend_close_history(
+        recommendation_api,
+        strategy_config=config,
+        start_time="2025-01-01",
+        end_time="2026-01-31",
+    )
+
+    assert backtest is not None and recommendation is not None
+    pd.testing.assert_frame_equal(backtest, recommendation)
+    assert backtest_api.calls == recommendation_api.calls
+
+
+def test_recommendation_runtime_passes_exact_bound_benchmark_history() -> None:
+    data_api = _FakeQlibDataApi()
+    dates = pd.bdate_range("2026-01-02", periods=20)
+    constituent_closes = pd.DataFrame(
+        {"A": np.linspace(10.0, 12.0, len(dates))}, index=dates
+    )
+
+    metadata = _recommendation_rule_runtime_metadata(
+        data_api,
+        config={
+            "market_trend_lookback_sessions": 20,
+            "market_trend_benchmark": "SH000300",
+        },
+        instruments=pd.Index(["A"]),
+        close_history=constituent_closes,
+        value_exposures=None,
+        start_time="2025-01-01",
+        end_time="2026-01-31",
+    )
+
+    assert metadata["market_regime_allows_entries"] is True
+    assert data_api.calls[0]["instruments"] == ["SH000300"]
+
+
+def test_backtest_and_recommendation_share_standardized_style_artifact(tmp_path) -> None:
+    metadata_root = tmp_path / "metadata"
+    metadata_root.mkdir()
+    instruments = [f"S{index:04d}" for index in range(100)]
+    source = pd.DataFrame(
+        {
+            "datetime": pd.Timestamp("2026-01-30"),
+            "instrument": instruments,
+            "size": np.linspace(-2.0, 2.0, len(instruments)),
+            "value": np.linspace(1.0, -1.0, len(instruments)),
+            "growth": 0.25,
+            "volatility": -0.10,
+        }
+    )
+    source.loc[0, "growth"] = np.nan
+    source.to_parquet(metadata_root / "style_exposures.parquet", index=False)
+
+    backtest_frame, backtest_evidence = _backtest_load_governed_style_exposures(
+        tmp_path
+    )
+    recommendation_frame, recommendation_evidence = (
+        _recommendation_load_governed_style_exposures(tmp_path)
+    )
+    backtest_cross_section = _backtest_latest_style_cross_section(
+        backtest_frame, pd.Timestamp("2026-01-30")
+    )
+    recommendation_cross_section = _recommendation_latest_style_cross_section(
+        recommendation_frame, pd.Timestamp("2026-01-30")
+    )
+    recommendation_raw_cross_section = _recommendation_latest_style_cross_section(
+        recommendation_frame,
+        pd.Timestamp("2026-01-30"),
+        preserve_missing=True,
+    )
+
+    pd.testing.assert_frame_equal(backtest_frame, recommendation_frame)
+    pd.testing.assert_frame_equal(
+        backtest_cross_section, recommendation_cross_section
+    )
+    assert backtest_cross_section.loc["S0000", "growth"] == 0.0
+    assert pd.isna(recommendation_raw_cross_section.loc["S0000", "growth"])
+    assert backtest_evidence == recommendation_evidence
+    assert backtest_evidence["max_cross_section_missing_rate"] == 0.05
+
+
+def test_topk_requires_only_signal_and_holding_industries() -> None:
+    metadata = build_portfolio_policy_runtime_metadata(
+        {"portfolio_construction": "topk_equal_weight"},
+        instruments=pd.Index(["SIGNAL", "HELD"]),
+        industries=pd.Series({"SIGNAL": "tech", "HELD": "bank"}),
+        benchmark_weights=None,
+        style_exposures=None,
+        return_covariance=None,
+    )
+
+    assert metadata["industries"].to_dict() == {
+        "SIGNAL": "tech",
+        "HELD": "bank",
+    }
+    assert "benchmark_weights" not in metadata
+    assert "benchmark_industry_weights" not in metadata
+    assert "benchmark_style_exposure" not in metadata
+    assert "return_covariance" not in metadata
+
+    with pytest.raises(ValueError, match="signal or current holdings"):
+        build_portfolio_policy_runtime_metadata(
+            {"portfolio_construction": "topk_equal_weight"},
+            instruments=pd.Index(["SIGNAL", "HELD"]),
+            industries=pd.Series({"SIGNAL": "tech"}),
+            benchmark_weights=None,
+            style_exposures=None,
+            return_covariance=None,
+        )
+
+
+def test_qp_remains_strict_about_benchmark_industry_style_and_covariance() -> None:
+    config = {"portfolio_construction": "benchmark_relative_qp"}
+    covariance = pd.DataFrame(
+        [[0.1, 0.0], [0.0, 0.1]],
+        index=["SIGNAL", "BENCHMARK"],
+        columns=["SIGNAL", "BENCHMARK"],
+    )
+    with pytest.raises(ValueError, match="benchmark constituents"):
+        build_portfolio_policy_runtime_metadata(
+            config,
+            instruments=pd.Index(["SIGNAL"]),
+            industries=pd.Series({"SIGNAL": "tech"}),
+            benchmark_weights=pd.Series({"BENCHMARK": 1.0}),
+            style_exposures=pd.DataFrame(
+                {"size": [0.1, 0.2]}, index=["SIGNAL", "BENCHMARK"]
+            ),
+            return_covariance=covariance,
+        )
+
+    with pytest.raises(ValueError, match="incomplete point-in-time styles"):
+        build_portfolio_policy_runtime_metadata(
+            config,
+            instruments=pd.Index(["SIGNAL"]),
+            industries=pd.Series({"SIGNAL": "tech", "BENCHMARK": "bank"}),
+            benchmark_weights=pd.Series({"BENCHMARK": 1.0}),
+            style_exposures=pd.DataFrame(
+                {"size": [0.1, np.nan]}, index=["SIGNAL", "BENCHMARK"]
+            ),
+            return_covariance=covariance,
+        )
+
+    with pytest.raises(ValueError, match="return covariance"):
+        build_portfolio_policy_runtime_metadata(
+            config,
+            instruments=pd.Index(["SIGNAL"]),
+            industries=pd.Series({"SIGNAL": "tech", "BENCHMARK": "bank"}),
+            benchmark_weights=pd.Series({"BENCHMARK": 1.0}),
+            style_exposures=pd.DataFrame(
+                {"size": [0.1, 0.2]}, index=["SIGNAL", "BENCHMARK"]
+            ),
+            return_covariance=None,
+        )
 
 
 def test_rule_alpha_weights_change_the_shared_factor_grid_deterministically() -> None:
@@ -222,13 +410,205 @@ def test_market_trend_fails_closed_on_wrong_or_incomplete_bound_index() -> None:
         )
 
 
-def test_rule_runtime_fails_closed_on_incomplete_history() -> None:
-    with pytest.raises(ValueError, match="six complete"):
-        build_strategy_rule_runtime_metadata(
-            {"extension_guard_max_return_5d": 0.10},
-            instruments=pd.Index(["A"]),
-            close_history=pd.DataFrame({"A": [1.0, 1.1]}),
+def test_extension_guard_emits_only_complete_per_stock_evidence() -> None:
+    metadata = build_strategy_rule_runtime_metadata(
+        {"extension_guard_max_return_5d": 0.10},
+        instruments=pd.Index(["A", "INCOMPLETE"]),
+        close_history=pd.DataFrame(
+            {
+                "A": np.linspace(1.0, 1.05, 6),
+                "INCOMPLETE": [np.nan, 1.0, 1.01, 1.02, 1.03, 1.04],
+            }
+        ),
+    )
+
+    assert list(metadata["five_day_returns"].index) == ["A"]
+
+
+def test_extension_gap_blocks_only_new_entry_and_preserves_existing_holding() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=1.0,
+            extension_guard_max_return_5d=0.10,
         )
+    )
+    evidence = pd.Series({"COMPLETE": 0.05})
+    fresh = policy.decide(
+        pd.Series({"INCOMPLETE": 2.0, "COMPLETE": 1.0}),
+        {},
+        five_day_returns=evidence,
+    )
+    held = policy.decide(
+        pd.Series({"INCOMPLETE": 2.0, "COMPLETE": 1.0}),
+        {"INCOMPLETE": 1.0},
+        five_day_returns=evidence,
+    )
+
+    assert fresh.target_weights == {"COMPLETE": 1.0}
+    assert held.target_weights == {"INCOMPLETE": 1.0}
+
+
+def test_trend_gap_blocks_new_entry_but_does_not_abort_existing_holding() -> None:
+    dates = pd.bdate_range("2026-01-02", periods=20)
+    closes = pd.DataFrame(
+        {
+            "COMPLETE": np.linspace(10.0, 12.0, len(dates)),
+            "INCOMPLETE": [np.nan, *np.linspace(10.0, 11.0, len(dates) - 1)],
+        },
+        index=dates,
+    )
+    metadata = build_strategy_rule_runtime_metadata(
+        {"trend_break_lookback_sessions": 20},
+        instruments=pd.Index(["COMPLETE", "INCOMPLETE"]),
+        close_history=closes,
+    )
+
+    assert metadata["trend_intact"].to_dict() == {"COMPLETE": True}
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=1.0,
+            trend_break_lookback_sessions=20,
+        )
+    )
+    first = policy.decide(
+        pd.Series({"INCOMPLETE": 2.0, "COMPLETE": 1.0}),
+        {},
+        trend_intact=metadata["trend_intact"],
+    )
+    second = policy.decide(
+        pd.Series({"INCOMPLETE": 2.0, "COMPLETE": 1.0}),
+        {"INCOMPLETE": 1.0},
+        trend_intact=metadata["trend_intact"],
+    )
+
+    assert first.target_weights == {"COMPLETE": 1.0}
+    assert second.target_weights == {"INCOMPLETE": 1.0}
+    assert any(
+        event["rule"] == "trend_evidence_unavailable"
+        and event["instrument"] == "INCOMPLETE"
+        for event in second.risk_events
+    )
+
+
+def test_suspended_holding_is_preserved_until_fresh_trend_evidence_recovers() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=1.0,
+            trend_break_lookback_sessions=3,
+        )
+    )
+    initial = build_strategy_rule_runtime_metadata(
+        {"trend_break_lookback_sessions": 3},
+        instruments=pd.Index(["A"]),
+        close_history=pd.DataFrame({"A": [10.0, 10.5, 11.0]}),
+    )
+    entered = policy.decide(
+        pd.Series({"A": 1.0}), {}, trend_intact=initial["trend_intact"]
+    )
+    suspended = build_strategy_rule_runtime_metadata(
+        {"trend_break_lookback_sessions": 3},
+        instruments=pd.Index(["A"]),
+        close_history=pd.DataFrame({"A": [10.5, 11.0, np.nan]}),
+    )
+    during_halt = policy.decide(
+        pd.Series({"A": 1.0}),
+        entered.target_weights,
+        trend_intact=suspended["trend_intact"],
+    )
+    resumed = build_strategy_rule_runtime_metadata(
+        {"trend_break_lookback_sessions": 3},
+        instruments=pd.Index(["A"]),
+        close_history=pd.DataFrame({"A": [11.0, 11.2, 11.4]}),
+    )
+    after_resume = policy.decide(
+        pd.Series({"A": 1.0}),
+        during_halt.target_weights,
+        trend_intact=resumed["trend_intact"],
+    )
+
+    assert entered.target_weights == {"A": 1.0}
+    assert during_halt.target_weights == {"A": 1.0}
+    assert any(
+        event["rule"] == "trend_evidence_unavailable"
+        for event in during_halt.risk_events
+    )
+    assert after_resume.target_weights == {"A": 1.0}
+    assert not any(
+        event["rule"] == "trend_evidence_unavailable"
+        for event in after_resume.risk_events
+    )
+
+
+def test_missing_valuation_rejects_only_new_entry_without_imputation() -> None:
+    config = {"valuation_regime_max_percentile": 0.9}
+    metadata = build_strategy_rule_runtime_metadata(
+        config,
+        instruments=pd.Index(["VALUED", "MISSING"]),
+        close_history=pd.DataFrame({"VALUED": [1.0], "MISSING": [1.0]}),
+        value_exposures=pd.Series({"VALUED": 0.5, "MISSING": np.nan}),
+    )
+    percentiles = metadata["valuation_percentiles"]
+    assert percentiles["VALUED"] == 1.0
+    assert pd.isna(percentiles["MISSING"])
+
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=1.0,
+            valuation_regime_max_percentile=1.0,
+        )
+    )
+    new_entry = policy.decide(
+        pd.Series({"MISSING": 2.0, "VALUED": 1.0}),
+        {},
+        valuation_percentiles=percentiles,
+    )
+    existing_holding = policy.decide(
+        pd.Series({"MISSING": 2.0, "VALUED": 1.0}),
+        {"MISSING": 1.0},
+        valuation_percentiles=percentiles,
+    )
+
+    assert set(new_entry.target_weights) == {"VALUED"}
+    assert existing_holding.target_weights == {"MISSING": 1.0}
+
+
+def test_all_missing_valuations_produce_cash_instead_of_fabricated_values() -> None:
+    metadata = build_strategy_rule_runtime_metadata(
+        {"valuation_regime_max_percentile": 0.9},
+        instruments=pd.Index(["A", "B"]),
+        close_history=pd.DataFrame({"A": [1.0], "B": [1.0]}),
+        value_exposures=None,
+    )
+    assert metadata["valuation_percentiles"].isna().all()
+
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=1.0,
+            valuation_regime_max_percentile=0.9,
+        )
+    )
+    decision = policy.decide(
+        pd.Series({"A": 2.0, "B": 1.0}),
+        {},
+        valuation_percentiles=metadata["valuation_percentiles"],
+    )
+
+    assert decision.target_weights == {}
 
 
 def test_policy_executes_holding_age_score_and_trend_exits() -> None:
@@ -248,7 +628,9 @@ def test_policy_executes_holding_age_score_and_trend_exits() -> None:
         pd.Series({"new": 4.0, "runner_up": 3.0, "aged": 2.0, "broken": 1.0}),
         {"aged": 0.5, "broken": 0.5},
         holding_age_sessions={"aged": 5, "broken": 2},
-        trend_intact=pd.Series({"aged": True, "broken": False}),
+        trend_intact=pd.Series(
+            {"new": True, "runner_up": True, "aged": True, "broken": False}
+        ),
     )
 
     assert set(decision.target_weights) == {"new", "runner_up"}

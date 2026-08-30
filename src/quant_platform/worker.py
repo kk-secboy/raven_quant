@@ -126,6 +126,7 @@ from .simulation_store import (
     build_settlement_calendar_binding,
     validate_settlement_calendar_binding,
 )
+from .strategy_feature_drift_source import StrategyFeatureDriftSource
 from .strategy_research_admission import (
     FIN_STRATEGY_FULL_STACK_ARTIFACT_TYPE,
     FIN_STRATEGY_POLICY_ARTIFACT_TYPE,
@@ -472,6 +473,10 @@ class LocalJobWorker:
         self.strategies = StrategyStore(settings.database_url)
         self.capital_oos = CapitalOOSAlphaLedgerStore(settings.database_url)
         self.model_artifacts = ModelArtifactStore(settings.database_url)
+        self.strategy_feature_drift = StrategyFeatureDriftSource(
+            settings.database_url,
+            settings.data_root,
+        )
         self.recommendations = RecommendationStore(settings.database_url)
         self.simulations = SimulationStore(settings.database_url)
         self.promotions = PromotionStore(settings.database_url)
@@ -2241,6 +2246,132 @@ class LocalJobWorker:
             "arxiv_selected": int(raw_result.get("arxiv_selected") or 0),
             "daily_limits": {"tushare_research_report": 20, "arxiv": 3},
         }
+
+    def _bound_current_model_artifact(
+        self,
+        *,
+        version: dict[str, Any],
+        payload: dict[str, Any],
+        dataset_identity_sha256: str,
+        signal_date: date,
+    ) -> dict[str, Any] | None:
+        signal_source = str(
+            version.get("config", {}).get("signal_source") or "factor_score"
+        )
+        frozen = payload.get("model_artifact_binding")
+        if signal_source != "model_prediction":
+            if frozen is not None:
+                raise ValueError("factor-score signal must not bind a ModelArtifact")
+            return None
+        if not isinstance(frozen, dict):
+            raise ValueError(
+                "model signal has no frozen current-dataset ModelArtifact binding"
+            )
+        artifact = self.model_artifacts.require_for_inference(
+            str(version["id"]),
+            dataset_identity_sha256=dataset_identity_sha256,
+            signal_date=signal_date,
+        )
+        expected = {
+            "id": str(artifact["id"]),
+            "artifact_sha256": str(artifact["artifact_sha256"]),
+            "checkpoint_sha256": str(artifact["checkpoint_sha256"]),
+            "dataset_identity_sha256": str(
+                artifact["dataset_identity_sha256"]
+            ),
+        }
+        if frozen != expected:
+            raise ValueError("signal changed its frozen current ModelArtifact binding")
+        return artifact
+
+    def _bound_current_factor_artifacts(
+        self,
+        *,
+        version: dict[str, Any],
+        payload: dict[str, Any],
+        dataset_identity_sha256: str,
+        signal_date: date,
+    ) -> list[dict[str, Any]]:
+        config = dict(version.get("config") or {})
+        signal_source = str(config.get("signal_source") or "factor_score")
+        frozen = payload.get("factor_materialization_binding")
+        if signal_source == "model_prediction":
+            if frozen is not None:
+                raise ValueError(
+                    "model signal must not bind factor-score materialization"
+                )
+            return []
+        if signal_source != "factor_score":
+            raise ValueError("strategy signal source is unsupported")
+        mode = str(config.get("factor_source_mode") or "promoted_only")
+        requires_challenger = mode in {
+            "promoted_only",
+            "qlib_baseline_plus_challenger",
+            "qlib_challenger_replacement",
+        }
+        if not requires_challenger:
+            if mode != "qlib_baseline":
+                raise ValueError("strategy factor source mode is unsupported")
+            if frozen is not None or version.get("factors"):
+                raise ValueError(
+                    "public-baseline signal must not bind challenger artifacts"
+                )
+            return []
+        if not isinstance(frozen, dict):
+            raise ValueError(
+                "challenger signal has no current-dataset materialization binding"
+            )
+        expected = self.strategy_feature_drift.current_challenger_artifact_binding(
+            str(version["id"]),
+            current_dataset_identity_sha256=dataset_identity_sha256,
+            signal_date=signal_date,
+        )
+        if expected is None or frozen != expected:
+            raise ValueError(
+                "challenger signal changed its frozen current materialization binding"
+            )
+        artifacts = {
+            str(item.get("candidate_id") or ""): item
+            for item in expected.get("factors") or []
+            if isinstance(item, dict)
+        }
+        factor_rows = list(version.get("factors") or [])
+        candidate_ids = {
+            str(item.get("factor_candidate_id") or "") for item in factor_rows
+        }
+        if (
+            not candidate_ids
+            or "" in candidate_ids
+            or set(artifacts) != candidate_ids
+        ):
+            raise ValueError(
+                "current challenger materialization does not match StrategyVersion"
+            )
+        result: list[dict[str, Any]] = []
+        for item in factor_rows:
+            candidate_id = str(item["factor_candidate_id"])
+            artifact = artifacts[candidate_id]
+            path = Path(str(artifact.get("artifact_path") or ""))
+            digest = str(artifact.get("artifact_sha256") or "")
+            if (
+                not path.is_file()
+                or path.is_symlink()
+                or len(digest) != 64
+                or _sha256_path(path) != digest
+            ):
+                raise ValueError(
+                    f"current challenger artifact changed: {candidate_id}"
+                )
+            result.append(
+                {
+                    "candidate_id": candidate_id,
+                    "artifact_path": str(path),
+                    "artifact_sha256": digest,
+                    "weight": float(item["weight"]),
+                    "direction": int(item["direction"]),
+                }
+            )
+        return result
 
     def _command(self, job: dict) -> tuple[list[str], Path | None, dict[str, str]]:
         payload = job["payload"]
@@ -4665,38 +4796,22 @@ class LocalJobWorker:
             def runtime_path(value: str | Path) -> str:
                 return _to_wsl_path(Path(value)) if is_wsl else str(value)
 
-            model_artifact = None
-            if str(version["config"].get("signal_source") or "factor_score") == (
-                "model_prediction"
-            ):
-                frozen_model_binding = payload.get("model_artifact_binding")
-                if not isinstance(frozen_model_binding, dict):
-                    raise ValueError(
-                        "model paper order-plan has no frozen ModelArtifact binding"
-                    )
-                model_artifact = self.model_artifacts.get(
-                    str(frozen_model_binding.get("id") or "")
-                )
-                expected_model_binding = {
-                    "id": str(model_artifact["id"]),
-                    "artifact_sha256": str(model_artifact["artifact_sha256"]),
-                    "checkpoint_sha256": str(model_artifact["checkpoint_sha256"]),
-                    "dataset_identity_sha256": str(
-                        model_artifact["dataset_identity_sha256"]
-                    ),
-                }
-                if (
-                    frozen_model_binding != expected_model_binding
-                    or str(model_artifact.get("strategy_version_id") or "")
-                    != str(version["id"])
-                ):
-                    raise ValueError(
-                        "paper order-plan job changed its frozen ModelArtifact binding"
-                    )
-            elif payload.get("model_artifact_binding") is not None:
-                raise ValueError(
-                    "factor-score paper order-plan must not bind a ModelArtifact"
-                )
+            model_artifact = self._bound_current_model_artifact(
+                version=version,
+                payload=payload,
+                dataset_identity_sha256=str(
+                    provenance["dataset_identity_sha256"]
+                ),
+                signal_date=signal_date,
+            )
+            factor_artifacts = self._bound_current_factor_artifacts(
+                version=version,
+                payload=payload,
+                dataset_identity_sha256=str(
+                    provenance["dataset_identity_sha256"]
+                ),
+                signal_date=signal_date,
+            )
 
             manifest = {
                 "artifact_kind": "simulation_order_plan",
@@ -4766,12 +4881,12 @@ class LocalJobWorker:
                 ),
                 "factors": [
                     {
-                        "candidate_id": item["factor_candidate_id"],
-                        "values_path": runtime_path(item["values_path"]),
+                        "candidate_id": item["candidate_id"],
+                        "values_path": runtime_path(item["artifact_path"]),
                         "weight": item["weight"],
                         "direction": item["direction"],
                     }
-                    for item in version["factors"]
+                    for item in factor_artifacts
                 ],
             }
             manifest_path.write_text(
@@ -4863,15 +4978,6 @@ class LocalJobWorker:
             def runtime_path(value: str) -> str:
                 return _to_wsl_path(Path(value)) if is_wsl else str(value)
 
-            model_artifact = None
-            if str(version["config"].get("signal_source") or "factor_score") == (
-                "model_prediction"
-            ):
-                model_artifact = self.model_artifacts.require_for_inference(
-                    str(version["id"]),
-                    dataset_identity_sha256=str(payload["dataset_identity_sha256"]),
-                )
-
             snapshot_history = [
                 item
                 for item in portfolio.get("snapshots") or []
@@ -4904,6 +5010,18 @@ class LocalJobWorker:
                 payload["dataset_identity_sha256"]
             ):
                 raise ValueError("recommendation refresh changed its dataset identity")
+            model_artifact = self._bound_current_model_artifact(
+                version=version,
+                payload=payload,
+                dataset_identity_sha256=str(payload["dataset_identity_sha256"]),
+                signal_date=recommendation_date,
+            )
+            factor_artifacts = self._bound_current_factor_artifacts(
+                version=version,
+                payload=payload,
+                dataset_identity_sha256=str(payload["dataset_identity_sha256"]),
+                signal_date=recommendation_date,
+            )
             horizon_profile = str(
                 version.get("horizon_profile")
                 or version.get("config", {}).get("horizon_profile")
@@ -4964,12 +5082,12 @@ class LocalJobWorker:
                 "financial_review_trigger": financial_review_trigger,
                 "factors": [
                     {
-                        "candidate_id": item["factor_candidate_id"],
-                        "values_path": runtime_path(item["values_path"]),
+                        "candidate_id": item["candidate_id"],
+                        "values_path": runtime_path(item["artifact_path"]),
                         "weight": item["weight"],
                         "direction": item["direction"],
                     }
-                    for item in version["factors"]
+                    for item in factor_artifacts
                 ],
             }
             manifest_path.write_text(

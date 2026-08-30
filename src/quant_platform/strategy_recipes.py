@@ -5,13 +5,14 @@ from typing import Any
 
 from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 
-# v10 changes only the compiled runtime's faithful execution of two already
-# frozen rule-IR contracts: market trend reads the declared PIT benchmark close
-# and reporting-only benchmark weights cannot add an undeclared relative
-# industry cap to equal-weight TopK.  Factors, costs, dataset/OOS windows,
-# economic parameters and random seeds stay unchanged from v9.  The failed
-# no-result v9 attempts remain immutable under a separate governed repair.
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v10"
+# v11 changes only the compiled runtime's evidence handling for already-frozen
+# rule contracts: TopK ignores unused benchmark inputs; backtest and daily
+# refresh share one governed style snapshot; missing trend/extension/valuation
+# evidence blocks only the affected new entry while an existing holding is not
+# misclassified as a trend break. Factors, costs, dataset/OOS windows, economic
+# parameters and random seeds stay unchanged from v10. The failed no-result
+# v10 attempts remain immutable under a separate governed repair.
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v11"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},

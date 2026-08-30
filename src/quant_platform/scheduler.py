@@ -698,6 +698,9 @@ class SchedulerEngine:
         for portfolio_id in portfolio_ids:
             try:
                 portfolio = self.recommendations.get(str(portfolio_id))
+                version = self.strategies.get_version(
+                    str(portfolio["strategy_version_id"])
+                )
                 dataset = select_qlib_dataset(
                     self.settings.data_root,
                     anchor_name=str(portfolio["dataset"]),
@@ -706,6 +709,12 @@ class SchedulerEngine:
                     required_date=local_date,
                 )
                 signal_date = qlib_trading_date_on_or_before(dataset, local_date)
+                dataset_identity_sha256 = str(
+                    dict(dataset.get("provenance") or {}).get(
+                        "dataset_identity_sha256"
+                    )
+                    or ""
+                )
                 latest = portfolio.get("latest_snapshot") or {}
                 if str(latest.get("as_of_date") or "") == signal_date.isoformat():
                     continue
@@ -720,20 +729,33 @@ class SchedulerEngine:
                 )
                 if not gate["passed"]:
                     continue
+                model_artifact_binding, factor_materialization_binding = (
+                    self._current_live_signal_bindings(
+                        version,
+                        dataset_identity_sha256=dataset_identity_sha256,
+                        signal_date=signal_date,
+                        now=now,
+                    )
+                )
                 snapshot, created = self.recommendations.create_snapshot(
                     portfolio_id=str(portfolio_id),
                     as_of_date=signal_date,
                     dataset=str(dataset["name"]),
-                    dataset_identity_sha256=str(
-                        dataset["provenance"]["dataset_identity_sha256"]
-                    ),
+                    dataset_identity_sha256=dataset_identity_sha256,
                     dataset_lineage_id=dataset.get("lineage_id"),
                 )
                 if not created:
                     continue
                 job = self.jobs.create(
                     "recommendation_refresh",
-                    recommendation_refresh_job_payload(snapshot, dataset),
+                    recommendation_refresh_job_payload(
+                        snapshot,
+                        dataset,
+                        model_artifact_binding=model_artifact_binding,
+                        factor_materialization_binding=(
+                            factor_materialization_binding
+                        ),
+                    ),
                     self.settings.data_root
                     / "platform"
                     / "logs"
@@ -749,6 +771,55 @@ class SchedulerEngine:
                 # Waiting datasets/stages are retried from the same durable state.
                 continue
         return enqueued
+
+    def _current_live_signal_bindings(
+        self,
+        version: dict[str, Any],
+        *,
+        dataset_identity_sha256: str,
+        signal_date: date,
+        now: datetime,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Resolve immutable current-publication inference dependencies.
+
+        Returning from this method is the enqueue gate: callers must not create
+        a paper job or recommendation snapshot while either dependency is still
+        materializing.  The next scheduler tick retries the same signal date.
+        """
+
+        if len(str(dataset_identity_sha256 or "")) != 64:
+            raise ValueError("current signal dataset identity is invalid")
+        signal_source = str(
+            version.get("config", {}).get("signal_source") or "factor_score"
+        )
+        if signal_source == "model_prediction":
+            artifact = self.model_artifacts.require_for_inference(
+                str(version["id"]),
+                dataset_identity_sha256=dataset_identity_sha256,
+                signal_date=signal_date,
+                now=now,
+            )
+            return (
+                {
+                    "id": str(artifact["id"]),
+                    "artifact_sha256": str(artifact["artifact_sha256"]),
+                    "checkpoint_sha256": str(artifact["checkpoint_sha256"]),
+                    "dataset_identity_sha256": str(
+                        artifact["dataset_identity_sha256"]
+                    ),
+                },
+                None,
+            )
+        if signal_source != "factor_score":
+            raise ValueError("strategy signal source is unsupported")
+        return (
+            None,
+            self.strategy_feature_drift.current_challenger_artifact_binding(
+                str(version["id"]),
+                current_dataset_identity_sha256=dataset_identity_sha256,
+                signal_date=signal_date,
+            ),
+        )
 
     def _enqueue_due_factor_library_materialization(self, now: datetime) -> int:
         """Materialize the governed factor library once for every sealed daily dataset.
@@ -1127,31 +1198,19 @@ class SchedulerEngine:
                 if len(dataset_identity_sha256) != 64:
                     continue
 
-                # A model-prediction paper account must wait for the immutable
-                # checkpoint/prediction artifact for *this* daily publication.
-                # Merely queueing model_refit earlier in the same scheduler
-                # tick is not a dependency: the order-plan worker can otherwise
-                # win the race, exhaust its short retries and permanently bind
-                # the day's idempotency key to a failed job.  Readiness is
-                # therefore checked before the order plan is materialized.
-                model_artifact_binding: dict[str, str] | None = None
-                if str(
-                    version.get("config", {}).get("signal_source")
-                    or "factor_score"
-                ) == "model_prediction":
-                    model_artifact = self.model_artifacts.require_for_inference(
-                        str(version["id"]),
-                        dataset_identity_sha256=dataset_identity_sha256,
-                        now=now,
-                    )
-                    model_artifact_binding = {
-                        "id": str(model_artifact["id"]),
-                        "artifact_sha256": str(model_artifact["artifact_sha256"]),
-                        "checkpoint_sha256": str(model_artifact["checkpoint_sha256"]),
-                        "dataset_identity_sha256": str(
-                            model_artifact["dataset_identity_sha256"]
-                        ),
-                    }
+                # Model predictions and active challenger factors are durable
+                # dependencies for this exact daily publication.  Merely
+                # enqueueing their producers earlier in the tick is not enough:
+                # wait here and retry next tick before creating the order job.
+                (
+                    model_artifact_binding,
+                    factor_materialization_binding,
+                ) = self._current_live_signal_bindings(
+                    version,
+                    dataset_identity_sha256=dataset_identity_sha256,
+                    signal_date=signal_date,
+                    now=now,
+                )
                 stage = self.promotions.require_paper_signal(
                     str(portfolio["source_id"]),
                     portfolio_id=str(portfolio_id),
@@ -1172,6 +1231,9 @@ class SchedulerEngine:
                         "promotion_stage_opened_at": stage["opened_at"],
                         "dataset_identity_sha256": dataset_identity_sha256,
                         "model_artifact_binding": model_artifact_binding,
+                        "factor_materialization_binding": (
+                            factor_materialization_binding
+                        ),
                         "actor": "autopilot",
                     },
                     self.settings.data_root
@@ -3216,6 +3278,9 @@ class SchedulerEngine:
     ) -> dict[str, Any] | None:
         portfolio_id = str(run["payload"]["recommendation_portfolio_id"])
         portfolio = self.recommendations.get(portfolio_id)
+        version = self.strategies.get_version(
+            str(portfolio["strategy_version_id"])
+        )
         signal_date = scheduled_for.astimezone(ZoneInfo(run["timezone"])).date()
         # Safe mode (design draft 11.3) is the first check of the
         # recommendation gate: while it is active no new recommendation is
@@ -3313,11 +3378,28 @@ class SchedulerEngine:
                 },
             )
             raise ScheduleRunWaiting(f"reconciliation gate blocked: {message}")
+        dataset_identity_sha256 = str(
+            dict(dataset.get("provenance") or {}).get("dataset_identity_sha256")
+            or ""
+        )
+        try:
+            model_artifact_binding, factor_materialization_binding = (
+                self._current_live_signal_bindings(
+                    version,
+                    dataset_identity_sha256=dataset_identity_sha256,
+                    signal_date=signal_date,
+                    now=scheduled_for,
+                )
+            )
+        except (KeyError, OSError, ValueError) as exc:
+            raise ScheduleRunWaiting(
+                "current signal artifacts are still materializing"
+            ) from exc
         snapshot, created = self.recommendations.create_snapshot(
             portfolio_id=portfolio_id,
             as_of_date=signal_date,
             dataset=dataset["name"],
-            dataset_identity_sha256=dataset["provenance"]["dataset_identity_sha256"],
+            dataset_identity_sha256=dataset_identity_sha256,
             dataset_lineage_id=dataset.get("lineage_id"),
         )
         if not created:
@@ -3336,7 +3418,12 @@ class SchedulerEngine:
         )
         job = self.jobs.create(
             "recommendation_refresh",
-            recommendation_refresh_job_payload(snapshot, dataset),
+            recommendation_refresh_job_payload(
+                snapshot,
+                dataset,
+                model_artifact_binding=model_artifact_binding,
+                factor_materialization_binding=factor_materialization_binding,
+            ),
             log_path,
             dedupe_active_kind=False,
             idempotency_key=recommendation_refresh_job_idempotency_key(

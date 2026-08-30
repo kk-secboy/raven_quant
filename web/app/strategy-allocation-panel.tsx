@@ -61,7 +61,7 @@ export function StrategyAllocationPanel({ api }: { api: string }) {
   const [memberCaps, setMemberCaps] = useState<Record<string, number>>({});
   const [name, setName] = useState("低相关核心卫星组合");
   const [dataset, setDataset] = useState("");
-  const [capital, setCapital] = useState(5_000_000);
+  const [capital, setCapital] = useState(100_000);
   const [method, setMethod] = useState("risk_parity");
   const [lookback, setLookback] = useState(252);
   const [targetVolatility, setTargetVolatility] = useState(0.15);
@@ -114,6 +114,10 @@ export function StrategyAllocationPanel({ api }: { api: string }) {
   async function create(event: FormEvent) {
     event.preventDefault();
     const ids = Object.entries(selectedVersions).filter(([, value]) => value).map(([id]) => id);
+    if (!Number.isFinite(capital) || capital <= 0) {
+      setMessage("总资金必须大于 0；系统没有 50 万元起步限制。");
+      return;
+    }
     if (!(maxMemberDrawdown < maxDrawdownReduce && maxDrawdownReduce < maxDrawdownLiquidate)) {
       setMessage("回撤阈值必须依次递增：成员熔断 < 组合减仓 < 组合清仓。");
       return;
@@ -252,7 +256,7 @@ export function StrategyAllocationPanel({ api }: { api: string }) {
         <label>主组合名称<input value={name} onChange={(event) => setName(event.target.value)} /></label>
         <label>Qlib 快照<select value={dataset} onChange={(event) => setDataset(event.target.value)}>{datasets.map((item) => <option key={item.name} value={item.name}>{item.name} · 截至 {item.end_date}</option>)}</select></label>
         <label>分配方法<select value={method} onChange={(event) => setMethod(event.target.value)}><option value="risk_parity">风险平价</option><option value="inverse_volatility">逆波动率</option><option value="fixed">固定等权</option></select></label>
-        <label>总资金<input type="number" min="500000" step="100000" value={capital} onChange={(event) => setCapital(Number(event.target.value))} /></label>
+        <label>总资金<input type="number" min="0.01" step="0.01" value={capital} onChange={(event) => setCapital(Number(event.target.value))} /><small>没有 50 万元硬门槛；不足整手时保留现金并解释。</small></label>
         <label>回看交易日<input type="number" min="60" value={lookback} onChange={(event) => setLookback(Number(event.target.value))} /></label>
         <div className="risk-grid">
           <label>目标年化波动率（%）<input type="number" min="0.1" max="50" step="0.5" value={targetVolatility * 100} onChange={(event) => setTargetVolatility(Number(event.target.value) / 100)} /></label>
@@ -289,7 +293,7 @@ export function StrategyAllocationPanel({ api }: { api: string }) {
             </div>}
           </div>;
         })}</div>
-        <button className="primary" disabled={selectedCount < 2 || selectedCoreCount < 1 || !dataset || !validDrawdownThresholds}>计算风险预算并创建草案</button>
+        <button className="primary" disabled={selectedCount < 2 || selectedCoreCount < 1 || !dataset || !validDrawdownThresholds || !Number.isFinite(capital) || capital <= 0}>计算风险预算并创建草案</button>
       </form>
       <article className="portfolio-summary">
         <label>当前主组合<select value={selected?.id ?? ""} onChange={(event) => setSelectedId(event.target.value)}>{allocations.length ? allocations.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.status}</option>) : <option value="">尚无主组合</option>}</select></label>

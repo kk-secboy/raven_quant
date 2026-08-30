@@ -37,6 +37,15 @@ RUNTIME_ALIGNMENT_SOURCE_RUNTIME_BUNDLE_SHA256 = (
 RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256 = (
     "eea7ca8854acbed0370ead8d97fdfdb128059f41d8a5995a5050b7ec9e9f3a34"
 )
+RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION = (
+    "qlib-rdagent-single-mainline-2026-08-30-v11"
+)
+RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256 = (
+    "64fa634b4e774279356c5655e70c741890ed9b208ccf75df757a378c0f56a432"
+)
+RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256 = (
+    "687ad83efd9d734a238bd6b52b3f5e670cec1e5d165ec2b25cabcef724feb7cf"
+)
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"
 TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD = "target_runtime_bundle_sha256"
@@ -54,6 +63,7 @@ _TARGET_RUNNERS = {
     ),
     CANONICAL_LF_TARGET_RECIPE_VERSION: CANONICAL_LF_TARGET_RUNNER_SHA256,
     RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION: RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256,
+    RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION: RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256,
 }
 
 
@@ -66,7 +76,7 @@ def _file_sha256(path: Path) -> str:
 
 
 def runtime_alignment_bundle_sha256(project_root: Path) -> str:
-    """Hash every executable module changed by the governed v10 repair."""
+    """Hash every executable module governed by the v10+ runtime receipts."""
 
     inventory = []
     for relative in RUNTIME_ALIGNMENT_RUNTIME_PATHS:
@@ -99,6 +109,8 @@ def target_runtime_bundle_for_recipe(recipe_id: Any, recipe_version: Any) -> str
         return None
     if str(recipe_version or "") == RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION:
         return RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256
+    if str(recipe_version or "") == RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION:
+        return RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256
     return None
 
 
@@ -140,6 +152,7 @@ def require_transparent_baseline_runner(
         OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION: "v8",
         CANONICAL_LF_TARGET_RECIPE_VERSION: "v9",
         RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION: "v10",
+        RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION: "v11",
     }[str(config.get("recipe_version") or "")]
     if bootstrap_value != expected or payload_value != expected:
         raise ValueError(
@@ -163,13 +176,20 @@ def require_transparent_baseline_runner(
         raise ValueError(
             f"transparent {version_label} runner bytes differ from the repair authorization"
         )
-    if version_label == "v10":
+    if version_label in {"v10", "v11"}:
         try:
             bundle_sha256 = runtime_alignment_bundle_sha256(runner_path.parents[1])
         except OSError as exc:
-            raise ValueError("transparent v10 runtime bundle cannot be verified") from exc
-        if bundle_sha256 != RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256:
             raise ValueError(
-                "transparent v10 runtime bundle differs from the repair authorization"
+                f"transparent {version_label} runtime bundle cannot be verified"
+            ) from exc
+        expected_bundle_sha256 = {
+            "v10": RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v11": RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256,
+        }[version_label]
+        if bundle_sha256 != expected_bundle_sha256:
+            raise ValueError(
+                f"transparent {version_label} runtime bundle differs from the repair "
+                "authorization"
             )
     return observed

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,87 @@ from scripts.materialize_factor_library import (
 )
 
 pytestmark = pytest.mark.no_database
+
+
+def test_current_challenger_binding_covers_signal_date_before_d_plus_one(
+    tmp_path: Path,
+) -> None:
+    signal_date = pd.Timestamp("2026-08-28").date()
+    identity = "a" * 64
+    feature_set = {
+        "id": "strategy-health:version-a",
+        "definition_sha256": "b" * 64,
+        "factor_contract": {
+            "sources": {
+                "factor-live": {
+                    "source": "governed_factor_definition",
+                    "factor_candidate_id": "candidate-a",
+                }
+            }
+        },
+    }
+    factor_path = tmp_path / "recent" / "factor-live.parquet"
+    factor_path.parent.mkdir()
+    index = pd.MultiIndex.from_product(
+        [[pd.Timestamp(signal_date)], [f"SH{600000 + offset:06d}" for offset in range(50)]],
+        names=["datetime", "instrument"],
+    )
+    pd.DataFrame({"score": np.linspace(-1.0, 1.0, len(index))}, index=index).to_parquet(
+        factor_path
+    )
+    digest = hashlib.sha256(factor_path.read_bytes()).hexdigest()
+    manifest = {
+        "requested_end": signal_date.isoformat(),
+        "materialized_end": signal_date.isoformat(),
+        "completed": {
+            "factor-live": {
+                "recent_relative_path": "recent/factor-live.parquet",
+                "recent_sha256": digest,
+            }
+        },
+    }
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def execute(_statement):
+            return SimpleNamespace(
+                first=lambda: SimpleNamespace(config_json={"min_daily_instruments": 50})
+            )
+
+    source = StrategyFeatureDriftSource.__new__(StrategyFeatureDriftSource)
+    source.data_root = tmp_path.resolve()
+    source.engine = SimpleNamespace(connect=lambda: Connection())
+    source.feature_set = lambda _version_id: feature_set
+    source._current_materialization = lambda **_kwargs: {
+        "root": tmp_path,
+        "manifest": manifest,
+        "manifest_sha256": "c" * 64,
+    }
+
+    binding = source.current_challenger_artifact_binding(
+        "version-a",
+        current_dataset_identity_sha256=identity,
+        signal_date=signal_date,
+    )
+    assert binding is not None
+    assert binding["dataset_identity_sha256"] == identity
+    assert binding["signal_date"] == signal_date.isoformat()
+    assert binding["factors"][0]["artifact_path"] == str(factor_path)
+    assert binding["factors"][0]["finite_instruments"] == 50
+
+    manifest["materialized_end"] = "2026-08-27"
+    with pytest.raises(ValueError, match="current signal date"):
+        source.current_challenger_artifact_binding(
+            "version-a",
+            current_dataset_identity_sha256=identity,
+            signal_date=signal_date,
+        )
 
 
 def test_strategy_health_query_uses_last_64_calendar_sessions(tmp_path: Path) -> None:

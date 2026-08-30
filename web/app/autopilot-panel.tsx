@@ -63,6 +63,13 @@ type AdviceEvidence = {
   passed: boolean;
   reasons?: string[];
   checks?: Record<string, EvidenceCheck>;
+  maturity?: {
+    status: "mature" | "accumulating";
+    label: string;
+    passed: boolean;
+    recommendation_blocking: false;
+    checks: Record<string, EvidenceCheck>;
+  };
 };
 type AdviceSignal = {
   instrument: string;
@@ -81,6 +88,8 @@ type AdviceSignal = {
   risks?: string[];
   invalidation?: string[];
   evidence_state?: string;
+  cannot_buy_reasons?: string[];
+  execution_constraints?: Record<string, unknown>;
 };
 type AdviceCard = {
   horizon: "short_1_5d" | "swing_1_6m" | "long_1_3y";
@@ -248,12 +257,20 @@ function EvidenceSummary({ evidence }: { evidence: AdviceEvidence }) {
         {EVIDENCE_LABELS[name]} {Number(check.observed).toLocaleString("zh-CN")}/{Number(check.threshold).toLocaleString("zh-CN")}
       </span>)}
     </div> : <small>{evidence.reasons?.[0] ?? "等待策略进入隔离模拟盘后开始累计。"}</small>}
+    {evidence.maturity ? <small className={evidence.maturity.passed ? "maturity mature" : "maturity"}>
+      {evidence.maturity.label} · 仅表示真实前向运行资历，不阻断已通过12个月门槛的长线推荐
+    </small> : null}
   </div>;
 }
 
 function SignalRow({ signal, simulationOnly }: { signal: AdviceSignal; simulationOnly: boolean }) {
   const accountAction = signal.account_action ?? signal.action;
+  const displayedAction = simulationOnly ? signal.action : accountAction;
   const executionWaiting = signal.execution_state === "WAIT" || signal.execution_state === "BLOCKED";
+  const constraintAction = accountAction === "NO_ACTION" ? signal.action : accountAction;
+  const constraintHeading = ["REDUCE", "EXIT"].includes(constraintAction)
+    ? "为什么现在不能卖"
+    : "为什么现在不能买";
   const tradeQuantityLabel = executionWaiting
     ? "账户当前不可执行"
     : accountAction === "BUY" || accountAction === "ADD"
@@ -265,7 +282,7 @@ function SignalRow({ signal, simulationOnly }: { signal: AdviceSignal; simulatio
     <div className="novice-signal-main">
       <div>
         <code>{signal.instrument}</code>
-        <span className={`novice-action action-${signal.action.toLowerCase()}`}>{simulationOnly ? "模拟" : ""}{ACTION_LABELS[signal.action]}</span>
+        <span className={`novice-action action-${displayedAction.toLowerCase()}`}>{simulationOnly ? "模拟" : ""}{ACTION_LABELS[displayedAction]}</span>
       </div>
       <strong>{pct(signal.target_weight)}</strong>
       <small>目标仓位</small>
@@ -282,6 +299,10 @@ function SignalRow({ signal, simulationOnly }: { signal: AdviceSignal; simulatio
       <span><b>主要风险</b>{signal.risks?.[0] ?? "市场变化可能使信号失效"}</span>
       <span><b>失效条件</b>{signal.invalidation?.[0] ?? "策略规则或交易资格失效"}</span>
     </div>
+    {signal.cannot_buy_reasons?.length ? <div className="novice-cannot-buy">
+      <b>{constraintHeading}</b>
+      {signal.cannot_buy_reasons.map((reason) => <span key={reason}>{reason}</span>)}
+    </div> : null}
     {simulationOnly ? <div className="simulation-boundary">仅供隔离模拟验证，不是荐股，也不会进入统一账户。</div> : null}
   </article>;
 }
@@ -357,11 +378,15 @@ function UnifiedAccountCard({ account }: { account: UnifiedAccount }) {
       <span>执行日<strong>{account.decision_date ?? "尚未生成"}</strong></span>
     </div>
     {trades.length ? <div className="novice-account-trades">
-      {trades.slice(0, 8).map((trade, index) => <div key={`${recordText(trade, ["instrument"])}-${index}`}>
-        <code>{recordText(trade, ["instrument"])}</code>
-        <strong>{recordText(trade, ["action", "side"], "调仓")}</strong>
-        <span>{recordText(trade, ["trade_quantity", "quantity", "delta_quantity", "target_weight"], "等待整手换算")}</span>
-      </div>)}
+      {trades.slice(0, 8).map((trade, index) => {
+        const action = recordText(trade, ["action", "side"], "REBALANCE").toUpperCase();
+        const quantity = recordText(trade, ["trade_quantity", "quantity", "delta_quantity"], "0");
+        return <div key={`${recordText(trade, ["instrument"])}-${index}`}>
+          <code>{recordText(trade, ["instrument"])}</code>
+          <strong>{ACTION_LABELS[action] ?? action}</strong>
+          <span>{quantity} 股</span>
+        </div>;
+      })}
     </div> : targets.length ? <div className="novice-account-trades">
       {targets.slice(0, 8).map((target, index) => <div key={`${recordText(target, ["instrument"])}-${index}`}>
         <code>{recordText(target, ["instrument"])}</code><strong>目标</strong><span>{recordText(target, ["target_weight", "weight", "target_position_quantity"])}</span>

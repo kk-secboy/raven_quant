@@ -50,8 +50,16 @@ from quant_platform.strategy_backtest import (
 )
 from quant_platform.strategy_rule_runtime import (
     apply_strategy_rule_alpha_weights,
+    build_portfolio_policy_runtime_metadata,
     build_strategy_rule_runtime_metadata,
+    load_market_trend_close_history,
     required_rule_history_sessions,
+)
+from quant_platform.strategy_rule_runtime import (
+    latest_governed_style_cross_section as _latest_style_cross_section,
+)
+from quant_platform.strategy_rule_runtime import (
+    load_governed_style_exposures as _load_governed_style_exposures,
 )
 
 _COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS = frozenset(
@@ -89,6 +97,48 @@ def _portfolio_return_covariance(
     if len(risk_returns) < 60:
         raise ValueError("recommendation optimizer requires 60 complete return observations")
     return estimate_covariance(risk_returns)
+
+
+def _market_trend_close_history(
+    data_api: Any,
+    *,
+    strategy_config: dict[str, Any],
+    start_time: str,
+    end_time: str,
+) -> pd.DataFrame | None:
+    return load_market_trend_close_history(
+        data_api,
+        config=strategy_config,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+
+def _recommendation_rule_runtime_metadata(
+    data_api: Any,
+    *,
+    config: dict[str, Any],
+    instruments: pd.Index,
+    close_history: pd.DataFrame,
+    value_exposures: pd.Series | None,
+    start_time: str,
+    end_time: str,
+) -> dict[str, Any]:
+    """Build recommendation rules with the same bound benchmark as backtests."""
+
+    benchmark_close_history = _market_trend_close_history(
+        data_api,
+        strategy_config=config,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    return build_strategy_rule_runtime_metadata(
+        config,
+        instruments=instruments,
+        close_history=close_history,
+        benchmark_close_history=benchmark_close_history,
+        value_exposures=value_exposures,
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -412,26 +462,6 @@ def _latest(frame: pd.DataFrame, when: pd.Timestamp, column: str) -> pd.Series:
     return result.astype(float)
 
 
-def _latest_styles(frame: pd.DataFrame, when: pd.Timestamp) -> pd.DataFrame:
-    values = frame.copy()
-    values["datetime"] = pd.to_datetime(values["datetime"], errors="coerce")
-    values = values[values["datetime"] <= when]
-    if values.empty:
-        raise ValueError(f"style metadata has no snapshot at {when.date()}")
-    values = values[values["datetime"] == values["datetime"].max()]
-    result = values.set_index(values["instrument"].astype(str)).drop(
-        columns=["datetime", "instrument"]
-    )
-    result = result.apply(pd.to_numeric, errors="coerce")
-    if (
-        result.index.has_duplicates
-        or result.isna().any().any()
-        or not np.isfinite(result.to_numpy(dtype=float)).all()
-    ):
-        raise ValueError("style metadata snapshot is incomplete")
-    return result.astype(float)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-uri", required=True)
@@ -596,26 +626,22 @@ def main() -> None:
     point_metadata = execution_metadata.xs(market_as_of, level="datetime")
     metadata_root = Path(args.provider_uri) / "metadata"
     memberships = pd.read_parquet(metadata_root / "industry_memberships.parquet")
+    constrained = (
+        str(config.get("portfolio_construction") or "")
+        in _COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS
+    )
     if config.get("portfolio_construction") == "industry_neutral_qp":
         benchmark_frame = pd.read_parquet(metadata_root / "full_market_weights.parquet")
-    else:
+    elif constrained:
         benchmark_frame = pd.read_parquet(metadata_root / "benchmark_weights.parquet")
         benchmark_frame = benchmark_frame[
             benchmark_frame["benchmark"] == manifest["benchmark"]
         ].drop(columns=["benchmark"])
-    style_fields = {
-        "Log($total_mv)": "size",
-        "1/$pb": "value",
-        "($fund_quarter_revenue_yoy+$fund_op_profit_yoy)/2": "growth",
-        "Std($close/Ref($close, 1)-1, 60)": "volatility",
-    }
-    styles_frame = D.features(
-        instruments,
-        list(style_fields),
-        start_time=lookback,
-        end_time=as_of.date().isoformat(),
-        freq="day",
-    ).rename(columns=style_fields).reset_index()
+    else:
+        benchmark_frame = None
+    styles_frame, style_exposure_evidence = _load_governed_style_exposures(
+        args.provider_uri
+    )
     eligibility_frame = pd.read_parquet(metadata_root / "eligibility_matrix.parquet")
     eligibility_evidence = eligibility_statistics(eligibility_frame)
     if config.get("require_regulatory_events") and not eligibility_evidence[
@@ -655,23 +681,42 @@ def main() -> None:
         .drop_duplicates("instrument", keep="last")
     )
     industries = active.set_index(active["instrument"].astype(str))["industry"].astype(str)
-    benchmark = _latest(filter_available("index_weight", benchmark_frame, as_of), as_of, "weight")
-    styles = _latest_styles(styles_frame, as_of)
-    benchmark_industries = industries.reindex(benchmark.index)
-    if benchmark_industries.isna().any() or styles.reindex(benchmark.index).isna().any().any():
-        raise ValueError("benchmark metadata is incomplete")
+    benchmark = (
+        _latest(
+            filter_available("index_weight", benchmark_frame, as_of),
+            as_of,
+            "weight",
+        )
+        if constrained and benchmark_frame is not None
+        else None
+    )
     previous = {
         item["instrument"]: item["weight"] for item in manifest.get("previous_holdings", [])
     }
-    risk_instruments = (
-        signal.index.astype(str)
-        .union(benchmark.index.astype(str))
-        .union(pd.Index(previous, dtype=str))
+    required_instruments = signal.index.astype(str).union(
+        pd.Index(previous, dtype=str)
     )
+    raw_styles = _latest_style_cross_section(
+        styles_frame, as_of, preserve_missing=True
+    )
+    styles = (
+        _latest_style_cross_section(styles_frame, as_of) if constrained else None
+    )
+    risk_instruments = required_instruments
+    if constrained and benchmark is not None:
+        risk_instruments = risk_instruments.union(benchmark.index.astype(str))
     return_covariance = _portfolio_return_covariance(
         config,
         close_history,
         risk_instruments,
+    )
+    portfolio_metadata = build_portfolio_policy_runtime_metadata(
+        config,
+        instruments=required_instruments,
+        industries=industries,
+        benchmark_weights=benchmark,
+        style_exposures=styles,
+        return_covariance=return_covariance,
     )
     cost_model = CostModelConfig.from_mapping(config)
     policy = PortfolioPolicy(policy_config, cost_model)
@@ -691,12 +736,16 @@ def main() -> None:
         rebalance_due = True
     construction_notional = float(manifest["construction_notional"])
     previous_position_state = dict(previous_snapshot.get("position_state") or {})
-    runtime_rule_metadata = build_strategy_rule_runtime_metadata(
-        config,
-        instruments=signal.index,
+    runtime_rule_metadata = _recommendation_rule_runtime_metadata(
+        D,
+        config=config,
+        instruments=required_instruments,
         close_history=close_history.loc[:market_as_of],
-        benchmark_weights=benchmark,
-        value_exposures=(styles["value"] if "value" in styles.columns else None),
+        value_exposures=(
+            raw_styles["value"] if "value" in raw_styles.columns else None
+        ),
+        start_time=lookback,
+        end_time=as_of.date().isoformat(),
     )
     previous_holding_rows = {
         str(item["instrument"]): item
@@ -715,14 +764,7 @@ def main() -> None:
     decision = policy.decide(
         signal,
         previous,
-        industries=industries,
-        benchmark_weights=benchmark,
-        benchmark_industry_weights=benchmark.groupby(benchmark_industries).sum(),
-        style_exposures=styles,
-        benchmark_style_exposure=styles.reindex(benchmark.index).mul(
-            benchmark, axis=0
-        ).sum(),
-        return_covariance=return_covariance,
+        **portfolio_metadata,
         prices=pd.to_numeric(point_metadata["$open"], errors="coerce"),
         current_prices=pd.to_numeric(point_metadata["$close"], errors="coerce"),
         cost_basis=cost_basis,
@@ -786,6 +828,7 @@ def main() -> None:
             "member_risk_state": dict(manifest.get("member_risk_state") or {}),
             "account_risk_state": dict(manifest.get("account_risk_state") or {}),
             "eligibility": eligibility_evidence,
+            "style_exposure_contract": style_exposure_evidence,
         },
         "reasons": decision.reasons,
         "cash_weight": max(0.0, 1.0 - sum(decision.target_weights.values())),

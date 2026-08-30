@@ -130,7 +130,10 @@ def test_forward_gate_minima_are_horizon_specific_not_calendar_day_proxies() -> 
         long.min_forward_trading_days,
         long.min_review_events,
         long.min_financial_report_reviews,
-    ) == (756, 36, 12)
+    ) == (252, 12, 4)
+    # The live recommendation gate does not shorten the historically sealed
+    # strategy OOS evidence.
+    assert research_horizon_contract(LONG_1_3Y).sealed_oos_sessions == 756
 
 
 def test_closed_round_trips_require_a_prior_buy_and_full_exit() -> None:

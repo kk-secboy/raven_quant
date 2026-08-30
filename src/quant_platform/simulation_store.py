@@ -118,6 +118,9 @@ LEDGER_INTEGRITY_ERROR_MARKERS = (
 )
 
 ALLOCATION_SOURCE_REBIND_VERSION = "simulation-allocation-source-rebind-v1"
+ACCOUNT_ORDER_DECISION_VERSION = "simulation-account-order-decision-v1"
+ACCOUNT_ORDER_DECISION_EVENT_TYPE = "account_order_plan_decision_only"
+ACCOUNT_DECISION_VALUATION_VERSION = "simulation-account-decision-valuation-v1"
 
 
 def _now() -> datetime:
@@ -388,6 +391,146 @@ def _canonical_hash(payload: dict[str, Any]) -> str:
 def _is_sha256(value: Any) -> bool:
     text = str(value or "").lower()
     return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+def build_account_order_decision_event(
+    *,
+    portfolio_id: str,
+    account_netting_plan_id: str,
+    target_version: str,
+    actor: str,
+    signal_date: date,
+    trade_date: date,
+    actions: list[dict[str, Any]],
+    limit_prices: dict[str, float] | None = None,
+    not_before: datetime | None = None,
+    not_after: datetime | None = None,
+) -> dict[str, Any]:
+    """Seal an account decision that creates no new order-plan operations.
+
+    A cash-only target, a target below the exchange minimum lot, a permission
+    veto, or an already-satisfied HOLD is still a real account decision.  It is
+    persisted separately from :func:`create_order_plan_batch` so an empty
+    decision can never be mistaken for an executable batch or fake order.
+    """
+
+    identifiers = {
+        "portfolio_id": str(portfolio_id).strip(),
+        "account_netting_plan_id": str(account_netting_plan_id).strip(),
+        "target_version": str(target_version).strip(),
+        "actor": str(actor).strip(),
+    }
+    if any(not value for value in identifiers.values()):
+        raise ValueError("account order decision identifiers are required")
+    if not isinstance(signal_date, date) or not isinstance(trade_date, date):
+        raise ValueError("account order decision dates are required")
+    if signal_date > trade_date:
+        raise ValueError("account order decision signal date follows trade date")
+    if not isinstance(actions, list) or any(not isinstance(item, dict) for item in actions):
+        raise ValueError("account order decision actions must be a list of objects")
+    for action in actions:
+        order_plan = action.get("order_plan")
+        if not isinstance(order_plan, list):
+            raise ValueError("account order decision actions require order_plan lists")
+        if order_plan:
+            raise ValueError("decision-only evidence cannot contain order operations")
+        if str(action.get("action") or "").upper() not in {
+            "BUY",
+            "SELL",
+            "EXIT",
+            "HOLD",
+            "NO_ACTION",
+        }:
+            raise ValueError("decision-only evidence contains an unknown account action")
+    prices = {
+        str(key).upper(): float(value) for key, value in (limit_prices or {}).items()
+    }
+    if any(not isfinite(value) or value <= 0 for value in prices.values()):
+        raise ValueError("account order decision prices must be positive and finite")
+    payload = {
+        "contract_version": ACCOUNT_ORDER_DECISION_VERSION,
+        **identifiers,
+        "signal_date": signal_date.isoformat(),
+        "trade_date": trade_date.isoformat(),
+        "actions": actions,
+        "limit_prices": prices,
+        "not_before": not_before.isoformat() if not_before else None,
+        "not_after": not_after.isoformat() if not_after else None,
+        "decision_outcome": "no_new_order_plan_operations",
+        "execution_order_plan_batch_created": False,
+        "simulation_orders_created": 0,
+        "prior_plan_continuation_allowed": any(
+            "no_valid_target_previous_retained" in list(action.get("notes") or [])
+            for action in actions
+        ),
+        "valuation_replay_required": True,
+    }
+    return {**payload, "event_sha256": _canonical_hash(payload)}
+
+
+def validate_account_order_decision_event(
+    value: dict[str, Any],
+    *,
+    portfolio_id: str,
+    account_netting_plan_id: str,
+) -> dict[str, Any]:
+    """Validate decision-only evidence before Advice treats it as authoritative."""
+
+    if not isinstance(value, dict):
+        raise ValueError("account order decision evidence must be an object")
+    payload = dict(value)
+    event_sha256 = str(payload.pop("event_sha256", "")).lower()
+    if not _is_sha256(event_sha256) or event_sha256 != _canonical_hash(payload):
+        raise ValueError("account order decision evidence seal is invalid")
+    try:
+        signal_date = date.fromisoformat(str(payload.get("signal_date") or ""))
+        trade_date = date.fromisoformat(str(payload.get("trade_date") or ""))
+    except ValueError as exc:
+        raise ValueError("account order decision evidence dates are invalid") from exc
+    if (
+        payload.get("contract_version") != ACCOUNT_ORDER_DECISION_VERSION
+        or str(payload.get("portfolio_id") or "") != str(portfolio_id)
+        or str(payload.get("account_netting_plan_id") or "")
+        != str(account_netting_plan_id)
+        or not str(payload.get("target_version") or "").strip()
+        or not str(payload.get("actor") or "").strip()
+        or signal_date > trade_date
+        or payload.get("decision_outcome") != "no_new_order_plan_operations"
+        or payload.get("execution_order_plan_batch_created") is not False
+        or payload.get("simulation_orders_created") != 0
+        or not isinstance(payload.get("prior_plan_continuation_allowed"), bool)
+        or payload.get("valuation_replay_required") is not True
+    ):
+        raise ValueError("account order decision evidence identity is invalid")
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        raise ValueError("account order decision evidence actions are invalid")
+    expected_prior_continuation = False
+    for action in actions:
+        if (
+            not isinstance(action, dict)
+            or action.get("order_plan") != []
+            or str(action.get("action") or "").upper()
+            not in {"BUY", "SELL", "EXIT", "HOLD", "NO_ACTION"}
+        ):
+            raise ValueError("account order decision evidence contains order operations")
+        expected_prior_continuation = expected_prior_continuation or (
+            "no_valid_target_previous_retained"
+            in list(action.get("notes") or [])
+        )
+    if (
+        payload.get("prior_plan_continuation_allowed")
+        is not expected_prior_continuation
+    ):
+        raise ValueError(
+            "account order decision continuation authority is inconsistent"
+        )
+    prices = payload.get("limit_prices")
+    if not isinstance(prices, dict) or any(
+        not isfinite(float(value)) or float(value) <= 0 for value in prices.values()
+    ):
+        raise ValueError("account order decision evidence prices are invalid")
+    return {**payload, "event_sha256": event_sha256}
 
 
 def build_settlement_calendar_evidence(
@@ -4257,6 +4400,469 @@ class SimulationStore:
                 return self._batch_dict(existing), False
         return self.get_batch(batch_id), True
 
+    def record_account_order_plan_decision(
+        self,
+        portfolio_id: str,
+        *,
+        trade_date: date,
+        actions: list[dict[str, Any]],
+        target_version: str,
+        actor: str,
+        account_netting_plan_id: str,
+        limit_prices: dict[str, float] | None = None,
+        not_before: datetime | None = None,
+        not_after: datetime | None = None,
+        signal_date: date | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist an intentional zero-order account decision.
+
+        This is deliberately not a ``simulation_batch``.  It cannot cancel,
+        replace, create, reserve, or execute an order; it only seals why the
+        exact account-netting plan resulted in HOLD/NO_ACTION.  Locking the
+        primary ledger makes one plan id bind to exactly one decision even
+        when scheduler replicas or restarts race.
+        """
+
+        self.safe_mode.assert_inactive(action="simulation decision-only plan creation")
+        normalized_signal_date = signal_date or trade_date
+        event = build_account_order_decision_event(
+            portfolio_id=portfolio_id,
+            account_netting_plan_id=account_netting_plan_id,
+            target_version=target_version,
+            actor=actor,
+            signal_date=normalized_signal_date,
+            trade_date=trade_date,
+            actions=actions,
+            limit_prices=limit_prices,
+            not_before=not_before,
+            not_after=not_after,
+        )
+        now = _now()
+        with self.engine.begin() as connection:
+            portfolio = connection.execute(
+                select(simulation_portfolios)
+                .where(simulation_portfolios.c.id == portfolio_id)
+                .with_for_update()
+            ).first()
+            if portfolio is None:
+                raise KeyError(portfolio_id)
+            if portfolio.status != "active":
+                raise ValueError("simulation portfolio is not active")
+            self._require_current_source_contract(connection, portfolio)
+            if str(portfolio.execution_adapter) != "long_only":
+                raise ValueError("decision-only account plans require the long_only adapter")
+            plan_row = connection.execute(
+                select(account_netting_plans).where(
+                    account_netting_plans.c.id == account_netting_plan_id
+                )
+            ).first()
+            if plan_row is None:
+                raise KeyError(account_netting_plan_id)
+            if str(portfolio.source_type) != "allocation" or str(
+                portfolio.source_id
+            ) != str(plan_row.account_id):
+                raise ValueError(
+                    "account netting plan does not match the simulation account"
+                )
+            primary_evidence = dict(
+                dict(plan_row.plan_json or {}).get("input_evidence") or {}
+            ).get("primary_account")
+            if primary_evidence is not None:
+                if not isinstance(primary_evidence, dict):
+                    raise ValueError("account netting primary-capital evidence is invalid")
+                expected_nav = float(primary_evidence.get("nav") or 0.0)
+                if (
+                    str(primary_evidence.get("portfolio_id") or "")
+                    != str(portfolio.id)
+                    or str(primary_evidence.get("source_id") or "")
+                    != str(portfolio.source_id)
+                    or not isfinite(expected_nav)
+                    or expected_nav <= 0
+                    or abs(expected_nav - float(portfolio.nav)) > 1e-6
+                ):
+                    raise ValueError(
+                        "account NAV changed after netting; rebuild the order plan"
+                    )
+            existing_batch = connection.execute(
+                select(simulation_batches).where(
+                    simulation_batches.c.portfolio_id == portfolio.id,
+                    simulation_batches.c.account_netting_plan_id
+                    == account_netting_plan_id,
+                )
+            ).first()
+            if existing_batch is not None:
+                raise ValueError(
+                    "account netting plan is already bound to an execution batch"
+                )
+            existing_rows = connection.execute(
+                select(simulation_events).where(
+                    simulation_events.c.portfolio_id == portfolio.id,
+                    simulation_events.c.event_type
+                    == ACCOUNT_ORDER_DECISION_EVENT_TYPE,
+                )
+            ).all()
+            for row in existing_rows:
+                details = dict(row.details_json or {})
+                if str(details.get("account_netting_plan_id") or "") != str(
+                    account_netting_plan_id
+                ):
+                    continue
+                existing = validate_account_order_decision_event(
+                    details,
+                    portfolio_id=str(portfolio.id),
+                    account_netting_plan_id=account_netting_plan_id,
+                )
+                if existing != event or str(row.id) != event["event_sha256"]:
+                    raise ValueError(
+                        "account netting plan is already bound to a different "
+                        "decision-only record"
+                    )
+                return existing, False
+            inserted_id = connection.scalar(
+                pg_insert(simulation_events)
+                .values(
+                    id=event["event_sha256"],
+                    portfolio_id=portfolio.id,
+                    batch_id=None,
+                    trade_date=trade_date,
+                    severity="info",
+                    event_type=ACCOUNT_ORDER_DECISION_EVENT_TYPE,
+                    instrument=None,
+                    reason="account_netting_plan_created_no_new_order_operations",
+                    details_json=event,
+                    created_at=now,
+                )
+                .on_conflict_do_nothing(index_elements=[simulation_events.c.id])
+                .returning(simulation_events.c.id)
+            )
+            if inserted_id is None:
+                stored = connection.execute(
+                    select(simulation_events).where(
+                        simulation_events.c.id == event["event_sha256"]
+                    )
+                ).first()
+                if (
+                    stored is None
+                    or str(stored.portfolio_id) != str(portfolio.id)
+                    or str(stored.event_type) != ACCOUNT_ORDER_DECISION_EVENT_TYPE
+                    or dict(stored.details_json or {}) != event
+                ):
+                    raise ValueError("account order decision event identity was reused")
+                return event, False
+        return event, True
+
+    def get_account_order_plan_decision(
+        self,
+        portfolio_id: str,
+        *,
+        account_netting_plan_id: str,
+    ) -> dict[str, Any] | None:
+        """Read one exact decision-only record for an exact primary ledger."""
+
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(simulation_events)
+                .where(
+                    simulation_events.c.portfolio_id == portfolio_id,
+                    simulation_events.c.event_type
+                    == ACCOUNT_ORDER_DECISION_EVENT_TYPE,
+                )
+                .order_by(
+                    simulation_events.c.trade_date.desc(),
+                    simulation_events.c.created_at.desc(),
+                )
+            ).all()
+        matches: list[tuple[Any, dict[str, Any]]] = []
+        for row in rows:
+            details = dict(row.details_json or {})
+            if str(details.get("account_netting_plan_id") or "") != str(
+                account_netting_plan_id
+            ):
+                continue
+            validated = validate_account_order_decision_event(
+                details,
+                portfolio_id=portfolio_id,
+                account_netting_plan_id=account_netting_plan_id,
+            )
+            if (
+                str(row.id) != validated["event_sha256"]
+                or row.batch_id is not None
+                or row.trade_date.isoformat() != validated["trade_date"]
+            ):
+                raise ValueError("account order decision database binding is invalid")
+            matches.append((row, validated))
+        if len(matches) > 1:
+            raise ValueError("account netting plan has multiple decision-only records")
+        if not matches:
+            return None
+        row, decision = matches[0]
+        return {
+            "id": str(row.id),
+            "portfolio_id": str(row.portfolio_id),
+            "trade_date": row.trade_date.isoformat(),
+            "event_type": str(row.event_type),
+            "decision": decision,
+        }
+
+    def create_account_decision_valuation_batch(
+        self,
+        portfolio_id: str,
+        *,
+        decision_event_sha256: str,
+        actor: str,
+        data_root: Path,
+    ) -> tuple[dict[str, Any], bool]:
+        """Queue a zero-order daily mark for one sealed decision-only event.
+
+        The batch has no ``account_netting_plan_id`` and creates no new order.
+        It runs the existing corporate-action, closing-price, NAV, benchmark,
+        and reconciliation engine on a HOLD/NO_ACTION day.  When NO_ACTION
+        explicitly retains a previously frozen target, the normal engine may
+        continue that already-authorized open order; the decision event still
+        remains the only object bound to the new netting plan.
+        """
+
+        self.safe_mode.assert_inactive(action="simulation decision valuation")
+        responsible = str(actor).strip()
+        event_sha256 = str(decision_event_sha256).strip().lower()
+        if len(responsible) < 2:
+            raise ValueError("simulation decision valuation actor is required")
+        if not _is_sha256(event_sha256):
+            raise ValueError("simulation decision valuation event identity is invalid")
+        if data_root is None:
+            raise ValueError("simulation decision valuation requires governed datasets")
+        now = _now()
+        with self.engine.begin() as connection:
+            portfolio = connection.execute(
+                select(simulation_portfolios)
+                .where(simulation_portfolios.c.id == portfolio_id)
+                .with_for_update()
+            ).first()
+            if portfolio is None:
+                raise KeyError(portfolio_id)
+            if portfolio.status != "active":
+                raise ValueError("simulation portfolio is not active")
+            self._require_current_source_contract(connection, portfolio)
+            if (
+                str(portfolio.execution_adapter) != "long_only"
+                or str(portfolio.execution_frequency) != "day"
+            ):
+                raise ValueError(
+                    "decision-only valuation requires a daily long_only account"
+                )
+            event_row = connection.execute(
+                select(simulation_events).where(
+                    simulation_events.c.id == event_sha256,
+                    simulation_events.c.portfolio_id == portfolio.id,
+                    simulation_events.c.event_type
+                    == ACCOUNT_ORDER_DECISION_EVENT_TYPE,
+                    simulation_events.c.batch_id.is_(None),
+                )
+            ).first()
+            if event_row is None:
+                raise KeyError(event_sha256)
+            event = dict(event_row.details_json or {})
+            plan_id = str(event.get("account_netting_plan_id") or "")
+            validate_account_order_decision_event(
+                event,
+                portfolio_id=str(portfolio.id),
+                account_netting_plan_id=plan_id,
+            )
+            existing_execution = connection.execute(
+                select(simulation_batches.c.id).where(
+                    simulation_batches.c.portfolio_id == portfolio.id,
+                    simulation_batches.c.account_netting_plan_id == plan_id,
+                )
+            ).first()
+            if existing_execution is not None:
+                raise ValueError(
+                    "decision-only valuation cannot coexist with an execution batch"
+                )
+            signal_date = date.fromisoformat(event["signal_date"])
+            trade_date = date.fromisoformat(event["trade_date"])
+            dataset_bindings = self._account_order_plan_dataset_bindings(
+                portfolio=portfolio,
+                signal_date=signal_date,
+                trade_date=trade_date,
+                data_root=Path(data_root),
+            )
+            from .services import list_qlib_datasets
+
+            datasets = {
+                str(item["name"]): item
+                for item in list_qlib_datasets(Path(data_root))
+            }
+            execution_dataset = datasets.get(dataset_bindings["execution_dataset"])
+            if execution_dataset is None:
+                raise ValueError(
+                    "decision-only valuation execution dataset is unavailable"
+                )
+            settlement_binding = build_settlement_calendar_binding(
+                execution_dataset,
+                trade_date=trade_date,
+            )
+            target_payload = {
+                "order_plan": {
+                    "plan_version": ORDER_PLAN_MODEL_VERSION,
+                    "target_version": str(event["target_version"]),
+                    "account_netting_plan_id": None,
+                    "actions": [],
+                    "decision_valuation_replay": True,
+                    "decision_event_sha256": event_sha256,
+                },
+                "decision_actions": list(event.get("actions") or []),
+                "governed_order_plan": {
+                    "format_version": ACCOUNT_DECISION_VALUATION_VERSION,
+                    "decision_event_sha256": event_sha256,
+                    "settlement_calendar_binding": settlement_binding,
+                },
+            }
+            idempotency_key = (
+                f"account-decision-valuation:{portfolio.id}:{event_sha256}"
+            )
+            existing = connection.execute(
+                select(simulation_batches).where(
+                    simulation_batches.c.idempotency_key == idempotency_key
+                )
+            ).first()
+            if existing is not None:
+                if (
+                    str(existing.portfolio_id) != str(portfolio.id)
+                    or existing.account_netting_plan_id is not None
+                    or str(existing.source_snapshot_id) != event_sha256
+                    or dict(existing.target_payload_json or {}) != target_payload
+                    or existing.signal_date != signal_date
+                    or existing.trade_date != trade_date
+                ):
+                    raise ValueError(
+                        "decision-only valuation identity is already bound differently"
+                    )
+                return self._batch_dict(existing), False
+            batch_id = uuid.uuid4().hex
+            connection.execute(
+                insert(simulation_batches).values(
+                    id=batch_id,
+                    portfolio_id=portfolio.id,
+                    recommendation_snapshot_id=None,
+                    source_snapshot_id=event_sha256,
+                    target_payload_json=target_payload,
+                    execution_adapter="long_only",
+                    execution_contract_hash=portfolio.execution_contract_hash,
+                    **dataset_bindings,
+                    simulation_semantics_sha256=self._batch_simulation_semantics_sha256(
+                        portfolio, dataset_bindings
+                    ),
+                    signal_date=signal_date,
+                    trade_date=trade_date,
+                    signal_at=None,
+                    execution_not_before=None,
+                    status="queued",
+                    idempotency_key=idempotency_key,
+                    account_netting_plan_id=None,
+                    created_by=responsible,
+                    created_at=now,
+                )
+            )
+        return self.get_batch(batch_id), True
+
+    @staticmethod
+    def _validate_account_decision_valuation_batch(
+        connection: Any,
+        *,
+        batch: Any,
+        target_payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Rebind valuation replay to its sealed decision at execution time."""
+
+        order_plan = target_payload.get("order_plan")
+        governed_plan = target_payload.get("governed_order_plan")
+        source_event_id = str(batch.source_snapshot_id or "")
+        event_row = None
+        if source_event_id:
+            event_row = connection.execute(
+                select(simulation_events).where(
+                    simulation_events.c.id == source_event_id
+                )
+            ).first()
+        valuation_marker_present = (
+            str(batch.idempotency_key or "").startswith(
+                "account-decision-valuation:"
+            )
+            or (
+                isinstance(order_plan, dict)
+                and "decision_valuation_replay" in order_plan
+            )
+            or (
+                isinstance(governed_plan, dict)
+                and governed_plan.get("format_version")
+                == ACCOUNT_DECISION_VALUATION_VERSION
+            )
+            or (
+                event_row is not None
+                and str(event_row.event_type) == ACCOUNT_ORDER_DECISION_EVENT_TYPE
+            )
+        )
+        if not valuation_marker_present:
+            return None
+        if (
+            event_row is None
+            or str(event_row.portfolio_id) != str(batch.portfolio_id)
+            or str(event_row.event_type) != ACCOUNT_ORDER_DECISION_EVENT_TYPE
+            or event_row.batch_id is not None
+        ):
+            raise ValueError(
+                "decision-only valuation source event binding is invalid"
+            )
+        event_payload = dict(event_row.details_json or {})
+        plan_id = str(event_payload.get("account_netting_plan_id") or "")
+        event = validate_account_order_decision_event(
+            event_payload,
+            portfolio_id=str(batch.portfolio_id),
+            account_netting_plan_id=plan_id,
+        )
+        expected_order_plan = {
+            "plan_version": ORDER_PLAN_MODEL_VERSION,
+            "target_version": str(event["target_version"]),
+            "account_netting_plan_id": None,
+            "actions": [],
+            "decision_valuation_replay": True,
+            "decision_event_sha256": source_event_id,
+        }
+        if not isinstance(governed_plan, dict):
+            raise ValueError(
+                "decision-only valuation governed replay binding is missing"
+            )
+        expected_governed_plan = {
+            "format_version": ACCOUNT_DECISION_VALUATION_VERSION,
+            "decision_event_sha256": source_event_id,
+            "settlement_calendar_binding": governed_plan.get(
+                "settlement_calendar_binding"
+            ),
+        }
+        expected_payload = {
+            "order_plan": expected_order_plan,
+            "decision_actions": list(event.get("actions") or []),
+            "governed_order_plan": expected_governed_plan,
+        }
+        expected_idempotency_key = (
+            f"account-decision-valuation:{batch.portfolio_id}:{source_event_id}"
+        )
+        if (
+            str(event["event_sha256"]) != source_event_id
+            or str(batch.idempotency_key) != expected_idempotency_key
+            or batch.recommendation_snapshot_id is not None
+            or batch.account_netting_plan_id is not None
+            or batch.signal_date
+            != date.fromisoformat(str(event["signal_date"]))
+            or batch.trade_date != date.fromisoformat(str(event["trade_date"]))
+            or event_row.trade_date != batch.trade_date
+            or target_payload != expected_payload
+        ):
+            raise ValueError(
+                "decision-only valuation replay identity is invalid"
+            )
+        return event
+
     def create_order_plan_batch(
         self,
         portfolio_id: str,
@@ -4383,6 +4989,27 @@ class SimulationStore:
                         dict(plan_row.plan_json or {}).get("strategy_contributions") or {}
                     ).items()
                 }
+                decision_rows = connection.execute(
+                    select(simulation_events).where(
+                        simulation_events.c.portfolio_id == portfolio.id,
+                        simulation_events.c.event_type
+                        == ACCOUNT_ORDER_DECISION_EVENT_TYPE,
+                    )
+                ).all()
+                for decision_row in decision_rows:
+                    details = dict(decision_row.details_json or {})
+                    if str(details.get("account_netting_plan_id") or "") != str(
+                        account_netting_plan_id
+                    ):
+                        continue
+                    validate_account_order_decision_event(
+                        details,
+                        portfolio_id=str(portfolio.id),
+                        account_netting_plan_id=account_netting_plan_id,
+                    )
+                    raise ValueError(
+                        "account netting plan is already bound to a decision-only record"
+                    )
             existing = connection.execute(
                 select(simulation_batches).where(
                     simulation_batches.c.idempotency_key == idempotency_key
@@ -5784,6 +6411,13 @@ class SimulationStore:
                     "settlement horizon"
                 )
             batch_target_payload = dict(batch.target_payload_json or {})
+            decision_valuation_event = (
+                self._validate_account_decision_valuation_batch(
+                    connection,
+                    batch=batch,
+                    target_payload=batch_target_payload,
+                )
+            )
             if str(portfolio.execution_frequency) == "day":
                 governed_plan = batch_target_payload.get("governed_order_plan")
                 if not isinstance(governed_plan, dict):
@@ -5915,6 +6549,18 @@ class SimulationStore:
                     raise ValueError("order-plan batch netting binding has drifted")
                 order_plan_mode = True
                 working_orders = self._open_order_book(connection, portfolio, batch, now)
+                if (
+                    decision_valuation_event is not None
+                    and decision_valuation_event[
+                        "prior_plan_continuation_allowed"
+                    ]
+                    is False
+                    and working_orders
+                ):
+                    raise ValueError(
+                        "decision-only valuation forbids unapproved working-order "
+                        "continuation"
+                    )
             elif not target_payload:
                 raise ValueError("simulation batch has no governed target payload")
             if (

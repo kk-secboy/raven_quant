@@ -1107,6 +1107,7 @@ class ModelArtifactStore:
         strategy_version_id: str,
         *,
         dataset_identity_sha256: str,
+        signal_date: date | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Return only an active, intact artifact for a model-signal strategy.
@@ -1134,6 +1135,14 @@ class ModelArtifactStore:
         path = Path(str(selected["artifact_path"]))
         if not path.is_file() or _file_sha256(path) != str(selected["artifact_sha256"]):
             raise ValueError("active ModelArtifact failed immutable verification")
+        if signal_date is not None:
+            verify_model_prediction_artifact(
+                path,
+                expected_sha256=str(selected["predictions_sha256"]),
+                test_start=signal_date.isoformat(),
+                test_end=signal_date.isoformat(),
+                trading_days=[signal_date.isoformat()],
+            )
         verify_governed_checkpoint(
             Path(str(selected.get("checkpoint_path") or "")).resolve(),
             model_engine=str(

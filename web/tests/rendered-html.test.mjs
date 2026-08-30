@@ -146,6 +146,13 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(autopilot, /beijing_exchange/);
   assert.match(autopilot, /etf/);
   assert.match(autopilot, /initial_capital/);
+  assert.match(autopilot, /为什么现在不能买/);
+  assert.match(autopilot, /\["REDUCE", "EXIT"\]\.includes\(constraintAction\)/);
+  assert.match(autopilot, /displayedAction = simulationOnly \? signal\.action : accountAction/);
+  assert.match(autopilot, /ACTION_LABELS\[displayedAction\]/);
+  assert.doesNotMatch(autopilot, /ACTION_LABELS\[signal\.action\]<\/span>/);
+  assert.match(autopilot, /cannot_buy_reasons/);
+  assert.match(autopilot, /仅表示真实前向运行资历/);
   assert.match(autopilot, /advancedMode/);
   assert.match(sourceByName["page.tsx"], /今日选股与账户操作/);
   assert.match(sourceByName["page.tsx"], /今日建议/);
@@ -182,6 +189,8 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
 
   const allocation = sourceByName["strategy-allocation-panel.tsx"];
   assert.match(allocation, /\/api\/strategy-allocations/);
+  assert.match(allocation, /没有 50 万元硬门槛/);
+  assert.doesNotMatch(allocation, /min="500000"/);
   assert.match(allocation, /risk_parity/);
   assert.match(allocation, /role/);
   assert.match(allocation, /risk_budget/);

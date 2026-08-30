@@ -651,7 +651,9 @@ def test_approve_moves_version_to_paper_and_opens_stage(
     assert again["id"] == stage["id"]
 
 
-def test_gate_registration_only_before_paper(database_url: str, tmp_path: Path) -> None:
+def test_gate_registration_is_immutable_from_first_registration(
+    database_url: str, tmp_path: Path
+) -> None:
     version_id = create_strategy_version(database_url, tmp_path)
     promotion = PromotionStore(database_url)
     gate = promotion.register_forward_gate(
@@ -665,18 +667,38 @@ def test_gate_registration_only_before_paper(database_url: str, tmp_path: Path) 
         ),
     )
     assert gate["min_forward_calendar_days"] == 30
-    gate = promotion.register_forward_gate(
+    first_sha = gate["criteria_sha256"]
+    replay = promotion.register_forward_gate(
         version_id,
         actor=ACTOR,
         thresholds=ForwardGateThresholds(
             **{
                 **asdict(forward_gate_thresholds_for_horizon(SHORT_1_5D)),
-                "min_forward_calendar_days": 45,
+                "min_forward_calendar_days": 30,
             }
         ),
     )
-    assert gate["min_forward_calendar_days"] == 45
+    assert replay["criteria_sha256"] == first_sha
+    with pytest.raises(ValueError, match="immutable once registered"):
+        promotion.register_forward_gate(
+            version_id,
+            actor=ACTOR,
+            thresholds=ForwardGateThresholds(
+                **{
+                    **asdict(forward_gate_thresholds_for_horizon(SHORT_1_5D)),
+                    "min_forward_calendar_days": 45,
+                }
+            ),
+        )
     engine = open_database(database_url)
+    with engine.connect() as connection:
+        before_stage = connection.execute(
+            select(_gate_table()).where(
+                _gate_table().c.strategy_version_id == version_id
+            )
+        ).one()
+    assert int(before_stage.min_forward_calendar_days) == 30
+    assert str(before_stage.criteria_sha256) == first_sha
     with engine.begin() as connection:
         connection.execute(
             update(strategy_versions)
@@ -684,7 +706,7 @@ def test_gate_registration_only_before_paper(database_url: str, tmp_path: Path) 
             .values(status="approved", promotion_stage="paper")
         )
     promotion.open_paper_stage(version_id, actor=ACTOR)
-    with pytest.raises(ValueError, match="immutable after"):
+    with pytest.raises(ValueError, match="immutable"):
         promotion.register_forward_gate(version_id, actor=ACTOR)
 
 

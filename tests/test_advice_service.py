@@ -11,9 +11,13 @@ import pytest
 import quant_platform.advice_service as advice_module
 from quant_platform.advice_service import (
     AdviceService,
+    _cannot_buy_reasons,
+    _long_maturity_projection,
     _project_backtest_status,
     _project_stage,
     _remaining_trade_quantity,
+    _unified_account_action,
+    _unified_no_action_reason,
 )
 from quant_platform.research_horizon import SHORT_1_5D
 from quant_platform.three_horizon_account import (
@@ -704,7 +708,7 @@ def test_today_is_not_available_until_current_netting_plan_exists(
 
 def test_platform_safe_mode_removes_executable_advice_but_retains_exit_information() -> None:
     projection = {
-        "contract_version": "three-horizon-advice-v3",
+        "contract_version": "three-horizon-advice-v4",
         "advice_available": True,
         "cards": [
             {
@@ -778,6 +782,8 @@ def test_unified_account_facts_override_placeholder_quantity_and_age() -> None:
                 "target_position_quantity": 800,
                 "trade_quantity": 300,
                 "quantity_source": "unified_account_order_plan",
+                "cannot_buy_reasons": ["账户风险状态已禁止新增买入"],
+                "execution_constraints": {"blocked_reason": "risk-off"},
                 "holding_age_sessions": 12,
                 "holding_age_source": "simulation_position_lots_qlib_calendar",
                 "holding_age_evidence": {"status": "proven"},
@@ -793,6 +799,8 @@ def test_unified_account_facts_override_placeholder_quantity_and_age() -> None:
     assert signal["account_action"] == "ADD"
     assert signal["execution_state"] == "READY"
     assert signal["quantity_source"] == "unified_account_order_plan"
+    assert signal["cannot_buy_reasons"] == ["账户风险状态已禁止新增买入"]
+    assert signal["execution_constraints"] == {"blocked_reason": "risk-off"}
     assert signal["holding_age_sessions"] == 12
     assert signal["holding_age_source"] == "simulation_position_lots_qlib_calendar"
 
@@ -852,6 +860,71 @@ def test_verified_signal_defers_quantities_until_unified_account_plan() -> None:
     assert signals[0]["review_date"] is None
 
 
+def test_verified_signals_keep_reduce_and_exit_rows_removed_from_holdings() -> None:
+    snapshot = SimpleNamespace(
+        id="snapshot-exits",
+        effective_date=date(2026, 8, 31),
+        as_of_date=date(2026, 8, 28),
+        dataset="daily-v1",
+        account_actions_json={
+            "items": [
+                {
+                    "instrument": "SZ000001",
+                    "action": "EXIT",
+                    "target_quantity": 0,
+                    "order_plan": [],
+                }
+            ]
+        },
+        snapshot_json={
+            "changes": [
+                {
+                    "instrument": "SH600000",
+                    "action": "sell",
+                    "previous_weight": 0.05,
+                    "target_weight": 0.0,
+                    "reason": "exit rule fired",
+                },
+                {
+                    "instrument": "SZ000002",
+                    "action": "decrease",
+                    "previous_weight": 0.05,
+                    "target_weight": 0.02,
+                    "reason": "rank weakened",
+                },
+            ]
+        },
+    )
+
+    class ResultWithAll(_Result):
+        def all(self) -> list[Any]:
+            return list(self.row)
+
+    class ConnectionWithAll(_Connection):
+        def execute(self, statement: Any) -> ResultWithAll:
+            self.statements.append(statement)
+            return ResultWithAll(self.rows.pop(0))
+
+    connection = ConnectionWithAll([snapshot, []])
+    service = AdviceService.__new__(AdviceService)
+    service.engine = _Engine(connection)
+    service.data_root = None
+
+    signals, cutoff = service._verified_signals(
+        "version-1",
+        horizon=SHORT_1_5D,
+        review_sessions=1,
+    )
+
+    assert cutoff == "2026-08-28"
+    by_instrument = {item["instrument"]: item for item in signals}
+    assert by_instrument["SH600000"]["action"] == "EXIT"
+    assert by_instrument["SH600000"]["target_weight"] == 0.0
+    assert by_instrument["SZ000001"]["action"] == "EXIT"
+    assert by_instrument["SZ000002"]["action"] == "REDUCE"
+    assert by_instrument["SZ000002"]["target_weight"] == 0.02
+
+
 def test_remaining_trade_quantity_excludes_cancelled_orders() -> None:
     assert _remaining_trade_quantity(
         {
@@ -885,9 +958,57 @@ def test_waiting_order_plan_has_no_actionable_trade_quantity() -> None:
     ) == 0
 
 
+def test_unified_summary_uses_executable_board_lot_quantity_not_weight_intent() -> None:
+    zero_lot_trades = [
+        {
+            "instrument": "SH600519",
+            "action": "NO_ACTION",
+            "desired_action": "BUY",
+            "trade_quantity": 0,
+            "execution_state": "READY",
+        },
+        {
+            "instrument": "SH688001",
+            "action": "NO_ACTION",
+            "desired_action": "BUY",
+            "trade_quantity": 0,
+            "execution_state": "READY",
+        },
+    ]
+    assert _unified_account_action(zero_lot_trades) == "NO_ACTION"
+    assert _unified_account_action(
+        [
+            *zero_lot_trades,
+            {
+                "instrument": "SZ000001",
+                "action": "BUY",
+                "trade_quantity": 100,
+                "execution_state": "READY",
+            },
+        ]
+    ) == "REBALANCE"
+
+
+def test_unified_zero_order_reason_preserves_lot_and_permission_explanations() -> None:
+    facts = {
+        "SH600519": {
+            "cannot_buy_reasons": ["模拟本金不足以买入最小整手，资金保留为现金"]
+        },
+        "SH688001": {
+            "cannot_buy_reasons": ["你尚未确认科创板交易权限，本次不新增买入"]
+        },
+    }
+    reason = _unified_no_action_reason(facts)
+    assert "没有可执行的整手交易" in reason
+    assert "模拟本金不足" in reason
+    assert "科创板交易权限" in reason
+
+
 def test_member_signal_netted_out_has_zero_account_trade() -> None:
     cards = [
         {
+            "is_investment_advice": True,
+            "action": "BUY",
             "signals": [
                 {
                     "instrument": "SH600000",
@@ -910,6 +1031,99 @@ def test_member_signal_netted_out_has_zero_account_trade() -> None:
     assert signal["target_position_quantity"] == 0
     assert signal["trade_quantity"] == 0
     assert signal["quantity_source"] == "unified_account_netted_out"
+    assert signal["cannot_buy_reasons"] == [
+        "三个周期净额后该股票没有账户级买入量，本次无需买入"
+    ]
+    assert cards[0]["action"] == "NO_ACTION"
+
+
+def test_member_exit_netted_out_uses_sell_explanation() -> None:
+    cards = [
+        {
+            "is_investment_advice": True,
+            "action": "EXIT",
+            "signals": [
+                {
+                    "instrument": "SH600000",
+                    "action": "EXIT",
+                    "target_position_quantity": None,
+                    "trade_quantity": None,
+                }
+            ],
+        }
+    ]
+
+    AdviceService._attach_unified_account_facts(
+        cards,
+        {"status": "ready", "instrument_facts": {}},
+    )
+
+    signal = cards[0]["signals"][0]
+    assert signal["account_action"] == "NO_ACTION"
+    assert signal["cannot_buy_reasons"] == [
+        "三个周期净额后该股票没有账户级可卖数量，本次无需卖出"
+    ]
+    assert cards[0]["action"] == "NO_ACTION"
+
+
+def test_unready_unified_account_explains_each_blocked_stock() -> None:
+    cards = [{"signals": [{"instrument": "SH600000", "action": "BUY"}]}]
+
+    AdviceService._attach_unified_account_facts(
+        cards,
+        {
+            "status": "onboarding_required",
+            "reason": "请先填写模拟本金和证券权限",
+        },
+    )
+
+    signal = cards[0]["signals"][0]
+    assert signal["account_action"] == "NO_ACTION"
+    assert signal["execution_state"] == "BLOCKED"
+    assert signal["trade_quantity"] == 0
+    assert signal["cannot_buy_reasons"] == ["请先填写模拟本金和证券权限"]
+
+
+def test_account_constraints_are_translated_to_novice_cannot_buy_reasons() -> None:
+    reasons = _cannot_buy_reasons(
+        {
+            "instrument": "SH688001",
+            "action": "HOLD",
+            "execution_state": "READY",
+            "target_quantity": 0,
+            "filled_position": 0,
+            "new_risk_blocked": True,
+            "investor_permission_key": "star_market",
+            "notes": ["new_buy_below_min_lot"],
+        }
+    )
+
+    assert reasons == [
+        "你尚未确认科创板交易权限，本次不新增买入",
+        "模拟本金不足以买入最小整手，资金保留为现金",
+    ]
+
+
+def test_three_year_long_maturity_is_a_non_blocking_badge() -> None:
+    accumulating = _long_maturity_projection(
+        {
+            "forward_trading_days": 252,
+            "review_events": 12,
+            "financial_report_reviews": 4,
+        }
+    )
+    mature = _long_maturity_projection(
+        {
+            "forward_trading_days": 756,
+            "review_events": 36,
+            "financial_report_reviews": 12,
+        }
+    )
+
+    assert accumulating["passed"] is False
+    assert accumulating["recommendation_blocking"] is False
+    assert mature["passed"] is True
+    assert mature["label"] == "三年前向成熟"
 
 
 def test_unified_execution_facts_requires_exact_primary_account_ledger() -> None:

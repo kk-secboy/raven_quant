@@ -4,6 +4,7 @@ import hashlib
 import json
 from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -199,6 +200,60 @@ def test_failed_refit_keeps_previous_active_model(
     selected = store.select_for_inference(version_id, now=NOW + timedelta(days=1))
     assert selected["id"] == first["id"]
     assert store.get(failed["id"])["status"] == "failed"
+
+
+@pytest.mark.no_database
+def test_live_model_artifact_must_exactly_cover_current_signal_date(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prediction_path = tmp_path / "daily-live.parquet"
+    pd.DataFrame(
+        {
+            "datetime": [pd.Timestamp("2026-07-28")] * 50,
+            "instrument": [f"SH{600000 + offset:06d}" for offset in range(50)],
+            "score": [0.1 + offset / 10_000 for offset in range(50)],
+        }
+    ).set_index(["datetime", "instrument"]).to_parquet(prediction_path)
+    prediction_sha256 = hashlib.sha256(prediction_path.read_bytes()).hexdigest()
+    selected = {
+        "id": "artifact-live",
+        "selection_status": "active",
+        "dataset_identity_sha256": "a" * 64,
+        "artifact_path": str(prediction_path),
+        "artifact_sha256": prediction_sha256,
+        "predictions_sha256": prediction_sha256,
+        "checkpoint_path": str(tmp_path / "checkpoint.json"),
+        "checkpoint_sha256": "c" * 64,
+        "checkpoint_format": "ridge_numeric_json",
+        "training_evidence": {"model_engine": "ridge_baseline"},
+    }
+    store = object.__new__(ModelArtifactStore)
+    store.strategies = SimpleNamespace(
+        get_version=lambda _version_id: {
+            "config": {"signal_source": "model_prediction"}
+        }
+    )
+    store.select_for_inference = lambda *_args, **_kwargs: selected
+    monkeypatch.setattr(
+        "quant_platform.model_artifact_store.verify_governed_checkpoint",
+        lambda *_args, **_kwargs: None,
+    )
+
+    resolved = store.require_for_inference(
+        "version-live",
+        dataset_identity_sha256="a" * 64,
+        signal_date=date(2026, 7, 28),
+        now=NOW,
+    )
+    assert resolved["id"] == "artifact-live"
+
+    with pytest.raises(ValueError, match="exact OOS window"):
+        store.require_for_inference(
+            "version-live",
+            dataset_identity_sha256="a" * 64,
+            signal_date=date(2026, 7, 29),
+            now=NOW + timedelta(days=1),
+        )
 
 
 def test_expired_active_model_falls_back_to_simple_baseline(

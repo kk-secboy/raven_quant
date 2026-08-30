@@ -181,6 +181,7 @@ from .services import (
     system_summary,
 )
 from .simulation_store import SimulationStore
+from .strategy_feature_drift_source import StrategyFeatureDriftSource
 from .strategy_recipes import RECIPE_VERSION, get_strategy_recipe, list_strategy_recipes
 from .strategy_rule_compiler import validate_strategy_rule_binding
 from .strategy_store import StrategyStore
@@ -2195,6 +2196,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     recommendations = RecommendationStore(settings.database_url)
     simulations = SimulationStore(settings.database_url)
     model_artifacts = ModelArtifactStore(settings.database_url)
+    strategy_feature_drift = StrategyFeatureDriftSource(
+        settings.database_url,
+        settings.data_root,
+    )
     parameter_experiments = ParameterExperimentStore(settings.database_url)
     legacy_research_campaigns = ResearchCampaignStore(settings.database_url)
     legacy_research_programs = ResearchProgramStore(settings.database_url)
@@ -2512,6 +2517,45 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def authenticated_actor(request: Request, fallback: str = "local-operator") -> str:
         user = getattr(request.state, "user", None)
         return str(user["username"]) if user else fallback
+
+    def current_live_signal_bindings(
+        version: dict[str, Any],
+        *,
+        dataset_identity_sha256: str,
+        signal_date: date,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Fail closed until current model/factor inference artifacts exist."""
+
+        signal_source = str(
+            version.get("config", {}).get("signal_source") or "factor_score"
+        )
+        if signal_source == "model_prediction":
+            artifact = model_artifacts.require_for_inference(
+                str(version["id"]),
+                dataset_identity_sha256=dataset_identity_sha256,
+                signal_date=signal_date,
+            )
+            return (
+                {
+                    "id": str(artifact["id"]),
+                    "artifact_sha256": str(artifact["artifact_sha256"]),
+                    "checkpoint_sha256": str(artifact["checkpoint_sha256"]),
+                    "dataset_identity_sha256": str(
+                        artifact["dataset_identity_sha256"]
+                    ),
+                },
+                None,
+            )
+        if signal_source != "factor_score":
+            raise ValueError("strategy signal source is unsupported")
+        return (
+            None,
+            strategy_feature_drift.current_challenger_artifact_binding(
+                str(version["id"]),
+                current_dataset_identity_sha256=dataset_identity_sha256,
+                signal_date=signal_date,
+            ),
+        )
 
     def tushare_settings() -> tuple[str, str]:
         stored = runtime_secrets.get("tushare")
@@ -5542,6 +5586,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     ) -> dict:
         try:
             portfolio = recommendations.get(portfolio_id)
+            version = strategies.get_version(
+                str(portfolio["strategy_version_id"])
+            )
             dataset = select_qlib_dataset(
                 settings.data_root,
                 anchor_name=portfolio["dataset"],
@@ -5570,11 +5617,24 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 raise ValueError(
                     "recommendation reconciliation gate blocked: " + "; ".join(gate["reasons"])
                 )
+            dataset_identity_sha256 = str(
+                dict(dataset.get("provenance") or {}).get(
+                    "dataset_identity_sha256"
+                )
+                or ""
+            )
+            model_artifact_binding, factor_materialization_binding = (
+                current_live_signal_bindings(
+                    version,
+                    dataset_identity_sha256=dataset_identity_sha256,
+                    signal_date=payload.as_of_date,
+                )
+            )
             snapshot, created = recommendations.create_snapshot(
                 portfolio_id=portfolio_id,
                 as_of_date=payload.as_of_date,
                 dataset=dataset["name"],
-                dataset_identity_sha256=dataset["provenance"]["dataset_identity_sha256"],
+                dataset_identity_sha256=dataset_identity_sha256,
                 dataset_lineage_id=dataset.get("lineage_id"),
             )
         except KeyError as exc:
@@ -5585,7 +5645,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             return snapshot
         job = jobs.create(
             "recommendation_refresh",
-            recommendation_refresh_job_payload(snapshot, dataset),
+            recommendation_refresh_job_payload(
+                snapshot,
+                dataset,
+                model_artifact_binding=model_artifact_binding,
+                factor_materialization_binding=factor_materialization_binding,
+            ),
             platform_root / "logs" / f"recommendation-refresh-{snapshot['id']}.log",
             dedupe_active_kind=False,
             idempotency_key=recommendation_refresh_job_idempotency_key(
@@ -5732,22 +5797,13 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             dataset_identity_sha256 = str(
                 current_provenance.get("dataset_identity_sha256") or ""
             )
-            model_artifact_binding: dict[str, str] | None = None
-            if str(
-                version.get("config", {}).get("signal_source") or "factor_score"
-            ) == "model_prediction":
-                model_artifact = model_artifacts.require_for_inference(
-                    str(version["id"]),
+            model_artifact_binding, factor_materialization_binding = (
+                current_live_signal_bindings(
+                    version,
                     dataset_identity_sha256=dataset_identity_sha256,
+                    signal_date=payload.signal_date,
                 )
-                model_artifact_binding = {
-                    "id": str(model_artifact["id"]),
-                    "artifact_sha256": str(model_artifact["artifact_sha256"]),
-                    "checkpoint_sha256": str(model_artifact["checkpoint_sha256"]),
-                    "dataset_identity_sha256": str(
-                        model_artifact["dataset_identity_sha256"]
-                    ),
-                }
+            )
             promotion_stage = promotions.require_paper_signal(
                 str(version["id"]),
                 portfolio_id=portfolio_id,
@@ -5779,6 +5835,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 "promotion_stage_opened_at": promotion_stage["opened_at"],
                 "dataset_identity_sha256": dataset_identity_sha256,
                 "model_artifact_binding": model_artifact_binding,
+                "factor_materialization_binding": factor_materialization_binding,
                 "actor": actor,
             },
             platform_root / "logs" / f"simulation-order-plan-{portfolio_id}.log",

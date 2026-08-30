@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -44,7 +45,10 @@ from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.promotion import PromotionStore
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.recommendation_store import RecommendationStore
-from quant_platform.simulation_store import SimulationStore
+from quant_platform.simulation_store import (
+    SimulationStore,
+    build_settlement_calendar_evidence,
+)
 from quant_platform.strategy_store import StrategyStore
 
 TRADE_DATE = date(2026, 7, 13)
@@ -639,6 +643,124 @@ def test_simulation_batch_is_idempotent_and_books_auditable_nav(
     assert len(nav) == 1
     assert nav[0]["performance_certified"] is True
     assert len(store.rows(simulation["id"], "fills")) == 1
+
+
+def test_later_recommendation_cannot_rewrite_historical_snapshot_orders_fills_or_nav(
+    database_url: str, tmp_path
+) -> None:
+    """Appending a later decision leaves the completed historical chain immutable.
+
+    The source fixture is a sealed daily dataset whose calendar contains both
+    signal dates.  The first recommendation is converted into a real order-plan
+    batch and booked through the canonical simulation ledger.  A materially
+    different later recommendation is then appended.  Neither that append nor
+    an idempotent replay may change the earlier recommendation, orders, fills,
+    or certified NAV.
+    """
+
+    store, simulation, batch, _data_root = _create_recommendation_batch(
+        database_url, tmp_path
+    )
+    recommendations = RecommendationStore(database_url)
+    historical_snapshot_id = str(batch["recommendation_snapshot_id"])
+    settlement_binding = store.execution_manifest(batch["id"])[
+        "settlement_calendar_binding"
+    ]
+    next_trade_date = date.fromisoformat(settlement_binding["next_trade_date"])
+    execution_evidence = {
+        "batch_id": batch["id"],
+        "dataset_identity_sha256": DATASET_IDENTITY,
+        "dataset_lineage_id": "b" * 64,
+        "execution_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+        "execution_contract_hash": simulation["execution_contract_hash"],
+        "simulation_semantics_sha256": simulation["execution_policy"][
+            "simulation_semantics_sha256"
+        ],
+        "next_trade_date": next_trade_date.isoformat(),
+        "settlement_calendar_evidence": build_settlement_calendar_evidence(
+            trade_date=TRADE_DATE,
+            next_trade_date=next_trade_date,
+            dataset_identity_sha256=DATASET_IDENTITY,
+            dataset_lineage_id="b" * 64,
+            calendar_file_sha256=settlement_binding["calendar_file_sha256"],
+        ),
+    }
+    completed = store.process_batch(
+        batch["id"],
+        minute_bars=_bars(),
+        closing_prices={
+            "SH600000": {
+                "price": 10.0,
+                "market_date": TRADE_DATE.isoformat(),
+            }
+        },
+        execution_evidence=execution_evidence,
+    )
+    assert completed["status"] == "succeeded"
+
+    historical = {
+        "recommendation": deepcopy(
+            recommendations.get_snapshot(historical_snapshot_id)
+        ),
+        "orders": deepcopy(store.rows(simulation["id"], "orders")),
+        "fills": deepcopy(store.rows(simulation["id"], "fills")),
+        "nav": deepcopy(store.rows(simulation["id"], "nav")),
+    }
+    assert len(historical["orders"]) == 1
+    assert len(historical["fills"]) == 1
+    assert len(historical["nav"]) == 1
+    assert historical["nav"][0]["performance_certified"] is True
+
+    later, created = recommendations.create_snapshot(
+        portfolio_id=str(historical["recommendation"]["portfolio_id"]),
+        as_of_date=date(2026, 7, 14),
+        dataset="snapshot",
+        dataset_identity_sha256=DATASET_IDENTITY,
+    )
+    assert created is True
+    recommendations.apply_result(
+        later["id"],
+        {
+            "status": "ok",
+            "portfolio_id": historical["recommendation"]["portfolio_id"],
+            "strategy_version_id": historical["recommendation"][
+                "strategy_version_id"
+            ],
+            "dataset": "snapshot",
+            "dataset_identity_sha256": DATASET_IDENTITY,
+            "as_of_date": "2026-07-14",
+            "effective_date": "2026-07-15",
+            "policy_version": POLICY_VERSION,
+            "backtest_engine_version": QLIB_ENGINE_VERSION,
+            "cost_model": later["cost_model"],
+            "cash_weight": 1.0,
+            "reference_prices": {},
+            "holdings": [],
+            "changes": [
+                {
+                    "instrument": "SH600000",
+                    "action": "sell",
+                    "target_weight": 0.0,
+                }
+            ],
+        },
+    )
+
+    # A terminal batch replay returns the sealed result instead of consuming
+    # later inputs or appending another fill/NAV row.
+    replayed = store.process_batch(
+        batch["id"],
+        minute_bars=pd.DataFrame(),
+        closing_prices={},
+        execution_evidence={},
+    )
+    assert replayed["status"] == "succeeded"
+    assert recommendations.get_snapshot(historical_snapshot_id) == historical[
+        "recommendation"
+    ]
+    assert store.rows(simulation["id"], "orders") == historical["orders"]
+    assert store.rows(simulation["id"], "fills") == historical["fills"]
+    assert store.rows(simulation["id"], "nav") == historical["nav"]
 
 
 def test_simulation_persists_bound_benchmark_return_evidence(

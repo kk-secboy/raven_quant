@@ -280,11 +280,13 @@ class PortfolioPolicy:
                 raise ValueError("extension guard requires point-in-time five-day returns")
             extension = pd.to_numeric(five_day_returns, errors="coerce")
             extension.index = extension.index.astype(str)
+            if extension.index.has_duplicates:
+                raise ValueError("extension guard five-day returns are duplicated")
             aligned_extension = extension.reindex(signal.index)
-            if aligned_extension.isna().any():
-                raise ValueError("extension guard five-day returns are incomplete")
             new_entry_eligible &= (
-                aligned_extension <= self.config.extension_guard_max_return_5d
+                aligned_extension.notna()
+                & np.isfinite(aligned_extension.to_numpy(dtype=float))
+                & (aligned_extension <= self.config.extension_guard_max_return_5d)
             )
         if self.config.market_trend_lookback_sessions is not None:
             if market_regime_allows_entries is None:
@@ -297,11 +299,27 @@ class PortfolioPolicy:
             valuation = pd.to_numeric(valuation_percentiles, errors="coerce")
             valuation.index = valuation.index.astype(str)
             aligned_valuation = valuation.reindex(signal.index)
-            if aligned_valuation.isna().any():
-                raise ValueError("valuation-regime percentiles are incomplete")
             new_entry_eligible &= (
-                aligned_valuation <= self.config.valuation_regime_max_percentile
+                aligned_valuation.notna()
+                & np.isfinite(aligned_valuation.to_numpy(dtype=float))
+                & (
+                    aligned_valuation
+                    <= self.config.valuation_regime_max_percentile
+                )
             )
+        normalized_trends: pd.Series | None = None
+        if self.config.trend_break_lookback_sessions is not None:
+            if trend_intact is None:
+                raise ValueError("trend-break rule requires point-in-time trend evidence")
+            normalized_trends = trend_intact.copy()
+            normalized_trends.index = normalized_trends.index.astype(str)
+            if normalized_trends.index.has_duplicates:
+                raise ValueError("trend-break evidence is duplicated")
+            aligned_trends = normalized_trends.reindex(signal.index)
+            # A missing or already-broken trend can never become a new
+            # holding.  Existing holdings are handled separately below so a
+            # legitimate suspension does not abort every other decision.
+            new_entry_eligible &= aligned_trends.eq(True)
         keep_count = min(len(signal), self.config.topk + self.config.n_drop)
         ranked = signal.sort_values(ascending=False)
         retained = [item for item in ranked.index[:keep_count] if item in previous.index]
@@ -528,12 +546,24 @@ class PortfolioPolicy:
                         )
                     )
         if self.config.trend_break_lookback_sessions is not None:
-            if trend_intact is None:
-                raise ValueError("trend-break rule requires point-in-time trend evidence")
-            trends = trend_intact.reindex(pd.Index(previous_instruments, dtype=str))
-            if trends.isna().any():
-                raise ValueError("trend-break evidence is incomplete")
-            for instrument, intact in trends.items():
+            assert normalized_trends is not None
+            trends = normalized_trends.reindex(
+                pd.Index(previous_instruments, dtype=str)
+            )
+            for instrument in trends[trends.isna()].index:
+                # Missing is not evidence of a trend break.  Preserve the
+                # holding (it may be suspended) and make the degraded evidence
+                # explicit instead of failing the whole portfolio batch.
+                risk_events.append(
+                    self._risk_event(
+                        "trend_evidence_unavailable",
+                        0.0,
+                        1.0,
+                        "hold_no_new_entry",
+                        str(instrument),
+                    )
+                )
+            for instrument, intact in trends.dropna().items():
                 if not bool(intact):
                     target[instrument] = 0.0
                     risk_events.append(

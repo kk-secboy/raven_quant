@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -248,7 +249,11 @@ def test_worker_builds_production_qlib_order_plan_job(
                 "benchmark": "SH000300",
                 "universe": "cn_all",
                 "signal_frequency": "5min",
-                "config": {"execution_contract_hash": "c" * 64},
+                "config": {
+                    "execution_contract_hash": "c" * 64,
+                    "signal_source": "factor_score",
+                    "factor_source_mode": "promoted_only",
+                },
                 "factors": [
                     {
                         "factor_candidate_id": "factor-1",
@@ -292,6 +297,28 @@ def test_worker_builds_production_qlib_order_plan_job(
         "2026-07-10\n2026-07-13\n",
         encoding="utf-8",
     )
+    current_factor_path = tmp_path / "live-factors" / "factor-1.parquet"
+    current_factor_path.parent.mkdir(parents=True)
+    current_factor_path.write_bytes(b"current-dataset-factor-values")
+    current_factor_sha256 = hashlib.sha256(current_factor_path.read_bytes()).hexdigest()
+    current_factor_binding = {
+        "contract_version": "strategy-challenger-live-binding-v1",
+        "strategy_version_id": "version-1",
+        "dataset_identity_sha256": "a" * 64,
+        "signal_date": "2026-07-13",
+        "feature_set_id": "feature-set-1",
+        "feature_set_definition_sha256": "e" * 64,
+        "materialization_manifest_sha256": "f" * 64,
+        "factors": [
+            {
+                "candidate_id": "factor-1",
+                "factor_id": "definition-1",
+                "artifact_path": str(current_factor_path),
+                "artifact_sha256": current_factor_sha256,
+                "finite_instruments": 100,
+            }
+        ],
+    }
     newer_calendar_path = tmp_path / "qlib" / "daily-newer" / "calendars"
     newer_calendar_path.mkdir(parents=True)
     (newer_calendar_path / "day.txt").write_text(
@@ -361,6 +388,11 @@ def test_worker_builds_production_qlib_order_plan_job(
     worker.strategies = Strategies()
     worker.allocations = Allocations()
     worker.promotions = Promotions()
+    worker.strategy_feature_drift = SimpleNamespace(
+        current_challenger_artifact_binding=(
+            lambda _version_id, **_kwargs: current_factor_binding
+        )
+    )
     job = {
         "id": "order-plan-job-1",
         "kind": "simulation_order_plan",
@@ -371,6 +403,7 @@ def test_worker_builds_production_qlib_order_plan_job(
             "dataset_identity_sha256": "a" * 64,
             "promotion_stage_id": "paper-stage-1",
             "promotion_stage_opened_at": "2026-04-01T00:00:00+00:00",
+            "factor_materialization_binding": current_factor_binding,
             "actor": "simulation-operator",
         },
     }
@@ -408,6 +441,15 @@ def test_worker_builds_production_qlib_order_plan_job(
     assert manifest["portfolio_drawdown"] == pytest.approx(-0.12)
     assert manifest["daily_return"] == pytest.approx(-0.03)
     assert manifest["allow_new_risk"] is True
+    assert manifest["factors"] == [
+        {
+            "candidate_id": "factor-1",
+            "values_path": str(current_factor_path),
+            "weight": 1.0,
+            "direction": 1,
+        }
+    ]
+    assert manifest["factors"][0]["values_path"] != str(tmp_path / "factor.parquet")
     assert manifest["previous_holdings"] == [
         {
             "instrument": "SH600000",
@@ -488,7 +530,11 @@ def test_recommendation_refresh_reuses_last_succeeded_position_state_on_retry(
                 "status": "approved",
                 "benchmark": "SH000300",
                 "universe": "cn_all",
-                "config": {"execution_contract_hash": "c" * 64},
+                "config": {
+                    "execution_contract_hash": "c" * 64,
+                    "signal_source": "factor_score",
+                    "factor_source_mode": "promoted_only",
+                },
                 "factors": [
                     {
                         "factor_candidate_id": "factor-1",
@@ -521,6 +567,29 @@ def test_recommendation_refresh_reuses_last_succeeded_position_state_on_retry(
                 "allow_new_risk": True,
             }
 
+    current_factor_path = tmp_path / "live-factors" / "factor-1.parquet"
+    current_factor_path.parent.mkdir(parents=True)
+    current_factor_path.write_bytes(b"current-dataset-factor-values")
+    current_factor_sha256 = hashlib.sha256(current_factor_path.read_bytes()).hexdigest()
+    current_factor_binding = {
+        "contract_version": "strategy-challenger-live-binding-v1",
+        "strategy_version_id": "version-1",
+        "dataset_identity_sha256": "a" * 64,
+        "signal_date": local_today.isoformat(),
+        "feature_set_id": "feature-set-1",
+        "feature_set_definition_sha256": "e" * 64,
+        "materialization_manifest_sha256": "f" * 64,
+        "factors": [
+            {
+                "candidate_id": "factor-1",
+                "factor_id": "definition-1",
+                "artifact_path": str(current_factor_path),
+                "artifact_sha256": current_factor_sha256,
+                "finite_instruments": 100,
+            }
+        ],
+    }
+
     worker = object.__new__(LocalJobWorker)
     worker.project_root = tmp_path
     worker.settings = SimpleNamespace(
@@ -533,6 +602,11 @@ def test_recommendation_refresh_reuses_last_succeeded_position_state_on_retry(
     worker.promotions = Promotions()
     worker.allocations = Allocations()
     worker.recommendation_accounts = Accounts()
+    worker.strategy_feature_drift = SimpleNamespace(
+        current_challenger_artifact_binding=(
+            lambda _version_id, **_kwargs: current_factor_binding
+        )
+    )
     job = {
         "id": "recommendation-job-1",
         "kind": "recommendation_refresh",
@@ -543,6 +617,7 @@ def test_recommendation_refresh_reuses_last_succeeded_position_state_on_retry(
             "dataset_path": str(dataset_path),
             "dataset_identity_sha256": "a" * 64,
             "as_of_date": local_today.isoformat(),
+            "factor_materialization_binding": current_factor_binding,
         },
     }
 
@@ -559,7 +634,21 @@ def test_recommendation_refresh_reuses_last_succeeded_position_state_on_retry(
     manifest = json.loads(first)
     assert manifest["previous_holdings"] == prior["holdings"]
     assert manifest["previous_snapshot"]["position_state"] == previous_state
+    assert manifest["factors"][0]["values_path"] == str(current_factor_path)
+    assert manifest["factors"][0]["values_path"] != str(tmp_path / "factor.parquet")
 
     # A retry reconstructs byte-identical state and does not age the holding.
     worker._command(job)
+    assert manifest_path.read_bytes() == first
+
+    stale_binding = {**current_factor_binding, "signal_date": "2000-01-03"}
+    stale_job = {
+        **job,
+        "payload": {
+            **job["payload"],
+            "factor_materialization_binding": stale_binding,
+        },
+    }
+    with pytest.raises(ValueError, match="current materialization binding"):
+        worker._command(stale_job)
     assert manifest_path.read_bytes() == first

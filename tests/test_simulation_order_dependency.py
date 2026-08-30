@@ -60,12 +60,14 @@ class _ModelArtifacts:
         strategy_version_id: str,
         *,
         dataset_identity_sha256: str,
+        signal_date: date,
         now: datetime,
     ) -> dict[str, str]:
         self.calls.append(
             {
                 "strategy_version_id": strategy_version_id,
                 "dataset_identity_sha256": dataset_identity_sha256,
+                "signal_date": signal_date,
                 "now": now,
             }
         )
@@ -117,6 +119,7 @@ def _engine(*, model_ready: bool) -> SchedulerEngine:
 def _dataset() -> dict[str, object]:
     return {
         "name": "daily-v1",
+        "path": "test-data/qlib/daily-v1",
         "ready": True,
         "reproducible": True,
         "provenance": {
@@ -143,6 +146,62 @@ def test_model_paper_order_waits_for_same_dataset_inference_artifact(
         datetime(2026, 8, 26, 10, tzinfo=UTC)
     ) == 0
     assert engine.jobs.created == []
+    assert engine.model_artifacts.calls[0]["signal_date"] == date(2026, 8, 26)
+
+
+def test_model_recommendation_waits_before_creating_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _engine(model_ready=False)
+
+    class Recommendations:
+        create_calls = 0
+
+        @staticmethod
+        def get(_portfolio_id: str) -> dict[str, object]:
+            return {
+                "id": "recommendation-1",
+                "strategy_version_id": "strategy-1",
+                "dataset": "daily-v1",
+                "dataset_roll_policy": "latest_compatible",
+                "dataset_lineage_id": "l" * 64,
+                "latest_snapshot": None,
+            }
+
+        def create_snapshot(self, **_kwargs: object) -> tuple[dict, bool]:
+            self.create_calls += 1
+            return {"id": "snapshot-should-not-exist"}, True
+
+    recommendations = Recommendations()
+    engine.recommendations = recommendations
+    engine.safe_mode = SimpleNamespace(status=lambda: {"active": False})
+    engine.simulations = object()
+    engine.promotions = SimpleNamespace(
+        require_recommendation_signal=lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        "quant_platform.scheduler.select_qlib_dataset",
+        lambda *_args, **_kwargs: _dataset(),
+    )
+    monkeypatch.setattr(
+        "quant_platform.scheduler.qlib_trading_date_on_or_before",
+        lambda *_args, **_kwargs: date(2026, 8, 26),
+    )
+    monkeypatch.setattr(
+        "quant_platform.scheduler.load_calendar_days",
+        lambda *_args, **_kwargs: {date(2026, 8, 26)},
+    )
+    monkeypatch.setattr(
+        "quant_platform.scheduler.evaluate_recommendation_gate",
+        lambda *_args, **_kwargs: {"passed": True},
+    )
+
+    assert engine._enqueue_due_horizon_recommendations(
+        datetime(2026, 8, 26, 10, tzinfo=UTC)
+    ) == 0
+    assert recommendations.create_calls == 0
+    assert engine.jobs.created == []
+    assert engine.model_artifacts.calls[0]["signal_date"] == date(2026, 8, 26)
 
 
 def test_model_paper_order_freezes_ready_artifact_and_dataset_binding(
@@ -170,6 +229,8 @@ def test_model_paper_order_freezes_ready_artifact_and_dataset_binding(
         "checkpoint_sha256": "c" * 64,
         "dataset_identity_sha256": DATASET_IDENTITY,
     }
+    assert payload["factor_materialization_binding"] is None
+    assert engine.model_artifacts.calls[0]["signal_date"] == date(2026, 8, 26)
     assert created["idempotency_key"] == (
         "simulation-order-plan-v2:paper-1:2026-08-26:" + DATASET_IDENTITY
     )

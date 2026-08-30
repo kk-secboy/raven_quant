@@ -53,8 +53,22 @@ from .strategy_health_authority import load_production_health_gate
 from .strategy_store import StrategyStore
 from .three_horizon_account import THREE_HORIZON_PRIMARY_SIMULATION_ACTOR
 
-ADVICE_TODAY_CONTRACT_VERSION = "three-horizon-advice-v3"
+ADVICE_TODAY_CONTRACT_VERSION = "three-horizon-advice-v4"
 HORIZONS = (SHORT_1_5D, SWING_1_6M, LONG_1_3Y)
+
+_LONG_MATURITY_THRESHOLDS = {
+    "forward_trading_days": 756,
+    "review_events": 36,
+    "financial_report_reviews": 12,
+}
+
+_MARKET_PERMISSION_LABELS = {
+    "main_board": "沪深主板",
+    "star_market": "科创板",
+    "chi_next": "创业板",
+    "beijing_exchange": "北交所",
+    "etf": "境内ETF",
+}
 
 _HORIZON_UI = {
     SHORT_1_5D: {
@@ -330,6 +344,99 @@ def _remaining_trade_quantity(item: dict[str, Any]) -> int:
         if quantity > 0:
             total += quantity
     return total
+
+
+def _unified_account_action(trades: list[dict[str, Any]]) -> str:
+    """Summarize only executable account trades, never continuous weight intent."""
+
+    for item in trades:
+        action = str(item.get("action") or "").upper()
+        quantity = int(item.get("trade_quantity") or 0)
+        state = str(item.get("execution_state") or "").upper()
+        if (
+            action in {"BUY", "ADD", "REDUCE", "EXIT"}
+            and quantity > 0
+            and state not in {"BLOCKED", "WAIT"}
+        ):
+            return "REBALANCE"
+    return "NO_ACTION"
+
+
+def _unified_no_action_reason(instrument_facts: Mapping[str, Any]) -> str:
+    """Explain why a sealed net target produced no executable board-lot trade."""
+
+    reasons: list[str] = []
+    for raw in instrument_facts.values():
+        if not isinstance(raw, Mapping):
+            continue
+        reasons.extend(str(item) for item in raw.get("cannot_buy_reasons") or [])
+    unique = list(dict.fromkeys(reason for reason in reasons if reason))
+    if unique:
+        return "本次没有可执行的整手交易：" + "；".join(unique)
+    return "净额目标与当前持仓一致，本次不需要买卖，资金继续保留在现金或原持仓中"
+
+
+def _long_maturity_projection(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the optional three-year maturity badge, never an advice gate."""
+
+    checks = {
+        name: {
+            "observed": int(evidence.get(name) or 0),
+            "threshold": threshold,
+            "passed": int(evidence.get(name) or 0) >= threshold,
+        }
+        for name, threshold in _LONG_MATURITY_THRESHOLDS.items()
+    }
+    mature = all(item["passed"] for item in checks.values())
+    return {
+        "status": "mature" if mature else "accumulating",
+        "label": "三年前向成熟" if mature else "三年成熟度积累中",
+        "passed": mature,
+        "checks": checks,
+        "recommendation_blocking": False,
+    }
+
+
+def _cannot_buy_reasons(item: Mapping[str, Any]) -> list[str]:
+    """Translate sealed account-plan constraints into novice-facing reasons."""
+
+    reasons: list[str] = []
+    permission_key = str(item.get("investor_permission_key") or "")
+    if item.get("new_risk_blocked") is True or permission_key:
+        market = _MARKET_PERMISSION_LABELS.get(permission_key, "该证券市场")
+        reasons.append(f"你尚未确认{market}交易权限，本次不新增买入")
+
+    raw_reasons = [
+        str(item.get("blocked_reason") or ""),
+        str(item.get("wait_reason") or ""),
+    ]
+    for raw in raw_reasons:
+        if not raw:
+            continue
+        if raw == "fresh_reference_price_unavailable":
+            reasons.append("缺少当日有效参考价格，暂不能计算可买数量")
+        elif raw.startswith("account_risk_off_new_risk_blocked"):
+            reasons.append("账户风险状态已禁止新增买入")
+        elif raw.startswith("account_risk_caution_manual_review"):
+            reasons.append("账户风险状态需要复核，本次暂不新增买入")
+        elif raw.startswith("active_recommendation_account_unavailable"):
+            reasons.append("活动模拟账户不可用，暂不能计算买入")
+        elif raw.startswith("manual_shadow_valuation_incomplete"):
+            reasons.append("模拟账户估值不完整，暂不能计算买入")
+        elif raw == "sellable_quantity_unavailable":
+            reasons.append("可卖数量受T+1或未完成委托限制，等待下一次复核")
+        else:
+            reasons.append("账户执行门槛尚未满足，本次暂不交易")
+
+    notes = {str(note) for note in item.get("notes") or []}
+    if "new_buy_below_min_lot" in notes:
+        reasons.append("模拟本金不足以买入最小整手，资金保留为现金")
+
+    action = AdviceService._display_account_action(dict(item))
+    state = str(item.get("execution_state") or "").upper()
+    if action in {"BUY", "ADD"} and state in {"BLOCKED", "WAIT"} and not reasons:
+        reasons.append("账户执行条件尚未满足，本次暂不买入")
+    return list(dict.fromkeys(reasons))
 
 
 class AdviceService:
@@ -609,31 +716,78 @@ class AdviceService:
                 .limit(1)
             )
 
+        decision_record = None
+        if batch is None:
+            try:
+                decision_record = self.simulations.get_account_order_plan_decision(
+                    str(portfolio.id),
+                    account_netting_plan_id=plan_id,
+                )
+            except ValueError as exc:
+                return {
+                    "status": "decision_evidence_invalid",
+                    "items": {},
+                    "portfolio_id": str(portfolio.id),
+                    "batch_id": None,
+                    "decision_event_id": None,
+                    "reason": str(exc),
+                }
+
         facts: dict[str, dict[str, Any]] = {}
+        actions: list[Any] = []
+        quantity_source = "unified_account_order_plan"
         if batch is not None:
             payload = dict(batch.target_payload_json or {})
             actions = dict(payload.get("order_plan") or {}).get("actions") or []
-            for raw in actions:
-                if not isinstance(raw, dict):
-                    continue
-                item = dict(raw)
-                instrument = str(item.get("instrument") or "").upper()
-                if not instrument:
-                    continue
-                target = item.get("target_quantity")
-                facts[instrument] = {
-                    "action": self._display_account_action(item),
-                    "target_position_quantity": (
-                        int(target) if target is not None else None
+        elif decision_record is not None:
+            actions = list(
+                dict(decision_record.get("decision") or {}).get("actions") or []
+            )
+            quantity_source = "unified_account_decision_only"
+        for raw in actions:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            instrument = str(item.get("instrument") or "").upper()
+            if not instrument:
+                continue
+            target = item.get("target_quantity")
+            cannot_buy_reasons = _cannot_buy_reasons(item)
+            desired_action = self._display_account_action(item)
+            execution_state = str(item.get("execution_state") or "").upper()
+            trade_quantity = _remaining_trade_quantity(item)
+            executable_action = desired_action
+            if desired_action in {"BUY", "ADD", "REDUCE", "EXIT"} and (
+                trade_quantity <= 0 or execution_state in {"BLOCKED", "WAIT"}
+            ):
+                executable_action = "NO_ACTION"
+            facts[instrument] = {
+                "action": executable_action,
+                "desired_action": desired_action,
+                "target_position_quantity": (
+                    int(target) if target is not None else None
+                ),
+                "trade_quantity": trade_quantity,
+                "filled_position": int(item.get("filled_position") or 0),
+                "projected_position": int(item.get("projected_position") or 0),
+                "execution_state": execution_state,
+                "quantity_source": quantity_source,
+                "cannot_buy_reasons": cannot_buy_reasons,
+                "execution_constraints": {
+                    "blocked_reason": item.get("blocked_reason"),
+                    "wait_reason": item.get("wait_reason"),
+                    "notes": list(item.get("notes") or []),
+                    "new_risk_blocked": item.get("new_risk_blocked") is True,
+                    "new_risk_blocked_reason": item.get(
+                        "new_risk_blocked_reason"
                     ),
-                    "trade_quantity": _remaining_trade_quantity(item),
-                    "filled_position": int(item.get("filled_position") or 0),
-                    "projected_position": int(item.get("projected_position") or 0),
-                    "execution_state": str(item.get("execution_state") or ""),
-                    "quantity_source": "unified_account_order_plan",
-                    "holding_age_sessions": None,
-                    "holding_age_source": "awaiting_authoritative_account_lots",
-                }
+                    "investor_permission_key": item.get(
+                        "investor_permission_key"
+                    ),
+                },
+                "holding_age_sessions": None,
+                "holding_age_source": "awaiting_authoritative_account_lots",
+            }
 
         data_root = getattr(self, "data_root", None)
         if data_root is not None and isinstance(age_as_of, date):
@@ -678,16 +832,20 @@ class AdviceService:
                     else "unproven_authoritative_account_lots"
                 )
                 fact["holding_age_evidence"] = position.get("holding_age_evidence")
+        has_decision = batch is not None or decision_record is not None
         return {
-            "status": "ready" if batch is not None else "execution_plan_missing",
+            "status": "ready" if has_decision else "execution_plan_missing",
             "items": facts,
             "portfolio_id": str(portfolio.id),
             "batch_id": str(batch.id) if batch is not None else None,
+            "decision_event_id": (
+                str(decision_record["id"]) if decision_record is not None else None
+            ),
             "holding_age_as_of": age_as_of.isoformat() if isinstance(age_as_of, date) else None,
             "reason": (
                 None
-                if batch is not None
-                else "最新净额计划尚未生成统一账户执行批次"
+                if has_decision
+                else "最新净额计划尚未生成统一账户执行批次或零订单决策"
             ),
         }
 
@@ -767,6 +925,20 @@ class AdviceService:
     ) -> None:
         facts = dict(unified.get("instrument_facts") or {})
         if not facts and unified.get("status") != "ready":
+            reason = str(
+                unified.get("reason")
+                or "统一账户执行计划尚未就绪，本次暂不买入"
+            )
+            for card in cards:
+                for signal in card.get("signals") or []:
+                    signal["account_action"] = "NO_ACTION"
+                    signal["target_position_quantity"] = 0
+                    signal["trade_quantity"] = 0
+                    signal["execution_state"] = "BLOCKED"
+                    signal["quantity_source"] = "unified_account_not_ready"
+                    signal["cannot_buy_reasons"] = [reason]
+                if card.get("is_investment_advice") is True:
+                    card["action"] = "NO_ACTION"
             return
         for card in cards:
             for signal in card.get("signals") or []:
@@ -777,6 +949,20 @@ class AdviceService:
                         signal["target_position_quantity"] = 0
                         signal["trade_quantity"] = 0
                         signal["quantity_source"] = "unified_account_netted_out"
+                        desired_action = str(signal.get("action") or "").upper()
+                        if desired_action in {"SELL", "REDUCE", "EXIT"}:
+                            netted_reason = (
+                                "三个周期净额后该股票没有账户级可卖数量，本次无需卖出"
+                            )
+                        elif desired_action == "HOLD":
+                            netted_reason = "三个周期净额后该股票无需账户级交易，本次继续观察"
+                        else:
+                            netted_reason = (
+                                "三个周期净额后该股票没有账户级买入量，本次无需买入"
+                            )
+                        signal["cannot_buy_reasons"] = [
+                            netted_reason
+                        ]
                     continue
                 if fact.get("target_position_quantity") is not None:
                     signal["target_position_quantity"] = int(
@@ -787,6 +973,12 @@ class AdviceService:
                 signal["account_action"] = fact.get("action")
                 signal["execution_state"] = fact.get("execution_state")
                 signal["quantity_source"] = fact.get("quantity_source")
+                signal["cannot_buy_reasons"] = list(
+                    fact.get("cannot_buy_reasons") or []
+                )
+                signal["execution_constraints"] = dict(
+                    fact.get("execution_constraints") or {}
+                )
                 if fact.get("holding_age_sessions") is not None:
                     signal["holding_age_sessions"] = int(
                         fact["holding_age_sessions"]
@@ -795,6 +987,21 @@ class AdviceService:
                     signal["holding_age_evidence"] = fact.get(
                         "holding_age_evidence"
                     )
+            if card.get("is_investment_advice") is True:
+                account_actions = [
+                    str(signal.get("account_action") or "NO_ACTION").upper()
+                    for signal in card.get("signals") or []
+                ]
+                if any(action in {"BUY", "ADD"} for action in account_actions):
+                    card["action"] = "BUY"
+                elif any(
+                    action in {"REDUCE", "EXIT"} for action in account_actions
+                ):
+                    card["action"] = "REDUCE"
+                elif any(action == "HOLD" for action in account_actions):
+                    card["action"] = "HOLD"
+                else:
+                    card["action"] = "NO_ACTION"
 
     def _authoritative_member_health_snapshots(
         self, account_id: str
@@ -1016,6 +1223,8 @@ class AdviceService:
             "criteria_json": criteria,
             "criteria_sha256": str(gate.criteria_sha256),
         }
+        if str(version_row.horizon_profile) == LONG_1_3Y:
+            common["maturity"] = _long_maturity_projection(evidence)
         if failures:
             return _insufficient_evidence(
                 [
@@ -1285,24 +1494,88 @@ class AdviceService:
             )
             if isinstance(item, dict) and str(item.get("instrument") or "")
         }
+        changes = {
+            str(item.get("instrument") or "").upper(): dict(item)
+            for item in (
+                dict(getattr(snapshot, "snapshot_json", None) or {}).get("changes")
+                or []
+            )
+            if isinstance(item, dict) and str(item.get("instrument") or "")
+        }
+        holding_by_instrument = {
+            str(row.instrument).upper(): row for row in holdings
+        }
+        removed_instruments = {
+            instrument
+            for instrument in set(account_actions) | set(changes)
+            if _action(
+                (account_actions.get(instrument) or {}).get("action")
+                or (changes.get(instrument) or {}).get("action"),
+                previous_weight=float(
+                    (changes.get(instrument) or {}).get("previous_weight")
+                    or (account_actions.get(instrument) or {}).get("previous_weight")
+                    or 0.0
+                ),
+                weight=float(
+                    (changes.get(instrument) or {}).get("target_weight")
+                    or (changes.get(instrument) or {}).get("weight")
+                    or (account_actions.get(instrument) or {}).get("target_weight")
+                    or (account_actions.get(instrument) or {}).get("weight")
+                    or 0.0
+                ),
+            )
+            in {"REDUCE", "EXIT"}
+        }
+        projected_instruments = [
+            *holding_by_instrument,
+            *sorted(removed_instruments - set(holding_by_instrument)),
+        ]
         review = self._review_projection(
             effective_date=effective,
             review_sessions=review_sessions,
             dataset=str(snapshot.dataset or "") or None,
         )
         signals = []
-        for row in holdings:
-            weight = float(row.weight)
-            previous = float(row.previous_weight)
-            account_action = account_actions.get(str(row.instrument).upper()) or {}
+        for instrument in projected_instruments:
+            row = holding_by_instrument.get(instrument)
+            change = changes.get(instrument) or {}
+            account_action = account_actions.get(instrument) or {}
+            weight = float(
+                row.weight
+                if row is not None
+                else change.get("target_weight")
+                or change.get("weight")
+                or account_action.get("target_weight")
+                or account_action.get("weight")
+                or 0.0
+            )
+            previous = float(
+                row.previous_weight
+                if row is not None
+                else change.get("previous_weight")
+                or account_action.get("previous_weight")
+                or 0.0
+            )
+            action = _action(
+                account_action.get("action")
+                or change.get("action")
+                or (row.action if row is not None else None),
+                previous_weight=previous,
+                weight=weight,
+            )
+            if row is None and action not in {"REDUCE", "EXIT"}:
+                continue
+            reason = str(
+                row.reason
+                if row is not None
+                else change.get("reason")
+                or account_action.get("reason")
+                or "策略目标已减仓或退出"
+            )
             signals.append(
                 {
-                    "instrument": str(row.instrument),
-                    "action": _action(
-                        account_action.get("action") or row.action,
-                        previous_weight=previous,
-                        weight=weight,
-                    ),
+                    "instrument": str(row.instrument) if row is not None else instrument,
+                    "action": action,
                     "target_weight": weight,
                     "target_position_quantity": None,
                     "trade_quantity": None,
@@ -1313,8 +1586,8 @@ class AdviceService:
                     "holding_age_sessions": None,
                     "holding_age_source": "awaiting_authoritative_account_lots",
                     "reason": {
-                        "summary": str(row.reason),
-                        "signals": [str(row.reason)],
+                        "summary": reason,
+                        "signals": [reason],
                     },
                     "risks": ["市场、流动性、模型漂移与成本均可能使信号失效"],
                     "invalidation": ["策略排名、基本面、估值或风险规则失效"],
@@ -1520,9 +1793,15 @@ class AdviceService:
             }
             for instrument, value in sorted((plan.get("net_targets") or {}).items())
         ]
+        account_action = _unified_account_action(trades)
         return {
             "status": "ready",
-            "action": "NO_ACTION" if not trades else "REBALANCE",
+            "action": account_action,
+            "reason": (
+                _unified_no_action_reason(instrument_facts)
+                if account_action == "NO_ACTION"
+                else None
+            ),
             "verified_horizons": verified_horizons,
             "missing_horizons": missing_horizons,
             "missing_horizon_budget_policy": "remain_in_cash",
@@ -1532,6 +1811,7 @@ class AdviceService:
             "freshness": plan_freshness,
             "simulation_portfolio_id": execution.get("portfolio_id"),
             "execution_batch_id": execution.get("batch_id"),
+            "decision_event_id": execution.get("decision_event_id"),
             "holding_age_as_of": execution.get("holding_age_as_of"),
             "cash_weight": float(plan.get("cash_weight") or 0.0),
             "targets": targets,

@@ -178,7 +178,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0076_baseline_runtime_repair"
+    assert revision == "0077_baseline_input_scope"
     assert "capital_oos_alpha_batch_id" in {
         column["name"]
         for column in inspector.get_columns("oos_vintages", schema="quantlab")
@@ -966,7 +966,7 @@ def test_0045_retires_legacy_approved_pair_versions(database_url: str) -> None:
     assert audit is not None and audit[1] == "migration-0045"
 
 
-def test_same_lineage_repair_constraint_is_limited_to_exact_v2_v3_v4(
+def test_same_lineage_repair_constraint_is_limited_to_exact_v2_v3_v4_v5(
     database_url: str,
 ) -> None:
     engine = open_database(database_url)
@@ -1013,6 +1013,130 @@ def test_same_lineage_repair_constraint_is_limited_to_exact_v2_v3_v4(
     assert "256bbfd579865e7bc1442f1f64003d655241abecb320e5d27b440dd635224d57" in (
         definition
     )
+    assert "transparent-baseline-pre-result-repair-v5" in definition
+    assert "v10-to-v11-runtime-input-scope" in definition
+    assert "transparent-baseline-runtime-input-scope-v1" in definition
+    assert "bb4d1139f848f0e39b82d13f7c4d58ff7659d8d2" in definition
+    assert "9bc6a3017c2c718497dd53395da43c6d7392ceefdd0a268587c48d77813bcd65" in (
+        definition
+    )
+    assert "4771fc24680dcdca18fbcf73c887f604aad70d5f586c25116102f75d51d6e042" in (
+        definition
+    )
+    assert "6e169632f9f322db93856f0e7ade3c9436b310e3509806f68d0b47db837e1b6d" in (
+        definition
+    )
+    assert "64fa634b4e774279356c5655e70c741890ed9b208ccf75df757a378c0f56a432" in (
+        definition
+    )
+    assert "687ad83efd9d734a238bd6b52b3f5e670cec1e5d165ec2b25cabcef724feb7cf" in (
+        definition
+    )
+    assert "c2727672b33fed580841721551c45df1a11e864dd899cb6d473c220821da0dc0" in (
+        definition
+    )
+    for target_change_code in (
+        "missing-5d-extension-evidence-per-instrument-new-entry-rejection",
+        "missing-trend-evidence-holding-continuity-new-entry-rejection",
+        "shared-governed-style-exposure-snapshot-backtest-recommendation",
+        "topk-benchmark-weight-non-consumption",
+    ):
+        assert target_change_code in definition
+
+
+def test_downgrade_rejects_append_only_same_lineage_v5_atomically(
+    database_url: str,
+) -> None:
+    engine = open_database(database_url)
+    source_ids = [
+        "00f1b9171d3d4ec3a04ade9ddec7d061",
+        "04e84f759929477a9cae3de4ba1749fe",
+        "4aa9972029d34793848f2c5a3e4ddb43",
+    ]
+    verification = {
+        "receipt_contract_version": "transparent-baseline-pre-result-repair-v5",
+        "repair_generation": "v10-to-v11-runtime-input-scope",
+        "source_release_commit": "bb4d1139f848f0e39b82d13f7c4d58ff7659d8d2",
+        "source_batch_sha256": (
+            "9bc6a3017c2c718497dd53395da43c6d7392ceefdd0a268587c48d77813bcd65"
+        ),
+        "source_dataset_identity_sha256": (
+            "4771fc24680dcdca18fbcf73c887f604aad70d5f586c25116102f75d51d6e042"
+        ),
+        "source_dataset_lineage_id": (
+            "6e169632f9f322db93856f0e7ade3c9436b310e3509806f68d0b47db837e1b6d"
+        ),
+        "source_runner_sha256": (
+            "0f868f2f3beaf5cff5db461f11c411ab3ef960c620c3f2f902ac385fc79eff4d"
+        ),
+        "target_runner_sha256": (
+            "64fa634b4e774279356c5655e70c741890ed9b208ccf75df757a378c0f56a432"
+        ),
+        "source_runtime_bundle_sha256": (
+            "eea7ca8854acbed0370ead8d97fdfdb128059f41d8a5995a5050b7ec9e9f3a34"
+        ),
+        "target_runtime_bundle_sha256": (
+            "687ad83efd9d734a238bd6b52b3f5e670cec1e5d165ec2b25cabcef724feb7cf"
+        ),
+        "runtime_contract_version": "transparent-baseline-runtime-input-scope-v1",
+        "source_artifact_inventories_sha256": (
+            "c2727672b33fed580841721551c45df1a11e864dd899cb6d473c220821da0dc0"
+        ),
+        "target_change_codes": [
+            "missing-5d-extension-evidence-per-instrument-new-entry-rejection",
+            "missing-trend-evidence-holding-continuity-new-entry-rejection",
+            "shared-governed-style-exposure-snapshot-backtest-recommendation",
+            "topk-benchmark-weight-non-consumption",
+        ],
+    }
+    with engine.begin() as connection:
+        audit_id = connection.execute(
+            insert(audit_events)
+            .values(
+                user_id=None,
+                username="system:migration-test",
+                action="transparent_baseline_pre_result_repair_registered",
+                method="INTERNAL",
+                path="transparent-baseline/pre-result-repair",
+                status_code=201,
+                ip_hash=None,
+                user_agent="pytest",
+                details_json={},
+                created_at=datetime.now(UTC),
+            )
+            .returning(audit_events.c.id)
+        ).scalar_one()
+        connection.execute(
+            insert(transparent_baseline_pre_result_repairs).values(
+                receipt_sha256="a" * 64,
+                source_audit_event_id=audit_id,
+                source_batch_sha256=verification["source_batch_sha256"],
+                target_batch_sha256="b" * 64,
+                source_dataset_lineage_id=verification[
+                    "source_dataset_lineage_id"
+                ],
+                target_dataset_lineage_id=verification[
+                    "source_dataset_lineage_id"
+                ],
+                target_recipe_version=(
+                    "qlib-rdagent-single-mainline-2026-08-30-v11"
+                ),
+                source_backtest_ids_json=source_ids,
+                target_strategy_version_ids_json=["1" * 32, "2" * 32, "3" * 32],
+                verification_json=verification,
+                created_at=datetime.now(UTC),
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="runtime input-scope repair evidence"):
+        command.downgrade(
+            alembic_config(database_url), "0076_baseline_runtime_repair"
+        )
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM quantlab.alembic_version")
+        ) == "0077_baseline_input_scope"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
@@ -1090,7 +1214,7 @@ def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0076_baseline_runtime_repair"
+        ) == "0077_baseline_input_scope"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
@@ -1158,7 +1282,7 @@ def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0076_baseline_runtime_repair"
+        ) == "0077_baseline_input_scope"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
@@ -1220,4 +1344,4 @@ def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0076_baseline_runtime_repair"
+        ) == "0077_baseline_input_scope"

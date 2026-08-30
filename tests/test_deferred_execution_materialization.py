@@ -353,10 +353,16 @@ def test_predecessor_waiting_blocks_only_its_own_account(
     scheduler.strategies = SimpleNamespace(
         get_version=lambda version_id: {
             "id": version_id,
-            "config": {"signal_source": "factor_score"},
+            "config": {
+                "signal_source": "factor_score",
+                "factor_source_mode": "qlib_baseline",
+            },
         }
     )
     scheduler.model_artifacts = SimpleNamespace()
+    scheduler.strategy_feature_drift = SimpleNamespace(
+        current_challenger_artifact_binding=lambda *_args, **_kwargs: None
+    )
     scheduler.promotions = SimpleNamespace(
         require_paper_signal=lambda *_args, **_kwargs: {
             "id": "stage-1",

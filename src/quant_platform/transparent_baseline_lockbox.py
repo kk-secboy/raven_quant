@@ -41,6 +41,7 @@ from quant_platform.transparent_baseline_runner import (
     OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
     RUNTIME_ALIGNMENT_SOURCE_RUNTIME_BUNDLE_SHA256,
     RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256,
+    RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
     target_runner_for_recipe,
@@ -52,6 +53,12 @@ from quant_platform.transparent_baseline_runner import (
 from quant_platform.transparent_baseline_runner import (
     RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256 as GOVERNED_RUNTIME_TARGET_RUNNER_SHA256,
 )
+from quant_platform.transparent_baseline_runner import (
+    RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION as GOVERNED_INPUT_SCOPE_TARGET_RECIPE_VERSION,
+)
+from quant_platform.transparent_baseline_runner import (
+    RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256 as GOVERNED_INPUT_SCOPE_TARGET_RUNNER_SHA256,
+)
 
 LOCKBOX_CONTRACT_VERSION = "transparent-baseline-joint-lockbox-v1"
 LOCKBOX_LINK_VERSION = "transparent-baseline-joint-lockbox-link-v1"
@@ -62,6 +69,7 @@ PRE_RESULT_REPAIR_CONTRACT_VERSION_V1 = "transparent-baseline-pre-result-repair-
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 = "transparent-baseline-pre-result-repair-v2"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V3 = "transparent-baseline-pre-result-repair-v3"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V4 = "transparent-baseline-pre-result-repair-v4"
+PRE_RESULT_REPAIR_CONTRACT_VERSION_V5 = "transparent-baseline-pre-result-repair-v5"
 # Keep the historical public name pinned to v1.  Existing receipts and callers
 # must not silently acquire the wider v2 shape.
 PRE_RESULT_REPAIR_CONTRACT_VERSION = PRE_RESULT_REPAIR_CONTRACT_VERSION_V1
@@ -193,6 +201,106 @@ RUNTIME_ALIGNMENT_SOURCE_BINDINGS = {
 RUNTIME_ALIGNMENT_SOURCE_BACKTEST_IDS = frozenset(
     RUNTIME_ALIGNMENT_SOURCE_BINDINGS
 )
+RUNTIME_INPUT_SCOPE_REPAIR_GENERATION = "v10-to-v11-runtime-input-scope"
+RUNTIME_INPUT_SCOPE_CONTRACT_VERSION = "transparent-baseline-runtime-input-scope-v1"
+RUNTIME_INPUT_SCOPE_SOURCE_COMMIT = "bb4d1139f848f0e39b82d13f7c4d58ff7659d8d2"
+RUNTIME_INPUT_SCOPE_SOURCE_RECIPE_VERSION = RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION
+RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION = GOVERNED_INPUT_SCOPE_TARGET_RECIPE_VERSION
+RUNTIME_INPUT_SCOPE_SOURCE_RUNNER_SHA256 = RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256
+RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256 = GOVERNED_INPUT_SCOPE_TARGET_RUNNER_SHA256
+RUNTIME_INPUT_SCOPE_SOURCE_BUNDLE_SHA256 = RUNTIME_ALIGNMENT_TARGET_BUNDLE_SHA256
+RUNTIME_INPUT_SCOPE_TARGET_BUNDLE_SHA256 = (
+    RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256
+)
+RUNTIME_INPUT_SCOPE_TOPK_BENCHMARK_REASON = (
+    "topk-unused-benchmark-industry-metadata-leak"
+)
+RUNTIME_INPUT_SCOPE_TREND_REASON = "trend-break-nonholding-history-scope-leak"
+RUNTIME_INPUT_SCOPE_VALUATION_REASON = (
+    "valuation-entry-missing-exposure-global-failure"
+)
+# These codes describe target-runtime semantics that are materially different
+# from v10 but were not the observed error marker of any source backtest.  Keep
+# them separate from ``reason_codes`` so the repair receipt never rewrites the
+# historical failure evidence.
+RUNTIME_INPUT_SCOPE_TARGET_CHANGE_CODES = (
+    "missing-5d-extension-evidence-per-instrument-new-entry-rejection",
+    "missing-trend-evidence-holding-continuity-new-entry-rejection",
+    "shared-governed-style-exposure-snapshot-backtest-recommendation",
+    "topk-benchmark-weight-non-consumption",
+)
+RUNTIME_INPUT_SCOPE_TOPK_BENCHMARK_ERROR = (
+    "ValueError: benchmark constituents are missing point-in-time industries"
+)
+RUNTIME_INPUT_SCOPE_TREND_ERROR = (
+    "ValueError: trend-break rule has incomplete close history"
+)
+RUNTIME_INPUT_SCOPE_VALUATION_ERROR = (
+    "ValueError: valuation-regime value exposures are incomplete"
+)
+RUNTIME_INPUT_SCOPE_SOURCE_DATASET = "cn-20080101-20260828-v6-79a88b3"
+RUNTIME_INPUT_SCOPE_SOURCE_DATASET_IDENTITY_SHA256 = (
+    "4771fc24680dcdca18fbcf73c887f604aad70d5f586c25116102f75d51d6e042"
+)
+RUNTIME_INPUT_SCOPE_SOURCE_DATASET_LINEAGE_ID = (
+    "6e169632f9f322db93856f0e7ade3c9436b310e3509806f68d0b47db837e1b6d"
+)
+RUNTIME_INPUT_SCOPE_SOURCE_BATCH_SHA256 = (
+    "9bc6a3017c2c718497dd53395da43c6d7392ceefdd0a268587c48d77813bcd65"
+)
+RUNTIME_INPUT_SCOPE_SOURCE_ARTIFACT_INVENTORIES_SHA256 = (
+    "c2727672b33fed580841721551c45df1a11e864dd899cb6d473c220821da0dc0"
+)
+RUNTIME_INPUT_SCOPE_SOURCE_BINDINGS = {
+    "00f1b9171d3d4ec3a04ade9ddec7d061": {
+        "job_id": "36c20231ba7e48f285f4c3e16fc30ef6",
+        "strategy_version_id": "a9b9dd6a34d34ea983c4754912a87820",
+        "reason_code": RUNTIME_INPUT_SCOPE_TOPK_BENCHMARK_REASON,
+        "error": RUNTIME_INPUT_SCOPE_TOPK_BENCHMARK_ERROR,
+        "periods": {
+            "historical_start": "2014-02-11",
+            "historical_end": "2025-07-10",
+            "start": "2025-08-08",
+            "end": "2026-08-21",
+        },
+        "artifact_inventory_sha256": (
+            "d401693394d966fdb28bff4cede757dec225a26468ee8da43c2329ba7ce5d58e"
+        ),
+    },
+    "4aa9972029d34793848f2c5a3e4ddb43": {
+        "job_id": "88cd85f298c649a1b97130a996a8011e",
+        "strategy_version_id": "59b5315df5364438a60c57ee0d5a997f",
+        "reason_code": RUNTIME_INPUT_SCOPE_TREND_REASON,
+        "error": RUNTIME_INPUT_SCOPE_TREND_ERROR,
+        "periods": {
+            "historical_start": "2011-08-10",
+            "historical_end": "2023-07-17",
+            "start": "2024-01-22",
+            "end": "2026-02-26",
+        },
+        "artifact_inventory_sha256": (
+            "39af316bfeb9e2c3141d435f23354cbbd0575f981293da1fd627d84136ca610e"
+        ),
+    },
+    "04e84f759929477a9cae3de4ba1749fe": {
+        "job_id": "78c111bfb10f467b8e197fb7dde68f0e",
+        "strategy_version_id": "7b9476ece2b2455c8f61b36c46beddea",
+        "reason_code": RUNTIME_INPUT_SCOPE_VALUATION_REASON,
+        "error": RUNTIME_INPUT_SCOPE_VALUATION_ERROR,
+        "periods": {
+            "historical_start": "2009-01-08",
+            "historical_end": "2021-06-18",
+            "start": "2022-07-06",
+            "end": "2025-08-14",
+        },
+        "artifact_inventory_sha256": (
+            "412710b28ede1acaa3d27210fd6cbfeded8bf157e731b51eefd2a30c3d11c89e"
+        ),
+    },
+}
+RUNTIME_INPUT_SCOPE_SOURCE_BACKTEST_IDS = frozenset(
+    RUNTIME_INPUT_SCOPE_SOURCE_BINDINGS
+)
 
 _PRE_RESULT_REPAIR_REASON_CODES = frozenset(
     {
@@ -278,8 +386,10 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
     V2 authorizes only the v7-to-v8 optimizer-applicability repair; V3
     authorizes only the three exact v8 failures caused before the canonical-LF
     release package could execute the already-frozen runner source; V4 seals
-    the exact v9 runtime-contract failures and their complete partial-artifact
-    inventories before any corrected code can open a fresh OOS scope.
+    the exact v9 runtime-contract failures; V5 seals the exact v10 runtime
+    input-scope failures and their complete partial-artifact inventories, plus
+    a separate exact target-change list, before any corrected code can open a
+    fresh OOS scope.
     """
 
     if not isinstance(value, Mapping):
@@ -350,6 +460,37 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         }
         repair_generation = str(value.get("repair_generation") or "").strip()
         if repair_generation != RUNTIME_ALIGNMENT_REPAIR_GENERATION:
+            raise ValueError("transparent baseline repair generation is not allowlisted")
+    elif contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V5:
+        keys = common_keys | {
+            "repair_generation",
+            "source_batch_sha256",
+            "source_dataset_identity_sha256",
+            "source_dataset_lineage_id",
+            "source_runner_sha256",
+            TRANSPARENT_BASELINE_RUNNER_FIELD,
+            "source_runtime_bundle_sha256",
+            "target_runtime_bundle_sha256",
+            "runtime_contract_version",
+            "source_artifact_inventories_sha256",
+            "target_change_codes",
+        }
+        expected_reasons = frozenset(
+            {
+                RUNTIME_INPUT_SCOPE_TOPK_BENCHMARK_REASON,
+                RUNTIME_INPUT_SCOPE_TREND_REASON,
+                RUNTIME_INPUT_SCOPE_VALUATION_REASON,
+            }
+        )
+        failure_markers = {
+            RUNTIME_INPUT_SCOPE_TOPK_BENCHMARK_REASON: (
+                RUNTIME_INPUT_SCOPE_TOPK_BENCHMARK_ERROR
+            ),
+            RUNTIME_INPUT_SCOPE_TREND_REASON: RUNTIME_INPUT_SCOPE_TREND_ERROR,
+            RUNTIME_INPUT_SCOPE_VALUATION_REASON: RUNTIME_INPUT_SCOPE_VALUATION_ERROR,
+        }
+        repair_generation = str(value.get("repair_generation") or "").strip()
+        if repair_generation != RUNTIME_INPUT_SCOPE_REPAIR_GENERATION:
             raise ValueError("transparent baseline repair generation is not allowlisted")
     else:
         raise ValueError("transparent baseline pre-result repair contract is invalid")
@@ -425,6 +566,52 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         != RUNTIME_ALIGNMENT_CONTRACT_VERSION
     ):
         raise ValueError("runtime alignment repair source or target is not allowlisted")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V5 and (
+        commit != RUNTIME_INPUT_SCOPE_SOURCE_COMMIT
+        or target_recipe_version != RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION
+        or _require_sha256(
+            value.get("source_batch_sha256"), field="source_batch_sha256"
+        )
+        != RUNTIME_INPUT_SCOPE_SOURCE_BATCH_SHA256
+        or _require_sha256(
+            value.get("source_dataset_identity_sha256"),
+            field="source_dataset_identity_sha256",
+        )
+        != RUNTIME_INPUT_SCOPE_SOURCE_DATASET_IDENTITY_SHA256
+        or _require_sha256(
+            value.get("source_dataset_lineage_id"),
+            field="source_dataset_lineage_id",
+        )
+        != RUNTIME_INPUT_SCOPE_SOURCE_DATASET_LINEAGE_ID
+        or _require_sha256(
+            value.get("source_runner_sha256"), field="source_runner_sha256"
+        )
+        != RUNTIME_INPUT_SCOPE_SOURCE_RUNNER_SHA256
+        or _require_sha256(
+            value.get(TRANSPARENT_BASELINE_RUNNER_FIELD),
+            field=TRANSPARENT_BASELINE_RUNNER_FIELD,
+        )
+        != RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256
+        or _require_sha256(
+            value.get("source_runtime_bundle_sha256"),
+            field="source_runtime_bundle_sha256",
+        )
+        != RUNTIME_INPUT_SCOPE_SOURCE_BUNDLE_SHA256
+        or _require_sha256(
+            value.get("target_runtime_bundle_sha256"),
+            field="target_runtime_bundle_sha256",
+        )
+        != RUNTIME_INPUT_SCOPE_TARGET_BUNDLE_SHA256
+        or value.get("runtime_contract_version")
+        != RUNTIME_INPUT_SCOPE_CONTRACT_VERSION
+    ):
+        raise ValueError("runtime input-scope repair source or target is not allowlisted")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V5 and (
+        not isinstance(value.get("target_change_codes"), list)
+        or value.get("target_change_codes")
+        != list(RUNTIME_INPUT_SCOPE_TARGET_CHANGE_CODES)
+    ):
+        raise ValueError("runtime input-scope target changes are not allowlisted")
     if (
         value.get("target_eligibility_contract") != ELIGIBILITY_CONTRACT_VERSION
         or value.get("target_stock_scope_contract")
@@ -507,6 +694,7 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V2,
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V3,
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V4,
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V5,
         } and (
             member.get("status") != "failed"
         ):
@@ -530,6 +718,12 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
                 )
                 if source is None or error_text != source["error"]:
                     raise ValueError("runtime alignment repair error is not exact")
+            if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V5:
+                source = RUNTIME_INPUT_SCOPE_SOURCE_BINDINGS.get(
+                    str(member.get("backtest_id") or "")
+                )
+                if source is None or error_text != source["error"]:
+                    raise ValueError("runtime input-scope repair error is not exact")
             matches = {
                 code
                 for code, marker in failure_markers.items()
@@ -633,6 +827,45 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
             sorted(inventory_digests, key=lambda item: item["backtest_id"])
         ):
             raise ValueError("runtime alignment aggregate artifact inventory changed")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V5:
+        if identifiers["backtest_id"] != RUNTIME_INPUT_SCOPE_SOURCE_BACKTEST_IDS:
+            raise ValueError("runtime input-scope repair backtests are not allowlisted")
+        inventory_digests: list[dict[str, str]] = []
+        for member in members:
+            source = RUNTIME_INPUT_SCOPE_SOURCE_BINDINGS.get(member["backtest_id"])
+            if source is None or any(
+                member[field] != source[field]
+                for field in ("job_id", "strategy_version_id")
+            ):
+                raise ValueError("runtime input-scope source binding changed")
+            if (
+                member["dataset"] != RUNTIME_INPUT_SCOPE_SOURCE_DATASET
+                or member["periods"] != source["periods"]
+                or member["error"] != source["error"]
+            ):
+                raise ValueError("runtime input-scope source evidence changed")
+            inventory_sha256 = canonical_sha256(member["files"])
+            if inventory_sha256 != source["artifact_inventory_sha256"]:
+                raise ValueError("runtime input-scope artifact inventory changed")
+            inventory_digests.append(
+                {
+                    "backtest_id": member["backtest_id"],
+                    "artifact_inventory_sha256": inventory_sha256,
+                }
+            )
+        aggregate_inventory = canonical_sha256(
+            sorted(inventory_digests, key=lambda item: item["backtest_id"])
+        )
+        if (
+            aggregate_inventory
+            != RUNTIME_INPUT_SCOPE_SOURCE_ARTIFACT_INVENTORIES_SHA256
+            or _require_sha256(
+                value.get("source_artifact_inventories_sha256"),
+                field="source_artifact_inventories_sha256",
+            )
+            != aggregate_inventory
+        ):
+            raise ValueError("runtime input-scope aggregate artifact inventory changed")
     if observed_failure_markers != expected_reasons:
         raise ValueError("transparent baseline repair does not cover its allowlisted defect")
     return {
@@ -1118,6 +1351,36 @@ def _exact_same_lineage_registry_profile(
             )
             and source_backtest_ids == set(RUNTIME_ALIGNMENT_SOURCE_BACKTEST_IDS)
         )
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V5:
+        return (
+            verification.get("repair_generation")
+            == RUNTIME_INPUT_SCOPE_REPAIR_GENERATION
+            and verification.get("source_batch_sha256")
+            == RUNTIME_INPUT_SCOPE_SOURCE_BATCH_SHA256
+            and verification.get("source_dataset_identity_sha256")
+            == RUNTIME_INPUT_SCOPE_SOURCE_DATASET_IDENTITY_SHA256
+            and verification.get("source_dataset_lineage_id")
+            == RUNTIME_INPUT_SCOPE_SOURCE_DATASET_LINEAGE_ID
+            and verification.get("source_runner_sha256")
+            == RUNTIME_INPUT_SCOPE_SOURCE_RUNNER_SHA256
+            and verification.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+            == RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256
+            and verification.get("source_runtime_bundle_sha256")
+            == RUNTIME_INPUT_SCOPE_SOURCE_BUNDLE_SHA256
+            and verification.get("target_runtime_bundle_sha256")
+            == RUNTIME_INPUT_SCOPE_TARGET_BUNDLE_SHA256
+            and verification.get("runtime_contract_version")
+            == RUNTIME_INPUT_SCOPE_CONTRACT_VERSION
+            and verification.get("source_release_commit")
+            == RUNTIME_INPUT_SCOPE_SOURCE_COMMIT
+            and verification.get("target_recipe_version")
+            == RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION
+            and verification.get("source_artifact_inventories_sha256")
+            == RUNTIME_INPUT_SCOPE_SOURCE_ARTIFACT_INVENTORIES_SHA256
+            and verification.get("target_change_codes")
+            == list(RUNTIME_INPUT_SCOPE_TARGET_CHANGE_CODES)
+            and source_backtest_ids == set(RUNTIME_INPUT_SCOPE_SOURCE_BACKTEST_IDS)
+        )
     return False
 
 
@@ -1371,10 +1634,14 @@ class TransparentBaselineLockboxStore:
         is_runtime_alignment_repair = receipt["contract_version"] == (
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V4
         )
+        is_runtime_input_scope_repair = receipt["contract_version"] == (
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V5
+        )
         is_same_lineage_repair = (
             is_optimizer_applicability_repair
             or is_canonical_lf_packaging_repair
             or is_runtime_alignment_repair
+            or is_runtime_input_scope_repair
         )
         if is_same_lineage_repair:
             if (
@@ -1388,6 +1655,17 @@ class TransparentBaselineLockboxStore:
                 raise ValueError(
                     "same-lineage repair changed the dataset or lineage"
                 )
+            if is_runtime_input_scope_repair and (
+                source_batch_sha256 != RUNTIME_INPUT_SCOPE_SOURCE_BATCH_SHA256
+                or source_identity
+                != RUNTIME_INPUT_SCOPE_SOURCE_DATASET_IDENTITY_SHA256
+                or source_lineage != RUNTIME_INPUT_SCOPE_SOURCE_DATASET_LINEAGE_ID
+                or target_dataset_identity_sha256
+                != RUNTIME_INPUT_SCOPE_SOURCE_DATASET_IDENTITY_SHA256
+                or target_dataset_lineage_id
+                != RUNTIME_INPUT_SCOPE_SOURCE_DATASET_LINEAGE_ID
+            ):
+                raise ValueError("runtime input-scope source batch or dataset changed")
         elif source_lineage == target_dataset_lineage_id:
             raise ValueError("transparent baseline repair may not fabricate a fresh lineage")
 
@@ -1472,7 +1750,11 @@ class TransparentBaselineLockboxStore:
                 or str(expected["test_start"]) != member["periods"]["start"]
                 or str(expected["test_end"]) != member["periods"]["end"]
                 or (
-                    (is_canonical_lf_packaging_repair or is_runtime_alignment_repair)
+                    (
+                        is_canonical_lf_packaging_repair
+                        or is_runtime_alignment_repair
+                        or is_runtime_input_scope_repair
+                    )
                     and (
                         _repair_bootstrap_semantics(target_config)
                         != _repair_bootstrap_semantics(source_config)
@@ -1496,6 +1778,10 @@ class TransparentBaselineLockboxStore:
                 "recipe_version"
             ) != RUNTIME_ALIGNMENT_SOURCE_RECIPE_VERSION:
                 raise ValueError("runtime alignment repair source recipe changed")
+            if is_runtime_input_scope_repair and source_config.get(
+                "recipe_version"
+            ) != RUNTIME_INPUT_SCOPE_SOURCE_RECIPE_VERSION:
+                raise ValueError("runtime input-scope repair source recipe changed")
             if is_canonical_lf_packaging_repair and (
                 source_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
                 != receipt["source_runner_expected_sha256"]
@@ -1508,16 +1794,23 @@ class TransparentBaselineLockboxStore:
                 is not None
             ):
                 raise ValueError("runtime alignment source runtime binding changed")
+            if is_runtime_input_scope_repair and (
+                source_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+                != receipt["source_runner_sha256"]
+                or source_bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
+                != receipt["source_runtime_bundle_sha256"]
+            ):
+                raise ValueError("runtime input-scope source runtime binding changed")
             if is_same_lineage_repair and (
                 target_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
                 != receipt[TRANSPARENT_BASELINE_RUNNER_FIELD]
             ):
                 raise ValueError("same-lineage repair target runner changed")
-            if is_runtime_alignment_repair and (
+            if (is_runtime_alignment_repair or is_runtime_input_scope_repair) and (
                 target_bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
                 != receipt["target_runtime_bundle_sha256"]
             ):
-                raise ValueError("runtime alignment target runtime bundle changed")
+                raise ValueError("runtime repair target runtime bundle changed")
             has_metrics = backtest.metrics_json is not None
             has_result = _artifact_result_exists(backtest.artifact_path)
             declared_files = sorted(member["files"], key=lambda item: item["path"])
@@ -1541,7 +1834,11 @@ class TransparentBaselineLockboxStore:
                 later_results.append(str(backtest.id))
             elif member["status"] == "failed":
                 marker = str(member.get("error") or "")
-                if is_canonical_lf_packaging_repair or is_runtime_alignment_repair:
+                if (
+                    is_canonical_lf_packaging_repair
+                    or is_runtime_alignment_repair
+                    or is_runtime_input_scope_repair
+                ):
                     error_matches = (
                         str(backtest.error or "") == marker
                         and str(backtest.job_error or "") == marker
@@ -1579,6 +1876,15 @@ class TransparentBaselineLockboxStore:
             "source_batch_sha256": source_batch_sha256,
             "target_batch_sha256": target_batch_sha256,
             "source_dataset_lineage_id": source_lineage,
+            **(
+                {
+                    "source_dataset_identity_sha256": receipt[
+                        "source_dataset_identity_sha256"
+                    ]
+                }
+                if is_runtime_input_scope_repair
+                else {}
+            ),
             "target_dataset": target_dataset,
             "target_dataset_identity_sha256": target_dataset_identity_sha256,
             "target_dataset_lineage_id": target_dataset_lineage_id,
@@ -1608,6 +1914,11 @@ class TransparentBaselineLockboxStore:
             "runtime_contract_version": receipt.get("runtime_contract_version"),
             "source_artifact_inventories_sha256": receipt.get(
                 "source_artifact_inventories_sha256"
+            ),
+            **(
+                {"target_change_codes": list(receipt["target_change_codes"])}
+                if is_runtime_input_scope_repair
+                else {}
             ),
             "source_backtest_ids": sorted(item["backtest_id"] for item in members.values()),
             "target_strategy_version_ids": sorted(target_version_ids),
@@ -1820,7 +2131,7 @@ class TransparentBaselineLockboxStore:
                     )
                 },
             ):
-                # Both allowlisted same-lineage generations intentionally keep
+                # Allowlisted same-lineage generations intentionally keep
                 # the exact data and OOS dates. Use a repair-specific scope so
                 # each generation receives new immutable one-shot rows instead
                 # of mutating or reopening its consumed source rows.
