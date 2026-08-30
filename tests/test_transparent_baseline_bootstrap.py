@@ -37,6 +37,10 @@ from quant_platform.transparent_baseline_bootstrap import (
 )
 from quant_platform.transparent_baseline_lockbox import (
     BOOTSTRAP_CONFIG_KEY,
+    CANONICAL_LF_PACKAGING_ERROR,
+    CANONICAL_LF_PACKAGING_SOURCE_BINDINGS,
+    CANONICAL_LF_PACKAGING_SOURCE_OBSERVED_RUNNER_SHA256,
+    CANONICAL_LF_PACKAGING_TARGET_RECIPE_VERSION,
     LOCKBOX_CONFIG_KEY,
     OPTIMIZER_APPLICABILITY_REASON,
     OPTIMIZER_APPLICABILITY_REPAIR_GENERATION,
@@ -55,6 +59,7 @@ from quant_platform.transparent_baseline_lockbox import (
 )
 from quant_platform.transparent_baseline_repair import (
     build_optimizer_applicability_receipt,
+    register_canonical_lf_packaging_repair,
     register_optimizer_applicability_repair,
 )
 from quant_platform.transparent_baseline_runner import (
@@ -492,6 +497,7 @@ def _prepare_optimizer_repair_store_case(
     *,
     mutation: str | None = None,
     insert_receipt: bool = True,
+    target_version_ids_by_recipe: dict[str, str] | None = None,
 ) -> tuple[StrategyStore, list[dict], dict[str, str]]:
     """Create the exact failed v7 family and a governed v8 replacement."""
 
@@ -689,19 +695,38 @@ def _prepare_optimizer_repair_store_case(
                 creating_family=True,
             )
 
-    target_versions: list[dict] = []
-    for plan in target_plans:
-        recipe_id = str(plan["recipe"]["id"])
-        target_versions.append(
-            store.create_version_if_absent(
-                str(families[recipe_id]["id"]),
-                benchmark=str(plan["recipe"]["benchmark"]),
-                universe=str(plan["recipe"]["universe"]),
-                factors=[],
-                config=plan["config"],
-                actor="test",
+    def create_target_versions() -> list[dict]:
+        result: list[dict] = []
+        for plan in target_plans:
+            recipe_id = str(plan["recipe"]["id"])
+            result.append(
+                store.create_version_if_absent(
+                    str(families[recipe_id]["id"]),
+                    benchmark=str(plan["recipe"]["benchmark"]),
+                    universe=str(plan["recipe"]["universe"]),
+                    factors=[],
+                    config=plan["config"],
+                    actor="test",
+                )
             )
+        return result
+
+    if target_version_ids_by_recipe is None:
+        target_versions = create_target_versions()
+    else:
+        ordered_target_ids = iter(
+            [
+                target_version_ids_by_recipe[str(plan["recipe"]["id"])]
+                for plan in target_plans
+            ]
         )
+        with monkeypatch.context() as local_patch:
+            local_patch.setattr(
+                strategy_store_module.uuid,
+                "uuid4",
+                lambda: _FixedUuid(next(ordered_target_ids)),
+            )
+            target_versions = create_target_versions()
     return store, target_versions, {
         "dataset": target_dataset,
         "identity": target_identity,
@@ -1545,6 +1570,177 @@ def test_v2_optimizer_repair_consumes_only_its_preregistered_scope(
     assert len(repair_rows) == 3
     assert all(row.consumed_at is not None for row in source_rows)
     assert all(row.consumed_at is not None for row in repair_rows)
+
+
+def test_v3_packaging_repair_opens_and_consumes_a_new_exact_chain_scope(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quant_platform import strategy_store as strategy_store_module
+
+    source_by_recipe = {
+        "short_relative_strength": "1ca979f22a0d4e2981e6e5c5e478f583",
+        "swing_trend": "7b4386b52cf24d6d913dae3b232fbe7f",
+        "long_quality_value": "0c5f5a0b66284a66ba68225afd22b623",
+    }
+    source_version_ids = {
+        recipe_id: CANONICAL_LF_PACKAGING_SOURCE_BINDINGS[backtest_id][
+            "strategy_version_id"
+        ]
+        for recipe_id, backtest_id in source_by_recipe.items()
+    }
+    store, v8_versions, target = _prepare_optimizer_repair_store_case(
+        database_url,
+        tmp_path,
+        monkeypatch,
+        target_version_ids_by_recipe=source_version_ids,
+    )
+    lockboxes = TransparentBaselineLockboxStore(database_url)
+    v8_reservation = lockboxes.reserve(
+        versions=v8_versions,
+        dataset=target["dataset"],
+        dataset_identity_sha256=target["identity"],
+        dataset_lineage_id=target["lineage"],
+    )
+
+    class _FixedUuid:
+        def __init__(self, value: str) -> None:
+            self.hex = value
+
+    calendar = _calendar()
+    ordered_backtests = iter(
+        [source_by_recipe[str(version["config"]["recipe_id"])] for version in v8_versions]
+    )
+    engine = open_database(database_url)
+    with monkeypatch.context() as local_patch:
+        local_patch.setattr(
+            strategy_store_module.uuid,
+            "uuid4",
+            lambda: _FixedUuid(next(ordered_backtests)),
+        )
+        for version in v8_versions:
+            recipe_id = str(version["config"]["recipe_id"])
+            backtest_id = source_by_recipe[recipe_id]
+            binding = CANONICAL_LF_PACKAGING_SOURCE_BINDINGS[backtest_id]
+            bootstrap = dict(version["config"][BOOTSTRAP_CONFIG_KEY])
+            artifact = tmp_path / "packaging-repair-v8" / backtest_id
+            artifact.mkdir(parents=True)
+            created = store.create_backtest(
+                version_id=str(version["id"]),
+                dataset=target["dataset"],
+                periods=dict(bootstrap["formal_periods"]),
+                artifact_path=artifact,
+                trading_dates=calendar,
+                dataset_lineage_id=target["lineage"],
+                dataset_identity_sha256=target["identity"],
+            )
+            assert created["id"] == backtest_id
+            now = datetime.now(UTC)
+            with engine.begin() as connection:
+                connection.execute(
+                    insert(jobs).values(
+                        id=binding["job_id"],
+                        kind="strategy_backtest",
+                        idempotency_key=f"packaging-repair:{backtest_id}",
+                        status="failed",
+                        payload_json={
+                            "backtest_id": backtest_id,
+                            "strategy_version_id": str(version["id"]),
+                            "dataset": target["dataset"],
+                            "periods": dict(bootstrap["formal_periods"]),
+                            "transparent_baseline_runner_sha256": (
+                                OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
+                            ),
+                        },
+                        progress_json=None,
+                        log_path=str(tmp_path / f"{backtest_id}.log"),
+                        exit_code=1,
+                        error=CANONICAL_LF_PACKAGING_ERROR,
+                        attempts=1,
+                        max_attempts=1,
+                        next_attempt_at=None,
+                        cancel_requested_at=None,
+                        created_at=now,
+                        started_at=now,
+                        finished_at=now,
+                    )
+                )
+            store.attach_job(backtest_id, binding["job_id"])
+            store.mark_backtest(
+                backtest_id,
+                "failed",
+                error=CANONICAL_LF_PACKAGING_ERROR,
+            )
+
+    registered = register_canonical_lf_packaging_repair(
+        database_url,
+        backtest_ids=list(source_by_recipe.values()),
+        actor="system:test-v3",
+        source_runner_observed_sha256=(
+            CANONICAL_LF_PACKAGING_SOURCE_OBSERVED_RUNNER_SHA256
+        ),
+    )
+    assert registered["status"] == "registered"
+    assert all(member["files"] == [] for member in registered["receipt"]["members"])
+
+    current_plans, _ = _plans(calendar)
+    v9_plans, _ = _retarget_plans(
+        current_plans,
+        dataset=target["dataset"],
+        identity=target["identity"],
+        lineage=target["lineage"],
+        recipe_version=CANONICAL_LF_PACKAGING_TARGET_RECIPE_VERSION,
+    )
+    family_by_recipe = {
+        str(version["config"]["recipe_id"]): str(version["strategy_id"])
+        for version in v8_versions
+    }
+    v9_versions = [
+        store.create_version_if_absent(
+            family_by_recipe[str(plan["recipe"]["id"])],
+            benchmark=str(plan["recipe"]["benchmark"]),
+            universe=str(plan["recipe"]["universe"]),
+            factors=[],
+            config=plan["config"],
+            actor="test",
+        )
+        for plan in v9_plans
+    ]
+    v9_reservation = lockboxes.reserve(
+        versions=v9_versions,
+        dataset=target["dataset"],
+        dataset_identity_sha256=target["identity"],
+        dataset_lineage_id=target["lineage"],
+    )
+    assert v9_reservation["scope"] != v8_reservation["scope"]
+    assert v9_reservation["pre_result_repair"]["repair_generation"] == (
+        "v8-to-v9-canonical-lf-packaging"
+    )
+
+    for version in v9_versions:
+        bootstrap = dict(version["config"][BOOTSTRAP_CONFIG_KEY])
+        store.create_backtest(
+            version_id=str(version["id"]),
+            dataset=target["dataset"],
+            periods=dict(bootstrap["formal_periods"]),
+            artifact_path=tmp_path / "packaging-repair-v9" / str(version["id"]),
+            trading_dates=calendar,
+            dataset_lineage_id=target["lineage"],
+            dataset_identity_sha256=target["identity"],
+        )
+
+    with engine.connect() as connection:
+        vintages = connection.execute(select(oos_vintages)).all()
+        repairs = connection.execute(
+            select(transparent_baseline_pre_result_repairs)
+        ).all()
+    assert len(vintages) == 9
+    assert len({str(row.scope) for row in vintages}) == 3
+    assert len(repairs) == 2
+    v9_rows = [row for row in vintages if str(row.scope) == v9_reservation["scope"]]
+    assert len(v9_rows) == 3
+    assert all(row.consumed_at is not None for row in v9_rows)
 
 
 def test_optimizer_repair_registration_helper_seals_exact_v7_ids(

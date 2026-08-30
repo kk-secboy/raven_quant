@@ -178,7 +178,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0074_baseline_repair_chain"
+    assert revision == "0075_baseline_lf_repair"
     assert "capital_oos_alpha_batch_id" in {
         column["name"]
         for column in inspector.get_columns("oos_vintages", schema="quantlab")
@@ -966,7 +966,9 @@ def test_0045_retires_legacy_approved_pair_versions(database_url: str) -> None:
     assert audit is not None and audit[1] == "migration-0045"
 
 
-def test_same_lineage_repair_constraint_is_limited_to_exact_v2(database_url: str) -> None:
+def test_same_lineage_repair_constraint_is_limited_to_exact_v2_v3(
+    database_url: str,
+) -> None:
     engine = open_database(database_url)
     with engine.connect() as connection:
         definition = connection.scalar(
@@ -984,9 +986,85 @@ def test_same_lineage_repair_constraint_is_limited_to_exact_v2(database_url: str
     assert "target_dataset_lineage_id" in definition
     assert "transparent-baseline-pre-result-repair-v2" in definition
     assert "v7-to-v8-optimizer-applicability" in definition
+    assert "transparent-baseline-pre-result-repair-v3" in definition
+    assert "v8-to-v9-canonical-lf-packaging" in definition
     assert "fa1090deaa66ca77a045c1a872f7b6451043e116e717954533217908135c584e" in (
         definition
     )
+    assert "1ce281eb2e0141922215b9966f1ba91e09d073019a2e6e4b6a4614049b769e44" in (
+        definition
+    )
+    assert "256bbfd579865e7bc1442f1f64003d655241abecb320e5d27b440dd635224d57" in (
+        definition
+    )
+
+
+def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
+    database_url: str,
+) -> None:
+    engine = open_database(database_url)
+    source_ids = sorted(
+        [
+            "1ca979f22a0d4e2981e6e5c5e478f583",
+            "7b4386b52cf24d6d913dae3b232fbe7f",
+            "0c5f5a0b66284a66ba68225afd22b623",
+        ]
+    )
+    verification = {
+        "receipt_contract_version": "transparent-baseline-pre-result-repair-v3",
+        "repair_generation": "v8-to-v9-canonical-lf-packaging",
+        "source_release_commit": "413024ff5971115d4eb6a33872ebcafe9619cc9e",
+        "source_runner_expected_sha256": (
+            "fa1090deaa66ca77a045c1a872f7b6451043e116e717954533217908135c584e"
+        ),
+        "source_runner_observed_sha256": (
+            "1ce281eb2e0141922215b9966f1ba91e09d073019a2e6e4b6a4614049b769e44"
+        ),
+        "target_runner_sha256": (
+            "256bbfd579865e7bc1442f1f64003d655241abecb320e5d27b440dd635224d57"
+        ),
+        "packaging_contract_version": "git-archive-canonical-lf-v1",
+    }
+    with engine.begin() as connection:
+        audit_id = connection.execute(
+            insert(audit_events)
+            .values(
+                user_id=None,
+                username="system:migration-test",
+                action="transparent_baseline_pre_result_repair_registered",
+                method="INTERNAL",
+                path="transparent-baseline/pre-result-repair",
+                status_code=201,
+                ip_hash=None,
+                user_agent="pytest",
+                details_json={},
+                created_at=datetime.now(UTC),
+            )
+            .returning(audit_events.c.id)
+        ).scalar_one()
+        connection.execute(
+            insert(transparent_baseline_pre_result_repairs).values(
+                receipt_sha256="e" * 64,
+                source_audit_event_id=audit_id,
+                source_batch_sha256="a" * 64,
+                target_batch_sha256="b" * 64,
+                source_dataset_lineage_id="c" * 64,
+                target_dataset_lineage_id="c" * 64,
+                target_recipe_version="qlib-rdagent-single-mainline-2026-08-30-v9",
+                source_backtest_ids_json=source_ids,
+                target_strategy_version_ids_json=["1" * 32, "2" * 32, "3" * 32],
+                verification_json=verification,
+                created_at=datetime.now(UTC),
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="canonical-LF v3"):
+        command.downgrade(alembic_config(database_url), "0074_baseline_repair_chain")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM quantlab.alembic_version")
+        ) == "0075_baseline_lf_repair"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
@@ -1048,4 +1126,4 @@ def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0074_baseline_repair_chain"
+        ) == "0075_baseline_lf_repair"

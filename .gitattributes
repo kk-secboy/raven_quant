@@ -1,1 +1,2 @@
 *.sh text eol=lf
+scripts/run_multifactor_backtest.py text eol=lf

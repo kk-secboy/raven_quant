@@ -5,12 +5,12 @@ from typing import Any
 
 from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 
-# v8 fixes runner applicability: topk_equal_weight no longer asks for inputs
-# used only by covariance optimizers.  The factors, trading rules, costs,
-# dataset contract and sealed OOS windows are unchanged from v7.  A new recipe
-# version keeps the failed no-result v7 attempts immutable and opens only the
+# v9 changes only the release packaging of the already-authorized runner to
+# canonical LF bytes.  The factors, trading rules, costs, dataset contract,
+# runner source and sealed OOS windows are unchanged from v8.  A new recipe
+# version keeps the failed no-result v8 attempts immutable and opens only the
 # separately governed replacement batch.
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v8"
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v9"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},

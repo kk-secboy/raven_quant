@@ -35,9 +35,12 @@ from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
 from quant_platform.strategy_recipes import TRANSPARENT_RESEARCH_BASELINE_IDS
 from quant_platform.transparent_baseline_runner import (
+    CANONICAL_LF_TARGET_RECIPE_VERSION,
+    CANONICAL_LF_TARGET_RUNNER_SHA256,
     OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
     OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
+    target_runner_for_recipe,
 )
 
 LOCKBOX_CONTRACT_VERSION = "transparent-baseline-joint-lockbox-v1"
@@ -47,6 +50,7 @@ BOOTSTRAP_CONFIG_KEY = "transparent_baseline_bootstrap"
 PRE_RESULT_REPAIR_ACTION = "transparent_baseline_pre_result_repair_registered"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V1 = "transparent-baseline-pre-result-repair-v1"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 = "transparent-baseline-pre-result-repair-v2"
+PRE_RESULT_REPAIR_CONTRACT_VERSION_V3 = "transparent-baseline-pre-result-repair-v3"
 # Keep the historical public name pinned to v1.  Existing receipts and callers
 # must not silently acquire the wider v2 shape.
 PRE_RESULT_REPAIR_CONTRACT_VERSION = PRE_RESULT_REPAIR_CONTRACT_VERSION_V1
@@ -66,6 +70,44 @@ OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS = frozenset(
         "9c8a75ac646f452e8a5666bacd708936",
     }
 )
+CANONICAL_LF_PACKAGING_REPAIR_GENERATION = "v8-to-v9-canonical-lf-packaging"
+CANONICAL_LF_PACKAGING_REASON = "transparent_baseline_runner_canonical_lf_packaging"
+CANONICAL_LF_PACKAGING_SOURCE_COMMIT = (
+    "413024ff5971115d4eb6a33872ebcafe9619cc9e"
+)
+CANONICAL_LF_PACKAGING_SOURCE_RECIPE_VERSION = (
+    OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION
+)
+CANONICAL_LF_PACKAGING_TARGET_RECIPE_VERSION = CANONICAL_LF_TARGET_RECIPE_VERSION
+CANONICAL_LF_PACKAGING_SOURCE_EXPECTED_RUNNER_SHA256 = (
+    OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
+)
+CANONICAL_LF_PACKAGING_SOURCE_OBSERVED_RUNNER_SHA256 = (
+    "1ce281eb2e0141922215b9966f1ba91e09d073019a2e6e4b6a4614049b769e44"
+)
+CANONICAL_LF_PACKAGING_TARGET_RUNNER_SHA256 = CANONICAL_LF_TARGET_RUNNER_SHA256
+CANONICAL_LF_PACKAGING_CONTRACT_VERSION = "git-archive-canonical-lf-v1"
+CANONICAL_LF_PACKAGING_SOURCE_BACKTEST_IDS = frozenset(
+    {
+        "1ca979f22a0d4e2981e6e5c5e478f583",
+        "7b4386b52cf24d6d913dae3b232fbe7f",
+        "0c5f5a0b66284a66ba68225afd22b623",
+    }
+)
+CANONICAL_LF_PACKAGING_SOURCE_BINDINGS = {
+    "1ca979f22a0d4e2981e6e5c5e478f583": {
+        "job_id": "34f6675d3c79426babeaa08b14af6b5f",
+        "strategy_version_id": "e919845154444f93adceed9b14057289",
+    },
+    "7b4386b52cf24d6d913dae3b232fbe7f": {
+        "job_id": "e698fe80cfdf432d9ead1e810c409cdd",
+        "strategy_version_id": "d3b6b4918ef14350805c138290540731",
+    },
+    "0c5f5a0b66284a66ba68225afd22b623": {
+        "job_id": "3107865f05c547fb9e5d631e2b34a135",
+        "strategy_version_id": "acdd946a84d34197a68b1f9c33ea3553",
+    },
+}
 
 _PRE_RESULT_REPAIR_REASON_CODES = frozenset(
     {
@@ -85,6 +127,9 @@ OPTIMIZER_APPLICABILITY_FAILURE = (
     "optimizer requires 60 complete point-in-time return observations"
 )
 OPTIMIZER_APPLICABILITY_ERROR = f"ValueError: {OPTIMIZER_APPLICABILITY_FAILURE}"
+CANONICAL_LF_PACKAGING_ERROR = (
+    "transparent v8 runner bytes differ from the repair authorization"
+)
 
 _RECIPE_HORIZONS = {
     "short_relative_strength": "short_1_5d",
@@ -104,7 +149,7 @@ _MEMBER_KEYS = {
     "test_start",
     "test_end",
 }
-_V8_MEMBER_KEYS = _MEMBER_KEYS | {TRANSPARENT_BASELINE_RUNNER_FIELD}
+_RUNNER_BOUND_MEMBER_KEYS = _MEMBER_KEYS | {TRANSPARENT_BASELINE_RUNNER_FIELD}
 
 
 def canonical_sha256(value: Any) -> str:
@@ -142,7 +187,9 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
     exact prior attempts while they have no result/metrics and names the
     corrected recipe/data contracts before a replacement lockbox is opened.
     V1 remains byte-for-byte compatible with its historical receipt shape;
-    V2 authorizes only the v7-to-v8 optimizer-applicability repair.
+    V2 authorizes only the v7-to-v8 optimizer-applicability repair; V3
+    authorizes only the three exact v8 failures caused before the canonical-LF
+    release package could execute the already-frozen runner source.
     """
 
     if not isinstance(value, Mapping):
@@ -176,6 +223,21 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         repair_generation = str(value.get("repair_generation") or "").strip()
         if repair_generation != OPTIMIZER_APPLICABILITY_REPAIR_GENERATION:
             raise ValueError("transparent baseline repair generation is not allowlisted")
+    elif contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V3:
+        keys = common_keys | {
+            "repair_generation",
+            "source_runner_expected_sha256",
+            "source_runner_observed_sha256",
+            TRANSPARENT_BASELINE_RUNNER_FIELD,
+            "packaging_contract_version",
+        }
+        expected_reasons = frozenset({CANONICAL_LF_PACKAGING_REASON})
+        failure_markers = {
+            CANONICAL_LF_PACKAGING_REASON: CANONICAL_LF_PACKAGING_ERROR
+        }
+        repair_generation = str(value.get("repair_generation") or "").strip()
+        if repair_generation != CANONICAL_LF_PACKAGING_REPAIR_GENERATION:
+            raise ValueError("transparent baseline repair generation is not allowlisted")
     else:
         raise ValueError("transparent baseline pre-result repair contract is invalid")
     if set(value) != keys:
@@ -202,6 +264,28 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         != OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
     ):
         raise ValueError("optimizer applicability repair source or target is not allowlisted")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V3 and (
+        commit != CANONICAL_LF_PACKAGING_SOURCE_COMMIT
+        or target_recipe_version != CANONICAL_LF_PACKAGING_TARGET_RECIPE_VERSION
+        or _require_sha256(
+            value.get("source_runner_expected_sha256"),
+            field="source_runner_expected_sha256",
+        )
+        != CANONICAL_LF_PACKAGING_SOURCE_EXPECTED_RUNNER_SHA256
+        or _require_sha256(
+            value.get("source_runner_observed_sha256"),
+            field="source_runner_observed_sha256",
+        )
+        != CANONICAL_LF_PACKAGING_SOURCE_OBSERVED_RUNNER_SHA256
+        or _require_sha256(
+            value.get(TRANSPARENT_BASELINE_RUNNER_FIELD),
+            field=TRANSPARENT_BASELINE_RUNNER_FIELD,
+        )
+        != CANONICAL_LF_PACKAGING_TARGET_RUNNER_SHA256
+        or value.get("packaging_contract_version")
+        != CANONICAL_LF_PACKAGING_CONTRACT_VERSION
+    ):
+        raise ValueError("canonical LF packaging repair source or target is not allowlisted")
     if (
         value.get("target_eligibility_contract") != ELIGIBILITY_CONTRACT_VERSION
         or value.get("target_stock_scope_contract")
@@ -280,10 +364,13 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
             or member.get("job_status") != member.get("status")
         ):
             raise ValueError("transparent baseline repair member had a result or invalid state")
-        if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 and (
+        if contract_version in {
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V2,
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V3,
+        } and (
             member.get("status") != "failed"
         ):
-            raise ValueError("optimizer applicability repair requires three failed attempts")
+            raise ValueError("allowlisted repair requires three failed attempts")
         error = member.get("error")
         if error is not None:
             error_text = str(error)
@@ -292,6 +379,11 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
                 and error_text != OPTIMIZER_APPLICABILITY_ERROR
             ):
                 raise ValueError("optimizer applicability repair error is not exact")
+            if (
+                contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V3
+                and error_text != CANONICAL_LF_PACKAGING_ERROR
+            ):
+                raise ValueError("canonical LF packaging repair error is not exact")
             matches = {
                 code
                 for code, marker in failure_markers.items()
@@ -304,7 +396,11 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         elif member.get("status") != "running":
             raise ValueError("transparent baseline repair failed member has no error")
         files = member.get("files")
-        if not isinstance(files, list) or not files:
+        if not isinstance(files, list):
+            raise ValueError("transparent baseline repair artifact inventory is missing")
+        if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V3 and files:
+            raise ValueError("canonical LF packaging repair artifacts must be empty")
+        if contract_version != PRE_RESULT_REPAIR_CONTRACT_VERSION_V3 and not files:
             raise ValueError("transparent baseline repair artifact inventory is missing")
         normalized_files: list[dict[str, Any]] = []
         seen_paths: set[str] = set()
@@ -333,7 +429,10 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
                     ),
                 }
             )
-        if "manifest.json" not in seen_paths:
+        if (
+            contract_version != PRE_RESULT_REPAIR_CONTRACT_VERSION_V3
+            and "manifest.json" not in seen_paths
+        ):
             raise ValueError("transparent baseline repair execution manifest is missing")
         member["files"] = normalized_files
         members.append(member)
@@ -341,6 +440,20 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         identifiers["backtest_id"] != OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS
     ):
         raise ValueError("optimizer applicability repair backtests are not allowlisted")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V3 and (
+        identifiers["backtest_id"] != CANONICAL_LF_PACKAGING_SOURCE_BACKTEST_IDS
+    ):
+        raise ValueError("canonical LF packaging repair backtests are not allowlisted")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V3:
+        for member in members:
+            binding = CANONICAL_LF_PACKAGING_SOURCE_BINDINGS.get(
+                member["backtest_id"]
+            )
+            if binding is None or any(
+                member[field] != binding[field]
+                for field in ("job_id", "strategy_version_id")
+            ):
+                raise ValueError("canonical LF packaging source binding changed")
     if observed_failure_markers != expected_reasons:
         raise ValueError("transparent baseline repair does not cover its allowlisted defect")
     return {
@@ -364,11 +477,8 @@ def _normalize_member(raw: Mapping[str, Any]) -> dict[str, str]:
     recipe_version = str(raw.get("recipe_version") or "").strip()
     if not recipe_version:
         raise ValueError("transparent baseline lockbox recipe version is required")
-    expected_keys = (
-        _V8_MEMBER_KEYS
-        if recipe_version == OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION
-        else _MEMBER_KEYS
-    )
+    expected_runner = target_runner_for_recipe(recipe_id, recipe_version)
+    expected_keys = _RUNNER_BOUND_MEMBER_KEYS if expected_runner else _MEMBER_KEYS
     if set(raw) != expected_keys:
         raise ValueError("transparent baseline lockbox member fields are invalid")
     try:
@@ -403,16 +513,13 @@ def _normalize_member(raw: Mapping[str, Any]) -> dict[str, str]:
         "test_start": test_start.isoformat(),
         "test_end": test_end.isoformat(),
     }
-    if recipe_version == OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION:
+    if expected_runner is not None:
         member[TRANSPARENT_BASELINE_RUNNER_FIELD] = _require_sha256(
             raw.get(TRANSPARENT_BASELINE_RUNNER_FIELD),
             field=TRANSPARENT_BASELINE_RUNNER_FIELD,
         )
-        if (
-            member[TRANSPARENT_BASELINE_RUNNER_FIELD]
-            != OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
-        ):
-            raise ValueError("transparent v8 lockbox runner identity changed")
+        if member[TRANSPARENT_BASELINE_RUNNER_FIELD] != expected_runner:
+            raise ValueError("transparent lockbox runner identity changed")
     return member
 
 
@@ -661,6 +768,35 @@ def _repair_economic_config(value: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _repair_bootstrap_semantics(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare every bootstrap semantic except version-derived byte hashes."""
+
+    bootstrap_raw = value.get(BOOTSTRAP_CONFIG_KEY)
+    if not isinstance(bootstrap_raw, Mapping):
+        raise ValueError("transparent baseline repair bootstrap is missing")
+    bootstrap = json.loads(json.dumps(dict(bootstrap_raw), ensure_ascii=False))
+    for key in (
+        "recipe_version",
+        "recipe_sha256",
+        TRANSPARENT_BASELINE_RUNNER_FIELD,
+        "research_window_contract_sha256",
+    ):
+        bootstrap.pop(key, None)
+    feature_set = bootstrap.get("feature_set")
+    if not isinstance(feature_set, dict):
+        raise ValueError("transparent baseline repair feature contract is missing")
+    feature_set.pop("recipe_version", None)
+    feature_set.pop("definition_sha256", None)
+    research_window = bootstrap.get("research_window_contract")
+    if not isinstance(research_window, dict):
+        raise ValueError("transparent baseline repair research window is missing")
+    # This digest is derived from the version-bound feature-set definition;
+    # all feature expressions and every other research/data/OOS field remain
+    # in the comparison below.
+    research_window.pop("feature_set_sha256", None)
+    return bootstrap
+
+
 def _artifact_result_exists(artifact_path: Any) -> bool:
     try:
         root = Path(str(artifact_path)).resolve()
@@ -698,6 +834,186 @@ def _artifact_inventory(artifact_path: Any) -> list[dict[str, Any]]:
     except OSError as exc:
         raise ValueError("transparent baseline repair artifacts cannot be verified") from exc
     return files
+
+
+def _row_field(row: Any, field: str) -> Any:
+    if isinstance(row, Mapping):
+        return row.get(field)
+    return getattr(row, field, None)
+
+
+def _exact_same_lineage_registry_profile(
+    verification: Mapping[str, Any],
+    source_backtest_ids: set[str],
+) -> bool:
+    contract_version = verification.get("receipt_contract_version")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V2:
+        return (
+            verification.get("repair_generation")
+            == OPTIMIZER_APPLICABILITY_REPAIR_GENERATION
+            and verification.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+            == OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
+            and verification.get("target_recipe_version")
+            == OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION
+            and source_backtest_ids
+            == set(OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS)
+        )
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V3:
+        return (
+            verification.get("repair_generation")
+            == CANONICAL_LF_PACKAGING_REPAIR_GENERATION
+            and verification.get("source_runner_expected_sha256")
+            == CANONICAL_LF_PACKAGING_SOURCE_EXPECTED_RUNNER_SHA256
+            and verification.get("source_runner_observed_sha256")
+            == CANONICAL_LF_PACKAGING_SOURCE_OBSERVED_RUNNER_SHA256
+            and verification.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+            == CANONICAL_LF_PACKAGING_TARGET_RUNNER_SHA256
+            and verification.get("packaging_contract_version")
+            == CANONICAL_LF_PACKAGING_CONTRACT_VERSION
+            and verification.get("source_release_commit")
+            == CANONICAL_LF_PACKAGING_SOURCE_COMMIT
+            and verification.get("target_recipe_version")
+            == CANONICAL_LF_PACKAGING_TARGET_RECIPE_VERSION
+            and source_backtest_ids
+            == set(CANONICAL_LF_PACKAGING_SOURCE_BACKTEST_IDS)
+        )
+    return False
+
+
+def validate_repair_registry_binding(
+    repair: Any,
+    *,
+    lockbox_batch_sha256: str,
+    strategy_version_id: str,
+    batch_strategy_version_ids: set[str],
+    batch_dataset_identity_sha256s: set[str],
+    dataset: str,
+    dataset_lineage_id: str,
+) -> dict[str, Any]:
+    """Validate an exact append-only same-lineage repair registry row.
+
+    This is the shared consumption guard for StrategyStore.  It deliberately
+    recognizes only the two production-specific same-lineage generations and
+    checks the row, JSON verification, complete three-member lockbox and the
+    current member in one pure validation step.
+    """
+
+    failure = (
+        "transparent baseline repair scope has no exact append-only "
+        "pre-result registry binding"
+    )
+    try:
+        verification_raw = _row_field(repair, "verification_json")
+        if not isinstance(verification_raw, Mapping):
+            raise ValueError(failure)
+        verification = dict(verification_raw)
+        recorded_version_ids = [
+            str(value)
+            for value in list(
+                _row_field(repair, "target_strategy_version_ids_json") or []
+            )
+        ]
+        verification_version_ids = [
+            str(value)
+            for value in list(
+                verification.get("target_strategy_version_ids") or []
+            )
+        ]
+        row_source_ids = {
+            str(value)
+            for value in list(_row_field(repair, "source_backtest_ids_json") or [])
+        }
+        verification_source_ids = {
+            str(value)
+            for value in list(verification.get("source_backtest_ids") or [])
+        }
+        normalized_versions = {str(value) for value in batch_strategy_version_ids}
+        normalized_lineage = _require_sha256(
+            dataset_lineage_id, field="dataset_lineage_id"
+        )
+        normalized_batch = _require_sha256(
+            lockbox_batch_sha256, field="lockbox_batch_sha256"
+        )
+        normalized_identities = {
+            _require_sha256(value, field="dataset_identity_sha256")
+            for value in batch_dataset_identity_sha256s
+        }
+        source_audit_event_id = int(_row_field(repair, "source_audit_event_id"))
+        row_receipt_sha256 = _require_sha256(
+            _row_field(repair, "receipt_sha256"), field="receipt_sha256"
+        )
+        row_source_batch_sha256 = _require_sha256(
+            _row_field(repair, "source_batch_sha256"),
+            field="source_batch_sha256",
+        )
+        row_target_batch_sha256 = _require_sha256(
+            _row_field(repair, "target_batch_sha256"),
+            field="target_batch_sha256",
+        )
+        verification_receipt_sha256 = _require_sha256(
+            verification.get("receipt_sha256"), field="receipt_sha256"
+        )
+        verification_source_batch_sha256 = _require_sha256(
+            verification.get("source_batch_sha256"),
+            field="source_batch_sha256",
+        )
+        verification_target_batch_sha256 = _require_sha256(
+            verification.get("target_batch_sha256"),
+            field="target_batch_sha256",
+        )
+        receipt_created_at = datetime.fromisoformat(
+            str(verification.get("receipt_created_at") or "")
+        )
+        failed_without_results = {
+            str(value)
+            for value in list(verification.get("failed_without_results") or [])
+        }
+        results_created_after = list(
+            verification.get("results_created_after_preregistration") or []
+        )
+        if (
+            len(normalized_versions) != 3
+            or "" in normalized_versions
+            or len(recorded_version_ids) != 3
+            or len(verification_version_ids) != 3
+            or normalized_versions != set(recorded_version_ids)
+            or normalized_versions != set(verification_version_ids)
+            or str(strategy_version_id) not in normalized_versions
+            or len(normalized_identities) != 1
+            or row_source_ids != verification_source_ids
+            or str(_row_field(repair, "target_dataset_lineage_id"))
+            != normalized_lineage
+            or str(_row_field(repair, "source_dataset_lineage_id"))
+            != normalized_lineage
+            or str(verification.get("source_dataset_lineage_id") or "")
+            != normalized_lineage
+            or str(verification.get("target_dataset_lineage_id") or "")
+            != normalized_lineage
+            or str(verification.get("target_dataset") or "") != str(dataset)
+            or normalized_identities
+            != {str(verification.get("target_dataset_identity_sha256") or "")}
+            or row_receipt_sha256 != verification_receipt_sha256
+            or source_audit_event_id
+            != int(verification.get("source_audit_event_id") or -1)
+            or row_source_batch_sha256 != verification_source_batch_sha256
+            or row_target_batch_sha256 != normalized_batch
+            or normalized_batch != verification_target_batch_sha256
+            or str(_row_field(repair, "target_recipe_version"))
+            != str(verification.get("target_recipe_version") or "")
+            or verification.get("contract_version")
+            != PRE_RESULT_REPAIR_REGISTRY_VERSION
+            or verification.get("performance_information_used") is not False
+            or receipt_created_at.tzinfo is None
+            or failed_without_results != verification_source_ids
+            or results_created_after
+            or not _exact_same_lineage_registry_profile(
+                verification, verification_source_ids
+            )
+        ):
+            raise ValueError(failure)
+    except (TypeError, ValueError):
+        raise ValueError(failure) from None
+    return verification
 
 
 class TransparentBaselineLockboxStore:
@@ -808,7 +1124,14 @@ class TransparentBaselineLockboxStore:
         is_optimizer_applicability_repair = receipt["contract_version"] == (
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V2
         )
-        if is_optimizer_applicability_repair:
+        is_canonical_lf_packaging_repair = receipt["contract_version"] == (
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V3
+        )
+        is_same_lineage_repair = (
+            is_optimizer_applicability_repair
+            or is_canonical_lf_packaging_repair
+        )
+        if is_same_lineage_repair:
             if (
                 source_lineage != target_dataset_lineage_id
                 or source_identity != target_dataset_identity_sha256
@@ -818,7 +1141,7 @@ class TransparentBaselineLockboxStore:
                 )
             ):
                 raise ValueError(
-                    "optimizer applicability repair changed the dataset or lineage"
+                    "same-lineage repair changed the dataset or lineage"
                 )
         elif source_lineage == target_dataset_lineage_id:
             raise ValueError("transparent baseline repair may not fabricate a fresh lineage")
@@ -881,6 +1204,9 @@ class TransparentBaselineLockboxStore:
             expected = expected_by_recipe[recipe_id]
             recorded_periods = dict(backtest.periods_json or {})
             source_config = dict(source_version.config_json or {})
+            target_config = dict(target_version.config_json or {})
+            source_bootstrap = dict(source_config.get(BOOTSTRAP_CONFIG_KEY) or {})
+            target_bootstrap = dict(target_config.get(BOOTSTRAP_CONFIG_KEY) or {})
             if (
                 str(backtest.id) != member["backtest_id"]
                 or str(backtest.job_id or "") != member["job_id"]
@@ -896,24 +1222,41 @@ class TransparentBaselineLockboxStore:
                 or str(target_version.universe) != str(source_version.universe)
                 or str(target_version.economic_hypothesis_group)
                 != str(source_version.economic_hypothesis_group)
-                or _repair_economic_config(dict(target_version.config_json or {}))
+                or _repair_economic_config(target_config)
                 != _repair_economic_config(source_config)
                 or str(expected["test_start"]) != member["periods"]["start"]
                 or str(expected["test_end"]) != member["periods"]["end"]
+                or (
+                    is_canonical_lf_packaging_repair
+                    and (
+                        _repair_bootstrap_semantics(target_config)
+                        != _repair_bootstrap_semantics(source_config)
+                        or dict(source_bootstrap.get("formal_periods") or {})
+                        != member["periods"]
+                        or dict(target_bootstrap.get("formal_periods") or {})
+                        != member["periods"]
+                    )
+                )
             ):
                 raise ValueError("transparent baseline repair changed an economic or OOS binding")
             if is_optimizer_applicability_repair and source_config.get(
                 "recipe_version"
             ) != OPTIMIZER_APPLICABILITY_SOURCE_RECIPE_VERSION:
                 raise ValueError("optimizer applicability repair source recipe changed")
-            target_bootstrap = dict(
-                dict(target_version.config_json or {}).get(BOOTSTRAP_CONFIG_KEY) or {}
-            )
-            if is_optimizer_applicability_repair and (
+            if is_canonical_lf_packaging_repair and source_config.get(
+                "recipe_version"
+            ) != CANONICAL_LF_PACKAGING_SOURCE_RECIPE_VERSION:
+                raise ValueError("canonical LF packaging repair source recipe changed")
+            if is_canonical_lf_packaging_repair and (
+                source_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+                != receipt["source_runner_expected_sha256"]
+            ):
+                raise ValueError("canonical LF packaging source runner changed")
+            if is_same_lineage_repair and (
                 target_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
                 != receipt[TRANSPARENT_BASELINE_RUNNER_FIELD]
             ):
-                raise ValueError("optimizer applicability target runner changed")
+                raise ValueError("same-lineage repair target runner changed")
             has_metrics = backtest.metrics_json is not None
             has_result = _artifact_result_exists(backtest.artifact_path)
             declared_files = sorted(member["files"], key=lambda item: item["path"])
@@ -937,11 +1280,20 @@ class TransparentBaselineLockboxStore:
                 later_results.append(str(backtest.id))
             elif member["status"] == "failed":
                 marker = str(member.get("error") or "")
+                if is_canonical_lf_packaging_repair:
+                    error_matches = (
+                        str(backtest.error or "") == marker
+                        and str(backtest.job_error or "") == marker
+                    )
+                else:
+                    error_matches = (
+                        marker in str(backtest.error or "")
+                        and marker in str(backtest.job_error or "")
+                    )
                 if (
                     str(backtest.status) != "failed"
                     or str(backtest.job_status) != "failed"
-                    or marker not in str(backtest.error or "")
-                    or marker not in str(backtest.job_error or "")
+                    or not error_matches
                 ):
                     raise ValueError("transparent baseline repair failure evidence changed")
                 failed_without_results.append(str(backtest.id))
@@ -954,7 +1306,7 @@ class TransparentBaselineLockboxStore:
                         "transparent baseline running member ended before preregistration"
                     )
 
-        if not is_optimizer_applicability_repair and (
+        if not is_same_lineage_repair and (
             str(target_dataset or "").strip()
             == str(receipt["members"][0]["dataset"])
         ):
@@ -972,8 +1324,18 @@ class TransparentBaselineLockboxStore:
             "target_recipe_version": str(receipt["target_recipe_version"]),
             "receipt_contract_version": str(receipt["contract_version"]),
             "repair_generation": receipt.get("repair_generation"),
+            "source_release_commit": receipt.get("source_release_commit"),
+            "source_runner_expected_sha256": receipt.get(
+                "source_runner_expected_sha256"
+            ),
+            "source_runner_observed_sha256": receipt.get(
+                "source_runner_observed_sha256"
+            ),
             TRANSPARENT_BASELINE_RUNNER_FIELD: receipt.get(
                 TRANSPARENT_BASELINE_RUNNER_FIELD
+            ),
+            "packaging_contract_version": receipt.get(
+                "packaging_contract_version"
             ),
             "source_backtest_ids": sorted(item["backtest_id"] for item in members.values()),
             "target_strategy_version_ids": sorted(target_version_ids),
@@ -1177,13 +1539,19 @@ class TransparentBaselineLockboxStore:
                     target_dataset_identity_sha256=identity,
                     target_dataset_lineage_id=lineage,
                 )
-            if repair_registration is not None and repair_registration.get(
-                "repair_generation"
-            ) == OPTIMIZER_APPLICABILITY_REPAIR_GENERATION:
-                # The v7 and v8 attempts intentionally share the exact dataset
-                # lineage and OOS dates. Use a repair-specific scope so v8
-                # receives new immutable one-shot rows instead of mutating or
-                # reusing the consumed v7 rows.
+            if repair_registration is not None and _exact_same_lineage_registry_profile(
+                repair_registration,
+                {
+                    str(value)
+                    for value in list(
+                        repair_registration.get("source_backtest_ids") or []
+                    )
+                },
+            ):
+                # Both allowlisted same-lineage generations intentionally keep
+                # the exact data and OOS dates. Use a repair-specific scope so
+                # each generation receives new immutable one-shot rows instead
+                # of mutating or reopening its consumed source rows.
                 scope = f"{base_scope}:repair:{target_batch_sha256}"
             scope_filter = oos_vintages.c.scope == scope
             if scope == base_scope:

@@ -142,14 +142,9 @@ from quant_platform.strategy_rule_compiler import (
     validate_strategy_rule_binding,
 )
 from quant_platform.transparent_baseline_lockbox import (
-    OPTIMIZER_APPLICABILITY_REPAIR_GENERATION,
-    OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
-    OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
-    PRE_RESULT_REPAIR_CONTRACT_VERSION_V2,
-    PRE_RESULT_REPAIR_REGISTRY_VERSION,
-    TRANSPARENT_BASELINE_RUNNER_FIELD,
     baseline_oos_sealed_member_set,
     validate_lockbox_link,
+    validate_repair_registry_binding,
 )
 from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
@@ -4349,9 +4344,6 @@ class StrategyStore:
                     .with_for_update()
                 ).all()
                 repair = repair_rows[0] if len(repair_rows) == 1 else None
-                verification = (
-                    dict(repair.verification_json or {}) if repair is not None else {}
-                )
                 batch_version_ids = {
                     str(
                         dict(item[0].sealed_candidate_set_json or {}).get(
@@ -4364,68 +4356,15 @@ class StrategyStore:
                 batch_dataset_identities = {
                     str(item[0].dataset_identity or "") for item in batch_rows
                 }
-                recorded_version_values = (
-                    [
-                        str(value)
-                        for value in list(repair.target_strategy_version_ids_json or [])
-                    ]
-                    if repair is not None
-                    else []
+                validate_repair_registry_binding(
+                    repair,
+                    lockbox_batch_sha256=str(lockbox["batch_sha256"]),
+                    strategy_version_id=strategy_version_id,
+                    batch_strategy_version_ids=batch_version_ids,
+                    batch_dataset_identity_sha256s=batch_dataset_identities,
+                    dataset=dataset,
+                    dataset_lineage_id=normalized_lineage,
                 )
-                verification_version_values = [
-                    str(value)
-                    for value in list(
-                        verification.get("target_strategy_version_ids") or []
-                    )
-                ]
-                if (
-                    repair is None
-                    or len(batch_version_ids) != 3
-                    or "" in batch_version_ids
-                    or len(recorded_version_values) != 3
-                    or len(verification_version_values) != 3
-                    or sorted(batch_version_ids) != sorted(recorded_version_values)
-                    or sorted(batch_version_ids) != sorted(verification_version_values)
-                    or strategy_version_id not in batch_version_ids
-                    or str(repair.target_dataset_lineage_id) != normalized_lineage
-                    or str(repair.source_dataset_lineage_id) != normalized_lineage
-                    or str(verification.get("source_dataset_lineage_id") or "")
-                    != normalized_lineage
-                    or str(verification.get("target_dataset") or "") != dataset
-                    or batch_dataset_identities
-                    != {
-                        str(
-                            verification.get("target_dataset_identity_sha256") or ""
-                        )
-                    }
-                    or str(repair.receipt_sha256)
-                    != str(verification.get("receipt_sha256") or "")
-                    or int(repair.source_audit_event_id)
-                    != int(verification.get("source_audit_event_id") or -1)
-                    or str(repair.source_batch_sha256)
-                    != str(verification.get("source_batch_sha256") or "")
-                    or str(repair.target_batch_sha256)
-                    != str(verification.get("target_batch_sha256") or "")
-                    or str(repair.target_dataset_lineage_id)
-                    != str(verification.get("target_dataset_lineage_id") or "")
-                    or str(repair.target_recipe_version)
-                    != str(verification.get("target_recipe_version") or "")
-                    or verification.get("contract_version")
-                    != PRE_RESULT_REPAIR_REGISTRY_VERSION
-                    or verification.get("receipt_contract_version")
-                    != PRE_RESULT_REPAIR_CONTRACT_VERSION_V2
-                    or verification.get("repair_generation")
-                    != OPTIMIZER_APPLICABILITY_REPAIR_GENERATION
-                    or verification.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
-                    != OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
-                    or verification.get("target_recipe_version")
-                    != OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION
-                    or verification.get("performance_information_used") is not False
-                ):
-                    raise ValueError(
-                        "transparent baseline repair scope has no exact append-only "
-                        "pre-result registry binding"
-                    )
             if reserved_scope != scope:
                 connection.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:oos_scope))"),
