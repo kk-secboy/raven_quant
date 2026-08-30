@@ -11,8 +11,55 @@ from quant_platform.strategy_rule_runtime import (
     build_strategy_rule_runtime_metadata,
     required_rule_history_sessions,
 )
+from scripts.run_multifactor_backtest import _market_trend_close_history
 
 pytestmark = pytest.mark.no_database
+
+
+class _FakeQlibDataApi:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def features(
+        self,
+        instruments: list[str],
+        fields: list[str],
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        self.calls.append(
+            {"instruments": instruments, "fields": fields, **kwargs}
+        )
+        index = pd.MultiIndex.from_product(
+            [instruments, pd.bdate_range("2026-01-02", periods=20)],
+            names=["instrument", "datetime"],
+        )
+        return pd.DataFrame({"$close": np.linspace(1.0, 1.1, len(index))}, index=index)
+
+
+def test_runner_loads_the_exact_compiled_market_trend_benchmark() -> None:
+    data_api = _FakeQlibDataApi()
+
+    closes = _market_trend_close_history(
+        data_api,
+        strategy_config={
+            "market_trend_lookback_sessions": 20,
+            "market_trend_benchmark": "SH000300",
+        },
+        start_time="2025-01-01",
+        end_time="2026-01-31",
+    )
+
+    assert closes is not None
+    assert list(closes.columns) == ["SH000300"]
+    assert data_api.calls == [
+        {
+            "instruments": ["SH000300"],
+            "fields": ["$close"],
+            "start_time": "2025-01-01",
+            "end_time": "2026-01-31",
+            "freq": "day",
+        }
+    ]
 
 
 def test_rule_alpha_weights_change_the_shared_factor_grid_deterministically() -> None:
@@ -96,6 +143,7 @@ def test_rule_runtime_builds_pit_entry_and_exit_inputs() -> None:
         "extension_guard_max_return_5d": 0.12,
         "trend_break_lookback_sessions": 20,
         "market_trend_lookback_sessions": 60,
+        "market_trend_benchmark": "SH000300",
         "valuation_regime_max_percentile": 0.90,
         "liquidity_lookback_days": 20,
     }
@@ -105,6 +153,7 @@ def test_rule_runtime_builds_pit_entry_and_exit_inputs() -> None:
         instruments=pd.Index(["A", "B"]),
         close_history=closes,
         benchmark_weights=pd.Series({"A": 0.6, "B": 0.4}),
+        benchmark_close_history=closes[["A"]].rename(columns={"A": "SH000300"}),
         value_exposures=pd.Series({"A": 0.5, "B": 0.1}),
     )
 
@@ -113,6 +162,64 @@ def test_rule_runtime_builds_pit_entry_and_exit_inputs() -> None:
     assert metadata["trend_intact"].to_dict() == {"A": True, "B": False}
     assert metadata["five_day_returns"]["A"] > 0
     assert metadata["valuation_percentiles"]["B"] > metadata["valuation_percentiles"]["A"]
+
+
+def test_market_trend_uses_bound_index_not_incomplete_constituent_history() -> None:
+    dates = pd.bdate_range("2026-01-02", periods=20)
+    constituent_closes = pd.DataFrame(
+        {
+            "A": np.linspace(10.0, 12.0, len(dates)),
+            "NEW_MEMBER": [np.nan] * 19 + [8.0],
+        },
+        index=dates,
+    )
+    benchmark_closes = pd.DataFrame(
+        {"SH000300": np.linspace(1.0, 1.1, len(dates))}, index=dates
+    )
+
+    metadata = build_strategy_rule_runtime_metadata(
+        {
+            "market_trend_lookback_sessions": 20,
+            "market_trend_benchmark": "SH000300",
+        },
+        instruments=pd.Index(["A", "NEW_MEMBER"]),
+        close_history=constituent_closes,
+        benchmark_weights=pd.Series({"A": 0.5, "NEW_MEMBER": 0.5}),
+        benchmark_close_history=benchmark_closes,
+    )
+
+    assert metadata["market_regime_allows_entries"] is True
+
+
+def test_market_trend_fails_closed_on_wrong_or_incomplete_bound_index() -> None:
+    dates = pd.bdate_range("2026-01-02", periods=20)
+    closes = pd.DataFrame({"A": np.linspace(10.0, 12.0, len(dates))}, index=dates)
+    config = {
+        "market_trend_lookback_sessions": 20,
+        "market_trend_benchmark": "SH000300",
+    }
+
+    with pytest.raises(ValueError, match="differs from the bound benchmark"):
+        build_strategy_rule_runtime_metadata(
+            config,
+            instruments=pd.Index(["A"]),
+            close_history=closes,
+            benchmark_close_history=pd.DataFrame(
+                {"SH000905": np.linspace(1.0, 1.1, len(dates))}, index=dates
+            ),
+        )
+
+    incomplete = pd.DataFrame(
+        {"SH000300": [np.nan, *np.linspace(1.0, 1.1, len(dates) - 1)]},
+        index=dates,
+    )
+    with pytest.raises(ValueError, match="incomplete benchmark close history"):
+        build_strategy_rule_runtime_metadata(
+            config,
+            instruments=pd.Index(["A"]),
+            close_history=closes,
+            benchmark_close_history=incomplete,
+        )
 
 
 def test_rule_runtime_fails_closed_on_incomplete_history() -> None:

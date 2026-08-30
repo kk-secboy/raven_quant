@@ -386,7 +386,7 @@ def test_governed_signal_keeps_industry_feasible_substitutes_beyond_buffer() -> 
     assert set(without_buffer.target_weights) == {"SH600000", "SZ000001"}
 
 
-def test_governed_signal_industry_candidates_match_policy_position_size() -> None:
+def test_reporting_benchmark_does_not_add_relative_cap_to_topk_candidates() -> None:
     timestamp = pd.Timestamp("2025-06-03")
     instruments = ["SH600000", "SH600001", "SH600002"]
     scores = pd.Series(
@@ -422,6 +422,7 @@ def test_governed_signal_industry_candidates_match_policy_position_size() -> Non
         max_industry_deviation=0.10,
         metadata_availability_lag_days=0,
         neutralize_industry=False,
+        benchmark_relative_industry_constraints=False,
     ).xs(timestamp, level="datetime")
     decision = PortfolioPolicy(
         PortfolioPolicyConfig(
@@ -439,8 +440,52 @@ def test_governed_signal_industry_candidates_match_policy_position_size() -> Non
         benchmark_industry_weights=pd.Series({"bank": 1.0}),
     )
 
+    assert set(governed.index) == {"SH600000", "SH600001"}
+    assert set(decision.target_weights) == {"SH600000", "SH600001"}
+
+
+def test_candidate_builder_requires_explicit_benchmark_relative_constraint() -> None:
+    timestamp = pd.Timestamp("2025-06-03")
+    instruments = ["SH600000", "SH600001", "SH600002"]
+    scores = pd.Series(
+        [3.0, 2.0, 1.0],
+        index=pd.MultiIndex.from_product(
+            [[timestamp], instruments], names=["datetime", "instrument"]
+        ),
+    )
+    memberships = pd.DataFrame(
+        {
+            "instrument": instruments,
+            "industry": ["rare", "bank", "bank"],
+            "in_date": [pd.Timestamp("2020-01-01")] * 3,
+            "out_date": [pd.NaT] * 3,
+        }
+    )
+    benchmark = pd.DataFrame(
+        {
+            "datetime": [timestamp],
+            "instrument": ["SH600001"],
+            "weight": [1.0],
+        }
+    )
+
+    governed = build_governed_signal(
+        scores,
+        topk=2,
+        n_drop=0,
+        industry_memberships=memberships,
+        benchmark_weights=benchmark,
+        max_position_weight=0.50,
+        max_industry_weight=1.0,
+        max_industry_deviation=0.10,
+        metadata_availability_lag_days=0,
+        neutralize_industry=False,
+        benchmark_relative_industry_constraints=True,
+    ).xs(timestamp, level="datetime")
+
+    # The raw TopK retention set contains rare+bank, while the explicitly
+    # benchmark-relative feasible set contributes the lower-ranked bank.
     assert set(governed.index) == set(instruments)
-    assert set(decision.target_weights) == {"SH600001", "SH600002"}
 
 
 def test_governed_signal_neutralizes_point_in_time_industry_bias() -> None:

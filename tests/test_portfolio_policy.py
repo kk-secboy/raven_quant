@@ -217,6 +217,43 @@ def test_policy_enforces_industry_weight_cap() -> None:
     assert bank_weight <= 0.60 + 1e-12
 
 
+def test_topk_policy_ignores_reporting_only_benchmark_industry_deviation() -> None:
+    scores = pd.Series(
+        {
+            "SH600000": 3.0,
+            "SH600001": 2.0,
+            "SH600002": 1.0,
+        }
+    )
+    industries = pd.Series(
+        {
+            "SH600000": "rare",
+            "SH600001": "bank",
+            "SH600002": "bank",
+        }
+    )
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_industry_weight=1.0,
+            max_industry_deviation=0.10,
+            max_daily_turnover=1.0,
+            portfolio_construction="topk_equal_weight",
+        )
+    )
+
+    decision = policy.decide(
+        scores,
+        {},
+        industries=industries,
+        benchmark_industry_weights=pd.Series({"bank": 1.0}),
+    )
+
+    assert set(decision.target_weights) == {"SH600000", "SH600001"}
+
+
 def test_retention_buffer_uses_score_order_not_previous_input_order() -> None:
     scores = pd.Series(
         {

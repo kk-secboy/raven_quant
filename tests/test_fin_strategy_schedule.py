@@ -193,7 +193,7 @@ def test_scheduler_reconcile_lanes_are_throttled_and_isolated(monkeypatch) -> No
 
     def baselines(_settings) -> dict:
         calls["baselines"] += 1
-        return {"status": "pending", "errors": [], "members": []}
+        return {"status": "no_op", "errors": [], "members": []}
 
     monkeypatch.setattr(module, "reconcile_managed_fin_strategy_schedules", schedules)
     monkeypatch.setattr(module, "reconcile_transparent_baselines", baselines)

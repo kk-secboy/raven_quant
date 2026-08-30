@@ -31,8 +31,11 @@ from quant_platform.transparent_baseline_lockbox import (
 )
 from quant_platform.transparent_baseline_runner import (
     TRANSPARENT_BASELINE_JOB_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
     target_runner_for_recipe,
+    target_runtime_bundle_for_recipe,
 )
 
 BOOTSTRAP_CONTRACT_VERSION = "transparent-baseline-bootstrap-v1"
@@ -44,6 +47,12 @@ _RECONCILABLE_VERSION_LIFECYCLES = frozenset(
         ("draft", None),
         ("approved", "paper"),
     }
+)
+_GOVERNED_NOOP_STATUSES = frozenset(
+    {"watch", "paused", "restricted", "suspended", "rejected", "retired"}
+)
+_GOVERNED_NOOP_PROMOTION_STAGES = frozenset(
+    {"recommendation_enabled", "watch", "paused", "restricted", "suspended", "retired"}
 )
 FAMILY_NAMES = {
     "short_relative_strength": "QuantLab透明基线：1至5日短线相对强弱",
@@ -214,6 +223,13 @@ def _plan_member(
     target_runner_sha256 = target_runner_for_recipe(recipe["id"], recipe["version"])
     if target_runner_sha256 is not None:
         bootstrap[TRANSPARENT_BASELINE_RUNNER_FIELD] = target_runner_sha256
+    target_runtime_bundle_sha256 = target_runtime_bundle_for_recipe(
+        recipe["id"], recipe["version"]
+    )
+    if target_runtime_bundle_sha256 is not None:
+        bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
+            target_runtime_bundle_sha256
+        )
     config[BOOTSTRAP_CONFIG_KEY] = bootstrap
     normalized = _normalize_multifactor_contract(
         config,
@@ -266,41 +282,60 @@ class TransparentBaselineBootstrapService:
         }
 
     @staticmethod
-    def _require_reconcilable_lifecycle(
+    def _lifecycle_action(
         value: Mapping[str, Any],
         *,
         entity: str,
-    ) -> None:
-        """Fail closed instead of reviving an operator/risk lifecycle state.
+    ) -> str:
+        """Classify bootstrap-owned work without reviving a governed lifecycle.
 
         Managed reconciliation owns only the initial ``draft`` research path
         and the idempotent ``approved``/``paper`` continuation it created.
-        Every other status is an explicit lifecycle boundary.  In particular,
-        a successful historical backtest must never let the scheduler turn a
-        paused, restricted, suspended, rejected or retired version back into
-        an approved paper strategy.
+        Explicit recommendation, operator and risk states are safe terminal
+        no-ops for this bootstrap. Unknown or inconsistent states still fail
+        closed instead of being guessed into either path.
         """
 
         status = str(value.get("status") or "").strip()
         if entity == "family":
             if status in _RECONCILABLE_FAMILY_STATUSES:
-                return
+                return "reconcile"
             raise ValueError(
-                "transparent baseline family lifecycle is operator/risk controlled "
-                f"and cannot be auto-reconciled: {status or 'missing'}"
+                "transparent baseline family lifecycle is unknown or inconsistent: "
+                f"{status or 'missing'}"
             )
         if entity != "version":
             raise ValueError(f"unsupported transparent baseline lifecycle entity: {entity}")
         stage = value.get("promotion_stage")
         lifecycle = (status, str(stage).strip() if stage is not None else None)
         if lifecycle in _RECONCILABLE_VERSION_LIFECYCLES:
-            return
+            return "reconcile"
+        if (
+            status in _GOVERNED_NOOP_STATUSES
+            or lifecycle[1] in _GOVERNED_NOOP_PROMOTION_STAGES
+        ):
+            return "governed_no_op"
         rendered_stage = lifecycle[1] or "none"
         raise ValueError(
-            "transparent baseline version lifecycle is operator/risk controlled "
-            "and cannot be auto-reconciled: "
+            "transparent baseline version lifecycle is unknown or inconsistent: "
             f"status={status or 'missing'}, promotion_stage={rendered_stage}"
         )
+
+    @classmethod
+    def _governed_noop_result(
+        cls,
+        version: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if cls._lifecycle_action(version, entity="version") != "governed_no_op":
+            return None
+        return {
+            "state": "governed_no_op",
+            "paper_stage": None,
+            "lifecycle": {
+                "status": str(version.get("status") or ""),
+                "promotion_stage": version.get("promotion_stage"),
+            },
+        }
 
     @staticmethod
     def _anchored_dataset(
@@ -382,7 +417,7 @@ class TransparentBaselineBootstrapService:
                         raise
                 plan["family_action"] = "created"
             else:
-                self._require_reconcilable_lifecycle(family, entity="family")
+                self._lifecycle_action(family, entity="family")
                 exact = [
                     version
                     for version in family.get("versions") or []
@@ -440,7 +475,13 @@ class TransparentBaselineBootstrapService:
                     f"{recipe_id} current frozen StrategyVersion is missing or duplicated"
                 )
             version = exact[0]
-            self._require_reconcilable_lifecycle(version, entity="version")
+            lifecycle_action = self._lifecycle_action(version, entity="version")
+            if lifecycle_action == "governed_no_op":
+                plan["lifecycle_action"] = lifecycle_action
+                plan["lifecycle"] = {
+                    "status": str(version.get("status") or ""),
+                    "promotion_stage": version.get("promotion_stage"),
+                }
             plan["version_id"] = str(version["id"])
             versions.append(version)
         return versions
@@ -520,6 +561,13 @@ class TransparentBaselineBootstrapService:
             target_runner_sha256 = bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
             if target_runner_sha256 is not None:
                 payload[TRANSPARENT_BASELINE_JOB_RUNNER_FIELD] = target_runner_sha256
+            target_runtime_bundle_sha256 = bootstrap.get(
+                TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD
+            )
+            if target_runtime_bundle_sha256 is not None:
+                payload[TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD] = (
+                    target_runtime_bundle_sha256
+                )
             job = self.jobs.create(
                 "strategy_backtest",
                 payload,
@@ -562,7 +610,9 @@ class TransparentBaselineBootstrapService:
                 "paper_stage": None,
             }
         version = self.strategies.get_version(version_id)
-        self._require_reconcilable_lifecycle(version, entity="version")
+        governed_noop = self._governed_noop_result(version)
+        if governed_noop is not None:
+            return governed_noop
         if version.get("status") != "approved":
             try:
                 self.strategies.approve(
@@ -578,11 +628,15 @@ class TransparentBaselineBootstrapService:
                 # immutable backtest.  Recover only if the competing caller
                 # completed the exact safe approval transition.
                 raced = self.strategies.get_version(version_id)
-                self._require_reconcilable_lifecycle(raced, entity="version")
+                governed_noop = self._governed_noop_result(raced)
+                if governed_noop is not None:
+                    return governed_noop
                 if raced.get("status") != "approved":
                     raise
         version = self.strategies.get_version(version_id)
-        self._require_reconcilable_lifecycle(version, entity="version")
+        governed_noop = self._governed_noop_result(version)
+        if governed_noop is not None:
+            return governed_noop
         if version.get("status") != "approved":
             raise ValueError("strict approval did not produce an approved paper version")
         # StrategyStore.approve opens this automatically. A second idempotent
@@ -590,7 +644,9 @@ class TransparentBaselineBootstrapService:
         # failed. Investor capital/permissions are still required by PromotionStore.
         stage = self.promotions.prepare_paper_stage(version_id, actor=actor)
         version = self.strategies.get_version(version_id)
-        self._require_reconcilable_lifecycle(version, entity="version")
+        governed_noop = self._governed_noop_result(version)
+        if governed_noop is not None:
+            return governed_noop
         if version.get("status") != "approved":
             raise ValueError("strict approval did not end in paper validation")
         return {"state": "paper_validating", "paper_stage": stage}
@@ -651,12 +707,23 @@ class TransparentBaselineBootstrapService:
                 families=families,
                 actor=actor,
             )
-            reservation = self.lockboxes.reserve(
-                versions=versions,
-                dataset=str(dataset["name"]),
-                dataset_identity_sha256=str(dataset["dataset_identity_sha256"]),
-                dataset_lineage_id=str(dataset["dataset_lineage_id"]),
-            )
+            if all(
+                plan.get("lifecycle_action") == "governed_no_op" for plan in plans
+            ):
+                # The bootstrap no longer owns any member in this batch. Do not
+                # even reopen the lockbox reservation transaction; the existing
+                # strategy, paper and recommendation evidence stays untouched.
+                reservation = {
+                    "status": "governed_no_op",
+                    "reason": "all transparent baselines are governance controlled",
+                }
+            else:
+                reservation = self.lockboxes.reserve(
+                    versions=versions,
+                    dataset=str(dataset["name"]),
+                    dataset_identity_sha256=str(dataset["dataset_identity_sha256"]),
+                    dataset_lineage_id=str(dataset["dataset_lineage_id"]),
+                )
             result["joint_lockbox"] = reservation
         except Exception as exc:  # noqa: BLE001 - reconcile must return a failed result
             result["errors"].append(str(exc))
@@ -677,8 +744,13 @@ class TransparentBaselineBootstrapService:
                 "backtest": None,
                 "job": None,
                 "paper_stage": None,
+                "lifecycle": plan.get("lifecycle"),
                 "errors": [],
             }
+            if plan.get("lifecycle_action") == "governed_no_op":
+                member["state"] = "governed_no_op"
+                member_results.append(member)
+                continue
             try:
                 queued = self._ensure_backtest_job(
                     plan=plan,
@@ -719,7 +791,12 @@ class TransparentBaselineBootstrapService:
             for item in member_results
         ):
             result["status"] = "failed"
-        elif all(item["state"] == "paper_validating" for item in member_results):
+        elif all(item["state"] == "governed_no_op" for item in member_results):
+            result["status"] = "no_op"
+        elif all(
+            item["state"] in {"paper_validating", "governed_no_op"}
+            for item in member_results
+        ):
             result["status"] = "paper_validating"
         else:
             result["status"] = "pending"

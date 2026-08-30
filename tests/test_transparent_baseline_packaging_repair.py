@@ -203,7 +203,7 @@ def test_v3_bootstrap_comparison_ignores_only_version_derived_packaging_hashes()
     assert _repair_bootstrap_semantics(source) != _repair_bootstrap_semantics(target)
 
 
-def test_v9_uses_canonical_lf_runner_without_rebinding_historical_v8() -> None:
+def test_v9_identity_stays_historical_without_rebinding_to_v10_bytes() -> None:
     assert target_runner_for_recipe(
         "short_relative_strength", OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION
     ) == OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
@@ -219,13 +219,14 @@ def test_v9_uses_canonical_lf_runner_without_rebinding_historical_v8() -> None:
             TRANSPARENT_BASELINE_RUNNER_FIELD: CANONICAL_LF_TARGET_RUNNER_SHA256,
         },
     }
-    assert require_transparent_baseline_runner(
-        config=config,
-        job_payload={
-            "transparent_baseline_runner_sha256": CANONICAL_LF_TARGET_RUNNER_SHA256
-        },
-        runner_path=runner,
-    ) == CANONICAL_LF_TARGET_RUNNER_SHA256
+    with pytest.raises(ValueError, match="transparent v9 runner bytes differ"):
+        require_transparent_baseline_runner(
+            config=config,
+            job_payload={
+                "transparent_baseline_runner_sha256": CANONICAL_LF_TARGET_RUNNER_SHA256
+            },
+            runner_path=runner,
+        )
 
 
 def test_v3_registry_binding_is_exact_and_generation_aware() -> None:

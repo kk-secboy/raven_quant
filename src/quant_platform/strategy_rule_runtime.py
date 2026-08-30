@@ -50,6 +50,7 @@ def build_strategy_rule_runtime_metadata(
     instruments: pd.Index,
     close_history: pd.DataFrame,
     benchmark_weights: pd.Series | None = None,
+    benchmark_close_history: pd.DataFrame | pd.Series | None = None,
     value_exposures: pd.Series | None = None,
 ) -> dict[str, Any]:
     """Build PIT-only inputs consumed by :class:`PortfolioPolicy` rules.
@@ -87,28 +88,42 @@ def build_strategy_rule_runtime_metadata(
 
     market_lookback = int(config.get("market_trend_lookback_sessions") or 0)
     if market_lookback:
-        if benchmark_weights is None:
-            raise ValueError("market-trend rule requires PIT benchmark weights")
-        weights = pd.to_numeric(benchmark_weights, errors="coerce")
-        weights.index = weights.index.astype(str)
-        weights = weights[weights > 0]
-        benchmark_closes = close_history.copy()
-        benchmark_closes.columns = benchmark_closes.columns.astype(str)
+        benchmark = str(config.get("market_trend_benchmark") or "").strip()
+        if not benchmark:
+            raise ValueError("market-trend rule requires a bound benchmark instrument")
+        if benchmark_close_history is None:
+            raise ValueError("market-trend rule requires PIT benchmark close history")
+        if isinstance(benchmark_close_history, pd.Series):
+            if str(benchmark_close_history.name or "") != benchmark:
+                raise ValueError("market-trend close history differs from the bound benchmark")
+            benchmark_closes = benchmark_close_history.copy()
+        else:
+            benchmark_frame = benchmark_close_history.copy()
+            benchmark_frame.columns = benchmark_frame.columns.astype(str)
+            if (
+                benchmark_frame.columns.has_duplicates
+                or list(benchmark_frame.columns) != [benchmark]
+            ):
+                raise ValueError("market-trend close history differs from the bound benchmark")
+            benchmark_closes = benchmark_frame[benchmark]
         benchmark_closes.index = pd.to_datetime(benchmark_closes.index).tz_localize(None)
-        benchmark_closes = benchmark_closes.sort_index().reindex(columns=weights.index)
+        if benchmark_closes.index.has_duplicates:
+            raise ValueError("market-trend benchmark close history is duplicated")
+        benchmark_closes = pd.to_numeric(
+            benchmark_closes.sort_index(), errors="coerce"
+        )
         complete = benchmark_closes.tail(market_lookback)
         if (
-            weights.empty
-            or len(complete) < market_lookback
-            or complete.isna().any().any()
+            len(complete) < market_lookback
+            or complete.isna().any()
+            or not np.isfinite(complete.to_numpy(dtype=float)).all()
+            or (complete <= 0).any()
         ):
             raise ValueError("market-trend rule has incomplete benchmark close history")
-        normalized_weights = weights / float(weights.sum())
-        relative_to_average = complete.iloc[-1] / complete.mean(axis=0)
-        breadth_level = float(relative_to_average.mul(normalized_weights).sum())
-        if not np.isfinite(breadth_level):
+        trend_level = float(complete.iloc[-1] / complete.mean())
+        if not np.isfinite(trend_level):
             raise ValueError("market-trend rule produced a non-finite regime value")
-        result["market_regime_allows_entries"] = breadth_level >= 1.0
+        result["market_regime_allows_entries"] = trend_level >= 1.0
 
     if config.get("valuation_regime_max_percentile") is not None:
         if value_exposures is None:

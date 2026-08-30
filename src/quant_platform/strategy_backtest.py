@@ -90,6 +90,7 @@ def build_governed_signal(
     metadata_availability_lag_days: int = METADATA_AVAILABILITY_LAG_DAYS,
     neutralize_industry: bool = True,
     neutralize_style_columns: Sequence[str] = (),
+    benchmark_relative_industry_constraints: bool = False,
 ) -> pd.Series:
     """Apply eligibility gates before the shared PortfolioPolicy assigns weights.
 
@@ -105,6 +106,10 @@ def build_governed_signal(
     industry metadata has no source data, so decisions only use metadata whose
     effective date is at least metadata_availability_lag_days old. Style
     exposures keep the same-trade-date-after-close policy (lag 0).
+
+    ``benchmark_relative_industry_constraints`` is separate from industry
+    score neutralization.  Reporting-only benchmarks must not silently turn a
+    TopK absolute industry cap into a benchmark-relative deviation band.
     """
 
     if (
@@ -235,10 +240,13 @@ def build_governed_signal(
         assumed_position_weight = min(1.0 / topk, max_position_weight)
         for instrument in ranking.index.astype(str):
             industry = str(industries.get(instrument, "__unknown__"))
-            allowed_weight = min(
-                max_industry_weight,
-                float(benchmark_industry.get(industry, 0.0)) + max_industry_deviation,
-            )
+            allowed_weight = max_industry_weight
+            if benchmark_relative_industry_constraints:
+                allowed_weight = min(
+                    allowed_weight,
+                    float(benchmark_industry.get(industry, 0.0))
+                    + max_industry_deviation,
+                )
             allowed_count = int(
                 np.floor(allowed_weight / assumed_position_weight + 1e-12)
             )

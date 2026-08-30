@@ -1,5 +1,6 @@
 import hashlib
 import io
+import shutil
 import subprocess
 import tarfile
 from pathlib import Path
@@ -11,9 +12,16 @@ from quant_platform.transparent_baseline_runner import (
     CANONICAL_LF_TARGET_RUNNER_SHA256,
     OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
     OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
+    RUNTIME_ALIGNMENT_RUNTIME_PATHS,
+    RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION,
+    RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256,
+    RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256,
     TRANSPARENT_BASELINE_JOB_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
     require_transparent_baseline_runner,
+    runtime_alignment_bundle_sha256,
 )
 
 pytestmark = pytest.mark.no_database
@@ -32,12 +40,15 @@ def _config(
     recipe_version: str = OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
     runner_sha256: str = OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
 ) -> dict:
+    bootstrap = {TRANSPARENT_BASELINE_RUNNER_FIELD: runner_sha256}
+    if recipe_version == RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION:
+        bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
+            RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256
+        )
     return {
         "recipe_id": "short_relative_strength",
         "recipe_version": recipe_version,
-        "transparent_baseline_bootstrap": {
-            TRANSPARENT_BASELINE_RUNNER_FIELD: runner_sha256
-        },
+        "transparent_baseline_bootstrap": bootstrap,
     }
 
 
@@ -56,19 +67,67 @@ def test_historical_v8_identity_is_not_rebound_to_current_lf_bytes() -> None:
         )
 
 
-def test_current_transparent_v9_runner_matches_canonical_lf_identity() -> None:
+def test_historical_v9_identity_is_not_rebound_to_current_v10_bytes() -> None:
+    runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
+
+    with pytest.raises(ValueError, match="transparent v9 runner bytes differ"):
+        require_transparent_baseline_runner(
+            config=_config(
+                CANONICAL_LF_TARGET_RECIPE_VERSION,
+                CANONICAL_LF_TARGET_RUNNER_SHA256,
+            ),
+            job_payload={
+                TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: CANONICAL_LF_TARGET_RUNNER_SHA256
+            },
+            runner_path=runner,
+        )
+
+
+def test_current_transparent_v10_runner_matches_runtime_alignment_identity() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
     assert require_transparent_baseline_runner(
         config=_config(
-            CANONICAL_LF_TARGET_RECIPE_VERSION,
-            CANONICAL_LF_TARGET_RUNNER_SHA256,
+            RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION,
+            RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256,
         ),
         job_payload={
-            TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: CANONICAL_LF_TARGET_RUNNER_SHA256
+            TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
+                RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256
+            ),
+            TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
+                RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256
+            ),
         },
         runner_path=runner,
-    ) == CANONICAL_LF_TARGET_RUNNER_SHA256
+    ) == RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256
+
+
+def test_v10_rejects_changed_imported_runtime_module(tmp_path: Path) -> None:
+    root = Path(__file__).parents[1]
+    for relative in RUNTIME_ALIGNMENT_RUNTIME_PATHS:
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(root / relative, destination)
+    policy = tmp_path / "src" / "quant_platform" / "portfolio_policy.py"
+    policy.write_bytes(policy.read_bytes() + b"\n# unauthorized runtime change\n")
+
+    with pytest.raises(ValueError, match="runtime bundle differs"):
+        require_transparent_baseline_runner(
+            config=_config(
+                RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION,
+                RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256,
+            ),
+            job_payload={
+                TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
+                    RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
+                    RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256
+                ),
+            },
+            runner_path=tmp_path / "scripts" / "run_multifactor_backtest.py",
+        )
 
 
 def test_runner_bytes_survive_git_blob_and_archive_with_autocrlf(
@@ -125,16 +184,60 @@ def test_runner_bytes_survive_git_blob_and_archive_with_autocrlf(
     ) == 1
 
 
-def test_repair_migration_targets_the_current_runner_identity() -> None:
-    migration = (
+def test_v10_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -> None:
+    root = Path(__file__).parents[1]
+    repo = tmp_path / "runtime-bundle-repo"
+    archive_root = tmp_path / "runtime-bundle-archive"
+    (repo / ".gitattributes").parent.mkdir(parents=True)
+    (repo / ".gitattributes").write_bytes((root / ".gitattributes").read_bytes())
+    for relative in RUNTIME_ALIGNMENT_RUNTIME_PATHS:
+        destination = repo / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((root / relative).read_bytes())
+    _git(repo, "init", "--quiet")
+    _git(repo, "config", "core.autocrlf", "true")
+    _git(repo, "config", "user.name", "QuantLab Tests")
+    _git(repo, "config", "user.email", "tests@quantlab.invalid")
+    _git(repo, "add", ".gitattributes", *RUNTIME_ALIGNMENT_RUNTIME_PATHS)
+    _git(repo, "commit", "--quiet", "-m", "Seal v10 runtime bundle")
+    archive = _git(repo, "archive", "--format=tar", "HEAD")
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+        for relative in RUNTIME_ALIGNMENT_RUNTIME_PATHS:
+            archived = tar.extractfile(relative)
+            assert archived is not None
+            destination = archive_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(archived.read())
+
+    assert runtime_alignment_bundle_sha256(root) == (
+        RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256
+    )
+    assert runtime_alignment_bundle_sha256(repo) == (
+        RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256
+    )
+    assert runtime_alignment_bundle_sha256(archive_root) == (
+        RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256
+    )
+
+
+def test_repair_migrations_pin_historical_and_current_runner_identities() -> None:
+    v9_migration = (
         Path(__file__).parents[1]
         / "migrations"
         / "versions"
         / "0075_transparent_baseline_canonical_lf_repair.py"
     ).read_text(encoding="utf-8")
+    v10_migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "versions"
+        / "0076_transparent_baseline_runtime_alignment_repair.py"
+    ).read_text(encoding="utf-8")
 
-    assert CANONICAL_LF_TARGET_RUNNER_SHA256 in migration
-    assert OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256 in migration
+    assert CANONICAL_LF_TARGET_RUNNER_SHA256 in v9_migration
+    assert OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256 in v9_migration
+    assert CANONICAL_LF_TARGET_RUNNER_SHA256 in v10_migration
+    assert RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256 in v10_migration
 
 
 def test_transparent_v8_runner_rejects_changed_bytes(tmp_path: Path) -> None:
@@ -166,7 +269,7 @@ def test_runner_repair_identity_is_forbidden_on_other_recipes(tmp_path: Path) ->
         },
     }
 
-    with pytest.raises(ValueError, match="forbidden outside transparent v8"):
+    with pytest.raises(ValueError, match="outside governed transparent recipes"):
         require_transparent_baseline_runner(
             config=config,
             job_payload={},

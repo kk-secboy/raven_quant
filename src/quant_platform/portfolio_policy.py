@@ -313,6 +313,10 @@ class PortfolioPolicy:
         candidates = list(dict.fromkeys([*retained, *eligible_ranked]))
         if industries is not None:
             industry_by_instrument = industries.astype(str)
+            benchmark_relative_industry_constraints = (
+                self.config.portfolio_construction
+                in {"benchmark_relative_qp", "industry_neutral_qp"}
+            )
             assumed_weight = min(
                 1.0 / min(self.config.topk, len(signal)), self.config.max_position_weight
             )
@@ -321,7 +325,10 @@ class PortfolioPolicy:
             for instrument in candidates:
                 industry = str(industry_by_instrument.get(instrument, "__unknown__"))
                 industry_cap = self.config.max_industry_weight
-                if benchmark_industry_weights is not None:
+                if (
+                    benchmark_relative_industry_constraints
+                    and benchmark_industry_weights is not None
+                ):
                     industry_cap = min(
                         industry_cap,
                         float(benchmark_industry_weights.get(industry, 0.0))

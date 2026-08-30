@@ -178,7 +178,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0075_baseline_lf_repair"
+    assert revision == "0076_baseline_runtime_repair"
     assert "capital_oos_alpha_batch_id" in {
         column["name"]
         for column in inspector.get_columns("oos_vintages", schema="quantlab")
@@ -966,7 +966,7 @@ def test_0045_retires_legacy_approved_pair_versions(database_url: str) -> None:
     assert audit is not None and audit[1] == "migration-0045"
 
 
-def test_same_lineage_repair_constraint_is_limited_to_exact_v2_v3(
+def test_same_lineage_repair_constraint_is_limited_to_exact_v2_v3_v4(
     database_url: str,
 ) -> None:
     engine = open_database(database_url)
@@ -988,6 +988,22 @@ def test_same_lineage_repair_constraint_is_limited_to_exact_v2_v3(
     assert "v7-to-v8-optimizer-applicability" in definition
     assert "transparent-baseline-pre-result-repair-v3" in definition
     assert "v8-to-v9-canonical-lf-packaging" in definition
+    assert "transparent-baseline-pre-result-repair-v4" in definition
+    assert "v9-to-v10-runtime-contract-alignment" in definition
+    assert "transparent-baseline-runtime-contract-alignment-v1" in definition
+    assert "3e3bc56a2daf7e35206e94c8d36a4c9ffb2a9fd6" in definition
+    assert "0f868f2f3beaf5cff5db461f11c411ab3ef960c620c3f2f902ac385fc79eff4d" in (
+        definition
+    )
+    assert "b2b501cf1b59201b8732bacfa787ab38e41867993234aa2f9f605d9b163e7c68" in (
+        definition
+    )
+    assert "eea7ca8854acbed0370ead8d97fdfdb128059f41d8a5995a5050b7ec9e9f3a34" in (
+        definition
+    )
+    assert "6a988b654c9cd5ac9caca183d0efc83ce2f337f88b4fe33c8ac32c355b8fb86c" in (
+        definition
+    )
     assert "fa1090deaa66ca77a045c1a872f7b6451043e116e717954533217908135c584e" in (
         definition
     )
@@ -997,6 +1013,84 @@ def test_same_lineage_repair_constraint_is_limited_to_exact_v2_v3(
     assert "256bbfd579865e7bc1442f1f64003d655241abecb320e5d27b440dd635224d57" in (
         definition
     )
+
+
+def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
+    database_url: str,
+) -> None:
+    engine = open_database(database_url)
+    source_ids = sorted(
+        [
+            "ef927367c58143448ebeaab2eceab5f1",
+            "f795119754ea41c2960a710e2626bd19",
+            "e05b237e364c4811a97ff5e2b49fc68c",
+        ]
+    )
+    verification = {
+        "receipt_contract_version": "transparent-baseline-pre-result-repair-v4",
+        "repair_generation": "v9-to-v10-runtime-contract-alignment",
+        "source_release_commit": "3e3bc56a2daf7e35206e94c8d36a4c9ffb2a9fd6",
+        "source_runner_sha256": (
+            "256bbfd579865e7bc1442f1f64003d655241abecb320e5d27b440dd635224d57"
+        ),
+        "target_runner_sha256": (
+            "0f868f2f3beaf5cff5db461f11c411ab3ef960c620c3f2f902ac385fc79eff4d"
+        ),
+        "source_runtime_bundle_sha256": (
+            "b2b501cf1b59201b8732bacfa787ab38e41867993234aa2f9f605d9b163e7c68"
+        ),
+        "target_runtime_bundle_sha256": (
+            "eea7ca8854acbed0370ead8d97fdfdb128059f41d8a5995a5050b7ec9e9f3a34"
+        ),
+        "runtime_contract_version": (
+            "transparent-baseline-runtime-contract-alignment-v1"
+        ),
+        "source_artifact_inventories_sha256": (
+            "6a988b654c9cd5ac9caca183d0efc83ce2f337f88b4fe33c8ac32c355b8fb86c"
+        ),
+    }
+    with engine.begin() as connection:
+        audit_id = connection.execute(
+            insert(audit_events)
+            .values(
+                user_id=None,
+                username="system:migration-test",
+                action="transparent_baseline_pre_result_repair_registered",
+                method="INTERNAL",
+                path="transparent-baseline/pre-result-repair",
+                status_code=201,
+                ip_hash=None,
+                user_agent="pytest",
+                details_json={},
+                created_at=datetime.now(UTC),
+            )
+            .returning(audit_events.c.id)
+        ).scalar_one()
+        connection.execute(
+            insert(transparent_baseline_pre_result_repairs).values(
+                receipt_sha256="f" * 64,
+                source_audit_event_id=audit_id,
+                source_batch_sha256="a" * 64,
+                target_batch_sha256="b" * 64,
+                source_dataset_lineage_id="c" * 64,
+                target_dataset_lineage_id="c" * 64,
+                target_recipe_version=(
+                    "qlib-rdagent-single-mainline-2026-08-30-v10"
+                ),
+                source_backtest_ids_json=source_ids,
+                target_strategy_version_ids_json=["1" * 32, "2" * 32, "3" * 32],
+                verification_json=verification,
+                created_at=datetime.now(UTC),
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="runtime-alignment repair evidence"):
+        command.downgrade(alembic_config(database_url), "0075_baseline_lf_repair")
+
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT version_num FROM quantlab.alembic_version")
+        ) == "0076_baseline_runtime_repair"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
@@ -1064,7 +1158,7 @@ def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0075_baseline_lf_repair"
+        ) == "0076_baseline_runtime_repair"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
@@ -1126,4 +1220,4 @@ def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0075_baseline_lf_repair"
+        ) == "0076_baseline_runtime_repair"

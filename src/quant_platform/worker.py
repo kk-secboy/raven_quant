@@ -148,7 +148,11 @@ from .strategy_rule_compiler import (
     validate_compiled_strategy_artifact,
 )
 from .strategy_store import StrategyStore
-from .transparent_baseline_runner import require_transparent_baseline_runner
+from .transparent_baseline_runner import (
+    TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
+    require_transparent_baseline_runner,
+)
 
 _DATABASE_RETRY_INITIAL_SECONDS = 0.5
 _DATABASE_RETRY_MAX_SECONDS = 5.0
@@ -4386,6 +4390,13 @@ class LocalJobWorker:
             )
             if runner_sha256 is not None:
                 manifest["transparent_baseline_runner_sha256"] = runner_sha256
+            runtime_bundle_sha256 = dict(
+                version["config"].get("transparent_baseline_bootstrap") or {}
+            ).get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
+            if runtime_bundle_sha256 is not None:
+                manifest[TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD] = (
+                    runtime_bundle_sha256
+                )
             manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )

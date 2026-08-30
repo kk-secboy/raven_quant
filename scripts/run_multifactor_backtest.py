@@ -778,12 +778,47 @@ def _portfolio_return_covariance(
     return estimate_covariance(returns)
 
 
+def _market_trend_close_history(
+    data_api: Any,
+    *,
+    strategy_config: dict[str, Any],
+    start_time: str,
+    end_time: str,
+) -> pd.DataFrame | None:
+    """Load the exact index series named by the compiled market-trend rule."""
+
+    lookback = int(strategy_config.get("market_trend_lookback_sessions") or 0)
+    if not lookback:
+        return None
+    benchmark = str(strategy_config.get("market_trend_benchmark") or "").strip()
+    if not benchmark:
+        raise ValueError("market-trend rule requires a bound benchmark instrument")
+    values = data_api.features(
+        [benchmark],
+        ["$close"],
+        start_time=start_time,
+        end_time=end_time,
+        freq="day",
+    )
+    if values.empty or "$close" not in values.columns:
+        raise ValueError("Qlib has no bound market-trend benchmark close history")
+    try:
+        closes = values["$close"].unstack("instrument").sort_index()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Qlib market-trend benchmark history is malformed") from exc
+    closes.columns = closes.columns.astype(str)
+    if closes.columns.has_duplicates or list(closes.columns) != [benchmark]:
+        raise ValueError("Qlib market-trend history differs from the bound benchmark")
+    return closes
+
+
 def _metadata_provider(
     memberships: pd.DataFrame,
     benchmark_weights: pd.DataFrame,
     styles: pd.DataFrame,
     execution_metadata: pd.DataFrame,
     close_history: pd.DataFrame,
+    benchmark_close_history: pd.DataFrame | None,
     *,
     strategy_config: dict[str, Any],
     open_field: str = "$open",
@@ -858,6 +893,11 @@ def _metadata_provider(
                 instruments=instruments,
                 close_history=close_matrix.loc[:market_timestamp],
                 benchmark_weights=benchmark,
+                benchmark_close_history=(
+                    benchmark_close_history.loc[:market_timestamp]
+                    if benchmark_close_history is not None
+                    else None
+                ),
                 value_exposures=(
                     style["value"] if "value" in style.columns else None
                 ),
@@ -1469,6 +1509,12 @@ def main() -> None:
         end_time=data_periods["end"],
         freq="day",
     )
+    benchmark_close_history = _market_trend_close_history(
+        D,
+        strategy_config=config,
+        start_time=data_periods["start"],
+        end_time=data_periods["end"],
+    )
     intraday_prices = (
         D.features(
             instruments,
@@ -1537,6 +1583,10 @@ def main() -> None:
             liquidity_lookback_days=int(scenario_config.get("liquidity_lookback_days", 20)),
             neutralize_industry=neutralize_industry,
             neutralize_style_columns=neutralize_styles,
+            benchmark_relative_industry_constraints=(
+                scenario_config.get("portfolio_construction")
+                in _COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS
+            ),
         )
 
     governed_signal = governed_for(config)
@@ -1551,6 +1601,7 @@ def main() -> None:
         style_exposures,
         execution_metadata,
         close_history,
+        benchmark_close_history,
         strategy_config=config,
         open_field=open_field,
         close_field=close_field,

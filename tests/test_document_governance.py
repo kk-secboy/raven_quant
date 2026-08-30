@@ -219,6 +219,8 @@ def test_authoritative_markdown_contains_the_current_contract() -> None:
         "paper_validating → recommendation_enabled`",
         "`system:auto-promotion`",
         "D 日完整收盘数据 → D+1 开盘或保守日线成交模型",
+        "`reporting_only` 基准只用于绩效对照",
+        "不能因为运行时提供了基准权重，就给 `topk_equal_weight` 偷加基准行业权重偏离带",
         "没有合格股票时输出现金/`NO_ACTION`",
         "初始资金是首次使用时必填的账户配置",
         "也没有 10 万或 50 万元硬下限",

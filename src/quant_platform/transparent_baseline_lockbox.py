@@ -39,8 +39,18 @@ from quant_platform.transparent_baseline_runner import (
     CANONICAL_LF_TARGET_RUNNER_SHA256,
     OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
     OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
+    RUNTIME_ALIGNMENT_SOURCE_RUNTIME_BUNDLE_SHA256,
+    RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
     target_runner_for_recipe,
+    target_runtime_bundle_for_recipe,
+)
+from quant_platform.transparent_baseline_runner import (
+    RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION as GOVERNED_RUNTIME_TARGET_RECIPE_VERSION,
+)
+from quant_platform.transparent_baseline_runner import (
+    RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256 as GOVERNED_RUNTIME_TARGET_RUNNER_SHA256,
 )
 
 LOCKBOX_CONTRACT_VERSION = "transparent-baseline-joint-lockbox-v1"
@@ -51,6 +61,7 @@ PRE_RESULT_REPAIR_ACTION = "transparent_baseline_pre_result_repair_registered"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V1 = "transparent-baseline-pre-result-repair-v1"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 = "transparent-baseline-pre-result-repair-v2"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V3 = "transparent-baseline-pre-result-repair-v3"
+PRE_RESULT_REPAIR_CONTRACT_VERSION_V4 = "transparent-baseline-pre-result-repair-v4"
 # Keep the historical public name pinned to v1.  Existing receipts and callers
 # must not silently acquire the wider v2 shape.
 PRE_RESULT_REPAIR_CONTRACT_VERSION = PRE_RESULT_REPAIR_CONTRACT_VERSION_V1
@@ -108,6 +119,80 @@ CANONICAL_LF_PACKAGING_SOURCE_BINDINGS = {
         "strategy_version_id": "acdd946a84d34197a68b1f9c33ea3553",
     },
 }
+RUNTIME_ALIGNMENT_REPAIR_GENERATION = "v9-to-v10-runtime-contract-alignment"
+RUNTIME_ALIGNMENT_CONTRACT_VERSION = (
+    "transparent-baseline-runtime-contract-alignment-v1"
+)
+RUNTIME_ALIGNMENT_SOURCE_COMMIT = "3e3bc56a2daf7e35206e94c8d36a4c9ffb2a9fd6"
+RUNTIME_ALIGNMENT_SOURCE_RECIPE_VERSION = CANONICAL_LF_TARGET_RECIPE_VERSION
+RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION = GOVERNED_RUNTIME_TARGET_RECIPE_VERSION
+RUNTIME_ALIGNMENT_SOURCE_RUNNER_SHA256 = CANONICAL_LF_TARGET_RUNNER_SHA256
+RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256 = GOVERNED_RUNTIME_TARGET_RUNNER_SHA256
+RUNTIME_ALIGNMENT_SOURCE_BUNDLE_SHA256 = (
+    RUNTIME_ALIGNMENT_SOURCE_RUNTIME_BUNDLE_SHA256
+)
+RUNTIME_ALIGNMENT_TARGET_BUNDLE_SHA256 = (
+    RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256
+)
+RUNTIME_ALIGNMENT_BENCHMARK_REASON = "compiled-market-benchmark-close-binding"
+RUNTIME_ALIGNMENT_INDUSTRY_REASON = "reporting-benchmark-relative-cap-leak"
+RUNTIME_ALIGNMENT_BENCHMARK_ERROR = (
+    "ValueError: market-trend rule has incomplete benchmark close history"
+)
+RUNTIME_ALIGNMENT_INDUSTRY_ERROR = (
+    "ValueError: industry constraints leave too few eligible instruments"
+)
+RUNTIME_ALIGNMENT_SOURCE_DATASET = "cn-20080101-20260828-v6-79a88b3"
+RUNTIME_ALIGNMENT_SOURCE_BINDINGS = {
+    "ef927367c58143448ebeaab2eceab5f1": {
+        "job_id": "86d178fcdbaa4081bc3126810e87f0ef",
+        "strategy_version_id": "28ef148affcb4ce1ba516ea733500887",
+        "reason_code": RUNTIME_ALIGNMENT_INDUSTRY_REASON,
+        "error": RUNTIME_ALIGNMENT_INDUSTRY_ERROR,
+        "periods": {
+            "historical_start": "2009-01-08",
+            "historical_end": "2021-06-18",
+            "start": "2022-07-06",
+            "end": "2025-08-14",
+        },
+        "artifact_inventory_sha256": (
+            "76f50fbb3c3a5bd6ebedae14d1ac70e621b6a2d85b1f3e3594071eaac93bf2c7"
+        ),
+    },
+    "f795119754ea41c2960a710e2626bd19": {
+        "job_id": "4c8693f79bec47f5afe5560f376983ee",
+        "strategy_version_id": "7c52079068274f2e9e2e1dcbffce9559",
+        "reason_code": RUNTIME_ALIGNMENT_BENCHMARK_REASON,
+        "error": RUNTIME_ALIGNMENT_BENCHMARK_ERROR,
+        "periods": {
+            "historical_start": "2014-02-11",
+            "historical_end": "2025-07-10",
+            "start": "2025-08-08",
+            "end": "2026-08-21",
+        },
+        "artifact_inventory_sha256": (
+            "a5086dafde910b7f70fb29952a086b9ee9163186021a28697de1f9455cb1599c"
+        ),
+    },
+    "e05b237e364c4811a97ff5e2b49fc68c": {
+        "job_id": "e2b16680f3fc4dc0b1c1037ddb759e9e",
+        "strategy_version_id": "3399bd080d6c418d9ec972721344c656",
+        "reason_code": RUNTIME_ALIGNMENT_BENCHMARK_REASON,
+        "error": RUNTIME_ALIGNMENT_BENCHMARK_ERROR,
+        "periods": {
+            "historical_start": "2011-08-10",
+            "historical_end": "2023-07-17",
+            "start": "2024-01-22",
+            "end": "2026-02-26",
+        },
+        "artifact_inventory_sha256": (
+            "0716b0e590c3662c34c09f06f4d6aebf163a4e06be80a494a5031ca970c1fa16"
+        ),
+    },
+}
+RUNTIME_ALIGNMENT_SOURCE_BACKTEST_IDS = frozenset(
+    RUNTIME_ALIGNMENT_SOURCE_BINDINGS
+)
 
 _PRE_RESULT_REPAIR_REASON_CODES = frozenset(
     {
@@ -150,6 +235,9 @@ _MEMBER_KEYS = {
     "test_end",
 }
 _RUNNER_BOUND_MEMBER_KEYS = _MEMBER_KEYS | {TRANSPARENT_BASELINE_RUNNER_FIELD}
+_RUNTIME_BOUND_MEMBER_KEYS = _RUNNER_BOUND_MEMBER_KEYS | {
+    TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD
+}
 
 
 def canonical_sha256(value: Any) -> str:
@@ -189,7 +277,9 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
     V1 remains byte-for-byte compatible with its historical receipt shape;
     V2 authorizes only the v7-to-v8 optimizer-applicability repair; V3
     authorizes only the three exact v8 failures caused before the canonical-LF
-    release package could execute the already-frozen runner source.
+    release package could execute the already-frozen runner source; V4 seals
+    the exact v9 runtime-contract failures and their complete partial-artifact
+    inventories before any corrected code can open a fresh OOS scope.
     """
 
     if not isinstance(value, Mapping):
@@ -237,6 +327,29 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         }
         repair_generation = str(value.get("repair_generation") or "").strip()
         if repair_generation != CANONICAL_LF_PACKAGING_REPAIR_GENERATION:
+            raise ValueError("transparent baseline repair generation is not allowlisted")
+    elif contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V4:
+        keys = common_keys | {
+            "repair_generation",
+            "source_runner_sha256",
+            TRANSPARENT_BASELINE_RUNNER_FIELD,
+            "source_runtime_bundle_sha256",
+            "target_runtime_bundle_sha256",
+            "runtime_contract_version",
+            "source_artifact_inventories_sha256",
+        }
+        expected_reasons = frozenset(
+            {
+                RUNTIME_ALIGNMENT_BENCHMARK_REASON,
+                RUNTIME_ALIGNMENT_INDUSTRY_REASON,
+            }
+        )
+        failure_markers = {
+            RUNTIME_ALIGNMENT_BENCHMARK_REASON: RUNTIME_ALIGNMENT_BENCHMARK_ERROR,
+            RUNTIME_ALIGNMENT_INDUSTRY_REASON: RUNTIME_ALIGNMENT_INDUSTRY_ERROR,
+        }
+        repair_generation = str(value.get("repair_generation") or "").strip()
+        if repair_generation != RUNTIME_ALIGNMENT_REPAIR_GENERATION:
             raise ValueError("transparent baseline repair generation is not allowlisted")
     else:
         raise ValueError("transparent baseline pre-result repair contract is invalid")
@@ -286,6 +399,32 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         != CANONICAL_LF_PACKAGING_CONTRACT_VERSION
     ):
         raise ValueError("canonical LF packaging repair source or target is not allowlisted")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V4 and (
+        commit != RUNTIME_ALIGNMENT_SOURCE_COMMIT
+        or target_recipe_version != RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION
+        or _require_sha256(
+            value.get("source_runner_sha256"), field="source_runner_sha256"
+        )
+        != RUNTIME_ALIGNMENT_SOURCE_RUNNER_SHA256
+        or _require_sha256(
+            value.get(TRANSPARENT_BASELINE_RUNNER_FIELD),
+            field=TRANSPARENT_BASELINE_RUNNER_FIELD,
+        )
+        != RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256
+        or _require_sha256(
+            value.get("source_runtime_bundle_sha256"),
+            field="source_runtime_bundle_sha256",
+        )
+        != RUNTIME_ALIGNMENT_SOURCE_BUNDLE_SHA256
+        or _require_sha256(
+            value.get("target_runtime_bundle_sha256"),
+            field="target_runtime_bundle_sha256",
+        )
+        != RUNTIME_ALIGNMENT_TARGET_BUNDLE_SHA256
+        or value.get("runtime_contract_version")
+        != RUNTIME_ALIGNMENT_CONTRACT_VERSION
+    ):
+        raise ValueError("runtime alignment repair source or target is not allowlisted")
     if (
         value.get("target_eligibility_contract") != ELIGIBILITY_CONTRACT_VERSION
         or value.get("target_stock_scope_contract")
@@ -367,6 +506,7 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         if contract_version in {
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V2,
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V3,
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V4,
         } and (
             member.get("status") != "failed"
         ):
@@ -384,6 +524,12 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
                 and error_text != CANONICAL_LF_PACKAGING_ERROR
             ):
                 raise ValueError("canonical LF packaging repair error is not exact")
+            if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V4:
+                source = RUNTIME_ALIGNMENT_SOURCE_BINDINGS.get(
+                    str(member.get("backtest_id") or "")
+                )
+                if source is None or error_text != source["error"]:
+                    raise ValueError("runtime alignment repair error is not exact")
             matches = {
                 code
                 for code, marker in failure_markers.items()
@@ -454,6 +600,39 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
                 for field in ("job_id", "strategy_version_id")
             ):
                 raise ValueError("canonical LF packaging source binding changed")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V4:
+        if identifiers["backtest_id"] != RUNTIME_ALIGNMENT_SOURCE_BACKTEST_IDS:
+            raise ValueError("runtime alignment repair backtests are not allowlisted")
+        inventory_digests: list[dict[str, str]] = []
+        for member in members:
+            source = RUNTIME_ALIGNMENT_SOURCE_BINDINGS.get(member["backtest_id"])
+            if source is None or any(
+                member[field] != source[field]
+                for field in ("job_id", "strategy_version_id")
+            ):
+                raise ValueError("runtime alignment source binding changed")
+            if (
+                member["dataset"] != RUNTIME_ALIGNMENT_SOURCE_DATASET
+                or member["periods"] != source["periods"]
+                or member["error"] != source["error"]
+            ):
+                raise ValueError("runtime alignment source evidence changed")
+            inventory_sha256 = canonical_sha256(member["files"])
+            if inventory_sha256 != source["artifact_inventory_sha256"]:
+                raise ValueError("runtime alignment artifact inventory changed")
+            inventory_digests.append(
+                {
+                    "backtest_id": member["backtest_id"],
+                    "artifact_inventory_sha256": inventory_sha256,
+                }
+            )
+        if _require_sha256(
+            value.get("source_artifact_inventories_sha256"),
+            field="source_artifact_inventories_sha256",
+        ) != canonical_sha256(
+            sorted(inventory_digests, key=lambda item: item["backtest_id"])
+        ):
+            raise ValueError("runtime alignment aggregate artifact inventory changed")
     if observed_failure_markers != expected_reasons:
         raise ValueError("transparent baseline repair does not cover its allowlisted defect")
     return {
@@ -478,7 +657,16 @@ def _normalize_member(raw: Mapping[str, Any]) -> dict[str, str]:
     if not recipe_version:
         raise ValueError("transparent baseline lockbox recipe version is required")
     expected_runner = target_runner_for_recipe(recipe_id, recipe_version)
-    expected_keys = _RUNNER_BOUND_MEMBER_KEYS if expected_runner else _MEMBER_KEYS
+    expected_runtime_bundle = target_runtime_bundle_for_recipe(
+        recipe_id, recipe_version
+    )
+    expected_keys = (
+        _RUNTIME_BOUND_MEMBER_KEYS
+        if expected_runtime_bundle
+        else _RUNNER_BOUND_MEMBER_KEYS
+        if expected_runner
+        else _MEMBER_KEYS
+    )
     if set(raw) != expected_keys:
         raise ValueError("transparent baseline lockbox member fields are invalid")
     try:
@@ -520,6 +708,16 @@ def _normalize_member(raw: Mapping[str, Any]) -> dict[str, str]:
         )
         if member[TRANSPARENT_BASELINE_RUNNER_FIELD] != expected_runner:
             raise ValueError("transparent lockbox runner identity changed")
+    if expected_runtime_bundle is not None:
+        member[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = _require_sha256(
+            raw.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD),
+            field=TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
+        )
+        if (
+            member[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD]
+            != expected_runtime_bundle
+        ):
+            raise ValueError("transparent lockbox runtime bundle identity changed")
     return member
 
 
@@ -627,6 +825,9 @@ def build_lockbox_member(
     runner_sha256 = bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
     if runner_sha256 is not None:
         raw_member[TRANSPARENT_BASELINE_RUNNER_FIELD] = runner_sha256
+    runtime_bundle_sha256 = bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
+    if runtime_bundle_sha256 is not None:
+        raw_member[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = runtime_bundle_sha256
     return _normalize_member(raw_member)
 
 
@@ -666,6 +867,10 @@ def lockbox_member_link(config: Mapping[str, Any]) -> dict[str, Any] | None:
         or (
             member.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
             != bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+        )
+        or (
+            member.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
+            != bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
         )
     ):
         raise ValueError("strategy config differs from its joint-lockbox member")
@@ -779,6 +984,7 @@ def _repair_bootstrap_semantics(value: Mapping[str, Any]) -> dict[str, Any]:
         "recipe_version",
         "recipe_sha256",
         TRANSPARENT_BASELINE_RUNNER_FIELD,
+        TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
         "research_window_contract_sha256",
     ):
         bootstrap.pop(key, None)
@@ -877,6 +1083,41 @@ def _exact_same_lineage_registry_profile(
             and source_backtest_ids
             == set(CANONICAL_LF_PACKAGING_SOURCE_BACKTEST_IDS)
         )
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V4:
+        return (
+            verification.get("repair_generation")
+            == RUNTIME_ALIGNMENT_REPAIR_GENERATION
+            and verification.get("source_runner_sha256")
+            == RUNTIME_ALIGNMENT_SOURCE_RUNNER_SHA256
+            and verification.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+            == RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256
+            and verification.get("source_runtime_bundle_sha256")
+            == RUNTIME_ALIGNMENT_SOURCE_BUNDLE_SHA256
+            and verification.get("target_runtime_bundle_sha256")
+            == RUNTIME_ALIGNMENT_TARGET_BUNDLE_SHA256
+            and verification.get("runtime_contract_version")
+            == RUNTIME_ALIGNMENT_CONTRACT_VERSION
+            and verification.get("source_release_commit")
+            == RUNTIME_ALIGNMENT_SOURCE_COMMIT
+            and verification.get("target_recipe_version")
+            == RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION
+            and verification.get("source_artifact_inventories_sha256")
+            == canonical_sha256(
+                sorted(
+                    (
+                        {
+                            "backtest_id": backtest_id,
+                            "artifact_inventory_sha256": binding[
+                                "artifact_inventory_sha256"
+                            ],
+                        }
+                        for backtest_id, binding in RUNTIME_ALIGNMENT_SOURCE_BINDINGS.items()
+                    ),
+                    key=lambda item: item["backtest_id"],
+                )
+            )
+            and source_backtest_ids == set(RUNTIME_ALIGNMENT_SOURCE_BACKTEST_IDS)
+        )
     return False
 
 
@@ -893,7 +1134,7 @@ def validate_repair_registry_binding(
     """Validate an exact append-only same-lineage repair registry row.
 
     This is the shared consumption guard for StrategyStore.  It deliberately
-    recognizes only the two production-specific same-lineage generations and
+    recognizes only the production-specific same-lineage generations and
     checks the row, JSON verification, complete three-member lockbox and the
     current member in one pure validation step.
     """
@@ -1127,9 +1368,13 @@ class TransparentBaselineLockboxStore:
         is_canonical_lf_packaging_repair = receipt["contract_version"] == (
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V3
         )
+        is_runtime_alignment_repair = receipt["contract_version"] == (
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V4
+        )
         is_same_lineage_repair = (
             is_optimizer_applicability_repair
             or is_canonical_lf_packaging_repair
+            or is_runtime_alignment_repair
         )
         if is_same_lineage_repair:
             if (
@@ -1227,7 +1472,7 @@ class TransparentBaselineLockboxStore:
                 or str(expected["test_start"]) != member["periods"]["start"]
                 or str(expected["test_end"]) != member["periods"]["end"]
                 or (
-                    is_canonical_lf_packaging_repair
+                    (is_canonical_lf_packaging_repair or is_runtime_alignment_repair)
                     and (
                         _repair_bootstrap_semantics(target_config)
                         != _repair_bootstrap_semantics(source_config)
@@ -1247,16 +1492,32 @@ class TransparentBaselineLockboxStore:
                 "recipe_version"
             ) != CANONICAL_LF_PACKAGING_SOURCE_RECIPE_VERSION:
                 raise ValueError("canonical LF packaging repair source recipe changed")
+            if is_runtime_alignment_repair and source_config.get(
+                "recipe_version"
+            ) != RUNTIME_ALIGNMENT_SOURCE_RECIPE_VERSION:
+                raise ValueError("runtime alignment repair source recipe changed")
             if is_canonical_lf_packaging_repair and (
                 source_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
                 != receipt["source_runner_expected_sha256"]
             ):
                 raise ValueError("canonical LF packaging source runner changed")
+            if is_runtime_alignment_repair and (
+                source_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+                != receipt["source_runner_sha256"]
+                or source_bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
+                is not None
+            ):
+                raise ValueError("runtime alignment source runtime binding changed")
             if is_same_lineage_repair and (
                 target_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
                 != receipt[TRANSPARENT_BASELINE_RUNNER_FIELD]
             ):
                 raise ValueError("same-lineage repair target runner changed")
+            if is_runtime_alignment_repair and (
+                target_bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
+                != receipt["target_runtime_bundle_sha256"]
+            ):
+                raise ValueError("runtime alignment target runtime bundle changed")
             has_metrics = backtest.metrics_json is not None
             has_result = _artifact_result_exists(backtest.artifact_path)
             declared_files = sorted(member["files"], key=lambda item: item["path"])
@@ -1280,7 +1541,7 @@ class TransparentBaselineLockboxStore:
                 later_results.append(str(backtest.id))
             elif member["status"] == "failed":
                 marker = str(member.get("error") or "")
-                if is_canonical_lf_packaging_repair:
+                if is_canonical_lf_packaging_repair or is_runtime_alignment_repair:
                     error_matches = (
                         str(backtest.error or "") == marker
                         and str(backtest.job_error or "") == marker
@@ -1331,11 +1592,22 @@ class TransparentBaselineLockboxStore:
             "source_runner_observed_sha256": receipt.get(
                 "source_runner_observed_sha256"
             ),
+            "source_runner_sha256": receipt.get("source_runner_sha256"),
+            "source_runtime_bundle_sha256": receipt.get(
+                "source_runtime_bundle_sha256"
+            ),
+            "target_runtime_bundle_sha256": receipt.get(
+                "target_runtime_bundle_sha256"
+            ),
             TRANSPARENT_BASELINE_RUNNER_FIELD: receipt.get(
                 TRANSPARENT_BASELINE_RUNNER_FIELD
             ),
             "packaging_contract_version": receipt.get(
                 "packaging_contract_version"
+            ),
+            "runtime_contract_version": receipt.get("runtime_contract_version"),
+            "source_artifact_inventories_sha256": receipt.get(
+                "source_artifact_inventories_sha256"
             ),
             "source_backtest_ids": sorted(item["backtest_id"] for item in members.values()),
             "target_strategy_version_ids": sorted(target_version_ids),

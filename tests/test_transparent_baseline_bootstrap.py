@@ -64,7 +64,9 @@ from quant_platform.transparent_baseline_repair import (
 )
 from quant_platform.transparent_baseline_runner import (
     TRANSPARENT_BASELINE_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
     target_runner_for_recipe,
+    target_runtime_bundle_for_recipe,
 )
 from scripts.run_multifactor_backtest import _promotion_dataset_descriptors
 
@@ -146,6 +148,13 @@ def _base_plan(calendar: list[str], recipe_id: str) -> dict:
     if target_runner_sha256 is not None:
         raw[BOOTSTRAP_CONFIG_KEY][TRANSPARENT_BASELINE_RUNNER_FIELD] = (
             target_runner_sha256
+        )
+    target_runtime_bundle_sha256 = target_runtime_bundle_for_recipe(
+        recipe["id"], recipe["version"]
+    )
+    if target_runtime_bundle_sha256 is not None:
+        raw[BOOTSTRAP_CONFIG_KEY][TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
+            target_runtime_bundle_sha256
         )
     base = _normalize_multifactor_contract(
         raw,
@@ -236,6 +245,15 @@ def _retarget_plans(
             bootstrap.pop(TRANSPARENT_BASELINE_RUNNER_FIELD, None)
         else:
             bootstrap[TRANSPARENT_BASELINE_RUNNER_FIELD] = target_runner_sha256
+        target_runtime_bundle_sha256 = target_runtime_bundle_for_recipe(
+            plan["recipe"]["id"], recipe_version
+        )
+        if target_runtime_bundle_sha256 is None:
+            bootstrap.pop(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD, None)
+        else:
+            bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
+                target_runtime_bundle_sha256
+            )
         plan["base_config"] = _normalize_multifactor_contract(
             base,
             factor_count=0,

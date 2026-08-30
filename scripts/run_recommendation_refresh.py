@@ -640,6 +640,10 @@ def main() -> None:
         liquidity_lookback_days=int(config.get("liquidity_lookback_days", 20)),
         neutralize_industry=neutralize_industry,
         neutralize_style_columns=neutralize_styles,
+        benchmark_relative_industry_constraints=(
+            config.get("portfolio_construction")
+            in {"benchmark_relative_qp", "industry_neutral_qp"}
+        ),
     )
     signal = governed.xs(as_of, level="datetime")
     # Read-side availability guard (design draft 3.3): industry membership and
