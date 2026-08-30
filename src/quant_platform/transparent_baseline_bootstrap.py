@@ -38,6 +38,13 @@ from quant_platform.transparent_baseline_runner import (
 BOOTSTRAP_CONTRACT_VERSION = "transparent-baseline-bootstrap-v1"
 RECONCILE_RESULT_VERSION = "transparent-baseline-reconcile-v1"
 DEFAULT_ACTOR = "system:transparent-baseline-bootstrap"
+_RECONCILABLE_FAMILY_STATUSES = frozenset({"draft", "approved"})
+_RECONCILABLE_VERSION_LIFECYCLES = frozenset(
+    {
+        ("draft", None),
+        ("approved", "paper"),
+    }
+)
 FAMILY_NAMES = {
     "short_relative_strength": "QuantLab透明基线：1至5日短线相对强弱",
     "swing_trend": "QuantLab透明基线：1至6个月波段趋势",
@@ -259,6 +266,43 @@ class TransparentBaselineBootstrapService:
         }
 
     @staticmethod
+    def _require_reconcilable_lifecycle(
+        value: Mapping[str, Any],
+        *,
+        entity: str,
+    ) -> None:
+        """Fail closed instead of reviving an operator/risk lifecycle state.
+
+        Managed reconciliation owns only the initial ``draft`` research path
+        and the idempotent ``approved``/``paper`` continuation it created.
+        Every other status is an explicit lifecycle boundary.  In particular,
+        a successful historical backtest must never let the scheduler turn a
+        paused, restricted, suspended, rejected or retired version back into
+        an approved paper strategy.
+        """
+
+        status = str(value.get("status") or "").strip()
+        if entity == "family":
+            if status in _RECONCILABLE_FAMILY_STATUSES:
+                return
+            raise ValueError(
+                "transparent baseline family lifecycle is operator/risk controlled "
+                f"and cannot be auto-reconciled: {status or 'missing'}"
+            )
+        if entity != "version":
+            raise ValueError(f"unsupported transparent baseline lifecycle entity: {entity}")
+        stage = value.get("promotion_stage")
+        lifecycle = (status, str(stage).strip() if stage is not None else None)
+        if lifecycle in _RECONCILABLE_VERSION_LIFECYCLES:
+            return
+        rendered_stage = lifecycle[1] or "none"
+        raise ValueError(
+            "transparent baseline version lifecycle is operator/risk controlled "
+            "and cannot be auto-reconciled: "
+            f"status={status or 'missing'}, promotion_stage={rendered_stage}"
+        )
+
+    @staticmethod
     def _anchored_dataset(
         families: Mapping[str, Mapping[str, Any] | None]
     ) -> str | None:
@@ -338,6 +382,7 @@ class TransparentBaselineBootstrapService:
                         raise
                 plan["family_action"] = "created"
             else:
+                self._require_reconcilable_lifecycle(family, entity="family")
                 exact = [
                     version
                     for version in family.get("versions") or []
@@ -395,6 +440,7 @@ class TransparentBaselineBootstrapService:
                     f"{recipe_id} current frozen StrategyVersion is missing or duplicated"
                 )
             version = exact[0]
+            self._require_reconcilable_lifecycle(version, entity="version")
             plan["version_id"] = str(version["id"])
             versions.append(version)
         return versions
@@ -516,11 +562,7 @@ class TransparentBaselineBootstrapService:
                 "paper_stage": None,
             }
         version = self.strategies.get_version(version_id)
-        if version.get("promotion_stage") == "recommendation_enabled":
-            raise ValueError(
-                "transparent baseline already has external recommendation authority; "
-                "bootstrap will not mutate it"
-            )
+        self._require_reconcilable_lifecycle(version, entity="version")
         if version.get("status") != "approved":
             try:
                 self.strategies.approve(
@@ -536,20 +578,20 @@ class TransparentBaselineBootstrapService:
                 # immutable backtest.  Recover only if the competing caller
                 # completed the exact safe approval transition.
                 raced = self.strategies.get_version(version_id)
-                if (
-                    raced.get("status") != "approved"
-                    or raced.get("promotion_stage") != "paper"
-                ):
+                self._require_reconcilable_lifecycle(raced, entity="version")
+                if raced.get("status") != "approved":
                     raise
+        version = self.strategies.get_version(version_id)
+        self._require_reconcilable_lifecycle(version, entity="version")
+        if version.get("status") != "approved":
+            raise ValueError("strict approval did not produce an approved paper version")
         # StrategyStore.approve opens this automatically. A second idempotent
         # call recovers the safe state where approval committed but stage setup
         # failed. Investor capital/permissions are still required by PromotionStore.
         stage = self.promotions.prepare_paper_stage(version_id, actor=actor)
         version = self.strategies.get_version(version_id)
-        if (
-            version.get("status") != "approved"
-            or version.get("promotion_stage") != "paper"
-        ):
+        self._require_reconcilable_lifecycle(version, entity="version")
+        if version.get("status") != "approved":
             raise ValueError("strict approval did not end in paper validation")
         return {"state": "paper_validating", "paper_stage": stage}
 

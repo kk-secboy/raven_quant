@@ -1006,6 +1006,8 @@ def test_recipe_vnext_stays_in_family_and_uses_atomic_exact_create(tmp_path: Pat
     recipe = get_strategy_recipe("short_relative_strength")
     old = {
         "id": "old-version",
+        "status": "draft",
+        "promotion_stage": None,
         "benchmark": recipe["benchmark"],
         "universe": recipe["universe"],
         "factors": [],
@@ -1017,7 +1019,7 @@ def test_recipe_vnext_stays_in_family_and_uses_atomic_exact_create(tmp_path: Pat
         "recipe_version": recipe["version"],
         "material_contract": "current-release",
     }
-    family = {"id": "same-family", "versions": [old]}
+    family = {"id": "same-family", "status": "draft", "versions": [old]}
 
     class AtomicStrategies:
         calls = 0
@@ -1033,6 +1035,8 @@ def test_recipe_vnext_stays_in_family_and_uses_atomic_exact_create(tmp_path: Pat
                 return exact[0]
             created = {
                 "id": "current-version",
+                "status": "draft",
+                "promotion_stage": None,
                 "benchmark": values["benchmark"],
                 "universe": values["universe"],
                 "factors": [],
@@ -1500,6 +1504,47 @@ def test_v2_optimizer_repair_opens_new_same_lineage_oos_rows(
     assert len({str(row.scope) for row in vintages}) == 2
     assert str(repair.source_dataset_lineage_id) == "b" * 64
     assert str(repair.target_dataset_lineage_id) == "b" * 64
+
+
+def test_v2_optimizer_repair_consumes_only_its_preregistered_scope(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, target_versions, target = _prepare_optimizer_repair_store_case(
+        database_url,
+        tmp_path,
+        monkeypatch,
+    )
+    reservation = TransparentBaselineLockboxStore(database_url).reserve(
+        versions=target_versions,
+        dataset=target["dataset"],
+        dataset_identity_sha256=target["identity"],
+        dataset_lineage_id=target["lineage"],
+    )
+    repair_scope = str(reservation["scope"])
+
+    for version in target_versions:
+        bootstrap = dict(version["config"][BOOTSTRAP_CONFIG_KEY])
+        store.create_backtest(
+            version_id=str(version["id"]),
+            dataset=target["dataset"],
+            periods=dict(bootstrap["formal_periods"]),
+            artifact_path=tmp_path / "optimizer-repair-v8" / str(version["id"]),
+            trading_dates=_calendar(),
+            dataset_lineage_id=target["lineage"],
+            dataset_identity_sha256=target["identity"],
+        )
+
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        vintages = connection.execute(select(oos_vintages)).all()
+    source_rows = [row for row in vintages if str(row.scope) != repair_scope]
+    repair_rows = [row for row in vintages if str(row.scope) == repair_scope]
+    assert len(source_rows) == 3
+    assert len(repair_rows) == 3
+    assert all(row.consumed_at is not None for row in source_rows)
+    assert all(row.consumed_at is not None for row in repair_rows)
 
 
 def test_optimizer_repair_registration_helper_seals_exact_v7_ids(

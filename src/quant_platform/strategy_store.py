@@ -37,6 +37,7 @@ from quant_data.database import (
     strategy_health_snapshots,
     strategy_pairs,
     strategy_versions,
+    transparent_baseline_pre_result_repairs,
 )
 from quant_data.execution_contract import (
     require_daily_qlib_contract,
@@ -141,6 +142,12 @@ from quant_platform.strategy_rule_compiler import (
     validate_strategy_rule_binding,
 )
 from quant_platform.transparent_baseline_lockbox import (
+    OPTIMIZER_APPLICABILITY_REPAIR_GENERATION,
+    OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
+    OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
+    PRE_RESULT_REPAIR_CONTRACT_VERSION_V2,
+    PRE_RESULT_REPAIR_REGISTRY_VERSION,
+    TRANSPARENT_BASELINE_RUNNER_FIELD,
     baseline_oos_sealed_member_set,
     validate_lockbox_link,
 )
@@ -4281,12 +4288,155 @@ class StrategyStore:
             stored_lineage = None
             include_legacy_dataset_scopes = True
 
-        # Serialize both exact and partially overlapping reservations. A row
-        # lock cannot protect the first insert because no row exists yet.
+        lockbox_raw = sealed_member_set.get("transparent_baseline_lockbox")
+        lockbox = validate_lockbox_link(lockbox_raw) if lockbox_raw is not None else None
+
+        # Serialize against the reservation writer before resolving a repair
+        # batch.  Optimizer-applicability repairs deliberately keep the same
+        # dataset lineage while receiving append-only rows in a batch-specific
+        # scope.  The sealed batch itself, rather than the caller, is the only
+        # authority allowed to select that scope.
         connection.execute(
             text("SELECT pg_advisory_xact_lock(hashtext(:oos_scope))"),
             {"oos_scope": scope},
         )
+        if lockbox is not None:
+            if program_ids or not normalized_lineage:
+                raise ValueError(
+                    "transparent baseline joint lockbox requires standalone lineage scope"
+                )
+            batch_rows = []
+            for candidate in connection.execute(
+                select(oos_vintages)
+                .where(oos_vintages.c.dataset_lineage_id == normalized_lineage)
+                .with_for_update()
+            ).all():
+                candidate_members = dict(candidate.sealed_candidate_set_json or {})
+                candidate_link = candidate_members.get("transparent_baseline_lockbox")
+                if not isinstance(candidate_link, Mapping):
+                    continue
+                try:
+                    normalized_link = validate_lockbox_link(candidate_link)
+                except ValueError:
+                    continue
+                if normalized_link["batch_sha256"] == lockbox["batch_sha256"]:
+                    batch_rows.append((candidate, normalized_link))
+            batch_scopes = {str(item[0].scope) for item in batch_rows}
+            observed_members = {item[1]["member_sha256"] for item in batch_rows}
+            base_scope = f"lineage:{normalized_lineage}"
+            permitted_scopes = {
+                base_scope,
+                f"{base_scope}:repair:{lockbox['batch_sha256']}",
+            }
+            if (
+                len(batch_rows) != 3
+                or observed_members != set(lockbox["member_sha256s"])
+                or len(batch_scopes) != 1
+                or not batch_scopes <= permitted_scopes
+            ):
+                raise ValueError(
+                    "transparent baseline final OOS was not atomically preregistered "
+                    "in its complete three-member joint lockbox"
+                )
+            reserved_scope = next(iter(batch_scopes))
+            if reserved_scope != base_scope:
+                repair_rows = connection.execute(
+                    select(transparent_baseline_pre_result_repairs)
+                    .where(
+                        transparent_baseline_pre_result_repairs.c.target_batch_sha256
+                        == lockbox["batch_sha256"]
+                    )
+                    .with_for_update()
+                ).all()
+                repair = repair_rows[0] if len(repair_rows) == 1 else None
+                verification = (
+                    dict(repair.verification_json or {}) if repair is not None else {}
+                )
+                batch_version_ids = {
+                    str(
+                        dict(item[0].sealed_candidate_set_json or {}).get(
+                            "strategy_version_id"
+                        )
+                        or ""
+                    )
+                    for item in batch_rows
+                }
+                batch_dataset_identities = {
+                    str(item[0].dataset_identity or "") for item in batch_rows
+                }
+                recorded_version_values = (
+                    [
+                        str(value)
+                        for value in list(repair.target_strategy_version_ids_json or [])
+                    ]
+                    if repair is not None
+                    else []
+                )
+                verification_version_values = [
+                    str(value)
+                    for value in list(
+                        verification.get("target_strategy_version_ids") or []
+                    )
+                ]
+                if (
+                    repair is None
+                    or len(batch_version_ids) != 3
+                    or "" in batch_version_ids
+                    or len(recorded_version_values) != 3
+                    or len(verification_version_values) != 3
+                    or sorted(batch_version_ids) != sorted(recorded_version_values)
+                    or sorted(batch_version_ids) != sorted(verification_version_values)
+                    or strategy_version_id not in batch_version_ids
+                    or str(repair.target_dataset_lineage_id) != normalized_lineage
+                    or str(repair.source_dataset_lineage_id) != normalized_lineage
+                    or str(verification.get("source_dataset_lineage_id") or "")
+                    != normalized_lineage
+                    or str(verification.get("target_dataset") or "") != dataset
+                    or batch_dataset_identities
+                    != {
+                        str(
+                            verification.get("target_dataset_identity_sha256") or ""
+                        )
+                    }
+                    or str(repair.receipt_sha256)
+                    != str(verification.get("receipt_sha256") or "")
+                    or int(repair.source_audit_event_id)
+                    != int(verification.get("source_audit_event_id") or -1)
+                    or str(repair.source_batch_sha256)
+                    != str(verification.get("source_batch_sha256") or "")
+                    or str(repair.target_batch_sha256)
+                    != str(verification.get("target_batch_sha256") or "")
+                    or str(repair.target_dataset_lineage_id)
+                    != str(verification.get("target_dataset_lineage_id") or "")
+                    or str(repair.target_recipe_version)
+                    != str(verification.get("target_recipe_version") or "")
+                    or verification.get("contract_version")
+                    != PRE_RESULT_REPAIR_REGISTRY_VERSION
+                    or verification.get("receipt_contract_version")
+                    != PRE_RESULT_REPAIR_CONTRACT_VERSION_V2
+                    or verification.get("repair_generation")
+                    != OPTIMIZER_APPLICABILITY_REPAIR_GENERATION
+                    or verification.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+                    != OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256
+                    or verification.get("target_recipe_version")
+                    != OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION
+                    or verification.get("performance_information_used") is not False
+                ):
+                    raise ValueError(
+                        "transparent baseline repair scope has no exact append-only "
+                        "pre-result registry binding"
+                    )
+            if reserved_scope != scope:
+                connection.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:oos_scope))"),
+                    {"oos_scope": reserved_scope},
+                )
+            scope = reserved_scope
+            # The lockbox reservation already performed the global overlap
+            # check.  Consumption is allowed to touch only its exact immutable
+            # three-row scope, never legacy or source-repair rows.
+            include_legacy_dataset_scopes = False
+
         scope_filter = oos_vintages.c.scope == scope
         if include_legacy_dataset_scopes:
             # Rows written before scope-v2 used dataset identity as scope. Their
@@ -4310,8 +4460,6 @@ class StrategyStore:
             ),
             None,
         )
-        lockbox_raw = sealed_member_set.get("transparent_baseline_lockbox")
-        lockbox = validate_lockbox_link(lockbox_raw) if lockbox_raw is not None else None
         if lockbox is not None:
             # The three public control windows are allowed to overlap only
             # after all three exact members have been atomically preregistered.
