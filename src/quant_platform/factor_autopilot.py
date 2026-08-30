@@ -24,7 +24,12 @@ from .factor_library_store import (
 )
 from .feature_set_registry import get_feature_set, register_feature_set
 from .job_store import JobStore
-from .research_automation import factor_spearman, resolve_research_periods
+from .research_automation import factor_spearman, resolve_research_window_contract
+from .research_horizon import (
+    SHORT_1_5D,
+    primary_label_horizon_sessions,
+    primary_label_policy_contract,
+)
 from .research_store import FactorGatePolicy, ResearchStore
 from .services import list_qlib_datasets
 
@@ -389,8 +394,13 @@ class FactorAutopilotService:
         self.project_root = Path(__file__).resolve().parents[2]
 
     def ensure_incremental_lane(
-        self, *, cycle: dict[str, Any], dataset: dict[str, Any]
+        self,
+        *,
+        cycle: dict[str, Any],
+        dataset: dict[str, Any],
+        horizon_profile: str = SHORT_1_5D,
     ) -> dict[str, Any] | None:
+        label_horizon_sessions = primary_label_horizon_sessions(horizon_profile)
         identity = str((dataset.get("provenance") or {}).get("dataset_identity_sha256") or "")
         lineage_id = str(
             dataset.get("lineage_id")
@@ -406,16 +416,33 @@ class FactorAutopilotService:
             or not dataset_end_date
         ):
             raise ValueError("factor SOTA autopilot requires verified dataset lineage")
-        active_run = self._active_incremental_run()
+        policy = primary_label_policy_contract()
+        if (
+            cycle.get("horizon_profile") != horizon_profile
+            or cycle.get("primary_label_policy_sha256") != policy["policy_sha256"]
+        ):
+            raise ValueError("factor SOTA cycle horizon binding changed")
+        active_run = self._active_incremental_run(horizon_profile)
         if active_run is not None:
             return self._recover_active_lane(
                 active_run,
                 cycle_id=str(cycle["id"]),
+                horizon_profile=horizon_profile,
+                label_horizon_sessions=label_horizon_sessions,
             )
-        candidates = self._eligible_candidates(str(cycle["id"]), identity)
+        candidates = self._eligible_candidates(
+            str(cycle["id"]),
+            identity,
+            horizon_profile=horizon_profile,
+            label_horizon_sessions=label_horizon_sessions,
+        )
         if not candidates:
             return None
-        baseline = self._frozen_baseline(dataset, identity)
+        baseline = self._frozen_baseline(
+            dataset,
+            identity,
+            horizon_profile=horizon_profile,
+        )
         attempted, prior = self._multiplicity_reference(
             identity=identity,
             frozen_model_sha256=baseline["frozen_model_sha256"],
@@ -428,7 +455,8 @@ class FactorAutopilotService:
         proposals = [self._proposal(item, baseline) for item in candidates]
         hypothesis_count = int(prior["attempted_hypotheses"]) + len(proposals)
         family_id = (
-            f"factor-sota:{identity}:{baseline['frozen_model_sha256']}:"
+            f"factor-sota:{horizon_profile}:{identity}:"
+            f"{baseline['frozen_model_sha256']}:"
             f"{baseline.get('predecessor_id') or 'bootstrap'}"
         )
         calendar = (
@@ -436,7 +464,13 @@ class FactorAutopilotService:
             .read_text(encoding="utf-8")
             .splitlines()
         )
-        periods, resolution = resolve_research_periods(calendar)
+        feature_set = dict(baseline["frozen_model"]["feature_set"])
+        periods, resolution = resolve_research_window_contract(
+            dataset,
+            calendar,
+            horizon_profile=horizon_profile,
+            feature_set=feature_set,
+        )
         candidate_set_sha256 = canonical_sha256(
             {
                 "candidates": [
@@ -446,13 +480,15 @@ class FactorAutopilotService:
                     }
                     for item in proposals
                 ],
+                "horizon_profile": horizon_profile,
+                "label_horizon_sessions": label_horizon_sessions,
                 "frozen_model_sha256": baseline["frozen_model_sha256"],
                 "predecessor_roll_forward": baseline["predecessor_roll_forward"],
                 "prior_hypotheses": prior["attempted_hypotheses"],
             }
         )
         run = self.research.create_run(
-            kind="factor_sota_increment",
+            kind=f"factor_sota_increment:{horizon_profile}",
             objective=(
                 "Test hard-gate-passing standalone and complementary factors as paired "
                 "additions or replacements against one frozen LightGBM recipe without "
@@ -468,6 +504,10 @@ class FactorAutopilotService:
             config={
                 "contract_version": FACTOR_SOTA_AUTOPILOT_CONTRACT_VERSION,
                 "autopilot_cycle_id": str(cycle["id"]),
+                "horizon_profile": horizon_profile,
+                "label_horizon_sessions": label_horizon_sessions,
+                "primary_label_policy": policy,
+                "primary_label_policy_sha256": policy["policy_sha256"],
                 "dataset_identity_sha256": identity,
                 "dataset_lineage_id": lineage_id,
                 "dataset_end_date": dataset_end_date,
@@ -483,6 +523,12 @@ class FactorAutopilotService:
                 "predecessor_roll_forward": baseline["predecessor_roll_forward"],
                 "evaluation_profiles": resolution["evaluation_profiles"],
                 "periods": periods,
+                "research_window_contract": resolution[
+                    "research_window_contract"
+                ],
+                "research_window_contract_sha256": resolution[
+                    "research_window_contract_sha256"
+                ],
                 "final_oos_opened": False,
             },
             artifact_path=self.settings.data_root / "artifacts" / "factor-sota-evaluations",
@@ -490,6 +536,10 @@ class FactorAutopilotService:
         payload = {
             "research_run_id": str(run["id"]),
             "autopilot_cycle_id": str(cycle["id"]),
+            "horizon_profile": horizon_profile,
+            "label_horizon_sessions": label_horizon_sessions,
+            "primary_label_policy": policy,
+            "primary_label_policy_sha256": policy["policy_sha256"],
             "evaluation_scope_id": str(run["id"]),
             "dataset": str(dataset["name"]),
             "dataset_path": str(dataset["path"]),
@@ -499,6 +549,14 @@ class FactorAutopilotService:
             "dataset_end_date": dataset_end_date,
             "universe": "cn_all",
             "evaluation_profiles": resolution["evaluation_profiles"],
+            "periods": periods,
+            "feature_set": feature_set,
+            "research_window_contract": resolution[
+                "research_window_contract"
+            ],
+            "research_window_contract_sha256": resolution[
+                "research_window_contract_sha256"
+            ],
             "baseline_members": baseline["baseline_members"],
             "candidates": proposals,
             "predecessor_id": baseline.get("predecessor_id"),
@@ -530,7 +588,8 @@ class FactorAutopilotService:
                 / f"factor-sota-autopilot-{run['id']}.log",
                 dedupe_active_kind=False,
                 idempotency_key=(
-                    f"autopilot-factor-sota:{cycle['id']}:{candidate_set_sha256}:"
+                    f"autopilot-factor-sota:{cycle['id']}:{horizon_profile}:"
+                    f"{candidate_set_sha256}:"
                     f"{FACTOR_SOTA_AUTOPILOT_CONTRACT_VERSION}"
                 ),
             )
@@ -551,11 +610,14 @@ class FactorAutopilotService:
             "frozen_model_sha256": baseline["frozen_model_sha256"],
         }
 
-    def _active_incremental_run(self) -> dict[str, Any] | None:
+    def _active_incremental_run(
+        self, horizon_profile: str
+    ) -> dict[str, Any] | None:
         with self.engine.connect() as connection:
             row = connection.execute(
                 select(research_runs).where(
-                    research_runs.c.kind == "factor_sota_increment",
+                    research_runs.c.kind
+                    == f"factor_sota_increment:{horizon_profile}",
                     research_runs.c.status.in_(("queued", "running", "evaluating")),
                 )
             ).first()
@@ -566,11 +628,22 @@ class FactorAutopilotService:
         run: dict[str, Any],
         *,
         cycle_id: str,
+        horizon_profile: str,
+        label_horizon_sessions: int,
     ) -> dict[str, Any] | None:
         """Attach an orphaned active run to its Autopilot branch on retry."""
 
         config = dict(run.get("config_json") or {})
-        if str(config.get("autopilot_cycle_id") or "") != cycle_id:
+        policy = primary_label_policy_contract()
+        if (
+            str(config.get("autopilot_cycle_id") or "") != cycle_id
+            or str(config.get("horizon_profile") or "") != horizon_profile
+            or int(config.get("label_horizon_sessions") or 0)
+            != label_horizon_sessions
+            or config.get("primary_label_policy") != policy
+            or config.get("primary_label_policy_sha256")
+            != policy["policy_sha256"]
+        ):
             # Factor ablations are intentionally globally serial.  Another
             # cycle's active frozen baseline must finish before this one starts.
             return None
@@ -583,6 +656,12 @@ class FactorAutopilotService:
             job.get("kind") != "factor_sota_evaluate"
             or str(payload.get("research_run_id") or "") != str(run["id"])
             or str(payload.get("autopilot_cycle_id") or "") != cycle_id
+            or str(payload.get("horizon_profile") or "") != horizon_profile
+            or int(payload.get("label_horizon_sessions") or 0)
+            != label_horizon_sessions
+            or payload.get("primary_label_policy") != policy
+            or payload.get("primary_label_policy_sha256")
+            != policy["policy_sha256"]
             or str(payload.get("dataset_identity_sha256") or "")
             != str(config.get("dataset_identity_sha256") or "")
             or str(payload.get("dataset_lineage_id") or "")
@@ -629,7 +708,14 @@ class FactorAutopilotService:
             "frozen_model_sha256": str(payload["frozen_model_sha256"]),
         }
 
-    def _eligible_candidates(self, cycle_id: str, identity: str) -> list[dict[str, Any]]:
+    def _eligible_candidates(
+        self,
+        cycle_id: str,
+        identity: str,
+        *,
+        horizon_profile: str,
+        label_horizon_sessions: int,
+    ) -> list[dict[str, Any]]:
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(factor_candidates, research_runs.c.config_json)
@@ -649,6 +735,7 @@ class FactorAutopilotService:
                 .order_by(factor_candidates.c.created_at, factor_candidates.c.id)
             ).all()
         eligible: list[dict[str, Any]] = []
+        policy = primary_label_policy_contract()
         for row in rows:
             item = dict(row._mapping)
             config = dict(item.pop("config_json") or {})
@@ -658,11 +745,18 @@ class FactorAutopilotService:
             ):
                 continue
             candidate = self.research.get_candidate(str(item["id"]))
+            variables = dict(candidate.get("variables") or {})
             if not (
                 candidate.get("factor_definition_id")
                 and candidate.get("economic_family")
                 and candidate.get("code_sha256")
                 and candidate.get("values_sha256")
+                and int(candidate.get("label_horizon_days") or 0)
+                == label_horizon_sessions
+                and variables.get("horizon_profile") == horizon_profile
+                and variables.get("primary_label_policy") == policy
+                and variables.get("primary_label_policy_sha256")
+                == policy["policy_sha256"]
             ):
                 continue
             evaluations = self.research.list_evaluations(str(candidate["id"]))
@@ -698,13 +792,20 @@ class FactorAutopilotService:
             eligible.append(candidate)
         return eligible
 
-    def resolve_active_sota(self, dataset: dict[str, Any]) -> dict[str, Any] | None:
+    def resolve_active_sota(
+        self,
+        dataset: dict[str, Any],
+        *,
+        horizon_profile: str = SHORT_1_5D,
+    ) -> dict[str, Any] | None:
+        label_horizon_sessions = primary_label_horizon_sessions(horizon_profile)
         versions = [
             item
             for item in self.library.list_sota(limit=1000)
             if item.get("status") == "active"
             and item.get("universe") == "cn_all"
-            and int(item.get("label_horizon_days") or 0) == 1
+            and int(item.get("label_horizon_days") or 0)
+            == label_horizon_sessions
         ]
         if not versions:
             return None
@@ -718,11 +819,19 @@ class FactorAutopilotService:
         version_id = str(resolution["predecessor_id"])
         detail = self.library.get_sota(version_id)
         if (
-            canonical_sha256(detail["evidence"]) != detail.get("evidence_sha256")
+            int(detail.get("label_horizon_days") or 0)
+            != label_horizon_sessions
+            or detail.get("universe") != "cn_all"
+            or detail.get("status") != "active"
+            or canonical_sha256(detail["evidence"])
+            != detail.get("evidence_sha256")
             or canonical_sha256(detail["policy"]) != detail.get("policy_sha256")
         ):
             raise ValueError("active SOTA version provenance changed in place")
-        feature_set = self.library.sota_feature_set(version_id)
+        feature_set = self.library.horizon_champion_feature_set(
+            version_id,
+            horizon_profile=horizon_profile,
+        )
         if canonical_sha256(
             {key: value for key, value in feature_set.items() if key != "definition_sha256"}
         ) != feature_set.get("definition_sha256"):
@@ -760,25 +869,42 @@ class FactorAutopilotService:
             )
         resolution = {
             **resolution,
+            "horizon_profile": horizon_profile,
+            "label_horizon_sessions": label_horizon_sessions,
             "source_sota_evidence_sha256": str(detail["evidence_sha256"]),
             "source_feature_set_definition_sha256": str(
+                feature_set["sota_feature_set_sha256"]
+            ),
+            "source_horizon_champion_feature_set_definition_sha256": str(
                 feature_set["definition_sha256"]
             ),
             "source_member_set_sha256": canonical_sha256(member_manifest),
         }
         return {
             "id": version_id,
+            "horizon_profile": horizon_profile,
+            "label_horizon_sessions": label_horizon_sessions,
             "detail": detail,
             "feature_set": register_feature_set(feature_set),
             "resolution": resolution,
         }
 
-    def _frozen_baseline(self, dataset: dict[str, Any], identity: str) -> dict[str, Any]:
+    def _frozen_baseline(
+        self,
+        dataset: dict[str, Any],
+        identity: str,
+        *,
+        horizon_profile: str = SHORT_1_5D,
+    ) -> dict[str, Any]:
+        label_horizon_sessions = primary_label_horizon_sessions(horizon_profile)
         baseline_members: list[dict[str, Any]] = []
         predecessor_id: str | None = None
         feature_set = get_feature_set("qlib-alpha158")
         predecessor_roll_forward: dict[str, Any] | None = None
-        resolved = self.resolve_active_sota(dataset)
+        resolved = self.resolve_active_sota(
+            dataset,
+            horizon_profile=horizon_profile,
+        )
         if resolved is not None:
             predecessor_id = str(resolved["id"])
             predecessor_roll_forward = dict(resolved["resolution"])
@@ -786,6 +912,13 @@ class FactorAutopilotService:
             feature_set = dict(resolved["feature_set"])
             for member in detail["members"]:
                 candidate = self.research.get_candidate(str(member["factor_candidate_id"]))
+                if (
+                    int(candidate.get("label_horizon_days") or 0)
+                    != label_horizon_sessions
+                ):
+                    raise ValueError(
+                        "active SOTA member label differs from its horizon champion"
+                    )
                 evaluation = self.research.get_evaluation(str(member["factor_evaluation_id"]))
                 feature_name = (
                     f"SOTA_{int(member['member_rank']):03d}_"
@@ -802,7 +935,7 @@ class FactorAutopilotService:
                             if (evaluation.get("metrics") or {}).get("direction") == "inverted"
                             else 1
                         ),
-                        "label_horizon_days": int(candidate.get("label_horizon_days") or 1),
+                        "label_horizon_days": label_horizon_sessions,
                     }
                 )
         stub = self.project_root / "scripts" / "baseline_model_stub.py"
@@ -816,6 +949,8 @@ class FactorAutopilotService:
             "training_hyperparameters": {},
             "seed": 11,
             "feature_set_definition_sha256": feature_set["definition_sha256"],
+            "horizon_profile": horizon_profile,
+            "label_horizon_sessions": label_horizon_sessions,
             "final_oos_opened": False,
         }
         artifact_identity = {
@@ -842,6 +977,8 @@ class FactorAutopilotService:
         }
         return {
             "predecessor_id": predecessor_id,
+            "horizon_profile": horizon_profile,
+            "label_horizon_sessions": label_horizon_sessions,
             "predecessor_roll_forward": predecessor_roll_forward,
             "baseline_members": baseline_members,
             "frozen_model": frozen_model,
@@ -971,7 +1108,7 @@ class FactorAutopilotService:
                 == "inverted"
                 else 1
             ),
-            "label_horizon_days": int(candidate.get("label_horizon_days") or 1),
+            "label_horizon_days": int(candidate.get("label_horizon_days") or 0),
             "replaced_feature_name": candidate.get("replaced_feature_name"),
             "preflight_rejection_reason": candidate.get("preflight_rejection_reason"),
             "frozen_model_sha256": baseline["frozen_model_sha256"],

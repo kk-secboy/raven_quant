@@ -61,9 +61,18 @@ from quant_platform.transparent_baseline_runner import (
 )
 
 LOCKBOX_CONTRACT_VERSION = "transparent-baseline-joint-lockbox-v1"
+LOCKBOX_CONTRACT_VERSION_V2 = "transparent-baseline-joint-lockbox-v2"
+LOCKBOX_CONTRACT_VERSION_V3 = "transparent-baseline-available-horizons-lockbox-v3"
 LOCKBOX_LINK_VERSION = "transparent-baseline-joint-lockbox-link-v1"
+LOCKBOX_LINK_VERSION_V2 = "transparent-baseline-available-horizons-link-v2"
 LOCKBOX_CONFIG_KEY = "transparent_baseline_joint_lockbox"
 BOOTSTRAP_CONFIG_KEY = "transparent_baseline_bootstrap"
+UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION = (
+    "transparent-baseline-unopened-history-selection-v1"
+)
+UNOPENED_HISTORY_SELECTION_POLICY = (
+    "exclude-current-recipe-at-earliest-prior-opened-final-oos-v1"
+)
 PRE_RESULT_REPAIR_ACTION = "transparent_baseline_pre_result_repair_registered"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V1 = "transparent-baseline-pre-result-repair-v1"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 = "transparent-baseline-pre-result-repair-v2"
@@ -373,6 +382,326 @@ def _require_identifier(value: Any, *, field: str) -> str:
         character not in "0123456789abcdef" for character in normalized
     ):
         raise ValueError(f"{field} must be a lowercase 32-character identifier")
+    return normalized
+
+
+def _ordered_calendar(calendar_days: Sequence[Any]) -> list[str]:
+    try:
+        ordered = [date.fromisoformat(str(day)).isoformat() for day in calendar_days]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("transparent baseline selection calendar is invalid") from exc
+    if not ordered or ordered != sorted(set(ordered)):
+        raise ValueError(
+            "transparent baseline selection calendar must be ordered and unique"
+        )
+    return ordered
+
+
+def _normalize_prior_batch(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("transparent baseline prior-batch evidence is invalid")
+    expected_keys = {
+        "batch_sha256",
+        "recipe_version",
+        "earliest_final_oos_start",
+        "latest_final_oos_end",
+        "members",
+        "members_sha256",
+    }
+    if set(value) != expected_keys:
+        raise ValueError("transparent baseline prior-batch evidence is invalid")
+    batch_sha256 = _require_sha256(
+        value.get("batch_sha256"), field="prior batch_sha256"
+    )
+    recipe_version = str(value.get("recipe_version") or "").strip()
+    if not recipe_version:
+        raise ValueError("transparent baseline prior recipe version is required")
+    raw_members = value.get("members")
+    if not isinstance(raw_members, Sequence) or isinstance(raw_members, (str, bytes)):
+        raise ValueError("transparent baseline prior-batch members are invalid")
+    members: list[dict[str, Any]] = []
+    member_keys = {
+        "oos_vintage_id",
+        "strategy_version_id",
+        "recipe_id",
+        "horizon_profile",
+        "recipe_version",
+        "test_start",
+        "test_end",
+        "first_opened_at",
+        "sealed_member_set_sha256",
+    }
+    for raw in raw_members:
+        if not isinstance(raw, Mapping) or set(raw) != member_keys:
+            raise ValueError("transparent baseline prior-batch member is invalid")
+        recipe_id = str(raw.get("recipe_id") or "").strip()
+        if recipe_id not in _RECIPE_HORIZONS:
+            raise ValueError("transparent baseline prior-batch recipe is invalid")
+        horizon = str(raw.get("horizon_profile") or "").strip()
+        if horizon != _RECIPE_HORIZONS[recipe_id]:
+            raise ValueError("transparent baseline prior-batch horizon changed")
+        if str(raw.get("recipe_version") or "").strip() != recipe_version:
+            raise ValueError("transparent baseline prior batch mixes recipe versions")
+        try:
+            test_start = date.fromisoformat(str(raw.get("test_start")))
+            test_end = date.fromisoformat(str(raw.get("test_end")))
+            first_opened_at = datetime.fromisoformat(
+                str(raw.get("first_opened_at"))
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "transparent baseline prior-batch dates are invalid"
+            ) from exc
+        if test_start > test_end:
+            raise ValueError("transparent baseline prior-batch OOS is not ordered")
+        if first_opened_at.tzinfo is None:
+            raise ValueError(
+                "transparent baseline prior-batch opening time must be timezone-aware"
+            )
+        members.append(
+            {
+                "oos_vintage_id": _require_identifier(
+                    raw.get("oos_vintage_id"), field="oos_vintage_id"
+                ),
+                "strategy_version_id": _require_identifier(
+                    raw.get("strategy_version_id"), field="strategy_version_id"
+                ),
+                "recipe_id": recipe_id,
+                "horizon_profile": horizon,
+                "recipe_version": recipe_version,
+                "test_start": test_start.isoformat(),
+                "test_end": test_end.isoformat(),
+                "first_opened_at": first_opened_at.isoformat(),
+                "sealed_member_set_sha256": _require_sha256(
+                    raw.get("sealed_member_set_sha256"),
+                    field="sealed_member_set_sha256",
+                ),
+            }
+        )
+    members.sort(key=lambda item: item["recipe_id"])
+    member_recipe_ids = [str(item["recipe_id"]) for item in members]
+    if (
+        not member_recipe_ids
+        or len(member_recipe_ids) != len(set(member_recipe_ids))
+        or not set(member_recipe_ids) <= set(TRANSPARENT_RESEARCH_BASELINE_IDS)
+    ):
+        raise ValueError(
+            "transparent baseline prior batch must contain one to three unique horizons"
+        )
+    if canonical_sha256(members) != _require_sha256(
+        value.get("members_sha256"), field="prior members_sha256"
+    ):
+        raise ValueError("transparent baseline prior-batch member digest changed")
+    earliest = min(item["test_start"] for item in members)
+    latest = max(item["test_end"] for item in members)
+    if (
+        str(value.get("earliest_final_oos_start") or "") != earliest
+        or str(value.get("latest_final_oos_end") or "") != latest
+    ):
+        raise ValueError("transparent baseline prior-batch OOS bounds changed")
+    return {
+        "batch_sha256": batch_sha256,
+        "recipe_version": recipe_version,
+        "earliest_final_oos_start": earliest,
+        "latest_final_oos_end": latest,
+        "members": members,
+        "members_sha256": canonical_sha256(members),
+    }
+
+
+def build_unopened_history_selection(
+    *,
+    calendar_days: Sequence[Any],
+    current_recipe_version: str,
+    prior_batches: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Freeze the latest calendar prefix never opened by a prior recipe.
+
+    This function consumes only immutable OOS-window identities. It never
+    reads prior results, metrics or repair receipts.
+    """
+
+    calendar = _ordered_calendar(calendar_days)
+    recipe_version = str(current_recipe_version or "").strip()
+    if not recipe_version:
+        raise ValueError("transparent baseline current recipe version is required")
+    normalized_batches = sorted(
+        (_normalize_prior_batch(value) for value in prior_batches),
+        key=lambda item: item["batch_sha256"],
+    )
+    if len({item["batch_sha256"] for item in normalized_batches}) != len(
+        normalized_batches
+    ):
+        raise ValueError("transparent baseline prior-batch evidence is duplicated")
+    if any(
+        item["recipe_version"] == recipe_version for item in normalized_batches
+    ):
+        raise ValueError("current transparent recipe cannot move its own history cutoff")
+    earliest_prior_start = (
+        min(item["earliest_final_oos_start"] for item in normalized_batches)
+        if normalized_batches
+        else None
+    )
+    if earliest_prior_start is None:
+        selected_calendar = calendar
+        cutoff_rule = "latest_real_trading_session"
+        selection_mode = "latest_history_no_prior_transparent_batch"
+    else:
+        selected_calendar = [day for day in calendar if day < earliest_prior_start]
+        if not selected_calendar:
+            raise ValueError(
+                "transparent baseline history has no trading session before the prior OOS"
+            )
+        cutoff_rule = "real_trading_session_preceding_earliest_prior_final_oos"
+        selection_mode = "unopened_history_before_prior_transparent_oos"
+    prior_batches_sha256 = canonical_sha256(normalized_batches)
+    payload = {
+        "contract_version": UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION,
+        "selection_policy": UNOPENED_HISTORY_SELECTION_POLICY,
+        "selection_mode": selection_mode,
+        "cutoff_rule": cutoff_rule,
+        "current_recipe_version": recipe_version,
+        "source_calendar_start": calendar[0],
+        "source_calendar_end": calendar[-1],
+        "source_calendar_trading_days": len(calendar),
+        "source_calendar_sha256": canonical_sha256(calendar),
+        "earliest_prior_final_oos_start": earliest_prior_start,
+        "selected_calendar_end": selected_calendar[-1],
+        "selected_calendar_trading_days": len(selected_calendar),
+        "selected_calendar_sha256": canonical_sha256(selected_calendar),
+        "prior_batches": normalized_batches,
+        "prior_batches_sha256": prior_batches_sha256,
+        "prior_results_or_metrics_read": False,
+        "prior_windows_treatment": "ordinary_historical_validation_only",
+    }
+    return {**payload, "selection_sha256": canonical_sha256(payload)}
+
+
+def validate_unopened_history_selection(
+    value: Any,
+    *,
+    calendar_days: Sequence[Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("transparent baseline unopened-history selection is required")
+    expected_keys = {
+        "contract_version",
+        "selection_policy",
+        "selection_mode",
+        "cutoff_rule",
+        "current_recipe_version",
+        "source_calendar_start",
+        "source_calendar_end",
+        "source_calendar_trading_days",
+        "source_calendar_sha256",
+        "earliest_prior_final_oos_start",
+        "selected_calendar_end",
+        "selected_calendar_trading_days",
+        "selected_calendar_sha256",
+        "prior_batches",
+        "prior_batches_sha256",
+        "prior_results_or_metrics_read",
+        "prior_windows_treatment",
+        "selection_sha256",
+    }
+    if set(value) != expected_keys:
+        raise ValueError("transparent baseline unopened-history selection is invalid")
+    raw_batches = value.get("prior_batches")
+    if not isinstance(raw_batches, Sequence) or isinstance(raw_batches, (str, bytes)):
+        raise ValueError("transparent baseline prior-batch evidence is invalid")
+    if len([item for item in raw_batches if isinstance(item, Mapping)]) != len(
+        raw_batches
+    ):
+        raise ValueError("transparent baseline prior-batch evidence is invalid")
+    if calendar_days is None:
+        # Without the source calendar, validate the recursively sealed payload
+        # directly; callers that select a prefix always provide the calendar.
+        normalized_batches = sorted(
+            (_normalize_prior_batch(item) for item in raw_batches),
+            key=lambda item: item["batch_sha256"],
+        )
+        payload = dict(value)
+        selection_sha256 = _require_sha256(
+            payload.pop("selection_sha256", None), field="selection_sha256"
+        )
+        if canonical_sha256(payload) != selection_sha256:
+            raise ValueError("transparent baseline history selection digest changed")
+        try:
+            source_start = date.fromisoformat(str(value.get("source_calendar_start")))
+            source_end = date.fromisoformat(str(value.get("source_calendar_end")))
+            selected_end = date.fromisoformat(str(value.get("selected_calendar_end")))
+            source_days = int(value.get("source_calendar_trading_days"))
+            selected_days = int(value.get("selected_calendar_trading_days"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "transparent baseline history selection calendar is invalid"
+            ) from exc
+        earliest = (
+            min(item["earliest_final_oos_start"] for item in normalized_batches)
+            if normalized_batches
+            else None
+        )
+        expected_mode = (
+            "unopened_history_before_prior_transparent_oos"
+            if normalized_batches
+            else "latest_history_no_prior_transparent_batch"
+        )
+        expected_rule = (
+            "real_trading_session_preceding_earliest_prior_final_oos"
+            if normalized_batches
+            else "latest_real_trading_session"
+        )
+        if (
+            value.get("contract_version")
+            != UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION
+            or value.get("selection_policy") != UNOPENED_HISTORY_SELECTION_POLICY
+            or value.get("selection_mode") != expected_mode
+            or value.get("cutoff_rule") != expected_rule
+            or not str(value.get("current_recipe_version") or "").strip()
+            or source_days < 1
+            or selected_days < 1
+            or selected_days > source_days
+            or not source_start <= selected_end <= source_end
+            or value.get("earliest_prior_final_oos_start") != earliest
+            or (earliest is not None and selected_end >= date.fromisoformat(earliest))
+            or _require_sha256(
+                value.get("source_calendar_sha256"),
+                field="source_calendar_sha256",
+            )
+            != value.get("source_calendar_sha256")
+            or _require_sha256(
+                value.get("selected_calendar_sha256"),
+                field="selected_calendar_sha256",
+            )
+            != value.get("selected_calendar_sha256")
+            or value.get("prior_results_or_metrics_read") is not False
+            or value.get("prior_windows_treatment")
+            != "ordinary_historical_validation_only"
+            or value.get("prior_batches_sha256")
+            != canonical_sha256(normalized_batches)
+            or any(
+                item["recipe_version"] == value.get("current_recipe_version")
+                for item in normalized_batches
+            )
+            or (
+                not normalized_batches
+                and (
+                    selected_end != source_end
+                    or selected_days != source_days
+                    or value.get("selected_calendar_sha256")
+                    != value.get("source_calendar_sha256")
+                )
+            )
+        ):
+            raise ValueError("transparent baseline history selection policy changed")
+        return dict(value)
+    normalized = build_unopened_history_selection(
+        calendar_days=calendar_days,
+        current_recipe_version=str(value.get("current_recipe_version") or ""),
+        prior_batches=[item for item in raw_batches if isinstance(item, Mapping)],
+    )
+    if dict(value) != normalized:
+        raise ValueError("transparent baseline history selection or cutoff changed")
     return normalized
 
 
@@ -954,30 +1283,108 @@ def _normalize_member(raw: Mapping[str, Any]) -> dict[str, str]:
     return member
 
 
+def _normalize_unavailable_horizon(value: Mapping[str, Any]) -> dict[str, Any]:
+    keys = {
+        "recipe_id",
+        "horizon_profile",
+        "status",
+        "reason",
+        "evidence",
+        "evidence_sha256",
+    }
+    if set(value) != keys:
+        raise ValueError("unavailable baseline horizon contract is invalid")
+    recipe_id = str(value.get("recipe_id") or "")
+    horizon_profile = str(value.get("horizon_profile") or "")
+    evidence = value.get("evidence")
+    if (
+        recipe_id not in _RECIPE_HORIZONS
+        or horizon_profile != _RECIPE_HORIZONS[recipe_id]
+        or value.get("status") != "unavailable"
+        or not str(value.get("reason") or "").strip()
+        or not isinstance(evidence, Mapping)
+        or evidence.get("capital_evaluation_eligible") is not False
+        or not str(
+            evidence.get("capital_evaluation_unavailable_reason") or ""
+        ).strip()
+        or canonical_sha256(dict(evidence))
+        != _require_sha256(value.get("evidence_sha256"), field="evidence_sha256")
+    ):
+        raise ValueError("unavailable baseline horizon evidence is invalid")
+    return {
+        "recipe_id": recipe_id,
+        "horizon_profile": horizon_profile,
+        "status": "unavailable",
+        "reason": str(value["reason"]).strip(),
+        "evidence": dict(evidence),
+        "evidence_sha256": canonical_sha256(dict(evidence)),
+    }
+
+
 def build_joint_lockbox(
     *,
     dataset: str,
     dataset_identity_sha256: str,
     dataset_lineage_id: str,
     members: Sequence[Mapping[str, Any]],
+    unopened_history_selection: Mapping[str, Any] | None = None,
+    unavailable_horizons: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Build the only supported three-baseline preregistration contract."""
+    """Build one atomic preregistration for every statistically available lane."""
 
     normalized_members = sorted(
         (_normalize_member(item) for item in members),
         key=lambda item: item["recipe_id"],
     )
-    if [item["recipe_id"] for item in normalized_members] != sorted(
-        TRANSPARENT_RESEARCH_BASELINE_IDS
+    normalized_unavailable = sorted(
+        (
+            _normalize_unavailable_horizon(item)
+            for item in (unavailable_horizons or [])
+        ),
+        key=lambda item: item["recipe_id"],
+    )
+    member_recipe_ids = [str(item["recipe_id"]) for item in normalized_members]
+    unavailable_recipe_ids = [
+        str(item["recipe_id"]) for item in normalized_unavailable
+    ]
+    expected_recipe_ids = sorted(TRANSPARENT_RESEARCH_BASELINE_IDS)
+    if (
+        not normalized_members
+        or len(member_recipe_ids) != len(set(member_recipe_ids))
+        or len({item["horizon_profile"] for item in normalized_members})
+        != len(normalized_members)
+        or sorted(member_recipe_ids + unavailable_recipe_ids) != expected_recipe_ids
     ):
-        raise ValueError("joint lockbox must declare exactly the three public baselines")
-    if len({item["horizon_profile"] for item in normalized_members}) != 3:
-        raise ValueError("joint lockbox must declare one member per horizon")
+        raise ValueError(
+            "baseline lockbox must account exactly once for all three public horizons"
+        )
     dataset_name = str(dataset or "").strip()
     if not dataset_name:
         raise ValueError("joint lockbox dataset is required")
+    selection = (
+        validate_unopened_history_selection(unopened_history_selection)
+        if unopened_history_selection is not None
+        else None
+    )
+    if selection is not None:
+        member_recipe_versions = {
+            str(item["recipe_version"]) for item in normalized_members
+        }
+        if member_recipe_versions != {selection["current_recipe_version"]}:
+            raise ValueError(
+                "joint lockbox history selection differs from its recipe version"
+            )
+    if normalized_unavailable and selection is None:
+        raise ValueError("partial baseline lockbox requires unopened-history evidence")
+    contract_version = (
+        LOCKBOX_CONTRACT_VERSION_V3
+        if normalized_unavailable
+        else LOCKBOX_CONTRACT_VERSION_V2
+        if selection is not None
+        else LOCKBOX_CONTRACT_VERSION
+    )
     contract = {
-        "contract_version": LOCKBOX_CONTRACT_VERSION,
+        "contract_version": contract_version,
         "dataset": dataset_name,
         "dataset_identity_sha256": _require_sha256(
             dataset_identity_sha256,
@@ -988,6 +1395,16 @@ def build_joint_lockbox(
             field="dataset_lineage_id",
         ),
         "members": normalized_members,
+        **(
+            {"unopened_history_selection": selection}
+            if selection is not None
+            else {}
+        ),
+        **(
+            {"unavailable_horizons": normalized_unavailable}
+            if normalized_unavailable
+            else {}
+        ),
     }
     return {**contract, "batch_sha256": canonical_sha256(contract)}
 
@@ -995,6 +1412,7 @@ def build_joint_lockbox(
 def validate_joint_lockbox(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("transparent baseline joint lockbox is required")
+    contract_version = value.get("contract_version")
     allowed = {
         "contract_version",
         "dataset",
@@ -1003,7 +1421,16 @@ def validate_joint_lockbox(value: Any) -> dict[str, Any]:
         "members",
         "batch_sha256",
     }
-    if set(value) != allowed or value.get("contract_version") != LOCKBOX_CONTRACT_VERSION:
+    if contract_version in {
+        LOCKBOX_CONTRACT_VERSION_V2,
+        LOCKBOX_CONTRACT_VERSION_V3,
+    }:
+        allowed.add("unopened_history_selection")
+        if contract_version == LOCKBOX_CONTRACT_VERSION_V3:
+            allowed.add("unavailable_horizons")
+    elif contract_version != LOCKBOX_CONTRACT_VERSION:
+        raise ValueError("transparent baseline joint lockbox contract is invalid")
+    if set(value) != allowed:
         raise ValueError("transparent baseline joint lockbox contract is invalid")
     members = value.get("members")
     if not isinstance(members, Sequence) or isinstance(members, (str, bytes)):
@@ -1013,6 +1440,17 @@ def validate_joint_lockbox(value: Any) -> dict[str, Any]:
         dataset_identity_sha256=str(value.get("dataset_identity_sha256") or ""),
         dataset_lineage_id=str(value.get("dataset_lineage_id") or ""),
         members=[item for item in members if isinstance(item, Mapping)],
+        unopened_history_selection=(
+            value.get("unopened_history_selection")
+            if contract_version
+            in {LOCKBOX_CONTRACT_VERSION_V2, LOCKBOX_CONTRACT_VERSION_V3}
+            else None
+        ),
+        unavailable_horizons=(
+            value.get("unavailable_horizons")
+            if contract_version == LOCKBOX_CONTRACT_VERSION_V3
+            else None
+        ),
     )
     if len(members) != len(normalized["members"]) or dict(value) != normalized:
         raise ValueError("transparent baseline joint lockbox digest or members changed")
@@ -1098,6 +1536,10 @@ def lockbox_member_link(config: Mapping[str, Any]) -> dict[str, Any] | None:
             "end": member["test_end"],
         }
         or (
+            lockbox.get("unopened_history_selection")
+            != bootstrap.get("unopened_history_selection")
+        )
+        or (
             member.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
             != bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
         )
@@ -1109,7 +1551,11 @@ def lockbox_member_link(config: Mapping[str, Any]) -> dict[str, Any] | None:
         raise ValueError("strategy config differs from its joint-lockbox member")
     member_hashes = sorted(canonical_sha256(item) for item in lockbox["members"])
     return {
-        "contract_version": LOCKBOX_LINK_VERSION,
+        "contract_version": (
+            LOCKBOX_LINK_VERSION_V2
+            if lockbox["contract_version"] == LOCKBOX_CONTRACT_VERSION_V3
+            else LOCKBOX_LINK_VERSION
+        ),
         "batch_sha256": lockbox["batch_sha256"],
         "member_sha256": canonical_sha256(member),
         "member_sha256s": member_hashes,
@@ -1129,7 +1575,11 @@ def validate_lockbox_link(value: Any) -> dict[str, Any]:
         "recipe_id",
         "horizon_profile",
     }
-    if set(value) != keys or value.get("contract_version") != LOCKBOX_LINK_VERSION:
+    link_version = value.get("contract_version")
+    if set(value) != keys or link_version not in {
+        LOCKBOX_LINK_VERSION,
+        LOCKBOX_LINK_VERSION_V2,
+    }:
         raise ValueError("transparent baseline lockbox link contract is invalid")
     recipe_id = str(value.get("recipe_id") or "")
     if (
@@ -1138,18 +1588,27 @@ def validate_lockbox_link(value: Any) -> dict[str, Any]:
     ):
         raise ValueError("transparent baseline lockbox link recipe is invalid")
     member_hashes = value.get("member_sha256s")
-    if not isinstance(member_hashes, list) or len(member_hashes) != 3:
-        raise ValueError("transparent baseline lockbox link must name three members")
+    expected_count = 3 if link_version == LOCKBOX_LINK_VERSION else None
+    if (
+        not isinstance(member_hashes, list)
+        or not member_hashes
+        or len(member_hashes) > 3
+        or (expected_count is not None and len(member_hashes) != expected_count)
+    ):
+        raise ValueError("transparent baseline lockbox link member count is invalid")
     normalized_hashes = sorted(
         _require_sha256(item, field="member_sha256") for item in member_hashes
     )
     member_sha256 = _require_sha256(
         value.get("member_sha256"), field="member_sha256"
     )
-    if len(set(normalized_hashes)) != 3 or member_sha256 not in normalized_hashes:
+    if (
+        len(set(normalized_hashes)) != len(normalized_hashes)
+        or member_sha256 not in normalized_hashes
+    ):
         raise ValueError("transparent baseline lockbox member identities are invalid")
     return {
-        "contract_version": LOCKBOX_LINK_VERSION,
+        "contract_version": str(link_version),
         "batch_sha256": _require_sha256(
             value.get("batch_sha256"), field="batch_sha256"
         ),
@@ -1521,10 +1980,136 @@ def validate_repair_registry_binding(
 
 
 class TransparentBaselineLockboxStore:
-    """Atomically reserve/recover the three public baseline OOS vintages."""
+    """Atomically reserve/recover every statistically available baseline OOS."""
 
     def __init__(self, database_url: str) -> None:
         self.engine = open_database(database_url)
+
+    def resolve_unopened_history_selection(
+        self,
+        *,
+        calendar_days: Sequence[Any],
+        current_recipe_version: str,
+        anchored_selection: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Select a stable calendar prefix without reading prior performance.
+
+        Current-recipe rows are deliberately excluded, so reserving v12 and
+        reconciling it again cannot move its own cutoff. A partially created
+        v12 batch may additionally supply its immutable bootstrap selection as
+        an anchor.
+        """
+
+        calendar = _ordered_calendar(calendar_days)
+        current = str(current_recipe_version or "").strip()
+        if anchored_selection is not None:
+            evidence = validate_unopened_history_selection(
+                anchored_selection,
+                calendar_days=calendar,
+            )
+            if evidence["current_recipe_version"] != current:
+                raise ValueError(
+                    "transparent baseline anchored history belongs to another recipe"
+                )
+            selected = calendar[: int(evidence["selected_calendar_trading_days"])]
+            return {"calendar": selected, "evidence": evidence}
+
+        with self.engine.connect() as connection:
+            rows = connection.execute(select(oos_vintages)).all()
+            transparent_rows: list[tuple[Any, dict[str, Any], str]] = []
+            version_ids: set[str] = set()
+            for row in rows:
+                sealed = dict(row.sealed_candidate_set_json or {})
+                raw_link = sealed.get("transparent_baseline_lockbox")
+                if not isinstance(raw_link, Mapping):
+                    continue
+                if str(raw_link.get("recipe_id") or "") not in _RECIPE_HORIZONS:
+                    continue
+                link = validate_lockbox_link(raw_link)
+                version_id = _require_identifier(
+                    sealed.get("strategy_version_id"),
+                    field="strategy_version_id",
+                )
+                transparent_rows.append((row, link, version_id))
+                version_ids.add(version_id)
+            version_configs = {
+                str(row.id): dict(row.config_json or {})
+                for row in (
+                    connection.execute(
+                        select(
+                            strategy_versions.c.id,
+                            strategy_versions.c.config_json,
+                        ).where(strategy_versions.c.id.in_(version_ids))
+                    ).all()
+                    if version_ids
+                    else []
+                )
+            }
+        if set(version_configs) != version_ids:
+            raise ValueError(
+                "transparent baseline prior OOS lost its strategy version evidence"
+            )
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row, link, version_id in transparent_rows:
+            config = version_configs[version_id]
+            recipe_id = str(config.get("recipe_id") or "").strip()
+            recipe_version = str(config.get("recipe_version") or "").strip()
+            if (
+                recipe_id != link["recipe_id"]
+                or str(config.get("horizon_profile") or "")
+                != link["horizon_profile"]
+                or not recipe_version
+            ):
+                raise ValueError(
+                    "transparent baseline prior OOS differs from its strategy version"
+                )
+            grouped.setdefault(str(link["batch_sha256"]), []).append(
+                {
+                    "oos_vintage_id": str(row.id),
+                    "strategy_version_id": version_id,
+                    "recipe_id": recipe_id,
+                    "horizon_profile": str(link["horizon_profile"]),
+                    "recipe_version": recipe_version,
+                    "test_start": row.test_start.isoformat(),
+                    "test_end": row.test_end.isoformat(),
+                    "first_opened_at": row.first_opened_at.isoformat(),
+                    "sealed_member_set_sha256": str(
+                        row.sealed_candidate_set_sha256
+                    ),
+                }
+            )
+        prior_batches: list[dict[str, Any]] = []
+        for batch_sha256, members in grouped.items():
+            recipe_versions = {str(item["recipe_version"]) for item in members}
+            if len(recipe_versions) != 1:
+                raise ValueError("transparent baseline OOS batch mixes recipe versions")
+            recipe_version = next(iter(recipe_versions))
+            if recipe_version == current:
+                continue
+            ordered_members = sorted(members, key=lambda item: item["recipe_id"])
+            prior_batches.append(
+                _normalize_prior_batch(
+                    {
+                        "batch_sha256": batch_sha256,
+                        "recipe_version": recipe_version,
+                        "earliest_final_oos_start": min(
+                            item["test_start"] for item in ordered_members
+                        ),
+                        "latest_final_oos_end": max(
+                            item["test_end"] for item in ordered_members
+                        ),
+                        "members": ordered_members,
+                        "members_sha256": canonical_sha256(ordered_members),
+                    }
+                )
+            )
+        evidence = build_unopened_history_selection(
+            calendar_days=calendar,
+            current_recipe_version=current,
+            prior_batches=prior_batches,
+        )
+        selected = calendar[: int(evidence["selected_calendar_trading_days"])]
+        return {"calendar": selected, "evidence": evidence}
 
     @staticmethod
     def _repair_source_batches(
@@ -2014,8 +2599,8 @@ class TransparentBaselineLockboxStore:
         dataset_identity_sha256: str,
         dataset_lineage_id: str,
     ) -> dict[str, Any]:
-        if len(versions) != 3:
-            raise ValueError("joint lockbox reservation requires exactly three versions")
+        if not 1 <= len(versions) <= 3:
+            raise ValueError("baseline lockbox reservation requires one to three versions")
         identity = _require_sha256(
             dataset_identity_sha256,
             field="dataset_identity_sha256",
@@ -2023,6 +2608,7 @@ class TransparentBaselineLockboxStore:
         lineage = _require_sha256(dataset_lineage_id, field="dataset_lineage_id")
         expected: list[dict[str, Any]] = []
         batch_ids: set[str] = set()
+        lockbox_contract_versions: set[str] = set()
         for version in versions:
             config = version.get("config")
             if not isinstance(config, Mapping):
@@ -2035,6 +2621,7 @@ class TransparentBaselineLockboxStore:
             ):
                 raise ValueError("joint lockbox dataset binding changed")
             batch_ids.add(str(lockbox["batch_sha256"]))
+            lockbox_contract_versions.add(str(lockbox["contract_version"]))
             member_set = baseline_oos_sealed_member_set(version)
             link = validate_lockbox_link(member_set["transparent_baseline_lockbox"])
             bootstrap = config.get(BOOTSTRAP_CONFIG_KEY)
@@ -2053,6 +2640,16 @@ class TransparentBaselineLockboxStore:
             )
         if len(batch_ids) != 1:
             raise ValueError("public baseline versions do not share one joint lockbox")
+        if len(lockbox_contract_versions) != 1:
+            raise ValueError("public baseline versions mix lockbox contract versions")
+        lockbox_contract_version = next(iter(lockbox_contract_versions))
+        if (
+            len(versions) != 3
+            and lockbox_contract_version != LOCKBOX_CONTRACT_VERSION_V3
+        ):
+            raise ValueError(
+                "partial baseline reservation requires the unavailable-horizons contract"
+            )
         observed_links = {item["link"]["member_sha256"] for item in expected}
         declared_links = set(expected[0]["link"]["member_sha256s"])
         if observed_links != declared_links:
@@ -2106,6 +2703,10 @@ class TransparentBaselineLockboxStore:
                 superseded_source_batches=superseded_source_batches,
             )
             if source_batches and repair_registration is None:
+                if len(expected) != 3:
+                    raise ValueError(
+                        "partial baseline lockboxes cannot reuse an opened final OOS"
+                    )
                 if len(source_batches) != 1:
                     raise ValueError(
                         "transparent baseline final OOS already has more than one prior batch"
@@ -2155,7 +2756,7 @@ class TransparentBaselineLockboxStore:
                 expected_by_window = {
                     (item["test_start"], item["test_end"]): item for item in expected
                 }
-                if len(rows) != 3:
+                if len(rows) != len(expected):
                     raise ValueError(
                         "joint lockbox overlaps another reserved or consumed OOS vintage"
                     )
@@ -2221,7 +2822,7 @@ class TransparentBaselineLockboxStore:
                 }
             )
         return {
-            "contract_version": LOCKBOX_CONTRACT_VERSION,
+            "contract_version": lockbox_contract_version,
             "batch_sha256": target_batch_sha256,
             "scope": scope,
             "dataset": dataset,
@@ -2249,6 +2850,16 @@ class TransparentBaselineLockboxStore:
                     "horizon_profile": link["horizon_profile"],
                 }
             )
-        if len(matches) != 3:
+        first_link = (
+            validate_lockbox_link(
+                matches[0]["sealed_candidate_set_json"].get(
+                    "transparent_baseline_lockbox"
+                )
+            )
+            if matches
+            else None
+        )
+        expected_count = len(first_link["member_sha256s"]) if first_link else 0
+        if not matches or len(matches) != expected_count:
             raise KeyError(batch)
         return {"batch_sha256": batch, "members": matches}

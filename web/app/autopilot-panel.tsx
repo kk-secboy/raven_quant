@@ -165,8 +165,13 @@ const ACTION_LABELS: Record<string, string> = {
 };
 const HORIZON_WEIGHTS: Record<AdviceCard["horizon"], string> = {
   short_1_5d: "20% 预算",
-  swing_1_6m: "40% 预算",
-  long_1_3y: "40% 预算",
+  swing_1_6m: "50% 预算",
+  long_1_3y: "30% 预算",
+};
+const HORIZON_LABELS: Record<AdviceCard["horizon"], string> = {
+  short_1_5d: "短线",
+  swing_1_6m: "中线",
+  long_1_3y: "长线",
 };
 const EVIDENCE_LABELS: Record<string, string> = {
   forward_trading_days: "前向交易日",
@@ -361,37 +366,126 @@ function recordText(record: Record<string, unknown>, keys: string[], fallback = 
   return fallback;
 }
 
-function UnifiedAccountCard({ account }: { account: UnifiedAccount }) {
+function recordNumber(record: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const raw = record[key];
+    if (raw === null || raw === undefined || raw === "") continue;
+    const value = Number(raw);
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function executionConstraintReasons(record: Record<string, unknown>) {
+  const raw = record.execution_constraints;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const constraints = raw as Record<string, unknown>;
+  const reasons: string[] = [];
+  for (const key of ["blocked_reasons", "wait_reasons", "reasons", "cannot_execute_reasons"]) {
+    const value = constraints[key];
+    if (Array.isArray(value)) {
+      reasons.push(...value.filter((item): item is string => typeof item === "string" && Boolean(item.trim())));
+    } else if (typeof value === "string" && value.trim()) {
+      reasons.push(value);
+    }
+  }
+  for (const key of ["blocked_reason", "wait_reason", "reason"]) {
+    const value = constraints[key];
+    if (typeof value === "string" && value.trim()) reasons.push(value);
+  }
+  return [...new Set(reasons)];
+}
+
+function accountAction(record: Record<string, unknown>, target: Record<string, unknown> | undefined) {
+  const explicit = recordText(record, ["action", "desired_action"], "").toUpperCase();
+  if (explicit && explicit in ACTION_LABELS) return explicit;
+  const side = recordText(record, ["side"], "").toLowerCase();
+  if (side === "buy") return "BUY";
+  if (side === "sell") {
+    const targetQuantity = recordNumber(target ?? record, ["target_position_quantity", "target_quantity"]);
+    const targetWeight = recordNumber(target ?? record, ["target_weight", "weight"]);
+    return targetQuantity === 0 || targetWeight === 0 ? "EXIT" : "REDUCE";
+  }
+  return target ? "HOLD" : "NO_ACTION";
+}
+
+function accountStatus(record: Record<string, unknown>, action: string, ready: boolean) {
+  if (!ready) return "账户未就绪";
+  const state = recordText(record, ["execution_state", "status"], "").toUpperCase();
+  if (state === "BLOCKED") return "已阻断";
+  if (state === "WAIT" || state === "WAITING") return "等待条件";
+  if (action === "HOLD" || action === "NO_ACTION") return "无需交易";
+  return state === "READY" || !state ? "可执行" : state;
+}
+
+function UnifiedAccountCard({ account, cards }: { account: UnifiedAccount; cards: AdviceCard[] }) {
   const trades = account.trades ?? [];
   const targets = account.targets ?? [];
   const ready = account.status === "ready";
+  const targetByInstrument = new Map(
+    targets.map((target) => [recordText(target, ["instrument"], "").toUpperCase(), target]),
+  );
+  const tradeByInstrument = new Map(
+    trades.map((trade) => [recordText(trade, ["instrument"], "").toUpperCase(), trade]),
+  );
+  // Executable changes must stay above unchanged holdings when the account has
+  // more rows than the novice view can show.
+  const instruments = [...new Set([...tradeByInstrument.keys(), ...targetByInstrument.keys()])].filter(Boolean);
   return <section className={`novice-account-card ${ready ? "ready" : "waiting"}`}>
     <div className="novice-account-heading">
-      <div><p className="eyebrow">ONE ACCOUNT · THREE HORIZONS</p><h3>统一账户建议</h3></div>
+      <div><p className="eyebrow">ONE ACCOUNT · FINAL ANSWER</p><h3>今日唯一操作清单</h3><small>统一账户建议 · 已合并各周期对同一股票的意见</small></div>
       <span className={`novice-action account-action-${account.action.toLowerCase()}`}>{ACTION_LABELS[account.action] ?? account.action}</span>
     </div>
     <p>{account.reason ?? account.accounting_rule ?? "三周期先独立形成目标，再在账户层合并同一股票的买卖。"}</p>
     <div className="novice-account-metrics">
-      <span>短 / 中 / 长预算<strong>20% / 40% / 40%</strong></span>
+      <span>短 / 中 / 长预算<strong>20% / 50% / 30%</strong></span>
       <span>最低现金<strong>{account.cash_weight == null ? "10%" : pct(account.cash_weight)}</strong></span>
       <span>数据截止<strong>{account.inputs_as_of ?? "等待三周期验证"}</strong></span>
       <span>执行日<strong>{account.decision_date ?? "尚未生成"}</strong></span>
     </div>
-    {trades.length ? <div className="novice-account-trades">
-      {trades.slice(0, 8).map((trade, index) => {
-        const action = recordText(trade, ["action", "side"], "REBALANCE").toUpperCase();
-        const quantity = recordText(trade, ["trade_quantity", "quantity", "delta_quantity"], "0");
-        return <div key={`${recordText(trade, ["instrument"])}-${index}`}>
-          <code>{recordText(trade, ["instrument"])}</code>
-          <strong>{ACTION_LABELS[action] ?? action}</strong>
-          <span>{quantity} 股</span>
-        </div>;
+    {instruments.length ? <div className="novice-account-actions" aria-label="统一账户今日操作清单">
+      {instruments.slice(0, 12).map((instrument) => {
+        const target = targetByInstrument.get(instrument);
+        const trade = tradeByInstrument.get(instrument);
+        const record = { ...(target ?? {}), ...(trade ?? {}) };
+        const action = accountAction(record, target);
+        const sourceSignals = cards.flatMap((card) => card.is_investment_advice
+          ? card.signals
+            .filter((signal) => signal.instrument.toUpperCase() === instrument)
+            .map((signal) => ({ card, signal }))
+          : []);
+        const sourceHorizons = [...new Set(sourceSignals.map(({ card }) => card.horizon))];
+        const sourceLabel = sourceHorizons.length > 1
+          ? `多周期 · ${sourceHorizons.map((horizon) => HORIZON_LABELS[horizon]).join("＋")}`
+          : sourceHorizons.length === 1 ? HORIZON_LABELS[sourceHorizons[0]] : "账户净额";
+        const reasons = [...new Set(sourceSignals.map(({ signal }) => reasonText(signal.reason)).filter(Boolean))];
+        const invalidations = [...new Set(sourceSignals.flatMap(({ signal }) => signal.invalidation ?? []))];
+        const tradeQuantity = recordNumber(record, ["trade_quantity", "quantity", "delta_quantity"]);
+        const targetQuantity = recordNumber(record, ["target_position_quantity", "target_quantity"]);
+        const targetWeight = recordNumber(record, ["target_weight", "weight"]);
+        const executionReasons = executionConstraintReasons(record);
+        const constraints = [
+          ...sourceSignals.flatMap(({ signal }) => signal.cannot_buy_reasons ?? []),
+          ...executionReasons,
+        ];
+        return <article className="novice-account-action-row" key={instrument}>
+          <div className="novice-account-action-title">
+            <code>{instrument}</code>
+            <span className={`novice-action action-${action.toLowerCase()}`}>{ACTION_LABELS[action] ?? action}</span>
+            <span className={`novice-source-badge ${sourceHorizons.length > 1 ? "multi" : ""}`}>{sourceLabel}</span>
+            <span className="novice-execution-status">{accountStatus(record, action, ready)}</span>
+          </div>
+          <div className="novice-account-action-facts">
+            <span>本次数量<strong>{tradeQuantity == null ? "等待执行计划" : `${tradeQuantity} 股`}</strong></span>
+            <span>账户目标<strong>{targetQuantity == null ? "等待账户换算" : `${targetQuantity} 股`}{targetWeight == null ? "" : ` · ${pct(targetWeight)}`}</strong></span>
+          </div>
+          <p><b>原因</b>{reasons.join("；") || executionReasons.join("；") || recordText(record, ["reason", "blocked_reason", "wait_reason"], account.reason ?? "账户净额计划已生成。")}</p>
+          <p><b>失效条件</b>{invalidations.join("；") || "按来源策略的复核和统一风险规则处理。"}</p>
+          {constraints.length ? <p className="novice-account-constraint"><b>当前限制</b>{[...new Set(constraints)].join("；")}</p> : null}
+        </article>;
       })}
-    </div> : targets.length ? <div className="novice-account-trades">
-      {targets.slice(0, 8).map((target, index) => <div key={`${recordText(target, ["instrument"])}-${index}`}>
-        <code>{recordText(target, ["instrument"])}</code><strong>目标</strong><span>{recordText(target, ["target_weight", "weight", "target_position_quantity"])}</span>
-      </div>)}
-    </div> : <div className="novice-account-empty">没有完整的三周期净额计划时，系统保持现金，不会拼凑一份建议。</div>}
+      {instruments.length > 12 ? <small className="novice-more">其余 {instruments.length - 12} 只请到模拟账本查看。</small> : null}
+    </div> : <div className="novice-account-empty">今天没有可执行股票时，系统保持现金和原持仓，不会拼凑一份建议。</div>}
     <small>同一股票会在这里合并为一次账户动作；某个周期暂停时，其预算留在现金中，不挪给其他周期。</small>
   </section>;
 }
@@ -472,7 +566,7 @@ function InvestorOnboarding({
       <span className="status-chip">首次使用 · 必填</span>
       <h2>先建立你的隔离模拟账户</h2>
       <p>只填写模拟本金和你真实拥有的证券权限。这里不会连接券商，也不会下真实订单；资金不足买 100 股时会保留现金并说明原因。</p>
-      <div><span>默认分配</span><strong>短线 20% · 中线 40% · 长线 40%</strong></div>
+      <div><span>默认分配</span><strong>短线 20% · 中线 50% · 长线 30%</strong></div>
       <div><span>平衡型边界</span><strong>不融资、不做空 · 最大总暴露 90%</strong></div>
     </div>
     <div className="novice-onboarding-form">
@@ -539,15 +633,21 @@ function NoviceAdvicePanel({ api, onNavigate }: { api: string; onNavigate: (inde
       </div>
     </section>
 
-    <div className="novice-horizon-grid">
-      {advice?.cards?.map((card) => <HorizonCard card={card} key={card.horizon} />)}
-      {!advice?.cards?.length ? <div className="novice-results-unavailable">今日结果不可用，正式动作统一为“不操作”。</div> : null}
-    </div>
+    <UnifiedAccountCard
+      account={advice?.unified_account ?? { status: "unavailable", action: "NO_ACTION", reason: "今日结果不可用，账户保持现金和原持仓。" }}
+      cards={advice?.cards ?? []}
+    />
 
-    <UnifiedAccountCard account={advice?.unified_account ?? { status: "unavailable", action: "NO_ACTION", reason: "今日结果不可用，账户保持现金和原持仓。" }} />
+    <details className="novice-source-details">
+      <summary><span>查看三周期来源与研究详情</span><small>短线、中线和长线独立验证；这里只解释统一账户答案从哪里来。</small></summary>
+      <div className="novice-horizon-grid">
+        {advice?.cards?.map((card) => <HorizonCard card={card} key={card.horizon} />)}
+        {!advice?.cards?.length ? <div className="novice-results-unavailable">今日结果不可用，正式动作统一为“不操作”。</div> : null}
+      </div>
+    </details>
 
     <section className="novice-boundary-note">
-      <div><strong>你只需要看两件事</strong><span>每个周期是否“已验证”，以及统一账户最终让你买、卖还是不操作。</span></div>
+      <div><strong>你只需要看一张清单</strong><span>上方统一账户已经给出最终买、卖、持有或不操作；周期详情仅用于解释来源。</span></div>
       <div><strong>短线也不是盘中追涨</strong><span>目前只使用完整收盘数据，D 日盘后计算，最早 D+1 执行。</span></div>
       <button className="action-button action-secondary" type="button" onClick={() => onNavigate(8)}>打开模拟账本</button>
     </section>

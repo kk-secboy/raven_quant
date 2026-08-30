@@ -8,7 +8,7 @@ import pandas as pd
 
 from .portfolio_optimizer import validate_covariance
 
-DISCRETE_CONSTRAINT_MODEL_VERSION = "discrete-constraint-validation-v1"
+DISCRETE_CONSTRAINT_MODEL_VERSION = "discrete-constraint-validation-v3"
 _TOLERANCE = 1e-8
 
 
@@ -101,6 +101,10 @@ def validate_discrete_constraints(
     prices: pd.Series | dict[str, float] | None = None,
     lot_size: int | None = None,
     risk_ceiling: pd.Series | dict[str, float] | None = None,
+    risk_turnover_exempt_instruments: (
+        set[str] | frozenset[str] | list[str] | tuple[str, ...] | None
+    ) = None,
+    frozen_instruments: set[str] | frozenset[str] | list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Validate the final, discrete account target against frozen hard limits.
 
@@ -123,6 +127,30 @@ def validate_discrete_constraints(
     instruments = target.index.union(previous.index)
     target = target.reindex(instruments, fill_value=0.0)
     previous = previous.reindex(instruments, fill_value=0.0)
+    frozen = {str(item) for item in (frozen_instruments or ())}
+    unknown_frozen = frozen - set(instruments)
+    if unknown_frozen:
+        raise ValueError(
+            "frozen instruments are outside the target contract: "
+            + ", ".join(sorted(unknown_frozen))
+        )
+    frozen_changes = (target - previous).abs().reindex(sorted(frozen), fill_value=0.0)
+    if (frozen_changes > _TOLERANCE).any():
+        raise ValueError("frozen instruments must retain their previous target weight")
+    risk_turnover_exempt = {
+        str(item) for item in (risk_turnover_exempt_instruments or ())
+    }
+    unknown_risk_turnover_exempt = risk_turnover_exempt - set(instruments)
+    if unknown_risk_turnover_exempt:
+        raise ValueError(
+            "risk turnover exceptions are outside the target contract: "
+            + ", ".join(sorted(unknown_risk_turnover_exempt))
+        )
+    risk_turnover_changes = (target - previous).reindex(
+        sorted(risk_turnover_exempt), fill_value=0.0
+    )
+    if (risk_turnover_changes > _TOLERANCE).any():
+        raise ValueError("risk turnover exceptions cannot authorize increases")
     checks: list[dict[str, Any]] = []
 
     minimum_weight = float(target.min()) if len(target) else 0.0
@@ -144,7 +172,39 @@ def validate_discrete_constraints(
         relation=">=",
         passed=cash_weight + _TOLERANCE >= min_cash_weight,
     )
-    largest_position = float(target.max()) if len(target) else 0.0
+    inherited_frozen_position_exceptions: list[dict[str, Any]] = []
+    enforced_positions: list[float] = []
+    for instrument, weight in target.items():
+        previous_weight = float(previous[instrument])
+        inherited_frozen_breach = (
+            str(instrument) in frozen
+            and previous_weight > max_position_weight + _TOLERANCE
+            and float(weight) <= previous_weight + _TOLERANCE
+        )
+        if inherited_frozen_breach:
+            exception = {
+                "constraint": "max_position_weight",
+                "instrument": str(instrument),
+                "target_weight": float(weight),
+                "previous_weight": previous_weight,
+                "configured_limit": float(max_position_weight),
+                "non_worsening": bool(float(weight) <= previous_weight + _TOLERANCE),
+            }
+            inherited_frozen_position_exceptions.append(exception)
+            checks.append(
+                {
+                    "name": "frozen_inherited_max_position_weight",
+                    "scope": str(instrument),
+                    "observed": float(weight),
+                    "limit": previous_weight,
+                    "configured_limit": float(max_position_weight),
+                    "relation": "<= inherited previous_weight",
+                    "passed": True,
+                }
+            )
+            continue
+        enforced_positions.append(float(weight))
+    largest_position = max(enforced_positions, default=0.0)
     _record(
         checks,
         name="max_position_weight",
@@ -157,14 +217,66 @@ def validate_discrete_constraints(
     turnover = 0.5 * (
         float((target - previous).abs().sum()) + abs(cash_weight - previous_cash)
     )
+    weight_changes = target - previous
+    gross_increase_weight = float(weight_changes.clip(lower=0.0).sum())
+    non_exempt_decrease_weight = float(
+        (-weight_changes.drop(labels=list(risk_turnover_exempt), errors="ignore"))
+        .clip(lower=0.0)
+        .sum()
+    )
+    turnover_subject_to_limit = max(
+        gross_increase_weight,
+        non_exempt_decrease_weight,
+    )
+    risk_exempt_decrease_weight = float(
+        (-weight_changes.reindex(sorted(risk_turnover_exempt), fill_value=0.0))
+        .clip(lower=0.0)
+        .sum()
+    )
     _record(
         checks,
         name="daily_turnover",
-        observed=turnover,
+        observed=turnover_subject_to_limit,
         limit=max_daily_turnover,
         relation="<=",
-        passed=turnover <= max_daily_turnover + _TOLERANCE,
+        passed=turnover_subject_to_limit <= max_daily_turnover + _TOLERANCE,
     )
+    risk_turnover_exception_applied = bool(
+        risk_exempt_decrease_weight > _TOLERANCE
+        and turnover > max_daily_turnover + _TOLERANCE
+    )
+    risk_turnover_exception = {
+        "status": "applied" if risk_turnover_exception_applied else "not_applied",
+        "instruments": sorted(
+            str(instrument)
+            for instrument in risk_turnover_exempt
+            if float(weight_changes[instrument]) < -_TOLERANCE
+        ),
+        "actual_turnover": turnover,
+        "turnover_subject_to_limit": turnover_subject_to_limit,
+        "normal_daily_turnover_limit": float(max_daily_turnover),
+        "gross_increase_weight": gross_increase_weight,
+        "non_exempt_decrease_weight": non_exempt_decrease_weight,
+        "exempt_risk_decrease_weight": risk_exempt_decrease_weight,
+        "no_extra_buys": bool(
+            gross_increase_weight <= max_daily_turnover + _TOLERANCE
+        ),
+    }
+    if risk_turnover_exception_applied:
+        checks.append(
+            {
+                "name": "risk_turnover_decrease_exception",
+                "scope": "account",
+                "observed": risk_exempt_decrease_weight,
+                "limit": float(max_daily_turnover),
+                "relation": "exempt governed decrease only",
+                "passed": bool(
+                    risk_turnover_exception["no_extra_buys"]
+                    and turnover_subject_to_limit <= max_daily_turnover + _TOLERANCE
+                ),
+                "instruments": list(risk_turnover_exception["instruments"]),
+            }
+        )
 
     industry = _categorical_mapping(
         industries,
@@ -333,15 +445,41 @@ def validate_discrete_constraints(
             )
         if float(portfolio_value) <= 0 or not 0 < float(max_volume_participation) <= 1:
             raise ValueError("capacity contract contains invalid limits")
-        daily_values = _finite_weights(
-            average_daily_values,  # type: ignore[arg-type]
-            label="average_daily_values",
-        ).reindex(instruments)
-        if daily_values.isna().any() or (daily_values < 0).any():
-            raise ValueError("average daily values must cover every instrument")
+        daily_values = (
+            average_daily_values.copy()
+            if isinstance(average_daily_values, pd.Series)
+            else pd.Series(average_daily_values, dtype=float)
+        )
+        daily_values.index = daily_values.index.astype(str)
+        if not daily_values.index.is_unique:
+            raise ValueError("average_daily_values must have a unique instrument index")
+        daily_values = pd.to_numeric(daily_values, errors="coerce").reindex(instruments)
+        invalid_daily_values = daily_values.isna() | ~np.isfinite(
+            daily_values.to_numpy(dtype=float)
+        ) | (daily_values < 0)
+        requested_trades = (target - previous).abs() > _TOLERANCE
+        unavailable_liquidity = (daily_values <= 0) & requested_trades
+        invalid_unfrozen = (
+            invalid_daily_values | unavailable_liquidity
+        ) & ~daily_values.index.isin(frozen)
+        if invalid_unfrozen.any():
+            raise ValueError(
+                "positive average daily values must cover every requested trade"
+            )
         trade_values = (target - previous).abs() * float(portfolio_value)
         capacities = daily_values * float(max_volume_participation)
         for instrument in instruments:
+            if str(instrument) in frozen:
+                _record(
+                    checks,
+                    name="capacity_frozen_no_trade",
+                    scope=str(instrument),
+                    observed=float(trade_values[instrument]),
+                    limit=0.0,
+                    relation="<=",
+                    passed=float(trade_values[instrument]) <= _TOLERANCE,
+                )
+                continue
             _record(
                 checks,
                 name="capacity_trade_value",
@@ -359,14 +497,34 @@ def validate_discrete_constraints(
             raise ValueError("prices, portfolio value and lot size must be supplied together")
         if int(lot_size) < 1:
             raise ValueError("lot_size must be positive")
-        price_values = _finite_weights(
-            prices,  # type: ignore[arg-type]
-            label="prices",
-        ).reindex(instruments)
-        if price_values.isna().any() or (price_values <= 0).any():
+        price_values = (
+            prices.copy()
+            if isinstance(prices, pd.Series)
+            else pd.Series(prices, dtype=float)
+        )
+        price_values.index = price_values.index.astype(str)
+        if not price_values.index.is_unique:
+            raise ValueError("prices must have a unique instrument index")
+        price_values = pd.to_numeric(price_values, errors="coerce").reindex(instruments)
+        invalid_prices = price_values.isna() | ~np.isfinite(
+            price_values.to_numpy(dtype=float)
+        ) | (price_values <= 0)
+        invalid_unfrozen = invalid_prices & ~price_values.index.isin(frozen)
+        if invalid_unfrozen.any():
             raise ValueError("prices must cover every instrument")
         quantities = target * float(portfolio_value) / price_values
         for instrument, quantity in quantities.items():
+            if str(instrument) in frozen:
+                _record(
+                    checks,
+                    name="round_lot_frozen_no_trade",
+                    scope=str(instrument),
+                    observed=float(abs(target[instrument] - previous[instrument])),
+                    limit=0.0,
+                    relation="<=",
+                    passed=abs(float(target[instrument] - previous[instrument])) <= _TOLERANCE,
+                )
+                continue
             lots = float(quantity) / int(lot_size)
             distance = abs(lots - round(lots))
             _record(
@@ -401,6 +559,12 @@ def validate_discrete_constraints(
         "status": "passed" if not violations else "failed",
         "cash_weight": cash_weight,
         "turnover": turnover,
+        "turnover_subject_to_limit": turnover_subject_to_limit,
+        "risk_turnover_exception": risk_turnover_exception,
+        "frozen_instruments": sorted(frozen),
+        "frozen_inherited_max_position_exceptions": (
+            inherited_frozen_position_exceptions
+        ),
         "checks": checks,
         "violations": violations,
     }

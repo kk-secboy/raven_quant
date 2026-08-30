@@ -12,7 +12,10 @@ from quant_data.config import Settings
 from quant_data.execution_contract import require_daily_qlib_contract
 from quant_platform.job_store import JobStore
 from quant_platform.promotion import PromotionStore
-from quant_platform.research_automation import resolve_research_window_contract
+from quant_platform.research_automation import (
+    ResearchWindowUnavailableError,
+    resolve_research_window_contract,
+)
 from quant_platform.research_horizon import research_horizon_contract
 from quant_platform.services import list_qlib_datasets
 from quant_platform.strategy_recipes import (
@@ -28,18 +31,22 @@ from quant_platform.transparent_baseline_lockbox import (
     build_lockbox_member,
     canonical_sha256,
     lockbox_member_link,
+    validate_unopened_history_selection,
 )
 from quant_platform.transparent_baseline_runner import (
     TRANSPARENT_BASELINE_JOB_RUNNER_FIELD,
     TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
     target_runner_for_recipe,
     target_runtime_bundle_for_recipe,
+    target_worker_runtime_image_for_recipe,
 )
 
-BOOTSTRAP_CONTRACT_VERSION = "transparent-baseline-bootstrap-v1"
-RECONCILE_RESULT_VERSION = "transparent-baseline-reconcile-v1"
+BOOTSTRAP_CONTRACT_VERSION = "transparent-baseline-bootstrap-v2"
+RECONCILE_RESULT_VERSION = "transparent-baseline-reconcile-v2"
 DEFAULT_ACTOR = "system:transparent-baseline-bootstrap"
 _RECONCILABLE_FAMILY_STATUSES = frozenset({"draft", "approved"})
 _RECONCILABLE_VERSION_LIFECYCLES = frozenset(
@@ -176,6 +183,15 @@ def _plan_member(
     recipe = get_strategy_recipe(recipe_id)
     recipe_sha256 = canonical_sha256(recipe)
     feature_set = _feature_set(recipe)
+    raw_selection = dataset.get("unopened_history_selection")
+    selection = validate_unopened_history_selection(
+        raw_selection,
+        calendar_days=dataset.get("source_calendar") or dataset["calendar"],
+    )
+    if selection["current_recipe_version"] != recipe["version"]:
+        raise ValueError(
+            "transparent baseline history selection belongs to another recipe version"
+        )
     periods, evidence = resolve_research_window_contract(
         dict(dataset),
         list(dataset["calendar"]),
@@ -219,6 +235,7 @@ def _plan_member(
         "formal_periods": formal_periods,
         "research_window_contract": dict(research_window),
         "research_window_contract_sha256": research_window_sha256,
+        "unopened_history_selection": selection,
     }
     target_runner_sha256 = target_runner_for_recipe(recipe["id"], recipe["version"])
     if target_runner_sha256 is not None:
@@ -229,6 +246,13 @@ def _plan_member(
     if target_runtime_bundle_sha256 is not None:
         bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
             target_runtime_bundle_sha256
+        )
+    target_worker_runtime_image_digest = target_worker_runtime_image_for_recipe(
+        recipe["id"], recipe["version"]
+    )
+    if target_worker_runtime_image_digest is not None:
+        bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
+            target_worker_runtime_image_digest
         )
     config[BOOTSTRAP_CONFIG_KEY] = bootstrap
     normalized = _normalize_multifactor_contract(
@@ -378,6 +402,52 @@ class TransparentBaselineBootstrapService:
         if len(anchors) != 1 or "" in anchors:
             raise ValueError("partial transparent baselines do not share one frozen dataset")
         return next(iter(anchors))
+
+    @staticmethod
+    def _anchored_unopened_history_selection(
+        families: Mapping[str, Mapping[str, Any] | None]
+    ) -> dict[str, Any] | None:
+        """Recover the immutable cutoff from a partially created current batch."""
+
+        selections: list[dict[str, Any]] = []
+        for recipe_id, family in families.items():
+            if family is None:
+                continue
+            recipe = get_strategy_recipe(recipe_id)
+            recipe_sha256 = canonical_sha256(recipe)
+            current = []
+            for version in family.get("versions") or []:
+                config = version.get("config") or {}
+                bootstrap = config.get(BOOTSTRAP_CONFIG_KEY)
+                if (
+                    config.get("recipe_id") == recipe_id
+                    and config.get("recipe_version") == recipe["version"]
+                    and isinstance(bootstrap, Mapping)
+                    and bootstrap.get("recipe_sha256") == recipe_sha256
+                ):
+                    current.append(bootstrap)
+            if len(current) > 1:
+                raise ValueError(
+                    f"{recipe_id} transparent baseline has duplicate current-recipe versions"
+                )
+            if not current:
+                continue
+            raw_selection = current[0].get("unopened_history_selection")
+            if not isinstance(raw_selection, Mapping):
+                raise ValueError(
+                    "current transparent baseline has no frozen history selection"
+                )
+            selections.append(validate_unopened_history_selection(raw_selection))
+        if not selections:
+            return None
+        selection_hashes = {
+            str(item["selection_sha256"]) for item in selections
+        }
+        if len(selection_hashes) != 1:
+            raise ValueError(
+                "partial transparent baselines do not share one history cutoff"
+            )
+        return selections[0]
 
     def _ensure_versions(
         self,
@@ -568,6 +638,13 @@ class TransparentBaselineBootstrapService:
                 payload[TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD] = (
                     target_runtime_bundle_sha256
                 )
+            target_worker_runtime_image_digest = bootstrap.get(
+                TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD
+            )
+            if target_worker_runtime_image_digest is not None:
+                payload[TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD] = (
+                    target_worker_runtime_image_digest
+                )
             job = self.jobs.create(
                 "strategy_backtest",
                 payload,
@@ -656,6 +733,7 @@ class TransparentBaselineBootstrapService:
             "contract_version": RECONCILE_RESULT_VERSION,
             "status": "failed",
             "dataset": None,
+            "unopened_history_selection": None,
             "joint_lockbox": None,
             "members": [],
             "recommendation_enabled_created": False,
@@ -681,15 +759,60 @@ class TransparentBaselineBootstrapService:
                     "dataset_lineage_id",
                 )
             }
-            plans = [
-                _plan_member(recipe_id=recipe_id, dataset=dataset)
+            current_recipe_versions = {
+                str(get_strategy_recipe(recipe_id)["version"])
                 for recipe_id in TRANSPARENT_RESEARCH_BASELINE_IDS
-            ]
+            }
+            if len(current_recipe_versions) != 1:
+                raise ValueError(
+                    "transparent baseline batch mixes current recipe versions"
+                )
+            history_selection = self.lockboxes.resolve_unopened_history_selection(
+                calendar_days=dataset["calendar"],
+                current_recipe_version=next(iter(current_recipe_versions)),
+                anchored_selection=self._anchored_unopened_history_selection(
+                    families
+                ),
+            )
+            selection_evidence = dict(history_selection["evidence"])
+            research_dataset = {
+                **dataset,
+                "source_calendar": list(dataset["calendar"]),
+                "calendar": list(history_selection["calendar"]),
+                "unopened_history_selection": selection_evidence,
+            }
+            result["unopened_history_selection"] = selection_evidence
+            plans: list[dict[str, Any]] = []
+            unavailable_horizons: list[dict[str, Any]] = []
+            for recipe_id in TRANSPARENT_RESEARCH_BASELINE_IDS:
+                try:
+                    plans.append(
+                        _plan_member(recipe_id=recipe_id, dataset=research_dataset)
+                    )
+                except ResearchWindowUnavailableError as exc:
+                    recipe = get_strategy_recipe(recipe_id)
+                    evidence = dict(exc.evidence)
+                    unavailable_horizons.append(
+                        {
+                            "recipe_id": recipe_id,
+                            "horizon_profile": str(recipe["horizon"]),
+                            "status": "unavailable",
+                            "reason": str(exc),
+                            "evidence": evidence,
+                            "evidence_sha256": canonical_sha256(evidence),
+                        }
+                    )
+            if not plans:
+                raise ValueError(
+                    "no transparent baseline horizon has enough unopened evidence"
+                )
             lockbox = build_joint_lockbox(
                 dataset=str(dataset["name"]),
                 dataset_identity_sha256=str(dataset["dataset_identity_sha256"]),
                 dataset_lineage_id=str(dataset["dataset_lineage_id"]),
                 members=[plan["lockbox_member"] for plan in plans],
+                unopened_history_selection=selection_evidence,
+                unavailable_horizons=unavailable_horizons,
             )
             for plan in plans:
                 plan["config"] = _normalize_multifactor_contract(
@@ -729,7 +852,27 @@ class TransparentBaselineBootstrapService:
             result["errors"].append(str(exc))
             return result
 
-        member_results: list[dict[str, Any]] = []
+        member_results: list[dict[str, Any]] = [
+            {
+                "recipe_id": item["recipe_id"],
+                "horizon_profile": item["horizon_profile"],
+                "family_action": None,
+                "strategy_version_id": None,
+                "research_window_contract_sha256": None,
+                "formal_periods": None,
+                "state": "unavailable",
+                "backtest": None,
+                "job": None,
+                "paper_stage": None,
+                "lifecycle": None,
+                "errors": [],
+                "unavailable_reason": item["reason"],
+                "unavailable_evidence": item["evidence"],
+                "unavailable_evidence_sha256": item["evidence_sha256"],
+                "sleeve_action": "remain_in_cash",
+            }
+            for item in unavailable_horizons
+        ]
         for plan, version in zip(plans, versions, strict=True):
             member = {
                 "recipe_id": plan["recipe"]["id"],
@@ -755,7 +898,7 @@ class TransparentBaselineBootstrapService:
                 queued = self._ensure_backtest_job(
                     plan=plan,
                     version=version,
-                    dataset=dataset,
+                    dataset=research_dataset,
                 )
                 backtest = queued["backtest"]
                 member.update(
@@ -785,16 +928,25 @@ class TransparentBaselineBootstrapService:
             except Exception as exc:  # noqa: BLE001 - isolate one failed horizon
                 member["errors"].append(str(exc))
             member_results.append(member)
+        recipe_order = {
+            recipe_id: index
+            for index, recipe_id in enumerate(TRANSPARENT_RESEARCH_BASELINE_IDS)
+        }
+        member_results.sort(key=lambda item: recipe_order[str(item["recipe_id"])])
         result["members"] = member_results
         if any(
             item["errors"] or item["state"] == "formal_backtest_failed"
             for item in member_results
         ):
             result["status"] = "failed"
-        elif all(item["state"] == "governed_no_op" for item in member_results):
+        elif all(
+            item["state"] in {"governed_no_op", "unavailable"}
+            for item in member_results
+        ):
             result["status"] = "no_op"
         elif all(
-            item["state"] in {"paper_validating", "governed_no_op"}
+            item["state"]
+            in {"paper_validating", "governed_no_op", "unavailable"}
             for item in member_results
         ):
             result["status"] = "paper_validating"

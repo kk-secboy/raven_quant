@@ -2793,7 +2793,15 @@ class QlibBuilder:
         balancesheet = (
             self._read_dataset_for_symbols(
                 "balancesheet",
-                {"ts_code", "ann_date", equity_column},
+                {
+                    "ts_code",
+                    "ann_date",
+                    "end_date",
+                    "f_ann_date",
+                    "update_flag",
+                    "ingested_at",
+                    equity_column,
+                },
                 stock_batch,
                 required={"ts_code", "ann_date", equity_column},
             )
@@ -2803,7 +2811,15 @@ class QlibBuilder:
         audit = (
             self._read_dataset_for_symbols(
                 "fina_audit",
-                {"ts_code", "ann_date", opinion_column},
+                {
+                    "ts_code",
+                    "ann_date",
+                    "end_date",
+                    "f_ann_date",
+                    "update_flag",
+                    "ingested_at",
+                    opinion_column,
+                },
                 stock_batch,
                 required={"ts_code", "ann_date", opinion_column},
             )
@@ -2812,6 +2828,14 @@ class QlibBuilder:
         )
         if balancesheet is None or audit is None:
             raise ValueError("eligibility financial source schema changed during publication")
+        balancesheet = _select_latest_fundamental_revisions(
+            balancesheet,
+            value_columns=[equity_column],
+        )
+        audit = _select_latest_fundamental_revisions(
+            audit,
+            value_columns=[opinion_column],
+        )
         instruments = set(market["instrument"].dropna().astype(str))
         suspension_columns = self._parquet_columns("suspend_d")
         suspension_date = next(
@@ -4169,6 +4193,67 @@ def _fundamental_revision_order(
     )
     ordering.append(f"md5(concat_ws('|', {hashed})) ASC")
     return ", ".join(ordering)
+
+
+def _select_latest_fundamental_revisions(
+    values: pd.DataFrame,
+    *,
+    value_columns: list[str],
+) -> pd.DataFrame:
+    """Resolve one deterministic financial row per instrument/announcement.
+
+    Eligibility consumes the same point-in-time statement surface as the
+    formal factor join.  In particular, one announcement date can contain
+    multiple report periods and multiple revisions of the newest period.  Use
+    the shared SQL ordering contract rather than allowing pandas/parquet row
+    order to decide which equity or audit value reaches the eligibility gate.
+
+    Older snapshots may not contain ``end_date``.  They remain readable, but a
+    null synthetic report period sorts behind any evidenced report period.
+    Visibility is still governed solely by ``ann_date`` in
+    ``build_point_in_time_eligibility`` (strictly after the announcement day).
+    """
+
+    required = {"ts_code", "ann_date", *value_columns}
+    missing = sorted(required.difference(values.columns))
+    if missing:
+        raise ValueError(
+            "fundamental revision selection is missing columns: " + ", ".join(missing)
+        )
+    if values.empty:
+        return values.copy()
+
+    source = values.copy()
+    if "end_date" not in source.columns:
+        source["end_date"] = pd.NaT
+    source_columns = set(source.columns)
+    revision_columns = [
+        column
+        for column in ("f_ann_date", "update_flag", "ingested_at")
+        if column in source_columns
+    ]
+    payload_columns = ["ts_code", "ann_date", "end_date", *value_columns]
+    projected_columns = list(dict.fromkeys([*payload_columns, *revision_columns]))
+    projection = ", ".join(_sql_identifier(column) for column in projected_columns)
+    revision_order = _fundamental_revision_order(payload_columns, source_columns)
+
+    connection = duckdb.connect()
+    try:
+        connection.register("fundamental_revision_source", source)
+        return connection.execute(
+            f"""
+            SELECT {projection}
+            FROM fundamental_revision_source
+            WHERE ts_code IS NOT NULL AND try_cast(ann_date AS DATE) IS NOT NULL
+            QUALIFY row_number() OVER (
+                PARTITION BY ts_code, try_cast(ann_date AS DATE)
+                ORDER BY {revision_order}
+            ) = 1
+            ORDER BY ts_code, try_cast(ann_date AS DATE)
+            """
+        ).fetch_df()
+    finally:
+        connection.close()
 
 
 def _sha256_file(path: Path) -> str:

@@ -18,6 +18,8 @@ from quant_platform.research_horizon import (
     SWING_1_6M,
     horizon_columns_from_config,
     normalize_horizon_config,
+    primary_label_horizon_sessions,
+    primary_label_policy_contract,
     require_horizon_row,
     require_label_horizon,
     research_horizon_contract,
@@ -108,6 +110,35 @@ def test_label_horizon_must_belong_to_selected_track() -> None:
         require_label_horizon(SWING_1_6M, 2)
     with pytest.raises(ValueError, match="no admissible"):
         require_label_horizon(LEGACY_AMBIGUOUS, 1)
+
+
+def test_primary_prediction_labels_are_stable_per_horizon() -> None:
+    assert primary_label_horizon_sessions(SHORT_1_5D) == 5
+    assert primary_label_horizon_sessions(SWING_1_6M) == 63
+    assert primary_label_horizon_sessions(LONG_1_3Y) == 252
+
+    with pytest.raises(ValueError, match="no primary"):
+        primary_label_horizon_sessions(LEGACY_AMBIGUOUS)
+
+
+def test_primary_label_policy_has_an_independent_frozen_digest() -> None:
+    policy = primary_label_policy_contract()
+
+    assert policy == {
+        "contract_version": "primary-label-policy-v1",
+        "horizon_primary_labels_sessions": {
+            "long_1_3y": 252,
+            "short_1_5d": 5,
+            "swing_1_6m": 63,
+        },
+        "legacy_ambiguous_executable": False,
+        "policy_sha256": (
+            "f90f34e67b4721c0e7b82181007872cc099093e80ea92f8ed3d2d88e3e7adfdc"
+        ),
+    }
+    assert research_horizon_contract(SHORT_1_5D).sha256 == (
+        "a895312d55f19ffaf35e90c4bd7003af337c94e18b61e27b4ee62a584860e1e9"
+    )
 
 
 def test_forward_gate_minima_are_horizon_specific_not_calendar_day_proxies() -> None:
@@ -211,6 +242,9 @@ def test_financial_review_marker_is_sealed_and_requires_report_identity() -> Non
         source_datasets=["fina_indicator"],
         source_event_count=1,
         source_event_sha256="b" * 64,
+        report_periods=["2026Q2"],
+        reviewed_instruments=["SH600000"],
+        review_scope_sha256="c" * 64,
     )
 
     assert review["status"] == "completed"
@@ -232,4 +266,7 @@ def test_financial_review_marker_is_sealed_and_requires_report_identity() -> Non
             source_datasets=["fina_indicator"],
             source_event_count=1,
             source_event_sha256="b" * 64,
+            report_periods=["2026Q2"],
+            reviewed_instruments=["SH600000"],
+            review_scope_sha256="c" * 64,
         )

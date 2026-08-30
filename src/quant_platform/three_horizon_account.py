@@ -34,13 +34,13 @@ from .services import list_qlib_datasets
 from .simulation_order_state import OPEN_STATUSES
 from .simulation_store import SimulationStore
 
-THREE_HORIZON_ACCOUNT_VERSION = "three-horizon-account-v1"
+THREE_HORIZON_ACCOUNT_VERSION = "three-horizon-account-v2"
 THREE_HORIZON_PRIMARY_SIMULATION_ACTOR = "three-horizon-account"
 THREE_HORIZON_ACCOUNT_LOCK_KEY = 7_215_083_172_040_011
 HORIZON_WEIGHTS = {
     SHORT_1_5D: 0.20,
-    SWING_1_6M: 0.40,
-    LONG_1_3Y: 0.40,
+    SWING_1_6M: 0.50,
+    LONG_1_3Y: 0.30,
 }
 
 
@@ -108,11 +108,11 @@ def _select_current_three_horizon_dataset(
 
 
 class ThreeHorizonAccountService:
-    """Create and advance the sole 20/40/40 recommendation account.
+    """Create and advance the sole short/mid-led recommendation account.
 
     Research and forward paper accounts remain isolated.  This service starts
     as soon as one horizon has ``recommendation_enabled`` authority. Missing
-    sleeves remain cash at their frozen 20/40/40 budget; later horizons replace
+    sleeves remain cash at their frozen 20/50/30 budget; later horizons replace
     the active allocation atomically through the existing Allocation,
     AccountNetting and Simulation stores instead of creating another ledger.
     """
@@ -182,7 +182,7 @@ class ThreeHorizonAccountService:
                     actor="system:auto-promotion",
                     reason=(
                         "Every included horizon passed its sealed forward gate; activate "
-                        "the frozen 20/40/40 policy while missing sleeves remain cash."
+                        "the frozen 20/50/30 policy while missing sleeves remain cash."
                     ),
                 )
             except ValueError as exc:
@@ -246,8 +246,25 @@ class ThreeHorizonAccountService:
                 "reason": str(exc),
                 "advanced": False,
             }
+        plan_snapshot_evidence = dict(
+            (plan.get("input_evidence") or {}).get("member_snapshots") or {}
+        )
+        plan_snapshot_ids = {
+            str(version_id): str((value or {}).get("snapshot_id") or "").strip()
+            for version_id, value in plan_snapshot_evidence.items()
+        }
+        if set(plan_snapshot_ids) != set(versions.values()) or any(
+            not snapshot_id for snapshot_id in plan_snapshot_ids.values()
+        ):
+            return {
+                "status": "waiting_for_member_targets",
+                "allocation_id": str(allocation["id"]),
+                "simulation_portfolio_id": str(simulation["id"]),
+                "reason": "netting plan does not seal one exact snapshot id per member",
+                "advanced": False,
+            }
         _prices, member_snapshot_evidence = self._latest_snapshot_payloads(
-            str(allocation["id"])
+            str(allocation["id"]), expected_snapshot_ids=plan_snapshot_ids
         )
         if set(member_snapshot_evidence) != set(versions.values()):
             return {
@@ -264,6 +281,7 @@ class ThreeHorizonAccountService:
                 plan=plan,
                 investor_profile=profile,
                 now=current,
+                expected_snapshot_ids=plan_snapshot_ids,
             )
         except ValueError as exc:
             return {
@@ -365,7 +383,11 @@ class ThreeHorizonAccountService:
 
     def _allocation_name(self, versions: dict[str, str]) -> str:
         identity = hashlib.sha256(
-            "|".join(f"{key}:{versions[key]}" for key in sorted(versions)).encode()
+            (
+                THREE_HORIZON_ACCOUNT_VERSION
+                + "|"
+                + "|".join(f"{key}:{versions[key]}" for key in sorted(versions))
+            ).encode()
         ).hexdigest()[:12]
         return f"three-horizon-primary-{identity}"
 
@@ -400,7 +422,7 @@ class ThreeHorizonAccountService:
             lookback_days=252,
             target_volatility=0.50,
             max_pairwise_correlation=0.99,
-            max_strategy_weight=0.40,
+            max_strategy_weight=max(HORIZON_WEIGHTS.values()),
             max_member_drawdown=0.08,
             max_drawdown_reduce=0.10,
             max_drawdown_liquidate=0.15,
@@ -582,7 +604,10 @@ class ThreeHorizonAccountService:
         }
 
     def _latest_snapshot_payloads(
-        self, allocation_id: str
+        self,
+        allocation_id: str,
+        *,
+        expected_snapshot_ids: dict[str, str] | None = None,
     ) -> tuple[dict[str, float], dict[str, dict[str, str]]]:
         prices: dict[str, tuple[date, float]] = {}
         evidence: dict[str, dict[str, str]] = {}
@@ -593,19 +618,36 @@ class ThreeHorizonAccountService:
                 )
             ).all()
             for member in members:
-                snapshot = connection.execute(
-                    select(recommendation_snapshots)
-                    .where(
-                        recommendation_snapshots.c.portfolio_id
-                        == member.recommendation_portfolio_id,
-                        recommendation_snapshots.c.status == "succeeded",
+                version_id = str(member.strategy_version_id)
+                statement = select(recommendation_snapshots).where(
+                    recommendation_snapshots.c.portfolio_id
+                    == member.recommendation_portfolio_id,
+                    recommendation_snapshots.c.status == "succeeded",
+                )
+                if expected_snapshot_ids is not None:
+                    expected_id = str(expected_snapshot_ids.get(version_id) or "").strip()
+                    if not expected_id:
+                        raise ValueError(
+                            "materialization is missing the netting plan snapshot id "
+                            f"for member {version_id}"
+                        )
+                    statement = statement.where(
+                        recommendation_snapshots.c.id == expected_id
                     )
-                    .order_by(recommendation_snapshots.c.as_of_date.desc())
-                    .limit(1)
-                ).first()
+                else:
+                    statement = statement.order_by(
+                        recommendation_snapshots.c.as_of_date.desc(),
+                        recommendation_snapshots.c.created_at.desc(),
+                    ).limit(1)
+                snapshot = connection.execute(statement).first()
                 if snapshot is None:
+                    if expected_snapshot_ids is not None:
+                        raise ValueError(
+                            "the exact recommendation snapshot sealed by the netting "
+                            f"plan is unavailable for member {version_id}"
+                        )
                     continue
-                evidence[str(member.strategy_version_id)] = {
+                evidence[version_id] = {
                     "snapshot_id": str(snapshot.id),
                     "as_of_date": snapshot.as_of_date.isoformat(),
                 }
@@ -626,9 +668,12 @@ class ThreeHorizonAccountService:
         plan: dict[str, Any],
         investor_profile: dict[str, Any],
         now: datetime,
+        expected_snapshot_ids: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         trade_date = date.fromisoformat(str(plan["decision_date"]))
-        prices, snapshot_evidence = self._latest_snapshot_payloads(str(allocation["id"]))
+        prices, snapshot_evidence = self._latest_snapshot_payloads(
+            str(allocation["id"]), expected_snapshot_ids=expected_snapshot_ids
+        )
         positions = {
             str(item["instrument"]): item
             for item in self.simulations.rows(str(simulation["id"]), "positions")

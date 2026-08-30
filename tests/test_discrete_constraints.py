@@ -62,6 +62,101 @@ def test_discrete_validation_reports_violations_without_relaxing_target() -> Non
     }
 
 
+def test_risk_turnover_exception_never_authorizes_extra_buys() -> None:
+    report = validate_discrete_constraints(
+        {"held": 0.0, "new": 0.30},
+        {"held": 1.0},
+        max_position_weight=1.0,
+        max_daily_turnover=0.15,
+        risk_turnover_exempt_instruments={"held"},
+    )
+
+    assert report["status"] == "failed"
+    assert report["turnover"] == pytest.approx(1.0)
+    assert report["turnover_subject_to_limit"] == pytest.approx(0.30)
+    assert report["risk_turnover_exception"]["no_extra_buys"] is False
+    assert {item["name"] for item in report["violations"]} == {
+        "daily_turnover",
+        "risk_turnover_decrease_exception",
+    }
+
+
+def test_frozen_position_exception_rejects_new_or_worsened_breaches() -> None:
+    inherited = validate_discrete_constraints(
+        {"held": 0.20},
+        {"held": 0.20},
+        max_position_weight=0.10,
+        max_daily_turnover=1.0,
+        frozen_instruments={"held"},
+    )
+    assert inherited["status"] == "passed"
+    assert inherited["frozen_inherited_max_position_exceptions"][0][
+        "instrument"
+    ] == "held"
+
+    new_breach = validate_discrete_constraints(
+        {"new": 0.20},
+        {},
+        max_position_weight=0.10,
+        max_daily_turnover=1.0,
+    )
+    assert new_breach["status"] == "failed"
+    assert {item["name"] for item in new_breach["violations"]} == {
+        "max_position_weight"
+    }
+
+    with pytest.raises(ValueError, match="retain their previous target weight"):
+        validate_discrete_constraints(
+            {"held": 0.21},
+            {"held": 0.20},
+            max_position_weight=0.10,
+            max_daily_turnover=1.0,
+            frozen_instruments={"held"},
+        )
+
+
+def test_zero_adv_requires_no_trade_or_an_explicit_freeze() -> None:
+    unchanged = validate_discrete_constraints(
+        {"held": 0.20},
+        {"held": 0.20},
+        max_position_weight=0.50,
+        max_daily_turnover=1.0,
+        average_daily_values={"held": 0.0},
+        portfolio_value=1_000_000.0,
+        max_volume_participation=0.10,
+        prices={"held": 10.0},
+        lot_size=100,
+    )
+    assert unchanged["status"] == "passed"
+
+    with pytest.raises(ValueError, match="positive average daily values"):
+        validate_discrete_constraints(
+            {"held": 0.10},
+            {"held": 0.20},
+            max_position_weight=0.50,
+            max_daily_turnover=1.0,
+            average_daily_values={"held": 0.0},
+            portfolio_value=1_000_000.0,
+            max_volume_participation=0.10,
+            prices={"held": 10.0},
+            lot_size=100,
+        )
+
+    frozen = validate_discrete_constraints(
+        {"held": 0.20},
+        {"held": 0.20},
+        max_position_weight=0.50,
+        max_daily_turnover=1.0,
+        average_daily_values={"held": 0.0},
+        portfolio_value=1_000_000.0,
+        max_volume_participation=0.10,
+        prices={"held": 10.0},
+        lot_size=100,
+        frozen_instruments={"held"},
+    )
+    assert frozen["status"] == "passed"
+
+
 def test_configured_asset_limit_requires_complete_classification() -> None:
     with pytest.raises(ValueError, match="asset class memberships"):
         validate_discrete_constraints(

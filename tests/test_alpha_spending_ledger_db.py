@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import numpy as np
 import pandas as pd
 import pytest
-from sqlalchemy import insert, inspect, update
+from sqlalchemy import insert, inspect, select, update
 from sqlalchemy.exc import DBAPIError
 
 from quant_data.database import (
@@ -16,7 +16,10 @@ from quant_data.database import (
     open_database,
 )
 from quant_data.snapshot_lineage import canonical_sha256
-from quant_platform.alpha_spending_integration import capital_oos_family_manifest
+from quant_platform.alpha_spending_integration import (
+    capital_oos_family_manifest,
+    capital_oos_family_manifest_sha256,
+)
 from quant_platform.alpha_spending_ledger import CapitalOOSAlphaLedgerStore
 from quant_platform.strategy_store import StrategyStore
 
@@ -44,6 +47,7 @@ def _reserve(
     bundle: str = "b" * 64,
     lineage: str = LINEAGE,
     dataset_identity: str = DATASET_IDENTITY,
+    mandate: dict | None = None,
 ) -> dict:
     final = _dates(start, 252)
     embargo_end = pd.Timestamp(final[0]) - pd.offsets.BDay(1)
@@ -54,7 +58,7 @@ def _reserve(
     return store.reserve_batch(
         dataset_lineage_id=lineage,
         dataset_identity_sha256=dataset_identity,
-        stable_mandate=MANDATE,
+        stable_mandate=mandate or MANDATE,
         batch_key=key,
         frozen_bundle_manifest_sha256=bundle,
         frozen_baseline_manifest_sha256="e" * 64,
@@ -62,6 +66,80 @@ def _reserve(
         final_oos_trading_dates=final,
         embargo_trading_dates=embargo,
     )
+
+
+def test_capital_vintage_scope_is_family_horizon_not_shared_lineage(
+    database_url: str,
+) -> None:
+    store = CapitalOOSAlphaLedgerStore(database_url)
+    short_mandate = MANDATE
+    swing_mandate = capital_oos_family_manifest(
+        "csi300",
+        "SH000300",
+        63,
+        "a" * 64,
+        "b" * 64,
+        "c" * 64,
+    )
+    short = _reserve(store, key="short-family-window", mandate=short_mandate)
+    swing = _reserve(store, key="swing-family-window", mandate=swing_mandate)
+    now = datetime.now(UTC)
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        for batch, label in ((short, 5), (swing, 63)):
+            StrategyStore._seal_and_consume_oos_vintage(
+                connection,
+                strategy_version_id=f"strategy-{label}",
+                candidate_ids=[],
+                sealed_member_set={
+                    "candidate_ids": [],
+                    "capital_scope_fixture": {"label_horizon_days": label},
+                },
+                dataset_identities=set(),
+                dataset_lineage_id=LINEAGE,
+                dataset="shared-snapshot",
+                test_start=pd.Timestamp(batch["final_oos_start"]).date(),
+                test_end=pd.Timestamp(batch["final_oos_end"]).date(),
+                consumed_at=now,
+                capital_oos_alpha_batch_id=str(batch["id"]),
+                capital_oos_dataset_identity_sha256=DATASET_IDENTITY,
+            )
+        rows = connection.execute(select(oos_vintages)).all()
+
+    assert len(rows) == 2
+    scopes = {str(row.scope) for row in rows}
+    assert scopes == {
+        "alpha-family:"
+        f"{capital_oos_family_manifest_sha256(short_mandate)}:label:5",
+        "alpha-family:"
+        f"{capital_oos_family_manifest_sha256(swing_mandate)}:label:63",
+    }
+    assert {str(row.dataset_lineage_id) for row in rows} == {LINEAGE}
+
+    with pytest.raises(
+        ValueError,
+        match="overlaps a reserved or consumed OOS vintage",
+    ):
+        with engine.begin() as connection:
+            StrategyStore._seal_and_consume_oos_vintage(
+                connection,
+                strategy_version_id="strategy-short-reuse",
+                candidate_ids=[],
+                sealed_member_set={
+                    "candidate_ids": [],
+                    "capital_scope_fixture": {"label_horizon_days": 5},
+                },
+                dataset_identities=set(),
+                dataset_lineage_id=LINEAGE,
+                dataset="shared-snapshot-next",
+                test_start=pd.Timestamp(short["final_oos_start"]).date()
+                + timedelta(days=1),
+                test_end=pd.Timestamp(short["final_oos_end"]).date()
+                + timedelta(days=1),
+                consumed_at=now,
+                capital_oos_alpha_batch_id=str(short["id"]),
+                capital_oos_dataset_identity_sha256=DATASET_IDENTITY,
+            )
 
 
 def _link_vintage(

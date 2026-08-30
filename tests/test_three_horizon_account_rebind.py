@@ -35,7 +35,10 @@ from quant_data.database import (
 )
 from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
-from quant_platform.account_netting import AccountNettingStore
+from quant_platform.account_netting import (
+    AccountNettingStore,
+    allocate_actual_sleeve_inventory,
+)
 from quant_platform.advice_service import AdviceService
 from quant_platform.allocation_store import AllocationStore
 from quant_platform.cost_model import COST_SCHEDULE_VERSION, CostModelConfig
@@ -466,6 +469,409 @@ def _seed_primary_ledger(
     return store, simulation, old_id, new_id
 
 
+def test_valued_decision_only_plan_is_the_durable_sleeve_continuity(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zero-order A->B transfer must not be replayed on every later day."""
+
+    store, simulation, allocation_id, _new_id = _seed_primary_ledger(
+        database_url, monkeypatch
+    )
+    netting = AccountNettingStore(database_url)
+    now = datetime.now(UTC)
+    account_weight = 1_100.0 / 1_000_000.0
+
+    def artifact(
+        *, decision_day: date, inputs_day: date, suffix: str
+    ) -> str:
+        artifact_id = f"continuity-{suffix}-{uuid.uuid4().hex}"
+        with store.engine.begin() as connection:
+            connection.execute(
+                insert(strategy_allocation_artifacts).values(
+                    id=artifact_id,
+                    allocation_id=allocation_id,
+                    decision_date=decision_day,
+                    inputs_as_of=inputs_day,
+                    valid_until=date(2026, 9, 30),
+                    member_weights_json={"A": 0.5, "B": 0.5},
+                    analysis_json={},
+                    artifact_hash=hashlib.sha256(artifact_id.encode()).hexdigest(),
+                    created_at=now,
+                )
+            )
+        return artifact_id
+
+    def evidence(*, inputs_day: date) -> dict[str, Any]:
+        return {
+            "allocation_artifact_inputs_as_of": inputs_day.isoformat(),
+            "primary_account": {
+                "portfolio_id": str(simulation["id"]),
+                "source_id": allocation_id,
+                "nav": 1_000_000.0,
+            },
+        }
+
+    initial_inputs = date(2026, 8, 27)
+    initial = netting.create_plan(
+        actor="three-horizon-netting",
+        account_id=allocation_id,
+        allocation_artifact_id=artifact(
+            decision_day=date(2026, 8, 28),
+            inputs_day=initial_inputs,
+            suffix="initial",
+        ),
+        decision_date=date(2026, 8, 28),
+        inputs_as_of=initial_inputs,
+        policy_version="decision-continuity-initial-v1",
+        member_budgets={"A": 0.5, "B": 0.5},
+        member_targets={"A": {"SH600000": account_weight / 0.5}, "B": {}},
+        total_capital=1_000_000,
+        input_evidence=evidence(inputs_day=initial_inputs),
+    )
+    current = store.get(str(simulation["id"]))
+    with store.engine.begin() as connection:
+        connection.execute(
+            insert(simulation_batches).values(
+                id=f"initial-plan-{uuid.uuid4().hex}",
+                portfolio_id=simulation["id"],
+                source_snapshot_id=None,
+                target_payload_json={
+                    "order_plan": {
+                        "target_version": (
+                            f"three-horizon-netting:{initial['plan_hash']}"
+                        ),
+                        "account_netting_plan_id": initial["id"],
+                        "actions": [],
+                    }
+                },
+                execution_adapter="long_only",
+                execution_contract_hash=current["execution_contract_hash"],
+                daily_dataset=current["daily_dataset"],
+                daily_dataset_identity_sha256=current[
+                    "daily_dataset_identity_sha256"
+                ],
+                daily_dataset_lineage_id=current["daily_dataset_lineage_id"],
+                execution_dataset=current["execution_dataset"],
+                execution_dataset_identity_sha256=current[
+                    "execution_dataset_identity_sha256"
+                ],
+                execution_dataset_lineage_id=current[
+                    "execution_dataset_lineage_id"
+                ],
+                simulation_semantics_sha256=current["execution_policy"][
+                    "simulation_semantics_sha256"
+                ],
+                signal_date=initial_inputs,
+                trade_date=date(2026, 8, 28),
+                status="succeeded",
+                idempotency_key=f"initial-plan:{initial['id']}",
+                account_netting_plan_id=initial["id"],
+                created_by=THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
+                summary_json={"conservation": {"cash_difference": 0.0}},
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+
+    transfer_inputs = date(2026, 8, 28)
+    transfer = netting.create_plan(
+        actor="three-horizon-netting",
+        account_id=allocation_id,
+        allocation_artifact_id=artifact(
+            decision_day=date(2026, 8, 31),
+            inputs_day=transfer_inputs,
+            suffix="transfer",
+        ),
+        decision_date=date(2026, 8, 31),
+        inputs_as_of=transfer_inputs,
+        policy_version="decision-continuity-transfer-v1",
+        member_budgets={"A": 0.5, "B": 0.5},
+        member_targets={"A": {}, "B": {"SH600000": account_weight / 0.5}},
+        member_current_account_weights={"A": {"SH600000": account_weight}},
+        total_capital=1_000_000,
+        input_evidence=evidence(inputs_day=transfer_inputs),
+    )
+    assert transfer["net_trades"] == {}
+
+    def seal_valued_decision(plan: dict, *, signal_day: date, trade_day: date) -> str:
+        event = build_account_order_decision_event(
+            portfolio_id=str(simulation["id"]),
+            account_netting_plan_id=str(plan["id"]),
+            target_version=f"three-horizon-netting:{plan['plan_hash']}",
+            actor=THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
+            signal_date=signal_day,
+            trade_date=trade_day,
+            actions=[
+                {
+                    "instrument": "SH600000",
+                    "action": "HOLD",
+                    "order_plan": [],
+                }
+            ],
+        )
+        batch_id = f"decision-valuation-{uuid.uuid4().hex}"
+        with store.engine.begin() as connection:
+            connection.execute(
+                insert(simulation_events).values(
+                    id=event["event_sha256"],
+                    portfolio_id=simulation["id"],
+                    batch_id=None,
+                    trade_date=trade_day,
+                    severity="info",
+                    event_type="account_order_plan_decision_only",
+                    instrument=None,
+                    reason="account_netting_plan_created_no_new_order_operations",
+                    details_json=event,
+                    created_at=now,
+                )
+            )
+            connection.execute(
+                insert(simulation_batches).values(
+                    id=batch_id,
+                    portfolio_id=simulation["id"],
+                    source_snapshot_id=event["event_sha256"],
+                    target_payload_json={
+                        "order_plan": {
+                            "target_version": (
+                                f"three-horizon-netting:{plan['plan_hash']}"
+                            ),
+                            "account_netting_plan_id": None,
+                            "actions": [],
+                            "decision_valuation_replay": True,
+                            "decision_event_sha256": event["event_sha256"],
+                        },
+                        "decision_actions": event["actions"],
+                        "governed_order_plan": {
+                            "format_version": (
+                                "simulation-account-decision-valuation-v1"
+                            ),
+                            "decision_event_sha256": event["event_sha256"],
+                            "settlement_calendar_binding": {},
+                        },
+                    },
+                    execution_adapter="long_only",
+                    execution_contract_hash=current["execution_contract_hash"],
+                    daily_dataset=current["daily_dataset"],
+                    daily_dataset_identity_sha256=current[
+                        "daily_dataset_identity_sha256"
+                    ],
+                    daily_dataset_lineage_id=current["daily_dataset_lineage_id"],
+                    execution_dataset=current["execution_dataset"],
+                    execution_dataset_identity_sha256=current[
+                        "execution_dataset_identity_sha256"
+                    ],
+                    execution_dataset_lineage_id=current[
+                        "execution_dataset_lineage_id"
+                    ],
+                    simulation_semantics_sha256=current["execution_policy"][
+                        "simulation_semantics_sha256"
+                    ],
+                    signal_date=signal_day,
+                    trade_date=trade_day,
+                    status="succeeded",
+                    idempotency_key=f"decision-valuation:{event['event_sha256']}",
+                    account_netting_plan_id=None,
+                    created_by=THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
+                    summary_json={"conservation": {"cash_difference": 0.0}},
+                    created_at=now,
+                    started_at=now,
+                    finished_at=now,
+                )
+            )
+            connection.execute(
+                insert(simulation_nav).values(
+                    portfolio_id=simulation["id"],
+                    trade_date=trade_day,
+                    cash=Decimal("998900"),
+                    market_value=Decimal("1100"),
+                    nav=Decimal("1000000"),
+                    daily_return=0.0,
+                    drawdown=0.0,
+                    market_date=trade_day,
+                    has_stale_prices=False,
+                    status="healthy",
+                    performance_certified=True,
+                    nav_scope="aggregate_view",
+                    produced_by=THREE_HORIZON_PRIMARY_SIMULATION_ACTOR,
+                    created_at=now,
+                )
+            )
+        return batch_id
+
+    transfer_batch_id = seal_valued_decision(
+        transfer,
+        signal_day=transfer_inputs,
+        trade_day=date(2026, 8, 31),
+    )
+    with store.engine.connect() as connection:
+        allocation = connection.execute(
+            select(strategy_allocations).where(
+                strategy_allocations.c.id == allocation_id
+            )
+        ).one()
+        selected = netting._authoritative_prior_plan(
+            connection,
+            portfolio_id=str(simulation["id"]),
+            current_allocation=allocation,
+            decision_date=date(2026, 9, 1),
+            inputs_as_of=date(2026, 8, 31),
+        )
+    assert selected is not None
+    assert selected["kind"] == "decision_only"
+    assert selected["plan_id"] == transfer["id"]
+    assert selected["batch_id"] == transfer_batch_id
+
+    # A decision event is not authoritative merely because it exists.  Until
+    # its valuation succeeds, continuity stays on the last executed plan.
+    with store.engine.begin() as connection:
+        connection.execute(
+            update(simulation_batches)
+            .where(simulation_batches.c.id == transfer_batch_id)
+            .values(status="failed", error="valuation failed")
+        )
+        allocation = connection.execute(
+            select(strategy_allocations).where(
+                strategy_allocations.c.id == allocation_id
+            )
+        ).one()
+        failed_selection = netting._authoritative_prior_plan(
+            connection,
+            portfolio_id=str(simulation["id"]),
+            current_allocation=allocation,
+            decision_date=date(2026, 9, 1),
+            inputs_as_of=date(2026, 8, 31),
+        )
+        connection.execute(
+            update(simulation_batches)
+            .where(simulation_batches.c.id == transfer_batch_id)
+            .values(status="succeeded", error=None)
+        )
+    assert failed_selection is not None
+    assert failed_selection["plan_id"] == initial["id"]
+
+    # The event->plan pointer is insufficient by itself: changing a hashed
+    # economic input makes the otherwise succeeded decision unusable.
+    with store.engine.begin() as connection:
+        stored_payload = dict(
+            connection.scalar(
+                select(account_netting_plans.c.plan_json).where(
+                    account_netting_plans.c.id == transfer["id"]
+                )
+            )
+        )
+        tampered_payload = {
+            **stored_payload,
+            "member_targets": {
+                **dict(stored_payload["member_targets"]),
+                "B": {"SH600000": account_weight},
+            },
+        }
+        connection.execute(
+            update(account_netting_plans)
+            .where(account_netting_plans.c.id == transfer["id"])
+            .values(plan_json=tampered_payload)
+        )
+        allocation = connection.execute(
+            select(strategy_allocations).where(
+                strategy_allocations.c.id == allocation_id
+            )
+        ).one()
+        with pytest.raises(ValueError, match="input hash is invalid"):
+            netting._authoritative_prior_plan(
+                connection,
+                portfolio_id=str(simulation["id"]),
+                current_allocation=allocation,
+                decision_date=date(2026, 9, 1),
+                inputs_as_of=date(2026, 8, 31),
+            )
+        connection.execute(
+            update(account_netting_plans)
+            .where(account_netting_plans.c.id == transfer["id"])
+            .values(plan_json=stored_payload)
+        )
+
+    inventory, _inventory_evidence = allocate_actual_sleeve_inventory(
+        actual_account_weights={"SH600000": account_weight},
+        prior_plan=selected["plan"],
+    )
+    assert inventory == {"B": {"SH600000": pytest.approx(account_weight)}}
+    next_inputs = date(2026, 8, 31)
+    next_day = netting.create_plan(
+        actor="three-horizon-netting",
+        account_id=allocation_id,
+        allocation_artifact_id=artifact(
+            decision_day=date(2026, 9, 1),
+            inputs_day=next_inputs,
+            suffix="next-day",
+        ),
+        decision_date=date(2026, 9, 1),
+        inputs_as_of=next_inputs,
+        policy_version="decision-continuity-next-v1",
+        member_budgets={"A": 0.5, "B": 0.5},
+        member_targets={"A": {}, "B": {"SH600000": account_weight / 0.5}},
+        member_current_account_weights=inventory,
+        total_capital=1_000_000,
+        input_evidence=evidence(inputs_day=next_inputs),
+    )
+    assert next_day["net_trades"] == {}
+    seal_valued_decision(
+        next_day,
+        signal_day=next_inputs,
+        trade_day=date(2026, 9, 1),
+    )
+
+    with store.engine.connect() as connection:
+        allocation = connection.execute(
+            select(strategy_allocations).where(
+                strategy_allocations.c.id == allocation_id
+            )
+        ).one()
+        selected_next = netting._authoritative_prior_plan(
+            connection,
+            portfolio_id=str(simulation["id"]),
+            current_allocation=allocation,
+            decision_date=date(2026, 9, 2),
+            inputs_as_of=date(2026, 9, 1),
+        )
+    assert selected_next is not None
+    assert selected_next["plan_id"] == next_day["id"]
+    next_inventory, _ = allocate_actual_sleeve_inventory(
+        actual_account_weights={"SH600000": account_weight},
+        prior_plan=selected_next["plan"],
+    )
+    partial_inputs = date(2026, 9, 1)
+    partial_kwargs = {
+        "account_id": allocation_id,
+        "allocation_artifact_id": artifact(
+            decision_day=date(2026, 9, 2),
+            inputs_day=partial_inputs,
+            suffix="partial",
+        ),
+        "decision_date": date(2026, 9, 2),
+        "inputs_as_of": partial_inputs,
+        "policy_version": "decision-continuity-partial-v1",
+        "member_budgets": {"A": 0.5, "B": 0.5},
+        "member_targets": {
+            "A": {},
+            "B": {"SH600000": account_weight / 0.5 / 2.0},
+        },
+        "member_current_account_weights": next_inventory,
+        "total_capital": 1_000_000,
+        "input_evidence": evidence(inputs_day=partial_inputs),
+    }
+    partial = netting.create_plan(actor="three-horizon-netting", **partial_kwargs)
+    retry = netting.create_plan(actor="three-horizon-netting", **partial_kwargs)
+    assert retry["id"] == partial["id"]
+    assert retry["idempotent_replay"] is True
+    assert partial["net_trades"]["SH600000"]["delta_weight"] == pytest.approx(
+        -account_weight / 2.0
+    )
+    assert partial["strategy_contributions"]["SH600000"]["members"]["B"][
+        "net_contribution"
+    ] == pytest.approx(-account_weight / 2.0)
+
+
 def test_zero_order_account_decision_survives_restart_and_projects_to_advice(
     database_url: str, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -551,7 +957,7 @@ def test_zero_order_account_decision_survives_restart_and_projects_to_advice(
         ],
     )
     service.settings = SimpleNamespace(data_root=data_root)
-    service._latest_snapshot_payloads = lambda _allocation_id: (
+    service._latest_snapshot_payloads = lambda _allocation_id, **_kwargs: (
         {"SH600001": 20.0, "SH688001": 11.0, "SZ300001": 10.0},
         {},
     )

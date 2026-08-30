@@ -57,6 +57,34 @@ def test_build_and_backup_topologies_cover_all_writer_aliases() -> None:
     } <= set(WRITER_SERVICES)
 
 
+def test_every_built_service_has_an_explicit_stable_image_alias() -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+
+    aliases: dict[str, str] = {}
+    for service in BUILT_SERVICES:
+        match = re.search(
+            rf"^  {re.escape(service)}:\s*$\n(?P<body>.*?)(?=^  [a-z0-9-]+:\s*$|\Z)",
+            text,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None, service
+        image = re.search(r"^    image:\s+(?P<image>\S+)\s*$", match.group("body"), re.MULTILINE)
+        assert image is not None, service
+        aliases[service] = image.group("image")
+
+    assert all("${" not in image for image in aliases.values())
+    assert aliases["api"] == aliases["scheduler"]
+    assert aliases["worker"] == aliases["evaluation-worker"] == aliases["paper-worker"]
+    assert (
+        aliases["rdagent-worker"]
+        == aliases["rdagent-model-worker"]
+        == aliases["rdagent-report-worker"]
+        == aliases["rdagent-quant-worker"]
+        == aliases["rdagent-data-science-worker"]
+    )
+
+
 def test_compose_stamps_every_stateless_runtime_with_release_identity() -> None:
     root = Path(__file__).resolve().parents[1]
     text = (root / "deploy" / "compose.yaml").read_text(encoding="utf-8")

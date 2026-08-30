@@ -57,6 +57,32 @@ def test_research_schedule_payload_is_normalized() -> None:
     assert normalized["duration"] == "1h"
     assert normalized["periods"]["test_end"] == "2025-01-02"
     assert normalized["horizon_profile"] == "short_1_5d"
+    assert normalized["primary_label_policy_sha256"] == (
+        "f90f34e67b4721c0e7b82181007872cc099093e80ea92f8ed3d2d88e3e7adfdc"
+    )
+
+
+@pytest.mark.no_database
+def test_factor_report_schedule_remains_legacy_without_primary_label_policy() -> None:
+    payload = {
+        "scenario": "fin_factor_report",
+        "objective": "Extract one testable factor hypothesis from a governed report.",
+        "dataset": "cn-research",
+        "asset_ids": ["report-a"],
+        "loop_n": 1,
+        "duration": "30m",
+        "requested_by": "research-scheduler",
+        "period_mode": "rolling",
+    }
+
+    normalized = normalize_research_schedule_payload(payload, max_loops=3)
+
+    assert normalized["horizon_profile"] == "legacy_ambiguous"
+    assert "primary_label_policy" not in normalized
+    assert normalized["period_policy"] == {
+        "test_trading_days": 252,
+        "embargo_trading_days": 20,
+    }
 
 
 @pytest.mark.no_database
@@ -268,7 +294,7 @@ def test_multi_profile_windows_share_one_final_oos() -> None:
     assert robust["authoritative_cost_schedule_first_trading_day"] == "2015-08-03"
     assert robust["validation_window_truncated"] is True
     assert robust["validation_window_truncation_reason"] == (
-        "authoritative_cn_cost_schedule_starts_after_requested_validation"
+        "authoritative_cn_cost_schedule_start"
     )
     robust_train_days = (
         calendar.index(robust["periods"]["train_end"])
@@ -313,7 +339,7 @@ def test_explicit_pre_cost_validation_is_rejected_instead_of_truncated() -> None
 
 
 @pytest.mark.no_database
-def test_rolling_profiles_fail_closed_when_non_robust_history_predates_costs() -> None:
+def test_rolling_profiles_are_truncated_to_cost_coverage_without_fake_depth() -> None:
     calendar: list[str] = []
     day = date(2005, 1, 3)
     while len(calendar) < 4000:
@@ -321,12 +347,22 @@ def test_rolling_profiles_fail_closed_when_non_robust_history_predates_costs() -
             calendar.append(day.isoformat())
         day += timedelta(days=1)
 
-    with pytest.raises(ValueError, match="balanced_5y validation starts before"):
-        derive_multi_profile_research_periods(
-            calendar,
-            test_days=252,
-            embargo_days=5,
-        )
+    _, profiles = derive_multi_profile_research_periods(
+        calendar,
+        test_days=252,
+        embargo_days=5,
+    )
+
+    by_id = {str(item["id"]): item for item in profiles}
+    assert by_id["balanced_5y"]["periods"]["valid_start"] >= "2015-08-03"
+    assert by_id["balanced_5y"]["validation_window_truncated"] is True
+    assert by_id["balanced_5y"]["effective_validation_trading_days"] < (
+        by_id["balanced_5y"]["requested_validation_trading_days"]
+    )
+    assert by_id["balanced_5y"]["binding_constraints"] == [
+        "authoritative_cn_cost_schedule_start",
+        "confirmation_shortened_to_distinct_cost_covered_midpoint",
+    ]
 
 
 @pytest.mark.no_database

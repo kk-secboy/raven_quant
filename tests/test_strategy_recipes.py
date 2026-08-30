@@ -120,7 +120,16 @@ def test_transparent_short_swing_long_research_baselines_have_fixed_rule_ir() ->
     assert short["config_overrides"]["execution_method"] == "open"
     long = get_strategy_recipe("long_quality_value")
     long_exits = long["strategy_rule_ir"]["slots"]["exit_state"]["components"]
-    assert [item["component"] for item in long_exits] == ["thesis_break"]
+    assert [item["component"] for item in long_exits] == [
+        "score_deterioration_reduce",
+        "valuation_reduce",
+        "stop_loss",
+        "thesis_break",
+    ]
+    assert long["config_overrides"]["holding_min_sessions"] == 252
+    assert long["config_overrides"]["min_rebalance_weight_change"] == pytest.approx(
+        0.0025
+    )
     assert long["config_overrides"]["rebalance_frequency"] == "month"
     assert long["config_overrides"]["profit_taking_mode"] == "thesis_only"
     assert long["config_overrides"]["industry_relative_rank"] is True

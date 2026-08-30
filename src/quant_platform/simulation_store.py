@@ -62,6 +62,7 @@ from quant_data.execution_contract import (
     require_strategy_execution_contract,
 )
 
+from .account_netting import primary_position_inventory_evidence
 from .account_risk_state import (
     LEDGER_POLICY_RISK_VERSION,
     RISK_SCOPE,
@@ -386,6 +387,104 @@ def _canonical_hash(payload: dict[str, Any]) -> str:
             "utf-8"
         )
     ).hexdigest()
+
+
+def _validate_account_netting_primary_evidence(
+    connection: Any,
+    *,
+    portfolio: Any,
+    plan_json: dict[str, Any],
+) -> None:
+    """Reject a netting plan if its authoritative account snapshot changed."""
+
+    raw_evidence = plan_json.get("input_evidence") or {}
+    if not isinstance(raw_evidence, dict):
+        raise ValueError("account netting input evidence is invalid")
+    primary = raw_evidence.get("primary_account")
+    if primary is None:
+        return
+    if not isinstance(primary, dict):
+        raise ValueError("account netting primary-capital evidence is invalid")
+    expected_nav = float(primary.get("nav") or 0.0)
+    if (
+        str(primary.get("portfolio_id") or "") != str(portfolio.id)
+        or str(primary.get("source_id") or "") != str(portfolio.source_id)
+        or not isfinite(expected_nav)
+        or expected_nav <= 0
+        or abs(expected_nav - float(portfolio.nav)) > 1e-6
+    ):
+        raise ValueError("account NAV changed after netting; rebuild the order plan")
+
+    expected_positions_sha256 = str(primary.get("positions_sha256") or "")
+    if not expected_positions_sha256:
+        # Legacy primary-capital plans predate exact sleeve inventory.  Their
+        # existing NAV seal remains valid, but no position identity is invented.
+        return
+    if not _is_sha256(expected_positions_sha256):
+        raise ValueError("account netting position-inventory evidence is invalid")
+    raw_inventory = raw_evidence.get("primary_position_inventory")
+    if not isinstance(raw_inventory, dict):
+        raise ValueError("account netting position-inventory evidence is missing")
+    stored_inventory = dict(raw_inventory)
+    stored_sha256 = str(stored_inventory.pop("positions_sha256", ""))
+    if (
+        stored_sha256 != expected_positions_sha256
+        or _canonical_hash(stored_inventory) != expected_positions_sha256
+    ):
+        raise ValueError("account netting position-inventory seal is invalid")
+    policy_sha256 = str(primary.get("sleeve_inventory_policy_sha256") or "")
+    if not _is_sha256(policy_sha256):
+        raise ValueError("account netting sleeve-inventory policy seal is invalid")
+    raw_sleeve = raw_evidence.get("sleeve_inventory_allocation")
+    if not isinstance(raw_sleeve, dict):
+        raise ValueError("account netting sleeve-inventory allocation is missing")
+    sleeve = dict(raw_sleeve)
+    allocation_sha256 = str(sleeve.pop("allocation_sha256", ""))
+    if (
+        str(sleeve.get("policy_sha256") or "") != policy_sha256
+        or not _is_sha256(allocation_sha256)
+        or _canonical_hash(sleeve) != allocation_sha256
+    ):
+        raise ValueError("account netting sleeve-inventory allocation seal is invalid")
+    expected_account_weights = {
+        str(instrument): float(values.get("account_weight") or 0.0)
+        for instrument, values in dict(stored_inventory.get("positions") or {}).items()
+        if float(values.get("account_weight") or 0.0) > 1e-9
+    }
+    if dict(sleeve.get("actual_account_weights") or {}) != expected_account_weights:
+        raise ValueError("account netting sleeve inventory differs from primary positions")
+    member_inventory = plan_json.get("member_current_account_weights") or {}
+    if not isinstance(member_inventory, dict):
+        raise ValueError("account netting exact member inventory is invalid")
+    attributed_account_weights: dict[str, float] = {}
+    for raw_book in member_inventory.values():
+        if not isinstance(raw_book, dict):
+            raise ValueError("account netting exact member inventory is invalid")
+        for instrument, weight in raw_book.items():
+            attributed_account_weights[str(instrument)] = (
+                attributed_account_weights.get(str(instrument), 0.0) + float(weight)
+            )
+    if set(attributed_account_weights) != set(expected_account_weights) or any(
+        abs(attributed_account_weights[instrument] - expected_account_weights[instrument])
+        > 1e-9
+        for instrument in expected_account_weights
+    ):
+        raise ValueError("account netting member inventory does not reconcile to positions")
+
+    live_rows = connection.execute(
+        select(simulation_positions)
+        .where(simulation_positions.c.portfolio_id == portfolio.id)
+        .order_by(simulation_positions.c.instrument)
+    ).all()
+    live_inventory, _actual_weights = primary_position_inventory_evidence(
+        portfolio_id=str(portfolio.id),
+        nav=float(portfolio.nav),
+        positions=[dict(row._mapping) for row in live_rows],
+    )
+    if live_inventory["positions_sha256"] != expected_positions_sha256:
+        raise ValueError(
+            "account positions changed after netting; rebuild the order plan"
+        )
 
 
 def _is_sha256(value: Any) -> bool:
@@ -4464,25 +4563,11 @@ class SimulationStore:
                 raise ValueError(
                     "account netting plan does not match the simulation account"
                 )
-            primary_evidence = dict(
-                dict(plan_row.plan_json or {}).get("input_evidence") or {}
-            ).get("primary_account")
-            if primary_evidence is not None:
-                if not isinstance(primary_evidence, dict):
-                    raise ValueError("account netting primary-capital evidence is invalid")
-                expected_nav = float(primary_evidence.get("nav") or 0.0)
-                if (
-                    str(primary_evidence.get("portfolio_id") or "")
-                    != str(portfolio.id)
-                    or str(primary_evidence.get("source_id") or "")
-                    != str(portfolio.source_id)
-                    or not isfinite(expected_nav)
-                    or expected_nav <= 0
-                    or abs(expected_nav - float(portfolio.nav)) > 1e-6
-                ):
-                    raise ValueError(
-                        "account NAV changed after netting; rebuild the order plan"
-                    )
+            _validate_account_netting_primary_evidence(
+                connection,
+                portfolio=portfolio,
+                plan_json=dict(plan_row.plan_json or {}),
+            )
             existing_batch = connection.execute(
                 select(simulation_batches).where(
                     simulation_batches.c.portfolio_id == portfolio.id,
@@ -4964,25 +5049,11 @@ class SimulationStore:
                     raise ValueError(
                         "account netting plan does not match the simulation account"
                     )
-                primary_evidence = dict(
-                    dict(plan_row.plan_json or {}).get("input_evidence") or {}
-                ).get("primary_account")
-                if primary_evidence is not None:
-                    if not isinstance(primary_evidence, dict):
-                        raise ValueError("account netting primary-capital evidence is invalid")
-                    expected_nav = float(primary_evidence.get("nav") or 0.0)
-                    if (
-                        str(primary_evidence.get("portfolio_id") or "")
-                        != str(portfolio.id)
-                        or str(primary_evidence.get("source_id") or "")
-                        != str(portfolio.source_id)
-                        or not isfinite(expected_nav)
-                        or expected_nav <= 0
-                        or abs(expected_nav - float(portfolio.nav)) > 1e-6
-                    ):
-                        raise ValueError(
-                            "account NAV changed after netting; rebuild the order plan"
-                        )
+                _validate_account_netting_primary_evidence(
+                    connection,
+                    portfolio=portfolio,
+                    plan_json=dict(plan_row.plan_json or {}),
+                )
                 contributions = {
                     str(instrument): entry
                     for instrument, entry in (

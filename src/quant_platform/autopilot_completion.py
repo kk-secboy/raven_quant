@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -27,8 +28,21 @@ from quant_platform.model_research_governance import (
     REQUIRED_RESEARCH_PROFILES,
 )
 from quant_platform.model_strategy_contract import normalize_model_signal_config
-from quant_platform.promotion import ForwardGateThresholds, PromotionStore
+from quant_platform.promotion import (
+    ForwardGateThresholds,
+    PromotionStore,
+    forward_gate_thresholds_for_horizon,
+)
 from quant_platform.rdagent_candidate_store import RDAGentCandidateStore
+from quant_platform.research_horizon import (
+    LEGACY_AMBIGUOUS,
+    LONG_1_3Y,
+    SHORT_1_5D,
+    SUPPORTED_HORIZON_PROFILES,
+    SWING_1_6M,
+    normalize_horizon_config,
+    research_horizon_contract,
+)
 from quant_platform.research_tournament import ResearchTournamentStore
 from quant_platform.strategy_recipes import RECIPE_VERSION, get_strategy_recipe
 from quant_platform.strategy_store import StrategyStore
@@ -73,10 +87,35 @@ _PORTFOLIO_OVERRIDE_FIELDS = frozenset(
 _SUPPORTED_PORTFOLIO_CONSTRUCTION = frozenset(
     {"topk_equal_weight", "benchmark_relative_qp", "industry_neutral_qp"}
 )
+_AUTOPILOT_RECIPE_BY_HORIZON = {
+    SHORT_1_5D: "short_relative_strength",
+    SWING_1_6M: "swing_trend",
+    LONG_1_3Y: "long_quality_value",
+    LEGACY_AMBIGUOUS: "full_market_multifactor",
+}
 
 
 class _DatasetIdentityMismatch(ValueError):
     pass
+
+
+def _model_horizon_profile(model: Mapping[str, Any]) -> str:
+    """Read the immutable research-label horizon from one admitted model."""
+
+    manifest = model.get("manifest_json")
+    binding = (
+        manifest.get("research_label_binding")
+        if isinstance(manifest, Mapping)
+        else None
+    )
+    profile = (
+        str(binding.get("horizon_profile") or "")
+        if isinstance(binding, Mapping)
+        else LEGACY_AMBIGUOUS
+    )
+    if profile not in SUPPORTED_HORIZON_PROFILES:
+        raise ValueError("admitted model carries an unsupported horizon profile")
+    return profile
 
 
 def _canonical_json(value: Any) -> str:
@@ -304,19 +343,28 @@ def build_long_only_strategy_config(
     signal_config: Mapping[str, Any],
     portfolio_config: Mapping[str, Any],
     selection_evidence_sha256: str,
+    horizon_profile: str = LEGACY_AMBIGUOUS,
 ) -> dict[str, Any]:
     """Build a complete governed config without importing the API module."""
 
     selection_sha = _sha256(selection_evidence_sha256, "selection evidence")
+    profile = str(horizon_profile or LEGACY_AMBIGUOUS)
+    if profile not in SUPPORTED_HORIZON_PROFILES:
+        raise ValueError("autopilot strategy horizon profile is unsupported")
+    supplied_profile = signal_config.get("horizon_profile")
+    if supplied_profile is not None and str(supplied_profile) != profile:
+        raise ValueError("admitted signal horizon differs from the frozen cycle")
     unknown = set(portfolio_config).difference(_PORTFOLIO_OVERRIDE_FIELDS)
     if unknown:
         raise ValueError(f"unsupported autopilot portfolio fields: {sorted(unknown)}")
 
-    recipe = get_strategy_recipe("full_market_multifactor")
+    recipe_id = _AUTOPILOT_RECIPE_BY_HORIZON[profile]
+    recipe = get_strategy_recipe(recipe_id)
+    strategy_recipe_id = recipe_id if profile == LEGACY_AMBIGUOUS else "custom"
     cost = CostModelConfig().to_dict()
     cost["cost_schedule_version"] = cost.pop("version")
     config: dict[str, Any] = {
-        "recipe_id": "full_market_multifactor",
+        "recipe_id": strategy_recipe_id,
         "recipe_version": RECIPE_VERSION,
         "factor_source_mode": "not_applicable_model_prediction",
         "challenger_weight": 0.0,
@@ -410,6 +458,45 @@ def build_long_only_strategy_config(
         **dict(signal_config),
         **dict(portfolio_config),
     }
+    if profile != LEGACY_AMBIGUOUS:
+        horizon = research_horizon_contract(profile)
+        if (
+            config.get("strategy_rule_ir") != recipe.get("strategy_rule_ir")
+            or config.get("strategy_rules_sha256")
+            != (recipe.get("strategy_rule_ir") or {}).get("rules_sha256")
+        ):
+            raise ValueError(
+                "admitted signal changed the frozen horizon rule baseline"
+            )
+        config.update(
+            {
+                # The cycle horizon is an immutable capital identity. Model
+                # metadata and Web portfolio knobs may not reinterpret it.
+                # This is a model-plus-policy full-stack candidate, not the
+                # untouched transparent control. Keep the exact public rule
+                # baseline as provenance without claiming the control's
+                # sealed runner identity.
+                "recipe_id": strategy_recipe_id,
+                "autopilot_rule_baseline_recipe_id": recipe_id,
+                "autopilot_rule_baseline_recipe_version": recipe["version"],
+                "autopilot_rule_baseline_rules_sha256": config[
+                    "strategy_rules_sha256"
+                ],
+                "horizon_profile": profile,
+                "outer_purge_days": max(
+                    int(config.get("outer_purge_days") or 0),
+                    int(horizon.purge_sessions or 0),
+                ),
+                "outer_embargo_days": max(
+                    int(config.get("outer_embargo_days") or 0),
+                    int(horizon.embargo_sessions or 0),
+                ),
+                "min_backtest_days": max(
+                    int(config.get("min_backtest_days") or 0),
+                    int(horizon.sealed_oos_sessions or 0),
+                ),
+            }
+        )
     # These capital-boundary values are invariants, not user-selectable knobs.
     config.update(
         {
@@ -500,6 +587,7 @@ def build_long_only_strategy_config(
         }
     )
     config = normalize_model_signal_config(config)
+    config = normalize_horizon_config(config)
     config["execution_contract_hash"] = strategy_execution_contract_hash(config)
     require_strategy_execution_contract(config)
     return config
@@ -619,6 +707,7 @@ class AutopilotCompletionService:
         *,
         dataset: str,
         dataset_identity_sha256: str,
+        horizon_profile: str = LEGACY_AMBIGUOUS,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         kind = str(signal.get("kind") or "")
         config = signal.get("strategy_config")
@@ -712,6 +801,12 @@ class AutopilotCompletionService:
                 for model in models
             ):
                 raise ValueError("ensemble component is no longer independently admitted")
+            if any(
+                _model_horizon_profile(model) != horizon_profile for model in models
+            ):
+                raise _DatasetIdentityMismatch(
+                    "admitted ensemble does not match the requested horizon"
+                )
             periods = {
                 (
                     _iso(model.get("pre_final_end"), "pre-final end"),
@@ -738,6 +833,10 @@ class AutopilotCompletionService:
         ):
             raise _DatasetIdentityMismatch(
                 "admitted signal does not match the requested dataset identity"
+            )
+        if _model_horizon_profile(model) != horizon_profile:
+            raise _DatasetIdentityMismatch(
+                "admitted signal does not match the requested horizon"
             )
         selected = model
         if kind == "joint":
@@ -845,11 +944,15 @@ class AutopilotCompletionService:
         dataset: str,
         dataset_identity_sha256: str,
         allowed_candidate_ids: set[str] | frozenset[str] | None = None,
+        horizon_profile: str = LEGACY_AMBIGUOUS,
     ) -> dict[str, Any]:
         identity = _sha256(dataset_identity_sha256, "dataset identity")
         dataset_name = str(dataset or "").strip()
         if not dataset_name:
             raise ValueError("dataset is required")
+        profile = str(horizon_profile or LEGACY_AMBIGUOUS)
+        if profile not in SUPPORTED_HORIZON_PROFILES:
+            raise ValueError("autopilot selection horizon profile is unsupported")
         eligible: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
         for signal in self.candidates.list_admitted_strategy_signals(limit=500):
@@ -867,6 +970,7 @@ class AutopilotCompletionService:
                     signal,
                     dataset=dataset_name,
                     dataset_identity_sha256=identity,
+                    horizon_profile=profile,
                 )
                 grid_rows = self._grid_rows(kind=kind, candidate_id=candidate_id)
                 grid = aggregate_pre_final_grid(grid_rows)
@@ -1033,6 +1137,7 @@ class AutopilotCompletionService:
             "selection_policy_version": CHAMPION_SELECTION_POLICY_VERSION,
             "dataset": dataset_name,
             "dataset_identity_sha256": identity,
+            "horizon_profile": profile,
             "final_oos_opened": False,
             "candidate_preference": (
                 "frozen_incumbent_plus_three_window-qualified-joint-challengers"
@@ -1092,8 +1197,16 @@ class AutopilotCompletionService:
         dataset: str,
         dataset_identity_sha256: str,
         allowed_candidate_ids: set[str] | frozenset[str] | None = None,
+        horizon_profile: str = LEGACY_AMBIGUOUS,
     ) -> dict[str, Any]:
         result = dict(state or {})
+        profile = str(horizon_profile or LEGACY_AMBIGUOUS)
+        if profile not in SUPPORTED_HORIZON_PROFILES:
+            raise ValueError("autopilot selection horizon profile is unsupported")
+        state_profile = str(result.get("horizon_profile") or profile)
+        if state_profile != profile:
+            raise ValueError("frozen capital state belongs to another horizon")
+        result["horizon_profile"] = profile
         existing = result.get("champion_selection_evidence")
         existing_sha = result.get("champion_selection_evidence_sha256")
         if existing is not None or existing_sha is not None:
@@ -1106,8 +1219,12 @@ class AutopilotCompletionService:
                 existing.get("dataset") != dataset
                 or existing.get("dataset_identity_sha256")
                 != _sha256(dataset_identity_sha256, "dataset identity")
+                or str(existing.get("horizon_profile") or LEGACY_AMBIGUOUS)
+                != profile
             ):
-                raise ValueError("frozen champion belongs to another dataset identity")
+                raise ValueError(
+                    "frozen champion belongs to another dataset or horizon identity"
+                )
             if (
                 existing.get("contract_version")
                 != AUTOPILOT_COMPLETION_CONTRACT_VERSION
@@ -1143,6 +1260,7 @@ class AutopilotCompletionService:
                 },
                 dataset=dataset,
                 dataset_identity_sha256=str(existing["dataset_identity_sha256"]),
+                horizon_profile=profile,
             )
             return result
         result.update(
@@ -1150,6 +1268,7 @@ class AutopilotCompletionService:
                 dataset=dataset,
                 dataset_identity_sha256=dataset_identity_sha256,
                 allowed_candidate_ids=allowed_candidate_ids,
+                horizon_profile=profile,
             )
         )
         result["phase"] = "champion_frozen"
@@ -1201,6 +1320,17 @@ class AutopilotCompletionService:
         selection_sha = result.get("champion_selection_evidence_sha256")
         if not isinstance(selection, Mapping) or canonical_sha256(dict(selection)) != selection_sha:
             raise ValueError("a frozen champion selection is required")
+        profile = str(
+            selection.get("horizon_profile")
+            or result.get("horizon_profile")
+            or LEGACY_AMBIGUOUS
+        )
+        if profile not in SUPPORTED_HORIZON_PROFILES:
+            raise ValueError("frozen champion horizon profile is unsupported")
+        state_profile = str(result.get("horizon_profile") or profile)
+        if state_profile != profile:
+            raise ValueError("frozen champion and capital state horizons differ")
+        result["horizon_profile"] = profile
         signal_config = selection.get("selected_strategy_config")
         if not isinstance(signal_config, Mapping):
             raise ValueError("frozen champion has no DB-derived StrategySpec config")
@@ -1208,10 +1338,18 @@ class AutopilotCompletionService:
             signal_config=signal_config,
             portfolio_config=portfolio_config,
             selection_evidence_sha256=str(selection_sha),
+            horizon_profile=profile,
         )
         existing_version_id = str(result.get("strategy_version_id") or "")
         if existing_version_id:
             version = self.strategies.get_version(existing_version_id)
+            version_profile = str(
+                version.get("horizon_profile")
+                or (version.get("config") or {}).get("horizon_profile")
+                or LEGACY_AMBIGUOUS
+            )
+            if version_profile != profile:
+                raise ValueError("existing strategy version belongs to another horizon")
             config_sha = self._verify_version_binding(
                 version=version, state=result, expected_config=config
             )
@@ -1252,6 +1390,13 @@ class AutopilotCompletionService:
         if len(versions) != 1:
             raise ValueError("autopilot strategy family must contain exactly one frozen version")
         version = versions[0]
+        version_profile = str(
+            version.get("horizon_profile")
+            or (version.get("config") or {}).get("horizon_profile")
+            or LEGACY_AMBIGUOUS
+        )
+        if version_profile != profile:
+            raise ValueError("created strategy version belongs to another horizon")
         config_sha = self._verify_version_binding(
             version=version, state=result, expected_config=config
         )
@@ -1403,18 +1548,29 @@ class AutopilotCompletionService:
         forward_thresholds: ForwardGateThresholds | None = None,
     ) -> dict[str, Any]:
         result = dict(state)
-        thresholds = self._require_autopilot_forward_thresholds(
-            forward_thresholds or self._forward_thresholds()
-        )
-        forward_gate_state = {
-            "min_forward_calendar_days": thresholds.min_forward_calendar_days,
-            "min_decision_batches": thresholds.min_decision_batches,
-        }
         version_id = str(result.get("strategy_version_id") or "")
         backtest_id = str(result.get("formal_backtest_id") or "")
         if not version_id or not backtest_id:
             raise ValueError("approval requires a frozen strategy and formal backtest")
+        version = self.strategies.get_version(version_id)
+        horizon_profile = str(
+            version.get("horizon_profile")
+            or (version.get("config") or {}).get("horizon_profile")
+            or LEGACY_AMBIGUOUS
+        )
         selection = result.get("champion_selection_evidence")
+        selection_profile = (
+            str(selection.get("horizon_profile") or LEGACY_AMBIGUOUS)
+            if isinstance(selection, Mapping)
+            else LEGACY_AMBIGUOUS
+        )
+        if selection_profile != horizon_profile:
+            raise ValueError("strategy and frozen champion horizons differ")
+        thresholds = self._require_autopilot_forward_thresholds(
+            forward_thresholds or self._forward_thresholds(),
+            horizon_profile=horizon_profile,
+        )
+        forward_gate_state = asdict(thresholds)
         if not isinstance(selection, Mapping):
             raise ValueError("approval requires frozen champion evidence")
         periods = selection.get("selected_periods")
@@ -1434,7 +1590,6 @@ class AutopilotCompletionService:
                 str(result.get("formal_execution_dataset") or "") or None
             ),
         )
-        version = self.strategies.get_version(version_id)
         if str(version.get("status")) == "approved":
             if str(backtest.get("status") or "") != "succeeded":
                 raise ValueError(
@@ -1523,16 +1678,50 @@ class AutopilotCompletionService:
     @staticmethod
     def _require_autopilot_forward_thresholds(
         thresholds: ForwardGateThresholds,
+        *,
+        horizon_profile: str = LEGACY_AMBIGUOUS,
     ) -> ForwardGateThresholds:
-        """Never let a caller weaken the six-month paper boundary."""
+        """Reject a gate weaker than its frozen product-horizon authority."""
 
-        if thresholds.min_forward_calendar_days < 183:
+        profile = str(horizon_profile or LEGACY_AMBIGUOUS)
+        if profile == LEGACY_AMBIGUOUS:
+            if thresholds.min_forward_calendar_days < 183:
+                raise ValueError(
+                    "legacy autopilot paper gate requires at least 183 calendar days"
+                )
+            if thresholds.min_decision_batches < 126:
+                raise ValueError(
+                    "legacy autopilot paper gate requires at least 126 decision batches"
+                )
+            return thresholds
+        if profile not in SUPPORTED_HORIZON_PROFILES:
+            raise ValueError("autopilot paper gate horizon profile is unsupported")
+
+        minimum = forward_gate_thresholds_for_horizon(profile)
+        minimum_fields = (
+            "min_forward_calendar_days",
+            "min_forward_trading_days",
+            "min_decision_batches",
+            "min_completed_cycles",
+            "min_closed_round_trips",
+            "min_review_events",
+            "min_financial_report_reviews",
+        )
+        weaker = [
+            field
+            for field in minimum_fields
+            if int(getattr(thresholds, field)) < int(getattr(minimum, field))
+        ]
+        if thresholds.min_data_completeness < minimum.min_data_completeness:
+            weaker.append("min_data_completeness")
+        if thresholds.min_reconciliation_rate < minimum.min_reconciliation_rate:
+            weaker.append("min_reconciliation_rate")
+        if thresholds.max_cost_deviation > minimum.max_cost_deviation:
+            weaker.append("max_cost_deviation")
+        if weaker:
             raise ValueError(
-                "autopilot paper gate requires at least 183 calendar days"
-            )
-        if thresholds.min_decision_batches < 126:
-            raise ValueError(
-                "autopilot paper gate requires at least 126 decision batches"
+                f"autopilot paper gate is weaker than {profile}: "
+                + ", ".join(weaker)
             )
         return thresholds
 
@@ -1551,6 +1740,7 @@ class AutopilotCompletionService:
         benchmark: str = "SH000300",
         universe: str = "cn_all",
         forward_thresholds: ForwardGateThresholds | None = None,
+        horizon_profile: str = LEGACY_AMBIGUOUS,
     ) -> dict[str, Any]:
         """Advance the frozen champion without ever choosing a runner-up."""
 
@@ -1558,6 +1748,7 @@ class AutopilotCompletionService:
             state=state,
             dataset=dataset,
             dataset_identity_sha256=dataset_identity_sha256,
+            horizon_profile=horizon_profile,
         )
         result = self.ensure_strategy(
             state=result,

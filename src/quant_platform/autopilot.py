@@ -35,6 +35,10 @@ from .autopilot_completion import aggregate_pre_final_grid
 from .factor_autopilot import FactorAutopilotService
 from .factor_library_store import FactorLibraryStore
 from .feature_set_registry import get_feature_set
+from .horizon_factor_bundle import (
+    build_horizon_factor_bundle,
+    validate_horizon_factor_bundle,
+)
 from .job_store import JobStore
 from .model_ensemble import (
     EnsemblePredictionsPending,
@@ -57,7 +61,20 @@ from .rdagent_scenarios import (
     resolve_rdagent_assets,
 )
 from .research_asset_store import ResearchAssetStore
-from .research_automation import resolve_research_periods
+from .research_automation import resolve_research_periods, resolve_research_window_contract
+from .research_horizon import (
+    LEGACY_AMBIGUOUS,
+    LONG_1_3Y,
+    SHORT_1_5D,
+    SWING_1_6M,
+    primary_label_horizon_sessions,
+    primary_label_policy_contract,
+    primary_label_policy_sha256,
+)
+from .research_horizon import (
+    research_cadence_bucket as horizon_research_cadence_bucket,
+)
+from .research_label_binding import resolve_research_label_binding
 from .research_store import ResearchStore
 from .research_tournament import (
     FEATURE_SCREEN_IDS,
@@ -73,6 +90,7 @@ from .statistical_validation import holm_bonferroni
 AUTOPILOT_CONFIG_KEY = "autopilot"
 AUTOPILOT_CONTRACT_VERSION = "autopilot-v1"
 RDAGENT_INTEGRATION_CONTRACT_VERSION = "rdagent-integration-v4"
+AUTOPILOT_RESEARCH_HORIZONS = (SHORT_1_5D, SWING_1_6M, LONG_1_3Y)
 
 DEFAULT_AUTOPILOT_CONFIG: dict[str, Any] = {
     "contract_version": AUTOPILOT_CONTRACT_VERSION,
@@ -412,10 +430,11 @@ def _prediction_champion_identity_error(
 def _cycle_has_capital_commitment(cycle: dict[str, Any]) -> bool:
     """Return whether a cycle has crossed from research into capital validation.
 
-    A newly published daily dataset may supersede ordinary research work, but it
-    must never orphan a joint winner after the formal capital pipeline has
-    started.  The old immutable dataset remains available to finish that one
-    shot OOS attempt while a new research cycle consumes the latest publication.
+    A publication from a later cadence bucket may supersede ordinary research,
+    but it must never orphan a joint winner after the formal capital pipeline
+    has started.  The old immutable dataset remains available to finish that
+    one-shot OOS attempt while a new research cycle consumes the latest
+    publication.
     """
 
     branches = list(cycle.get("branches") or [])
@@ -432,12 +451,20 @@ class AutopilotStore:
     def __init__(self, database_url: str) -> None:
         self.engine = open_database(database_url)
 
-    def ensure_cycle(self, dataset: dict[str, Any], *, config_revision: int) -> dict[str, Any]:
+    def ensure_cycle(
+        self,
+        dataset: dict[str, Any],
+        *,
+        config_revision: int,
+        horizon_profile: str = SHORT_1_5D,
+    ) -> dict[str, Any]:
         provenance = dict(dataset.get("provenance") or {})
         identity = str(provenance.get("dataset_identity_sha256") or "")
         lineage = str(dataset.get("lineage_id") or provenance.get("dataset_lineage_id") or "")
         if len(identity) != 64 or len(lineage) != 64:
             raise ValueError("autopilot requires verified dataset identity and lineage")
+        primary_label = primary_label_horizon_sessions(horizon_profile)
+        policy_sha256 = primary_label_policy_sha256()
         now = _now()
         try:
             with self.engine.begin() as connection:
@@ -447,34 +474,55 @@ class AutopilotStore:
                         dataset=str(dataset["name"]),
                         dataset_identity_sha256=identity,
                         dataset_lineage_id=lineage,
+                        horizon_profile=horizon_profile,
+                        primary_label_policy_sha256=policy_sha256,
                         status="active",
                         stage="parallel_research",
                         config_revision=config_revision,
-                        state_json={"dataset_end_date": dataset.get("end_date")},
+                        state_json={
+                            "dataset_end_date": dataset.get("end_date"),
+                            "horizon_profile": horizon_profile,
+                            "label_horizon_sessions": primary_label,
+                            "primary_label_policy": primary_label_policy_contract(),
+                            "research_cadence_bucket": horizon_research_cadence_bucket(
+                                horizon_profile, str(dataset.get("end_date") or "")
+                            ),
+                        },
                         created_at=now,
                         updated_at=now,
                     )
                 )
         except IntegrityError:
             pass
-        return self.get_cycle_by_identity(identity)
+        return self.get_cycle_by_identity(identity, horizon_profile=horizon_profile)
 
-    def get_cycle_by_identity(self, identity: str) -> dict[str, Any]:
+    def get_cycle_by_identity(
+        self, identity: str, *, horizon_profile: str = SHORT_1_5D
+    ) -> dict[str, Any]:
         with self.engine.connect() as connection:
             row = connection.execute(
                 select(autopilot_cycles).where(
-                    autopilot_cycles.c.dataset_identity_sha256 == identity
+                    autopilot_cycles.c.dataset_identity_sha256 == identity,
+                    autopilot_cycles.c.horizon_profile == horizon_profile,
                 )
             ).first()
         if row is None:
             raise KeyError(identity)
         return self._decode_cycle(row_dict(row))
 
-    def latest_active_cycle(self) -> dict[str, Any] | None:
+    def latest_active_cycle(
+        self, *, horizon_profile: str | None = None
+    ) -> dict[str, Any] | None:
         with self.engine.connect() as connection:
+            statement = select(autopilot_cycles).where(
+                autopilot_cycles.c.status == "active"
+            )
+            if horizon_profile is not None:
+                statement = statement.where(
+                    autopilot_cycles.c.horizon_profile == horizon_profile
+                )
             row = connection.execute(
-                select(autopilot_cycles)
-                .where(autopilot_cycles.c.status == "active")
+                statement
                 .order_by(autopilot_cycles.c.created_at.desc())
                 .limit(1)
             ).first()
@@ -706,11 +754,18 @@ class AutopilotStore:
             )
         return self.get_branch(branch_id)
 
-    def latest_branch(self, scenario: str) -> dict[str, Any] | None:
+    def latest_branch(
+        self, scenario: str, *, horizon_profile: str | None = None
+    ) -> dict[str, Any] | None:
         with self.engine.connect() as connection:
+            statement = select(autopilot_branches)
+            if horizon_profile is not None:
+                statement = statement.join(
+                    autopilot_cycles,
+                    autopilot_cycles.c.id == autopilot_branches.c.cycle_id,
+                ).where(autopilot_cycles.c.horizon_profile == horizon_profile)
             row = connection.execute(
-                select(autopilot_branches)
-                .where(autopilot_branches.c.scenario == scenario)
+                statement.where(autopilot_branches.c.scenario == scenario)
                 .order_by(autopilot_branches.c.created_at.desc())
                 .limit(1)
             ).first()
@@ -854,6 +909,27 @@ class AutopilotStore:
     @staticmethod
     def _decode_cycle(row: dict[str, Any]) -> dict[str, Any]:
         row["state"] = row.pop("state_json")
+        profile = str(row.get("horizon_profile") or "")
+        policy = primary_label_policy_contract()
+        if profile == LEGACY_AMBIGUOUS:
+            state = dict(row["state"] or {})
+            if (
+                row.get("primary_label_policy_sha256")
+                != policy["policy_sha256"]
+                or state.get("primary_label_policy") != policy
+                or state.get("label_horizon_sessions") is not None
+                or state.get("historical_results_only") is not True
+                or state.get("migrated_from_unbound_autopilot_cycle") is not True
+            ):
+                raise ValueError("legacy autopilot cycle was reinterpreted as executable")
+            return row
+        if (
+            primary_label_horizon_sessions(profile)
+            != int((row["state"] or {}).get("label_horizon_sessions") or 0)
+            or row.get("primary_label_policy_sha256") != policy["policy_sha256"]
+            or (row["state"] or {}).get("primary_label_policy") != policy
+        ):
+            raise ValueError("autopilot cycle horizon or primary-label policy drifted")
         return row
 
     @staticmethod
@@ -893,10 +969,31 @@ class AutopilotController:
         config, revision = self.config()
         if not config["enabled"]:
             return {"cycles": 0, "branches": 0}
-        latest_dataset = self._latest_dataset()
-        if latest_dataset is None:
+        dataset = self._latest_dataset()
+        if dataset is None:
             return {"cycles": 0, "branches": 0}
-        dataset = latest_dataset
+        totals = {"cycles": 0, "branches": 0, "failed": 0}
+        for horizon_profile in AUTOPILOT_RESEARCH_HORIZONS:
+            result = self._tick_horizon(
+                current=current,
+                config=config,
+                revision=revision,
+                dataset=dataset,
+                horizon_profile=horizon_profile,
+            )
+            for key in totals:
+                totals[key] += int(result.get(key) or 0)
+        return totals
+
+    def _tick_horizon(
+        self,
+        *,
+        current: datetime,
+        config: dict[str, Any],
+        revision: int,
+        dataset: dict[str, Any],
+        horizon_profile: str,
+    ) -> dict[str, int]:
         latest_identity = str(
             (dataset.get("provenance") or {}).get("dataset_identity_sha256") or ""
         )
@@ -904,16 +1001,29 @@ class AutopilotController:
             str(item.get("name")): item
             for item in list_qlib_datasets(self.settings.data_root)
         }
+        listed_cycles = self.store.list_cycles(limit=500)
+        latest_cycle_is_active = any(
+            item.get("status") == "active"
+            and item.get("horizon_profile") == horizon_profile
+            and str(item.get("dataset_identity_sha256") or "") == latest_identity
+            for item in listed_cycles
+        )
+        cadence_bucket = horizon_research_cadence_bucket(
+            horizon_profile, str(dataset.get("end_date") or "")
+        )
+        continuing_cycle: dict[str, Any] | None = None
+        continuing_dataset: dict[str, Any] | None = None
         created = 0
         failed = 0
-        # Research follows the newest immutable daily publication immediately.
-        # Older in-flight research is allowed to finish for audit/history but is
-        # barred from SOTA and capital writes.  A cycle that already produced a
-        # joint winner is different: its one-shot capital OOS remains bound to
-        # the old immutable vintage and is advanced independently.
-        for stale_cycle in self.store.list_cycles(limit=500):
+        # Each weekly/monthly/quarterly event stays on the immutable publication
+        # that started it.  A newer daily snapshot in that same bucket waits for
+        # the in-flight event to finish; a later bucket supersedes ordinary work.
+        # A cycle that already produced a joint winner is different: its one-shot
+        # capital OOS remains bound to the old vintage and advances independently.
+        for stale_cycle in listed_cycles:
             if (
                 stale_cycle.get("status") != "active"
+                or stale_cycle.get("horizon_profile") != horizon_profile
                 or str(stale_cycle.get("dataset_identity_sha256") or "")
                 == latest_identity
             ):
@@ -942,26 +1052,102 @@ class AutopilotController:
                 )
                 created += capital_created
                 failed += capital_failed
+            elif (
+                not latest_cycle_is_active
+                and continuing_cycle is None
+                and horizon_research_cadence_bucket(
+                    horizon_profile,
+                    str(
+                        (stale_cycle.get("state") or {}).get("dataset_end_date")
+                        or stale_dataset.get("end_date")
+                        or ""
+                    ),
+                )
+                == cadence_bucket
+            ):
+                # One immutable publication owns the complete research event.
+                # A newer daily snapshot inside the same week/month/quarter
+                # cannot pause it and then suppress its replacement via the
+                # cadence gate.  Finish this cycle; the latest publication is
+                # consumed after the owner reaches a terminal state.
+                continuing_cycle = stale_cycle
+                continuing_dataset = stale_dataset
             else:
                 self.store.supersede_research_cycle(
                     str(stale_cycle["id"]),
                     replacement_dataset=dataset,
                 )
-        cycle = self.store.ensure_cycle(dataset, config_revision=revision)
+        if continuing_cycle is not None and continuing_dataset is not None:
+            cycle = continuing_cycle
+            dataset = continuing_dataset
+        else:
+            cycle = self.store.ensure_cycle(
+                dataset,
+                config_revision=revision,
+                horizon_profile=horizon_profile,
+            )
         if cycle.get("status") != "active":
             return {
                 "cycles": 1,
                 "branches": created,
                 "failed": failed + int(cycle.get("status") == "blocked"),
             }
+        factor_due = self._factor_due(
+            dataset,
+            current,
+            config,
+            horizon_profile=horizon_profile,
+        )
+        model_due = self._model_due(
+            dataset,
+            current,
+            config,
+            horizon_profile=horizon_profile,
+        )
+        cycle = self.store.get_cycle(str(cycle["id"]))
+        research_already_started = bool(cycle.get("branches")) or bool(
+            (cycle.get("state") or {}).get("research_tournament_id")
+        )
+        if not factor_due and not model_due and not research_already_started:
+            self.store.set_cycle_state(
+                str(cycle["id"]),
+                state={
+                    **dict(cycle.get("state") or {}),
+                    "result": "research_cadence_not_due",
+                    "research_cadence_bucket": horizon_research_cadence_bucket(
+                        horizon_profile, str(dataset.get("end_date") or "")
+                    ),
+                },
+                stage="complete",
+                status="succeeded",
+                finished=True,
+            )
+            return {"cycles": 1, "branches": created, "failed": failed}
         cycle = self._roll_forward_prediction_champion(cycle, dataset)
         if cycle.get("status") == "succeeded":
             return {"cycles": 1, "branches": created, "failed": failed}
-        factor_due = self._factor_due(current, config)
-        model_due = self._model_due(dataset, current, config)
-        sota_feature_set_id = self._active_sota_feature_set_id(dataset)
+        sota_feature_set_id = self._active_sota_feature_set_id(
+            dataset, horizon_profile=horizon_profile
+        )
+        cycle = self._ensure_horizon_factor_bundle(
+            cycle,
+            dataset,
+            feature_set_id=(
+                sota_feature_set_id or str(config["model_feature_set_id"])
+            ),
+        )
         revalidation_pending = self._current_identity_revalidation_pending(cycle, dataset)
-        if revalidation_pending and not model_due:
+        try:
+            existing_model_tournament = self.tournaments.get_for_cycle(
+                str(cycle["id"])
+            )
+        except KeyError:
+            existing_model_tournament = None
+        if (
+            revalidation_pending
+            and not model_due
+            and existing_model_tournament is None
+        ):
             revalidation_created, revalidation_failed = (
                 self._ensure_current_identity_revalidation(cycle, dataset)
             )
@@ -981,7 +1167,9 @@ class AutopilotController:
         try:
             tournament = (
                 None
-                if revalidation_pending and not model_due
+                if revalidation_pending
+                and not model_due
+                and existing_model_tournament is None
                 else self.tournaments.get_for_cycle(str(cycle["id"]))
             )
         except KeyError:
@@ -1061,15 +1249,18 @@ class AutopilotController:
             ),
             None,
         )
-        try:
-            if report_active:
-                pass
-            elif report_retry is not None:
-                created += int(self._retry_failed_branch(report_retry))
-            else:
-                created += self._enqueue_reports(cycle, dataset, config=config, now=current)
-        except ValueError:
-            failed += 1
+        if horizon_profile == SHORT_1_5D:
+            try:
+                if report_active:
+                    pass
+                elif report_retry is not None:
+                    created += int(self._retry_failed_branch(report_retry))
+                else:
+                    created += self._enqueue_reports(
+                        cycle, dataset, config=config, now=current
+                    )
+            except ValueError:
+                failed += 1
         factor_sota_branches = [
             branch
             for branch in self.store.get_cycle(cycle["id"])["branches"]
@@ -1095,6 +1286,7 @@ class AutopilotController:
                     lane = self.factor_autopilot.ensure_incremental_lane(
                         cycle=cycle,
                         dataset=dataset,
+                        horizon_profile=horizon_profile,
                     )
                     if lane is not None:
                         self.store.create_branch(
@@ -1411,50 +1603,56 @@ class AutopilotController:
             default=None,
         )
 
-    def _factor_due(self, now: datetime, config: dict[str, Any]) -> bool:
-        latest = self.store.latest_branch("fin_factor")
-        return latest is None or _branch_created_at(latest) <= now - timedelta(
-            days=int(config["factor_research_interval_days"])
+    def _factor_due(
+        self,
+        dataset: dict[str, Any],
+        now: datetime,
+        config: dict[str, Any],
+        *,
+        horizon_profile: str = SHORT_1_5D,
+    ) -> bool:
+        del now, config
+        return self._horizon_branch_due(
+            "fin_factor", dataset, horizon_profile=horizon_profile
         )
 
     def _model_due(
-        self, dataset: dict[str, Any], now: datetime, config: dict[str, Any]
+        self,
+        dataset: dict[str, Any],
+        now: datetime,
+        config: dict[str, Any],
+        *,
+        horizon_profile: str = SHORT_1_5D,
     ) -> bool:
-        with self.engine.connect() as connection:
-            has_admitted = connection.scalar(
-                select(model_candidates.c.id)
-                .where(
-                    model_candidates.c.status == "research_admitted",
-                )
-                .limit(1)
-            )
-        latest = self.store.latest_branch("fin_model")
+        del now, config
+        return self._horizon_branch_due(
+            "fin_model", dataset, horizon_profile=horizon_profile
+        )
+
+    def _horizon_branch_due(
+        self,
+        scenario: str,
+        dataset: dict[str, Any],
+        *,
+        horizon_profile: str,
+    ) -> bool:
+        latest = self.store.latest_branch(
+            scenario, horizon_profile=horizon_profile
+        )
         if latest is None:
             return True
-        # A new daily data identity is used for inference and paper valuation;
-        # it must not trigger a full four-model tournament every night.  Model
-        # research follows its explicit monthly cadence.  If no model has ever
-        # passed, one exhausted run may be challenged again after seven days,
-        # rather than spinning on every publication.
-        if has_admitted is None:
-            return _branch_created_at(latest) <= now - timedelta(days=7)
-        # With an incumbent, research runs once for each market-data month.
-        # The first published trading-day snapshot of a new month triggers it;
-        # a brief outage on that day is recovered by the next snapshot in the
-        # same month instead of silently skipping a whole month.
-        current_end = str(dataset.get("end_date") or "")
         try:
-            current_month = date.fromisoformat(current_end).replace(day=1)
             source_cycle = self.store.get_cycle(str(latest["cycle_id"]))
             source_end = str((source_cycle.get("state") or {}).get("dataset_end_date") or "")
-            source_month = date.fromisoformat(source_end).replace(day=1)
         except (KeyError, TypeError, ValueError):
-            # Legacy rows without a frozen dataset date retain the old bounded
-            # cadence until the first new monthly run creates a complete row.
-            return _branch_created_at(latest) <= now - timedelta(
-                days=int(config["model_research_interval_days"])
-            )
-        return source_month < current_month
+            return True
+        if source_cycle.get("horizon_profile") != horizon_profile:
+            raise ValueError("automatic research branch belongs to another horizon")
+        return horizon_research_cadence_bucket(
+            horizon_profile, source_end
+        ) != horizon_research_cadence_bucket(
+            horizon_profile, str(dataset.get("end_date") or "")
+        )
 
     def _ensure_platform_model_branches(
         self,
@@ -1484,10 +1682,19 @@ class AutopilotController:
             .read_text(encoding="utf-8")
             .splitlines()
         )
-        periods, resolution = resolve_research_periods(calendar)
+        horizon_profile = str(cycle.get("horizon_profile") or "")
+        primary_label = primary_label_horizon_sessions(horizon_profile)
+        policy = primary_label_policy_contract()
         created = 0
         failed = 0
         for feature_set_id, trials in by_feature.items():
+            feature_set = get_feature_set(feature_set_id)
+            periods, resolution = resolve_research_window_contract(
+                dataset,
+                calendar,
+                horizon_profile=horizon_profile,
+                feature_set=feature_set,
+            )
             scope = f"platform:{stage}:{feature_set_id}"
             branch = self.store.branch_for_scope(str(cycle["id"]), "fin_model", scope)
             if branch is not None:
@@ -1503,6 +1710,15 @@ class AutopilotController:
                     feature_set_id=feature_set_id,
                     periods=periods,
                     evaluation_profiles=resolution["evaluation_profiles"],
+                    horizon_profile=horizon_profile,
+                    label_horizon_sessions=primary_label,
+                    primary_label_policy=policy,
+                    research_window_contract=resolution[
+                        "research_window_contract"
+                    ],
+                    research_window_contract_sha256=resolution[
+                        "research_window_contract_sha256"
+                    ],
                     trials=trials,
                 )
                 bindings: list[dict[str, str]] = []
@@ -1525,6 +1741,11 @@ class AutopilotController:
                         "tournament_stage": stage,
                         "feature_set_id": feature_set_id,
                         "tournament_id": str(tournament["id"]),
+                        "horizon_profile": horizon_profile,
+                        "label_horizon_sessions": primary_label,
+                        "primary_label_policy_sha256": policy[
+                            "policy_sha256"
+                        ],
                         "candidate_bindings": bindings,
                         "final_oos_opened": False,
                     },
@@ -1698,7 +1919,9 @@ class AutopilotController:
                 .read_text(encoding="utf-8")
                 .splitlines()
             )
-            periods, resolution = resolve_research_periods(calendar)
+            horizon_profile = str(cycle.get("horizon_profile") or "")
+            primary_label = primary_label_horizon_sessions(horizon_profile)
+            policy = primary_label_policy_contract()
             trials_by_source = {
                 str((item.get("spec") or {}).get("source_model_candidate_id") or ""): item
                 for item in tournament["trials"]
@@ -1708,6 +1931,13 @@ class AutopilotController:
                 groups.setdefault(str(component["feature_set_id"]), []).append(component)
             created = 0
             for feature_set_id, group in sorted(groups.items()):
+                feature_set = get_feature_set(feature_set_id)
+                periods, resolution = resolve_research_window_contract(
+                    dataset,
+                    calendar,
+                    horizon_profile=horizon_profile,
+                    feature_set=feature_set,
+                )
                 scope = f"revalidation:{feature_set_id}"
                 branch = self.store.branch_for_scope(cycle["id"], "fin_model", scope)
                 if branch is not None:
@@ -1722,6 +1952,15 @@ class AutopilotController:
                     dataset=dataset,
                     periods=periods,
                     evaluation_profiles=resolution["evaluation_profiles"],
+                    horizon_profile=horizon_profile,
+                    label_horizon_sessions=primary_label,
+                    primary_label_policy=policy,
+                    research_window_contract=resolution[
+                        "research_window_contract"
+                    ],
+                    research_window_contract_sha256=resolution[
+                        "research_window_contract_sha256"
+                    ],
                     source_components=group,
                     trials=trials,
                     source_manifest_sha256=str(tournament["manifest_sha256"]),
@@ -1743,6 +1982,11 @@ class AutopilotController:
                         "branch_kind": "champion_current_identity_revalidation",
                         "tournament_id": str(tournament["id"]),
                         "feature_set_id": feature_set_id,
+                        "horizon_profile": horizon_profile,
+                        "label_horizon_sessions": primary_label,
+                        "primary_label_policy_sha256": policy[
+                            "policy_sha256"
+                        ],
                         "candidate_bindings": bindings,
                         "final_oos_opened": False,
                         "research_screening_only": True,
@@ -3674,6 +3918,8 @@ class AutopilotController:
         for predecessor in self.store.list_cycles(limit=500):
             if str(predecessor.get("id")) == str(cycle.get("id")):
                 continue
+            if predecessor.get("horizon_profile") != cycle.get("horizon_profile"):
+                continue
             if str(predecessor.get("dataset_lineage_id") or "") != lineage_id:
                 continue
             predecessor_state = dict(predecessor.get("state") or {})
@@ -3776,12 +4022,102 @@ class AutopilotController:
             )
         return cycle
 
-    def _active_sota_feature_set_id(self, dataset: dict[str, Any]) -> str | None:
-        resolved = self.factor_autopilot.resolve_active_sota(dataset)
+    def _active_sota_feature_set_id(
+        self,
+        dataset: dict[str, Any],
+        *,
+        horizon_profile: str = SHORT_1_5D,
+    ) -> str | None:
+        resolved = self.factor_autopilot.resolve_active_sota(
+            dataset,
+            horizon_profile=horizon_profile,
+        )
         if resolved is None:
             return None
         definition = dict(resolved["feature_set"])
         return str(definition["id"])
+
+    def _ensure_horizon_factor_bundle(
+        self,
+        cycle: dict[str, Any],
+        dataset: dict[str, Any],
+        *,
+        feature_set_id: str,
+    ) -> dict[str, Any]:
+        """Freeze the base/SOTA factor champion on its existing cycle.
+
+        Alpha158 (or the configured immutable base) is a real incumbent even
+        before RD-Agent admits an incremental factor.  Recording an empty-
+        increment bundle gives every horizon a content-addressed champion
+        identity without opening another research or promotion path.
+        """
+
+        state = dict(cycle.get("state") or {})
+        existing = state.get("horizon_factor_bundle")
+        if existing is not None:
+            validated = validate_horizon_factor_bundle(existing)
+            if (
+                state.get("horizon_factor_bundle_sha256")
+                != validated["bundle_sha256"]
+                or validated["horizon_profile"]
+                != cycle.get("horizon_profile")
+                or validated["dataset_identity_sha256"]
+                != cycle.get("dataset_identity_sha256")
+            ):
+                raise ValueError("autopilot horizon factor champion changed in place")
+            return cycle
+
+        feature_set = get_feature_set(feature_set_id)
+        calendar = (
+            (Path(str(dataset["path"])) / "calendars" / "day.txt")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        horizon_profile = str(cycle.get("horizon_profile") or "")
+        periods, resolution = resolve_research_window_contract(
+            dataset,
+            calendar,
+            horizon_profile=horizon_profile,
+            feature_set=feature_set,
+        )
+        label_binding = resolve_research_label_binding(
+            {
+                "horizon_profile": horizon_profile,
+                "dataset": str(dataset["name"]),
+                "dataset_identity_sha256": str(
+                    dataset["provenance"]["dataset_identity_sha256"]
+                ),
+                "periods": periods,
+                "feature_set": feature_set,
+                "research_window_contract": resolution[
+                    "research_window_contract"
+                ],
+                "research_window_contract_sha256": resolution[
+                    "research_window_contract_sha256"
+                ],
+                "label_horizon_sessions": primary_label_horizon_sessions(
+                    horizon_profile
+                ),
+            }
+        )
+        if label_binding is None:
+            raise ValueError("active horizon factor champion has no label binding")
+        bundle = build_horizon_factor_bundle(
+            feature_set=feature_set,
+            incremental_factors=[],
+            research_label_binding=label_binding,
+        )
+        return self.store.patch_cycle_state(
+            str(cycle["id"]),
+            state_patch={
+                "horizon_factor_bundle": bundle,
+                "horizon_factor_bundle_sha256": bundle["bundle_sha256"],
+                "horizon_factor_bundle_feature_set_id": feature_set["id"],
+                "horizon_factor_bundle_research_label_binding_sha256": (
+                    label_binding["binding_sha256"]
+                ),
+            },
+        )
 
     def _quant_input_sha256(
         self, cycle: dict[str, Any], dataset: dict[str, Any]
@@ -3819,7 +4155,11 @@ class AutopilotController:
             != model_selection.get("evidence_sha256")
         ):
             return None
-        sota_feature_set_id = self._active_sota_feature_set_id(dataset)
+        horizon_profile = str(cycle.get("horizon_profile") or "")
+        primary_label_horizon_sessions(horizon_profile)
+        sota_feature_set_id = self._active_sota_feature_set_id(
+            dataset, horizon_profile=horizon_profile
+        )
         sota_definition_sha256 = (
             str(get_feature_set(sota_feature_set_id)["definition_sha256"])
             if sota_feature_set_id
@@ -3909,7 +4249,11 @@ class AutopilotController:
             )
         if has_prediction_champion is None or active_parallel is not None:
             return False
-        latest = self.store.latest_branch("fin_quant")
+        horizon_profile = str(cycle.get("horizon_profile") or "")
+        primary_label_horizon_sessions(horizon_profile)
+        latest = self.store.latest_branch(
+            "fin_quant", horizon_profile=horizon_profile
+        )
         if latest is None:
             return True
         if (latest.get("details") or {}).get("quant_input_sha256") == input_sha256:
@@ -3994,13 +4338,6 @@ class AutopilotController:
             .read_text(encoding="utf-8")
             .splitlines()
         )
-        periods, resolution = resolve_research_periods(calendar)
-        resolved_assets = resolve_rdagent_assets(
-            self.settings,
-            scenario,
-            asset_ids or [],
-            pre_final_end=date.fromisoformat(periods["valid_end"]),
-        )
         feature_set = (
             get_feature_set(
                 feature_set_id
@@ -4012,6 +4349,33 @@ class AutopilotController:
             )
             if scenario.requires_feature_set
             else None
+        )
+        active_horizon = (
+            str(cycle.get("horizon_profile") or "")
+            if scenario_id in {"fin_factor", "fin_model", "fin_quant"}
+            else None
+        )
+        if active_horizon is not None:
+            primary_label = primary_label_horizon_sessions(active_horizon)
+            policy = primary_label_policy_contract()
+            if (
+                cycle.get("primary_label_policy_sha256") != policy["policy_sha256"]
+                or (cycle.get("state") or {}).get("primary_label_policy") != policy
+            ):
+                raise ValueError("autopilot cycle primary-label policy changed")
+            periods, resolution = resolve_research_window_contract(
+                dataset,
+                calendar,
+                horizon_profile=active_horizon,
+                feature_set=feature_set,
+            )
+        else:
+            periods, resolution = resolve_research_periods(calendar)
+        resolved_assets = resolve_rdagent_assets(
+            self.settings,
+            scenario,
+            asset_ids or [],
+            pre_final_end=date.fromisoformat(periods["valid_end"]),
         )
         config_prefix = {
             "fin_factor": "factor",
@@ -4047,7 +4411,11 @@ class AutopilotController:
         ).hexdigest()[:16]
         manifest_sha256 = resolved_assets["manifest_sha256"]
         run = self.research.create_run(
-            kind=scenario.research_kind,
+            kind=(
+                f"{scenario.research_kind}:{active_horizon}"
+                if active_horizon is not None
+                else scenario.research_kind
+            ),
             objective=objective,
             dataset=str(dataset["name"]),
             requested_by="autopilot",
@@ -4064,6 +4432,22 @@ class AutopilotController:
                 "asset_ids": list(manifest_sha256),
                 "asset_manifest_sha256": manifest_sha256,
                 "feature_set": feature_set,
+                **(
+                    {
+                        "horizon_profile": active_horizon,
+                        "primary_label_policy": policy,
+                        "primary_label_policy_sha256": policy["policy_sha256"],
+                        "research_window_contract": resolution[
+                            "research_window_contract"
+                        ],
+                        "research_window_contract_sha256": resolution[
+                            "research_window_contract_sha256"
+                        ],
+                        "label_horizon_sessions": primary_label,
+                    }
+                    if active_horizon is not None
+                    else {}
+                ),
                 "expected_rdagent_runtime": expected_runtime,
                 **(
                     {
@@ -4111,6 +4495,24 @@ class AutopilotController:
                     "asset_ids": list(manifest_sha256),
                     "asset_manifest_sha256": manifest_sha256,
                     "feature_set": feature_set,
+                    **(
+                        {
+                            "horizon_profile": active_horizon,
+                            "primary_label_policy": policy,
+                            "primary_label_policy_sha256": policy[
+                                "policy_sha256"
+                            ],
+                            "research_window_contract": resolution[
+                                "research_window_contract"
+                            ],
+                            "research_window_contract_sha256": resolution[
+                                "research_window_contract_sha256"
+                            ],
+                            "label_horizon_sessions": primary_label,
+                        }
+                        if active_horizon is not None
+                        else {}
+                    ),
                     "research_tournament_id": tournament_id,
                     "expected_rdagent_runtime": expected_runtime,
                     **(
@@ -4154,6 +4556,12 @@ class AutopilotController:
                         "dataset_identity_sha256"
                     ],
                     "feature_set_id": feature_set["id"] if feature_set else None,
+                    "horizon_profile": active_horizon,
+                    "primary_label_policy_sha256": (
+                        policy["policy_sha256"]
+                        if active_horizon is not None
+                        else None
+                    ),
                     "research_tournament_id": tournament_id,
                     "asset_ids": list(manifest_sha256),
                     "final_oos_opened": False,

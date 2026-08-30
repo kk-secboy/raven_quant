@@ -274,6 +274,12 @@ def build_quant_preregistered_manifest(
         candidate_baseline_sha = str(
             candidate.get("baseline_prediction_champion_sha256") or ""
         ).lower()
+        label_binding_sha = str(
+            candidate.get("research_label_binding_sha256") or ""
+        ).lower()
+        factor_bundle_sha = str(
+            candidate.get("horizon_factor_bundle_sha256") or ""
+        ).lower()
         if (
             not candidate_id
             or candidate_id in seen
@@ -283,6 +289,22 @@ def build_quant_preregistered_manifest(
             or len(feature_sha) != 64
             or any(character not in "0123456789abcdef" for character in feature_sha)
             or candidate_baseline_sha != baseline_sha
+            or (
+                bool(label_binding_sha)
+                and (
+                    len(label_binding_sha) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in label_binding_sha
+                    )
+                    or len(factor_bundle_sha) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in factor_bundle_sha
+                    )
+                )
+            )
+            or (not label_binding_sha and bool(factor_bundle_sha))
         ):
             raise ValueError("fin_quant preregistration candidate is invalid")
         seen.add(candidate_id)
@@ -310,6 +332,14 @@ def build_quant_preregistered_manifest(
                     "feature_set_id": str(candidate.get("feature_set_id") or ""),
                     "feature_set_definition_sha256": feature_sha,
                     "baseline_prediction_champion_sha256": baseline_sha,
+                    **(
+                        {
+                            "research_label_binding_sha256": label_binding_sha,
+                            "horizon_factor_bundle_sha256": factor_bundle_sha,
+                        }
+                        if label_binding_sha
+                        else {}
+                    ),
                     "required_ablations": list(QUANT_SCREENING_ABLATIONS),
                     "profiles": list(FULL_PROFILES),
                     "seeds": list(FULL_SEEDS),

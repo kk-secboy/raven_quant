@@ -28,6 +28,10 @@ from quant_platform.qlib_factor_baseline import (
 )
 from quant_platform.strategy_recipes import get_strategy_recipe
 from quant_platform.strategy_store import StrategyStore
+from quant_platform.transparent_baseline_runner import (
+    POSITION_RISK_TARGET_RUNNER_SHA256,
+    POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256,
+)
 
 
 def _core_config(
@@ -311,6 +315,12 @@ def test_swing_family_starts_from_qlib_baseline_before_rdagent_challengers(
     assert version["factors"] == []
     assert version["config"]["baseline_definition"]["frequency"] == "day"
     assert len(version["config"]["baseline_definition"]["factors"]) == 6
+    runtime = version["config"]["transparent_baseline_bootstrap"]
+    assert runtime["target_runner_sha256"] == POSITION_RISK_TARGET_RUNNER_SHA256
+    assert runtime["target_runtime_bundle_sha256"] == (
+        POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
+    )
+    assert runtime["target_worker_runtime_image_digest"] == "sha256:" + "d" * 64
 
 
 def test_baseline_approval_validates_expression_artifacts_hashes_and_recorder(

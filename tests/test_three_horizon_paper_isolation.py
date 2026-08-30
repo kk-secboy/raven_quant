@@ -7,9 +7,9 @@ from quant_platform.promotion import _autopilot_paper_accounts_compete
 @pytest.mark.parametrize(
     ("current", "prior", "expected"),
     [
-        ("short_1_5d", "short_1_5d", True),
-        ("swing_1_6m", "swing_1_6m", True),
-        ("long_1_3y", "long_1_3y", True),
+        ("short_1_5d", "short_1_5d", False),
+        ("swing_1_6m", "swing_1_6m", False),
+        ("long_1_3y", "long_1_3y", False),
         ("short_1_5d", "swing_1_6m", False),
         ("short_1_5d", "long_1_3y", False),
         ("swing_1_6m", "long_1_3y", False),
@@ -18,7 +18,7 @@ from quant_platform.promotion import _autopilot_paper_accounts_compete
         (None, None, True),
     ],
 )
-def test_autopilot_paper_accounts_only_compete_inside_one_explicit_horizon(
+def test_explicit_horizon_challengers_keep_independent_paper_accounts(
     current: str | None,
     prior: str | None,
     expected: bool,

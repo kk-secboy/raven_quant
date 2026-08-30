@@ -99,6 +99,10 @@ from .recommendation_account_store import RecommendationAccountStore
 from .recommendation_store import RecommendationStore
 from .report_rc_factors import FACTOR_NAMES as REPORT_RC_FACTOR_NAMES
 from .report_rc_factors import default_factors_dir as report_rc_factors_dir
+from .research_horizon import (
+    primary_label_policy_contract,
+    research_cadence_bucket,
+)
 from .research_label_binding import (
     resolve_research_label_binding,
     validate_research_label_binding,
@@ -151,7 +155,9 @@ from .strategy_rule_compiler import (
 from .strategy_store import StrategyStore
 from .transparent_baseline_runner import (
     TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
     require_transparent_baseline_runner,
 )
 
@@ -4528,6 +4534,13 @@ class LocalJobWorker:
                 manifest[TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD] = (
                     runtime_bundle_sha256
                 )
+            worker_runtime_image_digest = dict(
+                version["config"].get("transparent_baseline_bootstrap") or {}
+            ).get(TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD)
+            if worker_runtime_image_digest is not None:
+                manifest[TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD] = (
+                    worker_runtime_image_digest
+                )
             manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -5451,12 +5464,17 @@ class LocalJobWorker:
             if item.get("hypothesis") is not None:
                 variables["hypothesis"] = item["hypothesis"]
             if label_binding is not None:
+                policy = primary_label_policy_contract()
                 variables.update(
                     {
                         "horizon_profile": label_binding["horizon_profile"],
                         "research_label_binding": label_binding,
                         "research_label_binding_sha256": label_binding[
                             "binding_sha256"
+                        ],
+                        "primary_label_policy": policy,
+                        "primary_label_policy_sha256": policy[
+                            "policy_sha256"
                         ],
                         "rdagent_reported_label_horizon_days": item.get(
                             "label_horizon_days"
@@ -6999,6 +7017,7 @@ class LocalJobWorker:
         periods = payload.get("periods") or {}
         if not feature_set.get("id") or not periods.get("valid_end"):
             raise ValueError("model candidates have no governed feature set or cutoff")
+        label_binding = resolve_research_label_binding(payload)
         imported: list[dict] = []
         for item in result.get("model_candidates") or []:
             code_path_value = _local_artifact_path(item.get("code_path"))
@@ -7046,6 +7065,7 @@ class LocalJobWorker:
                 pre_final_end=date.fromisoformat(str(periods["valid_end"])),
                 final_oos_start=date.fromisoformat(str(periods["test_start"])),
                 final_oos_end=date.fromisoformat(str(periods["test_end"])),
+                research_label_binding=label_binding,
                 source_iteration=item.get("source_iteration"),
                 rdagent_decision=item.get("rdagent_decision"),
                 rdagent_feedback=item.get("rdagent_feedback"),
@@ -7584,6 +7604,7 @@ class LocalJobWorker:
                 pre_final_end=date.fromisoformat(str(periods["valid_end"])),
                 final_oos_start=date.fromisoformat(str(periods["test_start"])),
                 final_oos_end=date.fromisoformat(str(periods["test_end"])),
+                research_label_binding=label_binding,
                 source_iteration=bundle.get("source_iteration"),
                 rdagent_decision=bundle.get("rdagent_decision"),
                 rdagent_feedback=bundle.get("rdagent_feedback"),
@@ -7654,6 +7675,18 @@ class LocalJobWorker:
                         if label_binding is not None
                         else None
                     ),
+                    **(
+                        {
+                            "horizon_factor_bundle": governed[
+                                "bundle_manifest_json"
+                            ]["horizon_factor_bundle"],
+                            "horizon_factor_bundle_sha256": governed[
+                                "bundle_manifest_json"
+                            ]["horizon_factor_bundle_sha256"],
+                        }
+                        if label_binding is not None
+                        else {}
+                    ),
                     "factors": [
                         {
                             **factor,
@@ -7691,6 +7724,13 @@ class LocalJobWorker:
                     ),
                     "research_label_binding_sha256": (
                         label_binding["binding_sha256"]
+                        if label_binding is not None
+                        else None
+                    ),
+                    "horizon_factor_bundle_sha256": (
+                        governed["bundle_manifest_json"][
+                            "horizon_factor_bundle_sha256"
+                        ]
                         if label_binding is not None
                         else None
                     ),
@@ -8191,13 +8231,25 @@ class LocalJobWorker:
             key=lambda item: (str(item.get("end_date") or ""), str(item["name"])),
             default=None,
         )
-        if (
-            latest_daily is None
-            or str((latest_daily.get("provenance") or {}).get("dataset_identity_sha256") or "")
-            != str(payload["dataset_identity_sha256"])
+        if latest_daily is None:
+            raise ValueError(
+                "factor SOTA result has no published daily Qlib comparison identity"
+            )
+        latest_identity = str(
+            (latest_daily.get("provenance") or {}).get(
+                "dataset_identity_sha256"
+            )
+            or ""
+        )
+        bound_identity = str(payload["dataset_identity_sha256"])
+        horizon_profile = str(payload.get("horizon_profile") or "")
+        if latest_identity != bound_identity and research_cadence_bucket(
+            horizon_profile, str(latest_daily.get("end_date") or "")
+        ) != research_cadence_bucket(
+            horizon_profile, str(payload.get("dataset_end_date") or "")
         ):
             raise ValueError(
-                "factor SOTA result is not bound to the latest published daily Qlib identity"
+                "factor SOTA result belongs to a superseded research cadence"
             )
         with self.factor_library.engine.begin() as connection:
             connection.execute(
@@ -8207,6 +8259,7 @@ class LocalJobWorker:
             cycle = connection.execute(
                 select(
                     autopilot_cycles.c.status,
+                    autopilot_cycles.c.horizon_profile,
                     autopilot_cycles.c.dataset_identity_sha256,
                     autopilot_cycles.c.state_json,
                 )
@@ -8220,6 +8273,7 @@ class LocalJobWorker:
             if (
                 cycle is None
                 or str(cycle.status) != "active"
+                or str(cycle.horizon_profile) != horizon_profile
                 or str(cycle.dataset_identity_sha256)
                 != str(payload["dataset_identity_sha256"])
                 or cycle_state.get("historical_results_only") is True
@@ -8374,6 +8428,7 @@ class LocalJobWorker:
             )
             if label_binding is not None:
                 variables = dict(item.get("variables") or {})
+                policy = primary_label_policy_contract()
                 if (
                     int(item.get("label_horizon_days") or 0)
                     != int(label_binding["label_horizon_sessions"])
@@ -8383,6 +8438,9 @@ class LocalJobWorker:
                         variables.get("research_label_binding") or {}
                     )
                     != label_binding
+                    or variables.get("primary_label_policy") != policy
+                    or variables.get("primary_label_policy_sha256")
+                    != policy["policy_sha256"]
                 ):
                     raise ValueError(
                         "factor candidate label differs from its verified research window"

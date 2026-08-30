@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,30 @@ STANDARD_AUDIT_OPINIONS = frozenset(
         "unqualified",
         "标准无保留意见",
         "无保留意见",
+    }
+)
+
+INSTRUMENT_RISK_STATES = frozenset(
+    {"normal", "watch", "restricted", "reduce", "exit"}
+)
+_RISK_STATE_SEVERITY = {
+    "normal": 0,
+    "watch": 1,
+    "restricted": 2,
+    "reduce": 3,
+    "exit": 4,
+}
+_SEVERE_AUDIT_OPINIONS = frozenset(
+    {
+        "adverse",
+        "adverse_opinion",
+        "disclaimer",
+        "disclaimer_of_opinion",
+        "unable_to_express",
+        "no_opinion",
+        "否定意见",
+        "无法表示意见",
+        "拒绝表示意见",
     }
 )
 
@@ -254,6 +279,204 @@ def build_point_in_time_eligibility(
     return base[columns].sort_values(["datetime", "instrument"]).reset_index(drop=True)
 
 
+def project_point_in_time_risk_states(
+    values: pd.DataFrame,
+    *,
+    as_of: Any,
+    instruments: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """Project the latest known eligibility evidence into trading risk states.
+
+    The projection is deliberately point-in-time: only observations on or before
+    ``as_of`` are considered.  Explicit adverse facts can force a reduction or
+    exit, while absent evidence is fail-closed for *new* risk without pretending
+    that a bad event occurred.  A requested instrument with no available row is
+    therefore ``restricted`` and non-tradable, not ``exit``.
+
+    The returned frame contains one deterministic row per requested instrument:
+
+    - ``normal``: eligible and tradable;
+    - ``watch``: temporarily non-tradable (currently suspension only);
+    - ``restricted``: no new risk because eligibility evidence is incomplete or
+      the instrument fails a non-terminal entry gate;
+    - ``reduce``: explicit non-standard (but not severe) audit evidence;
+    - ``exit``: explicit ST, delisting, non-positive equity, severe audit opinion,
+      or major regulatory violation.
+
+    ``tradable`` is independent from severity.  For example, a suspended ST stock
+    remains an ``exit`` risk but has ``tradable=False`` until execution is possible.
+    """
+
+    required = {
+        "datetime",
+        "instrument",
+        "eligible",
+        "reasons",
+        "is_st",
+        "suspended",
+        "delisted",
+        "normal_listing_status",
+        "equity",
+        "audit_opinion",
+        "financial_gate_required",
+        "regulatory_data_available",
+        "major_violation",
+        "contract_version",
+    }
+    source = _required_frame(values, required, "eligibility risk projection")
+    source["datetime"] = pd.to_datetime(source["datetime"], errors="coerce").dt.normalize()
+    source["instrument"] = source["instrument"].astype(str).str.upper()
+    if source[["datetime", "instrument"]].isna().any().any():
+        raise ValueError("eligibility risk projection has invalid dates or instruments")
+    if source.duplicated(["datetime", "instrument"]).any():
+        raise ValueError("eligibility risk projection observations are duplicated")
+    if source["contract_version"].ne(ELIGIBILITY_CONTRACT_VERSION).any():
+        raise ValueError("eligibility risk projection contract is obsolete")
+
+    timestamp = pd.Timestamp(as_of).normalize()
+    if pd.isna(timestamp):
+        raise ValueError("eligibility risk projection as_of is invalid")
+    available = source[source["datetime"].le(timestamp)].sort_values(
+        ["instrument", "datetime"]
+    )
+    latest = available.drop_duplicates("instrument", keep="last").set_index("instrument")
+
+    if instruments is None:
+        requested = sorted(latest.index.astype(str).unique())
+    else:
+        requested = sorted({str(instrument).upper() for instrument in instruments})
+
+    rows: list[dict[str, Any]] = []
+    for instrument in requested:
+        if instrument not in latest.index:
+            rows.append(
+                {
+                    "datetime": timestamp,
+                    "instrument": instrument,
+                    "evidence_datetime": pd.NaT,
+                    "risk_state": "restricted",
+                    "tradable": False,
+                    "allow_new_risk": False,
+                    "risk_reasons": json.dumps(["eligibility_evidence_missing"]),
+                    "contract_version": ELIGIBILITY_CONTRACT_VERSION,
+                }
+            )
+            continue
+
+        row = latest.loc[instrument]
+        source_reasons, reasons_valid = _decode_eligibility_reasons(row["reasons"])
+        risk_state = "normal"
+        risk_reasons: list[str] = []
+        suspended = _safe_boolean(row["suspended"])
+        evidence_datetime = pd.Timestamp(row["datetime"]).normalize()
+        stale_evidence = evidence_datetime < timestamp
+        financial_gate_required = _safe_boolean(row["financial_gate_required"])
+
+        def apply(
+            state: str,
+            reason: str,
+            recorded_reasons: list[str] = risk_reasons,
+        ) -> None:
+            nonlocal risk_state
+            if _RISK_STATE_SEVERITY[state] > _RISK_STATE_SEVERITY[risk_state]:
+                risk_state = state
+            recorded_reasons.append(reason)
+
+        if suspended:
+            apply("watch", "suspended")
+        if stale_evidence:
+            # Eligibility is a daily point-in-time matrix.  Carrying an older
+            # `normal` row forward could miss a new ST flag, suspension,
+            # delisting or filing, so stale evidence is non-tradable.
+            apply("restricted", "eligibility_evidence_stale")
+        if _safe_boolean(row["is_st"]):
+            apply("exit", "st")
+        if _safe_boolean(row["delisted"]):
+            apply("exit", "delisted")
+        elif "abnormal_listing" in source_reasons or not _safe_boolean(
+            row["normal_listing_status"]
+        ):
+            apply("restricted", "listing_status_unavailable_or_inactive")
+        if _safe_boolean(row["major_violation"]):
+            apply("exit", "major_violation")
+
+        if financial_gate_required:
+            equity = pd.to_numeric(pd.Series([row["equity"]]), errors="coerce").iloc[0]
+            if pd.isna(equity):
+                apply("restricted", "equity_evidence_missing")
+            elif float(equity) <= 0:
+                apply("exit", "non_positive_equity")
+
+            audit_opinion = _normalized_audit_opinion(row["audit_opinion"])
+            if audit_opinion is None:
+                apply("restricted", "audit_evidence_missing")
+            elif not _is_standard_audit_opinion(audit_opinion):
+                if audit_opinion in _SEVERE_AUDIT_OPINIONS:
+                    apply("exit", "severe_nonstandard_audit")
+                else:
+                    apply("reduce", "nonstandard_audit")
+
+        restricted_source_reasons = {
+            "new_listing",
+            "insufficient_liquidity",
+            "regulatory_data_missing",
+        }
+        for reason in sorted(source_reasons & restricted_source_reasons):
+            apply("restricted", reason)
+        if "negative_or_missing_equity" in source_reasons and not financial_gate_required:
+            apply("restricted", "unexpected_financial_gate_rejection")
+        if "nonstandard_or_missing_audit" in source_reasons and not financial_gate_required:
+            apply("restricted", "unexpected_audit_gate_rejection")
+        if not reasons_valid:
+            apply("restricted", "eligibility_reasons_invalid")
+
+        known_reasons = {
+            "new_listing",
+            "st",
+            "suspended",
+            "abnormal_listing",
+            "negative_or_missing_equity",
+            "nonstandard_or_missing_audit",
+            "insufficient_liquidity",
+            "major_violation",
+            "regulatory_data_missing",
+        }
+        unknown_reasons = sorted(source_reasons - known_reasons)
+        for reason in unknown_reasons:
+            apply("restricted", f"unrecognized_eligibility_reason:{reason}")
+        if not _safe_boolean(row["eligible"]) and risk_state == "normal":
+            apply("restricted", "eligibility_rejection_unexplained")
+
+        rows.append(
+            {
+                "datetime": timestamp,
+                "instrument": instrument,
+                "evidence_datetime": evidence_datetime,
+                "risk_state": risk_state,
+                "tradable": not suspended and not stale_evidence,
+                "allow_new_risk": (
+                    risk_state == "normal" and not suspended and not stale_evidence
+                ),
+                "risk_reasons": json.dumps(sorted(set(risk_reasons))),
+                "contract_version": ELIGIBILITY_CONTRACT_VERSION,
+            }
+        )
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "datetime",
+            "instrument",
+            "evidence_datetime",
+            "risk_state",
+            "tradable",
+            "allow_new_risk",
+            "risk_reasons",
+            "contract_version",
+        ],
+    )
+
+
 def eligibility_statistics(values: pd.DataFrame) -> dict[str, Any]:
     required = {"datetime", "instrument", "eligible", "reasons", "contract_version"}
     if not required.issubset(values.columns) or values.empty:
@@ -371,3 +594,33 @@ def _asof_disclosure(
             "announcement_date"
         ]
     return result
+
+
+def _decode_eligibility_reasons(value: Any) -> tuple[set[str], bool]:
+    try:
+        decoded = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return set(), False
+    if not isinstance(decoded, list) or any(not isinstance(item, str) for item in decoded):
+        return set(), False
+    return set(decoded), True
+
+
+def _safe_boolean(value: Any) -> bool:
+    normalized = _strict_boolean(value)
+    return bool(normalized) if normalized is not None else False
+
+
+def _normalized_audit_opinion(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    return normalized.lower() if normalized.isascii() else normalized
+
+
+def _is_standard_audit_opinion(value: str) -> bool:
+    return value in {
+        item.lower() if item.isascii() else item for item in STANDARD_AUDIT_OPINIONS
+    }

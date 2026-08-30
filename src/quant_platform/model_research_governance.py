@@ -10,8 +10,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .horizon_factor_bundle import validate_horizon_factor_bundle
 from .research_horizon import (
     LEGACY_AMBIGUOUS,
+    primary_label_horizon_sessions,
     require_label_horizon,
     research_horizon_contract,
 )
@@ -97,9 +99,10 @@ def resolve_model_label_contract(
     """Resolve one executable forward-return label from a research window.
 
     Product horizons describe a set of labels.  One model run must select one
-    member explicitly; absent a choice, active horizons use their longest
-    predictive label.  Old runs retain the historical next-session-to-following-
-    session return and are marked legacy rather than reinterpreted.
+    member explicitly; absent a choice, active horizons use the governed
+    primary comparison label (5/63/252 sessions).  Old runs retain the
+    historical next-session-to-following-session return and are marked legacy
+    rather than reinterpreted.
     """
 
     if research_window_contract is None:
@@ -146,7 +149,11 @@ def resolve_model_label_contract(
         raise ValueError("research window label horizons are invalid") from exc
     if allowed != horizon.label_horizons_sessions:
         raise ValueError("research window labels differ from the horizon contract")
-    selected = int(label_horizon_sessions) if label_horizon_sessions is not None else max(allowed)
+    selected = (
+        int(label_horizon_sessions)
+        if label_horizon_sessions is not None
+        else primary_label_horizon_sessions(profile)
+    )
     require_label_horizon(profile, selected)
     purge = int(research_window_contract.get("purge_sessions") or 0)
     embargo = int(research_window_contract.get("embargo_sessions") or 0)
@@ -723,6 +730,46 @@ def validate_quant_bundle_evidence(
         if not factor_id or factor_id in factor_ids or not is_sha256(factor.get("code_sha256")):
             raise ValueError("quant bundle factor identities are invalid")
         factor_ids.add(factor_id)
+    horizon_profile = str(bundle.get("horizon_profile") or "").strip()
+    horizon_factor_bundle = bundle.get("horizon_factor_bundle")
+    if horizon_profile:
+        factor_bundle = validate_horizon_factor_bundle(
+            horizon_factor_bundle if isinstance(horizon_factor_bundle, Mapping) else {}
+        )
+        observed_incremental = [
+            {
+                "candidate_id": str(factor.get("candidate_id") or ""),
+                "code_sha256": str(factor.get("code_sha256") or ""),
+            }
+            for factor in factors
+        ]
+        challenge = factor_bundle["incremental_challenge"]
+        if (
+            bundle.get("horizon_factor_bundle_sha256")
+            != factor_bundle["bundle_sha256"]
+            or factor_bundle["horizon_profile"] != horizon_profile
+            or int(factor_bundle["label_horizon_sessions"])
+            != int(bundle.get("label_horizon_sessions") or 0)
+            or factor_bundle["research_label_binding_sha256"]
+            != bundle.get("research_label_binding_sha256")
+            or factor_bundle["dataset_identity_sha256"]
+            != dataset_identity_sha256.lower()
+            or factor_bundle["base_feature_set"]["definition_sha256"]
+            != bundle.get("feature_set_definition_sha256")
+            or factor_bundle["incremental_factors"] != observed_incremental
+            or not isinstance(baseline, Mapping)
+            or challenge["incumbent_kind"] != baseline.get("kind")
+            or challenge["incumbent_candidate_id"]
+            != baseline.get("candidate_id")
+            or challenge["incumbent_evidence_sha256"]
+            != baseline.get("evidence_sha256")
+        ):
+            raise ValueError("quant horizon factor bundle identity is invalid")
+    elif (
+        horizon_factor_bundle is not None
+        or bundle.get("horizon_factor_bundle_sha256") is not None
+    ):
+        raise ValueError("legacy quant evidence cannot claim a horizon factor bundle")
     if not is_sha256(model.get("code_sha256")) or not is_sha256(model.get("recipe_sha256")):
         raise ValueError("quant bundle model code and recipe must be immutable")
     ablations = bundle.get("ablations")

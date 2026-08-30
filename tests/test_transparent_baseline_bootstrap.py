@@ -5,7 +5,9 @@ import json
 from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 from governance_fixtures import governed_etf_ready_evidence
 from sqlalchemy import func, insert, select, update
@@ -24,6 +26,7 @@ from quant_data.execution_contract import DAILY_QLIB_FIELD_CONTRACT_VERSION
 from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.api import StrategyConfigRequest
 from quant_platform.promotion import PromotionStore
+from quant_platform.research_automation import ResearchWindowUnavailableError
 from quant_platform.research_horizon import research_horizon_contract
 from quant_platform.strategy_recipes import (
     TRANSPARENT_RESEARCH_BASELINE_IDS,
@@ -31,8 +34,10 @@ from quant_platform.strategy_recipes import (
 )
 from quant_platform.strategy_store import StrategyStore, _normalize_multifactor_contract
 from quant_platform.transparent_baseline_bootstrap import (
+    FAMILY_NAMES,
     TransparentBaselineBootstrapService,
     _feature_set,
+    _plan_member,
     _select_dataset,
 )
 from quant_platform.transparent_baseline_lockbox import (
@@ -42,6 +47,9 @@ from quant_platform.transparent_baseline_lockbox import (
     CANONICAL_LF_PACKAGING_SOURCE_OBSERVED_RUNNER_SHA256,
     CANONICAL_LF_PACKAGING_TARGET_RECIPE_VERSION,
     LOCKBOX_CONFIG_KEY,
+    LOCKBOX_CONTRACT_VERSION_V2,
+    LOCKBOX_CONTRACT_VERSION_V3,
+    LOCKBOX_LINK_VERSION_V2,
     OPTIMIZER_APPLICABILITY_REASON,
     OPTIMIZER_APPLICABILITY_REPAIR_GENERATION,
     OPTIMIZER_APPLICABILITY_SOURCE_BACKTEST_IDS,
@@ -52,9 +60,11 @@ from quant_platform.transparent_baseline_lockbox import (
     TransparentBaselineLockboxStore,
     build_joint_lockbox,
     build_lockbox_member,
+    build_unopened_history_selection,
     canonical_sha256,
     lockbox_member_link,
     validate_joint_lockbox,
+    validate_lockbox_link,
     validate_pre_result_repair_receipt,
 )
 from quant_platform.transparent_baseline_repair import (
@@ -63,12 +73,23 @@ from quant_platform.transparent_baseline_repair import (
     register_optimizer_applicability_repair,
 )
 from quant_platform.transparent_baseline_runner import (
+    TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
+    WORKER_RUNTIME_IMAGE_DIGEST_ENV,
     target_runner_for_recipe,
     target_runtime_bundle_for_recipe,
+    target_worker_runtime_image_for_recipe,
 )
 from scripts.run_multifactor_backtest import _promotion_dataset_descriptors
+
+_WORKER_IMAGE_DIGEST = "sha256:" + "d" * 64
+
+
+@pytest.fixture(autouse=True)
+def _sealed_worker_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV, _WORKER_IMAGE_DIGEST)
 
 
 def _calendar(count: int = 4300) -> list[str]:
@@ -79,6 +100,89 @@ def _calendar(count: int = 4300) -> list[str]:
             result.append(current.isoformat())
         current += timedelta(days=1)
     return result
+
+
+def _pre_2022_server_calendar() -> list[str]:
+    pre_cost = [
+        item.date().isoformat()
+        for item in pd.bdate_range(end="2015-07-31", periods=1844)
+    ]
+    raw_cost = [
+        item.date().isoformat()
+        for item in pd.bdate_range("2015-08-03", "2022-07-05")
+    ]
+    indices = sorted(
+        {
+            round(index * (len(raw_cost) - 1) / (1683 - 1))
+            for index in range(1683)
+        }
+    )
+    return pre_cost + [raw_cost[index] for index in indices]
+
+
+def _research_dataset(
+    calendar: list[str],
+    *,
+    path: Path,
+    name: str = "daily-ready",
+    identity: str = "a" * 64,
+    lineage: str = "b" * 64,
+) -> dict:
+    required_fields = {
+        "amount",
+        "close",
+        "fund_debt_to_assets",
+        "fund_op_profit_yoy",
+        "fund_quarter_revenue_yoy",
+        "fund_roa",
+        "fund_roe",
+        "fund_roic",
+        "fund_sales_cash_to_revenue",
+        "high",
+        "low",
+        "pb",
+        "pe_ttm",
+    }
+    coverage = {
+        field: {
+            "research_available_from": calendar[0],
+            "available_to": calendar[-1],
+            "years": [],
+        }
+        for field in sorted(required_fields)
+    }
+    provenance = {
+        "dataset_identity_sha256": identity,
+        "dataset_lineage_id": lineage,
+        "dataset_contract_sha256": "c" * 64,
+        "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+        "fields": sorted(required_fields),
+        "field_units": {},
+        "research_features": {},
+        "source_start_date": calendar[0],
+        "source_end_date": calendar[-1],
+        "field_year_coverage": {
+            "version": "qlib-field-year-source-coverage-v1",
+            "evidence_status": "complete",
+            "fields": coverage,
+        },
+    }
+    return {
+        "name": name,
+        "path": str(path),
+        "ready": True,
+        "reproducible": True,
+        "output_files_verified": True,
+        "frequency": "day",
+        "start_date": calendar[0],
+        "end_date": calendar[-1],
+        "trading_days": len(calendar),
+        "dataset_identity_sha256": identity,
+        "dataset_lineage_id": lineage,
+        "lineage_id": lineage,
+        "provenance": provenance,
+        "calendar": calendar,
+    }
 
 
 def _formal_periods(calendar: list[str], recipe_id: str) -> dict[str, str]:
@@ -155,6 +259,13 @@ def _base_plan(calendar: list[str], recipe_id: str) -> dict:
     if target_runtime_bundle_sha256 is not None:
         raw[BOOTSTRAP_CONFIG_KEY][TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
             target_runtime_bundle_sha256
+        )
+    target_worker_runtime_image_digest = target_worker_runtime_image_for_recipe(
+        recipe["id"], recipe["version"]
+    )
+    if target_worker_runtime_image_digest is not None:
+        raw[BOOTSTRAP_CONFIG_KEY][TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
+            target_worker_runtime_image_digest
         )
     base = _normalize_multifactor_contract(
         raw,
@@ -253,6 +364,15 @@ def _retarget_plans(
         else:
             bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
                 target_runtime_bundle_sha256
+            )
+        target_worker_runtime_image_digest = target_worker_runtime_image_for_recipe(
+            plan["recipe"]["id"], recipe_version
+        )
+        if target_worker_runtime_image_digest is None:
+            bootstrap.pop(TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD, None)
+        else:
+            bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
+                target_worker_runtime_image_digest
             )
         plan["base_config"] = _normalize_multifactor_contract(
             base,
@@ -762,7 +882,7 @@ def test_joint_lockbox_requires_exact_three_members_and_detects_tampering() -> N
         assert len(_feature_set(plan["recipe"])["features"]) == len(
             plan["recipe"].get("factor_baseline") or []
         )
-    with pytest.raises(ValueError, match="exactly the three"):
+    with pytest.raises(ValueError, match="all three"):
         build_joint_lockbox(
             dataset="daily-ready",
             dataset_identity_sha256="a" * 64,
@@ -1179,6 +1299,9 @@ def test_backtest_creation_race_recovers_only_the_exact_frozen_run(
         def create(kind: str, payload: dict, _log_path: Path, **options) -> dict:
             assert kind == "strategy_backtest"
             assert payload["backtest_id"] == "formal-backtest"
+            assert payload[TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD] == (
+                _WORKER_IMAGE_DIGEST
+            )
             assert options["idempotency_key"] == (
                 "transparent-baseline:baseline-version:formal-backtest"
             )
@@ -1194,7 +1317,16 @@ def test_backtest_creation_race_recovers_only_the_exact_frozen_run(
     )
     result = service._ensure_backtest_job(
         plan={"formal_periods": formal_periods},
-        version={"id": "baseline-version"},
+        version={
+            "id": "baseline-version",
+            "config": {
+                BOOTSTRAP_CONFIG_KEY: {
+                    TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: (
+                        _WORKER_IMAGE_DIGEST
+                    )
+                }
+            },
+        },
         dataset={
             "name": "daily-ready",
             "path": str(tmp_path / "daily-ready"),
@@ -2010,6 +2142,502 @@ def test_three_daily_baseline_artifacts_load_and_attach_paper_simulations(
         assert stage["simulation_portfolio_id"]
 
 
+def test_v12_reconcile_uses_only_history_before_prior_transparent_oos(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quant_platform import transparent_baseline_bootstrap as module
+
+    calendar = _calendar(6000)
+    dataset = _research_dataset(calendar, path=tmp_path / "daily-ready")
+    current_recipe_version = get_strategy_recipe("short_relative_strength")[
+        "version"
+    ]
+    latest_selection = build_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version=current_recipe_version,
+        prior_batches=[],
+    )
+    latest_dataset = {
+        **dataset,
+        "source_calendar": calendar,
+        "unopened_history_selection": latest_selection,
+    }
+    latest_plans = [
+        _plan_member(recipe_id=recipe_id, dataset=latest_dataset)
+        for recipe_id in TRANSPARENT_RESEARCH_BASELINE_IDS
+    ]
+
+    source_recipe_version = "qlib-rdagent-single-mainline-2026-08-30-v11"
+    source_plans = deepcopy(latest_plans)
+    for plan in source_plans:
+        base = deepcopy(plan["base_config"])
+        base["recipe_version"] = source_recipe_version
+        bootstrap = base[BOOTSTRAP_CONFIG_KEY]
+        bootstrap["recipe_version"] = source_recipe_version
+        bootstrap["recipe_sha256"] = canonical_sha256(
+            {
+                "recipe_id": plan["recipe"]["id"],
+                "recipe_version": source_recipe_version,
+            }
+        )
+        bootstrap.pop("unopened_history_selection")
+        bootstrap[TRANSPARENT_BASELINE_RUNNER_FIELD] = target_runner_for_recipe(
+            str(plan["recipe"]["id"]), source_recipe_version
+        )
+        bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
+            target_runtime_bundle_for_recipe(
+                str(plan["recipe"]["id"]), source_recipe_version
+            )
+        )
+        bootstrap.pop(TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD, None)
+        plan["base_config"] = _normalize_multifactor_contract(
+            base,
+            factor_count=0,
+            creating_family=True,
+        )
+        plan["lockbox_member"] = build_lockbox_member(
+            config=plan["base_config"],
+            formal_periods=plan["formal_periods"],
+        )
+    source_lockbox = build_joint_lockbox(
+        dataset=str(dataset["name"]),
+        dataset_identity_sha256=str(dataset["dataset_identity_sha256"]),
+        dataset_lineage_id=str(dataset["dataset_lineage_id"]),
+        members=[plan["lockbox_member"] for plan in source_plans],
+    )
+    strategies = StrategyStore(database_url)
+    source_versions: list[dict] = []
+    for plan in source_plans:
+        recipe_id = str(plan["recipe"]["id"])
+        config = _normalize_multifactor_contract(
+            {**plan["base_config"], LOCKBOX_CONFIG_KEY: source_lockbox},
+            factor_count=0,
+            creating_family=True,
+        )
+        family = strategies.create(
+            name=FAMILY_NAMES[recipe_id],
+            description="Prior transparent v11 final-OOS fixture.",
+            benchmark=str(plan["recipe"]["benchmark"]),
+            universe=str(plan["recipe"]["universe"]),
+            factors=[],
+            config=config,
+            actor="test",
+            economic_hypothesis_group=f"transparent-public-control:{recipe_id}",
+        )
+        source_versions.append(family["versions"][0])
+    lockboxes = TransparentBaselineLockboxStore(database_url)
+    source_reservation = lockboxes.reserve(
+        versions=source_versions,
+        dataset=str(dataset["name"]),
+        dataset_identity_sha256=str(dataset["dataset_identity_sha256"]),
+        dataset_lineage_id=str(dataset["dataset_lineage_id"]),
+    )
+    source_vintage_ids = {
+        str(item["oos_vintage_id"]) for item in source_reservation["members"]
+    }
+    earliest_source_start = min(
+        str(item["test_start"]) for item in source_reservation["members"]
+    )
+
+    monkeypatch.setattr(module, "_validate_dataset", lambda value: dict(value))
+    service = TransparentBaselineBootstrapService(
+        database_url=database_url,
+        data_root=tmp_path,
+        dataset_loader=lambda _root: [dataset],
+    )
+    first = service.reconcile(actor="test-v12-unopened-history")
+    repeated = service.reconcile(actor="test-v12-unopened-history")
+
+    assert first["status"] == repeated["status"] == "pending"
+    selection = first["unopened_history_selection"]
+    assert selection == repeated["unopened_history_selection"]
+    assert selection["selection_mode"] == (
+        "unopened_history_before_prior_transparent_oos"
+    )
+    assert selection["earliest_prior_final_oos_start"] == earliest_source_start
+    assert selection["selected_calendar_end"] < earliest_source_start
+    assert selection["prior_results_or_metrics_read"] is False
+    assert selection["prior_windows_treatment"] == (
+        "ordinary_historical_validation_only"
+    )
+    assert len(selection["prior_batches"]) == 1
+    assert selection["prior_batches"][0]["batch_sha256"] == source_lockbox[
+        "batch_sha256"
+    ]
+    assert all(
+        str(member["formal_periods"]["end"]) < earliest_source_start
+        for member in first["members"]
+    )
+    assert first["joint_lockbox"]["contract_version"] == (
+        LOCKBOX_CONTRACT_VERSION_V2
+    )
+    assert len(first["joint_lockbox"]["members"]) == 3
+    assert first["joint_lockbox"]["pre_result_repair"] is None
+    assert first["joint_lockbox"]["batch_sha256"] == repeated[
+        "joint_lockbox"
+    ]["batch_sha256"]
+    assert all(
+        item["backtest"]["action"] == "reused" for item in repeated["members"]
+    )
+
+    recomputed = lockboxes.resolve_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version=current_recipe_version,
+        anchored_selection=None,
+    )
+    assert recomputed["evidence"] == selection
+
+    engine = open_database(database_url)
+    with engine.connect() as connection:
+        recorded_vintages = connection.execute(select(oos_vintages)).all()
+        assert len(recorded_vintages) == 6
+        assert source_vintage_ids <= {str(row.id) for row in recorded_vintages}
+        assert connection.scalar(
+            select(func.count()).select_from(
+                transparent_baseline_pre_result_repairs
+            )
+        ) == 0
+
+
+@pytest.mark.no_database
+def test_unopened_history_cutoff_fails_when_no_horizon_window_can_mature(
+    tmp_path: Path,
+) -> None:
+    calendar = _calendar(1200)
+    prior_members = []
+    for index, recipe_id in enumerate(TRANSPARENT_RESEARCH_BASELINE_IDS, start=1):
+        recipe = get_strategy_recipe(recipe_id)
+        prior_members.append(
+            {
+                "oos_vintage_id": f"{index:x}" * 32,
+                "strategy_version_id": f"{index + 3:x}" * 32,
+                "recipe_id": recipe_id,
+                "horizon_profile": recipe["horizon"],
+                "recipe_version": "prior-v11",
+                "test_start": calendar[900],
+                "test_end": calendar[1000 + index],
+                "first_opened_at": "2026-08-30T00:00:00+00:00",
+                "sealed_member_set_sha256": f"{index + 6:x}" * 64,
+            }
+        )
+    prior_batch = {
+        "batch_sha256": "f" * 64,
+        "recipe_version": "prior-v11",
+        "earliest_final_oos_start": calendar[900],
+        "latest_final_oos_end": max(item["test_end"] for item in prior_members),
+        "members": sorted(prior_members, key=lambda item: item["recipe_id"]),
+    }
+    prior_batch["members_sha256"] = canonical_sha256(prior_batch["members"])
+    selection = build_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version=get_strategy_recipe("long_quality_value")["version"],
+        prior_batches=[prior_batch],
+    )
+    dataset = _research_dataset(calendar, path=tmp_path / "insufficient")
+    planning_dataset = {
+        **dataset,
+        "source_calendar": calendar,
+        "calendar": calendar[: selection["selected_calendar_trading_days"]],
+        "unopened_history_selection": selection,
+    }
+
+    with pytest.raises(ValueError, match="frozen final OOS"):
+        _plan_member(recipe_id="long_quality_value", dataset=planning_dataset)
+
+
+@pytest.mark.no_database
+def test_partial_v12_lockbox_preregisters_short_swing_and_seals_long_cash(
+    tmp_path: Path,
+) -> None:
+    calendar = _pre_2022_server_calendar()
+    dataset = _research_dataset(calendar, path=tmp_path / "server-pre-2022")
+    selection = build_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version=get_strategy_recipe("short_relative_strength")[
+            "version"
+        ],
+        prior_batches=[],
+    )
+    planning_dataset = {
+        **dataset,
+        "source_calendar": calendar,
+        "calendar": calendar,
+        "unopened_history_selection": selection,
+    }
+    plans = [
+        _plan_member(recipe_id=recipe_id, dataset=planning_dataset)
+        for recipe_id in ("short_relative_strength", "swing_trend")
+    ]
+    with pytest.raises(ResearchWindowUnavailableError) as captured:
+        _plan_member(recipe_id="long_quality_value", dataset=planning_dataset)
+    evidence = dict(captured.value.evidence)
+    unavailable = {
+        "recipe_id": "long_quality_value",
+        "horizon_profile": "long_1_3y",
+        "status": "unavailable",
+        "reason": str(captured.value),
+        "evidence": evidence,
+        "evidence_sha256": canonical_sha256(evidence),
+    }
+
+    lockbox = build_joint_lockbox(
+        dataset=str(dataset["name"]),
+        dataset_identity_sha256=str(dataset["dataset_identity_sha256"]),
+        dataset_lineage_id=str(dataset["dataset_lineage_id"]),
+        members=[plan["lockbox_member"] for plan in plans],
+        unopened_history_selection=selection,
+        unavailable_horizons=[unavailable],
+    )
+
+    assert validate_joint_lockbox(lockbox) == lockbox
+    assert lockbox["contract_version"] == LOCKBOX_CONTRACT_VERSION_V3
+    assert [item["recipe_id"] for item in lockbox["members"]] == [
+        "short_relative_strength",
+        "swing_trend",
+    ]
+    assert lockbox["unavailable_horizons"] == [unavailable]
+    for plan in plans:
+        config = _normalize_multifactor_contract(
+            {**dict(plan["base_config"]), LOCKBOX_CONFIG_KEY: lockbox},
+            factor_count=0,
+            creating_family=True,
+        )
+        link = lockbox_member_link(config)
+        assert link is not None
+        assert validate_lockbox_link(link) == link
+        assert link["contract_version"] == LOCKBOX_LINK_VERSION_V2
+        assert len(link["member_sha256s"]) == 2
+
+    falsely_unavailable = deepcopy(unavailable)
+    falsely_unavailable["evidence"]["capital_evaluation_eligible"] = True
+    falsely_unavailable["evidence_sha256"] = canonical_sha256(
+        falsely_unavailable["evidence"]
+    )
+    with pytest.raises(
+        ValueError,
+        match="unavailable baseline horizon evidence is invalid",
+    ):
+        build_joint_lockbox(
+            dataset=str(dataset["name"]),
+            dataset_identity_sha256=str(dataset["dataset_identity_sha256"]),
+            dataset_lineage_id=str(dataset["dataset_lineage_id"]),
+            members=[plan["lockbox_member"] for plan in plans],
+            unopened_history_selection=selection,
+            unavailable_horizons=[falsely_unavailable],
+        )
+
+
+def test_v12_reconcile_starts_available_horizons_and_keeps_long_sleeve_cash(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quant_platform import transparent_baseline_bootstrap as module
+
+    calendar = _pre_2022_server_calendar()
+    dataset = _research_dataset(calendar, path=tmp_path / "server-pre-2022-db")
+    monkeypatch.setattr(module, "_validate_dataset", lambda value: dict(value))
+    service = TransparentBaselineBootstrapService(
+        database_url=database_url,
+        data_root=tmp_path,
+        dataset_loader=lambda _root: [dataset],
+    )
+
+    first = service.reconcile(actor="test-partial-v12")
+    repeated = service.reconcile(actor="test-partial-v12")
+
+    assert first["status"] == repeated["status"] == "pending"
+    assert first["joint_lockbox"]["contract_version"] == (
+        LOCKBOX_CONTRACT_VERSION_V3
+    )
+    assert len(first["joint_lockbox"]["members"]) == 2
+    members = {str(item["horizon_profile"]): item for item in first["members"]}
+    assert members["short_1_5d"]["state"] == "formal_backtest_pending"
+    assert members["swing_1_6m"]["state"] == "formal_backtest_pending"
+    assert members["long_1_3y"]["state"] == "unavailable"
+    assert members["long_1_3y"]["sleeve_action"] == "remain_in_cash"
+    assert members["long_1_3y"]["strategy_version_id"] is None
+    assert members["long_1_3y"]["unavailable_evidence"][
+        "capital_evaluation_eligible"
+    ] is False
+    assert all(
+        repeated_member["backtest"]["action"] == "reused"
+        for repeated_member in repeated["members"]
+        if repeated_member["state"] != "unavailable"
+    )
+    with open_database(database_url).connect() as connection:
+        assert connection.scalar(select(func.count()).select_from(oos_vintages)) == 2
+        assert connection.scalar(select(func.count()).select_from(strategy_versions)) == 2
+
+    next_recipe = service.lockboxes.resolve_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version="qlib-rdagent-single-mainline-future-test-v13",
+    )
+    next_evidence = next_recipe["evidence"]
+    available_starts = [
+        str(item["formal_periods"]["start"])
+        for item in first["members"]
+        if item["state"] != "unavailable"
+    ]
+    assert next_evidence["earliest_prior_final_oos_start"] == min(
+        available_starts
+    )
+    assert next_evidence["selected_calendar_end"] < min(available_starts)
+    assert len(next_evidence["prior_batches"]) == 1
+    assert len(next_evidence["prior_batches"][0]["members"]) == 2
+
+
+@pytest.mark.no_database
+def test_v12_unopened_history_selection_ignores_its_own_rows_and_jointly_locks(
+    tmp_path: Path,
+) -> None:
+    calendar = _calendar(6000)
+    current_version = get_strategy_recipe("short_relative_strength")["version"]
+    prior_version = "qlib-rdagent-single-mainline-2026-08-30-v11"
+    rows: list[SimpleNamespace] = []
+    versions: list[SimpleNamespace] = []
+
+    def add_batch(recipe_version: str, *, start_index: int, ordinal: int) -> None:
+        batch_sha256 = canonical_sha256(
+            {"recipe_version": recipe_version, "ordinal": ordinal}
+        )
+        member_hashes = [
+            canonical_sha256({"batch": batch_sha256, "member": index})
+            for index in range(3)
+        ]
+        for index, recipe_id in enumerate(TRANSPARENT_RESEARCH_BASELINE_IDS):
+            recipe = get_strategy_recipe(recipe_id)
+            strategy_version_id = f"{ordinal * 10 + index + 1:032x}"
+            oos_vintage_id = f"{ordinal * 10 + index + 4:032x}"
+            link = {
+                "contract_version": "transparent-baseline-joint-lockbox-link-v1",
+                "batch_sha256": batch_sha256,
+                "member_sha256": member_hashes[index],
+                "member_sha256s": sorted(member_hashes),
+                "recipe_id": recipe_id,
+                "horizon_profile": recipe["horizon"],
+            }
+            sealed = {
+                "strategy_version_id": strategy_version_id,
+                "transparent_baseline_lockbox": link,
+            }
+            rows.append(
+                SimpleNamespace(
+                    id=oos_vintage_id,
+                    test_start=date.fromisoformat(calendar[start_index + index]),
+                    test_end=date.fromisoformat(calendar[start_index + 300 + index]),
+                    first_opened_at=datetime(2026, 8, 30, ordinal, tzinfo=UTC),
+                    sealed_candidate_set_json=sealed,
+                    sealed_candidate_set_sha256=canonical_sha256(sealed),
+                )
+            )
+            versions.append(
+                SimpleNamespace(
+                    id=strategy_version_id,
+                    config_json={
+                        "recipe_id": recipe_id,
+                        "recipe_version": recipe_version,
+                        "horizon_profile": recipe["horizon"],
+                    },
+                )
+            )
+
+    # Current v12 rows sit earlier than v11 by construction. If retries read
+    # their own rows, the cutoff would incorrectly move from 4999 to 4499.
+    add_batch(prior_version, start_index=5000, ordinal=1)
+    add_batch(current_version, start_index=4500, ordinal=2)
+    original_row_ids = [row.id for row in rows]
+
+    class Result:
+        def __init__(self, values: list[SimpleNamespace]) -> None:
+            self.values = values
+
+        def all(self) -> list[SimpleNamespace]:
+            return list(self.values)
+
+    class Connection:
+        def __enter__(self) -> Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        @staticmethod
+        def execute(statement: object) -> Result:
+            selected = tuple(statement.selected_columns)  # type: ignore[attr-defined]
+            return Result(versions if len(selected) == 2 else rows)
+
+    class Engine:
+        @staticmethod
+        def connect() -> Connection:
+            return Connection()
+
+    store = TransparentBaselineLockboxStore.__new__(
+        TransparentBaselineLockboxStore
+    )
+    store.engine = Engine()
+    first = store.resolve_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version=current_version,
+        anchored_selection=None,
+    )
+    repeated = store.resolve_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version=current_version,
+        anchored_selection=None,
+    )
+
+    assert first == repeated
+    assert [row.id for row in rows] == original_row_ids
+    evidence = first["evidence"]
+    assert evidence["selected_calendar_end"] == calendar[4999]
+    assert evidence["earliest_prior_final_oos_start"] == calendar[5000]
+    assert evidence["prior_results_or_metrics_read"] is False
+    assert evidence["prior_windows_treatment"] == (
+        "ordinary_historical_validation_only"
+    )
+    assert [item["recipe_version"] for item in evidence["prior_batches"]] == [
+        prior_version
+    ]
+    assert "pre_result_repair" not in evidence
+
+    dataset = _research_dataset(calendar, path=tmp_path / "unopened-v12")
+    planning_dataset = {
+        **dataset,
+        "source_calendar": calendar,
+        "calendar": first["calendar"],
+        "unopened_history_selection": evidence,
+    }
+    plans = [
+        _plan_member(recipe_id=recipe_id, dataset=planning_dataset)
+        for recipe_id in TRANSPARENT_RESEARCH_BASELINE_IDS
+    ]
+    assert all(
+        plan["base_config"][BOOTSTRAP_CONFIG_KEY][
+            TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD
+        ]
+        == _WORKER_IMAGE_DIGEST
+        for plan in plans
+    )
+    assert all(
+        plan["formal_periods"]["end"] < calendar[5000] for plan in plans
+    )
+    lockbox = build_joint_lockbox(
+        dataset=str(dataset["name"]),
+        dataset_identity_sha256=str(dataset["dataset_identity_sha256"]),
+        dataset_lineage_id=str(dataset["dataset_lineage_id"]),
+        members=[plan["lockbox_member"] for plan in plans],
+        unopened_history_selection=evidence,
+    )
+    assert validate_joint_lockbox(lockbox) == lockbox
+    assert lockbox["contract_version"] == LOCKBOX_CONTRACT_VERSION_V2
+    assert len(lockbox["members"]) == 3
+    assert lockbox["unopened_history_selection"] == evidence
+    assert "pre_result_repair" not in lockbox
+
+
 def test_reconcile_is_idempotent_and_invalid_success_cannot_enter_paper(
     database_url: str,
     tmp_path: Path,
@@ -2035,14 +2663,31 @@ def test_reconcile_is_idempotent_and_invalid_success_cannot_enter_paper(
         "calendar": calendar,
     }
     monkeypatch.setattr(module, "_validate_dataset", lambda value: dict(value))
+
+    def _selected_history_plan(*, recipe_id: str, dataset: dict) -> dict:
+        plan = deepcopy(by_recipe[recipe_id])
+        base_config = deepcopy(plan["base_config"])
+        base_config[BOOTSTRAP_CONFIG_KEY]["unopened_history_selection"] = deepcopy(
+            dataset["unopened_history_selection"]
+        )
+        base_config = _normalize_multifactor_contract(
+            base_config,
+            factor_count=0,
+            creating_family=True,
+        )
+        return {
+            **plan,
+            "base_config": base_config,
+            "lockbox_member": build_lockbox_member(
+                config=base_config,
+                formal_periods=plan["formal_periods"],
+            ),
+        }
+
     monkeypatch.setattr(
         module,
         "_plan_member",
-        lambda *, recipe_id, dataset: {
-            **by_recipe[recipe_id],
-            "base_config": dict(by_recipe[recipe_id]["base_config"]),
-            "lockbox_member": dict(by_recipe[recipe_id]["lockbox_member"]),
-        },
+        _selected_history_plan,
     )
     service = TransparentBaselineBootstrapService(
         database_url=database_url,

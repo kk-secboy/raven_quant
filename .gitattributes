@@ -4,3 +4,6 @@ scripts/run_recommendation_refresh.py text eol=lf
 src/quant_platform/portfolio_policy.py text eol=lf
 src/quant_platform/strategy_backtest.py text eol=lf
 src/quant_platform/strategy_rule_runtime.py text eol=lf
+src/quant_platform/eligibility.py text eol=lf
+src/quant_platform/discrete_constraints.py text eol=lf
+src/quant_platform/horizon_review.py text eol=lf

@@ -16,6 +16,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from datetime import date
 from typing import Any
 
 RESEARCH_HORIZON_CONTRACT_VERSION = "research-horizon-v1"
@@ -24,6 +25,17 @@ SHORT_1_5D = "short_1_5d"
 SWING_1_6M = "swing_1_6m"
 LONG_1_3Y = "long_1_3y"
 LEGACY_AMBIGUOUS = "legacy_ambiguous"
+
+# This policy is intentionally versioned independently from
+# ``research-horizon-v1``.  Changing which modelling label is primary must not
+# silently rewrite the older horizon contract digests embedded in historical
+# evidence.
+PRIMARY_LABEL_POLICY_CONTRACT_VERSION = "primary-label-policy-v1"
+_PRIMARY_LABEL_HORIZON_SESSIONS = {
+    SHORT_1_5D: 5,
+    SWING_1_6M: 63,
+    LONG_1_3Y: 252,
+}
 
 SUPPORTED_HORIZON_PROFILES = (
     SHORT_1_5D,
@@ -226,12 +238,63 @@ _PROFILE_CONTRACTS = {
     ),
 }
 
-
 def research_horizon_contract(profile: str) -> ResearchHorizonContract:
     try:
         return _PROFILE_CONTRACTS[str(profile)]
     except KeyError as exc:
         raise ValueError(f"unsupported horizon profile: {profile}") from exc
+
+
+def primary_label_horizon_sessions(profile: str) -> int:
+    """Return the single prediction target used to compare one horizon.
+
+    A horizon may expose auxiliary labels for diagnostics, but its factor and
+    model champion must have one stable comparison target.  This mapping is a
+    derived product rule and intentionally does not change the immutable
+    ``ResearchHorizonContract`` digest stored by existing StrategyVersions.
+    """
+
+    contract = research_horizon_contract(profile)
+    if contract.horizon_profile == LEGACY_AMBIGUOUS:
+        raise ValueError("legacy_ambiguous has no primary prediction label")
+    selected = _PRIMARY_LABEL_HORIZON_SESSIONS[contract.horizon_profile]
+    if selected not in contract.label_horizons_sessions:
+        raise ValueError("primary prediction label differs from its horizon contract")
+    return selected
+
+
+def primary_label_policy_contract() -> dict[str, Any]:
+    """Return the immutable policy that selects one comparison label per horizon."""
+
+    body: dict[str, Any] = {
+        "contract_version": PRIMARY_LABEL_POLICY_CONTRACT_VERSION,
+        "horizon_primary_labels_sessions": dict(
+            sorted(_PRIMARY_LABEL_HORIZON_SESSIONS.items())
+        ),
+        "legacy_ambiguous_executable": False,
+    }
+    return {**body, "policy_sha256": canonical_sha256(body)}
+
+
+def primary_label_policy_sha256() -> str:
+    return str(primary_label_policy_contract()["policy_sha256"])
+
+
+def research_cadence_bucket(horizon_profile: str, dataset_end_date: str) -> str:
+    """Return the governed research event owning one daily publication."""
+
+    try:
+        session = date.fromisoformat(str(dataset_end_date))
+    except ValueError as exc:
+        raise ValueError("research dataset end date is invalid") from exc
+    if horizon_profile == SHORT_1_5D:
+        iso_year, iso_week, _ = session.isocalendar()
+        return f"week:{iso_year:04d}-{iso_week:02d}"
+    if horizon_profile == SWING_1_6M:
+        return f"month:{session.year:04d}-{session.month:02d}"
+    if horizon_profile == LONG_1_3Y:
+        return f"quarter:{session.year:04d}-Q{((session.month - 1) // 3) + 1}"
+    raise ValueError(f"unsupported automatic research horizon: {horizon_profile}")
 
 
 def normalize_horizon_config(config: Mapping[str, Any]) -> dict[str, Any]:

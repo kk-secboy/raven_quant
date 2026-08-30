@@ -25,8 +25,15 @@ from quant_data.execution_contract import (
 )
 from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.cost_model import CostModelConfig
-from quant_platform.eligibility import eligibility_statistics
-from quant_platform.horizon_review import validate_financial_review_trigger
+from quant_platform.eligibility import (
+    eligibility_statistics,
+    project_point_in_time_risk_states,
+)
+from quant_platform.horizon_review import (
+    build_financial_review_scope,
+    validate_financial_review_scope,
+    validate_financial_review_trigger,
+)
 from quant_platform.paper_policy_state import seal_paper_policy_state
 from quant_platform.portfolio_policy import (
     PortfolioPolicy,
@@ -243,6 +250,37 @@ def _review_completed_at(signal_date: date) -> datetime:
     ).astimezone(UTC)
 
 
+def _rebalance_due_for_financial_review(
+    *,
+    scheduled_rebalance_due: bool,
+    financial_review_scope: dict[str, Any] | None,
+) -> bool:
+    return bool(
+        scheduled_rebalance_due
+        or (
+            financial_review_scope is not None
+            and financial_review_scope.get("review_mode") == "decision_review"
+        )
+    )
+
+
+def _rebalance_instruments_for_financial_review(
+    *,
+    scheduled_rebalance_due: bool,
+    financial_review_scope: dict[str, Any] | None,
+) -> list[str] | None:
+    """Return the local decision sleeve for an off-cadence PIT review."""
+
+    if scheduled_rebalance_due or financial_review_scope is None:
+        return None
+    if financial_review_scope.get("review_mode") != "decision_review":
+        return None
+    reviewed = financial_review_scope.get("reviewed_instruments")
+    if not isinstance(reviewed, list) or not reviewed:
+        raise ValueError("financial decision review requires governed instruments")
+    return [str(instrument) for instrument in reviewed]
+
+
 def _horizon_review_for_order_plan(
     *,
     manifest: dict[str, Any],
@@ -261,9 +299,19 @@ def _horizon_review_for_order_plan(
         raise ValueError("horizon review changed its immutable dataset binding")
     rebalance_due = bool((result.get("risk_summary") or {}).get("rebalance_due"))
     financial = _financial_review_for_signal(manifest, signal_date)
+    financial_scope = None
+    if financial is not None:
+        raw_scope = (result.get("risk_summary") or {}).get("financial_review_scope")
+        if raw_scope is not None:
+            financial_scope = validate_financial_review_scope(
+                raw_scope,
+                trigger=financial,
+            )
     completed_at = _review_completed_at(signal_date)
     strategy_version_id = str(manifest.get("strategy_version_id") or "")
-    if financial is not None:
+    if financial is not None and financial_scope is not None and (
+        financial_scope["review_mode"] == "decision_review"
+    ):
         if not rebalance_due:
             raise ValueError(
                 "financial review evidence requires an executed rebalance decision"
@@ -286,6 +334,12 @@ def _horizon_review_for_order_plan(
                 str(financial["trigger_effective_date"])
             ),
             report_period=str(financial["report_period"]),
+            report_periods=[
+                str(item)
+                for item in (
+                    financial.get("report_periods") or [financial["report_period"]]
+                )
+            ],
             announcement_date=date.fromisoformat(str(financial["announcement_date"])),
             previous_signal_date=date.fromisoformat(
                 str(financial["previous_signal_date"])
@@ -293,6 +347,10 @@ def _horizon_review_for_order_plan(
             source_datasets=[str(item) for item in financial["source_datasets"]],
             source_event_count=int(financial["source_event_count"]),
             source_event_sha256=source_event_sha256,
+            reviewed_instruments=[
+                str(item) for item in financial_scope["reviewed_instruments"]
+            ],
+            review_scope_sha256=str(financial_scope["scope_sha256"]),
         )
     if not rebalance_due:
         return None
@@ -462,6 +520,70 @@ def _latest(frame: pd.DataFrame, when: pd.Timestamp, column: str) -> pd.Series:
     return result.astype(float)
 
 
+def _prepare_execution_evidence(
+    point_metadata: pd.DataFrame,
+    *,
+    instruments: pd.Index,
+    risk_projection: pd.DataFrame,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    current_closes = pd.to_numeric(point_metadata["$close"], errors="coerce").reindex(
+        instruments
+    )
+    execution_prices = pd.to_numeric(point_metadata["$open"], errors="coerce").reindex(
+        instruments
+    )
+    valid_current_close = current_closes.notna() & np.isfinite(
+        current_closes.to_numpy(dtype=float)
+    ) & (current_closes > 0)
+    execution_prices = execution_prices.where(valid_current_close)
+    average_daily_values = pd.to_numeric(
+        point_metadata["Ref(Mean($amount, 20), 1)"], errors="coerce"
+    ).reindex(instruments)
+    non_tradable = ~risk_projection["tradable"].astype(bool)
+    if non_tradable.any():
+        blocked = risk_projection.index[non_tradable]
+        execution_prices.loc[blocked] = np.nan
+        average_daily_values.loc[blocked] = np.nan
+    return execution_prices, current_closes, average_daily_values
+
+
+def _resolve_reference_prices(
+    target_weights: dict[str, float],
+    *,
+    current_prices: pd.Series,
+    close_history: pd.DataFrame,
+    previous_weights: dict[str, float],
+    frozen_instruments: set[str],
+) -> tuple[pd.Series, dict[str, str]]:
+    """Resolve display/valuation prices without turning stale marks into executions.
+
+    A current positive close is always preferred.  Only an already-held,
+    execution-frozen instrument may fall back to its latest positive PIT close;
+    a new target with no current close is rejected instead of being converted
+    into an order using stale data.
+    """
+
+    instruments = pd.Index(target_weights, dtype=str)
+    prices = pd.to_numeric(current_prices, errors="coerce").reindex(instruments)
+    sources = {str(instrument): "current_close" for instrument in instruments}
+    invalid = prices.isna() | ~np.isfinite(prices.to_numpy(dtype=float)) | (prices <= 0)
+    for instrument in instruments[invalid]:
+        name = str(instrument)
+        if float(previous_weights.get(name, 0.0)) <= 0 or name not in frozen_instruments:
+            raise ValueError(
+                f"new or tradable target {name} requires a positive current reference price"
+            )
+        if name not in close_history.columns:
+            raise ValueError(f"held frozen instrument {name} has no PIT close history")
+        history = pd.to_numeric(close_history[name], errors="coerce")
+        history = history[np.isfinite(history.to_numpy(dtype=float)) & (history > 0)]
+        if history.empty:
+            raise ValueError(f"held frozen instrument {name} has no positive PIT reference price")
+        prices.loc[name] = float(history.iloc[-1])
+        sources[name] = "latest_positive_pit_close"
+    return prices.astype(float), sources
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider-uri", required=True)
@@ -593,24 +715,33 @@ def main() -> None:
             clear_mem_cache=True,
         )
     market_as_of = as_of.normalize()
-    instruments = sorted(set(scores.index.get_level_values("instrument")))
+    previous = {
+        str(item["instrument"]): float(item["weight"])
+        for item in manifest.get("previous_holdings", [])
+    }
+    score_instruments = sorted(set(scores.index.get_level_values("instrument")))
+    data_instruments = sorted(set(score_instruments) | set(previous))
     required_history = required_rule_history_sessions(config)
     lookback = (
         as_of - pd.Timedelta(days=required_history * 2 + 30)
     ).date().isoformat()
     # $amount is CNY yuan under the v3 daily field contract.
     liquidity = D.features(
-        instruments, ["$amount"], start_time=lookback, end_time=as_of.date().isoformat(), freq="day"
+        data_instruments,
+        ["$amount"],
+        start_time=lookback,
+        end_time=as_of.date().isoformat(),
+        freq="day",
     )
     execution_metadata = D.features(
-        instruments,
+        data_instruments,
         ["$open", "$close", "Ref(Mean($amount, 20), 1)"],
         start_time=as_of.date().isoformat(),
         end_time=as_of.date().isoformat(),
         freq="day",
     )
     close_history = D.features(
-        instruments,
+        data_instruments,
         ["$close"],
         start_time=lookback,
         end_time=as_of.date().isoformat(),
@@ -690,9 +821,6 @@ def main() -> None:
         if constrained and benchmark_frame is not None
         else None
     )
-    previous = {
-        item["instrument"]: item["weight"] for item in manifest.get("previous_holdings", [])
-    }
     required_instruments = signal.index.astype(str).union(
         pd.Index(previous, dtype=str)
     )
@@ -721,7 +849,7 @@ def main() -> None:
     cost_model = CostModelConfig.from_mapping(config)
     policy = PortfolioPolicy(policy_config, cost_model)
     previous_snapshot = manifest.get("previous_snapshot") or {}
-    rebalance_due = is_rebalance_due(
+    scheduled_rebalance_due = is_rebalance_due(
         as_of,
         previous_snapshot.get("as_of_date"),
         str(config.get("rebalance_frequency", "day")),
@@ -729,11 +857,28 @@ def main() -> None:
     financial_review_trigger = _financial_review_for_signal(
         manifest, as_of.date()
     )
-    if financial_review_trigger is not None:
-        # A newly PIT-effective filing is an actual long-horizon decision, not
-        # a daily synthetic review.  The immutable source interval above proves
-        # why this otherwise off-cadence recalculation is due.
-        rebalance_due = True
+    financial_review_scope = (
+        build_financial_review_scope(
+            financial_review_trigger,
+            current_holdings=list(previous),
+            qualified_candidates=list(signal.index.astype(str)),
+        )
+        if financial_review_trigger is not None
+        else None
+    )
+    # Filing season produces announcements almost every trading day.  Only a
+    # newly PIT-effective filing for a held name or an already qualified
+    # candidate may open an off-cadence decision; all other source events are
+    # retained as a governance-only batch.  Hard risk exits still run below
+    # with rebalance_due=False inside the shared policy.
+    rebalance_due = _rebalance_due_for_financial_review(
+        scheduled_rebalance_due=scheduled_rebalance_due,
+        financial_review_scope=financial_review_scope,
+    )
+    rebalance_instruments = _rebalance_instruments_for_financial_review(
+        scheduled_rebalance_due=scheduled_rebalance_due,
+        financial_review_scope=financial_review_scope,
+    )
     construction_notional = float(manifest["construction_notional"])
     previous_position_state = dict(previous_snapshot.get("position_state") or {})
     runtime_rule_metadata = _recommendation_rule_runtime_metadata(
@@ -761,12 +906,25 @@ def main() -> None:
         instrument: int(item.get("take_profit_stage") or 0)
         for instrument, item in previous_holding_rows.items()
     }
+    risk_projection = project_point_in_time_risk_states(
+        eligibility_frame,
+        as_of=market_as_of,
+        instruments=required_instruments,
+    ).set_index("instrument")
+    # A positive current close is part of the recommendation evidence contract.
+    # Without it, an existing position may be frozen and marked from the latest
+    # PIT close, but a new instrument must not become an order.
+    execution_prices, current_closes, average_daily_values = _prepare_execution_evidence(
+        point_metadata,
+        instruments=required_instruments,
+        risk_projection=risk_projection,
+    )
     decision = policy.decide(
         signal,
         previous,
         **portfolio_metadata,
-        prices=pd.to_numeric(point_metadata["$open"], errors="coerce"),
-        current_prices=pd.to_numeric(point_metadata["$close"], errors="coerce"),
+        prices=execution_prices,
+        current_prices=current_closes,
         cost_basis=cost_basis,
         take_profit_stages=(
             previous_position_state.get("take_profit_stages") or take_profit_stages
@@ -780,13 +938,13 @@ def main() -> None:
         portfolio_drawdown=float(manifest["portfolio_drawdown"]),
         daily_return=float(manifest["daily_return"]),
         # $amount is CNY yuan under the v3 daily field contract.
-        average_daily_values=(
-            pd.to_numeric(point_metadata["Ref(Mean($amount, 20), 1)"], errors="coerce")
-        ),
+        average_daily_values=average_daily_values,
+        instrument_risk_states=risk_projection["risk_state"],
         portfolio_value=construction_notional,
         risk_exposure=float(manifest.get("risk_exposure", 1.0)),
         allow_new_risk=bool(manifest.get("allow_new_risk", True)),
         rebalance_due=rebalance_due,
+        rebalance_instruments=rebalance_instruments,
         **runtime_rule_metadata,
     )
     if signal_frequency == "day":
@@ -796,11 +954,36 @@ def main() -> None:
             raise ValueError("minute Qlib order-plan generation requires signal_at")
         effective_date = as_of.date().isoformat()
     changes = {item["instrument"]: item for item in decision.changes}
-    reference_prices = pd.to_numeric(
-        point_metadata["$close"], errors="coerce"
-    ).reindex(decision.target_weights)
-    if reference_prices.isna().any() or (reference_prices <= 0).any():
-        raise ValueError("recommendation target holdings require positive reference prices")
+    frozen_instruments = {
+        str(item) for item in decision.position_state.get("frozen_instruments") or []
+    }
+    reference_prices, reference_price_sources = _resolve_reference_prices(
+        decision.target_weights,
+        current_prices=current_closes,
+        close_history=close_history.loc[:market_as_of],
+        previous_weights=previous,
+        frozen_instruments=frozen_instruments,
+    )
+    evidence_instruments = (
+        set(decision.target_weights)
+        | set(previous)
+        | set(risk_projection.index[risk_projection["risk_state"].ne("normal")])
+    )
+    instrument_risk_evidence = {
+        str(instrument): {
+            "risk_state": str(row["risk_state"]),
+            "tradable": bool(row["tradable"]),
+            "allow_new_risk": bool(row["allow_new_risk"]),
+            "risk_reasons": json.loads(str(row["risk_reasons"])),
+            "evidence_date": (
+                pd.Timestamp(row["evidence_datetime"]).date().isoformat()
+                if pd.notna(row["evidence_datetime"])
+                else None
+            ),
+        }
+        for instrument, row in risk_projection.iterrows()
+        if str(instrument) in evidence_instruments
+    }
 
     result = {
         "status": "ok",
@@ -824,9 +1007,14 @@ def main() -> None:
             "execution_contract_hash": config["execution_contract_hash"],
             "rebalance_frequency": config.get("rebalance_frequency", "day"),
             "rebalance_due": rebalance_due,
+            "scheduled_rebalance_due": scheduled_rebalance_due,
             "financial_review_trigger": financial_review_trigger,
+            "financial_review_scope": financial_review_scope,
             "member_risk_state": dict(manifest.get("member_risk_state") or {}),
             "account_risk_state": dict(manifest.get("account_risk_state") or {}),
+            "instrument_risk_states": instrument_risk_evidence,
+            "frozen_instruments": sorted(frozen_instruments),
+            "reference_price_sources": reference_price_sources,
             "eligibility": eligibility_evidence,
             "style_exposure_contract": style_exposure_evidence,
         },
@@ -853,7 +1041,15 @@ def main() -> None:
                 "previous_weight": changes.get(instrument, {}).get("previous_weight", weight),
                 "weight_change": changes.get(instrument, {}).get("weight_change", 0.0),
                 "action": changes.get(instrument, {}).get("action", "hold"),
-                "reason": changes.get(instrument, {}).get("reason", "unchanged target"),
+                "reason": (
+                    "execution evidence unavailable; retained at previous weight"
+                    if instrument in frozen_instruments
+                    else changes.get(instrument, {}).get("reason", "unchanged target")
+                ),
+                "execution_state": (
+                    "WAIT" if instrument in frozen_instruments else "READY"
+                ),
+                "reference_price_source": reference_price_sources[instrument],
                 "average_cost": cost_basis.get(
                     instrument, float(reference_prices[instrument])
                 ),

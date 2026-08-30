@@ -140,6 +140,25 @@ test("ships the Qlib and RD-Agent single-mainline interface", async () => {
   assert.match(autopilot, /仅供隔离模拟验证，不是荐股/);
   assert.match(autopilot, /今天的正式动作/);
   assert.match(autopilot, /统一账户建议/);
+  assert.match(autopilot, /今日唯一操作清单/);
+  assert.match(autopilot, /统一账户今日操作清单/);
+  assert.match(autopilot, /查看三周期来源与研究详情/);
+  assert.match(autopilot, /多周期 ·/);
+  assert.match(autopilot, /本次数量/);
+  assert.match(autopilot, /账户目标/);
+  assert.match(autopilot, /失效条件/);
+  assert.match(autopilot, /executionConstraintReasons\(record\)/);
+  assert.match(autopilot, /blocked_reasons/);
+  assert.match(autopilot, /wait_reasons/);
+  assert.match(autopilot, /sourceSignals = cards\.flatMap/);
+  assert.match(autopilot, /card\.is_investment_advice/);
+  assert.match(autopilot, /account=\{advice\?\.unified_account/);
+  assert.match(autopilot, /cards=\{advice\?\.cards \?\? \[\]\}/);
+  assert.match(autopilot, /new Set\(\[\.\.\.tradeByInstrument\.keys\(\), \.\.\.targetByInstrument\.keys\(\)\]\)/);
+  assert.ok(
+    autopilot.indexOf("<UnifiedAccountCard") < autopilot.indexOf('<details className="novice-source-details">'),
+    "the novice surface must show the one account answer before collapsed horizon research details",
+  );
   assert.match(autopilot, /main_board/);
   assert.match(autopilot, /star_market/);
   assert.match(autopilot, /chi_next/);

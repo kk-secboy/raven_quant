@@ -217,6 +217,11 @@ def test_authoritative_markdown_contains_the_current_contract() -> None:
         "旧 `research_program/research_campaign` 记录只保留 `legacy_readonly` 历史查询",
         "创建、状态修改、重试和调度入口一律返回 410",
         "日常推荐只执行编译后的规则 IR，绝不运行 LLM 代码",
+        "每个周期只冻结一份活动冠军因子包",
+        "每个周期同一时点最多保留一个活动策略和两个隔离的 `paper_validating` 影子挑战者",
+        "今日唯一账户操作清单",
+        "20/50/30 短中线为主的三周期预算",
+        "停牌或当日执行价格证据缺失时只能冻结为 `WAIT` 并延后目标",
         "`research_sota → research_candidate → governed_evaluation_winner → "
         "paper_validating → recommendation_enabled`",
         "`system:auto-promotion`",
@@ -679,6 +684,8 @@ def test_paper_isolation_and_promotion_have_no_shadow_path() -> None:
         "例行 `ModelArtifact` 切换若超出预注册日历或改变模型配方，必须先形成新 `StrategySpec`，"
         "不能借“refit”绕过重置",
         "主模拟账户的归因不能代替各策略独立 `forward_paper` 的晋升证据",
+        "不得把上一计划的 `member_targets` 当作已经成交的袖套持仓",
+        "部分成交、拒单或目标不变时，未完成差额仍须保留精确成员贡献并继续补单",
         "证据不足时链路正确停在 `paper_validating`，人工不能覆盖失败门",
         "任一因子、模型、规则、数据合同或执行合同实质变化都形成新版本并从零累计前向证据",
     ):

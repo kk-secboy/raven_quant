@@ -82,9 +82,9 @@ def _payload(
 
 @pytest.mark.parametrize(
     ("profile", "expected"),
-    ((SHORT_1_5D, 5), (SWING_1_6M, 126), (LONG_1_3Y, 252)),
+    ((SHORT_1_5D, 5), (SWING_1_6M, 63), (LONG_1_3Y, 252)),
 )
-def test_active_factor_and_quant_labels_default_to_the_longest_window_label(
+def test_active_factor_and_quant_labels_default_to_the_primary_window_label(
     profile: str, expected: int
 ) -> None:
     binding = resolve_research_label_binding(_payload(profile))
@@ -199,7 +199,7 @@ def test_worker_overrides_untrusted_rdagent_label_and_freezes_factor_job(
     candidates = worker._import_rdagent_candidates("run-1", job, result)
     binding = resolve_research_label_binding(payload)
     assert binding is not None
-    assert candidates[0]["label_horizon_days"] == 126
+    assert candidates[0]["label_horizon_days"] == 63
     assert candidates[0]["variables"]["rdagent_reported_label_horizon_days"] == 1
     assert candidates[0]["variables"]["research_label_binding_sha256"] == binding[
         "binding_sha256"
@@ -208,8 +208,8 @@ def test_worker_overrides_untrusted_rdagent_label_and_freezes_factor_job(
     worker._queue_factor_evaluation(job, candidates)
     assert jobs.created is not None
     frozen = jobs.created["payload"]
-    assert frozen["label_horizon_sessions"] == 126
-    assert frozen["candidates"][0]["label_horizon_days"] == 126
+    assert frozen["label_horizon_sessions"] == 63
+    assert frozen["candidates"][0]["label_horizon_days"] == 63
     assert frozen["research_label_binding"] == binding
 
 

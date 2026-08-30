@@ -159,6 +159,8 @@ from .research_horizon import (
     LONG_1_3Y,
     SHORT_1_5D,
     SWING_1_6M,
+    primary_label_horizon_sessions,
+    primary_label_policy_contract,
     research_horizon_contract,
 )
 from .research_program_store import ResearchProgramStore
@@ -1242,10 +1244,16 @@ class StrategyConfigRequest(BaseModel):
     min_listing_days: int = Field(default=0, ge=0, le=2520)
     entry_score_min_percentile: float = Field(default=0.0, ge=0.0, le=1.0)
     score_drop_exit_percentile: float | None = Field(default=None, ge=0.0, le=1.0)
+    score_deterioration_reduce_percentile: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    score_deterioration_reduce_fraction: float = Field(default=0.50, ge=0.0, lt=1.0)
     extension_guard_max_return_5d: float | None = Field(
         default=None, ge=0.0, le=5.0
     )
+    holding_min_sessions: int | None = Field(default=None, ge=1, le=756)
     max_holding_sessions: int | None = Field(default=None, ge=1, le=756)
+    min_rebalance_weight_change: float = Field(default=0.0, ge=0.0, le=1.0)
     market_trend_lookback_sessions: int | None = Field(
         default=None, ge=2, le=756
     )
@@ -1253,12 +1261,15 @@ class StrategyConfigRequest(BaseModel):
     valuation_regime_max_percentile: float | None = Field(
         default=None, ge=0.0, le=1.0
     )
+    valuation_reduce_percentile: float | None = Field(default=None, ge=0.0, le=1.0)
+    valuation_reduce_fraction: float = Field(default=0.50, ge=0.0, lt=1.0)
     trend_break_lookback_sessions: int | None = Field(default=None, ge=2, le=756)
     thesis_min_holding_sessions: int | None = Field(default=None, ge=1, le=756)
     thesis_break_score_percentile: float | None = Field(
         default=None, ge=0.0, le=1.0
     )
     thesis_review_frequency: Literal["month"] | None = None
+    hard_risk_target_fraction: float = Field(default=0.50, ge=0.0, lt=1.0)
     cash_when_no_edge: bool = False
     topk: int = Field(default=50, ge=5, le=500)
     n_drop: int = Field(default=5, ge=0, le=100)
@@ -4449,6 +4460,16 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "strategy_horizon_profile": strategy_horizon_profile,
             "horizon_profile": research_horizon_profile,
             "incumbent_strategy": incumbent_binding,
+            **(
+                {
+                    "primary_label_policy": primary_label_policy_contract(),
+                    "primary_label_policy_sha256": primary_label_policy_contract()[
+                        "policy_sha256"
+                    ],
+                }
+                if scenario.id in HORIZON_RESEARCH_SCENARIOS
+                else {}
+            ),
         }
         if dataset is not None and periods is not None and period_resolution is not None:
             config.update(
@@ -4462,8 +4483,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     "research_window_contract_sha256": period_resolution.get(
                         "research_window_contract_sha256"
                     ),
-                    "label_horizon_sessions": max(
-                        period_resolution.get("label_horizons_sessions") or []
+                    "label_horizon_sessions": (
+                        primary_label_horizon_sessions(research_horizon_profile)
+                        if scenario.id in HORIZON_RESEARCH_SCENARIOS
+                        else None
                     ),
                     "dataset_path": dataset["path"],
                 }
@@ -4526,11 +4549,22 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "strategy_horizon_profile": strategy_horizon_profile,
             "horizon_profile": research_horizon_profile,
             "label_horizon_sessions": (
-                max(period_resolution.get("label_horizons_sessions") or [])
+                primary_label_horizon_sessions(research_horizon_profile)
                 if period_resolution
+                and scenario.id in HORIZON_RESEARCH_SCENARIOS
                 else None
             ),
             "incumbent_strategy": incumbent_binding,
+            **(
+                {
+                    "primary_label_policy": primary_label_policy_contract(),
+                    "primary_label_policy_sha256": primary_label_policy_contract()[
+                        "policy_sha256"
+                    ],
+                }
+                if scenario.id in HORIZON_RESEARCH_SCENARIOS
+                else {}
+            ),
         }
         try:
             job = jobs.create(

@@ -344,14 +344,23 @@ def test_v5_real_inventory_and_runtime_hashes_are_frozen() -> None:
     assert canonical_sha256(inventories) == (
         RUNTIME_INPUT_SCOPE_SOURCE_ARTIFACT_INVENTORIES_SHA256
     )
-    assert runtime_alignment_bundle_sha256(root) == (
+    # v11 is immutable historical evidence.  A material v12 runtime must have
+    # different bytes instead of silently rebinding these v11 constants to the
+    # current checkout.
+    assert RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256 == (
+        "687ad83efd9d734a238bd6b52b3f5e670cec1e5d165ec2b25cabcef724feb7cf"
+    )
+    assert RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256 == (
+        "64fa634b4e774279356c5655e70c741890ed9b208ccf75df757a378c0f56a432"
+    )
+    assert runtime_alignment_bundle_sha256(root) != (
         RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert (
         __import__("hashlib")
         .sha256((root / "scripts" / "run_multifactor_backtest.py").read_bytes())
         .hexdigest()
-        == RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256
+        != RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256
     )
 
 

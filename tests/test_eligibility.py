@@ -6,8 +6,10 @@ import pytest
 
 from quant_platform.eligibility import (
     ELIGIBILITY_CONTRACT_VERSION,
+    INSTRUMENT_RISK_STATES,
     EligibilityPolicy,
     build_point_in_time_eligibility,
+    project_point_in_time_risk_states,
 )
 from quant_platform.portfolio_policy import PortfolioPolicy, PortfolioPolicyConfig
 from quant_platform.strategy_backtest import (
@@ -16,6 +18,193 @@ from quant_platform.strategy_backtest import (
 )
 
 pytestmark = pytest.mark.no_database
+
+
+def _risk_row(instrument: str, **overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "datetime": pd.Timestamp("2025-06-03"),
+        "instrument": instrument,
+        "eligible": True,
+        "reasons": "[]",
+        "is_st": False,
+        "suspended": False,
+        "delisted": False,
+        "normal_listing_status": True,
+        "equity": 10_000_000.0,
+        "audit_opinion": "standard_unqualified",
+        "financial_gate_required": True,
+        "regulatory_data_available": True,
+        "major_violation": False,
+        "contract_version": ELIGIBILITY_CONTRACT_VERSION,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_point_in_time_risk_projection_distinguishes_bad_news_from_missing_data() -> None:
+    values = pd.DataFrame(
+        [
+            _risk_row("SH600000"),
+            _risk_row(
+                "SH600001",
+                eligible=False,
+                reasons='["suspended"]',
+                suspended=True,
+            ),
+            _risk_row(
+                "SH600002",
+                eligible=False,
+                reasons='["new_listing"]',
+            ),
+            _risk_row(
+                "SH600003",
+                eligible=False,
+                reasons=(
+                    '["negative_or_missing_equity", '
+                    '"nonstandard_or_missing_audit"]'
+                ),
+                equity=np.nan,
+                audit_opinion=None,
+            ),
+            _risk_row(
+                "SH600004",
+                eligible=False,
+                reasons='["negative_or_missing_equity"]',
+                equity=-1.0,
+            ),
+            _risk_row(
+                "SH600005",
+                eligible=False,
+                reasons='["nonstandard_or_missing_audit"]',
+                audit_opinion="qualified",
+            ),
+            _risk_row(
+                "SH600006",
+                eligible=False,
+                reasons='["nonstandard_or_missing_audit"]',
+                audit_opinion="adverse",
+            ),
+            _risk_row(
+                "SH600007",
+                eligible=False,
+                reasons='["major_violation"]',
+                major_violation=True,
+            ),
+            _risk_row(
+                "SH600008",
+                eligible=False,
+                reasons='["st"]',
+                is_st=True,
+            ),
+            _risk_row(
+                "SH600009",
+                eligible=False,
+                reasons='["abnormal_listing"]',
+                delisted=True,
+                normal_listing_status=False,
+            ),
+            _risk_row(
+                "SH600010",
+                eligible=False,
+                reasons='["insufficient_liquidity"]',
+            ),
+            _risk_row(
+                "SH600011",
+                eligible=False,
+                reasons='["regulatory_data_missing"]',
+                regulatory_data_available=False,
+            ),
+        ]
+    )
+
+    result = project_point_in_time_risk_states(
+        values,
+        as_of="2025-06-03",
+        instruments=[*values["instrument"], "SZ000001"],
+    ).set_index("instrument")
+
+    assert set(result["risk_state"]).issubset(INSTRUMENT_RISK_STATES)
+    assert result.loc["SH600000", "risk_state"] == "normal"
+    assert result.loc["SH600001", "risk_state"] == "watch"
+    assert not result.loc["SH600001", "tradable"]
+    assert result.loc["SH600002", "risk_state"] == "restricted"
+    assert result.loc["SH600003", "risk_state"] == "restricted"
+    assert json.loads(result.loc["SH600003", "risk_reasons"]) == [
+        "audit_evidence_missing",
+        "equity_evidence_missing",
+    ]
+    assert result.loc["SH600004", "risk_state"] == "exit"
+    assert result.loc["SH600005", "risk_state"] == "reduce"
+    assert result.loc["SH600006", "risk_state"] == "exit"
+    assert result.loc["SH600007", "risk_state"] == "exit"
+    assert result.loc["SH600008", "risk_state"] == "exit"
+    assert result.loc["SH600009", "risk_state"] == "exit"
+    assert result.loc["SH600010", "risk_state"] == "restricted"
+    assert result.loc["SH600011", "risk_state"] == "restricted"
+    assert result.loc["SZ000001", "risk_state"] == "restricted"
+    assert not result.loc["SZ000001", "tradable"]
+    assert not result.loc["SZ000001", "allow_new_risk"]
+
+
+def test_point_in_time_risk_projection_does_not_read_future_bad_news() -> None:
+    values = pd.DataFrame(
+        [
+            _risk_row("SH600000", datetime=pd.Timestamp("2025-06-02")),
+            _risk_row(
+                "SH600000",
+                datetime=pd.Timestamp("2025-06-04"),
+                eligible=False,
+                reasons='["st", "suspended"]',
+                is_st=True,
+                suspended=True,
+            ),
+        ]
+    )
+
+    before = project_point_in_time_risk_states(values, as_of="2025-06-03").iloc[0]
+    after = project_point_in_time_risk_states(values, as_of="2025-06-04").iloc[0]
+
+    assert before["risk_state"] == "restricted"
+    assert before["evidence_datetime"] == pd.Timestamp("2025-06-02")
+    assert not before["tradable"]
+    assert json.loads(before["risk_reasons"]) == ["eligibility_evidence_stale"]
+    assert after["risk_state"] == "exit"
+    assert not after["tradable"]
+    assert set(json.loads(after["risk_reasons"])) == {"st", "suspended"}
+
+
+def test_point_in_time_risk_projection_does_not_reuse_stale_normal_state() -> None:
+    values = pd.DataFrame([_risk_row("SH600000")])
+
+    result = project_point_in_time_risk_states(
+        values,
+        as_of="2025-06-04",
+        instruments=["SH600000"],
+    ).iloc[0]
+
+    assert result["risk_state"] == "restricted"
+    assert not result["tradable"]
+    assert not result["allow_new_risk"]
+    assert json.loads(result["risk_reasons"]) == ["eligibility_evidence_stale"]
+
+
+def test_point_in_time_risk_projection_does_not_apply_stock_financial_gates_to_etf() -> None:
+    values = pd.DataFrame(
+        [
+            _risk_row(
+                "SH510300",
+                equity=np.nan,
+                audit_opinion=None,
+                financial_gate_required=False,
+            )
+        ]
+    )
+
+    result = project_point_in_time_risk_states(values, as_of="2025-06-03").iloc[0]
+
+    assert result["risk_state"] == "normal"
+    assert result["tradable"]
+    assert result["allow_new_risk"]
 
 
 def test_score_neutralization_contract_is_shared_by_recipe_mode() -> None:

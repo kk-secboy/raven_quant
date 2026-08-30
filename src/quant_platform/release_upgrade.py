@@ -32,6 +32,7 @@ from .deployment_services import (
 )
 from .release_identity import (
     RELEASE_IDENTITY_ENV_KEYS,
+    STATEFUL_RELEASE_IDENTITY_EXEMPT,
     release_identity_environment,
 )
 from .release_preflight import (
@@ -128,7 +129,14 @@ def _capture_rollback_compose_contract(
     allow_missing: frozenset[str] = frozenset(),
     trusted_external_root: Path | None = None,
 ) -> RollbackComposeContract:
-    """Capture the exact Compose release contract owning the running containers."""
+    """Capture the exact Compose contract owning the running stateless services.
+
+    A protected stateful service can legitimately survive several immutable
+    application releases, so its Compose provenance labels can point at a
+    release directory which retention has already removed.  It remains part
+    of the live project identity check, but it must not select (or veto) the
+    application contract used to restore the writers and control plane.
+    """
 
     identities: set[tuple[Path, tuple[Path, ...], Path | None]] = set()
     present_services: set[str] = set()
@@ -146,6 +154,9 @@ def _capture_rollback_compose_contract(
             raise RuntimeError(f"rollback container {service} belongs to another Compose project")
         if labels.get("com.docker.compose.service") != service:
             raise RuntimeError(f"rollback container {service} has inconsistent service labels")
+        present_services.add(service)
+        if service in STATEFUL_RELEASE_IDENTITY_EXEMPT:
+            continue
         working_raw = str(
             labels.get("com.docker.compose.project.working_dir") or ""
         ).strip()
@@ -227,9 +238,15 @@ def _capture_rollback_compose_contract(
                             "external rollback Compose environment is group/world writable"
                         )
         identities.add((working_directory, compose_sources, environment_source))
-        present_services.add(service)
+    if not identities:
+        raise RuntimeError(
+            "cannot capture rollback Compose contract without a running "
+            "stateless release service"
+        )
     if len(identities) != 1:
-        raise RuntimeError("running rollback services do not share one Compose release contract")
+        raise RuntimeError(
+            "running stateless rollback services do not share one Compose release contract"
+        )
 
     working_directory, compose_sources, labeled_env_source = identities.pop()
     if labeled_env_source is not None:
@@ -832,6 +849,28 @@ def _configured_service_images(
     return resolved
 
 
+def _representative_build_services(
+    configured_images: dict[str, str],
+    services: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Select one deterministic Compose build target for each mutable image alias."""
+
+    missing = [service for service in services if service not in configured_images]
+    if missing:
+        raise RuntimeError(
+            "configured build images are missing services: " + ", ".join(missing)
+        )
+    selected: list[str] = []
+    seen_images: set[str] = set()
+    for service in services:
+        image = configured_images[service]
+        if image in seen_images:
+            continue
+        seen_images.add(image)
+        selected.append(service)
+    return tuple(selected)
+
+
 def _prepare_sandbox_images(
     context: ComposeContext,
     project_root: Path,
@@ -1036,6 +1075,7 @@ def _prepare_sandbox_images(
         )
         sealed = {
             "RDAGENT_RUNTIME_IMAGE_DIGEST": runtime_image_id,
+            "QUANTLAB_WORKER_RUNTIME_IMAGE_DIGEST": sandbox_base_image_id,
             "RDAGENT_QLIB_SANDBOX_IMAGE": qlib_image,
             "RDAGENT_DATA_SCIENCE_IMAGE": data_science_image,
             "MODEL_SANDBOX_IMAGE": model_image,
@@ -1925,13 +1965,17 @@ def run_release_upgrade(
         result["rollback_images"] = rollback_tags
         result["rollback_disabled_services"] = sorted(rollback_disabled_services)
         configured_build_images = _configured_service_images(context, *built_services)
+        representative_build_services = _representative_build_services(
+            configured_build_images,
+            built_services,
+        )
         build_arguments = ["build"]
         if pull_images:
             build_arguments.append("--pull")
         # A partially successful Compose build can already overwrite mutable
         # aliases, even when the command subsequently fails.
         build_aliases_dirty = True
-        context.run(*build_arguments, *built_services)
+        context.run(*build_arguments, *representative_build_services)
 
         final_gate = assess_release(
             context,

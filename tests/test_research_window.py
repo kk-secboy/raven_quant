@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+import pandas as pd
 import pytest
 
 from quant_platform.factor_library import compile_qlib_expression
 from quant_platform.feature_set_registry import get_feature_set
 from quant_platform.research_automation import (
+    ResearchWindowUnavailableError,
     normalize_research_period_policy,
     normalize_research_schedule_payload,
     resolve_research_periods,
@@ -28,6 +30,29 @@ def _calendar(count: int = 5500) -> list[str]:
             result.append(current.isoformat())
         current += timedelta(days=1)
     return result
+
+
+def _pre_2022_unopened_calendar() -> list[str]:
+    """Mirror the server audit: 3,527 sessions, 1,683 cost-covered."""
+
+    pre_cost = [
+        item.date().isoformat()
+        for item in pd.bdate_range(end="2015-07-31", periods=1844)
+    ]
+    candidates = [
+        item.date().isoformat()
+        for item in pd.bdate_range("2015-08-03", "2022-07-05")
+    ]
+    indices = sorted(
+        {
+            round(index * (len(candidates) - 1) / (1683 - 1))
+            for index in range(1683)
+        }
+    )
+    cost_covered = [candidates[index] for index in indices]
+    assert len(pre_cost) == 1844
+    assert len(cost_covered) == 1683
+    return pre_cost + cost_covered
 
 
 def _dataset(feature_set: dict | None = None) -> dict:
@@ -132,6 +157,89 @@ def test_three_horizon_windows_freeze_labels_gaps_oos_and_maturity(
         == embargo
     )
     assert calendar.index(periods["test_end"]) - calendar.index(periods["test_start"]) + 1 == oos
+
+
+@pytest.mark.no_database
+def test_pre_2022_unopened_history_runs_short_and_swing_without_fake_10y() -> None:
+    calendar = _pre_2022_unopened_calendar()
+
+    short_periods, short = resolve_research_periods(
+        calendar, horizon_profile=SHORT_1_5D
+    )
+    swing_periods, swing = resolve_research_periods(
+        calendar, horizon_profile=SWING_1_6M
+    )
+
+    assert len(calendar) == 3527
+    assert sum(day >= "2015-08-03" for day in calendar) == 1683
+    assert short_periods["test_end"] < "2022-07-06"
+    assert swing_periods["test_end"] < "2022-07-06"
+    assert [item["id"] for item in short["evaluation_profiles"]] == [
+        "recent_3y",
+        "robust_10y",
+        "balanced_5y",
+    ]
+    assert [item["id"] for item in swing["evaluation_profiles"]] == [
+        "recent_3y",
+        "robust_10y",
+        "balanced_5y",
+    ]
+    swing_resolution = swing["evaluation_profile_resolution"]
+    assert swing_resolution["capital_evaluation_eligible"] is True
+    assert swing_resolution["effective_profiles"] == [
+        "recent_3y",
+        "robust_10y",
+        "balanced_5y",
+    ]
+    assert swing_resolution["unavailable_profiles"] == []
+    robust = next(
+        item for item in swing["evaluation_profiles"] if item["id"] == "robust_10y"
+    )
+    assert robust["requested_validation_trading_days"] == 2520
+    assert robust["effective_validation_trading_days"] == 926
+    assert robust["validation_window_truncated"] is True
+    confirmation = next(
+        item
+        for item in swing["evaluation_profiles"]
+        if item["id"] == "balanced_5y"
+    )
+    assert confirmation["requested_validation_trading_days"] == 1260
+    assert confirmation["effective_validation_trading_days"] == 841
+    assert confirmation["binding_constraints"][-1] == (
+        "confirmation_shortened_to_distinct_cost_covered_midpoint"
+    )
+
+
+@pytest.mark.no_database
+def test_pre_2022_long_is_explicitly_unavailable_without_weakening_oos() -> None:
+    calendar = _pre_2022_unopened_calendar()
+
+    with pytest.raises(ResearchWindowUnavailableError) as captured:
+        resolve_research_periods(calendar, horizon_profile=LONG_1_3Y)
+
+    evidence = captured.value.evidence
+    assert evidence["calendar_trading_days"] == 3527
+    assert evidence["capital_evaluation_eligible"] is False
+    assert evidence["capital_evaluation_unavailable_reason"] == (
+        "primary_and_distinct_stress_profiles_required"
+    )
+    assert evidence["effective_profiles"] == ["recent_3y"]
+    assert {item["id"] for item in evidence["unavailable_profiles"]} == {
+        "robust_10y",
+        "balanced_5y",
+    }
+    primary = next(
+        item
+        for item in evidence["requested_profiles"]
+        if item["id"] == "recent_3y"
+    )
+    assert primary["periods"]["test_end"] == calendar[-253]
+    assert sum(
+        primary["periods"]["test_start"]
+        <= day
+        <= primary["periods"]["test_end"]
+        for day in calendar
+    ) == 756
 
 
 @pytest.mark.no_database

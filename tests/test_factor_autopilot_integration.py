@@ -5,12 +5,15 @@ import json
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from qlib_test_doubles import qlib_workflow_identity
 
+import quant_platform.factor_autopilot as factor_autopilot_module
 import quant_platform.strategy_store as strategy_store_module
 from quant_platform.factor_autopilot import (
+    FactorAutopilotService,
     canonical_sha256,
     factor_sota_admission_path,
     resolve_sota_roll_forward,
@@ -23,9 +26,11 @@ from quant_platform.factor_library import (
 )
 from quant_platform.factor_library_store import (
     INCREMENTAL_EVIDENCE_VERSION,
+    FactorLibraryStore,
     validate_factor_definition_immutability,
     validate_sota_roll_forward,
 )
+from quant_platform.feature_set_registry import get_feature_set, register_feature_set
 from quant_platform.research_automation import build_multi_profile_consensus
 from quant_platform.research_store import FactorGatePolicy
 from quant_platform.strategy_store import (
@@ -209,6 +214,129 @@ def test_factor_sota_refuses_non_monotonic_same_lineage_roll_forward() -> None:
 
     with pytest.raises(ValueError, match="did not increase monotonically"):
         resolve_sota_roll_forward(current, versions, catalog)
+
+
+def test_active_sota_resolution_is_primary_label_and_horizon_specific(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current, _, _ = _roll_forward_inputs()
+    current["name"] = "cn-20260826"
+    current["provenance"]["dataset_identity_sha256"] = "b" * 64
+
+    def detail(version_id: str, label: int) -> dict:
+        evidence = {"version_id": version_id, "kind": "governed-factor-sota"}
+        policy = {"version": "test-policy"}
+        return {
+            "id": version_id,
+            "status": "active",
+            "universe": "cn_all",
+            "label_horizon_days": label,
+            "evidence": evidence,
+            "evidence_sha256": canonical_sha256(evidence),
+            "policy": policy,
+            "policy_sha256": canonical_sha256(policy),
+            "members": [],
+        }
+
+    details = {
+        "legacy-one-day": detail("legacy-one-day", 1),
+        "short-primary": detail("short-primary", 5),
+        "swing-primary": detail("swing-primary", 63),
+    }
+
+    class _Library:
+        def list_sota(self, *, limit: int) -> list[dict]:
+            assert limit == 1000
+            return [
+                {
+                    **item,
+                    "dataset": current["name"],
+                    "dataset_identity_sha256": current["provenance"][
+                        "dataset_identity_sha256"
+                    ],
+                }
+                for item in details.values()
+            ]
+
+        def get_sota(self, version_id: str) -> dict:
+            return details[version_id]
+
+        def horizon_champion_feature_set(
+            self, version_id: str, *, horizon_profile: str
+        ) -> dict:
+            definition = {
+                "contract_version": "governed-feature-set-v1-horizon-champion",
+                "id": f"champion:{horizon_profile}:{version_id}",
+                "name": f"SOTA {version_id}",
+                "source": version_id,
+                "features": {"SOTA_000": "$close"},
+                "sota_feature_set_sha256": "f" * 64,
+            }
+            return {
+                **definition,
+                "definition_sha256": canonical_sha256(definition),
+            }
+
+    service = object.__new__(FactorAutopilotService)
+    service.settings = SimpleNamespace(data_root=Path("unused"))
+    service.library = _Library()
+    service.research = SimpleNamespace()
+    monkeypatch.setattr(factor_autopilot_module, "list_qlib_datasets", lambda _root: [])
+
+    default_short = service.resolve_active_sota(current)
+    swing = service.resolve_active_sota(current, horizon_profile="swing_1_6m")
+    long = service.resolve_active_sota(current, horizon_profile="long_1_3y")
+
+    assert default_short is not None
+    assert default_short["id"] == "short-primary"
+    assert default_short["label_horizon_sessions"] == 5
+    assert swing is not None
+    assert swing["id"] == "swing-primary"
+    assert swing["label_horizon_sessions"] == 63
+    assert long is None
+
+
+def test_horizon_champion_keeps_alpha158_and_adds_admitted_sota() -> None:
+    addition = {
+        "contract_version": "governed-feature-set-v2-research-sota",
+        "id": "sota:swing-v1",
+        "name": "SOTA swing-v1",
+        "source": "swing-v1",
+        "features": {"SOTA_000_factor": "Mean($close,5)"},
+        "sota_evidence_sha256": "e" * 64,
+    }
+
+    class _Store:
+        @staticmethod
+        def get_sota(_version_id: str) -> dict:
+            return {
+                "status": "active",
+                "label_horizon_days": 63,
+                "evidence_sha256": "e" * 64,
+            }
+
+        @staticmethod
+        def sota_feature_set(_version_id: str) -> dict:
+            return {
+                **addition,
+                "definition_sha256": canonical_sha256(addition),
+            }
+
+    champion = FactorLibraryStore.horizon_champion_feature_set(
+        _Store(),
+        "swing-v1",
+        horizon_profile="swing_1_6m",
+    )
+    alpha158 = get_feature_set("qlib-alpha158")
+
+    assert set(alpha158["features"]).issubset(champion["features"])
+    assert champion["features"]["SOTA_000_factor"] == "Mean($close,5)"
+    assert champion["foundation_feature_set_sha256"] == alpha158[
+        "definition_sha256"
+    ]
+    assert champion["primary_label_horizon_sessions"] == 63
+    assert len(champion["definition_sha256"]) == 64
+    assert register_feature_set(champion) == champion
 
 
 def test_factor_sota_roll_forward_contract_seals_member_and_feature_hashes() -> None:

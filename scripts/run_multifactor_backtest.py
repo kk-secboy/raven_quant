@@ -26,7 +26,10 @@ from quant_data.execution_contract import (
 )
 from quant_data.qlib_builder import verify_qlib_output_manifest
 from quant_platform.cost_model import CostScheduleBook
-from quant_platform.eligibility import eligibility_statistics
+from quant_platform.eligibility import (
+    eligibility_statistics,
+    project_point_in_time_risk_states,
+)
 from quant_platform.execution_algorithms import execution_time_slots
 from quant_platform.factor_recompute import (
     execute_factor_code,
@@ -109,6 +112,11 @@ from quant_platform.strategy_rule_runtime import (
 )
 from quant_platform.strategy_rule_runtime import (
     load_governed_style_exposures as _load_governed_style_exposures,
+)
+from quant_platform.transparent_baseline_runner import (
+    TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
+    TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD,
+    require_transparent_baseline_runner,
 )
 from quant_platform.upstream_versions import upstream_runtime_identity
 
@@ -734,6 +742,7 @@ def _metadata_provider(
     memberships: pd.DataFrame,
     benchmark_weights: pd.DataFrame | None,
     styles: pd.DataFrame,
+    eligibility_matrix: pd.DataFrame,
     execution_metadata: pd.DataFrame,
     close_history: pd.DataFrame,
     benchmark_close_history: pd.DataFrame | None,
@@ -803,26 +812,38 @@ def _metadata_provider(
             style_exposures=style,
             return_covariance=return_covariance,
         )
+        risk_projection = project_point_in_time_risk_states(
+            eligibility_matrix,
+            as_of=market_timestamp,
+            instruments=instruments,
+        ).set_index("instrument")
+        execution_prices = _qlib_cross_section(
+            intraday_prices if intraday_prices is not None else execution_metadata,
+            timestamp if intraday_prices is not None else market_timestamp,
+            "$vwap" if intraday_prices is not None else open_field,
+        ).reindex(instruments.astype(str))
+        current_prices = _qlib_cross_section(
+            intraday_prices if intraday_prices is not None else execution_metadata,
+            timestamp if intraday_prices is not None else market_timestamp,
+            "$close" if intraday_prices is not None else close_field,
+        ).reindex(instruments.astype(str))
+        average_daily_values = _qlib_cross_section(
+            execution_metadata,
+            market_timestamp,
+            "Ref(Mean($amount, 20), 1)",
+        ).reindex(instruments.astype(str))
+        non_tradable = ~risk_projection["tradable"].astype(bool)
+        if non_tradable.any():
+            blocked = risk_projection.index[non_tradable]
+            execution_prices.loc[blocked] = np.nan
+            average_daily_values.loc[blocked] = np.nan
         result = {
             **portfolio_metadata,
-            "prices": _qlib_cross_section(
-                intraday_prices if intraday_prices is not None else execution_metadata,
-                timestamp if intraday_prices is not None else market_timestamp,
-                "$vwap" if intraday_prices is not None else open_field,
-            ).reindex(instruments.astype(str)),
-            "current_prices": _qlib_cross_section(
-                intraday_prices if intraday_prices is not None else execution_metadata,
-                timestamp if intraday_prices is not None else market_timestamp,
-                "$close" if intraday_prices is not None else close_field,
-            ).reindex(instruments.astype(str)),
+            "prices": execution_prices,
+            "current_prices": current_prices,
             # $amount is CNY yuan under the v3 daily field contract.
-            "average_daily_values": (
-                _qlib_cross_section(
-                    execution_metadata,
-                    market_timestamp,
-                    "Ref(Mean($amount, 20), 1)",
-                ).reindex(instruments.astype(str))
-            ),
+            "average_daily_values": average_daily_values,
+            "instrument_risk_states": risk_projection["risk_state"],
         }
         result.update(
             build_strategy_rule_runtime_metadata(
@@ -873,6 +894,17 @@ def main() -> None:
     }
 
     config = manifest["config"]
+    # Recheck inside the actual evaluation process.  The parent worker already
+    # verifies the same binding before launch; this second boundary proves that
+    # the executed Python environment inherited the release-stamped image ID.
+    require_transparent_baseline_runner(
+        config=config,
+        job_payload=manifest,
+        runner_path=Path(__file__).resolve(),
+    )
+    worker_runtime_image_digest = manifest.get(
+        TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD
+    )
     signal_source = str(config.get("signal_source") or "factor_score")
     if evaluation_mode == PRE_FINAL_PORTFOLIO_TRIAL_MODE and signal_source != (
         "model_prediction"
@@ -1542,6 +1574,7 @@ def main() -> None:
         industry_memberships,
         benchmark_weights,
         style_exposures,
+        eligibility_matrix,
         execution_metadata,
         close_history,
         benchmark_close_history,
@@ -2164,6 +2197,9 @@ def main() -> None:
                 else "final_oos_once"
             ),
             "final_oos_opened": evaluation_mode == FORMAL_FINAL_OOS_MODE,
+            TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD: (
+                worker_runtime_image_digest
+            ),
             "dataset_identity_sha256": provider_provenance.get("dataset_identity_sha256"),
             "pre_final_cutoff": (
                 str(manifest.get("pre_final_cutoff") or "")

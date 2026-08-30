@@ -7,12 +7,17 @@ from pathlib import Path
 
 import pytest
 
+from quant_platform.runtime_source_closure import (
+    position_risk_source_closure_inventory,
+)
 from quant_platform.transparent_baseline_runner import (
     CANONICAL_LF_TARGET_RECIPE_VERSION,
     CANONICAL_LF_TARGET_RUNNER_SHA256,
     OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
     OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
-    RUNTIME_ALIGNMENT_RUNTIME_PATHS,
+    POSITION_RISK_TARGET_RECIPE_VERSION,
+    POSITION_RISK_TARGET_RUNNER_SHA256,
+    POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256,
     RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION,
     RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256,
     RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256,
@@ -21,13 +26,22 @@ from quant_platform.transparent_baseline_runner import (
     RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256,
     TRANSPARENT_BASELINE_JOB_RUNNER_FIELD,
     TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
+    WORKER_RUNTIME_IMAGE_DIGEST_ENV,
+    position_risk_bundle_sha256,
     require_transparent_baseline_runner,
-    runtime_alignment_bundle_sha256,
 )
 
 pytestmark = pytest.mark.no_database
+_WORKER_IMAGE_DIGEST = "sha256:" + "d" * 64
+
+
+@pytest.fixture(autouse=True)
+def _sealed_worker_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV, _WORKER_IMAGE_DIGEST)
 
 
 def _git(repo: Path, *args: str) -> bytes:
@@ -37,6 +51,19 @@ def _git(repo: Path, *args: str) -> bytes:
         check=True,
         capture_output=True,
     ).stdout
+
+
+def _v12_source_paths(project_root: Path) -> tuple[str, ...]:
+    manifest = position_risk_source_closure_inventory(project_root)
+    paths = {
+        str(item["path"])
+        for item in manifest["inventory"]
+        if item["kind"] == "module"
+    }
+    # api.py is represented by a narrow fragment in the manifest; the release
+    # still needs the source file from which that fragment is deterministically cut.
+    paths.add("src/quant_platform/api.py")
+    return tuple(sorted(paths))
 
 
 def _config(
@@ -51,6 +78,13 @@ def _config(
     if recipe_version == RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION:
         bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
             RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256
+        )
+    if recipe_version == POSITION_RISK_TARGET_RECIPE_VERSION:
+        bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
+            POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
+        )
+        bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
+            _WORKER_IMAGE_DIGEST
         )
     return {
         "recipe_id": "short_relative_strength",
@@ -90,7 +124,7 @@ def test_historical_v9_identity_is_not_rebound_to_current_v10_bytes() -> None:
         )
 
 
-def test_historical_v10_identity_is_not_rebound_to_current_v11_bytes() -> None:
+def test_historical_v10_identity_is_not_rebound_to_current_v12_bytes() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
     with pytest.raises(ValueError, match="transparent v10 runner bytes differ"):
@@ -111,36 +145,10 @@ def test_historical_v10_identity_is_not_rebound_to_current_v11_bytes() -> None:
         )
 
 
-def test_current_transparent_v11_runner_matches_input_scope_identity() -> None:
+def test_historical_v11_identity_is_not_rebound_to_current_v12_bytes() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
-    assert require_transparent_baseline_runner(
-        config=_config(
-            RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION,
-            RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256,
-        ),
-        job_payload={
-            TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
-                RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256
-            ),
-            TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
-                RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256
-            ),
-        },
-        runner_path=runner,
-    ) == RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256
-
-
-def test_v11_rejects_changed_imported_runtime_module(tmp_path: Path) -> None:
-    root = Path(__file__).parents[1]
-    for relative in RUNTIME_ALIGNMENT_RUNTIME_PATHS:
-        destination = tmp_path / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(root / relative, destination)
-    policy = tmp_path / "src" / "quant_platform" / "portfolio_policy.py"
-    policy.write_bytes(policy.read_bytes() + b"\n# unauthorized runtime change\n")
-
-    with pytest.raises(ValueError, match="runtime bundle differs"):
+    with pytest.raises(ValueError, match="transparent v11 runner bytes differ"):
         require_transparent_baseline_runner(
             config=_config(
                 RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION,
@@ -154,7 +162,112 @@ def test_v11_rejects_changed_imported_runtime_module(tmp_path: Path) -> None:
                     RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256
                 ),
             },
+            runner_path=runner,
+        )
+
+
+def test_current_transparent_v12_runner_matches_position_risk_identity() -> None:
+    runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
+
+    assert require_transparent_baseline_runner(
+        config=_config(
+            POSITION_RISK_TARGET_RECIPE_VERSION,
+            POSITION_RISK_TARGET_RUNNER_SHA256,
+        ),
+        job_payload={
+            TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: POSITION_RISK_TARGET_RUNNER_SHA256,
+            TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
+                POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
+            ),
+            TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
+                _WORKER_IMAGE_DIGEST
+            ),
+        },
+        runner_path=runner,
+    ) == POSITION_RISK_TARGET_RUNNER_SHA256
+
+
+def test_v12_rejects_changed_imported_runtime_module(tmp_path: Path) -> None:
+    root = Path(__file__).parents[1]
+    for relative in _v12_source_paths(root):
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(root / relative, destination)
+    policy = tmp_path / "src" / "quant_platform" / "portfolio_policy.py"
+    policy.write_bytes(policy.read_bytes() + b"\n# unauthorized runtime change\n")
+
+    with pytest.raises(ValueError, match="runtime bundle differs"):
+        require_transparent_baseline_runner(
+            config=_config(
+                POSITION_RISK_TARGET_RECIPE_VERSION,
+                POSITION_RISK_TARGET_RUNNER_SHA256,
+            ),
+            job_payload={
+                TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
+                    POSITION_RISK_TARGET_RUNNER_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
+                    POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
+                    _WORKER_IMAGE_DIGEST
+                ),
+            },
             runner_path=tmp_path / "scripts" / "run_multifactor_backtest.py",
+        )
+
+
+def test_v12_rejects_missing_worker_runtime_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV)
+    runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
+
+    with pytest.raises(ValueError, match="worker runtime image digest is missing"):
+        require_transparent_baseline_runner(
+            config=_config(
+                POSITION_RISK_TARGET_RECIPE_VERSION,
+                POSITION_RISK_TARGET_RUNNER_SHA256,
+            ),
+            job_payload={
+                TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
+                    POSITION_RISK_TARGET_RUNNER_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
+                    POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
+                    _WORKER_IMAGE_DIGEST
+                ),
+            },
+            runner_path=runner,
+        )
+
+
+def test_v12_rejects_worker_runtime_image_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV, "sha256:" + "e" * 64)
+    runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
+
+    with pytest.raises(ValueError, match="worker runtime image differs"):
+        require_transparent_baseline_runner(
+            config=_config(
+                POSITION_RISK_TARGET_RECIPE_VERSION,
+                POSITION_RISK_TARGET_RUNNER_SHA256,
+            ),
+            job_payload={
+                TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
+                    POSITION_RISK_TARGET_RUNNER_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
+                    POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
+                    _WORKER_IMAGE_DIGEST
+                ),
+            },
+            runner_path=runner,
         )
 
 
@@ -212,13 +325,14 @@ def test_runner_bytes_survive_git_blob_and_archive_with_autocrlf(
     ) == 1
 
 
-def test_v11_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -> None:
+def test_v12_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -> None:
     root = Path(__file__).parents[1]
+    source_paths = _v12_source_paths(root)
     repo = tmp_path / "runtime-bundle-repo"
     archive_root = tmp_path / "runtime-bundle-archive"
     (repo / ".gitattributes").parent.mkdir(parents=True)
     (repo / ".gitattributes").write_bytes((root / ".gitattributes").read_bytes())
-    for relative in RUNTIME_ALIGNMENT_RUNTIME_PATHS:
+    for relative in source_paths:
         destination = repo / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes((root / relative).read_bytes())
@@ -226,25 +340,25 @@ def test_v11_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -
     _git(repo, "config", "core.autocrlf", "true")
     _git(repo, "config", "user.name", "QuantLab Tests")
     _git(repo, "config", "user.email", "tests@quantlab.invalid")
-    _git(repo, "add", ".gitattributes", *RUNTIME_ALIGNMENT_RUNTIME_PATHS)
-    _git(repo, "commit", "--quiet", "-m", "Seal v11 runtime bundle")
+    _git(repo, "add", ".gitattributes", *source_paths)
+    _git(repo, "commit", "--quiet", "-m", "Seal v12 runtime bundle")
     archive = _git(repo, "archive", "--format=tar", "HEAD")
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
-        for relative in RUNTIME_ALIGNMENT_RUNTIME_PATHS:
+        for relative in source_paths:
             archived = tar.extractfile(relative)
             assert archived is not None
             destination = archive_root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(archived.read())
 
-    assert runtime_alignment_bundle_sha256(root) == (
-        RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256
+    assert position_risk_bundle_sha256(root) == (
+        POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
     )
-    assert runtime_alignment_bundle_sha256(repo) == (
-        RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256
+    assert position_risk_bundle_sha256(repo) == (
+        POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
     )
-    assert runtime_alignment_bundle_sha256(archive_root) == (
-        RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256
+    assert position_risk_bundle_sha256(archive_root) == (
+        POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
     )
 
 
@@ -267,6 +381,12 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
         / "versions"
         / "0077_transparent_baseline_runtime_input_scope_repair.py"
     ).read_text(encoding="utf-8")
+    v12_migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "versions"
+        / "0078_transparent_baseline_v12_runtime_seal.py"
+    ).read_text(encoding="utf-8")
 
     assert CANONICAL_LF_TARGET_RUNNER_SHA256 in v9_migration
     assert OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256 in v9_migration
@@ -274,6 +394,9 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
     assert RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256 in v10_migration
     assert RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256 in v11_migration
     assert RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256 in v11_migration
+    assert RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256 not in v12_migration
+    assert POSITION_RISK_TARGET_RUNNER_SHA256 in v12_migration
+    assert POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256 in v12_migration
 
 
 def test_transparent_v8_runner_rejects_changed_bytes(tmp_path: Path) -> None:

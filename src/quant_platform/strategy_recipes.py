@@ -12,7 +12,7 @@ from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 # misclassified as a trend break. Factors, costs, dataset/OOS windows, economic
 # parameters and random seeds stay unchanged from v10. The failed no-result
 # v10 attempts remain immutable under a separate governed repair.
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v11"
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v12"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},
@@ -192,13 +192,35 @@ def _transparent_baseline_rules(
     elif horizon == "swing_1_6m":
         exit_components.extend(
             [
+                _component(
+                    "score_deterioration_reduce",
+                    below_percentile=0.35,
+                    reduce_fraction=0.50,
+                ),
                 _component("trend_break", lookback_days=20),
                 _component("stop_loss", fraction=0.07),
             ]
         )
     else:
-        exit_components.append(
-            _component("thesis_break", minimum_holding_days=252, review_frequency="month")
+        exit_components.extend(
+            [
+                _component(
+                    "score_deterioration_reduce",
+                    below_percentile=0.40,
+                    reduce_fraction=0.33,
+                ),
+                _component(
+                    "valuation_reduce",
+                    above_percentile=0.95,
+                    reduce_fraction=0.33,
+                ),
+                _component("stop_loss", fraction=0.25),
+                _component(
+                    "thesis_break",
+                    minimum_holding_days=252,
+                    review_frequency="month",
+                ),
+            ]
         )
     topk = {"short_1_5d": 20, "swing_1_6m": 20, "long_1_3y": 30}[horizon]
     position_weight = {"short_1_5d": 0.05, "swing_1_6m": 0.10, "long_1_3y": 0.05}[
@@ -282,6 +304,14 @@ def _transparent_baseline_rules(
                     fraction={"short_1_5d": 0.50, "swing_1_6m": 0.25, "long_1_3y": 0.05}[
                         horizon
                     ],
+                ),
+                _component(
+                    "minimum_trade_band",
+                    fraction={
+                        "short_1_5d": 0.002,
+                        "swing_1_6m": 0.005,
+                        "long_1_3y": 0.0025,
+                    }[horizon],
                 ),
                 _component("cash_when_no_edge"),
             ],
@@ -709,15 +739,22 @@ def _with_execution_policy(recipe: dict[str, Any]) -> dict[str, Any]:
         "min_listing_days",
         "entry_score_min_percentile",
         "score_drop_exit_percentile",
+        "score_deterioration_reduce_percentile",
+        "score_deterioration_reduce_fraction",
         "extension_guard_max_return_5d",
+        "holding_min_sessions",
         "max_holding_sessions",
+        "min_rebalance_weight_change",
         "market_trend_lookback_sessions",
         "market_trend_benchmark",
         "valuation_regime_max_percentile",
+        "valuation_reduce_percentile",
+        "valuation_reduce_fraction",
         "trend_break_lookback_sessions",
         "thesis_min_holding_sessions",
         "thesis_review_frequency",
         "thesis_break_score_percentile",
+        "hard_risk_target_fraction",
         "stop_loss",
         "rebalance_frequency",
         "lot_size",

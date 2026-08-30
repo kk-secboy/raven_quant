@@ -56,13 +56,22 @@ _SLOT_COMPONENTS: dict[str, frozenset[str]] = {
         {"next_open", "score_threshold", "extension_guard", "rebalance_calendar"}
     ),
     "exit_state": frozenset(
-        {"max_holding_days", "score_drop_exit", "stop_loss", "trend_break", "thesis_break"}
+        {
+            "max_holding_days",
+            "score_drop_exit",
+            "score_deterioration_reduce",
+            "valuation_reduce",
+            "stop_loss",
+            "trend_break",
+            "thesis_break",
+        }
     ),
     "portfolio_risk": frozenset(
         {
             "topk_equal_weight",
             "max_industry_weight",
             "max_daily_turnover",
+            "minimum_trade_band",
             "cash_when_no_edge",
         }
     ),
@@ -287,6 +296,46 @@ def _validate_component_parameters(
                 values["below_percentile"], name="below_percentile", minimum=0.0, maximum=0.9
             )
         }
+    if component == "score_deterioration_reduce":
+        values = _exact_parameters(
+            component,
+            parameters,
+            frozenset({"below_percentile", "reduce_fraction"}),
+        )
+        return {
+            "below_percentile": _plain_number(
+                values["below_percentile"],
+                name="below_percentile",
+                minimum=0.0,
+                maximum=0.9,
+            ),
+            "reduce_fraction": _plain_number(
+                values["reduce_fraction"],
+                name="reduce_fraction",
+                minimum=0.05,
+                maximum=0.95,
+            ),
+        }
+    if component == "valuation_reduce":
+        values = _exact_parameters(
+            component,
+            parameters,
+            frozenset({"above_percentile", "reduce_fraction"}),
+        )
+        return {
+            "above_percentile": _plain_number(
+                values["above_percentile"],
+                name="above_percentile",
+                minimum=0.5,
+                maximum=1.0,
+            ),
+            "reduce_fraction": _plain_number(
+                values["reduce_fraction"],
+                name="reduce_fraction",
+                minimum=0.05,
+                maximum=0.95,
+            ),
+        }
     if component == "stop_loss":
         values = _exact_parameters(component, parameters, frozenset({"fraction"}))
         return {
@@ -340,6 +389,13 @@ def _validate_component_parameters(
         return {
             "fraction": _plain_number(
                 values["fraction"], name="fraction", minimum=0.0, maximum=1.0
+            )
+        }
+    if component == "minimum_trade_band":
+        values = _exact_parameters(component, parameters, frozenset({"fraction"}))
+        return {
+            "fraction": _plain_number(
+                values["fraction"], name="fraction", minimum=0.0, maximum=0.10
             )
         }
     if component == "cash_when_no_edge":

@@ -192,6 +192,278 @@ def test_policy_applies_liquidity_and_round_lot_constraints() -> None:
         assert shares % 100 == pytest.approx(0.0)
 
 
+def test_missing_execution_price_freezes_only_that_holding_and_continues_batch() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=1.0,
+        )
+    )
+
+    decision = policy.decide(
+        pd.Series({"new": 2.0, "held": 1.0}),
+        {"held": 0.50},
+        prices=pd.Series({"new": 10.0, "held": np.nan}),
+        average_daily_values=pd.Series({"new": 1_000_000_000.0, "held": np.nan}),
+        portfolio_value=1_000_000,
+    )
+
+    assert decision.target_weights == {
+        "new": pytest.approx(0.50),
+        "held": pytest.approx(0.50),
+    }
+    assert decision.position_state["frozen_instruments"] == ["held"]
+    assert decision.position_state["deferred_target_weights"] == {"held": 0.0}
+    assert decision.position_state["discrete_constraint_validation"]["status"] == "passed"
+    assert "execution_evidence_unavailable" in {
+        event["rule"] for event in decision.risk_events
+    }
+
+
+def test_missing_price_blocks_new_entry_without_aborting_valid_candidate() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_daily_turnover=1.0,
+        )
+    )
+
+    decision = policy.decide(
+        pd.Series({"missing": 2.0, "valid": 1.0}),
+        {},
+        prices=pd.Series({"missing": np.nan, "valid": 10.0}),
+        average_daily_values=pd.Series(
+            {"missing": 1_000_000_000.0, "valid": 1_000_000_000.0}
+        ),
+        portfolio_value=1_000_000,
+    )
+
+    assert "missing" not in decision.target_weights
+    assert decision.target_weights == {"valid": pytest.approx(0.50)}
+    assert decision.position_state["frozen_instruments"] == ["missing"]
+
+
+def test_governed_exit_can_exceed_turnover_without_funding_extra_buys() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=0.15,
+        )
+    )
+
+    decision = policy.decide(
+        pd.Series({"new": 2.0, "held": 1.0}),
+        {"held": 1.0},
+        instrument_risk_states={"held": "exit"},
+    )
+
+    assert decision.target_weights == {"new": pytest.approx(0.15)}
+    assert decision.expected_turnover == pytest.approx(1.0)
+    validation = decision.position_state["discrete_constraint_validation"]
+    exception = validation["risk_turnover_exception"]
+    assert validation["status"] == "passed"
+    assert validation["turnover_subject_to_limit"] == pytest.approx(0.15)
+    assert exception == {
+        "status": "applied",
+        "instruments": ["held"],
+        "actual_turnover": pytest.approx(1.0),
+        "turnover_subject_to_limit": pytest.approx(0.15),
+        "normal_daily_turnover_limit": pytest.approx(0.15),
+        "gross_increase_weight": pytest.approx(0.15),
+        "non_exempt_decrease_weight": pytest.approx(0.0),
+        "exempt_risk_decrease_weight": pytest.approx(1.0),
+        "no_extra_buys": True,
+    }
+    event = next(
+        item
+        for item in decision.risk_events
+        if item["rule"] == "risk_driven_turnover_exception"
+    )
+    assert event["instruments"] == ["held"]
+    assert event["gross_increase_weight"] == pytest.approx(0.15)
+
+
+def test_frozen_inherited_position_breach_is_non_worsening_and_does_not_abort_batch() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=3,
+            n_drop=0,
+            max_position_weight=0.10,
+            max_daily_turnover=1.0,
+            min_cash_weight=0.10,
+        )
+    )
+
+    decision = policy.decide(
+        pd.Series({"new_best": 3.0, "new_other": 2.0, "held": 1.0}),
+        {"held": 0.20},
+        prices=pd.Series({"new_best": 10.0, "new_other": 10.0, "held": np.nan}),
+        average_daily_values=pd.Series(
+            {"new_best": 100_000_000.0, "new_other": 100_000_000.0, "held": np.nan}
+        ),
+        portfolio_value=1_000_000.0,
+    )
+
+    assert decision.target_weights == {
+        "new_best": pytest.approx(0.10),
+        "held": pytest.approx(0.20),
+    }
+    validation = decision.position_state["discrete_constraint_validation"]
+    assert validation["status"] == "passed"
+    assert validation["frozen_inherited_max_position_exceptions"] == [
+        {
+            "constraint": "max_position_weight",
+            "instrument": "held",
+            "target_weight": pytest.approx(0.20),
+            "previous_weight": pytest.approx(0.20),
+            "configured_limit": pytest.approx(0.10),
+            "non_worsening": True,
+        }
+    ]
+    assert "frozen_inherited_max_position_exception" in {
+        item["rule"] for item in decision.risk_events
+    }
+
+
+def test_zero_adv_freezes_requested_trade_with_explicit_wait_and_continues_batch() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_daily_turnover=1.0,
+        )
+    )
+
+    decision = policy.decide(
+        pd.Series({"new": 2.0, "held": 1.0}),
+        {"held": 0.20},
+        prices=pd.Series({"new": 10.0, "held": 10.0}),
+        average_daily_values=pd.Series({"new": 100_000_000.0, "held": 0.0}),
+        portfolio_value=1_000_000.0,
+    )
+
+    assert decision.target_weights == {
+        "new": pytest.approx(0.30),
+        "held": pytest.approx(0.20),
+    }
+    assert decision.position_state["frozen_instruments"] == ["held"]
+    assert decision.position_state["deferred_target_weights"] == {"held": 0.0}
+    event = next(
+        item
+        for item in decision.risk_events
+        if item["rule"] == "execution_evidence_unavailable"
+    )
+    assert event["instrument"] == "held"
+    assert event["action"] == "wait_existing"
+    assert event["unavailable_evidence"] == ["average_daily_value"]
+
+
+def test_zero_adv_is_valid_only_when_no_trade_is_requested() -> None:
+    decision = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=1.0,
+        )
+    ).decide(
+        pd.Series({"held": 1.0}),
+        {"held": 0.20},
+        rebalance_due=False,
+        prices=pd.Series({"held": 10.0}),
+        average_daily_values=pd.Series({"held": 0.0}),
+        portfolio_value=1_000_000.0,
+    )
+
+    assert decision.target_weights == {"held": pytest.approx(0.20)}
+    assert decision.position_state["frozen_instruments"] == []
+    assert "execution_evidence_unavailable" not in {
+        item["rule"] for item in decision.risk_events
+    }
+
+
+def test_minimum_holding_blocks_normal_churn_but_hard_risk_can_exit() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=1.0,
+            holding_min_sessions=21,
+        )
+    )
+    scores = pd.Series({"new": 2.0, "held": 1.0})
+
+    held = policy.decide(
+        scores,
+        {"held": 1.0},
+        holding_age_sessions={"held": 5},
+    )
+    assert held.target_weights == {"held": pytest.approx(1.0)}
+    assert held.position_state["suppressed_changes"][0]["rule"] == (
+        "minimum_holding_sessions"
+    )
+
+    exited = policy.decide(
+        scores,
+        {"held": 1.0},
+        holding_age_sessions={"held": 5},
+        instrument_risk_states={"held": "exit"},
+    )
+    assert exited.target_weights == {}
+    assert "instrument_hard_risk_exit" in {
+        event["rule"] for event in exited.risk_events
+    }
+
+
+def test_partial_reductions_and_no_trade_band_are_deterministic() -> None:
+    no_trade = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_daily_turnover=1.0,
+            min_rebalance_weight_change=0.02,
+        )
+    ).decide(
+        pd.Series({"one": 2.0, "two": 1.0}),
+        {"one": 0.49, "two": 0.49},
+    )
+    assert no_trade.target_weights == {
+        "one": pytest.approx(0.49),
+        "two": pytest.approx(0.49),
+    }
+
+    reduced = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_daily_turnover=1.0,
+            score_deterioration_reduce_percentile=0.60,
+            score_deterioration_reduce_fraction=0.50,
+            valuation_reduce_percentile=0.95,
+            valuation_reduce_fraction=0.50,
+        )
+    ).decide(
+        pd.Series({"one": 1.0, "two": 2.0}),
+        {"one": 0.50, "two": 0.50},
+        valuation_percentiles=pd.Series({"one": 1.0, "two": 0.5}),
+    )
+    assert reduced.target_weights["one"] == pytest.approx(0.25)
+    assert reduced.target_weights["two"] == pytest.approx(0.50)
+    assert {event["rule"] for event in reduced.risk_events}.issuperset(
+        {"score_deterioration_reduce", "valuation_reduce"}
+    )
+
+
 def test_policy_enforces_industry_weight_cap() -> None:
     scores = pd.Series({f"S{index:02d}": float(20 - index) for index in range(20)})
     industries = pd.Series(
@@ -542,6 +814,60 @@ def test_monthly_rebalance_holds_targets_but_allows_risk_exits() -> None:
     assert "one" not in stopped.target_weights
     assert stopped.target_weights["two"] == pytest.approx(0.5)
     assert {item["rule"] for item in stopped.risk_events} == {"stop_loss"}
+
+
+def test_off_cadence_review_changes_only_its_scoped_sleeve_and_hard_risk() -> None:
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_daily_turnover=1.0,
+            rebalance_frequency="month",
+        )
+    )
+    scores = pd.Series(
+        {
+            "reviewed_candidate": 4.0,
+            "unrelated_candidate": 3.0,
+            "reviewed_holding": 2.0,
+            "unrelated_holding": 1.0,
+        }
+    )
+    previous = {"reviewed_holding": 0.25, "unrelated_holding": 0.25}
+
+    reviewed = policy.decide(
+        scores,
+        previous,
+        rebalance_due=True,
+        rebalance_instruments={"reviewed_candidate", "reviewed_holding"},
+    )
+
+    assert reviewed.target_weights == {
+        "reviewed_candidate": pytest.approx(0.50),
+        "unrelated_holding": pytest.approx(0.25),
+    }
+    assert {change["instrument"] for change in reviewed.changes} == {
+        "reviewed_candidate",
+        "reviewed_holding",
+    }
+    assert reviewed.position_state["rebalance_instruments"] == [
+        "reviewed_candidate",
+        "reviewed_holding",
+    ]
+
+    risk_exit = policy.decide(
+        scores,
+        previous,
+        rebalance_due=True,
+        rebalance_instruments={"reviewed_candidate", "reviewed_holding"},
+        instrument_risk_states={"unrelated_holding": "exit"},
+    )
+
+    assert "unrelated_holding" not in risk_exit.target_weights
+    assert "instrument_hard_risk_exit" in {
+        event["rule"] for event in risk_exit.risk_events
+    }
 
 
 def test_non_rebalance_day_continues_governed_multiday_execution() -> None:

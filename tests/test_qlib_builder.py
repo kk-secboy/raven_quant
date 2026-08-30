@@ -617,6 +617,142 @@ def test_eligibility_metadata_reads_full_history_in_bounded_symbol_batches(
     assert not (target / ".eligibility_attempt").exists()
 
 
+def _write_eligibility_revision_snapshot(tmp_path: Path, *, reverse: bool) -> Path:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    daily_path = next((snapshot / "parquet" / "daily").rglob("*.parquet"))
+    daily = pd.read_parquet(daily_path)
+    announcement_day = daily.copy()
+    announcement_day["trade_date"] = "2024-01-01"
+    pd.concat([announcement_day, daily], ignore_index=True).to_parquet(
+        daily_path, index=False
+    )
+
+    balancesheet_rows = [
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-09-30",
+            "f_ann_date": "2024-01-05",
+            "update_flag": 9,
+            "ingested_at": "2024-01-06T00:00:00Z",
+            "total_hldr_eqy_exc_min_int": -900.0,
+        },
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-12-31",
+            "f_ann_date": "2024-01-01",
+            "update_flag": 0,
+            "ingested_at": "2024-01-02T00:00:00Z",
+            "total_hldr_eqy_exc_min_int": -100.0,
+        },
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-12-31",
+            "f_ann_date": "2024-01-02",
+            "update_flag": 1,
+            "ingested_at": "2024-01-03T00:00:00Z",
+            "total_hldr_eqy_exc_min_int": 100.0,
+        },
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-12-31",
+            "f_ann_date": "2024-01-02",
+            "update_flag": 1,
+            "ingested_at": "2024-01-03T00:00:00Z",
+            "total_hldr_eqy_exc_min_int": 200.0,
+        },
+    ]
+    audit_rows = [
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-09-30",
+            "f_ann_date": "2024-01-05",
+            "update_flag": 9,
+            "ingested_at": "2024-01-06T00:00:00Z",
+            "audit_result": "adverse",
+        },
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-12-31",
+            "f_ann_date": "2024-01-01",
+            "update_flag": 0,
+            "ingested_at": "2024-01-02T00:00:00Z",
+            "audit_result": "adverse",
+        },
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-12-31",
+            "f_ann_date": "2024-01-02",
+            "update_flag": 1,
+            "ingested_at": "2024-01-03T00:00:00Z",
+            "audit_result": "standard_unqualified",
+        },
+        {
+            "ts_code": "000001.SZ",
+            "ann_date": "2024-01-01",
+            "end_date": "2023-12-31",
+            "f_ann_date": "2024-01-02",
+            "update_flag": 1,
+            "ingested_at": "2024-01-03T00:00:00Z",
+            "audit_result": "unqualified",
+        },
+    ]
+    if reverse:
+        balancesheet_rows.reverse()
+        audit_rows.reverse()
+    for dataset, rows in (
+        ("balancesheet", balancesheet_rows),
+        ("fina_audit", audit_rows),
+    ):
+        path = next((snapshot / "parquet" / dataset).rglob("*.parquet"))
+        pd.DataFrame(rows).to_parquet(path, index=False)
+    return snapshot
+
+
+def test_eligibility_financial_revisions_are_order_independent_and_pit(
+    tmp_path: Path,
+) -> None:
+    outputs: list[Path] = []
+    for label, reverse in (("forward", False), ("reverse", True)):
+        snapshot = _write_eligibility_revision_snapshot(
+            tmp_path / label,
+            reverse=reverse,
+        )
+        target = tmp_path / label / "metadata"
+        assert QlibBuilder(snapshot)._write_eligibility_metadata(target) is True
+        outputs.append(target / "eligibility_matrix.parquet")
+
+    forward = pd.read_parquet(outputs[0])
+    reverse = pd.read_parquet(outputs[1])
+    pd.testing.assert_frame_equal(forward, reverse)
+    assert hashlib.sha256(outputs[0].read_bytes()).hexdigest() == hashlib.sha256(
+        outputs[1].read_bytes()
+    ).hexdigest()
+
+    by_date = forward.set_index("datetime")
+    announcement_day = by_date.loc[pd.Timestamp("2024-01-01")]
+    assert pd.isna(announcement_day["equity"])
+    assert pd.isna(announcement_day["audit_opinion"])
+
+    next_session = by_date.loc[pd.Timestamp("2024-01-02")]
+    assert next_session["equity"] in {100.0, 200.0}
+    assert next_session["audit_opinion"] in {"standard_unqualified", "unqualified"}
+    reasons = json.loads(next_session["reasons"])
+    assert "negative_or_missing_equity" not in reasons
+    assert "nonstandard_or_missing_audit" not in reasons
+
+
 def test_eligibility_rejects_symbols_that_collide_after_qlib_normalization(
     tmp_path: Path,
 ) -> None:

@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from quant_data.database import (
     backtest_runs,
     capital_oos_alpha_batches,
+    capital_oos_alpha_families,
     factor_candidates,
     factor_evaluations,
     model_artifacts,
@@ -71,6 +72,7 @@ from quant_platform.formal_validation import (
     PRE_FINAL_HISTORY_CONTRACT_VERSION,
     SIGNAL_DECAY_FRONTIER_VERSION,
 )
+from quant_platform.horizon_factor_bundle import validate_horizon_factor_bundle
 from quant_platform.model_ensemble import prediction_grid_from_admission
 from quant_platform.model_research_governance import (
     MODEL_REFIT_POLICY,
@@ -146,6 +148,17 @@ from quant_platform.transparent_baseline_lockbox import (
     validate_lockbox_link,
     validate_repair_registry_binding,
 )
+from quant_platform.transparent_baseline_runner import (
+    POSITION_RISK_TARGET_RECIPE_VERSION,
+    TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
+    TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD,
+    TRANSPARENT_BASELINE_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
+    target_runner_for_recipe,
+    target_runtime_bundle_for_recipe,
+    target_worker_runtime_image_for_recipe,
+)
 from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
 
@@ -163,9 +176,93 @@ def _is_sha256(value: Any) -> bool:
     return True
 
 
+def _is_image_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("sha256:")
+        and _is_sha256(value.removeprefix("sha256:"))
+    )
+
+
+def _transparent_worker_runtime_failures(
+    version: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> list[str]:
+    """Bind v12 config, formal job manifest and result to one worker image."""
+
+    config_raw = version.get("config")
+    config = dict(config_raw) if isinstance(config_raw, Mapping) else {}
+    if (
+        str(config.get("recipe_version") or "") != POSITION_RISK_TARGET_RECIPE_VERSION
+        or target_runner_for_recipe(
+            config.get("recipe_id"), config.get("recipe_version")
+        ) is None
+    ):
+        return []
+    bootstrap_raw = config.get("transparent_baseline_bootstrap")
+    bootstrap = dict(bootstrap_raw) if isinstance(bootstrap_raw, Mapping) else {}
+    expected = bootstrap.get(TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD)
+    if not _is_image_digest(expected):
+        return ["transparent v12 worker runtime image digest is missing or invalid"]
+    failures: list[str] = []
+    if manifest.get(TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD) != expected:
+        failures.append(
+            "strategy backtest manifest worker runtime image differs from the sealed version"
+        )
+    if provenance.get(TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD) != expected:
+        failures.append(
+            "formal result worker runtime image differs from the sealed version"
+        )
+    return failures
+
+
 def _canonical_sha256(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _bind_transparent_v12_runtime_identity(config: dict[str, Any]) -> dict[str, Any]:
+    """Seal every governed v12 draft to the current release runtime.
+
+    The automated bootstrap already supplies a larger dataset/window contract,
+    while the advanced strategy API can create a research-only draft directly
+    from a public recipe.  Both write paths must carry the same immutable
+    runner, local-source closure and exact worker image identity before the
+    database accepts the StrategyVersion.  Existing mismatched values are
+    rejected rather than silently replaced.
+    """
+
+    recipe_id = config.get("recipe_id")
+    recipe_version = config.get("recipe_version")
+    if (
+        str(recipe_version or "") != POSITION_RISK_TARGET_RECIPE_VERSION
+        or target_runner_for_recipe(recipe_id, recipe_version) is None
+    ):
+        return config
+    bootstrap_raw = config.get("transparent_baseline_bootstrap")
+    if bootstrap_raw is not None and not isinstance(bootstrap_raw, Mapping):
+        raise ValueError("transparent v12 bootstrap must be an object")
+    bootstrap = dict(bootstrap_raw or {})
+    bindings = {
+        TRANSPARENT_BASELINE_RUNNER_FIELD: target_runner_for_recipe(
+            recipe_id, recipe_version
+        ),
+        TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: target_runtime_bundle_for_recipe(
+            recipe_id, recipe_version
+        ),
+        TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: (
+            target_worker_runtime_image_for_recipe(recipe_id, recipe_version)
+        ),
+    }
+    for field, expected in bindings.items():
+        existing = bootstrap.get(field)
+        if expected is None or (existing is not None and existing != expected):
+            raise ValueError(
+                f"transparent v12 bootstrap {field} differs from this release"
+            )
+        bootstrap[field] = expected
+    return {**config, "transparent_baseline_bootstrap": bootstrap}
 
 
 def _factor_evaluation_artifact_metrics(
@@ -483,6 +580,7 @@ def _normalize_multifactor_contract(
     normalized.setdefault("execution_slice_minutes", 20)
     normalized.setdefault("max_execution_slices", 24)
     normalized = normalize_horizon_config(normalized)
+    normalized = _bind_transparent_v12_runtime_identity(normalized)
     if normalized["horizon_profile"] != LEGACY_AMBIGUOUS:
         horizon = normalized["horizon_contract"]
         normalized.setdefault("outer_purge_days", horizon["purge_sessions"])
@@ -995,6 +1093,9 @@ def _multifactor_manifest_failures(
         return ["strategy backtest manifest artifact must be a JSON object"]
 
     failures: list[str] = []
+    failures.extend(
+        _transparent_worker_runtime_failures(version, manifest, provenance)
+    )
     if (
         provenance.get("artifact_manifest_version")
         != STRATEGY_BACKTEST_ARTIFACT_MANIFEST_VERSION
@@ -1883,6 +1984,34 @@ class StrategyStore:
             "standalone_promotion_required": False,
             "factors": frozen_factors,
         }
+        horizon_factor_bundle = manifest.get("horizon_factor_bundle")
+        if horizon_factor_bundle is not None:
+            horizon_factor_bundle = validate_horizon_factor_bundle(
+                horizon_factor_bundle
+            )
+            if (
+                manifest.get("horizon_factor_bundle_sha256")
+                != horizon_factor_bundle["bundle_sha256"]
+                or horizon_factor_bundle["incremental_factors"]
+                != [
+                    {
+                        "candidate_id": item["candidate_id"],
+                        "code_sha256": item["code_sha256"],
+                    }
+                    for item in frozen_factors
+                ]
+            ):
+                raise ValueError(
+                    "joint bundle horizon factor package changed after admission"
+                )
+            contract.update(
+                {
+                    "horizon_factor_bundle": horizon_factor_bundle,
+                    "horizon_factor_bundle_sha256": horizon_factor_bundle[
+                        "bundle_sha256"
+                    ],
+                }
+            )
         return runtime_factors, contract
 
     @staticmethod
@@ -4262,7 +4391,52 @@ class StrategyStore:
         normalized_lineage = str(dataset_lineage_id or "").strip().lower()
         if normalized_lineage and not _is_sha256(normalized_lineage):
             raise ValueError("final test requires a valid dataset lineage SHA-256")
-        if program_ids:
+        capital_family: dict[str, str] | None = None
+        if capital_oos_alpha_batch_id is not None:
+            family = connection.execute(
+                select(
+                    capital_oos_alpha_batches.c.family_id,
+                    capital_oos_alpha_families.c.capital_oos_family_sha256,
+                    capital_oos_alpha_families.c.mandate_json,
+                )
+                .join(
+                    capital_oos_alpha_families,
+                    capital_oos_alpha_families.c.id
+                    == capital_oos_alpha_batches.c.family_id,
+                )
+                .where(
+                    capital_oos_alpha_batches.c.id == capital_oos_alpha_batch_id
+                )
+            ).first()
+            mandate = dict(family.mandate_json or {}) if family is not None else {}
+            family_sha256 = (
+                str(family.capital_oos_family_sha256 or "").strip().lower()
+                if family is not None
+                else ""
+            )
+            label_horizon_days = mandate.get("label_horizon_days")
+            if (
+                family is None
+                or not _is_sha256(family_sha256)
+                or isinstance(label_horizon_days, bool)
+                or not isinstance(label_horizon_days, int)
+                or label_horizon_days < 1
+            ):
+                raise ValueError(
+                    "capital OOS alpha batch has no stable family/horizon scope"
+                )
+            capital_family = {
+                "family_id": str(family.family_id),
+                "family_sha256": family_sha256,
+                "label_horizon_days": str(label_horizon_days),
+            }
+            scope = (
+                f"alpha-family:{family_sha256}:"
+                f"label:{label_horizon_days}"
+            )
+            stored_lineage = normalized_lineage or None
+            include_legacy_dataset_scopes = False
+        elif program_ids:
             program_id = next(iter(program_ids))
             scope = f"program:{program_id}"
             program_lineage = connection.scalar(
@@ -4318,20 +4492,21 @@ class StrategyStore:
                     batch_rows.append((candidate, normalized_link))
             batch_scopes = {str(item[0].scope) for item in batch_rows}
             observed_members = {item[1]["member_sha256"] for item in batch_rows}
+            expected_lockbox_members = set(lockbox["member_sha256s"])
             base_scope = f"lineage:{normalized_lineage}"
             permitted_scopes = {
                 base_scope,
                 f"{base_scope}:repair:{lockbox['batch_sha256']}",
             }
             if (
-                len(batch_rows) != 3
-                or observed_members != set(lockbox["member_sha256s"])
+                len(batch_rows) != len(expected_lockbox_members)
+                or observed_members != expected_lockbox_members
                 or len(batch_scopes) != 1
                 or not batch_scopes <= permitted_scopes
             ):
                 raise ValueError(
                     "transparent baseline final OOS was not atomically preregistered "
-                    "in its complete three-member joint lockbox"
+                    "for every statistically available horizon"
                 )
             reserved_scope = next(iter(batch_scopes))
             if reserved_scope != base_scope:
@@ -4372,11 +4547,31 @@ class StrategyStore:
                 )
             scope = reserved_scope
             # The lockbox reservation already performed the global overlap
-            # check.  Consumption is allowed to touch only its exact immutable
-            # three-row scope, never legacy or source-repair rows.
+            # check. Consumption is allowed to touch only the exact immutable
+            # rows declared by this lockbox, never legacy or source-repair rows.
             include_legacy_dataset_scopes = False
 
         scope_filter = oos_vintages.c.scope == scope
+        if capital_family is not None:
+            # Before this scope contract, capital attempts were written under
+            # dataset lineage.  They remain binding history for the same
+            # governed alpha family and may not be reopened after migration.
+            prior_family_vintages = (
+                select(oos_vintages.c.id)
+                .join(
+                    capital_oos_alpha_batches,
+                    capital_oos_alpha_batches.c.id
+                    == oos_vintages.c.capital_oos_alpha_batch_id,
+                )
+                .where(
+                    capital_oos_alpha_batches.c.family_id
+                    == capital_family["family_id"]
+                )
+            )
+            scope_filter = or_(
+                scope_filter,
+                oos_vintages.c.id.in_(prior_family_vintages),
+            )
         if include_legacy_dataset_scopes:
             # Rows written before scope-v2 used dataset identity as scope. Their
             # lineage cannot be reconstructed safely, so they conservatively
@@ -4400,8 +4595,8 @@ class StrategyStore:
             None,
         )
         if lockbox is not None:
-            # The three public control windows are allowed to overlap only
-            # after all three exact members have been atomically preregistered.
+            # Available public control windows are allowed to overlap only
+            # after every exact declared member has been atomically preregistered.
             # No call through create_backtest may create a missing member row.
             batch_rows = []
             for candidate in connection.execute(
@@ -4422,10 +4617,11 @@ class StrategyStore:
             observed_members = {
                 item[1]["member_sha256"] for item in batch_rows
             }
+            expected_lockbox_members = set(lockbox["member_sha256s"])
             if (
                 row is None
-                or len(batch_rows) != 3
-                or observed_members != set(lockbox["member_sha256s"])
+                or len(batch_rows) != len(expected_lockbox_members)
+                or observed_members != expected_lockbox_members
                 or any(
                     validate_lockbox_link(
                         dict(item.sealed_candidate_set_json or {}).get(
@@ -4438,7 +4634,7 @@ class StrategyStore:
             ):
                 raise ValueError(
                     "transparent baseline final OOS was not atomically preregistered "
-                    "in its complete three-member joint lockbox"
+                    "for every statistically available horizon"
                 )
         elif any(item is not row for item in overlapping_rows):
             raise ValueError(
@@ -5300,6 +5496,13 @@ class StrategyStore:
             ).first()
             if locked_version is None:
                 raise KeyError(version_id)
+            from .promotion import require_horizon_challenger_capacity
+
+            require_horizon_challenger_capacity(
+                connection,
+                horizon_profile=str(locked_version.horizon_profile),
+                version_id=version_id,
+            )
             if fin_strategy_admission_binding is not None:
                 locked_value = row_dict(locked_version)
                 locked_value["config"] = dict(locked_version.config_json or {})

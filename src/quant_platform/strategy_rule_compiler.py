@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
+from quant_platform.research_horizon import research_horizon_contract
 from quant_platform.strategy_proposal import validate_strategy_proposal
 from quant_platform.strategy_rule_ir import (
     STRATEGY_RULE_IR_VERSION,
@@ -24,15 +25,22 @@ _POLICY_CONFIG_FIELDS = (
     "min_listing_days",
     "entry_score_min_percentile",
     "score_drop_exit_percentile",
+    "score_deterioration_reduce_percentile",
+    "score_deterioration_reduce_fraction",
     "extension_guard_max_return_5d",
+    "holding_min_sessions",
     "max_holding_sessions",
+    "min_rebalance_weight_change",
     "market_trend_lookback_sessions",
     "market_trend_benchmark",
     "valuation_regime_max_percentile",
+    "valuation_reduce_percentile",
+    "valuation_reduce_fraction",
     "trend_break_lookback_sessions",
     "thesis_min_holding_sessions",
     "thesis_review_frequency",
     "thesis_break_score_percentile",
+    "hard_risk_target_fraction",
     "stop_loss",
     "rebalance_frequency",
     "lot_size",
@@ -83,12 +91,19 @@ def compile_strategy_rule_policy(
     rebalance = _component_parameters(slots, "entry_timing", "rebalance_calendar")
     max_holding = _component_parameters(slots, "exit_state", "max_holding_days")
     score_drop = _component_parameters(slots, "exit_state", "score_drop_exit")
+    score_reduce = _component_parameters(
+        slots, "exit_state", "score_deterioration_reduce"
+    )
+    valuation_reduce = _component_parameters(slots, "exit_state", "valuation_reduce")
     stop_loss = _component_parameters(slots, "exit_state", "stop_loss")
     trend_break = _component_parameters(slots, "exit_state", "trend_break")
     thesis_break = _component_parameters(slots, "exit_state", "thesis_break")
     topk = _component_parameters(slots, "portfolio_risk", "topk_equal_weight")
     industry = _component_parameters(slots, "portfolio_risk", "max_industry_weight")
     turnover = _component_parameters(slots, "portfolio_risk", "max_daily_turnover")
+    minimum_trade_band = _component_parameters(
+        slots, "portfolio_risk", "minimum_trade_band"
+    )
     liquidity = _component_parameters(slots, "eligibility_gate", "liquidity_floor")
     listing = _component_parameters(slots, "eligibility_gate", "tradable_ashare")
     market_trend = _component_parameters(
@@ -109,6 +124,7 @@ def compile_strategy_rule_policy(
     if board_lot is None or participation is None:
         raise ValueError("strategy rule IR is missing governed execution limits")
 
+    horizon_contract = research_horizon_contract(horizon)
     policy = {
         "contract_version": "strategy-rule-policy-v1",
         "horizon_profile": horizon,
@@ -126,6 +142,16 @@ def compile_strategy_rule_policy(
         "score_drop_exit_percentile": (
             float(score_drop["below_percentile"]) if score_drop is not None else None
         ),
+        "score_deterioration_reduce_percentile": (
+            float(score_reduce["below_percentile"])
+            if score_reduce is not None
+            else None
+        ),
+        "score_deterioration_reduce_fraction": (
+            float(score_reduce["reduce_fraction"])
+            if score_reduce is not None
+            else 0.50
+        ),
         "extension_guard_max_return_5d": (
             float(extension_guard["max_return_5d"])
             if extension_guard is not None
@@ -133,6 +159,12 @@ def compile_strategy_rule_policy(
         ),
         "max_holding_sessions": (
             int(max_holding["days"]) if max_holding is not None else None
+        ),
+        "holding_min_sessions": horizon_contract.holding_min_sessions,
+        "min_rebalance_weight_change": (
+            float(minimum_trade_band["fraction"])
+            if minimum_trade_band is not None
+            else 0.0
         ),
         "market_trend_lookback_sessions": (
             int(market_trend["lookback_days"]) if market_trend is not None else None
@@ -142,6 +174,16 @@ def compile_strategy_rule_policy(
         ),
         "valuation_regime_max_percentile": (
             float(valuation["max_percentile"]) if valuation is not None else None
+        ),
+        "valuation_reduce_percentile": (
+            float(valuation_reduce["above_percentile"])
+            if valuation_reduce is not None
+            else None
+        ),
+        "valuation_reduce_fraction": (
+            float(valuation_reduce["reduce_fraction"])
+            if valuation_reduce is not None
+            else 0.50
         ),
         "trend_break_lookback_sessions": (
             int(trend_break["lookback_days"]) if trend_break is not None else None
@@ -159,6 +201,7 @@ def compile_strategy_rule_policy(
         # period.  This is deliberately described as a proxy, not a moat verdict.
         "thesis_break_score_percentile": 0.50 if thesis_break is not None else None,
         "stop_loss": float(stop_loss["fraction"]) if stop_loss is not None else None,
+        "hard_risk_target_fraction": 0.50,
         "rebalance_frequency": str(rebalance["frequency"]),
         "lot_size": int(board_lot["shares"]),
         "max_volume_participation": float(participation["max_fraction"]),

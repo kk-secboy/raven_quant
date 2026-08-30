@@ -41,6 +41,10 @@ from quant_data.database import (
     recommendation_holdings,
     recommendation_snapshots,
     simulation_batches,
+    simulation_events,
+    simulation_nav,
+    simulation_portfolios,
+    simulation_positions,
     strategy_allocation_artifacts,
     strategy_allocation_members,
     strategy_allocations,
@@ -51,7 +55,10 @@ from .research_horizon import LONG_1_3Y, SHORT_1_5D, SWING_1_6M
 from .strategy_health import cap_targets_for_health
 from .strategy_health_authority import load_production_health_gate
 
-NETTING_PLAN_VERSION = "account-netting-plan-v5-primary-ledger-capital"
+NETTING_PLAN_VERSION = "account-netting-plan-v6-actual-sleeve-inventory"
+SLEEVE_INVENTORY_POLICY_VERSION = (
+    "actual-account-weight-prior-plan-member-pro-rata-v1"
+)
 DEFAULT_EXECUTION_POLICY = "open"
 EXECUTION_POLICIES = (DEFAULT_EXECUTION_POLICY, "next_bar", "twap", "vwap")
 
@@ -62,6 +69,324 @@ def _canonical_hash(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _is_sha256(value: Any) -> bool:
+    text = str(value or "").lower()
+    return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+def sleeve_inventory_policy_contract() -> dict[str, Any]:
+    """Return the immutable policy used to project one real account into sleeves."""
+
+    contract: dict[str, Any] = {
+        "policy_version": SLEEVE_INVENTORY_POLICY_VERSION,
+        "actual_inventory": "position_market_value_divided_by_primary_nav",
+        "target_component": "prior_net_target_by_prior_member_account_target_ratio",
+        "residual_basis_precedence": [
+            "prior_negative_gross_demand",
+            "prior_member_current_account_inventory",
+            "prior_absolute_gross_demand",
+            "prior_member_account_targets",
+        ],
+        "allocation": "target_component_then_unfilled_residual_sorted_pro_rata",
+        "unattributed_positive_inventory": "fail_closed",
+    }
+    return {**contract, "policy_sha256": _canonical_hash(contract)}
+
+
+def primary_position_inventory_evidence(
+    *,
+    portfolio_id: str,
+    nav: float,
+    positions: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, float]]:
+    """Seal the exact primary-ledger positions used by sleeve attribution."""
+
+    normalized_nav = float(nav)
+    if not isfinite(normalized_nav) or normalized_nav <= 0:
+        raise ValueError("primary account NAV must be positive")
+    facts: dict[str, Any] = {}
+    actual_weights: dict[str, float] = {}
+    for raw in sorted(positions, key=lambda value: str(value.get("instrument") or "")):
+        instrument = str(raw.get("instrument") or "").strip()
+        quantity = int(raw.get("quantity") or 0)
+        market_value = float(raw.get("market_value") or 0.0)
+        if (
+            not instrument
+            or quantity < 0
+            or not isfinite(market_value)
+            or market_value < 0
+        ):
+            raise ValueError("primary account has invalid long-only position inventory")
+        if quantity > 0 and market_value <= 0:
+            raise ValueError(
+                "primary account position has no positive marked market value: "
+                f"{instrument}"
+            )
+        market_price = raw.get("market_price")
+        normalized_market_price = (
+            float(market_price) if market_price is not None else None
+        )
+        if normalized_market_price is not None and (
+            not isfinite(normalized_market_price) or normalized_market_price < 0
+        ):
+            raise ValueError("primary account position has an invalid market price")
+        market_date = raw.get("market_date")
+        updated_at = raw.get("updated_at")
+        account_weight = market_value / normalized_nav
+        if account_weight > _TOLERANCE:
+            actual_weights[instrument] = account_weight
+        facts[instrument] = {
+            "quantity": quantity,
+            "market_value": market_value,
+            "market_price": normalized_market_price,
+            "market_date": (
+                market_date.isoformat()
+                if hasattr(market_date, "isoformat")
+                else (str(market_date) if market_date else None)
+            ),
+            "stale": bool(raw.get("stale")),
+            "updated_at": (
+                updated_at.isoformat()
+                if hasattr(updated_at, "isoformat")
+                else str(updated_at or "")
+            ),
+            "account_weight": account_weight,
+        }
+    if sum(actual_weights.values()) > 1.0 + 1e-6:
+        raise ValueError("actual account inventory exceeds primary account NAV")
+    evidence: dict[str, Any] = {
+        "portfolio_id": str(portfolio_id),
+        "nav": normalized_nav,
+        "positions": facts,
+    }
+    evidence["positions_sha256"] = _canonical_hash(evidence)
+    return evidence, actual_weights
+
+
+def allocate_actual_sleeve_inventory(
+    *,
+    actual_account_weights: dict[str, float],
+    prior_plan: dict[str, Any],
+) -> tuple[dict[str, dict[str, float]], dict[str, Any]]:
+    """Allocate real account weights to virtual sleeves deterministically.
+
+    The unified account is the accounting authority.  A previous plan is used
+    only for each instrument's member *ratio*; its target weights are never
+    treated as proof that an order filled.  Exact account weights are assigned
+    in sorted member order, with the final member receiving the floating-point
+    residual so sleeve inventory reconciles to the account exactly.
+    """
+
+    actual = {
+        str(instrument): float(weight)
+        for instrument, weight in actual_account_weights.items()
+    }
+    if len(actual) != len(actual_account_weights) or any(
+        not isfinite(weight) or weight < -_TOLERANCE for weight in actual.values()
+    ):
+        raise ValueError("actual account inventory must contain finite non-negative weights")
+    actual = {
+        instrument: max(weight, 0.0)
+        for instrument, weight in actual.items()
+        if weight > _TOLERANCE
+    }
+    if sum(actual.values()) > 1.0 + 1e-6:
+        raise ValueError("actual account inventory exceeds primary account NAV")
+
+    raw_budgets = prior_plan.get("member_budgets") or {}
+    raw_targets = prior_plan.get("member_targets") or {}
+    if not isinstance(raw_budgets, dict) or not isinstance(raw_targets, dict):
+        raise ValueError("prior plan has invalid member target attribution")
+    budgets = {str(member): float(weight) for member, weight in raw_budgets.items()}
+    if any(not isfinite(weight) or weight < -_TOLERANCE for weight in budgets.values()):
+        raise ValueError("prior plan has invalid member budgets")
+
+    def _add_basis(
+        destination: dict[str, dict[str, float]],
+        member: str,
+        instrument: str,
+        weight: float,
+    ) -> None:
+        if weight > _TOLERANCE:
+            destination.setdefault(instrument, {})[member] = (
+                destination.setdefault(instrument, {}).get(member, 0.0) + weight
+            )
+
+    target_basis: dict[str, dict[str, float]] = {}
+    for raw_member, raw_book in raw_targets.items():
+        member = str(raw_member)
+        if not isinstance(raw_book, dict):
+            raise ValueError("prior plan has invalid member target attribution")
+        budget = budgets.get(member, 0.0)
+        for raw_instrument, raw_weight in raw_book.items():
+            weight = float(raw_weight)
+            if not isfinite(weight) or weight < -_TOLERANCE:
+                raise ValueError("prior plan has invalid member target weights")
+            _add_basis(target_basis, member, str(raw_instrument), budget * weight)
+
+    current_basis: dict[str, dict[str, float]] = {}
+    raw_current_account = prior_plan.get("member_current_account_weights")
+    if isinstance(raw_current_account, dict):
+        for raw_member, raw_book in raw_current_account.items():
+            member = str(raw_member)
+            if not isinstance(raw_book, dict):
+                raise ValueError("prior plan has invalid exact sleeve inventory")
+            for raw_instrument, raw_weight in raw_book.items():
+                weight = float(raw_weight)
+                if not isfinite(weight) or weight < -_TOLERANCE:
+                    raise ValueError("prior plan has invalid exact sleeve inventory")
+                _add_basis(current_basis, member, str(raw_instrument), weight)
+    else:
+        raw_current = prior_plan.get("member_current_weights") or {}
+        if not isinstance(raw_current, dict):
+            raise ValueError("prior plan has invalid legacy sleeve inventory")
+        for raw_member, raw_book in raw_current.items():
+            member = str(raw_member)
+            if not isinstance(raw_book, dict):
+                raise ValueError("prior plan has invalid legacy sleeve inventory")
+            budget = budgets.get(member, 0.0)
+            for raw_instrument, raw_weight in raw_book.items():
+                weight = float(raw_weight)
+                if not isfinite(weight) or weight < -_TOLERANCE:
+                    raise ValueError("prior plan has invalid legacy sleeve inventory")
+                _add_basis(current_basis, member, str(raw_instrument), budget * weight)
+
+    negative_demand_basis: dict[str, dict[str, float]] = {}
+    gross_demand_basis: dict[str, dict[str, float]] = {}
+    raw_contributions = prior_plan.get("strategy_contributions") or {}
+    if not isinstance(raw_contributions, dict):
+        raise ValueError("prior plan has invalid strategy attribution")
+    for raw_instrument, raw_entry in raw_contributions.items():
+        if not isinstance(raw_entry, dict):
+            raise ValueError("prior plan has invalid strategy attribution")
+        raw_members = raw_entry.get("members") or {}
+        if not isinstance(raw_members, dict):
+            raise ValueError("prior plan has invalid strategy attribution")
+        for raw_member, raw_values in raw_members.items():
+            if not isinstance(raw_values, dict):
+                raise ValueError("prior plan has invalid strategy attribution")
+            gross_delta = float(raw_values.get("gross_delta") or 0.0)
+            if not isfinite(gross_delta):
+                raise ValueError("prior plan has invalid strategy attribution")
+            member = str(raw_member)
+            instrument = str(raw_instrument)
+            if gross_delta < -_TOLERANCE:
+                _add_basis(negative_demand_basis, member, instrument, abs(gross_delta))
+            if abs(gross_delta) > _TOLERANCE:
+                _add_basis(gross_demand_basis, member, instrument, abs(gross_delta))
+
+    raw_net_targets = prior_plan.get("net_targets") or {}
+    if not isinstance(raw_net_targets, dict):
+        raise ValueError("prior plan has invalid account targets")
+    prior_net_targets: dict[str, float] = {}
+    for raw_instrument, raw_entry in raw_net_targets.items():
+        if not isinstance(raw_entry, dict):
+            raise ValueError("prior plan has invalid account targets")
+        weight = float(raw_entry.get("weight") or 0.0)
+        if not isfinite(weight) or weight < -_TOLERANCE:
+            raise ValueError("prior plan has invalid account targets")
+        prior_net_targets[str(raw_instrument)] = max(weight, 0.0)
+
+    residual_sources = (
+        ("prior_negative_gross_demand", negative_demand_basis),
+        ("prior_member_current_account_inventory", current_basis),
+        ("prior_absolute_gross_demand", gross_demand_basis),
+        ("prior_member_account_targets", target_basis),
+    )
+
+    def _allocate_component(
+        amount: float, basis: dict[str, float]
+    ) -> dict[str, float]:
+        members = sorted(basis)
+        total_basis = sum(basis.values())
+        remaining = amount
+        result: dict[str, float] = {}
+        for member in members[:-1]:
+            member_weight = amount * basis[member] / total_basis
+            result[member] = member_weight
+            remaining -= member_weight
+        result[members[-1]] = max(remaining, 0.0)
+        return result
+
+    inventory: dict[str, dict[str, float]] = {}
+    allocations: dict[str, Any] = {}
+    for instrument in sorted(actual):
+        assigned: dict[str, float] = {}
+        allocation_steps: list[dict[str, Any]] = []
+        target_members = {
+            member: weight
+            for member, weight in (target_basis.get(instrument) or {}).items()
+            if weight > _TOLERANCE
+        }
+        target_component = min(
+            actual[instrument], prior_net_targets.get(instrument, 0.0)
+        )
+        if target_component > _TOLERANCE and target_members:
+            component = _allocate_component(target_component, target_members)
+            for member, weight in component.items():
+                assigned[member] = assigned.get(member, 0.0) + weight
+            allocation_steps.append(
+                {
+                    "source": "prior_member_account_targets",
+                    "account_weight": target_component,
+                    "basis_account_weights": {
+                        member: target_members[member] for member in sorted(target_members)
+                    },
+                    "allocated_account_weights": component,
+                }
+            )
+
+        residual = actual[instrument] - sum(assigned.values())
+        for candidate_name, candidate in residual_sources:
+            if residual <= _TOLERANCE:
+                break
+            candidate_basis = {
+                member: weight
+                for member, weight in (candidate.get(instrument) or {}).items()
+                if weight > _TOLERANCE
+            }
+            if sum(candidate_basis.values()) > _TOLERANCE:
+                component = _allocate_component(residual, candidate_basis)
+                for member, weight in component.items():
+                    assigned[member] = assigned.get(member, 0.0) + weight
+                allocation_steps.append(
+                    {
+                        "source": candidate_name,
+                        "account_weight": residual,
+                        "basis_account_weights": {
+                            member: candidate_basis[member]
+                            for member in sorted(candidate_basis)
+                        },
+                        "allocated_account_weights": component,
+                    }
+                )
+                residual = 0.0
+                break
+        if residual > _TOLERANCE or not assigned:
+            raise ValueError(
+                "actual primary position has no prior member attribution: "
+                f"{instrument}"
+            )
+        for member, weight in assigned.items():
+            inventory.setdefault(member, {})[instrument] = weight
+        allocations[instrument] = {
+            "actual_account_weight": actual[instrument],
+            "basis_source": "+".join(step["source"] for step in allocation_steps),
+            "allocation_steps": allocation_steps,
+            "allocated_account_weights": assigned,
+        }
+
+    policy = sleeve_inventory_policy_contract()
+    evidence: dict[str, Any] = {
+        **policy,
+        "prior_plan_hash": str(prior_plan.get("plan_hash") or ""),
+        "actual_account_weights": actual,
+        "instrument_allocations": allocations,
+    }
+    evidence["allocation_sha256"] = _canonical_hash(evidence)
+    return inventory, evidence
 
 
 def _now() -> datetime:
@@ -94,6 +419,100 @@ def plan_idempotency_key(
 def pd_date(value: date) -> str:
     day = value if isinstance(value, date) else date.fromisoformat(str(value))
     return day.isoformat()
+
+
+def _validated_persisted_plan_payload(row: Any) -> dict[str, Any]:
+    """Verify a stored plan's identity and economic-input hash.
+
+    ``account_netting_plans`` is append-only by convention, but continuity is
+    too important to trust a JSON reference alone.  Recompute both the stable
+    plan key and the economic plan hash from the persisted payload before a
+    prior plan can own sleeve inventory on another day.
+    """
+
+    plan = dict(row.plan_json or {})
+    column_identity = {
+        "plan_key": str(row.plan_key),
+        "account_id": str(row.account_id),
+        "allocation_artifact_id": str(row.allocation_artifact_id),
+        "decision_date": row.decision_date.isoformat(),
+        "inputs_as_of": row.inputs_as_of.isoformat(),
+        "policy_version": str(row.policy_version),
+        "execution_policy": str(row.execution_policy),
+        "tranche_index": int(row.tranche_index),
+        "plan_hash": str(row.plan_hash),
+    }
+    textual_fields = (
+        "plan_key",
+        "account_id",
+        "allocation_artifact_id",
+        "decision_date",
+        "inputs_as_of",
+        "policy_version",
+        "execution_policy",
+        "plan_hash",
+    )
+    if any(
+        str(plan.get(key)) != str(column_identity[key]) for key in textual_fields
+    ) or int(plan.get("tranche_index", -1)) != int(row.tranche_index):
+        raise ValueError("account netting plan columns differ from the sealed payload")
+    expected_key = plan_idempotency_key(
+        account_id=column_identity["account_id"],
+        allocation_artifact_id=column_identity["allocation_artifact_id"],
+        decision_date=row.decision_date,
+        inputs_as_of=row.inputs_as_of,
+        policy_version=column_identity["policy_version"],
+        tranche_index=int(row.tranche_index),
+    )
+    if expected_key != column_identity["plan_key"]:
+        raise ValueError("account netting plan key seal is invalid")
+
+    raw_targets = plan.get("net_targets")
+    raw_trades = plan.get("net_trades")
+    if not isinstance(raw_targets, dict) or not isinstance(raw_trades, dict):
+        raise ValueError("account netting plan economic inputs are invalid")
+    try:
+        net_targets = {
+            str(instrument): float(values["weight"])
+            for instrument, values in raw_targets.items()
+            if isinstance(values, dict)
+        }
+        net_trades = {
+            str(instrument): float(values["delta_weight"])
+            for instrument, values in raw_trades.items()
+            if isinstance(values, dict)
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("account netting plan economic inputs are invalid") from exc
+    if len(net_targets) != len(raw_targets) or len(net_trades) != len(raw_trades):
+        raise ValueError("account netting plan economic inputs are invalid")
+    hash_payload: dict[str, Any] = {
+        "plan_version": str(plan.get("plan_version") or ""),
+        "plan_key": column_identity["plan_key"],
+        "member_budgets": plan.get("member_budgets") or {},
+        "member_targets": plan.get("member_targets") or {},
+        "member_current_weights": plan.get("member_current_weights") or {},
+        "total_capital": float(plan.get("total_capital") or 0.0),
+        "net_targets": net_targets,
+        "net_trades": net_trades,
+        "cash_weight": float(plan.get("cash_weight") or 0.0),
+        "strategy_contributions": plan.get("strategy_contributions") or {},
+        "constraint_clamps": plan.get("constraint_clamps") or {},
+        "industry_memberships": plan.get("industry_memberships") or {},
+        "industry_exposure": plan.get("industry_exposure") or {},
+        "industry_constraint_clamps": plan.get("industry_constraint_clamps") or {},
+        "max_instrument_weight": plan.get("max_instrument_weight"),
+        "max_industry_weight": plan.get("max_industry_weight"),
+        "execution_policy": column_identity["execution_policy"],
+        "input_evidence": plan.get("input_evidence") or {},
+    }
+    if plan.get("plan_version") == NETTING_PLAN_VERSION:
+        hash_payload["member_current_account_weights"] = (
+            plan.get("member_current_account_weights") or {}
+        )
+    if _canonical_hash(hash_payload) != column_identity["plan_hash"]:
+        raise ValueError("account netting plan input hash is invalid")
+    return plan
 
 
 def net_member_demands(
@@ -157,6 +576,7 @@ def build_account_netting_plan(
     member_budgets: dict[str, float],
     member_targets: dict[str, dict[str, float]],
     member_current_weights: dict[str, dict[str, float]] | None = None,
+    member_current_account_weights: dict[str, dict[str, float]] | None = None,
     total_capital: float = 1.0,
     execution_policy: str = DEFAULT_EXECUTION_POLICY,
     tranche_index: int = 0,
@@ -171,7 +591,11 @@ def build_account_netting_plan(
     investable capital, summing to at most one — the remainder is cash).
     ``member_targets`` are long-only target weights inside each member's
     sleeve. ``member_current_weights`` optionally carries each member's
-    current sleeve weights; without it every target is a fresh buy.
+    current sleeve weights. ``member_current_account_weights`` is the
+    authoritative live-account form: it carries actual account weights already
+    allocated to sleeves and may include a departed member whose residual
+    position must still be sold. The two current-inventory forms are mutually
+    exclusive; without either every target is a fresh buy.
     ``max_instrument_weight`` (the account hard constraint applied after
     netting, e.g. ``PortfolioPolicyConfig.max_position_weight``) clamps net
     targets, the overflow moving to cash.  ``max_industry_weight`` applies to
@@ -217,9 +641,17 @@ def build_account_netting_plan(
     current_books = {
         str(member): values for member, values in (member_current_weights or {}).items()
     }
+    current_account_books = {
+        str(member): values
+        for member, values in (member_current_account_weights or {}).items()
+    }
+    if member_current_weights is not None and member_current_account_weights is not None:
+        raise ValueError(
+            "member current sleeve weights and exact account weights are mutually exclusive"
+        )
     if len(target_books) != len(member_targets) or len(current_books) != len(
         member_current_weights or {}
-    ):
+    ) or len(current_account_books) != len(member_current_account_weights or {}):
         raise ValueError("member identifiers must be unique after normalization")
     unknown_targets = set(target_books).difference(budgets)
     unknown_currents = set(current_books).difference(budgets)
@@ -231,6 +663,7 @@ def build_account_netting_plan(
     net_targets: dict[str, float] = {}
     normalized_member_targets: dict[str, dict[str, float]] = {}
     normalized_member_current_weights: dict[str, dict[str, float]] = {}
+    normalized_member_current_account_weights: dict[str, dict[str, float]] = {}
     for member, budget in budgets.items():
         raw_targets = target_books.get(member) or {}
         targets = {
@@ -263,14 +696,57 @@ def build_account_netting_plan(
         if sum(sleeve_current.values()) > 1.0 + 1e-6:
             raise ValueError(f"member {member} current weights exceed the member sleeve")
         normalized_member_current_weights[member] = sleeve_current
-        for instrument in sorted(set(targets) | set(sleeve_current)):
-            target = targets.get(instrument, 0.0)
-            current = sleeve_current.get(instrument, 0.0)
-            net_targets[instrument] = net_targets.get(instrument, 0.0) + budget * target
-            account_current[instrument] = (
-                account_current.get(instrument, 0.0) + budget * current
+        normalized_member_current_account_weights[member] = {
+            instrument: budget * weight for instrument, weight in sleeve_current.items()
+        }
+
+    if member_current_account_weights is not None:
+        normalized_member_current_account_weights = {}
+        for member, raw_book in current_account_books.items():
+            account_book = {
+                str(instrument): float(weight)
+                for instrument, weight in raw_book.items()
+            }
+            if len(account_book) != len(raw_book):
+                raise ValueError(
+                    "current account instruments must be unique after normalization"
+                )
+            if any(
+                not isfinite(weight) or weight < -_TOLERANCE
+                for weight in account_book.values()
+            ):
+                raise ValueError(
+                    "member current account weights must be finite and non-negative"
+                )
+            normalized_member_current_account_weights[member] = account_book
+        if (
+            sum(
+                weight
+                for book in normalized_member_current_account_weights.values()
+                for weight in book.values()
             )
-            delta = budget * (target - current)
+            > 1.0 + 1e-6
+        ):
+            raise ValueError("member current account weights exceed primary account NAV")
+
+    target_account_books = {
+        member: {
+            instrument: budgets[member] * weight
+            for instrument, weight in targets.items()
+        }
+        for member, targets in normalized_member_targets.items()
+    }
+    for member in sorted(
+        set(target_account_books) | set(normalized_member_current_account_weights)
+    ):
+        targets = target_account_books.get(member) or {}
+        currents = normalized_member_current_account_weights.get(member) or {}
+        for instrument in sorted(set(targets) | set(currents)):
+            target = targets.get(instrument, 0.0)
+            current = currents.get(instrument, 0.0)
+            net_targets[instrument] = net_targets.get(instrument, 0.0) + target
+            account_current[instrument] = account_current.get(instrument, 0.0) + current
+            delta = target - current
             if abs(delta) > _TOLERANCE:
                 demands.setdefault(member, {})[instrument] = delta
 
@@ -378,6 +854,7 @@ def build_account_netting_plan(
         "member_budgets": budgets,
         "member_targets": normalized_member_targets,
         "member_current_weights": normalized_member_current_weights,
+        "member_current_account_weights": normalized_member_current_account_weights,
         "net_targets": {
             instrument: {
                 "weight": weight,
@@ -397,10 +874,12 @@ def build_account_netting_plan(
         "strategy_contributions": contributions,
         "constraint_clamps": clamps,
         "max_instrument_weight": normalized_cap,
+        # Keep the complete normalized input, not only surviving targets.  The
+        # plan hash already commits to this full map; persisting the same map
+        # makes that input hash independently reproducible during continuity
+        # selection.
         "industry_memberships": {
-            instrument: industries[instrument]
-            for instrument in sorted(clamped_targets)
-            if instrument in industries
+            instrument: industries[instrument] for instrument in sorted(industries)
         },
         "industry_exposure": industry_exposure,
         "industry_constraint_clamps": industry_clamps,
@@ -414,6 +893,9 @@ def build_account_netting_plan(
             "member_budgets": budgets,
             "member_targets": normalized_member_targets,
             "member_current_weights": normalized_member_current_weights,
+            "member_current_account_weights": (
+                normalized_member_current_account_weights
+            ),
             "total_capital": capital,
             "net_targets": clamped_targets,
             "net_trades": net_trades,
@@ -491,6 +973,296 @@ class AccountNettingStore:
         plan["id"] = str(row.id)
         return plan
 
+    @staticmethod
+    def _authoritative_prior_plan(
+        connection: Any,
+        *,
+        portfolio_id: str,
+        current_allocation: Any,
+        decision_date: date,
+        inputs_as_of: date,
+    ) -> dict[str, Any] | None:
+        """Select one valued prior plan across execution and decision-only days.
+
+        A zero-order sleeve transfer is economically effective only after its
+        valuation replay succeeds.  Such batches deliberately have no plan FK,
+        so their sealed source event is the join authority.  Executed plans and
+        those decision-only plans are validated under the same portfolio,
+        allocation-lineage and input-hash rules, then ordered on their actual
+        trade/effective time.
+        """
+
+        from .simulation_store import (  # local import avoids the module cycle
+            ACCOUNT_DECISION_VALUATION_VERSION,
+            ACCOUNT_ORDER_DECISION_EVENT_TYPE,
+            validate_account_order_decision_event,
+        )
+
+        portfolio = connection.execute(
+            select(simulation_portfolios).where(
+                simulation_portfolios.c.id == portfolio_id
+            )
+        ).first()
+        if portfolio is None:
+            raise ValueError("primary account continuity portfolio is unavailable")
+        if str(portfolio.source_type) != "allocation" or str(portfolio.source_id) != str(
+            current_allocation.id
+        ):
+            raise ValueError("primary account continuity does not match its allocation")
+
+        common_columns = (
+            simulation_batches.c.id.label("continuity_batch_id"),
+            simulation_batches.c.trade_date.label("continuity_trade_date"),
+            simulation_batches.c.finished_at.label("continuity_finished_at"),
+            simulation_batches.c.created_at.label("continuity_batch_created_at"),
+            simulation_batches.c.target_payload_json.label("continuity_target_payload"),
+            strategy_allocation_artifacts.c.allocation_id.label(
+                "continuity_artifact_allocation_id"
+            ),
+            strategy_allocation_artifacts.c.inputs_as_of.label(
+                "continuity_artifact_inputs_as_of"
+            ),
+            strategy_allocation_artifacts.c.artifact_hash.label(
+                "continuity_artifact_hash"
+            ),
+            strategy_allocations.c.analysis_json.label(
+                "continuity_allocation_analysis"
+            ),
+        )
+        executed = connection.execute(
+            select(
+                account_netting_plans,
+                *common_columns,
+            )
+            .select_from(
+                simulation_batches.join(
+                    account_netting_plans,
+                    account_netting_plans.c.id
+                    == simulation_batches.c.account_netting_plan_id,
+                )
+                .join(
+                    simulation_nav,
+                    (simulation_nav.c.portfolio_id == simulation_batches.c.portfolio_id)
+                    & (simulation_nav.c.trade_date == simulation_batches.c.trade_date),
+                )
+                .join(
+                    strategy_allocation_artifacts,
+                    strategy_allocation_artifacts.c.id
+                    == account_netting_plans.c.allocation_artifact_id,
+                )
+                .join(
+                    strategy_allocations,
+                    strategy_allocations.c.id
+                    == strategy_allocation_artifacts.c.allocation_id,
+                )
+            )
+            .where(
+                simulation_batches.c.portfolio_id == portfolio_id,
+                simulation_batches.c.status == "succeeded",
+                account_netting_plans.c.inputs_as_of <= inputs_as_of,
+                account_netting_plans.c.decision_date <= decision_date,
+                simulation_batches.c.trade_date <= decision_date,
+            )
+            .order_by(
+                simulation_batches.c.trade_date.desc(),
+                simulation_batches.c.finished_at.desc(),
+                simulation_batches.c.created_at.desc(),
+            )
+            .limit(64)
+        ).all()
+        decision_only = connection.execute(
+            select(
+                account_netting_plans,
+                *common_columns,
+                simulation_events.c.id.label("continuity_event_id"),
+                simulation_events.c.batch_id.label("continuity_event_batch_id"),
+                simulation_events.c.trade_date.label("continuity_event_trade_date"),
+                simulation_events.c.created_at.label("continuity_event_created_at"),
+                simulation_events.c.details_json.label("continuity_event_payload"),
+            )
+            .select_from(
+                simulation_batches.join(
+                    simulation_events,
+                    simulation_events.c.id == simulation_batches.c.source_snapshot_id,
+                )
+                .join(
+                    account_netting_plans,
+                    account_netting_plans.c.id
+                    == simulation_events.c.details_json[
+                        "account_netting_plan_id"
+                    ].as_string(),
+                )
+                .join(
+                    simulation_nav,
+                    (simulation_nav.c.portfolio_id == simulation_batches.c.portfolio_id)
+                    & (simulation_nav.c.trade_date == simulation_batches.c.trade_date),
+                )
+                .join(
+                    strategy_allocation_artifacts,
+                    strategy_allocation_artifacts.c.id
+                    == account_netting_plans.c.allocation_artifact_id,
+                )
+                .join(
+                    strategy_allocations,
+                    strategy_allocations.c.id
+                    == strategy_allocation_artifacts.c.allocation_id,
+                )
+            )
+            .where(
+                simulation_batches.c.portfolio_id == portfolio_id,
+                simulation_batches.c.status == "succeeded",
+                simulation_batches.c.account_netting_plan_id.is_(None),
+                simulation_events.c.portfolio_id == portfolio_id,
+                simulation_events.c.event_type == ACCOUNT_ORDER_DECISION_EVENT_TYPE,
+                simulation_events.c.batch_id.is_(None),
+                account_netting_plans.c.inputs_as_of <= inputs_as_of,
+                account_netting_plans.c.decision_date <= decision_date,
+                simulation_batches.c.trade_date <= decision_date,
+            )
+            .order_by(
+                simulation_batches.c.trade_date.desc(),
+                simulation_batches.c.finished_at.desc(),
+                simulation_batches.c.created_at.desc(),
+            )
+            .limit(64)
+        ).all()
+
+        current_analysis = dict(current_allocation.analysis_json or {})
+        current_lineage = str(
+            current_analysis.get("allocation_dataset_lineage_id") or ""
+        ).lower()
+        if (
+            not _is_sha256(current_lineage)
+            or current_lineage != str(portfolio.daily_dataset_lineage_id).lower()
+        ):
+            raise ValueError("primary account allocation lineage is invalid")
+
+        candidates: list[dict[str, Any]] = []
+        for kind, rows in (("execution", executed), ("decision_only", decision_only)):
+            for row in rows:
+                plan = _validated_persisted_plan_payload(row)
+                artifact_hash = str(row.continuity_artifact_hash or "").lower()
+                if (
+                    str(row.account_id)
+                    != str(row.continuity_artifact_allocation_id)
+                    or str(row.allocation_artifact_id)
+                    != str(plan.get("allocation_artifact_id") or "")
+                    or not _is_sha256(artifact_hash)
+                    or str(row.continuity_artifact_inputs_as_of)
+                    != str((plan.get("input_evidence") or {}).get(
+                        "allocation_artifact_inputs_as_of"
+                    ) or "")
+                ):
+                    raise ValueError("prior account plan allocation input seal is invalid")
+                prior_analysis = dict(row.continuity_allocation_analysis or {})
+                prior_lineage = str(
+                    prior_analysis.get("allocation_dataset_lineage_id") or ""
+                ).lower()
+                if not _is_sha256(prior_lineage) or prior_lineage != current_lineage:
+                    raise ValueError(
+                        "prior account plan belongs to another allocation lineage"
+                    )
+
+                input_evidence = plan.get("input_evidence") or {}
+                primary = (
+                    input_evidence.get("primary_account")
+                    if isinstance(input_evidence, dict)
+                    else None
+                )
+                if (
+                    not isinstance(primary, dict)
+                    or str(primary.get("portfolio_id") or "") != portfolio_id
+                    or str(primary.get("source_id") or "") != str(row.account_id)
+                ):
+                    raise ValueError(
+                        "prior account plan is not sealed to the primary portfolio"
+                    )
+
+                target_payload = dict(row.continuity_target_payload or {})
+                target_version = f"three-horizon-netting:{row.plan_hash}"
+                if kind == "execution":
+                    order_plan = target_payload.get("order_plan")
+                    if (
+                        not isinstance(order_plan, dict)
+                        or str(order_plan.get("account_netting_plan_id") or "")
+                        != str(row.id)
+                        or str(order_plan.get("target_version") or "") != target_version
+                    ):
+                        raise ValueError(
+                            "executed account plan batch has invalid input binding"
+                        )
+                    event_id = None
+                else:
+                    event_payload = dict(row.continuity_event_payload or {})
+                    validated_event = validate_account_order_decision_event(
+                        event_payload,
+                        portfolio_id=portfolio_id,
+                        account_netting_plan_id=str(row.id),
+                    )
+                    order_plan = target_payload.get("order_plan")
+                    governed = target_payload.get("governed_order_plan")
+                    if (
+                        str(row.continuity_event_id)
+                        != str(validated_event["event_sha256"])
+                        or row.continuity_event_batch_id is not None
+                        or row.continuity_event_trade_date
+                        != row.continuity_trade_date
+                        or str(validated_event.get("target_version") or "")
+                        != target_version
+                        or not isinstance(order_plan, dict)
+                        or order_plan.get("decision_valuation_replay") is not True
+                        or str(order_plan.get("decision_event_sha256") or "")
+                        != str(row.continuity_event_id)
+                        or order_plan.get("account_netting_plan_id") is not None
+                        or order_plan.get("actions") != []
+                        or not isinstance(governed, dict)
+                        or governed.get("format_version")
+                        != ACCOUNT_DECISION_VALUATION_VERSION
+                        or str(governed.get("decision_event_sha256") or "")
+                        != str(row.continuity_event_id)
+                    ):
+                        raise ValueError(
+                            "decision-only account plan valuation binding is invalid"
+                        )
+                    event_id = str(row.continuity_event_id)
+
+                effective_at = (
+                    row.continuity_finished_at
+                    or row.continuity_batch_created_at
+                    or row.created_at
+                )
+                candidates.append(
+                    {
+                        "kind": kind,
+                        "plan": plan,
+                        "plan_id": str(row.id),
+                        "batch_id": str(row.continuity_batch_id),
+                        "event_id": event_id,
+                        "trade_date": row.continuity_trade_date,
+                        "effective_at": effective_at,
+                        "allocation_id": str(row.account_id),
+                        "allocation_lineage_id": prior_lineage or current_lineage,
+                        "artifact_hash": artifact_hash,
+                    }
+                )
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda value: (value["trade_date"], value["effective_at"]),
+            reverse=True,
+        )
+        selected = candidates[0]
+        tied = [
+            value
+            for value in candidates[1:]
+            if (value["trade_date"], value["effective_at"])
+            == (selected["trade_date"], selected["effective_at"])
+            and value["plan_id"] != selected["plan_id"]
+        ]
+        if tied:
+            raise ValueError("account plan continuity has an ambiguous effective time")
+        return selected
+
     def build_plan_for_allocation(
         self,
         allocation_id: str,
@@ -513,6 +1285,13 @@ class AccountNettingStore:
         the account target.
         """
 
+        if primary_account is not None and member_current_weights is not None:
+            raise ValueError(
+                "primary account sleeve inventory must come from the real ledger"
+            )
+        member_current_account_weights: dict[str, dict[str, float]] | None = None
+        sleeve_inventory_evidence: dict[str, Any] | None = None
+        primary_position_evidence: dict[str, Any] | None = None
         with self.engine.connect() as connection:
             allocation = connection.execute(
                 select(strategy_allocations).where(
@@ -521,6 +1300,19 @@ class AccountNettingStore:
             ).first()
             if allocation is None:
                 raise KeyError(allocation_id)
+            if primary_account is not None:
+                primary_id = str(primary_account.get("portfolio_id") or "").strip()
+                primary_source = str(primary_account.get("source_id") or "").strip()
+                primary_nav = float(primary_account.get("nav") or 0.0)
+                if (
+                    not primary_id
+                    or primary_source != str(allocation.id)
+                    or not isfinite(primary_nav)
+                    or primary_nav <= 0
+                ):
+                    raise ValueError(
+                        "primary account capital evidence does not match the active allocation"
+                    )
             artifact = connection.execute(
                 select(strategy_allocation_artifacts)
                 .where(strategy_allocation_artifacts.c.allocation_id == allocation_id)
@@ -580,7 +1372,13 @@ class AccountNettingStore:
                                 recommendation_snapshots.c.portfolio_id == portfolio_id,
                                 recommendation_snapshots.c.status == "succeeded",
                             )
-                            .order_by(recommendation_snapshots.c.created_at.desc())
+                            # A historical backfill can finish after a newer
+                            # trading-day snapshot.  Creation time is therefore
+                            # not the business ordering for account targets.
+                            .order_by(
+                                recommendation_snapshots.c.as_of_date.desc(),
+                                recommendation_snapshots.c.created_at.desc(),
+                            )
                             .limit(2)
                         ).all()
                     )
@@ -676,53 +1474,86 @@ class AccountNettingStore:
             if decision_date > artifact.valid_until:
                 raise ValueError("allocation artifact expired before the latest member target")
             continuity_evidence: dict[str, Any] | None = None
-            if member_current_weights is None and primary_account is not None:
-                primary_id = str(primary_account.get("portfolio_id") or "").strip()
-                if not primary_id:
-                    raise ValueError("primary account capital evidence requires a portfolio id")
-                prior = connection.execute(
-                    select(account_netting_plans, simulation_batches.c.id.label("batch_id"))
-                    .select_from(
-                        simulation_batches.join(
-                            account_netting_plans,
-                            account_netting_plans.c.id
-                            == simulation_batches.c.account_netting_plan_id,
-                        )
+            if primary_account is not None:
+                position_rows = connection.execute(
+                    select(simulation_positions)
+                    .where(simulation_positions.c.portfolio_id == primary_id)
+                    .order_by(simulation_positions.c.instrument)
+                ).all()
+                primary_position_evidence, actual_account_weights = (
+                    primary_position_inventory_evidence(
+                        portfolio_id=primary_id,
+                        nav=primary_nav,
+                        positions=[dict(position._mapping) for position in position_rows],
                     )
-                    .where(
-                        simulation_batches.c.portfolio_id == primary_id,
-                        simulation_batches.c.status == "succeeded",
-                        account_netting_plans.c.inputs_as_of <= inputs_as_of,
+                )
+                prior = (
+                    self._authoritative_prior_plan(
+                        connection,
+                        portfolio_id=primary_id,
+                        current_allocation=allocation,
+                        decision_date=decision_date,
+                        inputs_as_of=inputs_as_of,
                     )
-                    .order_by(
-                        simulation_batches.c.trade_date.desc(),
-                        simulation_batches.c.created_at.desc(),
+                    if actual_account_weights
+                    else None
+                )
+                if prior is None and actual_account_weights:
+                    raise ValueError(
+                        "primary account has positions but no valued plan for sleeve attribution"
                     )
-                    .limit(1)
-                ).first()
+                prior_plan = dict(prior["plan"]) if prior is not None else {}
+                member_current_account_weights, sleeve_inventory_evidence = (
+                    allocate_actual_sleeve_inventory(
+                        actual_account_weights=actual_account_weights,
+                        prior_plan=prior_plan,
+                    )
+                )
                 if prior is not None:
-                    prior_targets = dict(
-                        dict(prior.plan_json or {}).get("member_targets") or {}
-                    )
-                    if any(not isinstance(value, dict) for value in prior_targets.values()):
-                        raise ValueError(
-                            "prior primary-account plan has invalid durable member targets"
-                        )
-                    member_current_weights = {
-                        str(member): {
-                            str(instrument): float(weight)
-                            for instrument, weight in dict(prior_targets.get(member) or {}).items()
+                    sleeve_inventory_evidence.update(
+                        {
+                            "prior_plan_id": prior["plan_id"],
+                            "prior_batch_id": prior["batch_id"],
+                            "prior_allocation_id": prior["allocation_id"],
+                            "prior_source_kind": prior["kind"],
+                            "prior_decision_event_id": prior["event_id"],
+                            "prior_effective_trade_date": prior[
+                                "trade_date"
+                            ].isoformat(),
+                            "prior_allocation_lineage_id": prior[
+                                "allocation_lineage_id"
+                            ],
+                            "prior_allocation_artifact_hash": prior[
+                                "artifact_hash"
+                            ],
                         }
-                        for member in budgets
-                    }
+                    )
+                    sleeve_inventory_evidence["allocation_sha256"] = _canonical_hash(
+                        {
+                            key: value
+                            for key, value in sleeve_inventory_evidence.items()
+                            if key != "allocation_sha256"
+                        }
+                    )
                     continuity_evidence = {
                         "portfolio_id": primary_id,
-                        "prior_plan_id": str(prior.id),
-                        "prior_batch_id": str(prior.batch_id),
-                        "prior_allocation_id": str(prior.account_id),
-                        "carried_members": sorted(set(prior_targets).intersection(budgets)),
+                        "prior_plan_id": prior["plan_id"],
+                        "prior_batch_id": prior["batch_id"],
+                        "prior_allocation_id": prior["allocation_id"],
+                        "prior_source_kind": prior["kind"],
+                        "prior_decision_event_id": prior["event_id"],
+                        "prior_effective_trade_date": prior[
+                            "trade_date"
+                        ].isoformat(),
+                        "prior_effective_at": prior["effective_at"].isoformat(),
+                        "prior_plan_hash": str(prior_plan["plan_hash"]),
+                        "prior_allocation_lineage_id": prior[
+                            "allocation_lineage_id"
+                        ],
+                        "prior_allocation_artifact_hash": prior["artifact_hash"],
+                        "carried_members": sorted(member_current_account_weights),
                     }
-            if member_current_weights is None:
+            if member_current_weights is None and primary_account is None:
                 prior = connection.execute(
                     select(account_netting_plans)
                     .where(
@@ -773,6 +1604,12 @@ class AccountNettingStore:
                 "source_id": primary_source,
                 "nav": account_capital,
                 "updated_at": str(primary_account.get("updated_at") or ""),
+                "positions_sha256": str(
+                    (primary_position_evidence or {}).get("positions_sha256") or ""
+                ),
+                "sleeve_inventory_policy_sha256": str(
+                    (sleeve_inventory_evidence or {}).get("policy_sha256") or ""
+                ),
             }
         capital_identity = _canonical_hash(
             primary_evidence
@@ -798,6 +1635,7 @@ class AccountNettingStore:
             member_budgets=budgets,
             member_targets=targets,
             member_current_weights=member_current_weights,
+            member_current_account_weights=member_current_account_weights,
             total_capital=account_capital,
             execution_policy=execution_policy,
             tranche_index=tranche_index,
@@ -812,6 +1650,8 @@ class AccountNettingStore:
                 "allocation_artifact_inputs_as_of": artifact.inputs_as_of.isoformat(),
                 "max_gross_exposure": gross_limit,
                 "primary_account": primary_evidence,
+                "primary_position_inventory": primary_position_evidence,
+                "sleeve_inventory_allocation": sleeve_inventory_evidence,
                 "allocation_continuity": continuity_evidence,
                 "industry_membership_as_of": {
                     instrument: observed[0].isoformat()

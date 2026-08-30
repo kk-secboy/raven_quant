@@ -86,8 +86,14 @@ from .recommendation_store import (
 )
 from .research_asset_store import ResearchAssetStore
 from .research_automation import (
+    HORIZON_RESEARCH_SCENARIOS,
     normalize_research_schedule_payload,
+    resolve_research_periods,
     resolve_research_window_contract,
+)
+from .research_horizon import (
+    primary_label_horizon_sessions,
+    primary_label_policy_contract,
 )
 from .research_report_backfill import ResearchReportBackfillStore
 from .research_store import ResearchStore
@@ -2827,14 +2833,24 @@ class SchedulerEngine:
                     .read_text(encoding="utf-8")
                     .splitlines()
                 )
-                periods, period_resolution = resolve_research_window_contract(
-                    dataset,
-                    calendar,
-                    periods=payload.get("periods"),
-                    period_policy=payload.get("period_policy"),
-                    horizon_profile=payload.get("horizon_profile"),
-                    feature_set=payload.get("feature_set"),
-                )
+                if scenario.id in HORIZON_RESEARCH_SCENARIOS:
+                    periods, period_resolution = resolve_research_window_contract(
+                        dataset,
+                        calendar,
+                        periods=payload.get("periods"),
+                        period_policy=payload.get("period_policy"),
+                        horizon_profile=payload.get("horizon_profile"),
+                        feature_set=payload.get("feature_set"),
+                    )
+                else:
+                    # Report-derived factors retain their historical 1-session
+                    # research contract.  They do not acquire an investment
+                    # horizon merely because their source PDF uses daily data.
+                    periods, period_resolution = resolve_research_periods(
+                        calendar,
+                        periods=payload.get("periods"),
+                        period_policy=payload.get("period_policy"),
+                    )
             except (FileNotFoundError, OSError) as exc:
                 raise ScheduleRunWaiting(
                     "scheduled RD-Agent dataset calendar is still publishing"
@@ -3055,6 +3071,16 @@ class SchedulerEngine:
             "dataset_binding": dataset_binding,
             "incumbent_strategy": incumbent_strategy,
             "managed_fin_strategy_run": managed_run,
+            **(
+                {
+                    "primary_label_policy": primary_label_policy_contract(),
+                    "primary_label_policy_sha256": payload[
+                        "primary_label_policy_sha256"
+                    ],
+                }
+                if scenario.id in HORIZON_RESEARCH_SCENARIOS
+                else {}
+            ),
         }
         if dataset is not None and periods is not None and period_resolution is not None:
             config.update(
@@ -3170,14 +3196,25 @@ class SchedulerEngine:
                         else None
                     ),
                     "label_horizon_sessions": (
-                        max(period_resolution.get("label_horizons_sessions") or [])
+                        primary_label_horizon_sessions(payload["horizon_profile"])
                         if period_resolution
+                        and scenario.id in HORIZON_RESEARCH_SCENARIOS
                         else None
                     ),
                     "asset_ids": resolved_asset_ids,
                     "asset_manifest_sha256": assets["manifest_sha256"],
                     "feature_set": payload["feature_set"],
                     "horizon_profile": payload["horizon_profile"],
+                    **(
+                        {
+                            "primary_label_policy": primary_label_policy_contract(),
+                            "primary_label_policy_sha256": payload[
+                                "primary_label_policy_sha256"
+                            ],
+                        }
+                        if scenario.id in HORIZON_RESEARCH_SCENARIOS
+                        else {}
+                    ),
                     "incumbent_strategy": incumbent_strategy,
                     "managed_fin_strategy_run": managed_run,
                     "expected_rdagent_runtime": expected_runtime_identity,

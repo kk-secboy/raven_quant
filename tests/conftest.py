@@ -10,6 +10,8 @@ from sqlalchemy import text
 from quant_data.database import open_database
 from quant_platform.db_cli import upgrade_database
 
+_TEST_WORKER_RUNTIME_IMAGE_DIGEST = "sha256:" + "d" * 64
+
 
 @pytest.fixture(scope="session")
 def migrated_database() -> str:
@@ -23,6 +25,14 @@ def migrated_database() -> str:
 
 @pytest.fixture(autouse=True)
 def database_state(monkeypatch, request: pytest.FixtureRequest) -> Iterator[str]:
+    # Production releases stamp the exact worker image ID before any governed
+    # v12 StrategyVersion can be created.  The disposable test runtime has no
+    # release upgrader, so give every test the same valid, deterministic seal;
+    # missing/mismatch tests explicitly delete or replace it themselves.
+    monkeypatch.setenv(
+        "QUANTLAB_WORKER_RUNTIME_IMAGE_DIGEST",
+        _TEST_WORKER_RUNTIME_IMAGE_DIGEST,
+    )
     if request.node.get_closest_marker("no_database") is not None:
         yield ""
         return

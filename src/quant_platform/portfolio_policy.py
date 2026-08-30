@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -74,14 +75,21 @@ class PortfolioPolicyConfig:
     rebalance_frequency: str = "day"
     entry_score_min_percentile: float = 0.0
     score_drop_exit_percentile: float | None = None
+    score_deterioration_reduce_percentile: float | None = None
+    score_deterioration_reduce_fraction: float = 0.50
     extension_guard_max_return_5d: float | None = None
+    holding_min_sessions: int | None = None
     max_holding_sessions: int | None = None
+    min_rebalance_weight_change: float = 0.0
     market_trend_lookback_sessions: int | None = None
     valuation_regime_max_percentile: float | None = None
+    valuation_reduce_percentile: float | None = None
+    valuation_reduce_fraction: float = 0.50
     trend_break_lookback_sessions: int | None = None
     thesis_min_holding_sessions: int | None = None
     thesis_break_score_percentile: float | None = None
     thesis_review_frequency: str | None = None
+    hard_risk_target_fraction: float = 0.50
     cash_when_no_edge: bool = False
 
     @classmethod
@@ -133,7 +141,12 @@ class PortfolioPolicyConfig:
             raise ValueError("entry score percentile must be within [0, 1]")
         for name, value in (
             ("score-drop exit percentile", self.score_drop_exit_percentile),
+            (
+                "score-deterioration reduce percentile",
+                self.score_deterioration_reduce_percentile,
+            ),
             ("valuation regime percentile", self.valuation_regime_max_percentile),
+            ("valuation reduce percentile", self.valuation_reduce_percentile),
             ("thesis-break score percentile", self.thesis_break_score_percentile),
         ):
             if value is not None and not 0.0 <= value <= 1.0:
@@ -144,6 +157,7 @@ class PortfolioPolicyConfig:
         ):
             raise ValueError("extension guard return must be within (0, 1]")
         for name, value in (
+            ("minimum holding", self.holding_min_sessions),
             ("maximum holding", self.max_holding_sessions),
             ("market-trend lookback", self.market_trend_lookback_sessions),
             ("trend-break lookback", self.trend_break_lookback_sessions),
@@ -151,6 +165,21 @@ class PortfolioPolicyConfig:
         ):
             if value is not None and (isinstance(value, bool) or value < 1):
                 raise ValueError(f"{name} sessions must be positive")
+        if (
+            self.holding_min_sessions is not None
+            and self.max_holding_sessions is not None
+            and self.holding_min_sessions > self.max_holding_sessions
+        ):
+            raise ValueError("minimum holding cannot exceed maximum holding")
+        if not 0.0 <= self.min_rebalance_weight_change <= 1.0:
+            raise ValueError("minimum rebalance weight change must be within [0, 1]")
+        for name, value in (
+            ("score-deterioration reduce fraction", self.score_deterioration_reduce_fraction),
+            ("valuation reduce fraction", self.valuation_reduce_fraction),
+            ("hard-risk target fraction", self.hard_risk_target_fraction),
+        ):
+            if not 0.0 <= value < 1.0:
+                raise ValueError(f"{name} must be within [0, 1)")
         if self.thesis_review_frequency not in {None, "month", "quarter"}:
             raise ValueError("thesis review frequency must be month or quarter")
         if (self.thesis_min_holding_sessions is None) != (
@@ -214,9 +243,11 @@ class PortfolioPolicy:
         trend_intact: pd.Series | None = None,
         valuation_percentiles: pd.Series | None = None,
         market_regime_allows_entries: bool | None = None,
+        instrument_risk_states: pd.Series | dict[str, str] | None = None,
         portfolio_drawdown: float = 0.0,
         daily_return: float = 0.0,
         rebalance_due: bool = True,
+        rebalance_instruments: Collection[str] | None = None,
     ) -> PolicyDecision:
         signal = pd.to_numeric(scores, errors="coerce").dropna().astype(float)
         signal.index = signal.index.astype(str)
@@ -268,11 +299,44 @@ class PortfolioPolicy:
         if any(value < 0 for value in ages.values()):
             raise ValueError("holding ages must be non-negative trading sessions")
         previous_instruments = set(previous[previous > 0].index)
-        if self.config.max_holding_sessions is not None and ages and not (
+        normalized_rebalance_instruments: set[str] | None = None
+        if rebalance_instruments is not None:
+            normalized_rebalance_instruments = {
+                str(instrument).strip() for instrument in rebalance_instruments
+            }
+            if (
+                not rebalance_due
+                or not normalized_rebalance_instruments
+                or "" in normalized_rebalance_instruments
+                or not normalized_rebalance_instruments
+                <= set(signal.index).union(previous.index)
+            ):
+                raise ValueError(
+                    "scoped rebalance instruments require a due decision and known identities"
+                )
+        reviewed_previous_instruments = (
+            previous_instruments
+            if normalized_rebalance_instruments is None
+            else previous_instruments & normalized_rebalance_instruments
+        )
+        if (
+            self.config.max_holding_sessions is not None
+            or self.config.holding_min_sessions is not None
+        ) and ages and not (
             previous_instruments <= set(ages)
         ):
-            raise ValueError("maximum-holding policy requires complete holding-age state")
+            raise ValueError("holding-period policy requires complete holding-age state")
+        if (
+            previous_instruments
+            and (
+                self.config.max_holding_sessions is not None
+                or self.config.holding_min_sessions is not None
+            )
+            and not ages
+        ):
+            raise ValueError("holding-period policy requires complete holding-age state")
         risk_events: list[dict[str, Any]] = []
+        suppressed_changes: list[dict[str, Any]] = []
         score_percentiles = signal.rank(method="average", pct=True)
         new_entry_eligible = score_percentiles >= self.config.entry_score_min_percentile
         if self.config.extension_guard_max_return_5d is not None:
@@ -293,12 +357,20 @@ class PortfolioPolicy:
                 raise ValueError("market-trend rule requires point-in-time regime evidence")
             if not market_regime_allows_entries:
                 new_entry_eligible[:] = False
-        if self.config.valuation_regime_max_percentile is not None:
+        normalized_valuations: pd.Series | None = None
+        if (
+            self.config.valuation_regime_max_percentile is not None
+            or self.config.valuation_reduce_percentile is not None
+        ):
             if valuation_percentiles is None:
-                raise ValueError("valuation-regime rule requires point-in-time percentiles")
-            valuation = pd.to_numeric(valuation_percentiles, errors="coerce")
-            valuation.index = valuation.index.astype(str)
-            aligned_valuation = valuation.reindex(signal.index)
+                raise ValueError("valuation rules require point-in-time percentiles")
+            normalized_valuations = pd.to_numeric(valuation_percentiles, errors="coerce")
+            normalized_valuations.index = normalized_valuations.index.astype(str)
+            if normalized_valuations.index.has_duplicates:
+                raise ValueError("valuation evidence is duplicated")
+        if self.config.valuation_regime_max_percentile is not None:
+            assert normalized_valuations is not None
+            aligned_valuation = normalized_valuations.reindex(signal.index)
             new_entry_eligible &= (
                 aligned_valuation.notna()
                 & np.isfinite(aligned_valuation.to_numpy(dtype=float))
@@ -432,6 +504,55 @@ class PortfolioPolicy:
         cadence_hold = not rebalance_due
         if cadence_hold:
             target = previous.reindex(target.index.union(previous.index), fill_value=0.0)
+        elif self.config.holding_min_sessions is not None:
+            target, holding_events = self._preserve_minimum_holding(
+                target,
+                previous,
+                signal=signal,
+                ages=ages,
+                minimum_sessions=self.config.holding_min_sessions,
+            )
+            suppressed_changes.extend(holding_events)
+
+        if rebalance_due and self.config.min_rebalance_weight_change > 0:
+            target = target.reindex(target.index.union(previous.index), fill_value=0.0)
+            previous_for_band = previous.reindex(target.index, fill_value=0.0)
+            small_changes = (target - previous_for_band).abs().between(
+                0.0,
+                self.config.min_rebalance_weight_change,
+                inclusive="neither",
+            )
+            for instrument in target.index[small_changes]:
+                suppressed_changes.append(
+                    {
+                        "instrument": str(instrument),
+                        "rule": "minimum_rebalance_weight_change",
+                        "requested_weight": float(target[instrument]),
+                        "retained_weight": float(previous_for_band[instrument]),
+                    }
+                )
+            target.loc[small_changes] = previous_for_band.loc[small_changes]
+
+        if normalized_rebalance_instruments is not None:
+            # An off-cadence PIT filing review is a local decision, not a
+            # licence to recompute the entire long-horizon account.  Preserve
+            # every unrelated holding and suppress unrelated new entries.  A
+            # reviewed sleeve may use existing cash, but can never crowd the
+            # fixed sleeve above the account exposure/cash ceiling.
+            all_scope_instruments = target.index.union(previous.index)
+            target = target.reindex(all_scope_instruments, fill_value=0.0)
+            previous_for_scope = previous.reindex(all_scope_instruments, fill_value=0.0)
+            scoped_mask = target.index.isin(normalized_rebalance_instruments)
+            fixed_weight = float(previous_for_scope.loc[~scoped_mask].sum())
+            desired_total = min(
+                1.0 - self.config.min_cash_weight,
+                max(float(previous_for_scope.sum()), float(target.sum())),
+            )
+            scoped_capacity = max(0.0, desired_total - fixed_weight)
+            requested_scoped_weight = float(target.loc[scoped_mask].sum())
+            if requested_scoped_weight > scoped_capacity + 1e-12:
+                target.loc[scoped_mask] *= scoped_capacity / requested_scoped_weight
+            target.loc[~scoped_mask] = previous_for_scope.loc[~scoped_mask]
 
         if normalized_drawdown <= -self.config.max_drawdown_liquidate:
             target *= 0.0
@@ -483,7 +604,8 @@ class PortfolioPolicy:
                         )
                     )
                 elif (
-                    self.config.profit_taking_mode == "threshold"
+                    instrument in reviewed_previous_instruments
+                    and self.config.profit_taking_mode == "threshold"
                     and position_return >= self.config.take_profit
                 ):
                     target[instrument] = 0.0
@@ -497,7 +619,8 @@ class PortfolioPolicy:
                         )
                     )
                 elif (
-                    self.config.profit_taking_mode == "threshold"
+                    instrument in reviewed_previous_instruments
+                    and self.config.profit_taking_mode == "threshold"
                     and position_return >= self.config.take_profit_partial
                 ):
                     if stages.get(instrument, 0) < 1:
@@ -518,7 +641,7 @@ class PortfolioPolicy:
                     else:
                         target[instrument] = min(target[instrument], previous[instrument])
         if self.config.score_drop_exit_percentile is not None:
-            for instrument in previous_instruments:
+            for instrument in reviewed_previous_instruments:
                 percentile = float(score_percentiles.get(instrument, 0.0))
                 if percentile < self.config.score_drop_exit_percentile:
                     target[instrument] = 0.0
@@ -531,8 +654,53 @@ class PortfolioPolicy:
                             instrument,
                         )
                     )
+        if self.config.score_deterioration_reduce_percentile is not None and rebalance_due:
+            for instrument in reviewed_previous_instruments:
+                percentile = float(score_percentiles.get(instrument, 0.0))
+                if (
+                    percentile < self.config.score_deterioration_reduce_percentile
+                    and float(target.get(instrument, 0.0)) > 0.0
+                ):
+                    target[instrument] = min(
+                        float(target[instrument]),
+                        float(previous[instrument])
+                        * (1.0 - self.config.score_deterioration_reduce_fraction),
+                    )
+                    risk_events.append(
+                        self._risk_event(
+                            "score_deterioration_reduce",
+                            percentile,
+                            self.config.score_deterioration_reduce_percentile,
+                            "reduce_position",
+                            instrument,
+                        )
+                    )
+        if self.config.valuation_reduce_percentile is not None and rebalance_due:
+            assert normalized_valuations is not None
+            held_valuations = normalized_valuations.reindex(
+                pd.Index(reviewed_previous_instruments, dtype=str)
+            )
+            for instrument, percentile in held_valuations.dropna().items():
+                if (
+                    float(percentile) > self.config.valuation_reduce_percentile
+                    and float(target.get(instrument, 0.0)) > 0.0
+                ):
+                    target[instrument] = min(
+                        float(target[instrument]),
+                        float(previous[instrument])
+                        * (1.0 - self.config.valuation_reduce_fraction),
+                    )
+                    risk_events.append(
+                        self._risk_event(
+                            "valuation_reduce",
+                            float(percentile),
+                            self.config.valuation_reduce_percentile,
+                            "reduce_position",
+                            str(instrument),
+                        )
+                    )
         if self.config.max_holding_sessions is not None:
-            for instrument in previous_instruments:
+            for instrument in reviewed_previous_instruments:
                 age = ages.get(instrument, 0)
                 if age >= self.config.max_holding_sessions:
                     target[instrument] = 0.0
@@ -548,7 +716,7 @@ class PortfolioPolicy:
         if self.config.trend_break_lookback_sessions is not None:
             assert normalized_trends is not None
             trends = normalized_trends.reindex(
-                pd.Index(previous_instruments, dtype=str)
+                pd.Index(reviewed_previous_instruments, dtype=str)
             )
             for instrument in trends[trends.isna()].index:
                 # Missing is not evidence of a trend break.  Preserve the
@@ -581,7 +749,7 @@ class PortfolioPolicy:
         # the quality/value thesis proxy into a daily trading rule.
         if self.config.thesis_min_holding_sessions is not None and rebalance_due:
             assert self.config.thesis_break_score_percentile is not None
-            for instrument in previous_instruments:
+            for instrument in reviewed_previous_instruments:
                 age = ages.get(instrument, 0)
                 percentile = float(score_percentiles.get(instrument, 0.0))
                 if (
@@ -608,6 +776,74 @@ class PortfolioPolicy:
                     "no_new_buys",
                 )
             )
+        normalized_risk_states = self._normalize_instrument_risk_states(
+            instrument_risk_states,
+            index=all_instruments,
+        )
+        for instrument, state in normalized_risk_states.items():
+            previous_weight = float(previous.get(instrument, 0.0))
+            desired_weight = float(target.get(instrument, 0.0))
+            if state == "normal":
+                continue
+            if state in {"watch", "restricted"}:
+                target[instrument] = min(desired_weight, previous_weight)
+                if previous_weight <= 0 and desired_weight <= 0:
+                    continue
+                risk_events.append(
+                    self._risk_event(
+                        f"instrument_{state}",
+                        1.0,
+                        1.0,
+                        "no_new_buys",
+                        str(instrument),
+                    )
+                )
+            elif state == "reduce":
+                if previous_weight <= 0 and desired_weight <= 0:
+                    continue
+                target[instrument] = min(
+                    desired_weight,
+                    previous_weight * self.config.hard_risk_target_fraction,
+                )
+                risk_events.append(
+                    self._risk_event(
+                        "instrument_hard_risk_reduce",
+                        1.0,
+                        1.0,
+                        "reduce_position",
+                        str(instrument),
+                    )
+                )
+            elif state == "exit":
+                if previous_weight <= 0 and desired_weight <= 0:
+                    continue
+                target[instrument] = 0.0
+                risk_events.append(
+                    self._risk_event(
+                        "instrument_hard_risk_exit",
+                        1.0,
+                        1.0,
+                        "exit",
+                        str(instrument),
+                    )
+                )
+        governed_risk_decrease_candidates = {
+            str(event["instrument"])
+            for event in risk_events
+            if event.get("instrument") is not None
+            and event.get("action") in {"reduce_position", "exit"}
+        }
+        if any(
+            event.get("instrument") is None
+            and event.get("action") in {"reduce_exposure", "liquidate"}
+            for event in risk_events
+        ):
+            governed_risk_decrease_candidates.update(
+                str(instrument)
+                for instrument in target.index
+                if float(target.get(instrument, 0.0))
+                < float(previous.get(instrument, 0.0)) - 1e-12
+            )
         pending_target: pd.Series | None = None
         remaining_execution_days = 0
         if self.config.execution_days > 1 and not risk_events:
@@ -619,61 +855,155 @@ class PortfolioPolicy:
                 all_instruments = all_instruments.union(pending_target.index)
                 previous = previous.reindex(all_instruments, fill_value=0.0)
                 pending_target = pending_target.reindex(all_instruments, fill_value=0.0)
+                if normalized_rebalance_instruments is not None:
+                    outside_scope = ~pending_target.index.isin(
+                        normalized_rebalance_instruments
+                    )
+                    pending_target.loc[outside_scope] = previous.loc[outside_scope]
                 remaining_execution_days = saved_remaining
             else:
                 pending_target = target.copy()
                 remaining_execution_days = self.config.execution_days
             target = previous + (pending_target - previous) / remaining_execution_days
-        risk_ceiling = target.copy() if risk_events else None
+        frozen_instruments: set[str] = set()
+        deferred_target_weights: dict[str, float] = {}
+        price_values: pd.Series | None = None
         if (prices is None) != (portfolio_value is None):
             raise ValueError("prices and portfolio_value must be supplied together")
         if prices is not None and portfolio_value is not None:
             if portfolio_value <= 0:
                 raise ValueError("portfolio_value must be positive")
-            price_values = pd.to_numeric(prices, errors="coerce").reindex(all_instruments)
-            if price_values.isna().any() or (price_values <= 0).any():
-                raise ValueError("prices must cover every target and existing holding")
+            price_values = prices.copy()
+            price_values.index = price_values.index.astype(str)
+            if price_values.index.has_duplicates:
+                raise ValueError("prices are duplicated")
+            price_values = pd.to_numeric(price_values, errors="coerce").reindex(
+                all_instruments
+            )
+            invalid_prices = price_values.isna() | ~np.isfinite(
+                price_values.to_numpy(dtype=float)
+            ) | (price_values <= 0)
+            invalid_execution = invalid_prices.copy()
+            daily_values: pd.Series | None = None
             if average_daily_values is not None:
-                daily_values = pd.to_numeric(average_daily_values, errors="coerce").reindex(
+                daily_values = average_daily_values.copy()
+                daily_values.index = daily_values.index.astype(str)
+                if daily_values.index.has_duplicates:
+                    raise ValueError("average daily values are duplicated")
+                daily_values = pd.to_numeric(daily_values, errors="coerce").reindex(
                     all_instruments
                 )
-                if daily_values.isna().any() or (daily_values < 0).any():
-                    raise ValueError("average daily values must cover every instrument")
+                requested_execution = (
+                    target.reindex(all_instruments, fill_value=0.0)
+                    - previous.reindex(all_instruments, fill_value=0.0)
+                ).abs() > 1e-10
+                invalid_daily_values = daily_values.isna() | ~np.isfinite(
+                    daily_values.to_numpy(dtype=float)
+                ) | (daily_values < 0)
+                unavailable_liquidity = (daily_values <= 0) & requested_execution
+                invalid_execution |= invalid_daily_values | unavailable_liquidity
+            frozen_instruments = {
+                str(instrument) for instrument in all_instruments[invalid_execution]
+            }
+            desired_before_freeze = target.reindex(all_instruments, fill_value=0.0).copy()
+            for instrument in sorted(frozen_instruments):
+                desired_weight = float(desired_before_freeze[instrument])
+                retained_weight = float(previous[instrument])
+                target[instrument] = retained_weight
+                if abs(desired_weight - retained_weight) > 1e-10:
+                    deferred_target_weights[instrument] = desired_weight
+                event = self._risk_event(
+                    "execution_evidence_unavailable",
+                    0.0,
+                    1.0,
+                    "wait_existing" if retained_weight > 0 else "block_new_entry",
+                    instrument,
+                )
+                unavailable_evidence: list[str] = []
+                if bool(invalid_prices.loc[instrument]):
+                    unavailable_evidence.append("price")
+                if daily_values is not None and (
+                    not np.isfinite(float(daily_values.loc[instrument]))
+                    or float(daily_values.loc[instrument]) <= 0
+                ):
+                    unavailable_evidence.append("average_daily_value")
+                event["unavailable_evidence"] = unavailable_evidence
+                risk_events.append(event)
+            desired_exposure = max(
+                float(desired_before_freeze.sum()),
+                float(previous.sum()),
+            )
+            excess = max(0.0, float(target.sum()) - desired_exposure)
+            funding_order = sorted(
+                (
+                    str(instrument)
+                    for instrument in target[target > previous + 1e-12].index
+                    if str(instrument) not in frozen_instruments
+                ),
+                key=lambda instrument: (float(signal.get(instrument, -np.inf)), instrument),
+            )
+            for instrument in funding_order:
+                available = float(target[instrument] - previous[instrument])
+                reduction = min(available, excess)
+                target[instrument] -= reduction
+                excess -= reduction
+                if excess <= 1e-12:
+                    break
+            if excess > 1e-8:
+                raise ValueError("frozen holdings cannot be funded without leverage")
+            tradable = ~target.index.isin(frozen_instruments)
+            if daily_values is not None:
                 max_change = (
                     daily_values * self.cost_model.max_volume_participation / portfolio_value
                 )
-                target = target.clip(
-                    lower=(previous - max_change).clip(lower=0.0),
-                    upper=previous + max_change,
+                target.loc[tradable] = target.loc[tradable].clip(
+                    lower=(previous - max_change).clip(lower=0.0).loc[tradable],
+                    upper=(previous + max_change).loc[tradable],
                 )
-            lots = (
-                np.floor(target * portfolio_value / price_values / self.cost_model.lot_size)
-                * self.cost_model.lot_size
+            target = self._round_tradable_lots(
+                target,
+                price_values,
+                portfolio_value=portfolio_value,
+                lot_size=self.cost_model.lot_size,
+                frozen_instruments=frozen_instruments,
             )
-            target = lots * price_values / portfolio_value
+        risk_turnover_exempt_instruments = {
+            instrument
+            for instrument in governed_risk_decrease_candidates
+            if instrument in target.index
+            and float(target[instrument]) < float(previous[instrument]) - 1e-12
+        }
+        risk_ceiling: pd.Series | None = None
+        if risk_turnover_exempt_instruments:
+            risk_ceiling = pd.Series(1.0, index=target.index, dtype=float)
+            risk_ceiling.loc[sorted(risk_turnover_exempt_instruments)] = target.loc[
+                sorted(risk_turnover_exempt_instruments)
+            ]
         raw_changes = target - previous
         turnover = self._turnover(target, previous)
         if turnover > self.config.max_daily_turnover and turnover > 0:
             scale = self.config.max_daily_turnover / turnover
             target = previous + raw_changes * scale
-            if prices is not None and portfolio_value is not None:
-                price_values = pd.to_numeric(prices, errors="coerce").reindex(all_instruments)
-                lots = (
-                    np.floor(target * portfolio_value / price_values / self.cost_model.lot_size)
-                    * self.cost_model.lot_size
+            if price_values is not None and portfolio_value is not None:
+                target = self._round_tradable_lots(
+                    target,
+                    price_values,
+                    portfolio_value=portfolio_value,
+                    lot_size=self.cost_model.lot_size,
+                    frozen_instruments=frozen_instruments,
                 )
-                target = lots * price_values / portfolio_value
             raw_changes = target - previous
             turnover = self._turnover(target, previous)
         if risk_ceiling is not None:
             target = pd.concat([target, risk_ceiling.reindex(target.index)], axis=1).min(axis=1)
-            if prices is not None and portfolio_value is not None:
-                price_values = pd.to_numeric(prices, errors="coerce").reindex(all_instruments)
-                lots = (
-                    np.floor(target * portfolio_value / price_values / self.cost_model.lot_size)
-                    * self.cost_model.lot_size
+            if price_values is not None and portfolio_value is not None:
+                target = self._round_tradable_lots(
+                    target,
+                    price_values,
+                    portfolio_value=portfolio_value,
+                    lot_size=self.cost_model.lot_size,
+                    frozen_instruments=frozen_instruments,
                 )
-                target = lots * price_values / portfolio_value
             raw_changes = target - previous
             turnover = self._turnover(target, previous)
         target[target.abs() < 1e-10] = 0.0
@@ -762,6 +1092,8 @@ class PortfolioPolicy:
             prices=prices,
             lot_size=self.cost_model.lot_size if prices is not None else None,
             risk_ceiling=risk_ceiling,
+            risk_turnover_exempt_instruments=risk_turnover_exempt_instruments,
+            frozen_instruments=frozen_instruments,
         )
         if discrete_validation["status"] != "passed":
             failures = ", ".join(
@@ -771,6 +1103,34 @@ class PortfolioPolicy:
             raise ValueError(
                 "post-discretization hard constraint violation: " + failures
             )
+        risk_turnover_exception = discrete_validation["risk_turnover_exception"]
+        if risk_turnover_exception["status"] == "applied":
+            event = self._risk_event(
+                "risk_driven_turnover_exception",
+                float(risk_turnover_exception["actual_turnover"]),
+                self.config.max_daily_turnover,
+                "allow_governed_decreases_only",
+            )
+            event["instruments"] = list(risk_turnover_exception["instruments"])
+            event["turnover_subject_to_limit"] = float(
+                risk_turnover_exception["turnover_subject_to_limit"]
+            )
+            event["gross_increase_weight"] = float(
+                risk_turnover_exception["gross_increase_weight"]
+            )
+            risk_events.append(event)
+        for exception in discrete_validation[
+            "frozen_inherited_max_position_exceptions"
+        ]:
+            event = self._risk_event(
+                "frozen_inherited_max_position_exception",
+                float(exception["target_weight"]),
+                float(exception["configured_limit"]),
+                "retain_non_worsening_until_tradable",
+                str(exception["instrument"]),
+            )
+            event["previous_weight"] = float(exception["previous_weight"])
+            risk_events.append(event)
         next_execution_state: dict[str, Any] = {}
         if pending_target is not None:
             pending_target = pending_target.reindex(target.index, fill_value=0.0)
@@ -818,6 +1178,8 @@ class PortfolioPolicy:
             reasons.append("target volatility exposure scaling")
         if not allow_new_risk:
             reasons.append("member drawdown gate pauses new risk")
+        if suppressed_changes:
+            reasons.append("holding discipline and no-trade band")
         reasons.extend(str(item["rule"]) for item in risk_events)
         return PolicyDecision(
             target_weights={key: float(value) for key, value in target[target > 0].items()},
@@ -833,6 +1195,18 @@ class PortfolioPolicy:
                 "holding_age_sessions": next_holding_ages,
                 "constraint_benchmark_scale": constraint_scale,
                 "discrete_constraint_validation": discrete_validation,
+                "suppressed_changes": suppressed_changes,
+                "frozen_instruments": sorted(frozen_instruments),
+                "deferred_target_weights": deferred_target_weights,
+                **(
+                    {
+                        "rebalance_instruments": sorted(
+                            normalized_rebalance_instruments
+                        )
+                    }
+                    if normalized_rebalance_instruments is not None
+                    else {}
+                ),
                 **(
                     {"target_volatility": target_volatility_evidence}
                     if target_volatility_evidence
@@ -840,6 +1214,98 @@ class PortfolioPolicy:
                 ),
             },
         )
+
+    @classmethod
+    def _preserve_minimum_holding(
+        cls,
+        target: pd.Series,
+        previous: pd.Series,
+        *,
+        signal: pd.Series,
+        ages: dict[str, int],
+        minimum_sessions: int,
+    ) -> tuple[pd.Series, list[dict[str, Any]]]:
+        instruments = target.index.union(previous.index)
+        result = target.reindex(instruments, fill_value=0.0).astype(float)
+        prior = previous.reindex(instruments, fill_value=0.0).astype(float)
+        desired_exposure = max(float(result.sum()), float(prior.sum()))
+        locked: set[str] = set()
+        events: list[dict[str, Any]] = []
+        for instrument in prior[prior > 0].index:
+            age = int(ages[str(instrument)])
+            if age >= minimum_sessions or result[instrument] >= prior[instrument]:
+                continue
+            result[instrument] = prior[instrument]
+            locked.add(str(instrument))
+            events.append(
+                {
+                    "instrument": str(instrument),
+                    "rule": "minimum_holding_sessions",
+                    "observed_sessions": age,
+                    "minimum_sessions": minimum_sessions,
+                    "action": "retain_normal_decrease",
+                }
+            )
+        excess = max(0.0, float(result.sum()) - desired_exposure)
+        if excess <= 1e-12:
+            return result, events
+        increases = result[result > prior + 1e-12].index
+        funding_order = sorted(
+            (str(item) for item in increases if str(item) not in locked),
+            key=lambda item: (float(signal.get(item, -np.inf)), item),
+        )
+        for instrument in funding_order:
+            available = float(result[instrument] - prior[instrument])
+            reduction = min(available, excess)
+            result[instrument] -= reduction
+            excess -= reduction
+            if excess <= 1e-12:
+                break
+        if excess > 1e-8:
+            raise ValueError("minimum-holding lock cannot be funded without leverage")
+        return result, events
+
+    @staticmethod
+    def _normalize_instrument_risk_states(
+        values: pd.Series | dict[str, str] | None,
+        *,
+        index: pd.Index,
+    ) -> pd.Series:
+        if values is None:
+            return pd.Series("normal", index=index, dtype=str)
+        result = values.copy() if isinstance(values, pd.Series) else pd.Series(values, dtype=str)
+        result.index = result.index.astype(str)
+        if result.index.has_duplicates:
+            raise ValueError("instrument risk states are duplicated")
+        result = result.astype(str).str.strip().str.lower().reindex(index, fill_value="normal")
+        allowed = {"normal", "watch", "restricted", "reduce", "exit"}
+        invalid = sorted(set(result) - allowed)
+        if invalid:
+            raise ValueError("instrument risk states are invalid: " + ", ".join(invalid))
+        return result
+
+    @staticmethod
+    def _round_tradable_lots(
+        target: pd.Series,
+        prices: pd.Series,
+        *,
+        portfolio_value: float,
+        lot_size: int,
+        frozen_instruments: set[str],
+    ) -> pd.Series:
+        result = target.copy().astype(float)
+        tradable = ~result.index.isin(frozen_instruments)
+        quantities = (
+            np.floor(
+                result.loc[tradable]
+                * portfolio_value
+                / prices.loc[tradable]
+                / lot_size
+            )
+            * lot_size
+        )
+        result.loc[tradable] = quantities * prices.loc[tradable] / portfolio_value
+        return result
 
     @staticmethod
     def _turnover(target: pd.Series, previous: pd.Series) -> float:

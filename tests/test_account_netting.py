@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from governance_fixtures import DATASET_IDENTITY
@@ -17,15 +18,20 @@ from quant_data.database import (
 )
 from quant_platform.account_netting import (
     NETTING_PLAN_VERSION,
+    SLEEVE_INVENTORY_POLICY_VERSION,
     AccountNettingStore,
+    allocate_actual_sleeve_inventory,
     build_account_netting_plan,
     net_member_demands,
     plan_idempotency_key,
+    primary_position_inventory_evidence,
+    sleeve_inventory_policy_contract,
 )
 from quant_platform.allocation_store import AllocationStore
 from quant_platform.portfolio_policy import POLICY_VERSION
 from quant_platform.qlib_backtest import QLIB_ENGINE_VERSION
 from quant_platform.recommendation_store import RecommendationStore
+from quant_platform.simulation_store import _validate_account_netting_primary_evidence
 from quant_platform.three_horizon_account import (
     HORIZON_WEIGHTS,
     _active_horizon_fixed_weights,
@@ -211,11 +217,11 @@ def test_missing_industry_metadata_fails_closed_with_explanation() -> None:
 
 
 @pytest.mark.no_database
-def test_three_horizon_default_is_20_40_40_of_investable_capital() -> None:
+def test_three_horizon_default_is_short_mid_led_of_investable_capital() -> None:
     assert HORIZON_WEIGHTS == {
         "short_1_5d": 0.20,
-        "swing_1_6m": 0.40,
-        "long_1_3y": 0.40,
+        "swing_1_6m": 0.50,
+        "long_1_3y": 0.30,
     }
     # Balanced account: sleeves consume 90% gross and preserve 10% cash.
     budgets = {key: value * 0.90 for key, value in HORIZON_WEIGHTS.items()}
@@ -255,10 +261,10 @@ def test_verified_horizons_do_not_redistribute_missing_sleeve_budgets() -> None:
     assert short_only == {"short-version": pytest.approx(0.18)}
     assert short_and_swing == {
         "short-version": pytest.approx(0.18),
-        "swing-version": pytest.approx(0.36),
+        "swing-version": pytest.approx(0.45),
     }
     assert 1.0 - sum(short_only.values()) == pytest.approx(0.82)
-    assert 1.0 - sum(short_and_swing.values()) == pytest.approx(0.46)
+    assert 1.0 - sum(short_and_swing.values()) == pytest.approx(0.37)
 
 
 @pytest.mark.no_database
@@ -294,6 +300,260 @@ def test_member_target_transition_preserves_exit_attribution_conservation() -> N
     assert sum(
         item["net_contribution"] for item in contribution["members"].values()
     ) == pytest.approx(plan["net_trades"].get("SH600000", {}).get("delta_weight", 0.0))
+
+
+@pytest.mark.no_database
+def test_partial_fill_keeps_unchanged_target_remainder_strategy_exact() -> None:
+    prior = build_account_netting_plan(
+        account_id="primary",
+        allocation_artifact_id=ARTIFACT,
+        decision_date=DECISION,
+        inputs_as_of=AS_OF,
+        policy_version="partial-fill-prior",
+        member_budgets={"short": 0.5, "swing": 0.5},
+        member_targets={
+            "short": {"SH600000": 0.20},
+            "swing": {"SH600000": 0.10},
+        },
+    )
+    inventory, evidence = allocate_actual_sleeve_inventory(
+        actual_account_weights={"SH600000": 0.06},
+        prior_plan=prior,
+    )
+
+    assert inventory == {
+        "short": {"SH600000": pytest.approx(0.04)},
+        "swing": {"SH600000": pytest.approx(0.02)},
+    }
+    assert evidence["policy_version"] == SLEEVE_INVENTORY_POLICY_VERSION
+    assert evidence["instrument_allocations"]["SH600000"]["basis_source"] == (
+        "prior_member_account_targets"
+    )
+
+    retry = build_account_netting_plan(
+        account_id="primary",
+        allocation_artifact_id=ARTIFACT,
+        decision_date=date(2026, 7, 21),
+        inputs_as_of=date(2026, 7, 20),
+        policy_version="partial-fill-retry",
+        member_budgets={"short": 0.5, "swing": 0.5},
+        member_targets=prior["member_targets"],
+        member_current_account_weights=inventory,
+    )
+
+    trade = retry["net_trades"]["SH600000"]["delta_weight"]
+    members = retry["strategy_contributions"]["SH600000"]["members"]
+    assert trade == pytest.approx(0.09)
+    assert members["short"]["net_contribution"] == pytest.approx(0.06)
+    assert members["swing"]["net_contribution"] == pytest.approx(0.03)
+    assert sum(item["net_contribution"] for item in members.values()) == pytest.approx(
+        trade
+    )
+
+
+@pytest.mark.no_database
+def test_rejected_buy_retries_full_target_with_exact_contributions() -> None:
+    prior = _plan(
+        member_targets={"m1": {"SH600000": 0.20}, "m2": {"SH600000": 0.10}}
+    )
+    inventory, _evidence = allocate_actual_sleeve_inventory(
+        actual_account_weights={},
+        prior_plan=prior,
+    )
+    retry = _plan(
+        member_targets=prior["member_targets"],
+        member_current_account_weights=inventory,
+    )
+
+    trade = retry["net_trades"]["SH600000"]["delta_weight"]
+    contributions = retry["strategy_contributions"]["SH600000"]["members"]
+    assert trade == pytest.approx(0.15)
+    assert sum(
+        item["net_contribution"] for item in contributions.values()
+    ) == pytest.approx(trade)
+
+
+@pytest.mark.no_database
+def test_departed_member_residual_inventory_remains_an_exact_exit() -> None:
+    prior = build_account_netting_plan(
+        account_id="primary",
+        allocation_artifact_id=ARTIFACT,
+        decision_date=DECISION,
+        inputs_as_of=AS_OF,
+        policy_version="member-before-exit",
+        member_budgets={"departed": 0.5, "survivor": 0.5},
+        member_targets={"departed": {"SH600000": 0.20}, "survivor": {}},
+    )
+    inventory, _evidence = allocate_actual_sleeve_inventory(
+        actual_account_weights={"SH600000": 0.10},
+        prior_plan=prior,
+    )
+    exit_plan = build_account_netting_plan(
+        account_id="primary",
+        allocation_artifact_id=ARTIFACT,
+        decision_date=date(2026, 7, 21),
+        inputs_as_of=date(2026, 7, 20),
+        policy_version="member-exited",
+        member_budgets={"survivor": 0.5},
+        member_targets={"survivor": {}},
+        member_current_account_weights=inventory,
+    )
+
+    trade = exit_plan["net_trades"]["SH600000"]["delta_weight"]
+    contribution = exit_plan["strategy_contributions"]["SH600000"]["members"]
+    assert trade == pytest.approx(-0.10)
+    assert contribution["departed"]["net_contribution"] == pytest.approx(trade)
+
+
+@pytest.mark.no_database
+def test_rejected_exit_uses_prior_inventory_attribution_for_next_retry() -> None:
+    rejected_exit = build_account_netting_plan(
+        account_id="primary",
+        allocation_artifact_id=ARTIFACT,
+        decision_date=DECISION,
+        inputs_as_of=AS_OF,
+        policy_version="rejected-exit",
+        member_budgets={"remaining": 0.5},
+        member_targets={"remaining": {}},
+        member_current_account_weights={"departed": {"SH600000": 0.10}},
+    )
+    inventory, evidence = allocate_actual_sleeve_inventory(
+        actual_account_weights={"SH600000": 0.10},
+        prior_plan=rejected_exit,
+    )
+    retry = build_account_netting_plan(
+        account_id="primary",
+        allocation_artifact_id=ARTIFACT,
+        decision_date=date(2026, 7, 21),
+        inputs_as_of=date(2026, 7, 20),
+        policy_version="rejected-exit-retry",
+        member_budgets={"remaining": 0.5},
+        member_targets={"remaining": {}},
+        member_current_account_weights=inventory,
+    )
+
+    assert evidence["instrument_allocations"]["SH600000"]["basis_source"] == (
+        "prior_negative_gross_demand"
+    )
+    trade = retry["net_trades"]["SH600000"]["delta_weight"]
+    members = retry["strategy_contributions"]["SH600000"]["members"]
+    assert trade == pytest.approx(-0.10)
+    assert members["departed"]["net_contribution"] == pytest.approx(trade)
+
+
+@pytest.mark.no_database
+def test_partial_member_exit_preserves_survivor_target_and_departed_remainder() -> None:
+    prior_exit = build_account_netting_plan(
+        account_id="primary",
+        allocation_artifact_id=ARTIFACT,
+        decision_date=DECISION,
+        inputs_as_of=AS_OF,
+        policy_version="shared-stock-member-exit",
+        member_budgets={"survivor": 0.5},
+        member_targets={"survivor": {"SH600000": 0.10}},
+        member_current_account_weights={
+            "survivor": {"SH600000": 0.05},
+            "departed": {"SH600000": 0.10},
+        },
+    )
+    inventory, evidence = allocate_actual_sleeve_inventory(
+        actual_account_weights={"SH600000": 0.12},
+        prior_plan=prior_exit,
+    )
+
+    assert inventory["survivor"]["SH600000"] == pytest.approx(0.05)
+    assert inventory["departed"]["SH600000"] == pytest.approx(0.07)
+    assert evidence["instrument_allocations"]["SH600000"]["basis_source"] == (
+        "prior_member_account_targets+prior_negative_gross_demand"
+    )
+    retry = build_account_netting_plan(
+        account_id="primary",
+        allocation_artifact_id=ARTIFACT,
+        decision_date=date(2026, 7, 21),
+        inputs_as_of=date(2026, 7, 20),
+        policy_version="shared-stock-member-exit-retry",
+        member_budgets={"survivor": 0.5},
+        member_targets={"survivor": {"SH600000": 0.10}},
+        member_current_account_weights=inventory,
+    )
+    trade = retry["net_trades"]["SH600000"]["delta_weight"]
+    members = retry["strategy_contributions"]["SH600000"]["members"]
+    assert trade == pytest.approx(-0.07)
+    assert members["departed"]["net_contribution"] == pytest.approx(trade)
+    assert members.get("survivor") is None
+
+
+@pytest.mark.no_database
+def test_position_inventory_seal_rejects_stale_strategy_attribution() -> None:
+    now = datetime(2026, 7, 20, 16, tzinfo=UTC)
+    position = {
+        "instrument": "SH600000",
+        "quantity": 100,
+        "market_value": 1_000.0,
+        "market_price": 10.0,
+        "market_date": date(2026, 7, 20),
+        "stale": False,
+        "updated_at": now,
+    }
+    inventory, _weights = primary_position_inventory_evidence(
+        portfolio_id="primary-ledger",
+        nav=100_000.0,
+        positions=[position],
+    )
+    prior = _plan(
+        member_targets={"m1": {"SH600000": 0.02}, "m2": {}}
+    )
+    member_inventory, sleeve_evidence = allocate_actual_sleeve_inventory(
+        actual_account_weights={"SH600000": 0.01},
+        prior_plan=prior,
+    )
+    policy = sleeve_inventory_policy_contract()
+    plan_json = {
+        "member_current_account_weights": member_inventory,
+        "input_evidence": {
+            "primary_account": {
+                "portfolio_id": "primary-ledger",
+                "source_id": "allocation-1",
+                "nav": 100_000.0,
+                "positions_sha256": inventory["positions_sha256"],
+                "sleeve_inventory_policy_sha256": policy["policy_sha256"],
+            },
+            "primary_position_inventory": inventory,
+            "sleeve_inventory_allocation": sleeve_evidence,
+        }
+    }
+    portfolio = SimpleNamespace(
+        id="primary-ledger",
+        source_id="allocation-1",
+        nav=100_000.0,
+    )
+
+    class _Rows:
+        def __init__(self, values: list[dict]) -> None:
+            self.values = values
+
+        def all(self) -> list[SimpleNamespace]:
+            return [SimpleNamespace(_mapping=value) for value in self.values]
+
+    class _Connection:
+        def __init__(self, values: list[dict]) -> None:
+            self.values = values
+
+        def execute(self, _statement) -> _Rows:
+            return _Rows(self.values)
+
+    _validate_account_netting_primary_evidence(
+        _Connection([position]),
+        portfolio=portfolio,
+        plan_json=plan_json,
+    )
+    changed = {**position, "market_value": 1_100.0, "market_price": 11.0}
+    with pytest.raises(ValueError, match="positions changed after netting"):
+        _validate_account_netting_primary_evidence(
+            _Connection([changed]),
+            portfolio=portfolio,
+            plan_json=plan_json,
+        )
 
 
 @pytest.mark.no_database
@@ -506,6 +766,33 @@ def test_build_plan_for_allocation(database_url: str, tmp_path: Path, monkeypatc
                 ],
             },
         )
+        # A delayed historical backfill is written after the current business
+        # date.  Account netting must still select by as-of date rather than by
+        # row creation time.
+        backfill, _ = recommendations.create_snapshot(
+            portfolio_id=portfolio["id"],
+            as_of_date=date(2026, 7, 19),
+            dataset="allocation-data",
+            dataset_identity_sha256=DATASET_IDENTITY,
+        )
+        recommendations.apply_result(
+            backfill["id"],
+            {
+                "status": "ok",
+                "portfolio_id": portfolio["id"],
+                "strategy_version_id": version_id,
+                "dataset": "allocation-data",
+                "dataset_identity_sha256": DATASET_IDENTITY,
+                "as_of_date": "2026-07-19",
+                "effective_date": "2026-07-20",
+                "policy_version": POLICY_VERSION,
+                "backtest_engine_version": QLIB_ENGINE_VERSION,
+                "cost_model": backfill["cost_model"],
+                "cash_weight": 1.0,
+                "reference_prices": {},
+                "holdings": [],
+            },
+        )
         with engine.begin() as connection:
             connection.execute(
                 update(strategy_allocation_members)
@@ -531,6 +818,10 @@ def test_build_plan_for_allocation(database_url: str, tmp_path: Path, monkeypatc
         budgets[version_ids[0]] * 0.10
     )
     assert plan["execution_policy"] == "open"
+    assert {
+        item["as_of_date"]
+        for item in plan["input_evidence"]["member_snapshots"].values()
+    } == {"2026-07-20"}
     assert plan["total_capital"] == pytest.approx(1_000_000.0)
     assert plan["cash_weight"] == pytest.approx(
         1.0 - expected - budgets[version_ids[0]] * 0.10

@@ -21,6 +21,7 @@ from quant_platform.factor_recompute import (
     validate_factor_prefix_invariance,
 )
 from quant_platform.feature_set_registry import resolve_feature_set
+from quant_platform.horizon_factor_bundle import validate_horizon_factor_bundle
 from quant_platform.model_ensemble import equal_rank_predictions
 from quant_platform.model_recompute import (
     GOVERNED_MODEL_ENGINES,
@@ -1454,6 +1455,45 @@ def main() -> None:
                 feature_set_id,
                 candidate.get("feature_set") or manifest.get("feature_set"),
             )
+            horizon_factor_bundle = None
+            if label_binding is not None:
+                horizon_factor_bundle = validate_horizon_factor_bundle(
+                    candidate.get("horizon_factor_bundle") or {}
+                )
+                if (
+                    candidate.get("horizon_factor_bundle_sha256")
+                    != horizon_factor_bundle["bundle_sha256"]
+                    or horizon_factor_bundle["horizon_profile"]
+                    != label_binding["horizon_profile"]
+                    or horizon_factor_bundle["label_horizon_sessions"]
+                    != label_binding["label_horizon_sessions"]
+                    or horizon_factor_bundle["research_label_binding_sha256"]
+                    != label_binding["binding_sha256"]
+                    or horizon_factor_bundle["base_feature_set"]["id"]
+                    != feature_set["id"]
+                    or horizon_factor_bundle["base_feature_set"][
+                        "definition_sha256"
+                    ]
+                    != feature_set["definition_sha256"]
+                    or horizon_factor_bundle["incremental_factors"]
+                    != [
+                        {
+                            "candidate_id": str(factor.get("candidate_id") or ""),
+                            "code_sha256": str(factor.get("code_sha256") or ""),
+                        }
+                        for factor in candidate.get("factors") or []
+                    ]
+                ):
+                    raise ValueError(
+                        "quant evaluation changed the horizon factor bundle"
+                    )
+            elif (
+                candidate.get("horizon_factor_bundle") is not None
+                or candidate.get("horizon_factor_bundle_sha256") is not None
+            ):
+                raise ValueError(
+                    "legacy quant evaluation cannot claim a horizon factor bundle"
+                )
             baseline = _validate_baseline_prediction(
                 baseline=candidate.get("baseline_prediction_champion"),
                 runtime_baseline=candidate.get("baseline_prediction_runtime"),
@@ -1532,6 +1572,10 @@ def main() -> None:
                         ],
                         "research_window_contract_sha256": label_binding[
                             "research_window_contract_sha256"
+                        ],
+                        "horizon_factor_bundle": horizon_factor_bundle,
+                        "horizon_factor_bundle_sha256": horizon_factor_bundle[
+                            "bundle_sha256"
                         ],
                     }
                     if label_binding is not None

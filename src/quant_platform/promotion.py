@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import func, insert, select, text, update
 
 from quant_data.database import (
     account_netting_plans,
@@ -80,7 +80,8 @@ from quant_platform.strategy_health_authority import load_production_health_gate
 
 PROMOTION_CONTRACT_VERSION = "promotion-chain-v1"
 FORWARD_GATE_CRITERIA_VERSION = "strategy-forward-gate-v2"
-HORIZON_REVIEW_CONTRACT_VERSION = "strategy-horizon-review-v2"
+HORIZON_REVIEW_CONTRACT_VERSION = "strategy-horizon-review-v3"
+LEGACY_HORIZON_REVIEW_CONTRACT_VERSION = "strategy-horizon-review-v2"
 
 STAGE_PAPER = "paper"
 STAGE_RECOMMENDATION_ENABLED = "recommendation_enabled"
@@ -95,6 +96,7 @@ _STAGE_FROZEN = "frozen"
 
 _REFERENCE_ORDER_VALUE = 100_000.0
 _DEFAULT_PAPER_INITIAL_CASH = 100_000.0
+MAX_FORWARD_CHALLENGERS_PER_HORIZON = 2
 _RECONCILIATION_TOLERANCE = 1e-6
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -110,6 +112,78 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def require_horizon_challenger_capacity(
+    connection: Any,
+    *,
+    horizon_profile: str,
+    version_id: str,
+) -> dict[str, Any]:
+    """Keep one production incumbent and at most two forward challengers.
+
+    The production incumbent is already protected by the unique active-horizon
+    database index.  This gate bounds the expensive, isolated paper side of
+    the same lifecycle.  It runs under a horizon advisory lock both before
+    approval and while reconciling the paper stage, so concurrent research
+    completions cannot each observe the last free slot.
+    """
+
+    profile = str(horizon_profile or "").strip()
+    candidate_id = str(version_id or "").strip()
+    if not candidate_id:
+        raise ValueError("forward challenger version id is required")
+    if profile == LEGACY_AMBIGUOUS:
+        return {
+            "horizon_profile": profile,
+            "challenger_count": 0,
+            "challenger_limit": MAX_FORWARD_CHALLENGERS_PER_HORIZON,
+            "legacy_unbounded": True,
+        }
+    if profile not in {SHORT_1_5D, SWING_1_6M, LONG_1_3Y}:
+        raise ValueError("forward challenger uses an unsupported horizon")
+    connection.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:scope))"),
+        {"scope": f"forward-challenger-capacity:{profile}"},
+    )
+    # A StrategyVersion is immutable history.  Its ``promotion_stage=paper``
+    # marker deliberately remains after a paper stage is frozen, so counting
+    # version rows would permanently consume capacity.  The stage lifecycle is
+    # the authority for whether a challenger is actually occupying a forward
+    # slot; recommendation-enabled and retired versions are excluded as well.
+    challengers = {
+        str(value)
+        for value in connection.scalars(
+            select(strategy_promotion_stages.c.strategy_version_id)
+            .join(
+                strategy_versions,
+                strategy_versions.c.id
+                == strategy_promotion_stages.c.strategy_version_id,
+            )
+            .where(
+                strategy_versions.c.horizon_profile == profile,
+                strategy_versions.c.status == "approved",
+                strategy_versions.c.promotion_stage == STAGE_PAPER,
+                strategy_promotion_stages.c.status.in_(
+                    [_STAGE_ACTIVE, _STAGE_AWAITING]
+                ),
+            )
+            .distinct()
+        )
+    }
+    projected_count = len(challengers | {candidate_id})
+    if projected_count > MAX_FORWARD_CHALLENGERS_PER_HORIZON:
+        raise ValueError(
+            f"{profile} already has {len(challengers)} forward challengers; "
+            f"the governed limit is {MAX_FORWARD_CHALLENGERS_PER_HORIZON}"
+        )
+    return {
+        "horizon_profile": profile,
+        "challenger_count": projected_count,
+        "challenger_limit": MAX_FORWARD_CHALLENGERS_PER_HORIZON,
+        "challenger_version_ids": sorted(challengers | {candidate_id}),
+        "legacy_unbounded": False,
+    }
+
+
 def _is_autopilot_config(value: Any) -> bool:
     return isinstance(value, dict) and str(
         value.get("autopilot_completion_contract_version") or ""
@@ -121,18 +195,18 @@ def _autopilot_paper_accounts_compete(
 ) -> bool:
     """Return whether two Autopilot paper accounts occupy the same evidence lane.
 
-    Explicit short, swing and long horizons must accumulate forward evidence in
-    parallel.  A new champion therefore supersedes only the incumbent from its
-    own horizon.  Legacy strategies retain the historical single-primary
-    behaviour because their ambiguous holding period cannot be assigned to an
-    independent lane safely.
+    Explicit short, swing and long horizons may each keep two governed shadow
+    challengers active in parallel.  Capacity is enforced before their stages
+    open, so those accounts do not supersede one another.  Legacy strategies
+    retain the historical single-primary behaviour because their ambiguous
+    holding period cannot be assigned to an independent lane safely.
     """
 
     current = str(current_horizon or LEGACY_AMBIGUOUS)
     prior = str(prior_horizon or LEGACY_AMBIGUOUS)
     if current == LEGACY_AMBIGUOUS or prior == LEGACY_AMBIGUOUS:
         return True
-    return current == prior
+    return False
 
 
 def resolve_paper_initial_cash(
@@ -409,6 +483,9 @@ def build_horizon_review_evidence(
     source_datasets: list[str] | None = None,
     source_event_count: int | None = None,
     source_event_sha256: str | None = None,
+    report_periods: list[str] | None = None,
+    reviewed_instruments: list[str] | None = None,
+    review_scope_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Build one deduplicated review marker for a governed order plan."""
 
@@ -447,20 +524,44 @@ def build_horizon_review_evidence(
                 previous_signal_date,
                 source_event_count,
                 source_event_sha256,
+                review_scope_sha256,
             )
-        ) or source_datasets:
+        ) or source_datasets or report_periods or reviewed_instruments:
             raise ValueError("scheduled reviews must not claim financial announcement evidence")
     else:
         if horizon_profile != LONG_1_3Y or trigger_source != "pit_financial_announcement":
             raise ValueError("financial reviews are reserved for PIT long-horizon events")
         normalized_sources = sorted(set(str(item) for item in source_datasets or []))
         normalized_source_sha256 = str(source_event_sha256 or "").lower()
+        normalized_report_periods = sorted(
+            set(str(item or "").strip() for item in report_periods or [])
+        )
+        normalized_reviewed_instruments = sorted(
+            set(str(item or "").strip().upper() for item in reviewed_instruments or [])
+        )
+        normalized_scope_sha256 = str(review_scope_sha256 or "").lower()
         if (
             not str(report_period or "").strip()
+            or not normalized_report_periods
+            or str(report_period).strip() != normalized_report_periods[-1]
+            or any(
+                len(period) != 6
+                or not period[:4].isdigit()
+                or period[4] != "Q"
+                or period[5] not in "1234"
+                for period in normalized_report_periods
+            )
             or announcement_date is None
             or previous_signal_date is None
             or not previous_signal_date <= announcement_date < signal_date
             or not normalized_sources
+            or not normalized_reviewed_instruments
+            or any(
+                len(instrument) < 3
+                or instrument[:2] not in {"SH", "SZ", "BJ"}
+                or not instrument[2:].isdigit()
+                for instrument in normalized_reviewed_instruments
+            )
             or isinstance(source_event_count, bool)
             or not isinstance(source_event_count, int)
             or source_event_count < 1
@@ -469,9 +570,15 @@ def build_horizon_review_evidence(
                 character not in "0123456789abcdef"
                 for character in normalized_source_sha256
             )
+            or len(normalized_scope_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in normalized_scope_sha256
+            )
         ):
             raise ValueError(
-                "financial review requires a report period, PIT dates, and source-event identity"
+                "financial review requires report periods, PIT dates, reviewed "
+                "instruments, and sealed source/scope identity"
             )
     payload = {
         "contract_version": HORIZON_REVIEW_CONTRACT_VERSION,
@@ -486,6 +593,11 @@ def build_horizon_review_evidence(
         "trigger_source": trigger_source,
         "trigger_effective_date": trigger_effective_date.isoformat(),
         "report_period": str(report_period).strip() if report_period is not None else None,
+        "report_periods": (
+            normalized_report_periods
+            if review_type == "financial_report_review"
+            else []
+        ),
         "announcement_date": (
             announcement_date.isoformat() if announcement_date is not None else None
         ),
@@ -496,6 +608,16 @@ def build_horizon_review_evidence(
         "source_event_count": source_event_count,
         "source_event_sha256": (
             str(source_event_sha256).lower() if source_event_sha256 is not None else None
+        ),
+        "reviewed_instruments": (
+            normalized_reviewed_instruments
+            if review_type == "financial_report_review"
+            else []
+        ),
+        "review_scope_sha256": (
+            normalized_scope_sha256
+            if review_type == "financial_report_review"
+            else None
         ),
     }
     return {**payload, "evidence_sha256": _canonical_sha256(payload)}
@@ -534,7 +656,11 @@ def validate_horizon_review_evidence(
     if completed_at.tzinfo is None or completed_at.utcoffset() is None:
         raise ValueError("horizon review completion must be timezone-aware")
     if (
-        review.get("contract_version") != HORIZON_REVIEW_CONTRACT_VERSION
+        review.get("contract_version")
+        not in {
+            HORIZON_REVIEW_CONTRACT_VERSION,
+            LEGACY_HORIZON_REVIEW_CONTRACT_VERSION,
+        }
         or review.get("status") != "completed"
         or review.get("horizon_profile") != horizon_profile
         or review.get("strategy_version_id") != strategy_version_id
@@ -546,6 +672,7 @@ def validate_horizon_review_evidence(
     ):
         raise ValueError("horizon review evidence does not match its paper batch")
     review_type = str(review.get("review_type") or "")
+    contract_version = str(review.get("contract_version") or "")
     trigger_source = str(review.get("trigger_source") or "")
     expected_scheduled_source = {
         SWING_1_6M: "rebalance_calendar:week",
@@ -560,12 +687,15 @@ def validate_horizon_review_evidence(
                 "previous_signal_date",
                 "source_event_count",
                 "source_event_sha256",
+                "review_scope_sha256",
             )
         )
         if (
             trigger_source != expected_scheduled_source
             or any(value not in (None, "") for value in financial_values)
             or review.get("source_datasets") not in (None, [], ())
+            or review.get("report_periods") not in (None, [], ())
+            or review.get("reviewed_instruments") not in (None, [], ())
         ):
             raise ValueError("scheduled horizon review evidence is invalid")
     elif review_type == "financial_report_review":
@@ -579,10 +709,11 @@ def validate_horizon_review_evidence(
         sources = review.get("source_datasets")
         event_count = review.get("source_event_count")
         event_sha256 = str(review.get("source_event_sha256") or "").lower()
+        report_period = str(review.get("report_period") or "").strip()
         if (
             horizon_profile != LONG_1_3Y
             or trigger_source != "pit_financial_announcement"
-            or not str(review.get("report_period") or "").strip()
+            or not report_period
             or not previous_signal_date <= announcement_date < signal_date
             or not isinstance(sources, list)
             or not sources
@@ -594,6 +725,54 @@ def validate_horizon_review_evidence(
             or any(character not in "0123456789abcdef" for character in event_sha256)
         ):
             raise ValueError("financial horizon review evidence is invalid")
+        if contract_version == HORIZON_REVIEW_CONTRACT_VERSION:
+            report_periods = review.get("report_periods")
+            reviewed_instruments = review.get("reviewed_instruments")
+            scope_sha256 = str(review.get("review_scope_sha256") or "").lower()
+            if (
+                not isinstance(report_periods, list)
+                or report_periods
+                != sorted(set(str(item or "").strip() for item in report_periods))
+                or not report_periods
+                or report_period != report_periods[-1]
+                or any(
+                    len(period) != 6
+                    or not period[:4].isdigit()
+                    or period[4] != "Q"
+                    or period[5] not in "1234"
+                    for period in report_periods
+                )
+                or not isinstance(reviewed_instruments, list)
+                or reviewed_instruments
+                != sorted(
+                    set(
+                        str(instrument or "").strip().upper()
+                        for instrument in reviewed_instruments
+                    )
+                )
+                or not reviewed_instruments
+                or any(
+                    len(instrument) < 3
+                    or instrument[:2] not in {"SH", "SZ", "BJ"}
+                    or not instrument[2:].isdigit()
+                    for instrument in reviewed_instruments
+                )
+                or len(scope_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in scope_sha256
+                )
+            ):
+                raise ValueError("financial horizon review scope binding is invalid")
+        elif any(
+            review.get(field) not in (None, [], ())
+            for field in (
+                "report_periods",
+                "reviewed_instruments",
+                "review_scope_sha256",
+            )
+        ):
+            raise ValueError("legacy financial review cannot claim scoped evidence")
         if stage_opened_at is not None and not (
             stage_opened_at.astimezone(_SHANGHAI).date() < announcement_date
         ):
@@ -791,6 +970,14 @@ class PromotionStore:
                 raise KeyError(version_id)
             if str(version.status) != "approved":
                 raise ValueError("paper stage requires an approved strategy version")
+            # Keep the advisory lock and the stage insert in the same
+            # transaction.  This closes both the direct ``open_paper_stage``
+            # compatibility path and the race between two automatic approvals.
+            require_horizon_challenger_capacity(
+                connection,
+                horizon_profile=str(version.horizon_profile),
+                version_id=version_id,
+            )
             gate = connection.execute(
                 select(strategy_forward_gates).where(
                     strategy_forward_gates.c.strategy_version_id == version_id
@@ -875,6 +1062,11 @@ class PromotionStore:
             ).first()
             if version is None:
                 raise KeyError(version_id)
+            require_horizon_challenger_capacity(
+                connection,
+                horizon_profile=str(version.horizon_profile),
+                version_id=version_id,
+            )
             existing_gate = connection.execute(
                 select(strategy_forward_gates.c.strategy_version_id).where(
                     strategy_forward_gates.c.strategy_version_id == version_id
@@ -1128,11 +1320,10 @@ class PromotionStore:
                 connection, current_portfolio
             )
 
-            # Autopilot has one official forward-paper account at a time.  A
-            # new champion does not erase prior ledgers: it freezes their
-            # promotion stage and pauses the account atomically before the new
-            # account becomes active.  Manual/non-Autopilot paper accounts are
-            # outside this policy and are never touched here.
+            # Explicit horizon lanes retain up to two forward-shadow accounts
+            # concurrently; the capacity gate is authoritative.  Legacy
+            # Autopilot accounts keep the historical single-primary behavior.
+            # Superseded legacy ledgers are frozen, never deleted.
             if _is_autopilot_config(config):
                 prior_rows = connection.execute(
                     select(
@@ -2449,8 +2640,12 @@ class PromotionStore:
             review_type = str(review_payload["review_type"])
             completed_at = datetime.fromisoformat(str(review_payload["completed_at"]))
             if review_type == "financial_report_review":
-                financial_report_periods.add(
-                    str(review_payload["report_period"]).strip()
+                financial_report_periods.update(
+                    str(period).strip()
+                    for period in (
+                        review_payload.get("report_periods")
+                        or [review_payload["report_period"]]
+                    )
                 )
             seen_review_event_ids.add(review_id)
             review_periods.add(

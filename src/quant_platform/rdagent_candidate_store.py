@@ -31,6 +31,10 @@ from quant_data.database import (
 from quant_data.research_assets import load_research_asset_manifest
 
 from .feature_set_registry import get_feature_set
+from .horizon_factor_bundle import (
+    build_horizon_factor_bundle,
+    validate_horizon_factor_bundle,
+)
 from .model_recompute import verify_governed_checkpoint
 from .model_research_governance import (
     MODEL_REFIT_POLICY,
@@ -50,6 +54,7 @@ from .model_research_governance import (
 from .model_research_governance import (
     validate_quant_bundle_evidence as _validate_quant_bundle_evidence,
 )
+from .research_horizon import primary_label_policy_contract
 from .research_label_binding import validate_research_label_binding
 
 RESEARCH_ASSET_CONTRACT_VERSION = "research-asset-v1"
@@ -1031,6 +1036,7 @@ class RDAGentCandidateStore:
         pre_final_end: date,
         final_oos_start: date,
         final_oos_end: date,
+        research_label_binding: Mapping[str, Any] | None = None,
         source_iteration: int | None = None,
         rdagent_decision: bool | None = None,
         rdagent_feedback: str | None = None,
@@ -1044,6 +1050,24 @@ class RDAGentCandidateStore:
         feature_sha = _sha(features["definition_sha256"], "feature-set definition")
         if not pre_final_end < final_oos_start <= final_oos_end:
             raise ValueError("model candidate final OOS boundary is invalid")
+        label_binding = (
+            validate_research_label_binding(research_label_binding)
+            if research_label_binding is not None
+            else None
+        )
+        primary_label_policy = (
+            primary_label_policy_contract() if label_binding is not None else None
+        )
+        if label_binding is not None and (
+            label_binding["dataset_name"] != str(dataset)
+            or label_binding["dataset_identity_sha256"] != dataset_identity
+            or label_binding["feature_set_id"] != features["id"]
+            or label_binding["feature_set_sha256"] != feature_sha
+            or label_binding["periods"]["valid_end"] != pre_final_end.isoformat()
+            or label_binding["periods"]["test_start"] != final_oos_start.isoformat()
+            or label_binding["periods"]["test_end"] != final_oos_end.isoformat()
+        ):
+            raise ValueError("model candidate label binding differs from its inputs")
         now = _now()
         with self.engine.begin() as connection:
             self._one(connection, research_runs, research_run_id, "research run")
@@ -1087,6 +1111,16 @@ class RDAGentCandidateStore:
                 "pre_final_end": pre_final_end.isoformat(),
                 "final_oos_start": final_oos_start.isoformat(),
                 "final_oos_end": final_oos_end.isoformat(),
+                "research_label_binding": label_binding,
+                "research_label_binding_sha256": (
+                    label_binding["binding_sha256"] if label_binding is not None else None
+                ),
+                "primary_label_policy": primary_label_policy,
+                "primary_label_policy_sha256": (
+                    primary_label_policy["policy_sha256"]
+                    if primary_label_policy is not None
+                    else None
+                ),
             }
             try:
                 connection.execute(
@@ -1161,6 +1195,18 @@ class RDAGentCandidateStore:
                     or manifest.get("final_oos_end") != row.final_oos_end.isoformat()
                 ):
                     raise ValueError("model candidate columns do not match its frozen manifest")
+                label_binding = manifest.get("research_label_binding")
+                if label_binding is not None:
+                    validated_binding = validate_research_label_binding(label_binding)
+                    policy = primary_label_policy_contract()
+                    if (
+                        manifest.get("research_label_binding_sha256")
+                        != validated_binding["binding_sha256"]
+                        or manifest.get("primary_label_policy") != policy
+                        or manifest.get("primary_label_policy_sha256")
+                        != policy["policy_sha256"]
+                    ):
+                        raise ValueError("model candidate primary-label policy drifted")
                 if str(row.status) == "research_admitted":
                     admission = dict(row.admission_evidence_json or {})
                     if admission.get("evidence_sha256") != str(row.admission_evidence_sha256):
@@ -2483,6 +2529,14 @@ class RDAGentCandidateStore:
                                     "research_label_binding_sha256": label_binding[
                                         "binding_sha256"
                                     ],
+                                    "primary_label_policy": (
+                                        primary_label_policy_contract()
+                                    ),
+                                    "primary_label_policy_sha256": (
+                                        primary_label_policy_contract()[
+                                            "policy_sha256"
+                                        ]
+                                    ),
                                 }
                                 if label_binding is not None
                                 else {}
@@ -2518,6 +2572,16 @@ class RDAGentCandidateStore:
                 "feature_expressions": dict(features["features"]),
                 "definition_sha256": feature_sha,
             }
+            horizon_factor_bundle = (
+                build_horizon_factor_bundle(
+                    feature_set=features,
+                    incremental_factors=frozen_factors,
+                    research_label_binding=label_binding,
+                    incumbent_prediction=baseline,
+                )
+                if label_binding is not None
+                else None
+            )
             recipe = {
                 "model_type": str(model.model_type),
                 "architecture": dict(model.architecture_json or {}),
@@ -2542,6 +2606,16 @@ class RDAGentCandidateStore:
                     label_binding["binding_sha256"]
                     if label_binding is not None
                     else None
+                ),
+                **(
+                    {
+                        "horizon_factor_bundle": horizon_factor_bundle,
+                        "horizon_factor_bundle_sha256": horizon_factor_bundle[
+                            "bundle_sha256"
+                        ],
+                    }
+                    if horizon_factor_bundle is not None
+                    else {}
                 ),
                 "feature_set_definition_sha256": feature_sha,
                 "base_features_manifest_sha256": canonical_sha256(base_features),
@@ -2646,8 +2720,43 @@ class RDAGentCandidateStore:
                         != str(row.dataset_identity_sha256)
                     ):
                         raise ValueError("quant bundle label binding is invalid")
+                    factor_bundle = validate_horizon_factor_bundle(
+                        manifest.get("horizon_factor_bundle") or {}
+                    )
+                    if (
+                        manifest.get("horizon_factor_bundle_sha256")
+                        != factor_bundle["bundle_sha256"]
+                        or factor_bundle["horizon_profile"]
+                        != validated_label_binding["horizon_profile"]
+                        or factor_bundle["label_horizon_sessions"]
+                        != validated_label_binding["label_horizon_sessions"]
+                        or factor_bundle["research_label_binding_sha256"]
+                        != validated_label_binding["binding_sha256"]
+                        or factor_bundle["base_feature_set"]["id"]
+                        != feature_set["id"]
+                        or factor_bundle["base_feature_set"][
+                            "definition_sha256"
+                        ]
+                        != feature_set["definition_sha256"]
+                        or factor_bundle["incremental_factors"]
+                        != [
+                            {
+                                "candidate_id": str(item.get("candidate_id") or ""),
+                                "code_sha256": str(item.get("code_sha256") or ""),
+                            }
+                            for item in manifest.get("factors") or []
+                        ]
+                    ):
+                        raise ValueError("quant bundle horizon factor identity is invalid")
                 else:
                     validated_label_binding = None
+                    if (
+                        manifest.get("horizon_factor_bundle") is not None
+                        or manifest.get("horizon_factor_bundle_sha256") is not None
+                    ):
+                        raise ValueError(
+                            "legacy quant bundle cannot claim a horizon factor identity"
+                        )
                 if bool(row.model_candidate_id) == bool(
                     row.model_ensemble_candidate_id
                 ):
@@ -3163,6 +3272,32 @@ class RDAGentCandidateStore:
                     )
                 ):
                     raise ValueError("quant result identity or immutable hash is invalid")
+                frozen_factor_bundle = composition.get("horizon_factor_bundle")
+                result_factor_bundle = validated.get("horizon_factor_bundle")
+                if frozen_label_binding is not None:
+                    frozen_factor_bundle = validate_horizon_factor_bundle(
+                        frozen_factor_bundle or {}
+                    )
+                    result_factor_bundle = validate_horizon_factor_bundle(
+                        result_factor_bundle or {}
+                    )
+                    if (
+                        frozen_factor_bundle != result_factor_bundle
+                        or composition.get("horizon_factor_bundle_sha256")
+                        != frozen_factor_bundle["bundle_sha256"]
+                        or validated.get("horizon_factor_bundle_sha256")
+                        != frozen_factor_bundle["bundle_sha256"]
+                    ):
+                        raise ValueError(
+                            "quant result changed the horizon factor bundle"
+                        )
+                elif (
+                    frozen_factor_bundle is not None
+                    or result_factor_bundle is not None
+                ):
+                    raise ValueError(
+                        "legacy quant result cannot claim a horizon factor bundle"
+                    )
                 frozen_baseline = dict(
                     composition.get("baseline_prediction_champion") or {}
                 )

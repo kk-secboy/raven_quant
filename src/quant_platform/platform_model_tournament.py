@@ -19,6 +19,8 @@ from quant_data.database import (
 from .feature_set_registry import get_feature_set
 from .job_store import JobStore
 from .rdagent_candidate_store import RDAGentCandidateStore
+from .research_horizon import primary_label_policy_contract
+from .research_label_binding import resolve_research_label_binding
 from .research_store import ResearchStore
 from .research_tournament import MODEL_FAMILIES
 
@@ -53,6 +55,11 @@ class PlatformModelTournamentService:
         feature_set_id: str,
         periods: Mapping[str, str],
         evaluation_profiles: Sequence[Mapping[str, Any]],
+        horizon_profile: str,
+        label_horizon_sessions: int,
+        primary_label_policy: Mapping[str, Any],
+        research_window_contract: Mapping[str, Any],
+        research_window_contract_sha256: str,
         trials: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
         if stage not in {"feature_screen", "model_full"}:
@@ -72,8 +79,28 @@ class PlatformModelTournamentService:
         lineage_id = str(dataset.get("lineage_id") or "")
         if len(identity) != 64 or len(lineage_id) != 64:
             raise ValueError("platform model tournament requires sealed dataset lineage")
+        policy = primary_label_policy_contract()
+        if dict(primary_label_policy) != policy:
+            raise ValueError("platform model tournament primary-label policy changed")
+        label_binding = resolve_research_label_binding(
+            {
+                "horizon_profile": horizon_profile,
+                "dataset": str(dataset["name"]),
+                "dataset_identity_sha256": identity,
+                "periods": dict(periods),
+                "feature_set": feature_set,
+                "research_window_contract": dict(research_window_contract),
+                "research_window_contract_sha256": research_window_contract_sha256,
+                "label_horizon_sessions": label_horizon_sessions,
+            }
+        )
+        if label_binding is None:
+            raise ValueError("platform model tournament has no active label binding")
         requested_by = f"autopilot:{cycle_id}"
-        run_kind = f"platform_model_{stage}_{_safe_scope_token(feature_set_id)}"
+        run_kind = (
+            f"platform_model_{stage}_{_safe_scope_token(feature_set_id)}_"
+            f"{horizon_profile}"
+        )
         with self.engine.connect() as connection:
             existing_run = connection.execute(
                 select(research_runs).where(
@@ -97,7 +124,7 @@ class PlatformModelTournamentService:
                     "service_resource_reserve": 0.25,
                 },
                 config={
-                    "contract_version": "platform-model-tournament-run-v1",
+                    "contract_version": "platform-model-tournament-run-v2-horizon",
                     "autopilot_cycle_id": cycle_id,
                     "tournament_stage": stage,
                     "feature_set_id": feature_set_id,
@@ -105,6 +132,14 @@ class PlatformModelTournamentService:
                     "dataset_identity_sha256": identity,
                     "periods": dict(periods),
                     "evaluation_profiles": stage_profiles,
+                    "horizon_profile": horizon_profile,
+                    "label_horizon_sessions": label_horizon_sessions,
+                    "research_window_contract": dict(research_window_contract),
+                    "research_window_contract_sha256": research_window_contract_sha256,
+                    "research_label_binding": label_binding,
+                    "research_label_binding_sha256": label_binding["binding_sha256"],
+                    "primary_label_policy": policy,
+                    "primary_label_policy_sha256": policy["policy_sha256"],
                 },
                 artifact_path=self.settings.data_root / "artifacts" / "model-tournaments",
             )
@@ -112,7 +147,8 @@ class PlatformModelTournamentService:
             run = self.research.get_run(str(existing_run.id))
             config = dict(existing_run.config_json or {})
             if (
-                config.get("contract_version") != "platform-model-tournament-run-v1"
+                config.get("contract_version")
+                != "platform-model-tournament-run-v2-horizon"
                 or config.get("autopilot_cycle_id") != cycle_id
                 or config.get("tournament_stage") != stage
                 or config.get("feature_set_definition_sha256")
@@ -120,6 +156,8 @@ class PlatformModelTournamentService:
                 or config.get("dataset_identity_sha256") != identity
                 or config.get("periods") != dict(periods)
                 or config.get("evaluation_profiles") != stage_profiles
+                or config.get("research_label_binding") != label_binding
+                or config.get("primary_label_policy") != policy
             ):
                 raise ValueError("existing platform model tournament run changed contract")
             if str(existing_run.status) in {"failed", "cancelled"}:
@@ -204,6 +242,7 @@ class PlatformModelTournamentService:
                     pre_final_end=date.fromisoformat(str(periods["valid_end"])),
                     final_oos_start=date.fromisoformat(str(periods["test_start"])),
                     final_oos_end=date.fromisoformat(str(periods["test_end"])),
+                    research_label_binding=label_binding,
                     rdagent_decision=None,
                     rdagent_feedback=None,
                 )
@@ -261,6 +300,14 @@ class PlatformModelTournamentService:
                 "candidate_bindings": bindings,
                 "universe": "cn_all",
                 "benchmark": "SH000300",
+                "horizon_profile": horizon_profile,
+                "label_horizon_sessions": label_horizon_sessions,
+                "research_window_contract": dict(research_window_contract),
+                "research_window_contract_sha256": research_window_contract_sha256,
+                "research_label_binding": label_binding,
+                "research_label_binding_sha256": label_binding["binding_sha256"],
+                "primary_label_policy": policy,
+                "primary_label_policy_sha256": policy["policy_sha256"],
             }
             job = self.jobs.create(
                 "model_evaluate",
@@ -294,6 +341,11 @@ class PlatformModelTournamentService:
         dataset: Mapping[str, Any],
         periods: Mapping[str, str],
         evaluation_profiles: Sequence[Mapping[str, Any]],
+        horizon_profile: str,
+        label_horizon_sessions: int,
+        primary_label_policy: Mapping[str, Any],
+        research_window_contract: Mapping[str, Any],
+        research_window_contract_sha256: str,
         source_components: Sequence[Mapping[str, Any]],
         trials: Sequence[Mapping[str, Any]],
         source_manifest_sha256: str,
@@ -310,6 +362,9 @@ class PlatformModelTournamentService:
         lineage_id = str(dataset.get("lineage_id") or "")
         if len(identity) != 64 or len(lineage_id) != 64:
             raise ValueError("champion revalidation requires sealed dataset lineage")
+        policy = primary_label_policy_contract()
+        if dict(primary_label_policy) != policy:
+            raise ValueError("champion revalidation primary-label policy changed")
         if len(source_components) != len(trials) or not source_components:
             raise ValueError("champion revalidation components and trials differ")
         profiles = [dict(item) for item in evaluation_profiles]
@@ -331,7 +386,28 @@ class PlatformModelTournamentService:
         # different feature sets.  Qlib's evaluator accepts one feature set
         # per job, so each same-feature group is its own immutable lane while
         # all lanes remain bound to one revalidation tournament.
-        run_kind = f"champion_current_identity_revalidation_{lane_token}"
+        feature_ids = {str(item["feature_set_id"]) for item in source_components}
+        if len(feature_ids) != 1:
+            raise ValueError("champion revalidation lane mixes feature sets")
+        feature_set = get_feature_set(next(iter(feature_ids)))
+        label_binding = resolve_research_label_binding(
+            {
+                "horizon_profile": horizon_profile,
+                "dataset": str(dataset["name"]),
+                "dataset_identity_sha256": identity,
+                "periods": dict(periods),
+                "feature_set": feature_set,
+                "research_window_contract": dict(research_window_contract),
+                "research_window_contract_sha256": research_window_contract_sha256,
+                "label_horizon_sessions": label_horizon_sessions,
+            }
+        )
+        if label_binding is None:
+            raise ValueError("champion revalidation has no active label binding")
+        run_kind = (
+            f"champion_current_identity_revalidation_{lane_token}_"
+            f"{horizon_profile}"
+        )
         with self.engine.connect() as connection:
             existing_run = connection.execute(
                 select(research_runs).where(
@@ -341,7 +417,7 @@ class PlatformModelTournamentService:
                 )
             ).first()
         config = {
-            "contract_version": "champion-current-identity-revalidation-run-v1",
+            "contract_version": "champion-current-identity-revalidation-run-v2-horizon",
             "autopilot_cycle_id": cycle_id,
             "research_tournament_id": tournament_id,
             "dataset_identity_sha256": identity,
@@ -349,6 +425,14 @@ class PlatformModelTournamentService:
             "source_model_candidate_ids": source_ids,
             "periods": dict(periods),
             "evaluation_profiles": profiles,
+            "horizon_profile": horizon_profile,
+            "label_horizon_sessions": label_horizon_sessions,
+            "research_window_contract": dict(research_window_contract),
+            "research_window_contract_sha256": research_window_contract_sha256,
+            "research_label_binding": label_binding,
+            "research_label_binding_sha256": label_binding["binding_sha256"],
+            "primary_label_policy": policy,
+            "primary_label_policy_sha256": policy["policy_sha256"],
             "fixed_recipe_only": True,
             "final_oos_opened": False,
             "research_screening_only": True,
@@ -469,6 +553,7 @@ class PlatformModelTournamentService:
                     pre_final_end=date.fromisoformat(str(periods["valid_end"])),
                     final_oos_start=date.fromisoformat(str(periods["test_start"])),
                     final_oos_end=date.fromisoformat(str(periods["test_end"])),
+                    research_label_binding=label_binding,
                     rdagent_decision=None,
                     rdagent_feedback="fixed champion current-identity revalidation",
                 )
@@ -521,10 +606,6 @@ class PlatformModelTournamentService:
             # feature ensemble.  A lane itself must stay single-feature: the
             # evaluator's DataHandler is intentionally not allowed to merge
             # feature definitions behind the frozen ensemble contract.
-            feature_ids = {str(item["feature_set_id"]) for item in source_by_id.values()}
-            if len(feature_ids) != 1:
-                raise ValueError("champion revalidation lane mixes feature sets")
-            feature_set = get_feature_set(next(iter(feature_ids)))
             job = self.jobs.create(
                 "model_evaluate",
                 {
@@ -543,6 +624,14 @@ class PlatformModelTournamentService:
                     "champion_revalidation": True,
                     "universe": "cn_all",
                     "benchmark": "SH000300",
+                    "horizon_profile": horizon_profile,
+                    "label_horizon_sessions": label_horizon_sessions,
+                    "research_window_contract": dict(research_window_contract),
+                    "research_window_contract_sha256": research_window_contract_sha256,
+                    "research_label_binding": label_binding,
+                    "research_label_binding_sha256": label_binding["binding_sha256"],
+                    "primary_label_policy": policy,
+                    "primary_label_policy_sha256": policy["policy_sha256"],
                 },
                 self.settings.data_root
                 / "platform"

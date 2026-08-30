@@ -372,7 +372,10 @@ def build_strategy_rule_runtime_metadata(
             raise ValueError("market-trend rule produced a non-finite regime value")
         result["market_regime_allows_entries"] = trend_level >= 1.0
 
-    if config.get("valuation_regime_max_percentile") is not None:
+    if (
+        config.get("valuation_regime_max_percentile") is not None
+        or config.get("valuation_reduce_percentile") is not None
+    ):
         if value_exposures is None:
             values = pd.Series(np.nan, index=requested, dtype=float)
         else:

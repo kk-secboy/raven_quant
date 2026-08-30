@@ -786,12 +786,38 @@ def test_approve_waits_for_investor_capital_before_creating_paper_account(
     assert again["id"] == stage["id"]
 
 
-def test_new_autopilot_champion_pauses_prior_primary_without_deleting_history(
+def test_two_autopilot_challengers_coexist_and_frozen_stage_releases_capacity(
     database_url: str, tmp_path: Path, monkeypatch
 ) -> None:
     _qlib_doubles(monkeypatch)
     promotion = PromotionStore(database_url)
     engine = open_database(database_url)
+    # Four disjoint, sufficiently long final-OOS windows let this test reach
+    # the forward-capacity gate itself.  Reusing the global OOS window would be
+    # rejected earlier by the alpha-family vintage ledger, which is a separate
+    # and independently tested invariant.
+    capacity_periods = [
+        {
+            **PERIODS,
+            "test_start": date(2021, 1, 11),
+            "test_end": date(2022, 4, 29),
+        },
+        {
+            **PERIODS,
+            "test_start": date(2022, 5, 3),
+            "test_end": date(2023, 8, 31),
+        },
+        {
+            **PERIODS,
+            "test_start": date(2023, 9, 1),
+            "test_end": date(2024, 12, 31),
+        },
+        {
+            **PERIODS,
+            "test_start": date(2025, 1, 2),
+            "test_end": date(2026, 7, 10),
+        },
+    ]
 
     def mark_autopilot(version_id: str) -> None:
         with engine.begin() as connection:
@@ -816,7 +842,7 @@ def test_new_autopilot_champion_pauses_prior_primary_without_deleting_history(
         database_url,
         tmp_path,
         suffix="primary-one",
-        periods=FIRST_FINAL_PERIODS,
+        periods=capacity_periods[0],
     )
     mark_autopilot(first_version)
     first_stage = _attach_simulation(promotion, first_version)
@@ -825,7 +851,7 @@ def test_new_autopilot_champion_pauses_prior_primary_without_deleting_history(
         database_url,
         tmp_path,
         suffix="primary-two",
-        periods=SECOND_FINAL_PERIODS,
+        periods=capacity_periods[1],
     )
     mark_autopilot(second_version)
     second_stage = _attach_simulation(promotion, second_version)
@@ -855,11 +881,70 @@ def test_new_autopilot_champion_pauses_prior_primary_without_deleting_history(
             )
         }
 
-    assert str(stages[first_version].status) == "frozen"
+    assert str(stages[first_version].status) == "active"
     assert str(stages[second_version].status) == "active"
-    assert str(portfolios[first_stage["simulation_portfolio_id"]].status) == "paused"
+    assert str(portfolios[first_stage["simulation_portfolio_id"]].status) == "active"
     assert str(portfolios[second_stage["simulation_portfolio_id"]].status) == "active"
-    assert len(portfolios) == 2  # the superseded ledger is retained and auditable
+    assert len(portfolios) == 2
+
+    # A third live challenger is rejected while both forward slots are
+    # occupied.  Historical versions are never deleted to manufacture room.
+    with pytest.raises(ValueError, match="governed limit"):
+        _short_version(
+            database_url,
+            tmp_path,
+            suffix="primary-three-blocked",
+            periods=capacity_periods[2],
+        )
+
+    # Freezing one evidence stage releases exactly that live slot even though
+    # its immutable StrategyVersion remains approved/paper for audit history.
+    with engine.begin() as connection:
+        connection.execute(
+            update(strategy_promotion_stages)
+            .where(strategy_promotion_stages.c.id == first_stage["id"])
+            .values(
+                status="frozen",
+                frozen_at=promotion_module._now(),
+                freeze_reason="test-governed-contract-drift",
+            )
+        )
+        connection.execute(
+            update(simulation_portfolios)
+            .where(
+                simulation_portfolios.c.id
+                == first_stage["simulation_portfolio_id"]
+            )
+            .values(status="paused", updated_at=promotion_module._now())
+        )
+
+    replacement = _short_version(
+        database_url,
+        tmp_path,
+        suffix="primary-three-after-freeze",
+        periods=capacity_periods[3],
+    )
+    mark_autopilot(replacement)
+    replacement_stage = _attach_simulation(promotion, replacement)
+    with engine.connect() as connection:
+        retained = connection.execute(
+            select(strategy_versions).where(strategy_versions.c.id == first_version)
+        ).one()
+        live = connection.execute(
+            select(strategy_promotion_stages.c.strategy_version_id).where(
+                strategy_promotion_stages.c.status == "active",
+                strategy_promotion_stages.c.strategy_version_id.in_(
+                    [first_version, second_version, replacement]
+                ),
+            )
+        ).scalars().all()
+
+    assert str(retained.status) == "approved"
+    assert str(retained.promotion_stage) == "paper"
+    assert sorted(str(value) for value in live) == sorted(
+        [second_version, replacement]
+    )
+    assert replacement_stage["status"] == "active"
 
 
 def test_new_paper_candidate_does_not_pause_recommendation_incumbent(

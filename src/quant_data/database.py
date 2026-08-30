@@ -496,7 +496,8 @@ research_sota_members = Table(
 )
 
 # Sealed one-shot consumption ledger for reserved final out-of-sample windows.
-# Scope is stable across snapshot identities: a research program, a verified
+# Scope is stable across snapshot identities: a capital alpha family (whose
+# immutable mandate contains its label horizon), research program, verified
 # dataset lineage, or the fail-closed global standalone scope. Dataset identity
 # remains immutable audit evidence, but it never grants a fresh OOS window.
 oos_vintages = Table(
@@ -1270,6 +1271,25 @@ strategy_versions = Table(
         "promotion_stage IS DISTINCT FROM 'recommendation_enabled') IS TRUE",
         name="ck_strategy_versions_legacy_authority",
     ),
+    CheckConstraint(
+        "(CASE WHEN "
+        "COALESCE(config_json ->> 'recipe_version', '') = "
+        "'qlib-rdagent-single-mainline-2026-08-30-v12' AND "
+        "COALESCE(config_json ->> 'recipe_id', '') IN "
+        "('short_relative_strength','swing_trend','long_quality_value') "
+        "THEN ("
+        "config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_runner_sha256' = "
+        "'31d4c7a294ae61c19edcdb8e014b521c1b544836d6891af36cfba3ecf4ab43a3' "
+        "AND config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_runtime_bundle_sha256' = "
+        "'6366bd2b77c1c60ea4069afde43d5335c1e362c18acf2955f13902e7ba9ccbc6' "
+        "AND config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_worker_runtime_image_digest' ~ "
+        "'^sha256:[0-9a-f]{64}$'"
+        ") ELSE true END) IS TRUE",
+        name="ck_strategy_versions_v12_runtime_identity",
+    ),
 )
 Index(
     "uq_strategy_versions_number",
@@ -1917,8 +1937,10 @@ autopilot_cycles = Table(
     metadata,
     Column("id", String, primary_key=True),
     Column("dataset", String, nullable=False),
-    Column("dataset_identity_sha256", String, nullable=False, unique=True),
+    Column("dataset_identity_sha256", String, nullable=False),
     Column("dataset_lineage_id", String, nullable=False),
+    Column("horizon_profile", String, nullable=False),
+    Column("primary_label_policy_sha256", String, nullable=False),
     Column("status", String, nullable=False),
     Column("stage", String, nullable=False),
     Column("config_revision", Integer, nullable=False),
@@ -1930,6 +1952,16 @@ autopilot_cycles = Table(
     CheckConstraint(
         "status IN ('active', 'blocked', 'succeeded', 'paused')",
         name="ck_autopilot_cycles_status",
+    ),
+    CheckConstraint(
+        "horizon_profile IN "
+        "('short_1_5d', 'swing_1_6m', 'long_1_3y', 'legacy_ambiguous')",
+        name="ck_autopilot_cycles_horizon",
+    ),
+    UniqueConstraint(
+        "dataset_identity_sha256",
+        "horizon_profile",
+        name="uq_autopilot_cycle_dataset_horizon",
     ),
 )
 Index(

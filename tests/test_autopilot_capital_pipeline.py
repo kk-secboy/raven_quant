@@ -23,6 +23,7 @@ from quant_platform.parameter_experiments import (
     build_portfolio_construction_trials,
 )
 from quant_platform.promotion import ForwardGateThresholds
+from quant_platform.research_horizon import LONG_1_3Y, SHORT_1_5D, SWING_1_6M
 
 pytestmark = pytest.mark.no_database
 
@@ -468,6 +469,96 @@ def test_cycle_uses_its_exact_persisted_paper_threshold_revision() -> None:
 
     assert thresholds.min_forward_calendar_days == 240
     assert thresholds.min_decision_batches == 160
+
+
+@pytest.mark.parametrize(
+    ("horizon_profile", "expected"),
+    [
+        (
+            SHORT_1_5D,
+            {
+                "min_forward_trading_days": 126,
+                "min_decision_batches": 60,
+                "min_closed_round_trips": 30,
+                "min_review_events": 0,
+                "min_financial_report_reviews": 0,
+            },
+        ),
+        (
+            SWING_1_6M,
+            {
+                "min_forward_trading_days": 252,
+                "min_decision_batches": 0,
+                "min_closed_round_trips": 6,
+                "min_review_events": 24,
+                "min_financial_report_reviews": 0,
+            },
+        ),
+        (
+            LONG_1_3Y,
+            {
+                "min_forward_trading_days": 252,
+                "min_decision_batches": 0,
+                "min_closed_round_trips": 0,
+                "min_review_events": 12,
+                "min_financial_report_reviews": 4,
+            },
+        ),
+    ],
+)
+def test_explicit_horizon_uses_complete_authoritative_forward_gate(
+    horizon_profile: str, expected: dict[str, int]
+) -> None:
+    pipeline = object.__new__(AutopilotCapitalPipeline)
+
+    thresholds = pipeline._forward_thresholds_for_cycle(
+        {"config_revision": 0, "horizon_profile": horizon_profile}
+    )
+
+    assert thresholds.min_forward_calendar_days == 183
+    for field, value in expected.items():
+        assert getattr(thresholds, field) == value
+
+
+def test_explicit_swing_web_floor_is_trading_time_not_daily_decisions() -> None:
+    class _Result:
+        @staticmethod
+        def first() -> Any:
+            return SimpleNamespace(
+                value_json={
+                    "paper_min_calendar_days": 240,
+                    "paper_min_trading_days": 300,
+                }
+            )
+
+    class _Connection:
+        def __enter__(self) -> _Connection:
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        @staticmethod
+        def execute(_: Any) -> _Result:
+            return _Result()
+
+    class _Engine:
+        @staticmethod
+        def connect() -> _Connection:
+            return _Connection()
+
+    pipeline = object.__new__(AutopilotCapitalPipeline)
+    pipeline.engine = _Engine()
+
+    thresholds = pipeline._forward_thresholds_for_cycle(
+        {"config_revision": 9, "horizon_profile": SWING_1_6M}
+    )
+
+    assert thresholds.min_forward_calendar_days == 240
+    assert thresholds.min_forward_trading_days == 300
+    assert thresholds.min_decision_batches == 0
+    assert thresholds.min_review_events == 24
+    assert thresholds.min_closed_round_trips == 6
 
 
 def test_portfolio_job_creation_is_idempotent() -> None:

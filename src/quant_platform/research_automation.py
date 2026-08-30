@@ -23,6 +23,7 @@ from .research_horizon import (
     LONG_1_3Y,
     SHORT_1_5D,
     SWING_1_6M,
+    primary_label_policy_contract,
     research_horizon_contract,
 )
 from .research_window import (
@@ -71,6 +72,19 @@ HORIZON_PERIOD_RESOLUTION_VERSION = "rolling_three_horizon_qlib_calendar_v1"
 HORIZON_RESEARCH_SCENARIOS = frozenset(
     {"fin_factor", "fin_model", "fin_quant", "fin_strategy"}
 )
+
+
+class ResearchWindowUnavailableError(ValueError):
+    """A statistically required research window cannot be formed honestly.
+
+    ``evidence`` is deliberately carried with the failure so orchestrators can
+    expose the unavailable horizon without weakening, shortening, or silently
+    relabelling its final OOS contract.
+    """
+
+    def __init__(self, message: str, *, evidence: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.evidence = evidence
 
 _HORIZON_ALIASES = {
     "short": SHORT_1_5D,
@@ -308,6 +322,20 @@ def normalize_research_schedule_payload(
         "feature_set": feature_set,
         "horizon_profile": horizon_profile,
     }
+    if scenario.id in HORIZON_RESEARCH_SCENARIOS:
+        policy = primary_label_policy_contract()
+        if (
+            payload.get("primary_label_policy") not in (None, policy)
+            or payload.get("primary_label_policy_sha256")
+            not in (None, policy["policy_sha256"])
+        ):
+            raise ValueError("rdagent_research primary-label policy changed")
+        normalized.update(
+            {
+                "primary_label_policy": policy,
+                "primary_label_policy_sha256": policy["policy_sha256"],
+            }
+        )
     if not scenario.requires_dataset:
         return normalized
     if period_mode == "explicit":
@@ -355,6 +383,232 @@ def derive_rolling_research_periods(
     }
 
 
+def _derive_multi_profile_research_periods(
+    calendar_days: list[str],
+    *,
+    test_days: int,
+    embargo_days: int,
+    purge_days: int = MODEL_LABEL_HORIZON_TRADING_DAYS,
+    label_maturity_days: int = 0,
+) -> tuple[dict[str, str], list[dict[str, Any]], dict[str, Any]]:
+    """Build a primary window plus honest, cost-covered stress profiles.
+
+    Every effective profile shares the exact sealed final-OOS boundary.  The
+    requested 3/5/10-year validation depths are targets, not permission to
+    invent coverage before the authoritative cost schedule.  A target may be
+    truncated or declared unavailable, and duplicate effective windows are
+    never presented as independent confirmation.
+    """
+
+    if min(test_days, embargo_days, purge_days) < 1 or label_maturity_days < 0:
+        raise ValueError("research final-test, purge, embargo, and maturity lengths are invalid")
+    ordered = sorted(dict.fromkeys(calendar_days))
+    minimum_layout = (
+        MINIMUM_PROFILE_TRAINING_DAYS
+        + purge_days
+        + 1
+        + embargo_days
+        + test_days
+        + label_maturity_days
+    )
+    if len(ordered) < minimum_layout:
+        raise ResearchWindowUnavailableError(
+            f"Qlib calendar has {len(ordered)} trading days; the frozen final OOS, "
+            f"purge, embargo, maturity, training, and one validation session require "
+            f"{minimum_layout}",
+            evidence={
+                "contract_version": "horizon-multi-profile-resolution-v1",
+                "calendar_trading_days": len(ordered),
+                "minimum_layout_trading_days": minimum_layout,
+                "capital_evaluation_eligible": False,
+                "capital_evaluation_unavailable_reason": (
+                    "insufficient_calendar_for_frozen_timing_contract"
+                ),
+                "requested_profiles": [],
+                "effective_profiles": [],
+                "unavailable_profiles": [],
+            },
+        )
+    test_end_index = len(ordered) - label_maturity_days - 1
+    test_start_index = test_end_index - test_days + 1
+    valid_end_index = test_start_index - embargo_days - 1
+    _, first_cost_trading_day, cost_effective_from = _first_governed_cost_trading_day(
+        ordered
+    )
+    cost_start_index = next(
+        index for index, day in enumerate(ordered) if day >= first_cost_trading_day
+    )
+    earliest_valid_start_index = MINIMUM_PROFILE_TRAINING_DAYS + purge_days
+    profiles: list[dict[str, Any]] = []
+    requested_profiles: list[dict[str, Any]] = []
+    unavailable_profiles: list[dict[str, Any]] = []
+    effective_windows: dict[tuple[int, int], str] = {}
+    for spec in RESEARCH_EVALUATION_PROFILES:
+        requested_validation_days = int(spec["validation_trading_days"])
+        requested_valid_start_index = valid_end_index - requested_validation_days + 1
+        valid_start_index = max(
+            requested_valid_start_index,
+            cost_start_index,
+            earliest_valid_start_index,
+        )
+        constraints: list[str] = []
+        if requested_valid_start_index < 0:
+            constraints.append("requested_validation_precedes_available_calendar")
+        if valid_start_index == cost_start_index and (
+            requested_valid_start_index < cost_start_index
+        ):
+            constraints.append("authoritative_cn_cost_schedule_start")
+        if valid_start_index == earliest_valid_start_index and (
+            requested_valid_start_index < earliest_valid_start_index
+        ):
+            constraints.append("minimum_training_and_purge_floor")
+        requested_profile = {
+            "id": str(spec["id"]),
+            "label": str(spec["label"]),
+            "role": str(spec["role"]),
+            "requested_validation_trading_days": requested_validation_days,
+            "requested_valid_start": (
+                ordered[requested_valid_start_index]
+                if requested_valid_start_index >= 0
+                else None
+            ),
+        }
+        if valid_start_index > valid_end_index:
+            unavailable = {
+                **requested_profile,
+                "status": "unavailable",
+                "effective_validation_trading_days": 0,
+                "unavailable_reason": "no_cost_covered_validation_session",
+                "binding_constraints": constraints,
+            }
+            requested_profiles.append(unavailable)
+            unavailable_profiles.append(unavailable)
+            continue
+        train_end_index = valid_start_index - purge_days - 1
+        effective_training_days = train_end_index + 1
+        if effective_training_days < MINIMUM_PROFILE_TRAINING_DAYS:
+            unavailable = {
+                **requested_profile,
+                "status": "unavailable",
+                "effective_validation_trading_days": 0,
+                "effective_training_trading_days": effective_training_days,
+                "unavailable_reason": "minimum_training_history_not_met",
+                "binding_constraints": constraints,
+            }
+            requested_profiles.append(unavailable)
+            unavailable_profiles.append(unavailable)
+            continue
+        effective_validation_days = valid_end_index - valid_start_index + 1
+        window_key = (valid_start_index, valid_end_index)
+        duplicate_of = effective_windows.get(window_key)
+        if duplicate_of is not None and spec["role"] == "confirmation":
+            primary_profile = next(
+                (item for item in profiles if item["role"] == "primary"), None
+            )
+            stress_profile = next(
+                (item for item in profiles if item["role"] == "stress"), None
+            )
+            if primary_profile is not None and stress_profile is not None:
+                primary_start = ordered.index(
+                    str(primary_profile["periods"]["valid_start"])
+                )
+                stress_start = ordered.index(
+                    str(stress_profile["periods"]["valid_start"])
+                )
+                # A requested confirmation depth that collapses onto the
+                # stress boundary may be shortened to the deterministic
+                # midpoint.  This records what was actually tested and avoids
+                # counting a one-session perturbation as independent evidence.
+                if stress_start + 2 <= primary_start:
+                    valid_start_index = (stress_start + primary_start) // 2
+                    constraints.append(
+                        "confirmation_shortened_to_distinct_cost_covered_midpoint"
+                    )
+                    train_end_index = valid_start_index - purge_days - 1
+                    effective_training_days = train_end_index + 1
+                    effective_validation_days = (
+                        valid_end_index - valid_start_index + 1
+                    )
+                    window_key = (valid_start_index, valid_end_index)
+                    duplicate_of = effective_windows.get(window_key)
+        if duplicate_of is not None:
+            unavailable = {
+                **requested_profile,
+                "status": "unavailable",
+                "effective_validation_trading_days": effective_validation_days,
+                "effective_valid_start": ordered[valid_start_index],
+                "effective_valid_end": ordered[valid_end_index],
+                "unavailable_reason": "duplicate_effective_validation_window",
+                "duplicate_of_profile_id": duplicate_of,
+                "binding_constraints": constraints,
+            }
+            requested_profiles.append(unavailable)
+            unavailable_profiles.append(unavailable)
+            continue
+        effective_windows[window_key] = str(spec["id"])
+        truncated = effective_validation_days != requested_validation_days
+        periods = {
+            "train_start": ordered[0],
+            "train_end": ordered[train_end_index],
+            "valid_start": ordered[valid_start_index],
+            "valid_end": ordered[valid_end_index],
+            "test_start": ordered[test_start_index],
+            "test_end": ordered[test_end_index],
+        }
+        effective = {
+            **spec,
+            "status": "available",
+            "requested_validation_trading_days": requested_validation_days,
+            "effective_validation_trading_days": effective_validation_days,
+            "effective_training_trading_days": effective_training_days,
+            "requested_valid_start": requested_profile["requested_valid_start"],
+            "effective_valid_start": ordered[valid_start_index],
+            "effective_valid_end": ordered[valid_end_index],
+            "validation_window_truncated": truncated,
+            "validation_window_truncation_reason": (
+                "+".join(constraints) if truncated else None
+            ),
+            "binding_constraints": constraints,
+            "authoritative_cost_schedule_effective_from": cost_effective_from,
+            "authoritative_cost_schedule_first_trading_day": first_cost_trading_day,
+            "periods": periods,
+        }
+        profiles.append(effective)
+        requested_profiles.append(effective)
+    primary = [item for item in profiles if item["role"] == "primary"]
+    stresses = [item for item in profiles if item["role"] == "stress"]
+    distinct_stress = bool(
+        primary
+        and any(item["periods"] != primary[0]["periods"] for item in stresses)
+    )
+    resolution = {
+        "contract_version": "horizon-multi-profile-resolution-v1",
+        "calendar_trading_days": len(ordered),
+        "authoritative_cost_schedule_effective_from": cost_effective_from,
+        "authoritative_cost_schedule_first_trading_day": first_cost_trading_day,
+        "requested_profiles": requested_profiles,
+        "effective_profiles": [str(item["id"]) for item in profiles],
+        "unavailable_profiles": unavailable_profiles,
+        "required_capital_roles": ["primary", "stress"],
+        "capital_evaluation_eligible": bool(primary and distinct_stress),
+        "capital_evaluation_unavailable_reason": (
+            None
+            if primary and distinct_stress
+            else "primary_and_distinct_stress_profiles_required"
+        ),
+    }
+    if not resolution["capital_evaluation_eligible"]:
+        raise ResearchWindowUnavailableError(
+            "multi-profile capital evaluation requires an available primary profile "
+            "and one genuinely different cost-covered stress profile",
+            evidence=resolution,
+        )
+    discovery = dict(primary[0]["periods"])
+    for item in profiles:
+        item["profile_resolution_contract_version"] = resolution["contract_version"]
+    return dict(discovery), profiles, resolution
+
+
 def derive_multi_profile_research_periods(
     calendar_days: list[str],
     *,
@@ -363,102 +617,16 @@ def derive_multi_profile_research_periods(
     purge_days: int = MODEL_LABEL_HORIZON_TRADING_DAYS,
     label_maturity_days: int = 0,
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """Build one discovery window and three pre-final evaluation profiles.
+    """Compatibility facade returning only executable effective profiles."""
 
-    Every profile shares the exact same final OOS boundary.  Only validation
-    history changes, so comparing profiles cannot select on final-test results.
-    """
-
-    if min(test_days, embargo_days, purge_days) < 1 or label_maturity_days < 0:
-        raise ValueError("research final-test, purge, embargo, and maturity lengths are invalid")
-    ordered = sorted(dict.fromkeys(calendar_days))
-    required = required_multi_profile_trading_days(
-        test_trading_days=test_days,
-        embargo_trading_days=embargo_days,
-        purge_trading_days=purge_days,
-        label_maturity_trading_days=label_maturity_days,
+    discovery, profiles, _ = _derive_multi_profile_research_periods(
+        calendar_days,
+        test_days=test_days,
+        embargo_days=embargo_days,
+        purge_days=purge_days,
+        label_maturity_days=label_maturity_days,
     )
-    if len(ordered) < required:
-        raise ValueError(
-            f"Qlib calendar has {len(ordered)} trading days; multi-profile research "
-            f"requires {required}"
-        )
-    selected = ordered[-required:]
-    test_end_index = len(selected) - label_maturity_days - 1
-    test_start_index = test_end_index - test_days + 1
-    valid_end_index = test_start_index - embargo_days - 1
-    _, first_cost_trading_day, cost_effective_from = _first_governed_cost_trading_day(
-        ordered
-    )
-    cost_start_index = next(
-        index for index, day in enumerate(selected) if day >= first_cost_trading_day
-    )
-    profiles: list[dict[str, Any]] = []
-    for spec in RESEARCH_EVALUATION_PROFILES:
-        requested_validation_days = int(spec["validation_trading_days"])
-        requested_valid_start_index = valid_end_index - requested_validation_days + 1
-        valid_start_index = requested_valid_start_index
-        if spec["id"] == "robust_10y":
-            valid_start_index = max(valid_start_index, cost_start_index)
-        elif selected[valid_start_index] < first_cost_trading_day:
-            raise ValueError(
-                f"{spec['id']} validation starts before the first trading day "
-                "covered by the authoritative CN cost schedule"
-            )
-        if valid_start_index > valid_end_index:
-            raise ValueError(
-                f"{spec['id']} has no validation trading day covered by the "
-                "authoritative CN cost schedule"
-            )
-        train_end_index = valid_start_index - purge_days - 1
-        effective_training_days = train_end_index + 1
-        if effective_training_days < MINIMUM_PROFILE_TRAINING_DAYS:
-            raise ValueError(
-                f"{spec['id']} leaves {effective_training_days} training trading days; "
-                f"at least {MINIMUM_PROFILE_TRAINING_DAYS} are required"
-            )
-        effective_validation_days = valid_end_index - valid_start_index + 1
-        truncated = valid_start_index != requested_valid_start_index
-        periods = {
-            "train_start": selected[0],
-            "train_end": selected[train_end_index],
-            "valid_start": selected[valid_start_index],
-            "valid_end": selected[valid_end_index],
-            "test_start": selected[test_start_index],
-            "test_end": selected[test_end_index],
-        }
-        profiles.append(
-            {
-                **spec,
-                "requested_validation_trading_days": requested_validation_days,
-                "effective_validation_trading_days": effective_validation_days,
-                "effective_training_trading_days": effective_training_days,
-                "requested_valid_start": selected[requested_valid_start_index],
-                "validation_window_truncated": truncated,
-                "validation_window_truncation_reason": (
-                    "authoritative_cn_cost_schedule_starts_after_requested_validation"
-                    if truncated
-                    else None
-                ),
-                "authoritative_cost_schedule_effective_from": cost_effective_from,
-                "authoritative_cost_schedule_first_trading_day": first_cost_trading_day,
-                "periods": periods,
-            }
-        )
-    profile_starts = {
-        str(item["id"]): str(item["periods"]["valid_start"]) for item in profiles
-    }
-    if not (
-        profile_starts["robust_10y"]
-        < profile_starts["balanced_5y"]
-        < profile_starts["recent_3y"]
-    ):
-        raise ValueError(
-            "cost-covered rolling profiles must preserve robust, balanced, and recent "
-            "validation depth"
-        )
-    discovery = next(item["periods"] for item in profiles if item["role"] == "primary")
-    return dict(discovery), profiles
+    return discovery, profiles
 
 
 def resolve_research_periods(
@@ -545,7 +713,7 @@ def resolve_research_periods(
             period_policy,
             horizon_profile=profile,
         )
-        resolved, profiles = derive_multi_profile_research_periods(
+        resolved, profiles, profile_resolution = _derive_multi_profile_research_periods(
             ordered,
             test_days=policy["test_trading_days"],
             embargo_days=policy["embargo_trading_days"],
@@ -559,6 +727,16 @@ def resolve_research_periods(
         )
         effective_embargo_days = policy["embargo_trading_days"]
         effective_maturity_days = maturity_days
+    if periods is not None:
+        profile_resolution = {
+            "contract_version": "explicit-profile-resolution-v1",
+            "requested_profiles": profiles,
+            "effective_profiles": [str(item["id"]) for item in profiles],
+            "unavailable_profiles": [],
+            "required_capital_roles": ["primary"],
+            "capital_evaluation_eligible": True,
+            "capital_evaluation_unavailable_reason": None,
+        }
     latest_mature_label_sessions: dict[str, str] = {}
     for label in labels:
         if len(ordered) <= label:
@@ -582,6 +760,7 @@ def resolve_research_periods(
             resolved["test_start"] <= day <= resolved["test_end"] for day in ordered
         ),
         "evaluation_profiles": profiles,
+        "evaluation_profile_resolution": profile_resolution,
     }
 
 

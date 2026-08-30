@@ -18,6 +18,7 @@ from quant_platform.research_horizon import (
     LONG_1_3Y,
     SHORT_1_5D,
     SWING_1_6M,
+    primary_label_horizon_sessions,
     research_horizon_contract,
 )
 from quant_platform.worker import LocalJobWorker
@@ -43,11 +44,11 @@ def _window(profile: str) -> tuple[dict[str, Any], str]:
     ("profile", "selected", "expression", "purge", "embargo"),
     (
         (SHORT_1_5D, 5, "Ref($close,-6)/Ref($close,-1)-1", 6, 6),
-        (SWING_1_6M, 126, "Ref($close,-127)/Ref($close,-1)-1", 127, 127),
+        (SWING_1_6M, 63, "Ref($close,-64)/Ref($close,-1)-1", 127, 127),
         (LONG_1_3Y, 252, "Ref($close,-253)/Ref($close,-1)-1", 253, 253),
     ),
 )
-def test_active_model_runs_default_to_the_longest_allowed_prediction_label(
+def test_active_model_runs_default_to_the_primary_prediction_label(
     profile: str,
     selected: int,
     expression: str,
@@ -67,6 +68,7 @@ def test_active_model_runs_default_to_the_longest_allowed_prediction_label(
     assert contract["label_expression"] == expression
     assert contract["purge_sessions"] == purge
     assert contract["embargo_sessions"] == embargo
+    assert selected == primary_label_horizon_sessions(profile)
 
 
 def test_model_run_can_select_another_preregistered_horizon_but_not_invent_one() -> None:

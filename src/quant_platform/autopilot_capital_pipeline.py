@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
 
@@ -25,7 +25,14 @@ from .cost_model import CostModelConfig
 from .job_store import JobStore
 from .ops_calendar import load_calendar_days
 from .parameter_experiment_store import ParameterExperimentStore
-from .promotion import ForwardGateThresholds
+from .promotion import (
+    ForwardGateThresholds,
+    forward_gate_thresholds_for_horizon,
+)
+from .research_horizon import (
+    LEGACY_AMBIGUOUS,
+    SUPPORTED_HORIZON_PROFILES,
+)
 from .services import list_qlib_datasets
 from .strategy_store import StrategyStore
 
@@ -96,12 +103,26 @@ class AutopilotCapitalPipeline:
     def _forward_thresholds_for_cycle(
         self, cycle: Mapping[str, Any]
     ) -> ForwardGateThresholds:
-        """Resolve the exact Web config revision frozen by this cycle.
+        """Resolve the horizon gate and the exact Web revision frozen by a cycle.
 
         Revision zero is the built-in configuration used before an explicit
         Web save.  A persisted non-zero revision must exist; falling back to a
         newer revision would silently change an already-running experiment.
+
+        The two original Web fields pre-date product horizons.  For a legacy
+        cycle they retain their historical calendar/decision semantics.  For
+        an explicit horizon, ``paper_min_trading_days`` is an additional
+        *exchange-session* floor, never a decision-batch floor: forcing 126
+        daily decisions onto weekly/monthly strategies would make their
+        horizon-authoritative review gates impossible to satisfy.  Every other
+        field comes from the single authority in ``promotion``.
         """
+
+        profile = str(cycle.get("horizon_profile") or LEGACY_AMBIGUOUS)
+        if profile not in SUPPORTED_HORIZON_PROFILES:
+            raise AutopilotCapitalBlocked(
+                "autopilot cycle has an invalid horizon profile"
+            )
 
         try:
             revision = int(cycle.get("config_revision") or 0)
@@ -145,13 +166,25 @@ class AutopilotCapitalPipeline:
             raise AutopilotCapitalBlocked(
                 "frozen paper_min_trading_days is invalid"
             )
-        return ForwardGateThresholds(
-            min_forward_calendar_days=calendar_days,
-            min_decision_batches=trading_days,
-            min_completed_cycles=0,
-            min_data_completeness=0.95,
-            min_reconciliation_rate=1.0,
-            max_cost_deviation=0.005,
+        if profile == LEGACY_AMBIGUOUS:
+            return ForwardGateThresholds(
+                min_forward_calendar_days=calendar_days,
+                min_decision_batches=trading_days,
+                min_completed_cycles=0,
+                min_data_completeness=0.95,
+                min_reconciliation_rate=1.0,
+                max_cost_deviation=0.005,
+            )
+
+        minimum = forward_gate_thresholds_for_horizon(profile)
+        return replace(
+            minimum,
+            min_forward_calendar_days=max(
+                minimum.min_forward_calendar_days, calendar_days
+            ),
+            min_forward_trading_days=max(
+                minimum.min_forward_trading_days, trading_days
+            ),
         )
 
     def _require_current_quant_admission(self, research_run_id: str) -> list[str]:
@@ -219,11 +252,19 @@ class AutopilotCapitalPipeline:
             raise AutopilotCapitalBlocked(
                 "frozen champion has no primary pre-final validation period"
             )
-        execution_dataset = self._execution_dataset(
-            state=state,
-            daily_dataset=dataset,
-            required_start=valid_start,
-            required_end=str(selection_periods.get("end") or valid_end),
+        horizon_profile = str(
+            state.get("horizon_profile") or LEGACY_AMBIGUOUS
+        )
+        explicit_horizon = horizon_profile != LEGACY_AMBIGUOUS
+        execution_dataset = (
+            None
+            if explicit_horizon
+            else self._execution_dataset(
+                state=state,
+                daily_dataset=dataset,
+                required_start=valid_start,
+                required_end=str(selection_periods.get("end") or valid_end),
+            )
         )
         # The provisional version may have been created by a retry before the
         # minute binding was persisted. Rebuild/verify it with the exact
@@ -243,25 +284,38 @@ class AutopilotCapitalPipeline:
             )
         provisional = self.completion.ensure_strategy(
             state=provisional_input,
-            portfolio_config={
-                "portfolio_construction": "topk_equal_weight",
-                # Daily close predictions are executed from the next tradable
-                # session with a frozen minute VWAP profile.  ``next_bar`` is
-                # reserved for intraday signals and would make a daily signal
-                # contract internally inconsistent.
-                "execution_method": "vwap",
-                "execution_frequency": str(execution_dataset["frequency"]),
-                "execution_slice_minutes": 20,
-                "max_execution_slices": 24,
-            },
+            portfolio_config=(
+                {
+                    "portfolio_construction": "topk_equal_weight",
+                    # Explicit product horizons are daily close-to-next-open
+                    # policies. They cannot depend on a minute feed that the
+                    # product does not have and whose execution rule would
+                    # differ from the frozen public baseline IR.
+                    "execution_method": "open",
+                    "execution_frequency": "day",
+                    "execution_days": 1,
+                }
+                if explicit_horizon
+                else {
+                    "portfolio_construction": "topk_equal_weight",
+                    # Preserve the historical legacy competition contract.
+                    "execution_method": "vwap",
+                    "execution_frequency": str(execution_dataset["frequency"]),
+                    "execution_slice_minutes": 20,
+                    "max_execution_slices": 24,
+                }
+            ),
             actor="autopilot",
         )
         version_id = str(provisional["strategy_version_id"])
         version = self.strategies.get_version(version_id)
         valid_start, valid_end = self._primary_validation_period(version)
+        competition_dataset = dict(dataset)
+        if execution_dataset is not None:
+            competition_dataset["execution_dataset"] = execution_dataset
         prepared = self.experiments.ensure_model_portfolio_competition(
             strategy_version=version,
-            dataset={**dict(dataset), "execution_dataset": execution_dataset},
+            dataset=competition_dataset,
             candidate_valid_start=valid_start,
             candidate_valid_end=valid_end,
             artifact_root=self.settings.data_root
@@ -295,20 +349,24 @@ class AutopilotCapitalPipeline:
             ),
             "portfolio_experiment_id": str(experiment["id"]),
             "portfolio_experiment_status": str(experiment.get("status") or ""),
-            "execution_dataset": {
-                "name": str(execution_dataset["name"]),
-                "frequency": str(execution_dataset["frequency"]),
-                "dataset_identity_sha256": str(
-                    (execution_dataset.get("provenance") or {})[
-                        "dataset_identity_sha256"
-                    ]
-                ),
-                "dataset_lineage_id": str(
-                    (execution_dataset.get("provenance") or {})[
-                        "dataset_lineage_id"
-                    ]
-                ),
-            },
+            "execution_dataset": (
+                {
+                    "name": str(execution_dataset["name"]),
+                    "frequency": str(execution_dataset["frequency"]),
+                    "dataset_identity_sha256": str(
+                        (execution_dataset.get("provenance") or {})[
+                            "dataset_identity_sha256"
+                        ]
+                    ),
+                    "dataset_lineage_id": str(
+                        (execution_dataset.get("provenance") or {})[
+                            "dataset_lineage_id"
+                        ]
+                    ),
+                }
+                if execution_dataset is not None
+                else None
+            ),
             "phase": "portfolio_selection",
         }
         return result, created_jobs
@@ -646,11 +704,14 @@ class AutopilotCapitalPipeline:
                 (dataset.get("provenance") or {}).get("dataset_identity_sha256") or ""
             ),
         }
+        execution_dataset_name = str(
+            (state.get("execution_dataset") or {}).get("name") or ""
+        )
         try:
             formal = self.completion.ensure_formal_backtest(
                 state=formal_input,
                 artifact_path=self.settings.data_root / "artifacts" / "backtests",
-                execution_dataset=str((state.get("execution_dataset") or {}).get("name") or ""),
+                execution_dataset=execution_dataset_name or None,
                 trading_dates=calendar,
                 dataset_lineage_id=str(
                     dataset.get("lineage_id")
@@ -676,12 +737,8 @@ class AutopilotCapitalPipeline:
         backtest = self.strategies.get_backtest(backtest_id)
         created_jobs = 0
         if not backtest.get("job_id") and str(backtest.get("status")) == "queued":
-            payload = {
-                "backtest_id": backtest_id,
-                "strategy_version_id": str(state["strategy_version_id"]),
-                "dataset": str(dataset["name"]),
-                "dataset_path": str(dataset["path"]),
-                "execution_dataset": self._execution_dataset(
+            execution_payload = (
+                self._execution_dataset(
                     state=state,
                     daily_dataset=dataset,
                     required_start=str(
@@ -694,7 +751,17 @@ class AutopilotCapitalPipeline:
                             "end"
                         ]
                     ),
-                ),
+                )
+                if str(state.get("horizon_profile") or LEGACY_AMBIGUOUS)
+                == LEGACY_AMBIGUOUS
+                else None
+            )
+            payload = {
+                "backtest_id": backtest_id,
+                "strategy_version_id": str(state["strategy_version_id"]),
+                "dataset": str(dataset["name"]),
+                "dataset_path": str(dataset["path"]),
+                "execution_dataset": execution_payload,
                 "periods": dict(backtest["periods"]),
                 "capital_oos_batch_id": capital_oos["batch_id"],
                 "capital_oos_preregistration_sha256": capital_oos[
@@ -756,6 +823,19 @@ class AutopilotCapitalPipeline:
         state = dict(
             (cycle.get("state") or {}).get(CAPITAL_PIPELINE_STATE_KEY) or {}
         )
+        horizon_profile = str(
+            cycle.get("horizon_profile") or LEGACY_AMBIGUOUS
+        )
+        if horizon_profile not in SUPPORTED_HORIZON_PROFILES:
+            raise AutopilotCapitalBlocked(
+                "autopilot cycle has an invalid horizon profile"
+            )
+        frozen_horizon = str(state.get("horizon_profile") or horizon_profile)
+        if frozen_horizon != horizon_profile:
+            raise AutopilotCapitalBlocked(
+                "capital pipeline horizon changed after the cycle was frozen"
+            )
+        state["horizon_profile"] = horizon_profile
         forward_thresholds = self._forward_thresholds_for_cycle(cycle)
         state.setdefault("contract_version", CAPITAL_PIPELINE_CONTRACT_VERSION)
         if state["contract_version"] != CAPITAL_PIPELINE_CONTRACT_VERSION:
@@ -771,6 +851,7 @@ class AutopilotCapitalPipeline:
                 (dataset.get("provenance") or {})["dataset_identity_sha256"]
             ),
             allowed_candidate_ids=frozenset(admitted),
+            horizon_profile=horizon_profile,
         )
         state, portfolio_jobs = self._ensure_portfolio_experiment(
             state=state,

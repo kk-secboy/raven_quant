@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,13 @@ from quant_platform.model_research_governance import (
     REQUIRED_MODEL_SEEDS,
     REQUIRED_RESEARCH_PROFILES,
 )
-from quant_platform.promotion import ForwardGateThresholds, resolve_paper_initial_cash
+from quant_platform.promotion import (
+    ForwardGateThresholds,
+    forward_gate_thresholds_for_horizon,
+    resolve_paper_initial_cash,
+)
+from quant_platform.research_horizon import LONG_1_3Y, SHORT_1_5D, SWING_1_6M
+from quant_platform.strategy_rule_compiler import validate_strategy_rule_binding
 
 pytestmark = pytest.mark.no_database
 
@@ -546,6 +553,32 @@ def test_completion_rejects_research_admission_without_scope_or_quant_receipt() 
             dataset="snapshot-v1", dataset_identity_sha256=IDENTITY
         )
 
+
+def test_champion_selection_is_bound_to_the_cycle_horizon() -> None:
+    candidates = _Candidates()
+    for model_id in ("model-strong", "model-joint"):
+        candidates.models[model_id]["manifest_json"] = {
+            "research_label_binding": {"horizon_profile": SHORT_1_5D}
+        }
+    events: list[str] = []
+    service = _Service(candidates, _Strategies(events), _Promotions(events))
+
+    selection = service.select_champion(
+        dataset="snapshot-v1",
+        dataset_identity_sha256=IDENTITY,
+        allowed_candidate_ids={"bundle-joint"},
+        horizon_profile=SHORT_1_5D,
+    )
+
+    assert selection["champion_selection_evidence"]["horizon_profile"] == SHORT_1_5D
+    with pytest.raises(ValueError, match="no independently admitted signal"):
+        service.select_champion(
+            dataset="snapshot-v1",
+            dataset_identity_sha256=IDENTITY,
+            allowed_candidate_ids={"bundle-joint"},
+            horizon_profile=SWING_1_6M,
+        )
+
     candidates = _Candidates()
     candidates.bundles["bundle-joint"]["admission_evidence_json"].pop(
         "research_trial_ledger_receipt"
@@ -623,6 +656,39 @@ def test_long_only_config_rejects_financing_and_impossible_qp() -> None:
             },
             selection_evidence_sha256="8" * 64,
         )
+
+
+@pytest.mark.parametrize(
+    ("horizon_profile", "recipe_id", "minimum_oos"),
+    [
+        (SHORT_1_5D, "short_relative_strength", 252),
+        (SWING_1_6M, "swing_trend", 504),
+        (LONG_1_3Y, "long_quality_value", 756),
+    ],
+)
+def test_autopilot_strategy_config_freezes_cycle_horizon_and_public_rule_ir(
+    horizon_profile: str,
+    recipe_id: str,
+    minimum_oos: int,
+) -> None:
+    config = build_long_only_strategy_config(
+        signal_config=_signal_config("model-strong"),
+        portfolio_config={
+            "portfolio_construction": "topk_equal_weight",
+            "execution_method": "open",
+            "execution_frequency": "day",
+            "execution_days": 1,
+        },
+        selection_evidence_sha256="8" * 64,
+        horizon_profile=horizon_profile,
+    )
+
+    assert config["horizon_profile"] == horizon_profile
+    assert config["horizon_contract"]["horizon_profile"] == horizon_profile
+    assert config["recipe_id"] == "custom"
+    assert config["autopilot_rule_baseline_recipe_id"] == recipe_id
+    assert config["min_backtest_days"] >= minimum_oos
+    assert validate_strategy_rule_binding(config) is not None
 
 
 def test_completion_is_idempotent_and_registers_forward_gate_before_approval() -> None:
@@ -707,7 +773,15 @@ def test_completion_uses_stricter_frozen_forward_thresholds() -> None:
     assert promotions.thresholds.min_decision_batches == 160
     assert approved["forward_gate"] == {
         "min_forward_calendar_days": 240,
+        "min_forward_trading_days": 0,
         "min_decision_batches": 160,
+        "min_completed_cycles": 0,
+        "min_closed_round_trips": 0,
+        "min_review_events": 0,
+        "min_financial_report_reviews": 0,
+        "min_data_completeness": 0.95,
+        "min_reconciliation_rate": 1.0,
+        "max_cost_deviation": 0.005,
     }
 
 
@@ -719,6 +793,34 @@ def test_completion_rejects_weaker_forward_thresholds() -> None:
                 min_forward_calendar_days=182,
                 min_decision_batches=126,
             )
+        )
+
+
+@pytest.mark.parametrize(
+    ("horizon_profile", "weakened_field"),
+    [
+        (SHORT_1_5D, "min_closed_round_trips"),
+        (SWING_1_6M, "min_review_events"),
+        (LONG_1_3Y, "min_financial_report_reviews"),
+    ],
+)
+def test_completion_enforces_every_horizon_authoritative_forward_minimum(
+    horizon_profile: str, weakened_field: str
+) -> None:
+    minimum = forward_gate_thresholds_for_horizon(horizon_profile)
+    assert AutopilotCompletionService._require_autopilot_forward_thresholds(
+        minimum,
+        horizon_profile=horizon_profile,
+    ) == minimum
+    weakened = replace(
+        minimum,
+        **{weakened_field: int(getattr(minimum, weakened_field)) - 1},
+    )
+
+    with pytest.raises(ValueError, match=weakened_field):
+        AutopilotCompletionService._require_autopilot_forward_thresholds(
+            weakened,
+            horizon_profile=horizon_profile,
         )
 
 

@@ -34,6 +34,8 @@ from .factor_library import (
     compile_qlib_expression,
     library_release_definition,
 )
+from .feature_set_registry import get_feature_set
+from .research_horizon import primary_label_horizon_sessions
 from .upstream_versions import QLIB_COMMIT
 
 SOTA_POLICY_VERSION = "research-sota-policy-v1"
@@ -1476,5 +1478,58 @@ class FactorLibraryStore:
             "source": version_id,
             "features": features,
             "sota_evidence_sha256": sota["evidence_sha256"],
+        }
+        return {**definition, "definition_sha256": canonical_sha256(definition)}
+
+    def horizon_champion_feature_set(
+        self,
+        version_id: str,
+        *,
+        horizon_profile: str,
+        foundation_feature_set_id: str = "qlib-alpha158",
+    ) -> dict[str, Any]:
+        """Compose the immutable public baseline with admitted SOTA factors.
+
+        ``sota_feature_set`` remains readable for historical model artifacts
+        whose identity contained only RD-Agent members.  New horizon research
+        uses this content-addressed composition so accepting the first factor
+        never silently drops Alpha158 from the next challenger round.
+        """
+
+        sota = self.get_sota(version_id)
+        primary_label = primary_label_horizon_sessions(horizon_profile)
+        if (
+            sota.get("status") != "active"
+            or int(sota.get("label_horizon_days") or 0) != primary_label
+        ):
+            raise ValueError("SOTA version is not the active primary horizon champion")
+        foundation = get_feature_set(foundation_feature_set_id)
+        additions = self.sota_feature_set(version_id)
+        foundation_features = dict(foundation["features"])
+        addition_features = dict(additions["features"])
+        collisions = set(foundation_features) & set(addition_features)
+        if collisions:
+            raise ValueError("SOTA factor names collide with the foundation feature set")
+        composition = {
+            "horizon_profile": horizon_profile,
+            "primary_label_horizon_sessions": primary_label,
+            "foundation_feature_set_id": foundation["id"],
+            "foundation_feature_set_sha256": foundation["definition_sha256"],
+            "sota_version_id": version_id,
+            "sota_feature_set_sha256": additions["definition_sha256"],
+            "sota_evidence_sha256": sota["evidence_sha256"],
+        }
+        composition_sha256 = canonical_sha256(composition)
+        definition = {
+            "contract_version": "governed-feature-set-v1-horizon-champion",
+            "id": (
+                f"horizon-champion:{horizon_profile}:"
+                f"{composition_sha256[:24]}"
+            ),
+            "name": f"{horizon_profile} factor champion {version_id}",
+            "source": version_id,
+            "features": {**foundation_features, **addition_features},
+            **composition,
+            "composition_sha256": composition_sha256,
         }
         return {**definition, "definition_sha256": canonical_sha256(definition)}

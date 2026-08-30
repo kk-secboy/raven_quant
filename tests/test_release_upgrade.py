@@ -150,6 +150,81 @@ def test_prepare_sandbox_removes_loopback_tags_when_sealing_fails(
     ) in context.calls
 
 
+def test_prepare_sandbox_stamps_exact_worker_runtime_image_digest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    worker_digest = "sha256:" + "b" * 64
+    rdagent_digest = "sha256:" + "a" * 64
+
+    class SealingContext(FakeContext):
+        def run(self, *args: str, **_kwargs) -> str:
+            self.calls.append(args)
+            if args == ("config", "--format", "json"):
+                return json.dumps(
+                    {
+                        "services": {
+                            "worker": {"image": "quantlab-worker-runtime:v2"},
+                            "rdagent-worker": {
+                                "image": "quantlab-rdagent-runtime:v2"
+                            },
+                        }
+                    }
+                )
+            if args[:3] == ("exec", "-T", "rdagent-docker") and any(
+                str(item).startswith("find ") for item in args
+            ):
+                return "/data/qlib/daily/calendars/day.txt\n"
+            return ""
+
+        def docker(self, *args: str, **_kwargs) -> str:
+            self.calls.append(("docker", *args))
+            if args[:4] == ("image", "inspect", "--format", "{{.Id}}"):
+                return (
+                    worker_digest
+                    if args[4] == "quantlab-worker-runtime:v2"
+                    else rdagent_digest
+                )
+            if args[:4] == (
+                "image",
+                "inspect",
+                "--format",
+                "{{json .RepoDigests}}",
+            ):
+                repository = str(args[4]).rsplit(":", 1)[0]
+                return json.dumps([repository + "@sha256:" + "c" * 64])
+            return ""
+
+    context = SealingContext(tmp_path / ".env")
+    monkeypatch.setattr(release_upgrade, "_registry_port", lambda _context: 55000)
+    monkeypatch.setattr(release_upgrade, "_wait_for_registry", lambda *_args: None)
+    monkeypatch.setattr(
+        release_upgrade,
+        "_governed_sandbox_evidence",
+        lambda _root: {"qlib": {"dockerfile_sha256": "d" * 64}},
+    )
+    monkeypatch.setattr(
+        release_upgrade,
+        "_build_and_publish_host_image",
+        lambda _context, **kwargs: (
+            kwargs["dind_repository"] + "@sha256:" + "e" * 64
+        ),
+    )
+    monkeypatch.setattr(release_upgrade, "_dind_smoke", lambda *_args, **_kwargs: None)
+
+    sealed = release_upgrade._prepare_sandbox_images(
+        context,  # type: ignore[arg-type]
+        tmp_path,
+        "20260829T120000Z",
+        wait_timeout=45,
+    )
+
+    assert sealed["sandbox_base_image_id"] == worker_digest
+    assert sealed["QUANTLAB_WORKER_RUNTIME_IMAGE_DIGEST"] == worker_digest
+    environment = context.env_file.read_text(encoding="utf-8")
+    assert f"QUANTLAB_WORKER_RUNTIME_IMAGE_DIGEST={worker_digest}" in environment
+
+
 @pytest.mark.parametrize(
     "payload, error",
     [
@@ -175,6 +250,38 @@ def test_configured_service_images_fail_closed(
         release_upgrade._configured_service_images(
             RenderedConfigContext(),  # type: ignore[arg-type]
             "rdagent-worker",
+        )
+
+
+def test_representative_build_services_builds_each_image_alias_once() -> None:
+    services = ("scheduler", "api", "worker", "paper-worker", "web")
+    # Deliberately use a different mapping insertion order: selection authority
+    # is the stable service order supplied by deployment_services.py.
+    configured_images = {
+        "web": "quantlab-web-runtime:v2",
+        "paper-worker": "quantlab-worker-runtime:v2",
+        "worker": "quantlab-worker-runtime:v2",
+        "api": "quantlab-api-runtime:v2",
+        "scheduler": "quantlab-api-runtime:v2",
+    }
+
+    selected = release_upgrade._representative_build_services(
+        configured_images,
+        services,
+    )
+
+    assert selected == ("scheduler", "worker", "web")
+    assert len({configured_images[service] for service in selected}) == len(selected)
+    assert {configured_images[service] for service in selected} == set(
+        configured_images.values()
+    )
+
+
+def test_representative_build_services_fails_closed_on_missing_service() -> None:
+    with pytest.raises(RuntimeError, match="missing services: scheduler"):
+        release_upgrade._representative_build_services(
+            {"api": "quantlab-api-runtime:v2"},
+            ("api", "scheduler"),
         )
 
 
@@ -629,7 +736,14 @@ def test_release_upgrade_builds_backs_up_and_accepts_current_schema(
         "evidence": "all release checks passed; only post-cutover durable work is active",
     }
     assert result["checks"]["gateway_smoke"]["status"] == "pass"
-    assert ("build", *release_upgrade.BUILT_SERVICES) in context.calls
+    expected_build_services = release_upgrade._representative_build_services(
+        {
+            service: f"quantlab-test-{service}:latest"
+            for service in release_upgrade.BUILT_SERVICES
+        },
+        release_upgrade.BUILT_SERVICES,
+    )
+    assert ("build", *expected_build_services) in context.calls
     assert ("rm", "-s", "-f", "factor-sandbox-builder") in context.calls
     core_start = next(
         index
@@ -1381,6 +1495,132 @@ def test_rollback_contract_falls_back_to_environment_in_compose_working_director
     assert contract.working_directory == old_deploy.resolve()
     assert contract.env_source == old_env.resolve()
     assert contract.env_content == old_env.read_bytes()
+
+
+def test_rollback_contract_uses_stateless_authority_when_postgres_release_was_removed(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    new_root = tmp_path / "new-release"
+    live_deploy = tmp_path / "live-release" / "deploy"
+    removed_postgres_deploy = tmp_path / "removed-postgres-release" / "deploy"
+    live_deploy.mkdir(parents=True)
+    current_env = new_root / "deploy" / ".env"
+    current_env.parent.mkdir(parents=True)
+    current_env.write_text("POSTGRES_PASSWORD=new\n", encoding="utf-8")
+    live_env = live_deploy / ".env"
+    live_env.write_text("POSTGRES_PASSWORD=live\n", encoding="utf-8")
+    live_compose = live_deploy / "compose.yaml"
+    live_compose.write_text(
+        "services:\n  postgres:\n    image: postgres:16-alpine\n  api:\n    image: old-api\n",
+        encoding="utf-8",
+    )
+
+    class LabelContext(FakeContext):
+        def container_id(self, service: str) -> str:
+            return f"container-{service}"
+
+        def docker(self, *args: str, **_kwargs) -> str:
+            service = args[1].removeprefix("container-")
+            deploy = removed_postgres_deploy if service == "postgres" else live_deploy
+            return json.dumps(
+                [
+                    {
+                        "Config": {
+                            "Labels": {
+                                "com.docker.compose.project": self.project_name,
+                                "com.docker.compose.service": service,
+                                "com.docker.compose.project.working_dir": str(
+                                    deploy.resolve()
+                                ),
+                                "com.docker.compose.project.config_files": str(
+                                    (deploy / "compose.yaml").resolve()
+                                ),
+                                "com.docker.compose.project.environment_file": str(
+                                    (deploy / ".env").resolve()
+                                ),
+                            }
+                        }
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(
+        release_upgrade.ComposeContext,
+        "run",
+        lambda *_args, **_kwargs: "",
+    )
+
+    contract = release_upgrade._capture_rollback_compose_contract(
+        LabelContext(current_env),  # type: ignore[arg-type]
+        new_root,
+        services=("postgres", "api"),
+    )
+
+    assert not removed_postgres_deploy.exists()
+    assert contract.working_directory == live_deploy.resolve()
+    assert contract.env_source == live_env.resolve()
+    assert contract.compose_sources == (live_compose.resolve(),)
+
+
+@pytest.mark.parametrize(
+    ("bad_label", "message"),
+    [
+        ("project", "another Compose project"),
+        ("service", "inconsistent service labels"),
+    ],
+)
+def test_rollback_contract_still_validates_protected_postgres_identity(
+    monkeypatch,
+    tmp_path: Path,
+    bad_label: str,
+    message: str,
+) -> None:
+    current_env = tmp_path / "new-release" / "deploy" / ".env"
+    current_env.parent.mkdir(parents=True)
+    current_env.write_text("POSTGRES_PASSWORD=new\n", encoding="utf-8")
+
+    class LabelContext(FakeContext):
+        def container_id(self, service: str) -> str:
+            assert service == "postgres"
+            return "container-postgres"
+
+        def docker(self, *args: str, **_kwargs) -> str:
+            return json.dumps(
+                [
+                    {
+                        "Config": {
+                            "Labels": {
+                                "com.docker.compose.project": (
+                                    "wrong-project"
+                                    if bad_label == "project"
+                                    else self.project_name
+                                ),
+                                "com.docker.compose.service": (
+                                    "wrong-service"
+                                    if bad_label == "service"
+                                    else "postgres"
+                                ),
+                                # Deliberately absent: protected stateful
+                                # services are not rollback-file authorities.
+                            }
+                        }
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(
+        release_upgrade.ComposeContext,
+        "run",
+        lambda *_args, **_kwargs: "",
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        release_upgrade._capture_rollback_compose_contract(
+            LabelContext(current_env),  # type: ignore[arg-type]
+            tmp_path / "new-release",
+            services=("postgres",),
+        )
 
 
 def test_rollback_contract_rejects_labeled_environment_outside_trusted_root(

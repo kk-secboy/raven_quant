@@ -229,6 +229,14 @@ def test_all_governed_members_reconcile_as_noop_without_backtest_work(
 
     class Lockboxes:
         @staticmethod
+        def resolve_unopened_history_selection(**values) -> dict:
+            assert values["anchored_selection"] is None
+            return {
+                "calendar": list(values["calendar_days"]),
+                "evidence": {"selection_sha256": "d" * 64},
+            }
+
+        @staticmethod
         def reserve(**_values) -> dict:
             raise AssertionError("governed no-op must not reopen lockbox reservation")
 
@@ -242,6 +250,7 @@ def test_all_governed_members_reconcile_as_noop_without_backtest_work(
             "trading_days": 4500,
             "dataset_identity_sha256": "a" * 64,
             "dataset_lineage_id": "b" * 64,
+            "calendar": ["2008-01-02", "2026-08-28"],
         },
     )
 

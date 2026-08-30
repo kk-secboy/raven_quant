@@ -12,6 +12,7 @@ x-release-environment: &release-environment
   QUANTLAB_RELEASE_KIND: ${QUANTLAB_RELEASE_KIND:-}
   QUANTLAB_RELEASE_ALIAS_OF: ${QUANTLAB_RELEASE_ALIAS_OF:-}
   QUANTLAB_CANONICAL_BASELINE: ${QUANTLAB_CANONICAL_BASELINE:-}
+  QUANTLAB_WORKER_RUNTIME_IMAGE_DIGEST: ${QUANTLAB_WORKER_RUNTIME_IMAGE_DIGEST:-}
 
 x-release-labels: &release-labels
   quantlab.release: ${QUANTLAB_RELEASE_ID:-}
@@ -41,6 +42,7 @@ services:
       start_period: 10s
 
   api:
+    image: quantlab-api-runtime:v2
     build:
       context: ..
       dockerfile: deploy/Dockerfile.api
@@ -95,6 +97,7 @@ services:
       start_period: 15s
 
   scheduler:
+    image: quantlab-api-runtime:v2
     build:
       context: ..
       dockerfile: deploy/Dockerfile.api
@@ -602,6 +605,7 @@ services:
 
   rdagent-llm-finetune-worker:
     profiles: ["gpu"]
+    image: quantlab-rdagent-finetune-runtime:v2
     build:
       context: ..
       dockerfile: deploy/Dockerfile.rdagent
@@ -652,6 +656,7 @@ services:
       start_period: 90s
 
   web:
+    image: quantlab-web-runtime:v2
     build:
       context: ..
       dockerfile: deploy/Dockerfile.web

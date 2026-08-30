@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -15,8 +15,14 @@ from quant_data.database import (
     strategy_health_snapshots,
     strategy_versions,
 )
+from quant_platform.autopilot_capital_pipeline import AutopilotCapitalPipeline
 from quant_platform.promotion import ForwardGateThresholds, PromotionStore
-from quant_platform.research_horizon import SHORT_1_5D, canonical_sha256
+from quant_platform.research_horizon import (
+    LONG_1_3Y,
+    SHORT_1_5D,
+    SWING_1_6M,
+    canonical_sha256,
+)
 from quant_platform.strategy_recipes import get_strategy_recipe
 from quant_platform.strategy_store import StrategyStore
 
@@ -120,6 +126,84 @@ def test_forward_gate_persists_and_checks_horizon_bound_criteria(
     evaluated = promotion.evaluate_forward_gate(version_id)
     assert evaluated["passed"] is False
     assert evaluated["reasons"] == ["forward evidence gate criteria seal is invalid"]
+
+
+@pytest.mark.parametrize(
+    ("recipe_id", "horizon_profile", "minimums"),
+    [
+        (
+            "short_relative_strength",
+            SHORT_1_5D,
+            {
+                "min_forward_trading_days": 90,
+                "min_decision_batches": 60,
+                "min_closed_round_trips": 30,
+            },
+        ),
+        (
+            "swing_trend",
+            SWING_1_6M,
+            {
+                "min_forward_trading_days": 252,
+                "min_review_events": 24,
+                "min_closed_round_trips": 6,
+            },
+        ),
+        (
+            "long_quality_value",
+            LONG_1_3Y,
+            {
+                "min_forward_trading_days": 252,
+                "min_review_events": 12,
+                "min_financial_report_reviews": 4,
+            },
+        ),
+    ],
+)
+def test_autopilot_horizon_gate_registers_complete_paper_validation_contract(
+    database_url: str,
+    tmp_path: Path,
+    recipe_id: str,
+    horizon_profile: str,
+    minimums: dict[str, int],
+) -> None:
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        recipe_id=recipe_id,
+        periods={
+            "train_start": date(2008, 1, 1),
+            "train_end": date(2017, 12, 31),
+            "valid_start": date(2018, 1, 1),
+            "valid_end": date(2020, 12, 31),
+            "test_start": date(2021, 4, 1),
+            "test_end": date(2026, 7, 10),
+        },
+    )
+    version = StrategyStore(database_url).get_version(version_id)
+    assert version["horizon_profile"] == horizon_profile
+
+    pipeline = object.__new__(AutopilotCapitalPipeline)
+    thresholds = pipeline._forward_thresholds_for_cycle(
+        {"config_revision": 0, "horizon_profile": horizon_profile}
+    )
+    gate = PromotionStore(database_url).register_forward_gate(
+        version_id,
+        actor="autopilot-horizon-test",
+        thresholds=thresholds,
+    )
+
+    assert gate["criteria_json"]["horizon_profile"] == horizon_profile
+    assert gate["criteria_json"]["thresholds"] == {
+        key: getattr(thresholds, key)
+        for key in gate["criteria_json"]["thresholds"]
+    }
+    for field, minimum in minimums.items():
+        assert int(gate[field]) >= minimum
+    if horizon_profile in {SWING_1_6M, LONG_1_3Y}:
+        # Weekly and monthly policies are proven by reviews, never by a
+        # fabricated requirement for 126 daily decisions.
+        assert gate["min_decision_batches"] == 0
 
 
 def test_strategy_health_snapshots_are_sealed_idempotent_and_append_only(

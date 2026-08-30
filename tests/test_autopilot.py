@@ -6,15 +6,18 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+import quant_platform.autopilot as autopilot_module
 from quant_platform import research_tournament as tournament_module
 from quant_platform.autopilot import (
     AUTOPILOT_CONTRACT_VERSION,
+    AUTOPILOT_RESEARCH_HORIZONS,
     AutopilotController,
     _asset_available_on,
     _cycle_has_capital_commitment,
     _cycle_terminal_resolution,
     _derived_branch_status,
     _profile_family_multiple_testing,
+    horizon_research_cadence_bucket,
     normalize_autopilot_config,
 )
 from quant_platform.data_automation import (
@@ -231,6 +234,7 @@ def test_quant_input_requires_current_identity_revalidation() -> None:
     model_selection["evidence_sha256"] = canonical_sha256(model_selection)
     cycle = {
         "dataset_identity_sha256": "a" * 64,
+        "horizon_profile": "short_1_5d",
         "state": {
             "prediction_champion": {
                 "kind": "model",
@@ -244,7 +248,9 @@ def test_quant_input_requires_current_identity_revalidation() -> None:
         }
     }
     controller = AutopilotController.__new__(AutopilotController)
-    controller._active_sota_feature_set_id = lambda _dataset: None
+    controller._active_sota_feature_set_id = (
+        lambda _dataset, *, horizon_profile: None
+    )
 
     first = controller._quant_input_sha256(
         cycle, {"name": "snapshot-a", "provenance": {"dataset_identity_sha256": "a" * 64}}
@@ -352,27 +358,10 @@ def test_quant_due_rejects_cross_identity_champion_before_database_access() -> N
     ) is False
 
 
-def test_model_research_runs_once_on_the_first_available_snapshot_of_a_new_month() -> None:
-    class Connection:
-        @staticmethod
-        def scalar(_statement):
-            return "admitted-model"
-
-    class ConnectionContext:
-        def __enter__(self):
-            return Connection()
-
-        def __exit__(self, *_args):
-            return False
-
-    class Engine:
-        @staticmethod
-        def connect():
-            return ConnectionContext()
-
+def test_model_research_uses_each_horizons_calendar_cadence() -> None:
     class Store:
         @staticmethod
-        def latest_branch(_scenario):
+        def latest_branch(_scenario, *, horizon_profile):
             return {
                 "cycle_id": "previous-cycle",
                 "created_at": datetime(2026, 8, 1, tzinfo=UTC),
@@ -380,31 +369,450 @@ def test_model_research_runs_once_on_the_first_available_snapshot_of_a_new_month
 
         @staticmethod
         def get_cycle(_cycle_id):
-            return {"state": {"dataset_end_date": "2026-08-31"}}
+            return {
+                "horizon_profile": Store.horizon_profile,
+                "state": {"dataset_end_date": Store.source_end},
+            }
 
     controller = AutopilotController.__new__(AutopilotController)
-    controller.engine = Engine()
     controller.store = Store()
     now = datetime(2026, 9, 1, 12, tzinfo=UTC)
     config = normalize_autopilot_config()
 
-    assert controller._model_due({"end_date": "2026-08-31"}, now, config) is False
-    assert controller._model_due({"end_date": "2026-09-02"}, now, config) is True
+    cases = (
+        ("short_1_5d", "2026-08-24", "2026-08-28", "2026-08-31"),
+        ("swing_1_6m", "2026-08-03", "2026-08-31", "2026-09-01"),
+        ("long_1_3y", "2026-07-01", "2026-09-30", "2026-10-08"),
+    )
+    for horizon, source_end, same_bucket, next_bucket in cases:
+        Store.horizon_profile = horizon
+        Store.source_end = source_end
+        assert controller._model_due(
+            {"end_date": same_bucket},
+            now,
+            config,
+            horizon_profile=horizon,
+        ) is False
+        assert controller._model_due(
+            {"end_date": next_bucket},
+            now,
+            config,
+            horizon_profile=horizon,
+        ) is True
 
 
 def test_factor_cadence_accepts_serialized_database_timestamp() -> None:
     class Store:
         @staticmethod
-        def latest_branch(_scenario):
-            return {"created_at": "2026-08-28T11:00:00+00:00"}
+        def latest_branch(_scenario, *, horizon_profile):
+            return {
+                "cycle_id": "prior",
+                "created_at": "2026-08-28T11:00:00+00:00",
+            }
+
+        @staticmethod
+        def get_cycle(_cycle_id):
+            return {
+                "horizon_profile": "short_1_5d",
+                "state": {"dataset_end_date": "2026-08-28"},
+            }
 
     controller = AutopilotController.__new__(AutopilotController)
     controller.store = Store()
 
     assert controller._factor_due(
+        {"end_date": "2026-08-31"},
         datetime(2026, 8, 29, 12, tzinfo=UTC),
         normalize_autopilot_config(),
+        horizon_profile="short_1_5d",
     ) is True
+
+
+def test_automatic_research_cadence_has_exactly_three_governed_lanes() -> None:
+    assert AUTOPILOT_RESEARCH_HORIZONS == (
+        "short_1_5d",
+        "swing_1_6m",
+        "long_1_3y",
+    )
+    assert horizon_research_cadence_bucket("short_1_5d", "2026-08-31").startswith(
+        "week:"
+    )
+    assert horizon_research_cadence_bucket("swing_1_6m", "2026-08-31") == (
+        "month:2026-08"
+    )
+    assert horizon_research_cadence_bucket("long_1_3y", "2026-08-31") == (
+        "quarter:2026-Q3"
+    )
+
+
+def test_migrated_unbound_cycle_stays_read_only_legacy_evidence() -> None:
+    policy = autopilot_module.primary_label_policy_contract()
+    row = {
+        "id": "legacy-cycle",
+        "horizon_profile": "legacy_ambiguous",
+        "primary_label_policy_sha256": policy["policy_sha256"],
+        "state_json": {
+            "horizon_profile": "legacy_ambiguous",
+            "label_horizon_sessions": None,
+            "primary_label_policy": policy,
+            "historical_results_only": True,
+            "capital_eligible": False,
+            "final_oos_must_not_open": True,
+            "migrated_from_unbound_autopilot_cycle": True,
+        },
+    }
+
+    decoded = autopilot_module.AutopilotStore._decode_cycle(dict(row))
+    assert decoded["horizon_profile"] == "legacy_ambiguous"
+    assert decoded["state"]["label_horizon_sessions"] is None
+
+    relabelled = dict(row)
+    relabelled["state_json"] = {**row["state_json"], "label_horizon_sessions": 5}
+    with pytest.raises(ValueError, match="reinterpreted"):
+        autopilot_module.AutopilotStore._decode_cycle(relabelled)
+
+
+def test_autopilot_tick_dispatches_the_same_mainline_for_all_horizons() -> None:
+    calls: list[str] = []
+
+    class Store:
+        @staticmethod
+        def reconcile() -> int:
+            return 0
+
+    controller = AutopilotController.__new__(AutopilotController)
+    controller.store = Store()
+    controller.config = lambda: (normalize_autopilot_config(), 7)
+    controller._latest_dataset = lambda: {"name": "latest"}
+
+    def tick_horizon(**kwargs):
+        calls.append(str(kwargs["horizon_profile"]))
+        return {"cycles": 1, "branches": 1, "failed": 0}
+
+    controller._tick_horizon = tick_horizon
+
+    result = controller.tick(datetime(2026, 8, 31, tzinfo=UTC))
+
+    assert calls == ["short_1_5d", "swing_1_6m", "long_1_3y"]
+    assert result == {"cycles": 3, "branches": 3, "failed": 0}
+
+
+@pytest.mark.parametrize(
+    ("horizon_profile", "old_end", "latest_end"),
+    [
+        ("short_1_5d", "2026-08-24", "2026-08-25"),
+        ("swing_1_6m", "2026-08-03", "2026-08-31"),
+        ("long_1_3y", "2026-07-01", "2026-09-30"),
+    ],
+)
+def test_new_daily_snapshot_continues_same_cadence_immutable_cycle(
+    monkeypatch, horizon_profile, old_end, latest_end
+) -> None:
+    old_dataset = {
+        "name": f"daily-{old_end}",
+        "end_date": old_end,
+        "provenance": {"dataset_identity_sha256": "a" * 64},
+    }
+    latest_dataset = {
+        "name": f"daily-{latest_end}",
+        "end_date": latest_end,
+        "provenance": {"dataset_identity_sha256": "b" * 64},
+    }
+    old_cycle = {
+        "id": "cycle-old",
+        "status": "active",
+        "horizon_profile": horizon_profile,
+        "dataset": old_dataset["name"],
+        "dataset_identity_sha256": "a" * 64,
+        "state": {"dataset_end_date": old_end},
+        "branches": [{"scenario": "fin_factor", "status": "running"}],
+    }
+    calls: dict[str, object] = {}
+
+    class Store:
+        @staticmethod
+        def list_cycles(*, limit):
+            assert limit == 500
+            return [old_cycle]
+
+        @staticmethod
+        def supersede_research_cycle(*_args, **_kwargs):
+            raise AssertionError("same-cadence research must not be superseded")
+
+        @staticmethod
+        def ensure_cycle(*_args, **_kwargs):
+            raise AssertionError("same-cadence research must not open a replacement")
+
+        @staticmethod
+        def get_cycle(cycle_id):
+            assert cycle_id == old_cycle["id"]
+            return old_cycle
+
+    controller = AutopilotController.__new__(AutopilotController)
+    controller.settings = SimpleNamespace(data_root="unused")
+    controller.store = Store()
+    controller._factor_due = lambda *_args, **_kwargs: False
+    controller._model_due = lambda *_args, **_kwargs: False
+
+    def roll_forward(cycle, bound_dataset):
+        calls["cycle"] = cycle
+        calls["dataset"] = bound_dataset
+        return {**cycle, "status": "succeeded"}
+
+    controller._roll_forward_prediction_champion = roll_forward
+    monkeypatch.setattr(
+        autopilot_module,
+        "list_qlib_datasets",
+        lambda _root: [old_dataset, latest_dataset],
+    )
+
+    result = controller._tick_horizon(
+        current=datetime(2026, 8, 25, tzinfo=UTC),
+        config=normalize_autopilot_config(),
+        revision=1,
+        dataset=latest_dataset,
+        horizon_profile=horizon_profile,
+    )
+
+    assert calls == {"cycle": old_cycle, "dataset": old_dataset}
+    assert result == {"cycles": 1, "branches": 0, "failed": 0}
+
+
+def test_factor_model_and_quant_runs_bind_each_horizons_primary_label(
+    tmp_path, monkeypatch
+) -> None:
+    calendar = tmp_path / "calendars"
+    calendar.mkdir()
+    (calendar / "day.txt").write_text(
+        "2024-01-02\n2024-01-03\n", encoding="utf-8"
+    )
+    dataset = {
+        "name": "governed-daily",
+        "path": str(tmp_path),
+        "lineage_id": "b" * 64,
+        "provenance": {"dataset_identity_sha256": "a" * 64},
+    }
+    labels = {
+        "short_1_5d": 5,
+        "swing_1_6m": 63,
+        "long_1_3y": 252,
+    }
+    policy = autopilot_module.primary_label_policy_contract()
+    run_configs: list[dict] = []
+    job_payloads: list[dict] = []
+    branches: list[dict] = []
+
+    class Research:
+        @staticmethod
+        def create_run(**kwargs):
+            run_configs.append(dict(kwargs["config"]))
+            return {"id": f"run-{len(run_configs)}"}
+
+        @staticmethod
+        def attach_job(_run_id, _job_id):
+            return None
+
+        @staticmethod
+        def mark_run(*_args, **_kwargs):
+            return None
+
+    class Jobs:
+        @staticmethod
+        def create(_kind, payload, *_args, **_kwargs):
+            job_payloads.append(dict(payload))
+            return {"id": f"job-{len(job_payloads)}"}
+
+    class Store:
+        @staticmethod
+        def create_branch(*_args, **kwargs):
+            branches.append(dict(kwargs["details"]))
+
+    class Assets:
+        @staticmethod
+        def reserve_automatic(**_kwargs):
+            raise AssertionError("empty asset manifest must not reserve assets")
+
+    monkeypatch.setattr(
+        autopilot_module,
+        "get_rdagent_scenario",
+        lambda scenario_id: SimpleNamespace(
+            id=scenario_id,
+            requires_feature_set=scenario_id in {"fin_model", "fin_quant"},
+            research_kind=scenario_id,
+            job_kind=f"job:{scenario_id}",
+        ),
+    )
+    monkeypatch.setattr(autopilot_module, "probe_rdagent", lambda *_args: {})
+    monkeypatch.setattr(
+        autopilot_module, "require_ready_scenario", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        autopilot_module,
+        "expected_rdagent_runtime_identity",
+        lambda _runtime, scenario_id: {"scenario": scenario_id},
+    )
+    monkeypatch.setattr(
+        autopilot_module,
+        "resolve_rdagent_assets",
+        lambda *_args, **_kwargs: {"manifest_sha256": ""},
+    )
+    monkeypatch.setattr(
+        autopilot_module,
+        "get_feature_set",
+        lambda feature_set_id: {"id": feature_set_id},
+    )
+
+    def resolve_window(_dataset, _calendar, *, horizon_profile, feature_set):
+        label = labels[horizon_profile]
+        return (
+            {
+                "train_start": "2020-01-02",
+                "train_end": "2021-12-31",
+                "valid_start": "2022-01-04",
+                "valid_end": "2022-12-30",
+                "test_start": "2023-01-03",
+                "test_end": "2024-01-03",
+            },
+            {
+                "evaluation_profiles": [],
+                "research_window_contract": {
+                    "horizon_profile": horizon_profile,
+                    "label_horizon_sessions": label,
+                    "feature_set_id": (feature_set or {}).get("id"),
+                },
+                "research_window_contract_sha256": str(label) * 64,
+            },
+        )
+
+    monkeypatch.setattr(
+        autopilot_module, "resolve_research_window_contract", resolve_window
+    )
+
+    controller = AutopilotController.__new__(AutopilotController)
+    controller.settings = SimpleNamespace(data_root=tmp_path)
+    controller.research = Research()
+    controller.jobs = Jobs()
+    controller.store = Store()
+    controller.assets = Assets()
+    config = normalize_autopilot_config()
+
+    for horizon, label in labels.items():
+        cycle = {
+            "id": f"cycle-{horizon}",
+            "horizon_profile": horizon,
+            "primary_label_policy_sha256": policy["policy_sha256"],
+            "state": {"primary_label_policy": policy},
+        }
+        for scenario in ("fin_factor", "fin_model", "fin_quant"):
+            controller._enqueue(
+                cycle,
+                dataset,
+                scenario,
+                f"{scenario}:{horizon}",
+                config=config,
+            )
+            assert run_configs[-1]["horizon_profile"] == horizon
+            assert run_configs[-1]["label_horizon_sessions"] == label
+            assert job_payloads[-1]["horizon_profile"] == horizon
+            assert job_payloads[-1]["label_horizon_sessions"] == label
+            assert branches[-1]["horizon_profile"] == horizon
+            assert branches[-1]["primary_label_policy_sha256"] == policy[
+                "policy_sha256"
+            ]
+
+
+@pytest.mark.parametrize(
+    ("horizon_profile", "label_horizon_sessions"),
+    [("short_1_5d", 5), ("swing_1_6m", 63), ("long_1_3y", 252)],
+)
+def test_cycle_materializes_base_only_horizon_factor_champion(
+    tmp_path,
+    monkeypatch,
+    horizon_profile,
+    label_horizon_sessions,
+) -> None:
+    calendar = tmp_path / "calendars"
+    calendar.mkdir()
+    (calendar / "day.txt").write_text("2024-01-02\n", encoding="utf-8")
+    feature_set = {
+        "id": "qlib-alpha158",
+        "definition_sha256": "c" * 64,
+        "contract_version": "governed-feature-set-v1",
+        "source": "qlib",
+        "features": {"KMID": "$close/$open-1"},
+    }
+    dataset = {
+        "name": "governed-daily",
+        "path": str(tmp_path),
+        "provenance": {"dataset_identity_sha256": "a" * 64},
+    }
+    cycle = {
+        "id": f"cycle-{horizon_profile}",
+        "horizon_profile": horizon_profile,
+        "dataset_identity_sha256": "a" * 64,
+        "state": {},
+    }
+    patch_calls: list[dict] = []
+
+    class Store:
+        @staticmethod
+        def patch_cycle_state(cycle_id, *, state_patch):
+            assert cycle_id == cycle["id"]
+            patch_calls.append(dict(state_patch))
+            return {**cycle, "state": {**cycle["state"], **state_patch}}
+
+    controller = AutopilotController.__new__(AutopilotController)
+    controller.store = Store()
+    monkeypatch.setattr(
+        autopilot_module, "get_feature_set", lambda _feature_id: feature_set
+    )
+    monkeypatch.setattr(
+        autopilot_module,
+        "resolve_research_window_contract",
+        lambda *_args, **_kwargs: (
+            {"valid_end": "2023-12-29"},
+            {
+                "research_window_contract": {"horizon_profile": horizon_profile},
+                "research_window_contract_sha256": "d" * 64,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        autopilot_module,
+        "resolve_research_label_binding",
+        lambda _payload: {
+            "horizon_profile": horizon_profile,
+            "label_horizon_sessions": label_horizon_sessions,
+            "feature_set_id": feature_set["id"],
+            "feature_set_sha256": feature_set["definition_sha256"],
+            "dataset_identity_sha256": "a" * 64,
+            "binding_sha256": "e" * 64,
+        },
+    )
+
+    materialized = controller._ensure_horizon_factor_bundle(
+        cycle,
+        dataset,
+        feature_set_id=feature_set["id"],
+    )
+    bundle = materialized["state"]["horizon_factor_bundle"]
+
+    assert bundle["incremental_factors"] == []
+    assert bundle["incremental_challenge"]["mode"] == "baseline_seed"
+    assert bundle["horizon_profile"] == horizon_profile
+    assert bundle["label_horizon_sessions"] == label_horizon_sessions
+    assert materialized["state"]["horizon_factor_bundle_sha256"] == bundle[
+        "bundle_sha256"
+    ]
+    assert len(patch_calls) == 1
+
+    replay = controller._ensure_horizon_factor_bundle(
+        materialized,
+        dataset,
+        feature_set_id=feature_set["id"],
+    )
+    assert replay == materialized
+    assert len(patch_calls) == 1
 
 
 def test_full_model_score_uses_equal_three_window_mean_and_worst_window() -> None:
