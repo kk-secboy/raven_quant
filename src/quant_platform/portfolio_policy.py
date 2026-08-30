@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from dataclasses import asdict, dataclass
+from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 
 import numpy as np
@@ -11,7 +12,8 @@ from .cost_model import CostModelConfig
 from .discrete_constraints import validate_discrete_constraints
 from .portfolio_optimizer import optimize_benchmark_relative_weights
 
-POLICY_VERSION = "portfolio-policy-v2"
+POLICY_VERSION = "portfolio-policy-v3"
+_DISCRETE_CONSTRAINT_TOLERANCE = 1e-8
 
 
 def rebalance_period_key(value: Any, frequency: str) -> tuple[int, ...]:
@@ -967,6 +969,50 @@ class PortfolioPolicy:
                 lot_size=self.cost_model.lot_size,
                 frozen_instruments=frozen_instruments,
             )
+        target, max_position_repair_events = self._repair_max_position_weight(
+            target,
+            max_position_weight=self.config.max_position_weight,
+            frozen_instruments=frozen_instruments,
+            prices=price_values,
+            portfolio_value=portfolio_value,
+            lot_size=self.cost_model.lot_size,
+        )
+        repaired_instruments = {
+            str(event["instrument"]) for event in max_position_repair_events
+        }
+        for instrument in sorted(str(item) for item in target.index):
+            if instrument in frozen_instruments or instrument in repaired_instruments:
+                continue
+            previous_weight = float(previous[instrument])
+            target_weight = float(target[instrument])
+            if (
+                previous_weight
+                > self.config.max_position_weight + _DISCRETE_CONSTRAINT_TOLERANCE
+                and target_weight < previous_weight - 1e-12
+            ):
+                event = self._risk_event(
+                    "max_position_weight_risk_reduction",
+                    previous_weight,
+                    self.config.max_position_weight,
+                    "reduce_position",
+                    instrument,
+                )
+                event["target_weight_after"] = target_weight
+                max_position_repair_events.append(event)
+        risk_events.extend(max_position_repair_events)
+        governed_risk_decrease_candidates.update(
+            str(event["instrument"])
+            for event in max_position_repair_events
+            if float(target[str(event["instrument"])])
+            < float(previous[str(event["instrument"])]) - 1e-12
+        )
+        if pending_target is not None:
+            for event in max_position_repair_events:
+                instrument = str(event["instrument"])
+                pending_target[instrument] = min(
+                    float(pending_target.get(instrument, 0.0)),
+                    self.config.max_position_weight,
+                )
         risk_turnover_exempt_instruments = {
             instrument
             for instrument in governed_risk_decrease_candidates
@@ -1306,6 +1352,73 @@ class PortfolioPolicy:
         )
         result.loc[tradable] = quantities * prices.loc[tradable] / portfolio_value
         return result
+
+    @staticmethod
+    def _repair_max_position_weight(
+        target: pd.Series,
+        *,
+        max_position_weight: float,
+        frozen_instruments: set[str],
+        prices: pd.Series | None,
+        portfolio_value: float | None,
+        lot_size: int,
+    ) -> tuple[pd.Series, list[dict[str, Any]]]:
+        """Reduce tradable targets to the largest whole-lot position under the cap."""
+
+        result = target.copy().astype(float)
+        events: list[dict[str, Any]] = []
+        for instrument in sorted(str(item) for item in result.index):
+            if instrument in frozen_instruments:
+                continue
+            observed_weight = float(result[instrument])
+            if observed_weight <= (
+                max_position_weight + _DISCRETE_CONSTRAINT_TOLERANCE
+            ):
+                continue
+
+            repaired_weight = max_position_weight
+            event = PortfolioPolicy._risk_event(
+                "post_discretization_max_position_repair",
+                observed_weight,
+                max_position_weight,
+                "reduce_position",
+                instrument,
+            )
+            if prices is not None and portfolio_value is not None:
+                price = float(prices[instrument])
+                price_decimal = Decimal(str(price))
+                portfolio_decimal = Decimal(str(portfolio_value))
+                allowed_notional = Decimal(str(max_position_weight)) * portfolio_decimal
+                lot_notional = price_decimal * Decimal(lot_size)
+                allowed_lots = int(
+                    (allowed_notional / lot_notional).to_integral_value(
+                        rounding=ROUND_FLOOR
+                    )
+                )
+                current_quantity = int(
+                    round(observed_weight * portfolio_value / price / lot_size)
+                ) * lot_size
+                repaired_quantity = min(current_quantity, allowed_lots * lot_size)
+                while (
+                    repaired_quantity > 0
+                    and Decimal(repaired_quantity) * price_decimal > allowed_notional
+                ):
+                    repaired_quantity -= lot_size
+                repaired_weight = repaired_quantity * price / portfolio_value
+                event.update(
+                    {
+                        "price": price,
+                        "portfolio_value": float(portfolio_value),
+                        "lot_size": int(lot_size),
+                        "quantity_before": current_quantity,
+                        "quantity_after": repaired_quantity,
+                        "quantity_reduced": current_quantity - repaired_quantity,
+                    }
+                )
+            result[instrument] = repaired_weight
+            event["target_weight_after"] = float(repaired_weight)
+            events.append(event)
+        return result, events
 
     @staticmethod
     def _turnover(target: pd.Series, previous: pd.Series) -> float:

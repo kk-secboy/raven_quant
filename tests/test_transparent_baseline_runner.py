@@ -13,6 +13,9 @@ from quant_platform.runtime_source_closure import (
 from quant_platform.transparent_baseline_runner import (
     CANONICAL_LF_TARGET_RECIPE_VERSION,
     CANONICAL_LF_TARGET_RUNNER_SHA256,
+    DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION,
+    DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNNER_SHA256,
+    DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
     FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION,
     FAIL_CLOSED_EXECUTION_TARGET_RUNNER_SHA256,
     FAIL_CLOSED_EXECUTION_TARGET_RUNTIME_BUNDLE_SHA256,
@@ -112,6 +115,13 @@ def _config(
     if recipe_version == SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION:
         bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
             SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+        )
+        bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
+            _WORKER_IMAGE_DIGEST
+        )
+    if recipe_version == DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION:
+        bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
+            DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
         )
         bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
             _WORKER_IMAGE_DIGEST
@@ -244,27 +254,51 @@ def test_historical_v13_identity_is_not_rebound_to_current_v14_runtime() -> None
         )
 
 
-def test_current_transparent_v15_runner_matches_single_member_repair_identity() -> None:
+def test_historical_v15_identity_is_not_rebound_to_current_v16_runtime() -> None:
+    runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
+
+    with pytest.raises(ValueError, match="transparent v15 runtime bundle differs"):
+        require_transparent_baseline_runner(
+            config=_config(
+                SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
+                SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256,
+            ),
+            job_payload={
+                TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
+                    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
+                    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
+                    _WORKER_IMAGE_DIGEST
+                ),
+            },
+            runner_path=runner,
+        )
+
+
+def test_current_transparent_v16_runner_matches_position_cap_repair_identity() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
     assert require_transparent_baseline_runner(
         config=_config(
-            SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
-            SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256,
+            DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION,
+            DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNNER_SHA256,
         ),
         job_payload={
             TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
-                SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256
+                DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNNER_SHA256
             ),
             TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
-                SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+                DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
             ),
             TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
                 _WORKER_IMAGE_DIGEST
             ),
         },
         runner_path=runner,
-    ) == SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256
+    ) == DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNNER_SHA256
 
 
 def test_v12_rejects_changed_imported_runtime_module(tmp_path: Path) -> None:
@@ -405,7 +439,7 @@ def test_runner_bytes_survive_git_blob_and_archive_with_autocrlf(
     ) == 1
 
 
-def test_v15_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -> None:
+def test_v16_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -> None:
     root = Path(__file__).parents[1]
     source_paths = _v12_source_paths(root)
     repo = tmp_path / "runtime-bundle-repo"
@@ -432,13 +466,13 @@ def test_v15_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -
             destination.write_bytes(archived.read())
 
     assert position_risk_bundle_sha256(root) == (
-        SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+        DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert position_risk_bundle_sha256(repo) == (
-        SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+        DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert position_risk_bundle_sha256(archive_root) == (
-        SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+        DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
     )
 
 
@@ -485,6 +519,12 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
         / "versions"
         / "0082_transparent_baseline_v15_runtime_repair.py"
     ).read_text(encoding="utf-8")
+    v16_migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "versions"
+        / "0084_transparent_baseline_v16_position_cap_repair.py"
+    ).read_text(encoding="utf-8")
 
     assert CANONICAL_LF_TARGET_RUNNER_SHA256 in v9_migration
     assert OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256 in v9_migration
@@ -501,6 +541,8 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
     assert FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256 in v14_migration
     assert SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256 in v15_migration
     assert SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256 in v15_migration
+    assert DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNNER_SHA256 in v16_migration
+    assert DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256 in v16_migration
 
 
 def test_transparent_v8_runner_rejects_changed_bytes(tmp_path: Path) -> None:

@@ -192,6 +192,141 @@ def test_policy_applies_liquidity_and_round_lot_constraints() -> None:
         assert shares % 100 == pytest.approx(0.0)
 
 
+def test_policy_repairs_discrete_overweight_without_relaxing_position_cap() -> None:
+    instruments = [f"stock_{index:02d}" for index in range(20)]
+    previous = {instrument: 0.05 for instrument in instruments}
+    previous["stock_00"] = 0.051
+    previous["stock_19"] = 0.049
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=20,
+            n_drop=0,
+            max_position_weight=0.05,
+            max_daily_turnover=0.0005,
+            min_rebalance_weight_change=0.002,
+        )
+    )
+
+    decision = policy.decide(
+        pd.Series(
+            {
+                instrument: float(len(instruments) - index)
+                for index, instrument in enumerate(instruments)
+            }
+        ),
+        previous,
+        prices=pd.Series(1.0, index=instruments),
+        average_daily_values=pd.Series(1_000_000_000.0, index=instruments),
+        portfolio_value=1_000_000.0,
+    )
+
+    assert decision.policy_version == "portfolio-policy-v3"
+    assert max(decision.target_weights.values()) <= 0.05
+    assert decision.target_weights["stock_00"] == pytest.approx(0.05)
+    assert all(
+        weight * 1_000_000.0 % 100 == pytest.approx(0.0)
+        for weight in decision.target_weights.values()
+    )
+    validation = decision.position_state["discrete_constraint_validation"]
+    assert validation["status"] == "passed"
+    assert validation["risk_turnover_exception"]["status"] == "applied"
+    repair = next(
+        event
+        for event in decision.risk_events
+        if event["rule"] == "post_discretization_max_position_repair"
+    )
+    assert repair == {
+        "rule": "post_discretization_max_position_repair",
+        "observed": pytest.approx(0.051),
+        "limit": pytest.approx(0.05),
+        "action": "reduce_position",
+        "instrument": "stock_00",
+        "price": pytest.approx(1.0),
+        "portfolio_value": pytest.approx(1_000_000.0),
+        "lot_size": 100,
+        "quantity_before": 51_000,
+        "quantity_after": 50_000,
+        "quantity_reduced": 1_000,
+        "target_weight_after": pytest.approx(0.05),
+    }
+
+
+def test_position_cap_reduction_is_not_reintroduced_by_turnover_scaling() -> None:
+    instruments = [f"stock_{index:02d}" for index in range(20)]
+    previous = {"stock_00": 0.06}
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=20,
+            n_drop=0,
+            max_position_weight=0.05,
+            max_daily_turnover=0.005,
+        )
+    )
+
+    decision = policy.decide(
+        pd.Series(
+            {
+                instrument: float(len(instruments) - index)
+                for index, instrument in enumerate(instruments)
+            }
+        ),
+        previous,
+        prices=pd.Series(1.0, index=instruments),
+        average_daily_values=pd.Series(1_000_000_000.0, index=instruments),
+        portfolio_value=1_000_000.0,
+    )
+
+    assert decision.target_weights["stock_00"] == pytest.approx(0.05)
+    assert max(decision.target_weights.values()) <= 0.05
+    validation = decision.position_state["discrete_constraint_validation"]
+    assert validation["status"] == "passed"
+    assert validation["risk_turnover_exception"]["status"] == "applied"
+    event = next(
+        item
+        for item in decision.risk_events
+        if item["rule"] == "max_position_weight_risk_reduction"
+    )
+    assert event == {
+        "rule": "max_position_weight_risk_reduction",
+        "observed": pytest.approx(0.06),
+        "limit": pytest.approx(0.05),
+        "action": "reduce_position",
+        "instrument": "stock_00",
+        "target_weight_after": pytest.approx(0.05),
+    }
+
+
+def test_position_cap_repair_sells_one_lot_when_no_lot_fits_under_cap() -> None:
+    decision = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=0.05,
+            max_daily_turnover=1.0,
+            min_rebalance_weight_change=0.002,
+        )
+    ).decide(
+        pd.Series({"stock": 1.0}),
+        {"stock": 0.0501},
+        prices=pd.Series({"stock": 50.1}),
+        average_daily_values=pd.Series({"stock": 1_000_000_000.0}),
+        portfolio_value=100_000.0,
+    )
+
+    assert decision.target_weights == {}
+    validation = decision.position_state["discrete_constraint_validation"]
+    assert validation["status"] == "passed"
+    assert validation["cash_weight"] == pytest.approx(1.0)
+    repair = next(
+        event
+        for event in decision.risk_events
+        if event["rule"] == "post_discretization_max_position_repair"
+    )
+    assert repair["quantity_before"] == 100
+    assert repair["quantity_after"] == 0
+    assert repair["quantity_reduced"] == 100
+
+
 def test_missing_execution_price_freezes_only_that_holding_and_continues_batch() -> None:
     policy = PortfolioPolicy(
         PortfolioPolicyConfig(

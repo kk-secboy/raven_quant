@@ -178,7 +178,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0083_baseline_v15_evidence"
+    assert revision == "0084_baseline_v16_pos_cap"
     assert {"horizon_profile", "primary_label_policy_sha256"} <= {
         column["name"]
         for column in inspector.get_columns("autopilot_cycles", schema="quantlab")
@@ -216,6 +216,12 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         )
     }
     assert "ck_strategy_versions_v15_runtime_identity" in {
+        constraint["name"]
+        for constraint in inspector.get_check_constraints(
+            "strategy_versions", schema="quantlab"
+        )
+    }
+    assert "ck_strategy_versions_v16_runtime_identity" in {
         constraint["name"]
         for constraint in inspector.get_check_constraints(
             "strategy_versions", schema="quantlab"
@@ -1040,6 +1046,150 @@ def test_v15_exact_single_member_repair_evidence_is_admitted(database_url: str) 
         )
 
 
+def _v7_registry_values(*, audit_id: int) -> dict[str, object]:
+    receipt_sha256 = (
+        "dbe47a338ee6fd75c5b6dc471775aaa0155697fa7c31012561f362c7cfb5128a"
+    )
+    source_batch_sha256 = (
+        "913ebb7aa7dcdb1267d31ee1079eb9206068e25bb8a1f858e0a85b7d37dac157"
+    )
+    lineage_id = "1b97efcc3956b4be2dfebff7567efd4707c73d806f9d0cb2b63540d9dedd852e"
+    source_backtest_id = "afa2257f2f6f4f0fb70cd285be5a9605"
+    target_strategy_version_id = "2" * 32
+    verification = {
+        "receipt_sha256": receipt_sha256,
+        "receipt_contract_version": "transparent-baseline-pre-result-repair-v7",
+        "repair_generation": "v15-to-v16-discrete-max-position-weight",
+        "source_release_commit": "efec9ceca53b5f62e986e38b3d701c8dda7c8f56",
+        "source_batch_sha256": source_batch_sha256,
+        "source_dataset_identity_sha256": (
+            "eab69dff43abcc77e60f47ad51d2182c7bfd5d90f5d36c479e3de61cebf768f2"
+        ),
+        "source_dataset_lineage_id": lineage_id,
+        "source_runner_sha256": (
+            "31d4c7a294ae61c19edcdb8e014b521c1b544836d6891af36cfba3ecf4ab43a3"
+        ),
+        "target_runner_sha256": (
+            "31d4c7a294ae61c19edcdb8e014b521c1b544836d6891af36cfba3ecf4ab43a3"
+        ),
+        "source_runtime_bundle_sha256": (
+            "e361d85d69d77cb6e0de7072db6f8aaff5d83f1e7902fe16ef06c2e28fce1867"
+        ),
+        "target_runtime_bundle_sha256": (
+            "ac1c2020996efa4e3c3e9609dd4c736d8c65893dccd7ba9c90e3464402d2a329"
+        ),
+        "runtime_contract_version": (
+            "transparent-baseline-discrete-max-position-repair-v1"
+        ),
+        "source_artifact_inventories_sha256": (
+            "eaa39ec9858a37d4d71754832e2fd5a71ecf55230f426ecf725f3d188979fe51"
+        ),
+        "source_unopened_history_selection_sha256": (
+            "81431777c685845c00e12f49bc4c901d130c4704922216af3e407623b775727b"
+        ),
+        "source_unavailable_horizons_sha256": (
+            "b9f36421f0047ab024eec0f2b20909a105c2a57e17dc94a50aa25e632f8c3644"
+        ),
+        "source_unavailable_evidence_sha256s": [
+            "62f5642a4ad024cc24d23ec34b9ce760a552f560c783612b63dab459ba00d14d",
+            "b57d3dba4ab3d2284b2a001cb30a7b2862a8659c3738d5fc23419e7e7a6b5729",
+        ],
+        "target_change_codes": [
+            "reduce-tradable-position-to-largest-whole-lot-within-hard-cap",
+            "preserve-hard-position-cap-after-turnover-scaling",
+            "override-soft-hold-rules-for-tradable-inherited-overweight-risk-reduction",
+        ],
+        "source_backtest_ids": [source_backtest_id],
+        "target_strategy_version_ids": [target_strategy_version_id],
+        "source_bindings": [
+            {
+                "backtest_id": source_backtest_id,
+                "job_id": "4c1927be70314e7cb60e1e7992fa5d51",
+                "strategy_version_id": "9c9009051df64c2c91b879cb99421c68",
+            }
+        ],
+    }
+    return {
+        "receipt_sha256": receipt_sha256,
+        "source_audit_event_id": audit_id,
+        "source_batch_sha256": source_batch_sha256,
+        "target_batch_sha256": "e" * 64,
+        "source_dataset_lineage_id": lineage_id,
+        "target_dataset_lineage_id": lineage_id,
+        "target_recipe_version": "qlib-rdagent-single-mainline-2026-08-30-v16",
+        "source_backtest_ids_json": [source_backtest_id],
+        "target_strategy_version_ids_json": [target_strategy_version_id],
+        "verification_json": verification,
+        "created_at": datetime.now(UTC),
+    }
+
+
+def _insert_v7_audit(connection, *, exact_details: bool) -> int:
+    details = {}
+    if exact_details:
+        details = {
+            "receipt_sha256": (
+                "dbe47a338ee6fd75c5b6dc471775aaa0155697fa7c31012561f362c7cfb5128a"
+            ),
+            "contract_version": "transparent-baseline-pre-result-repair-v7",
+            "repair_generation": "v15-to-v16-discrete-max-position-weight",
+        }
+    return connection.execute(
+        insert(audit_events)
+        .values(
+            user_id=None,
+            username="system:migration-test",
+            action="transparent_baseline_pre_result_repair_registered",
+            method="INTERNAL",
+            path="transparent-baseline/pre-result-repair",
+            status_code=201,
+            ip_hash=None,
+            user_agent="pytest",
+            details_json=details,
+            created_at=datetime.now(UTC),
+        )
+        .returning(audit_events.c.id)
+    ).scalar_one()
+
+
+def test_v16_exact_single_member_repair_evidence_is_admitted(database_url: str) -> None:
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        audit_id = _insert_v7_audit(connection, exact_details=False)
+        connection.execute(
+            insert(transparent_baseline_pre_result_repairs).values(
+                **_v7_registry_values(audit_id=audit_id)
+            )
+        )
+
+
+@pytest.mark.parametrize("evidence_kind", ["registry", "audit"])
+def test_0084_downgrade_rejects_each_v7_evidence_atomically(
+    database_url: str,
+    evidence_kind: str,
+) -> None:
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        audit_id = _insert_v7_audit(
+            connection, exact_details=evidence_kind == "audit"
+        )
+        if evidence_kind == "registry":
+            connection.execute(
+                insert(transparent_baseline_pre_result_repairs).values(
+                    **_v7_registry_values(audit_id=audit_id)
+                )
+            )
+
+    with pytest.raises(RuntimeError, match="immutable v16 strategy"):
+        command.downgrade(
+            alembic_config(database_url), "0083_baseline_v15_evidence"
+        )
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT version_num FROM quantlab.alembic_version")
+        ).scalar_one() == "0084_baseline_v16_pos_cap"
+
+
 def test_0045_retires_legacy_approved_pair_versions(database_url: str) -> None:
     """Seed a pre-gate approved pair version, replay 0045, expect retirement."""
 
@@ -1106,7 +1256,7 @@ def test_0045_retires_legacy_approved_pair_versions(database_url: str) -> None:
     assert audit is not None and audit[1] == "migration-0045"
 
 
-def test_same_lineage_repair_constraint_is_limited_to_exact_v2_through_v6(
+def test_same_lineage_repair_constraint_is_limited_to_exact_v2_through_v7(
     database_url: str,
 ) -> None:
     engine = open_database(database_url)
@@ -1178,6 +1328,17 @@ def test_same_lineage_repair_constraint_is_limited_to_exact_v2_through_v6(
     assert "4f4c1f51e74e4ed18cb6cb9f6ed757c7" in definition
     assert "520b4c76f75445a88039a6f02d0d7dd1" in definition
     assert "source_bindings" in definition
+    assert "transparent-baseline-pre-result-repair-v7" in definition
+    assert "v15-to-v16-discrete-max-position-weight" in definition
+    assert "afa2257f2f6f4f0fb70cd285be5a9605" in definition
+    assert "4c1927be70314e7cb60e1e7992fa5d51" in definition
+    assert "9c9009051df64c2c91b879cb99421c68" in definition
+    assert "dbe47a338ee6fd75c5b6dc471775aaa0155697fa7c31012561f362c7cfb5128a" in (
+        definition
+    )
+    assert "ac1c2020996efa4e3c3e9609dd4c736d8c65893dccd7ba9c90e3464402d2a329" in (
+        definition
+    )
     assert "c2727672b33fed580841721551c45df1a11e864dd899cb6d473c220821da0dc0" in (
         definition
     )
@@ -1282,7 +1443,7 @@ def test_downgrade_rejects_append_only_same_lineage_v5_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0083_baseline_v15_evidence"
+        ) == "0084_baseline_v16_pos_cap"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
@@ -1360,7 +1521,7 @@ def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0083_baseline_v15_evidence"
+        ) == "0084_baseline_v16_pos_cap"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
@@ -1428,7 +1589,7 @@ def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0083_baseline_v15_evidence"
+        ) == "0084_baseline_v16_pos_cap"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
@@ -1490,4 +1651,4 @@ def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0083_baseline_v15_evidence"
+        ) == "0084_baseline_v16_pos_cap"

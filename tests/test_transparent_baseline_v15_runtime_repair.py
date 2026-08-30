@@ -39,11 +39,11 @@ def _migration_module():
     return module
 
 
-def test_v15_recipe_uses_the_append_only_runner_and_runtime_bundle() -> None:
+def test_v15_append_only_runner_and_runtime_bundle_remain_sealed() -> None:
     root = Path(__file__).parents[1]
     runner = root / "scripts" / "run_multifactor_backtest.py"
 
-    assert RECIPE_VERSION == SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION
+    assert RECIPE_VERSION != SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION
     assert SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256 == (
         "e361d85d69d77cb6e0de7072db6f8aaff5d83f1e7902fe16ef06c2e28fce1867"
     )
@@ -52,16 +52,20 @@ def test_v15_recipe_uses_the_append_only_runner_and_runtime_bundle() -> None:
         "swing_trend",
         "long_quality_value",
     ):
-        assert target_runner_for_recipe(recipe_id, RECIPE_VERSION) == (
+        assert target_runner_for_recipe(
+            recipe_id, SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION
+        ) == (
             SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256
         )
-        assert target_runtime_bundle_for_recipe(recipe_id, RECIPE_VERSION) == (
+        assert target_runtime_bundle_for_recipe(
+            recipe_id, SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION
+        ) == (
             SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
         )
     assert hashlib.sha256(runner.read_bytes()).hexdigest() == (
         SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256
     )
-    assert position_risk_bundle_sha256(root) == (
+    assert position_risk_bundle_sha256(root) != (
         SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
     )
 

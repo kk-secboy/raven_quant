@@ -16,6 +16,7 @@ from quant_data.database import (
     jobs,
     open_database,
     strategy_versions,
+    transparent_baseline_pre_result_repairs,
 )
 from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_platform.eligibility import ELIGIBILITY_CONTRACT_VERSION
@@ -31,6 +32,28 @@ from quant_platform.transparent_baseline_lockbox import (
     CANONICAL_LF_PACKAGING_SOURCE_RECIPE_VERSION,
     CANONICAL_LF_PACKAGING_TARGET_RECIPE_VERSION,
     CANONICAL_LF_PACKAGING_TARGET_RUNNER_SHA256,
+    DISCRETE_MAX_POSITION_ERROR,
+    DISCRETE_MAX_POSITION_REASON,
+    DISCRETE_MAX_POSITION_REPAIR_GENERATION,
+    DISCRETE_MAX_POSITION_RUNTIME_CONTRACT_VERSION,
+    DISCRETE_MAX_POSITION_SOURCE_ARTIFACT_INVENTORIES_SHA256,
+    DISCRETE_MAX_POSITION_SOURCE_BACKTEST_IDS,
+    DISCRETE_MAX_POSITION_SOURCE_BATCH_SHA256,
+    DISCRETE_MAX_POSITION_SOURCE_BINDINGS,
+    DISCRETE_MAX_POSITION_SOURCE_BUNDLE_SHA256,
+    DISCRETE_MAX_POSITION_SOURCE_COMMIT,
+    DISCRETE_MAX_POSITION_SOURCE_DATASET,
+    DISCRETE_MAX_POSITION_SOURCE_DATASET_IDENTITY_SHA256,
+    DISCRETE_MAX_POSITION_SOURCE_DATASET_LINEAGE_ID,
+    DISCRETE_MAX_POSITION_SOURCE_RECIPE_VERSION,
+    DISCRETE_MAX_POSITION_SOURCE_RUNNER_SHA256,
+    DISCRETE_MAX_POSITION_SOURCE_SELECTION_SHA256,
+    DISCRETE_MAX_POSITION_SOURCE_UNAVAILABLE_HORIZONS_SHA256,
+    DISCRETE_MAX_POSITION_TARGET_BUNDLE_SHA256,
+    DISCRETE_MAX_POSITION_TARGET_CHANGE_CODES,
+    DISCRETE_MAX_POSITION_TARGET_RECIPE_VERSION,
+    DISCRETE_MAX_POSITION_TARGET_RUNNER_SHA256,
+    DISCRETE_MAX_POSITION_UNAVAILABLE_EVIDENCE_SHA256S,
     FILL_AWARE_HOLDING_AGE_ERROR,
     FILL_AWARE_HOLDING_AGE_REASON,
     FILL_AWARE_HOLDING_AGE_REPAIR_GENERATION,
@@ -69,6 +92,7 @@ from quant_platform.transparent_baseline_lockbox import (
     PRE_RESULT_REPAIR_CONTRACT_VERSION_V4,
     PRE_RESULT_REPAIR_CONTRACT_VERSION_V5,
     PRE_RESULT_REPAIR_CONTRACT_VERSION_V6,
+    PRE_RESULT_REPAIR_CONTRACT_VERSION_V7,
     RUNTIME_ALIGNMENT_BENCHMARK_REASON,
     RUNTIME_ALIGNMENT_CONTRACT_VERSION,
     RUNTIME_ALIGNMENT_INDUSTRY_REASON,
@@ -106,6 +130,7 @@ from quant_platform.transparent_baseline_lockbox import (
     TRANSPARENT_BASELINE_RUNNER_FIELD,
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
     canonical_sha256,
+    validate_discrete_max_position_predecessor_registry,
     validate_joint_lockbox,
     validate_pre_result_repair_receipt,
     validate_unopened_history_selection,
@@ -374,6 +399,65 @@ def build_fill_aware_holding_age_receipt(
         FILL_AWARE_HOLDING_AGE_SOURCE_ARTIFACT_INVENTORIES_SHA256
     ):
         raise ValueError("fill-aware holding-age aggregate artifact inventory changed")
+    receipt = {**payload, "receipt_sha256": canonical_sha256(payload)}
+    return validate_pre_result_repair_receipt(receipt)
+
+
+def build_discrete_max_position_receipt(
+    members: Sequence[dict[str, Any]],
+    *,
+    source_release_commit: str = DISCRETE_MAX_POSITION_SOURCE_COMMIT,
+    target_recipe_version: str = DISCRETE_MAX_POSITION_TARGET_RECIPE_VERSION,
+) -> dict[str, Any]:
+    """Build the exact one-member v15-to-v16 pre-result receipt."""
+
+    inventories = [
+        {
+            "backtest_id": str(member.get("backtest_id") or ""),
+            "artifact_inventory_sha256": canonical_sha256(
+                list(member.get("files") or [])
+            ),
+        }
+        for member in members
+    ]
+    payload = {
+        "contract_version": PRE_RESULT_REPAIR_CONTRACT_VERSION_V7,
+        "repair_generation": DISCRETE_MAX_POSITION_REPAIR_GENERATION,
+        "source_release_commit": source_release_commit,
+        "target_recipe_version": target_recipe_version,
+        "source_batch_sha256": DISCRETE_MAX_POSITION_SOURCE_BATCH_SHA256,
+        "source_dataset_identity_sha256": (
+            DISCRETE_MAX_POSITION_SOURCE_DATASET_IDENTITY_SHA256
+        ),
+        "source_dataset_lineage_id": (
+            DISCRETE_MAX_POSITION_SOURCE_DATASET_LINEAGE_ID
+        ),
+        "source_runner_sha256": DISCRETE_MAX_POSITION_SOURCE_RUNNER_SHA256,
+        TRANSPARENT_BASELINE_RUNNER_FIELD: DISCRETE_MAX_POSITION_TARGET_RUNNER_SHA256,
+        "source_runtime_bundle_sha256": DISCRETE_MAX_POSITION_SOURCE_BUNDLE_SHA256,
+        "target_runtime_bundle_sha256": DISCRETE_MAX_POSITION_TARGET_BUNDLE_SHA256,
+        "runtime_contract_version": DISCRETE_MAX_POSITION_RUNTIME_CONTRACT_VERSION,
+        "source_artifact_inventories_sha256": canonical_sha256(inventories),
+        "source_unopened_history_selection_sha256": (
+            DISCRETE_MAX_POSITION_SOURCE_SELECTION_SHA256
+        ),
+        "source_unavailable_horizons_sha256": (
+            DISCRETE_MAX_POSITION_SOURCE_UNAVAILABLE_HORIZONS_SHA256
+        ),
+        "source_unavailable_evidence_sha256s": sorted(
+            DISCRETE_MAX_POSITION_UNAVAILABLE_EVIDENCE_SHA256S
+        ),
+        "target_change_codes": list(DISCRETE_MAX_POSITION_TARGET_CHANGE_CODES),
+        "target_eligibility_contract": ELIGIBILITY_CONTRACT_VERSION,
+        "target_stock_scope_contract": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+        "reason_codes": [DISCRETE_MAX_POSITION_REASON],
+        "performance_information_used": False,
+        "members": list(members),
+    }
+    if payload["source_artifact_inventories_sha256"] != (
+        DISCRETE_MAX_POSITION_SOURCE_ARTIFACT_INVENTORIES_SHA256
+    ):
+        raise ValueError("discrete max-position aggregate artifact inventory changed")
     receipt = {**payload, "receipt_sha256": canonical_sha256(payload)}
     return validate_pre_result_repair_receipt(receipt)
 
@@ -1265,6 +1349,228 @@ def register_fill_aware_holding_age_repair(
                 status_code=201,
                 ip_hash=None,
                 user_agent="register_transparent_baseline_holding_age_repair.py",
+                details_json=receipt,
+                created_at=datetime.now(UTC),
+            )
+            .returning(audit_events.c.id)
+        ).scalar_one()
+    return {
+        "status": "registered",
+        "audit_event_id": int(event_id),
+        "receipt": receipt,
+    }
+
+
+def register_discrete_max_position_repair(
+    database_url: str,
+    *,
+    backtest_ids: Sequence[str],
+    actor: str,
+    target_runtime_root: Path | None = None,
+    source_release_commit: str = DISCRETE_MAX_POSITION_SOURCE_COMMIT,
+    target_recipe_version: str = DISCRETE_MAX_POSITION_TARGET_RECIPE_VERSION,
+) -> dict[str, Any]:
+    """Register only the exact failed v15 short attempt before v16 planning."""
+
+    normalized_ids = [str(value or "").strip().lower() for value in backtest_ids]
+    if len(normalized_ids) != 1 or set(normalized_ids) != (
+        DISCRETE_MAX_POSITION_SOURCE_BACKTEST_IDS
+    ):
+        raise ValueError(
+            "discrete max-position repair requires the exact one v15 short backtest"
+        )
+    username = str(actor or "").strip()
+    if not username:
+        raise ValueError("transparent baseline repair actor is required")
+    target_root = (
+        target_runtime_root.resolve()
+        if target_runtime_root is not None
+        else Path(__file__).resolve().parents[2]
+    )
+    target_runner = target_root / "scripts" / "run_multifactor_backtest.py"
+    if _file_sha256(target_runner) != DISCRETE_MAX_POSITION_TARGET_RUNNER_SHA256:
+        raise ValueError("discrete max-position target runner bytes are not sealed")
+    if position_risk_bundle_sha256(target_root) != (
+        DISCRETE_MAX_POSITION_TARGET_BUNDLE_SHA256
+    ):
+        raise ValueError("discrete max-position target runtime bundle is not sealed")
+
+    engine = open_database(database_url)
+    with engine.begin() as connection:
+        row = connection.execute(
+            select(
+                backtest_runs.c.id,
+                backtest_runs.c.strategy_version_id,
+                backtest_runs.c.job_id,
+                backtest_runs.c.dataset,
+                backtest_runs.c.periods_json,
+                backtest_runs.c.status,
+                backtest_runs.c.metrics_json,
+                backtest_runs.c.artifact_path,
+                backtest_runs.c.error,
+                jobs.c.kind.label("job_kind"),
+                jobs.c.status.label("job_status"),
+                jobs.c.error.label("job_error"),
+                jobs.c.payload_json.label("job_payload_json"),
+                strategy_versions.c.config_json,
+            )
+            .join(jobs, jobs.c.id == backtest_runs.c.job_id)
+            .join(
+                strategy_versions,
+                strategy_versions.c.id == backtest_runs.c.strategy_version_id,
+            )
+            .where(backtest_runs.c.id == normalized_ids[0])
+            .with_for_update()
+        ).one_or_none()
+        if row is None:
+            raise ValueError("discrete max-position source backtest is missing")
+        source = DISCRETE_MAX_POSITION_SOURCE_BINDINGS[str(row.id)]
+        config = dict(row.config_json or {})
+        bootstrap = dict(config.get("transparent_baseline_bootstrap") or {})
+        lockbox = validate_joint_lockbox(config.get(LOCKBOX_CONFIG_KEY))
+        unavailable = list(lockbox.get("unavailable_horizons") or [])
+        selection = validate_unopened_history_selection(
+            bootstrap.get("unopened_history_selection")
+        )
+        periods = {
+            key: str(dict(row.periods_json or {})[key])
+            for key in ("historical_start", "historical_end", "start", "end")
+        }
+        job_payload = dict(row.job_payload_json or {})
+        source_worker_image = str(
+            bootstrap.get(TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD) or ""
+        ).strip().lower()
+        if (
+            str(row.strategy_version_id) != source["strategy_version_id"]
+            or str(row.job_id) != source["job_id"]
+            or str(row.dataset) != DISCRETE_MAX_POSITION_SOURCE_DATASET
+            or periods != source["periods"]
+            or config.get("recipe_id") != "short_relative_strength"
+            or config.get("recipe_version")
+            != DISCRETE_MAX_POSITION_SOURCE_RECIPE_VERSION
+            or bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+            != DISCRETE_MAX_POSITION_SOURCE_RUNNER_SHA256
+            or bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
+            != DISCRETE_MAX_POSITION_SOURCE_BUNDLE_SHA256
+            or bootstrap.get("dataset") != DISCRETE_MAX_POSITION_SOURCE_DATASET
+            or bootstrap.get("dataset_identity_sha256")
+            != DISCRETE_MAX_POSITION_SOURCE_DATASET_IDENTITY_SHA256
+            or bootstrap.get("dataset_lineage_id")
+            != DISCRETE_MAX_POSITION_SOURCE_DATASET_LINEAGE_ID
+            or dict(bootstrap.get("formal_periods") or {}) != source["periods"]
+            or lockbox["contract_version"] != LOCKBOX_CONTRACT_VERSION_V3
+            or lockbox["batch_sha256"]
+            != DISCRETE_MAX_POSITION_SOURCE_BATCH_SHA256
+            or [member["recipe_id"] for member in lockbox["members"]]
+            != ["short_relative_strength"]
+            or {item["recipe_id"] for item in unavailable}
+            != {"swing_trend", "long_quality_value"}
+            or canonical_sha256(unavailable)
+            != DISCRETE_MAX_POSITION_SOURCE_UNAVAILABLE_HORIZONS_SHA256
+            or {item["evidence_sha256"] for item in unavailable}
+            != DISCRETE_MAX_POSITION_UNAVAILABLE_EVIDENCE_SHA256S
+            or selection["selection_sha256"]
+            != DISCRETE_MAX_POSITION_SOURCE_SELECTION_SHA256
+            or not source_worker_image.startswith("sha256:")
+            or len(source_worker_image) != 71
+            or any(
+                character not in "0123456789abcdef"
+                for character in source_worker_image[7:]
+            )
+        ):
+            raise ValueError("discrete max-position source contract changed")
+        if (
+            str(job_payload.get("backtest_id") or "") != str(row.id)
+            or str(job_payload.get("strategy_version_id") or "")
+            != str(row.strategy_version_id)
+            or str(job_payload.get("dataset") or "") != str(row.dataset)
+            or dict(job_payload.get("periods") or {}) != periods
+            or job_payload.get("transparent_baseline_runner_sha256")
+            != DISCRETE_MAX_POSITION_SOURCE_RUNNER_SHA256
+            or job_payload.get(TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD)
+            != DISCRETE_MAX_POSITION_SOURCE_BUNDLE_SHA256
+            or job_payload.get(
+                TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD
+            )
+            != source_worker_image
+        ):
+            raise ValueError("discrete max-position source job binding changed")
+        predecessor_rows = connection.execute(
+            select(transparent_baseline_pre_result_repairs).where(
+                transparent_baseline_pre_result_repairs.c.target_batch_sha256
+                == DISCRETE_MAX_POSITION_SOURCE_BATCH_SHA256
+            )
+        ).all()
+        if len(predecessor_rows) != 1:
+            raise ValueError(
+                "discrete max-position predecessor repair registry is incomplete"
+            )
+        validate_discrete_max_position_predecessor_registry(
+            predecessor_rows[0], source_version_id=str(row.strategy_version_id)
+        )
+        if (
+            str(row.job_kind) != "strategy_backtest"
+            or str(row.status) != "failed"
+            or str(row.job_status) != "failed"
+            or row.metrics_json is not None
+            or str(row.error or "") != DISCRETE_MAX_POSITION_ERROR
+            or str(row.job_error or "") != DISCRETE_MAX_POSITION_ERROR
+        ):
+            raise ValueError(
+                "discrete max-position repair requires exact failed no-metrics evidence"
+            )
+        root = Path(str(row.artifact_path or "")).resolve()
+        if any(root.rglob("result.json")):
+            raise ValueError("discrete max-position source already has a result")
+        files = _artifact_inventory(root)
+        if canonical_sha256(files) != source["artifact_inventory_sha256"]:
+            raise ValueError("discrete max-position artifact inventory changed")
+        member = {
+            "backtest_id": str(row.id),
+            "strategy_version_id": str(row.strategy_version_id),
+            "job_id": str(row.job_id),
+            "dataset": str(row.dataset),
+            "periods": periods,
+            "status": "failed",
+            "job_status": "failed",
+            "error": DISCRETE_MAX_POSITION_ERROR,
+            "metrics_absent": True,
+            "result_absent": True,
+            "files": files,
+        }
+        receipt = build_discrete_max_position_receipt(
+            [member],
+            source_release_commit=source_release_commit,
+            target_recipe_version=target_recipe_version,
+        )
+        for audit_row in connection.execute(
+            select(audit_events).where(audit_events.c.action == PRE_RESULT_REPAIR_ACTION)
+        ).all():
+            details = dict(audit_row.details_json or {})
+            if details.get("receipt_sha256") == receipt["receipt_sha256"]:
+                return {
+                    "status": "already_registered",
+                    "audit_event_id": int(audit_row.id),
+                    "receipt": receipt,
+                }
+            raw_members = details.get("members")
+            if isinstance(raw_members, list) and any(
+                isinstance(item, dict)
+                and str(item.get("backtest_id") or "") == str(row.id)
+                for item in raw_members
+            ):
+                raise ValueError("v15 short backtest already has a different repair receipt")
+        event_id = connection.execute(
+            insert(audit_events)
+            .values(
+                user_id=None,
+                username=username,
+                action=PRE_RESULT_REPAIR_ACTION,
+                method="INTERNAL",
+                path="transparent-baseline/pre-result-repair",
+                status_code=201,
+                ip_hash=None,
+                user_agent="register_transparent_baseline_position_cap_repair.py",
                 details_json=receipt,
                 created_at=datetime.now(UTC),
             )
