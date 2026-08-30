@@ -558,6 +558,10 @@ def _record_collector_authority(
 
     engine = open_database(database_url)
     with engine.connect() as connection:
+        binding = health_authority_module.current_paper_health_binding(
+            connection,
+            version_id,
+        )
         stage = connection.execute(
             select(strategy_promotion_stages).where(
                 strategy_promotion_stages.c.strategy_version_id == version_id,
@@ -601,6 +605,10 @@ def _record_collector_authority(
         ),
         "daily_dataset_lineage_id": str(batch.daily_dataset_lineage_id),
         "source_snapshot_id": str(batch.source_snapshot_id),
+        "formal_backtest_id": str(binding["formal_backtest_id"]),
+        "order_plan_manifest_sha256": str(
+            binding["order_plan_manifest_sha256"]
+        ),
         "feature_drift_current_end": batch.signal_date.isoformat(),
         "feature_drift_evidence_available": True,
         "feature_drift": 0.01,
@@ -610,7 +618,7 @@ def _record_collector_authority(
     }
     snapshot = StrategyStore(database_url).record_health_snapshot(
         version_id,
-        as_of=datetime.now(UTC),
+        as_of=promotion_module._now(),
         health_status="healthy",
         criteria={"fixture": "sealed-live-collector-authority"},
         evidence=evidence,

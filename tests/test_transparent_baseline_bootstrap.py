@@ -1318,6 +1318,7 @@ def test_new_lineage_cannot_reopen_overlapping_baseline_oos_without_repair_recei
                 "dataset_lineage_id": "e" * 64,
             }
         )
+        bootstrap.pop(TRANSPARENT_BASELINE_RUNNER_FIELD, None)
         plan["base_config"] = _normalize_multifactor_contract(
             base,
             factor_count=0,

@@ -41,6 +41,33 @@ from quant_platform.strategy_store import StrategyStore
 DATASET_IDENTITY = "a" * 64
 
 
+def allow_strategy_new_risk_for_test(monkeypatch) -> None:
+    """Open only the member-risk seam for downstream ledger arithmetic tests."""
+
+    import quant_platform.simulation_store as simulation_store_module
+
+    def allowed(_connection, strategy_version_id: str) -> dict:
+        return {
+            "strategy_version_id": str(strategy_version_id),
+            "state": "active",
+            "allow_new_risk": True,
+            "risk_exposure_override": 1.0,
+            "event_ids": [],
+            "allocation_ids": [],
+            "strategy_health_gate": {
+                "ready": True,
+                "allow_new_risk": True,
+                "fixture_only": True,
+            },
+        }
+
+    monkeypatch.setattr(
+        simulation_store_module,
+        "load_strategy_risk_state",
+        allowed,
+    )
+
+
 def governed_etf_ready_evidence() -> dict:
     return {
         **governed_daily_etf_whitelist_contract(),

@@ -33,6 +33,7 @@ from quant_data.execution_data import (
     minute_specs,
     news_specs,
 )
+from quant_data.history_bounds import GOVERNED_DAILY_STOCK_SCOPE_VERSION
 from quant_data.models import ProviderResult
 from quant_data.provider import ProviderError
 from quant_data.qlib_builder import build_qlib_output_manifest
@@ -421,6 +422,11 @@ def test_execution_data_api_and_worker_commands(
                 "source_hand_size": 100,
                     "index_volume_policy": "excluded_non_tradable_benchmark",
                     "governed_etf_whitelist": governed_etf_ready_evidence(),
+                    "execution_controls": {
+                        "formal_execution_requires_native_controls": True,
+                        "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+                        "native_complete_from": "2024-01-01",
+                    },
                     "lineage_verified": True,
                     "output_manifest": build_qlib_output_manifest(daily_dataset),
                 }

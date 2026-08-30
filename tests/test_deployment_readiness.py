@@ -250,6 +250,11 @@ def _qlib_dataset(
                 "source_hand_size": 100,
                 "index_volume_policy": "excluded_non_tradable_benchmark",
                 "governed_etf_whitelist": governed_etf_ready_evidence(),
+                "execution_controls": {
+                    "formal_execution_requires_native_controls": True,
+                    "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+                    "native_complete_from": days[0],
+                },
                 "output_manifest": build_qlib_output_manifest(target),
             }
         ),

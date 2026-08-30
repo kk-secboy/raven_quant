@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 from governance_fixtures import (
     DATASET_IDENTITY,
+    allow_strategy_new_risk_for_test,
     create_strategy_version,
     enable_recommendation_authority_for_test,
     governed_etf_ready_evidence,
@@ -246,7 +247,10 @@ def _holding(weight: float) -> list[dict]:
     ]
 
 
-def test_corporate_action_full_lifecycle(database_url: str, tmp_path) -> None:
+def test_corporate_action_full_lifecycle(
+    database_url: str, tmp_path, monkeypatch
+) -> None:
+    allow_strategy_new_risk_for_test(monkeypatch)
     store, recommendations, recommendation, simulation, version_id, data_root = _setup(
         database_url, tmp_path
     )

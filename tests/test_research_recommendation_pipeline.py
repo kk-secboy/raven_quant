@@ -14,6 +14,7 @@ from governance_fixtures import (
 from test_promotion_chain import (
     _governed_daily_dataset,
     _qlib_doubles,
+    _record_collector_authority,
     _seed_evidence,
 )
 
@@ -179,6 +180,7 @@ def test_three_horizon_research_to_recommendation_snapshot(
         "_now",
         lambda: datetime(2026, 7, 9, tzinfo=UTC),
     )
+    _record_collector_authority(database_url, version_id, monkeypatch)
     promoted = promotion.promote(
         version_id,
         actor="pipeline-risk-owner",
