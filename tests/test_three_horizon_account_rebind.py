@@ -785,12 +785,12 @@ def test_zero_order_account_decision_survives_restart_and_projects_to_advice(
         tranche_index=1,
         member_budgets={"short": 0.20},
         member_targets={"short": {}},
-        total_capital=1_000_000,
+        total_capital=100_000,
         input_evidence={
             "primary_account": {
                 "portfolio_id": simulation["id"],
                 "source_id": allocation_id,
-                "nav": 1_000_000,
+                "nav": 100_000,
             }
         },
     )

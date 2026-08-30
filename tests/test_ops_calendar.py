@@ -783,6 +783,22 @@ def test_recommendation_refresh_blocked_until_reconciled_then_recovers(
     portfolio = _create_portfolio(database_url, tmp_path)
     _create_gate_schedule(database_url, portfolio["id"])
     engine = SchedulerEngine(settings)
+    # Current-publication factor readiness has its own dependency-gate tests.
+    # Keep this integration test focused on the reconciliation dependency by
+    # presenting an already sealed current-factor binding for each signal day.
+    engine._current_live_signal_bindings = lambda version, **kwargs: (
+        None,
+        {
+            "contract_version": "strategy-challenger-live-binding-v1",
+            "strategy_version_id": str(version["id"]),
+            "dataset_identity_sha256": str(kwargs["dataset_identity_sha256"]),
+            "signal_date": kwargs["signal_date"].isoformat(),
+            "feature_set_id": "test-current-factor-set",
+            "feature_set_definition_sha256": "f" * 64,
+            "materialization_manifest_sha256": "e" * 64,
+            "factors": [],
+        },
+    )
     jobs = JobStore(database_url)
     alerts = AlertStore(database_url)
 

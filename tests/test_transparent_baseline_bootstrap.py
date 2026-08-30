@@ -1366,6 +1366,7 @@ def test_new_lineage_cannot_reopen_overlapping_baseline_oos_without_repair_recei
             }
         )
         bootstrap.pop(TRANSPARENT_BASELINE_RUNNER_FIELD, None)
+        bootstrap.pop(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD, None)
         plan["base_config"] = _normalize_multifactor_contract(
             base,
             factor_count=0,

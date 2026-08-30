@@ -233,6 +233,12 @@ def _bars() -> pd.DataFrame:
     )
 
 
+def _open_bars() -> pd.DataFrame:
+    bars = _bars().copy()
+    bars.loc[:, "datetime"] = "2026-07-13 09:30:00"
+    return bars
+
+
 def _create_batch(
     database_url: str,
     tmp_path,
@@ -482,14 +488,17 @@ def _create_recommendation_batch(
             "policy_version": POLICY_VERSION,
             "backtest_engine_version": QLIB_ENGINE_VERSION,
             "cost_model": snapshot["cost_model"],
-            "cash_weight": 0.999,
+            # Keep this regression comfortably above the A-share minimum-lot
+            # boundary.  The test is about historical immutability after a
+            # real fill, not about the separate zero-lot/NO_ACTION contract.
+            "cash_weight": 0.99,
             "reference_prices": {"SH600000": 10.0},
             "holdings": [
                 {
                     "instrument": "SH600000",
-                    "weight": 0.001,
+                    "weight": 0.01,
                     "previous_weight": 0.0,
-                    "weight_change": 0.001,
+                    "weight_change": 0.01,
                     "action": "increase",
                     "reason": "governed target",
                 }
@@ -687,7 +696,7 @@ def test_later_recommendation_cannot_rewrite_historical_snapshot_orders_fills_or
     }
     completed = store.process_batch(
         batch["id"],
-        minute_bars=_bars(),
+        minute_bars=_open_bars(),
         closing_prices={
             "SH600000": {
                 "price": 10.0,
@@ -1355,6 +1364,23 @@ def test_api_queues_qlib_order_plan_generation_without_client_targets(
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("RUN_EMBEDDED_WORKER", "false")
+    # Current-factor materialization is covered independently.  This API test
+    # isolates server-side order-plan generation and supplies the same sealed
+    # dependency shape the real materializer would return.
+    monkeypatch.setattr(
+        "quant_platform.strategy_feature_drift_source.StrategyFeatureDriftSource."
+        "current_challenger_artifact_binding",
+        lambda _self, version_id, *, current_dataset_identity_sha256, signal_date: {
+            "contract_version": "strategy-challenger-live-binding-v1",
+            "strategy_version_id": version_id,
+            "dataset_identity_sha256": current_dataset_identity_sha256,
+            "signal_date": signal_date.isoformat(),
+            "feature_set_id": "test-current-factor-set",
+            "feature_set_definition_sha256": "f" * 64,
+            "materialization_manifest_sha256": "e" * 64,
+            "factors": [],
+        },
+    )
     with TestClient(create_app(tmp_path)) as client:
         response = client.post(
             f"/api/simulation-portfolios/{simulation['id']}/order-plans",
@@ -1370,6 +1396,9 @@ def test_api_queues_qlib_order_plan_generation_without_client_targets(
     assert response.status_code == 202
     assert response.json()["kind"] == "simulation_order_plan"
     assert response.json()["payload"]["simulation_portfolio_id"] == simulation["id"]
+    assert response.json()["payload"]["factor_materialization_binding"][
+        "signal_date"
+    ] == "2026-07-10"
     assert forbidden.status_code == 422
 
 
