@@ -1309,6 +1309,25 @@ strategy_versions = Table(
         ") ELSE true END) IS TRUE",
         name="ck_strategy_versions_v13_runtime_identity",
     ),
+    CheckConstraint(
+        "(CASE WHEN "
+        "COALESCE(config_json ->> 'recipe_version', '') = "
+        "'qlib-rdagent-single-mainline-2026-08-30-v14' AND "
+        "COALESCE(config_json ->> 'recipe_id', '') IN "
+        "('short_relative_strength','swing_trend','long_quality_value') "
+        "THEN ("
+        "config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_runner_sha256' = "
+        "'31d4c7a294ae61c19edcdb8e014b521c1b544836d6891af36cfba3ecf4ab43a3' "
+        "AND config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_runtime_bundle_sha256' = "
+        "'04f9dce110aaf44d32972c68db3edefafbd08cfdbf1f7dfb98aac9a15409bfe5' "
+        "AND config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_worker_runtime_image_digest' ~ "
+        "'^sha256:[0-9a-f]{64}$'"
+        ") ELSE true END) IS TRUE",
+        name="ck_strategy_versions_v14_runtime_identity",
+    ),
 )
 Index(
     "uq_strategy_versions_number",

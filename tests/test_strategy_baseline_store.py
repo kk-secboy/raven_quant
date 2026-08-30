@@ -29,8 +29,8 @@ from quant_platform.qlib_factor_baseline import (
 from quant_platform.strategy_recipes import get_strategy_recipe
 from quant_platform.strategy_store import StrategyStore
 from quant_platform.transparent_baseline_runner import (
-    FAIL_CLOSED_EXECUTION_TARGET_RUNNER_SHA256,
-    FAIL_CLOSED_EXECUTION_TARGET_RUNTIME_BUNDLE_SHA256,
+    FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256,
+    FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256,
 )
 
 
@@ -317,10 +317,10 @@ def test_swing_family_starts_from_qlib_baseline_before_rdagent_challengers(
     assert len(version["config"]["baseline_definition"]["factors"]) == 6
     runtime = version["config"]["transparent_baseline_bootstrap"]
     assert runtime["target_runner_sha256"] == (
-        FAIL_CLOSED_EXECUTION_TARGET_RUNNER_SHA256
+        FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256
     )
     assert runtime["target_runtime_bundle_sha256"] == (
-        FAIL_CLOSED_EXECUTION_TARGET_RUNTIME_BUNDLE_SHA256
+        FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert runtime["target_worker_runtime_image_digest"] == "sha256:" + "d" * 64
 

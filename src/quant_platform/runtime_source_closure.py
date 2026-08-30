@@ -41,13 +41,14 @@ LOCAL_IMPORT_FRAGMENT_BOUNDARIES: Mapping[str, tuple[str, ...]] = {
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _RUNNER_SEAL_ASSIGNMENT = re.compile(
-    r"(?ms)^((?:POSITION_RISK|FAIL_CLOSED_EXECUTION)_TARGET_"
+    r"(?ms)^((?:POSITION_RISK|FAIL_CLOSED_EXECUTION|FILL_AWARE_HOLDING_AGE)_TARGET_"
     r"(?:RUNNER|RUNTIME_BUNDLE)_SHA256\s*=\s*\(\s*)"
     r'"[0-9a-f]{64}"(\s*\))'
 )
 _DATABASE_RUNTIME_IDENTITY_CONSTRAINTS = (
     "ck_strategy_versions_v12_runtime_identity",
     "ck_strategy_versions_v13_runtime_identity",
+    "ck_strategy_versions_v14_runtime_identity",
 )
 _DYNAMIC_IMPORT_CALLS = frozenset(
     {
@@ -309,7 +310,7 @@ def _normalized_seal_payload(relative: str, source: str) -> bytes:
             lambda match: f'{match.group(1)}"<sealed-at-release>"{match.group(2)}',
             source,
         )
-        if replacements != 4:
+        if replacements != 6:
             raise ValueError("transparent runner seal constants cannot be normalized")
     elif relative == "src/quant_data/database.py":
         for constraint in _DATABASE_RUNTIME_IDENTITY_CONSTRAINTS:

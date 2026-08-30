@@ -145,7 +145,7 @@ def test_fragment_local_dependency_requires_an_explicit_supplement(tmp_path: Pat
     } <= set(closure_paths(manifest))
 
 
-def test_current_v13_closure_covers_execution_research_and_construction() -> None:
+def test_current_v14_closure_covers_execution_research_and_construction() -> None:
     root = Path(__file__).parents[1]
     manifest = position_risk_source_closure_inventory(root)
     paths = set(closure_paths(manifest))
@@ -170,7 +170,7 @@ def test_current_v13_closure_covers_execution_research_and_construction() -> Non
     assert not any(path.startswith(("tests/", "web/")) for path in paths)
 
 
-def test_current_v13_closure_survives_git_archive_and_autocrlf(tmp_path: Path) -> None:
+def test_current_v14_closure_survives_git_archive_and_autocrlf(tmp_path: Path) -> None:
     root = Path(__file__).parents[1]
     manifest = position_risk_source_closure_inventory(root)
     source_paths = {

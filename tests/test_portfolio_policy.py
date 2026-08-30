@@ -969,6 +969,103 @@ def test_qlib_adapter_and_recommendation_call_return_identical_targets(monkeypat
     assert metadata_dates == [pd.Timestamp("2026-07-09")]
 
 
+def test_qlib_adapter_preserves_holding_age_when_an_exit_is_not_filled(
+    monkeypatch,
+) -> None:
+    class WeightStrategyBase:
+        def __init__(self, signal):
+            self.signal = signal
+
+    module = types.ModuleType("qlib.contrib.strategy.signal_strategy")
+    module.WeightStrategyBase = WeightStrategyBase
+    monkeypatch.setitem(sys.modules, "qlib", types.ModuleType("qlib"))
+    monkeypatch.setitem(sys.modules, "qlib.contrib", types.ModuleType("qlib.contrib"))
+    monkeypatch.setitem(
+        sys.modules, "qlib.contrib.strategy", types.ModuleType("qlib.contrib.strategy")
+    )
+    monkeypatch.setitem(sys.modules, "qlib.contrib.strategy.signal_strategy", module)
+
+    from quant_platform.qlib_policy_strategy import create_qlib_policy_strategy
+
+    class Current:
+        def __init__(self, weights: dict[str, float]) -> None:
+            self.weights = weights
+
+        def get_stock_list(self):
+            return list(self.weights)
+
+        def get_stock_weight(self, instrument):
+            return self.weights[instrument]
+
+        def calculate_value(self):
+            return 1_000_000
+
+    class Calendar:
+        def __init__(self) -> None:
+            self.step = 0
+
+        def get_trade_step(self):
+            self.step += 1
+            return self.step
+
+        def get_step_time(self, trade_step, shift=0):
+            assert shift == 1
+            return pd.Timestamp("2026-07-01") + pd.offsets.BDay(trade_step), None
+
+    scores = pd.Series({"SH600000": 1.0})
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=1,
+            n_drop=0,
+            max_position_weight=1.0,
+            max_daily_turnover=1.0,
+            max_holding_sessions=1,
+        )
+    )
+
+    def metadata_provider(_when, instruments):
+        index = pd.Index(instruments, dtype="object")
+        return {
+            "prices": pd.Series(10.0, index=index),
+            "current_prices": pd.Series(10.0, index=index),
+            "average_daily_values": pd.Series(1_000_000_000.0, index=index),
+        }
+
+    strategy = create_qlib_policy_strategy(
+        signal=scores,
+        policy=policy,
+        metadata_provider=metadata_provider,
+    )
+    strategy.trade_calendar = Calendar()
+
+    assert strategy.generate_target_weight_position(
+        scores, Current({}), pd.Timestamp("2026-07-02"), pd.Timestamp("2026-07-02")
+    ) == {"SH600000": 1.0}
+    assert strategy.generate_target_weight_position(
+        scores,
+        Current({"SH600000": 1.0}),
+        pd.Timestamp("2026-07-03"),
+        pd.Timestamp("2026-07-03"),
+    ) == {"SH600000": 1.0}
+    assert strategy.generate_target_weight_position(
+        scores,
+        Current({"SH600000": 1.0}),
+        pd.Timestamp("2026-07-06"),
+        pd.Timestamp("2026-07-06"),
+    ) == {}
+
+    # Simulate the sell being rejected: Qlib still reports the position on the
+    # next session.  The adapter must retain complete age state and retry the
+    # governed exit instead of aborting the whole backtest.
+    assert strategy.generate_target_weight_position(
+        scores,
+        Current({"SH600000": 1.0}),
+        pd.Timestamp("2026-07-07"),
+        pd.Timestamp("2026-07-07"),
+    ) == {}
+    assert strategy._holding_age_sessions == {"SH600000": 3}
+
+
 def test_qlib_t1_floor_keeps_stock_bought_today_but_not_etf() -> None:
     from quant_platform.qlib_policy_strategy import apply_t1_target_floor
 

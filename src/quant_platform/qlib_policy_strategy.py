@@ -102,6 +102,20 @@ def create_qlib_policy_strategy(
                 str(instrument): float(current.get_stock_weight(instrument))
                 for instrument in current.get_stock_list()
             }
+            current_instruments = {
+                instrument for instrument, weight in current_weights.items() if weight > 0
+            }
+            # The policy emits intended target state, while Qlib reports the
+            # actually filled portfolio on the next decision.  A sell can be
+            # rejected by a suspension, price limit, lot rule, or liquidity
+            # control, so an intended exit must not erase the holding age of a
+            # position that is still present in the executor account.  Prune
+            # completed exits here, then retain rejected/partial exits below.
+            self._holding_age_sessions = {
+                instrument: age
+                for instrument, age in self._holding_age_sessions.items()
+                if instrument in current_instruments
+            }
             metadata = (
                 metadata_provider(
                     signal_start_time,
@@ -145,12 +159,21 @@ def create_qlib_policy_strategy(
                 decision.position_state.get("take_profit_stages") or {}
             )
             self._execution_state = dict(decision.position_state.get("execution") or {})
-            self._holding_age_sessions = {
+            next_holding_age_sessions = {
                 str(key): int(value)
                 for key, value in (
                     decision.position_state.get("holding_age_sessions") or {}
                 ).items()
             }
+            for instrument in current_instruments - set(next_holding_age_sessions):
+                # ``policy.decide`` already required complete age evidence for
+                # every actual holding.  Increment the age just as it does for
+                # retained targets so a failed exit remains governed on the
+                # following trading session instead of becoming untracked.
+                next_holding_age_sessions[instrument] = (
+                    int(self._holding_age_sessions[instrument]) + 1
+                )
+            self._holding_age_sessions = next_holding_age_sessions
             self._high_water_mark = peak
             trade_date = trade_start_time.date()
             for instrument in list(self._t1_locked):
