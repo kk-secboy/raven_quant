@@ -384,6 +384,53 @@ def test_governed_signal_cannot_select_an_ineligible_high_score() -> None:
     assert result.index.get_level_values("instrument").tolist() == ["SZ000001"]
 
 
+def test_governed_signal_reuses_latest_prior_eligibility_snapshot() -> None:
+    snapshot_dates = pd.to_datetime(["2025-06-02", "2025-06-04"])
+    score_dates = pd.to_datetime(["2025-06-03", "2025-06-05"])
+    instruments = ["SH600000", "SZ000001"]
+    scores = pd.Series(
+        [2.0, 1.0, 2.0, 1.0],
+        index=pd.MultiIndex.from_product(
+            [score_dates, instruments], names=["datetime", "instrument"]
+        ),
+    )
+    eligibility = pd.DataFrame(
+        [
+            {
+                "datetime": snapshot_dates[0],
+                "instrument": "SH600000",
+                "eligible": False,
+                "contract_version": ELIGIBILITY_CONTRACT_VERSION,
+            },
+            {
+                "datetime": snapshot_dates[0],
+                "instrument": "SZ000001",
+                "eligible": True,
+                "contract_version": ELIGIBILITY_CONTRACT_VERSION,
+            },
+            {
+                "datetime": snapshot_dates[1],
+                "instrument": "SH600000",
+                "eligible": True,
+                "contract_version": ELIGIBILITY_CONTRACT_VERSION,
+            },
+            {
+                "datetime": snapshot_dates[1],
+                "instrument": "SZ000001",
+                "eligible": False,
+                "contract_version": ELIGIBILITY_CONTRACT_VERSION,
+            },
+        ]
+    )
+
+    result = build_governed_signal(scores, topk=1, eligibility_matrix=eligibility)
+
+    assert result.index.tolist() == [
+        (score_dates[0], "SZ000001"),
+        (score_dates[1], "SH600000"),
+    ]
+
+
 def test_governed_signal_skips_an_empty_eligible_day_before_later_candidates() -> None:
     dates = pd.to_datetime(["2025-06-02", "2025-06-03"])
     instruments = ["SH600000", "SZ000001"]

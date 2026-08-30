@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -36,6 +37,18 @@ from quant_platform.runtime_secret_store import RuntimeSecretStore
 from quant_platform.schedule_store import ScheduleStore
 from quant_platform.scheduler import AUTOMATED_DATA_BUNDLES
 from quant_platform.services import refresh_qlib_display_catalog
+from quant_platform.strategy_recipes import get_strategy_recipe
+from quant_platform.transparent_baseline_lockbox import (
+    LOCKBOX_CONFIG_KEY,
+    build_joint_lockbox,
+    build_unopened_history_selection,
+)
+from quant_platform.transparent_baseline_runner import (
+    TRANSPARENT_BASELINE_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
+    target_runner_for_recipe,
+    target_runtime_bundle_for_recipe,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -205,6 +218,148 @@ def test_horizon_readiness_requires_fresh_health_for_paper_and_recommendation() 
     assert stale["candidates"][0]["blocking_reasons"] == [
         "strategy_health_evidence_stale"
     ]
+
+
+def _cash_only_lockbox_rows() -> tuple[list[dict], dict]:
+    recipe_ids = ("short_relative_strength", "swing_trend")
+    members: list[dict[str, str]] = []
+    for recipe_id in recipe_ids:
+        recipe = get_strategy_recipe(recipe_id)
+        member = {
+            "recipe_id": recipe_id,
+            "recipe_version": str(recipe["version"]),
+            "recipe_sha256": readiness_module.canonical_sha256(recipe),
+            "horizon_profile": str(recipe["horizon"]),
+            "base_config_sha256": readiness_module.canonical_sha256(
+                {"recipe_id": recipe_id}
+            ),
+            "baseline_definition_sha256": readiness_module.canonical_sha256(
+                {"baseline": recipe_id}
+            ),
+            "research_window_contract_sha256": readiness_module.canonical_sha256(
+                {"window": recipe_id}
+            ),
+            "historical_start": "2016-01-04",
+            "historical_end": "2020-12-31",
+            "test_start": "2021-01-04",
+            "test_end": "2023-12-29",
+        }
+        runner = target_runner_for_recipe(recipe_id, str(recipe["version"]))
+        if runner is not None:
+            member[TRANSPARENT_BASELINE_RUNNER_FIELD] = runner
+        runtime_bundle = target_runtime_bundle_for_recipe(
+            recipe_id, str(recipe["version"])
+        )
+        if runtime_bundle is not None:
+            member[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = runtime_bundle
+        members.append(member)
+    version = str(get_strategy_recipe("short_relative_strength")["version"])
+    selection = build_unopened_history_selection(
+        calendar_days=["2016-01-04", "2026-08-28"],
+        current_recipe_version=version,
+        prior_batches=[],
+    )
+    evidence = {
+        "capital_evaluation_eligible": False,
+        "capital_evaluation_unavailable_reason": (
+            "insufficient_unopened_sessions_for_sealed_long_oos"
+        ),
+    }
+    unavailable = {
+        "recipe_id": "long_quality_value",
+        "horizon_profile": "long_1_3y",
+        "status": "unavailable",
+        "reason": "the sealed long OOS window is unavailable",
+        "evidence": evidence,
+        "evidence_sha256": readiness_module.canonical_sha256(evidence),
+    }
+    lockbox = build_joint_lockbox(
+        dataset="daily-v12",
+        dataset_identity_sha256="a" * 64,
+        dataset_lineage_id="b" * 64,
+        members=members,
+        unopened_history_selection=selection,
+        unavailable_horizons=[unavailable],
+    )
+    rows = [
+        {
+            "horizon_profile": member["horizon_profile"],
+            "created_by": "system:transparent-baseline-bootstrap",
+            "config_json": {
+                "recipe_id": member["recipe_id"],
+                "recipe_version": member["recipe_version"],
+                "horizon_profile": member["horizon_profile"],
+                LOCKBOX_CONFIG_KEY: lockbox,
+            },
+        }
+        for member in members
+    ]
+    return rows, lockbox
+
+
+@pytest.mark.no_database
+def test_readiness_accepts_only_sealed_unavailable_horizon_as_cash_only() -> None:
+    rows, lockbox = _cash_only_lockbox_rows()
+
+    lanes = readiness_module._validated_cash_only_horizon_lanes(rows)
+
+    assert set(lanes) == {"long_1_3y"}
+    long_lane = lanes["long_1_3y"]
+    assert long_lane["status"] == "ok"
+    assert long_lane["stage"] == "cash_only"
+    assert long_lane["sleeve_action"] == "remain_in_cash"
+    assert long_lane["new_entries_allowed"] is False
+    assert long_lane["recommendation_eligible"] is False
+    assert long_lane["lockbox_evidence"]["batch_sha256"] == lockbox["batch_sha256"]
+
+
+@pytest.mark.no_database
+def test_cash_only_readiness_fails_closed_without_current_valid_lockbox() -> None:
+    rows, _ = _cash_only_lockbox_rows()
+    tampered = deepcopy(rows)
+    for row in tampered:
+        row["config_json"][LOCKBOX_CONFIG_KEY]["unavailable_horizons"][0][
+            "reason"
+        ] = "runtime failed"
+
+    # A malformed newest batch cannot fall back to an older valid lockbox.
+    assert readiness_module._validated_cash_only_horizon_lanes([*tampered, *rows]) == {}
+    newest_without_lockbox = {
+        "horizon_profile": "short_1_5d",
+        "created_by": "system:transparent-baseline-bootstrap",
+        "config_json": {
+            "recipe_id": "short_relative_strength",
+            "recipe_version": get_strategy_recipe("short_relative_strength")[
+                "version"
+            ],
+            "horizon_profile": "short_1_5d",
+        },
+    }
+    assert readiness_module._validated_cash_only_horizon_lanes(
+        [newest_without_lockbox, *rows]
+    ) == {}
+    untrusted = deepcopy(rows)
+    for row in untrusted:
+        row["created_by"] = "admin"
+    assert readiness_module._validated_cash_only_horizon_lanes(untrusted) == {}
+    assert readiness_module._validated_cash_only_horizon_lanes(
+        [
+            {
+                "horizon_profile": "long_1_3y",
+                "created_by": "system:transparent-baseline-bootstrap",
+                "config_json": {
+                    "recipe_id": "long_quality_value",
+                    "recipe_version": get_strategy_recipe("long_quality_value")[
+                        "version"
+                    ],
+                    "horizon_profile": "long_1_3y",
+                    "last_error": "ordinary strategy failure",
+                },
+            }
+        ]
+    ) == {}
+    missing = readiness_module._assess_horizon_candidates("long_1_3y", [])
+    assert missing["status"] == "blocked"
 
 
 def _settings(monkeypatch, database_url: str, data_root: Path, *, auth_mode: str) -> Settings:

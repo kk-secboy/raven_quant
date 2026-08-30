@@ -38,6 +38,7 @@ from quant_platform.transparent_baseline_bootstrap import (
     TransparentBaselineBootstrapService,
     _feature_set,
     _plan_member,
+    _require_native_formal_oos,
     _select_dataset,
 )
 from quant_platform.transparent_baseline_lockbox import (
@@ -165,6 +166,11 @@ def _research_dataset(
             "version": "qlib-field-year-source-coverage-v1",
             "evidence_status": "complete",
             "fields": coverage,
+        },
+        "execution_controls": {
+            "formal_execution_requires_native_controls": True,
+            "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+            "native_complete_from": calendar[0],
         },
     }
     return {
@@ -1109,16 +1115,67 @@ def test_latest_ready_dataset_does_not_fall_back_when_its_seal_is_broken(
                     "ready": True,
                     "frequency": "day",
                     "end_date": "2026-08-27",
+                    "provenance": {
+                        "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+                    },
                 },
                 {
                     "name": "latest-broken",
                     "ready": True,
                     "frequency": "day",
                     "end_date": "2026-08-28",
+                    "provenance": {
+                        "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+                    },
                 },
             ],
             anchored_name=None,
         )
+
+
+@pytest.mark.no_database
+def test_current_recipe_does_not_fall_back_from_newer_legacy_daily_contract(
+    monkeypatch,
+) -> None:
+    from quant_platform import transparent_baseline_bootstrap as module
+
+    selected: list[str] = []
+
+    def validate(dataset: dict) -> dict:
+        selected.append(str(dataset["name"]))
+        if (
+            dataset["provenance"]["field_contract_version"]
+            != DAILY_QLIB_FIELD_CONTRACT_VERSION
+        ):
+            raise ValueError(
+                "current transparent baselines require the fail-closed daily Qlib "
+                "field contract; rebuild the dataset"
+            )
+        return dataset
+
+    monkeypatch.setattr(module, "_validate_dataset", validate)
+    current = {
+        "name": "cn-current-v6",
+        "ready": True,
+        "frequency": "day",
+        "end_date": "2026-08-28",
+        "provenance": {
+            "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+        },
+    }
+    legacy = {
+        "name": "zz-newer-name-but-v5",
+        "ready": True,
+        "frequency": "day",
+        "end_date": "2026-08-28",
+        "provenance": {
+            "field_contract_version": "daily-qlib-field-v5-governed-domestic-etf",
+        },
+    }
+
+    with pytest.raises(ValueError, match="current transparent baselines require"):
+        _select_dataset([current, legacy], anchored_name=None)
+    assert selected == [legacy["name"]]
 
 
 @pytest.mark.no_database
@@ -2427,6 +2484,232 @@ def test_partial_v12_lockbox_preregisters_short_swing_and_seals_long_cash(
             unopened_history_selection=selection,
             unavailable_horizons=[falsely_unavailable],
         )
+
+
+@pytest.mark.no_database
+def test_swing_oos_is_unavailable_when_native_price_limits_leave_fewer_than_504_sessions(
+    tmp_path: Path,
+) -> None:
+    calendar = _calendar()
+    dataset = _research_dataset(calendar, path=tmp_path / "native-limit-boundary")
+    selection = build_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version=get_strategy_recipe("swing_trend")["version"],
+        prior_batches=[],
+    )
+    planning_dataset = {
+        **dataset,
+        "source_calendar": calendar,
+        "calendar": calendar,
+        "unopened_history_selection": selection,
+    }
+    unrestricted = _plan_member(
+        recipe_id="swing_trend",
+        dataset=planning_dataset,
+    )
+    original_start = str(unrestricted["formal_periods"]["start"])
+    original_start_index = calendar.index(original_start)
+    first_native_session = calendar[original_start_index + 10]
+    planning_dataset["provenance"]["execution_controls"][
+        "native_complete_from"
+    ] = first_native_session
+
+    with pytest.raises(ResearchWindowUnavailableError) as captured:
+        _plan_member(recipe_id="swing_trend", dataset=planning_dataset)
+
+    evidence = captured.value.evidence
+    assert evidence["capital_evaluation_eligible"] is False
+    assert evidence["capital_evaluation_unavailable_reason"] == (
+        "insufficient_native_execution_controlled_sessions_before_immutable_cutoff"
+    )
+    assert evidence["rejected_test_start"] == original_start
+    assert evidence["proposed_test_start"] == first_native_session
+    assert evidence["required_sealed_oos_sessions"] == 504
+    assert evidence["available_native_controlled_oos_sessions"] == 494
+
+
+@pytest.mark.no_database
+def test_native_price_limit_boundary_uses_complete_remaining_oos_when_available(
+    tmp_path: Path,
+) -> None:
+    calendar = _calendar()
+    dataset = _research_dataset(calendar, path=tmp_path / "native-limit-shift")
+    dataset["provenance"]["field_contract_version"] = (
+        "daily-qlib-field-v5-governed-domestic-etf"
+    )
+    boundary = calendar[1010]
+    maturity_cutoff = calendar[1600]
+    dataset["provenance"]["execution_controls"]["native_complete_from"] = boundary
+    periods = {
+        "train_start": calendar[0],
+        "train_end": calendar[700],
+        "valid_start": calendar[800],
+        "valid_end": calendar[999],
+        "test_start": calendar[1000],
+        "test_end": maturity_cutoff,
+    }
+    evidence = {
+        "latest_mature_label_sessions": {
+            "21": calendar[1705],
+            "63": calendar[1663],
+            "126": maturity_cutoff,
+        }
+    }
+
+    adjusted = _require_native_formal_oos(
+        dataset=dataset,
+        periods=periods,
+        evidence=evidence,
+        horizon_profile="swing_1_6m",
+    )
+
+    assert adjusted["test_start"] == boundary
+    assert adjusted["test_end"] == maturity_cutoff
+    assert sum(
+        adjusted["test_start"] <= day <= adjusted["test_end"]
+        for day in calendar
+    ) >= 504
+    assert adjusted == _require_native_formal_oos(
+        dataset=dataset,
+        periods=periods,
+        evidence=evidence,
+        horizon_profile="swing_1_6m",
+    )
+
+
+@pytest.mark.no_database
+def test_plan_member_rebinds_shifted_native_control_oos_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quant_platform import transparent_baseline_bootstrap as module
+
+    calendar = _calendar()
+    dataset = _research_dataset(calendar, path=tmp_path / "native-limit-plan-shift")
+    selection = build_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version=get_strategy_recipe("swing_trend")["version"],
+        prior_batches=[],
+    )
+    planning_dataset = {
+        **dataset,
+        "source_calendar": calendar,
+        "calendar": calendar,
+        "unopened_history_selection": selection,
+    }
+    recipe = get_strategy_recipe("swing_trend")
+    feature_set = _feature_set(recipe)
+    resolved, evidence = module.resolve_research_window_contract(
+        dict(planning_dataset),
+        calendar,
+        horizon_profile="swing_1_6m",
+        feature_set=feature_set,
+        universe=str(recipe["universe"]),
+    )
+    native_start = str(resolved["test_start"])
+    fake_periods = {
+        **resolved,
+        "test_start": calendar[calendar.index(native_start) - 10],
+    }
+    original_contract = evidence["research_window_contract"]
+    effective_calendar = [
+        day
+        for day in calendar
+        if original_contract["calendar_start"]
+        <= day
+        <= original_contract["calendar_end"]
+    ]
+    fake_contract = module.build_research_window_contract(
+        dataset=planning_dataset,
+        calendar_days=effective_calendar,
+        periods=fake_periods,
+        period_resolution=evidence,
+        horizon_profile="swing_1_6m",
+        feature_set=feature_set,
+        universe=str(recipe["universe"]),
+    )
+    fake_evidence = {
+        **evidence,
+        "final_test_trading_days": fake_contract.sealed_oos_sessions,
+        "research_window_contract": fake_contract.to_dict(),
+        "research_window_contract_sha256": fake_contract.sha256,
+    }
+    planning_dataset["provenance"]["field_contract_version"] = (
+        "daily-qlib-field-v5-governed-domestic-etf"
+    )
+    planning_dataset["provenance"]["execution_controls"][
+        "native_complete_from"
+    ] = native_start
+    monkeypatch.setattr(
+        module,
+        "resolve_research_window_contract",
+        lambda *_args, **_kwargs: (fake_periods, fake_evidence),
+    )
+
+    plan = _plan_member(recipe_id="swing_trend", dataset=planning_dataset)
+
+    assert plan["periods"]["test_start"] == native_start
+    assert plan["periods"]["test_end"] == resolved["test_end"]
+    rebound = plan["base_config"][BOOTSTRAP_CONFIG_KEY]["research_window_contract"]
+    assert rebound["periods"] == plan["periods"]
+    assert rebound["sealed_oos_sessions"] == 504
+    assert plan["research_window_contract_sha256"] == canonical_sha256(rebound)
+
+
+def test_reconcile_starts_short_and_marks_native_control_ineligible_horizons_unavailable(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quant_platform import transparent_baseline_bootstrap as module
+
+    calendar = _calendar()
+    dataset = _research_dataset(calendar, path=tmp_path / "native-limit-reconcile")
+    selection = build_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version=get_strategy_recipe("swing_trend")["version"],
+        prior_batches=[],
+    )
+    planning_dataset = {
+        **dataset,
+        "source_calendar": calendar,
+        "calendar": calendar,
+        "unopened_history_selection": selection,
+    }
+    short = _plan_member(
+        recipe_id="short_relative_strength",
+        dataset=planning_dataset,
+    )
+    swing = _plan_member(recipe_id="swing_trend", dataset=planning_dataset)
+    boundary_index = calendar.index(str(swing["formal_periods"]["start"])) + 10
+    boundary = calendar[boundary_index]
+    assert boundary < str(short["formal_periods"]["start"])
+    dataset["provenance"]["execution_controls"]["native_complete_from"] = boundary
+
+    monkeypatch.setattr(module, "_validate_dataset", lambda value: dict(value))
+    service = TransparentBaselineBootstrapService(
+        database_url=database_url,
+        data_root=tmp_path,
+        dataset_loader=lambda _root: [dataset],
+    )
+    result = service.reconcile(actor="test-native-limit-boundary")
+
+    assert result["status"] == "pending"
+    members = {str(item["horizon_profile"]): item for item in result["members"]}
+    assert members["short_1_5d"]["state"] == "formal_backtest_pending"
+    for horizon in ("swing_1_6m", "long_1_3y"):
+        assert members[horizon]["state"] == "unavailable"
+        assert members[horizon]["sleeve_action"] == "remain_in_cash"
+        assert members[horizon]["unavailable_evidence"][
+            "capital_evaluation_unavailable_reason"
+        ] == (
+            "insufficient_native_execution_controlled_sessions_before_immutable_cutoff"
+        )
+    assert len(result["joint_lockbox"]["members"]) == 1
+    assert len(result["joint_lockbox"]["unavailable_horizons"]) == 2
+    with open_database(database_url).connect() as connection:
+        assert connection.scalar(select(func.count()).select_from(oos_vintages)) == 1
+        assert connection.scalar(select(func.count()).select_from(strategy_versions)) == 1
 
 
 def test_v12_reconcile_starts_available_horizons_and_keeps_long_sleeve_cash(

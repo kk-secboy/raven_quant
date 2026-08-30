@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,12 @@ from .runtime_secret_store import RuntimeSecretStore
 from .schedule_store import ACTIVE_SCHEDULE_KINDS
 from .scheduler import AUTOMATED_DATA_BUNDLES
 from .services import list_qlib_datasets_for_display
+from .strategy_recipes import TRANSPARENT_RESEARCH_BASELINE_IDS, get_strategy_recipe
+from .transparent_baseline_lockbox import (
+    LOCKBOX_CONFIG_KEY,
+    LOCKBOX_CONTRACT_VERSION_V3,
+    validate_joint_lockbox,
+)
 
 RESEARCH_LONGEST_VALIDATION_TRADING_DAYS = max(
     int(profile["validation_trading_days"])
@@ -85,6 +92,7 @@ _NON_BLOCKING_RECOMMENDATION_HEALTH = frozenset({"healthy", "watch"})
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _DAILY_CLOSE = time(15, 0)
 _STRATEGY_HEALTH_COLLECTOR_ACTOR = "system:strategy-health-collector"
+_TRANSPARENT_BASELINE_BOOTSTRAP_ACTOR = "system:transparent-baseline-bootstrap"
 
 
 def _latest_closed_trading_day(
@@ -417,6 +425,130 @@ def _assess_horizon_candidates(
         ),
         "candidates": evaluated,
     }
+
+
+def _validated_cash_only_horizon_lanes(
+    rows: Sequence[Any],
+) -> dict[str, dict[str, Any]]:
+    """Project unavailable horizons from the current governed lockbox.
+
+    ``rows`` must be ordered newest-first.  A cash-only lane is deliberately
+    narrower than a strategy lane: it is accepted only from the current recipe
+    version's fully validated v3 joint lockbox.  Runtime failures, missing
+    versions and free-form error strings never enter this projection.
+    """
+
+    current_recipe_versions = {
+        recipe_id: str(get_strategy_recipe(recipe_id)["version"])
+        for recipe_id in TRANSPARENT_RESEARCH_BASELINE_IDS
+    }
+    current_rows: list[tuple[dict[str, Any], Any]] = []
+    for raw_row in rows:
+        row = raw_row._mapping if hasattr(raw_row, "_mapping") else raw_row
+        if not isinstance(row, Mapping):
+            continue
+        values = dict(row)
+        config = values.get("config_json")
+        if not isinstance(config, Mapping):
+            continue
+        recipe_id = str(config.get("recipe_id") or "")
+        if (
+            recipe_id not in current_recipe_versions
+            or str(config.get("recipe_version") or "")
+            != current_recipe_versions[recipe_id]
+        ):
+            continue
+        if values.get("created_by") != _TRANSPARENT_BASELINE_BOOTSTRAP_ACTOR:
+            continue
+        current_rows.append((values, config.get(LOCKBOX_CONFIG_KEY)))
+    if not current_rows:
+        return {}
+
+    # The newest current-recipe row defines the current batch.  If that batch
+    # is malformed, fail closed instead of falling back to an older lockbox.
+    newest_lockbox = current_rows[0][1]
+    if not isinstance(newest_lockbox, Mapping):
+        return {}
+    current_batch_sha256 = str(newest_lockbox.get("batch_sha256") or "")
+    if len(current_batch_sha256) != 64:
+        return {}
+    batch_rows = [
+        (row, raw_lockbox)
+        for row, raw_lockbox in current_rows
+        if isinstance(raw_lockbox, Mapping)
+        and str(raw_lockbox.get("batch_sha256") or "") == current_batch_sha256
+    ]
+    try:
+        validated = [validate_joint_lockbox(raw) for _, raw in batch_rows]
+    except (TypeError, ValueError):
+        return {}
+    if not validated or any(item != validated[0] for item in validated[1:]):
+        return {}
+    lockbox = validated[0]
+    if lockbox.get("contract_version") != LOCKBOX_CONTRACT_VERSION_V3:
+        return {}
+    selection = lockbox.get("unopened_history_selection")
+    current_versions = set(current_recipe_versions.values())
+    if (
+        not isinstance(selection, Mapping)
+        or len(current_versions) != 1
+        or str(selection.get("current_recipe_version") or "")
+        != next(iter(current_versions))
+    ):
+        return {}
+
+    declared_members = {
+        (
+            str(member["recipe_id"]),
+            str(member["recipe_version"]),
+            str(member["horizon_profile"]),
+        )
+        for member in lockbox["members"]
+    }
+    observed_members: set[tuple[str, str, str]] = set()
+    for row, _ in batch_rows:
+        config = row["config_json"]
+        recipe_id = str(config.get("recipe_id") or "")
+        member = (
+            recipe_id,
+            str(config.get("recipe_version") or ""),
+            str(config.get("horizon_profile") or ""),
+        )
+        if (
+            member in declared_members
+            and str(row.get("horizon_profile") or member[2]) == member[2]
+        ):
+            observed_members.add(member)
+    if observed_members != declared_members:
+        return {}
+
+    lanes: dict[str, dict[str, Any]] = {}
+    for item in lockbox.get("unavailable_horizons") or []:
+        horizon = str(item["horizon_profile"])
+        lanes[horizon] = {
+            "horizon": horizon,
+            "status": "ok",
+            "stage": "cash_only",
+            "strategy_version_id": None,
+            "health_status": "not_applicable",
+            "runner": "cash_only_no_orders",
+            "message": (
+                "horizon is sealed unavailable and its sleeve remains in cash"
+            ),
+            "candidates": [],
+            "cash_only": True,
+            "sleeve_action": "remain_in_cash",
+            "new_entries_allowed": False,
+            "recommendation_eligible": False,
+            "lockbox_evidence": {
+                "batch_sha256": lockbox["batch_sha256"],
+                "recipe_id": item["recipe_id"],
+                "status": item["status"],
+                "reason": item["reason"],
+                "evidence_sha256": item["evidence_sha256"],
+            },
+        }
+    return lanes
 
 
 def _is_governed_incremental_sync(row: Any) -> bool:
@@ -755,6 +887,28 @@ class DeploymentReadinessStore:
             horizon: [] for horizon in _PRODUCT_HORIZONS
         }
         with self.engine.connect() as connection:
+            lockbox_rows = connection.execute(
+                select(
+                    strategy_versions.c.id,
+                    strategy_versions.c.status,
+                    strategy_versions.c.horizon_profile,
+                    strategy_versions.c.config_json,
+                    strategy_versions.c.created_by,
+                    strategy_versions.c.created_at,
+                )
+                .where(
+                    strategy_versions.c.is_legacy.is_(False),
+                    strategy_versions.c.created_by
+                    == _TRANSPARENT_BASELINE_BOOTSTRAP_ACTOR,
+                    strategy_versions.c.config_json["recipe_id"]
+                    .as_string()
+                    .in_(TRANSPARENT_RESEARCH_BASELINE_IDS),
+                )
+                .order_by(
+                    strategy_versions.c.created_at.desc(),
+                    strategy_versions.c.id.desc(),
+                )
+            ).all()
             versions = connection.execute(
                 select(
                     strategy_versions.c.id,
@@ -920,18 +1074,25 @@ class DeploymentReadinessStore:
             horizon: _assess_horizon_candidates(horizon, candidates[horizon])
             for horizon in _PRODUCT_HORIZONS
         }
+        cash_only_lanes = _validated_cash_only_horizon_lanes(lockbox_rows)
+        applied_cash_only_horizons: list[str] = []
+        for horizon, cash_lane in cash_only_lanes.items():
+            if horizon in lanes and lanes[horizon]["status"] != "ok":
+                lanes[horizon] = cash_lane
+                applied_cash_only_horizons.append(horizon)
         missing_or_blocked = [
             horizon for horizon, lane in lanes.items() if lane["status"] != "ok"
         ]
         return {
             "status": "ok" if not missing_or_blocked else "blocked",
             "message": (
-                "all three product horizons have an operable production lane"
+                "all product horizons have an operable or sealed cash-only lane"
                 if not missing_or_blocked
-                else "one or more product horizons have no operable production lane"
+                else "one or more product horizons have no operable or sealed cash-only lane"
             ),
             "required_horizons": list(_PRODUCT_HORIZONS),
             "blocked_horizons": missing_or_blocked,
+            "cash_only_horizons": sorted(applied_cash_only_horizons),
             "horizons": lanes,
         }
 

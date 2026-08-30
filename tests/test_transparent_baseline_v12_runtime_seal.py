@@ -7,10 +7,6 @@ import pytest
 import yaml
 
 from quant_data.database import strategy_versions
-from quant_platform.runtime_source_closure import (
-    closure_paths,
-    position_risk_source_closure_inventory,
-)
 from quant_platform.strategy_recipes import RECIPE_VERSION
 from quant_platform.strategy_store import _transparent_worker_runtime_failures
 from quant_platform.transparent_baseline_runner import (
@@ -23,7 +19,6 @@ from quant_platform.transparent_baseline_runner import (
     TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
-    position_risk_bundle_sha256,
     target_runner_for_recipe,
     target_runtime_bundle_for_recipe,
 )
@@ -45,28 +40,31 @@ def _migration_module():
     return module
 
 
-def test_v12_recipe_uses_the_new_sealed_runner_and_runtime_bundle() -> None:
-    root = Path(__file__).parents[1]
-    assert RECIPE_VERSION == POSITION_RISK_TARGET_RECIPE_VERSION
+def test_v12_recipe_identity_remains_immutable_history() -> None:
+    assert RECIPE_VERSION != POSITION_RISK_TARGET_RECIPE_VERSION
     for recipe_id in (
         "short_relative_strength",
         "swing_trend",
         "long_quality_value",
     ):
-        assert target_runner_for_recipe(recipe_id, RECIPE_VERSION) == (
+        assert target_runner_for_recipe(
+            recipe_id, POSITION_RISK_TARGET_RECIPE_VERSION
+        ) == (
             POSITION_RISK_TARGET_RUNNER_SHA256
         )
-        assert target_runtime_bundle_for_recipe(recipe_id, RECIPE_VERSION) == (
+        assert target_runtime_bundle_for_recipe(
+            recipe_id, POSITION_RISK_TARGET_RECIPE_VERSION
+        ) == (
             POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
         )
-    assert {
-        "src/quant_data/qlib_builder.py",
-        "src/quant_platform/eligibility.py",
-        "src/quant_platform/discrete_constraints.py",
-        "src/quant_platform/horizon_review.py",
-    } <= set(closure_paths(position_risk_source_closure_inventory(root)))
-    assert position_risk_bundle_sha256(root) == (
-        POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
+    assert POSITION_RISK_TARGET_RECIPE_VERSION == (
+        "qlib-rdagent-single-mainline-2026-08-30-v12"
+    )
+    assert POSITION_RISK_TARGET_RUNNER_SHA256 == (
+        "31d4c7a294ae61c19edcdb8e014b521c1b544836d6891af36cfba3ecf4ab43a3"
+    )
+    assert POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256 == (
+        "6366bd2b77c1c60ea4069afde43d5335c1e362c18acf2955f13902e7ba9ccbc6"
     )
 
 

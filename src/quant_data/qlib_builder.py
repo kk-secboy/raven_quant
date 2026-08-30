@@ -31,6 +31,8 @@ from .availability import (
     recoverability_level,
 )
 from .execution_contract import (
+    DAILY_MISSING_EXECUTION_CONTROL_POLICY,
+    DAILY_PAUSED_FIELD_UNIT,
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
     INDEX_VOLUME_POLICY,
     QLIB_DAILY_AMOUNT_UNIT,
@@ -291,7 +293,7 @@ _DAILY_FIELD_UNITS = {
     "factor": "adj_factor_div_base_price",
     "change": "decimal_return",
     "amount": "cny_yuan",
-    "paused": "flag_1_when_no_volume",
+    "paused": DAILY_PAUSED_FIELD_UNIT,
     "up_limit": "snapshot_anchor_normalized_price",
     "down_limit": "snapshot_anchor_normalized_price",
 }
@@ -884,7 +886,9 @@ class QlibBuilder:
             if field in {"up_limit", "down_limit"}:
                 sources: list[str] = []
                 if not native_controls_from or first < native_controls_from:
-                    sources.append("derived-unrestricted-execution-sentinel")
+                    sources.append(
+                        "derived-unrestricted-research-sentinel-formal-paused-block"
+                    )
                 if native_controls_from and last >= native_controls_from:
                     sources.append(f"{primary_source}:stk_limit")
                 if etf_rows:
@@ -1216,7 +1220,10 @@ class QlibBuilder:
                 "first_missing_date": None,
                 "last_missing_date": None,
                 "native_complete_from": None,
-                "missing_row_policy": "research_only_unrestricted_sentinel",
+                "missing_row_policy": DAILY_MISSING_EXECUTION_CONTROL_POLICY,
+                "missing_row_formal_action": "block_buy_and_sell",
+                "missing_row_block_field": "paused",
+                "formal_blocked_rows": 0,
                 "formal_execution_requires_native_controls": True,
             }
             self._execution_control_coverage_cache = result
@@ -1261,13 +1268,13 @@ class QlibBuilder:
                 summary AS (
                     SELECT
                         count(*) FILTER (
-                            WHERE up_limit IS NULL AND down_limit IS NULL
+                            WHERE up_limit IS NULL OR down_limit IS NULL
                         ) AS missing_rows,
                         min(trade_date) FILTER (
-                            WHERE up_limit IS NULL AND down_limit IS NULL
+                            WHERE up_limit IS NULL OR down_limit IS NULL
                         ) AS first_missing_date,
                         max(trade_date) FILTER (
-                            WHERE up_limit IS NULL AND down_limit IS NULL
+                            WHERE up_limit IS NULL OR down_limit IS NULL
                         ) AS last_missing_date,
                         count(*) AS total_rows,
                         min(trade_date) AS first_trade_date
@@ -1313,7 +1320,10 @@ class QlibBuilder:
             "native_complete_from": (
                 str(native_complete_from) if native_complete_from is not None else None
             ),
-            "missing_row_policy": "research_only_unrestricted_sentinel",
+            "missing_row_policy": DAILY_MISSING_EXECUTION_CONTROL_POLICY,
+            "missing_row_formal_action": "block_buy_and_sell",
+            "missing_row_block_field": "paused",
+            "formal_blocked_rows": missing_rows,
             "formal_execution_requires_native_controls": True,
         }
         self._execution_control_coverage_cache = result
@@ -3442,7 +3452,11 @@ class QlibBuilder:
                     d.pct_chg,
                     {source_adjustment_factor} AS adj_factor,
                     coalesce(l.up_limit, {_UNRESTRICTED_UP_LIMIT}) AS up_limit,
-                    coalesce(l.down_limit, 0.0) AS down_limit
+                    coalesce(l.down_limit, 0.0) AS down_limit,
+                    CASE
+                        WHEN l.up_limit IS NULL OR l.down_limit IS NULL THEN 1.0
+                        ELSE 0.0
+                    END AS execution_control_missing
                     {joined_daily_select}
                     {joined_fundamental_select}
                     {capital_flow_select}
@@ -3482,7 +3496,10 @@ class QlibBuilder:
                 pct_chg / 100.0 AS change,
                 -- Tushare amount is thousand-CNY; the Qlib field contract is CNY yuan
                 amount * 1000.0 AS amount,
-                CASE WHEN vol IS NULL OR vol <= 0 THEN 1.0 ELSE 0.0 END AS paused
+                CASE
+                    WHEN vol IS NULL OR vol <= 0 OR execution_control_missing > 0
+                    THEN 1.0 ELSE 0.0
+                END AS paused
                 , up_limit * adj_factor / base_price AS up_limit
                 , down_limit * adj_factor / base_price AS down_limit
                 {''.join(f', {field}' for field in daily_features)}

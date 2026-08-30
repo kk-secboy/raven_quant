@@ -59,6 +59,15 @@ POSITION_RISK_TARGET_RUNNER_SHA256 = (
 POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256 = (
     "6366bd2b77c1c60ea4069afde43d5335c1e362c18acf2955f13902e7ba9ccbc6"
 )
+FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION = (
+    "qlib-rdagent-single-mainline-2026-08-30-v13"
+)
+FAIL_CLOSED_EXECUTION_TARGET_RUNNER_SHA256 = (
+    "31d4c7a294ae61c19edcdb8e014b521c1b544836d6891af36cfba3ecf4ab43a3"
+)
+FAIL_CLOSED_EXECUTION_TARGET_RUNTIME_BUNDLE_SHA256 = (
+    "3000d84d183fe589da13d01902f88b1da1d402f47e18e4aafe91831cc59bdd8f"
+)
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"
 TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD = "target_runtime_bundle_sha256"
@@ -89,6 +98,9 @@ _TARGET_RUNNERS = {
     RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION: RUNTIME_ALIGNMENT_TARGET_RUNNER_SHA256,
     RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION: RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256,
     POSITION_RISK_TARGET_RECIPE_VERSION: POSITION_RISK_TARGET_RUNNER_SHA256,
+    FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION: (
+        FAIL_CLOSED_EXECUTION_TARGET_RUNNER_SHA256
+    ),
 }
 
 
@@ -128,7 +140,7 @@ def runtime_alignment_bundle_sha256(project_root: Path) -> str:
 
 
 def position_risk_bundle_sha256(project_root: Path) -> str:
-    """Hash the fail-closed local Python source closure for material v12."""
+    """Hash the fail-closed local Python closure for the current material runtime."""
 
     return position_risk_source_closure_sha256(project_root)
 
@@ -148,6 +160,8 @@ def target_runtime_bundle_for_recipe(recipe_id: Any, recipe_version: Any) -> str
         return RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256
     if str(recipe_version or "") == POSITION_RISK_TARGET_RECIPE_VERSION:
         return POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256
+    if str(recipe_version or "") == FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION:
+        return FAIL_CLOSED_EXECUTION_TARGET_RUNTIME_BUNDLE_SHA256
     return None
 
 
@@ -155,22 +169,30 @@ def target_worker_runtime_image_for_recipe(
     recipe_id: Any,
     recipe_version: Any,
 ) -> str | None:
-    """Return the exact release-built worker image required by material v12.
+    """Return the exact release-built worker image required by material v12+.
 
     The digest is deliberately release data rather than a source constant: the
     release controller resolves Docker's immutable content ID after building
-    the worker and stamps it into every process before any v12 version exists.
+    the worker and stamps it into every process before any sealed version exists.
     """
 
     if (
         str(recipe_id or "") not in _TRANSPARENT_RECIPE_IDS
-        or str(recipe_version or "") != POSITION_RISK_TARGET_RECIPE_VERSION
+        or str(recipe_version or "")
+        not in {
+            POSITION_RISK_TARGET_RECIPE_VERSION,
+            FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION,
+        }
     ):
         return None
+    version_label = {
+        POSITION_RISK_TARGET_RECIPE_VERSION: "v12",
+        FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION: "v13",
+    }[str(recipe_version or "")]
     value = str(os.getenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV) or "").strip().lower()
     if not _IMAGE_DIGEST.fullmatch(value):
         raise ValueError(
-            "transparent v12 worker runtime image digest is missing or invalid"
+            f"transparent {version_label} worker runtime image digest is missing or invalid"
         )
     return value
 
@@ -223,6 +245,7 @@ def require_transparent_baseline_runner(
         RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION: "v10",
         RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION: "v11",
         POSITION_RISK_TARGET_RECIPE_VERSION: "v12",
+        FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION: "v13",
     }[str(config.get("recipe_version") or "")]
     if bootstrap_value != expected or payload_value != expected:
         raise ValueError(
@@ -244,7 +267,8 @@ def require_transparent_baseline_runner(
         or payload_worker_image != expected_worker_image
     ):
         raise ValueError(
-            "transparent v12 worker runtime image differs from its sealed bootstrap"
+            f"transparent {version_label} worker runtime image differs from its "
+            "sealed bootstrap"
         )
     try:
         observed = _file_sha256(runner_path)
@@ -256,11 +280,11 @@ def require_transparent_baseline_runner(
         raise ValueError(
             f"transparent {version_label} runner bytes differ from the repair authorization"
         )
-    if version_label in {"v10", "v11", "v12"}:
+    if version_label in {"v10", "v11", "v12", "v13"}:
         try:
             bundle_sha256 = (
                 position_risk_bundle_sha256(runner_path.parents[1])
-                if version_label == "v12"
+                if version_label in {"v12", "v13"}
                 else runtime_alignment_bundle_sha256(runner_path.parents[1])
             )
         except OSError as exc:
@@ -271,6 +295,7 @@ def require_transparent_baseline_runner(
             "v10": RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256,
             "v11": RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256,
             "v12": POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v13": FAIL_CLOSED_EXECUTION_TARGET_RUNTIME_BUNDLE_SHA256,
         }[version_label]
         if bundle_sha256 != expected_bundle_sha256:
             raise ValueError(

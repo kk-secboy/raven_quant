@@ -210,6 +210,40 @@ def test_robustness_runs_all_four_configured_scenarios() -> None:
     assert validation["robustness"]["passed"] is True
 
 
+def test_single_full_range_rolling_window_reuses_formal_result() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=60)
+    report = pd.DataFrame(
+        {"return": 0.001, "cost": 0.0, "bench": 0.0, "turnover": 0.0}, index=dates
+    )
+    runner_calls: list[tuple[str, str]] = []
+
+    def runner(start: str, end: str, _costs: CostModelConfig) -> QlibBacktestResult:
+        runner_calls.append((start, end))
+        return _result(report.loc[start:end], excess=-1.0)
+
+    validation = run_qlib_validation_suites(
+        runner=runner,
+        full_result=_result(report, excess=0.25),
+        start_time=dates[0].date().isoformat(),
+        end_time=dates[-1].date().isoformat(),
+        cost_model=CostModelConfig(),
+        config={
+            "rolling_window_days": len(dates),
+            "rolling_step_days": 20,
+            "min_rolling_windows": 1,
+            "event_count": 0,
+        },
+        robustness_runner=lambda _overrides, _costs: _result(report),
+    )
+
+    assert runner_calls == []
+    assert validation["rolling"]["window_count"] == 1
+    assert validation["rolling"]["windows"][0]["metrics"] is not None
+    assert validation["rolling"]["windows"][0]["metrics"][
+        "annualized_excess_return"
+    ] == pytest.approx(0.25)
+
+
 def test_robustness_uses_policy_ndrop_default_when_config_omits_it() -> None:
     dates = pd.bdate_range("2024-01-02", periods=80)
     report = pd.DataFrame(

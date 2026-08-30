@@ -6,6 +6,8 @@ import pytest
 from governance_fixtures import governed_etf_ready_evidence
 
 from quant_data.execution_contract import (
+    DAILY_MISSING_EXECUTION_CONTROL_POLICY,
+    DAILY_PAUSED_FIELD_UNIT,
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
     MINUTE_EXECUTION_CONTRACT_VERSION,
     MINUTE_SOURCE_UNIT_CONTRACTS,
@@ -76,6 +78,59 @@ def test_formal_daily_execution_requires_native_price_limit_boundary() -> None:
             },
             start="2024-01-01",
         )
+
+
+def test_formal_daily_execution_accepts_pre_boundary_rows_only_when_fail_closed() -> None:
+    provenance = {
+        "field_contract_version": DAILY_QLIB_FIELD_CONTRACT_VERSION,
+        "fields": ["open", "paused", "up_limit", "down_limit"],
+        "field_units": {"paused": DAILY_PAUSED_FIELD_UNIT},
+        "execution_controls": {
+            "formal_execution_requires_native_controls": True,
+            "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
+            "native_complete_from": "2019-12-16",
+            "missing_rows": 3_205,
+            "total_rows": 14_931_193,
+            "missing_row_policy": DAILY_MISSING_EXECUTION_CONTROL_POLICY,
+            "missing_row_formal_action": "block_buy_and_sell",
+            "missing_row_block_field": "paused",
+            "formal_blocked_rows": 3_205,
+        },
+    }
+
+    require_native_daily_execution_controls(provenance, start="2019-11-28")
+    no_global_boundary = {
+        **provenance,
+        "execution_controls": {
+            **provenance["execution_controls"],
+            "native_complete_from": None,
+        },
+    }
+    require_native_daily_execution_controls(no_global_boundary, start="2008-01-02")
+    with pytest.raises(ValueError, match="start date is invalid"):
+        require_native_daily_execution_controls(no_global_boundary, start="not-a-date")
+
+    changed = {
+        **provenance,
+        "execution_controls": {
+            **provenance["execution_controls"],
+            "formal_blocked_rows": 3_204,
+        },
+    }
+    with pytest.raises(ValueError, match="before native price-limit controls"):
+        require_native_daily_execution_controls(changed, start="2019-11-28")
+
+    for invalid_missing_rows in (0, True):
+        changed = {
+            **provenance,
+            "execution_controls": {
+                **provenance["execution_controls"],
+                "missing_rows": invalid_missing_rows,
+                "formal_blocked_rows": invalid_missing_rows,
+            },
+        }
+        with pytest.raises(ValueError, match="before native price-limit controls"):
+            require_native_daily_execution_controls(changed, start="2019-11-28")
 
 
 def test_minute_contract_requires_version_frequency_and_verified_lineage() -> None:

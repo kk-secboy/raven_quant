@@ -11,7 +11,18 @@ from .universe import (
     governed_daily_etf_whitelist_contract,
 )
 
-DAILY_QLIB_FIELD_CONTRACT_VERSION = "daily-qlib-field-v5-governed-domestic-etf"
+LEGACY_DAILY_QLIB_FIELD_CONTRACT_VERSION = (
+    "daily-qlib-field-v5-governed-domestic-etf"
+)
+DAILY_QLIB_FIELD_CONTRACT_VERSION = (
+    "daily-qlib-field-v6-fail-closed-missing-controls"
+)
+DAILY_MISSING_EXECUTION_CONTROL_POLICY = (
+    "formal-nontradable-instrument-day-v1"
+)
+DAILY_PAUSED_FIELD_UNIT = (
+    "flag_1_when_no_volume_or_execution_controls_unknown"
+)
 QLIB_OUTPUT_MANIFEST_VERSION = "qlib-output-files-v1"
 QLIB_ORDER_PLAN_FORMAT_VERSION = "qlib-order-plan-v1"
 TUSHARE_DAILY_VOLUME_UNIT = "hand"
@@ -269,7 +280,10 @@ def require_next_bar_execution(
 def require_daily_qlib_contract(provenance: dict[str, Any]) -> None:
     if provenance.get("frequency") != "day":
         raise ValueError("daily Qlib dataset provenance frequency is invalid")
-    if provenance.get("field_contract_version") != DAILY_QLIB_FIELD_CONTRACT_VERSION:
+    if provenance.get("field_contract_version") not in {
+        LEGACY_DAILY_QLIB_FIELD_CONTRACT_VERSION,
+        DAILY_QLIB_FIELD_CONTRACT_VERSION,
+    }:
         raise ValueError("daily Qlib dataset uses an obsolete field contract; rebuild it")
     if (
         provenance.get("source_volume_unit") != TUSHARE_DAILY_VOLUME_UNIT
@@ -315,12 +329,23 @@ def require_native_daily_execution_controls(
         raise ValueError("daily Qlib dataset has no governed native execution-control contract")
     if controls.get("scope_version") != GOVERNED_DAILY_STOCK_SCOPE_VERSION:
         raise ValueError("daily Qlib dataset has an obsolete governed stock execution scope")
-    raw_boundary = str(controls.get("native_complete_from") or "")[:10]
     try:
-        boundary = date.fromisoformat(raw_boundary)
         requested_start = (
             start if isinstance(start, date) else date.fromisoformat(str(start)[:10])
         )
+    except ValueError as exc:
+        raise ValueError("formal execution start date is invalid") from exc
+    # V6 proves safety per instrument-day instead of relying on one global
+    # completeness boundary.  A dataset can legitimately have no global
+    # ``native_complete_from`` when an old/delisted instrument never received
+    # a native stk_limit row; every such row is nevertheless non-tradable via
+    # the sealed paused gate.  Validate that stronger evidence before parsing
+    # the legacy boundary.
+    if _missing_daily_controls_fail_closed(provenance, controls):
+        return
+    raw_boundary = str(controls.get("native_complete_from") or "")[:10]
+    try:
+        boundary = date.fromisoformat(raw_boundary)
     except ValueError as exc:
         raise ValueError(
             "daily Qlib dataset has no dated native execution-control boundary"
@@ -330,6 +355,51 @@ def require_native_daily_execution_controls(
             "formal execution starts before native price-limit controls are complete "
             f"({boundary.isoformat()})"
         )
+
+
+def _missing_daily_controls_fail_closed(
+    provenance: dict[str, Any],
+    controls: dict[str, Any],
+) -> bool:
+    """Prove that every missing native control row is blocked on both sides.
+
+    The old daily field contract materialized missing ``stk_limit`` rows with
+    unrestricted research sentinels.  Those bytes remain usable for formal
+    periods beginning on or after ``native_complete_from`` only.  V6 keeps the
+    same non-fabricated limit values for research, but marks the affected
+    instrument-day through Qlib's ``$paused`` execution gate.  The formal
+    exchange already evaluates that gate for both buys and sells.
+    """
+
+    if (
+        provenance.get("field_contract_version")
+        != DAILY_QLIB_FIELD_CONTRACT_VERSION
+        or controls.get("missing_row_policy")
+        != DAILY_MISSING_EXECUTION_CONTROL_POLICY
+        or controls.get("missing_row_formal_action")
+        != "block_buy_and_sell"
+        or controls.get("missing_row_block_field") != "paused"
+        or dict(provenance.get("field_units") or {}).get("paused")
+        != DAILY_PAUSED_FIELD_UNIT
+        or "paused" not in set(provenance.get("fields") or [])
+    ):
+        return False
+    raw_counts = (
+        controls.get("missing_rows"),
+        controls.get("formal_blocked_rows"),
+        controls.get("total_rows"),
+    )
+    if any(isinstance(value, bool) for value in raw_counts):
+        return False
+    try:
+        missing_rows, blocked_rows, total_rows = map(int, raw_counts)
+    except (TypeError, ValueError):
+        return False
+    return (
+        total_rows > 0
+        and 0 < missing_rows <= total_rows
+        and blocked_rows == missing_rows
+    )
 
 
 def require_minute_execution_contract(

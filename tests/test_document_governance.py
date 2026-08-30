@@ -235,6 +235,8 @@ def test_authoritative_markdown_contains_the_current_contract() -> None:
         "这仍不构成收益保证",
         "当前没有盘中数据接口",
         "生产发布没有 QMT 或任何券商网关例外",
+        "不得推导或伪造涨跌停价",
+        "逐行 fail-closed 标记覆盖全部缺失行",
     )
     for contract in required_contracts:
         assert contract in specification

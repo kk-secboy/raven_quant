@@ -566,7 +566,21 @@ def run_qlib_validation_suites(
         selected = dates[offset : offset + window]
         if len(selected) != window:
             continue
-        result = runner(selected[0].date().isoformat(), selected[-1].date().isoformat(), schedule)
+        # A horizon whose sealed OOS is exactly one rolling window has already
+        # produced this result above.  Re-running the identical Qlib strategy,
+        # account, costs and date range is expensive (the daily exchange reloads
+        # the full quote panel) and cannot add independent evidence.  Reuse the
+        # caller-supplied formal result only for the exact full-report bounds;
+        # proper sub-windows still start from their own clean account state.
+        result = (
+            full_result
+            if selected[0] == dates[0] and selected[-1] == dates[-1]
+            else runner(
+                selected[0].date().isoformat(),
+                selected[-1].date().isoformat(),
+                schedule,
+            )
+        )
         rolling.append(
             {
                 "start": selected[0].date().isoformat(),

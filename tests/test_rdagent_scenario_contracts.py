@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -11,6 +12,7 @@ from sqlalchemy.dialects import postgresql
 from quant_data.config import Settings
 from quant_data.database import jobs
 from quant_platform import api
+from quant_platform import worker as worker_module
 from quant_platform.job_store import (
     EVALUATION_STATUS_COUNTS_KEY,
     JobStore,
@@ -31,6 +33,7 @@ from quant_platform.rdagent_scenarios import (
     SCENARIOS,
     rdagent_scenario_catalog,
 )
+from quant_platform.worker import LocalJobWorker
 
 
 def test_public_rdagent_status_keeps_safe_credential_readiness_boolean() -> None:
@@ -216,6 +219,64 @@ def test_only_strategy_research_accepts_an_incumbent_binding() -> None:
                 "incumbent_strategy_version_id": "a" * 32,
             }
         )
+
+
+def test_factor_worker_keeps_research_horizon_without_strategy_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        worker_module,
+        "probe_rdagent",
+        lambda *_args, **_kwargs: {"runtime_identity": {"commit": "pinned"}},
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "require_matching_rdagent_runtime_identity",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def capture_command(_settings: object, **kwargs: object):
+        captured.update(kwargs)
+        return ["rdagent"], {}
+
+    monkeypatch.setattr(worker_module, "rdagent_command", capture_command)
+
+    worker = object.__new__(LocalJobWorker)
+    worker.settings = SimpleNamespace(data_root=tmp_path)
+    worker.project_root = tmp_path / "project"
+    worker.runtime_secrets = SimpleNamespace(get=lambda _name: None)
+    worker.rdagent_candidates = SimpleNamespace(import_manifest=lambda *_args, **_kwargs: None)
+    worker.factor_library = SimpleNamespace(
+        list_library_versions=lambda: [
+            {
+                "id": "library-1",
+                "status": "active",
+                "definition_sha256": "a" * 64,
+            }
+        ]
+    )
+    payload = {
+        "scenario": "fin_factor",
+        "research_run_id": "factor-short-1",
+        "dataset_path": str(tmp_path / "dataset"),
+        "loop_n": 1,
+        "duration": "1h",
+        "periods": {},
+        "objective": "Research a governed short-horizon factor.",
+        "feature_set": {"id": "governed-baseline"},
+        "horizon_profile": "short_1_5d",
+    }
+
+    command, _result_path, environment = worker._command(
+        {"kind": "rdagent_factor", "payload": payload}
+    )
+
+    assert command == ["rdagent"]
+    assert payload["horizon_profile"] == "short_1_5d"
+    assert captured["strategy_horizon_profile"] is None
+    assert environment["QUANTLAB_FACTOR_LIBRARY_VERSION_ID"] == "library-1"
 
 
 def test_research_asset_acquisition_api_accepts_only_governed_inputs() -> None:

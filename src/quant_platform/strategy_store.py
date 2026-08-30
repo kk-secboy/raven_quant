@@ -149,6 +149,7 @@ from quant_platform.transparent_baseline_lockbox import (
     validate_repair_registry_binding,
 )
 from quant_platform.transparent_baseline_runner import (
+    FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION,
     POSITION_RISK_TARGET_RECIPE_VERSION,
     TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD,
@@ -189,12 +190,16 @@ def _transparent_worker_runtime_failures(
     manifest: Mapping[str, Any],
     provenance: Mapping[str, Any],
 ) -> list[str]:
-    """Bind v12 config, formal job manifest and result to one worker image."""
+    """Bind sealed config, formal job manifest and result to one worker image."""
 
     config_raw = version.get("config")
     config = dict(config_raw) if isinstance(config_raw, Mapping) else {}
     if (
-        str(config.get("recipe_version") or "") != POSITION_RISK_TARGET_RECIPE_VERSION
+        str(config.get("recipe_version") or "")
+        not in {
+            POSITION_RISK_TARGET_RECIPE_VERSION,
+            FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION,
+        }
         or target_runner_for_recipe(
             config.get("recipe_id"), config.get("recipe_version")
         ) is None
@@ -204,7 +209,7 @@ def _transparent_worker_runtime_failures(
     bootstrap = dict(bootstrap_raw) if isinstance(bootstrap_raw, Mapping) else {}
     expected = bootstrap.get(TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD)
     if not _is_image_digest(expected):
-        return ["transparent v12 worker runtime image digest is missing or invalid"]
+        return ["transparent worker runtime image digest is missing or invalid"]
     failures: list[str] = []
     if manifest.get(TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD) != expected:
         failures.append(
@@ -222,8 +227,8 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _bind_transparent_v12_runtime_identity(config: dict[str, Any]) -> dict[str, Any]:
-    """Seal every governed v12 draft to the current release runtime.
+def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[str, Any]:
+    """Seal every governed current-recipe draft to the release runtime.
 
     The automated bootstrap already supplies a larger dataset/window contract,
     while the advanced strategy API can create a research-only draft directly
@@ -236,13 +241,13 @@ def _bind_transparent_v12_runtime_identity(config: dict[str, Any]) -> dict[str, 
     recipe_id = config.get("recipe_id")
     recipe_version = config.get("recipe_version")
     if (
-        str(recipe_version or "") != POSITION_RISK_TARGET_RECIPE_VERSION
+        str(recipe_version or "") != FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION
         or target_runner_for_recipe(recipe_id, recipe_version) is None
     ):
         return config
     bootstrap_raw = config.get("transparent_baseline_bootstrap")
     if bootstrap_raw is not None and not isinstance(bootstrap_raw, Mapping):
-        raise ValueError("transparent v12 bootstrap must be an object")
+        raise ValueError("transparent current bootstrap must be an object")
     bootstrap = dict(bootstrap_raw or {})
     bindings = {
         TRANSPARENT_BASELINE_RUNNER_FIELD: target_runner_for_recipe(
@@ -259,7 +264,7 @@ def _bind_transparent_v12_runtime_identity(config: dict[str, Any]) -> dict[str, 
         existing = bootstrap.get(field)
         if expected is None or (existing is not None and existing != expected):
             raise ValueError(
-                f"transparent v12 bootstrap {field} differs from this release"
+                f"transparent current bootstrap {field} differs from this release"
             )
         bootstrap[field] = expected
     return {**config, "transparent_baseline_bootstrap": bootstrap}
@@ -580,7 +585,7 @@ def _normalize_multifactor_contract(
     normalized.setdefault("execution_slice_minutes", 20)
     normalized.setdefault("max_execution_slices", 24)
     normalized = normalize_horizon_config(normalized)
-    normalized = _bind_transparent_v12_runtime_identity(normalized)
+    normalized = _bind_current_transparent_runtime_identity(normalized)
     if normalized["horizon_profile"] != LEGACY_AMBIGUOUS:
         horizon = normalized["horizon_contract"]
         normalized.setdefault("outer_purge_days", horizon["purge_sessions"])

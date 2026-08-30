@@ -5,14 +5,12 @@ from typing import Any
 
 from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 
-# v11 changes only the compiled runtime's evidence handling for already-frozen
-# rule contracts: TopK ignores unused benchmark inputs; backtest and daily
-# refresh share one governed style snapshot; missing trend/extension/valuation
-# evidence blocks only the affected new entry while an existing holding is not
-# misclassified as a trend break. Factors, costs, dataset/OOS windows, economic
-# parameters and random seeds stay unchanged from v10. The failed no-result
-# v10 attempts remain immutable under a separate governed repair.
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v12"
+# v13 is a material append-only generation.  It binds the current strategy
+# runtime to the daily-v6 execution-control contract, where an instrument-day
+# without a native price-limit row is non-tradable instead of receiving a
+# fabricated limit.  Historical v8-v12 recipes and their OOS evidence remain
+# immutable under their original runner/runtime identities.
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v13"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},

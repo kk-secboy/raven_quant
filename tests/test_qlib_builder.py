@@ -1189,7 +1189,7 @@ def test_accepts_tushare_unrestricted_price_limit_sentinel(tmp_path: Path) -> No
     assert frame["down_limit"].iloc[0] == 0.0
 
 
-def test_missing_native_price_limits_are_research_only_unrestricted_rows(
+def test_missing_native_price_limits_are_research_values_but_formally_nontradable(
     tmp_path: Path,
 ) -> None:
     snapshot = _write_market_control_snapshot(
@@ -1231,6 +1231,8 @@ def test_missing_native_price_limits_are_research_only_unrestricted_rows(
 
     assert frame["up_limit"].iloc[0] == pytest.approx(9999.999)
     assert frame["down_limit"].iloc[0] == 0.0
+    assert frame["paused"].iloc[0] == 1.0
+    assert frame["paused"].iloc[1] == 0.0
     assert coverage == {
         "source": "native_stk_limit",
         "scope_version": GOVERNED_DAILY_STOCK_SCOPE_VERSION,
@@ -1259,9 +1261,37 @@ def test_missing_native_price_limits_are_research_only_unrestricted_rows(
         "first_missing_date": "2024-01-02",
         "last_missing_date": "2024-01-02",
         "native_complete_from": "2024-01-08",
-        "missing_row_policy": "research_only_unrestricted_sentinel",
+        "missing_row_policy": "formal-nontradable-instrument-day-v1",
+        "missing_row_formal_action": "block_buy_and_sell",
+        "missing_row_block_field": "paused",
+        "formal_blocked_rows": 1,
         "formal_execution_requires_native_controls": True,
     }
+
+
+def test_partial_native_price_limit_is_counted_as_missing_and_rejected(
+    tmp_path: Path,
+) -> None:
+    snapshot = _write_market_control_snapshot(
+        tmp_path,
+        ts_code="000001.SZ",
+        up_limit=11.0,
+        down_limit=9.0,
+    )
+    limit_path = snapshot / "parquet" / "stk_limit" / "partition_year=2024" / "data.parquet"
+    limits = pd.read_parquet(limit_path)
+    limits.loc[0, "down_limit"] = None
+    limits.to_parquet(limit_path, index=False)
+
+    builder = QlibBuilder(snapshot)
+    coverage = builder._execution_control_coverage()
+
+    assert coverage["missing_rows"] == 1
+    assert coverage["formal_blocked_rows"] == 1
+    assert coverage["first_missing_date"] == "2024-01-02"
+    assert coverage["last_missing_date"] == "2024-01-02"
+    with pytest.raises(RuntimeError, match="partial/malformed price limits"):
+        builder.build_staging(tmp_path / "staging-partial-limit")
 
 
 def test_governed_stock_scope_is_shared_by_publication_controls_and_eligibility(

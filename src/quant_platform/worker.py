@@ -3065,8 +3065,12 @@ class LocalJobWorker:
                 asset_manifest_sha256=dict(payload.get("asset_manifest_sha256") or {}),
                 feature_set=payload.get("feature_set"),
                 strategy_horizon_profile=(
-                    payload.get("strategy_horizon_profile")
-                    or payload.get("horizon_profile")
+                    (
+                        payload.get("strategy_horizon_profile")
+                        or payload.get("horizon_profile")
+                    )
+                    if scenario.id == "fin_strategy"
+                    else None
                 ),
                 incumbent_strategy_version_id=(
                     str(payload["incumbent_strategy"]["id"])

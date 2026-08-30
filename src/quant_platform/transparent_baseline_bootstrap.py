@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from quant_data.config import Settings
-from quant_data.execution_contract import require_daily_qlib_contract
+from quant_data.execution_contract import (
+    DAILY_QLIB_FIELD_CONTRACT_VERSION,
+    require_daily_qlib_contract,
+    require_native_daily_execution_controls,
+)
 from quant_platform.job_store import JobStore
 from quant_platform.promotion import PromotionStore
 from quant_platform.research_automation import (
@@ -17,6 +21,7 @@ from quant_platform.research_automation import (
     resolve_research_window_contract,
 )
 from quant_platform.research_horizon import research_horizon_contract
+from quant_platform.research_window import build_research_window_contract
 from quant_platform.services import list_qlib_datasets
 from quant_platform.strategy_recipes import (
     TRANSPARENT_RESEARCH_BASELINE_IDS,
@@ -107,6 +112,11 @@ def _validate_dataset(dataset: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(provenance, Mapping):
         raise ValueError("latest ready daily Qlib dataset has no provenance")
     require_daily_qlib_contract(dict(provenance))
+    if provenance.get("field_contract_version") != DAILY_QLIB_FIELD_CONTRACT_VERSION:
+        raise ValueError(
+            "current transparent baselines require the fail-closed daily Qlib "
+            "field contract; rebuild the dataset"
+        )
     identity = _sha256(
         provenance.get("dataset_identity_sha256"),
         field="dataset_identity_sha256",
@@ -177,6 +187,107 @@ def _validated_recipe_config(values: Mapping[str, Any]) -> dict[str, Any]:
     return StrategyConfigRequest.model_validate(dict(values)).model_dump()
 
 
+def _require_native_formal_oos(
+    *,
+    dataset: Mapping[str, Any],
+    periods: Mapping[str, str],
+    evidence: Mapping[str, Any],
+    horizon_profile: str,
+) -> dict[str, str]:
+    """Reject a frozen OOS that predates native A-share execution controls.
+
+    The daily runner already fails closed on this boundary.  Transparent
+    baselines must apply the same check *before* preregistration, otherwise a
+    one-shot OOS can be consumed by a job that was impossible to execute.
+
+    A rolling horizon already ends at the latest session that leaves the full
+    label-maturity tail.  Therefore moving its start forward also moves its
+    fixed-length end forward.  If the immutable unopened-history prefix cannot
+    hold that complete shifted window, the honest result is ``unavailable``;
+    shortening the OOS or reading into a prior opened batch is forbidden.
+    """
+
+    provenance = dataset.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise ValueError("transparent baseline dataset has no provenance")
+    try:
+        require_native_daily_execution_controls(
+            dict(provenance),
+            start=str(periods["test_start"]),
+        )
+        return dict(periods)
+    except ValueError as exc:
+        if "formal execution starts before native price-limit controls" not in str(exc):
+            raise
+        execution_boundary_error = exc
+        controls = provenance.get("execution_controls")
+        if not isinstance(controls, Mapping):
+            raise
+        raw_boundary = str(controls.get("native_complete_from") or "")[:10]
+        try:
+            boundary = date.fromisoformat(raw_boundary)
+        except ValueError:
+            raise
+
+    calendar = [str(day) for day in dataset.get("calendar") or []]
+    first_native_session = next(
+        (day for day in calendar if date.fromisoformat(day) >= boundary),
+        None,
+    )
+    horizon = research_horizon_contract(horizon_profile)
+    required_sessions = int(horizon.sealed_oos_sessions or 0)
+    maturity = evidence.get("latest_mature_label_sessions")
+    if not isinstance(maturity, Mapping):
+        raise ValueError("research window has no label-maturity evidence")
+    maturity_cutoff = str(maturity.get(str(max(horizon.label_horizons_sessions))) or "")
+    available_sessions = (
+        sum(
+            first_native_session <= day <= maturity_cutoff
+            for day in calendar
+        )
+        if first_native_session is not None and maturity_cutoff
+        else 0
+    )
+    if (
+        first_native_session is not None
+        and maturity_cutoff
+        and available_sessions >= required_sessions
+    ):
+        # ``test_end`` is already the latest label-mature session allowed by
+        # the immutable research-window contract.  Keep that sealed cutoff and
+        # move the start to the first natively controlled session.  The result
+        # therefore remains a complete (possibly conservative, longer) OOS,
+        # never consumes the label-maturity tail, and is deterministic for the
+        # same calendar and provenance.
+        return {
+            **dict(periods),
+            "test_start": first_native_session,
+            "test_end": maturity_cutoff,
+        }
+    unavailable_evidence = {
+        "contract_version": "native-execution-oos-resolution-v1",
+        "horizon_profile": horizon_profile,
+        "native_complete_from": boundary.isoformat(),
+        "first_native_controlled_trading_session": first_native_session,
+        "rejected_test_start": str(periods["test_start"]),
+        "proposed_test_start": first_native_session,
+        "label_maturity_cutoff_session": maturity_cutoff or None,
+        "required_sealed_oos_sessions": required_sessions,
+        "available_native_controlled_oos_sessions": available_sessions,
+        "capital_evaluation_eligible": False,
+        "capital_evaluation_unavailable_reason": (
+            "insufficient_native_execution_controlled_sessions_before_immutable_cutoff"
+        ),
+    }
+    raise ResearchWindowUnavailableError(
+        "formal OOS would start before native price-limit controls; moving it to "
+        f"{first_native_session or boundary.isoformat()} leaves {available_sessions} "
+        f"sessions before the immutable label-maturity cutoff, but {required_sessions} "
+        "are required",
+        evidence=unavailable_evidence,
+    ) from execution_boundary_error
+
+
 def _plan_member(
     *, recipe_id: str, dataset: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -199,6 +310,39 @@ def _plan_member(
         feature_set=feature_set,
         universe=str(recipe["universe"]),
     )
+    original_research_window = evidence.get("research_window_contract")
+    if not isinstance(original_research_window, Mapping):
+        raise ValueError("research window resolver returned no immutable contract")
+    adjusted_periods = _require_native_formal_oos(
+        dataset=dataset,
+        periods=periods,
+        evidence=evidence,
+        horizon_profile=str(recipe["horizon"]),
+    )
+    if adjusted_periods != periods:
+        calendar_start = str(original_research_window.get("calendar_start") or "")
+        calendar_end = str(original_research_window.get("calendar_end") or "")
+        effective_calendar = [
+            str(day)
+            for day in dataset.get("calendar") or []
+            if calendar_start <= str(day) <= calendar_end
+        ]
+        rebound = build_research_window_contract(
+            dataset=dataset,
+            calendar_days=effective_calendar,
+            periods=adjusted_periods,
+            period_resolution=evidence,
+            horizon_profile=str(recipe["horizon"]),
+            feature_set=feature_set,
+            universe=str(recipe["universe"]),
+        )
+        periods = adjusted_periods
+        evidence = {
+            **evidence,
+            "final_test_trading_days": int(rebound.sealed_oos_sessions),
+            "research_window_contract": rebound.to_dict(),
+            "research_window_contract_sha256": rebound.sha256,
+        }
     research_window = evidence.get("research_window_contract")
     research_window_sha256 = _sha256(
         evidence.get("research_window_contract_sha256"),
@@ -847,7 +991,23 @@ class TransparentBaselineBootstrapService:
                     dataset_identity_sha256=str(dataset["dataset_identity_sha256"]),
                     dataset_lineage_id=str(dataset["dataset_lineage_id"]),
                 )
-            result["joint_lockbox"] = reservation
+            # Reservation rows exist only for horizons that consume an OOS
+            # vintage.  Preserve the validated v3 cash-only declarations in
+            # the reconcile projection as well, so operators and the novice
+            # UI can distinguish an intentionally unavailable sleeve from a
+            # missing strategy lane without opening StrategyVersion internals.
+            result["joint_lockbox"] = {
+                **reservation,
+                **(
+                    {
+                        "unavailable_horizons": deepcopy(
+                            lockbox["unavailable_horizons"]
+                        )
+                    }
+                    if lockbox.get("unavailable_horizons")
+                    else {}
+                ),
+            }
         except Exception as exc:  # noqa: BLE001 - reconcile must return a failed result
             result["errors"].append(str(exc))
             return result

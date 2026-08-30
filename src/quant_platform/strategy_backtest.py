@@ -150,17 +150,33 @@ def build_governed_signal(
             )
     benchmark = _normalize_snapshots(benchmark_weights, "weight")
     eligibility = _normalize_eligibility(eligibility_matrix)
+    # Scores are consumed in chronological order below.  Advance the PIT
+    # eligibility snapshots once instead of filtering the complete
+    # instrument-by-day matrix for every trading day.  The former expression
+    # (`eligibility[datetime <= timestamp]`) is quadratic in the number of
+    # dates and repeatedly copies a multi-million-row frame; this cursor keeps
+    # exactly the same latest-snapshot semantics in one linear pass.
+    eligibility_groups = (
+        iter(eligibility.groupby("datetime", sort=True))
+        if eligibility is not None
+        else None
+    )
+    eligibility_next = (
+        next(eligibility_groups, None) if eligibility_groups is not None else None
+    )
+    eligibility_at = eligibility.iloc[0:0] if eligibility is not None else None
     rows: list[pd.Series] = []
     for timestamp, daily in score.groupby(level="datetime", sort=True):
         ranking = daily.droplevel("datetime").dropna()
         if eligibility is not None:
-            available = eligibility[eligibility["datetime"] <= timestamp]
-            eligible_at = (
-                available[available["datetime"] == available["datetime"].max()]
-                if not available.empty
-                else available
-            )
-            qualified = eligible_at[eligible_at["eligible"]]["instrument"]
+            while (
+                eligibility_next is not None
+                and pd.Timestamp(eligibility_next[0]) <= pd.Timestamp(timestamp)
+            ):
+                eligibility_at = eligibility_next[1]
+                eligibility_next = next(eligibility_groups, None)
+            assert eligibility_at is not None
+            qualified = eligibility_at[eligibility_at["eligible"]]["instrument"]
             ranking = ranking[ranking.index.astype(str).isin(set(qualified.astype(str)))]
         daily_industries = _industries_at(
             memberships, timestamp, lag_days=metadata_availability_lag_days

@@ -1,4 +1,4 @@
-"""Deterministic local-source closure for the governed v12 quant runtime.
+"""Deterministic local-source closure for governed transparent quant runtimes.
 
 The closure is resolved from Python syntax without importing project modules.
 Only ``quant_data`` and ``quant_platform`` are local namespaces.  External
@@ -41,8 +41,13 @@ LOCAL_IMPORT_FRAGMENT_BOUNDARIES: Mapping[str, tuple[str, ...]] = {
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _RUNNER_SEAL_ASSIGNMENT = re.compile(
-    r"(?ms)^(POSITION_RISK_TARGET_(?:RUNNER|RUNTIME_BUNDLE)_SHA256\s*=\s*\(\s*)"
+    r"(?ms)^((?:POSITION_RISK|FAIL_CLOSED_EXECUTION)_TARGET_"
+    r"(?:RUNNER|RUNTIME_BUNDLE)_SHA256\s*=\s*\(\s*)"
     r'"[0-9a-f]{64}"(\s*\))'
+)
+_DATABASE_RUNTIME_IDENTITY_CONSTRAINTS = (
+    "ck_strategy_versions_v12_runtime_identity",
+    "ck_strategy_versions_v13_runtime_identity",
 )
 _DYNAMIC_IMPORT_CALLS = frozenset(
     {
@@ -304,23 +309,30 @@ def _normalized_seal_payload(relative: str, source: str) -> bytes:
             lambda match: f'{match.group(1)}"<sealed-at-release>"{match.group(2)}',
             source,
         )
-        if replacements != 2:
-            raise ValueError("v12 runner seal constants cannot be normalized")
+        if replacements != 4:
+            raise ValueError("transparent runner seal constants cannot be normalized")
     elif relative == "src/quant_data/database.py":
-        marker = 'name="ck_strategy_versions_v12_runtime_identity"'
-        marker_at = source.find(marker)
-        if marker_at < 0:
-            raise ValueError("v12 database runtime identity constraint is missing")
-        block_start = source.rfind("    CheckConstraint(", 0, marker_at)
-        block_end = source.find("    ),", marker_at)
-        if block_start < 0 or block_end < 0:
-            raise ValueError("v12 database runtime identity constraint is malformed")
-        block_end += len("    ),")
-        block = source[block_start:block_end]
-        block, replacements = _SHA256.subn("<sealed-at-release>", block)
-        if replacements != 2:
-            raise ValueError("v12 database runtime hashes cannot be normalized")
-        source = source[:block_start] + block + source[block_end:]
+        for constraint in _DATABASE_RUNTIME_IDENTITY_CONSTRAINTS:
+            marker = f'name="{constraint}"'
+            marker_at = source.find(marker)
+            if marker_at < 0:
+                raise ValueError(
+                    f"database runtime identity constraint is missing: {constraint}"
+                )
+            block_start = source.rfind("    CheckConstraint(", 0, marker_at)
+            block_end = source.find("    ),", marker_at)
+            if block_start < 0 or block_end < 0:
+                raise ValueError(
+                    f"database runtime identity constraint is malformed: {constraint}"
+                )
+            block_end += len("    ),")
+            block = source[block_start:block_end]
+            block, replacements = _SHA256.subn("<sealed-at-release>", block)
+            if replacements != 2:
+                raise ValueError(
+                    f"database runtime hashes cannot be normalized: {constraint}"
+                )
+            source = source[:block_start] + block + source[block_end:]
     return source.encode("utf-8")
 
 

@@ -178,7 +178,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0079_autopilot_horizon_cycles"
+    assert revision == "0080_baseline_v13_seal"
     assert {"horizon_profile", "primary_label_policy_sha256"} <= {
         column["name"]
         for column in inspector.get_columns("autopilot_cycles", schema="quantlab")
@@ -198,6 +198,12 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         )
     }
     assert "ck_strategy_versions_v12_runtime_identity" in {
+        constraint["name"]
+        for constraint in inspector.get_check_constraints(
+            "strategy_versions", schema="quantlab"
+        )
+    }
+    assert "ck_strategy_versions_v13_runtime_identity" in {
         constraint["name"]
         for constraint in inspector.get_check_constraints(
             "strategy_versions", schema="quantlab"
@@ -1160,7 +1166,7 @@ def test_downgrade_rejects_append_only_same_lineage_v5_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0079_autopilot_horizon_cycles"
+        ) == "0080_baseline_v13_seal"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
@@ -1238,7 +1244,7 @@ def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0079_autopilot_horizon_cycles"
+        ) == "0080_baseline_v13_seal"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
@@ -1306,7 +1312,7 @@ def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0079_autopilot_horizon_cycles"
+        ) == "0080_baseline_v13_seal"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
@@ -1368,4 +1374,4 @@ def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0079_autopilot_horizon_cycles"
+        ) == "0080_baseline_v13_seal"
