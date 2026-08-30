@@ -624,6 +624,170 @@ def test_policy_enforces_industry_weight_cap() -> None:
     assert bank_weight <= 0.60 + 1e-12
 
 
+def test_topk_industry_shortfall_holds_feasible_candidates_and_cash() -> None:
+    scores = pd.Series({f"S{index:02d}": float(20 - index) for index in range(20)})
+    industries = pd.Series(
+        {
+            **{f"S{index:02d}": "bank" for index in range(8)},
+            **{f"S{index:02d}": "technology" for index in range(8, 14)},
+            **{f"S{index:02d}": "__UNKNOWN__" for index in range(14, 20)},
+        }
+    )
+    decision = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=20,
+            n_drop=0,
+            max_position_weight=0.05,
+            max_industry_weight=0.30,
+            max_daily_turnover=1.0,
+        )
+    ).decide(scores, {}, industries=industries)
+
+    assert set(decision.target_weights) == {
+        *(f"S{index:02d}" for index in range(6)),
+        *(f"S{index:02d}" for index in range(8, 20)),
+    }
+    assert all(
+        weight == pytest.approx(0.05) for weight in decision.target_weights.values()
+    )
+    assert sum(decision.target_weights.values()) == pytest.approx(0.90)
+    industry_weights = pd.Series(decision.target_weights).groupby(industries).sum()
+    assert industry_weights.to_dict() == {
+        "__UNKNOWN__": pytest.approx(0.30),
+        "bank": pytest.approx(0.30),
+        "technology": pytest.approx(0.30),
+    }
+    validation = decision.position_state["discrete_constraint_validation"]
+    assert validation["status"] == "passed"
+    assert validation["cash_weight"] == pytest.approx(0.10)
+    assert "industry_capacity_cash" in decision.reasons
+
+
+def test_topk_industry_cap_can_leave_cash_with_no_actionable_candidate() -> None:
+    decision = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=2,
+            n_drop=0,
+            max_position_weight=0.50,
+            max_industry_weight=0.30,
+            max_daily_turnover=1.0,
+        )
+    ).decide(
+        pd.Series({"one": 2.0, "two": 1.0}),
+        {},
+        industries=pd.Series({"one": "__UNKNOWN__", "two": "__UNKNOWN__"}),
+    )
+
+    assert decision.target_weights == {}
+    assert decision.changes == []
+    assert decision.expected_turnover == pytest.approx(0.0)
+    validation = decision.position_state["discrete_constraint_validation"]
+    assert validation["status"] == "passed"
+    assert validation["cash_weight"] == pytest.approx(1.0)
+    assert "industry_capacity_cash" in decision.reasons
+
+
+def test_topk_eligibility_shortfall_keeps_pre_filter_weight_and_cash() -> None:
+    instruments = [f"S{index:02d}" for index in range(20)]
+    decision = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=20,
+            n_drop=0,
+            max_position_weight=0.10,
+            max_industry_weight=0.30,
+            max_daily_turnover=1.0,
+            entry_score_min_percentile=0.80,
+        )
+    ).decide(
+        pd.Series(
+            {instrument: float(index + 1) for index, instrument in enumerate(instruments)}
+        ),
+        {},
+        industries=pd.Series(
+            {
+                **{instrument: "bank" for instrument in instruments[-4:]},
+                instruments[-5]: "technology",
+                **{instrument: "industry" for instrument in instruments[:-5]},
+            }
+        ),
+    )
+
+    assert len(decision.target_weights) == 5
+    assert all(
+        weight == pytest.approx(0.05) for weight in decision.target_weights.values()
+    )
+    assert sum(decision.target_weights.values()) == pytest.approx(0.25)
+    assert "eligible_universe_cash" in decision.reasons
+    assert decision.position_state["discrete_constraint_validation"]["status"] == "passed"
+
+
+def test_topk_industry_shortfall_preserves_turnover_and_round_lot_constraints() -> None:
+    instruments = [f"S{index:02d}" for index in range(20)]
+    scores = pd.Series(
+        {instrument: float(20 - index) for index, instrument in enumerate(instruments)}
+    )
+    industries = pd.Series("bank", index=instruments)
+    decision = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=20,
+            n_drop=0,
+            max_position_weight=0.05,
+            max_industry_weight=0.30,
+            max_daily_turnover=0.10,
+        )
+    ).decide(
+        scores,
+        {"S00": 0.05, "S01": 0.05},
+        industries=industries,
+        prices=pd.Series(10.0, index=instruments),
+        average_daily_values=pd.Series(1_000_000_000.0, index=instruments),
+        portfolio_value=1_000_000.0,
+    )
+
+    assert set(decision.target_weights) == {f"S{index:02d}" for index in range(6)}
+    assert decision.target_weights["S00"] == pytest.approx(0.05)
+    assert decision.target_weights["S01"] == pytest.approx(0.05)
+    assert all(
+        0.0 < decision.target_weights[f"S{index:02d}"] <= 0.025
+        for index in range(2, 6)
+    )
+    assert decision.expected_turnover <= 0.10 + 1e-12
+    assert sum(decision.target_weights.values()) <= 0.30 + 1e-12
+    assert all(
+        weight * 1_000_000.0 / 10.0 % 100 == pytest.approx(0.0)
+        for weight in decision.target_weights.values()
+    )
+    validation = decision.position_state["discrete_constraint_validation"]
+    assert validation["status"] == "passed"
+    assert validation["cash_weight"] >= 0.80
+
+
+def test_industry_shortfall_still_fails_closed_for_qp_construction() -> None:
+    instruments = [f"S{index:02d}" for index in range(20)]
+    policy = PortfolioPolicy(
+        PortfolioPolicyConfig(
+            topk=20,
+            n_drop=0,
+            max_position_weight=0.05,
+            max_industry_weight=0.30,
+            max_daily_turnover=1.0,
+            portfolio_construction="benchmark_relative_qp",
+        )
+    )
+
+    with pytest.raises(ValueError, match="industry constraints leave too few"):
+        policy.decide(
+            pd.Series(
+                {
+                    instrument: float(20 - index)
+                    for index, instrument in enumerate(instruments)
+                }
+            ),
+            {},
+            industries=pd.Series("bank", index=instruments),
+        )
+
+
 def test_topk_policy_ignores_reporting_only_benchmark_industry_deviation() -> None:
     scores = pd.Series(
         {

@@ -51,6 +51,9 @@ from quant_platform.transparent_baseline_runner import (
     SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
     SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256,
     SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
+    TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
+    TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256,
+    TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
     TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
@@ -87,6 +90,9 @@ UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V2 = (
 UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V3 = (
     "transparent-baseline-chained-repair-history-selection-v3"
 )
+UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V4 = (
+    "transparent-baseline-multi-generation-repair-history-selection-v4"
+)
 UNOPENED_HISTORY_SELECTION_POLICY = (
     "exclude-current-recipe-at-earliest-prior-opened-final-oos-v1"
 )
@@ -96,6 +102,9 @@ UNOPENED_HISTORY_SELECTION_POLICY_V2 = (
 UNOPENED_HISTORY_SELECTION_POLICY_V3 = (
     "reuse-exact-preregistered-chained-single-member-pre-result-source-v1"
 )
+UNOPENED_HISTORY_SELECTION_POLICY_V4 = (
+    "reuse-exact-preregistered-multi-generation-single-member-pre-result-source-v1"
+)
 PRE_RESULT_REPAIR_ACTION = "transparent_baseline_pre_result_repair_registered"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V1 = "transparent-baseline-pre-result-repair-v1"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 = "transparent-baseline-pre-result-repair-v2"
@@ -104,6 +113,7 @@ PRE_RESULT_REPAIR_CONTRACT_VERSION_V4 = "transparent-baseline-pre-result-repair-
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V5 = "transparent-baseline-pre-result-repair-v5"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V6 = "transparent-baseline-pre-result-repair-v6"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V7 = "transparent-baseline-pre-result-repair-v7"
+PRE_RESULT_REPAIR_CONTRACT_VERSION_V8 = "transparent-baseline-pre-result-repair-v8"
 # Keep the historical public name pinned to v1.  Existing receipts and callers
 # must not silently acquire the wider v2 shape.
 PRE_RESULT_REPAIR_CONTRACT_VERSION = PRE_RESULT_REPAIR_CONTRACT_VERSION_V1
@@ -507,6 +517,91 @@ DISCRETE_MAX_POSITION_SOURCE_BINDINGS = {
 DISCRETE_MAX_POSITION_SOURCE_BACKTEST_IDS = frozenset(
     DISCRETE_MAX_POSITION_SOURCE_BINDINGS
 )
+DISCRETE_MAX_POSITION_RECEIPT_SHA256 = (
+    "dbe47a338ee6fd75c5b6dc471775aaa0155697fa7c31012561f362c7cfb5128a"
+)
+
+TOPK_INDUSTRY_CAPACITY_REPAIR_GENERATION = (
+    "v16-to-v17-topk-industry-capacity-partial-cash"
+)
+TOPK_INDUSTRY_CAPACITY_RUNTIME_CONTRACT_VERSION = (
+    "transparent-baseline-topk-industry-capacity-partial-cash-repair-v1"
+)
+TOPK_INDUSTRY_CAPACITY_REASON = "topk-industry-capacity-partial-cash"
+TOPK_INDUSTRY_CAPACITY_ERROR = (
+    "ValueError: industry constraints leave too few eligible instruments"
+)
+TOPK_INDUSTRY_CAPACITY_TARGET_CHANGE_CODES = (
+    "topk_industry_capacity_partial_cash",
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_COMMIT = (
+    "92c722b89450d9b25549ac777ca171fd163c57ca"
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_RECIPE_VERSION = (
+    DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION
+)
+TOPK_INDUSTRY_CAPACITY_TARGET_RECIPE_VERSION = (
+    TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_RUNNER_SHA256 = (
+    DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNNER_SHA256
+)
+TOPK_INDUSTRY_CAPACITY_TARGET_RUNNER_SHA256 = (
+    TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_BUNDLE_SHA256 = (
+    DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+)
+TOPK_INDUSTRY_CAPACITY_TARGET_BUNDLE_SHA256 = (
+    TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_BATCH_SHA256 = (
+    "9721d472a343295294d6199de9c17bfcd932f1494b88e9dfa18928a3c682f5c9"
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET = (
+    "cn-20080101-20260828-v7-failclosed-ed5c8b3"
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_IDENTITY_SHA256 = (
+    "eab69dff43abcc77e60f47ad51d2182c7bfd5d90f5d36c479e3de61cebf768f2"
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_LINEAGE_ID = (
+    "1b97efcc3956b4be2dfebff7567efd4707c73d806f9d0cb2b63540d9dedd852e"
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_ARTIFACT_INVENTORIES_SHA256 = (
+    "fb4a4a2e457ae0e674ba638af7c0e11c604a9847375d1470bdf4e3d255630435"
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_SELECTION_SHA256 = (
+    "b86ed4a518a6d58b049ad3aeb31e058daaff75de67619b316f39f8fb2f2b1d67"
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_UNAVAILABLE_HORIZONS_SHA256 = (
+    "b9f36421f0047ab024eec0f2b20909a105c2a57e17dc94a50aa25e632f8c3644"
+)
+TOPK_INDUSTRY_CAPACITY_UNAVAILABLE_EVIDENCE_SHA256S = frozenset(
+    {
+        "b57d3dba4ab3d2284b2a001cb30a7b2862a8659c3738d5fc23419e7e7a6b5729",
+        "62f5642a4ad024cc24d23ec34b9ce760a552f560c783612b63dab459ba00d14d",
+    }
+)
+TOPK_INDUSTRY_CAPACITY_SOURCE_BINDINGS = {
+    "b1a0f92acf3145ba9a6d887d459d1129": {
+        "job_id": "5587b686787f47dca72abad634d18ec3",
+        "strategy_version_id": "934a776a9d6c4c538411473165d3c93e",
+        "reason_code": TOPK_INDUSTRY_CAPACITY_REASON,
+        "error": TOPK_INDUSTRY_CAPACITY_ERROR,
+        "periods": {
+            "historical_start": "2008-01-02",
+            "historical_end": "2018-10-10",
+            "start": "2018-11-08",
+            "end": "2019-11-20",
+        },
+        "artifact_inventory_sha256": (
+            "14f0a3e2262095c4229254ac52ad7a9a0d6ed5f28ce3a6ee78fb61981d58837e"
+        ),
+    }
+}
+TOPK_INDUSTRY_CAPACITY_SOURCE_BACKTEST_IDS = frozenset(
+    TOPK_INDUSTRY_CAPACITY_SOURCE_BINDINGS
+)
 
 _PRE_RESULT_REPAIR_REASON_CODES = frozenset(
     {
@@ -814,6 +909,13 @@ def _single_member_repair_profile_for_target(
             "unavailable_evidence_sha256s": (
                 FILL_AWARE_HOLDING_AGE_UNAVAILABLE_EVIDENCE_SHA256S
             ),
+            "source_history_contract": UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION,
+            "target_history_contract": UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V2,
+            "target_selection_policy": UNOPENED_HISTORY_SELECTION_POLICY_V2,
+            "target_selection_mode": (
+                "exact_preregistered_single_member_pre_result_repair"
+            ),
+            "source_receipt_sha256": None,
         }
     if current_recipe_version == DISCRETE_MAX_POSITION_TARGET_RECIPE_VERSION:
         return {
@@ -841,6 +943,55 @@ def _single_member_repair_profile_for_target(
             "unavailable_evidence_sha256s": (
                 DISCRETE_MAX_POSITION_UNAVAILABLE_EVIDENCE_SHA256S
             ),
+            "source_history_contract": (
+                UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V2
+            ),
+            "target_history_contract": (
+                UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V3
+            ),
+            "target_selection_policy": UNOPENED_HISTORY_SELECTION_POLICY_V3,
+            "target_selection_mode": (
+                "exact_preregistered_chained_single_member_pre_result_repair"
+            ),
+            "source_receipt_sha256": FILL_AWARE_HOLDING_AGE_RECEIPT_SHA256,
+        }
+    if current_recipe_version == TOPK_INDUSTRY_CAPACITY_TARGET_RECIPE_VERSION:
+        return {
+            "label": "topk industry-capacity",
+            "contract_version": PRE_RESULT_REPAIR_CONTRACT_VERSION_V8,
+            "source_batch_sha256": TOPK_INDUSTRY_CAPACITY_SOURCE_BATCH_SHA256,
+            "source_recipe_version": TOPK_INDUSTRY_CAPACITY_SOURCE_RECIPE_VERSION,
+            "target_recipe_version": TOPK_INDUSTRY_CAPACITY_TARGET_RECIPE_VERSION,
+            "source_selection_sha256": TOPK_INDUSTRY_CAPACITY_SOURCE_SELECTION_SHA256,
+            "source_bindings": TOPK_INDUSTRY_CAPACITY_SOURCE_BINDINGS,
+            "source_dataset": TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET,
+            "source_dataset_identity_sha256": (
+                TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_IDENTITY_SHA256
+            ),
+            "source_dataset_lineage_id": (
+                TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_LINEAGE_ID
+            ),
+            "source_runner_sha256": TOPK_INDUSTRY_CAPACITY_SOURCE_RUNNER_SHA256,
+            "target_runner_sha256": TOPK_INDUSTRY_CAPACITY_TARGET_RUNNER_SHA256,
+            "source_bundle_sha256": TOPK_INDUSTRY_CAPACITY_SOURCE_BUNDLE_SHA256,
+            "target_bundle_sha256": TOPK_INDUSTRY_CAPACITY_TARGET_BUNDLE_SHA256,
+            "source_unavailable_horizons_sha256": (
+                TOPK_INDUSTRY_CAPACITY_SOURCE_UNAVAILABLE_HORIZONS_SHA256
+            ),
+            "unavailable_evidence_sha256s": (
+                TOPK_INDUSTRY_CAPACITY_UNAVAILABLE_EVIDENCE_SHA256S
+            ),
+            "source_history_contract": (
+                UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V3
+            ),
+            "target_history_contract": (
+                UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V4
+            ),
+            "target_selection_policy": UNOPENED_HISTORY_SELECTION_POLICY_V4,
+            "target_selection_mode": (
+                "exact_preregistered_multi_generation_single_member_pre_result_repair"
+            ),
+            "source_receipt_sha256": DISCRETE_MAX_POSITION_RECEIPT_SHA256,
         }
     raise ValueError("single-member repair target recipe is not allowlisted")
 
@@ -901,16 +1052,8 @@ def build_pre_result_repair_history_selection(
         source_selection,
         calendar_days=calendar,
     )
-    is_chained_repair = (
-        profile["contract_version"] == PRE_RESULT_REPAIR_CONTRACT_VERSION_V7
-    )
-    expected_source_contract = (
-        UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V2
-        if is_chained_repair
-        else UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION
-    )
     if (
-        source["contract_version"] != expected_source_contract
+        source["contract_version"] != profile["source_history_contract"]
         or source["current_recipe_version"] != profile["source_recipe_version"]
         or source["selection_sha256"] != profile["source_selection_sha256"]
         or source["selected_calendar_end"] != "2019-11-27"
@@ -947,21 +1090,9 @@ def build_pre_result_repair_history_selection(
             raise ValueError(f"{profile['label']} history selection moved")
     payload = {
         **{key: value for key, value in ordinary.items() if key != "selection_sha256"},
-        "contract_version": (
-            UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V3
-            if is_chained_repair
-            else UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V2
-        ),
-        "selection_policy": (
-            UNOPENED_HISTORY_SELECTION_POLICY_V3
-            if is_chained_repair
-            else UNOPENED_HISTORY_SELECTION_POLICY_V2
-        ),
-        "selection_mode": (
-            "exact_preregistered_chained_single_member_pre_result_repair"
-            if is_chained_repair
-            else "exact_preregistered_single_member_pre_result_repair"
-        ),
+        "contract_version": profile["target_history_contract"],
+        "selection_policy": profile["target_selection_policy"],
+        "selection_mode": profile["target_selection_mode"],
         "prior_windows_treatment": (
             "ordinary_historical_validation_plus_exact_pre_result_source_exclusion"
         ),
@@ -971,13 +1102,13 @@ def build_pre_result_repair_history_selection(
         "repair_receipt_sha256": receipt["receipt_sha256"],
         "performance_information_used": False,
     }
-    if is_chained_repair:
+    if profile["source_receipt_sha256"] is not None:
         source_receipt_sha256 = _require_sha256(
             source.get("repair_receipt_sha256"),
             field="source_repair_receipt_sha256",
         )
-        if source_receipt_sha256 != FILL_AWARE_HOLDING_AGE_RECEIPT_SHA256:
-            raise ValueError("discrete max-position predecessor receipt changed")
+        if source_receipt_sha256 != profile["source_receipt_sha256"]:
+            raise ValueError(f"{profile['label']} predecessor receipt changed")
         payload["source_repair_receipt_sha256"] = source_receipt_sha256
     return {**payload, "selection_sha256": canonical_sha256(payload)}
 
@@ -993,10 +1124,12 @@ def validate_unopened_history_selection(
     if history_contract in {
         UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V2,
         UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V3,
+        UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V4,
     }:
-        is_chained_repair = (
-            history_contract == UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V3
-        )
+        has_predecessor_receipt = history_contract in {
+            UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V3,
+            UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V4,
+        }
         expected_repair_keys = {
             "contract_version",
             "selection_policy",
@@ -1022,7 +1155,7 @@ def validate_unopened_history_selection(
             "performance_information_used",
             "selection_sha256",
         }
-        if is_chained_repair:
+        if has_predecessor_receipt:
             expected_repair_keys.add("source_repair_receipt_sha256")
         if set(value) != expected_repair_keys:
             raise ValueError("transparent baseline repair history selection is invalid")
@@ -1038,12 +1171,15 @@ def validate_unopened_history_selection(
         profile = _single_member_repair_profile_for_target(
             str(value.get("current_recipe_version") or "")
         )
-        expected_receipt_contract = (
-            PRE_RESULT_REPAIR_CONTRACT_VERSION_V7
-            if is_chained_repair
-            else PRE_RESULT_REPAIR_CONTRACT_VERSION_V6
-        )
-        if profile["contract_version"] != expected_receipt_contract:
+        if (
+            profile["contract_version"]
+            not in {
+                PRE_RESULT_REPAIR_CONTRACT_VERSION_V6,
+                PRE_RESULT_REPAIR_CONTRACT_VERSION_V7,
+                PRE_RESULT_REPAIR_CONTRACT_VERSION_V8,
+            }
+            or profile["target_history_contract"] != history_contract
+        ):
             raise ValueError("transparent baseline repair history generation changed")
         source_batch = _validate_single_member_repair_source_batch(
             value.get("repaired_source_batch"),
@@ -1055,18 +1191,8 @@ def validate_unopened_history_selection(
         )
         if (
             canonical_sha256(payload) != selection_sha256
-            or value.get("selection_policy")
-            != (
-                UNOPENED_HISTORY_SELECTION_POLICY_V3
-                if is_chained_repair
-                else UNOPENED_HISTORY_SELECTION_POLICY_V2
-            )
-            or value.get("selection_mode")
-            != (
-                "exact_preregistered_chained_single_member_pre_result_repair"
-                if is_chained_repair
-                else "exact_preregistered_single_member_pre_result_repair"
-            )
+            or value.get("selection_policy") != profile["target_selection_policy"]
+            or value.get("selection_mode") != profile["target_selection_mode"]
             or value.get("current_recipe_version") != profile["target_recipe_version"]
             or value.get("repaired_source_batch_sha256")
             != profile["source_batch_sha256"]
@@ -1095,12 +1221,12 @@ def validate_unopened_history_selection(
             or value.get("selected_calendar_end") != "2019-11-27"
             or value.get("selected_calendar_trading_days") != 2897
             or (
-                is_chained_repair
+                has_predecessor_receipt
                 and _require_sha256(
                     value.get("source_repair_receipt_sha256"),
                     field="source_repair_receipt_sha256",
                 )
-                != FILL_AWARE_HOLDING_AGE_RECEIPT_SHA256
+                != profile["source_receipt_sha256"]
             )
         ):
             raise ValueError("transparent baseline repair history selection changed")
@@ -1260,9 +1386,10 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
     the exact v9 runtime-contract failures; V5 seals the exact v10 runtime
     input-scope failures and their complete partial-artifact inventories, plus
     a separate exact target-change list, before any corrected code can open a
-    fresh OOS scope. V6 and V7 are exact one-member generations: they bind the
-    failed v13 holding-age and v15 discrete-position attempts, respectively,
-    before the same OOS can be opened by their governed successors.
+    fresh OOS scope. V6, V7 and V8 are exact one-member generations: they bind
+    the failed v13 holding-age, v15 discrete-position and v16 topk industry-
+    capacity attempts, respectively, before the same OOS can be opened by
+    their governed successors.
     """
 
     if not isinstance(value, Mapping):
@@ -1412,6 +1539,30 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         }
         repair_generation = str(value.get("repair_generation") or "").strip()
         if repair_generation != DISCRETE_MAX_POSITION_REPAIR_GENERATION:
+            raise ValueError("transparent baseline repair generation is not allowlisted")
+    elif contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V8:
+        keys = common_keys | {
+            "repair_generation",
+            "source_batch_sha256",
+            "source_dataset_identity_sha256",
+            "source_dataset_lineage_id",
+            "source_runner_sha256",
+            TRANSPARENT_BASELINE_RUNNER_FIELD,
+            "source_runtime_bundle_sha256",
+            "target_runtime_bundle_sha256",
+            "runtime_contract_version",
+            "source_artifact_inventories_sha256",
+            "source_unopened_history_selection_sha256",
+            "source_unavailable_horizons_sha256",
+            "source_unavailable_evidence_sha256s",
+            "target_change_codes",
+        }
+        expected_reasons = frozenset({TOPK_INDUSTRY_CAPACITY_REASON})
+        failure_markers = {
+            TOPK_INDUSTRY_CAPACITY_REASON: TOPK_INDUSTRY_CAPACITY_ERROR
+        }
+        repair_generation = str(value.get("repair_generation") or "").strip()
+        if repair_generation != TOPK_INDUSTRY_CAPACITY_REPAIR_GENERATION:
             raise ValueError("transparent baseline repair generation is not allowlisted")
     else:
         raise ValueError("transparent baseline pre-result repair contract is invalid")
@@ -1651,6 +1802,65 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         != list(DISCRETE_MAX_POSITION_TARGET_CHANGE_CODES)
     ):
         raise ValueError("discrete max-position repair source or target is not allowlisted")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V8 and (
+        commit != TOPK_INDUSTRY_CAPACITY_SOURCE_COMMIT
+        or target_recipe_version != TOPK_INDUSTRY_CAPACITY_TARGET_RECIPE_VERSION
+        or _require_sha256(
+            value.get("source_batch_sha256"), field="source_batch_sha256"
+        )
+        != TOPK_INDUSTRY_CAPACITY_SOURCE_BATCH_SHA256
+        or _require_sha256(
+            value.get("source_dataset_identity_sha256"),
+            field="source_dataset_identity_sha256",
+        )
+        != TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_IDENTITY_SHA256
+        or _require_sha256(
+            value.get("source_dataset_lineage_id"),
+            field="source_dataset_lineage_id",
+        )
+        != TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_LINEAGE_ID
+        or _require_sha256(
+            value.get("source_runner_sha256"), field="source_runner_sha256"
+        )
+        != TOPK_INDUSTRY_CAPACITY_SOURCE_RUNNER_SHA256
+        or _require_sha256(
+            value.get(TRANSPARENT_BASELINE_RUNNER_FIELD),
+            field=TRANSPARENT_BASELINE_RUNNER_FIELD,
+        )
+        != TOPK_INDUSTRY_CAPACITY_TARGET_RUNNER_SHA256
+        or _require_sha256(
+            value.get("source_runtime_bundle_sha256"),
+            field="source_runtime_bundle_sha256",
+        )
+        != TOPK_INDUSTRY_CAPACITY_SOURCE_BUNDLE_SHA256
+        or _require_sha256(
+            value.get("target_runtime_bundle_sha256"),
+            field="target_runtime_bundle_sha256",
+        )
+        != TOPK_INDUSTRY_CAPACITY_TARGET_BUNDLE_SHA256
+        or value.get("runtime_contract_version")
+        != TOPK_INDUSTRY_CAPACITY_RUNTIME_CONTRACT_VERSION
+        or _require_sha256(
+            value.get("source_artifact_inventories_sha256"),
+            field="source_artifact_inventories_sha256",
+        )
+        != TOPK_INDUSTRY_CAPACITY_SOURCE_ARTIFACT_INVENTORIES_SHA256
+        or _require_sha256(
+            value.get("source_unopened_history_selection_sha256"),
+            field="source_unopened_history_selection_sha256",
+        )
+        != TOPK_INDUSTRY_CAPACITY_SOURCE_SELECTION_SHA256
+        or _require_sha256(
+            value.get("source_unavailable_horizons_sha256"),
+            field="source_unavailable_horizons_sha256",
+        )
+        != TOPK_INDUSTRY_CAPACITY_SOURCE_UNAVAILABLE_HORIZONS_SHA256
+        or value.get("source_unavailable_evidence_sha256s")
+        != sorted(TOPK_INDUSTRY_CAPACITY_UNAVAILABLE_EVIDENCE_SHA256S)
+        or value.get("target_change_codes")
+        != list(TOPK_INDUSTRY_CAPACITY_TARGET_CHANGE_CODES)
+    ):
+        raise ValueError("topk industry-capacity repair source or target is not allowlisted")
     if (
         value.get("target_eligibility_contract") != ELIGIBILITY_CONTRACT_VERSION
         or value.get("target_stock_scope_contract")
@@ -1672,6 +1882,7 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         in {
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V6,
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V7,
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V8,
         }
         else 3
     )
@@ -1748,12 +1959,14 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V5,
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V6,
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V7,
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V8,
         } and (
             member.get("status") != "failed"
         ):
             if contract_version in {
                 PRE_RESULT_REPAIR_CONTRACT_VERSION_V6,
                 PRE_RESULT_REPAIR_CONTRACT_VERSION_V7,
+                PRE_RESULT_REPAIR_CONTRACT_VERSION_V8,
             }:
                 raise ValueError("allowlisted repair requires one failed attempt")
             raise ValueError("allowlisted repair requires three failed attempts")
@@ -1794,6 +2007,12 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
                 )
                 if source is None or error_text != source["error"]:
                     raise ValueError("discrete max-position repair error is not exact")
+            if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V8:
+                source = TOPK_INDUSTRY_CAPACITY_SOURCE_BINDINGS.get(
+                    str(member.get("backtest_id") or "")
+                )
+                if source is None or error_text != source["error"]:
+                    raise ValueError("topk industry-capacity repair error is not exact")
             matches = {
                 code
                 for code, marker in failure_markers.items()
@@ -1994,6 +2213,35 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
             != DISCRETE_MAX_POSITION_SOURCE_ARTIFACT_INVENTORIES_SHA256
         ):
             raise ValueError("discrete max-position artifact inventory changed")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V8:
+        if identifiers["backtest_id"] != TOPK_INDUSTRY_CAPACITY_SOURCE_BACKTEST_IDS:
+            raise ValueError("topk industry-capacity repair backtest is not allowlisted")
+        member = members[0]
+        source = TOPK_INDUSTRY_CAPACITY_SOURCE_BINDINGS.get(member["backtest_id"])
+        if source is None or any(
+            member[field] != source[field]
+            for field in ("job_id", "strategy_version_id")
+        ):
+            raise ValueError("topk industry-capacity source binding changed")
+        if (
+            member["dataset"] != TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET
+            or member["periods"] != source["periods"]
+            or member["error"] != source["error"]
+        ):
+            raise ValueError("topk industry-capacity source evidence changed")
+        inventory_sha256 = canonical_sha256(member["files"])
+        inventory_rows = [
+            {
+                "backtest_id": member["backtest_id"],
+                "artifact_inventory_sha256": inventory_sha256,
+            }
+        ]
+        if (
+            inventory_sha256 != source["artifact_inventory_sha256"]
+            or canonical_sha256(inventory_rows)
+            != TOPK_INDUSTRY_CAPACITY_SOURCE_ARTIFACT_INVENTORIES_SHA256
+        ):
+            raise ValueError("topk industry-capacity artifact inventory changed")
     if observed_failure_markers != expected_reasons:
         raise ValueError("transparent baseline repair does not cover its allowlisted defect")
     return {
@@ -2539,6 +2787,43 @@ def _row_field(row: Any, field: str) -> Any:
     return getattr(row, field, None)
 
 
+def validate_pre_result_repair_audit_event(
+    audit_event: Any,
+    *,
+    expected_receipt: Mapping[str, Any] | None = None,
+    expected_receipt_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Validate both the immutable receipt and its audit-event envelope."""
+
+    failure = "transparent baseline pre-result repair audit event is invalid"
+    try:
+        created_at = _row_field(audit_event, "created_at")
+        if (
+            str(_row_field(audit_event, "action") or "") != PRE_RESULT_REPAIR_ACTION
+            or str(_row_field(audit_event, "method") or "") != "INTERNAL"
+            or str(_row_field(audit_event, "path") or "")
+            != "transparent-baseline/pre-result-repair"
+            or int(_row_field(audit_event, "status_code")) != 201
+            or not isinstance(created_at, datetime)
+            or created_at.tzinfo is None
+            or created_at.utcoffset() is None
+        ):
+            raise ValueError(failure)
+        receipt = validate_pre_result_repair_receipt(
+            dict(_row_field(audit_event, "details_json") or {})
+        )
+        if (
+            expected_receipt_sha256 is not None
+            and receipt["receipt_sha256"] != expected_receipt_sha256
+        ):
+            raise ValueError(failure)
+        if expected_receipt is not None and receipt != dict(expected_receipt):
+            raise ValueError(failure)
+    except (TypeError, ValueError):
+        raise ValueError(failure) from None
+    return receipt
+
+
 def _exact_same_lineage_registry_profile(
     verification: Mapping[str, Any],
     source_backtest_ids: set[str],
@@ -2735,6 +3020,54 @@ def _exact_same_lineage_registry_profile(
             and source_backtest_ids
             == set(DISCRETE_MAX_POSITION_SOURCE_BACKTEST_IDS)
         )
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V8:
+        return (
+            verification.get("repair_generation")
+            == TOPK_INDUSTRY_CAPACITY_REPAIR_GENERATION
+            and verification.get("source_batch_sha256")
+            == TOPK_INDUSTRY_CAPACITY_SOURCE_BATCH_SHA256
+            and verification.get("source_dataset_identity_sha256")
+            == TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_IDENTITY_SHA256
+            and verification.get("source_dataset_lineage_id")
+            == TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_LINEAGE_ID
+            and verification.get("source_runner_sha256")
+            == TOPK_INDUSTRY_CAPACITY_SOURCE_RUNNER_SHA256
+            and verification.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+            == TOPK_INDUSTRY_CAPACITY_TARGET_RUNNER_SHA256
+            and verification.get("source_runtime_bundle_sha256")
+            == TOPK_INDUSTRY_CAPACITY_SOURCE_BUNDLE_SHA256
+            and verification.get("target_runtime_bundle_sha256")
+            == TOPK_INDUSTRY_CAPACITY_TARGET_BUNDLE_SHA256
+            and verification.get("runtime_contract_version")
+            == TOPK_INDUSTRY_CAPACITY_RUNTIME_CONTRACT_VERSION
+            and verification.get("source_release_commit")
+            == TOPK_INDUSTRY_CAPACITY_SOURCE_COMMIT
+            and verification.get("target_recipe_version")
+            == TOPK_INDUSTRY_CAPACITY_TARGET_RECIPE_VERSION
+            and verification.get("source_artifact_inventories_sha256")
+            == TOPK_INDUSTRY_CAPACITY_SOURCE_ARTIFACT_INVENTORIES_SHA256
+            and verification.get("source_unopened_history_selection_sha256")
+            == TOPK_INDUSTRY_CAPACITY_SOURCE_SELECTION_SHA256
+            and verification.get("source_unavailable_horizons_sha256")
+            == TOPK_INDUSTRY_CAPACITY_SOURCE_UNAVAILABLE_HORIZONS_SHA256
+            and verification.get("source_unavailable_evidence_sha256s")
+            == sorted(TOPK_INDUSTRY_CAPACITY_UNAVAILABLE_EVIDENCE_SHA256S)
+            and verification.get("target_change_codes")
+            == list(TOPK_INDUSTRY_CAPACITY_TARGET_CHANGE_CODES)
+            and verification.get("source_bindings")
+            == [
+                {
+                    "backtest_id": backtest_id,
+                    "job_id": binding["job_id"],
+                    "strategy_version_id": binding["strategy_version_id"],
+                }
+                for backtest_id, binding in sorted(
+                    TOPK_INDUSTRY_CAPACITY_SOURCE_BINDINGS.items()
+                )
+            ]
+            and source_backtest_ids
+            == set(TOPK_INDUSTRY_CAPACITY_SOURCE_BACKTEST_IDS)
+        )
     return False
 
 
@@ -2780,6 +3113,44 @@ def validate_discrete_max_position_predecessor_registry(
         or not _exact_same_lineage_registry_profile(verification, source_ids)
     ):
         raise ValueError(failure)
+    return verification
+
+
+def validate_topk_industry_capacity_predecessor_registry(
+    repair: Any,
+    *,
+    source_version_id: str,
+    audit_event: Any,
+) -> dict[str, Any]:
+    """Require the exact v7 registry row that created the failed v16 source."""
+
+    failure = "topk industry-capacity predecessor repair registry changed"
+    try:
+        verification = validate_repair_registry_binding(
+            repair,
+            lockbox_batch_sha256=TOPK_INDUSTRY_CAPACITY_SOURCE_BATCH_SHA256,
+            strategy_version_id=str(source_version_id),
+            batch_strategy_version_ids={str(source_version_id)},
+            batch_dataset_identity_sha256s={
+                TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_IDENTITY_SHA256
+            },
+            dataset=TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET,
+            dataset_lineage_id=TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_LINEAGE_ID,
+        )
+        receipt = validate_pre_result_repair_audit_event(
+            audit_event,
+            expected_receipt_sha256=DISCRETE_MAX_POSITION_RECEIPT_SHA256,
+        )
+        created_at = _row_field(audit_event, "created_at")
+        if (
+            receipt["contract_version"] != PRE_RESULT_REPAIR_CONTRACT_VERSION_V7
+            or int(_row_field(audit_event, "id"))
+            != int(_row_field(repair, "source_audit_event_id"))
+            or verification.get("receipt_created_at") != created_at.isoformat()
+        ):
+            raise ValueError(failure)
+    except (TypeError, ValueError):
+        raise ValueError(failure) from None
     return verification
 
 
@@ -2877,6 +3248,7 @@ def validate_repair_registry_binding(
         is_single_member_repair = verification.get("receipt_contract_version") in {
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V6,
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V7,
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V8,
         }
         expected_member_count = 1 if is_single_member_repair else 3
         if (
@@ -2969,6 +3341,10 @@ class TransparentBaselineLockboxStore:
                     raise ValueError(
                         "v16 discrete max-position repair receipt is not registered"
                     )
+                if current == TOPK_INDUSTRY_CAPACITY_TARGET_RECIPE_VERSION:
+                    raise ValueError(
+                        "v17 topk industry-capacity repair receipt is not registered"
+                    )
                 return None
             if len(matches) != 1:
                 raise ValueError(
@@ -3034,6 +3410,32 @@ class TransparentBaselineLockboxStore:
                     )
                 validate_discrete_max_position_predecessor_registry(
                     predecessor_rows[0], source_version_id=source_version_id
+                )
+            if current == TOPK_INDUSTRY_CAPACITY_TARGET_RECIPE_VERSION:
+                predecessor_rows = connection.execute(
+                    select(transparent_baseline_pre_result_repairs).where(
+                        transparent_baseline_pre_result_repairs.c.target_batch_sha256
+                        == TOPK_INDUSTRY_CAPACITY_SOURCE_BATCH_SHA256
+                    )
+                ).all()
+                if len(predecessor_rows) != 1:
+                    raise ValueError(
+                        "topk industry-capacity predecessor repair registry is incomplete"
+                    )
+                predecessor = predecessor_rows[0]
+                predecessor_audit = connection.execute(
+                    select(audit_events).where(
+                        audit_events.c.id == predecessor.source_audit_event_id
+                    )
+                ).one_or_none()
+                if predecessor_audit is None:
+                    raise ValueError(
+                        "topk industry-capacity predecessor repair audit is incomplete"
+                    )
+                validate_topk_industry_capacity_predecessor_registry(
+                    predecessor,
+                    source_version_id=source_version_id,
+                    audit_event=predecessor_audit,
                 )
 
             version_row = connection.execute(
@@ -3376,8 +3778,13 @@ class TransparentBaselineLockboxStore:
         is_discrete_max_position_repair = receipt["contract_version"] == (
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V7
         )
+        is_topk_industry_capacity_repair = receipt["contract_version"] == (
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V8
+        )
         is_single_member_repair = (
-            is_fill_aware_holding_age_repair or is_discrete_max_position_repair
+            is_fill_aware_holding_age_repair
+            or is_discrete_max_position_repair
+            or is_topk_industry_capacity_repair
         )
         single_member_profile = (
             _single_member_repair_profile_for_target(
@@ -3492,6 +3899,20 @@ class TransparentBaselineLockboxStore:
                 != DISCRETE_MAX_POSITION_SOURCE_DATASET_LINEAGE_ID
             ):
                 raise ValueError("discrete max-position source batch or dataset changed")
+            if is_topk_industry_capacity_repair and (
+                source_batch_sha256 != TOPK_INDUSTRY_CAPACITY_SOURCE_BATCH_SHA256
+                or source_identity
+                != TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_IDENTITY_SHA256
+                or source_lineage
+                != TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_LINEAGE_ID
+                or target_dataset_identity_sha256
+                != TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_IDENTITY_SHA256
+                or target_dataset_lineage_id
+                != TOPK_INDUSTRY_CAPACITY_SOURCE_DATASET_LINEAGE_ID
+            ):
+                raise ValueError(
+                    "topk industry-capacity source batch or dataset changed"
+                )
         elif source_lineage == target_dataset_lineage_id:
             raise ValueError("transparent baseline repair may not fabricate a fresh lineage")
 
@@ -3621,6 +4042,10 @@ class TransparentBaselineLockboxStore:
                 "recipe_version"
             ) != DISCRETE_MAX_POSITION_SOURCE_RECIPE_VERSION:
                 raise ValueError("discrete max-position repair source recipe changed")
+            if is_topk_industry_capacity_repair and source_config.get(
+                "recipe_version"
+            ) != TOPK_INDUSTRY_CAPACITY_SOURCE_RECIPE_VERSION:
+                raise ValueError("topk industry-capacity repair source recipe changed")
             if is_canonical_lf_packaging_repair and (
                 source_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
                 != receipt["source_runner_expected_sha256"]
@@ -3654,6 +4079,15 @@ class TransparentBaselineLockboxStore:
                 != receipt["source_runtime_bundle_sha256"]
             ):
                 raise ValueError("discrete max-position source runtime binding changed")
+            if is_topk_industry_capacity_repair and (
+                source_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+                != receipt["source_runner_sha256"]
+                or source_bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
+                != receipt["source_runtime_bundle_sha256"]
+            ):
+                raise ValueError(
+                    "topk industry-capacity source runtime binding changed"
+                )
             if is_same_lineage_repair and (
                 target_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
                 != receipt[TRANSPARENT_BASELINE_RUNNER_FIELD]
@@ -3739,11 +4173,7 @@ class TransparentBaselineLockboxStore:
                     or source_selection["selection_sha256"]
                     != single_member_profile["source_selection_sha256"]
                     or target_selection["contract_version"]
-                    != (
-                        UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V3
-                        if is_discrete_max_position_repair
-                        else UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V2
-                    )
+                    != single_member_profile["target_history_contract"]
                     or target_selection["repaired_source_batch_sha256"]
                     != single_member_profile["source_batch_sha256"]
                     or target_selection["repair_receipt_sha256"]
@@ -4093,6 +4523,7 @@ class TransparentBaselineLockboxStore:
                     in {
                         FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION,
                         DISCRETE_MAX_POSITION_TARGET_RECIPE_VERSION,
+                        TOPK_INDUSTRY_CAPACITY_TARGET_RECIPE_VERSION,
                     }
                 )
                 if len(expected) != 3 and not is_exact_single_member_repair_target:

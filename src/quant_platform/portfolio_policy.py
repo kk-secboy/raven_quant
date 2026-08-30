@@ -403,15 +403,28 @@ class PortfolioPolicy:
             if bool(new_entry_eligible[item]) or item in previous_instruments
         ]
         candidates = list(dict.fromkeys([*retained, *eligible_ranked]))
+        benchmark_relative_industry_constraints = self.config.portfolio_construction in {
+            "benchmark_relative_qp",
+            "industry_neutral_qp",
+        }
+        target_slots = min(self.config.topk, len(signal))
+        assumed_weight = min(
+            1.0 / target_slots,
+            self.config.max_position_weight,
+        )
+        partial_cash_target_weight: float | None = None
+        partial_cash_reasons: list[str] = []
+        if (
+            not benchmark_relative_industry_constraints
+            and len(candidates) < target_slots
+        ):
+            # Entry, regime and PIT eligibility are economic gates.  A smaller
+            # qualified set must not be re-normalized into larger positions;
+            # keep the unallocated sleeve as cash.
+            partial_cash_target_weight = assumed_weight
+            partial_cash_reasons.append("eligible_universe_cash")
         if industries is not None:
             industry_by_instrument = industries.astype(str)
-            benchmark_relative_industry_constraints = (
-                self.config.portfolio_construction
-                in {"benchmark_relative_qp", "industry_neutral_qp"}
-            )
-            assumed_weight = min(
-                1.0 / min(self.config.topk, len(signal)), self.config.max_position_weight
-            )
             counts: dict[str, int] = {}
             selected = []
             for instrument in candidates:
@@ -434,7 +447,15 @@ class PortfolioPolicy:
                 if len(selected) == self.config.topk:
                     break
             if len(selected) < min(self.config.topk, len(candidates)):
-                raise ValueError("industry constraints leave too few eligible instruments")
+                if benchmark_relative_industry_constraints:
+                    raise ValueError(
+                        "industry constraints leave too few eligible instruments"
+                    )
+                # The industry count limits were calculated with this fixed
+                # per-position weight. Re-normalizing a smaller feasible set
+                # would breach those limits, so retain the residual as cash.
+                partial_cash_target_weight = assumed_weight
+                partial_cash_reasons.append("industry_capacity_cash")
         else:
             selected = candidates[: self.config.topk]
         selected_scores = ranked.reindex(selected).dropna()
@@ -500,7 +521,14 @@ class PortfolioPolicy:
                     "exposure_scale": exposure_scale,
                 }
         else:
-            target_weight = min(1.0 / len(selected_scores), self.config.max_position_weight)
+            target_weight = (
+                partial_cash_target_weight
+                if partial_cash_target_weight is not None
+                else min(
+                    1.0 / len(selected_scores),
+                    self.config.max_position_weight,
+                )
+            )
             target = pd.Series(target_weight, index=selected_scores.index, dtype=float)
 
         cadence_hold = not rebalance_due
@@ -1212,6 +1240,7 @@ class PortfolioPolicy:
             if abs(float(delta)) > 1e-10
         ]
         reasons = ["ranked signal", "position cap", "turnover cap"]
+        reasons.extend(dict.fromkeys(partial_cash_reasons))
         if cadence_hold:
             reasons.append(f"{self.config.rebalance_frequency} rebalance cadence hold")
         if self.config.execution_days > 1:

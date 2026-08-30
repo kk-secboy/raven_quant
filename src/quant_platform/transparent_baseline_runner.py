@@ -98,6 +98,18 @@ DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNNER_SHA256 = (
 DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256 = (
     "ac1c2020996efa4e3c3e9609dd4c736d8c65893dccd7ba9c90e3464402d2a329"
 )
+TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION = (
+    "qlib-rdagent-single-mainline-2026-08-31-v17"
+)
+TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256 = (
+    "31d4c7a294ae61c19edcdb8e014b521c1b544836d6891af36cfba3ecf4ab43a3"
+)
+# Filled only after the complete v17 source closure is stable in two
+# consecutive calculations. The source-closure normalizer excludes this
+# release seal from its own digest.
+TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256 = (
+    "c3d6aeb00a8f5286ee117f885231b43ad49e461c5183f5cbf32c4601824bb9fc"
+)
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"
 TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD = "target_runtime_bundle_sha256"
@@ -139,6 +151,9 @@ _TARGET_RUNNERS = {
     ),
     DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION: (
         DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNNER_SHA256
+    ),
+    TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION: (
+        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256
     ),
 }
 
@@ -210,6 +225,11 @@ def target_runtime_bundle_for_recipe(recipe_id: Any, recipe_version: Any) -> str
         return SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
     if str(recipe_version or "") == DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION:
         return DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+    if (
+        str(recipe_version or "")
+        == TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION
+    ):
+        return TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
     return None
 
 
@@ -233,6 +253,7 @@ def target_worker_runtime_image_for_recipe(
             FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION,
             SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
             DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION,
+            TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
         }
     ):
         return None
@@ -242,6 +263,7 @@ def target_worker_runtime_image_for_recipe(
         FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION: "v14",
         SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION: "v15",
         DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION: "v16",
+        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION: "v17",
     }[str(recipe_version or "")]
     value = str(os.getenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV) or "").strip().lower()
     if not _IMAGE_DIGEST.fullmatch(value):
@@ -303,6 +325,7 @@ def require_transparent_baseline_runner(
         FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION: "v14",
         SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION: "v15",
         DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION: "v16",
+        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION: "v17",
     }[str(config.get("recipe_version") or "")]
     if bootstrap_value != expected or payload_value != expected:
         raise ValueError(
@@ -337,11 +360,20 @@ def require_transparent_baseline_runner(
         raise ValueError(
             f"transparent {version_label} runner bytes differ from the repair authorization"
         )
-    if version_label in {"v10", "v11", "v12", "v13", "v14", "v15", "v16"}:
+    if version_label in {
+        "v10",
+        "v11",
+        "v12",
+        "v13",
+        "v14",
+        "v15",
+        "v16",
+        "v17",
+    }:
         try:
             bundle_sha256 = (
                 position_risk_bundle_sha256(runner_path.parents[1])
-                if version_label in {"v12", "v13", "v14", "v15", "v16"}
+                if version_label in {"v12", "v13", "v14", "v15", "v16", "v17"}
                 else runtime_alignment_bundle_sha256(runner_path.parents[1])
             )
         except OSError as exc:
@@ -356,6 +388,7 @@ def require_transparent_baseline_runner(
             "v14": FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256,
             "v15": SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
             "v16": DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v17": TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
         }[version_label]
         if bundle_sha256 != expected_bundle_sha256:
             raise ValueError(
