@@ -65,7 +65,8 @@ COPY pyproject.toml README.md alembic.ini ./
 COPY migrations ./migrations
 COPY src ./src
 COPY scripts ./scripts
-RUN python -m pip install . \
+ARG APP_PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple/
+RUN python -m pip install --index-url "${APP_PIP_INDEX_URL}" . \
     && python -m pip check \
     && python -c "import cvxpy, importlib.metadata as md, numpy as np, torch; from qlib.contrib.strategy import TopkDropoutStrategy; from qlib.data._libs.rolling import rolling_mean; names=sorted((dist.metadata.get('Name') or '').lower() for dist in md.distributions()); bad=[name for name in names if name.startswith(('nvidia-', 'cuda-', 'cupy')) or '-cuda' in name]; assert cvxpy.__version__ == '1.7.5'; assert np.__version__ == '1.26.4'; assert torch.__version__ == '2.2.2+cpu'; assert torch.version.cuda is None; assert TopkDropoutStrategy; assert torch.from_numpy(np.arange(3)).numpy().tolist() == [0, 1, 2]; assert rolling_mean(np.arange(3, dtype=float), 2).shape == (3,); assert not bad, f'forbidden accelerator distributions: {bad}'"
 

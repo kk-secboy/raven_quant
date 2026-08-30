@@ -52,6 +52,7 @@ COPY pyproject.toml README.md alembic.ini ./
 COPY migrations ./migrations
 COPY src ./src
 COPY scripts ./scripts
-RUN python -m pip install .
+ARG APP_PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple/
+RUN python -m pip install --index-url "${APP_PIP_INDEX_URL}" .
 
 CMD ["quant-worker"]
