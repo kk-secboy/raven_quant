@@ -1,5 +1,5 @@
 [Unit]
-Description=QuantLab bounded control-plane backup
+Description=QuantLab online bounded control-plane backup
 Documentation=file:/opt/quantlab/docs/DEPLOYMENT.md
 Requires=docker.service
 After=docker.service network-online.target
@@ -16,7 +16,7 @@ Group=root
 WorkingDirectory=/opt/quantlab
 Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/opt/quantlab-ops/venv/bin/python /opt/quantlab/scripts/backup_preflight.py --backup-root /opt/quantlab-backups --minimum-free-gb 10 --report /var/lib/quantlab-ops/scheduled-backup-preflight.json
-ExecStart=/opt/quantlab-ops/venv/bin/python /opt/quantlab/scripts/backup.py --backup-root /opt/quantlab-backups --retention-count 14 --format-version 2 --minimum-free-gb 10
+ExecStart=/opt/quantlab-ops/venv/bin/python /opt/quantlab/scripts/backup.py --backup-root /opt/quantlab-backups --retention-count 14 --format-version 2 --online --minimum-free-gb 10
 TimeoutStartSec=6h
 Nice=10
 IOSchedulingClass=best-effort

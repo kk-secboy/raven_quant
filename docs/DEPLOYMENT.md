@@ -132,8 +132,10 @@ python scripts/backup.py \
 ```
 
 生产每日定时备份使用 v2 控制面格式，只保存 PostgreSQL custom dump、脱敏部署配置和
-不可变数据 manifest 清单；它明确不复制或恢复 `/data`。首次安装或发布 systemd 单元后，
-以 root 从当前受控 release 执行：
+不可变数据 manifest 清单；它明确不复制或恢复 `/data`。systemd 单元显式传入 `--online`，
+因此 PostgreSQL 使用在线一致性 dump，清单作为在线快照采集，不停止 API、scheduler、
+worker 或其他 `WRITER_SERVICES`，也不会中断正在运行的研究、回测和模拟任务。首次安装或
+发布 systemd 单元后，以 root 从当前受控 release 执行：
 
 ```bash
 sh /opt/quantlab/scripts/install_backup_service.sh /opt/quantlab
@@ -143,8 +145,9 @@ sh /opt/quantlab/scripts/install_backup_service.sh /opt/quantlab
 `deploy/backup-ops-requirements.txt` 安装固定依赖，并启用持久 timer。定时任务使用专用
 `backup_preflight.py`，只检查部署配置、Compose/PostgreSQL、备份目录边界、数据库大小及
 10 GiB 保留空间；它不依赖业务 readiness、策略是否已进入 paper 或 release 根盘的
-20 GiB 门槛。v2 恢复只替换数据库，现有 `/data` 保持原样；不可变数据必须由独立存储
-和 manifest 清单另行保障。
+20 GiB 门槛。`--online` 只允许用于 v2；full v1 手工备份及发布升级创建的回滚备份仍会
+协调停止写入服务，升级成功前也继续保持停写。v2 恢复只替换数据库，现有 `/data` 保持
+原样；不可变数据必须由独立存储和 manifest 清单另行保障。
 
 将完成的备份目录复制到独立存储，并单独保存正确的 `PLATFORM_SECRET_KEY`。恢复属于
 破坏性操作，必须显式确认；工具在停止写入服务前验证清单、校验和与密钥指纹：

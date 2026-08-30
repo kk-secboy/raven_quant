@@ -381,6 +381,7 @@ def test_successful_backup_can_leave_writers_stopped_for_upgrade(tmp_path: Path)
         tmp_path,
         retention_count=1,
         restart_services=False,
+        format_version=1,
     )
 
     assert backup.is_dir()
@@ -394,6 +395,22 @@ def test_successful_backup_can_leave_writers_stopped_for_upgrade(tmp_path: Path)
     assert not any(call[0] == "start" for call in context.calls)
 
 
+def test_control_plane_backup_for_upgrade_remains_quiesced(tmp_path: Path) -> None:
+    context = FakeBackupContext(tmp_path)
+
+    backup = create_backup(
+        context,  # type: ignore[arg-type]
+        tmp_path / "backups",
+        retention_count=1,
+        restart_services=False,
+        format_version=2,
+    )
+
+    assert backup.is_dir()
+    assert ("stop", "scheduler", "api") in context.calls
+    assert not any(call[0] == "start" for call in context.calls)
+
+
 def test_failed_backup_restarts_writers_even_in_upgrade_mode(tmp_path: Path) -> None:
     context = FakeBackupContext(tmp_path, fail_copy=True)
 
@@ -403,6 +420,7 @@ def test_failed_backup_restarts_writers_even_in_upgrade_mode(tmp_path: Path) -> 
             tmp_path,
             retention_count=1,
             restart_services=False,
+            format_version=1,
         )
 
     assert ("start", "scheduler", "api") in context.calls
@@ -423,6 +441,7 @@ def test_control_plane_backup_is_sanitized_bounded_and_does_not_copy_data(
         retention_count=1,
         format_version=2,
         minimum_free_gb=0,
+        online=True,
     )
 
     manifest = load_and_verify_manifest(backup)
@@ -461,6 +480,37 @@ def test_control_plane_backup_is_sanitized_bounded_and_does_not_copy_data(
     assert inventory_payload["immutable_data_copied"] is False
     assert not any("-czf" in call for call in context.calls)
     assert not any("du" in call and "/source" in call for call in context.calls)
+    assert not any(call[0] in {"stop", "start"} for call in context.calls)
+
+
+def test_failed_online_control_plane_backup_does_not_touch_writers(tmp_path: Path) -> None:
+    context = FakeBackupContext(tmp_path, fail_copy=True)
+
+    with pytest.raises(RuntimeError, match="copy failed"):
+        create_backup(
+            context,  # type: ignore[arg-type]
+            tmp_path / "backups",
+            retention_count=1,
+            format_version=2,
+            online=True,
+        )
+
+    assert not any(call[0] in {"stop", "start"} for call in context.calls)
+
+
+def test_full_backup_rejects_online_mode_before_touching_services(tmp_path: Path) -> None:
+    context = FakeBackupContext(tmp_path)
+
+    with pytest.raises(ValueError, match="only supported for control-plane v2"):
+        create_backup(
+            context,  # type: ignore[arg-type]
+            tmp_path / "backups",
+            retention_count=1,
+            format_version=1,
+            online=True,
+        )
+
+    assert context.calls == []
 
 
 def test_control_plane_backup_preflight_is_independent_of_business_readiness(

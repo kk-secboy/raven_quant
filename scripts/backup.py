@@ -16,6 +16,11 @@ def main() -> None:
     parser.add_argument("--retention-count", type=int, default=14)
     parser.add_argument("--format-version", type=int, choices=(1, 2), default=1)
     parser.add_argument("--minimum-free-gb", type=float, default=0.0)
+    parser.add_argument(
+        "--online",
+        action="store_true",
+        help="capture a control-plane v2 snapshot without stopping writer services",
+    )
     parser.add_argument("--project-name", default="quantlab-platform")
     parser.add_argument("--env-file", type=Path, default=PROJECT_ROOT / "deploy" / ".env")
     parser.add_argument(
@@ -30,6 +35,7 @@ def main() -> None:
             retention_count=args.retention_count,
             format_version=args.format_version,
             minimum_free_gb=args.minimum_free_gb,
+            online=args.online,
         )
     )
 

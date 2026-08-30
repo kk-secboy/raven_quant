@@ -1349,6 +1349,7 @@ def create_backup(
     restart_services: bool = True,
     format_version: int = FULL_BACKUP_FORMAT_VERSION,
     minimum_free_gb: float = 0.0,
+    online: bool = False,
 ) -> Path:
     if retention_count < 1:
         raise ValueError("retention_count must be positive")
@@ -1359,6 +1360,8 @@ def create_backup(
         raise ValueError("unsupported backup format")
     if minimum_free_gb < 0:
         raise ValueError("minimum_free_gb must not be negative")
+    if online and format_version != CONTROL_PLANE_BACKUP_FORMAT_VERSION:
+        raise ValueError("online backup is only supported for control-plane v2")
     key_fingerprint = _platform_secret_key_fingerprint(context)
     root = backup_root.resolve()
     name = f"quantlab-{_utc_stamp()}"
@@ -1374,8 +1377,10 @@ def create_backup(
     if staging.exists() or final.exists():
         raise FileExistsError(f"backup destination already exists: {name}")
 
-    running = context.running_services()
-    stopped = [service for service in WRITER_SERVICES if service in running]
+    stopped: list[str] = []
+    if not online:
+        running = context.running_services()
+        stopped = [service for service in WRITER_SERVICES if service in running]
     postgres_id = context.container_id("postgres")
     if not postgres_id:
         raise RuntimeError("the PostgreSQL service must be running before backup")

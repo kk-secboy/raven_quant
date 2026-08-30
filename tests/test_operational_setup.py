@@ -346,9 +346,15 @@ def test_factor_sandbox_is_seeded_offline_from_the_release_worker() -> None:
 
 def test_systemd_backup_timer_is_persistent_and_fail_closed() -> None:
     root = Path(__file__).resolve().parents[1]
-    service = (root / "deploy" / "systemd" / "quantlab-backup.service").read_text(encoding="utf-8")
-    timer = (root / "deploy" / "systemd" / "quantlab-backup.timer").read_text(encoding="utf-8")
+    service = (root / "deploy" / "systemd" / "quantlab-backup.service").read_text(
+        encoding="utf-8"
+    )
+    timer = (root / "deploy" / "systemd" / "quantlab-backup.timer").read_text(
+        encoding="utf-8"
+    )
+    backup_script = (root / "scripts" / "backup.py").read_text(encoding="utf-8")
 
+    assert "Description=QuantLab online bounded control-plane backup" in service
     assert service.index("ExecStartPre=") < service.index("ExecStart=")
     assert "/opt/quantlab-ops/venv/bin/python" in service
     assert "scripts/backup_preflight.py" in service
@@ -356,7 +362,10 @@ def test_systemd_backup_timer_is_persistent_and_fail_closed() -> None:
     assert "scripts/backup.py" in service
     assert "--retention-count 14" in service
     assert "--format-version 2" in service
+    assert "--online" in service
     assert "--minimum-free-gb 10" in service
+    assert '"--online"' in backup_script
+    assert "online=args.online" in backup_script
     assert "OnCalendar=*-*-* 03:20:00 Asia/Shanghai" in timer
     assert "Persistent=true" in timer
     assert "RandomizedDelaySec=10m" in timer
