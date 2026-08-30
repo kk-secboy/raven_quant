@@ -73,6 +73,86 @@ FAMILY_NAMES = {
 }
 
 
+def _unavailable_member_results(
+    unavailable_horizons: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project unavailable research lanes without inventing a lockbox member."""
+
+    return [
+        {
+            "recipe_id": item["recipe_id"],
+            "horizon_profile": item["horizon_profile"],
+            "family_action": None,
+            "strategy_version_id": None,
+            "research_window_contract_sha256": None,
+            "formal_periods": None,
+            "state": "unavailable",
+            "backtest": None,
+            "job": None,
+            "paper_stage": None,
+            "lifecycle": None,
+            "errors": [],
+            "unavailable_reason": item["reason"],
+            "unavailable_evidence": item["evidence"],
+            "unavailable_evidence_sha256": item["evidence_sha256"],
+            "sleeve_action": "remain_in_cash",
+        }
+        for item in unavailable_horizons
+    ]
+
+
+def _require_preregistered_single_member_repair_oos(
+    *,
+    repair_selection: Mapping[str, Any],
+    plans: Sequence[Mapping[str, Any]],
+    unavailable_horizons: Sequence[Mapping[str, Any]],
+) -> None:
+    """Keep the exact preregistered short repair on its source final OOS.
+
+    Receipt eligibility, source-result absence and the frozen history-selection
+    v2 contract belong to ``TransparentBaselineLockboxStore``.  Bootstrap only
+    enforces the final planning invariant it owns: the one repaired short lane
+    must use the same OOS dates, while the same two source lanes remain cash.
+    """
+
+    source_lockbox = repair_selection.get("source_lockbox")
+    if not isinstance(source_lockbox, Mapping):
+        raise ValueError("single-member repair has no frozen source lockbox")
+    source_members = source_lockbox.get("members")
+    if (
+        not isinstance(source_members, Sequence)
+        or isinstance(source_members, (str, bytes))
+        or len(source_members) != 1
+        or not isinstance(source_members[0], Mapping)
+    ):
+        raise ValueError("single-member repair source must contain exactly one member")
+    source_member = source_members[0]
+    if (
+        str(source_member.get("recipe_id") or "") != "short_relative_strength"
+        or str(source_member.get("horizon_profile") or "") != "short_1_5d"
+    ):
+        raise ValueError("single-member repair source is not the short baseline")
+    if len(plans) != 1:
+        raise ValueError("single-member repair must plan exactly one target member")
+    target_member = plans[0].get("lockbox_member")
+    if not isinstance(target_member, Mapping):
+        raise ValueError("single-member repair target has no lockbox member")
+    if (
+        str(target_member.get("recipe_id") or "") != "short_relative_strength"
+        or str(target_member.get("horizon_profile") or "") != "short_1_5d"
+        or str(target_member.get("test_start") or "")
+        != str(source_member.get("test_start") or "")
+        or str(target_member.get("test_end") or "")
+        != str(source_member.get("test_end") or "")
+    ):
+        raise ValueError("single-member repair changed the frozen short final OOS")
+    if {str(item.get("recipe_id") or "") for item in unavailable_horizons} != {
+        "swing_trend",
+        "long_quality_value",
+    }:
+        raise ValueError("single-member repair changed the unavailable source lanes")
+
+
 def _sha256(value: Any, *, field: str) -> str:
     normalized = str(value or "").strip().lower()
     if len(normalized) != 64 or any(
@@ -911,13 +991,22 @@ class TransparentBaselineBootstrapService:
                 raise ValueError(
                     "transparent baseline batch mixes current recipe versions"
                 )
-            history_selection = self.lockboxes.resolve_unopened_history_selection(
-                calendar_days=dataset["calendar"],
-                current_recipe_version=next(iter(current_recipe_versions)),
-                anchored_selection=self._anchored_unopened_history_selection(
-                    families
-                ),
+            current_recipe_version = next(iter(current_recipe_versions))
+            repair_selection = (
+                self.lockboxes.resolve_preregistered_single_member_repair(
+                    calendar_days=dataset["calendar"],
+                    current_recipe_version=current_recipe_version,
+                )
             )
+            history_selection = repair_selection
+            if history_selection is None:
+                history_selection = self.lockboxes.resolve_unopened_history_selection(
+                    calendar_days=dataset["calendar"],
+                    current_recipe_version=current_recipe_version,
+                    anchored_selection=self._anchored_unopened_history_selection(
+                        families
+                    ),
+                )
             selection_evidence = dict(history_selection["evidence"])
             research_dataset = {
                 **dataset,
@@ -946,10 +1035,28 @@ class TransparentBaselineBootstrapService:
                             "evidence_sha256": canonical_sha256(evidence),
                         }
                     )
-            if not plans:
-                raise ValueError(
-                    "no transparent baseline horizon has enough unopened evidence"
+            if repair_selection is not None:
+                _require_preregistered_single_member_repair_oos(
+                    repair_selection=repair_selection,
+                    plans=plans,
+                    unavailable_horizons=unavailable_horizons,
                 )
+            if not plans:
+                reason = "no transparent baseline horizon has enough unopened evidence"
+                # There is no statistical member to reserve, so building a
+                # joint lockbox would be dishonest.  Still project every
+                # deterministic exclusion into the reconcile report instead
+                # of losing it behind the generic terminal error.
+                result["joint_lockbox"] = {
+                    "status": "unavailable",
+                    "reason": reason,
+                    "unavailable_horizons": deepcopy(unavailable_horizons),
+                }
+                result["members"] = _unavailable_member_results(
+                    unavailable_horizons
+                )
+                result["errors"].append(reason)
+                return result
             lockbox = build_joint_lockbox(
                 dataset=str(dataset["name"]),
                 dataset_identity_sha256=str(dataset["dataset_identity_sha256"]),
@@ -1012,27 +1119,7 @@ class TransparentBaselineBootstrapService:
             result["errors"].append(str(exc))
             return result
 
-        member_results: list[dict[str, Any]] = [
-            {
-                "recipe_id": item["recipe_id"],
-                "horizon_profile": item["horizon_profile"],
-                "family_action": None,
-                "strategy_version_id": None,
-                "research_window_contract_sha256": None,
-                "formal_periods": None,
-                "state": "unavailable",
-                "backtest": None,
-                "job": None,
-                "paper_stage": None,
-                "lifecycle": None,
-                "errors": [],
-                "unavailable_reason": item["reason"],
-                "unavailable_evidence": item["evidence"],
-                "unavailable_evidence_sha256": item["evidence_sha256"],
-                "sleeve_action": "remain_in_cash",
-            }
-            for item in unavailable_horizons
-        ]
+        member_results = _unavailable_member_results(unavailable_horizons)
         for plan, version in zip(plans, versions, strict=True):
             member = {
                 "recipe_id": plan["recipe"]["id"],

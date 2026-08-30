@@ -152,6 +152,7 @@ from quant_platform.transparent_baseline_runner import (
     FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION,
     FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION,
     POSITION_RISK_TARGET_RECIPE_VERSION,
+    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
     TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
@@ -201,6 +202,7 @@ def _transparent_worker_runtime_failures(
             POSITION_RISK_TARGET_RECIPE_VERSION,
             FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION,
             FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION,
+            SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
         }
         or target_runner_for_recipe(
             config.get("recipe_id"), config.get("recipe_version")
@@ -243,7 +245,8 @@ def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[s
     recipe_id = config.get("recipe_id")
     recipe_version = config.get("recipe_version")
     if (
-        str(recipe_version or "") != FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION
+        str(recipe_version or "")
+        != SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION
         or target_runner_for_recipe(recipe_id, recipe_version) is None
     ):
         return config

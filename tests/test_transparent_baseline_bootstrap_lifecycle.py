@@ -229,6 +229,10 @@ def test_all_governed_members_reconcile_as_noop_without_backtest_work(
 
     class Lockboxes:
         @staticmethod
+        def resolve_preregistered_single_member_repair(**_values) -> None:
+            return None
+
+        @staticmethod
         def resolve_unopened_history_selection(**values) -> dict:
             assert values["anchored_selection"] is None
             return {

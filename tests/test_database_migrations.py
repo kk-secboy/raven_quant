@@ -178,7 +178,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         revision = connection.execute(
             text("SELECT version_num FROM quantlab.alembic_version")
         ).scalar_one()
-    assert revision == "0081_baseline_v14_seal"
+    assert revision == "0082_baseline_v15_repair"
     assert {"horizon_profile", "primary_label_policy_sha256"} <= {
         column["name"]
         for column in inspector.get_columns("autopilot_cycles", schema="quantlab")
@@ -210,6 +210,12 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         )
     }
     assert "ck_strategy_versions_v14_runtime_identity" in {
+        constraint["name"]
+        for constraint in inspector.get_check_constraints(
+            "strategy_versions", schema="quantlab"
+        )
+    }
+    assert "ck_strategy_versions_v15_runtime_identity" in {
         constraint["name"]
         for constraint in inspector.get_check_constraints(
             "strategy_versions", schema="quantlab"
@@ -1002,7 +1008,7 @@ def test_0045_retires_legacy_approved_pair_versions(database_url: str) -> None:
     assert audit is not None and audit[1] == "migration-0045"
 
 
-def test_same_lineage_repair_constraint_is_limited_to_exact_v2_v3_v4_v5(
+def test_same_lineage_repair_constraint_is_limited_to_exact_v2_through_v6(
     database_url: str,
 ) -> None:
     engine = open_database(database_url)
@@ -1068,6 +1074,12 @@ def test_same_lineage_repair_constraint_is_limited_to_exact_v2_v3_v4_v5(
     assert "687ad83efd9d734a238bd6b52b3f5e670cec1e5d165ec2b25cabcef724feb7cf" in (
         definition
     )
+    assert "transparent-baseline-pre-result-repair-v6" in definition
+    assert "v13-to-v15-fill-aware-holding-age" in definition
+    assert "51959d99d199410fa13a718658d03773" in definition
+    assert "4f4c1f51e74e4ed18cb6cb9f6ed757c7" in definition
+    assert "520b4c76f75445a88039a6f02d0d7dd1" in definition
+    assert "source_bindings" in definition
     assert "c2727672b33fed580841721551c45df1a11e864dd899cb6d473c220821da0dc0" in (
         definition
     )
@@ -1172,7 +1184,7 @@ def test_downgrade_rejects_append_only_same_lineage_v5_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0081_baseline_v14_seal"
+        ) == "0082_baseline_v15_repair"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
@@ -1250,7 +1262,7 @@ def test_downgrade_rejects_append_only_same_lineage_v4_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0081_baseline_v14_seal"
+        ) == "0082_baseline_v15_repair"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
@@ -1318,7 +1330,7 @@ def test_downgrade_rejects_append_only_same_lineage_v3_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0081_baseline_v14_seal"
+        ) == "0082_baseline_v15_repair"
 
 
 def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
@@ -1380,4 +1392,4 @@ def test_downgrade_rejects_append_only_same_lineage_v2_atomically(
     with engine.connect() as connection:
         assert connection.scalar(
             text("SELECT version_num FROM quantlab.alembic_version")
-        ) == "0081_baseline_v14_seal"
+        ) == "0082_baseline_v15_repair"

@@ -2405,6 +2405,197 @@ def test_unopened_history_cutoff_fails_when_no_horizon_window_can_mature(
 
 
 @pytest.mark.no_database
+def test_reconcile_preserves_every_unavailable_horizon_when_no_plan_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quant_platform import transparent_baseline_bootstrap as module
+
+    calendar = _calendar(1200)
+    dataset = _research_dataset(calendar, path=tmp_path / "all-unavailable")
+    current_recipe_version = get_strategy_recipe("short_relative_strength")[
+        "version"
+    ]
+    selection = build_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version=current_recipe_version,
+        prior_batches=[],
+    )
+
+    class Lockboxes:
+        @staticmethod
+        def resolve_preregistered_single_member_repair(**_kwargs: object) -> None:
+            return None
+
+        @staticmethod
+        def resolve_unopened_history_selection(**_kwargs: object) -> dict:
+            return {"calendar": list(calendar), "evidence": dict(selection)}
+
+    def unavailable(*, recipe_id: str, dataset: dict) -> dict:
+        assert dataset["unopened_history_selection"] == selection
+        evidence = {
+            "contract_version": "test-unavailable-horizon-v1",
+            "recipe_id": recipe_id,
+            "capital_evaluation_eligible": False,
+        }
+        raise ResearchWindowUnavailableError(
+            f"{recipe_id} has no honest window",
+            evidence=evidence,
+        )
+
+    monkeypatch.setattr(module, "_validate_dataset", lambda value: dict(value))
+    monkeypatch.setattr(module, "_plan_member", unavailable)
+    service = TransparentBaselineBootstrapService.__new__(
+        TransparentBaselineBootstrapService
+    )
+    service.data_root = tmp_path
+    service.dataset_loader = lambda _root: [dataset]
+    service.lockboxes = Lockboxes()
+    service._existing_families = lambda: {
+        recipe_id: None for recipe_id in TRANSPARENT_RESEARCH_BASELINE_IDS
+    }
+
+    result = service.reconcile(actor="test-all-unavailable")
+
+    assert result["status"] == "failed"
+    assert result["errors"] == [
+        "no transparent baseline horizon has enough unopened evidence"
+    ]
+    assert result["joint_lockbox"]["status"] == "unavailable"
+    unavailable_horizons = result["joint_lockbox"]["unavailable_horizons"]
+    assert [item["recipe_id"] for item in unavailable_horizons] == list(
+        TRANSPARENT_RESEARCH_BASELINE_IDS
+    )
+    assert all(item["status"] == "unavailable" for item in unavailable_horizons)
+    assert [item["recipe_id"] for item in result["members"]] == list(
+        TRANSPARENT_RESEARCH_BASELINE_IDS
+    )
+    assert all(item["state"] == "unavailable" for item in result["members"])
+    assert all(item["sleeve_action"] == "remain_in_cash" for item in result["members"])
+
+
+@pytest.mark.no_database
+def test_reconcile_prefers_exact_single_member_repair_history_and_same_oos(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quant_platform import transparent_baseline_bootstrap as module
+
+    calendar = _calendar(4300)
+    repaired_calendar = calendar[:2897]
+    dataset = _research_dataset(calendar, path=tmp_path / "single-member-repair")
+    source_start = repaired_calendar[-257]
+    source_end = repaired_calendar[-6]
+    repair_selection = {
+        "calendar": repaired_calendar,
+        "evidence": {
+            "contract_version": "transparent-baseline-unopened-history-selection-v2",
+            "current_recipe_version": get_strategy_recipe(
+                "short_relative_strength"
+            )["version"],
+            "selected_calendar_end": repaired_calendar[-1],
+            "selected_calendar_trading_days": len(repaired_calendar),
+            "receipt_sha256": "a" * 64,
+            "performance_information_used": False,
+        },
+        "repair_receipt": {"receipt_sha256": "a" * 64},
+        "source_batch_sha256": "b" * 64,
+        "source_lockbox": {
+            "members": [
+                {
+                    "recipe_id": "short_relative_strength",
+                    "horizon_profile": "short_1_5d",
+                    "test_start": source_start,
+                    "test_end": source_end,
+                }
+            ],
+            "unavailable_horizons": [
+                {"recipe_id": "swing_trend"},
+                {"recipe_id": "long_quality_value"},
+            ],
+        },
+    }
+    calls = {"repair": 0, "ordinary": 0}
+    seen_calendars: list[list[str]] = []
+
+    class Lockboxes:
+        @staticmethod
+        def resolve_preregistered_single_member_repair(**values: object) -> dict:
+            calls["repair"] += 1
+            assert values["calendar_days"] == calendar
+            return deepcopy(repair_selection)
+
+        @staticmethod
+        def resolve_unopened_history_selection(**_values: object) -> dict:
+            calls["ordinary"] += 1
+            raise AssertionError("exact preregistered repair must bypass ordinary left shift")
+
+    def plan_member(*, recipe_id: str, dataset: dict) -> dict:
+        seen_calendars.append(list(dataset["calendar"]))
+        if recipe_id == "short_relative_strength":
+            return {
+                "lockbox_member": {
+                    "recipe_id": recipe_id,
+                    "horizon_profile": "short_1_5d",
+                    "test_start": source_start,
+                    "test_end": source_end,
+                }
+            }
+        evidence = {
+            "contract_version": "test-source-unavailable-v1",
+            "recipe_id": recipe_id,
+            "capital_evaluation_eligible": False,
+        }
+        raise ResearchWindowUnavailableError(
+            f"{recipe_id} remains unavailable",
+            evidence=evidence,
+        )
+
+    monkeypatch.setattr(module, "_select_dataset", lambda *_args, **_kwargs: dataset)
+    monkeypatch.setattr(module, "_plan_member", plan_member)
+
+    def stop_after_planning(**_kwargs: object) -> dict:
+        raise ValueError("stop after exact repair planning")
+
+    monkeypatch.setattr(module, "build_joint_lockbox", stop_after_planning)
+    service = TransparentBaselineBootstrapService.__new__(
+        TransparentBaselineBootstrapService
+    )
+    service.data_root = tmp_path
+    service.dataset_loader = lambda _root: [dataset]
+    service.lockboxes = Lockboxes()
+    service._existing_families = lambda: {
+        recipe_id: None for recipe_id in TRANSPARENT_RESEARCH_BASELINE_IDS
+    }
+
+    result = service.reconcile(actor="test-exact-single-member-repair")
+
+    assert calls == {"repair": 1, "ordinary": 0}
+    assert seen_calendars == [repaired_calendar] * 3
+    assert result["unopened_history_selection"] == repair_selection["evidence"]
+    assert result["errors"] == ["stop after exact repair planning"]
+
+    changed = deepcopy(repair_selection)
+    changed_plan = {
+        "lockbox_member": {
+            "recipe_id": "short_relative_strength",
+            "horizon_profile": "short_1_5d",
+            "test_start": calendar[-300],
+            "test_end": source_end,
+        }
+    }
+    with pytest.raises(ValueError, match="changed the frozen short final OOS"):
+        module._require_preregistered_single_member_repair_oos(
+            repair_selection=changed,
+            plans=[changed_plan],
+            unavailable_horizons=[
+                {"recipe_id": "swing_trend"},
+                {"recipe_id": "long_quality_value"},
+            ],
+        )
+
+
+@pytest.mark.no_database
 def test_partial_v12_lockbox_preregisters_short_swing_and_seals_long_cash(
     tmp_path: Path,
 ) -> None:

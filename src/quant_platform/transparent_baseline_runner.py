@@ -77,6 +77,18 @@ FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256 = (
 FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256 = (
     "04f9dce110aaf44d32972c68db3edefafbd08cfdbf1f7dfb98aac9a15409bfe5"
 )
+SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION = (
+    "qlib-rdagent-single-mainline-2026-08-30-v15"
+)
+SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256 = (
+    "31d4c7a294ae61c19edcdb8e014b521c1b544836d6891af36cfba3ecf4ab43a3"
+)
+# Filled only after the complete v15 source closure is stable in two
+# consecutive calculations.  Keeping this assignment in the same normalized
+# seal family prevents the digest from hashing itself.
+SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256 = (
+    "e361d85d69d77cb6e0de7072db6f8aaff5d83f1e7902fe16ef06c2e28fce1867"
+)
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"
 TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD = "target_runtime_bundle_sha256"
@@ -112,6 +124,9 @@ _TARGET_RUNNERS = {
     ),
     FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION: (
         FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256
+    ),
+    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION: (
+        SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256
     ),
 }
 
@@ -176,6 +191,11 @@ def target_runtime_bundle_for_recipe(recipe_id: Any, recipe_version: Any) -> str
         return FAIL_CLOSED_EXECUTION_TARGET_RUNTIME_BUNDLE_SHA256
     if str(recipe_version or "") == FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION:
         return FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256
+    if (
+        str(recipe_version or "")
+        == SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION
+    ):
+        return SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
     return None
 
 
@@ -197,6 +217,7 @@ def target_worker_runtime_image_for_recipe(
             POSITION_RISK_TARGET_RECIPE_VERSION,
             FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION,
             FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION,
+            SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
         }
     ):
         return None
@@ -204,6 +225,7 @@ def target_worker_runtime_image_for_recipe(
         POSITION_RISK_TARGET_RECIPE_VERSION: "v12",
         FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION: "v13",
         FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION: "v14",
+        SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION: "v15",
     }[str(recipe_version or "")]
     value = str(os.getenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV) or "").strip().lower()
     if not _IMAGE_DIGEST.fullmatch(value):
@@ -263,6 +285,7 @@ def require_transparent_baseline_runner(
         POSITION_RISK_TARGET_RECIPE_VERSION: "v12",
         FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION: "v13",
         FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION: "v14",
+        SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION: "v15",
     }[str(config.get("recipe_version") or "")]
     if bootstrap_value != expected or payload_value != expected:
         raise ValueError(
@@ -297,11 +320,11 @@ def require_transparent_baseline_runner(
         raise ValueError(
             f"transparent {version_label} runner bytes differ from the repair authorization"
         )
-    if version_label in {"v10", "v11", "v12", "v13", "v14"}:
+    if version_label in {"v10", "v11", "v12", "v13", "v14", "v15"}:
         try:
             bundle_sha256 = (
                 position_risk_bundle_sha256(runner_path.parents[1])
-                if version_label in {"v12", "v13", "v14"}
+                if version_label in {"v12", "v13", "v14", "v15"}
                 else runtime_alignment_bundle_sha256(runner_path.parents[1])
             )
         except OSError as exc:
@@ -314,6 +337,7 @@ def require_transparent_baseline_runner(
             "v12": POSITION_RISK_TARGET_RUNTIME_BUNDLE_SHA256,
             "v13": FAIL_CLOSED_EXECUTION_TARGET_RUNTIME_BUNDLE_SHA256,
             "v14": FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v15": SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
         }[version_label]
         if bundle_sha256 != expected_bundle_sha256:
             raise ValueError(

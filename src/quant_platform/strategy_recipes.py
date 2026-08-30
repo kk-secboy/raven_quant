@@ -5,12 +5,11 @@ from typing import Any
 
 from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 
-# v14 is a material append-only generation.  It binds the current strategy
-# runtime to fill-aware holding-age reconciliation: rejected and partial exits
-# keep their governed age until Qlib's actual account no longer holds them.
-# Historical v8-v13 recipes and their OOS evidence remain immutable under their
+# v15 is a material append-only generation.  It binds the current strategy
+# runtime to the narrowly preregistered single-member pre-result recovery path.
+# Historical v8-v14 recipes and their OOS evidence remain immutable under their
 # original runner/runtime identities.
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v14"
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-30-v15"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},

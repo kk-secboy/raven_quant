@@ -37,13 +37,21 @@ from quant_platform.strategy_recipes import TRANSPARENT_RESEARCH_BASELINE_IDS
 from quant_platform.transparent_baseline_runner import (
     CANONICAL_LF_TARGET_RECIPE_VERSION,
     CANONICAL_LF_TARGET_RUNNER_SHA256,
+    FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION,
+    FAIL_CLOSED_EXECUTION_TARGET_RUNNER_SHA256,
+    FAIL_CLOSED_EXECUTION_TARGET_RUNTIME_BUNDLE_SHA256,
     OPTIMIZER_APPLICABILITY_TARGET_RECIPE_VERSION,
     OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256,
     RUNTIME_ALIGNMENT_SOURCE_RUNTIME_BUNDLE_SHA256,
     RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256,
     RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256,
+    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
+    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256,
+    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
+    TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
     target_runner_for_recipe,
     target_runtime_bundle_for_recipe,
 )
@@ -70,8 +78,14 @@ BOOTSTRAP_CONFIG_KEY = "transparent_baseline_bootstrap"
 UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION = (
     "transparent-baseline-unopened-history-selection-v1"
 )
+UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V2 = (
+    "transparent-baseline-unopened-history-selection-v2"
+)
 UNOPENED_HISTORY_SELECTION_POLICY = (
     "exclude-current-recipe-at-earliest-prior-opened-final-oos-v1"
+)
+UNOPENED_HISTORY_SELECTION_POLICY_V2 = (
+    "reuse-exact-preregistered-single-member-pre-result-source-v1"
 )
 PRE_RESULT_REPAIR_ACTION = "transparent_baseline_pre_result_repair_registered"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V1 = "transparent-baseline-pre-result-repair-v1"
@@ -79,6 +93,7 @@ PRE_RESULT_REPAIR_CONTRACT_VERSION_V2 = "transparent-baseline-pre-result-repair-
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V3 = "transparent-baseline-pre-result-repair-v3"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V4 = "transparent-baseline-pre-result-repair-v4"
 PRE_RESULT_REPAIR_CONTRACT_VERSION_V5 = "transparent-baseline-pre-result-repair-v5"
+PRE_RESULT_REPAIR_CONTRACT_VERSION_V6 = "transparent-baseline-pre-result-repair-v6"
 # Keep the historical public name pinned to v1.  Existing receipts and callers
 # must not silently acquire the wider v2 shape.
 PRE_RESULT_REPAIR_CONTRACT_VERSION = PRE_RESULT_REPAIR_CONTRACT_VERSION_V1
@@ -311,6 +326,90 @@ RUNTIME_INPUT_SCOPE_SOURCE_BACKTEST_IDS = frozenset(
     RUNTIME_INPUT_SCOPE_SOURCE_BINDINGS
 )
 
+FILL_AWARE_HOLDING_AGE_REPAIR_GENERATION = (
+    "v13-to-v15-fill-aware-holding-age"
+)
+FILL_AWARE_HOLDING_AGE_RUNTIME_CONTRACT_VERSION = (
+    "transparent-baseline-fill-aware-holding-age-repair-v1"
+)
+FILL_AWARE_HOLDING_AGE_REASON = (
+    "holding-age-reconciliation-after-unfilled-or-partial-exit"
+)
+FILL_AWARE_HOLDING_AGE_ERROR = (
+    "ValueError: holding-period policy requires complete holding-age state"
+)
+FILL_AWARE_HOLDING_AGE_TARGET_CHANGE_CODES = (
+    "preserve-and-reconcile-holding-age-from-actual-holdings-after-unfilled-or-partial-exit",
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_COMMIT = (
+    "ed5c8b3d0ea118dddbec7b1b5cf3c82b8cd72c08"
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_RECIPE_VERSION = (
+    FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION
+)
+FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION = (
+    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_RUNNER_SHA256 = (
+    FAIL_CLOSED_EXECUTION_TARGET_RUNNER_SHA256
+)
+FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256 = (
+    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_BUNDLE_SHA256 = (
+    FAIL_CLOSED_EXECUTION_TARGET_RUNTIME_BUNDLE_SHA256
+)
+FILL_AWARE_HOLDING_AGE_TARGET_BUNDLE_SHA256 = (
+    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256 = (
+    "34e96967cdb021913489ec95eebfd82eda68df7bdbee92ead837e467c3e7af96"
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_DATASET = (
+    "cn-20080101-20260828-v7-failclosed-ed5c8b3"
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_IDENTITY_SHA256 = (
+    "eab69dff43abcc77e60f47ad51d2182c7bfd5d90f5d36c479e3de61cebf768f2"
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_LINEAGE_ID = (
+    "1b97efcc3956b4be2dfebff7567efd4707c73d806f9d0cb2b63540d9dedd852e"
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_ARTIFACT_INVENTORIES_SHA256 = (
+    "7a83e76cde3fbc8a62583da41aef00613d4e15479a71b6e83a03b069d6005e01"
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_SELECTION_SHA256 = (
+    "145161dbb19e8448995dcaaf781a9d433cfb0ce99ff9812367d5b1fbf1860076"
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_UNAVAILABLE_HORIZONS_SHA256 = (
+    "b9f36421f0047ab024eec0f2b20909a105c2a57e17dc94a50aa25e632f8c3644"
+)
+FILL_AWARE_HOLDING_AGE_UNAVAILABLE_EVIDENCE_SHA256S = frozenset(
+    {
+        "b57d3dba4ab3d2284b2a001cb30a7b2862a8659c3738d5fc23419e7e7a6b5729",
+        "62f5642a4ad024cc24d23ec34b9ce760a552f560c783612b63dab459ba00d14d",
+    }
+)
+FILL_AWARE_HOLDING_AGE_SOURCE_BINDINGS = {
+    "51959d99d199410fa13a718658d03773": {
+        "job_id": "4f4c1f51e74e4ed18cb6cb9f6ed757c7",
+        "strategy_version_id": "520b4c76f75445a88039a6f02d0d7dd1",
+        "reason_code": FILL_AWARE_HOLDING_AGE_REASON,
+        "error": FILL_AWARE_HOLDING_AGE_ERROR,
+        "periods": {
+            "historical_start": "2008-01-02",
+            "historical_end": "2018-10-10",
+            "start": "2018-11-08",
+            "end": "2019-11-20",
+        },
+        "artifact_inventory_sha256": (
+            "883add2be6f985fead0528b6d8dd2faa8e418a47041af71901a0d677ab5ff381"
+        ),
+    }
+}
+FILL_AWARE_HOLDING_AGE_SOURCE_BACKTEST_IDS = frozenset(
+    FILL_AWARE_HOLDING_AGE_SOURCE_BINDINGS
+)
+
 _PRE_RESULT_REPAIR_REASON_CODES = frozenset(
     {
         "empty_eligible_session_pandas_concat_failure",
@@ -382,6 +481,17 @@ def _require_identifier(value: Any, *, field: str) -> str:
         character not in "0123456789abcdef" for character in normalized
     ):
         raise ValueError(f"{field} must be a lowercase 32-character identifier")
+    return normalized
+
+
+def _require_worker_image_digest(value: Any, *, field: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if (
+        not normalized.startswith("sha256:")
+        or len(normalized) != 71
+        or any(character not in "0123456789abcdef" for character in normalized[7:])
+    ):
+        raise ValueError(f"{field} must be a sha256 image digest")
     return normalized
 
 
@@ -577,6 +687,105 @@ def build_unopened_history_selection(
     return {**payload, "selection_sha256": canonical_sha256(payload)}
 
 
+def _validate_fill_aware_repair_source_batch(value: Any) -> dict[str, Any]:
+    source_batch = _normalize_prior_batch(value)
+    members = list(source_batch["members"])
+    source_binding = next(iter(FILL_AWARE_HOLDING_AGE_SOURCE_BINDINGS.values()))
+    if (
+        source_batch["batch_sha256"] != FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256
+        or source_batch["recipe_version"]
+        != FILL_AWARE_HOLDING_AGE_SOURCE_RECIPE_VERSION
+        or len(members) != 1
+        or members[0]["recipe_id"] != "short_relative_strength"
+        or members[0]["horizon_profile"] != "short_1_5d"
+        or members[0]["recipe_version"]
+        != FILL_AWARE_HOLDING_AGE_SOURCE_RECIPE_VERSION
+        or members[0]["strategy_version_id"]
+        != source_binding["strategy_version_id"]
+        or members[0]["test_start"] != source_binding["periods"]["start"]
+        or members[0]["test_end"] != source_binding["periods"]["end"]
+    ):
+        raise ValueError("fill-aware holding-age repair source batch changed")
+    return source_batch
+
+
+def build_pre_result_repair_history_selection(
+    *,
+    calendar_days: Sequence[Any],
+    current_recipe_version: str,
+    source_selection: Mapping[str, Any],
+    repaired_source_batch: Mapping[str, Any],
+    repair_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Rebind only the exact preregistered v13 short OOS to governed v15.
+
+    The repaired v13 batch is deliberately *not* added to ``prior_batches``:
+    doing so would move the final OOS to an earlier window.  Instead this v2
+    evidence names that one excluded batch and its pre-result receipt while
+    preserving every ordinary prior batch from the frozen v13 selection.
+    """
+
+    calendar = _ordered_calendar(calendar_days)
+    current = str(current_recipe_version or "").strip()
+    if current != FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION:
+        raise ValueError("fill-aware holding-age history target recipe changed")
+    source = validate_unopened_history_selection(
+        source_selection,
+        calendar_days=calendar,
+    )
+    if (
+        source["contract_version"] != UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION
+        or source["current_recipe_version"]
+        != FILL_AWARE_HOLDING_AGE_SOURCE_RECIPE_VERSION
+        or source["selection_sha256"]
+        != FILL_AWARE_HOLDING_AGE_SOURCE_SELECTION_SHA256
+        or source["selected_calendar_end"] != "2019-11-27"
+        or source["selected_calendar_trading_days"] != 2897
+    ):
+        raise ValueError("fill-aware holding-age source history selection changed")
+    source_batch = _validate_fill_aware_repair_source_batch(repaired_source_batch)
+    receipt = validate_pre_result_repair_receipt(repair_receipt)
+    if (
+        receipt["contract_version"] != PRE_RESULT_REPAIR_CONTRACT_VERSION_V6
+        or receipt["source_batch_sha256"]
+        != FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256
+    ):
+        raise ValueError("fill-aware holding-age history receipt changed")
+    ordinary = build_unopened_history_selection(
+        calendar_days=calendar,
+        current_recipe_version=current,
+        prior_batches=list(source["prior_batches"]),
+    )
+    for field in (
+        "source_calendar_start",
+        "source_calendar_end",
+        "source_calendar_trading_days",
+        "source_calendar_sha256",
+        "earliest_prior_final_oos_start",
+        "selected_calendar_end",
+        "selected_calendar_trading_days",
+        "selected_calendar_sha256",
+        "prior_batches_sha256",
+    ):
+        if ordinary[field] != source[field]:
+            raise ValueError("fill-aware holding-age history selection moved")
+    payload = {
+        **{key: value for key, value in ordinary.items() if key != "selection_sha256"},
+        "contract_version": UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V2,
+        "selection_policy": UNOPENED_HISTORY_SELECTION_POLICY_V2,
+        "selection_mode": "exact_preregistered_single_member_pre_result_repair",
+        "prior_windows_treatment": (
+            "ordinary_historical_validation_plus_exact_pre_result_source_exclusion"
+        ),
+        "repaired_source_batch": source_batch,
+        "repaired_source_batch_sha256": FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256,
+        "source_history_selection_sha256": source["selection_sha256"],
+        "repair_receipt_sha256": receipt["receipt_sha256"],
+        "performance_information_used": False,
+    }
+    return {**payload, "selection_sha256": canonical_sha256(payload)}
+
+
 def validate_unopened_history_selection(
     value: Any,
     *,
@@ -584,6 +793,107 @@ def validate_unopened_history_selection(
 ) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("transparent baseline unopened-history selection is required")
+    if value.get("contract_version") == UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V2:
+        expected_v2_keys = {
+            "contract_version",
+            "selection_policy",
+            "selection_mode",
+            "cutoff_rule",
+            "current_recipe_version",
+            "source_calendar_start",
+            "source_calendar_end",
+            "source_calendar_trading_days",
+            "source_calendar_sha256",
+            "earliest_prior_final_oos_start",
+            "selected_calendar_end",
+            "selected_calendar_trading_days",
+            "selected_calendar_sha256",
+            "prior_batches",
+            "prior_batches_sha256",
+            "prior_results_or_metrics_read",
+            "prior_windows_treatment",
+            "repaired_source_batch",
+            "repaired_source_batch_sha256",
+            "source_history_selection_sha256",
+            "repair_receipt_sha256",
+            "performance_information_used",
+            "selection_sha256",
+        }
+        if set(value) != expected_v2_keys:
+            raise ValueError("transparent baseline repair history selection is invalid")
+        raw_batches = value.get("prior_batches")
+        if not isinstance(raw_batches, list) or any(
+            not isinstance(item, Mapping) for item in raw_batches
+        ):
+            raise ValueError("transparent baseline prior-batch evidence is invalid")
+        normalized_batches = sorted(
+            (_normalize_prior_batch(item) for item in raw_batches),
+            key=lambda item: item["batch_sha256"],
+        )
+        source_batch = _validate_fill_aware_repair_source_batch(
+            value.get("repaired_source_batch")
+        )
+        payload = dict(value)
+        selection_sha256 = _require_sha256(
+            payload.pop("selection_sha256", None), field="selection_sha256"
+        )
+        if (
+            canonical_sha256(payload) != selection_sha256
+            or value.get("selection_policy") != UNOPENED_HISTORY_SELECTION_POLICY_V2
+            or value.get("selection_mode")
+            != "exact_preregistered_single_member_pre_result_repair"
+            or value.get("current_recipe_version")
+            != FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION
+            or value.get("repaired_source_batch_sha256")
+            != FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256
+            or source_batch["batch_sha256"]
+            != FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256
+            or _require_sha256(
+                value.get("source_history_selection_sha256"),
+                field="source_history_selection_sha256",
+            )
+            != FILL_AWARE_HOLDING_AGE_SOURCE_SELECTION_SHA256
+            or _require_sha256(
+                value.get("repair_receipt_sha256"),
+                field="repair_receipt_sha256",
+            )
+            != value.get("repair_receipt_sha256")
+            or value.get("performance_information_used") is not False
+            or value.get("prior_results_or_metrics_read") is not False
+            or value.get("prior_windows_treatment")
+            != "ordinary_historical_validation_plus_exact_pre_result_source_exclusion"
+            or value.get("prior_batches_sha256")
+            != canonical_sha256(normalized_batches)
+            or any(
+                item["recipe_version"] == value.get("current_recipe_version")
+                for item in normalized_batches
+            )
+            or value.get("selected_calendar_end") != "2019-11-27"
+            or value.get("selected_calendar_trading_days") != 2897
+        ):
+            raise ValueError("transparent baseline repair history selection changed")
+        if calendar_days is not None:
+            ordinary = build_unopened_history_selection(
+                calendar_days=calendar_days,
+                current_recipe_version=FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION,
+                prior_batches=normalized_batches,
+            )
+            for field in (
+                "cutoff_rule",
+                "source_calendar_start",
+                "source_calendar_end",
+                "source_calendar_trading_days",
+                "source_calendar_sha256",
+                "earliest_prior_final_oos_start",
+                "selected_calendar_end",
+                "selected_calendar_trading_days",
+                "selected_calendar_sha256",
+            ):
+                if value.get(field) != ordinary[field]:
+                    raise ValueError(
+                        "transparent baseline repair history selection or cutoff changed"
+                    )
+        return dict(value)
     expected_keys = {
         "contract_version",
         "selection_policy",
@@ -718,7 +1028,9 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
     the exact v9 runtime-contract failures; V5 seals the exact v10 runtime
     input-scope failures and their complete partial-artifact inventories, plus
     a separate exact target-change list, before any corrected code can open a
-    fresh OOS scope.
+    fresh OOS scope. V6 is intentionally the only one-member generation: it
+    binds the exact failed v13 short attempt and its v3 unavailable-horizon
+    evidence before the same OOS can be opened by v15.
     """
 
     if not isinstance(value, Mapping):
@@ -820,6 +1132,30 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         }
         repair_generation = str(value.get("repair_generation") or "").strip()
         if repair_generation != RUNTIME_INPUT_SCOPE_REPAIR_GENERATION:
+            raise ValueError("transparent baseline repair generation is not allowlisted")
+    elif contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V6:
+        keys = common_keys | {
+            "repair_generation",
+            "source_batch_sha256",
+            "source_dataset_identity_sha256",
+            "source_dataset_lineage_id",
+            "source_runner_sha256",
+            TRANSPARENT_BASELINE_RUNNER_FIELD,
+            "source_runtime_bundle_sha256",
+            "target_runtime_bundle_sha256",
+            "runtime_contract_version",
+            "source_artifact_inventories_sha256",
+            "source_unopened_history_selection_sha256",
+            "source_unavailable_horizons_sha256",
+            "source_unavailable_evidence_sha256s",
+            "target_change_codes",
+        }
+        expected_reasons = frozenset({FILL_AWARE_HOLDING_AGE_REASON})
+        failure_markers = {
+            FILL_AWARE_HOLDING_AGE_REASON: FILL_AWARE_HOLDING_AGE_ERROR
+        }
+        repair_generation = str(value.get("repair_generation") or "").strip()
+        if repair_generation != FILL_AWARE_HOLDING_AGE_REPAIR_GENERATION:
             raise ValueError("transparent baseline repair generation is not allowlisted")
     else:
         raise ValueError("transparent baseline pre-result repair contract is invalid")
@@ -941,6 +1277,65 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
         != list(RUNTIME_INPUT_SCOPE_TARGET_CHANGE_CODES)
     ):
         raise ValueError("runtime input-scope target changes are not allowlisted")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V6 and (
+        commit != FILL_AWARE_HOLDING_AGE_SOURCE_COMMIT
+        or target_recipe_version != FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION
+        or _require_sha256(
+            value.get("source_batch_sha256"), field="source_batch_sha256"
+        )
+        != FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256
+        or _require_sha256(
+            value.get("source_dataset_identity_sha256"),
+            field="source_dataset_identity_sha256",
+        )
+        != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_IDENTITY_SHA256
+        or _require_sha256(
+            value.get("source_dataset_lineage_id"),
+            field="source_dataset_lineage_id",
+        )
+        != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_LINEAGE_ID
+        or _require_sha256(
+            value.get("source_runner_sha256"), field="source_runner_sha256"
+        )
+        != FILL_AWARE_HOLDING_AGE_SOURCE_RUNNER_SHA256
+        or _require_sha256(
+            value.get(TRANSPARENT_BASELINE_RUNNER_FIELD),
+            field=TRANSPARENT_BASELINE_RUNNER_FIELD,
+        )
+        != FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256
+        or _require_sha256(
+            value.get("source_runtime_bundle_sha256"),
+            field="source_runtime_bundle_sha256",
+        )
+        != FILL_AWARE_HOLDING_AGE_SOURCE_BUNDLE_SHA256
+        or _require_sha256(
+            value.get("target_runtime_bundle_sha256"),
+            field="target_runtime_bundle_sha256",
+        )
+        != FILL_AWARE_HOLDING_AGE_TARGET_BUNDLE_SHA256
+        or value.get("runtime_contract_version")
+        != FILL_AWARE_HOLDING_AGE_RUNTIME_CONTRACT_VERSION
+        or _require_sha256(
+            value.get("source_artifact_inventories_sha256"),
+            field="source_artifact_inventories_sha256",
+        )
+        != FILL_AWARE_HOLDING_AGE_SOURCE_ARTIFACT_INVENTORIES_SHA256
+        or _require_sha256(
+            value.get("source_unopened_history_selection_sha256"),
+            field="source_unopened_history_selection_sha256",
+        )
+        != FILL_AWARE_HOLDING_AGE_SOURCE_SELECTION_SHA256
+        or _require_sha256(
+            value.get("source_unavailable_horizons_sha256"),
+            field="source_unavailable_horizons_sha256",
+        )
+        != FILL_AWARE_HOLDING_AGE_SOURCE_UNAVAILABLE_HORIZONS_SHA256
+        or value.get("source_unavailable_evidence_sha256s")
+        != sorted(FILL_AWARE_HOLDING_AGE_UNAVAILABLE_EVIDENCE_SHA256S)
+        or value.get("target_change_codes")
+        != list(FILL_AWARE_HOLDING_AGE_TARGET_CHANGE_CODES)
+    ):
+        raise ValueError("fill-aware holding-age repair source or target is not allowlisted")
     if (
         value.get("target_eligibility_contract") != ELIGIBILITY_CONTRACT_VERSION
         or value.get("target_stock_scope_contract")
@@ -956,8 +1351,14 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
     ):
         raise ValueError("transparent baseline repair reason or performance boundary is invalid")
     raw_members = value.get("members")
-    if not isinstance(raw_members, list) or len(raw_members) != 3:
-        raise ValueError("transparent baseline repair must seal exactly three attempts")
+    expected_member_count = (
+        1 if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V6 else 3
+    )
+    if not isinstance(raw_members, list) or len(raw_members) != expected_member_count:
+        raise ValueError(
+            "transparent baseline repair must seal exactly "
+            f"{expected_member_count} attempt{'s' if expected_member_count != 1 else ''}"
+        )
     members: list[dict[str, Any]] = []
     identifiers: dict[str, set[str]] = {
         "backtest_id": set(),
@@ -1024,9 +1425,12 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V3,
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V4,
             PRE_RESULT_REPAIR_CONTRACT_VERSION_V5,
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V6,
         } and (
             member.get("status") != "failed"
         ):
+            if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V6:
+                raise ValueError("allowlisted repair requires one failed attempt")
             raise ValueError("allowlisted repair requires three failed attempts")
         error = member.get("error")
         if error is not None:
@@ -1053,6 +1457,12 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
                 )
                 if source is None or error_text != source["error"]:
                     raise ValueError("runtime input-scope repair error is not exact")
+            if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V6:
+                source = FILL_AWARE_HOLDING_AGE_SOURCE_BINDINGS.get(
+                    str(member.get("backtest_id") or "")
+                )
+                if source is None or error_text != source["error"]:
+                    raise ValueError("fill-aware holding-age repair error is not exact")
             matches = {
                 code
                 for code, marker in failure_markers.items()
@@ -1195,6 +1605,35 @@ def validate_pre_result_repair_receipt(value: Any) -> dict[str, Any]:
             != aggregate_inventory
         ):
             raise ValueError("runtime input-scope aggregate artifact inventory changed")
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V6:
+        if identifiers["backtest_id"] != FILL_AWARE_HOLDING_AGE_SOURCE_BACKTEST_IDS:
+            raise ValueError("fill-aware holding-age repair backtest is not allowlisted")
+        member = members[0]
+        source = FILL_AWARE_HOLDING_AGE_SOURCE_BINDINGS.get(member["backtest_id"])
+        if source is None or any(
+            member[field] != source[field]
+            for field in ("job_id", "strategy_version_id")
+        ):
+            raise ValueError("fill-aware holding-age source binding changed")
+        if (
+            member["dataset"] != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET
+            or member["periods"] != source["periods"]
+            or member["error"] != source["error"]
+        ):
+            raise ValueError("fill-aware holding-age source evidence changed")
+        inventory_sha256 = canonical_sha256(member["files"])
+        inventory_rows = [
+            {
+                "backtest_id": member["backtest_id"],
+                "artifact_inventory_sha256": inventory_sha256,
+            }
+        ]
+        if (
+            inventory_sha256 != source["artifact_inventory_sha256"]
+            or canonical_sha256(inventory_rows)
+            != FILL_AWARE_HOLDING_AGE_SOURCE_ARTIFACT_INVENTORIES_SHA256
+        ):
+            raise ValueError("fill-aware holding-age artifact inventory changed")
     if observed_failure_markers != expected_reasons:
         raise ValueError("transparent baseline repair does not cover its allowlisted defect")
     return {
@@ -1840,6 +2279,54 @@ def _exact_same_lineage_registry_profile(
             == list(RUNTIME_INPUT_SCOPE_TARGET_CHANGE_CODES)
             and source_backtest_ids == set(RUNTIME_INPUT_SCOPE_SOURCE_BACKTEST_IDS)
         )
+    if contract_version == PRE_RESULT_REPAIR_CONTRACT_VERSION_V6:
+        return (
+            verification.get("repair_generation")
+            == FILL_AWARE_HOLDING_AGE_REPAIR_GENERATION
+            and verification.get("source_batch_sha256")
+            == FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256
+            and verification.get("source_dataset_identity_sha256")
+            == FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_IDENTITY_SHA256
+            and verification.get("source_dataset_lineage_id")
+            == FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_LINEAGE_ID
+            and verification.get("source_runner_sha256")
+            == FILL_AWARE_HOLDING_AGE_SOURCE_RUNNER_SHA256
+            and verification.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+            == FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256
+            and verification.get("source_runtime_bundle_sha256")
+            == FILL_AWARE_HOLDING_AGE_SOURCE_BUNDLE_SHA256
+            and verification.get("target_runtime_bundle_sha256")
+            == FILL_AWARE_HOLDING_AGE_TARGET_BUNDLE_SHA256
+            and verification.get("runtime_contract_version")
+            == FILL_AWARE_HOLDING_AGE_RUNTIME_CONTRACT_VERSION
+            and verification.get("source_release_commit")
+            == FILL_AWARE_HOLDING_AGE_SOURCE_COMMIT
+            and verification.get("target_recipe_version")
+            == FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION
+            and verification.get("source_artifact_inventories_sha256")
+            == FILL_AWARE_HOLDING_AGE_SOURCE_ARTIFACT_INVENTORIES_SHA256
+            and verification.get("source_unopened_history_selection_sha256")
+            == FILL_AWARE_HOLDING_AGE_SOURCE_SELECTION_SHA256
+            and verification.get("source_unavailable_horizons_sha256")
+            == FILL_AWARE_HOLDING_AGE_SOURCE_UNAVAILABLE_HORIZONS_SHA256
+            and verification.get("source_unavailable_evidence_sha256s")
+            == sorted(FILL_AWARE_HOLDING_AGE_UNAVAILABLE_EVIDENCE_SHA256S)
+            and verification.get("target_change_codes")
+            == list(FILL_AWARE_HOLDING_AGE_TARGET_CHANGE_CODES)
+            and verification.get("source_bindings")
+            == [
+                {
+                    "backtest_id": backtest_id,
+                    "job_id": binding["job_id"],
+                    "strategy_version_id": binding["strategy_version_id"],
+                }
+                for backtest_id, binding in sorted(
+                    FILL_AWARE_HOLDING_AGE_SOURCE_BINDINGS.items()
+                )
+            ]
+            and source_backtest_ids
+            == set(FILL_AWARE_HOLDING_AGE_SOURCE_BACKTEST_IDS)
+        )
     return False
 
 
@@ -1934,11 +2421,15 @@ def validate_repair_registry_binding(
         results_created_after = list(
             verification.get("results_created_after_preregistration") or []
         )
+        is_single_member_repair = verification.get("receipt_contract_version") == (
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V6
+        )
+        expected_member_count = 1 if is_single_member_repair else 3
         if (
-            len(normalized_versions) != 3
+            len(normalized_versions) != expected_member_count
             or "" in normalized_versions
-            or len(recorded_version_ids) != 3
-            or len(verification_version_ids) != 3
+            or len(recorded_version_ids) != expected_member_count
+            or len(verification_version_ids) != expected_member_count
             or normalized_versions != set(recorded_version_ids)
             or normalized_versions != set(verification_version_ids)
             or str(strategy_version_id) not in normalized_versions
@@ -1984,6 +2475,241 @@ class TransparentBaselineLockboxStore:
 
     def __init__(self, database_url: str) -> None:
         self.engine = open_database(database_url)
+
+    def resolve_preregistered_single_member_repair(
+        self,
+        *,
+        calendar_days: Sequence[Any],
+        current_recipe_version: str,
+    ) -> dict[str, Any] | None:
+        """Return the one exact v13-short repair selection, if preregistered.
+
+        This lookup never reads performance.  It accepts only the production
+        V6 receipt and independently rechecks the still-failed source row,
+        immutable v3 partial lockbox, unavailable horizons, artifact inventory
+        and frozen v13 history selection before producing v2 evidence.
+        """
+
+        current = str(current_recipe_version or "").strip()
+        if current != FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION:
+            return None
+        calendar = _ordered_calendar(calendar_days)
+        matches: list[tuple[Any, dict[str, Any]]] = []
+        with self.engine.connect() as connection:
+            for audit_row in connection.execute(
+                select(audit_events)
+                .where(audit_events.c.action == PRE_RESULT_REPAIR_ACTION)
+                .order_by(audit_events.c.created_at)
+            ).all():
+                try:
+                    receipt = validate_pre_result_repair_receipt(
+                        dict(audit_row.details_json or {})
+                    )
+                except ValueError:
+                    continue
+                if receipt["contract_version"] == PRE_RESULT_REPAIR_CONTRACT_VERSION_V6:
+                    matches.append((audit_row, receipt))
+            if not matches:
+                return None
+            if len(matches) != 1:
+                raise ValueError(
+                    "fill-aware holding-age repair has more than one preregistration"
+                )
+            audit_row, receipt = matches[0]
+            if (
+                str(audit_row.method) != "INTERNAL"
+                or str(audit_row.path) != "transparent-baseline/pre-result-repair"
+                or int(audit_row.status_code) != 201
+                or audit_row.created_at is None
+            ):
+                raise ValueError("fill-aware holding-age repair audit envelope is invalid")
+
+            source_rows: list[Any] = []
+            for row in connection.execute(select(oos_vintages)).all():
+                raw_link = dict(row.sealed_candidate_set_json or {}).get(
+                    "transparent_baseline_lockbox"
+                )
+                if not isinstance(raw_link, Mapping):
+                    continue
+                try:
+                    link = validate_lockbox_link(raw_link)
+                except ValueError:
+                    continue
+                if link["batch_sha256"] == FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256:
+                    source_rows.append(row)
+            if len(source_rows) != 1 or source_rows[0].consumed_at is None:
+                raise ValueError("fill-aware holding-age source lockbox is incomplete")
+            source_row = source_rows[0]
+            sealed = dict(source_row.sealed_candidate_set_json or {})
+            link = validate_lockbox_link(sealed.get("transparent_baseline_lockbox"))
+            source_binding = next(
+                iter(FILL_AWARE_HOLDING_AGE_SOURCE_BINDINGS.values())
+            )
+            source_version_id = _require_identifier(
+                sealed.get("strategy_version_id"), field="strategy_version_id"
+            )
+            if (
+                link["batch_sha256"] != FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256
+                or link["recipe_id"] != "short_relative_strength"
+                or link["horizon_profile"] != "short_1_5d"
+                or source_version_id != source_binding["strategy_version_id"]
+                or str(source_row.dataset_identity or "")
+                != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_IDENTITY_SHA256
+                or str(source_row.dataset_lineage_id or "")
+                != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_LINEAGE_ID
+                or source_row.test_start.isoformat()
+                != source_binding["periods"]["start"]
+                or source_row.test_end.isoformat() != source_binding["periods"]["end"]
+            ):
+                raise ValueError("fill-aware holding-age source OOS binding changed")
+
+            version_row = connection.execute(
+                select(strategy_versions).where(
+                    strategy_versions.c.id == source_version_id
+                )
+            ).one()
+            source_config = dict(version_row.config_json or {})
+            source_bootstrap = dict(source_config.get(BOOTSTRAP_CONFIG_KEY) or {})
+            source_lockbox = validate_joint_lockbox(
+                source_config.get(LOCKBOX_CONFIG_KEY)
+            )
+            unavailable = list(source_lockbox.get("unavailable_horizons") or [])
+            if (
+                source_lockbox["contract_version"] != LOCKBOX_CONTRACT_VERSION_V3
+                or source_lockbox["batch_sha256"]
+                != FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256
+                or [item["recipe_id"] for item in source_lockbox["members"]]
+                != ["short_relative_strength"]
+                or {item["recipe_id"] for item in unavailable}
+                != {"swing_trend", "long_quality_value"}
+                or canonical_sha256(unavailable)
+                != FILL_AWARE_HOLDING_AGE_SOURCE_UNAVAILABLE_HORIZONS_SHA256
+                or {item["evidence_sha256"] for item in unavailable}
+                != FILL_AWARE_HOLDING_AGE_UNAVAILABLE_EVIDENCE_SHA256S
+                or source_config.get("recipe_id") != "short_relative_strength"
+                or source_config.get("recipe_version")
+                != FILL_AWARE_HOLDING_AGE_SOURCE_RECIPE_VERSION
+                or source_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+                != FILL_AWARE_HOLDING_AGE_SOURCE_RUNNER_SHA256
+                or source_bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
+                != FILL_AWARE_HOLDING_AGE_SOURCE_BUNDLE_SHA256
+                or source_bootstrap.get("dataset")
+                != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET
+                or source_bootstrap.get("dataset_identity_sha256")
+                != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_IDENTITY_SHA256
+                or source_bootstrap.get("dataset_lineage_id")
+                != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_LINEAGE_ID
+                or dict(source_bootstrap.get("formal_periods") or {})
+                != source_binding["periods"]
+            ):
+                raise ValueError("fill-aware holding-age source contract changed")
+
+            backtest_id = next(iter(FILL_AWARE_HOLDING_AGE_SOURCE_BACKTEST_IDS))
+            backtest = connection.execute(
+                select(
+                    backtest_runs,
+                    jobs.c.kind.label("job_kind"),
+                    jobs.c.status.label("job_status"),
+                    jobs.c.error.label("job_error"),
+                    jobs.c.payload_json.label("job_payload_json"),
+                )
+                .join(jobs, jobs.c.id == backtest_runs.c.job_id)
+                .where(backtest_runs.c.id == backtest_id)
+            ).one()
+            member = receipt["members"][0]
+            observed_files = _artifact_inventory(backtest.artifact_path)
+            source_worker_image = _require_worker_image_digest(
+                source_bootstrap.get(TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD),
+                field="source worker runtime image digest",
+            )
+            job_payload = dict(backtest.job_payload_json or {})
+            if (
+                str(backtest.strategy_version_id) != source_version_id
+                or str(backtest.job_id or "") != source_binding["job_id"]
+                or str(backtest.dataset or "") != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET
+                or dict(backtest.periods_json or {}) != source_binding["periods"]
+                or str(backtest.status) != "failed"
+                or str(backtest.job_kind) != "strategy_backtest"
+                or str(backtest.job_status) != "failed"
+                or str(backtest.error or "") != FILL_AWARE_HOLDING_AGE_ERROR
+                or str(backtest.job_error or "") != FILL_AWARE_HOLDING_AGE_ERROR
+                or job_payload.get(
+                    TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD
+                )
+                != source_worker_image
+                or backtest.metrics_json is not None
+                or _artifact_result_exists(backtest.artifact_path)
+                or backtest.created_at is None
+                or backtest.created_at > audit_row.created_at
+                or observed_files != member["files"]
+                or canonical_sha256(observed_files)
+                != source_binding["artifact_inventory_sha256"]
+            ):
+                raise ValueError("fill-aware holding-age source failure evidence changed")
+
+            source_selection = validate_unopened_history_selection(
+                source_bootstrap.get("unopened_history_selection"),
+                calendar_days=calendar,
+            )
+            source_batch_evidence = _normalize_prior_batch(
+                {
+                    "batch_sha256": FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256,
+                    "recipe_version": FILL_AWARE_HOLDING_AGE_SOURCE_RECIPE_VERSION,
+                    "earliest_final_oos_start": source_row.test_start.isoformat(),
+                    "latest_final_oos_end": source_row.test_end.isoformat(),
+                    "members": [
+                        {
+                            "oos_vintage_id": str(source_row.id),
+                            "strategy_version_id": source_version_id,
+                            "recipe_id": "short_relative_strength",
+                            "horizon_profile": "short_1_5d",
+                            "recipe_version": (
+                                FILL_AWARE_HOLDING_AGE_SOURCE_RECIPE_VERSION
+                            ),
+                            "test_start": source_row.test_start.isoformat(),
+                            "test_end": source_row.test_end.isoformat(),
+                            "first_opened_at": source_row.first_opened_at.isoformat(),
+                            "sealed_member_set_sha256": str(
+                                source_row.sealed_candidate_set_sha256
+                            ),
+                        }
+                    ],
+                    "members_sha256": canonical_sha256(
+                        [
+                            {
+                                "oos_vintage_id": str(source_row.id),
+                                "strategy_version_id": source_version_id,
+                                "recipe_id": "short_relative_strength",
+                                "horizon_profile": "short_1_5d",
+                                "recipe_version": (
+                                    FILL_AWARE_HOLDING_AGE_SOURCE_RECIPE_VERSION
+                                ),
+                                "test_start": source_row.test_start.isoformat(),
+                                "test_end": source_row.test_end.isoformat(),
+                                "first_opened_at": source_row.first_opened_at.isoformat(),
+                                "sealed_member_set_sha256": str(
+                                    source_row.sealed_candidate_set_sha256
+                                ),
+                            }
+                        ]
+                    ),
+                }
+            )
+        evidence = build_pre_result_repair_history_selection(
+            calendar_days=calendar,
+            current_recipe_version=current,
+            source_selection=source_selection,
+            repaired_source_batch=source_batch_evidence,
+            repair_receipt=receipt,
+        )
+        selected = calendar[: int(evidence["selected_calendar_trading_days"])]
+        return {
+            "calendar": selected,
+            "evidence": evidence,
+            "repair_receipt": receipt,
+            "source_batch_sha256": FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256,
+            "source_lockbox": source_lockbox,
+        }
 
     def resolve_unopened_history_selection(
         self,
@@ -2176,13 +2902,22 @@ class TransparentBaselineLockboxStore:
         ):
             raise ValueError("transparent baseline repair audit envelope is invalid")
         members = {str(item["strategy_version_id"]): item for item in receipt["members"]}
+        is_fill_aware_holding_age_repair = receipt["contract_version"] == (
+            PRE_RESULT_REPAIR_CONTRACT_VERSION_V6
+        )
+        expected_recipe_ids = (
+            {"short_relative_strength"}
+            if is_fill_aware_holding_age_repair
+            else set(TRANSPARENT_RESEARCH_BASELINE_IDS)
+        )
+        expected_member_count = len(expected_recipe_ids)
         source_version_ids = {
             str(dict(row.sealed_candidate_set_json or {}).get("strategy_version_id") or "")
             for row in source_rows
         }
         if (
-            len(source_rows) != 3
-            or len(source_version_ids) != 3
+            len(source_rows) != expected_member_count
+            or len(source_version_ids) != expected_member_count
             or set(members) != source_version_ids
             or any(row.consumed_at is None for row in source_rows)
         ):
@@ -2199,7 +2934,7 @@ class TransparentBaselineLockboxStore:
             {str(item["batch_sha256"]) for item in source_links}
             != {source_batch_sha256}
             or {str(item["recipe_id"]) for item in source_links}
-            != set(TRANSPARENT_RESEARCH_BASELINE_IDS)
+            != expected_recipe_ids
         ):
             raise ValueError("transparent baseline repair source batch binding changed")
         source_lineages = {str(row.dataset_lineage_id or "") for row in source_rows}
@@ -2227,6 +2962,7 @@ class TransparentBaselineLockboxStore:
             or is_canonical_lf_packaging_repair
             or is_runtime_alignment_repair
             or is_runtime_input_scope_repair
+            or is_fill_aware_holding_age_repair
         )
         if is_same_lineage_repair:
             if (
@@ -2251,12 +2987,24 @@ class TransparentBaselineLockboxStore:
                 != RUNTIME_INPUT_SCOPE_SOURCE_DATASET_LINEAGE_ID
             ):
                 raise ValueError("runtime input-scope source batch or dataset changed")
+            if is_fill_aware_holding_age_repair and (
+                source_batch_sha256 != FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256
+                or source_identity
+                != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_IDENTITY_SHA256
+                or source_lineage
+                != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_LINEAGE_ID
+                or target_dataset_identity_sha256
+                != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_IDENTITY_SHA256
+                or target_dataset_lineage_id
+                != FILL_AWARE_HOLDING_AGE_SOURCE_DATASET_LINEAGE_ID
+            ):
+                raise ValueError("fill-aware holding-age source batch or dataset changed")
         elif source_lineage == target_dataset_lineage_id:
             raise ValueError("transparent baseline repair may not fabricate a fresh lineage")
 
         source_versions = cls._version_repair_rows(connection, source_version_ids)
         target_version_ids = {str(item["id"]) for item in target_versions}
-        if len(target_version_ids) != 3:
+        if len(target_version_ids) != expected_member_count:
             raise ValueError("transparent baseline repair target versions are incomplete")
         target_version_rows = cls._version_repair_rows(connection, target_version_ids)
         target_by_recipe: dict[str, Any] = {}
@@ -2264,12 +3012,12 @@ class TransparentBaselineLockboxStore:
             config = dict(row.config_json or {})
             recipe_id = str(config.get("recipe_id") or "")
             if (
-                recipe_id not in TRANSPARENT_RESEARCH_BASELINE_IDS
+                recipe_id not in expected_recipe_ids
                 or config.get("recipe_version") != receipt["target_recipe_version"]
             ):
                 raise ValueError("transparent baseline repair target recipe changed")
             target_by_recipe[recipe_id] = row
-        if set(target_by_recipe) != set(TRANSPARENT_RESEARCH_BASELINE_IDS):
+        if set(target_by_recipe) != expected_recipe_ids:
             raise ValueError("transparent baseline repair target recipes are incomplete")
 
         source_backtests = connection.execute(
@@ -2278,11 +3026,12 @@ class TransparentBaselineLockboxStore:
                 jobs.c.kind.label("job_kind"),
                 jobs.c.status.label("job_status"),
                 jobs.c.error.label("job_error"),
+                jobs.c.payload_json.label("job_payload_json"),
             )
             .join(jobs, jobs.c.id == backtest_runs.c.job_id)
             .where(backtest_runs.c.id.in_({str(item["backtest_id"]) for item in members.values()}))
         ).all()
-        if len(source_backtests) != 3:
+        if len(source_backtests) != expected_member_count:
             raise ValueError("transparent baseline repair source backtests are incomplete")
         by_version = {str(row.strategy_version_id): row for row in source_backtests}
         if set(by_version) != source_version_ids:
@@ -2301,7 +3050,7 @@ class TransparentBaselineLockboxStore:
         expected_by_recipe = {
             str(item["link"]["recipe_id"]): item for item in target_expected
         }
-        if set(expected_by_recipe) != set(TRANSPARENT_RESEARCH_BASELINE_IDS):
+        if set(expected_by_recipe) != expected_recipe_ids:
             raise ValueError("transparent baseline repair target lockbox is incomplete")
 
         for recipe_id, source_version_id in source_recipe_map.items():
@@ -2339,10 +3088,14 @@ class TransparentBaselineLockboxStore:
                         is_canonical_lf_packaging_repair
                         or is_runtime_alignment_repair
                         or is_runtime_input_scope_repair
+                        or is_fill_aware_holding_age_repair
                     )
                     and (
-                        _repair_bootstrap_semantics(target_config)
-                        != _repair_bootstrap_semantics(source_config)
+                        (
+                            not is_fill_aware_holding_age_repair
+                            and _repair_bootstrap_semantics(target_config)
+                            != _repair_bootstrap_semantics(source_config)
+                        )
                         or dict(source_bootstrap.get("formal_periods") or {})
                         != member["periods"]
                         or dict(target_bootstrap.get("formal_periods") or {})
@@ -2367,6 +3120,10 @@ class TransparentBaselineLockboxStore:
                 "recipe_version"
             ) != RUNTIME_INPUT_SCOPE_SOURCE_RECIPE_VERSION:
                 raise ValueError("runtime input-scope repair source recipe changed")
+            if is_fill_aware_holding_age_repair and source_config.get(
+                "recipe_version"
+            ) != FILL_AWARE_HOLDING_AGE_SOURCE_RECIPE_VERSION:
+                raise ValueError("fill-aware holding-age repair source recipe changed")
             if is_canonical_lf_packaging_repair and (
                 source_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
                 != receipt["source_runner_expected_sha256"]
@@ -2386,16 +3143,105 @@ class TransparentBaselineLockboxStore:
                 != receipt["source_runtime_bundle_sha256"]
             ):
                 raise ValueError("runtime input-scope source runtime binding changed")
+            if is_fill_aware_holding_age_repair and (
+                source_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+                != receipt["source_runner_sha256"]
+                or source_bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
+                != receipt["source_runtime_bundle_sha256"]
+            ):
+                raise ValueError("fill-aware holding-age source runtime binding changed")
             if is_same_lineage_repair and (
                 target_bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
                 != receipt[TRANSPARENT_BASELINE_RUNNER_FIELD]
             ):
                 raise ValueError("same-lineage repair target runner changed")
-            if (is_runtime_alignment_repair or is_runtime_input_scope_repair) and (
+            if (
+                is_runtime_alignment_repair
+                or is_runtime_input_scope_repair
+                or is_fill_aware_holding_age_repair
+            ) and (
                 target_bootstrap.get(TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD)
                 != receipt["target_runtime_bundle_sha256"]
             ):
                 raise ValueError("runtime repair target runtime bundle changed")
+            if is_fill_aware_holding_age_repair:
+                source_lockbox = validate_joint_lockbox(
+                    source_config.get(LOCKBOX_CONFIG_KEY)
+                )
+                target_lockbox = validate_joint_lockbox(
+                    target_config.get(LOCKBOX_CONFIG_KEY)
+                )
+                source_unavailable = list(
+                    source_lockbox.get("unavailable_horizons") or []
+                )
+                target_unavailable = list(
+                    target_lockbox.get("unavailable_horizons") or []
+                )
+                source_selection = validate_unopened_history_selection(
+                    source_bootstrap.get("unopened_history_selection")
+                )
+                target_selection = validate_unopened_history_selection(
+                    target_bootstrap.get("unopened_history_selection")
+                )
+                source_semantics = _repair_bootstrap_semantics(source_config)
+                target_semantics = _repair_bootstrap_semantics(target_config)
+                source_semantics.pop("unopened_history_selection", None)
+                target_semantics.pop("unopened_history_selection", None)
+                source_worker_image = _require_worker_image_digest(
+                    source_bootstrap.get(
+                        TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD
+                    ),
+                    field="source worker runtime image digest",
+                )
+                target_worker_image = _require_worker_image_digest(
+                    target_bootstrap.get(
+                        TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD
+                    ),
+                    field="target worker runtime image digest",
+                )
+                source_semantics.pop(
+                    TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
+                    None,
+                )
+                target_semantics.pop(
+                    TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
+                    None,
+                )
+                source_job_payload = dict(backtest.job_payload_json or {})
+                if (
+                    source_semantics != target_semantics
+                    or source_job_payload.get(
+                        TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD
+                    )
+                    != source_worker_image
+                    or target_worker_image
+                    != target_bootstrap.get(
+                        TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD
+                    )
+                    or source_lockbox["contract_version"]
+                    != LOCKBOX_CONTRACT_VERSION_V3
+                    or target_lockbox["contract_version"]
+                    != LOCKBOX_CONTRACT_VERSION_V3
+                    or source_lockbox["batch_sha256"]
+                    != FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256
+                    or source_unavailable != target_unavailable
+                    or canonical_sha256(source_unavailable)
+                    != FILL_AWARE_HOLDING_AGE_SOURCE_UNAVAILABLE_HORIZONS_SHA256
+                    or {item["evidence_sha256"] for item in source_unavailable}
+                    != FILL_AWARE_HOLDING_AGE_UNAVAILABLE_EVIDENCE_SHA256S
+                    or source_selection["selection_sha256"]
+                    != FILL_AWARE_HOLDING_AGE_SOURCE_SELECTION_SHA256
+                    or target_selection["contract_version"]
+                    != UNOPENED_HISTORY_SELECTION_CONTRACT_VERSION_V2
+                    or target_selection["repaired_source_batch_sha256"]
+                    != FILL_AWARE_HOLDING_AGE_SOURCE_BATCH_SHA256
+                    or target_selection["repair_receipt_sha256"]
+                    != receipt["receipt_sha256"]
+                    or target_selection["performance_information_used"] is not False
+                ):
+                    raise ValueError(
+                        "fill-aware holding-age repair changed partial-lockbox evidence"
+                    )
             has_metrics = backtest.metrics_json is not None
             has_result = _artifact_result_exists(backtest.artifact_path)
             declared_files = sorted(member["files"], key=lambda item: item["path"])
@@ -2423,6 +3269,7 @@ class TransparentBaselineLockboxStore:
                     is_canonical_lf_packaging_repair
                     or is_runtime_alignment_repair
                     or is_runtime_input_scope_repair
+                    or is_fill_aware_holding_age_repair
                 ):
                     error_matches = (
                         str(backtest.error or "") == marker
@@ -2467,7 +3314,7 @@ class TransparentBaselineLockboxStore:
                         "source_dataset_identity_sha256"
                     ]
                 }
-                if is_runtime_input_scope_repair
+                if is_runtime_input_scope_repair or is_fill_aware_holding_age_repair
                 else {}
             ),
             "target_dataset": target_dataset,
@@ -2502,7 +3349,30 @@ class TransparentBaselineLockboxStore:
             ),
             **(
                 {"target_change_codes": list(receipt["target_change_codes"])}
-                if is_runtime_input_scope_repair
+                if is_runtime_input_scope_repair or is_fill_aware_holding_age_repair
+                else {}
+            ),
+            **(
+                {
+                    "source_unopened_history_selection_sha256": receipt[
+                        "source_unopened_history_selection_sha256"
+                    ],
+                    "source_unavailable_horizons_sha256": receipt[
+                        "source_unavailable_horizons_sha256"
+                    ],
+                    "source_unavailable_evidence_sha256s": list(
+                        receipt["source_unavailable_evidence_sha256s"]
+                    ),
+                    "source_bindings": [
+                        {
+                            "backtest_id": item["backtest_id"],
+                            "job_id": item["job_id"],
+                            "strategy_version_id": item["strategy_version_id"],
+                        }
+                        for item in receipt["members"]
+                    ],
+                }
+                if is_fill_aware_holding_age_repair
                 else {}
             ),
             "source_backtest_ids": sorted(item["backtest_id"] for item in members.values()),
@@ -2703,7 +3573,14 @@ class TransparentBaselineLockboxStore:
                 superseded_source_batches=superseded_source_batches,
             )
             if source_batches and repair_registration is None:
-                if len(expected) != 3:
+                is_exact_single_member_v15_target = (
+                    len(expected) == 1
+                    and expected[0]["link"]["recipe_id"]
+                    == "short_relative_strength"
+                    and str(dict(versions[0].get("config") or {}).get("recipe_version") or "")
+                    == FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION
+                )
+                if len(expected) != 3 and not is_exact_single_member_v15_target:
                     raise ValueError(
                         "partial baseline lockboxes cannot reuse an opened final OOS"
                     )

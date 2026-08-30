@@ -41,11 +41,11 @@ def _migration_module():
     return module
 
 
-def test_v14_recipe_uses_the_append_only_runner_and_runtime_bundle() -> None:
+def test_v14_recipe_identity_remains_immutable_history() -> None:
     root = Path(__file__).parents[1]
     runner = root / "scripts" / "run_multifactor_backtest.py"
 
-    assert RECIPE_VERSION == FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION
+    assert RECIPE_VERSION != FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION
     assert FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256 == (
         "04f9dce110aaf44d32972c68db3edefafbd08cfdbf1f7dfb98aac9a15409bfe5"
     )
@@ -54,16 +54,20 @@ def test_v14_recipe_uses_the_append_only_runner_and_runtime_bundle() -> None:
         "swing_trend",
         "long_quality_value",
     ):
-        assert target_runner_for_recipe(recipe_id, RECIPE_VERSION) == (
+        assert target_runner_for_recipe(
+            recipe_id, FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION
+        ) == (
             FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256
         )
-        assert target_runtime_bundle_for_recipe(recipe_id, RECIPE_VERSION) == (
+        assert target_runtime_bundle_for_recipe(
+            recipe_id, FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION
+        ) == (
             FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256
         )
     assert hashlib.sha256(runner.read_bytes()).hexdigest() == (
         FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256
     )
-    assert position_risk_bundle_sha256(root) == (
+    assert position_risk_bundle_sha256(root) != (
         FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256
     )
 

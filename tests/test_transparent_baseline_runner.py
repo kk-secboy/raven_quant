@@ -30,6 +30,9 @@ from quant_platform.transparent_baseline_runner import (
     RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION,
     RUNTIME_INPUT_SCOPE_TARGET_RUNNER_SHA256,
     RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256,
+    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
+    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256,
+    SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
     TRANSPARENT_BASELINE_JOB_RUNNER_FIELD,
     TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
     TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
@@ -102,6 +105,13 @@ def _config(
     if recipe_version == FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION:
         bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
             FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256
+        )
+        bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
+            _WORKER_IMAGE_DIGEST
+        )
+    if recipe_version == SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION:
+        bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
+            SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
         )
         bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
             _WORKER_IMAGE_DIGEST
@@ -234,27 +244,27 @@ def test_historical_v13_identity_is_not_rebound_to_current_v14_runtime() -> None
         )
 
 
-def test_current_transparent_v14_runner_matches_fill_aware_identity() -> None:
+def test_current_transparent_v15_runner_matches_single_member_repair_identity() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
     assert require_transparent_baseline_runner(
         config=_config(
-            FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION,
-            FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256,
+            SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
+            SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256,
         ),
         job_payload={
             TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
-                FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256
+                SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256
             ),
             TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
-                FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256
+                SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
             ),
             TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
                 _WORKER_IMAGE_DIGEST
             ),
         },
         runner_path=runner,
-    ) == FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256
+    ) == SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256
 
 
 def test_v12_rejects_changed_imported_runtime_module(tmp_path: Path) -> None:
@@ -395,7 +405,7 @@ def test_runner_bytes_survive_git_blob_and_archive_with_autocrlf(
     ) == 1
 
 
-def test_v14_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -> None:
+def test_v15_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -> None:
     root = Path(__file__).parents[1]
     source_paths = _v12_source_paths(root)
     repo = tmp_path / "runtime-bundle-repo"
@@ -422,13 +432,13 @@ def test_v14_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -
             destination.write_bytes(archived.read())
 
     assert position_risk_bundle_sha256(root) == (
-        FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256
+        SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert position_risk_bundle_sha256(repo) == (
-        FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256
+        SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert position_risk_bundle_sha256(archive_root) == (
-        FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256
+        SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
     )
 
 
@@ -469,6 +479,12 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
         / "versions"
         / "0081_transparent_baseline_v14_runtime_seal.py"
     ).read_text(encoding="utf-8")
+    v15_migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "versions"
+        / "0082_transparent_baseline_v15_runtime_repair.py"
+    ).read_text(encoding="utf-8")
 
     assert CANONICAL_LF_TARGET_RUNNER_SHA256 in v9_migration
     assert OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256 in v9_migration
@@ -483,6 +499,8 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
     assert FAIL_CLOSED_EXECUTION_TARGET_RUNTIME_BUNDLE_SHA256 in v13_migration
     assert FILL_AWARE_HOLDING_AGE_TARGET_RUNNER_SHA256 in v14_migration
     assert FILL_AWARE_HOLDING_AGE_TARGET_RUNTIME_BUNDLE_SHA256 in v14_migration
+    assert SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256 in v15_migration
+    assert SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256 in v15_migration
 
 
 def test_transparent_v8_runner_rejects_changed_bytes(tmp_path: Path) -> None:
