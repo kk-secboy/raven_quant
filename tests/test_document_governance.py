@@ -514,6 +514,11 @@ def test_trial_ledger_and_independence_controls_prevent_self_deception() -> None
         "候选很多时，根据假设数量和依赖结构选择一种适当的标准校正方法，例如探索阶段的 FDR，"
         "或最终少量候选的 Holm 校正",
         "DSR、PBO 等只在前提成立时作为诊断，不把所有方法同时堆成通用认证平台",
+        "不得伪造 `trial_sharpes`",
+        "`not_computable_incomplete_historical_family`",
+        "按试验台账中的真实试验数作 Bonferroni 家族校正",
+        "资本 OOS alpha 台账仍是独立且不变的门",
+        "具有完整候选矩阵的 model/`fin_quant` 路径继续执行原有 Holm、PBO 与 DSR 合同",
     ):
         assert required in specification
 

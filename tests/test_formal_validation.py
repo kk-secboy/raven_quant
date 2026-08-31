@@ -1,24 +1,39 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from quant_data.snapshot_lineage import canonical_sha256
 from quant_platform.formal_validation import (
+    CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS,
     FORMAL_VALIDATION_CONTRACT_VERSION,
+    FROZEN_STRATEGY_OUTER_SCOPE,
+    NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS,
     PRE_FINAL_HISTORY_CONTRACT_VERSION,
+    build_factor_score_incomplete_family_dsr,
+    build_factor_score_incomplete_family_multiple_testing,
     build_outer_walk_forward_folds,
     build_pre_final_history_evidence,
     run_ablation_suite,
     run_outer_walk_forward,
     run_signal_decay_suite,
+    validate_factor_score_incomplete_family_dsr,
+    validate_factor_score_incomplete_family_multiple_testing,
 )
 from quant_platform.statistical_validation import (
+    deflated_sharpe_probability,
     holm_bonferroni,
     paired_moving_block_bootstrap,
     probability_of_backtest_overfitting,
 )
-from quant_platform.strategy_store import _formal_validation_failures
+from quant_platform.strategy_store import (
+    _formal_validation_failures,
+    _incomplete_family_manifest_binding_failures,
+    _valid_factor_score_incomplete_family_alternative,
+)
 
 pytestmark = pytest.mark.no_database
 
@@ -338,3 +353,220 @@ def test_pbo_distinguishes_stable_candidate_from_fold_winners() -> None:
     assert result["status"] == "ok"
     assert 0.0 <= result["pbo"] <= 1.0
     assert result["split_count"] == 35
+
+
+def _incomplete_factor_family_fixture() -> tuple[dict, dict]:
+    audit_sha256 = "a" * 64
+    trial_count = 4
+    bootstrap = {
+        "status": "ok",
+        "confidence_interval_95": [0.0001, 0.01],
+        "one_sided_p_value": 0.01,
+    }
+    multiple = build_factor_score_incomplete_family_multiple_testing(
+        paired_bootstrap=bootstrap,
+        trial_count=trial_count,
+        trial_count_audit_sha256=audit_sha256,
+    )
+    blocked_dsr = deflated_sharpe_probability(
+        pd.Series(np.linspace(-0.01, 0.02, 120)),
+        trials=trial_count,
+    )
+    deflated = build_factor_score_incomplete_family_dsr(
+        blocked_dsr=blocked_dsr,
+        trial_count=trial_count,
+        trial_count_audit_sha256=audit_sha256,
+    )
+    version = {
+        "config": {
+            "signal_source": "factor_score",
+            "minimum_outer_test_excess_return": 0.0,
+            "minimum_outer_test_pass_rate": 0.60,
+            "min_pre_final_history_days": 2520,
+            "outer_embargo_days": 5,
+            "baseline_definition": None,
+        },
+        "factors": [],
+    }
+    metrics = {
+        "deflated_sharpe": deflated,
+        "deflated_sharpe_probability": None,
+        "formal_validation_passed": True,
+        "formal_validation": {
+            "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
+            "status": "passed",
+            "pre_final_history": {
+                "status": "completed",
+                "contract_version": PRE_FINAL_HISTORY_CONTRACT_VERSION,
+                "requested_periods": {"start": "2008-01-01", "end": "2020-12-31"},
+                "observed_periods": {"start": "2008-01-02", "end": "2020-12-31"},
+                "final_test_periods": {"start": "2021-01-11", "end": "2026-07-28"},
+                "trading_days": 3150,
+                "minimum_trading_days": 2520,
+                "embargo_trading_days": 5,
+                "minimum_embargo_trading_days": 5,
+                "overlaps_final_test": False,
+                "uses_final_test_data": False,
+                "execution_model": {
+                    "method": "open",
+                    "frequency": "day",
+                    "minute_execution_claimed": False,
+                },
+            },
+            "outer_walk_forward": {
+                "status": "completed",
+                "passed": True,
+                "fold_count": 3,
+                "test_pass_rate": 1.0,
+                "mean_test_metric": 0.02,
+                "candidate_ids": ["frozen-strategy"],
+                "candidate_coverage": {
+                    "required_group_trials": trial_count,
+                    "provided_candidates": 1,
+                    "scope": FROZEN_STRATEGY_OUTER_SCOPE,
+                    "selection_performed": False,
+                    "historical_candidate_matrix": "incomplete",
+                    "trial_count_audit_sha256": audit_sha256,
+                },
+                "folds": [
+                    {"test_metric": 0.01, "test_passed": True},
+                    {"test_metric": 0.02, "test_passed": True},
+                    {"test_metric": 0.03, "test_passed": True},
+                ],
+            },
+            "ablation": {"status": "passed", "runs": []},
+            "signal_decay": {
+                "status": "completed",
+                "frontier_version": "contiguous-zero-delay-frontier-v2",
+                "maximum_supported_delay_bars": 0,
+                "runs": [{"delay_bars": 0, "passed": True}],
+            },
+            "paired_block_bootstrap": bootstrap,
+            "multiple_testing": multiple,
+        },
+    }
+    return version, metrics
+
+
+def test_incomplete_factor_family_uses_exact_bonferroni_and_not_computable_diagnostics() -> None:
+    version, metrics = _incomplete_factor_family_fixture()
+    multiple = metrics["formal_validation"]["multiple_testing"]
+    deflated = metrics["deflated_sharpe"]
+
+    assert multiple["status"] == CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS
+    assert multiple["bonferroni_adjusted_p_value"] == pytest.approx(0.04)
+    assert multiple["gate_passed"] is True
+    assert multiple["pbo"]["status"] == NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS
+    assert multiple["pbo"]["pbo"] is None
+    assert deflated["status"] == NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS
+    assert deflated["probability"] is None
+    assert _valid_factor_score_incomplete_family_alternative(version, metrics) is True
+    assert _formal_validation_failures(version, metrics) == []
+
+
+def test_incomplete_factor_family_rejects_tampering_and_failed_familywise_alpha() -> None:
+    version, metrics = _incomplete_factor_family_fixture()
+    bootstrap = metrics["formal_validation"]["paired_block_bootstrap"]
+    multiple = metrics["formal_validation"]["multiple_testing"]
+    audit_sha256 = multiple["trial_count_audit_sha256"]
+
+    assert validate_factor_score_incomplete_family_multiple_testing(
+        multiple,
+        paired_bootstrap=bootstrap,
+        trial_count=4,
+        trial_count_audit_sha256=audit_sha256,
+    ) == multiple
+    assert validate_factor_score_incomplete_family_dsr(
+        metrics["deflated_sharpe"],
+        trial_count=4,
+        trial_count_audit_sha256=audit_sha256,
+    ) == metrics["deflated_sharpe"]
+
+    tampered = deepcopy(metrics)
+    tampered["formal_validation"]["multiple_testing"]["pbo"]["status"] = "ok"
+    assert _valid_factor_score_incomplete_family_alternative(version, tampered) is False
+    assert _formal_validation_failures(version, tampered)
+
+    failed_bootstrap = {**bootstrap, "one_sided_p_value": 0.02}
+    failed_multiple = build_factor_score_incomplete_family_multiple_testing(
+        paired_bootstrap=failed_bootstrap,
+        trial_count=4,
+        trial_count_audit_sha256=audit_sha256,
+    )
+    assert failed_multiple["bonferroni_adjusted_p_value"] == pytest.approx(0.08)
+    assert failed_multiple["gate_passed"] is False
+
+
+def test_incomplete_factor_family_requires_one_frozen_outer_candidate() -> None:
+    version, metrics = _incomplete_factor_family_fixture()
+    metrics["formal_validation"]["outer_walk_forward"]["candidate_coverage"][
+        "provided_candidates"
+    ] = 4
+
+    assert any(
+        "outer walk-forward" in failure
+        for failure in _formal_validation_failures(version, metrics)
+    )
+
+
+def test_incomplete_factor_family_binds_real_trial_count_to_manifest_audit() -> None:
+    _version, metrics = _incomplete_factor_family_fixture()
+    trial_count_audit = {
+        "strategy_version_components": [
+            {"component_id": "trial-a"},
+            {"component_id": "trial-b"},
+            {"component_id": "trial-c"},
+            {"component_id": "trial-d"},
+        ]
+    }
+    audit_sha256 = canonical_sha256(trial_count_audit)
+    bootstrap = metrics["formal_validation"]["paired_block_bootstrap"]
+    metrics["formal_validation"][
+        "multiple_testing"
+    ] = build_factor_score_incomplete_family_multiple_testing(
+        paired_bootstrap=bootstrap,
+        trial_count=4,
+        trial_count_audit_sha256=audit_sha256,
+    )
+    metrics["formal_validation"]["outer_walk_forward"]["candidate_coverage"][
+        "trial_count_audit_sha256"
+    ] = audit_sha256
+    metrics["deflated_sharpe"] = build_factor_score_incomplete_family_dsr(
+        blocked_dsr=deflated_sharpe_probability(
+            pd.Series(np.linspace(-0.01, 0.02, 120)),
+            trials=4,
+        ),
+        trial_count=4,
+        trial_count_audit_sha256=audit_sha256,
+    )
+    manifest = {
+        "strategy_trial_count": 4,
+        "hypothesis_group_evidence": {"trial_count_audit": trial_count_audit},
+    }
+
+    assert _incomplete_family_manifest_binding_failures(manifest, metrics) == []
+
+    tampered_manifest = deepcopy(manifest)
+    tampered_manifest["strategy_trial_count"] = 3
+    assert _incomplete_family_manifest_binding_failures(tampered_manifest, metrics)
+
+    tampered_manifest = deepcopy(manifest)
+    tampered_manifest["hypothesis_group_evidence"]["trial_count_audit"][
+        "strategy_version_components"
+    ].append({"component_id": "post-hoc"})
+    assert _incomplete_family_manifest_binding_failures(tampered_manifest, metrics)
+
+
+def test_complete_multi_trial_factor_family_still_requires_real_pbo() -> None:
+    version, metrics = _incomplete_factor_family_fixture()
+    metrics["formal_validation"]["multiple_testing"] = {
+        "status": "ok",
+        "trial_count": 4,
+        "holm_adjusted_p_values": [0.01, 0.02, 0.03, 0.04],
+        "pbo": {"status": NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS, "pbo": None},
+    }
+
+    assert any(
+        "multiple-testing evidence" in failure
+        for failure in _formal_validation_failures(version, metrics)
+    )

@@ -40,7 +40,11 @@ from quant_platform.factor_recompute import (
     validate_factor_prefix_invariance,
 )
 from quant_platform.formal_validation import (
+    CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS,
     FORMAL_VALIDATION_CONTRACT_VERSION,
+    FROZEN_STRATEGY_OUTER_SCOPE,
+    build_factor_score_incomplete_family_dsr,
+    build_factor_score_incomplete_family_multiple_testing,
     build_pre_final_history_evidence,
     run_ablation_suite,
     run_outer_walk_forward,
@@ -1778,6 +1782,25 @@ def main() -> None:
         qlib_report.get("cost", 0.0), errors="coerce"
     )
     strategy_trial_count = int(manifest.get("strategy_trial_count") or 1)
+    trial_count_audit = (
+        (manifest.get("hypothesis_group_evidence") or {}).get("trial_count_audit")
+        if isinstance(manifest.get("hypothesis_group_evidence"), dict)
+        else None
+    )
+    trial_count_audit_sha256 = (
+        _canonical_sha256(trial_count_audit)
+        if isinstance(trial_count_audit, dict)
+        else None
+    )
+    incomplete_factor_family = (
+        signal_source == "factor_score"
+        and strategy_trial_count > 1
+        and evaluation_mode == FORMAL_FINAL_OOS_MODE
+    )
+    if incomplete_factor_family and trial_count_audit_sha256 is None:
+        raise ValueError(
+            "multi-trial factor formal OOS requires the frozen trial-count audit"
+        )
 
     def write_formal_run_artifacts(category: str, name: str, result: Any) -> dict[str, Any]:
         target = output / "formal-validation" / category / name
@@ -1956,7 +1979,7 @@ def main() -> None:
                 or formal_model_admission["model_grid"]["cell_count"]
             ),
         }
-    elif strategy_trial_count == 1:
+    elif strategy_trial_count == 1 or incomplete_factor_family:
         outer_walk_forward = run_outer_walk_forward(
             dates=history_calendar,
             candidate_ids=["frozen-strategy"],
@@ -1986,9 +2009,20 @@ def main() -> None:
             minimum_test_pass_rate=float(config.get("minimum_outer_test_pass_rate", 0.60)),
         )
         outer_walk_forward["candidate_coverage"] = {
-            "required_group_trials": 1,
+            "required_group_trials": strategy_trial_count,
             "provided_candidates": 1,
-            "scope": "pre_final_history_fixed_specification",
+            "scope": FROZEN_STRATEGY_OUTER_SCOPE,
+            "selection_performed": False,
+            "historical_candidate_matrix": (
+                "incomplete"
+                if incomplete_factor_family
+                else "not_applicable_single_trial"
+            ),
+            **(
+                {"trial_count_audit_sha256": trial_count_audit_sha256}
+                if incomplete_factor_family
+                else {}
+            ),
         }
     else:
         outer_walk_forward = {
@@ -2066,6 +2100,12 @@ def main() -> None:
                 "pbo": None,
             },
         }
+    elif incomplete_factor_family:
+        multiple_testing = build_factor_score_incomplete_family_multiple_testing(
+            paired_bootstrap=paired_bootstrap,
+            trial_count=strategy_trial_count,
+            trial_count_audit_sha256=str(trial_count_audit_sha256),
+        )
     else:
         multiple_testing = {
             "status": "blocked_missing_group_candidate_artifacts",
@@ -2093,13 +2133,22 @@ def main() -> None:
             and ablation["status"] == "passed"
         )
     )
-    multiple_testing_passed = multiple_testing["status"] == "not_applicable_single_trial" or (
-        signal_source == "model_prediction"
-        and multiple_testing.get("status") == "ok"
-        and multiple_testing.get("gate_passed") is True
-        and multiple_testing.get("final_oos_opened") is False
-        and multiple_testing.get("independent_admission_binding_sha256")
-        == (formal_model_admission or {}).get("binding_sha256")
+    multiple_testing_passed = (
+        multiple_testing["status"] == "not_applicable_single_trial"
+        or (
+            incomplete_factor_family
+            and multiple_testing.get("status")
+            == CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS
+            and multiple_testing.get("gate_passed") is True
+        )
+        or (
+            signal_source == "model_prediction"
+            and multiple_testing.get("status") == "ok"
+            and multiple_testing.get("gate_passed") is True
+            and multiple_testing.get("final_oos_opened") is False
+            and multiple_testing.get("independent_admission_binding_sha256")
+            == (formal_model_admission or {}).get("binding_sha256")
+        )
     )
     formal_validation = {
         "contract_version": FORMAL_VALIDATION_CONTRACT_VERSION,
@@ -2135,6 +2184,12 @@ def main() -> None:
             else None
         ),
     )
+    if incomplete_factor_family:
+        deflated_sharpe = build_factor_score_incomplete_family_dsr(
+            blocked_dsr=deflated_sharpe,
+            trial_count=strategy_trial_count,
+            trial_count_audit_sha256=str(trial_count_audit_sha256),
+        )
     metrics = {
         **formal.metrics,
         "policy_version": policy.version,

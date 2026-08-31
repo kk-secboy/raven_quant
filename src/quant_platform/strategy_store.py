@@ -69,9 +69,15 @@ from quant_platform.factor_recompute import (
     submitted_comparison_is_admissible,
 )
 from quant_platform.formal_validation import (
+    CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS,
+    FACTOR_SCORE_INCOMPLETE_FAMILY_MULTIPLE_TESTING_VERSION,
     FORMAL_VALIDATION_CONTRACT_VERSION,
+    FROZEN_STRATEGY_OUTER_SCOPE,
+    NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS,
     PRE_FINAL_HISTORY_CONTRACT_VERSION,
     SIGNAL_DECAY_FRONTIER_VERSION,
+    validate_factor_score_incomplete_family_dsr,
+    validate_factor_score_incomplete_family_multiple_testing,
 )
 from quant_platform.horizon_factor_bundle import validate_horizon_factor_bundle
 from quant_platform.model_ensemble import prediction_grid_from_admission
@@ -871,6 +877,50 @@ def _pre_final_stability_failures(
     return []
 
 
+def _valid_factor_score_incomplete_family_alternative(
+    version: Mapping[str, Any], metrics: Mapping[str, Any]
+) -> bool:
+    """Validate the narrow conservative substitute for an unavailable old matrix."""
+
+    config = version.get("config")
+    config = config if isinstance(config, Mapping) else {}
+    if str(config.get("signal_source") or "factor_score") != "factor_score":
+        return False
+    formal = metrics.get("formal_validation")
+    if (
+        not isinstance(formal, Mapping)
+        or formal.get("contract_version") != FORMAL_VALIDATION_CONTRACT_VERSION
+    ):
+        return False
+    multiple = formal.get("multiple_testing")
+    bootstrap = formal.get("paired_block_bootstrap")
+    deflated = metrics.get("deflated_sharpe")
+    try:
+        trials = int((deflated or {}).get("trials") or 0)
+        audit_sha256 = str((multiple or {}).get("trial_count_audit_sha256") or "")
+        validated_multiple = validate_factor_score_incomplete_family_multiple_testing(
+            multiple,
+            paired_bootstrap=bootstrap if isinstance(bootstrap, Mapping) else {},
+            trial_count=trials,
+            trial_count_audit_sha256=audit_sha256,
+        )
+        validated_dsr = validate_factor_score_incomplete_family_dsr(
+            deflated,
+            trial_count=trials,
+            trial_count_audit_sha256=audit_sha256,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (
+        validated_multiple.get("gate_passed") is True
+        and validated_multiple.get("pbo", {}).get("status")
+        == NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS
+        and validated_multiple.get("pbo", {}).get("pbo") is None
+        and validated_dsr.get("probability") is None
+        and metrics.get("deflated_sharpe_probability") is None
+    )
+
+
 def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
     evidence = metrics.get("formal_validation")
     if not isinstance(evidence, dict):
@@ -882,7 +932,8 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
         failures.append("formal validation suite did not pass")
 
     config = version.get("config", {})
-    model_prediction = str(config.get("signal_source") or "factor_score") == ("model_prediction")
+    signal_source = str(config.get("signal_source") or "factor_score")
+    model_prediction = signal_source == "model_prediction"
     history = evidence.get("pre_final_history")
     minimum_history_days = int(config.get("min_pre_final_history_days") or 2520)
     valid_history = False
@@ -930,6 +981,16 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
     outer = evidence.get("outer_walk_forward")
     coverage = outer.get("candidate_coverage") if isinstance(outer, dict) else {}
     trials = int((metrics.get("deflated_sharpe") or {}).get("trials") or 1)
+    multiple = evidence.get("multiple_testing")
+    conservative_incomplete_family = (
+        signal_source == "factor_score"
+        and trials > 1
+        and isinstance(multiple, dict)
+        and multiple.get("status")
+        == CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS
+        and multiple.get("contract_version")
+        == FACTOR_SCORE_INCOMPLETE_FAMILY_MULTIPLE_TESTING_VERSION
+    )
     minimum_outer_test_metric = float(config.get("minimum_outer_test_excess_return", 0.0))
     minimum_outer_test_pass_rate = float(config.get("minimum_outer_test_pass_rate", 0.60))
     outer_folds = outer.get("folds") if isinstance(outer, dict) else None
@@ -969,6 +1030,23 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
         recorded_test_pass_rate = float("-inf")
         recorded_mean_test_metric = float("-inf")
 
+    if conservative_incomplete_family:
+        valid_candidate_coverage = (
+            int((coverage or {}).get("required_group_trials") or 0) == trials
+            and int((coverage or {}).get("provided_candidates") or 0) == 1
+            and (coverage or {}).get("scope") == FROZEN_STRATEGY_OUTER_SCOPE
+            and (coverage or {}).get("selection_performed") is False
+            and (coverage or {}).get("historical_candidate_matrix") == "incomplete"
+            and (coverage or {}).get("trial_count_audit_sha256")
+            == multiple.get("trial_count_audit_sha256")
+            and outer.get("candidate_ids") == ["frozen-strategy"]
+        )
+    else:
+        valid_candidate_coverage = (
+            int((coverage or {}).get("required_group_trials") or 0) == trials
+            and int((coverage or {}).get("provided_candidates") or 0) == trials
+        )
+
     if model_prediction:
         admission = evidence.get("model_admission")
         provenance = metrics.get("provenance")
@@ -1003,8 +1081,7 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
         or outer.get("status") != "completed"
         or outer.get("passed") is not True
         or int(outer.get("fold_count") or 0) < 3
-        or int((coverage or {}).get("required_group_trials") or 0) != trials
-        or int((coverage or {}).get("provided_candidates") or 0) != trials
+        or not valid_candidate_coverage
         or recorded_test_pass_rate < minimum_outer_test_pass_rate
         or recorded_mean_test_metric <= minimum_outer_test_metric
         or not isinstance(outer_folds, list)
@@ -1014,7 +1091,7 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
         or abs(recorded_mean_test_metric - calculated_mean_test_metric) > 1e-12
     ):
         failures.append(
-            "outer walk-forward must cover the complete candidate set and pass OOS gates"
+            "outer walk-forward candidate coverage is invalid or its OOS gates did not pass"
         )
 
     baseline = version.get("config", {}).get("baseline_definition")
@@ -1075,7 +1152,6 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
     ):
         failures.append("paired moving-block bootstrap did not show positive baseline increment")
 
-    multiple = evidence.get("multiple_testing")
     if model_prediction:
         pbo = multiple.get("pbo") if isinstance(multiple, dict) else None
         admission_multiple = (
@@ -1145,6 +1221,23 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
             and multiple.get("status") == "not_applicable_single_trial"
             and len(multiple.get("holm_adjusted_p_values") or []) == 1
         )
+    elif conservative_incomplete_family:
+        try:
+            validated_multiple = validate_factor_score_incomplete_family_multiple_testing(
+                multiple,
+                paired_bootstrap=bootstrap if isinstance(bootstrap, dict) else {},
+                trial_count=trials,
+                trial_count_audit_sha256=str(
+                    multiple.get("trial_count_audit_sha256") or ""
+                ),
+            )
+        except (TypeError, ValueError):
+            validated_multiple = {}
+        valid_multiple = (
+            bool(validated_multiple)
+            and validated_multiple == multiple
+            and multiple.get("gate_passed") is True
+        )
     else:
         pbo = multiple.get("pbo") if isinstance(multiple, dict) else None
         valid_multiple = (
@@ -1156,8 +1249,67 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
             and pbo.get("pbo") is not None
         )
     if not valid_multiple:
-        failures.append("Holm/PBO evidence must cover the shared hypothesis-group trial count")
+        failures.append(
+            "multiple-testing evidence must cover the shared hypothesis-group trial count"
+        )
+    if conservative_incomplete_family and not _valid_factor_score_incomplete_family_alternative(
+        version, metrics
+    ):
+        failures.append(
+            "incomplete historical factor family must record DSR and PBO as not computable"
+        )
     return failures
+
+
+def _incomplete_family_manifest_binding_failures(
+    manifest: Mapping[str, Any], metrics: Mapping[str, Any]
+) -> list[str]:
+    """Bind the conservative family size to the frozen manifest audit."""
+
+    formal_evidence = metrics.get("formal_validation")
+    formal_evidence = formal_evidence if isinstance(formal_evidence, Mapping) else {}
+    multiple = formal_evidence.get("multiple_testing")
+    if (
+        not isinstance(multiple, Mapping)
+        or multiple.get("status")
+        != CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS
+    ):
+        return []
+    hypothesis_group = manifest.get("hypothesis_group_evidence")
+    trial_count_audit = (
+        hypothesis_group.get("trial_count_audit")
+        if isinstance(hypothesis_group, Mapping)
+        else None
+    )
+    audit_sha256 = (
+        _canonical_sha256(trial_count_audit)
+        if isinstance(trial_count_audit, Mapping)
+        else None
+    )
+    outer = formal_evidence.get("outer_walk_forward")
+    outer_coverage = outer.get("candidate_coverage") if isinstance(outer, Mapping) else None
+    deflated = metrics.get("deflated_sharpe")
+    try:
+        manifest_trial_count = int(manifest.get("strategy_trial_count") or 0)
+        multiple_trial_count = int(multiple.get("trial_count") or 0)
+        deflated_trial_count = int((deflated or {}).get("trials") or 0)
+    except (AttributeError, TypeError, ValueError):
+        manifest_trial_count = 0
+        multiple_trial_count = -1
+        deflated_trial_count = -2
+    if (
+        audit_sha256 is None
+        or manifest_trial_count <= 1
+        or multiple_trial_count != manifest_trial_count
+        or deflated_trial_count != manifest_trial_count
+        or multiple.get("trial_count_audit_sha256") != audit_sha256
+        or not isinstance(outer_coverage, Mapping)
+        or outer_coverage.get("trial_count_audit_sha256") != audit_sha256
+        or not isinstance(deflated, Mapping)
+        or deflated.get("trial_count_audit_sha256") != audit_sha256
+    ):
+        return ["incomplete-family statistics do not bind the manifest trial-count audit"]
+    return []
 
 
 def _multifactor_manifest_failures(
@@ -1242,6 +1394,8 @@ def _multifactor_manifest_failures(
         or history_evidence.get("final_test_periods") != expected_final_periods
     ):
         failures.append("pre-final history evidence periods do not match the immutable run")
+
+    failures.extend(_incomplete_family_manifest_binding_failures(manifest, metrics))
 
     expected_factors = {
         str(item["factor_candidate_id"]): {
@@ -5122,6 +5276,9 @@ class StrategyStore:
         if backtests[0].get("is_legacy"):
             raise ValueError("legacy backtests cannot approve a new strategy")
         config = version["config"]
+        conservative_incomplete_family = (
+            _valid_factor_score_incomplete_family_alternative(version, metrics)
+        )
         fin_strategy_admission_binding: dict[str, Any] | None = None
         source_research_artifact_id = str(
             version.get("source_research_artifact_id")
@@ -5297,6 +5454,11 @@ class StrategyStore:
                 "min",
             ),
         }
+        if conservative_incomplete_family:
+            # DSR is truthfully not computable because the historical trial
+            # matrix does not exist. Its narrow Bonferroni substitute is
+            # validated separately; do not convert None into a numeric pass.
+            checks.pop("deflated_sharpe_probability")
         if str(config.get("horizon_profile") or LEGACY_AMBIGUOUS) == LEGACY_AMBIGUOUS:
             # Preserve the historical contract for versions whose research
             # horizon is unknown. New horizon strategies prove rolling
@@ -5444,7 +5606,7 @@ class StrategyStore:
         if metrics.get("sortino_status") != "ok":
             failures.append("Sortino is undefined or non-finite")
         deflated = metrics.get("deflated_sharpe")
-        if (
+        if not conservative_incomplete_family and (
             not isinstance(deflated, dict)
             or deflated.get("status") != "ok"
             or deflated.get("method_version") != DEFLATED_SHARPE_METHOD_VERSION

@@ -1,17 +1,200 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from quant_data.snapshot_lineage import canonical_sha256
+from quant_platform.statistical_validation import (
+    DEFLATED_SHARPE_METHOD_VERSION,
+    STATISTICAL_CONTRACT_VERSION,
+)
+
 FORMAL_VALIDATION_CONTRACT_VERSION = (
-    "formal-validation-evidence-v3-pre-final-history"
+    "formal-validation-evidence-v4-incomplete-family-bonferroni"
 )
 PRE_FINAL_HISTORY_CONTRACT_VERSION = "pre-final-history-calendar-v1"
 SIGNAL_DECAY_FRONTIER_VERSION = "contiguous-zero-delay-frontier-v2"
+FACTOR_SCORE_FAMILYWISE_ALPHA = 0.05
+FACTOR_SCORE_INCOMPLETE_FAMILY_MULTIPLE_TESTING_VERSION = (
+    "factor-score-incomplete-family-bonferroni-v1"
+)
+CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS = (
+    "conservative_bonferroni_incomplete_historical_family"
+)
+NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS = (
+    "not_computable_incomplete_historical_family"
+)
+FROZEN_STRATEGY_OUTER_SCOPE = "pre_final_history_current_frozen_strategy"
+FACTOR_SCORE_INCOMPLETE_FAMILY_DSR_VERSION = (
+    "factor-score-incomplete-family-dsr-not-computable-v1"
+)
+
+
+def _require_sha256(value: Any, *, label: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError(f"{label} must be SHA256")
+    return normalized
+
+
+def build_factor_score_incomplete_family_multiple_testing(
+    *,
+    paired_bootstrap: Mapping[str, Any],
+    trial_count: int,
+    trial_count_audit_sha256: str,
+) -> dict[str, Any]:
+    """Build the conservative factor-family alternative when old returns are absent.
+
+    Bonferroni controls family-wise error under arbitrary dependence without
+    inventing the unavailable historical return matrix. PBO remains explicitly
+    not computable and the physical trial count is never reduced.
+    """
+
+    if isinstance(trial_count, bool) or int(trial_count) <= 1:
+        raise ValueError("incomplete-family Bonferroni requires multiple trials")
+    count = int(trial_count)
+    audit_sha256 = _require_sha256(
+        trial_count_audit_sha256,
+        label="trial_count_audit_sha256",
+    )
+    if paired_bootstrap.get("status") != "ok":
+        raise ValueError("paired bootstrap must be complete before Bonferroni")
+    try:
+        raw_p_value = float(paired_bootstrap["one_sided_p_value"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("paired bootstrap one-sided p-value is required") from exc
+    if not np.isfinite(raw_p_value) or not 0.0 <= raw_p_value <= 1.0:
+        raise ValueError("paired bootstrap one-sided p-value must be in [0, 1]")
+    adjusted_p_value = min(1.0, raw_p_value * count)
+    payload = {
+        "status": CONSERVATIVE_BONFERRONI_INCOMPLETE_FAMILY_STATUS,
+        "contract_version": FACTOR_SCORE_INCOMPLETE_FAMILY_MULTIPLE_TESTING_VERSION,
+        "method": "bonferroni",
+        "dependence_assumption": "valid_under_arbitrary_trial_dependence",
+        "evidence_scope": "current_frozen_factor_strategy_against_declared_trial_family",
+        "trial_count": count,
+        "available_candidate_return_series": 1,
+        "trial_count_audit_sha256": audit_sha256,
+        "p_value_source": "paired_moving_block_bootstrap",
+        "raw_one_sided_p_value": raw_p_value,
+        "bonferroni_adjusted_p_value": adjusted_p_value,
+        "familywise_alpha": FACTOR_SCORE_FAMILYWISE_ALPHA,
+        "gate_passed": adjusted_p_value <= FACTOR_SCORE_FAMILYWISE_ALPHA,
+        "pbo": {
+            "status": NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS,
+            "pbo": None,
+            "required_trial_return_series": count,
+            "available_trial_return_series": 1,
+            "reason": "complete aligned historical candidate return matrix is unavailable",
+        },
+    }
+    return {**payload, "evidence_sha256": canonical_sha256(payload)}
+
+
+def validate_factor_score_incomplete_family_multiple_testing(
+    value: Any,
+    *,
+    paired_bootstrap: Mapping[str, Any],
+    trial_count: int,
+    trial_count_audit_sha256: str,
+) -> dict[str, Any]:
+    """Rebuild and exactly validate conservative incomplete-family evidence."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("incomplete-family multiple-testing evidence must be an object")
+    expected = build_factor_score_incomplete_family_multiple_testing(
+        paired_bootstrap=paired_bootstrap,
+        trial_count=trial_count,
+        trial_count_audit_sha256=trial_count_audit_sha256,
+    )
+    if dict(value) != expected:
+        raise ValueError("incomplete-family Bonferroni evidence is not canonical")
+    return expected
+
+
+def build_factor_score_incomplete_family_dsr(
+    *,
+    blocked_dsr: Mapping[str, Any],
+    trial_count: int,
+    trial_count_audit_sha256: str,
+) -> dict[str, Any]:
+    """Record unavailable DSR inputs without converting them into a pass."""
+
+    if isinstance(trial_count, bool) or int(trial_count) <= 1:
+        raise ValueError("incomplete-family DSR requires multiple trials")
+    count = int(trial_count)
+    audit_sha256 = _require_sha256(
+        trial_count_audit_sha256,
+        label="trial_count_audit_sha256",
+    )
+    if (
+        blocked_dsr.get("status") != "blocked_missing_trial_sharpe_distribution"
+        or blocked_dsr.get("probability") is not None
+        or int(blocked_dsr.get("trials") or 0) != count
+        or blocked_dsr.get("method_version") != DEFLATED_SHARPE_METHOD_VERSION
+        or blocked_dsr.get("contract_version") != STATISTICAL_CONTRACT_VERSION
+        or blocked_dsr.get("expected_maximum_daily_sharpe") is not None
+        or blocked_dsr.get("trial_sharpe_std") is not None
+    ):
+        raise ValueError("DSR must be blocked by the missing complete trial distribution")
+    payload = {
+        **dict(blocked_dsr),
+        "status": NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS,
+        "source_status": "blocked_missing_trial_sharpe_distribution",
+        "incomplete_family_contract_version": (
+            FACTOR_SCORE_INCOMPLETE_FAMILY_DSR_VERSION
+        ),
+        "trial_count_audit_sha256": audit_sha256,
+        "trial_sharpes_available": False,
+        "reason": "complete historical trial Sharpe distribution is unavailable",
+    }
+    return {**payload, "evidence_sha256": canonical_sha256(payload)}
+
+
+def validate_factor_score_incomplete_family_dsr(
+    value: Any,
+    *,
+    trial_count: int,
+    trial_count_audit_sha256: str,
+) -> dict[str, Any]:
+    """Validate an explicitly not-computable DSR record and its audit binding."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("incomplete-family DSR evidence must be an object")
+    count = int(trial_count)
+    audit_sha256 = _require_sha256(
+        trial_count_audit_sha256,
+        label="trial_count_audit_sha256",
+    )
+    payload = dict(value)
+    evidence_sha256 = payload.pop("evidence_sha256", None)
+    if evidence_sha256 != canonical_sha256(payload):
+        raise ValueError("incomplete-family DSR evidence SHA256 is invalid")
+    if (
+        payload.get("status") != NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS
+        or payload.get("source_status")
+        != "blocked_missing_trial_sharpe_distribution"
+        or payload.get("incomplete_family_contract_version")
+        != FACTOR_SCORE_INCOMPLETE_FAMILY_DSR_VERSION
+        or payload.get("probability") is not None
+        or int(payload.get("trials") or 0) != count
+        or payload.get("method_version") != DEFLATED_SHARPE_METHOD_VERSION
+        or payload.get("contract_version") != STATISTICAL_CONTRACT_VERSION
+        or payload.get("expected_maximum_daily_sharpe") is not None
+        or payload.get("trial_sharpe_std") is not None
+        or payload.get("trial_count_audit_sha256") != audit_sha256
+        or payload.get("trial_sharpes_available") is not False
+        or payload.get("reason")
+        != "complete historical trial Sharpe distribution is unavailable"
+    ):
+        raise ValueError("incomplete-family DSR evidence is not canonical")
+    return dict(value)
 
 
 @dataclass(frozen=True)
