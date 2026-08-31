@@ -40,6 +40,13 @@ from quant_data.execution_contract import (
 
 from .data_task_store import DataTaskStore
 from .feature_drift import validate_factor_psi_observation
+from .forward_only_rehabilitation import (
+    TERMINAL_CASH_ONLY_BACKTEST_ID,
+    TERMINAL_CASH_ONLY_CONTRACT_VERSION,
+    TERMINAL_CASH_ONLY_JOB_ID,
+    TERMINAL_CASH_ONLY_VERSION_ID,
+    require_terminal_cash_only_receipt,
+)
 from .health_store import OperationalHealthStore
 from .information_schedule import (
     STRUCTURED_INFORMATION_SOURCES,
@@ -734,6 +741,94 @@ def _validated_rehabilitation_cash_only_horizon_lanes(
     return lanes
 
 
+def _validated_terminal_cash_only_horizon_lanes(
+    connection: Any,
+    *,
+    data_root: Path,
+) -> dict[str, dict[str, Any]]:
+    """Project the exact terminally rejected short baseline as cash only.
+
+    This receipt is deliberately weaker than a successful formal backtest: it
+    proves that the one pinned public baseline exhausted its immutable attempt
+    and failed every required robustness scenario.  It can therefore close the
+    product sleeve with ``NO_ACTION`` but can never approve a StrategyVersion,
+    create a paper account, or emit a recommendation.
+
+    Artifact payloads are fully hashed when the receipt is first registered.
+    Readiness uses the bounded verifier so the health endpoint does not re-read
+    hundreds of megabytes on every poll; all canonical receipt, database,
+    source-lockbox, and immutable identity checks still run here.
+    """
+
+    try:
+        receipt = require_terminal_cash_only_receipt(
+            connection,
+            data_root=data_root,
+            verify_artifact_hashes=False,
+        )
+    except Exception:  # noqa: BLE001 - readiness must fail closed
+        return {}
+    if not isinstance(receipt, Mapping):
+        return {}
+    gate = receipt.get("robustness_gate")
+    receipt_sha256 = str(receipt.get("receipt_sha256") or "")
+    if (
+        receipt.get("contract_version") != TERMINAL_CASH_ONLY_CONTRACT_VERSION
+        or receipt.get("strategy_version_id")
+        != TERMINAL_CASH_ONLY_VERSION_ID
+        or receipt.get("backtest_id") != TERMINAL_CASH_ONLY_BACKTEST_ID
+        or receipt.get("job_id") != TERMINAL_CASH_ONLY_JOB_ID
+        or receipt.get("horizon_profile") != "short_1_5d"
+        or receipt.get("authority") != _SOURCE_CASH_ONLY_SCOPE
+        or receipt.get("cash_only_scope") != _SOURCE_CASH_ONLY_SCOPE
+        or receipt.get("formal_result_complete") is not False
+        or receipt.get("approval_eligible") is not False
+        or receipt.get("rerun_allowed") is not False
+        or not isinstance(gate, Mapping)
+        or gate.get("passed") != 0
+        or gate.get("total") != 4
+        or gate.get("min_pass_rate") != 1.0
+        or gate.get("passed_gate") is not False
+        or len(receipt_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in receipt_sha256
+        )
+    ):
+        return {}
+    return {
+        "short_1_5d": {
+            "horizon": "short_1_5d",
+            "status": "ok",
+            "stage": "cash_only",
+            "strategy_version_id": None,
+            "health_status": "not_applicable",
+            "runner": "cash_only_no_orders",
+            "message": (
+                "the pinned short baseline was terminally rejected; its sleeve "
+                "remains in cash while governed research seeks a replacement"
+            ),
+            "candidates": [],
+            "cash_only": True,
+            "sleeve_action": "remain_in_cash",
+            "new_entries_allowed": False,
+            "recommendation_eligible": False,
+            "terminal_failure_evidence": {
+                "receipt_sha256": receipt_sha256,
+                "strategy_version_id": TERMINAL_CASH_ONLY_VERSION_ID,
+                "backtest_id": TERMINAL_CASH_ONLY_BACKTEST_ID,
+                "job_id": TERMINAL_CASH_ONLY_JOB_ID,
+                "authority": _SOURCE_CASH_ONLY_SCOPE,
+                "cash_only_scope": _SOURCE_CASH_ONLY_SCOPE,
+                "formal_result_complete": False,
+                "approval_eligible": False,
+                "rerun_allowed": False,
+                "robustness_gate": dict(gate),
+            },
+        }
+    }
+
+
 def _project_three_horizon_production(
     candidates: Mapping[str, list[dict[str, Any]]],
     cash_only_lanes: Mapping[str, Mapping[str, Any]],
@@ -756,9 +851,9 @@ def _project_three_horizon_production(
     return {
         "status": "ok" if not missing_or_blocked else "blocked",
         "message": (
-            "all product horizons have an operable or sealed cash-only lane"
+            "all product horizons have an operable or governed cash-only lane"
             if not missing_or_blocked
-            else "one or more product horizons have no operable or sealed cash-only lane"
+            else "one or more product horizons have no operable or governed cash-only lane"
         ),
         "required_horizons": list(_PRODUCT_HORIZONS),
         "blocked_horizons": missing_or_blocked,
@@ -1102,6 +1197,7 @@ class DeploymentReadinessStore:
         candidates: dict[str, list[dict[str, Any]]] = {
             horizon: [] for horizon in _PRODUCT_HORIZONS
         }
+        terminal_cash_only_lanes: dict[str, dict[str, Any]] = {}
         with self.engine.connect() as connection:
             lockbox_rows = connection.execute(
                 select(
@@ -1324,6 +1420,12 @@ class DeploymentReadinessStore:
                         ),
                     }
                 )
+            terminal_cash_only_lanes = (
+                _validated_terminal_cash_only_horizon_lanes(
+                    connection,
+                    data_root=self.settings.data_root,
+                )
+            )
         short_lane = _assess_horizon_candidates(
             "short_1_5d", candidates["short_1_5d"]
         )
@@ -1338,6 +1440,7 @@ class DeploymentReadinessStore:
         # reference and never impersonates that sealed path.
         cash_only_lanes = {
             **rehabilitation_cash_only_lanes,
+            **terminal_cash_only_lanes,
             **_validated_cash_only_horizon_lanes(lockbox_rows),
         }
         return _project_three_horizon_production(candidates, cash_only_lanes)

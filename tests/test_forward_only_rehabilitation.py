@@ -56,6 +56,146 @@ pytestmark = pytest.mark.no_database
 _WORKER_IMAGE = "sha256:" + "d" * 64
 
 
+def _terminal_cash_only_receipt(tmp_path: Path) -> dict:
+    files: dict[str, dict] = {}
+    expected_paths = {
+        "manifest": (
+            f"artifacts/backtests/{rehabilitation.TERMINAL_CASH_ONLY_BACKTEST_ID}"
+            "/manifest.json"
+        ),
+        "job_log": (
+            "platform/logs/strategy-backtest-"
+            f"{rehabilitation.TERMINAL_CASH_ONLY_BACKTEST_ID}.log"
+        ),
+    }
+    for name in rehabilitation.TERMINAL_CASH_ONLY_CORE_SCENARIOS:
+        root = (
+            f"artifacts/backtests/{rehabilitation.TERMINAL_CASH_ONLY_BACKTEST_ID}"
+            f"/robustness/{name}"
+        )
+        expected_paths.update(
+            {
+                f"{name}:daily_report": f"{root}/daily_report.parquet",
+                f"{name}:fills": f"{root}/fills.parquet",
+                f"{name}:metrics": f"{root}/metrics.json",
+            }
+        )
+    for key, relative in expected_paths.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"sealed:{key}".encode())
+        files[key] = {
+            "path": relative,
+            "bytes": path.stat().st_size,
+            "sha256": rehabilitation.sha256_file(path),
+        }
+    scenarios = [
+        {
+            "name": name,
+            "passed": False,
+            "reported_metrics": {
+                "trading_days": 252,
+                "annualized_excess_return": -0.20 - index / 100,
+                "max_drawdown": -0.10,
+            },
+            "recomputed_metrics": {
+                "trading_days": 252,
+                "annualized_excess_return": -0.20 - index / 100,
+                "max_drawdown": -0.10,
+            },
+        }
+        for index, name in enumerate(
+            rehabilitation.TERMINAL_CASH_ONLY_CORE_SCENARIOS
+        )
+    ]
+    core = {
+        "contract_version": rehabilitation.TERMINAL_CASH_ONLY_CONTRACT_VERSION,
+        "strategy_version_id": rehabilitation.TERMINAL_CASH_ONLY_VERSION_ID,
+        "backtest_id": rehabilitation.TERMINAL_CASH_ONLY_BACKTEST_ID,
+        "job_id": rehabilitation.TERMINAL_CASH_ONLY_JOB_ID,
+        "recipe_id": rehabilitation.TERMINAL_CASH_ONLY_RECIPE_ID,
+        "horizon_profile": rehabilitation.TERMINAL_CASH_ONLY_HORIZON,
+        "authority": rehabilitation.TERMINAL_CASH_ONLY_AUTHORITY,
+        "cash_only_scope": rehabilitation.SOURCE_CASH_ONLY_SCOPE,
+        "reason_code": rehabilitation.TERMINAL_CASH_ONLY_REASON_CODE,
+        "failure": rehabilitation.TERMINAL_CASH_ONLY_FAILURE,
+        "formal_result_complete": False,
+        "approval_eligible": False,
+        "paper_eligible": False,
+        "recommendation_eligible": False,
+        "rerun_allowed": False,
+        "dataset": rehabilitation.SOURCE_DATASET,
+        "dataset_identity_sha256": rehabilitation.SOURCE_DATASET_IDENTITY_SHA256,
+        "dataset_lineage_id": rehabilitation.SOURCE_DATASET_LINEAGE_ID,
+        "periods": rehabilitation.SOURCE_PERIODS,
+        "strategy_rules_sha256": rehabilitation.SOURCE_RULES_SHA256,
+        "execution_contract_hash": rehabilitation.SOURCE_EXECUTION_CONTRACT_HASH,
+        "recipe_version": FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
+        "runner_sha256": FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256,
+        "runtime_bundle_sha256": (
+            FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
+        ),
+        "worker_runtime_image_digest": _WORKER_IMAGE,
+        "source_lockbox_contract_version": (
+            "transparent-baseline-available-horizons-lockbox-v3"
+        ),
+        "source_lockbox_batch_sha256": "1" * 64,
+        "source_lockbox_member_sha256": "2" * 64,
+        "source_history_selection_sha256": "3" * 64,
+        "source_unavailable_horizons_sha256": "4" * 64,
+        "source_unavailable_evidence_sha256s": {
+            "swing_1_6m": "5" * 64,
+            "long_1_3y": "6" * 64,
+        },
+        "source_cash_only_scope": rehabilitation.SOURCE_CASH_ONLY_SCOPE,
+        "robustness_gate": {
+            "passed": 0,
+            "total": 4,
+            "pass_rate": 0.0,
+            "min_pass_rate": 1.0,
+            "passed_gate": False,
+        },
+        "scenarios": scenarios,
+        "files": files,
+    }
+    return {**core, "receipt_sha256": rehabilitation.canonical_sha256(core)}
+
+
+def test_terminal_cash_only_receipt_is_exact_and_artifact_bound(
+    tmp_path: Path,
+) -> None:
+    receipt = _terminal_cash_only_receipt(tmp_path)
+
+    validated = rehabilitation.validate_terminal_cash_only_receipt(
+        receipt,
+        artifact_root=tmp_path,
+    )
+
+    assert validated["robustness_gate"]["passed"] == 0
+    assert validated["approval_eligible"] is False
+    assert validated["recommendation_eligible"] is False
+
+    manifest_path = tmp_path / receipt["files"]["manifest"]["path"]
+    manifest_path.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="changed after registration"):
+        rehabilitation.validate_terminal_cash_only_receipt(
+            receipt,
+            artifact_root=tmp_path,
+        )
+
+
+def test_terminal_cash_only_receipt_cannot_claim_a_passing_scenario(
+    tmp_path: Path,
+) -> None:
+    receipt = _terminal_cash_only_receipt(tmp_path)
+    receipt["scenarios"][0]["passed"] = True
+    core = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    receipt["receipt_sha256"] = rehabilitation.canonical_sha256(core)
+
+    with pytest.raises(ValueError, match="exact 0/4 rejection"):
+        rehabilitation.validate_terminal_cash_only_receipt(receipt)
+
+
 def _raw_source_catalog(tmp_path: Path) -> list[dict]:
     from governance_fixtures import write_governed_daily_qlib_dataset
 

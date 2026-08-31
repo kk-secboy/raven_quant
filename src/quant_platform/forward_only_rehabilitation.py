@@ -11,10 +11,12 @@ import hashlib
 import json
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
+from math import isclose, isfinite
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import insert, select
+import pandas as pd
+from sqlalchemy import insert, select, update
 
 from quant_data.database import (
     audit_events,
@@ -24,6 +26,7 @@ from quant_data.database import (
     oos_vintages,
     row_dict,
     strategies,
+    strategy_events,
     strategy_forward_only_rehabilitations,
     strategy_incomplete_family_eligibilities,
     strategy_versions,
@@ -98,6 +101,45 @@ SOURCE_ATTEMPT_ARTIFACT_RELATIVE_PATH = (
     "artifacts/formal-backtest-recoveries/"
     f"{SOURCE_BACKTEST_ID}/attempt-2"
 )
+
+# One exact v18 public-control attempt reached all four primary robustness
+# scenarios before the nominal-result reconstruction rejected legitimate
+# zero-amount execution evidence.  The independently recomputed scenarios are
+# all economically negative, so rerunning that already-opened historical
+# window cannot make the public control eligible.  This receipt records only a
+# terminal cash/NO_ACTION projection.  It is deliberately stored on the
+# already-failed backtest and never turns that row into a successful result.
+TERMINAL_CASH_ONLY_CONTRACT_VERSION = (
+    "transparent-baseline-terminal-cash-only-v1"
+)
+TERMINAL_CASH_ONLY_AUTHORITY = SOURCE_CASH_ONLY_SCOPE
+TERMINAL_CASH_ONLY_AUDIT_ACTION = "strategy.terminal_cash_only_registered"
+TERMINAL_CASH_ONLY_WRAPPER_KEY = "terminal_cash_only_receipt"
+TERMINAL_CASH_ONLY_VERSION_ID = "47eb2ea1152e438f9579843d2f3fb16f"
+TERMINAL_CASH_ONLY_BACKTEST_ID = "2daa5d6d976f4a5d9fdc2d9e6d279884"
+TERMINAL_CASH_ONLY_JOB_ID = "4ebf57ad734a4fcc90b7b4c163819baf"
+TERMINAL_CASH_ONLY_FAILURE = (
+    "ValueError: formal fill ledger contains invalid position evidence"
+)
+TERMINAL_CASH_ONLY_REASON_CODE = (
+    "public_control_failed_all_primary_robustness_scenarios"
+)
+TERMINAL_CASH_ONLY_CORE_SCENARIOS = (
+    "double_cost",
+    "turnover_75pct",
+    "topk_80pct",
+    "zero_retention_buffer",
+)
+TERMINAL_CASH_ONLY_RECIPE_ID = "short_relative_strength"
+TERMINAL_CASH_ONLY_HORIZON = "short_1_5d"
+TERMINAL_CASH_ONLY_ARTIFACT_RELATIVE_PATH = (
+    f"artifacts/backtests/{TERMINAL_CASH_ONLY_BACKTEST_ID}"
+)
+# Short aliases are intentionally confined to this exact one-shot receipt and
+# are used by the bounded readiness projection.
+TARGET_VERSION_ID = TERMINAL_CASH_ONLY_VERSION_ID
+TARGET_BACKTEST_ID = TERMINAL_CASH_ONLY_BACKTEST_ID
+TARGET_JOB_ID = TERMINAL_CASH_ONLY_JOB_ID
 
 REPLAY_MARKERS: dict[str, Any] = {
     "evidence_mode": EVIDENCE_MODE_REPLAY,
@@ -595,6 +637,571 @@ def sha256_file(path: Path) -> str:
 def is_sha256(value: Any) -> bool:
     text = str(value or "")
     return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+def _resolve_terminal_evidence_path(data_root: Path, stored_path: str) -> Path:
+    root = data_root.resolve()
+    raw = Path(stored_path)
+    normalized = stored_path.replace("\\", "/")
+    if normalized == "/data":
+        candidate = root
+    elif normalized.startswith("/data/"):
+        candidate = root.joinpath(*normalized.removeprefix("/data/").split("/"))
+    elif raw.is_absolute():
+        candidate = raw
+    else:
+        candidate = root / raw
+    resolved = candidate.resolve(strict=True)
+    if resolved != root and root not in resolved.parents:
+        raise ValueError("terminal cash-only evidence escapes DATA_ROOT")
+    if not resolved.is_file():
+        raise ValueError("terminal cash-only evidence is not a regular file")
+    return resolved
+
+
+def _terminal_file_record(data_root: Path, path: Path) -> dict[str, Any]:
+    root = data_root.resolve()
+    resolved = path.resolve(strict=True)
+    if resolved != root and root not in resolved.parents:
+        raise ValueError("terminal cash-only artifact escapes DATA_ROOT")
+    relative = resolved.relative_to(root).as_posix()
+    return {
+        "path": relative,
+        "bytes": int(resolved.stat().st_size),
+        "sha256": sha256_file(resolved),
+    }
+
+
+def _recompute_terminal_scenario(report_path: Path) -> dict[str, Any]:
+    report = pd.read_parquet(report_path)
+    required = {"return", "cost", "bench"}
+    if report.empty or not required.issubset(report.columns):
+        raise ValueError("terminal robustness daily report is incomplete")
+    net = pd.to_numeric(report["return"], errors="coerce") - pd.to_numeric(
+        report["cost"], errors="coerce"
+    )
+    benchmark = pd.to_numeric(report["bench"], errors="coerce")
+    if (
+        net.isna().any()
+        or benchmark.isna().any()
+        or not all(isfinite(float(value)) for value in net)
+        or not all(isfinite(float(value)) for value in benchmark)
+    ):
+        raise ValueError("terminal robustness daily report contains non-finite returns")
+    annualized_excess = float((net - benchmark).mean() * 252.0)
+    nav = (1.0 + net).cumprod()
+    max_drawdown = float((nav / nav.cummax() - 1.0).min())
+    if not isfinite(annualized_excess) or not isfinite(max_drawdown):
+        raise ValueError("terminal robustness recomputation is non-finite")
+    return {
+        "trading_days": int(len(report)),
+        "annualized_excess_return": annualized_excess,
+        "max_drawdown": max_drawdown,
+    }
+
+
+def validate_terminal_cash_only_receipt(
+    value: Mapping[str, Any],
+    *,
+    expected_backtest_id: str = TERMINAL_CASH_ONLY_BACKTEST_ID,
+    expected_job_id: str = TERMINAL_CASH_ONLY_JOB_ID,
+    expected_version_id: str = TERMINAL_CASH_ONLY_VERSION_ID,
+    artifact_root: Path | None = None,
+) -> dict[str, Any]:
+    """Validate the exact terminal rejection receipt without granting authority."""
+
+    receipt = dict(value)
+    receipt_sha256 = str(receipt.pop("receipt_sha256", ""))
+    gate = receipt.get("robustness_gate")
+    scenarios = receipt.get("scenarios")
+    files = receipt.get("files")
+    if (
+        not is_sha256(receipt_sha256)
+        or canonical_sha256(receipt) != receipt_sha256
+        or receipt.get("contract_version") != TERMINAL_CASH_ONLY_CONTRACT_VERSION
+        or receipt.get("strategy_version_id") != expected_version_id
+        or receipt.get("backtest_id") != expected_backtest_id
+        or receipt.get("job_id") != expected_job_id
+        or receipt.get("recipe_id") != TERMINAL_CASH_ONLY_RECIPE_ID
+        or receipt.get("horizon_profile") != TERMINAL_CASH_ONLY_HORIZON
+        or receipt.get("authority") != TERMINAL_CASH_ONLY_AUTHORITY
+        or receipt.get("cash_only_scope") != SOURCE_CASH_ONLY_SCOPE
+        or receipt.get("reason_code") != TERMINAL_CASH_ONLY_REASON_CODE
+        or receipt.get("failure") != TERMINAL_CASH_ONLY_FAILURE
+        or receipt.get("formal_result_complete") is not False
+        or receipt.get("approval_eligible") is not False
+        or receipt.get("rerun_allowed") is not False
+        or receipt.get("recommendation_eligible") is not False
+        or receipt.get("paper_eligible") is not False
+        or receipt.get("dataset") != SOURCE_DATASET
+        or receipt.get("dataset_identity_sha256") != SOURCE_DATASET_IDENTITY_SHA256
+        or receipt.get("dataset_lineage_id") != SOURCE_DATASET_LINEAGE_ID
+        or receipt.get("periods") != SOURCE_PERIODS
+        or receipt.get("strategy_rules_sha256") != SOURCE_RULES_SHA256
+        or receipt.get("execution_contract_hash") != SOURCE_EXECUTION_CONTRACT_HASH
+        or receipt.get("recipe_version")
+        != FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+        or receipt.get("runner_sha256")
+        != FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256
+        or receipt.get("runtime_bundle_sha256")
+        != FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
+        or not str(receipt.get("worker_runtime_image_digest") or "").startswith(
+            "sha256:"
+        )
+        or not is_sha256(
+            str(receipt.get("worker_runtime_image_digest") or "").removeprefix(
+                "sha256:"
+            )
+        )
+        or receipt.get("source_lockbox_contract_version")
+        != "transparent-baseline-available-horizons-lockbox-v3"
+        or not is_sha256(receipt.get("source_lockbox_batch_sha256"))
+        or not is_sha256(receipt.get("source_lockbox_member_sha256"))
+        or not is_sha256(receipt.get("source_history_selection_sha256"))
+        or not is_sha256(receipt.get("source_unavailable_horizons_sha256"))
+        or receipt.get("source_cash_only_scope") != SOURCE_CASH_ONLY_SCOPE
+        or not isinstance(receipt.get("source_unavailable_evidence_sha256s"), Mapping)
+        or set(receipt["source_unavailable_evidence_sha256s"])
+        != {"swing_1_6m", "long_1_3y"}
+        or not all(
+            is_sha256(digest)
+            for digest in receipt["source_unavailable_evidence_sha256s"].values()
+        )
+        or not isinstance(gate, Mapping)
+        or dict(gate)
+        != {
+            "passed": 0,
+            "total": 4,
+            "pass_rate": 0.0,
+            "min_pass_rate": 1.0,
+            "passed_gate": False,
+        }
+        or not isinstance(scenarios, list)
+        or not isinstance(files, Mapping)
+    ):
+        raise ValueError("terminal cash-only receipt is malformed or has changed")
+
+    expected_names = list(TERMINAL_CASH_ONLY_CORE_SCENARIOS)
+    observed_names: list[str] = []
+    for scenario in scenarios:
+        if not isinstance(scenario, Mapping):
+            raise ValueError("terminal cash-only scenario is malformed")
+        name = str(scenario.get("name") or "")
+        reported = scenario.get("reported_metrics")
+        recomputed = scenario.get("recomputed_metrics")
+        if not isinstance(reported, Mapping) or not isinstance(recomputed, Mapping):
+            raise ValueError("terminal cash-only scenario metrics are missing")
+        try:
+            reported_excess = float(reported["annualized_excess_return"])
+            reported_drawdown = float(reported["max_drawdown"])
+            reported_days = int(reported["trading_days"])
+            recomputed_excess = float(recomputed["annualized_excess_return"])
+            recomputed_drawdown = float(recomputed["max_drawdown"])
+            recomputed_days = int(recomputed["trading_days"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("terminal cash-only scenario metrics are invalid") from exc
+        if (
+            name not in TERMINAL_CASH_ONLY_CORE_SCENARIOS
+            or scenario.get("passed") is not False
+            or not all(
+                isfinite(number)
+                for number in (
+                    reported_excess,
+                    reported_drawdown,
+                    recomputed_excess,
+                    recomputed_drawdown,
+                )
+            )
+            or reported_excess >= 0.0
+            or recomputed_excess >= 0.0
+            or reported_days != 252
+            or recomputed_days != reported_days
+            or not isclose(reported_excess, recomputed_excess, rel_tol=1e-9, abs_tol=1e-12)
+            or not isclose(
+                reported_drawdown,
+                recomputed_drawdown,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError("terminal robustness result is not an exact 0/4 rejection")
+        observed_names.append(name)
+    if observed_names != expected_names:
+        raise ValueError("terminal cash-only receipt does not contain the four core scenarios")
+
+    expected_file_keys = {"manifest", "job_log"}
+    for scenario_name in TERMINAL_CASH_ONLY_CORE_SCENARIOS:
+        expected_file_keys.update(
+            {
+                f"{scenario_name}:daily_report",
+                f"{scenario_name}:fills",
+                f"{scenario_name}:metrics",
+            }
+        )
+    if set(files) != expected_file_keys:
+        raise ValueError("terminal cash-only artifact inventory is incomplete")
+    expected_paths = {
+        "manifest": f"{TERMINAL_CASH_ONLY_ARTIFACT_RELATIVE_PATH}/manifest.json",
+        "job_log": (
+            "platform/logs/strategy-backtest-"
+            f"{TERMINAL_CASH_ONLY_BACKTEST_ID}.log"
+        ),
+    }
+    for scenario_name in TERMINAL_CASH_ONLY_CORE_SCENARIOS:
+        scenario_root = (
+            f"{TERMINAL_CASH_ONLY_ARTIFACT_RELATIVE_PATH}/robustness/{scenario_name}"
+        )
+        expected_paths.update(
+            {
+                f"{scenario_name}:daily_report": f"{scenario_root}/daily_report.parquet",
+                f"{scenario_name}:fills": f"{scenario_root}/fills.parquet",
+                f"{scenario_name}:metrics": f"{scenario_root}/metrics.json",
+            }
+        )
+    observed_paths: set[str] = set()
+    for file_key, entry in files.items():
+        if not isinstance(entry, Mapping) or set(entry) != {"path", "bytes", "sha256"}:
+            raise ValueError("terminal cash-only artifact entry is malformed")
+        path_text = str(entry.get("path") or "")
+        if (
+            path_text != expected_paths[file_key]
+            or Path(path_text).is_absolute()
+            or ".." in Path(path_text).parts
+            or path_text in observed_paths
+            or not isinstance(entry.get("bytes"), int)
+            or int(entry["bytes"]) <= 0
+            or not is_sha256(entry.get("sha256"))
+        ):
+            raise ValueError("terminal cash-only artifact entry is unsafe")
+        observed_paths.add(path_text)
+        if artifact_root is not None:
+            path = _resolve_terminal_evidence_path(artifact_root, path_text)
+            if (
+                int(path.stat().st_size) != int(entry["bytes"])
+                or sha256_file(path) != str(entry["sha256"])
+            ):
+                raise ValueError("terminal cash-only artifact changed after registration")
+    return {**receipt, "receipt_sha256": receipt_sha256}
+
+
+def _terminal_rows(connection: Any, *, lock: bool = False) -> tuple[Any, Any, Any]:
+    statements = (
+        select(strategy_versions).where(
+            strategy_versions.c.id == TERMINAL_CASH_ONLY_VERSION_ID
+        ),
+        select(backtest_runs).where(
+            backtest_runs.c.id == TERMINAL_CASH_ONLY_BACKTEST_ID
+        ),
+        select(jobs).where(jobs.c.id == TERMINAL_CASH_ONLY_JOB_ID),
+    )
+    if lock:
+        statements = tuple(statement.with_for_update() for statement in statements)
+    version = connection.execute(statements[0]).first()
+    backtest = connection.execute(statements[1]).first()
+    job = connection.execute(statements[2]).first()
+    if version is None or backtest is None or job is None:
+        raise ValueError("terminal cash-only target rows are missing")
+    return version, backtest, job
+
+
+def build_terminal_cash_only_receipt(
+    connection: Any,
+    *,
+    data_root: Path,
+) -> dict[str, Any]:
+    """Build a deterministic receipt from the exact failed public control."""
+
+    version, backtest, job = _terminal_rows(connection)
+    config = dict(version.config_json or {})
+    bootstrap = dict(config.get(BOOTSTRAP_CONFIG_KEY) or {})
+    if (
+        str(version.status) != "draft"
+        or version.promotion_stage is not None
+        or version.approved_at is not None
+        or version.approved_by is not None
+        or bool(version.is_legacy)
+        or str(version.evidence_mode) != EVIDENCE_MODE_REPLAY
+        or str(version.horizon_profile) != TERMINAL_CASH_ONLY_HORIZON
+        or str(version.strategy_rules_sha256) != SOURCE_RULES_SHA256
+        or str(version.execution_contract_hash) != SOURCE_EXECUTION_CONTRACT_HASH
+        or str(config.get("recipe_id") or "") != TERMINAL_CASH_ONLY_RECIPE_ID
+        or str(config.get("recipe_version") or "")
+        != FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+        or float(config.get("min_robustness_pass_rate") or 0.0) != 1.0
+        or str(backtest.status) != "failed"
+        or str(backtest.strategy_version_id) != TERMINAL_CASH_ONLY_VERSION_ID
+        or str(backtest.job_id) != TERMINAL_CASH_ONLY_JOB_ID
+        or str(backtest.dataset) != SOURCE_DATASET
+        or dict(backtest.periods_json or {}) != SOURCE_PERIODS
+        or backtest.metrics_json is not None
+        or str(backtest.error or "") != TERMINAL_CASH_ONLY_FAILURE
+        or str(backtest.evidence_mode) != EVIDENCE_MODE_REPLAY
+        or str(job.kind) != "strategy_backtest"
+        or str(job.status) != "failed"
+        or str(job.error or "") != TERMINAL_CASH_ONLY_FAILURE
+        or int(job.exit_code or 0) != 1
+        or int(job.attempts or 0) != 1
+        or int(job.max_attempts or 0) != 1
+    ):
+        raise ValueError("terminal cash-only target is not the exact inert failed replay")
+    if (
+        bootstrap.get("dataset") != SOURCE_DATASET
+        or bootstrap.get("dataset_identity_sha256") != SOURCE_DATASET_IDENTITY_SHA256
+        or bootstrap.get("dataset_lineage_id") != SOURCE_DATASET_LINEAGE_ID
+        or bootstrap.get("recipe_id") != TERMINAL_CASH_ONLY_RECIPE_ID
+        or bootstrap.get("recipe_version")
+        != FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+        or bootstrap.get("formal_periods") != SOURCE_PERIODS
+        or bootstrap.get("target_runner_sha256")
+        != FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256
+        or bootstrap.get("target_runtime_bundle_sha256")
+        != FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
+        or not str(bootstrap.get("target_worker_runtime_image_digest") or "").startswith(
+            "sha256:"
+        )
+    ):
+        raise ValueError("terminal cash-only runtime binding changed")
+
+    root = _resolve_terminal_evidence_path(
+        data_root,
+        f"{str(backtest.artifact_path).rstrip('/')}/manifest.json",
+    ).parent
+    expected_relative_root = TERMINAL_CASH_ONLY_ARTIFACT_RELATIVE_PATH
+    if root.relative_to(data_root.resolve()).as_posix() != expected_relative_root:
+        raise ValueError("terminal cash-only artifact root changed")
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("backtest_id") != TERMINAL_CASH_ONLY_BACKTEST_ID
+        or manifest.get("strategy_version_id") != TERMINAL_CASH_ONLY_VERSION_ID
+        or manifest.get("dataset") != SOURCE_DATASET
+        or manifest.get("strategy_rules_sha256") != SOURCE_RULES_SHA256
+        or manifest.get("periods") != {
+            "start": SOURCE_PERIODS["start"],
+            "end": SOURCE_PERIODS["end"],
+        }
+        or manifest.get("transparent_baseline_runner_sha256")
+        != bootstrap["target_runner_sha256"]
+        or manifest.get("transparent_baseline_runtime_bundle_sha256")
+        != bootstrap["target_runtime_bundle_sha256"]
+        or manifest.get("transparent_baseline_worker_runtime_image_digest")
+        != bootstrap["target_worker_runtime_image_digest"]
+        or manifest.get("authority") != REPLAY_AUTHORITY
+        or manifest.get("final_oos_opened") is not True
+        or manifest.get("sealed_final_oos") is not False
+        or manifest.get("unseen_oos") is not False
+    ):
+        raise ValueError("terminal cash-only manifest identity changed")
+
+    files: dict[str, dict[str, Any]] = {
+        "manifest": _terminal_file_record(data_root, manifest_path),
+        "job_log": _terminal_file_record(
+            data_root,
+            _resolve_terminal_evidence_path(data_root, str(job.log_path or "")),
+        ),
+    }
+    scenarios: list[dict[str, Any]] = []
+    max_drawdown = float(config.get("max_drawdown") or 0.0)
+    for scenario_name in TERMINAL_CASH_ONLY_CORE_SCENARIOS:
+        scenario_root = root / "robustness" / scenario_name
+        report_path = scenario_root / "daily_report.parquet"
+        fills_path = scenario_root / "fills.parquet"
+        metrics_path = scenario_root / "metrics.json"
+        reported_all = json.loads(metrics_path.read_text(encoding="utf-8"))
+        recomputed = _recompute_terminal_scenario(report_path)
+        reported = {
+            "trading_days": int(reported_all.get("trading_days") or 0),
+            "annualized_excess_return": float(
+                reported_all.get("annualized_excess_return")
+            ),
+            "max_drawdown": float(reported_all.get("max_drawdown")),
+        }
+        passed = (
+            recomputed["annualized_excess_return"] > 0.0
+            and recomputed["max_drawdown"] >= -max_drawdown
+        )
+        scenarios.append(
+            {
+                "name": scenario_name,
+                "passed": passed,
+                "reported_metrics": reported,
+                "recomputed_metrics": recomputed,
+            }
+        )
+        files[f"{scenario_name}:daily_report"] = _terminal_file_record(
+            data_root, report_path
+        )
+        files[f"{scenario_name}:fills"] = _terminal_file_record(data_root, fills_path)
+        files[f"{scenario_name}:metrics"] = _terminal_file_record(
+            data_root, metrics_path
+        )
+    if any(bool(item["passed"]) for item in scenarios):
+        raise ValueError("terminal public control did not fail all core robustness scenarios")
+
+    source_cash_only = require_source_cash_only_lockbox(connection)
+    core = {
+        "contract_version": TERMINAL_CASH_ONLY_CONTRACT_VERSION,
+        "strategy_version_id": TERMINAL_CASH_ONLY_VERSION_ID,
+        "backtest_id": TERMINAL_CASH_ONLY_BACKTEST_ID,
+        "job_id": TERMINAL_CASH_ONLY_JOB_ID,
+        "recipe_id": TERMINAL_CASH_ONLY_RECIPE_ID,
+        "horizon_profile": TERMINAL_CASH_ONLY_HORIZON,
+        "authority": TERMINAL_CASH_ONLY_AUTHORITY,
+        "cash_only_scope": SOURCE_CASH_ONLY_SCOPE,
+        "reason_code": TERMINAL_CASH_ONLY_REASON_CODE,
+        "failure": TERMINAL_CASH_ONLY_FAILURE,
+        "formal_result_complete": False,
+        "approval_eligible": False,
+        "paper_eligible": False,
+        "recommendation_eligible": False,
+        "rerun_allowed": False,
+        "dataset": SOURCE_DATASET,
+        "dataset_identity_sha256": SOURCE_DATASET_IDENTITY_SHA256,
+        "dataset_lineage_id": SOURCE_DATASET_LINEAGE_ID,
+        "periods": SOURCE_PERIODS,
+        "strategy_rules_sha256": SOURCE_RULES_SHA256,
+        "execution_contract_hash": SOURCE_EXECUTION_CONTRACT_HASH,
+        "recipe_version": FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
+        "runner_sha256": bootstrap["target_runner_sha256"],
+        "runtime_bundle_sha256": bootstrap["target_runtime_bundle_sha256"],
+        "worker_runtime_image_digest": bootstrap[
+            "target_worker_runtime_image_digest"
+        ],
+        **source_cash_only,
+        "robustness_gate": {
+            "passed": 0,
+            "total": 4,
+            "pass_rate": 0.0,
+            "min_pass_rate": 1.0,
+            "passed_gate": False,
+        },
+        "scenarios": scenarios,
+        "files": files,
+    }
+    receipt = {**core, "receipt_sha256": canonical_sha256(core)}
+    return validate_terminal_cash_only_receipt(receipt, artifact_root=data_root)
+
+
+def require_terminal_cash_only_receipt(
+    connection: Any,
+    *,
+    data_root: Path,
+    verify_artifact_hashes: bool = True,
+) -> dict[str, Any]:
+    """Revalidate the registered receipt against database and source lockbox."""
+
+    version, backtest, job = _terminal_rows(connection)
+    config = dict(version.config_json or {})
+    bootstrap = dict(config.get(BOOTSTRAP_CONFIG_KEY) or {})
+    wrapper = backtest.metrics_json
+    if not isinstance(wrapper, Mapping) or set(wrapper) != {
+        TERMINAL_CASH_ONLY_WRAPPER_KEY
+    }:
+        raise ValueError("terminal cash-only receipt is not registered")
+    raw_receipt = wrapper.get(TERMINAL_CASH_ONLY_WRAPPER_KEY)
+    if not isinstance(raw_receipt, Mapping):
+        raise ValueError("terminal cash-only receipt wrapper is malformed")
+    receipt = validate_terminal_cash_only_receipt(
+        raw_receipt,
+        artifact_root=data_root if verify_artifact_hashes else None,
+    )
+    source_cash_only = require_source_cash_only_lockbox(connection)
+    if (
+        str(version.status) != "rejected"
+        or version.promotion_stage is not None
+        or version.approved_at is not None
+        or version.approved_by is not None
+        or bool(version.is_legacy)
+        or str(version.evidence_mode) != EVIDENCE_MODE_REPLAY
+        or str(version.horizon_profile) != TERMINAL_CASH_ONLY_HORIZON
+        or str(version.strategy_rules_sha256) != SOURCE_RULES_SHA256
+        or str(version.execution_contract_hash) != SOURCE_EXECUTION_CONTRACT_HASH
+        or str(config.get("recipe_id") or "") != TERMINAL_CASH_ONLY_RECIPE_ID
+        or str(config.get("recipe_version") or "")
+        != FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+        or bootstrap.get("dataset") != SOURCE_DATASET
+        or bootstrap.get("dataset_identity_sha256") != SOURCE_DATASET_IDENTITY_SHA256
+        or bootstrap.get("dataset_lineage_id") != SOURCE_DATASET_LINEAGE_ID
+        or bootstrap.get("target_runner_sha256") != receipt.get("runner_sha256")
+        or bootstrap.get("target_runtime_bundle_sha256")
+        != receipt.get("runtime_bundle_sha256")
+        or bootstrap.get("target_worker_runtime_image_digest")
+        != receipt.get("worker_runtime_image_digest")
+        or str(backtest.status) != "failed"
+        or str(backtest.job_id) != TERMINAL_CASH_ONLY_JOB_ID
+        or str(backtest.strategy_version_id) != TERMINAL_CASH_ONLY_VERSION_ID
+        or str(backtest.dataset) != SOURCE_DATASET
+        or dict(backtest.periods_json or {}) != SOURCE_PERIODS
+        or str(backtest.error or "") != TERMINAL_CASH_ONLY_FAILURE
+        or str(job.status) != "failed"
+        or str(job.error or "") != TERMINAL_CASH_ONLY_FAILURE
+        or int(job.attempts or 0) != 1
+        or int(job.max_attempts or 0) != 1
+        or any(receipt.get(key) != item for key, item in source_cash_only.items())
+    ):
+        raise ValueError("terminal cash-only database or source-lockbox binding changed")
+    return receipt
+
+
+def register_terminal_cash_only_receipt(
+    connection: Any,
+    *,
+    data_root: Path,
+    actor: str,
+) -> dict[str, Any]:
+    """CAS-register the rejection while keeping formal and production states inert."""
+
+    responsible = actor.strip()
+    if len(responsible) < 2:
+        raise ValueError("terminal cash-only registration requires a responsible actor")
+    version, backtest, _job = _terminal_rows(connection, lock=True)
+    if backtest.metrics_json is not None:
+        return require_terminal_cash_only_receipt(
+            connection,
+            data_root=data_root,
+            verify_artifact_hashes=True,
+        )
+    receipt = build_terminal_cash_only_receipt(connection, data_root=data_root)
+    backtest_result = connection.execute(
+        update(backtest_runs)
+        .where(
+            backtest_runs.c.id == TERMINAL_CASH_ONLY_BACKTEST_ID,
+            backtest_runs.c.strategy_version_id == TERMINAL_CASH_ONLY_VERSION_ID,
+            backtest_runs.c.job_id == TERMINAL_CASH_ONLY_JOB_ID,
+            backtest_runs.c.status == "failed",
+            backtest_runs.c.metrics_json.is_(None),
+        )
+        .values(metrics_json={TERMINAL_CASH_ONLY_WRAPPER_KEY: receipt})
+    )
+    version_result = connection.execute(
+        update(strategy_versions)
+        .where(
+            strategy_versions.c.id == TERMINAL_CASH_ONLY_VERSION_ID,
+            strategy_versions.c.status == "draft",
+            strategy_versions.c.promotion_stage.is_(None),
+            strategy_versions.c.approved_at.is_(None),
+            strategy_versions.c.approved_by.is_(None),
+        )
+        .values(status="rejected")
+    )
+    if backtest_result.rowcount != 1 or version_result.rowcount != 1:
+        raise ValueError("terminal cash-only compare-and-set lost its exact target")
+    connection.execute(
+        insert(strategy_events).values(
+            strategy_id=str(version.strategy_id),
+            strategy_version_id=TERMINAL_CASH_ONLY_VERSION_ID,
+            event_type=TERMINAL_CASH_ONLY_AUDIT_ACTION,
+            actor=responsible,
+            payload_json={
+                "receipt_sha256": receipt["receipt_sha256"],
+                "backtest_id": TERMINAL_CASH_ONLY_BACKTEST_ID,
+                "job_id": TERMINAL_CASH_ONLY_JOB_ID,
+                "reason_code": TERMINAL_CASH_ONLY_REASON_CODE,
+            },
+            created_at=datetime.now(UTC),
+        )
+    )
+    return receipt
 
 
 def require_replay_markers(value: Mapping[str, Any], *, label: str) -> None:

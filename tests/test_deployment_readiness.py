@@ -424,6 +424,153 @@ def test_cash_only_readiness_fails_closed_without_current_valid_lockbox() -> Non
     assert missing["status"] == "blocked"
 
 
+def _terminal_short_cash_only_receipt() -> dict:
+    return {
+        "contract_version": readiness_module.TERMINAL_CASH_ONLY_CONTRACT_VERSION,
+        "strategy_version_id": readiness_module.TERMINAL_CASH_ONLY_VERSION_ID,
+        "backtest_id": readiness_module.TERMINAL_CASH_ONLY_BACKTEST_ID,
+        "job_id": readiness_module.TERMINAL_CASH_ONLY_JOB_ID,
+        "horizon_profile": "short_1_5d",
+        "authority": "cash_only_projection_only",
+        "cash_only_scope": "cash_only_projection_only",
+        "formal_result_complete": False,
+        "approval_eligible": False,
+        "rerun_allowed": False,
+        "robustness_gate": {
+            "passed": 0,
+            "total": 4,
+            "min_pass_rate": 1.0,
+            "passed_gate": False,
+        },
+        "receipt_sha256": "a" * 64,
+    }
+
+
+@pytest.mark.no_database
+def test_terminally_rejected_short_baseline_projects_only_cash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    def require_receipt(_connection, **kwargs):
+        calls.append(kwargs)
+        return _terminal_short_cash_only_receipt()
+
+    monkeypatch.setattr(
+        readiness_module,
+        "require_terminal_cash_only_receipt",
+        require_receipt,
+    )
+
+    lanes = readiness_module._validated_terminal_cash_only_horizon_lanes(
+        object(), data_root=tmp_path
+    )
+
+    assert calls == [
+        {"data_root": tmp_path, "verify_artifact_hashes": False}
+    ]
+    assert set(lanes) == {"short_1_5d"}
+    lane = lanes["short_1_5d"]
+    assert lane["status"] == "ok"
+    assert lane["stage"] == "cash_only"
+    assert lane["runner"] == "cash_only_no_orders"
+    assert lane["strategy_version_id"] is None
+    assert lane["new_entries_allowed"] is False
+    assert lane["recommendation_eligible"] is False
+    assert lane["terminal_failure_evidence"]["formal_result_complete"] is False
+    assert lane["terminal_failure_evidence"]["robustness_gate"]["passed"] == 0
+
+
+@pytest.mark.no_database
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("backtest_id",), "another-backtest"),
+        (("strategy_version_id",), "another-version"),
+        (("approval_eligible",), True),
+        (("robustness_gate", "passed"), 1),
+        (("receipt_sha256",), "x" * 64),
+    ],
+)
+def test_terminal_short_cash_projection_fails_closed_on_tamper_or_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: tuple[str, ...],
+    value: object,
+) -> None:
+    receipt = _terminal_short_cash_only_receipt()
+    target = receipt
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    monkeypatch.setattr(
+        readiness_module,
+        "require_terminal_cash_only_receipt",
+        lambda *_args, **_kwargs: receipt,
+    )
+
+    assert (
+        readiness_module._validated_terminal_cash_only_horizon_lanes(
+            object(), data_root=tmp_path
+        )
+        == {}
+    )
+
+
+@pytest.mark.no_database
+def test_terminal_short_cash_projection_fails_closed_when_receipt_validation_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_receipt(*_args, **_kwargs):
+        raise KeyError("tampered receipt")
+
+    monkeypatch.setattr(
+        readiness_module,
+        "require_terminal_cash_only_receipt",
+        reject_receipt,
+    )
+
+    assert (
+        readiness_module._validated_terminal_cash_only_horizon_lanes(
+            object(), data_root=tmp_path
+        )
+        == {}
+    )
+
+
+@pytest.mark.no_database
+def test_real_short_production_lane_overrides_terminal_cash_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        readiness_module,
+        "require_terminal_cash_only_receipt",
+        lambda *_args, **_kwargs: _terminal_short_cash_only_receipt(),
+    )
+    cash_lanes = readiness_module._validated_terminal_cash_only_horizon_lanes(
+        object(), data_root=tmp_path
+    )
+    short = _healthy_short_paper_candidate(strategy_version_id="passing-short")
+
+    result = readiness_module._project_three_horizon_production(
+        {
+            "short_1_5d": [short],
+            "swing_1_6m": [],
+            "long_1_3y": [],
+        },
+        cash_lanes,
+    )
+
+    assert result["horizons"]["short_1_5d"]["stage"] == "paper"
+    assert result["horizons"]["short_1_5d"]["strategy_version_id"] == (
+        "passing-short"
+    )
+    assert "short_1_5d" not in result["cash_only_horizons"]
+
+
 def _rehabilitation_cash_only_rows(
     *,
     short_version_id: str = "v18-short-paper",

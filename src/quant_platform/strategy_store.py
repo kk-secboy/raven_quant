@@ -94,6 +94,7 @@ from quant_platform.forward_only_rehabilitation import (
     incomplete_family_eligibility_for_version,
     insert_incomplete_family_eligibility,
     insert_qualification,
+    register_terminal_cash_only_receipt,
     rehabilitation_forward_thresholds,
     require_consumed_vintage,
     require_incomplete_family_eligibility,
@@ -5318,6 +5319,21 @@ class StrategyStore:
             )
             if not result.rowcount:
                 raise KeyError(backtest_id)
+
+    def register_terminal_cash_only(
+        self,
+        *,
+        data_root: Path,
+        actor: str,
+    ) -> dict[str, Any]:
+        """Seal the exact failed public control as cash/NO_ACTION only."""
+
+        with self.engine.begin() as connection:
+            return register_terminal_cash_only_receipt(
+                connection,
+                data_root=data_root,
+                actor=actor,
+            )
 
     def requeue_backtest(self, backtest_id: str) -> None:
         with self.engine.begin() as connection:
