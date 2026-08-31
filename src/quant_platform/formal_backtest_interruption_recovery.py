@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import insert, null, select, text, update
 
 from quant_data.database import (
     audit_events,
@@ -71,6 +71,27 @@ V17_RECOVERY_CONTROLLER_SHA256 = (
 V17_INTERRUPTION_RECOVERY_RECEIPT_SHA256 = (
     "6345c455862d8bb587e12f8ce0be7c1da291f2dde82fbdbb31e954bb88b9d3df"
 )
+
+
+def _job_requeue_values() -> dict[str, Any]:
+    """Return the exact SQL values for the one authorized requeue.
+
+    ``jobs.progress_json`` is JSONB, so a Python ``None`` is encoded as the
+    JSON value ``null``.  The database authorization trigger deliberately
+    requires SQL NULL; use an explicit SQL NULL expression for that column.
+    """
+
+    return {
+        "status": "queued",
+        "max_attempts": 2,
+        "progress_json": null(),
+        "exit_code": None,
+        "error": None,
+        "started_at": None,
+        "finished_at": None,
+        "cancel_requested_at": None,
+        "next_attempt_at": None,
+    }
 V17_EXTERNAL_JOURNAL_EXCERPT: Mapping[str, Any] = {
     "contract_version": "quantlab-systemd-docker-journal-excerpt-v1",
     "records": [
@@ -1136,17 +1157,7 @@ class FormalBacktestInterruptionRecoveryStore:
                     jobs.c.exit_code == 143,
                     jobs.c.error == INTERRUPTED_JOB_ERROR,
                 )
-                .values(
-                    status="queued",
-                    max_attempts=2,
-                    progress_json=None,
-                    exit_code=None,
-                    error=None,
-                    started_at=None,
-                    finished_at=None,
-                    cancel_requested_at=None,
-                    next_attempt_at=None,
-                )
+                .values(**_job_requeue_values())
             )
             if backtest_update.rowcount != 1 or job_update.rowcount != 1:
                 raise ValueError("v17 formal backtest recovery source changed during registration")

@@ -6,6 +6,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.sql.elements import Null
 
 from quant_platform.formal_backtest_interruption_recovery import (
     EXTERNAL_EVIDENCE_CONTRACT_VERSION,
@@ -20,6 +21,7 @@ from quant_platform.formal_backtest_interruption_recovery import (
     V17_RECOVERY_DATABASE_APPLICATION_NAME,
     V17_REPAIR_RECEIPT_SHA256,
     FormalBacktestInterruptionRecoveryStore,
+    _job_requeue_values,
     _source_backtest_snapshot,
     _source_job_snapshot,
     _validate_snapshot_hash,
@@ -36,6 +38,14 @@ from quant_platform.transparent_baseline_runner import (
 )
 
 pytestmark = pytest.mark.no_database
+
+
+def test_authorized_requeue_uses_sql_null_for_json_progress() -> None:
+    values = _job_requeue_values()
+
+    assert isinstance(values["progress_json"], Null)
+    assert values["status"] == "queued"
+    assert values["max_attempts"] == 2
 
 
 def _external_evidence() -> dict:
