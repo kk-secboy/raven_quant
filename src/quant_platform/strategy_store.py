@@ -295,20 +295,20 @@ def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[s
 
     recipe_id = config.get("recipe_id")
     recipe_version = config.get("recipe_version")
-    if (
-        str(recipe_version or "")
-        != FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
-        or target_runner_for_recipe(recipe_id, recipe_version) is None
-    ):
+    if str(recipe_version or "") != FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION:
         return config
-    if (
-        str(recipe_id or "") == "short_relative_strength"
-        and config.get("evidence_mode") != EVIDENCE_MODE_REPLAY
-    ):
+    if str(recipe_id or "") != "short_relative_strength":
+        raise ValueError(
+            "the v18 transparent runtime is restricted to the exact short "
+            "forward-only rehabilitation entry point"
+        )
+    if config.get("evidence_mode") != EVIDENCE_MODE_REPLAY:
         raise ValueError(
             "the current short transparent baseline is restricted to the exact "
             "forward-only rehabilitation entry point"
         )
+    if target_runner_for_recipe(recipe_id, recipe_version) is None:
+        raise ValueError("the v18 forward-only runner identity is unavailable")
     bootstrap_raw = config.get("transparent_baseline_bootstrap")
     if bootstrap_raw is not None and not isinstance(bootstrap_raw, Mapping):
         raise ValueError("transparent current bootstrap must be an object")
@@ -5264,6 +5264,37 @@ class StrategyStore:
             )
             if not result.rowcount:
                 raise KeyError(backtest_id)
+
+    def attach_job_once(self, backtest_id: str, job_id: str) -> None:
+        """Attach one immutable job without overwriting a concurrent binding.
+
+        Ordinary pair/research flows retain :meth:`attach_job` because their
+        explicit requeue path can replace a prior job.  Consumed-history replay
+        is one-shot and uses this compare-and-set boundary instead.
+        """
+
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(backtest_runs)
+                .where(
+                    backtest_runs.c.id == backtest_id,
+                    or_(
+                        backtest_runs.c.job_id.is_(None),
+                        backtest_runs.c.job_id == job_id,
+                    ),
+                )
+                .values(job_id=job_id)
+            )
+            if result.rowcount:
+                return
+            existing = connection.execute(
+                select(backtest_runs.c.job_id).where(backtest_runs.c.id == backtest_id)
+            ).first()
+            if existing is None:
+                raise KeyError(backtest_id)
+            if str(existing.job_id or "") == job_id:
+                return
+            raise ValueError("formal backtest is already attached to a different job")
 
     def mark_backtest(
         self,

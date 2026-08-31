@@ -57,6 +57,8 @@ def test_evidence_mode_backfill_default_and_v18_scope_are_fail_closed() -> None:
     )
     assert "recipe_id', '') = 'short_relative_strength'" in runtime_check
     assert "evidence_mode = 'consumed_historical_replay'" in runtime_check
+    assert "v18' THEN (COALESCE" in runtime_check
+    assert "v18' AND" not in runtime_check
     assert "ELSE true END) IS TRUE" in runtime_check
 
 
@@ -140,3 +142,25 @@ def test_0088_triggers_bind_family_runtime_periods_criteria_and_artifacts() -> N
     assert "trg_incomplete_family_eligibility_append_only" in source
     assert "trg_forward_only_rehabilitation_no_truncate" in source
     assert "trg_incomplete_family_eligibility_no_truncate" in source
+
+
+def test_0088_downgrade_locks_receipts_before_checking_or_dropping() -> None:
+    source = _MIGRATION_PATH.read_text(encoding="utf-8")
+    downgrade = source[source.index("def downgrade()") :]
+    advisory = "forward-only-rehabilitation:0088-downgrade"
+    lock_start = downgrade.index(
+        '"LOCK TABLE quantlab.strategy_versions, quantlab.backtest_runs, "'
+    )
+    count_start = downgrade.index('"SELECT (SELECT count(*) FROM "')
+    evidence_count_start = downgrade.index(
+        '"WHERE evidence_mode <> \'legacy_ambiguous\') + "'
+    )
+    drop_start = downgrade.index(
+        'op.drop_table("strategy_forward_only_rehabilitations"'
+    )
+
+    assert advisory in downgrade
+    assert '"IN ACCESS EXCLUSIVE MODE"' in downgrade
+    assert "quantlab.strategy_incomplete_family_eligibilities" in downgrade
+    assert "quantlab.strategy_forward_only_rehabilitations" in downgrade
+    assert lock_start < count_start < evidence_count_start < drop_start

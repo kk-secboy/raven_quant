@@ -65,6 +65,9 @@ from .transparent_baseline_lockbox import (
     LOCKBOX_CONTRACT_VERSION_V3,
     validate_joint_lockbox,
 )
+from .transparent_baseline_runner import (
+    FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
+)
 
 RESEARCH_LONGEST_VALIDATION_TRADING_DAYS = max(
     int(profile["validation_trading_days"])
@@ -603,8 +606,8 @@ def _validated_rehabilitation_cash_only_horizon_lanes(
     qualification_core = {
         key: value for key, value in qualification.items() if key != "receipt_sha256"
     }
-    current_recipe_version = str(
-        get_strategy_recipe("short_relative_strength")["version"]
+    rehabilitation_recipe_version = (
+        FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
     )
     normalized_evidence_hashes = {
         str(key): str(value) for key, value in evidence_hashes.items()
@@ -651,7 +654,7 @@ def _validated_rehabilitation_cash_only_horizon_lanes(
         or row.get("target_horizon_profile") != "short_1_5d"
         or row.get("target_evidence_mode") != _CONSUMED_HISTORICAL_REPLAY
         or config.get("recipe_id") != "short_relative_strength"
-        or config.get("recipe_version") != current_recipe_version
+        or config.get("recipe_version") != rehabilitation_recipe_version
         or config.get("horizon_profile") != "short_1_5d"
         or config.get("evidence_mode") != _CONSUMED_HISTORICAL_REPLAY
         or qualification.get("historical_replay_opened") is not True

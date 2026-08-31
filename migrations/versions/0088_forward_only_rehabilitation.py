@@ -40,7 +40,7 @@ EXECUTION_SHA256 = "0ffa8939a70f0c46499e3ae472b877f68cce1b9fb95dfe81886ab8430ddc
 V18_RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-31-v18"
 V18_RUNNER_SHA256 = "c45bd901f25ba0cf289e3ec1a71015865d190afb4510c6bc207d53c9cc2ab24d"
 V18_RUNTIME_BUNDLE_SHA256 = (
-    "938e777424ebbaa6afc9f4d68baf18daf081044e883152696041290165b103ed"
+    "2a2547f585e016ad9459f1b7bd039541285869eb524b0b43e2b57981eed633cb"
 )
 
 
@@ -69,10 +69,10 @@ def upgrade() -> None:
         "ck_strategy_versions_v18_runtime_identity",
         "strategy_versions",
         "(CASE WHEN COALESCE(config_json ->> 'recipe_version', '') = "
-        f"'{V18_RECIPE_VERSION}' AND "
+        f"'{V18_RECIPE_VERSION}' THEN ("
         "COALESCE(config_json ->> 'recipe_id', '') = "
-        "'short_relative_strength' THEN ("
-        "evidence_mode = 'consumed_historical_replay' "
+        "'short_relative_strength' "
+        "AND evidence_mode = 'consumed_historical_replay' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
         f"'target_runner_sha256' = '{V18_RUNNER_SHA256}' "
         "AND config_json -> 'transparent_baseline_bootstrap' ->> "
@@ -723,6 +723,20 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
+    bind.execute(
+        sa.text(
+            "SELECT pg_advisory_xact_lock("
+            "hashtext('forward-only-rehabilitation:0088-downgrade'))"
+        )
+    )
+    bind.execute(
+        sa.text(
+            "LOCK TABLE quantlab.strategy_versions, quantlab.backtest_runs, "
+            "quantlab.strategy_incomplete_family_eligibilities, "
+            "quantlab.strategy_forward_only_rehabilitations "
+            "IN ACCESS EXCLUSIVE MODE"
+        )
+    )
     receipt_count = bind.scalar(
         sa.text(
             "SELECT (SELECT count(*) FROM "
@@ -731,9 +745,17 @@ def downgrade() -> None:
             "quantlab.strategy_incomplete_family_eligibilities)"
         )
     )
-    if int(receipt_count or 0) > 0:
+    governed_evidence_count = bind.scalar(
+        sa.text(
+            "SELECT (SELECT count(*) FROM quantlab.strategy_versions "
+            "WHERE evidence_mode <> 'legacy_ambiguous') + "
+            "(SELECT count(*) FROM quantlab.backtest_runs "
+            "WHERE evidence_mode <> 'legacy_ambiguous')"
+        )
+    )
+    if int(receipt_count or 0) > 0 or int(governed_evidence_count or 0) > 0:
         raise RuntimeError(
-            "cannot downgrade after immutable forward-only rehabilitation evidence exists"
+            "cannot downgrade after immutable governed strategy evidence exists"
         )
     for table in ("backtest_runs", "strategy_versions"):
         op.execute(

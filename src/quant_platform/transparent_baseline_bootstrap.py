@@ -1041,6 +1041,21 @@ class TransparentBaselineBootstrapService:
                 ):
                     raise
                 backtest_action = "reused"
+        strict_replay_job = version.get("evidence_mode") == EVIDENCE_MODE_REPLAY
+        if strict_replay_job:
+            replay_backtest_id = str(backtest.get("id") or "")
+            expected_artifact_path = (self.artifact_root / replay_backtest_id).resolve()
+            if (
+                not replay_backtest_id
+                or replay_backtest_id == SOURCE_BACKTEST_ID
+                or backtest.get("evidence_mode") != EVIDENCE_MODE_REPLAY
+                or not str(backtest.get("artifact_path") or "")
+                or Path(str(backtest["artifact_path"])).resolve()
+                != expected_artifact_path
+            ):
+                raise ValueError(
+                    "existing forward-only v18 replay backtest differs from the frozen plan"
+                )
         status = str(backtest.get("status") or "")
         job: dict[str, Any] | None = None
         job_action = "not_required"
@@ -1073,38 +1088,106 @@ class TransparentBaselineBootstrapService:
                 target_worker_runtime_image_digest
             )
         idempotency_key = f"transparent-baseline:{version['id']}:{backtest['id']}"
-        if not allow_create:
-            attached_job_id = str(backtest.get("job_id") or "")
-            if not attached_job_id:
-                raise ValueError(
-                    "existing forward-only v18 replay is partial: attached job is missing"
-                )
-            job = self.jobs.get(attached_job_id)
+        attached_job_id = str(backtest.get("job_id") or "")
+
+        # Preserve the ordinary transparent-baseline path exactly.  The
+        # consumed-history crash recovery below is intentionally narrower and
+        # must not weaken or otherwise reinterpret v17 job attachment rules.
+        if not strict_replay_job:
+            if not allow_create:
+                if not attached_job_id:
+                    raise ValueError(
+                        "existing forward-only v18 replay is partial: "
+                        "attached job is missing"
+                    )
+                job = self.jobs.get(attached_job_id)
+                if (
+                    attached_job_id == SOURCE_JOB_ID
+                    or job.get("kind") != "strategy_backtest"
+                    or job.get("payload") != payload
+                    or job.get("idempotency_key") != idempotency_key
+                    or int(job.get("max_attempts") or 0) != 1
+                ):
+                    raise ValueError(
+                        "existing forward-only v18 replay job differs from "
+                        "the frozen plan"
+                    )
+                allowed_job_statuses = {
+                    "queued": {"queued"},
+                    "running": {"queued", "running"},
+                    "succeeded": {"succeeded"},
+                    "failed": {"failed", "cancelled"},
+                    "cancelled": {"failed", "cancelled"},
+                }
+                if str(job.get("status") or "") not in allowed_job_statuses.get(
+                    status, set()
+                ):
+                    raise ValueError(
+                        "existing forward-only v18 replay job/backtest lifecycle "
+                        "is partial"
+                    )
+                job_action = "reused"
+            if status in {"queued", "running"}:
+                if allow_create:
+                    job = self.jobs.create(
+                        "strategy_backtest",
+                        payload,
+                        self.log_root / f"strategy-backtest-{backtest['id']}.log",
+                        dedupe_active_kind=False,
+                        idempotency_key=idempotency_key,
+                        max_attempts=1,
+                    )
+                    job_action = "reused" if backtest.get("job_id") else "created"
+                assert job is not None
+                if backtest.get("job_id") not in {None, str(job["id"])}:
+                    raise ValueError("formal backtest is attached to a different job")
+                if str(job.get("status") or "") in {"failed", "cancelled"}:
+                    raise ValueError(
+                        "formal backtest job is terminal and cannot reopen its one-shot OOS"
+                    )
+                self.strategies.attach_job(str(backtest["id"]), str(job["id"]))
+                backtest = self.strategies.get_backtest(str(backtest["id"]))
+            return {
+                "backtest": backtest,
+                "backtest_action": backtest_action,
+                "job": job,
+                "job_action": job_action,
+            }
+
+        def require_exact_job(candidate: Mapping[str, Any]) -> dict[str, Any]:
+            normalized = dict(candidate)
+            replay_job_id = str(normalized.get("id") or "")
+            retry_budget = normalized.get("max_attempts")
             if (
-                attached_job_id == SOURCE_JOB_ID
-                or job.get("kind") != "strategy_backtest"
-                or job.get("payload") != payload
-                or job.get("idempotency_key") != idempotency_key
-                or int(job.get("max_attempts") or 0) != 1
+                not replay_job_id
+                or replay_job_id == SOURCE_JOB_ID
+                or normalized.get("kind") != "strategy_backtest"
+                or normalized.get("payload") != payload
+                or normalized.get("idempotency_key") != idempotency_key
+                or isinstance(retry_budget, bool)
+                or not isinstance(retry_budget, int)
+                or retry_budget != 1
             ):
                 raise ValueError(
                     "existing forward-only v18 replay job differs from the frozen plan"
                 )
-            allowed_job_statuses = {
-                "queued": {"queued"},
-                "running": {"queued", "running"},
-                "succeeded": {"succeeded"},
-                "failed": {"failed", "cancelled"},
-                "cancelled": {"failed", "cancelled"},
-            }
-            if str(job.get("status") or "") not in allowed_job_statuses.get(status, set()):
-                raise ValueError(
-                    "existing forward-only v18 replay job/backtest lifecycle is partial"
-                )
+            return normalized
+
+        if attached_job_id:
+            job = require_exact_job(self.jobs.get(attached_job_id))
             job_action = "reused"
-        if status in {"queued", "running"}:
-            if allow_create:
-                job = self.jobs.create(
+        elif not allow_create:
+            raise ValueError(
+                "existing forward-only v18 replay is partial: attached job is missing"
+            )
+        elif status in {"queued", "running"}:
+            # This is the only resumable partial state.  JobStore's immutable
+            # idempotency key makes a crash after job creation but before
+            # attachment converge on the same max_attempts=1 job.  A terminal
+            # backtest without an attachment remains corruption and may not
+            # manufacture a replacement execution.
+            job = require_exact_job(
+                self.jobs.create(
                     "strategy_backtest",
                     payload,
                     self.log_root / f"strategy-backtest-{backtest['id']}.log",
@@ -1112,16 +1195,52 @@ class TransparentBaselineBootstrapService:
                     idempotency_key=idempotency_key,
                     max_attempts=1,
                 )
-                job_action = "reused" if backtest.get("job_id") else "created"
-            assert job is not None
+            )
+            # Keep the public reconciliation action stable.  The durable
+            # idempotency key means this can physically recover an orphaned
+            # exact job, but in both cases this invocation completes the one
+            # missing backtest-to-job edge.
+            job_action = "created"
+        else:
+            raise ValueError(
+                "existing forward-only v18 replay is terminal without its exact job"
+            )
+
+        assert job is not None
+        allowed_job_statuses = {
+            # A worker claims a job before projecting the running state onto
+            # its backtest, and projects the terminal backtest before finishing
+            # the job.  Those two narrow orderings are safe exact-state races.
+            "queued": {"queued", "running"},
+            "running": {"queued", "running"},
+            "succeeded": {"running", "succeeded"},
+            "failed": {"running", "failed", "cancelled"},
+            "cancelled": {"running", "failed", "cancelled"},
+        }
+        if str(job.get("status") or "") not in allowed_job_statuses.get(status, set()):
+            raise ValueError(
+                "existing forward-only v18 replay job/backtest lifecycle is partial"
+            )
+        if status in {"queued", "running"}:
             if backtest.get("job_id") not in {None, str(job["id"])}:
                 raise ValueError("formal backtest is attached to a different job")
             if str(job.get("status") or "") in {"failed", "cancelled"}:
                 raise ValueError(
                     "formal backtest job is terminal and cannot reopen its one-shot OOS"
                 )
-            self.strategies.attach_job(str(backtest["id"]), str(job["id"]))
-            backtest = self.strategies.get_backtest(str(backtest["id"]))
+            if not attached_job_id:
+                # StrategyStore performs a compare-and-set attachment.  A
+                # concurrent different binding is rejected rather than being
+                # overwritten after this method's earlier read.
+                if version.get("evidence_mode") == EVIDENCE_MODE_REPLAY:
+                    self.strategies.attach_job_once(
+                        str(backtest["id"]), str(job["id"])
+                    )
+                else:
+                    self.strategies.attach_job(
+                        str(backtest["id"]), str(job["id"])
+                    )
+                backtest = self.strategies.get_backtest(str(backtest["id"]))
         return {
             "backtest": backtest,
             "backtest_action": backtest_action,
@@ -1283,13 +1402,23 @@ class TransparentBaselineBootstrapService:
                 or version.get("evidence_mode") != EVIDENCE_MODE_REPLAY
             ):
                 raise ValueError("v18 StrategyVersion differs from the frozen replay plan")
+            lifecycle_action = self._lifecycle_action(version, entity="version")
+            allow_partial_resume = (
+                lifecycle_action == "reconcile"
+                and str(version.get("status") or "") == "draft"
+                and version.get("promotion_stage") is None
+            )
             result["strategy_version_id"] = str(version["id"])
             result["strategy_version_action"] = version_action
             queued = self._ensure_backtest_job(
                 plan=plan,
                 version=version,
                 dataset=dataset,
-                allow_create=version_action == "created",
+                # Only an untouched draft may resume either permitted crash
+                # boundary: version-before-backtest or
+                # backtest/job-before-attachment.  Approved paper and governed
+                # terminal states must already have a complete immutable chain.
+                allow_create=allow_partial_resume,
             )
             backtest = queued["backtest"]
             job = queued["job"]

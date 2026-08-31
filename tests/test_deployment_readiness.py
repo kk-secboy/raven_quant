@@ -44,6 +44,7 @@ from quant_platform.transparent_baseline_lockbox import (
     build_unopened_history_selection,
 )
 from quant_platform.transparent_baseline_runner import (
+    FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
     target_runner_for_recipe,
@@ -495,9 +496,9 @@ def _rehabilitation_cash_only_rows(
             "target_evidence_mode": "consumed_historical_replay",
             "target_config_json": {
                 "recipe_id": "short_relative_strength",
-                "recipe_version": get_strategy_recipe("short_relative_strength")[
-                    "version"
-                ],
+                "recipe_version": (
+                    FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+                ),
                 "horizon_profile": "short_1_5d",
                 "evidence_mode": "consumed_historical_replay",
             },
@@ -527,6 +528,12 @@ def _healthy_short_paper_candidate(
 @pytest.mark.no_database
 def test_rehabilitation_receipt_projects_only_source_revalidated_cash_sleeves() -> None:
     rows = _rehabilitation_cash_only_rows()
+    assert rows[0]["target_config_json"]["recipe_version"] == (
+        FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+    )
+    assert get_strategy_recipe("short_relative_strength")["version"] != (
+        FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+    )
     assert LOCKBOX_CONFIG_KEY not in rows[0]["target_config_json"]
     short = _healthy_short_paper_candidate()
     short_lane = readiness_module._assess_horizon_candidates(

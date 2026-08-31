@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from quant_platform import forward_only_rehabilitation as rehabilitation
+from quant_platform import transparent_baseline_bootstrap as bootstrap
 from quant_platform.forward_only_rehabilitation import (
     EVIDENCE_MODE_REPLAY,
     REPLAY_AUTHORITY,
@@ -21,7 +22,10 @@ from quant_platform.forward_only_rehabilitation import (
     require_replay_config,
 )
 from quant_platform.strategy_recipes import get_strategy_recipe
-from quant_platform.strategy_store import StrategyStore
+from quant_platform.strategy_store import (
+    StrategyStore,
+    _bind_current_transparent_runtime_identity,
+)
 from quant_platform.transparent_baseline_bootstrap import (
     TransparentBaselineBootstrapService,
     _build_forward_only_rehabilitation_plan,
@@ -119,6 +123,20 @@ def test_v18_plan_is_an_opened_descriptive_replay_without_a_new_lockbox(
     tampered[LOCKBOX_CONFIG_KEY] = {"forbidden": True}
     with pytest.raises(ValueError, match="exact forward-only rehabilitation"):
         require_replay_config(tampered)
+
+
+@pytest.mark.parametrize("recipe_id", ["swing_trend", "long_quality_value"])
+def test_v18_runtime_is_rejected_for_every_non_short_recipe(recipe_id: str) -> None:
+    with pytest.raises(ValueError, match="restricted to the exact short"):
+        _bind_current_transparent_runtime_identity(
+            {
+                "recipe_id": recipe_id,
+                "recipe_version": (
+                    FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+                ),
+                "evidence_mode": "sealed_final_oos",
+            }
+        )
 
 
 def test_replay_config_requires_the_sealed_runner_bundle_and_image(
@@ -273,6 +291,9 @@ def test_existing_replay_must_have_a_complete_exact_backtest_and_job(
         "dataset": SOURCE_DATASET,
         "execution_dataset": None,
         "periods": SOURCE_PERIODS,
+        "artifact_path": str(
+            tmp_path / "artifacts" / "backtests" / "new-v18-backtest"
+        ),
         "evidence_mode": EVIDENCE_MODE_REPLAY,
         "status": "queued",
         "job_id": None,
@@ -334,6 +355,712 @@ def test_existing_replay_must_have_a_complete_exact_backtest_and_job(
     assert result["job_action"] == "reused"
     assert result["job"]["id"] == "new-v18-job"
     assert CompleteJobs.create_calls == 0
+
+
+def test_exact_v18_version_resumes_one_frozen_backtest_then_reuses_it(
+    tmp_path: Path,
+) -> None:
+    version = {
+        "id": "new-v18-version",
+        "evidence_mode": EVIDENCE_MODE_REPLAY,
+        "config": {
+            BOOTSTRAP_CONFIG_KEY: {
+                TRANSPARENT_BASELINE_RUNNER_FIELD: "a" * 64,
+                TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: "b" * 64,
+                TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: _WORKER_IMAGE,
+            }
+        },
+    }
+    dataset = {
+        "name": SOURCE_DATASET,
+        "path": "/data/qlib/source",
+        "calendar": ["2018-11-08", "2019-11-20"],
+        "dataset_lineage_id": "c" * 64,
+        "dataset_identity_sha256": "d" * 64,
+    }
+    plan = {"formal_periods": SOURCE_PERIODS}
+
+    class Strategies:
+        create_calls = 0
+        attach_calls = 0
+        backtest: dict | None = None
+
+        @classmethod
+        def list_backtests(cls, **_kwargs) -> list[dict]:
+            return [dict(cls.backtest)] if cls.backtest is not None else []
+
+        @classmethod
+        def create_backtest(cls, **kwargs) -> dict:
+            cls.create_calls += 1
+            assert kwargs["version_id"] == version["id"]
+            assert kwargs["periods"] == SOURCE_PERIODS
+            assert kwargs["dataset_identity_sha256"] == "d" * 64
+            assert not any(key.startswith("capital_oos") for key in kwargs)
+            cls.backtest = {
+                "id": "new-v18-backtest",
+                "dataset": SOURCE_DATASET,
+                "execution_dataset": None,
+                "periods": SOURCE_PERIODS,
+                "artifact_path": str(
+                    tmp_path / "artifacts" / "backtests" / "new-v18-backtest"
+                ),
+                "evidence_mode": EVIDENCE_MODE_REPLAY,
+                "status": "queued",
+                "job_id": None,
+            }
+            return dict(cls.backtest)
+
+        @classmethod
+        def attach_job_once(cls, backtest_id: str, job_id: str) -> None:
+            cls.attach_calls += 1
+            assert backtest_id == "new-v18-backtest"
+            assert job_id == "new-v18-job"
+            assert cls.backtest is not None
+            cls.backtest["job_id"] = job_id
+
+        @classmethod
+        def get_backtest(cls, _backtest_id: str) -> dict:
+            assert cls.backtest is not None
+            return dict(cls.backtest)
+
+    class Jobs:
+        create_calls = 0
+        job: dict | None = None
+
+        @classmethod
+        def create(cls, kind: str, payload: dict, _log_path: Path, **kwargs) -> dict:
+            cls.create_calls += 1
+            assert kind == "strategy_backtest"
+            assert kwargs["max_attempts"] == 1
+            assert kwargs["idempotency_key"] == (
+                "transparent-baseline:new-v18-version:new-v18-backtest"
+            )
+            cls.job = {
+                "id": "new-v18-job",
+                "kind": kind,
+                "status": "queued",
+                "payload": payload,
+                "idempotency_key": kwargs["idempotency_key"],
+                "max_attempts": kwargs["max_attempts"],
+            }
+            return dict(cls.job)
+
+        @classmethod
+        def get(cls, job_id: str) -> dict:
+            assert cls.job is not None and job_id == cls.job["id"]
+            return dict(cls.job)
+
+    service = TransparentBaselineBootstrapService(
+        database_url="unused",
+        data_root=tmp_path,
+        strategies=Strategies(),
+        jobs=Jobs(),
+        promotions=object(),
+        lockboxes=object(),
+    )
+    created = service._ensure_backtest_job(
+        plan=plan,
+        version=version,
+        dataset=dataset,
+        allow_create=True,
+    )
+    reused = service._ensure_backtest_job(
+        plan=plan,
+        version=version,
+        dataset=dataset,
+        allow_create=True,
+    )
+
+    assert created["backtest_action"] == "created"
+    assert created["job_action"] == "created"
+    assert reused["backtest_action"] == "reused"
+    assert reused["job_action"] == "reused"
+    assert Strategies.create_calls == 1
+    assert Jobs.create_calls == 1
+    assert Strategies.attach_calls == 1
+
+
+def test_v18_job_creation_crash_recovers_only_the_same_one_attempt_job(
+    tmp_path: Path,
+) -> None:
+    version = {
+        "id": "new-v18-version",
+        "evidence_mode": EVIDENCE_MODE_REPLAY,
+        "config": {
+            BOOTSTRAP_CONFIG_KEY: {
+                TRANSPARENT_BASELINE_RUNNER_FIELD: "a" * 64,
+                TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: "b" * 64,
+                TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: _WORKER_IMAGE,
+            }
+        },
+    }
+    dataset = {"name": SOURCE_DATASET, "path": "/data/qlib/source"}
+    plan = {"formal_periods": SOURCE_PERIODS}
+    backtest = {
+        "id": "new-v18-backtest",
+        "dataset": SOURCE_DATASET,
+        "execution_dataset": None,
+        "periods": SOURCE_PERIODS,
+        "artifact_path": str(
+            tmp_path / "artifacts" / "backtests" / "new-v18-backtest"
+        ),
+        "evidence_mode": EVIDENCE_MODE_REPLAY,
+        "status": "queued",
+        "job_id": None,
+    }
+
+    class Strategies:
+        attach_calls = 0
+
+        @staticmethod
+        def list_backtests(**_kwargs) -> list[dict]:
+            return [dict(backtest)]
+
+        @classmethod
+        def attach_job_once(cls, _backtest_id: str, job_id: str) -> None:
+            cls.attach_calls += 1
+            if cls.attach_calls == 1:
+                raise RuntimeError("simulated process crash before attachment")
+            backtest["job_id"] = job_id
+
+        @staticmethod
+        def get_backtest(_backtest_id: str) -> dict:
+            return dict(backtest)
+
+    class Jobs:
+        create_calls = 0
+        unique_jobs: dict[str, dict] = {}
+
+        @classmethod
+        def create(cls, kind: str, payload: dict, _log_path: Path, **kwargs) -> dict:
+            cls.create_calls += 1
+            key = kwargs["idempotency_key"]
+            candidate = {
+                "id": "new-v18-job",
+                "kind": kind,
+                "status": "queued",
+                "payload": payload,
+                "idempotency_key": key,
+                "max_attempts": kwargs["max_attempts"],
+            }
+            existing = cls.unique_jobs.setdefault(key, candidate)
+            assert existing == candidate
+            return dict(existing)
+
+        @classmethod
+        def get(cls, job_id: str) -> dict:
+            [job] = cls.unique_jobs.values()
+            assert job_id == job["id"]
+            return dict(job)
+
+    service = TransparentBaselineBootstrapService(
+        database_url="unused",
+        data_root=tmp_path,
+        strategies=Strategies(),
+        jobs=Jobs(),
+        promotions=object(),
+        lockboxes=object(),
+    )
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        service._ensure_backtest_job(
+            plan=plan,
+            version=version,
+            dataset=dataset,
+            allow_create=True,
+        )
+    recovered = service._ensure_backtest_job(
+        plan=plan,
+        version=version,
+        dataset=dataset,
+        allow_create=True,
+    )
+    reused = service._ensure_backtest_job(
+        plan=plan,
+        version=version,
+        dataset=dataset,
+        allow_create=True,
+    )
+
+    assert recovered["job"]["id"] == "new-v18-job"
+    assert recovered["job_action"] == "created"
+    assert reused["job_action"] == "reused"
+    assert Jobs.create_calls == 2
+    assert len(Jobs.unique_jobs) == 1
+    assert next(iter(Jobs.unique_jobs.values()))["max_attempts"] == 1
+
+
+def test_v18_backtest_creation_race_reuses_one_exact_row(
+    tmp_path: Path,
+) -> None:
+    version = {
+        "id": "new-v18-version",
+        "evidence_mode": EVIDENCE_MODE_REPLAY,
+        "config": {
+            BOOTSTRAP_CONFIG_KEY: {
+                TRANSPARENT_BASELINE_RUNNER_FIELD: "a" * 64,
+                TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: "b" * 64,
+                TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: _WORKER_IMAGE,
+            }
+        },
+    }
+    dataset = {
+        "name": SOURCE_DATASET,
+        "path": "/data/qlib/source",
+        "calendar": ["2018-11-08", "2019-11-20"],
+        "dataset_lineage_id": "c" * 64,
+        "dataset_identity_sha256": "d" * 64,
+    }
+    plan = {"formal_periods": SOURCE_PERIODS}
+    raced_backtest = {
+        "id": "new-v18-backtest",
+        "dataset": SOURCE_DATASET,
+        "execution_dataset": None,
+        "periods": SOURCE_PERIODS,
+        "artifact_path": str(
+            tmp_path / "artifacts" / "backtests" / "new-v18-backtest"
+        ),
+        "evidence_mode": EVIDENCE_MODE_REPLAY,
+        "status": "queued",
+        "job_id": None,
+    }
+
+    class Strategies:
+        list_calls = 0
+        attach_calls = 0
+
+        @classmethod
+        def list_backtests(cls, **_kwargs) -> list[dict]:
+            cls.list_calls += 1
+            return [] if cls.list_calls == 1 else [dict(raced_backtest)]
+
+        @staticmethod
+        def create_backtest(**_kwargs) -> dict:
+            raise ValueError("concurrent caller already created the formal row")
+
+        @classmethod
+        def attach_job_once(cls, _backtest_id: str, job_id: str) -> None:
+            cls.attach_calls += 1
+            raced_backtest["job_id"] = job_id
+
+        @staticmethod
+        def get_backtest(_backtest_id: str) -> dict:
+            return dict(raced_backtest)
+
+    class Jobs:
+        create_calls = 0
+
+        @classmethod
+        def create(cls, kind: str, payload: dict, _log_path: Path, **kwargs) -> dict:
+            cls.create_calls += 1
+            return {
+                "id": "new-v18-job",
+                "kind": kind,
+                "status": "queued",
+                "payload": payload,
+                "idempotency_key": kwargs["idempotency_key"],
+                "max_attempts": kwargs["max_attempts"],
+            }
+
+    service = TransparentBaselineBootstrapService(
+        database_url="unused",
+        data_root=tmp_path,
+        strategies=Strategies(),
+        jobs=Jobs(),
+        promotions=object(),
+        lockboxes=object(),
+    )
+    result = service._ensure_backtest_job(
+        plan=plan,
+        version=version,
+        dataset=dataset,
+        allow_create=True,
+    )
+
+    assert result["backtest_action"] == "reused"
+    assert result["backtest"]["id"] == "new-v18-backtest"
+    assert Strategies.list_calls == 2
+    assert Strategies.attach_calls == 1
+    assert Jobs.create_calls == 1
+
+
+def test_v18_resume_rejects_duplicates_and_tampered_retry_budget(
+    tmp_path: Path,
+) -> None:
+    version = {
+        "id": "new-v18-version",
+        "evidence_mode": EVIDENCE_MODE_REPLAY,
+        "config": {
+            BOOTSTRAP_CONFIG_KEY: {
+                TRANSPARENT_BASELINE_RUNNER_FIELD: "a" * 64,
+                TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: "b" * 64,
+                TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: _WORKER_IMAGE,
+            }
+        },
+    }
+    dataset = {"name": SOURCE_DATASET, "path": "/data/qlib/source"}
+    plan = {"formal_periods": SOURCE_PERIODS}
+    backtest = {
+        "id": "new-v18-backtest",
+        "dataset": SOURCE_DATASET,
+        "execution_dataset": None,
+        "periods": SOURCE_PERIODS,
+        "artifact_path": str(
+            tmp_path / "artifacts" / "backtests" / "new-v18-backtest"
+        ),
+        "evidence_mode": EVIDENCE_MODE_REPLAY,
+        "status": "queued",
+        "job_id": "new-v18-job",
+    }
+    payload = _job_payload(version, backtest, dataset)
+
+    class DuplicatedStrategies:
+        @staticmethod
+        def list_backtests(**_kwargs) -> list[dict]:
+            return [dict(backtest), {**backtest, "id": "duplicate"}]
+
+    service = TransparentBaselineBootstrapService(
+        database_url="unused",
+        data_root=tmp_path,
+        strategies=DuplicatedStrategies(),
+        jobs=object(),
+        promotions=object(),
+        lockboxes=object(),
+    )
+    with pytest.raises(ValueError, match="more than one formal backtest"):
+        service._ensure_backtest_job(
+            plan=plan,
+            version=version,
+            dataset=dataset,
+            allow_create=True,
+        )
+
+    class TamperedArtifactStrategies:
+        attach_calls = 0
+
+        @staticmethod
+        def list_backtests(**_kwargs) -> list[dict]:
+            return [
+                {
+                    **backtest,
+                    "job_id": None,
+                    "artifact_path": str(
+                        tmp_path / "artifacts" / "formal-backtest-recoveries" / SOURCE_BACKTEST_ID
+                    ),
+                }
+            ]
+
+        @classmethod
+        def attach_job_once(cls, *_args) -> None:
+            cls.attach_calls += 1
+
+    class NoJobCreation:
+        create_calls = 0
+
+        @classmethod
+        def create(cls, *_args, **_kwargs):
+            cls.create_calls += 1
+            raise AssertionError("tampered artifact paths must fail before job creation")
+
+    service.strategies = TamperedArtifactStrategies()
+    service.jobs = NoJobCreation()
+    with pytest.raises(ValueError, match="backtest differs from the frozen plan"):
+        service._ensure_backtest_job(
+            plan=plan,
+            version=version,
+            dataset=dataset,
+            allow_create=True,
+        )
+    assert NoJobCreation.create_calls == 0
+    assert TamperedArtifactStrategies.attach_calls == 0
+
+    class ExactStrategies:
+        attach_calls = 0
+
+        @staticmethod
+        def list_backtests(**_kwargs) -> list[dict]:
+            return [dict(backtest)]
+
+        @classmethod
+        def attach_job_once(cls, *_args) -> None:
+            cls.attach_calls += 1
+
+    class TamperedJobs:
+        @staticmethod
+        def get(_job_id: str) -> dict:
+            return {
+                "id": "new-v18-job",
+                "kind": "strategy_backtest",
+                "status": "queued",
+                "payload": payload,
+                "idempotency_key": (
+                    "transparent-baseline:new-v18-version:new-v18-backtest"
+                ),
+                "max_attempts": 2,
+            }
+
+    service.strategies = ExactStrategies()
+    service.jobs = TamperedJobs()
+    with pytest.raises(ValueError, match="differs from the frozen plan"):
+        service._ensure_backtest_job(
+            plan=plan,
+            version=version,
+            dataset=dataset,
+            allow_create=True,
+        )
+    assert ExactStrategies.attach_calls == 0
+
+
+def test_strategy_backtest_job_attachment_is_compare_and_set() -> None:
+    statements: list = []
+
+    class Result:
+        def __init__(self, *, rowcount: int = 0, job_id: str | None = None) -> None:
+            self.rowcount = rowcount
+            self.job_id = job_id
+
+        def first(self):
+            if self.job_id is None:
+                return None
+            return type("AttachedRow", (), {"job_id": self.job_id})()
+
+    class Connection:
+        @staticmethod
+        def execute(statement):
+            statements.append(statement)
+            if statement.is_update:
+                return Result(rowcount=0)
+            return Result(job_id="concurrent-different-job")
+
+    class Transaction:
+        def __enter__(self) -> Connection:
+            return Connection()
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    class Engine:
+        @staticmethod
+        def begin() -> Transaction:
+            return Transaction()
+
+    store = object.__new__(StrategyStore)
+    store.engine = Engine()
+    with pytest.raises(ValueError, match="already attached to a different job"):
+        store.attach_job_once("new-v18-backtest", "new-v18-job")
+
+    assert len(statements) == 2
+    update_sql = str(statements[0])
+    assert "job_id IS NULL OR" in update_sql
+    assert "job_id =" in update_sql
+    assert statements[0].is_update is True
+    assert statements[1].is_select is True
+
+
+def test_ordinary_baseline_still_revalidates_an_attached_job_via_idempotent_create(
+    tmp_path: Path,
+) -> None:
+    version = {
+        "id": "ordinary-v17-version",
+        "config": {BOOTSTRAP_CONFIG_KEY: {}},
+    }
+    periods = {
+        "historical_start": "2008-01-02",
+        "historical_end": "2024-12-31",
+        "start": "2025-01-02",
+        "end": "2025-12-31",
+    }
+    backtest = {
+        "id": "ordinary-v17-backtest",
+        "dataset": "daily-ready",
+        "execution_dataset": None,
+        "periods": periods,
+        "evidence_mode": "sealed_final_oos",
+        "status": "queued",
+        "job_id": "unrelated-attached-job",
+    }
+
+    class Strategies:
+        attach_calls = 0
+
+        @staticmethod
+        def list_backtests(**_kwargs) -> list[dict]:
+            return [dict(backtest)]
+
+        @classmethod
+        def attach_job(cls, *_args) -> None:
+            cls.attach_calls += 1
+
+    class Jobs:
+        create_calls = 0
+
+        @classmethod
+        def create(cls, kind: str, payload: dict, _log_path: Path, **kwargs) -> dict:
+            cls.create_calls += 1
+            assert kind == "strategy_backtest"
+            assert kwargs["idempotency_key"] == (
+                "transparent-baseline:ordinary-v17-version:ordinary-v17-backtest"
+            )
+            return {
+                "id": "exact-idempotent-job",
+                "status": "queued",
+                "payload": payload,
+            }
+
+        @staticmethod
+        def get(_job_id: str) -> dict:
+            raise AssertionError("ordinary active rows must re-enter idempotent create")
+
+    service = TransparentBaselineBootstrapService(
+        database_url="unused",
+        data_root=tmp_path,
+        strategies=Strategies(),
+        jobs=Jobs(),
+        promotions=object(),
+        lockboxes=object(),
+    )
+    with pytest.raises(ValueError, match="attached to a different job"):
+        service._ensure_backtest_job(
+            plan={"formal_periods": periods},
+            version=version,
+            dataset={"name": "daily-ready", "path": "/data/qlib/daily-ready"},
+            allow_create=True,
+        )
+    assert Jobs.create_calls == 1
+    assert Strategies.attach_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "promotion_stage", "expected_resume"),
+    [
+        ("draft", None, True),
+        ("approved", "paper", False),
+        ("suspended", "suspended", False),
+    ],
+)
+def test_one_shot_reuses_exact_version_and_resumes_only_an_untouched_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    promotion_stage: str | None,
+    expected_resume: bool,
+) -> None:
+    plan = {
+        "config": {
+            "recipe_version": FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
+            "evidence_mode": EVIDENCE_MODE_REPLAY,
+        },
+        "formal_periods": SOURCE_PERIODS,
+    }
+    source = {
+        **_source_version(),
+        "strategy_id": "source-family",
+        "benchmark": "SH000300",
+        "universe": "csi300",
+    }
+    version = {
+        "id": "new-v18-version",
+        "benchmark": source["benchmark"],
+        "universe": source["universe"],
+        "factors": [],
+        "config": plan["config"],
+        "evidence_mode": EVIDENCE_MODE_REPLAY,
+        "status": status,
+        "promotion_stage": promotion_stage,
+    }
+    dataset = {
+        "name": SOURCE_DATASET,
+        "path": "/data/qlib/source",
+    }
+
+    class Transaction:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    class Strategies:
+        class Engine:
+            @staticmethod
+            def begin() -> Transaction:
+                return Transaction()
+
+        engine = Engine()
+
+        @staticmethod
+        def get_version(version_id: str) -> dict:
+            assert version_id == SOURCE_VERSION_ID
+            return dict(source)
+
+        @staticmethod
+        def get(strategy_id: str) -> dict:
+            assert strategy_id == "source-family"
+            return {"versions": [dict(version)]}
+
+        @staticmethod
+        def create_version_if_absent(*_args, **_kwargs) -> dict:
+            raise AssertionError("the exact existing v18 version must be reused")
+
+    monkeypatch.setattr(bootstrap, "_select_forward_only_dataset", lambda _rows: dataset)
+    monkeypatch.setattr(
+        bootstrap,
+        "_build_forward_only_rehabilitation_plan",
+        lambda **_kwargs: plan,
+    )
+    monkeypatch.setattr(bootstrap, "require_source_cancellation", lambda _connection: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "require_source_cash_only_lockbox",
+        lambda _connection: {"scope": "cash_only"},
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "require_consumed_vintage",
+        lambda *_args, **_kwargs: type("Vintage", (), {"id": "consumed-vintage"})(),
+    )
+    service = TransparentBaselineBootstrapService(
+        database_url="unused",
+        data_root=tmp_path,
+        dataset_loader=lambda _root: [dataset],
+        strategies=Strategies(),
+        jobs=object(),
+        promotions=object(),
+        lockboxes=object(),
+    )
+    observed: dict = {}
+
+    def ensure(**kwargs) -> dict:
+        observed.update(kwargs)
+        if not kwargs["allow_create"]:
+            raise ValueError("existing replay chain is incomplete")
+        backtest_id = "new-v18-backtest"
+        return {
+            "backtest": {
+                "id": backtest_id,
+                "status": "queued",
+                "artifact_path": str(service.artifact_root / backtest_id),
+                "evidence_mode": EVIDENCE_MODE_REPLAY,
+            },
+            "backtest_action": "created",
+            "job": {"id": "new-v18-job", "status": "queued"},
+            "job_action": "created",
+        }
+
+    service._ensure_backtest_job = ensure
+    service._advance_paper = lambda **_kwargs: {
+        "state": "formal_backtest_pending",
+        "paper_stage": None,
+    }
+
+    result = service.reconcile_forward_only_rehabilitation(actor="system:test")
+
+    assert result["status"] == ("pending" if expected_resume else "failed")
+    assert result["strategy_version_action"] == "reused"
+    assert observed["allow_create"] is expected_resume
+    assert observed["version"] == version
+    assert observed["plan"] == plan
+    if not expected_resume:
+        assert result["errors"] == ["existing replay chain is incomplete"]
 
 
 def test_replay_uses_dedicated_admission_and_one_stricter_forward_gate(

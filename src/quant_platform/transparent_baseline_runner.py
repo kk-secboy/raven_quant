@@ -119,7 +119,7 @@ FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256 = (
 # Filled after the complete v18 source closure is stable. The source-closure
 # normalizer excludes both v18 seal assignments from their own digest.
 FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 = (
-    "938e777424ebbaa6afc9f4d68baf18daf081044e883152696041290165b103ed"
+    "2a2547f585e016ad9459f1b7bd039541285869eb524b0b43e2b57981eed633cb"
 )
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"
@@ -214,15 +214,31 @@ def position_risk_bundle_sha256(project_root: Path) -> str:
 
 
 def target_runner_for_recipe(recipe_id: Any, recipe_version: Any) -> str | None:
-    if str(recipe_id or "") not in _TRANSPARENT_RECIPE_IDS:
+    normalized_recipe_id = str(recipe_id or "")
+    normalized_recipe_version = str(recipe_version or "")
+    if normalized_recipe_id not in _TRANSPARENT_RECIPE_IDS:
         return None
-    return _TARGET_RUNNERS.get(str(recipe_version or ""))
+    if (
+        normalized_recipe_version
+        == FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+        and normalized_recipe_id != "short_relative_strength"
+    ):
+        return None
+    return _TARGET_RUNNERS.get(normalized_recipe_version)
 
 
 def target_runtime_bundle_for_recipe(recipe_id: Any, recipe_version: Any) -> str | None:
-    if str(recipe_id or "") not in _TRANSPARENT_RECIPE_IDS:
+    normalized_recipe_id = str(recipe_id or "")
+    normalized_recipe_version = str(recipe_version or "")
+    if normalized_recipe_id not in _TRANSPARENT_RECIPE_IDS:
         return None
-    if str(recipe_version or "") == RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION:
+    if (
+        normalized_recipe_version
+        == FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+        and normalized_recipe_id != "short_relative_strength"
+    ):
+        return None
+    if normalized_recipe_version == RUNTIME_ALIGNMENT_TARGET_RECIPE_VERSION:
         return RUNTIME_ALIGNMENT_TARGET_RUNTIME_BUNDLE_SHA256
     if str(recipe_version or "") == RUNTIME_INPUT_SCOPE_TARGET_RECIPE_VERSION:
         return RUNTIME_INPUT_SCOPE_TARGET_RUNTIME_BUNDLE_SHA256
@@ -244,7 +260,7 @@ def target_runtime_bundle_for_recipe(recipe_id: Any, recipe_version: Any) -> str
         == TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION
     ):
         return TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
-    if str(recipe_version or "") == FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION:
+    if normalized_recipe_version == FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION:
         return FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
     return None
 
@@ -260,9 +276,16 @@ def target_worker_runtime_image_for_recipe(
     the worker and stamps it into every process before any sealed version exists.
     """
 
+    normalized_recipe_id = str(recipe_id or "")
+    normalized_recipe_version = str(recipe_version or "")
     if (
-        str(recipe_id or "") not in _TRANSPARENT_RECIPE_IDS
-        or str(recipe_version or "")
+        normalized_recipe_id not in _TRANSPARENT_RECIPE_IDS
+        or (
+            normalized_recipe_version
+            == FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+            and normalized_recipe_id != "short_relative_strength"
+        )
+        or normalized_recipe_version
         not in {
             POSITION_RISK_TARGET_RECIPE_VERSION,
             FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION,
@@ -282,7 +305,7 @@ def target_worker_runtime_image_for_recipe(
         DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION: "v16",
         TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION: "v17",
         FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION: "v18",
-    }[str(recipe_version or "")]
+    }[normalized_recipe_version]
     value = str(os.getenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV) or "").strip().lower()
     if not _IMAGE_DIGEST.fullmatch(value):
         raise ValueError(

@@ -51,6 +51,9 @@ from quant_platform.transparent_baseline_runner import (
     WORKER_RUNTIME_IMAGE_DIGEST_ENV,
     position_risk_bundle_sha256,
     require_transparent_baseline_runner,
+    target_runner_for_recipe,
+    target_runtime_bundle_for_recipe,
+    target_worker_runtime_image_for_recipe,
 )
 
 pytestmark = pytest.mark.no_database
@@ -369,6 +372,17 @@ def test_current_transparent_v18_runner_matches_forward_only_identity() -> None:
     ) == FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256
 
 
+@pytest.mark.parametrize("recipe_id", ["swing_trend", "long_quality_value"])
+def test_v18_runtime_identity_is_not_available_to_non_short_recipes(
+    recipe_id: str,
+) -> None:
+    version = FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+
+    assert target_runner_for_recipe(recipe_id, version) is None
+    assert target_runtime_bundle_for_recipe(recipe_id, version) is None
+    assert target_worker_runtime_image_for_recipe(recipe_id, version) is None
+
+
 def test_v18_rejects_changed_imported_runtime_module(tmp_path: Path) -> None:
     root = Path(__file__).parents[1]
     for relative in _v12_source_paths(root):
@@ -605,6 +619,9 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
         / "versions"
         / "0088_forward_only_rehabilitation.py"
     ).read_text(encoding="utf-8")
+    database_metadata = (
+        Path(__file__).parents[1] / "src" / "quant_data" / "database.py"
+    ).read_text(encoding="utf-8")
 
     assert CANONICAL_LF_TARGET_RUNNER_SHA256 in v9_migration
     assert OPTIMIZER_APPLICABILITY_TARGET_RUNNER_SHA256 in v9_migration
@@ -629,6 +646,9 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
     )
     assert FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256 in v18_migration
     assert FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 in v18_migration
+    assert FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 in (
+        database_metadata
+    )
 
 
 def test_transparent_v8_runner_rejects_changed_bytes(tmp_path: Path) -> None:
