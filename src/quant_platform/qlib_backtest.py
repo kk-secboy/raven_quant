@@ -491,8 +491,17 @@ def run_qlib_validation_suites(
     robustness_runner: Callable[[dict[str, Any], CostScheduleBook], QlibBacktestResult]
     | None = None,
     robustness_artifact_writer: Callable[[str, QlibBacktestResult], dict[str, Any]] | None = None,
+    rolling_scope: str = "pre_final_stability",
+    rolling_gate_applied: bool = True,
 ) -> dict[str, Any]:
-    """Repeat the same Qlib runner for cost, rolling and event validation."""
+    """Repeat the same Qlib runner for cost, rolling and event validation.
+
+    A sealed final OOS is a once-only capital test.  Callers must set
+    ``rolling_gate_applied=False`` for that scope; the returned full-range
+    observation is then descriptive and never masquerades as several
+    independent rolling tests.  Pre-final callers retain the historical
+    rolling gate.
+    """
 
     schedule = _resolve_cost_schedule(cost_model, cost_schedule)
 
@@ -562,35 +571,49 @@ def run_qlib_validation_suites(
     window = int(config.get("rolling_window_days", 252))
     step = int(config.get("rolling_step_days", 63))
     rolling: list[dict[str, Any]] = []
-    for offset in range(0, max(0, len(dates) - window + 1), step):
-        selected = dates[offset : offset + window]
-        if len(selected) != window:
-            continue
-        # A horizon whose sealed OOS is exactly one rolling window has already
-        # produced this result above.  Re-running the identical Qlib strategy,
-        # account, costs and date range is expensive (the daily exchange reloads
-        # the full quote panel) and cannot add independent evidence.  Reuse the
-        # caller-supplied formal result only for the exact full-report bounds;
-        # proper sub-windows still start from their own clean account state.
-        result = (
-            full_result
-            if selected[0] == dates[0] and selected[-1] == dates[-1]
-            else runner(
-                selected[0].date().isoformat(),
-                selected[-1].date().isoformat(),
-                schedule,
-            )
-        )
+    if not rolling_gate_applied and len(dates):
+        # Do not reopen or subdivide a once-only final lockbox.  Its single
+        # immutable result remains useful as a path diagnostic, while rolling
+        # stability is proved by the isolated pre-final evidence consumed by
+        # StrategyStore.
         rolling.append(
             {
-                "start": selected[0].date().isoformat(),
-                "end": selected[-1].date().isoformat(),
-                "metrics": result.metrics,
+                "start": dates[0].date().isoformat(),
+                "end": dates[-1].date().isoformat(),
+                "metrics": full_result.metrics,
                 "status": "passed"
-                if (result.metrics.get("annualized_excess_return") or -np.inf) > 0
+                if (full_result.metrics.get("annualized_excess_return") or -np.inf) > 0
                 else "failed",
+                "state_source": "full_sealed_oos_result",
             }
         )
+    else:
+        for offset in range(0, max(0, len(dates) - window + 1), step):
+            selected = dates[offset : offset + window]
+            if len(selected) != window:
+                continue
+            # Reuse the caller-supplied result for exact bounds.  Proper
+            # pre-final sub-windows start from their own clean account state.
+            result = (
+                full_result
+                if selected[0] == dates[0] and selected[-1] == dates[-1]
+                else runner(
+                    selected[0].date().isoformat(),
+                    selected[-1].date().isoformat(),
+                    schedule,
+                )
+            )
+            rolling.append(
+                {
+                    "start": selected[0].date().isoformat(),
+                    "end": selected[-1].date().isoformat(),
+                    "metrics": result.metrics,
+                    "status": "passed"
+                    if (result.metrics.get("annualized_excess_return") or -np.inf) > 0
+                    else "failed",
+                    "state_source": "clean_pre_final_account",
+                }
+            )
     event_window = int(config.get("event_window_days", 20))
     event_count = int(config.get("event_count", 5))
     max_event_underperformance = float(config.get("max_event_underperformance", 0.05))
@@ -643,6 +666,9 @@ def run_qlib_validation_suites(
         )
     rolling_pass_rate = (
         sum(item["status"] == "passed" for item in rolling) / len(rolling) if rolling else 0.0
+    )
+    rolling_threshold_passed = len(rolling) >= int(config.get("min_rolling_windows", 3)) and (
+        rolling_pass_rate >= float(config.get("min_rolling_pass_rate", 0.60))
     )
     event_pass_rate = (
         sum(item["status"] == "passed" for item in events) / len(events) if events else 0.0
@@ -699,10 +725,16 @@ def run_qlib_validation_suites(
             "scenarios": component_cost_stress,
         },
         "rolling": {
+            "scope": rolling_scope,
+            "gate_applied": bool(rolling_gate_applied),
             "window_count": len(rolling),
             "pass_rate": rolling_pass_rate,
-            "passed": len(rolling) >= int(config.get("min_rolling_windows", 3))
-            and rolling_pass_rate >= float(config.get("min_rolling_pass_rate", 0.60)),
+            "passed": rolling_threshold_passed if rolling_gate_applied else None,
+            "gate_reason": (
+                None
+                if rolling_gate_applied
+                else "sealed final OOS stability is governed by pre-final evidence"
+            ),
             "windows": rolling,
         },
         "event_stress": {

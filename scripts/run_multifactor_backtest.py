@@ -1744,6 +1744,11 @@ def main() -> None:
             }.items()
         }
 
+    sealed_final_descriptive_rolling = (
+        evaluation_mode == FORMAL_FINAL_OOS_MODE
+        and str(config.get("horizon_profile") or "legacy_ambiguous")
+        != "legacy_ambiguous"
+    )
     validation = run_qlib_validation_suites(
         runner=run,
         full_result=formal,
@@ -1760,6 +1765,12 @@ def main() -> None:
             periods["start"], periods["end"], costs, scenario_config=overrides
         ),
         robustness_artifact_writer=write_robustness_artifacts,
+        rolling_scope=(
+            "sealed_final_oos_descriptive_only"
+            if sealed_final_descriptive_rolling
+            else "pre_final_stability"
+        ),
+        rolling_gate_applied=not sealed_final_descriptive_rolling,
     )
     qlib_report = formal.report
     qlib_positions = formal.positions

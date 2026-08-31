@@ -143,12 +143,88 @@ def test_only_v2_qlib_policy_backtest_can_be_approved(tmp_path: Path, database_u
             actor="risk-owner",
             reason="Event stress results failed the configured gate.",
         )
+    failed_legacy_rolling = deepcopy(metrics)
+    failed_legacy_rolling["rolling_window_count"] = 1
+    store.mark_backtest(backtest["id"], "succeeded", metrics=failed_legacy_rolling)
+    with pytest.raises(ValueError, match="rolling_window_count=1 violates min 3"):
+        store.approve(
+            version_id,
+            actor="risk-owner",
+            reason="Legacy versions retain their original final rolling gate.",
+        )
     store.mark_backtest(backtest["id"], "succeeded", metrics=metrics)
     approved = store.approve(
         version_id,
         actor="risk-owner",
         reason="Independent review accepted the governed final test.",
     )
+    assert approved["status"] == "approved"
+
+
+def test_active_horizon_approval_uses_pre_final_stability(
+    tmp_path: Path, database_url: str
+) -> None:
+    version_id = create_strategy_version(
+        database_url,
+        tmp_path,
+        recipe_id="short_relative_strength",
+        config_overrides={"min_backtest_days": 252},
+    )
+    store = StrategyStore(database_url)
+    version = store.get_version(version_id)
+    artifact = tmp_path / "active-horizon-formal-backtest"
+    artifact.mkdir()
+    periods = {
+        "start": PERIODS["test_start"].isoformat(),
+        "end": PERIODS["test_end"].isoformat(),
+    }
+    backtest = store.create_backtest(
+        version_id=version_id,
+        dataset="snapshot",
+        periods=periods,
+        artifact_path=artifact,
+    )
+    factor = version["factors"][0]
+    manifest = artifact / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "strategy_version_id": version_id,
+                "dataset": "snapshot",
+                "benchmark": version["benchmark"],
+                "universe": version["universe"],
+                "periods": periods,
+                "config": version["config"],
+                "factors": [
+                    {
+                        "candidate_id": factor["factor_candidate_id"],
+                        "values_path": factor["values_path"],
+                        "code_sha256": factor["code_sha256"],
+                        "weight": factor["weight"],
+                        "direction": factor["direction"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    metrics = formal_backtest_metrics(
+        version,
+        manifest,
+        hypothesis_group_evidence=store.hypothesis_group_evidence(version_id),
+    )
+    metrics["rolling_window_count"] = 1
+    metrics["rolling_pass_rate"] = 0.0
+    store.validate_backtest_artifacts(backtest["id"], metrics)
+    store.mark_backtest(backtest["id"], "succeeded", metrics=metrics)
+
+    approved = store.approve(
+        version_id,
+        actor="risk-owner",
+        reason="Pre-final outer folds, not final-window subdivision, prove stability.",
+    )
+
     assert approved["status"] == "approved"
 
 

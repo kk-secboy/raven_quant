@@ -803,6 +803,74 @@ def _scenario_artifact_failures(scenarios: dict[str, Any], artifact_root: Path) 
     return failures
 
 
+def _pre_final_stability_failures(
+    version: Mapping[str, Any], metrics: Mapping[str, Any]
+) -> list[str]:
+    """Validate stability before the once-only final capital OOS.
+
+    Active horizon strategies must not manufacture several independent tests
+    by subdividing their sealed final OOS. Factor strategies use the isolated
+    outer walk-forward folds. Model strategies use the independently
+    recomputed three-profile/three-seed admission grid; approval later rebuilds
+    that binding from the governed database before accepting it. Historical
+    ``legacy_ambiguous`` strategies retain their original final-window checks.
+    """
+
+    config = version.get("config")
+    config = config if isinstance(config, Mapping) else {}
+    if str(config.get("horizon_profile") or LEGACY_AMBIGUOUS) == LEGACY_AMBIGUOUS:
+        return []
+    evidence = metrics.get("formal_validation")
+    if not isinstance(evidence, Mapping):
+        return ["pre-final stability evidence is required"]
+    minimum_windows = int(config.get("min_rolling_windows") or 3)
+    minimum_pass_rate = float(config.get("min_rolling_pass_rate", 0.60))
+
+    if str(config.get("signal_source") or "factor_score") == "model_prediction":
+        admission = evidence.get("model_admission")
+        grid = admission.get("model_grid") if isinstance(admission, Mapping) else None
+        multiple = grid.get("multiple_testing") if isinstance(grid, Mapping) else None
+        profiles = grid.get("profiles") if isinstance(grid, Mapping) else None
+        seeds = grid.get("seeds") if isinstance(grid, Mapping) else None
+        expected_cells = len(REQUIRED_RESEARCH_PROFILES) * len(REQUIRED_MODEL_SEEDS)
+        if (
+            not isinstance(profiles, list)
+            or profiles != list(REQUIRED_RESEARCH_PROFILES)
+            or len(profiles) < minimum_windows
+            or not isinstance(seeds, list)
+            or seeds != list(REQUIRED_MODEL_SEEDS)
+            or int(grid.get("cell_count") or 0) != expected_cells
+            or not isinstance(multiple, Mapping)
+            or multiple.get("gate_passed") is not True
+            or admission.get("final_oos_opened") is not False
+        ):
+            return [
+                "pre-final model stability requires the complete independent "
+                "profile/seed grid and its multiple-testing gate"
+            ]
+        return []
+
+    outer = evidence.get("outer_walk_forward")
+    if not isinstance(outer, Mapping):
+        return ["pre-final factor stability requires outer walk-forward evidence"]
+    try:
+        fold_count = int(outer.get("fold_count") or 0)
+        pass_rate = float(outer.get("test_pass_rate"))
+    except (TypeError, ValueError):
+        return ["pre-final factor stability evidence is malformed"]
+    if (
+        outer.get("status") != "completed"
+        or outer.get("passed") is not True
+        or fold_count < minimum_windows
+        or pass_rate < minimum_pass_rate
+    ):
+        return [
+            "pre-final factor stability violates the configured outer "
+            "walk-forward window or pass-rate gate"
+        ]
+    return []
+
+
 def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
     evidence = metrics.get("formal_validation")
     if not isinstance(evidence, dict):
@@ -5193,16 +5261,6 @@ class StrategyStore:
                 "min",
             ),
             "robustness_pass_rate": (metrics.get("robustness_pass_rate"), 1.0, "min"),
-            "rolling_pass_rate": (
-                metrics.get("rolling_pass_rate"),
-                config.get("min_rolling_pass_rate", 0.60),
-                "min",
-            ),
-            "rolling_window_count": (
-                metrics.get("rolling_window_count"),
-                config.get("min_rolling_windows", 3),
-                "min",
-            ),
             "event_stress_count": (
                 metrics.get("event_stress_count"),
                 config.get("event_count", 5),
@@ -5239,6 +5297,24 @@ class StrategyStore:
                 "min",
             ),
         }
+        if str(config.get("horizon_profile") or LEGACY_AMBIGUOUS) == LEGACY_AMBIGUOUS:
+            # Preserve the historical contract for versions whose research
+            # horizon is unknown. New horizon strategies prove rolling
+            # stability before opening their once-only final OOS.
+            checks.update(
+                {
+                    "rolling_pass_rate": (
+                        metrics.get("rolling_pass_rate"),
+                        config.get("min_rolling_pass_rate", 0.60),
+                        "min",
+                    ),
+                    "rolling_window_count": (
+                        metrics.get("rolling_window_count"),
+                        config.get("min_rolling_windows", 3),
+                        "min",
+                    ),
+                }
+            )
         execution_method = str(config.get("execution_method", "open"))
         if execution_method in {"twap", "vwap", "next_bar"}:
             checks["capacity_fill_ratio"] = (
@@ -5375,6 +5451,7 @@ class StrategyStore:
         ):
             failures.append("Deflated Sharpe evidence is missing or invalid")
         failures.extend(_formal_validation_failures(version, metrics))
+        failures.extend(_pre_final_stability_failures(version, metrics))
         if metrics.get("capacity_curve_passed") is not True:
             failures.append("capacity curve did not satisfy the configured result gate")
         eligibility = metrics.get("eligibility")

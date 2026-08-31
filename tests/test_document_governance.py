@@ -476,6 +476,11 @@ def test_final_out_of_sample_is_a_one_time_sealed_resource() -> None:
         "只有候选冻结后的独立正式任务可以读取",
         "打开结果后发生任何特征、标签、模型、参数、组合或选择规则修改，都必须形成新候选",
         "最终保留一个未参与选择的样本外区间，只在候选冻结后使用",
+        "至少三个滚动窗口的稳定性门必须只使用最终锁箱之前的外层 Walk-forward "
+        "或独立模型 profile/seed 网格",
+        "最终密封 OOS 只形成一次资本确认和描述性路径诊断，"
+        "不能通过切成重叠或更短窗口伪造多个独立证据",
+        "`legacy_ambiguous` 历史版本继续按其冻结的原滚动门解释，不能追溯改写",
     ):
         assert required in specification
 

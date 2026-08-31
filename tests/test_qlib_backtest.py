@@ -244,6 +244,46 @@ def test_single_full_range_rolling_window_reuses_formal_result() -> None:
     ] == pytest.approx(0.25)
 
 
+def test_sealed_final_oos_rolling_is_one_descriptive_observation() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=252)
+    report = pd.DataFrame(
+        {"return": 0.001, "cost": 0.0, "bench": 0.0, "turnover": 0.0}, index=dates
+    )
+    runner_calls: list[tuple[str, str]] = []
+
+    def runner(start: str, end: str, _costs: CostModelConfig) -> QlibBacktestResult:
+        runner_calls.append((start, end))
+        return _result(report.loc[start:end])
+
+    validation = run_qlib_validation_suites(
+        runner=runner,
+        full_result=_result(report, excess=0.25),
+        start_time=dates[0].date().isoformat(),
+        end_time=dates[-1].date().isoformat(),
+        cost_model=CostModelConfig(),
+        config={
+            "rolling_window_days": 252,
+            "rolling_step_days": 63,
+            "min_rolling_windows": 3,
+            "event_count": 0,
+        },
+        robustness_runner=lambda _overrides, _costs: _result(report),
+        rolling_scope="sealed_final_oos_descriptive_only",
+        rolling_gate_applied=False,
+    )
+
+    rolling = validation["rolling"]
+    assert runner_calls == []
+    assert rolling["scope"] == "sealed_final_oos_descriptive_only"
+    assert rolling["gate_applied"] is False
+    assert rolling["window_count"] == 1
+    assert rolling["passed"] is None
+    assert rolling["gate_reason"] == (
+        "sealed final OOS stability is governed by pre-final evidence"
+    )
+    assert rolling["windows"][0]["state_source"] == "full_sealed_oos_result"
+
+
 def test_robustness_uses_policy_ndrop_default_when_config_omits_it() -> None:
     dates = pd.bdate_range("2024-01-02", periods=80)
     report = pd.DataFrame(
