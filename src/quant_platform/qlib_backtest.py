@@ -775,10 +775,22 @@ def _holdings_before(
         if timestamp >= boundary:
             break
         instrument = str(fill.get("instrument") or "")
-        amount = float(fill.get("amount") or 0.0)
         side = str(fill.get("side") or "")
-        if not instrument or not np.isfinite(amount) or amount <= 0 or side not in {"buy", "sell"}:
+        raw_amount = fill.get("amount")
+        try:
+            amount = float(raw_amount)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "formal fill ledger contains invalid position evidence"
+            ) from exc
+        if not instrument or not np.isfinite(amount) or amount < 0 or side not in {"buy", "sell"}:
             raise ValueError("formal fill ledger contains invalid position evidence")
+        # The governed exchange intentionally records rejected, suspended, or
+        # limit-locked orders as zero-amount fills so capacity calculations do
+        # not condition on successful orders.  They are execution evidence,
+        # but they do not change the reconstructed position state.
+        if amount == 0:
+            continue
         signed = amount if side == "buy" else -amount
         holdings[instrument] = holdings.get(instrument, 0.0) + signed
         if holdings[instrument] < -1e-8:

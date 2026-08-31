@@ -8,6 +8,7 @@ from quant_platform.cost_model import CostModelConfig
 from quant_platform.qlib_backtest import (
     COMPONENT_COST_STRESS_MULTIPLIERS,
     QlibBacktestResult,
+    _holdings_before,
     aggregate_intraday_report,
     calculate_capacity_fill_ratio,
     calculate_qlib_metrics,
@@ -576,6 +577,57 @@ def test_capacity_fill_ratio_includes_zero_fills_and_fails_closed_without_price(
 
     assert calculate_capacity_fill_ratio(zero_fill) == 0.0
     assert calculate_capacity_fill_ratio(unknown_notional) == 0.0
+
+
+def test_position_reconstruction_ignores_zero_capacity_fills() -> None:
+    holdings, applied = _holdings_before(
+        [
+            {
+                "instrument": "SZ000876",
+                "date": "2019-09-04 09:30:00",
+                "side": "buy",
+                "requested_amount": 674.826911,
+                "amount": 0.0,
+                "trade_price": 2.867402,
+                "trade_value": 0.0,
+            },
+            {
+                "instrument": "SH600000",
+                "date": "2019-09-05 09:30:00",
+                "side": "buy",
+                "amount": 100.0,
+            },
+            {
+                "instrument": "SH600000",
+                "date": "2019-09-06 09:30:00",
+                "side": "sell",
+                "amount": 40.0,
+            },
+        ],
+        pd.Timestamp("2019-09-09"),
+    )
+
+    assert holdings == {"SH600000": 60.0}
+    assert applied == 2
+
+
+@pytest.mark.parametrize("amount", [-1.0, float("nan"), None])
+def test_position_reconstruction_rejects_invalid_amounts(amount: float | None) -> None:
+    with pytest.raises(
+        ValueError,
+        match="formal fill ledger contains invalid position evidence",
+    ):
+        _holdings_before(
+            [
+                {
+                    "instrument": "SH600000",
+                    "date": "2019-09-05 09:30:00",
+                    "side": "buy",
+                    "amount": amount,
+                }
+            ],
+            pd.Timestamp("2019-09-09"),
+        )
 
 
 def test_capacity_curve_repeats_formal_runner_at_three_notionals() -> None:
