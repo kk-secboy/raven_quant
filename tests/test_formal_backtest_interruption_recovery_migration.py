@@ -111,6 +111,7 @@ class _FunctionDefinitionBind:
         self.recovery_count = recovery_count
         self.executed: list[tuple[str, dict[str, str] | None]] = []
         self.ddl: list[str] = []
+        self.execution_option_calls: list[dict[str, bool]] = []
 
     def scalar(self, statement: Any, params: dict[str, str] | None = None):
         sql = str(statement)
@@ -130,6 +131,10 @@ class _FunctionDefinitionBind:
     def exec_driver_sql(self, statement: str) -> None:
         self.ddl.append(statement)
         self.definition = statement
+
+    def execution_options(self, **options: bool) -> _FunctionDefinitionBind:
+        self.execution_option_calls.append(options)
+        return self
 
 
 class _FunctionDefinitionOp:
@@ -167,6 +172,8 @@ def test_0087_upgrade_replaces_only_the_deployed_recipe_digest_path() -> None:
     assert len(bind.ddl) == 4
     validator_ddl, guard_ddl, drop_trigger_ddl, create_trigger_ddl = bind.ddl
     assert validator_ddl.count("%ROWTYPE") == 4
+    assert bind.execution_option_calls == [{"no_parameters": True}]
+    assert '{"end":"2019-11-20"' in validator_ddl
     compiled = sa.text(validator_ddl).compile(dialect=PGDialect_psycopg())
     compiled_sql = str(compiled)
     assert compiled_sql.count("%%ROWTYPE") == 4
