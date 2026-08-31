@@ -2910,23 +2910,29 @@ class SchedulerEngine:
             incumbent_strategy = self._managed_fin_strategy_incumbent(
                 str(managed["horizon_profile"])
             )
-            if incumbent_strategy is None:
-                if cadence_event["due"]:
-                    raise ScheduleRunWaiting(
-                        "managed fin_strategy is waiting for an approved paper or active incumbent"
-                    )
+            drift_event: dict[str, Any] | None = None
+            if incumbent_strategy is None and not cadence_event["due"]:
+                # Cold start is still a governed research comparison: the
+                # transparent public recipe frozen by the managed schedule is
+                # the control, while the proposal has no production parent.
+                # Requiring a paper/recommendation incumbent here creates a
+                # circular dependency after every baseline is honestly
+                # rejected: no strategy can be researched until one already
+                # passed the very gates the research is meant to reach.
                 self.schedules.finish_run(
                     run["id"],
                     "skipped",
                     message=(
-                        f"{cadence_event['reason']}; no incumbent exists for drift evidence"
+                        f"{cadence_event['reason']}; no incumbent exists for "
+                        "drift evidence"
                     ),
                 )
                 return None
-            drift_event = self._managed_fin_strategy_drift_event(
-                incumbent_strategy,
-                observed_at=scheduled_for,
-            )
+            if incumbent_strategy is not None:
+                drift_event = self._managed_fin_strategy_drift_event(
+                    incumbent_strategy,
+                    observed_at=scheduled_for,
+                )
             if cadence_event["due"]:
                 calendar_identity = {
                     "contract_version": "managed-fin-strategy-trigger-id-v1",
@@ -2940,13 +2946,20 @@ class SchedulerEngine:
                         "trigger_id": fin_strategy_schedule_sha256(calendar_identity),
                     }
                 )
-            if drift_event["due"]:
+            if drift_event is not None and drift_event["due"]:
                 managed_trigger_events.append(dict(drift_event["event"]))
             if not managed_trigger_events:
                 self.schedules.finish_run(
                     run["id"],
                     "skipped",
-                    message=f"{cadence_event['reason']}; {drift_event['reason']}",
+                    message=(
+                        f"{cadence_event['reason']}; "
+                        + (
+                            str(drift_event["reason"])
+                            if drift_event is not None
+                            else "no incumbent drift evidence"
+                        )
+                    ),
                 )
                 return None
             consumed_trigger_ids = self._consumed_managed_fin_strategy_trigger_ids(
@@ -3041,7 +3054,7 @@ class SchedulerEngine:
                 str(item["trigger_id"]) for item in managed_trigger_events
             ]
             managed_run = {
-                "contract_version": "managed-fin-strategy-run-v2",
+                "contract_version": "managed-fin-strategy-run-v3",
                 "schedule_contract_sha256": managed["contract_sha256"],
                 "calendar_event": cadence_event["event"],
                 "trigger_events": managed_trigger_events,
@@ -3054,7 +3067,24 @@ class SchedulerEngine:
                 "feature_set_definition_sha256": payload["feature_set"][
                     "definition_sha256"
                 ],
-                "incumbent_strategy_version_id": incumbent_strategy["id"],
+                "incumbent_strategy_version_id": (
+                    incumbent_strategy["id"]
+                    if incumbent_strategy is not None
+                    else None
+                ),
+                "research_control": (
+                    {
+                        "mode": "approved_strategy_incumbent",
+                        "strategy_version_id": incumbent_strategy["id"],
+                    }
+                    if incumbent_strategy is not None
+                    else {
+                        "mode": "transparent_public_baseline",
+                        "recipe_id": managed["recipe_id"],
+                        "recipe_version": managed["recipe_version"],
+                        "recipe_sha256": managed["recipe_sha256"],
+                    }
+                ),
                 "runtime_identity_sha256": fin_strategy_schedule_sha256(
                     expected_runtime_identity
                 ),

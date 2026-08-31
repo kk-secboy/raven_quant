@@ -8604,6 +8604,11 @@ class LocalJobWorker:
                 "evaluation_profiles": payload.get("evaluation_profiles") or [],
                 "candidates": eligible,
                 **(
+                    {"feature_set": payload["feature_set"]}
+                    if payload.get("feature_set") is not None
+                    else {}
+                ),
+                **(
                     {
                         "horizon_profile": label_binding["horizon_profile"],
                         "research_window_contract": label_binding[

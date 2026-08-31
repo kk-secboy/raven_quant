@@ -210,6 +210,7 @@ def test_authoritative_markdown_contains_the_current_contract() -> None:
         "短线约 90 个交易日、中线约 12 个月、长线约 12 个月后才可能分别出现“已验证荐股”",
         "已经开始模拟的版本保留其原门槛",
         "`fin_strategy`",
+        "不得因为缺少已批准旧策略而形成“先有正式策略才能研究新策略”的循环等待",
         "`StrategyProposal`",
         "确定性编译",
         "`strategy-rule-ir-v1`",

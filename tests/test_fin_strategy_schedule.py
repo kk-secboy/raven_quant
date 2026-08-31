@@ -260,10 +260,16 @@ def test_managed_trigger_consumption_includes_unattached_research_run(
     ) == {trigger_id}
 
 
-def test_managed_run_freezes_actual_dataset_window_feature_and_incumbent(
+@pytest.mark.parametrize(
+    "incumbent_exists",
+    [True, False],
+    ids=["approved-incumbent", "transparent-baseline-cold-start"],
+)
+def test_managed_run_freezes_dataset_window_feature_and_research_control(
     database_url: str,
     tmp_path: Path,
     monkeypatch,
+    incumbent_exists: bool,
 ) -> None:
     from quant_platform import fin_strategy_schedule as schedule_module
     from quant_platform import scheduler as scheduler_module
@@ -358,23 +364,28 @@ def test_managed_run_freezes_actual_dataset_window_feature_and_incumbent(
     claimed = store.claim_run(now=current)
     assert claimed is not None and claimed["id"] == pending["id"]
     engine = SchedulerEngine(settings)
-    monkeypatch.setattr(
-        engine,
-        "_managed_fin_strategy_incumbent",
-        lambda _horizon: {
+    incumbent = (
+        {
             "id": "1" * 32,
             "status": "approved",
             "promotion_stage": "paper",
             "horizon_profile": "short_1_5d",
             "horizon_contract_sha256": "e" * 64,
             "version": 1,
-        },
+        }
+        if incumbent_exists
+        else None
     )
-    drift_trigger_id = "f" * 64
     monkeypatch.setattr(
         engine,
-        "_managed_fin_strategy_drift_event",
-        lambda *_args, **_kwargs: {
+        "_managed_fin_strategy_incumbent",
+        lambda _horizon: incumbent,
+    )
+    drift_trigger_id = "f" * 64
+
+    def drift_event(*_args, **_kwargs):
+        assert incumbent_exists
+        return {
             "due": True,
             "reason": "feature_drift_episode_due",
             "trigger_id": drift_trigger_id,
@@ -383,7 +394,12 @@ def test_managed_run_freezes_actual_dataset_window_feature_and_incumbent(
                 "kind": "feature_drift_episode",
                 "trigger_id": drift_trigger_id,
             },
-        },
+        }
+
+    monkeypatch.setattr(
+        engine,
+        "_managed_fin_strategy_drift_event",
+        drift_event,
     )
 
     engine._process_run(claimed, current)
@@ -401,10 +417,10 @@ def test_managed_run_freezes_actual_dataset_window_feature_and_incumbent(
         "end_date": "2026-01-05",
     }
     managed_run = research_run["config"]["managed_fin_strategy_run"]
-    assert managed_run["contract_version"] == "managed-fin-strategy-run-v2"
+    assert managed_run["contract_version"] == "managed-fin-strategy-run-v3"
     assert managed_run["calendar_event"] == "week:2026-W02"
-    assert len(managed_run["trigger_ids"]) == 2
-    assert drift_trigger_id in managed_run["trigger_ids"]
+    assert len(managed_run["trigger_ids"]) == (2 if incumbent_exists else 1)
+    assert (drift_trigger_id in managed_run["trigger_ids"]) is incumbent_exists
     calendar_trigger = next(
         item for item in managed_run["trigger_events"] if item["kind"] == "calendar"
     )
@@ -418,7 +434,27 @@ def test_managed_run_freezes_actual_dataset_window_feature_and_incumbent(
         "trigger_id": calendar_trigger["trigger_id"],
     }
     assert managed_run["research_window_contract_sha256"] == "c" * 64
-    assert managed_run["incumbent_strategy_version_id"] == "1" * 32
+    assert managed_run["incumbent_strategy_version_id"] == (
+        "1" * 32 if incumbent_exists else None
+    )
+    assert managed_run["research_control"] == (
+        {
+            "mode": "approved_strategy_incumbent",
+            "strategy_version_id": "1" * 32,
+        }
+        if incumbent_exists
+        else {
+            "mode": "transparent_public_baseline",
+            "recipe_id": "short_relative_strength",
+            "recipe_version": get_strategy_recipe("short_relative_strength")[
+                "version"
+            ],
+            "recipe_sha256": spec["payload"]["managed_fin_strategy"][
+                "recipe_sha256"
+            ],
+        }
+    )
+    assert research_run["config"]["incumbent_strategy"] == incumbent
     assert research_run["config"]["feature_set"]["features"] == {
         str(item["id"]): str(item["qlib_expression"])
         for item in get_strategy_recipe("short_relative_strength")["factor_baseline"]

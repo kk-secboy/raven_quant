@@ -22,6 +22,7 @@ from quant_data.database import (
     model_ensemble_candidates,
     model_evaluations,
     open_database,
+    research_events,
     research_runs,
     row_dict,
 )
@@ -355,7 +356,7 @@ _TERMINAL_BRANCH_STATUSES = frozenset({"succeeded", "failed", "blocked", "skippe
 def _derived_branch_status(run_status: str, job_status: str) -> str:
     """Project execution and research state without calling a blocked study successful."""
 
-    projected = {
+    run_projection = {
         "queued": "queued",
         "running": "running",
         "evaluating": "evaluating",
@@ -364,12 +365,17 @@ def _derived_branch_status(run_status: str, job_status: str) -> str:
         "failed": "failed",
         "cancelled": "failed",
     }.get(run_status)
-    if projected is not None:
-        # A research run can be re-attached to a newer evaluation job.  Its
-        # state is therefore authoritative over the branch's original job.
-        return projected
+    if run_status in {"succeeded", "blocked", "failed", "cancelled"}:
+        return str(run_projection)
+    # A ResearchRun is re-attached to each independent evaluator.  If that
+    # *current* job has already failed while the run still says queued/running,
+    # the active run state is stale and must not hide the terminal evaluator.
+    # Projecting it as failed lets the governed atomic retry repair all three
+    # rows instead of leaving a fake queue with no claimable work.
     if job_status in {"failed", "cancelled"}:
         return "failed"
+    if run_projection is not None:
+        return run_projection
     return "running"
 
 
@@ -723,27 +729,130 @@ class AutopilotStore:
             ).first()
         return self._decode_branch(row_dict(row)) if row else None
 
-    def mark_branch_retried(self, branch_id: str) -> dict[str, Any]:
+    def retry_failed_branch(self, branch_id: str, *, actor: str = "autopilot") -> bool:
+        """Atomically restore one failed branch and its current run/job binding.
+
+        ``autopilot_branches.job_id`` is immutable generation provenance.  A
+        ``ResearchRun`` may subsequently be attached to an independent
+        evaluator, so the run's current ``job_id`` is authoritative whenever
+        it exists.  Locking and validating all three rows before updating any
+        of them prevents a half-retry (for example, a queued run whose failed
+        evaluator can never be claimed).
+        """
+
         now = _now()
         with self.engine.begin() as connection:
-            row = connection.execute(
+            # Every caller uses this lock order.  A concurrent reconciler may
+            # wait, but two retry contenders cannot split ownership across the
+            # branch, run, and job rows.
+            branch = connection.execute(
                 select(autopilot_branches)
                 .where(autopilot_branches.c.id == branch_id)
                 .with_for_update()
             ).first()
-            if row is None:
+            if branch is None:
                 raise KeyError(branch_id)
-            if str(row.status) != "failed":
-                raise ValueError("only failed autopilot branches may be retried")
-            details = dict(row.details_json or {})
-            retry_count = int(details.get("retry_count") or 0)
-            if retry_count >= 1:
-                raise ValueError("autopilot branch retry budget is exhausted")
-            details["retry_count"] = retry_count + 1
-            details["retried_at"] = now.isoformat()
-            connection.execute(
+            details = dict(branch.details_json or {})
+            if (
+                str(branch.status) != "failed"
+                or int(details.get("retry_count") or 0) >= 1
+            ):
+                return False
+
+            run_id = str(branch.research_run_id or "")
+            if not run_id:
+                return False
+            run = connection.execute(
+                select(research_runs)
+                .where(research_runs.c.id == run_id)
+                .with_for_update()
+            ).first()
+            if run is None:
+                return False
+
+            current_job_id = str(run.job_id or branch.job_id or "")
+            if not current_job_id:
+                return False
+            job = connection.execute(
+                select(jobs).where(jobs.c.id == current_job_id).with_for_update()
+            ).first()
+            if job is None:
+                return False
+
+            run_status = str(run.status)
+            job_status = str(job.status)
+            if run_status not in {"failed", "cancelled", "queued"}:
+                return False
+            if job_status not in {"failed", "cancelled", "queued"}:
+                return False
+            if str(job.kind) == "strategy_backtest":
+                raise ValueError("formal final-test jobs cannot be retried")
+            if str(job.kind) == "simulation_order_plan":
+                raise ValueError("simulation order-plan jobs are not autopilot research branches")
+
+            if run_status in {"failed", "cancelled"}:
+                restored_run = connection.execute(
+                    update(research_runs)
+                    .where(
+                        research_runs.c.id == run_id,
+                        research_runs.c.status == run_status,
+                    )
+                    .values(
+                        status="queued",
+                        error=None,
+                        started_at=None,
+                        finished_at=None,
+                        updated_at=now,
+                    )
+                )
+                if int(restored_run.rowcount or 0) != 1:
+                    raise RuntimeError("research run changed during autopilot retry")
+                connection.execute(
+                    insert(research_events).values(
+                        research_run_id=run_id,
+                        factor_candidate_id=None,
+                        event_type="run.requeued",
+                        actor=actor,
+                        payload_json={},
+                        created_at=now,
+                    )
+                )
+
+            if job_status in {"failed", "cancelled"}:
+                restored_job = connection.execute(
+                    update(jobs)
+                    .where(jobs.c.id == current_job_id, jobs.c.status == job_status)
+                    .values(
+                        status="queued",
+                        attempts=0,
+                        progress_json=None,
+                        exit_code=None,
+                        error=None,
+                        started_at=None,
+                        finished_at=None,
+                        cancel_requested_at=None,
+                        next_attempt_at=None,
+                    )
+                )
+                if int(restored_job.rowcount or 0) != 1:
+                    raise RuntimeError("research job changed during autopilot retry")
+
+            details.update(
+                {
+                    "retry_count": int(details.get("retry_count") or 0) + 1,
+                    "retried_at": now.isoformat(),
+                    "retried_job_id": current_job_id,
+                    "retry_job_binding": (
+                        "research_run_current" if run.job_id else "branch_provenance"
+                    ),
+                }
+            )
+            restored_branch = connection.execute(
                 update(autopilot_branches)
-                .where(autopilot_branches.c.id == branch_id)
+                .where(
+                    autopilot_branches.c.id == branch_id,
+                    autopilot_branches.c.status == "failed",
+                )
                 .values(
                     status="queued",
                     details_json=details,
@@ -752,7 +861,9 @@ class AutopilotStore:
                     finished_at=None,
                 )
             )
-        return self.get_branch(branch_id)
+            if int(restored_branch.rowcount or 0) != 1:
+                raise RuntimeError("autopilot branch changed during retry")
+        return True
 
     def latest_branch(
         self, scenario: str, *, horizon_profile: str | None = None
@@ -789,27 +900,44 @@ class AutopilotStore:
         changed = 0
         now = _now()
         with self.engine.begin() as connection:
-            rows = connection.execute(
-                select(
-                    autopilot_branches,
-                    research_runs.c.status.label("run_status"),
-                    research_runs.c.error.label("run_error"),
-                    jobs.c.status.label("job_status"),
-                    jobs.c.error.label("job_error"),
-                )
-                .join(research_runs, research_runs.c.id == autopilot_branches.c.research_run_id)
-                .join(jobs, jobs.c.id == autopilot_branches.c.job_id)
-                .with_for_update()
+            branch_ids = connection.scalars(
+                select(autopilot_branches.c.id).order_by(autopilot_branches.c.id)
             ).all()
-            for row in rows:
-                run_status = str(row.run_status)
-                job_status = str(row.job_status)
+            for branch_id in branch_ids:
+                # Match retry_failed_branch's branch -> current run -> current
+                # job lock order.  A joined FOR UPDATE lets PostgreSQL choose
+                # its own row-lock order and can deadlock with a retry while
+                # also projecting the stale generation job after re-attach.
+                branch = connection.execute(
+                    select(autopilot_branches)
+                    .where(autopilot_branches.c.id == branch_id)
+                    .with_for_update()
+                ).first()
+                if branch is None or not branch.research_run_id:
+                    continue
+                run = connection.execute(
+                    select(research_runs)
+                    .where(research_runs.c.id == branch.research_run_id)
+                    .with_for_update()
+                ).first()
+                if run is None:
+                    continue
+                current_job_id = str(run.job_id or branch.job_id or "")
+                if not current_job_id:
+                    continue
+                job = connection.execute(
+                    select(jobs).where(jobs.c.id == current_job_id).with_for_update()
+                ).first()
+                if job is None:
+                    continue
+                run_status = str(run.status)
+                job_status = str(job.status)
                 status = _derived_branch_status(run_status, job_status)
-                if status != str(row.status):
-                    error = str(row.run_error or row.job_error or "") or None
+                if status != str(branch.status):
+                    error = str(run.error or job.error or "") or None
                     connection.execute(
                         update(autopilot_branches)
-                        .where(autopilot_branches.c.id == row.id)
+                        .where(autopilot_branches.c.id == branch.id)
                         .values(
                             status=status,
                             error=error,
@@ -824,14 +952,14 @@ class AutopilotStore:
                     connection.execute(
                         update(autopilot_cycles)
                         .where(
-                            autopilot_cycles.c.id == row.cycle_id,
+                            autopilot_cycles.c.id == branch.cycle_id,
                             autopilot_cycles.c.status != "paused",
                         )
                         .values(
                             status="active",
                             stage=(
                                 "joint_optimization"
-                                if str(row.scenario) == "fin_quant"
+                                if str(branch.scenario) == "fin_quant"
                                 else "parallel_research"
                             ),
                             updated_at=now,
@@ -1561,31 +1689,13 @@ class AutopilotController:
             return False
         if int((branch.get("details") or {}).get("retry_count") or 0) >= 1:
             return False
-        run_id = str(branch.get("research_run_id") or "")
-        job_id = str(branch.get("job_id") or "")
-        if not run_id or not job_id:
+        branch_id = str(branch.get("id") or "")
+        if not branch_id:
             return False
-        run = self.research.get_run(run_id)
-        job = self.jobs.get(job_id)
-        try:
-            if run["status"] in {"failed", "cancelled"}:
-                self.research.requeue_run(run_id, actor="autopilot")
-            elif run["status"] != "queued":
-                return False
-            if job["status"] in {"failed", "cancelled"}:
-                self.jobs.retry(job_id)
-            elif job["status"] != "queued":
-                return False
-            self.store.mark_branch_retried(str(branch["id"]))
-        except Exception as exc:
-            self.research.mark_run(
-                run_id,
-                "failed",
-                actor="autopilot",
-                error=f"autopilot retry failed: {exc}",
-            )
-            raise
-        return True
+        # AutopilotStore owns the cross-table transaction.  In particular, an
+        # exception rolls every restoration back; it must never be "handled"
+        # by unconditionally rewriting the ResearchRun as failed afterward.
+        return self.store.retry_failed_branch(branch_id, actor="autopilot")
 
     def _latest_dataset(self) -> dict[str, Any] | None:
         candidates = [

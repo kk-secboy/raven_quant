@@ -211,6 +211,59 @@ def test_worker_overrides_untrusted_rdagent_label_and_freezes_factor_job(
     assert frozen["label_horizon_sessions"] == 63
     assert frozen["candidates"][0]["label_horizon_days"] == 63
     assert frozen["research_label_binding"] == binding
+    assert frozen["feature_set"] == payload["feature_set"]
+    assert resolve_research_label_binding(frozen) == binding
+
+
+def test_worker_legacy_factor_replay_keeps_feature_set_key_absent(
+    tmp_path: Path,
+) -> None:
+    code_path = tmp_path / "legacy-factor.py"
+    values_path = tmp_path / "legacy-values.h5"
+    code_path.write_text("def factor_feature(data):\n    return data\n", encoding="utf-8")
+    values_path.write_bytes(b"legacy-values")
+    payload = {
+        "research_run_id": "legacy-run-1",
+        "dataset": "legacy-dataset",
+        "dataset_path": str(tmp_path / "legacy-qlib"),
+        "dataset_identity_sha256": "d" * 64,
+        "periods": {
+            "train_start": "2010-01-04",
+            "train_end": "2018-12-28",
+            "valid_start": "2019-01-02",
+            "valid_end": "2022-12-30",
+            "test_start": "2024-01-03",
+            "test_end": "2026-08-20",
+        },
+    }
+    candidate = {
+        "id": "legacy-candidate-1",
+        "code_path": str(code_path),
+        "values_path": str(values_path),
+        "variables": {},
+        "factor_definition_id": None,
+        "economic_family": "legacy",
+        "experiment_family_id": "legacy-family",
+        "label_horizon_days": 1,
+        "experiment_count": 1,
+    }
+    research = _CaptureResearch()
+    jobs = _CaptureJobs()
+    worker = object.__new__(LocalJobWorker)
+    worker.research = research
+    worker.store = jobs
+    worker.settings = SimpleNamespace(data_root=tmp_path)
+    worker.factor_library = SimpleNamespace()
+    job = {"kind": "rdagent_factor", "payload": payload}
+
+    worker._queue_factor_evaluation(job, [candidate])
+    assert jobs.created is not None
+    first_payload = dict(jobs.created["payload"])
+    assert "feature_set" not in first_payload
+
+    worker._queue_factor_evaluation(job, [candidate])
+    assert jobs.created is not None
+    assert jobs.created["payload"] == first_payload
 
 
 def test_factor_result_contract_rejects_label_evidence_substitution() -> None:
