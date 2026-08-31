@@ -6,6 +6,8 @@ import inspect
 import json
 import os
 import stat
+import subprocess
+import tarfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -652,6 +654,33 @@ def test_controller_hash_and_full_receipt_are_three_way_identical() -> None:
     assert hashlib.sha256(canonical).hexdigest() == supplied
     assert supplied == migration.RECEIPT_SHA256
     assert metadata_receipt == {**receipt, "receipt_sha256": supplied}
+
+
+def test_git_archive_preserves_the_sealed_controller_hash(tmp_path: Path) -> None:
+    repository = Path(__file__).parents[1]
+    controller_member = "scripts/v17_recovery_oneshot_controller.py"
+    archive_path = tmp_path / "sealed-controller.tar"
+
+    subprocess.run(
+        [
+            "git",
+            "archive",
+            "--worktree-attributes",
+            "--format=tar",
+            f"--output={archive_path}",
+            "HEAD",
+            "--",
+            controller_member,
+        ],
+        cwd=repository,
+        check=True,
+    )
+    with tarfile.open(archive_path, mode="r") as archive:
+        exported = archive.extractfile(controller_member)
+        assert exported is not None
+        controller_sha256 = hashlib.sha256(exported.read()).hexdigest()
+
+    assert controller_sha256 == V17_RECOVERY_CONTROLLER_SHA256
 
 
 def test_controller_rejects_a_double_bound_natural_target(

@@ -1,6 +1,7 @@
 *.sh text eol=lf
 scripts/run_multifactor_backtest.py text eol=lf
 scripts/run_recommendation_refresh.py text eol=lf
+scripts/v17_recovery_oneshot_controller.py text eol=lf
 src/quant_platform/portfolio_policy.py text eol=lf
 src/quant_platform/strategy_backtest.py text eol=lf
 src/quant_platform/strategy_rule_runtime.py text eol=lf
