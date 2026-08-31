@@ -6,8 +6,11 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import update
+from sqlalchemy.dialects.postgresql.psycopg import PGDialect_psycopg
 from sqlalchemy.sql.elements import Null
 
+from quant_data.database import jobs
 from quant_platform.formal_backtest_interruption_recovery import (
     EXTERNAL_EVIDENCE_CONTRACT_VERSION,
     INTERRUPTED_JOB_ERROR,
@@ -46,6 +49,9 @@ def test_authorized_requeue_uses_sql_null_for_json_progress() -> None:
     assert isinstance(values["progress_json"], Null)
     assert values["status"] == "queued"
     assert values["max_attempts"] == 2
+    compiled = update(jobs).values(**values).compile(dialect=PGDialect_psycopg())
+    assert "progress_json=NULL" in str(compiled)
+    assert "progress_json" not in compiled.params
 
 
 def _external_evidence() -> dict:
