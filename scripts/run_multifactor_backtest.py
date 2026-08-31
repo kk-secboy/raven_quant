@@ -45,10 +45,20 @@ from quant_platform.formal_validation import (
     FROZEN_STRATEGY_OUTER_SCOPE,
     build_factor_score_incomplete_family_dsr,
     build_factor_score_incomplete_family_multiple_testing,
+    build_paired_bootstrap_evidence,
     build_pre_final_history_evidence,
+    paired_bootstrap_parameters_from_config,
     run_ablation_suite,
     run_outer_walk_forward,
     run_signal_decay_suite,
+)
+from quant_platform.forward_only_rehabilitation import (
+    EVIDENCE_MODE_REPLAY,
+    EVIDENCE_MODE_SEALED,
+    REPLAY_MARKERS,
+    require_incomplete_family_eligibility,
+    require_replay_config,
+    require_replay_markers,
 )
 from quant_platform.model_recompute import (
     execute_model_candidate,
@@ -87,7 +97,6 @@ from quant_platform.risk_math import estimate_covariance
 from quant_platform.statistical_validation import (
     deflated_sharpe_probability,
     holm_bonferroni,
-    paired_moving_block_bootstrap,
 )
 from quant_platform.strategy_artifact_manifest import write_backtest_artifact_manifest
 from quant_platform.strategy_backtest import (
@@ -125,6 +134,7 @@ from quant_platform.transparent_baseline_runner import (
 from quant_platform.upstream_versions import upstream_runtime_identity
 
 FORMAL_FINAL_OOS_MODE = "formal_final_oos"
+CONSUMED_HISTORICAL_REPLAY_MODE = "consumed_historical_replay"
 PRE_FINAL_PORTFOLIO_TRIAL_MODE = "pre_final_portfolio_trial"
 _COVARIANCE_REQUIRED_PORTFOLIO_CONSTRUCTIONS = frozenset(
     {"benchmark_relative_qp", "industry_neutral_qp"}
@@ -393,8 +403,22 @@ def _promotion_dataset_descriptors(
 
 def _evaluation_mode(manifest: dict[str, Any]) -> str:
     mode = str(manifest.get("evaluation_mode") or FORMAL_FINAL_OOS_MODE)
-    if mode not in {FORMAL_FINAL_OOS_MODE, *PRE_FINAL_EVALUATION_MODES}:
+    if mode not in {
+        FORMAL_FINAL_OOS_MODE,
+        CONSUMED_HISTORICAL_REPLAY_MODE,
+        *PRE_FINAL_EVALUATION_MODES,
+    }:
         raise ValueError("unsupported governed backtest evaluation mode")
+    config = manifest.get("config")
+    config = config if isinstance(config, dict) else {}
+    evidence_mode = str(manifest.get("evidence_mode") or config.get("evidence_mode") or "")
+    if mode == CONSUMED_HISTORICAL_REPLAY_MODE:
+        require_replay_config(config)
+        require_replay_markers(manifest, label="backtest manifest")
+        if evidence_mode != EVIDENCE_MODE_REPLAY:
+            raise ValueError("historical replay manifest evidence mode is inconsistent")
+    elif mode == FORMAL_FINAL_OOS_MODE and evidence_mode != EVIDENCE_MODE_SEALED:
+        raise ValueError("formal final OOS requires sealed_final_oos evidence mode")
     return mode
 
 
@@ -882,6 +906,13 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, Any] = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     evaluation_mode = _evaluation_mode(manifest)
+    consumed_historical_replay = (
+        evaluation_mode == CONSUMED_HISTORICAL_REPLAY_MODE
+    )
+    historical_window_opened = evaluation_mode in {
+        FORMAL_FINAL_OOS_MODE,
+        CONSUMED_HISTORICAL_REPLAY_MODE,
+    }
     provider_provenance_path = Path(args.provider_uri) / "metadata" / "provenance.json"
     if not provider_provenance_path.exists():
         raise ValueError("formal Qlib backtest requires dataset provenance metadata")
@@ -1748,8 +1779,8 @@ def main() -> None:
             }.items()
         }
 
-    sealed_final_descriptive_rolling = (
-        evaluation_mode == FORMAL_FINAL_OOS_MODE
+    historical_descriptive_rolling = (
+        historical_window_opened
         and str(config.get("horizon_profile") or "legacy_ambiguous")
         != "legacy_ambiguous"
     )
@@ -1770,11 +1801,15 @@ def main() -> None:
         ),
         robustness_artifact_writer=write_robustness_artifacts,
         rolling_scope=(
-            "sealed_final_oos_descriptive_only"
-            if sealed_final_descriptive_rolling
+            (
+                "consumed_historical_replay_descriptive_only"
+                if consumed_historical_replay
+                else "sealed_final_oos_descriptive_only"
+            )
+            if historical_descriptive_rolling
             else "pre_final_stability"
         ),
-        rolling_gate_applied=not sealed_final_descriptive_rolling,
+        rolling_gate_applied=not historical_descriptive_rolling,
     )
     qlib_report = formal.report
     qlib_positions = formal.positions
@@ -1792,11 +1827,25 @@ def main() -> None:
         if isinstance(trial_count_audit, dict)
         else None
     )
-    incomplete_factor_family = (
+    incomplete_family_eligibility = None
+    if (
         signal_source == "factor_score"
         and strategy_trial_count > 1
-        and evaluation_mode == FORMAL_FINAL_OOS_MODE
-    )
+        and consumed_historical_replay
+    ):
+        raw_eligibility = manifest.get("incomplete_factor_family_eligibility")
+        if not isinstance(raw_eligibility, dict):
+            raise ValueError(
+                "multi-trial replay requires frozen incomplete-family eligibility"
+            )
+        incomplete_family_eligibility = require_incomplete_family_eligibility(
+            raw_eligibility,
+            hypothesis_group_evidence=dict(
+                manifest.get("hypothesis_group_evidence") or {}
+            ),
+            strategy_version_id=str(manifest["strategy_version_id"]),
+        )
+    incomplete_factor_family = incomplete_family_eligibility is not None
     if incomplete_factor_family and trial_count_audit_sha256 is None:
         raise ValueError(
             "multi-trial factor formal OOS requires the frozen trial-count audit"
@@ -2019,7 +2068,12 @@ def main() -> None:
                 else "not_applicable_single_trial"
             ),
             **(
-                {"trial_count_audit_sha256": trial_count_audit_sha256}
+                {
+                    "trial_count_audit_sha256": trial_count_audit_sha256,
+                    "eligibility_receipt_sha256": incomplete_family_eligibility[
+                        "receipt_sha256"
+                    ],
+                }
                 if incomplete_factor_family
                 else {}
             ),
@@ -2043,12 +2097,10 @@ def main() -> None:
         axis=1,
         join="inner",
     ).dropna()
-    paired_bootstrap = paired_moving_block_bootstrap(
+    paired_bootstrap = build_paired_bootstrap_evidence(
         paired["candidate"],
         paired["baseline"],
-        block_size=int(config.get("bootstrap_block_days", 20)),
-        samples=int(config.get("bootstrap_samples", 2000)),
-        seed=int(config.get("validation_seed", 0)),
+        parameters=paired_bootstrap_parameters_from_config(config),
     )
     governed_multiple_testing = None
     expected_governed_trial_names: list[str] = []
@@ -2105,6 +2157,9 @@ def main() -> None:
             paired_bootstrap=paired_bootstrap,
             trial_count=strategy_trial_count,
             trial_count_audit_sha256=str(trial_count_audit_sha256),
+            eligibility_receipt_sha256=str(
+                incomplete_family_eligibility["receipt_sha256"]
+            ),
         )
     else:
         multiple_testing = {
@@ -2173,6 +2228,8 @@ def main() -> None:
         formal_validation["status"] = "not_applicable_pre_final_only"
         formal_validation["capital_eligible"] = False
         formal_validation["final_oos_opened"] = False
+    elif consumed_historical_replay:
+        formal_validation.update(REPLAY_MARKERS)
     if formal_model_admission is not None:
         formal_validation["model_admission"] = formal_model_admission
     deflated_sharpe = deflated_sharpe_probability(
@@ -2189,6 +2246,9 @@ def main() -> None:
             blocked_dsr=deflated_sharpe,
             trial_count=strategy_trial_count,
             trial_count_audit_sha256=str(trial_count_audit_sha256),
+            eligibility_receipt_sha256=str(
+                incomplete_family_eligibility["receipt_sha256"]
+            ),
         )
     metrics = {
         **formal.metrics,
@@ -2205,15 +2265,27 @@ def main() -> None:
         "formal_validation": formal_validation,
         "formal_validation_passed": formal_validation["status"] == "passed",
         "evaluation_mode": evaluation_mode,
+        "evidence_mode": (
+            EVIDENCE_MODE_REPLAY
+            if consumed_historical_replay
+            else EVIDENCE_MODE_SEALED
+        ),
+        "strategy_trial_count": strategy_trial_count,
         "evaluation_scope": (
             "pre_final_only"
             if evaluation_mode in PRE_FINAL_EVALUATION_MODES
-            else "final_oos_once"
+            else (
+                "historical_description_only"
+                if consumed_historical_replay
+                else "final_oos_once"
+            )
         ),
-        "final_oos_opened": evaluation_mode == FORMAL_FINAL_OOS_MODE,
+        "final_oos_opened": historical_window_opened,
+        **(REPLAY_MARKERS if consumed_historical_replay else {}),
         **(
             {"capital_eligible": False}
             if evaluation_mode in PRE_FINAL_EVALUATION_MODES
+            or consumed_historical_replay
             else {}
         ),
         "execution_model": {
@@ -2257,12 +2329,22 @@ def main() -> None:
         "capacity_curve_passed": validation["capacity"]["passed"],
         "provenance": {
             "evaluation_mode": evaluation_mode,
+            "evidence_mode": (
+                EVIDENCE_MODE_REPLAY
+                if consumed_historical_replay
+                else EVIDENCE_MODE_SEALED
+            ),
             "evaluation_scope": (
                 "pre_final_only"
                 if evaluation_mode in PRE_FINAL_EVALUATION_MODES
-                else "final_oos_once"
+                else (
+                    "historical_description_only"
+                    if consumed_historical_replay
+                    else "final_oos_once"
+                )
             ),
-            "final_oos_opened": evaluation_mode == FORMAL_FINAL_OOS_MODE,
+            "final_oos_opened": historical_window_opened,
+            **(REPLAY_MARKERS if consumed_historical_replay else {}),
             TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD: (
                 worker_runtime_image_digest
             ),
@@ -2488,7 +2570,13 @@ def main() -> None:
         "status": "ok",
         "backtest_engine": "qlib",
         "evaluation_mode": evaluation_mode,
-        "final_oos_opened": evaluation_mode == FORMAL_FINAL_OOS_MODE,
+        "evidence_mode": (
+            EVIDENCE_MODE_REPLAY
+            if consumed_historical_replay
+            else EVIDENCE_MODE_SEALED
+        ),
+        "final_oos_opened": historical_window_opened,
+        **(REPLAY_MARKERS if consumed_historical_replay else {}),
         "metrics": metrics,
         "periods": periods,
         "benchmark": manifest["benchmark"],
@@ -2540,7 +2628,8 @@ def main() -> None:
                 "execution_frequency": (args.execution_frequency if minute_execution else "day"),
                 "strategy_config_sha256": metrics["provenance"]["strategy_config_sha256"],
                 "evaluation_mode": evaluation_mode,
-                "final_oos_opened": evaluation_mode == FORMAL_FINAL_OOS_MODE,
+                "final_oos_opened": historical_window_opened,
+                **(REPLAY_MARKERS if consumed_historical_replay else {}),
             }
         )
         workflow.log_metrics(metrics)
@@ -2548,6 +2637,9 @@ def main() -> None:
         manifest["qlib_workflow"] = recorder_identity
         manifest["factor_source_mode"] = factor_source_mode
         manifest["challenger_weight"] = float(config.get("challenger_weight") or 0.0)
+        manifest["final_oos_opened"] = historical_window_opened
+        if consumed_historical_replay:
+            manifest.update(REPLAY_MARKERS)
         Path(args.manifest).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )

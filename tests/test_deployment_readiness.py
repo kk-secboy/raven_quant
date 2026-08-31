@@ -436,6 +436,8 @@ def _rehabilitation_cash_only_rows(
         "evidence_mode": "consumed_historical_replay",
         "historical_replay_opened": True,
         "consumed_oos_replayed": True,
+        "final_oos_opened": True,
+        "capital_eligible": False,
         "sealed_final_oos": False,
         "unseen_oos": False,
         "authority": "historical_description_only",
@@ -607,6 +609,43 @@ def test_rehabilitation_cash_projection_requires_exact_operable_target_receipt()
         )
         == {}
     )
+
+
+@pytest.mark.no_database
+@pytest.mark.parametrize("missing_marker", ["final_oos_opened", "capital_eligible"])
+def test_rehabilitation_cash_projection_requires_complete_receipt_markers(
+    missing_marker: str,
+) -> None:
+    rows = _rehabilitation_cash_only_rows()
+    qualification = rows[0]["qualification_json"]
+    del qualification[missing_marker]
+    core = {key: value for key, value in qualification.items() if key != "receipt_sha256"}
+    rows[0]["receipt_sha256"] = readiness_module.canonical_sha256(core)
+    qualification["receipt_sha256"] = rows[0]["receipt_sha256"]
+
+    short = _healthy_short_paper_candidate()
+    short_lane = readiness_module._assess_horizon_candidates(
+        "short_1_5d", [short]
+    )
+    cash_only_lanes = (
+        readiness_module._validated_rehabilitation_cash_only_horizon_lanes(
+            rows,
+            short_lane=short_lane,
+        )
+    )
+    result = readiness_module._project_three_horizon_production(
+        {
+            "short_1_5d": [short],
+            "swing_1_6m": [],
+            "long_1_3y": [],
+        },
+        cash_only_lanes,
+    )
+
+    assert cash_only_lanes == {}
+    assert result["status"] == "blocked"
+    assert result["cash_only_horizons"] == []
+    assert result["blocked_horizons"] == ["swing_1_6m", "long_1_3y"]
 
 
 def _settings(monkeypatch, database_url: str, data_root: Path, *, auth_mode: str) -> Settings:

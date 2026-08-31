@@ -77,6 +77,7 @@ from .cost_model import (
     infer_cn_asset_type,
 )
 from .execution_algorithms import execution_time_slots, normalize_execution_policy
+from .forward_only_rehabilitation import EVIDENCE_MODE_REPLAY, require_qualification
 from .member_risk_gate import (
     load_allocation_risk_state,
     load_strategy_risk_state,
@@ -2698,6 +2699,12 @@ class SimulationStore:
             if str(backtest.execution_contract_hash) != contract_hash:
                 raise ValueError(
                     "strategy formal backtest contract does not match the approved version"
+                )
+            if str(row.evidence_mode) == EVIDENCE_MODE_REPLAY:
+                require_qualification(
+                    connection,
+                    version=row,
+                    backtest=backtest,
                 )
             return {
                 "dataset": str(backtest.dataset),

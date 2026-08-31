@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from datetime import date
@@ -13,6 +14,24 @@ from quant_data.execution_contract import (
     DAILY_QLIB_FIELD_CONTRACT_VERSION,
     require_daily_qlib_contract,
     require_native_daily_execution_controls,
+)
+from quant_platform.forward_only_rehabilitation import (
+    EVIDENCE_MODE_REPLAY,
+    REPLAY_MARKERS,
+    SOURCE_BACKTEST_ID,
+    SOURCE_DATASET,
+    SOURCE_DATASET_IDENTITY_SHA256,
+    SOURCE_DATASET_LINEAGE_ID,
+    SOURCE_EXECUTION_CONTRACT_HASH,
+    SOURCE_INTERRUPTION_RECEIPT_AUTHORITY,
+    SOURCE_INTERRUPTION_RECOVERY_RECEIPT_SHA256,
+    SOURCE_JOB_ID,
+    SOURCE_PERIODS,
+    SOURCE_RULES_SHA256,
+    SOURCE_VERSION_ID,
+    require_consumed_vintage,
+    require_source_cancellation,
+    require_source_cash_only_lockbox,
 )
 from quant_platform.job_store import JobStore
 from quant_platform.promotion import PromotionStore
@@ -39,12 +58,15 @@ from quant_platform.transparent_baseline_lockbox import (
     validate_unopened_history_selection,
 )
 from quant_platform.transparent_baseline_runner import (
+    FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
+    TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
     TRANSPARENT_BASELINE_JOB_RUNNER_FIELD,
     TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
     TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RUNNER_FIELD,
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
     TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
+    position_risk_bundle_sha256,
     target_runner_for_recipe,
     target_runtime_bundle_for_recipe,
     target_worker_runtime_image_for_recipe,
@@ -52,6 +74,13 @@ from quant_platform.transparent_baseline_runner import (
 
 BOOTSTRAP_CONTRACT_VERSION = "transparent-baseline-bootstrap-v2"
 RECONCILE_RESULT_VERSION = "transparent-baseline-reconcile-v2"
+FORWARD_ONLY_RECONCILE_RESULT_VERSION = (
+    "transparent-baseline-forward-only-rehabilitation-reconcile-v1"
+)
+FORWARD_ONLY_BOOTSTRAP_CONTRACT_VERSION = (
+    "transparent-baseline-forward-only-replay-bootstrap-v1"
+)
+FORWARD_ONLY_WINDOW_CONTRACT_VERSION = "consumed-historical-replay-window-v1"
 DEFAULT_ACTOR = "system:transparent-baseline-bootstrap"
 _RECONCILABLE_FAMILY_STATUSES = frozenset({"draft", "approved"})
 _RECONCILABLE_VERSION_LIFECYCLES = frozenset(
@@ -499,6 +528,174 @@ def _plan_member(
     }
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _select_forward_only_dataset(datasets: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    matches = [dict(item) for item in datasets if item.get("name") == SOURCE_DATASET]
+    if len(matches) != 1:
+        raise ValueError("forward-only rehabilitation source dataset is missing or duplicated")
+    dataset = matches[0]
+    if (
+        str(dataset.get("dataset_identity_sha256") or "")
+        != SOURCE_DATASET_IDENTITY_SHA256
+        or str(dataset.get("dataset_lineage_id") or "")
+        != SOURCE_DATASET_LINEAGE_ID
+        or not isinstance(dataset.get("calendar"), Sequence)
+        or isinstance(dataset.get("calendar"), (str, bytes))
+        or not dataset.get("calendar")
+        or not str(dataset.get("path") or "").strip()
+    ):
+        raise ValueError("forward-only rehabilitation dataset identity or calendar changed")
+    return dataset
+
+
+def _build_forward_only_rehabilitation_plan(
+    *,
+    source_version: Mapping[str, Any],
+    dataset: Mapping[str, Any],
+    consumed_oos_vintage_id: str | None,
+) -> dict[str, Any]:
+    """Build v18 descriptive replay config without creating a new lockbox."""
+
+    recipe = deepcopy(get_strategy_recipe("short_relative_strength"))
+    if (
+        str(recipe.get("version") or "")
+        != TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION
+    ):
+        raise ValueError("forward-only rehabilitation source recipe generation changed")
+    # v18 changes evidence authority and runtime identity, not economics.  It
+    # must never become the ordinary three-horizon recipe generation because
+    # only this exact short-horizon one-shot is eligible for rehabilitation.
+    recipe["version"] = FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+    recipe_version = FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+    source_config = source_version.get("config")
+    if not isinstance(source_config, Mapping):
+        raise ValueError("source v17 StrategyVersion config is missing")
+    if (
+        str(source_version.get("id") or "") != SOURCE_VERSION_ID
+        or str(source_version.get("strategy_rules_sha256") or "")
+        != SOURCE_RULES_SHA256
+        or str(source_version.get("execution_contract_hash") or "")
+        != SOURCE_EXECUTION_CONTRACT_HASH
+        or str(source_version.get("horizon_profile") or "") != "short_1_5d"
+        or source_config.get("recipe_id") != "short_relative_strength"
+        or source_config.get("recipe_version")
+        != TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION
+    ):
+        raise ValueError("source v17 economic strategy changed")
+    consumed_vintage_id = str(consumed_oos_vintage_id or "").strip()
+    feature_set = _feature_set(recipe)
+    raw_config = {
+        **deepcopy(dict(recipe["config_overrides"])),
+        "recipe_id": recipe["id"],
+        # Validate the unchanged economic recipe against its ordinary v17
+        # release contract first.  The dedicated builder then changes only the
+        # evidence/runtime generation to v18 before the stricter replay
+        # normalizer verifies every frozen binding below.
+        "recipe_version": TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
+    }
+    config = _validated_recipe_config(raw_config)
+    config["recipe_version"] = recipe_version
+    binding = {
+        "contract_version": "forward-only-rehabilitation-v1",
+        "source_strategy_version_id": SOURCE_VERSION_ID,
+        "source_backtest_id": SOURCE_BACKTEST_ID,
+        "source_job_id": SOURCE_JOB_ID,
+        "source_interruption_recovery_receipt_sha256": (
+            SOURCE_INTERRUPTION_RECOVERY_RECEIPT_SHA256
+        ),
+        "source_interruption_receipt_authority": (
+            SOURCE_INTERRUPTION_RECEIPT_AUTHORITY
+        ),
+        "dataset": SOURCE_DATASET,
+        "dataset_identity_sha256": SOURCE_DATASET_IDENTITY_SHA256,
+        "dataset_lineage_id": SOURCE_DATASET_LINEAGE_ID,
+        "strategy_rules_sha256": SOURCE_RULES_SHA256,
+        "execution_contract_hash": SOURCE_EXECUTION_CONTRACT_HASH,
+        "replay_periods": dict(SOURCE_PERIODS),
+        "source_attempt_artifact_relative_path": (
+            "artifacts/formal-backtest-recoveries/"
+            f"{SOURCE_BACKTEST_ID}/attempt-2"
+        ),
+        **(
+            {"consumed_oos_vintage_id": consumed_vintage_id}
+            if consumed_vintage_id
+            else {}
+        ),
+    }
+    window_core = {
+        "contract_version": FORWARD_ONLY_WINDOW_CONTRACT_VERSION,
+        **REPLAY_MARKERS,
+        "periods": dict(SOURCE_PERIODS),
+        **(
+            {"consumed_oos_vintage_id": consumed_vintage_id}
+            if consumed_vintage_id
+            else {}
+        ),
+    }
+    window = {**window_core, "contract_sha256": canonical_sha256(window_core)}
+    target_runner = target_runner_for_recipe(recipe["id"], recipe_version)
+    target_bundle = target_runtime_bundle_for_recipe(recipe["id"], recipe_version)
+    target_image = target_worker_runtime_image_for_recipe(recipe["id"], recipe_version)
+    project_root = Path(__file__).resolve().parents[2]
+    observed_runner = _sha256_file(project_root / "scripts" / "run_multifactor_backtest.py")
+    observed_bundle = position_risk_bundle_sha256(project_root)
+    if (
+        target_runner != observed_runner
+        or target_bundle != observed_bundle
+        or target_image is None
+    ):
+        raise ValueError(
+            "v18 runner, runtime source closure, or worker image is not the sealed release"
+        )
+    bootstrap = {
+        "contract_version": FORWARD_ONLY_BOOTSTRAP_CONTRACT_VERSION,
+        "recipe_id": recipe["id"],
+        "recipe_version": recipe_version,
+        "recipe_sha256": canonical_sha256(recipe),
+        "dataset": SOURCE_DATASET,
+        "dataset_identity_sha256": SOURCE_DATASET_IDENTITY_SHA256,
+        "dataset_lineage_id": SOURCE_DATASET_LINEAGE_ID,
+        "feature_set": feature_set,
+        "formal_periods": dict(SOURCE_PERIODS),
+        "research_window_contract": window,
+        "research_window_contract_sha256": window["contract_sha256"],
+        TRANSPARENT_BASELINE_RUNNER_FIELD: target_runner,
+        TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: target_bundle,
+        TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: target_image,
+    }
+    final_config = _normalize_multifactor_contract(
+        {
+            **config,
+            "evidence_mode": EVIDENCE_MODE_REPLAY,
+            "forward_only_rehabilitation": binding,
+            BOOTSTRAP_CONFIG_KEY: bootstrap,
+        },
+        factor_count=0,
+        creating_family=False,
+    )
+    if LOCKBOX_CONFIG_KEY in final_config:
+        raise ValueError("forward-only replay must not create a new OOS lockbox")
+    if (
+        final_config.get("strategy_rules_sha256") != SOURCE_RULES_SHA256
+        or final_config.get("execution_contract_hash")
+        != SOURCE_EXECUTION_CONTRACT_HASH
+    ):
+        raise ValueError("v18 replay changed the v17 economic or execution strategy")
+    return {
+        "recipe": recipe,
+        "config": final_config,
+        "formal_periods": dict(SOURCE_PERIODS),
+        "consumed_oos_vintage_id": consumed_vintage_id or None,
+    }
+
+
 class TransparentBaselineBootstrapService:
     """Reconcile the public controls without granting recommendation authority."""
 
@@ -786,6 +983,7 @@ class TransparentBaselineBootstrapService:
         plan: dict[str, Any],
         version: Mapping[str, Any],
         dataset: Mapping[str, Any],
+        allow_create: bool = True,
     ) -> dict[str, Any]:
         backtests = self.strategies.list_backtests(
             version_id=str(version["id"]),
@@ -799,10 +997,16 @@ class TransparentBaselineBootstrapService:
                 backtest.get("dataset") != dataset["name"]
                 or backtest.get("execution_dataset") is not None
                 or backtest.get("periods") != plan["formal_periods"]
+                or backtest.get("evidence_mode")
+                != version.get("evidence_mode", "sealed_final_oos")
             ):
                 raise ValueError("existing formal backtest differs from the frozen lockbox")
             backtest_action = "reused"
         else:
+            if not allow_create:
+                raise ValueError(
+                    "existing forward-only v18 replay is partial: formal backtest is missing"
+                )
             try:
                 backtest = self.strategies.create_backtest(
                     version_id=str(version["id"]),
@@ -840,46 +1044,76 @@ class TransparentBaselineBootstrapService:
         status = str(backtest.get("status") or "")
         job: dict[str, Any] | None = None
         job_action = "not_required"
-        if status in {"queued", "running"}:
-            payload = {
-                "backtest_id": str(backtest["id"]),
-                "strategy_version_id": str(version["id"]),
-                "dataset": str(dataset["name"]),
-                "dataset_path": str(dataset["path"]),
-                "execution_dataset": None,
-                "periods": dict(backtest["periods"]),
+        payload = {
+            "backtest_id": str(backtest["id"]),
+            "strategy_version_id": str(version["id"]),
+            "dataset": str(dataset["name"]),
+            "dataset_path": str(dataset["path"]),
+            "execution_dataset": None,
+            "periods": dict(backtest["periods"]),
+        }
+        bootstrap = dict(
+            dict(version.get("config") or {}).get(BOOTSTRAP_CONFIG_KEY) or {}
+        )
+        target_runner_sha256 = bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
+        if target_runner_sha256 is not None:
+            payload[TRANSPARENT_BASELINE_JOB_RUNNER_FIELD] = target_runner_sha256
+        target_runtime_bundle_sha256 = bootstrap.get(
+            TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD
+        )
+        if target_runtime_bundle_sha256 is not None:
+            payload[TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD] = (
+                target_runtime_bundle_sha256
+            )
+        target_worker_runtime_image_digest = bootstrap.get(
+            TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD
+        )
+        if target_worker_runtime_image_digest is not None:
+            payload[TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD] = (
+                target_worker_runtime_image_digest
+            )
+        idempotency_key = f"transparent-baseline:{version['id']}:{backtest['id']}"
+        if not allow_create:
+            attached_job_id = str(backtest.get("job_id") or "")
+            if not attached_job_id:
+                raise ValueError(
+                    "existing forward-only v18 replay is partial: attached job is missing"
+                )
+            job = self.jobs.get(attached_job_id)
+            if (
+                attached_job_id == SOURCE_JOB_ID
+                or job.get("kind") != "strategy_backtest"
+                or job.get("payload") != payload
+                or job.get("idempotency_key") != idempotency_key
+                or int(job.get("max_attempts") or 0) != 1
+            ):
+                raise ValueError(
+                    "existing forward-only v18 replay job differs from the frozen plan"
+                )
+            allowed_job_statuses = {
+                "queued": {"queued"},
+                "running": {"queued", "running"},
+                "succeeded": {"succeeded"},
+                "failed": {"failed", "cancelled"},
+                "cancelled": {"failed", "cancelled"},
             }
-            bootstrap = dict(
-                dict(version.get("config") or {}).get(BOOTSTRAP_CONFIG_KEY) or {}
-            )
-            target_runner_sha256 = bootstrap.get(TRANSPARENT_BASELINE_RUNNER_FIELD)
-            if target_runner_sha256 is not None:
-                payload[TRANSPARENT_BASELINE_JOB_RUNNER_FIELD] = target_runner_sha256
-            target_runtime_bundle_sha256 = bootstrap.get(
-                TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD
-            )
-            if target_runtime_bundle_sha256 is not None:
-                payload[TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD] = (
-                    target_runtime_bundle_sha256
+            if str(job.get("status") or "") not in allowed_job_statuses.get(status, set()):
+                raise ValueError(
+                    "existing forward-only v18 replay job/backtest lifecycle is partial"
                 )
-            target_worker_runtime_image_digest = bootstrap.get(
-                TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD
-            )
-            if target_worker_runtime_image_digest is not None:
-                payload[TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD] = (
-                    target_worker_runtime_image_digest
+            job_action = "reused"
+        if status in {"queued", "running"}:
+            if allow_create:
+                job = self.jobs.create(
+                    "strategy_backtest",
+                    payload,
+                    self.log_root / f"strategy-backtest-{backtest['id']}.log",
+                    dedupe_active_kind=False,
+                    idempotency_key=idempotency_key,
+                    max_attempts=1,
                 )
-            job = self.jobs.create(
-                "strategy_backtest",
-                payload,
-                self.log_root / f"strategy-backtest-{backtest['id']}.log",
-                dedupe_active_kind=False,
-                idempotency_key=(
-                    f"transparent-baseline:{version['id']}:{backtest['id']}"
-                ),
-                max_attempts=1,
-            )
-            job_action = "reused" if backtest.get("job_id") else "created"
+                job_action = "reused" if backtest.get("job_id") else "created"
+            assert job is not None
             if backtest.get("job_id") not in {None, str(job["id"])}:
                 raise ValueError("formal backtest is attached to a different job")
             if str(job.get("status") or "") in {"failed", "cancelled"}:
@@ -916,14 +1150,26 @@ class TransparentBaselineBootstrapService:
             return governed_noop
         if version.get("status") != "approved":
             try:
-                self.strategies.approve(
-                    version_id,
-                    actor=actor,
-                    reason=(
-                        "Transparent public baseline passed its immutable Qlib formal OOS, "
-                        "historical, cost, PIT, statistical, risk and execution gates."
-                    ),
-                )
+                if version.get("evidence_mode") == "consumed_historical_replay":
+                    self.strategies.admit_forward_only_rehabilitation(
+                        version_id,
+                        actor=actor,
+                        reason=(
+                            "Exact consumed-history public baseline replay passed every "
+                            "descriptive hard gate and enters strict forward-only paper "
+                            "observation without sealed or unseen OOS authority."
+                        ),
+                    )
+                else:
+                    self.strategies.approve(
+                        version_id,
+                        actor=actor,
+                        reason=(
+                            "Transparent public baseline passed its immutable Qlib formal "
+                            "OOS, historical, cost, PIT, statistical, risk and execution "
+                            "gates."
+                        ),
+                    )
             except ValueError:
                 # Concurrent scheduler ticks may both observe the successful
                 # immutable backtest.  Recover only if the competing caller
@@ -951,6 +1197,147 @@ class TransparentBaselineBootstrapService:
         if version.get("status") != "approved":
             raise ValueError("strict approval did not end in paper validation")
         return {"state": "paper_validating", "paper_stage": stage}
+
+    def reconcile_forward_only_rehabilitation(
+        self,
+        *,
+        actor: str = DEFAULT_ACTOR,
+    ) -> dict[str, Any]:
+        """Create/reuse the one exact v18 replay and its ordinary backtest job.
+
+        This entry point never reserves a new OOS vintage and never reopens the
+        v17 job.  It replays the already-consumed window under descriptive-only
+        authority, then reuses the existing paper/promotion lifecycle.
+        """
+
+        result: dict[str, Any] = {
+            "contract_version": FORWARD_ONLY_RECONCILE_RESULT_VERSION,
+            "status": "failed",
+            "source_strategy_version_id": SOURCE_VERSION_ID,
+            "source_backtest_id": SOURCE_BACKTEST_ID,
+            "source_job_id": SOURCE_JOB_ID,
+            "strategy_version_id": None,
+            "backtest": None,
+            "job": None,
+            "state": "failed",
+            "source_cash_only_lockbox": None,
+            "errors": [],
+        }
+        try:
+            source = self.strategies.get_version(SOURCE_VERSION_ID)
+            dataset = _select_forward_only_dataset(self.dataset_loader(self.data_root))
+            recipe_version = FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
+            preliminary_plan = _build_forward_only_rehabilitation_plan(
+                source_version=source,
+                dataset=dataset,
+                consumed_oos_vintage_id=None,
+            )
+            with self.strategies.engine.begin() as connection:
+                require_source_cancellation(connection)
+                source_cash_only = require_source_cash_only_lockbox(connection)
+                vintage = require_consumed_vintage(
+                    connection,
+                    version_config=preliminary_plan["config"],
+                    dataset_identity_sha256=SOURCE_DATASET_IDENTITY_SHA256,
+                    dataset_lineage_id=SOURCE_DATASET_LINEAGE_ID,
+                )
+            plan = _build_forward_only_rehabilitation_plan(
+                source_version=source,
+                dataset=dataset,
+                consumed_oos_vintage_id=str(vintage.id),
+            )
+            result["source_cash_only_lockbox"] = source_cash_only
+            family = self.strategies.get(str(source["strategy_id"]))
+            current_candidates = [
+                version
+                for version in family.get("versions") or []
+                if (version.get("config") or {}).get("recipe_version") == recipe_version
+            ]
+            exact_candidates = [
+                version
+                for version in current_candidates
+                if version.get("benchmark") == source["benchmark"]
+                and version.get("universe") == source["universe"]
+                and version.get("factors") == []
+                and version.get("config") == plan["config"]
+            ]
+            if len(current_candidates) != len(exact_candidates) or len(exact_candidates) > 1:
+                raise ValueError(
+                    "strategy family contains a conflicting or duplicate v18 replay version"
+                )
+            version_action = "reused" if exact_candidates else "created"
+            if exact_candidates:
+                version = exact_candidates[0]
+            else:
+                version = self.strategies.create_version_if_absent(
+                    str(source["strategy_id"]),
+                    benchmark=str(source["benchmark"]),
+                    universe=str(source["universe"]),
+                    factors=[],
+                    config=plan["config"],
+                    actor=actor,
+                )
+            if (
+                str(version.get("id") or "") == SOURCE_VERSION_ID
+                or version.get("config") != plan["config"]
+                or version.get("evidence_mode") != EVIDENCE_MODE_REPLAY
+            ):
+                raise ValueError("v18 StrategyVersion differs from the frozen replay plan")
+            result["strategy_version_id"] = str(version["id"])
+            result["strategy_version_action"] = version_action
+            queued = self._ensure_backtest_job(
+                plan=plan,
+                version=version,
+                dataset=dataset,
+                allow_create=version_action == "created",
+            )
+            backtest = queued["backtest"]
+            job = queued["job"]
+            expected_artifact_path = (
+                self.artifact_root / str(backtest["id"])
+            ).resolve()
+            if (
+                str(backtest["id"]) == SOURCE_BACKTEST_ID
+                or Path(str(backtest.get("artifact_path") or "")).resolve()
+                != expected_artifact_path
+                or (job is not None and str(job["id"]) == SOURCE_JOB_ID)
+            ):
+                raise ValueError(
+                    "v18 rehabilitation must use a new exact backtest/job artifact identity"
+                )
+            result["backtest"] = {
+                "id": str(backtest["id"]),
+                "status": str(backtest["status"]),
+                "action": queued["backtest_action"],
+                "evidence_mode": backtest.get("evidence_mode"),
+            }
+            result["job"] = (
+                {
+                    "id": str(job["id"]),
+                    "status": str(job["status"]),
+                    "action": queued["job_action"],
+                }
+                if job is not None
+                else None
+            )
+            advanced = self._advance_paper(
+                version_id=str(version["id"]),
+                backtest=backtest,
+                actor=actor,
+            )
+            result.update(advanced)
+            result["status"] = (
+                "paper_validating"
+                if advanced["state"] == "paper_validating"
+                else "no_op"
+                if advanced["state"] == "governed_no_op"
+                else "failed"
+                if advanced["state"] == "formal_backtest_failed"
+                else "pending"
+            )
+        except Exception as exc:  # noqa: BLE001 - one-shot emits a durable report
+            result["errors"].append(str(exc))
+        return result
 
     def reconcile(self, *, actor: str = DEFAULT_ACTOR) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -1209,3 +1596,16 @@ def reconcile(settings: Settings, *, actor: str = DEFAULT_ACTOR) -> dict[str, An
         database_url=settings.database_url,
         data_root=settings.data_root,
     ).reconcile(actor=actor)
+
+
+def reconcile_forward_only_rehabilitation(
+    settings: Settings,
+    *,
+    actor: str = DEFAULT_ACTOR,
+) -> dict[str, Any]:
+    """One-shot command entry point for the exact consumed-history v18 replay."""
+
+    return TransparentBaselineBootstrapService(
+        database_url=settings.database_url,
+        data_root=settings.data_root,
+    ).reconcile_forward_only_rehabilitation(actor=actor)

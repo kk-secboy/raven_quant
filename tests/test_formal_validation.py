@@ -357,6 +357,7 @@ def test_pbo_distinguishes_stable_candidate_from_fold_winners() -> None:
 
 def _incomplete_factor_family_fixture() -> tuple[dict, dict]:
     audit_sha256 = "a" * 64
+    eligibility_sha256 = "b" * 64
     trial_count = 4
     bootstrap = {
         "status": "ok",
@@ -367,6 +368,7 @@ def _incomplete_factor_family_fixture() -> tuple[dict, dict]:
         paired_bootstrap=bootstrap,
         trial_count=trial_count,
         trial_count_audit_sha256=audit_sha256,
+        eligibility_receipt_sha256=eligibility_sha256,
     )
     blocked_dsr = deflated_sharpe_probability(
         pd.Series(np.linspace(-0.01, 0.02, 120)),
@@ -376,6 +378,7 @@ def _incomplete_factor_family_fixture() -> tuple[dict, dict]:
         blocked_dsr=blocked_dsr,
         trial_count=trial_count,
         trial_count_audit_sha256=audit_sha256,
+        eligibility_receipt_sha256=eligibility_sha256,
     )
     version = {
         "config": {
@@ -427,6 +430,7 @@ def _incomplete_factor_family_fixture() -> tuple[dict, dict]:
                     "selection_performed": False,
                     "historical_candidate_matrix": "incomplete",
                     "trial_count_audit_sha256": audit_sha256,
+                    "eligibility_receipt_sha256": eligibility_sha256,
                 },
                 "folds": [
                     {"test_metric": 0.01, "test_passed": True},
@@ -475,11 +479,13 @@ def test_incomplete_factor_family_rejects_tampering_and_failed_familywise_alpha(
         paired_bootstrap=bootstrap,
         trial_count=4,
         trial_count_audit_sha256=audit_sha256,
+        eligibility_receipt_sha256=multiple["eligibility_receipt_sha256"],
     ) == multiple
     assert validate_factor_score_incomplete_family_dsr(
         metrics["deflated_sharpe"],
         trial_count=4,
         trial_count_audit_sha256=audit_sha256,
+        eligibility_receipt_sha256=multiple["eligibility_receipt_sha256"],
     ) == metrics["deflated_sharpe"]
 
     tampered = deepcopy(metrics)
@@ -492,6 +498,7 @@ def test_incomplete_factor_family_rejects_tampering_and_failed_familywise_alpha(
         paired_bootstrap=failed_bootstrap,
         trial_count=4,
         trial_count_audit_sha256=audit_sha256,
+        eligibility_receipt_sha256=multiple["eligibility_receipt_sha256"],
     )
     assert failed_multiple["bonferroni_adjusted_p_value"] == pytest.approx(0.08)
     assert failed_multiple["gate_passed"] is False
@@ -520,6 +527,7 @@ def test_incomplete_factor_family_binds_real_trial_count_to_manifest_audit() -> 
         ]
     }
     audit_sha256 = canonical_sha256(trial_count_audit)
+    eligibility_sha256 = "b" * 64
     bootstrap = metrics["formal_validation"]["paired_block_bootstrap"]
     metrics["formal_validation"][
         "multiple_testing"
@@ -527,10 +535,14 @@ def test_incomplete_factor_family_binds_real_trial_count_to_manifest_audit() -> 
         paired_bootstrap=bootstrap,
         trial_count=4,
         trial_count_audit_sha256=audit_sha256,
+        eligibility_receipt_sha256=eligibility_sha256,
     )
     metrics["formal_validation"]["outer_walk_forward"]["candidate_coverage"][
         "trial_count_audit_sha256"
     ] = audit_sha256
+    metrics["formal_validation"]["outer_walk_forward"]["candidate_coverage"][
+        "eligibility_receipt_sha256"
+    ] = eligibility_sha256
     metrics["deflated_sharpe"] = build_factor_score_incomplete_family_dsr(
         blocked_dsr=deflated_sharpe_probability(
             pd.Series(np.linspace(-0.01, 0.02, 120)),
@@ -538,10 +550,76 @@ def test_incomplete_factor_family_binds_real_trial_count_to_manifest_audit() -> 
         ),
         trial_count=4,
         trial_count_audit_sha256=audit_sha256,
+        eligibility_receipt_sha256=eligibility_sha256,
+    )
+    strategy_version_id = "target-v18"
+    strategy_version_ids = [
+        "4414d202dbb641608975e5305bc18da4",
+        strategy_version_id,
+    ]
+    missing_artifacts = [
+        {
+            "artifact_kind": kind,
+            "path": f"artifacts/source/{filename}",
+            "status": "missing",
+            "sha256": None,
+            "bytes": None,
+            "observed_at": "2026-08-31T00:00:00+00:00",
+        }
+        for kind, filename in (
+            ("trial_candidate_manifest_matrix", "trial_candidate_manifest_matrix.json"),
+            ("trial_daily_returns_matrix", "trial_daily_returns_matrix.parquet"),
+            ("trial_score_grid_matrix", "trial_score_grid_matrix.parquet"),
+        )
+    ]
+    eligibility_core = {
+        "contract_version": "incomplete-factor-family-eligibility-v1",
+        "evidence_mode": "consumed_historical_replay",
+        "authority": "conservative_bonferroni_only",
+        "source_strategy_version_id": "4414d202dbb641608975e5305bc18da4",
+        "source_backtest_id": "0a113fe28ca741b6be9c09ab046c9d02",
+        "source_job_id": "858a75a6f1994c359fa9c3567ed09f57",
+        "strategy_version_id": strategy_version_id,
+        "economic_hypothesis_group": "public-short",
+        "eligible_strategy_version_ids": strategy_version_ids,
+        "strategy_trial_count": 4,
+        "trial_count_audit": trial_count_audit,
+        "trial_count_audit_sha256": audit_sha256,
+        "missing_artifacts": missing_artifacts,
+        "cutoff_at": "2026-08-31T00:00:00+00:00",
+    }
+    eligibility = {**eligibility_core, "receipt_sha256": canonical_sha256(eligibility_core)}
+    assert eligibility["receipt_sha256"] != eligibility_sha256
+    eligibility_sha256 = eligibility["receipt_sha256"]
+    metrics["formal_validation"][
+        "multiple_testing"
+    ] = build_factor_score_incomplete_family_multiple_testing(
+        paired_bootstrap=bootstrap,
+        trial_count=4,
+        trial_count_audit_sha256=audit_sha256,
+        eligibility_receipt_sha256=eligibility_sha256,
+    )
+    metrics["formal_validation"]["outer_walk_forward"]["candidate_coverage"][
+        "eligibility_receipt_sha256"
+    ] = eligibility_sha256
+    metrics["deflated_sharpe"] = build_factor_score_incomplete_family_dsr(
+        blocked_dsr=deflated_sharpe_probability(
+            pd.Series(np.linspace(-0.01, 0.02, 120)), trials=4
+        ),
+        trial_count=4,
+        trial_count_audit_sha256=audit_sha256,
+        eligibility_receipt_sha256=eligibility_sha256,
     )
     manifest = {
+        "strategy_version_id": strategy_version_id,
         "strategy_trial_count": 4,
-        "hypothesis_group_evidence": {"trial_count_audit": trial_count_audit},
+        "hypothesis_group_evidence": {
+            "economic_hypothesis_group": "public-short",
+            "shared_experiment_count": 4,
+            "strategy_version_ids": strategy_version_ids,
+            "trial_count_audit": trial_count_audit,
+        },
+        "incomplete_factor_family_eligibility": eligibility,
     }
 
     assert _incomplete_family_manifest_binding_failures(manifest, metrics) == []

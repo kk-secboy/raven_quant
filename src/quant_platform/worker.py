@@ -63,6 +63,14 @@ from .factor_evaluation_recovery import (
 )
 from .factor_library_store import FactorLibraryStore
 from .feature_set_registry import get_feature_set, register_feature_set
+from .forward_only_rehabilitation import (
+    EVIDENCE_MODE_REPLAY,
+    EVIDENCE_MODE_SEALED,
+    REPLAY_MARKERS,
+    incomplete_family_eligibility_for_version,
+    require_replay_config,
+    require_replay_markers,
+)
 from .horizon_review import resolve_financial_review_trigger
 from .job_store import (
     INTERRUPTED_ATTEMPT_EXHAUSTED_ERROR,
@@ -1359,8 +1367,32 @@ class LocalJobWorker:
                 try:
                     if not isinstance(result, dict) or not isinstance(result.get("metrics"), dict):
                         raise ValueError("strategy backtest result is missing metrics")
+                    backtest = self.strategies.get_backtest(str(backtest_id))
+                    replay = backtest.get("evidence_mode") == EVIDENCE_MODE_REPLAY
+                    if replay:
+                        payload = dict(job.get("payload") or {})
+                        if payload.get("capital_oos_batch_id") or payload.get(
+                            "fin_strategy_research_run_id"
+                        ):
+                            raise ValueError(
+                                "consumed historical replay cannot settle capital or research"
+                            )
+                        for label, value in (
+                            ("result", result),
+                            ("metrics", result["metrics"]),
+                            (
+                                "provenance",
+                                result["metrics"].get("provenance") or {},
+                            ),
+                        ):
+                            require_replay_markers(value, label=f"replay {label}")
+                            if value.get("final_oos_opened") is not True:
+                                raise ValueError(
+                                    "consumed historical replay must admit that the "
+                                    f"{label} window was opened"
+                                )
                     self.strategies.validate_backtest_artifacts(str(backtest_id), result["metrics"])
-                    receipt = self._settle_capital_oos_success(job)
+                    receipt = None if replay else self._settle_capital_oos_success(job)
                     if receipt is not None:
                         result["metrics"]["capital_oos_receipt"] = receipt
                 except (KeyError, TypeError, ValueError) as exc:
@@ -1769,9 +1801,11 @@ class LocalJobWorker:
                         "succeeded",
                         metrics=result["metrics"],
                     )
-                    formal_settlement = self._settle_fin_strategy_formal_research(
-                        job,
-                        result,
+                    succeeded_backtest = self.strategies.get_backtest(str(backtest_id))
+                    formal_settlement = (
+                        None
+                        if succeeded_backtest.get("evidence_mode") == EVIDENCE_MODE_REPLAY
+                        else self._settle_fin_strategy_formal_research(job, result)
                     )
                     if formal_settlement is not None:
                         result["fin_strategy_formal_settlement"] = formal_settlement
@@ -4397,6 +4431,26 @@ class LocalJobWorker:
             manifest_path = output / "manifest.json"
             result_path = output / "result.json"
             version = self.strategies.get_version(payload["strategy_version_id"])
+            backtest = self.strategies.get_backtest(str(payload["backtest_id"]))
+            evidence_mode = str(backtest.get("evidence_mode") or "legacy_ambiguous")
+            if (
+                str(backtest.get("strategy_version_id") or "") != str(version["id"])
+                or evidence_mode != str(version.get("evidence_mode") or "legacy_ambiguous")
+            ):
+                raise ValueError("strategy backtest evidence authority changed after creation")
+            replay = evidence_mode == EVIDENCE_MODE_REPLAY
+            if replay:
+                require_replay_config(version["config"])
+                if payload.get("capital_oos_batch_id") or payload.get(
+                    "fin_strategy_research_run_id"
+                ):
+                    raise ValueError(
+                        "consumed historical replay cannot carry capital or fin_strategy settlement"
+                    )
+            elif evidence_mode != EVIDENCE_MODE_SEALED:
+                raise ValueError(
+                    "multifactor strategy backtest has ambiguous evidence authority"
+                )
             is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
 
             def runtime_path(value: str) -> str:
@@ -4404,6 +4458,16 @@ class LocalJobWorker:
 
             execution_dataset = payload.get("execution_dataset")
             hypothesis_evidence = self.strategies.hypothesis_group_evidence(version["id"])
+            incomplete_family_eligibility = None
+            if replay and int(hypothesis_evidence["shared_experiment_count"]) > 1:
+                with self.strategies.engine.connect() as connection:
+                    incomplete_family_eligibility = (
+                        incomplete_family_eligibility_for_version(
+                            connection,
+                            strategy_version_id=str(version["id"]),
+                            hypothesis_group_evidence=hypothesis_evidence,
+                        )
+                    )
             final_periods = {
                 "start": payload["periods"]["start"],
                 "end": payload["periods"]["end"],
@@ -4418,6 +4482,10 @@ class LocalJobWorker:
             manifest = {
                 "backtest_id": payload["backtest_id"],
                 "strategy_version_id": version["id"],
+                "evaluation_mode": evidence_mode if replay else "formal_final_oos",
+                "evidence_mode": evidence_mode,
+                **(REPLAY_MARKERS if replay else {}),
+                "final_oos_opened": True,
                 "strategy_rules_sha256": version["strategy_rules_sha256"],
                 "dataset": payload["dataset"],
                 "execution_dataset": (
@@ -4448,6 +4516,9 @@ class LocalJobWorker:
                 "strategy_trial_count": hypothesis_evidence["shared_experiment_count"],
                 "economic_hypothesis_group": hypothesis_evidence["economic_hypothesis_group"],
                 "hypothesis_group_evidence": hypothesis_evidence,
+                "incomplete_factor_family_eligibility": (
+                    incomplete_family_eligibility
+                ),
                 "periods": final_periods,
                 "historical_validation_periods": historical_validation_periods,
                 "config": version["config"],

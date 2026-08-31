@@ -5,10 +5,10 @@ from typing import Any
 
 from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 
-# v17 is a material append-only generation. It binds the current strategy
-# runtime to the narrowly preregistered topk industry-capacity partial-cash
-# repair path. Historical v8-v16 recipes and their OOS evidence remain
-# immutable under their original runner/runtime identities.
+# v17 remains the ordinary transparent-baseline generation.  The narrowly
+# scoped v18 consumed-history rehabilitation is materialized only by its
+# dedicated one-shot builder; publishing v18 here would make the scheduler
+# attempt to open another ordinary OOS batch for all three horizons.
 RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-31-v17"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (

@@ -4,12 +4,14 @@ import hashlib
 import json
 import uuid
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from math import isfinite
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 from sqlalchemy import func, insert, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 
@@ -36,6 +38,7 @@ from quant_data.database import (
     strategies,
     strategy_events,
     strategy_factors,
+    strategy_forward_gates,
     strategy_health_snapshots,
     strategy_pairs,
     strategy_versions,
@@ -76,8 +79,29 @@ from quant_platform.formal_validation import (
     NOT_COMPUTABLE_INCOMPLETE_FAMILY_STATUS,
     PRE_FINAL_HISTORY_CONTRACT_VERSION,
     SIGNAL_DECAY_FRONTIER_VERSION,
+    paired_bootstrap_parameters_from_config,
     validate_factor_score_incomplete_family_dsr,
     validate_factor_score_incomplete_family_multiple_testing,
+    validate_paired_bootstrap_evidence,
+)
+from quant_platform.forward_only_rehabilitation import (
+    EVIDENCE_MODE_LEGACY,
+    EVIDENCE_MODE_REPLAY,
+    EVIDENCE_MODE_SEALED,
+    audit_incomplete_family_artifacts,
+    build_incomplete_family_eligibility,
+    build_qualification,
+    incomplete_family_eligibility_for_version,
+    insert_incomplete_family_eligibility,
+    insert_qualification,
+    rehabilitation_forward_thresholds,
+    require_consumed_vintage,
+    require_incomplete_family_eligibility,
+    require_replay_config,
+    require_replay_markers,
+)
+from quant_platform.forward_only_rehabilitation import (
+    canonical_sha256 as rehabilitation_canonical_sha256,
 )
 from quant_platform.horizon_factor_bundle import validate_horizon_factor_bundle
 from quant_platform.model_ensemble import prediction_grid_from_admission
@@ -160,6 +184,7 @@ from quant_platform.transparent_baseline_runner import (
     DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION,
     FAIL_CLOSED_EXECUTION_TARGET_RECIPE_VERSION,
     FILL_AWARE_HOLDING_AGE_TARGET_RECIPE_VERSION,
+    FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
     POSITION_RISK_TARGET_RECIPE_VERSION,
     SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
     TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
@@ -177,6 +202,19 @@ from quant_platform.upstream_versions import QLIB_COMMIT, RDAGENT_COMMIT
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _lock_strategy_trial_family(connection: Any, economic_hypothesis_group: str) -> None:
+    group = str(economic_hypothesis_group or "").strip()
+    if not group:
+        raise ValueError("strategy trial-family lock requires an economic hypothesis group")
+    connection.execute(
+        select(
+            func.pg_advisory_xact_lock(
+                func.hashtext(f"strategy-trial-family:{group}")
+            )
+        )
+    )
 
 
 def _is_sha256(value: Any) -> bool:
@@ -215,6 +253,7 @@ def _transparent_worker_runtime_failures(
             SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
             DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION,
             TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
+            FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
         }
         or target_runner_for_recipe(
             config.get("recipe_id"), config.get("recipe_version")
@@ -258,10 +297,18 @@ def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[s
     recipe_version = config.get("recipe_version")
     if (
         str(recipe_version or "")
-        != TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION
+        != FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION
         or target_runner_for_recipe(recipe_id, recipe_version) is None
     ):
         return config
+    if (
+        str(recipe_id or "") == "short_relative_strength"
+        and config.get("evidence_mode") != EVIDENCE_MODE_REPLAY
+    ):
+        raise ValueError(
+            "the current short transparent baseline is restricted to the exact "
+            "forward-only rehabilitation entry point"
+        )
     bootstrap_raw = config.get("transparent_baseline_bootstrap")
     if bootstrap_raw is not None and not isinstance(bootstrap_raw, Mapping):
         raise ValueError("transparent current bootstrap must be an object")
@@ -548,6 +595,14 @@ def _version_contract_columns(config: dict[str, Any], *, strategy_type: str) -> 
         if not _is_sha256(contract_hash):
             raise ValueError("strategy execution contract hash is required")
     return {
+        "evidence_mode": str(
+            config.get("evidence_mode")
+            or (
+                EVIDENCE_MODE_LEGACY
+                if strategy_type == "pair"
+                else EVIDENCE_MODE_SEALED
+            )
+        ),
         "signal_frequency": signal_frequency,
         "signal_horizon": signal_horizon,
         "execution_frequency": execution_frequency,
@@ -566,6 +621,12 @@ def _normalize_multifactor_contract(
     config: dict[str, Any], *, factor_count: int, creating_family: bool
 ) -> dict[str, Any]:
     normalized = normalize_model_signal_config(dict(config))
+    normalized.setdefault("evidence_mode", EVIDENCE_MODE_SEALED)
+    if normalized["evidence_mode"] not in {
+        EVIDENCE_MODE_SEALED,
+        EVIDENCE_MODE_REPLAY,
+    }:
+        raise ValueError("new multifactor strategies require an explicit evidence mode")
     if normalized["signal_source"] == "model_prediction":
         submitted_factor_source = str(
             config.get("factor_source_mode") or "promoted_only"
@@ -629,6 +690,8 @@ def _normalize_multifactor_contract(
         validate_strategy_rule_binding(normalized)
     normalized["execution_contract_hash"] = strategy_execution_contract_hash(normalized)
     require_strategy_execution_contract(normalized)
+    if normalized["evidence_mode"] == EVIDENCE_MODE_REPLAY:
+        require_replay_config(normalized)
     return normalized
 
 
@@ -898,16 +961,21 @@ def _valid_factor_score_incomplete_family_alternative(
     try:
         trials = int((deflated or {}).get("trials") or 0)
         audit_sha256 = str((multiple or {}).get("trial_count_audit_sha256") or "")
+        eligibility_sha256 = str(
+            (multiple or {}).get("eligibility_receipt_sha256") or ""
+        )
         validated_multiple = validate_factor_score_incomplete_family_multiple_testing(
             multiple,
             paired_bootstrap=bootstrap if isinstance(bootstrap, Mapping) else {},
             trial_count=trials,
             trial_count_audit_sha256=audit_sha256,
+            eligibility_receipt_sha256=eligibility_sha256,
         )
         validated_dsr = validate_factor_score_incomplete_family_dsr(
             deflated,
             trial_count=trials,
             trial_count_audit_sha256=audit_sha256,
+            eligibility_receipt_sha256=eligibility_sha256,
         )
     except (AttributeError, TypeError, ValueError):
         return False
@@ -1230,6 +1298,9 @@ def _formal_validation_failures(version: dict[str, Any], metrics: dict[str, Any]
                 trial_count_audit_sha256=str(
                     multiple.get("trial_count_audit_sha256") or ""
                 ),
+                eligibility_receipt_sha256=str(
+                    multiple.get("eligibility_receipt_sha256") or ""
+                ),
             )
         except (TypeError, ValueError):
             validated_multiple = {}
@@ -1286,6 +1357,17 @@ def _incomplete_family_manifest_binding_failures(
         if isinstance(trial_count_audit, Mapping)
         else None
     )
+    try:
+        eligibility = require_incomplete_family_eligibility(
+            manifest.get("incomplete_factor_family_eligibility") or {},
+            hypothesis_group_evidence=(
+                hypothesis_group if isinstance(hypothesis_group, Mapping) else {}
+            ),
+            strategy_version_id=str(manifest.get("strategy_version_id") or ""),
+        )
+        eligibility_sha256 = str(eligibility["receipt_sha256"])
+    except (KeyError, TypeError, ValueError):
+        eligibility_sha256 = ""
     outer = formal_evidence.get("outer_walk_forward")
     outer_coverage = outer.get("candidate_coverage") if isinstance(outer, Mapping) else None
     deflated = metrics.get("deflated_sharpe")
@@ -1303,10 +1385,15 @@ def _incomplete_family_manifest_binding_failures(
         or multiple_trial_count != manifest_trial_count
         or deflated_trial_count != manifest_trial_count
         or multiple.get("trial_count_audit_sha256") != audit_sha256
+        or not _is_sha256(eligibility_sha256)
+        or multiple.get("eligibility_receipt_sha256") != eligibility_sha256
         or not isinstance(outer_coverage, Mapping)
         or outer_coverage.get("trial_count_audit_sha256") != audit_sha256
+        or outer_coverage.get("eligibility_receipt_sha256")
+        != eligibility_sha256
         or not isinstance(deflated, Mapping)
         or deflated.get("trial_count_audit_sha256") != audit_sha256
+        or deflated.get("eligibility_receipt_sha256") != eligibility_sha256
     ):
         return ["incomplete-family statistics do not bind the manifest trial-count audit"]
     return []
@@ -1329,6 +1416,43 @@ def _multifactor_manifest_failures(
         return ["strategy backtest manifest artifact must be a JSON object"]
 
     failures: list[str] = []
+    evidence_mode = str(version.get("evidence_mode") or EVIDENCE_MODE_LEGACY)
+    if str(backtest.get("evidence_mode") or EVIDENCE_MODE_LEGACY) != evidence_mode:
+        failures.append("strategy version and backtest evidence modes differ")
+    if evidence_mode == EVIDENCE_MODE_REPLAY:
+        for label, value in (
+            ("manifest", manifest),
+            ("metrics", metrics),
+            ("provenance", provenance),
+        ):
+            try:
+                require_replay_markers(value, label=f"historical replay {label}")
+            except ValueError as exc:
+                failures.append(str(exc))
+            if value.get("final_oos_opened") is not True:
+                failures.append(
+                    f"historical replay {label} must admit that the window was opened"
+                )
+        if any(
+            value.get("evaluation_mode") != EVIDENCE_MODE_REPLAY
+            for value in (manifest, metrics, provenance)
+        ):
+            failures.append("historical replay evaluation mode is inconsistent")
+    elif evidence_mode == EVIDENCE_MODE_SEALED:
+        if (
+            manifest.get("evidence_mode") != EVIDENCE_MODE_SEALED
+            or metrics.get("evidence_mode") != EVIDENCE_MODE_SEALED
+            or provenance.get("evidence_mode") != EVIDENCE_MODE_SEALED
+            or manifest.get("evaluation_mode") != "formal_final_oos"
+            or metrics.get("evaluation_mode") != "formal_final_oos"
+            or provenance.get("evaluation_mode") != "formal_final_oos"
+            or manifest.get("final_oos_opened") is not True
+            or metrics.get("final_oos_opened") is not True
+            or provenance.get("final_oos_opened") is not True
+        ):
+            failures.append("sealed final OOS evidence authority is inconsistent")
+    else:
+        failures.append("strategy backtest evidence authority is ambiguous")
     failures.extend(
         _transparent_worker_runtime_failures(version, manifest, provenance)
     )
@@ -1337,6 +1461,7 @@ def _multifactor_manifest_failures(
         != STRATEGY_BACKTEST_ARTIFACT_MANIFEST_VERSION
     ):
         failures.append("strategy backtest artifact manifest version is missing or obsolete")
+    artifact_manifest_valid = False
     try:
         artifact_manifest = validate_backtest_artifact_manifest(
             artifact_root,
@@ -1346,8 +1471,29 @@ def _multifactor_manifest_failures(
             artifact_manifest["files"]
         ):
             failures.append("strategy backtest artifact manifest file count is inconsistent")
+        else:
+            artifact_manifest_valid = True
     except (OSError, TypeError, ValueError) as exc:
         failures.append(str(exc))
+    if artifact_manifest_valid:
+        daily_returns_path = artifact_root / "daily_returns.parquet"
+        try:
+            daily_returns = pd.read_parquet(daily_returns_path)
+            formal_validation = metrics.get("formal_validation")
+            claimed_bootstrap = (
+                formal_validation.get("paired_block_bootstrap")
+                if isinstance(formal_validation, Mapping)
+                else None
+            )
+            validate_paired_bootstrap_evidence(
+                claimed_bootstrap,
+                daily_returns=daily_returns,
+                parameters=paired_bootstrap_parameters_from_config(
+                    version.get("config") or {}
+                ),
+            )
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            failures.append(f"paired bootstrap artifact recomputation failed: {exc}")
     try:
         require_qlib_workflow_identity(provenance.get("qlib_workflow"))
     except ValueError as exc:
@@ -2871,6 +3017,7 @@ class StrategyStore:
         now = _now()
         try:
             with self.engine.begin() as connection:
+                _lock_strategy_trial_family(connection, group)
                 _require_strategy_source_artifact(
                     connection,
                     config,
@@ -3056,6 +3203,10 @@ class StrategyStore:
                 ).first()
                 if strategy is None:
                     raise KeyError(strategy_id)
+                _lock_strategy_trial_family(
+                    connection,
+                    str(strategy.economic_hypothesis_group),
+                )
                 _require_strategy_source_artifact(
                     connection,
                     config,
@@ -3116,6 +3267,35 @@ class StrategyStore:
                 existing_version_id: str | None = None
                 if reuse_exact:
                     expected_config_sha256 = _canonical_sha256(config)
+                    if config.get("evidence_mode") == EVIDENCE_MODE_REPLAY:
+                        current_recipe_rows = connection.execute(
+                            select(
+                                strategy_versions.c.id,
+                                strategy_versions.c.config_json,
+                                strategy_versions.c.benchmark,
+                                strategy_versions.c.universe,
+                            ).where(
+                                strategy_versions.c.strategy_id == strategy_id,
+                                strategy_versions.c.strategy_type == "multifactor",
+                            )
+                        ).all()
+                        conflicting = [
+                            str(candidate.id)
+                            for candidate in current_recipe_rows
+                            if dict(candidate.config_json or {}).get("recipe_version")
+                            == config.get("recipe_version")
+                            and (
+                                _canonical_sha256(dict(candidate.config_json or {}))
+                                != expected_config_sha256
+                                or str(candidate.benchmark) != benchmark
+                                or str(candidate.universe) != universe
+                            )
+                        ]
+                        if conflicting:
+                            raise ValueError(
+                                "strategy family already contains a conflicting current "
+                                "forward-only replay version"
+                            )
                     candidates = connection.execute(
                         select(
                             strategy_versions.c.id,
@@ -3628,7 +3808,12 @@ class StrategyStore:
             }
         return result
 
-    def hypothesis_group_evidence(self, version_id: str) -> dict[str, Any]:
+    def hypothesis_group_evidence(
+        self,
+        version_id: str,
+        *,
+        connection: Any | None = None,
+    ) -> dict[str, Any]:
         """Return the immutable family-wide trial count used by formal gates.
 
         Factor experiment families carry their declared count (including
@@ -3640,9 +3825,26 @@ class StrategyStore:
         DSR/PBO inputs.
         """
 
-        version = self.get_version(version_id)
+        if connection is None:
+            version = self.get_version(version_id)
+        else:
+            version_row = connection.execute(
+                select(
+                    strategy_versions,
+                    strategies.c.economic_hypothesis_group,
+                    strategies.c.hypothesis_group_cap,
+                )
+                .join(strategies, strategies.c.id == strategy_versions.c.strategy_id)
+                .where(strategy_versions.c.id == version_id)
+            ).first()
+            if version_row is None:
+                raise KeyError(version_id)
+            version = row_dict(version_row)
         group = str(version["economic_hypothesis_group"])
-        with self.engine.connect() as connection:
+        connection_scope = (
+            self.engine.connect() if connection is None else nullcontext(connection)
+        )
+        with connection_scope as connection:
             version_rows = connection.execute(
                 select(strategy_versions.c.id, strategy_versions.c.config_json)
                 .join(strategies, strategies.c.id == strategy_versions.c.strategy_id)
@@ -4124,6 +4326,14 @@ class StrategyStore:
         capital_oos_dataset_identity_sha256: str | None = None,
     ) -> dict[str, Any]:
         version = self.get_version(version_id)
+        evidence_mode = str(version.get("evidence_mode") or EVIDENCE_MODE_LEGACY)
+        if version.get("strategy_type") == "multifactor" and evidence_mode not in {
+            EVIDENCE_MODE_SEALED,
+            EVIDENCE_MODE_REPLAY,
+        }:
+            raise ValueError(
+                "new multifactor backtests require sealed or consumed-replay evidence mode"
+            )
         is_fin_strategy_candidate = bool(
             str(
                 version.get("source_research_artifact_id")
@@ -4144,6 +4354,14 @@ class StrategyStore:
             raise ValueError(
                 "fin_strategy formal OOS requires a preregistered "
                 "CapitalOOSAlphaLedger batch"
+            )
+        if evidence_mode == EVIDENCE_MODE_REPLAY and any(capital_values_present):
+            raise ValueError(
+                "consumed historical replay cannot reserve or settle a capital OOS batch"
+            )
+        if evidence_mode == EVIDENCE_MODE_REPLAY and is_fin_strategy_candidate:
+            raise ValueError(
+                "forward-only rehabilitation is restricted to the transparent public baseline"
             )
         capital_batch_id: str | None = None
         capital_dataset_identity: str | None = None
@@ -4195,6 +4413,11 @@ class StrategyStore:
                 text("SELECT pg_advisory_xact_lock(hashtext(:identity))"),
                 {"identity": f"strategy-final-backtest:{version_id}"},
             )
+            if version.get("strategy_type") == "multifactor":
+                _lock_strategy_trial_family(
+                    connection,
+                    str(version["economic_hypothesis_group"]),
+                )
             fin_strategy_admission: dict[str, Any] | None = None
             if is_fin_strategy_candidate:
                 fin_strategy_admission = self._require_fin_strategy_formal_admission(
@@ -4444,7 +4667,11 @@ class StrategyStore:
                     }
                     dataset_identities = set()
                 else:
-                    sealed_member_set = baseline_oos_sealed_member_set(version)
+                    sealed_member_set = (
+                        {}
+                        if evidence_mode == EVIDENCE_MODE_REPLAY
+                        else baseline_oos_sealed_member_set(version)
+                    )
                     # Baseline-only versions have no factor evaluation carrying
                     # a snapshot identity. This value is audit-only; stable scope
                     # below, never the snapshot name, controls OOS reuse.
@@ -4503,37 +4730,90 @@ class StrategyStore:
                             "capital OOS sealed candidate patch collides with strategy evidence"
                         )
                     sealed_member_set.update(capital_sealed_patch)
-                # Every multifactor final test, including a pure Qlib baseline,
-                # consumes the same governed OOS ledger.
-                self._seal_and_consume_oos_vintage(
-                    connection,
-                    strategy_version_id=version_id,
-                    candidate_ids=candidate_ids,
-                    sealed_member_set=sealed_member_set,
-                    dataset_identities=dataset_identities,
-                    dataset_lineage_id=dataset_lineage_id,
-                    dataset=dataset,
-                    test_start=requested_start,
-                    test_end=requested_end,
-                    consumed_at=consumed_at,
-                    capital_oos_alpha_batch_id=capital_batch_id,
-                    capital_oos_dataset_identity_sha256=capital_dataset_identity,
-                )
-                for item in factor_windows:
-                    key = hashlib.sha256(
-                        (
-                            f"{version_id}:{item.id}:{dataset}:"
-                            f"{recorded_periods['start']}:{recorded_periods['end']}"
-                        ).encode()
-                    ).hexdigest()
-                    connection.execute(
-                        update(factor_evaluations)
-                        .where(
-                            factor_evaluations.c.id == item.id,
-                            factor_evaluations.c.final_test_consumed_at.is_(None),
+                if evidence_mode == EVIDENCE_MODE_REPLAY:
+                    if factor_windows or model_evidence is not None or candidate_ids:
+                        raise ValueError(
+                            "forward-only rehabilitation accepts only the public baseline"
                         )
-                        .values(final_test_key=key, final_test_consumed_at=consumed_at)
+                    binding = require_replay_config(version["config"])
+                    if (
+                        dataset != binding["dataset"]
+                        or dict(recorded_periods) != dict(binding["replay_periods"])
+                    ):
+                        raise ValueError(
+                            "historical replay differs from its exact consumed source window"
+                        )
+                    require_consumed_vintage(
+                        connection,
+                        version_config=version["config"],
+                        dataset_identity_sha256=str(dataset_identity_sha256 or ""),
+                        dataset_lineage_id=str(dataset_lineage_id or ""),
                     )
+                    hypothesis_evidence = self.hypothesis_group_evidence(
+                        version_id,
+                        connection=connection,
+                    )
+                    artifacts_root = next(
+                        (
+                            parent
+                            for parent in (artifact_directory, *artifact_directory.parents)
+                            if parent.name == "artifacts"
+                        ),
+                        None,
+                    )
+                    if artifacts_root is None:
+                        raise ValueError(
+                            "historical replay output is outside the governed artifacts root"
+                        )
+                    eligibility = build_incomplete_family_eligibility(
+                        connection,
+                        strategy_version_id=version_id,
+                        hypothesis_group_evidence=hypothesis_evidence,
+                        missing_artifacts=audit_incomplete_family_artifacts(
+                            data_root=artifacts_root.parent,
+                            observed_at=consumed_at
+                        ),
+                        cutoff_at=consumed_at,
+                        created_by="system:forward-only-rehabilitation",
+                    )
+                    insert_incomplete_family_eligibility(
+                        connection,
+                        eligibility,
+                        created_at=consumed_at,
+                    )
+                else:
+                    # Every real multifactor final test, including a pure Qlib
+                    # baseline, consumes the same governed OOS ledger. A replay
+                    # above can only point at an already-consumed exact row.
+                    self._seal_and_consume_oos_vintage(
+                        connection,
+                        strategy_version_id=version_id,
+                        candidate_ids=candidate_ids,
+                        sealed_member_set=sealed_member_set,
+                        dataset_identities=dataset_identities,
+                        dataset_lineage_id=dataset_lineage_id,
+                        dataset=dataset,
+                        test_start=requested_start,
+                        test_end=requested_end,
+                        consumed_at=consumed_at,
+                        capital_oos_alpha_batch_id=capital_batch_id,
+                        capital_oos_dataset_identity_sha256=capital_dataset_identity,
+                    )
+                    for item in factor_windows:
+                        key = hashlib.sha256(
+                            (
+                                f"{version_id}:{item.id}:{dataset}:"
+                                f"{recorded_periods['start']}:{recorded_periods['end']}"
+                            ).encode()
+                        ).hexdigest()
+                        connection.execute(
+                            update(factor_evaluations)
+                            .where(
+                                factor_evaluations.c.id == item.id,
+                                factor_evaluations.c.final_test_consumed_at.is_(None),
+                            )
+                            .values(final_test_key=key, final_test_consumed_at=consumed_at)
+                        )
             connection.execute(
                 insert(backtest_runs).values(
                     id=backtest_id,
@@ -4548,6 +4828,7 @@ class StrategyStore:
                     rdagent_version=version["rdagent_version"],
                     rdagent_commit=version["rdagent_commit"],
                     status="queued",
+                    evidence_mode=evidence_mode,
                     periods_json=recorded_periods,
                     artifact_path=str(artifact_directory),
                     created_at=_now(),
@@ -5054,14 +5335,21 @@ class StrategyStore:
             raise ValueError("strategy backtest artifact validation failed: " + "; ".join(failures))
 
     def _hypothesis_group_manifest_failures(
-        self, version_id: str, backtest: dict[str, Any]
+        self,
+        version_id: str,
+        backtest: dict[str, Any],
+        *,
+        connection: Any | None = None,
     ) -> list[str]:
         manifest_path = Path(str(backtest["artifact_path"])) / "manifest.json"
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return ["hypothesis-group evidence manifest is unreadable"]
-        current = self.hypothesis_group_evidence(version_id)
+        current = self.hypothesis_group_evidence(
+            version_id,
+            connection=connection,
+        )
         observed = manifest.get("hypothesis_group_evidence")
         if (
             not isinstance(observed, dict)
@@ -5264,6 +5552,47 @@ class StrategyStore:
         return self.get_version(version["id"])
 
     def approve(self, version_id: str, *, actor: str, reason: str) -> dict[str, Any]:
+        version = self.get_version(version_id)
+        if str(version.get("evidence_mode") or EVIDENCE_MODE_LEGACY) == EVIDENCE_MODE_REPLAY:
+            raise ValueError(
+                "consumed historical replay requires the dedicated forward-only admission"
+            )
+        return self._approve_version(
+            version_id,
+            actor=actor,
+            reason=reason,
+            allow_forward_only_rehabilitation=False,
+        )
+
+    def admit_forward_only_rehabilitation(
+        self,
+        version_id: str,
+        *,
+        actor: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Admit one exact descriptive replay into the existing forward paper stage."""
+
+        version = self.get_version(version_id)
+        if str(version.get("evidence_mode") or EVIDENCE_MODE_LEGACY) != EVIDENCE_MODE_REPLAY:
+            raise ValueError(
+                "forward-only rehabilitation admission requires consumed historical replay"
+            )
+        return self._approve_version(
+            version_id,
+            actor=actor,
+            reason=reason,
+            allow_forward_only_rehabilitation=True,
+        )
+
+    def _approve_version(
+        self,
+        version_id: str,
+        *,
+        actor: str,
+        reason: str,
+        allow_forward_only_rehabilitation: bool,
+    ) -> dict[str, Any]:
         if not actor.strip() or len(reason.strip()) < 10:
             raise ValueError("actor and a meaningful approval reason are required")
         version = self.get_version(version_id)
@@ -5276,6 +5605,28 @@ class StrategyStore:
         if backtests[0].get("is_legacy"):
             raise ValueError("legacy backtests cannot approve a new strategy")
         config = version["config"]
+        evidence_mode = str(version.get("evidence_mode") or EVIDENCE_MODE_LEGACY)
+        replay_admission = evidence_mode == EVIDENCE_MODE_REPLAY
+        if replay_admission is not allow_forward_only_rehabilitation:
+            raise ValueError("strategy approval evidence mode is not authorized by this action")
+        if version.get("strategy_type") == "multifactor":
+            if evidence_mode not in {EVIDENCE_MODE_SEALED, EVIDENCE_MODE_REPLAY}:
+                raise ValueError("multifactor strategy evidence authority is ambiguous")
+            if backtests[0].get("evidence_mode") != evidence_mode:
+                raise ValueError("strategy and backtest evidence authority differ")
+        if replay_admission:
+            require_replay_config(config)
+            for label, value in (
+                ("metrics", metrics),
+                ("provenance", metrics.get("provenance") or {}),
+            ):
+                require_replay_markers(value, label=f"historical replay {label}")
+                if value.get("final_oos_opened") is not True:
+                    raise ValueError(
+                        "historical replay must admit that its consumed window was opened"
+                    )
+            if metrics.get("capital_eligible") is not False:
+                raise ValueError("historical replay must be explicitly capital-ineligible")
         conservative_incomplete_family = (
             _valid_factor_score_incomplete_family_alternative(version, metrics)
         )
@@ -5308,6 +5659,10 @@ class StrategyStore:
             == "autopilot-completion-v1"
             or bool(source_research_artifact_id)
         )
+        if replay_admission and requires_capital_oos_receipt:
+            raise ValueError(
+                "forward-only rehabilitation cannot reuse a capital OOS or research admission"
+            )
         if requires_capital_oos_receipt:
             try:
                 receipt = require_capital_oos_receipt(
@@ -5794,6 +6149,29 @@ class StrategyStore:
                 backtests_root=backtest_artifact_root.parent,
             )
         now = _now()
+        replay_gate = None
+        replay_criteria: dict[str, Any] | None = None
+        if replay_admission:
+            from .promotion import (
+                ForwardGateThresholds,
+                build_forward_gate_criteria,
+                forward_gate_thresholds_for_horizon,
+            )
+
+            replay_gate = ForwardGateThresholds(
+                **rehabilitation_forward_thresholds(
+                    asdict(
+                        forward_gate_thresholds_for_horizon(
+                            str(version["horizon_profile"])
+                        )
+                    )
+                )
+            )
+            replay_criteria = build_forward_gate_criteria(
+                horizon_profile=str(version["horizon_profile"]),
+                horizon_contract_sha256=str(version["horizon_contract_sha256"]),
+                thresholds=replay_gate,
+            )
         with self.engine.begin() as connection:
             locked_version = connection.execute(
                 select(strategy_versions)
@@ -5802,6 +6180,59 @@ class StrategyStore:
             ).first()
             if locked_version is None:
                 raise KeyError(version_id)
+            locked_group = connection.scalar(
+                select(strategies.c.economic_hypothesis_group).where(
+                    strategies.c.id == locked_version.strategy_id
+                )
+            )
+            _lock_strategy_trial_family(connection, str(locked_group or ""))
+            locked_backtest = connection.execute(
+                select(backtest_runs)
+                .where(backtest_runs.c.id == backtests[0]["id"])
+                .with_for_update()
+            ).first()
+            if (
+                locked_backtest is None
+                or str(locked_backtest.strategy_version_id) != version_id
+                or str(locked_backtest.status) != "succeeded"
+            ):
+                raise ValueError("approval backtest changed during approval")
+            fresh_hypothesis = self.hypothesis_group_evidence(
+                version_id,
+                connection=connection,
+            )
+            fresh_family_failures = self._hypothesis_group_manifest_failures(
+                version_id,
+                backtests[0],
+                connection=connection,
+            )
+            if fresh_family_failures:
+                raise ValueError(
+                    "strategy trial family changed during approval: "
+                    + "; ".join(fresh_family_failures)
+                )
+            if replay_admission:
+                frozen_eligibility = incomplete_family_eligibility_for_version(
+                    connection,
+                    strategy_version_id=version_id,
+                    hypothesis_group_evidence=fresh_hypothesis,
+                )
+                formal = dict(locked_backtest.metrics_json or {}).get(
+                    "formal_validation"
+                )
+                multiple = (
+                    formal.get("multiple_testing")
+                    if isinstance(formal, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(multiple, Mapping)
+                    or multiple.get("eligibility_receipt_sha256")
+                    != frozen_eligibility["receipt_sha256"]
+                ):
+                    raise ValueError(
+                        "conservative statistics do not bind the frozen family eligibility"
+                    )
             from .promotion import require_horizon_challenger_capacity
 
             require_horizon_challenger_capacity(
@@ -5895,6 +6326,43 @@ class StrategyStore:
                     )
                 )
                 activated_model_artifact_id = str(artifact.id)
+            rehabilitation_receipt: dict[str, Any] | None = None
+            if replay_admission:
+                if replay_gate is None or replay_criteria is None:
+                    raise ValueError("forward-only rehabilitation gate was not frozen")
+                locked_version_value = row_dict(locked_version)
+                locked_version_value["config"] = dict(locked_version.config_json or {})
+                locked_backtest_value = row_dict(locked_backtest)
+                locked_backtest_value["periods"] = dict(
+                    locked_backtest.periods_json or {}
+                )
+                locked_backtest_value["metrics"] = dict(
+                    locked_backtest.metrics_json or {}
+                )
+                rehabilitation_receipt = insert_qualification(
+                    connection,
+                    build_qualification(
+                        connection,
+                        version=locked_version_value,
+                        backtest=locked_backtest_value,
+                        forward_criteria=replay_criteria,
+                        created_by=actor,
+                    ),
+                    created_at=now,
+                )
+                connection.execute(
+                    insert(strategy_forward_gates).values(
+                        strategy_version_id=version_id,
+                        **asdict(replay_gate),
+                        criteria_json=replay_criteria,
+                        criteria_sha256=rehabilitation_canonical_sha256(
+                            replay_criteria
+                        ),
+                        registered_by=actor.strip(),
+                        registered_at=now,
+                        updated_at=now,
+                    )
+                )
             connection.execute(
                 update(strategy_versions)
                 .where(strategy_versions.c.id == version_id)
@@ -5928,6 +6396,17 @@ class StrategyStore:
                         {"model_artifact_id": activated_model_artifact_id}
                         if activated_model_artifact_id is not None
                         else {}
+                    ),
+                    **(
+                        {
+                            "evidence_mode": EVIDENCE_MODE_REPLAY,
+                            "authority": "historical_description_only",
+                            "forward_only_receipt_sha256": rehabilitation_receipt[
+                                "receipt_sha256"
+                            ],
+                        }
+                        if rehabilitation_receipt is not None
+                        else {"evidence_mode": evidence_mode}
                     ),
                 },
             )

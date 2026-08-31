@@ -1124,6 +1124,16 @@ strategy_versions = Table(
     ),
     Column("version", Integer, nullable=False),
     Column("status", String, nullable=False),
+    # Evidence authority is immutable for the lifetime of a StrategyVersion.
+    # Rows created before migration 0088 remain explicitly ambiguous; future
+    # final tests and the narrow consumed-history rehabilitation path must opt
+    # into their authority instead of inheriting it from a default.
+    Column(
+        "evidence_mode",
+        String,
+        nullable=False,
+        server_default="legacy_ambiguous",
+    ),
     Column("strategy_type", String, nullable=False, server_default="multifactor"),
     Column("signal_frequency", String, nullable=False, server_default="day"),
     Column("signal_horizon", String, nullable=False, server_default="1d"),
@@ -1175,6 +1185,11 @@ strategy_versions = Table(
     Column("approval_reason", Text),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("approved_at", DateTime(timezone=True)),
+    CheckConstraint(
+        "evidence_mode IN "
+        "('legacy_ambiguous', 'sealed_final_oos', 'consumed_historical_replay')",
+        name="ck_strategy_versions_evidence_mode",
+    ),
     CheckConstraint(
         "horizon_profile IN "
         "('short_1_5d', 'swing_1_6m', 'long_1_3y', 'legacy_ambiguous')",
@@ -1387,6 +1402,25 @@ strategy_versions = Table(
         "'^sha256:[0-9a-f]{64}$'"
         ") ELSE true END) IS TRUE",
         name="ck_strategy_versions_v17_runtime_identity",
+    ),
+    CheckConstraint(
+        "(CASE WHEN "
+        "COALESCE(config_json ->> 'recipe_version', '') = "
+        "'qlib-rdagent-single-mainline-2026-08-31-v18' AND "
+        "COALESCE(config_json ->> 'recipe_id', '') = "
+        "'short_relative_strength' "
+        "THEN ("
+        "evidence_mode = 'consumed_historical_replay' "
+        "AND config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_runner_sha256' = "
+        "'0000000000000000000000000000000000000000000000000000000000000000' "
+        "AND config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_runtime_bundle_sha256' = "
+        "'0000000000000000000000000000000000000000000000000000000000000000' "
+        "AND config_json -> 'transparent_baseline_bootstrap' ->> "
+        "'target_worker_runtime_image_digest' ~ '^sha256:[0-9a-f]{64}$'"
+        ") ELSE true END) IS TRUE",
+        name="ck_strategy_versions_v18_runtime_identity",
     ),
 )
 Index(
@@ -1603,6 +1637,12 @@ backtest_runs = Table(
     Column("rdagent_version", String),
     Column("rdagent_commit", String),
     Column("status", String, nullable=False),
+    Column(
+        "evidence_mode",
+        String,
+        nullable=False,
+        server_default="legacy_ambiguous",
+    ),
     Column("periods_json", json_type, nullable=False),
     Column("metrics_json", json_type),
     Column("artifact_path", Text),
@@ -1610,11 +1650,248 @@ backtest_runs = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("started_at", DateTime(timezone=True)),
     Column("finished_at", DateTime(timezone=True)),
+    CheckConstraint(
+        "evidence_mode IN "
+        "('legacy_ambiguous', 'sealed_final_oos', 'consumed_historical_replay')",
+        name="ck_backtest_runs_evidence_mode",
+    ),
 )
 Index(
     "idx_backtest_runs_status_created",
     backtest_runs.c.status,
     backtest_runs.c.created_at.desc(),
+)
+
+# A consumed historical replay can never acquire recommendation authority by
+# itself.  This append-only receipt records the one narrow admission that may
+# move an exact transparent public baseline into the existing paper stage.
+# The existing forward gate and simulation ledger remain the only lifecycle
+# and evidence state machines.
+strategy_forward_only_rehabilitations = Table(
+    "strategy_forward_only_rehabilitations",
+    metadata,
+    Column("receipt_sha256", String, primary_key=True),
+    Column(
+        "source_audit_event_id",
+        BigInteger,
+        ForeignKey("quantlab.audit_events.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    ),
+    Column(
+        "source_strategy_version_id",
+        String,
+        ForeignKey("quantlab.strategy_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "source_backtest_id",
+        String,
+        ForeignKey("quantlab.backtest_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "source_job_id",
+        String,
+        ForeignKey("quantlab.jobs.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "source_interruption_recovery_receipt_sha256",
+        String,
+        ForeignKey(
+            "quantlab.formal_backtest_interruption_recoveries.receipt_sha256",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    ),
+    Column("source_interruption_receipt_authority", String, nullable=False),
+    Column("source_lockbox_contract_version", String, nullable=False),
+    Column("source_lockbox_batch_sha256", String, nullable=False),
+    Column("source_lockbox_member_sha256", String, nullable=False),
+    Column("source_history_selection_sha256", String, nullable=False),
+    Column("source_unavailable_horizons_sha256", String, nullable=False),
+    Column("source_unavailable_evidence_sha256s_json", json_type, nullable=False),
+    Column("source_cash_only_scope", String, nullable=False),
+    Column(
+        "strategy_version_id",
+        String,
+        ForeignKey("quantlab.strategy_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    ),
+    Column(
+        "backtest_id",
+        String,
+        ForeignKey("quantlab.backtest_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    ),
+    Column(
+        "consumed_oos_vintage_id",
+        String,
+        ForeignKey("quantlab.oos_vintages.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("contract_version", String, nullable=False),
+    Column("evidence_mode", String, nullable=False),
+    Column("authority", String, nullable=False),
+    Column("recipe_id", String, nullable=False),
+    Column("horizon_profile", String, nullable=False),
+    Column("dataset", String, nullable=False),
+    Column("dataset_identity_sha256", String, nullable=False),
+    Column("dataset_lineage_id", String, nullable=False),
+    Column("strategy_rules_sha256", String, nullable=False),
+    Column("execution_contract_hash", String, nullable=False),
+    Column("runner_sha256", String, nullable=False),
+    Column("runtime_bundle_sha256", String, nullable=False),
+    Column("worker_runtime_image_digest", String, nullable=False),
+    Column("replay_periods_json", json_type, nullable=False),
+    Column("replay_manifest_sha256", String, nullable=False),
+    Column("replay_result_sha256", String, nullable=False),
+    Column("replay_artifact_manifest_sha256", String, nullable=False),
+    Column("replay_daily_returns_sha256", String, nullable=False),
+    Column("strategy_trial_count", Integer, nullable=False),
+    Column("trial_count_audit_sha256", String, nullable=False),
+    Column("incomplete_family_eligibility_sha256", String, nullable=False),
+    Column("forward_criteria_json", json_type, nullable=False),
+    Column("forward_criteria_sha256", String, nullable=False),
+    Column("qualification_json", json_type, nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "contract_version = 'forward-only-rehabilitation-v1' "
+        "AND evidence_mode = 'consumed_historical_replay' "
+        "AND authority = 'historical_description_only' "
+        "AND source_interruption_receipt_authority = "
+        "'interruption_identity_only_not_pre_result' "
+        "AND source_lockbox_contract_version = "
+        "'transparent-baseline-available-horizons-lockbox-v3' "
+        "AND source_cash_only_scope = 'cash_only_projection_only' "
+        "AND strategy_version_id <> source_strategy_version_id "
+        "AND backtest_id <> source_backtest_id "
+        "AND strategy_trial_count > 1",
+        name="ck_forward_only_rehabilitation_authority",
+    ),
+    CheckConstraint(
+        "receipt_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND source_interruption_recovery_receipt_sha256 = "
+        "'6345c455862d8bb587e12f8ce0be7c1da291f2dde82fbdbb31e954bb88b9d3df' "
+        "AND source_lockbox_batch_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND source_lockbox_member_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND source_history_selection_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND source_unavailable_horizons_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND dataset_identity_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND dataset_lineage_id ~ '^[0-9a-f]{64}$' "
+        "AND strategy_rules_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND execution_contract_hash ~ '^[0-9a-f]{64}$' "
+        "AND runner_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND runtime_bundle_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND worker_runtime_image_digest ~ '^sha256:[0-9a-f]{64}$' "
+        "AND replay_manifest_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND replay_result_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND replay_artifact_manifest_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND replay_daily_returns_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND trial_count_audit_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND incomplete_family_eligibility_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND forward_criteria_sha256 ~ '^[0-9a-f]{64}$'",
+        name="ck_forward_only_rehabilitation_hashes",
+    ),
+    CheckConstraint(
+        "(jsonb_typeof(replay_periods_json) = 'object' "
+        "AND replay_periods_json ?& ARRAY['start','end','historical_start','historical_end'] "
+        "AND jsonb_typeof(forward_criteria_json) = 'object' "
+        "AND (forward_criteria_json -> 'thresholds' ->> "
+        "'min_forward_calendar_days')::integer >= 365 "
+        "AND (forward_criteria_json -> 'thresholds' ->> "
+        "'min_forward_trading_days')::integer >= 252 "
+        "AND jsonb_typeof(qualification_json) = 'object' "
+        "AND jsonb_typeof(source_unavailable_evidence_sha256s_json) = 'object' "
+        "AND source_unavailable_evidence_sha256s_json ?& "
+        "ARRAY['swing_1_6m','long_1_3y'] "
+        "AND jsonb_object_length(source_unavailable_evidence_sha256s_json) = 2 "
+        "AND qualification_json -> 'historical_replay_opened' = 'true'::jsonb "
+        "AND qualification_json -> 'final_oos_opened' = 'true'::jsonb "
+        "AND qualification_json -> 'capital_eligible' = 'false'::jsonb "
+        "AND qualification_json -> 'consumed_oos_replayed' = 'true'::jsonb "
+        "AND qualification_json -> 'sealed_final_oos' = 'false'::jsonb "
+        "AND qualification_json -> 'unseen_oos' = 'false'::jsonb "
+        "AND qualification_json ->> 'authority' = 'historical_description_only' "
+        "AND qualification_json ->> 'receipt_sha256' = receipt_sha256) IS TRUE",
+        name="ck_forward_only_rehabilitation_evidence",
+    ),
+)
+Index(
+    "idx_forward_only_rehabilitations_created",
+    strategy_forward_only_rehabilitations.c.created_at.desc(),
+)
+
+# This pre-run receipt is intentionally narrower than the rehabilitation
+# admission above. It only authorizes the conservative Bonferroni calculation
+# for one frozen, historically incomplete factor family. It grants no strategy
+# or capital status and cannot be reused by another StrategyVersion.
+strategy_incomplete_family_eligibilities = Table(
+    "strategy_incomplete_family_eligibilities",
+    metadata,
+    Column("receipt_sha256", String, primary_key=True),
+    Column(
+        "strategy_version_id",
+        String,
+        ForeignKey("quantlab.strategy_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    ),
+    Column("contract_version", String, nullable=False),
+    Column("evidence_mode", String, nullable=False),
+    Column("authority", String, nullable=False),
+    Column(
+        "source_strategy_version_id",
+        String,
+        ForeignKey("quantlab.strategy_versions.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "source_backtest_id",
+        String,
+        ForeignKey("quantlab.backtest_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "source_job_id",
+        String,
+        ForeignKey("quantlab.jobs.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("economic_hypothesis_group", String, nullable=False),
+    Column("eligible_strategy_version_ids_json", json_type, nullable=False),
+    Column("strategy_trial_count", Integer, nullable=False),
+    Column("trial_count_audit_json", json_type, nullable=False),
+    Column("trial_count_audit_sha256", String, nullable=False),
+    Column("missing_artifacts_json", json_type, nullable=False),
+    Column("cutoff_at", DateTime(timezone=True), nullable=False),
+    Column("qualification_json", json_type, nullable=False),
+    Column("created_by", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "(contract_version = 'incomplete-factor-family-eligibility-v1' "
+        "AND evidence_mode = 'consumed_historical_replay' "
+        "AND authority = 'conservative_bonferroni_only' "
+        "AND strategy_trial_count > 1 "
+        "AND receipt_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND trial_count_audit_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND jsonb_typeof(eligible_strategy_version_ids_json) = 'array' "
+        "AND jsonb_array_length(eligible_strategy_version_ids_json) > 1 "
+        "AND jsonb_typeof(trial_count_audit_json) = 'object' "
+        "AND jsonb_typeof(missing_artifacts_json) = 'array' "
+        "AND jsonb_array_length(missing_artifacts_json) >= 3 "
+        "AND qualification_json ->> 'receipt_sha256' = receipt_sha256) IS TRUE",
+        name="ck_incomplete_family_eligibility_authority",
+    ),
+)
+Index(
+    "idx_incomplete_family_eligibilities_created",
+    strategy_incomplete_family_eligibilities.c.created_at.desc(),
 )
 
 # A formal final-OOS backtest normally has exactly one process execution.  The

@@ -66,6 +66,13 @@ from quant_platform.cost_model import (
     COST_SCHEDULE_VERSION,
     CostModelConfig,
 )
+from quant_platform.forward_only_rehabilitation import (
+    EVIDENCE_MODE_REPLAY,
+    require_qualification,
+)
+from quant_platform.forward_only_rehabilitation import (
+    canonical_sha256 as rehabilitation_canonical_sha256,
+)
 from quant_platform.research_horizon import (
     LEGACY_AMBIGUOUS,
     LONG_1_3Y,
@@ -822,6 +829,34 @@ def _require_forward_gate_criteria(version: Any, gate: Any) -> dict[str, Any]:
     return expected
 
 
+def _require_forward_only_qualification(
+    connection: Any,
+    *,
+    version: Any,
+    gate: Any | None = None,
+    backtest: Any | None = None,
+) -> dict[str, Any] | None:
+    if str(getattr(version, "evidence_mode", "legacy_ambiguous")) != EVIDENCE_MODE_REPLAY:
+        return None
+    qualification = require_qualification(
+        connection,
+        version=version,
+        backtest=backtest,
+    )
+    if gate is not None and (
+        dict(gate.criteria_json or {})
+        != dict(qualification["forward_criteria_json"] or {})
+        or str(gate.criteria_sha256 or "")
+        != str(qualification["forward_criteria_sha256"] or "")
+        or rehabilitation_canonical_sha256(dict(gate.criteria_json or {}))
+        != str(gate.criteria_sha256 or "")
+    ):
+        raise ValueError(
+            "forward-only rehabilitation gate differs from its immutable qualification"
+        )
+    return qualification
+
+
 class PromotionStore:
     """Paper stage lifecycle and forward evidence gate evaluation."""
 
@@ -892,6 +927,15 @@ class PromotionStore:
                     strategy_forward_gates.c.strategy_version_id == version_id
                 )
             ).first()
+            qualification = _require_forward_only_qualification(
+                connection,
+                version=version,
+                gate=existing,
+            )
+            if qualification is not None and existing is None:
+                raise ValueError(
+                    "forward-only rehabilitation gate is created atomically at admission"
+                )
             if existing is not None:
                 immutable_values = {
                     key: values[key]
@@ -988,6 +1032,11 @@ class PromotionStore:
                     "paper stage requires a pre-registered immutable forward gate"
                 )
             _require_forward_gate_criteria(version, gate)
+            _require_forward_only_qualification(
+                connection,
+                version=version,
+                gate=gate,
+            )
             existing = connection.execute(
                 select(strategy_promotion_stages)
                 .where(
@@ -1068,7 +1117,7 @@ class PromotionStore:
                 version_id=version_id,
             )
             existing_gate = connection.execute(
-                select(strategy_forward_gates.c.strategy_version_id).where(
+                select(strategy_forward_gates).where(
                     strategy_forward_gates.c.strategy_version_id == version_id
                 )
             ).first()
@@ -1078,6 +1127,10 @@ class PromotionStore:
                 .limit(1)
             ).first()
             if existing_gate is None:
+                if str(version.evidence_mode) == EVIDENCE_MODE_REPLAY:
+                    raise ValueError(
+                        "forward-only rehabilitation is missing its atomic qualified gate"
+                    )
                 if existing_stage is not None:
                     raise ValueError(
                         "a paper stage exists without a pre-registered forward gate"
@@ -1097,6 +1150,12 @@ class PromotionStore:
                         registered_at=now,
                         updated_at=now,
                     )
+                )
+            else:
+                _require_forward_only_qualification(
+                    connection,
+                    version=version,
+                    gate=existing_gate,
                 )
         return self.open_paper_stage(version_id, actor=actor)
 
@@ -1478,6 +1537,11 @@ class PromotionStore:
                 return _insufficient(["forward evidence gate is not pre-registered"])
             try:
                 criteria = _require_forward_gate_criteria(version, gate)
+                _require_forward_only_qualification(
+                    connection,
+                    version=version,
+                    gate=gate,
+                )
             except ValueError as exc:
                 return _insufficient([str(exc)])
             stage = connection.execute(
@@ -1576,6 +1640,12 @@ class PromotionStore:
                 "max",
             ),
         }
+        if int(gate.min_forward_calendar_days) > 0:
+            checks["forward_calendar_days"] = (
+                evidence["forward_calendar_days"],
+                int(gate.min_forward_calendar_days),
+                "min",
+            )
         profile = str(version.horizon_profile)
         if profile == LEGACY_AMBIGUOUS:
             checks.update(
@@ -1712,6 +1782,18 @@ class PromotionStore:
                 raise KeyError(version_id)
             if str(version.status) != "approved" or version.promotion_stage != STAGE_PAPER:
                 raise ValueError("only a paper-stage approved version can be promoted")
+            promotion_gate = connection.execute(
+                select(strategy_forward_gates).where(
+                    strategy_forward_gates.c.strategy_version_id == version_id
+                )
+            ).first()
+            if promotion_gate is None:
+                raise ValueError("promotion requires an immutable forward gate")
+            _require_forward_only_qualification(
+                connection,
+                version=version,
+                gate=promotion_gate,
+            )
             version_config = dict(version.config_json or {})
             if str(
                 version.source_research_artifact_id

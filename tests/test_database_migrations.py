@@ -75,6 +75,8 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
         "research_sota_versions",
         "research_sota_members",
         "oos_vintages",
+        "strategy_forward_only_rehabilitations",
+        "strategy_incomplete_family_eligibilities",
         "transparent_baseline_pre_result_repairs",
         "formal_backtest_interruption_recoveries",
         "autopilot_cycles",
@@ -200,7 +202,7 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
                 "AND NOT tgisinternal"
             )
         ).scalar_one()
-    assert revision == "0087_recovery_recipe_path"
+    assert revision == "0088_forward_only_rehab"
     assert (
         "source_version.config_json -> 'transparent_baseline_bootstrap' ->> "
         "'recipe_sha256'"
@@ -276,6 +278,39 @@ def test_database_is_at_versioned_control_plane_schema(database_url: str) -> Non
             "strategy_versions", schema="quantlab"
         )
     }
+    assert "ck_strategy_versions_v18_runtime_identity" in {
+        constraint["name"]
+        for constraint in inspector.get_check_constraints(
+            "strategy_versions", schema="quantlab"
+        )
+    }
+    assert "evidence_mode" in {
+        column["name"]
+        for column in inspector.get_columns("strategy_versions", schema="quantlab")
+    }
+    assert "evidence_mode" in {
+        column["name"]
+        for column in inspector.get_columns("backtest_runs", schema="quantlab")
+    }
+    rehabilitation_checks = {
+        constraint["name"]: str(constraint["sqltext"])
+        for constraint in inspector.get_check_constraints(
+            "strategy_forward_only_rehabilitations", schema="quantlab"
+        )
+    }
+    replay_truth_check = rehabilitation_checks[
+        "ck_forward_only_rehabilitation_evidence"
+    ].lower()
+    assert "final_oos_opened" in replay_truth_check
+    assert "capital_eligible" in replay_truth_check
+    assert "is true" in replay_truth_check
+    for table in ("strategy_versions", "backtest_runs"):
+        evidence_column = next(
+            column
+            for column in inspector.get_columns(table, schema="quantlab")
+            if column["name"] == "evidence_mode"
+        )
+        assert "legacy_ambiguous" in str(evidence_column["default"])
     assert "capital_oos_alpha_batch_id" in {
         column["name"]
         for column in inspector.get_columns("oos_vintages", schema="quantlab")

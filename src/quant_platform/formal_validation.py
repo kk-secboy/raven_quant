@@ -428,6 +428,7 @@ def build_factor_score_incomplete_family_multiple_testing(
     paired_bootstrap: Mapping[str, Any],
     trial_count: int,
     trial_count_audit_sha256: str,
+    eligibility_receipt_sha256: str,
 ) -> dict[str, Any]:
     """Build the conservative factor-family alternative when old returns are absent.
 
@@ -442,6 +443,10 @@ def build_factor_score_incomplete_family_multiple_testing(
     audit_sha256 = _require_sha256(
         trial_count_audit_sha256,
         label="trial_count_audit_sha256",
+    )
+    eligibility_sha256 = _require_sha256(
+        eligibility_receipt_sha256,
+        label="eligibility_receipt_sha256",
     )
     if paired_bootstrap.get("status") != "ok":
         raise ValueError("paired bootstrap must be complete before Bonferroni")
@@ -461,6 +466,7 @@ def build_factor_score_incomplete_family_multiple_testing(
         "trial_count": count,
         "available_candidate_return_series": 1,
         "trial_count_audit_sha256": audit_sha256,
+        "eligibility_receipt_sha256": eligibility_sha256,
         "p_value_source": "paired_moving_block_bootstrap",
         "raw_one_sided_p_value": raw_p_value,
         "bonferroni_adjusted_p_value": adjusted_p_value,
@@ -483,6 +489,7 @@ def validate_factor_score_incomplete_family_multiple_testing(
     paired_bootstrap: Mapping[str, Any],
     trial_count: int,
     trial_count_audit_sha256: str,
+    eligibility_receipt_sha256: str,
 ) -> dict[str, Any]:
     """Rebuild and exactly validate conservative incomplete-family evidence."""
 
@@ -492,6 +499,7 @@ def validate_factor_score_incomplete_family_multiple_testing(
         paired_bootstrap=paired_bootstrap,
         trial_count=trial_count,
         trial_count_audit_sha256=trial_count_audit_sha256,
+        eligibility_receipt_sha256=eligibility_receipt_sha256,
     )
     if dict(value) != expected:
         raise ValueError("incomplete-family Bonferroni evidence is not canonical")
@@ -503,6 +511,7 @@ def build_factor_score_incomplete_family_dsr(
     blocked_dsr: Mapping[str, Any],
     trial_count: int,
     trial_count_audit_sha256: str,
+    eligibility_receipt_sha256: str,
 ) -> dict[str, Any]:
     """Record unavailable DSR inputs without converting them into a pass."""
 
@@ -512,6 +521,10 @@ def build_factor_score_incomplete_family_dsr(
     audit_sha256 = _require_sha256(
         trial_count_audit_sha256,
         label="trial_count_audit_sha256",
+    )
+    eligibility_sha256 = _require_sha256(
+        eligibility_receipt_sha256,
+        label="eligibility_receipt_sha256",
     )
     if (
         blocked_dsr.get("status") != "blocked_missing_trial_sharpe_distribution"
@@ -531,6 +544,7 @@ def build_factor_score_incomplete_family_dsr(
             FACTOR_SCORE_INCOMPLETE_FAMILY_DSR_VERSION
         ),
         "trial_count_audit_sha256": audit_sha256,
+        "eligibility_receipt_sha256": eligibility_sha256,
         "trial_sharpes_available": False,
         "reason": "complete historical trial Sharpe distribution is unavailable",
     }
@@ -542,6 +556,7 @@ def validate_factor_score_incomplete_family_dsr(
     *,
     trial_count: int,
     trial_count_audit_sha256: str,
+    eligibility_receipt_sha256: str,
 ) -> dict[str, Any]:
     """Validate an explicitly not-computable DSR record and its audit binding."""
 
@@ -551,6 +566,10 @@ def validate_factor_score_incomplete_family_dsr(
     audit_sha256 = _require_sha256(
         trial_count_audit_sha256,
         label="trial_count_audit_sha256",
+    )
+    eligibility_sha256 = _require_sha256(
+        eligibility_receipt_sha256,
+        label="eligibility_receipt_sha256",
     )
     payload = dict(value)
     evidence_sha256 = payload.pop("evidence_sha256", None)
@@ -569,6 +588,7 @@ def validate_factor_score_incomplete_family_dsr(
         or payload.get("expected_maximum_daily_sharpe") is not None
         or payload.get("trial_sharpe_std") is not None
         or payload.get("trial_count_audit_sha256") != audit_sha256
+        or payload.get("eligibility_receipt_sha256") != eligibility_sha256
         or payload.get("trial_sharpes_available") is not False
         or payload.get("reason")
         != "complete historical trial Sharpe distribution is unavailable"

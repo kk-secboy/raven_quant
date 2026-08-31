@@ -656,6 +656,8 @@ def _validated_rehabilitation_cash_only_horizon_lanes(
         or config.get("evidence_mode") != _CONSUMED_HISTORICAL_REPLAY
         or qualification.get("historical_replay_opened") is not True
         or qualification.get("consumed_oos_replayed") is not True
+        or qualification.get("final_oos_opened") is not True
+        or qualification.get("capital_eligible") is not False
         or qualification.get("sealed_final_oos") is not False
         or qualification.get("unseen_oos") is not False
         or qualification.get("authority") != _HISTORICAL_DESCRIPTION_ONLY
