@@ -44,6 +44,12 @@ V18_RUNTIME_BUNDLE_SHA256 = (
 )
 
 
+def _execute_raw_ddl(statement: str) -> None:
+    """Execute PL/pgSQL DDL without rewriting literal ``%ROWTYPE`` tokens."""
+
+    op.get_bind().execution_options(no_parameters=True).exec_driver_sql(statement)
+
+
 def upgrade() -> None:
     for table in ("strategy_versions", "backtest_runs"):
         op.add_column(
@@ -312,7 +318,7 @@ def upgrade() -> None:
         schema=SCHEMA,
     )
 
-    op.execute(
+    _execute_raw_ddl(
         f"""
         CREATE OR REPLACE FUNCTION quantlab.validate_forward_only_rehabilitation()
         RETURNS trigger AS $$
@@ -628,7 +634,7 @@ def upgrade() -> None:
         FOR EACH STATEMENT EXECUTE FUNCTION quantlab.guard_forward_only_rehabilitation();
         """
     )
-    op.execute(
+    _execute_raw_ddl(
         f"""
         CREATE OR REPLACE FUNCTION quantlab.validate_incomplete_family_eligibility()
         RETURNS trigger AS $$

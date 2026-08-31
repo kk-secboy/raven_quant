@@ -138,6 +138,26 @@ def test_rehabilitation_jsonb_checks_use_supported_exact_key_operators() -> None
     assert "'{{}}'::jsonb" in migration_source
 
 
+def test_0088_rowtype_functions_bypass_sqlalchemy_percent_rewriting() -> None:
+    source = _MIGRATION_PATH.read_text(encoding="utf-8")
+
+    assert "%%ROWTYPE" not in source
+    assert sum(
+        line.strip().endswith("%ROWTYPE;") for line in source.splitlines()
+    ) == 11
+    assert "execution_options(no_parameters=True).exec_driver_sql(statement)" in source
+    assert (
+        '_execute_raw_ddl(\n        f"""\n'
+        "        CREATE OR REPLACE FUNCTION quantlab.validate_forward_only_rehabilitation()"
+        in source
+    )
+    assert (
+        '_execute_raw_ddl(\n        f"""\n'
+        "        CREATE OR REPLACE FUNCTION quantlab.validate_incomplete_family_eligibility()"
+        in source
+    )
+
+
 def test_0088_triggers_bind_family_runtime_periods_criteria_and_artifacts() -> None:
     source = _MIGRATION_PATH.read_text(encoding="utf-8")
 
