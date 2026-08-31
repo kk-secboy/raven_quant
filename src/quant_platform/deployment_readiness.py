@@ -551,6 +551,39 @@ def _validated_cash_only_horizon_lanes(
     return lanes
 
 
+def _project_three_horizon_production(
+    candidates: Mapping[str, list[dict[str, Any]]],
+    cash_only_lanes: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Merge real production lanes with sealed, intentionally empty sleeves."""
+
+    lanes = {
+        horizon: _assess_horizon_candidates(horizon, candidates.get(horizon, []))
+        for horizon in _PRODUCT_HORIZONS
+    }
+    applied_cash_only_horizons: list[str] = []
+    for horizon in _PRODUCT_HORIZONS:
+        cash_lane = cash_only_lanes.get(horizon)
+        if cash_lane is not None and lanes[horizon]["status"] != "ok":
+            lanes[horizon] = dict(cash_lane)
+            applied_cash_only_horizons.append(horizon)
+    missing_or_blocked = [
+        horizon for horizon, lane in lanes.items() if lane["status"] != "ok"
+    ]
+    return {
+        "status": "ok" if not missing_or_blocked else "blocked",
+        "message": (
+            "all product horizons have an operable or sealed cash-only lane"
+            if not missing_or_blocked
+            else "one or more product horizons have no operable or sealed cash-only lane"
+        ),
+        "required_horizons": list(_PRODUCT_HORIZONS),
+        "blocked_horizons": missing_or_blocked,
+        "cash_only_horizons": applied_cash_only_horizons,
+        "horizons": lanes,
+    }
+
+
 def _is_governed_incremental_sync(row: Any) -> bool:
     payload = row.payload_json
     if not isinstance(payload, dict):
@@ -1070,31 +1103,8 @@ class DeploymentReadinessStore:
                         ),
                     }
                 )
-        lanes = {
-            horizon: _assess_horizon_candidates(horizon, candidates[horizon])
-            for horizon in _PRODUCT_HORIZONS
-        }
         cash_only_lanes = _validated_cash_only_horizon_lanes(lockbox_rows)
-        applied_cash_only_horizons: list[str] = []
-        for horizon, cash_lane in cash_only_lanes.items():
-            if horizon in lanes and lanes[horizon]["status"] != "ok":
-                lanes[horizon] = cash_lane
-                applied_cash_only_horizons.append(horizon)
-        missing_or_blocked = [
-            horizon for horizon, lane in lanes.items() if lane["status"] != "ok"
-        ]
-        return {
-            "status": "ok" if not missing_or_blocked else "blocked",
-            "message": (
-                "all product horizons have an operable or sealed cash-only lane"
-                if not missing_or_blocked
-                else "one or more product horizons have no operable or sealed cash-only lane"
-            ),
-            "required_horizons": list(_PRODUCT_HORIZONS),
-            "blocked_horizons": missing_or_blocked,
-            "cash_only_horizons": sorted(applied_cash_only_horizons),
-            "horizons": lanes,
-        }
+        return _project_three_horizon_production(candidates, cash_only_lanes)
 
     def _recommendation_checks(self) -> list[dict[str, Any]]:
         with self.engine.connect() as connection:

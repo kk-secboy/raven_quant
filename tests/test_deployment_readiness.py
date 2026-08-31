@@ -221,7 +221,7 @@ def test_horizon_readiness_requires_fresh_health_for_paper_and_recommendation() 
 
 
 def _cash_only_lockbox_rows() -> tuple[list[dict], dict]:
-    recipe_ids = ("short_relative_strength", "swing_trend")
+    recipe_ids = ("short_relative_strength",)
     members: list[dict[str, str]] = []
     for recipe_id in recipe_ids:
         recipe = get_strategy_recipe(recipe_id)
@@ -259,27 +259,32 @@ def _cash_only_lockbox_rows() -> tuple[list[dict], dict]:
         current_recipe_version=version,
         prior_batches=[],
     )
-    evidence = {
-        "capital_evaluation_eligible": False,
-        "capital_evaluation_unavailable_reason": (
-            "insufficient_unopened_sessions_for_sealed_long_oos"
-        ),
-    }
-    unavailable = {
-        "recipe_id": "long_quality_value",
-        "horizon_profile": "long_1_3y",
-        "status": "unavailable",
-        "reason": "the sealed long OOS window is unavailable",
-        "evidence": evidence,
-        "evidence_sha256": readiness_module.canonical_sha256(evidence),
-    }
+    unavailable_horizons = []
+    for recipe_id in ("swing_trend", "long_quality_value"):
+        recipe = get_strategy_recipe(recipe_id)
+        evidence = {
+            "capital_evaluation_eligible": False,
+            "capital_evaluation_unavailable_reason": (
+                "insufficient_native_execution_controlled_sessions_before_immutable_cutoff"
+            ),
+        }
+        unavailable_horizons.append(
+            {
+                "recipe_id": recipe_id,
+                "horizon_profile": str(recipe["horizon"]),
+                "status": "unavailable",
+                "reason": "the sealed OOS window is unavailable",
+                "evidence": evidence,
+                "evidence_sha256": readiness_module.canonical_sha256(evidence),
+            }
+        )
     lockbox = build_joint_lockbox(
         dataset="daily-v12",
         dataset_identity_sha256="a" * 64,
         dataset_lineage_id="b" * 64,
         members=members,
         unopened_history_selection=selection,
-        unavailable_horizons=[unavailable],
+        unavailable_horizons=unavailable_horizons,
     )
     rows = [
         {
@@ -303,7 +308,7 @@ def test_readiness_accepts_only_sealed_unavailable_horizon_as_cash_only() -> Non
 
     lanes = readiness_module._validated_cash_only_horizon_lanes(rows)
 
-    assert set(lanes) == {"long_1_3y"}
+    assert set(lanes) == {"swing_1_6m", "long_1_3y"}
     long_lane = lanes["long_1_3y"]
     assert long_lane["status"] == "ok"
     assert long_lane["stage"] == "cash_only"
@@ -311,6 +316,62 @@ def test_readiness_accepts_only_sealed_unavailable_horizon_as_cash_only() -> Non
     assert long_lane["new_entries_allowed"] is False
     assert long_lane["recommendation_eligible"] is False
     assert long_lane["lockbox_evidence"]["batch_sha256"] == lockbox["batch_sha256"]
+
+
+@pytest.mark.no_database
+def test_three_horizon_readiness_accepts_short_paper_and_sealed_cash_sleeves() -> None:
+    rows, lockbox = _cash_only_lockbox_rows()
+    assert lockbox["contract_version"] == readiness_module.LOCKBOX_CONTRACT_VERSION_V3
+    cash_only_lanes = readiness_module._validated_cash_only_horizon_lanes(rows)
+    short_paper = {
+        "strategy_version_id": "v18-short-paper",
+        "promotion_stage": "paper",
+        "signal_frequency": "day",
+        "execution_frequency": "day",
+        "contract_ready": True,
+        "health_status": "healthy",
+        "health_evidence_ready": True,
+        "health_evidence_reasons": [],
+        "paper_stage_status": "active",
+        "simulation_status": "active",
+        "active_recommendation_portfolios": 0,
+    }
+
+    result = readiness_module._project_three_horizon_production(
+        {
+            "short_1_5d": [short_paper],
+            "swing_1_6m": [],
+            "long_1_3y": [],
+        },
+        cash_only_lanes,
+    )
+
+    assert result["status"] == "ok"
+    assert result["blocked_horizons"] == []
+    assert result["cash_only_horizons"] == ["swing_1_6m", "long_1_3y"]
+    assert result["horizons"]["short_1_5d"]["strategy_version_id"] == (
+        "v18-short-paper"
+    )
+    for horizon in result["cash_only_horizons"]:
+        lane = result["horizons"][horizon]
+        assert lane["stage"] == "cash_only"
+        assert lane["strategy_version_id"] is None
+        assert lane["new_entries_allowed"] is False
+        assert lane["recommendation_eligible"] is False
+        assert "simulation_portfolio_id" not in lane
+
+    short_paper["simulation_status"] = "stopped"
+    blocked = readiness_module._project_three_horizon_production(
+        {
+            "short_1_5d": [short_paper],
+            "swing_1_6m": [],
+            "long_1_3y": [],
+        },
+        cash_only_lanes,
+    )
+    assert blocked["status"] == "blocked"
+    assert blocked["blocked_horizons"] == ["short_1_5d"]
+    assert blocked["cash_only_horizons"] == ["swing_1_6m", "long_1_3y"]
 
 
 @pytest.mark.no_database
