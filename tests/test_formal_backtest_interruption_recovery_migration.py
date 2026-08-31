@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql.psycopg import PGDialect_psycopg
+from psycopg._queries import PostgresQuery
+from psycopg.adapt import Transformer
 
 from quant_data.database import formal_backtest_interruption_recoveries
 from quant_platform import formal_backtest_interruption_recovery as recovery
@@ -129,6 +129,8 @@ class _FunctionDefinitionBind:
             self.definition = sql
 
     def exec_driver_sql(self, statement: str) -> None:
+        if "validate_formal_backtest_interruption_recovery" in statement:
+            assert self.execution_option_calls[-1] == {"no_parameters": True}
         self.ddl.append(statement)
         self.definition = statement
 
@@ -157,7 +159,8 @@ def test_0087_upgrade_replaces_only_the_deployed_recipe_digest_path() -> None:
         "source_version quantlab.strategy_versions%ROWTYPE;\n"
         "source_audit quantlab.audit_events%ROWTYPE;\n"
         "BEGIN\n"
-        "            IF NOT ((NEW.verification_json = '{}'::jsonb) IS TRUE) THEN\n"
+        "            IF NOT ((NEW.verification_json = "
+        "'{\"enabled\":true,\"zero\":0}'::jsonb) IS TRUE) THEN\n"
         "                RAISE EXCEPTION 'invalid';\n"
         "            END IF;\n"
         f"            IF {migration._TOP_LEVEL_RECIPE_BINDING} THEN\n"
@@ -173,11 +176,11 @@ def test_0087_upgrade_replaces_only_the_deployed_recipe_digest_path() -> None:
     validator_ddl, guard_ddl, drop_trigger_ddl, create_trigger_ddl = bind.ddl
     assert validator_ddl.count("%ROWTYPE") == 4
     assert bind.execution_option_calls == [{"no_parameters": True}]
-    assert '{"end":"2019-11-20"' in validator_ddl
-    compiled = sa.text(validator_ddl).compile(dialect=PGDialect_psycopg())
-    compiled_sql = str(compiled)
-    assert compiled_sql.count("%%ROWTYPE") == 4
-    assert compiled.params == {}
+    assert '":true' in validator_ddl
+    assert '":0' in validator_ddl
+    psycopg_query = PostgresQuery(Transformer())
+    psycopg_query.convert(validator_ddl, None)
+    assert bytes(psycopg_query.query).decode() == validator_ddl
     assert migration._BOOTSTRAP_RECIPE_BINDING in validator_ddl
     assert migration._TOP_LEVEL_RECIPE_BINDING not in validator_ddl
     assert migration._LOCKED_VALIDATOR_BEGIN in validator_ddl
