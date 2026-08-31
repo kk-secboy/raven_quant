@@ -48,6 +48,10 @@ def test_strategy_versions_share_hypothesis_trial_count_and_cap(
     assert first_evidence["strategy_version_ids"] == sorted(
         [first_id, second["id"]]
     )
+    assert first_evidence["trial_count_audit"]["strategy_version_count"] == 2
+    assert first_evidence["trial_count_audit"]["strategy_trial_count"] == 2
+    assert len(first_evidence["trial_count_audit"]["strategy_trial_components"]) == 2
+    assert first_evidence["trial_count_audit"]["accepted_pre_result_repair_links"] == []
 
 
 def test_only_v2_qlib_policy_backtest_can_be_approved(tmp_path: Path, database_url: str) -> None:

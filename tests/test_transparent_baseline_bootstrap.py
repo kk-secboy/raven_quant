@@ -1610,6 +1610,18 @@ def test_preregistered_pre_result_repair_opens_one_append_only_target_batch(
     )
     lockboxes = TransparentBaselineLockboxStore(database_url)
 
+    # An audit event by itself is not enough to reduce the trial count. Only
+    # the lockbox's validated append-only registry row may classify a version
+    # as the same pre-result implementation trial.
+    before_registration = store.hypothesis_group_evidence(target_versions[0]["id"])
+    assert before_registration["shared_experiment_count"] == 2
+    assert (
+        before_registration["trial_count_audit"][
+            "accepted_pre_result_repair_links"
+        ]
+        == []
+    )
+
     reserved = lockboxes.reserve(
         versions=target_versions,
         dataset="target-daily",
@@ -1654,6 +1666,29 @@ def test_preregistered_pre_result_repair_opens_one_append_only_target_batch(
         for row in vintages
         if str(row.dataset_lineage_id) == "e" * 64
     )
+
+    # The target is a new immutable implementation version, but the exact
+    # append-only pre-result receipt proves that it is not a second statistical
+    # strategy trial. Physical history remains visible in the audit payload.
+    trial_evidence = store.hypothesis_group_evidence(target_versions[0]["id"])
+    trial_audit = trial_evidence["trial_count_audit"]
+    assert trial_evidence["shared_experiment_count"] == 1
+    assert trial_audit["strategy_version_count"] == 2
+    assert trial_audit["strategy_trial_count"] == 1
+    assert len(trial_audit["strategy_trial_components"]) == 1
+    assert len(trial_audit["accepted_pre_result_repair_links"]) == 1
+    assert trial_audit["accepted_pre_result_repair_links"][0] == {
+        "classification": "pre_result_implementation_repair",
+        "receipt_sha256": str(registry_rows[0].receipt_sha256),
+        "repair_source_backtest_ids": sorted(
+            item["backtest_id"] for item in source_members
+        ),
+        "source_backtest_ids": [source_members[0]["backtest_id"]],
+        "source_strategy_version_ids": [source_members[0]["strategy_version_id"]],
+        "target_strategy_version_ids": [str(target_versions[0]["id"])],
+        "performance_information_used": False,
+    }
+    assert trial_audit["rejected_pre_result_repair_receipts"] == []
 
     with pytest.raises(DBAPIError, match="append-only"):
         with engine.begin() as connection:

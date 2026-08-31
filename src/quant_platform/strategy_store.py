@@ -14,6 +14,7 @@ from sqlalchemy import func, insert, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 from quant_data.database import (
+    audit_events,
     backtest_runs,
     capital_oos_alpha_batches,
     capital_oos_alpha_families,
@@ -143,6 +144,7 @@ from quant_platform.strategy_rule_compiler import (
     validate_compiled_strategy_artifact,
     validate_strategy_rule_binding,
 )
+from quant_platform.strategy_trial_lineage import build_strategy_trial_lineage
 from quant_platform.transparent_baseline_lockbox import (
     baseline_oos_sealed_member_set,
     validate_lockbox_link,
@@ -3408,8 +3410,12 @@ class StrategyStore:
         """Return the immutable family-wide trial count used by formal gates.
 
         Factor experiment families carry their declared count (including
-        non-winning variants); multiple versions/model wrappers also count as
-        trials.  Renaming or versioning therefore cannot reset DSR/PBO inputs.
+        non-winning variants). Ordinary versions/model wrappers count as new
+        trials. A version may share its predecessor's statistical trial only
+        through an append-only, validated pre-result implementation-repair
+        receipt which proves that no performance information was used.
+        Renaming, failing, or versioning alone can therefore never reset
+        DSR/PBO inputs.
         """
 
         version = self.get_version(version_id)
@@ -3423,6 +3429,45 @@ class StrategyStore:
                     strategy_versions.c.is_legacy.is_(False),
                 )
             ).all()
+            version_ids = {str(row.id) for row in version_rows}
+            version_configs = {
+                str(row.id): dict(row.config_json or {}) for row in version_rows
+            }
+            repair_rows = connection.execute(
+                select(transparent_baseline_pre_result_repairs)
+            ).all()
+            repair_source_backtest_ids = {
+                str(item)
+                for row in repair_rows
+                for item in list(row.source_backtest_ids_json or [])
+            }
+            backtest_rows = connection.execute(
+                select(
+                    backtest_runs.c.id,
+                    backtest_runs.c.strategy_version_id,
+                ).where(
+                    or_(
+                        backtest_runs.c.strategy_version_id.in_(version_ids),
+                        backtest_runs.c.id.in_(repair_source_backtest_ids),
+                    )
+                )
+            ).all()
+            backtests_by_id = {str(row.id): row for row in backtest_rows}
+            repair_audit_ids = {
+                int(row.source_audit_event_id) for row in repair_rows
+            }
+            repair_audits = {
+                int(row.id): row
+                for row in (
+                    connection.execute(
+                        select(audit_events).where(
+                            audit_events.c.id.in_(repair_audit_ids)
+                        )
+                    ).all()
+                    if repair_audit_ids
+                    else []
+                )
+            }
             factor_rows = connection.execute(
                 select(
                     factor_candidates.c.experiment_family_id,
@@ -3563,7 +3608,14 @@ class StrategyStore:
                 family_counts.get(family, 0),
                 int(row.experiment_count or 1),
             )
-        version_ids = sorted(str(row.id) for row in version_rows)
+        sorted_version_ids = sorted(version_ids)
+        trial_lineage = build_strategy_trial_lineage(
+            version_configs=version_configs,
+            backtests_by_id=backtests_by_id,
+            repair_rows=repair_rows,
+            repair_audits=repair_audits,
+        )
+        strategy_trial_count = int(trial_lineage["strategy_trial_count"])
         factor_trial_count = sum(family_counts.values())
         model_trial_count = sum(model_run_counts.values())
         quant_trial_count = sum(quant_run_counts.values()) * len(REQUIRED_QUANT_ABLATIONS)
@@ -3574,14 +3626,15 @@ class StrategyStore:
             + quant_trial_count
             + ensemble_trial_count
         )
-        shared_count = max(1, len(version_ids), research_trial_count)
+        shared_count = max(1, strategy_trial_count, research_trial_count)
         return {
             "economic_hypothesis_group": group,
             "hypothesis_group_cap": float(version["hypothesis_group_cap"]),
             "shared_experiment_count": shared_count,
-            "strategy_version_ids": version_ids,
+            "strategy_version_ids": sorted_version_ids,
             "experiment_family_counts": dict(sorted(family_counts.items())),
             "trial_count_audit": {
+                **trial_lineage,
                 "factor_trial_count": factor_trial_count,
                 "model_trial_count": model_trial_count,
                 "quant_trial_count": quant_trial_count,
