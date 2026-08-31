@@ -118,7 +118,10 @@ def _replace_validator_fragments(
             "formal-backtest interruption recovery validator DDL is not replaceable"
         )
 
-    bind.exec_driver_sql(replacement)
+    # Route the recovered PL/pgSQL source through SQLAlchemy's compiler. The
+    # psycopg dialect escapes `%ROWTYPE` and any other literal percent tokens
+    # for DBAPI transport while PostgreSQL still stores the original source.
+    bind.execute(sa.text(replacement))
 
     verified = _function_definition(bind)
     for old, new in replacements:

@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql.psycopg import PGDialect_psycopg
 
 from quant_data.database import formal_backtest_interruption_recoveries
 from quant_platform import formal_backtest_interruption_recovery as recovery
@@ -119,7 +121,11 @@ class _FunctionDefinitionBind:
         raise AssertionError(f"unexpected scalar statement: {sql}")
 
     def execute(self, statement: Any, params: dict[str, str] | None = None) -> None:
-        self.executed.append((str(statement), params))
+        sql = str(statement)
+        self.executed.append((sql, params))
+        if sql.lstrip().upper().startswith("CREATE OR REPLACE FUNCTION "):
+            self.ddl.append(sql)
+            self.definition = sql
 
     def exec_driver_sql(self, statement: str) -> None:
         self.ddl.append(statement)
@@ -140,6 +146,11 @@ def test_0087_upgrade_replaces_only_the_deployed_recipe_digest_path() -> None:
         "CREATE OR REPLACE FUNCTION "
         "quantlab.validate_formal_backtest_interruption_recovery()\n"
         "RETURNS trigger AS $$\n"
+        "DECLARE\n"
+        "source_job quantlab.jobs%ROWTYPE;\n"
+        "source_backtest quantlab.backtest_runs%ROWTYPE;\n"
+        "source_version quantlab.strategy_versions%ROWTYPE;\n"
+        "source_audit quantlab.audit_events%ROWTYPE;\n"
         "BEGIN\n"
         "            IF NOT ((NEW.verification_json = '{}'::jsonb) IS TRUE) THEN\n"
         "                RAISE EXCEPTION 'invalid';\n"
@@ -155,6 +166,11 @@ def test_0087_upgrade_replaces_only_the_deployed_recipe_digest_path() -> None:
     assert migration.down_revision == "0086_formal_bt_interrupt"
     assert len(bind.ddl) == 4
     validator_ddl, guard_ddl, drop_trigger_ddl, create_trigger_ddl = bind.ddl
+    assert validator_ddl.count("%ROWTYPE") == 4
+    compiled = sa.text(validator_ddl).compile(dialect=PGDialect_psycopg())
+    compiled_sql = str(compiled)
+    assert compiled_sql.count("%%ROWTYPE") == 4
+    assert compiled.params == {}
     assert migration._BOOTSTRAP_RECIPE_BINDING in validator_ddl
     assert migration._TOP_LEVEL_RECIPE_BINDING not in validator_ddl
     assert migration._LOCKED_VALIDATOR_BEGIN in validator_ddl
