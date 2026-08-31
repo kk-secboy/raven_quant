@@ -121,6 +121,17 @@ FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256 = (
 FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 = (
     "3f0c60adbe3b50ff26771e11ce75f6a48d13772ac5bff549f716469748b92874"
 )
+STRATEGY_RESEARCH_TARGET_RECIPE_VERSION = (
+    "qlib-rdagent-single-mainline-2026-09-01-v19"
+)
+STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 = (
+    "c45bd901f25ba0cf289e3ec1a71015865d190afb4510c6bc207d53c9cc2ab24d"
+)
+# Filled after the complete v19 source closure is stable.  The source-closure
+# normalizer excludes both v19 seal assignments from their own digest.
+STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 = (
+    "d6ded80dbe88c6bee0403428132e6def80e14bc7ff540ac41e4d83f8343bf1c3"
+)
 TRANSPARENT_BASELINE_RUNNER_FIELD = "target_runner_sha256"
 TRANSPARENT_BASELINE_JOB_RUNNER_FIELD = "transparent_baseline_runner_sha256"
 TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD = "target_runtime_bundle_sha256"
@@ -169,6 +180,7 @@ _TARGET_RUNNERS = {
     FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION: (
         FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256
     ),
+    STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
 }
 
 
@@ -262,6 +274,8 @@ def target_runtime_bundle_for_recipe(recipe_id: Any, recipe_version: Any) -> str
         return TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
     if normalized_recipe_version == FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION:
         return FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
+    if normalized_recipe_version == STRATEGY_RESEARCH_TARGET_RECIPE_VERSION:
+        return STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
     return None
 
 
@@ -294,6 +308,7 @@ def target_worker_runtime_image_for_recipe(
             DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION,
             TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
             FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
+            STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
         }
     ):
         return None
@@ -305,6 +320,7 @@ def target_worker_runtime_image_for_recipe(
         DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION: "v16",
         TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION: "v17",
         FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION: "v18",
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v19",
     }[normalized_recipe_version]
     value = str(os.getenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV) or "").strip().lower()
     if not _IMAGE_DIGEST.fullmatch(value):
@@ -312,6 +328,82 @@ def target_worker_runtime_image_for_recipe(
             f"transparent {version_label} worker runtime image digest is missing or invalid"
         )
     return value
+
+
+def bind_transparent_baseline_job_identity(
+    *,
+    config: Mapping[str, Any],
+    job_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Freeze the governed runtime identity into a child evaluation job.
+
+    Transparent strategies are executable only when the immutable strategy
+    bootstrap, the queued job, and the worker release all name the same
+    runner, source closure, and worker image.  Constructing these fields in one
+    place prevents nested parameter experiments from silently dropping the
+    identity that ordinary formal backtests already carry.
+    """
+
+    payload = dict(job_payload)
+    recipe_id = config.get("recipe_id")
+    recipe_version = config.get("recipe_version")
+    expected_runner = target_runner_for_recipe(recipe_id, recipe_version)
+    expected_bundle = target_runtime_bundle_for_recipe(recipe_id, recipe_version)
+    bootstrap_raw = config.get("transparent_baseline_bootstrap")
+    bootstrap = dict(bootstrap_raw) if isinstance(bootstrap_raw, Mapping) else {}
+    governed_fields = (
+        (
+            TRANSPARENT_BASELINE_RUNNER_FIELD,
+            TRANSPARENT_BASELINE_JOB_RUNNER_FIELD,
+            expected_runner,
+        ),
+        (
+            TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
+            TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
+            expected_bundle,
+        ),
+    )
+    if expected_runner is None:
+        if any(
+            bootstrap.get(source_field) is not None
+            or payload.get(job_field) is not None
+            for source_field, job_field, _ in governed_fields
+        ) or (
+            bootstrap.get(TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD) is not None
+            or payload.get(TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD)
+            is not None
+        ):
+            raise ValueError(
+                "runner repair identity is forbidden outside governed transparent recipes"
+            )
+        return payload
+
+    expected_worker_image = target_worker_runtime_image_for_recipe(
+        recipe_id, recipe_version
+    )
+    for source_field, job_field, expected in governed_fields:
+        value = bootstrap.get(source_field)
+        if value != expected:
+            raise ValueError("transparent strategy bootstrap runtime identity is invalid")
+        submitted = payload.get(job_field)
+        if submitted is not None and submitted != value:
+            raise ValueError("transparent strategy job runtime identity changed")
+        payload[job_field] = value
+    bootstrap_worker_image = bootstrap.get(
+        TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD
+    )
+    if bootstrap_worker_image != expected_worker_image:
+        raise ValueError("transparent strategy bootstrap worker image is invalid")
+    submitted_worker_image = payload.get(
+        TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD
+    )
+    if (
+        submitted_worker_image is not None
+        and submitted_worker_image != expected_worker_image
+    ):
+        raise ValueError("transparent strategy job worker image changed")
+    payload[TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD] = expected_worker_image
+    return payload
 
 
 def require_transparent_baseline_runner(
@@ -368,6 +460,7 @@ def require_transparent_baseline_runner(
         DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION: "v16",
         TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION: "v17",
         FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION: "v18",
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION: "v19",
     }[str(config.get("recipe_version") or "")]
     if bootstrap_value != expected or payload_value != expected:
         raise ValueError(
@@ -412,12 +505,13 @@ def require_transparent_baseline_runner(
         "v16",
         "v17",
         "v18",
+        "v19",
     }:
         try:
             bundle_sha256 = (
                 position_risk_bundle_sha256(runner_path.parents[1])
                 if version_label
-                in {"v12", "v13", "v14", "v15", "v16", "v17", "v18"}
+                in {"v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19"}
                 else runtime_alignment_bundle_sha256(runner_path.parents[1])
             )
         except OSError as exc:
@@ -434,6 +528,7 @@ def require_transparent_baseline_runner(
             "v16": DISCRETE_MAX_POSITION_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
             "v17": TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
             "v18": FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256,
+            "v19": STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
         }[version_label]
         if bundle_sha256 != expected_bundle_sha256:
             raise ValueError(

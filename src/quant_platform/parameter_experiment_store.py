@@ -41,6 +41,7 @@ from .strategy_rule_compiler import (
     validate_strategy_rule_binding,
 )
 from .strategy_store import StrategyStore
+from .transparent_baseline_runner import bind_transparent_baseline_job_identity
 
 
 def _now() -> datetime:
@@ -362,18 +363,21 @@ class ParameterExperimentStore:
                 dataset_identity_sha256=dataset_identity,
             )
             created = True
-        job_payload = {
-            "parameter_experiment_id": experiment["id"],
-            "strategy_version_id": version_id,
-            "dataset": dataset_name,
-            "dataset_identity_sha256": dataset_identity,
-            "dataset_path": dataset_path,
-            "execution_dataset": (
-                dict(execution_dataset)
-                if isinstance(execution_dataset, Mapping)
-                else None
-            ),
-        }
+        job_payload = bind_transparent_baseline_job_identity(
+            config=config,
+            job_payload={
+                "parameter_experiment_id": experiment["id"],
+                "strategy_version_id": version_id,
+                "dataset": dataset_name,
+                "dataset_identity_sha256": dataset_identity,
+                "dataset_path": dataset_path,
+                "execution_dataset": (
+                    dict(execution_dataset)
+                    if isinstance(execution_dataset, Mapping)
+                    else None
+                ),
+            },
+        )
         return {
             "experiment": experiment,
             "job_payload": job_payload,
@@ -624,17 +628,20 @@ class ParameterExperimentStore:
             created_by=created_by,
         )
         experiment, created = self._persist_strategy_research_competition(prepared)
-        job_payload = {
-            "parameter_experiment_id": experiment["id"],
-            "strategy_version_id": prepared["version_id"],
-            "dataset": prepared["dataset_name"],
-            "dataset_identity_sha256": prepared["dataset_identity_sha256"],
-            "dataset_path": prepared["dataset_path"],
-            "strategy_evaluation_mode": prepared["evaluation_mode"],
-            "strategy_competition_plan_sha256": prepared["plan_sha256"],
-            "strategy_competition_stage": prepared["stage"],
-            "execution_dataset": None,
-        }
+        job_payload = bind_transparent_baseline_job_identity(
+            config=dict(strategy_version.get("config") or {}),
+            job_payload={
+                "parameter_experiment_id": experiment["id"],
+                "strategy_version_id": prepared["version_id"],
+                "dataset": prepared["dataset_name"],
+                "dataset_identity_sha256": prepared["dataset_identity_sha256"],
+                "dataset_path": prepared["dataset_path"],
+                "strategy_evaluation_mode": prepared["evaluation_mode"],
+                "strategy_competition_plan_sha256": prepared["plan_sha256"],
+                "strategy_competition_stage": prepared["stage"],
+                "execution_dataset": None,
+            },
+        )
         return {
             "experiment": experiment,
             "job_payload": job_payload,

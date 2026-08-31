@@ -188,6 +188,7 @@ from quant_platform.transparent_baseline_runner import (
     FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
     POSITION_RISK_TARGET_RECIPE_VERSION,
     SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
+    STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
     TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
     TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RESULT_WORKER_RUNTIME_IMAGE_FIELD,
@@ -255,6 +256,7 @@ def _transparent_worker_runtime_failures(
             DISCRETE_MAX_POSITION_REPAIR_TARGET_RECIPE_VERSION,
             TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
             FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
+            STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
         }
         or target_runner_for_recipe(
             config.get("recipe_id"), config.get("recipe_version")
@@ -298,7 +300,7 @@ def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[s
     recipe_version = config.get("recipe_version")
     is_current_public_recipe = (
         str(recipe_version or "")
-        == TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION
+        == STRATEGY_RESEARCH_TARGET_RECIPE_VERSION
         and target_runner_for_recipe(recipe_id, recipe_version) is not None
     )
     is_forward_only_rehabilitation = (
@@ -316,6 +318,8 @@ def _bind_current_transparent_runtime_identity(config: dict[str, Any]) -> dict[s
             "the current short transparent baseline is restricted to the exact "
             "forward-only rehabilitation entry point"
         )
+    if is_current_public_recipe and config.get("evidence_mode") != EVIDENCE_MODE_SEALED:
+        raise ValueError("the v19 strategy-research runtime requires sealed final OOS")
     if target_runner_for_recipe(recipe_id, recipe_version) is None:
         raise ValueError("the current transparent runner identity is unavailable")
     bootstrap_raw = config.get("transparent_baseline_bootstrap")

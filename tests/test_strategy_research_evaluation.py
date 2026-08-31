@@ -21,6 +21,21 @@ from quant_platform.strategy_research_evaluation import (
 )
 from quant_platform.strategy_rule_compiler import compile_strategy_rule_policy
 from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
+from quant_platform.transparent_baseline_runner import (
+    STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
+    STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
+    TRANSPARENT_BASELINE_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
+    WORKER_RUNTIME_IMAGE_DIGEST_ENV,
+)
+
+_WORKER_IMAGE_DIGEST = "sha256:" + "e" * 64
+
+
+@pytest.fixture(autouse=True)
+def _sealed_worker_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(WORKER_RUNTIME_IMAGE_DIGEST_ENV, _WORKER_IMAGE_DIGEST)
 
 
 def _config() -> dict:
@@ -33,6 +48,17 @@ def _config() -> dict:
             "baseline_definition_sha256": "b" * 64,
             "strategy_evaluation_contract": {
                 "minimum_oos_observations": 252,
+            },
+            "transparent_baseline_bootstrap": {
+                TRANSPARENT_BASELINE_RUNNER_FIELD: (
+                    STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
+                ),
+                TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD: (
+                    STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
+                ),
+                TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD: (
+                    _WORKER_IMAGE_DIGEST
+                ),
             },
         }
     )
@@ -387,6 +413,15 @@ def test_strategy_competition_store_prepares_and_reuses_existing_dag(
     assert first["job_payload"]["strategy_evaluation_mode"] == (
         STRATEGY_POLICY_ONLY_MODE
     )
+    assert first["job_payload"]["transparent_baseline_runner_sha256"] == (
+        STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
+    )
+    assert first["job_payload"]["transparent_baseline_runtime_bundle_sha256"] == (
+        STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
+    )
+    assert first["job_payload"][
+        "transparent_baseline_worker_runtime_image_digest"
+    ] == _WORKER_IMAGE_DIGEST
 
 
 @pytest.mark.no_database

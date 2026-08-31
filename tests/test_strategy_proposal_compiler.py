@@ -114,8 +114,8 @@ def test_compiled_proposal_materializes_only_an_inert_rule_bound_candidate() -> 
     from quant_platform.api import StrategyConfigRequest
     from quant_platform.strategy_store import _normalize_multifactor_contract
     from quant_platform.transparent_baseline_runner import (
-        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256,
-        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
+        STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
+        STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
     )
 
     proposal = _proposal("swing_trend")
@@ -145,10 +145,10 @@ def test_compiled_proposal_materializes_only_an_inert_rule_bound_candidate() -> 
     )
     runtime = normalized["transparent_baseline_bootstrap"]
     assert runtime["target_runner_sha256"] == (
-        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256
+        STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
     )
     assert runtime["target_runtime_bundle_sha256"] == (
-        TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256
+        STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert runtime["target_worker_runtime_image_digest"] == "sha256:" + "d" * 64
 

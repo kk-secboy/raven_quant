@@ -163,6 +163,7 @@ from .strategy_rule_compiler import (
 )
 from .strategy_store import StrategyStore
 from .transparent_baseline_runner import (
+    TRANSPARENT_BASELINE_JOB_RUNNER_FIELD,
     TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
     TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
@@ -4178,6 +4179,12 @@ class LocalJobWorker:
             if version.get("strategy_type") != "multifactor":
                 raise ValueError("parameter experiments require a multifactor strategy")
             is_wsl = os.name == "nt" and self.settings.qlib_python.startswith("/")
+            backtest_script = self.project_root / "scripts" / "run_multifactor_backtest.py"
+            runner_sha256 = require_transparent_baseline_runner(
+                config=version["config"],
+                job_payload=payload,
+                runner_path=backtest_script,
+            )
 
             def runtime_path(value: str) -> str:
                 return _to_wsl_path(Path(value)) if is_wsl else str(Path(value))
@@ -4379,6 +4386,14 @@ class LocalJobWorker:
                     for item in experiment["trials"]
                 ],
             }
+            if runner_sha256 is not None:
+                manifest[TRANSPARENT_BASELINE_JOB_RUNNER_FIELD] = runner_sha256
+            for identity_field in (
+                TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
+                TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
+            ):
+                if payload.get(identity_field) is not None:
+                    manifest[identity_field] = payload[identity_field]
             manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )

@@ -51,6 +51,44 @@ def test_completed_segment_is_reused_only_when_period_and_config_match(
     ) is None
 
 
+def test_child_backtest_manifest_preserves_transparent_runtime_identity() -> None:
+    script = _script_module()
+    identity = {
+        "transparent_baseline_runner_sha256": "a" * 64,
+        "transparent_baseline_runtime_bundle_sha256": "b" * 64,
+        "transparent_baseline_worker_runtime_image_digest": "sha256:" + "c" * 64,
+    }
+    base = {
+        "strategy_version_id": "version-id",
+        "dataset": "dataset-id",
+        "benchmark": "SH000300",
+        "universe": "cn_all",
+        "execution_dataset": None,
+        "evaluation_mode": "strategy_policy_only_pre_final",
+        "pre_final_cutoff": "2024-12-31",
+        "historical_validation_periods": {
+            "start": "2015-01-01",
+            "end": "2021-12-31",
+        },
+        "strategy_trial_count": 2,
+        "shared_multiple_testing": None,
+        "model_signal": None,
+        "model_formal_admission": None,
+        "model_candidate": None,
+        "model_bundle_factors": [],
+        "factors": [],
+        **identity,
+    }
+
+    child = script._build_segment_manifest(
+        base_manifest=base,
+        config={"recipe_id": "short_relative_strength"},
+        periods={"start": "2022-01-01", "end": "2024-12-31"},
+    )
+
+    assert {key: child[key] for key in identity} == identity
+
+
 def test_cross_trial_dsr_rewrites_trial_metrics_and_progress() -> None:
     script = _script_module()
     returns = {

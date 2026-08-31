@@ -187,6 +187,7 @@ from .strategy_feature_drift_source import StrategyFeatureDriftSource
 from .strategy_recipes import RECIPE_VERSION, get_strategy_recipe, list_strategy_recipes
 from .strategy_rule_compiler import validate_strategy_rule_binding
 from .strategy_store import StrategyStore
+from .transparent_baseline_runner import bind_transparent_baseline_job_identity
 from .worker import LocalJobWorker
 
 
@@ -4974,15 +4975,19 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             raise HTTPException(409, str(exc)) from exc
         log_path = platform_root / "logs" / f"parameter-experiment-{experiment['id']}.log"
         try:
-            job = jobs.create(
-                "parameter_experiment",
-                {
+            job_payload = bind_transparent_baseline_job_identity(
+                config=dict(version.get("config") or {}),
+                job_payload={
                     "parameter_experiment_id": experiment["id"],
                     "strategy_version_id": version_id,
                     "dataset": payload.dataset,
                     "dataset_path": dataset["path"],
                     "execution_dataset": execution_dataset,
                 },
+            )
+            job = jobs.create(
+                "parameter_experiment",
+                job_payload,
                 log_path,
             )
         except ValueError as exc:

@@ -39,6 +39,9 @@ from quant_platform.transparent_baseline_runner import (
     SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RECIPE_VERSION,
     SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNNER_SHA256,
     SINGLE_MEMBER_PRE_RESULT_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
+    STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
+    STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
+    STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256,
     TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RECIPE_VERSION,
     TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNNER_SHA256,
     TOPK_INDUSTRY_CAPACITY_REPAIR_TARGET_RUNTIME_BUNDLE_SHA256,
@@ -49,6 +52,7 @@ from quant_platform.transparent_baseline_runner import (
     TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD,
     TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD,
     WORKER_RUNTIME_IMAGE_DIGEST_ENV,
+    bind_transparent_baseline_job_identity,
     position_risk_bundle_sha256,
     require_transparent_baseline_runner,
     target_runner_for_recipe,
@@ -145,6 +149,13 @@ def _config(
     if recipe_version == FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION:
         bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
             FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
+        )
+        bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
+            _WORKER_IMAGE_DIGEST
+        )
+    if recipe_version == STRATEGY_RESEARCH_TARGET_RECIPE_VERSION:
+        bootstrap[TRANSPARENT_BASELINE_RUNTIME_BUNDLE_FIELD] = (
+            STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
         )
         bootstrap[TRANSPARENT_BASELINE_WORKER_RUNTIME_IMAGE_FIELD] = (
             _WORKER_IMAGE_DIGEST
@@ -349,27 +360,69 @@ def test_historical_v17_identity_is_not_rebound_to_current_v18_runtime() -> None
         )
 
 
-def test_current_transparent_v18_runner_matches_forward_only_identity() -> None:
+def test_historical_v18_identity_is_not_rebound_to_current_v19_runtime() -> None:
     runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
 
-    assert require_transparent_baseline_runner(
-        config=_config(
-            FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
-            FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256,
-        ),
-        job_payload={
-            TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
+    with pytest.raises(ValueError, match="transparent v18 runtime bundle differs"):
+        require_transparent_baseline_runner(
+            config=_config(
+                FORWARD_ONLY_REHABILITATION_TARGET_RECIPE_VERSION,
                 FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256
             ),
-            TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
-                FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
-            ),
-            TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
-                _WORKER_IMAGE_DIGEST
-            ),
-        },
+            job_payload={
+                TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: (
+                    FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD: (
+                    FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
+                ),
+                TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD: (
+                    _WORKER_IMAGE_DIGEST
+                ),
+            },
+            runner_path=runner,
+        )
+
+
+def test_current_v19_identity_is_bound_and_executable() -> None:
+    runner = Path(__file__).parents[1] / "scripts" / "run_multifactor_backtest.py"
+    config = _config(
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
+        STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
+    )
+
+    payload = bind_transparent_baseline_job_identity(
+        config=config,
+        job_payload={"parameter_experiment_id": "experiment-id"},
+    )
+
+    assert payload[TRANSPARENT_BASELINE_JOB_RUNNER_FIELD] == (
+        STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
+    )
+    assert payload[TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD] == (
+        STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
+    )
+    assert payload[TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD] == (
+        _WORKER_IMAGE_DIGEST
+    )
+    assert require_transparent_baseline_runner(
+        config=config,
+        job_payload=payload,
         runner_path=runner,
-    ) == FORWARD_ONLY_REHABILITATION_TARGET_RUNNER_SHA256
+    ) == STRATEGY_RESEARCH_TARGET_RUNNER_SHA256
+
+
+def test_current_v19_job_identity_cannot_be_changed() -> None:
+    config = _config(
+        STRATEGY_RESEARCH_TARGET_RECIPE_VERSION,
+        STRATEGY_RESEARCH_TARGET_RUNNER_SHA256,
+    )
+
+    with pytest.raises(ValueError, match="job runtime identity changed"):
+        bind_transparent_baseline_job_identity(
+            config=config,
+            job_payload={TRANSPARENT_BASELINE_JOB_RUNNER_FIELD: "0" * 64},
+        )
 
 
 @pytest.mark.parametrize("recipe_id", ["swing_trend", "long_quality_value"])
@@ -548,13 +601,13 @@ def test_v18_runtime_bundle_survives_git_archive_with_autocrlf(tmp_path: Path) -
             destination.write_bytes(archived.read())
 
     assert position_risk_bundle_sha256(root) == (
-        FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
+        STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert position_risk_bundle_sha256(repo) == (
-        FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
+        STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
     )
     assert position_risk_bundle_sha256(archive_root) == (
-        FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256
+        STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256
     )
 
 
@@ -625,6 +678,12 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
         / "versions"
         / "0089_forward_only_dataset_catalog_repair.py"
     ).read_text(encoding="utf-8")
+    v19_migration = (
+        Path(__file__).parents[1]
+        / "migrations"
+        / "versions"
+        / "0090_strategy_research_runtime.py"
+    ).read_text(encoding="utf-8")
     database_metadata = (
         Path(__file__).parents[1] / "src" / "quant_data" / "database.py"
     ).read_text(encoding="utf-8")
@@ -664,6 +723,9 @@ def test_repair_migrations_pin_historical_and_current_runner_identities() -> Non
     assert FORWARD_ONLY_REHABILITATION_TARGET_RUNTIME_BUNDLE_SHA256 in (
         database_metadata
     )
+    assert STRATEGY_RESEARCH_TARGET_RUNNER_SHA256 in v19_migration
+    assert STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 in v19_migration
+    assert STRATEGY_RESEARCH_TARGET_RUNTIME_BUNDLE_SHA256 in database_metadata
 
 
 def test_transparent_v8_runner_rejects_changed_bytes(tmp_path: Path) -> None:

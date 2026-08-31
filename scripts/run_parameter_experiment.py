@@ -29,6 +29,11 @@ from quant_platform.statistical_validation import deflated_sharpe_probability
 from quant_platform.strategy_research_evaluation import (
     STRATEGY_RESEARCH_EVALUATION_MODES,
 )
+from quant_platform.transparent_baseline_runner import (
+    TRANSPARENT_BASELINE_JOB_RUNNER_FIELD,
+    TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
+    TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
+)
 
 PRE_FINAL_PORTFOLIO_TRIAL_MODE = "pre_final_portfolio_trial"
 PRE_FINAL_EVALUATION_MODES = frozenset(
@@ -98,27 +103,11 @@ def _run_segment(
     )
     if completed is not None:
         return completed
-    manifest = {
-        "strategy_version_id": base_manifest["strategy_version_id"],
-        "dataset": base_manifest["dataset"],
-        "benchmark": base_manifest["benchmark"],
-        "universe": base_manifest.get("universe", "cn_all"),
-        "execution_dataset": base_manifest.get("execution_dataset"),
-        "evaluation_mode": evaluation_mode,
-        "pre_final_cutoff": base_manifest.get("pre_final_cutoff"),
-        "historical_validation_periods": base_manifest.get(
-            "historical_validation_periods"
-        ),
-        "strategy_trial_count": base_manifest.get("strategy_trial_count"),
-        "shared_multiple_testing": base_manifest.get("shared_multiple_testing"),
-        "model_signal": base_manifest.get("model_signal"),
-        "model_formal_admission": base_manifest.get("model_formal_admission"),
-        "model_candidate": base_manifest.get("model_candidate"),
-        "model_bundle_factors": base_manifest.get("model_bundle_factors") or [],
-        "periods": periods,
-        "config": config,
-        "factors": base_manifest["factors"],
-    }
+    manifest = _build_segment_manifest(
+        base_manifest=base_manifest,
+        config=config,
+        periods=periods,
+    )
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     log_path = output / "backtest.log"
@@ -163,6 +152,45 @@ def _run_segment(
     if completed is None:
         raise RuntimeError("backtest result failed provenance validation")
     return completed
+
+
+def _build_segment_manifest(
+    *,
+    base_manifest: dict[str, Any],
+    config: dict[str, Any],
+    periods: dict[str, str],
+) -> dict[str, Any]:
+    """Project one outer experiment into the exact child backtest contract."""
+
+    manifest = {
+        "strategy_version_id": base_manifest["strategy_version_id"],
+        "dataset": base_manifest["dataset"],
+        "benchmark": base_manifest["benchmark"],
+        "universe": base_manifest.get("universe", "cn_all"),
+        "execution_dataset": base_manifest.get("execution_dataset"),
+        "evaluation_mode": base_manifest.get("evaluation_mode"),
+        "pre_final_cutoff": base_manifest.get("pre_final_cutoff"),
+        "historical_validation_periods": base_manifest.get(
+            "historical_validation_periods"
+        ),
+        "strategy_trial_count": base_manifest.get("strategy_trial_count"),
+        "shared_multiple_testing": base_manifest.get("shared_multiple_testing"),
+        "model_signal": base_manifest.get("model_signal"),
+        "model_formal_admission": base_manifest.get("model_formal_admission"),
+        "model_candidate": base_manifest.get("model_candidate"),
+        "model_bundle_factors": base_manifest.get("model_bundle_factors") or [],
+        "periods": periods,
+        "config": config,
+        "factors": base_manifest["factors"],
+    }
+    for identity_field in (
+        TRANSPARENT_BASELINE_JOB_RUNNER_FIELD,
+        TRANSPARENT_BASELINE_JOB_RUNTIME_BUNDLE_FIELD,
+        TRANSPARENT_BASELINE_JOB_WORKER_RUNTIME_IMAGE_FIELD,
+    ):
+        if base_manifest.get(identity_field) is not None:
+            manifest[identity_field] = base_manifest[identity_field]
+    return manifest
 
 
 def _progress_payload(

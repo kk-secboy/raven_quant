@@ -9,7 +9,7 @@ from quant_platform.strategy_rule_ir import validate_strategy_rule_ir
 # scoped v18 consumed-history rehabilitation is materialized only by its
 # dedicated one-shot builder; publishing v18 here would make the scheduler
 # attempt to open another ordinary OOS batch for all three horizons.
-RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-08-31-v17"
+RECIPE_VERSION = "qlib-rdagent-single-mainline-2026-09-01-v19"
 
 QLIB_SIX_FACTOR_BASELINE: tuple[dict[str, Any], ...] = (
     {"id": "momentum", "weight": 0.20, "qlib_expression": "Ref($close,21)/Ref($close,252)-1"},
