@@ -27,6 +27,7 @@ from quant_data.database import (
     strategy_allocation_members,
     strategy_allocation_nav,
     strategy_allocations,
+    strategy_forward_only_rehabilitations,
     strategy_health_snapshots,
     strategy_promotion_stages,
     strategy_versions,
@@ -93,6 +94,11 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _DAILY_CLOSE = time(15, 0)
 _STRATEGY_HEALTH_COLLECTOR_ACTOR = "system:strategy-health-collector"
 _TRANSPARENT_BASELINE_BOOTSTRAP_ACTOR = "system:transparent-baseline-bootstrap"
+_FORWARD_ONLY_REHABILITATION_CONTRACT_VERSION = "forward-only-rehabilitation-v1"
+_CONSUMED_HISTORICAL_REPLAY = "consumed_historical_replay"
+_HISTORICAL_DESCRIPTION_ONLY = "historical_description_only"
+_SOURCE_CASH_ONLY_SCOPE = "cash_only_projection_only"
+_SOURCE_TRANSPARENT_BASELINE_VERSION_ID = "4414d202dbb641608975e5305bc18da4"
 
 
 def _latest_closed_trading_day(
@@ -551,6 +557,178 @@ def _validated_cash_only_horizon_lanes(
     return lanes
 
 
+def _validated_rehabilitation_cash_only_horizon_lanes(
+    rows: Sequence[Any],
+    *,
+    short_lane: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Project source-bound cash sleeves for the exact operable replay version.
+
+    A rehabilitation receipt describes an already-opened historical replay.  It
+    is therefore never treated as a current-recipe lockbox or sealed final OOS.
+    The receipt may only carry forward the source lockbox's conservative
+    swing/long unavailability after the same target short version has reached an
+    operable paper or recommendation stage.
+    """
+
+    selected_version_id = str(short_lane.get("strategy_version_id") or "")
+    selected_stage = str(short_lane.get("stage") or "")
+    if (
+        short_lane.get("status") != "ok"
+        or not selected_version_id
+        or selected_stage not in _OPERABLE_PROMOTION_STAGES
+    ):
+        return {}
+    matching: list[dict[str, Any]] = []
+    for raw_row in rows:
+        row = raw_row._mapping if hasattr(raw_row, "_mapping") else raw_row
+        if isinstance(row, Mapping) and str(row.get("strategy_version_id") or "") == (
+            selected_version_id
+        ):
+            matching.append(dict(row))
+    if len(matching) != 1:
+        return {}
+    row = matching[0]
+    config = row.get("target_config_json")
+    qualification = row.get("qualification_json")
+    evidence_hashes = row.get("source_unavailable_evidence_sha256s_json")
+    if (
+        not isinstance(config, Mapping)
+        or not isinstance(qualification, Mapping)
+        or not isinstance(evidence_hashes, Mapping)
+    ):
+        return {}
+    receipt_sha256 = str(row.get("receipt_sha256") or "")
+    qualification_receipt = str(qualification.get("receipt_sha256") or "")
+    qualification_core = {
+        key: value for key, value in qualification.items() if key != "receipt_sha256"
+    }
+    current_recipe_version = str(
+        get_strategy_recipe("short_relative_strength")["version"]
+    )
+    normalized_evidence_hashes = {
+        str(key): str(value) for key, value in evidence_hashes.items()
+    }
+    expected_evidence_horizons = {"swing_1_6m", "long_1_3y"}
+    hash_fields = (
+        "source_lockbox_batch_sha256",
+        "source_lockbox_member_sha256",
+        "source_history_selection_sha256",
+        "source_unavailable_horizons_sha256",
+    )
+    qualification_pairs = {
+        "source_lockbox_contract_version": row.get(
+            "source_lockbox_contract_version"
+        ),
+        "source_lockbox_batch_sha256": row.get("source_lockbox_batch_sha256"),
+        "source_lockbox_member_sha256": row.get("source_lockbox_member_sha256"),
+        "source_history_selection_sha256": row.get(
+            "source_history_selection_sha256"
+        ),
+        "source_unavailable_horizons_sha256": row.get(
+            "source_unavailable_horizons_sha256"
+        ),
+        "source_unavailable_evidence_sha256s": normalized_evidence_hashes,
+        "source_cash_only_scope": row.get("source_cash_only_scope"),
+    }
+    if (
+        receipt_sha256 != qualification_receipt
+        or len(receipt_sha256) != 64
+        or canonical_sha256(qualification_core) != receipt_sha256
+        or row.get("contract_version")
+        != _FORWARD_ONLY_REHABILITATION_CONTRACT_VERSION
+        or row.get("evidence_mode") != _CONSUMED_HISTORICAL_REPLAY
+        or row.get("authority") != _HISTORICAL_DESCRIPTION_ONLY
+        or row.get("source_strategy_version_id")
+        != _SOURCE_TRANSPARENT_BASELINE_VERSION_ID
+        or row.get("source_lockbox_contract_version")
+        != LOCKBOX_CONTRACT_VERSION_V3
+        or row.get("source_cash_only_scope") != _SOURCE_CASH_ONLY_SCOPE
+        or row.get("recipe_id") != "short_relative_strength"
+        or row.get("horizon_profile") != "short_1_5d"
+        or row.get("target_status") != "approved"
+        or row.get("target_promotion_stage") != selected_stage
+        or row.get("target_horizon_profile") != "short_1_5d"
+        or row.get("target_evidence_mode") != _CONSUMED_HISTORICAL_REPLAY
+        or config.get("recipe_id") != "short_relative_strength"
+        or config.get("recipe_version") != current_recipe_version
+        or config.get("horizon_profile") != "short_1_5d"
+        or config.get("evidence_mode") != _CONSUMED_HISTORICAL_REPLAY
+        or qualification.get("historical_replay_opened") is not True
+        or qualification.get("consumed_oos_replayed") is not True
+        or qualification.get("sealed_final_oos") is not False
+        or qualification.get("unseen_oos") is not False
+        or qualification.get("authority") != _HISTORICAL_DESCRIPTION_ONLY
+        or qualification.get("strategy_version_id") != selected_version_id
+        or qualification.get("source_strategy_version_id")
+        != _SOURCE_TRANSPARENT_BASELINE_VERSION_ID
+        or any(
+            qualification.get(key) != value
+            for key, value in qualification_pairs.items()
+        )
+        or set(normalized_evidence_hashes) != expected_evidence_horizons
+        or any(
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in normalized_evidence_hashes.values()
+        )
+        or any(
+            len(str(row.get(field) or "")) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in str(row.get(field) or "")
+            )
+            for field in hash_fields
+        )
+    ):
+        return {}
+
+    lanes: dict[str, dict[str, Any]] = {}
+    for horizon in _PRODUCT_HORIZONS[1:]:
+        lanes[horizon] = {
+            "horizon": horizon,
+            "status": "ok",
+            "stage": "cash_only",
+            "strategy_version_id": None,
+            "health_status": "not_applicable",
+            "runner": "cash_only_no_orders",
+            "message": (
+                "horizon is source-revalidated unavailable and its sleeve remains "
+                "in cash; the historical replay is not sealed final OOS"
+            ),
+            "candidates": [],
+            "cash_only": True,
+            "sleeve_action": "remain_in_cash",
+            "new_entries_allowed": False,
+            "recommendation_eligible": False,
+            "rehabilitation_evidence": {
+                "receipt_sha256": receipt_sha256,
+                "target_short_strategy_version_id": selected_version_id,
+                "source_strategy_version_id": row["source_strategy_version_id"],
+                "source_lockbox_contract_version": row[
+                    "source_lockbox_contract_version"
+                ],
+                "source_lockbox_batch_sha256": row[
+                    "source_lockbox_batch_sha256"
+                ],
+                "source_history_selection_sha256": row[
+                    "source_history_selection_sha256"
+                ],
+                "source_unavailable_horizons_sha256": row[
+                    "source_unavailable_horizons_sha256"
+                ],
+                "source_unavailable_evidence_sha256": normalized_evidence_hashes[
+                    horizon
+                ],
+                "source_cash_only_scope": _SOURCE_CASH_ONLY_SCOPE,
+                "authority": _HISTORICAL_DESCRIPTION_ONLY,
+                "sealed_final_oos": False,
+                "unseen_oos": False,
+            },
+        }
+    return lanes
+
+
 def _project_three_horizon_production(
     candidates: Mapping[str, list[dict[str, Any]]],
     cash_only_lanes: Mapping[str, Mapping[str, Any]],
@@ -942,6 +1120,44 @@ class DeploymentReadinessStore:
                     strategy_versions.c.id.desc(),
                 )
             ).all()
+            rehabilitation_rows = connection.execute(
+                select(
+                    strategy_forward_only_rehabilitations.c.receipt_sha256,
+                    strategy_forward_only_rehabilitations.c.source_strategy_version_id,
+                    strategy_forward_only_rehabilitations.c.source_lockbox_contract_version,
+                    strategy_forward_only_rehabilitations.c.source_lockbox_batch_sha256,
+                    strategy_forward_only_rehabilitations.c.source_lockbox_member_sha256,
+                    strategy_forward_only_rehabilitations.c.source_history_selection_sha256,
+                    strategy_forward_only_rehabilitations.c.source_unavailable_horizons_sha256,
+                    strategy_forward_only_rehabilitations.c.source_unavailable_evidence_sha256s_json,
+                    strategy_forward_only_rehabilitations.c.source_cash_only_scope,
+                    strategy_forward_only_rehabilitations.c.strategy_version_id,
+                    strategy_forward_only_rehabilitations.c.contract_version,
+                    strategy_forward_only_rehabilitations.c.evidence_mode,
+                    strategy_forward_only_rehabilitations.c.authority,
+                    strategy_forward_only_rehabilitations.c.recipe_id,
+                    strategy_forward_only_rehabilitations.c.horizon_profile,
+                    strategy_forward_only_rehabilitations.c.qualification_json,
+                    strategy_versions.c.status.label("target_status"),
+                    strategy_versions.c.promotion_stage.label(
+                        "target_promotion_stage"
+                    ),
+                    strategy_versions.c.horizon_profile.label(
+                        "target_horizon_profile"
+                    ),
+                    strategy_versions.c.evidence_mode.label("target_evidence_mode"),
+                    strategy_versions.c.config_json.label("target_config_json"),
+                    strategy_forward_only_rehabilitations.c.created_at,
+                )
+                .select_from(
+                    strategy_forward_only_rehabilitations.join(
+                        strategy_versions,
+                        strategy_versions.c.id
+                        == strategy_forward_only_rehabilitations.c.strategy_version_id,
+                    )
+                )
+                .order_by(strategy_forward_only_rehabilitations.c.created_at.desc())
+            ).mappings().all()
             versions = connection.execute(
                 select(
                     strategy_versions.c.id,
@@ -1103,7 +1319,22 @@ class DeploymentReadinessStore:
                         ),
                     }
                 )
-        cash_only_lanes = _validated_cash_only_horizon_lanes(lockbox_rows)
+        short_lane = _assess_horizon_candidates(
+            "short_1_5d", candidates["short_1_5d"]
+        )
+        rehabilitation_cash_only_lanes = (
+            _validated_rehabilitation_cash_only_horizon_lanes(
+                rehabilitation_rows,
+                short_lane=short_lane,
+            )
+        )
+        # A genuine current-recipe sealed lockbox remains authoritative when it
+        # exists. The rehabilitation projection is an independent source
+        # reference and never impersonates that sealed path.
+        cash_only_lanes = {
+            **rehabilitation_cash_only_lanes,
+            **_validated_cash_only_horizon_lanes(lockbox_rows),
+        }
         return _project_three_horizon_production(candidates, cash_only_lanes)
 
     def _recommendation_checks(self) -> list[dict[str, Any]]:

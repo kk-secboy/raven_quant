@@ -423,6 +423,192 @@ def test_cash_only_readiness_fails_closed_without_current_valid_lockbox() -> Non
     assert missing["status"] == "blocked"
 
 
+def _rehabilitation_cash_only_rows(
+    *,
+    short_version_id: str = "v18-short-paper",
+) -> list[dict]:
+    evidence_hashes = {
+        "swing_1_6m": "c" * 64,
+        "long_1_3y": "d" * 64,
+    }
+    qualification = {
+        "contract_version": "forward-only-rehabilitation-v1",
+        "evidence_mode": "consumed_historical_replay",
+        "historical_replay_opened": True,
+        "consumed_oos_replayed": True,
+        "sealed_final_oos": False,
+        "unseen_oos": False,
+        "authority": "historical_description_only",
+        "source_strategy_version_id": "4414d202dbb641608975e5305bc18da4",
+        "source_lockbox_contract_version": (
+            "transparent-baseline-available-horizons-lockbox-v3"
+        ),
+        "source_lockbox_batch_sha256": "1" * 64,
+        "source_lockbox_member_sha256": "2" * 64,
+        "source_history_selection_sha256": "3" * 64,
+        "source_unavailable_horizons_sha256": "4" * 64,
+        "source_unavailable_evidence_sha256s": evidence_hashes,
+        "source_cash_only_scope": "cash_only_projection_only",
+        "strategy_version_id": short_version_id,
+        "recipe_id": "short_relative_strength",
+        "horizon_profile": "short_1_5d",
+    }
+    receipt_sha256 = readiness_module.canonical_sha256(qualification)
+    return [
+        {
+            "receipt_sha256": receipt_sha256,
+            "source_strategy_version_id": qualification[
+                "source_strategy_version_id"
+            ],
+            "source_lockbox_contract_version": qualification[
+                "source_lockbox_contract_version"
+            ],
+            "source_lockbox_batch_sha256": qualification[
+                "source_lockbox_batch_sha256"
+            ],
+            "source_lockbox_member_sha256": qualification[
+                "source_lockbox_member_sha256"
+            ],
+            "source_history_selection_sha256": qualification[
+                "source_history_selection_sha256"
+            ],
+            "source_unavailable_horizons_sha256": qualification[
+                "source_unavailable_horizons_sha256"
+            ],
+            "source_unavailable_evidence_sha256s_json": evidence_hashes,
+            "source_cash_only_scope": qualification["source_cash_only_scope"],
+            "strategy_version_id": short_version_id,
+            "contract_version": qualification["contract_version"],
+            "evidence_mode": qualification["evidence_mode"],
+            "authority": qualification["authority"],
+            "recipe_id": qualification["recipe_id"],
+            "horizon_profile": qualification["horizon_profile"],
+            "qualification_json": {
+                **qualification,
+                "receipt_sha256": receipt_sha256,
+            },
+            "target_status": "approved",
+            "target_promotion_stage": "paper",
+            "target_horizon_profile": "short_1_5d",
+            "target_evidence_mode": "consumed_historical_replay",
+            "target_config_json": {
+                "recipe_id": "short_relative_strength",
+                "recipe_version": get_strategy_recipe("short_relative_strength")[
+                    "version"
+                ],
+                "horizon_profile": "short_1_5d",
+                "evidence_mode": "consumed_historical_replay",
+            },
+        }
+    ]
+
+
+def _healthy_short_paper_candidate(
+    *,
+    strategy_version_id: str = "v18-short-paper",
+) -> dict:
+    return {
+        "strategy_version_id": strategy_version_id,
+        "promotion_stage": "paper",
+        "signal_frequency": "day",
+        "execution_frequency": "day",
+        "contract_ready": True,
+        "health_status": "healthy",
+        "health_evidence_ready": True,
+        "health_evidence_reasons": [],
+        "paper_stage_status": "active",
+        "simulation_status": "active",
+        "active_recommendation_portfolios": 0,
+    }
+
+
+@pytest.mark.no_database
+def test_rehabilitation_receipt_projects_only_source_revalidated_cash_sleeves() -> None:
+    rows = _rehabilitation_cash_only_rows()
+    assert LOCKBOX_CONFIG_KEY not in rows[0]["target_config_json"]
+    short = _healthy_short_paper_candidate()
+    short_lane = readiness_module._assess_horizon_candidates(
+        "short_1_5d", [short]
+    )
+
+    cash_only_lanes = (
+        readiness_module._validated_rehabilitation_cash_only_horizon_lanes(
+            rows,
+            short_lane=short_lane,
+        )
+    )
+    result = readiness_module._project_three_horizon_production(
+        {
+            "short_1_5d": [short],
+            "swing_1_6m": [],
+            "long_1_3y": [],
+        },
+        cash_only_lanes,
+    )
+
+    assert result["status"] == "ok"
+    assert result["cash_only_horizons"] == ["swing_1_6m", "long_1_3y"]
+    for horizon in result["cash_only_horizons"]:
+        lane = result["horizons"][horizon]
+        assert "lockbox_evidence" not in lane
+        assert lane["recommendation_eligible"] is False
+        assert lane["rehabilitation_evidence"]["authority"] == (
+            "historical_description_only"
+        )
+        assert lane["rehabilitation_evidence"]["sealed_final_oos"] is False
+        assert lane["rehabilitation_evidence"]["unseen_oos"] is False
+
+
+@pytest.mark.no_database
+def test_rehabilitation_cash_projection_requires_exact_operable_target_receipt() -> None:
+    rows = _rehabilitation_cash_only_rows()
+    short = _healthy_short_paper_candidate()
+    short_lane = readiness_module._assess_horizon_candidates(
+        "short_1_5d", [short]
+    )
+
+    tampered = deepcopy(rows)
+    tampered[0]["source_unavailable_horizons_sha256"] = "5" * 64
+    assert (
+        readiness_module._validated_rehabilitation_cash_only_horizon_lanes(
+            tampered,
+            short_lane=short_lane,
+        )
+        == {}
+    )
+    assert (
+        readiness_module._validated_rehabilitation_cash_only_horizon_lanes(
+            rows,
+            short_lane={**short_lane, "strategy_version_id": "another-short"},
+        )
+        == {}
+    )
+    opened = deepcopy(rows)
+    qualification = opened[0]["qualification_json"]
+    qualification["sealed_final_oos"] = True
+    core = {key: value for key, value in qualification.items() if key != "receipt_sha256"}
+    opened[0]["receipt_sha256"] = readiness_module.canonical_sha256(core)
+    qualification["receipt_sha256"] = opened[0]["receipt_sha256"]
+    assert (
+        readiness_module._validated_rehabilitation_cash_only_horizon_lanes(
+            opened,
+            short_lane=short_lane,
+        )
+        == {}
+    )
+
+    stopped = readiness_module._assess_horizon_candidates(
+        "short_1_5d", [{**short, "simulation_status": "stopped"}]
+    )
+    assert (
+        readiness_module._validated_rehabilitation_cash_only_horizon_lanes(
+            rows,
+            short_lane=stopped,
+        )
+        == {}
+    )
+
+
 def _settings(monkeypatch, database_url: str, data_root: Path, *, auth_mode: str) -> Settings:
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("DATA_ROOT", str(data_root))
